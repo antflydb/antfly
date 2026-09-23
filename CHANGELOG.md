@@ -16,6 +16,19 @@ All notable changes to Antfly will be documented in this file.
 
 ### [Unreleased]
 
+- **One rerank endpoint for text and images** — `POST /ai/v1/rerank` takes
+  `documents`, where each entry is a string or an array of text and image
+  content parts, the same format generation and embedding use. Documents with
+  images need a multimodal reranker (ColQwen or Qwen3-VL); other models reject
+  them with `400`. `/ai/v1/rerank_multimodal` is removed; send those requests
+  to `/rerank` with the document content directly in `documents` (the
+  `{id, content}` wrapper is gone). `prompts` is deprecated but still accepted
+  for text. The operation id is now `rerankDocuments`, so generated SDK methods
+  are renamed (`RerankDocumentsWithResponse`, `rerank_documents`). The Go SDK
+  adds `InferenceClient.RerankMultimodal`, and the TypeScript `rerank()` accepts
+  content-part documents. Inference proxy route rules that matched the
+  `rerank_multimodal` operation should match `rerank` and select the model by
+  name instead.
 - **TOON document rendering in retrieval agents** — the generation prompt now
   encodes each retrieved document's fields as TOON instead of raw JSON, and
   `document_renderer` on a retrieval agent request is accepted again: a

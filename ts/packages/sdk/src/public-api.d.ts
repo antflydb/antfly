@@ -3179,33 +3179,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/ai/v1/rerank_multimodal": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Rerank multimodal documents by relevance
-         * @description Re-scores multimodal documents based on relevance to a text query.
-         *
-         *     This endpoint accepts the same content-part image conventions as generation and embedding.
-         *     Text-only requests can be served immediately. Image-bearing requests reserve the stable
-         *     contract for native ColQwen-style late-interaction reranking as that encoder lands.
-         *     Image-bearing requests already run native Zig image preprocessing and grid preparation.
-         *     Remote URL byte potential is reserved before fetch, and image headers plus aggregate
-         *     decoded pixels are admitted before model loading.
-         */
-        post: operations["rerankMultimodalPrompts"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/ai/v1/rerank": {
         parameters: {
             query?: never;
@@ -3216,32 +3189,34 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Rerank prompts by relevance
-         * @description Re-scores pre-rendered text prompts based on relevance to a query using native or ONNX reranking models.
+         * Rerank documents by relevance
+         * @description Re-scores documents by relevance to a text query. Returns one score per
+         *     document, in request order.
          *
-         *     ## Client Responsibilities
+         *     Each entry in `documents` is either a string or an array of content parts, in
+         *     the same format that generation and embedding use: `text` parts, `image_url`
+         *     parts, and inline `media` parts with an `image/*` MIME type. The client renders
+         *     document fields or templates to text before calling this endpoint.
          *
-         *     The client must:
-         *     1. Extract relevant fields from documents
-         *     2. Render any templates
-         *     3. Send pre-rendered text strings as `prompts`
-         *
-         *     This design keeps inference stateless and allows clients to customize rendering logic.
+         *     Text-only documents work with any reranker. Documents with images require a
+         *     model that supports them: a ColQwen-style late-interaction reranker (manifest
+         *     capability `colqwen` or `multimodal_late_interaction`) or a Qwen3-VL reranker
+         *     bundled with its GGUF vision projector. Otherwise the request is rejected with
+         *     a `400`. Within a request that contains images, documents without images are
+         *     scored by the model's text scorer.
          *
          *     ## Models
          *
          *     - Models are auto-discovered from `models_dir/rerankers/`
-         *     - Cross-encoder rerankers are supported through the existing text scorer
+         *     - Cross-encoder rerankers are supported through the text scorer
          *     - Late-interaction text rerankers such as ColBERT can opt in with `model_manifest.json` capability `late_interaction` or `colbert`
-         *     - Supports quantized models (`model_quantized.onnx`)
          *     - Automatically prefers quantized variants if available
          *
-         *     This endpoint is still text-only. Real ColQwen-style multimodal reranking requires a future request shape that carries page images or image-derived embeddings.
-         *
-         *     For document-based reranking with field extraction, use the client-side
-         *     `lib/reranking` package which handles rendering before calling this endpoint.
+         *     Remote image URLs are fetched subject to the configured content security
+         *     policy. Image headers and aggregate decoded pixels are admitted before the
+         *     model loads.
          */
-        post: operations["rerankPrompts"];
+        post: operations["rerankDocuments"];
         delete?: never;
         options?: never;
         head?: never;
@@ -16727,33 +16702,32 @@ export interface components {
              */
             query: string;
             /**
-             * @description Pre-rendered document texts to rerank. The client is responsible for extracting
-             *     and rendering document fields/templates before calling this endpoint.
+             * @description Documents to rerank. Each entry is a string or an array of text and image
+             *     content parts. Exactly one of `documents` and `prompts` is required.
              * @example [
              *       "Introduction to machine learning...",
-             *       "Deep learning fundamentals..."
+             *       [
+             *         {
+             *           "type": "text",
+             *           "text": "Quarterly invoice"
+             *         },
+             *         {
+             *           "type": "image_url",
+             *           "image_url": {
+             *             "url": "data:image/png;base64,iVBORw0KGgo..."
+             *           }
+             *         }
+             *       ]
              *     ]
              */
-            prompts: string[];
-        };
-        InferenceRerankMultimodalDocument: {
-            /** @description Optional caller-provided document identifier */
-            id?: string;
-            content: components["schemas"]["ChatMessageContent"];
-        };
-        InferenceRerankMultimodalRequest: {
+            documents?: components["schemas"]["ChatMessageContent"][];
             /**
-             * @description Name of multimodal reranking model from models_dir/rerankers/
-             * @example vidore/colqwen2-v1.0
+             * @deprecated
+             * @description Deprecated text-only form of `documents`. Accepted so older clients keep
+             *     working; send `documents` instead. Exactly one of `documents` and `prompts`
+             *     is required.
              */
-            model: string;
-            /**
-             * @description Text query for relevance scoring
-             * @example invoice total due date
-             */
-            query: string;
-            /** @description Documents expressed as text and image content parts */
-            documents: components["schemas"]["InferenceRerankMultimodalDocument"][];
+            prompts?: string[];
         };
         InferenceRerankResponse: {
             /**
@@ -16761,7 +16735,7 @@ export interface components {
              * @enum {string}
              */
             object: "list";
-            /** @description Rerank score objects, one per input prompt. */
+            /** @description Rerank score objects, one per input document. */
             data: components["schemas"]["InferenceRerankObject"][];
             /** @description Name of model used for reranking */
             model: string;
@@ -25552,7 +25526,7 @@ export interface operations {
             503: components["responses"]["TransientCapacity"];
         };
     };
-    rerankMultimodalPrompts: {
+    rerankDocuments: {
         parameters: {
             query?: never;
             header?: {
@@ -25568,7 +25542,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["InferenceRerankMultimodalRequest"];
+                "application/json": components["schemas"]["InferenceRerankRequest"];
             };
         };
         responses: {
@@ -25627,8 +25601,8 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Multimodal reranking contract recognized but encoder path not implemented yet */
-            501: {
+            /** @description Internal server error */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -25638,76 +25612,6 @@ export interface operations {
             };
             /** @description Remote content fetch failed */
             502: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
-            /** @description Inference service unavailable. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
-            503: components["responses"]["TransientCapacity"];
-        };
-    };
-    rerankPrompts: {
-        parameters: {
-            query?: never;
-            header?: {
-                /**
-                 * @description Set to `application/vnd.antfly.numeric.v1` to receive the values as a binary
-                 *     frame instead of JSON, which avoids serializing every float as text. Any
-                 *     other value, or none, returns the JSON body.
-                 */
-                Accept?: string;
-            };
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["InferenceRerankRequest"];
-            };
-        };
-        responses: {
-            /** @description Prompts reranked successfully */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceRerankResponse"];
-                    "application/vnd.antfly.numeric.v1": string;
-                };
-            };
-            /** @description Invalid request */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
-            /** @description Authentication is enabled and valid credentials were not supplied */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
-            /** @description Model not found */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
-            /** @description Internal server error */
-            500: {
                 headers: {
                     [name: string]: unknown;
                 };

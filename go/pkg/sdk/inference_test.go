@@ -659,8 +659,10 @@ func TestClient_Rerank(t *testing.T) {
 		assert.Equal(t, "test-reranker", req["model"])
 		assert.Equal(t, "what is machine learning?", req["query"])
 
-		prompts := req["prompts"].([]any)
-		assert.Len(t, prompts, 3)
+		assert.NotContains(t, req, "prompts")
+		documents := req["documents"].([]any)
+		assert.Len(t, documents, 3)
+		assert.Equal(t, "Machine learning is a subset of AI...", documents[0])
 
 		// Return scores
 		w.Header().Set("Content-Type", "application/json")
@@ -693,6 +695,44 @@ func TestClient_Rerank(t *testing.T) {
 	assert.InDelta(t, expectedScores[0], scores[0], 0.0001)
 	assert.InDelta(t, expectedScores[1], scores[1], 0.0001)
 	assert.InDelta(t, expectedScores[2], scores[2], 0.0001)
+}
+
+func TestClient_RerankMultimodal(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/ai/v1/rerank", r.URL.Path)
+		body, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		assert.JSONEq(t, `{
+			"model": "owner/colqwen",
+			"query": "invoice total",
+			"documents": [[
+				{"type": "text", "text": "page one"},
+				{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}
+			]]
+		}`, string(body))
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"object": "list",
+			"model":  "owner/colqwen",
+			"data":   []map[string]any{{"object": "rerank.score", "index": 0, "score": 0.8}},
+			"usage":  map[string]any{"prompt_tokens": 1, "completion_tokens": 0, "total_tokens": 1},
+		})
+	}))
+	defer server.Close()
+
+	var textPart, imagePart oapi.ContentPart
+	require.NoError(t, textPart.FromTextContentPart(oapi.TextContentPart{Type: oapi.TextContentPartTypeText, Text: "page one"}))
+	require.NoError(t, imagePart.FromImageURLContentPart(oapi.ImageURLContentPart{
+		Type:     oapi.ImageURLContentPartTypeImageUrl,
+		ImageUrl: oapi.ImageURL{Url: "data:image/png;base64,AA=="},
+	}))
+
+	inferenceClient, err := NewInferenceClient(server.URL, nil)
+	require.NoError(t, err)
+	scores, err := inferenceClient.RerankMultimodal(context.Background(), "owner/colqwen", "invoice total", [][]oapi.ContentPart{{textPart, imagePart}})
+	require.NoError(t, err)
+	require.Len(t, scores, 1)
+	assert.InDelta(t, 0.8, scores[0], 0.0001)
 }
 
 func TestClient_Rerank_ModelNotFound(t *testing.T) {

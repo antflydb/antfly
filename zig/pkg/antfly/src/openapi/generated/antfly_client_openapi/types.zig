@@ -24321,46 +24321,6 @@ pub const InferenceRequestAdmissionConfig = struct {
     }
 };
 
-pub const InferenceRerankMultimodalDocument = struct {
-    /// Optional caller-provided document identifier
-    id: ?[]const u8 = null,
-    content: ChatMessageContent,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "id", "id", true },
-        .{ "content", "content", false },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        if (self.id) |value| {
-            try jw.objectField("id");
-            try jw.write(value);
-        }
-        try jw.objectField("content");
-        try jw.write(self.content);
-        try jw.endObject();
-    }
-};
-
-pub const InferenceRerankMultimodalRequest = struct {
-    /// Name of multimodal reranking model from models_dir/rerankers/
-    model: []const u8,
-    /// Text query for relevance scoring
-    query: []const u8,
-    /// Documents expressed as text and image content parts
-    documents: []const InferenceRerankMultimodalDocument,
-};
-
 pub const InferenceRerankObject = struct {
     object: []const u8,
     /// Original prompt index.
@@ -24374,14 +24334,49 @@ pub const InferenceRerankRequest = struct {
     model: []const u8,
     /// Search query for relevance scoring
     query: []const u8,
-    /// Pre-rendered document texts to rerank. The client is responsible for extracting and rendering document fields/templates before calling this endpoint.
-    prompts: []const []const u8,
+    /// Documents to rerank. Each entry is a string or an array of text and image content parts. Exactly one of `documents` and `prompts` is required.
+    documents: ?[]const ChatMessageContent = null,
+    /// Deprecated text-only form of `documents`. Accepted so older clients keep working; send `documents` instead. Exactly one of `documents` and `prompts` is required.
+    prompts: ?[]const []const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "model", "model", false },
+        .{ "query", "query", false },
+        .{ "documents", "documents", true },
+        .{ "prompts", "prompts", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("model");
+        try jw.write(self.model);
+        try jw.objectField("query");
+        try jw.write(self.query);
+        if (self.documents) |value| {
+            try jw.objectField("documents");
+            try jw.write(value);
+        }
+        if (self.prompts) |value| {
+            try jw.objectField("prompts");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const InferenceRerankResponse = struct {
     /// Object type, always "list"
     object: []const u8,
-    /// Rerank score objects, one per input prompt.
+    /// Rerank score objects, one per input document.
     data: []const InferenceRerankObject,
     /// Name of model used for reranking
     model: []const u8,

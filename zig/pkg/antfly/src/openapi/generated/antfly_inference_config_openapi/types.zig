@@ -1724,8 +1724,43 @@ pub const RerankRequest = struct {
     model: []const u8,
     /// Search query for relevance scoring
     query: []const u8,
-    /// Pre-rendered document texts to rerank. The client is responsible for extracting and rendering document fields/templates before calling this endpoint.
-    prompts: []const []const u8,
+    /// Documents to rerank. Each entry is a string or an array of text and image content parts. Exactly one of `documents` and `prompts` is required.
+    documents: ?[]const ChatMessageContent = null,
+    /// Deprecated text-only form of `documents`. Accepted so older clients keep working; send `documents` instead.
+    prompts: ?[]const []const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "model", "model", false },
+        .{ "query", "query", false },
+        .{ "documents", "documents", true },
+        .{ "prompts", "prompts", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("model");
+        try jw.write(self.model);
+        try jw.objectField("query");
+        try jw.write(self.query);
+        if (self.documents) |value| {
+            try jw.objectField("documents");
+            try jw.write(value);
+        }
+        if (self.prompts) |value| {
+            try jw.objectField("prompts");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const RerankResponse = struct {

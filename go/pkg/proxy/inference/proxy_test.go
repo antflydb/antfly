@@ -2113,8 +2113,8 @@ func TestExtractModelOperationsPreservesTaskIdentity(t *testing.T) {
 	if len(operations["legacy"]) != 0 {
 		t.Fatalf("legacy generic catalog must remain task-unknown, got %#v", operations["legacy"])
 	}
-	if !operations["multimodal"]["rerank"] || !operations["multimodal"]["rerank_multimodal"] {
-		t.Fatalf("reranker aliases = %#v, want text and multimodal operations", operations["multimodal"])
+	if !operations["multimodal"]["rerank"] || len(operations["multimodal"]) != 1 {
+		t.Fatalf("reranker operations = %#v, want only rerank", operations["multimodal"])
 	}
 }
 
@@ -4068,41 +4068,6 @@ func TestCapabilityLeaseRejectsRoutePolicyGenerationChange(t *testing.T) {
 	p.handleGenerate(recorder, request)
 	if recorder.Code != http.StatusConflict || recorder.Header().Get(capabilityStaleHeader) != "true" {
 		t.Fatalf("route-change response = %d headers=%v body=%q, want capability-stale conflict", recorder.Code, recorder.Header(), recorder.Body.String())
-	}
-}
-
-func TestMultimodalRerankHandlerPreservesConcreteOperation(t *testing.T) {
-	t.Parallel()
-	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "cpu"}, Logger: zap.NewNop()})
-	p.registry.RegisterEndpoint("http://cpu.internal", "cpu", WorkloadTypeGeneral)
-	p.registry.RegisterEndpoint("http://multimodal.internal", "gpu", WorkloadTypeGeneral)
-	advertiseModelOperation(p.registry, "http://cpu.internal", "rerank", "owner/reranker")
-	advertiseModelOperation(p.registry, "http://multimodal.internal", "rerank_multimodal", "owner/reranker")
-	p.Router().RouteManager().UpsertRoute(&Route{
-		Name:          "multimodal-rerank",
-		Operations:    map[OperationType]bool{"rerank_multimodal": true},
-		ModelPatterns: []*RegexPattern{MustRegexPattern(`^owner/reranker$`)},
-		Destinations:  []Destination{{Pool: "gpu", Weight: 1}},
-	})
-	var forwardedHost string
-	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		forwardedHost = req.URL.Host
-		return &http.Response{
-			StatusCode: http.StatusOK,
-			Header:     http.Header{"Content-Type": []string{"application/json"}},
-			Body:       io.NopCloser(strings.NewReader(`{"results":[]}`)),
-			Request:    req,
-		}, nil
-	})}
-
-	request := httptest.NewRequest(http.MethodPost, "/ai/v1/rerank_multimodal", strings.NewReader(`{"model":"owner/reranker","query":{"text":"q"},"documents":[]}`))
-	recorder := httptest.NewRecorder()
-	p.handleRerankMultimodal(recorder, request)
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("status = %d: %s", recorder.Code, recorder.Body.String())
-	}
-	if forwardedHost != "multimodal.internal" {
-		t.Fatalf("forwarded host = %q, want multimodal.internal", forwardedHost)
 	}
 }
 

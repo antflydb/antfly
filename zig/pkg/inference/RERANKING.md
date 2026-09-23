@@ -134,20 +134,22 @@ This makes the reranker compatible with both BERT-style ColBERT checkpoints and 
 
 ### Endpoint
 
-`POST /rerank_multimodal`
+`POST /rerank`, the same endpoint as text reranking.
 
 Request fields:
 - `model`: reranker name
 - `query`: text query
-- `documents`: array of multimodal documents
+- `documents`: array of documents
 
-Each document carries `content` in the same format used for generation and embedding:
+Each document uses the same content format as generation and embedding:
 - plain string text
 - array of `ContentPart` values: text parts, `image_url` parts using data URIs, or inline `media` parts with `image/*` mime types
 
+The deprecated `prompts` field (an array of strings) is still accepted in place of `documents`; a request may not send both.
+
 ### Current Behavior
 
-- Text-only multimodal documents are reranked through the existing native text reranker path.
+- Requests without images are reranked through the native text reranker path, whatever the model.
 - Image-bearing requests are parsed, validated, resized, normalized, and grid-prepared natively in Zig.
 - Models that do not advertise `colqwen` or `multimodal_late_interaction` are rejected for image-bearing requests.
 - Image-bearing requests execute end to end when the model has a native GPT/Qwen text session plus either a `visual_model` export or native Qwen2-VL vision config.
@@ -185,7 +187,7 @@ The published `vidore/colqwen2-v1.0-hf` config contains the full `vlm_config.vis
 
 ### Remaining Work
 
-- Request-level `/rerank_multimodal` smoke/regression surface
+- Request-level multimodal `/rerank` smoke/regression surface
 - Unified text and multimodal late-interaction reporting semantics
 - Broader multimodal server-path regression coverage
 ```

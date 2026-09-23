@@ -10800,45 +10800,7 @@ pub const Node = struct {
         });
     }
 
-    pub fn rerankPrompts(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        const execution_control = httpInferenceExecutionControl(self, ctx);
-        var parsed = (try ctx.parseJson(api.RerankRequest)) orelse
-            return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
-        defer parsed.deinit();
-        const body = parsed.value;
-        if (try self.acquireSlot(ctx)) |resp| return resp;
-        defer self.releaseSlot();
-        self.metrics.incRequest("rerank");
-        defer self.metrics.decActive();
-
-        const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
-        const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "rerankers") catch |err|
-            return requestModelResolutionError(ctx, err);
-        defer ctx.allocator.free(model_path);
-        const executor_contract = resolvedInferenceExecutorContractFromDir(self, ctx.allocator, model_path, "rerank") catch |err|
-            return inferenceExecutorContractFailureResponse(ctx, err);
-        validateTextExecutorInvocation(executor_contract, 1, body.prompts, body.query.len, 0, body.prompts.len, 0) catch |err|
-            return inferenceExecutorContractFailureResponse(ctx, err);
-
-        var model_handle = self.model_manager.acquireFromDirWithControl(model_path, execution_control) catch |err|
-            return modelLoadFailureResponse(ctx, err);
-        defer model_handle.release();
-        const model = model_handle.get();
-        var pipeline = self.createRerankingPipeline(ctx.allocator, model);
-        pipeline.execution_control = execution_control;
-        var prepared = pipeline.prepareInputs(body.query, body.prompts) catch |err|
-            return inferenceFailureResponse(ctx, err);
-        defer prepared.deinit();
-        validateTextExecutorInvocation(executor_contract, 1, body.prompts, body.query.len, prepared.max_input_tokens_per_item, body.prompts.len, 0) catch |err|
-            return inferenceExecutorContractFailureResponse(ctx, err);
-
-        const scores = pipeline.rerankPrepared(&prepared) catch |err|
-            return inferenceFailureResponse(ctx, err);
-        defer ctx.allocator.free(scores);
-        return writeRerankScoresResponse(ctx, body.model, scores, prepared.prompt_tokens);
-    }
-
-    pub fn rerankMultimodalPrompts(self: *Node, ctx: *httpx.Context) !httpx.Response {
+    pub fn rerankDocuments(self: *Node, ctx: *httpx.Context) !httpx.Response {
         const execution_control = httpInferenceExecutionControl(self, ctx);
         const uses_attachment_envelope = requestUsesAttachmentEnvelope(ctx);
         var attachment_envelope: ?httpx.attachment_envelope.Envelope = null;
@@ -10852,35 +10814,43 @@ pub const Node = struct {
                 .@"error" = attachmentEnvelopeErrorCode(err),
                 .message = attachmentEnvelopeErrorMessage(err),
             });
-            break :blk std.json.parseFromSlice(api.RerankMultimodalRequest, ctx.allocator, attachment_envelope.?.metadata, .{}) catch
+            break :blk std.json.parseFromSlice(api.RerankRequest, ctx.allocator, attachment_envelope.?.metadata, .{}) catch
                 return ctx.status(400).json(.{
                     .@"error" = "INVALID_REQUEST",
-                    .message = "attachment envelope metadata must be a valid multimodal rerank request",
+                    .message = "attachment envelope metadata must be a valid rerank request",
                 });
-        } else (try ctx.parseJson(api.RerankMultimodalRequest)) orelse
+        } else (try ctx.parseJson(api.RerankRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed_body.deinit();
         const body = parsed_body.value;
+        const documents = rerankRequestDocuments(ctx.allocator, body) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            error.RerankDocumentsAndPrompts => return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "send documents or the deprecated prompts, not both",
+            }),
+            error.RerankDocumentsRequired => return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "documents must not be empty",
+            }),
+        };
+        defer if (body.documents == null) ctx.allocator.free(documents);
         const attachments: []const httpx.attachment_envelope.Attachment = if (attachment_envelope) |envelope|
             envelope.attachments
         else
             &.{};
-        validateMultimodalRerankAttachmentReferences(ctx.allocator, body, attachments.len) catch |err|
+        validateRerankAttachmentReferences(ctx.allocator, documents, attachments.len) catch |err|
             return ctx.status(400).json(.{
                 .@"error" = "INVALID_REQUEST",
                 .message = embedAttachmentReferenceErrorMessage(err),
             });
-        const media_shape = multimodalRerankRequestMediaShapeWithAttachments(body, attachments);
+        const media_shape = rerankRequestMediaShapeWithAttachments(documents, attachments);
         const media_admission = requestMediaAdmission(self, media_shape);
         if (try self.acquireSlotUnits(ctx, media_admission.units)) |resp| return resp;
         var reserved_units = media_admission.units;
         defer self.releaseSlotUnits(reserved_units);
         self.metrics.incRequest("rerank");
         defer self.metrics.decActive();
-
-        if (body.documents.len == 0) {
-            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "documents must not be empty" });
-        }
 
         const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
         const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "rerankers") catch |err|
@@ -10916,11 +10886,11 @@ pub const Node = struct {
         var max_doc_text_bytes: usize = 0;
         var decoded_pixels: u64 = 0;
         var media_budget = RequestMediaBudget.init(media_admission.byte_cap);
-        for (body.documents) |doc| {
+        for (documents) |doc| {
             const parsed = parseChatMessageContentToTextAndImagesWithBudgetContextAndAttachments(
                 self,
                 ctx.allocator,
-                doc.content,
+                doc,
                 &media_budget,
                 .{ .io = ctx.io, .control = execution_control },
                 attachments,
@@ -10932,10 +10902,10 @@ pub const Node = struct {
                 error.RemoteContentNotConfigured,
                 error.RemoteContentUnavailable,
                 => return remoteContentErrorResponse(ctx, err),
-                error.UnsupportedContentPartType => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "multimodal rerank documents only support text and image content parts" }),
+                error.UnsupportedContentPartType => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "rerank documents only support text and image content parts" }),
                 error.OutOfMemory => return err,
                 error.Timeout, error.Canceled, error.Cancelled => return inferenceFailureResponse(ctx, err),
-                else => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid multimodal rerank document content" }),
+                else => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid rerank document content" }),
             };
             image_count = std.math.add(usize, image_count, parsed.images.len) catch std.math.maxInt(usize);
             max_doc_images = @max(max_doc_images, parsed.images.len);
@@ -10969,7 +10939,7 @@ pub const Node = struct {
             .encoded_media_bytes = media_budget.used_bytes,
             .decoded_pixels = decoded_pixels,
             .media_parts_per_item = max_doc_images,
-            .candidates_per_request = body.documents.len,
+            .candidates_per_request = documents.len,
             .has_text = true,
             .has_image = image_count > 0,
         }) catch |err| return inferenceExecutorContractFailureResponse(ctx, err);
@@ -10993,7 +10963,7 @@ pub const Node = struct {
                 .item_count = 1,
                 .text_bytes_per_item = rerank_text_bytes,
                 .input_tokens_per_item = prepared.max_input_tokens_per_item,
-                .candidates_per_request = body.documents.len,
+                .candidates_per_request = documents.len,
                 .has_text = true,
             }) catch |err| return inferenceExecutorContractFailureResponse(ctx, err);
             const scores = pipeline.rerankPrepared(&prepared) catch |err|
@@ -11193,7 +11163,7 @@ pub const Node = struct {
             .encoded_media_bytes = media_budget.used_bytes,
             .decoded_pixels = decoded_pixels,
             .media_parts_per_item = max_doc_images,
-            .candidates_per_request = body.documents.len,
+            .candidates_per_request = documents.len,
             .has_text = true,
             .has_image = true,
         }) catch |err| return inferenceExecutorContractFailureResponse(ctx, err);
@@ -23464,7 +23434,6 @@ fn inferenceHttpRouteAdmission(comptime method: []const u8, comptime path: []con
             std.mem.eql(u8, path, "/predict") or
             std.mem.eql(u8, path, "/read") or
             std.mem.eql(u8, path, "/rerank") or
-            std.mem.eql(u8, path, "/rerank_multimodal") or
             std.mem.eql(u8, path, "/rewrite") or
             std.mem.eql(u8, path, "/transcribe")) return .inference;
     }
@@ -23489,7 +23458,7 @@ fn inferenceRouteSupportsFramedAttachments(comptime path: []const u8) bool {
         std.mem.eql(u8, path, "/generate") or
         std.mem.eql(u8, path, "/generate/batch") or
         std.mem.eql(u8, path, "/read") or
-        std.mem.eql(u8, path, "/rerank_multimodal") or
+        std.mem.eql(u8, path, "/rerank") or
         std.mem.eql(u8, path, "/transcribe");
 }
 
@@ -25367,14 +25336,14 @@ test "accepted multimodal routes reject tiny high-pixel batches before model loa
     }
 
     {
-        const body = try std.fmt.allocPrint(allocator, "{{\"model\":\"owner/rerank\",\"query\":\"q\",\"documents\":[{{\"content\":{s}}}]}}", .{image_parts});
+        const body = try std.fmt.allocPrint(allocator, "{{\"model\":\"owner/rerank\",\"query\":\"q\",\"documents\":[{s}]}}", .{image_parts});
         defer allocator.free(body);
-        var request = try httpx.Request.init(allocator, .POST, "/ai/v1/rerank_multimodal");
+        var request = try httpx.Request.init(allocator, .POST, "/ai/v1/rerank");
         defer request.deinit();
         try request.setJson(body);
         var ctx = httpx.Context.init(allocator, std.testing.io, &request);
         defer ctx.deinit();
-        var response = try node.rerankMultimodalPrompts(&ctx);
+        var response = try node.rerankDocuments(&ctx);
         defer response.deinit();
         try std.testing.expectEqual(@as(u16, 413), response.status.code);
         try std.testing.expect(std.mem.indexOf(u8, response.body.?, "IMAGE_BATCH_TOO_LARGE") != null);
@@ -25556,18 +25525,18 @@ test "multimodal rerank rejects incompatible manifest before media or model load
     var node = try Node.init(allocator, .{ .models_dir = models_root, .max_concurrent_requests = 1 });
     defer node.deinit();
     resetRequestWorkTestCounters();
-    var request = try httpx.Request.init(allocator, .POST, "/ai/v1/rerank_multimodal");
+    var request = try httpx.Request.init(allocator, .POST, "/ai/v1/rerank");
     defer request.deinit();
     // The default deny-all policy makes this deterministic and network-free:
     // reaching media materialization would increment the attempt counter and
     // return a content-policy error instead of MODEL_NOT_SUPPORTED.
     try request.setJson(
-        "{\"model\":\"owner/text-only\",\"query\":\"q\",\"documents\":[{\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"https://example.invalid/x\"}}]}]}",
+        "{\"model\":\"owner/text-only\",\"query\":\"q\",\"documents\":[[{\"type\":\"image_url\",\"image_url\":{\"url\":\"https://example.invalid/x\"}}]]}",
     );
     var ctx = httpx.Context.init(allocator, std.testing.io, &request);
     defer ctx.deinit();
 
-    var response = try node.rerankMultimodalPrompts(&ctx);
+    var response = try node.rerankDocuments(&ctx);
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 400), response.status.code);
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "MODEL_NOT_SUPPORTED") != null);
@@ -29637,18 +29606,37 @@ fn validateGenerateAttachmentReferences(
     if (reference_count != attachment_count) return error.AttachmentReferenceRequired;
 }
 
-fn validateMultimodalRerankAttachmentReferences(
+/// Returns the request's documents as content values. The deprecated
+/// `prompts` form is wrapped into newly allocated string values that borrow the
+/// prompt text; the caller frees that slice only when `documents` was absent.
+fn rerankRequestDocuments(
     allocator: std.mem.Allocator,
-    body: api.RerankMultimodalRequest,
+    body: api.RerankRequest,
+) error{ OutOfMemory, RerankDocumentsAndPrompts, RerankDocumentsRequired }![]const std.json.Value {
+    if (body.documents) |documents| {
+        if (body.prompts != null) return error.RerankDocumentsAndPrompts;
+        if (documents.len == 0) return error.RerankDocumentsRequired;
+        return documents;
+    }
+    const prompts = body.prompts orelse return error.RerankDocumentsRequired;
+    if (prompts.len == 0) return error.RerankDocumentsRequired;
+    const documents = try allocator.alloc(std.json.Value, prompts.len);
+    for (prompts, documents) |prompt, *document| document.* = .{ .string = prompt };
+    return documents;
+}
+
+fn validateRerankAttachmentReferences(
+    allocator: std.mem.Allocator,
+    documents: []const std.json.Value,
     attachment_count: usize,
 ) !void {
     const seen = try allocator.alloc(bool, attachment_count);
     defer allocator.free(seen);
     @memset(seen, false);
     var reference_count: usize = 0;
-    for (body.documents) |document| {
-        if (document.content != .array) continue;
-        for (document.content.array.items) |part| {
+    for (documents) |document| {
+        if (document != .array) continue;
+        for (document.array.items) |part| {
             if (part != .object) continue;
             const part_type = part.object.get("type") orelse continue;
             if (part_type != .string or !std.mem.eql(u8, part_type.string, "media")) continue;
@@ -31949,25 +31937,23 @@ test "multimodal rerank parser accepts colqwen-style text and image content part
         \\  "model": "vidore/colqwen2-v1.0",
         \\  "query": "invoice total due date",
         \\  "documents": [
-        \\    {
-        \\      "content": [
-        \\        {"type":"text","text":"invoice page"},
-        \\        {"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}},
-        \\        {"type":"media","mime_type":"image/png","data":"AQ=="},
-        \\        {"type":"text","text":" appendix"}
-        \\      ]
-        \\    }
+        \\    [
+        \\      {"type":"text","text":"invoice page"},
+        \\      {"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}},
+        \\      {"type":"media","mime_type":"image/png","data":"AQ=="},
+        \\      {"type":"text","text":" appendix"}
+        \\    ]
         \\  ]
         \\}
     ;
 
-    var parsed = try std.json.parseFromSlice(api.RerankMultimodalRequest, alloc, body, .{});
+    var parsed = try std.json.parseFromSlice(api.RerankRequest, alloc, body, .{});
     defer parsed.deinit();
 
     var node: Node = undefined;
     node.config = .{};
 
-    var doc = try node.parseChatMessageContentToTextAndImages(alloc, parsed.value.documents[0].content);
+    var doc = try node.parseChatMessageContentToTextAndImages(alloc, parsed.value.documents.?[0]);
     defer doc.deinit();
 
     try std.testing.expectEqualStrings("invoice page appendix", doc.text);
@@ -31982,12 +31968,80 @@ test "multimodal rerank parser accepts colqwen-style text and image content part
     try std.testing.expectEqual(@as(u8, 1), doc.images[1][0]);
 }
 
+test "rerank requests take documents or the deprecated prompts, not both" {
+    const alloc = std.testing.allocator;
+    {
+        var parsed = try std.json.parseFromSlice(api.RerankRequest, alloc,
+            \\{"model":"m","query":"q","prompts":["alpha","beta"]}
+        , .{});
+        defer parsed.deinit();
+        const documents = try rerankRequestDocuments(alloc, parsed.value);
+        defer alloc.free(documents);
+        try std.testing.expectEqual(@as(usize, 2), documents.len);
+        try std.testing.expectEqualStrings("alpha", documents[0].string);
+        try std.testing.expectEqualStrings("beta", documents[1].string);
+    }
+    {
+        var parsed = try std.json.parseFromSlice(api.RerankRequest, alloc,
+            \\{"model":"m","query":"q","documents":["alpha",[{"type":"text","text":"beta"}]]}
+        , .{});
+        defer parsed.deinit();
+        const documents = try rerankRequestDocuments(alloc, parsed.value);
+        try std.testing.expect(documents.ptr == parsed.value.documents.?.ptr);
+        try std.testing.expectEqual(@as(usize, 2), documents.len);
+        try std.testing.expect(documents[1] == .array);
+    }
+    for ([_][]const u8{
+        \\{"model":"m","query":"q","documents":["a"],"prompts":["b"]}
+        ,
+        \\{"model":"m","query":"q"}
+        ,
+        \\{"model":"m","query":"q","documents":[]}
+        ,
+        \\{"model":"m","query":"q","prompts":[]}
+        ,
+    }, [_]anyerror{
+        error.RerankDocumentsAndPrompts,
+        error.RerankDocumentsRequired,
+        error.RerankDocumentsRequired,
+        error.RerankDocumentsRequired,
+    }) |body, expected| {
+        var parsed = try std.json.parseFromSlice(api.RerankRequest, alloc, body, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(expected, rerankRequestDocuments(alloc, parsed.value));
+    }
+}
+
+test "rerank rejects ambiguous or empty document lists before loading a model" {
+    const allocator = std.testing.allocator;
+    var node = try Node.init(allocator, .{ .models_dir = "/nonexistent-rerank-models", .max_concurrent_requests = 1 });
+    defer node.deinit();
+    resetRequestWorkTestCounters();
+    for ([_][]const u8{
+        "{\"model\":\"owner/rerank\",\"query\":\"q\",\"documents\":[\"a\"],\"prompts\":[\"b\"]}",
+        "{\"model\":\"owner/rerank\",\"query\":\"q\",\"documents\":[]}",
+        "{\"model\":\"owner/rerank\",\"query\":\"q\"}",
+    }) |body| {
+        var request = try httpx.Request.init(allocator, .POST, "/ai/v1/rerank");
+        defer request.deinit();
+        try request.setJson(body);
+        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try node.rerankDocuments(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, "INVALID_REQUEST") != null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_load_attempts);
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+}
+
 test "multimodal rerank parser borrows framed image attachments" {
     const allocator = std.testing.allocator;
     const body =
-        \\{"model":"m","query":"q","documents":[{"content":[{"type":"media","mime_type":"image/png","data":"attachment:0"}]}]}
+        \\{"model":"m","query":"q","documents":[[{"type":"media","mime_type":"image/png","data":"attachment:0"}]]}
     ;
-    var parsed = try std.json.parseFromSlice(api.RerankMultimodalRequest, allocator, body, .{});
+    var parsed = try std.json.parseFromSlice(api.RerankRequest, allocator, body, .{});
     defer parsed.deinit();
     var png = [_]u8{0} ** 24;
     png[0..8].* = .{ 0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a };
@@ -31995,13 +32049,13 @@ test "multimodal rerank parser borrows framed image attachments" {
         .mime_type = "image/png",
         .data = &png,
     }};
-    try validateMultimodalRerankAttachmentReferences(allocator, parsed.value, attachments.len);
+    try validateRerankAttachmentReferences(allocator, parsed.value.documents.?, attachments.len);
     var node: Node = undefined;
     node.config = .{};
     var budget = RequestMediaBudget.init(128);
     var document = try node.parseChatMessageContentToTextAndImagesWithBudgetAndAttachments(
         allocator,
-        parsed.value.documents[0].content,
+        parsed.value.documents.?[0],
         &budget,
         &attachments,
     );
@@ -32054,14 +32108,14 @@ test "multimodal rerank parser releases both owned slices on every allocation fa
         \\{
         \\  "model": "vidore/colqwen2-v1.0",
         \\  "query": "invoice",
-        \\  "documents": [{"content": [
+        \\  "documents": [[
         \\    {"type":"text","text":"invoice page"},
         \\    {"type":"image_url","image_url":{"url":"data:image/png;base64,YWJj"}},
         \\    {"type":"media","mime_type":"image/png","data":"ZGVm"}
-        \\  ]}]
+        \\  ]]
         \\}
     ;
-    var parsed = try std.json.parseFromSlice(api.RerankMultimodalRequest, backing_allocator, body, .{});
+    var parsed = try std.json.parseFromSlice(api.RerankRequest, backing_allocator, body, .{});
     defer parsed.deinit();
     var node: Node = undefined;
     node.config = .{};
@@ -32080,7 +32134,7 @@ test "multimodal rerank parser releases both owned slices on every allocation fa
             .fail_index = fail_index,
             .resize_fail_index = 0,
         });
-        Runner.run(failing.allocator(), &node, parsed.value.documents[0].content) catch |err| switch (err) {
+        Runner.run(failing.allocator(), &node, parsed.value.documents.?[0]) catch |err| switch (err) {
             error.OutOfMemory => {
                 try std.testing.expect(failing.has_induced_failure);
                 try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
@@ -32100,13 +32154,13 @@ test "multimodal rerank parser applies one aggregate budget to data URI media" {
         \\{
         \\  "model": "vidore/colqwen2-v1.0",
         \\  "query": "invoice",
-        \\  "documents": [{"content": [
+        \\  "documents": [[
         \\    {"type":"image_url","image_url":{"url":"data:image/png;base64,YWJj"}},
         \\    {"type":"image_url","image_url":{"url":"data:image/png;base64,ZGVm"}}
-        \\  ]}]
+        \\  ]]
         \\}
     ;
-    var parsed = try std.json.parseFromSlice(api.RerankMultimodalRequest, alloc, body, .{});
+    var parsed = try std.json.parseFromSlice(api.RerankRequest, alloc, body, .{});
     defer parsed.deinit();
     var node: Node = undefined;
     node.config = .{};
@@ -32115,7 +32169,7 @@ test "multimodal rerank parser applies one aggregate budget to data URI media" {
 
     try std.testing.expectError(
         error.RemoteContentTooLarge,
-        node.parseChatMessageContentToTextAndImagesWithBudget(alloc, parsed.value.documents[0].content, &budget),
+        node.parseChatMessageContentToTextAndImagesWithBudget(alloc, parsed.value.documents.?[0], &budget),
     );
     try std.testing.expectEqual(first_uri.len, budget.used_bytes);
 }
@@ -32127,16 +32181,14 @@ test "multimodal rerank parser rejects non-image media content parts" {
         \\  "model": "vidore/colqwen2-v1.0",
         \\  "query": "invoice total due date",
         \\  "documents": [
-        \\    {
-        \\      "content": [
-        \\        {"type":"media","mime_type":"audio/wav","data":"AA=="}
-        \\      ]
-        \\    }
+        \\    [
+        \\      {"type":"media","mime_type":"audio/wav","data":"AA=="}
+        \\    ]
         \\  ]
         \\}
     ;
 
-    var parsed = try std.json.parseFromSlice(api.RerankMultimodalRequest, alloc, body, .{});
+    var parsed = try std.json.parseFromSlice(api.RerankRequest, alloc, body, .{});
     defer parsed.deinit();
 
     var node: Node = undefined;
@@ -32144,7 +32196,7 @@ test "multimodal rerank parser rejects non-image media content parts" {
 
     try std.testing.expectError(
         error.UnsupportedContentPartType,
-        node.parseChatMessageContentToTextAndImages(alloc, parsed.value.documents[0].content),
+        node.parseChatMessageContentToTextAndImages(alloc, parsed.value.documents.?[0]),
     );
 }
 
@@ -32155,16 +32207,14 @@ test "multimodal rerank parser rejects invalid image data uris" {
         \\  "model": "vidore/colqwen2-v1.0",
         \\  "query": "invoice total due date",
         \\  "documents": [
-        \\    {
-        \\      "content": [
-        \\        {"type":"image_url","image_url":{"url":"data:image/png;base64,%%%"}}
-        \\      ]
-        \\    }
+        \\    [
+        \\      {"type":"image_url","image_url":{"url":"data:image/png;base64,%%%"}}
+        \\    ]
         \\  ]
         \\}
     ;
 
-    var parsed = try std.json.parseFromSlice(api.RerankMultimodalRequest, alloc, body, .{});
+    var parsed = try std.json.parseFromSlice(api.RerankRequest, alloc, body, .{});
     defer parsed.deinit();
 
     var node: Node = undefined;
@@ -32172,7 +32222,7 @@ test "multimodal rerank parser rejects invalid image data uris" {
 
     try std.testing.expectError(
         error.InvalidImageDataUri,
-        node.parseChatMessageContentToTextAndImages(alloc, parsed.value.documents[0].content),
+        node.parseChatMessageContentToTextAndImages(alloc, parsed.value.documents.?[0]),
     );
 }
 
@@ -32495,10 +32545,9 @@ fn denseEmbedRequestMediaShapeWithAttachments(
     return shape;
 }
 
-fn multimodalRerankRequestMediaShape(body: api.RerankMultimodalRequest) RequestMediaAdmissionShape {
+fn rerankRequestMediaShape(documents: []const std.json.Value) RequestMediaAdmissionShape {
     var shape: RequestMediaAdmissionShape = .{};
-    for (body.documents) |document| {
-        const content = document.content;
+    for (documents) |content| {
         if (content != .array) continue;
         for (content.array.items) |part| {
             if (part != .object) continue;
@@ -32520,11 +32569,11 @@ fn multimodalRerankRequestMediaShape(body: api.RerankMultimodalRequest) RequestM
     return shape;
 }
 
-fn multimodalRerankRequestMediaShapeWithAttachments(
-    body: api.RerankMultimodalRequest,
+fn rerankRequestMediaShapeWithAttachments(
+    documents: []const std.json.Value,
     attachments: []const httpx.attachment_envelope.Attachment,
 ) RequestMediaAdmissionShape {
-    var shape = multimodalRerankRequestMediaShape(body);
+    var shape = rerankRequestMediaShape(documents);
     for (attachments) |attachment|
         shape.addBorrowed(attachment.data.len, std.ascii.startsWithIgnoreCase(attachment.mime_type, "image/"));
     return shape;

@@ -632,7 +632,6 @@ fn trimOperationSuffix(value: []const u8) []const u8 {
     for ([_][]const u8{
         "/chat/completions",
         "/generate/batch",
-        "/rerank_multimodal",
         "/embeddings",
     }) |suffix| {
         if (std.mem.endsWith(u8, out, suffix)) {
@@ -1295,7 +1294,6 @@ test "remote Antfly model catalog URL normalizes service and operation URLs" {
         "embeddings",
         "chunk",
         "rerank",
-        "rerank_multimodal",
         "extract",
         "generate",
         "generate/batch",

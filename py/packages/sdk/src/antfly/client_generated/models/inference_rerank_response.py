@@ -21,7 +21,7 @@ class InferenceRerankResponse:
     """
     Attributes:
         object_ (InferenceRerankResponseObject): Object type, always "list"
-        data (list[InferenceRerankObject]): Rerank score objects, one per input prompt.
+        data (list[InferenceRerankObject]): Rerank score objects, one per input document.
         model (str): Name of model used for reranking
         usage (InferenceGenerateUsage):
     """

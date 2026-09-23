@@ -1360,7 +1360,7 @@ var modelCategoryOperations = map[string][]OperationType{
 	"embedders":    {"embed", "embeddings"},
 	"generators":   {"generate", "generate.batch", "chat.completions"},
 	"readers":      {"read"},
-	"rerankers":    {"rerank", "rerank_multimodal"},
+	"rerankers":    {"rerank"},
 	"chunkers":     {"chunk"},
 	"extractors":   {"extract"},
 	"rewriters":    {"rewrite"},
@@ -2076,7 +2076,6 @@ func (p *Proxy) Start(ctx context.Context) error {
 	apiMux.HandleFunc("/ai/v1/embeddings", p.handleEmbeddings)
 	apiMux.HandleFunc("/ai/v1/chunk", p.handleChunk)
 	apiMux.HandleFunc("/ai/v1/rerank", p.handleRerank)
-	apiMux.HandleFunc("/ai/v1/rerank_multimodal", p.handleRerankMultimodal)
 	apiMux.HandleFunc("/ai/v1/extract", p.handleExtract)
 	apiMux.HandleFunc("/ai/v1/rewrite", p.handleRewrite)
 	apiMux.HandleFunc("/ai/v1/transcribe", p.handleTranscribe)
@@ -2165,12 +2164,6 @@ func (p *Proxy) handleChunk(w http.ResponseWriter, r *http.Request) {
 // handleRerank routes reranking requests
 func (p *Proxy) handleRerank(w http.ResponseWriter, r *http.Request) {
 	p.proxyRequest(w, r, "rerank")
-}
-
-// handleRerankMultimodal preserves the concrete operation so route rules and
-// capability leases can distinguish multimodal rerankers from text rerankers.
-func (p *Proxy) handleRerankMultimodal(w http.ResponseWriter, r *http.Request) {
-	p.proxyRequest(w, r, "rerank_multimodal")
 }
 
 func (p *Proxy) handleExtract(w http.ResponseWriter, r *http.Request) {
@@ -3309,8 +3302,6 @@ func semanticTaskForOperation(operation OperationType) string {
 		return "generate"
 	case "embed", "embeddings":
 		return "embed"
-	case "rerank", "rerank_multimodal":
-		return "rerank"
 	default:
 		return string(operation)
 	}
@@ -3322,8 +3313,6 @@ func semanticOperationsForTask(task string, fallback OperationType) []OperationT
 		return []OperationType{"generate", "generate.batch", "chat.completions"}
 	case "embed":
 		return []OperationType{"embed", "embeddings"}
-	case "rerank":
-		return []OperationType{"rerank", "rerank_multimodal"}
 	default:
 		return []OperationType{fallback}
 	}

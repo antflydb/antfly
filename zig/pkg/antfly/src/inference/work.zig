@@ -45,7 +45,6 @@ pub const Operation = enum {
     embed,
     embeddings,
     rerank,
-    rerank_multimodal,
     chunk,
     extract,
     rewrite,
@@ -56,7 +55,7 @@ pub const Operation = enum {
             .read => .read,
             .generate, .generate_batch, .chat_completions => .generate,
             .embed, .embeddings => .embed,
-            .rerank, .rerank_multimodal => .rerank,
+            .rerank => .rerank,
             .chunk => .chunk,
             .extract => .extract,
             .rewrite => .rewrite,
@@ -68,7 +67,6 @@ pub const Operation = enum {
         return switch (self) {
             .generate_batch => "generate.batch",
             .chat_completions => "chat.completions",
-            .rerank_multimodal => "rerank_multimodal",
             else => @tagName(self),
         };
     }
