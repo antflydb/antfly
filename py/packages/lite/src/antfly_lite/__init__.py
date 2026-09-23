@@ -64,6 +64,7 @@ __all__ = [
     "UnsupportedError",
     "StalledError",
     "InternalError",
+    "MIN_THREAD_STACK_SIZE",
     "THREADING_SERIALIZED",
     "INFERENCE_MODE_CALLER_SUPPLIED_OR_DISABLED",
     "INFERENCE_MODE_CALLER_SUPPLIED_ARTIFACTS",
@@ -94,6 +95,10 @@ __all__ = [
 __version__ = "0.1.0"
 
 THREADING_SERIALIZED = _ffi.THREADING_SERIALIZED
+#: Minimum native stack, in bytes, for threads calling into libantfly
+#: (ANTFLY_MIN_THREAD_STACK_SIZE). Python's own threads already meet it on
+#: Linux and macOS; set threading.stack_size() if your platform's are smaller.
+MIN_THREAD_STACK_SIZE = 8 * 1024 * 1024
 
 INFERENCE_MODE_CALLER_SUPPLIED_OR_DISABLED = _ffi.INFERENCE_MODE_CALLER_SUPPLIED_OR_DISABLED
 INFERENCE_MODE_CALLER_SUPPLIED_ARTIFACTS = _ffi.INFERENCE_MODE_CALLER_SUPPLIED_ARTIFACTS

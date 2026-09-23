@@ -60,7 +60,8 @@ class WriteIntent:
     """A single key/value write or delete in a Lite batch."""
 
     key: str
-    value: bytes = b""
+    value: Any = b""
+    """Document bytes, a str (UTF-8), or any JSON-serializable value."""
     delete: bool = False
 
 
@@ -69,7 +70,9 @@ WriteLike = WriteIntent | tuple
 
 def _normalize_write(write: WriteLike) -> WriteIntent:
     if isinstance(write, WriteIntent):
-        return write
+        if write.delete or isinstance(write.value, bytes):
+            return write
+        return WriteIntent(key=write.key, value=_coerce_value(write.value), delete=False)
     if isinstance(write, tuple):
         if len(write) == 2:
             key, value = write
