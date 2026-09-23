@@ -43,6 +43,8 @@ APACHE_ROOTS = (
     "zig/lib",
     "zig/e2e/inference",
     "go/pkg/lite",
+    "py/packages/lite",
+    "ts/packages/lite",
     "go/pkg/docsaf",
     "go/pkg/evalaf",
     "go/pkg/genkit",
@@ -57,6 +59,11 @@ APACHE_ROOTS = (
     "compat",
 )
 
+# Files inside an ELv2 root that are Apache-2.0 anyway. The public C ABI
+# header is vendored or transcribed by the Apache-licensed Lite bindings.
+APACHE_FILES = {
+    "zig/pkg/antfly/include/antfly.h",
+}
 EXCLUDED_PARTS = {
     ".git",
     ".pytest_cache",
@@ -179,7 +186,9 @@ def excluded(path: str) -> bool:
 
 def group_for(path: str, selected_group: str) -> str | None:
     group: str | None = None
-    if is_under(path, ELV2_ROOTS):
+    if path in APACHE_FILES:
+        group = "apache"
+    elif is_under(path, ELV2_ROOTS):
         group = "elv2"
     elif is_under(path, APACHE_ROOTS):
         group = "apache"
