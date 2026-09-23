@@ -1689,8 +1689,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     secret_backend_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const secret_backend_tests = b.addTest(.{
         .root_module = secret_backend_test_mod,
-        // ReleaseSafe on macOS peaks above the aggregate 10 GiB estimate.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 13 else 7) * 1024 * 1024 * 1024,
+        // ReleaseSafe peaks above the aggregate estimates on both platforms:
+        // 12.88 GB measured on x86_64-linux in the VOPR qualification lane,
+        // above 10 GiB on macOS. Debug keeps the conservative default so the
+        // unit lanes retain their tighter scheduler claim.
+        .max_rss = @as(usize, switch (target.result.os.tag) {
+            .macos => 13,
+            else => if (optimize == .Debug) 7 else 14,
+        }) * 1024 * 1024 * 1024,
         .filters = &.{"secret backend"},
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });

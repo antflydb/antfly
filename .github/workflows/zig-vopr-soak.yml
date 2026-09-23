@@ -77,7 +77,10 @@ jobs:
   qualify:
     if: inputs.diagnostic_run == ''
     runs-on: arc-antfly-heavy
-    timeout-minutes: 90
+    # Six cold ReleaseSafe root compiles on a per-run cache; 90 minutes was
+    # observed insufficient once honest max_rss claims serialize the heavy
+    # compiles instead of oversubscribing the 24 GiB pod into swap.
+    timeout-minutes: 120
     env:
       VOPR_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/vopr-soak/${{ github.run_id }}-${{ github.run_attempt }}-qualify
       VOPR_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
