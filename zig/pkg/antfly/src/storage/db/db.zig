@@ -89040,6 +89040,11 @@ const TestAssetProducer = struct {
         }
         if (request.producer_type == .reader) {
             if (self.reader_output) |output| return try alloc.dupe(u8, output);
+            if (std.mem.eql(u8, request.content_type, "application/json")) {
+                const text = try std.fmt.allocPrint(alloc, "reader:{s}", .{request.source_text});
+                defer alloc.free(text);
+                return try std.json.Stringify.valueAlloc(alloc, .{.{ .text = text }}, .{});
+            }
         }
         if (request.producer_type == .transcriber) {
             if (self.transcriber_output) |output| return try alloc.dupe(u8, output);
@@ -90587,7 +90592,7 @@ test "db document extraction attempts forced OCR for a scanned PDF" {
     const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
-    var fake = TestAssetProducer{ .reader_output = "scanned PDF transcription with enough text to remain selected" };
+    var fake = TestAssetProducer{ .reader_output = "[{\"text\":\"scanned PDF transcription with enough text to remain selected\"}]" };
     var db = try DB.open(alloc, std.mem.span(path), .{
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
@@ -90704,7 +90709,7 @@ test "db document extraction stores structured OCR confidence and coordinates" {
     defer cleanupTempDir(path);
 
     var fake = TestAssetProducer{
-        .reader_output = "{\"text\":\"invoice total\",\"confidence\":0.92,\"bbox\":[1,2,101,42],\"warning\":\"low contrast\"}",
+        .reader_output = "[{\"text\":\"invoice total\",\"confidence\":0.92,\"bbox\":[1,2,101,42],\"warning\":\"low contrast\"}]",
     };
     var db = try DB.open(alloc, std.mem.span(path), .{
         .start_index_workers = false,

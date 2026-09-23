@@ -143,6 +143,52 @@ pub const RmsNormTripleResult = struct {
     third: CT,
 };
 
+/// Exact NCHW transposed-convolution request. Weights use the ONNX layout
+/// [in_channels, out_channels / groups, kernel...]. Only the first
+/// `num_spatial` entries of each spatial array are used.
+pub const ConvTransposeRequest = struct {
+    input: CT,
+    weight: CT,
+    batch: usize,
+    in_channels: usize,
+    out_channels: usize,
+    input_spatial: [2]usize,
+    kernel: [2]usize,
+    strides: [2]usize,
+    padding: [2][2]i32,
+    dilations: [2]usize,
+    output_padding: [2]usize,
+    output_spatial: [2]usize,
+    groups: usize,
+    num_spatial: u8,
+};
+pub fn convTransposeOutputDim(
+    input: usize,
+    kernel: usize,
+    stride: usize,
+    padding: [2]i32,
+    dilation: usize,
+    output_padding: usize,
+) ?usize {
+    if (input == 0 or kernel == 0 or stride == 0 or dilation == 0) return null;
+    if (output_padding >= stride and output_padding >= dilation) return null;
+
+    const expanded_input = std.math.mul(i128, @as(i128, @intCast(input)) - 1, @intCast(stride)) catch return null;
+    const expanded_kernel = std.math.mul(i128, @intCast(dilation), @as(i128, @intCast(kernel)) - 1) catch return null;
+    var value = std.math.add(i128, expanded_input, expanded_kernel) catch return null;
+    value = std.math.sub(i128, value, padding[0]) catch return null;
+    value = std.math.sub(i128, value, padding[1]) catch return null;
+    value = std.math.add(i128, value, @intCast(output_padding)) catch return null;
+    value = std.math.add(i128, value, 1) catch return null;
+    if (value <= 0 or value > @as(i128, @intCast(std.math.maxInt(usize)))) return null;
+    return @intCast(value);
+}
+
+test "transposed convolution dimensions reject arithmetic overflow" {
+    const maximum = std.math.maxInt(usize);
+    try std.testing.expectEqual(@as(?usize, null), convTransposeOutputDim(maximum, maximum, maximum, .{ 0, 0 }, maximum, 0));
+}
+
 /// Gemma 4's parallel FFN epilogue normalizes the shared and routed branches,
 /// adds them, normalizes the sum, then adds the attention residual. Backends
 /// may execute the full chain without materializing its four intermediates.
@@ -2329,6 +2375,11 @@ pub const ComputeBackend = struct {
         /// weight:[out_ch, in_ch/groups, kernel_h, kernel_w], bias:[out_ch].
         /// Returns [batch, out_ch, out_h, out_w].
         conv2d: *const fn (ctx: *anyopaque, input: CT, weight: CT, bias: CT, batch: usize, in_channels: usize, out_channels: usize, height: usize, width: usize, kernel_h: usize, kernel_w: usize, stride_h: usize, stride_w: usize, padding_h: usize, padding_w: usize, groups: usize) anyerror!CT,
+        /// Exact NCHW transposed convolution. Backends that do not implement
+        /// this operation must leave it null rather than treating it as Conv.
+        convTranspose: ?*const fn (ctx: *anyopaque, request: *const ConvTransposeRequest) anyerror!CT = null,
+        /// Exact local pooling; an absent callback is an unsupported operation.
+        averagePool: ?*const fn (ctx: *anyopaque, input: CT, attrs: *const ml.graph.node.AveragePoolAttrs) anyerror!CT = null,
 
         /// Apply rotary position embeddings (RoPE) in-place.
         /// input: [total, dim] where total = batch*seq_len.
@@ -4152,6 +4203,15 @@ pub const ComputeBackend = struct {
 
     pub fn conv2d(self: *const ComputeBackend, input: CT, weight: CT, bias: CT, batch: usize, in_channels: usize, out_channels: usize, height: usize, width: usize, kernel_h: usize, kernel_w: usize, stride_h: usize, stride_w: usize, padding_h: usize, padding_w: usize, groups: usize) !CT {
         return self.vtable.conv2d(self.ptr, input, weight, bias, batch, in_channels, out_channels, height, width, kernel_h, kernel_w, stride_h, stride_w, padding_h, padding_w, groups);
+    }
+    pub fn convTranspose(self: *const ComputeBackend, request: *const ConvTransposeRequest) !?CT {
+        const op = self.vtable.convTranspose orelse return null;
+        return try op(self.ptr, request);
+    }
+
+    pub fn averagePool(self: *const ComputeBackend, input: CT, attrs: *const ml.graph.node.AveragePoolAttrs) !CT {
+        const op = self.vtable.averagePool orelse return error.UnsupportedPrimitiveOp;
+        return op(self.ptr, input, attrs);
     }
 
     pub fn multiply(self: *const ComputeBackend, a: CT, b: CT) !CT {

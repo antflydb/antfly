@@ -7958,7 +7958,7 @@ const SharedPdfWindowScheduler = struct {
                     .config_json = document_extraction_mod.effectiveOcrConfigJson(consumer.config),
                     .source_text = "",
                     .source_parts_json = part,
-                    .content_type = "text/plain",
+                    .content_type = runtimeGeneratedTextContentType(.ocr, document_extraction_mod.ocrProducerType(consumer.config)),
                     .inline_media_trusted = true,
                     .source_fingerprint = source.fingerprint,
                     .item_id = unit.unit_id,
@@ -8056,7 +8056,7 @@ const SharedPdfWindowScheduler = struct {
     }
 
     fn commitTextOutput(self: *@This(), alloc: Allocator, consumer: *Consumer, index: usize, units: []document_extraction_mod.Unit, indices: []const usize, batch: ?*asset_producer_mod.ProducedBatch) !void {
-        if (batch) |output| try applyRuntimeGeneratedTextBatch(self.runtime, alloc, alloc, units, indices, "ocr_text", .ocr, consumer.config.ocr_quality, document_extraction_mod.effectiveOcrPrompt(consumer.config), output);
+        if (batch) |output| try applyRuntimeGeneratedTextBatch(self.runtime, alloc, alloc, units, indices, "ocr_text", .ocr, runtimeGeneratedTextOutputMode(.ocr, document_extraction_mod.ocrProducerType(consumer.config)), consumer.config.ocr_quality, document_extraction_mod.effectiveOcrPrompt(consumer.config), output);
         var writes = std.ArrayListUnmanaged(KVPair).empty;
         defer {
             for (writes.items) |write| {
@@ -8698,7 +8698,12 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
             defer self.mutex.unlock();
             try self.borrowed(request.media[0].bytes);
             self.text_calls += 1;
-            return a.dupe(u8, if (request.producer_type == .generator) "Generator independently recognized the entire document page." else "Reader independently recognized the entire document page.");
+            return a.dupe(u8, if (request.producer_type == .generator)
+                "Generator independently recognized the entire document page."
+            else if (std.mem.eql(u8, request.content_type, "application/json"))
+                "[{\"text\":\"Reader independently recognized the entire document page.\"}]"
+            else
+                "Reader independently recognized the entire document page.");
         }
         fn canBatch(_: *anyopaque, _: Allocator, _: []const asset_producer_mod.Request) !bool {
             return false;
@@ -8879,7 +8884,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
             .capabilities = .{ .task = .embed, .input_modalities = .{ .image = true }, .input_granularity = .page, .output = .embedding, .batch = .{ .max_items = 2, .max_decoded_pixels = 80_000_000 } },
         };
         try consumer.plans.resize(alloc, 2);
-        consumer.plans.items[1] = try Harness.memory(&harness, alloc, &.{.{ .producer_type = .reader, .source_text = "", .config_json = "", .content_type = "text/plain" }});
+        consumer.plans.items[1] = try Harness.memory(&harness, alloc, &.{.{ .producer_type = .reader, .source_text = "", .config_json = "", .content_type = runtimeGeneratedTextContentType(.ocr, .reader) }});
     }
     scheduler.consumers.?[2].config.ocr_executor = .generator;
     scheduler.consumers.?[5].transform.width = 123;
@@ -9633,7 +9638,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
                     self.calls += 1;
                     const out = try a.alloc([]u8, 1);
                     errdefer a.free(out);
-                    out[0] = try a.dupe(u8, "The OCR model independently recognized meaningful text on this page.");
+                    out[0] = try a.dupe(u8, "[{\"text\":\"The OCR model independently recognized meaningful text on this page.\"}]");
                     return out;
                 }
             };
@@ -13553,7 +13558,7 @@ const RuntimePdfOcrCoordinator = struct {
 /// intentionally lives beside the coordinator so the check cannot silently
 /// exercise the unit-test PDF stub or a parallel test-only implementation.
 /// The supplied producer carries the rendered PNGs through the same encoded
-/// media batching path used by the embedded Florence reader.
+/// media batching path used by the embedded Reader.
 pub fn runNativePdfOcrCoordinatorIntegration(
     alloc: Allocator,
     fixture: []const u8,
@@ -13699,7 +13704,7 @@ pub fn runNativePdfOcrCoordinatorIntegration(
         .{.{ .bytes = batch.results[0].rendered.?.png, .mime_type = "image/png" }},
         .{.{ .bytes = batch.results[1].rendered.?.png, .mime_type = "image/png" }},
     };
-    const reader_config = "{\"provider\":\"antfly\",\"model\":\"florence2-integration\"}";
+    const reader_config = "{\"provider\":\"antfly\",\"model\":\"multistage-integration\"}";
     const source_parts = "[{\"type\":\"text\",\"text\":\"<OCR>\"}]";
     const requests = [_]asset_producer_mod.Request{
         .{
@@ -13730,6 +13735,98 @@ pub fn runNativePdfOcrCoordinatorIntegration(
     }
     if (outputs.len != requests.len) return error.PdfCoordinatorReaderBatchFailed;
     for (outputs) |output| if (output.len == 0) return error.PdfCoordinatorReaderBatchFailed;
+}
+
+/// End-to-end production-boundary grounding probe for the dedicated PDF OCR
+/// integration target. The supplied Reader is synthetic so this proves the
+/// transport/mapping contract, not any installed model's region capability.
+pub fn runNativePdfOcrGroundingIntegration(
+    alloc: Allocator,
+    fixture: []const u8,
+    producer: asset_producer_mod.Producer,
+) !void {
+    if (!document_extraction_mod.pdf_runtime_available) return error.PdfRuntimeUnavailable;
+    const config = document_extraction_mod.Config{
+        .ocr_enabled = true,
+        .ocr_mode = .always,
+        .ocr_executor = .reader,
+        .ocr_model = "multistage-integration",
+        .ocr_config_json = "{\"provider\":\"antfly\",\"model\":\"multistage-integration\"}",
+        .ocr_render_dpi = 72,
+        .pdf_render_max_parallel_pages = 1,
+        .pdf_decode_limits = .{
+            .max_working_set_bytes = 32 * 1024 * 1024,
+            .max_decoded_stream_bytes = 32 * 1024 * 1024,
+        },
+    };
+    const downloaded = .{
+        .data = fixture,
+        .content_type = "application/pdf",
+    };
+    var extraction = try document_extraction_mod.extractDownloadedAlloc(
+        alloc,
+        downloaded,
+        "memory://reader-two-lines.pdf",
+        config,
+    );
+    defer extraction.deinit(alloc);
+    if (!std.mem.eql(u8, extraction.route_type, "pdf") or extraction.units.len != 1)
+        return error.InvalidGroundingIntegrationExtraction;
+
+    var resources = resource_manager_mod.ResourceManager.init(.{});
+    defer resources.deinit(alloc);
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{
+            .asset_producer = producer,
+            .resource_manager = &resources,
+        },
+        .ownership = undefined,
+    };
+    try completeRuntimeDocumentExtractionGeneratedTextBatch(
+        &runtime,
+        alloc,
+        producer,
+        config,
+        .{
+            .max_items = 1,
+            .max_bytes = 8 * 1024 * 1024,
+            .max_pixels = 4 * 1024 * 1024,
+        },
+        "memory://reader-two-lines.pdf",
+        fixture,
+        extraction.route_type,
+        extraction.content_type,
+        extraction.units,
+        .ocr,
+    );
+
+    const expected = "First line: native document reading.\nSecond line: invoice total 123.45.";
+    const first_line = "First line: native document reading.";
+    const unit = extraction.units[0];
+    if (!std.mem.eql(u8, unit.text, expected) or !unit.ocr_used or unit.text_regions.len != 2)
+        return error.InvalidGroundingIntegrationResult;
+    try std.testing.expectEqual([2]u32{ 0, first_line.len }, unit.text_regions[0].span);
+    try std.testing.expectEqual([2]u32{ first_line.len + 1, expected.len }, unit.text_regions[1].span);
+    const page_box = unit.page_bbox orelse return error.InvalidGroundingIntegrationGeometry;
+    for (unit.text_regions) |region| {
+        if (!(region.bbox[0] < region.bbox[2]) or !(region.bbox[1] < region.bbox[3]) or
+            region.bbox[0] < page_box[0] or region.bbox[1] < page_box[1] or
+            region.bbox[2] > page_box[2] or region.bbox[3] > page_box[3])
+            return error.InvalidGroundingIntegrationGeometry;
+    }
+    if (!(unit.text_regions[0].bbox[1] > unit.text_regions[1].bbox[1]))
+        return error.InvalidGroundingIntegrationGeometry;
 }
 
 pub const PdfPageEmbeddingResult = struct {
@@ -14019,7 +14116,7 @@ const SharedPdfPngPage = struct {
         for (raster.results, results) |input, *output| {
             output.* = .{ .page_number = input.page_number, .failure = input.failure, .render_elapsed_ns = input.render_elapsed_ns };
             if (input.rendered) |page| {
-                const png = antfly_image.png.encodeRgbaWithCancellation(alloc, page.width, page.height, page.bytes, .{ .context = &cancellation, .is_cancelled_fn = Cancellation.check }) catch |err| {
+                const png = antfly_image.png.encodeRgbaWithCancellation(alloc, alloc, page.width, page.height, page.bytes, .{ .context = &cancellation, .is_cancelled_fn = Cancellation.check }) catch |err| {
                     try checkProviderFailureGuard(runtime);
                     if (runtime.config.cancellation.isCancelled()) return error.Canceled;
                     if (err == error.Canceled) return error.DocumentExtractionWorkingSetTooLarge; // optional encoding deadline
@@ -15082,7 +15179,7 @@ pub fn documentExtractionPdfOutputReservationBytes(
         .config_json = config_json,
         .source_text = "",
         .source_parts_json = parts_json,
-        .content_type = "text/plain",
+        .content_type = runtimeGeneratedTextContentType(.ocr, producer_type),
         .inline_media_trusted = true,
         .source_fingerprint = "0000000000000000",
         .item_id = representative_unit.unit_id,
@@ -16020,7 +16117,7 @@ fn renderRuntimePdfWindow(
                 .config_json = producer_config_json,
                 .source_text = "",
                 .source_parts_json = prototype_parts[i],
-                .content_type = "text/plain",
+                .content_type = runtimeGeneratedTextContentType(.ocr, producer_type),
                 .inline_media_trusted = true,
                 .source_fingerprint = source_fingerprint,
                 .item_id = units[unit_index].unit_id,
@@ -16376,7 +16473,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
             .producer_type = producer_type,
             .config_json = config_json,
             .source_text = "",
-            .content_type = "text/plain",
+            .content_type = runtimeGeneratedTextContentType(kind, producer_type),
             .inline_media_trusted = true,
         };
         break :blk try assetProducerBorrowedRasterBatchAvailableGuarded(
@@ -16642,9 +16739,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
             .config_json = config_json,
             .source_text = if (has_rendered_media) "" else source_url,
             .source_parts_json = parts_json,
-            // A transcript comes back as the full STT response so its
-            // timestamped segments survive into the unit; OCR stays text.
-            .content_type = if (kind == .transcript) "application/json" else "text/plain",
+            .content_type = runtimeGeneratedTextContentType(kind, producer_type),
             .inline_media_trusted = has_rendered_media,
             .source_fingerprint = source_fingerprint,
             .item_id = unit.unit_id,
@@ -16728,7 +16823,10 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
 
 fn runtimeGeneratedTextRequestBytes(request: asset_producer_mod.Request) usize {
     var bytes = addUsizeSaturating(
-        addUsizeSaturating(request.config_json.len, request.source_text.len),
+        addUsizeSaturating(
+            addUsizeSaturating(request.config_json.len, request.source_text.len),
+            request.content_type.len,
+        ),
         if (request.source_parts_json) |parts| parts.len else 0,
     );
     for (request.media) |media| bytes = addUsizeSaturating(bytes, media.bytes.len);
@@ -17000,7 +17098,7 @@ fn flushRuntimeGeneratedTextBatch(
         null;
     logRuntimeOcrBatchProfile(runtime, source_fingerprint, units, unit_indices, requests.len, request_bytes, execution, fallback_reason, started_ns);
 
-    try applyRuntimeGeneratedTextBatch(runtime, alloc, working_alloc, units, unit_indices, method, kind, quality_config, ocr_prompt, &produced_batch);
+    try applyRuntimeGeneratedTextBatch(runtime, alloc, working_alloc, units, unit_indices, method, kind, try runtimeGeneratedTextBatchOutputMode(kind, requests), quality_config, ocr_prompt, &produced_batch);
     clearRuntimeGeneratedTextBatchParts(working_alloc, parts_values);
 }
 
@@ -17041,6 +17139,7 @@ fn applyRuntimeGeneratedTextBatch(
     unit_indices: []const usize,
     method: []const u8,
     kind: RuntimeGeneratedUnitTextKind,
+    output_mode: RuntimeGeneratedUnitTextOutputMode,
     quality_config: document_extraction_mod.OcrQualityConfig,
     ocr_prompt: []const u8,
     produced_batch: *asset_producer_mod.ProducedBatch,
@@ -17068,7 +17167,7 @@ fn applyRuntimeGeneratedTextBatch(
             .value => |output| {
                 staged_updates[i] = try cloneDocumentExtractionUnit(alloc, units[unit_idx]);
                 item.result = .{ .value = &.{} };
-                applyRuntimeGeneratedUnitTextInPlace(alloc, working_alloc, &staged_updates[i].?, output, method, "completed", kind, quality_config, ocr_prompt) catch |err| {
+                applyRuntimeGeneratedUnitTextInPlace(alloc, working_alloc, &staged_updates[i].?, output, method, "completed", kind, output_mode, quality_config, ocr_prompt) catch |err| {
                     staged_updates[i].?.deinit(alloc);
                     staged_updates[i] = null;
                     if (shouldYieldRequestError(runtime, err)) return err;
@@ -17110,7 +17209,7 @@ fn flushRuntimeGeneratedTextBatchSequential(
             continue;
         };
         logRuntimeOcrBatchProfile(runtime, source_fingerprint, units, &.{unit_idx}, 1, runtimeGeneratedTextRequestBytes(request), "serial", fallback_reason, started_ns);
-        applyRuntimeGeneratedUnitText(alloc, working_alloc, &units[unit_idx], produced, method, "completed", kind, quality_config, ocr_prompt) catch |err| {
+        applyRuntimeGeneratedUnitText(alloc, working_alloc, &units[unit_idx], produced, method, "completed", kind, runtimeGeneratedTextOutputModeForRequest(kind, request), quality_config, ocr_prompt) catch |err| {
             if (shouldYieldRequestError(runtime, err)) return err;
             try markRuntimeGeneratedUnitFailureTransactional(alloc, &units[unit_idx], method, kind, err);
         };
@@ -17208,6 +17307,52 @@ fn logRuntimeOcrBatchProfile(
 }
 
 const RuntimeGeneratedUnitTextKind = enum { ocr, transcript };
+const RuntimeGeneratedUnitTextOutputMode = enum { plain_or_generator_object, structured_reader };
+
+fn runtimeGeneratedTextOutputMode(
+    kind: RuntimeGeneratedUnitTextKind,
+    producer_type: asset_producer_mod.ProducerType,
+) RuntimeGeneratedUnitTextOutputMode {
+    return if (kind == .ocr and producer_type == .reader)
+        .structured_reader
+    else
+        .plain_or_generator_object;
+}
+
+fn runtimeGeneratedTextContentType(
+    kind: RuntimeGeneratedUnitTextKind,
+    producer_type: asset_producer_mod.ProducerType,
+) []const u8 {
+    if (kind == .transcript) return "application/json";
+    return switch (runtimeGeneratedTextOutputMode(kind, producer_type)) {
+        .structured_reader => "application/json",
+        .plain_or_generator_object => "text/plain",
+    };
+}
+
+fn runtimeGeneratedTextOutputModeForRequest(
+    kind: RuntimeGeneratedUnitTextKind,
+    request: asset_producer_mod.Request,
+) RuntimeGeneratedUnitTextOutputMode {
+    return if (kind == .ocr and request.producer_type == .reader and
+        std.mem.eql(u8, request.content_type, "application/json"))
+        .structured_reader
+    else
+        .plain_or_generator_object;
+}
+
+fn runtimeGeneratedTextBatchOutputMode(
+    kind: RuntimeGeneratedUnitTextKind,
+    requests: []const asset_producer_mod.Request,
+) !RuntimeGeneratedUnitTextOutputMode {
+    if (requests.len == 0) return error.InvalidAssetProducerResponse;
+    const mode = runtimeGeneratedTextOutputModeForRequest(kind, requests[0]);
+    for (requests[1..]) |request| {
+        if (runtimeGeneratedTextOutputModeForRequest(kind, request) != mode)
+            return error.InvalidAssetProducerResponse;
+    }
+    return mode;
+}
 
 fn isUnavailableOcrModelError(kind: RuntimeGeneratedUnitTextKind, err: anyerror) bool {
     if (kind != .ocr) return false;
@@ -17228,6 +17373,7 @@ fn applyRuntimeGeneratedUnitText(
     method: []const u8,
     status: []const u8,
     kind: RuntimeGeneratedUnitTextKind,
+    output_mode: RuntimeGeneratedUnitTextOutputMode,
     quality_config: document_extraction_mod.OcrQualityConfig,
     ocr_prompt: []const u8,
 ) !void {
@@ -17244,6 +17390,7 @@ fn applyRuntimeGeneratedUnitText(
         method,
         status,
         kind,
+        output_mode,
         quality_config,
         ocr_prompt,
     );
@@ -17259,6 +17406,7 @@ fn applyRuntimeGeneratedUnitTextInPlace(
     method: []const u8,
     status: []const u8,
     kind: RuntimeGeneratedUnitTextKind,
+    output_mode: RuntimeGeneratedUnitTextOutputMode,
     quality_config: document_extraction_mod.OcrQualityConfig,
     ocr_prompt: []const u8,
 ) !void {
@@ -17267,8 +17415,9 @@ fn applyRuntimeGeneratedUnitTextInPlace(
         return error.EmptyGeneratedText;
     }
     defer produced_alloc.free(produced);
-    var parsed = try parseRuntimeGeneratedUnitTextOutputAlloc(alloc, produced);
-    errdefer parsed.deinit(alloc);
+    var parsed = try parseRuntimeGeneratedUnitTextOutputAlloc(alloc, produced, output_mode);
+    defer parsed.deinit(alloc);
+    var grounded_ocr_text_len: usize = if (kind == .ocr) parsed.text.len else 0;
     if (kind == .ocr and document_extraction_mod.isOcrPromptEcho(parsed.text, ocr_prompt)) return error.OcrPromptEcho;
     if (kind == .ocr and !document_extraction_mod.hasMeaningfulOcrContent(parsed.text)) return error.TrivialOcrOutput;
     if (kind == .ocr) {
@@ -17301,7 +17450,6 @@ fn applyRuntimeGeneratedUnitTextInPlace(
             alloc.free(unit.method);
             unit.method = owned_method;
             unit.ocr_used = false;
-            parsed.deinit(alloc);
             return;
         }
         // Selection and quality are independent: useful short OCR is better
@@ -17315,8 +17463,15 @@ fn applyRuntimeGeneratedUnitTextInPlace(
             parsed.warning = quality_warning;
         }
         if (text_choice == .ocr_with_embedded_numeric_rows) {
-            const merged = try document_extraction_mod.mergeOcrWithEmbeddedNumericRowsAlloc(alloc, unit.text, parsed.text);
-            alloc.free(parsed.text);
+            const source_ocr_text = parsed.text;
+            const exact_prefix = std.mem.trimEnd(u8, source_ocr_text, &std.ascii.whitespace);
+            const merged = try document_extraction_mod.mergeOcrWithEmbeddedNumericRowsAlloc(alloc, unit.text, source_ocr_text);
+            grounded_ocr_text_len = if (merged.len >= exact_prefix.len and
+                std.mem.eql(u8, merged[0..exact_prefix.len], exact_prefix))
+                exact_prefix.len
+            else
+                0;
+            alloc.free(source_ocr_text);
             parsed.text = merged;
             const hybrid_warning = if (parsed.warning) |warning|
                 try std.fmt.allocPrint(alloc, "{s};ocr_numeric_table_hybrid", .{warning})
@@ -17325,6 +17480,17 @@ fn applyRuntimeGeneratedUnitTextInPlace(
             if (parsed.warning) |warning| alloc.free(warning);
             parsed.warning = hybrid_warning;
         }
+    }
+    var mapped_regions: []document_extraction_mod.TextRegion = &.{};
+    errdefer if (mapped_regions.len > 0) alloc.free(mapped_regions);
+    if (kind == .ocr) {
+        mapped_regions = try document_extraction_mod.mapOcrReaderRegionsAlloc(
+            alloc,
+            parsed.text,
+            grounded_ocr_text_len,
+            parsed.regions,
+            unit.*,
+        );
     }
     const owned_method = try alloc.dupe(u8, method);
     errdefer alloc.free(owned_method);
@@ -17357,7 +17523,8 @@ fn applyRuntimeGeneratedUnitTextInPlace(
             unit.ocr_confidence = parsed.confidence;
             unit.ocr_bbox = parsed.bbox;
             if (unit.text_regions.len > 0) alloc.free(unit.text_regions);
-            unit.text_regions = &.{};
+            unit.text_regions = mapped_regions;
+            mapped_regions = &.{};
         },
         .transcript => {
             unit.transcript_used = true;
@@ -17485,7 +17652,7 @@ fn setRuntimeGeneratedUnitFailureStage(
 
 fn runtimeGeneratedTextFailureStage(err: anyerror) []const u8 {
     return switch (err) {
-        error.OcrPromptEcho, error.TrivialOcrOutput => "ocr_output_validation",
+        error.OcrPromptEcho, error.TrivialOcrOutput, error.InvalidReaderResponseIdentity => "ocr_output_validation",
         else => "inference",
     };
 }
@@ -17495,12 +17662,17 @@ const RuntimeParsedGeneratedUnitText = struct {
     confidence: ?f64 = null,
     bbox: ?[4]f64 = null,
     warning: ?[]u8 = null,
+    regions: []document_extraction_mod.OcrReaderRegion = &.{},
     /// Phrase timing when the producer returned transcript segments.
     spans: []document_extraction_mod.TranscriptSpan = &.{},
 
     fn deinit(self: *RuntimeParsedGeneratedUnitText, alloc: Allocator) void {
         if (self.text.len > 0) alloc.free(self.text);
         if (self.warning) |value| alloc.free(value);
+        for (self.regions) |region| {
+            if (region.text.len > 0) alloc.free(region.text);
+        }
+        if (self.regions.len > 0) alloc.free(self.regions);
         if (self.spans.len > 0) alloc.free(self.spans);
         self.* = undefined;
     }
@@ -17551,7 +17723,18 @@ fn runtimeGeneratedTextSpansAlloc(alloc: Allocator, object: std.json.ObjectMap, 
     return try document_extraction_mod.transcriptSpansFromSegmentsAlloc(alloc, text, inputs[0..count]);
 }
 
-fn parseRuntimeGeneratedUnitTextOutputAlloc(alloc: Allocator, produced: []const u8) !RuntimeParsedGeneratedUnitText {
+fn parseRuntimeGeneratedUnitTextOutputAlloc(
+    alloc: Allocator,
+    produced: []const u8,
+    output_mode: RuntimeGeneratedUnitTextOutputMode,
+) !RuntimeParsedGeneratedUnitText {
+    return switch (output_mode) {
+        .plain_or_generator_object => parsePlainRuntimeGeneratedUnitTextOutputAlloc(alloc, produced),
+        .structured_reader => parseStructuredReaderUnitTextOutputAlloc(alloc, produced),
+    };
+}
+
+fn parsePlainRuntimeGeneratedUnitTextOutputAlloc(alloc: Allocator, produced: []const u8) !RuntimeParsedGeneratedUnitText {
     const trimmed = std.mem.trimStart(u8, produced, &std.ascii.whitespace);
     if (trimmed.len == 0 or trimmed[0] != '{')
         return .{ .text = try alloc.dupe(u8, produced) };
@@ -17572,6 +17755,72 @@ fn parseRuntimeGeneratedUnitTextOutputAlloc(alloc: Allocator, produced: []const 
     }
     out.spans = try runtimeGeneratedTextSpansAlloc(alloc, parsed.value.object, out.text);
     return out;
+}
+
+fn parseStructuredReaderUnitTextOutputAlloc(
+    alloc: Allocator,
+    produced: []const u8,
+) !RuntimeParsedGeneratedUnitText {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, produced, .{}) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return error.InvalidReaderResponseIdentity;
+    };
+    defer parsed.deinit();
+    if (parsed.value != .array or parsed.value.array.items.len != 1)
+        return error.InvalidReaderResponseIdentity;
+    const result = parsed.value.array.items[0];
+    if (result != .object) return error.InvalidReaderResponseIdentity;
+    const text_value = result.object.get("text") orelse return error.InvalidReaderResponseIdentity;
+    if (text_value != .string) return error.InvalidReaderResponseIdentity;
+
+    var out = RuntimeParsedGeneratedUnitText{ .text = try alloc.dupe(u8, text_value.string) };
+    errdefer out.deinit(alloc);
+    out.confidence = runtimeGeneratedTextJsonFloatField(result.object, "confidence");
+    out.bbox = runtimeGeneratedTextJsonBboxField(result.object, "ocr_bbox") orelse runtimeGeneratedTextJsonBboxField(result.object, "bbox") orelse runtimeGeneratedTextJsonBboxField(result.object, "coordinates");
+    if (runtimeGeneratedTextJsonStringField(result.object, "warning") orelse runtimeGeneratedTextJsonStringField(result.object, "extraction_warning")) |warning| {
+        out.warning = try alloc.dupe(u8, warning);
+    }
+    if (runtimeGeneratedTextJsonStringField(result.object, "regions_json")) |regions_json| {
+        out.regions = try parseRuntimeReaderRegionsAlloc(alloc, regions_json);
+    }
+    return out;
+}
+
+fn parseRuntimeReaderRegionsAlloc(
+    alloc: Allocator,
+    regions_json: []const u8,
+) ![]document_extraction_mod.OcrReaderRegion {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, regions_json, .{}) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return &.{};
+    };
+    defer parsed.deinit();
+    if (parsed.value != .array) return &.{};
+
+    var regions = std.ArrayListUnmanaged(document_extraction_mod.OcrReaderRegion).empty;
+    errdefer {
+        for (regions.items) |region| {
+            if (region.text.len > 0) alloc.free(region.text);
+        }
+        regions.deinit(alloc);
+    }
+    for (parsed.value.array.items) |value| {
+        if (value != .object) continue;
+        const text = runtimeGeneratedTextJsonStringField(value.object, "text") orelse continue;
+        const bbox = runtimeGeneratedTextJsonBboxField(value.object, "bbox");
+        const coordinate_space: document_extraction_mod.OcrRegionCoordinateSpace = if (runtimeGeneratedTextJsonStringField(value.object, "coordinate_space")) |coordinate|
+            if (std.mem.eql(u8, coordinate, "image_pixels_top_left")) .image_pixels_top_left else .unknown
+        else
+            .unknown;
+        const owned_text = try alloc.dupe(u8, text);
+        errdefer if (owned_text.len > 0) alloc.free(owned_text);
+        try regions.append(alloc, .{
+            .text = owned_text,
+            .bbox = bbox,
+            .coordinate_space = coordinate_space,
+        });
+    }
+    return try regions.toOwnedSlice(alloc);
 }
 
 fn runtimeGeneratedTextJsonStringField(object: std.json.ObjectMap, field: []const u8) ?[]const u8 {
@@ -29036,6 +29285,7 @@ test "document extraction generated OCR applies unit updates transactionally" {
                 "reader",
                 "completed",
                 .ocr,
+                .plain_or_generator_object,
                 .{},
                 "<OCR>",
             ) catch |err| {
@@ -29056,6 +29306,179 @@ test "document extraction generated OCR applies unit updates transactionally" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
+test "structured Reader output enforces singleton identity without guessing plain output" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(
+        error.InvalidReaderResponseIdentity,
+        parseRuntimeGeneratedUnitTextOutputAlloc(alloc, "[]", .structured_reader),
+    );
+    try std.testing.expectError(
+        error.InvalidReaderResponseIdentity,
+        parseRuntimeGeneratedUnitTextOutputAlloc(alloc, "[{\"text\":\"one\"},{\"text\":\"two\"}]", .structured_reader),
+    );
+    try std.testing.expectError(
+        error.InvalidReaderResponseIdentity,
+        parseRuntimeGeneratedUnitTextOutputAlloc(alloc, "{\"text\":\"not an array\"}", .structured_reader),
+    );
+
+    var malformed_regions = try parseRuntimeGeneratedUnitTextOutputAlloc(
+        alloc,
+        "[{\"text\":\"valid meaningful Reader text\",\"regions_json\":\"{\"}]",
+        .structured_reader,
+    );
+    defer malformed_regions.deinit(alloc);
+    try std.testing.expectEqualStrings("valid meaningful Reader text", malformed_regions.text);
+    try std.testing.expectEqual(@as(usize, 0), malformed_regions.regions.len);
+
+    var explicit_plain = try parseRuntimeGeneratedUnitTextOutputAlloc(
+        alloc,
+        "[{\"text\":\"plain clients keep their wire contract\"}]",
+        .plain_or_generator_object,
+    );
+    defer explicit_plain.deinit(alloc);
+    try std.testing.expectEqualStrings("[{\"text\":\"plain clients keep their wire contract\"}]", explicit_plain.text);
+}
+
+test "structured Reader regions survive OCR application and allocation failures" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            const text = "écho phrase répétée 123\nécho phrase répétée 123";
+            const regions_json =
+                "[{\"text\":\"écho phrase répétée 123\",\"bbox\":[10,10,80,20],\"coordinate_space\":\"image_pixels_top_left\"}," ++
+                "{\"text\":\"écho phrase répétée 123\",\"bbox\":[10,30,80,40],\"coordinate_space\":\"image_pixels_top_left\"}]";
+            const Response = struct {
+                text: []const u8,
+                regions_json: []const u8,
+            };
+            const response_items = [_]Response{.{ .text = text, .regions_json = regions_json }};
+            const produced = try std.json.Stringify.valueAlloc(alloc, response_items[0..], .{});
+            var produced_owned = true;
+            defer if (produced_owned) alloc.free(produced);
+            const fixture = document_extraction_mod.Unit{
+                .unit_id = @constCast("page:000001"),
+                .unit_type = @constCast("page"),
+                .text = @constCast(""),
+                .method = @constCast("pdf_text"),
+                .extraction_status = @constCast("pending_ocr"),
+                .page_number = 1,
+                .page_bbox = .{ 0, 0, 100, 100 },
+                .ocr_effective_render_dpi = 72,
+                .ocr_rendered_width = 100,
+                .ocr_rendered_height = 100,
+            };
+            var unit = try cloneDocumentExtractionUnit(alloc, fixture);
+            defer unit.deinit(alloc);
+            produced_owned = false;
+            applyRuntimeGeneratedUnitText(
+                alloc,
+                alloc,
+                &unit,
+                produced,
+                "reader",
+                "completed",
+                .ocr,
+                .structured_reader,
+                .{},
+                "<OCR>",
+            ) catch |err| {
+                try std.testing.expectEqualStrings("", unit.text);
+                try std.testing.expectEqual(@as(usize, 0), unit.text_regions.len);
+                return err;
+            };
+            try std.testing.expectEqualStrings(text, unit.text);
+            try std.testing.expectEqual(@as(usize, 2), unit.text_regions.len);
+            const first_end = "écho phrase répétée 123".len;
+            try std.testing.expectEqual([2]u32{ 0, first_end }, unit.text_regions[0].span);
+            try std.testing.expectEqual([2]u32{ first_end + 1, text.len }, unit.text_regions[1].span);
+            try std.testing.expect(unit.text_regions[0].bbox[1] > unit.text_regions[1].bbox[1]);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "invalid OCR boxes cannot shift grounding onto earlier repeated text" {
+    const alloc = std.testing.allocator;
+    const text = "café\ncafé\ncafé";
+    const fixture = document_extraction_mod.Unit{
+        .unit_id = @constCast("page:000001"),
+        .unit_type = @constCast("page"),
+        .text = @constCast(""),
+        .method = @constCast("pdf_text"),
+        .page_bbox = .{ 0, 0, 100, 100 },
+        .ocr_effective_render_dpi = 72,
+        .ocr_rendered_width = 100,
+        .ocr_rendered_height = 100,
+    };
+    var unit = try cloneDocumentExtractionUnit(alloc, fixture);
+    defer unit.deinit(alloc);
+    const response = .{.{
+        .text = text,
+        .regions_json = "[{\"text\":\"café\",\"bbox\":[10,10],\"coordinate_space\":\"image_pixels_top_left\"}," ++
+            "{\"text\":\"café\",\"bbox\":[10,30,200,40],\"coordinate_space\":\"image_pixels_top_left\"}," ++
+            "{\"text\":\"café\",\"bbox\":[10,50,80,60],\"coordinate_space\":\"image_pixels_top_left\"}]",
+    }};
+    const produced = try std.json.Stringify.valueAlloc(alloc, response, .{});
+    try applyRuntimeGeneratedUnitText(alloc, alloc, &unit, produced, "reader", "completed", .ocr, .structured_reader, .{}, "<OCR>");
+    try std.testing.expectEqualStrings(text, unit.text);
+    try std.testing.expectEqual(@as(usize, 1), unit.text_regions.len);
+    try std.testing.expectEqual([2]u32{ 12, 17 }, unit.text_regions[0].span);
+    try std.testing.expectEqual([4]f64{ 10, 40, 80, 50 }, unit.text_regions[0].bbox);
+}
+
+test "OCR text selection retains only exactly mapped region spans" {
+    const alloc = std.testing.allocator;
+    const embedded_text = "Quarter Revenue Cost Margin\nQ1 101 81 20\nQ2 115 90 25\nQ3 124 94 30\nQ4 140 100 40";
+    const ocr_text = "Quarterly revenue and margins improved throughout the year. This transcription contains fluent explanatory prose but omits the individual table cells.";
+    const regions_json =
+        "[{\"text\":\"Quarterly revenue and margins improved throughout the year. This transcription contains fluent explanatory prose but omits the individual table cells.\",\"bbox\":[5,5,95,35],\"coordinate_space\":\"image_pixels_top_left\"}," ++
+        "{\"text\":\"Q1 101 81 20\",\"bbox\":[5,40,50,50],\"coordinate_space\":\"image_pixels_top_left\"}]";
+    const Response = struct { text: []const u8, regions_json: []const u8 };
+    const response_items = [_]Response{.{ .text = ocr_text, .regions_json = regions_json }};
+    const produced = try std.json.Stringify.valueAlloc(alloc, response_items[0..], .{});
+    var produced_owned = true;
+    defer if (produced_owned) alloc.free(produced);
+    var hybrid = try cloneDocumentExtractionUnit(alloc, .{
+        .unit_id = @constCast("page:000001"),
+        .unit_type = @constCast("page"),
+        .text = @constCast(embedded_text),
+        .method = @constCast("pdf_text"),
+        .extraction_status = @constCast("pending_ocr"),
+        .page_number = 1,
+        .page_bbox = .{ 0, 0, 100, 100 },
+        .ocr_effective_render_dpi = 72,
+        .ocr_rendered_width = 100,
+        .ocr_rendered_height = 100,
+    });
+    defer hybrid.deinit(alloc);
+    produced_owned = false;
+    try applyRuntimeGeneratedUnitText(alloc, alloc, &hybrid, produced, "reader", "completed", .ocr, .structured_reader, .{}, "<OCR>");
+    try std.testing.expect(std.mem.startsWith(u8, hybrid.text, ocr_text));
+    try std.testing.expect(std.mem.indexOf(u8, hybrid.text, "Q1 101 81 20") != null);
+    try std.testing.expectEqual(@as(usize, 1), hybrid.text_regions.len);
+    try std.testing.expectEqual([2]u32{ 0, ocr_text.len }, hybrid.text_regions[0].span);
+
+    const original_regions = [_]document_extraction_mod.TextRegion{.{
+        .span = .{ 0, 4 },
+        .bbox = .{ 1, 2, 3, 4 },
+    }};
+    var embedded = try cloneDocumentExtractionUnit(alloc, .{
+        .unit_id = @constCast("page:000002"),
+        .unit_type = @constCast("page"),
+        .text = @constCast("This substantial embedded document text remains preferable to a short OCR response with weak coverage."),
+        .text_regions = @constCast(&original_regions),
+        .method = @constCast("pdf_text"),
+        .extraction_status = @constCast("pending_ocr"),
+        .page_number = 2,
+    });
+    defer embedded.deinit(alloc);
+    const embedded_response = try alloc.dupe(u8, "[{\"text\":\"A short note with I and a reference\",\"regions_json\":\"[]\"}]");
+    try applyRuntimeGeneratedUnitText(alloc, alloc, &embedded, embedded_response, "reader", "completed", .ocr, .structured_reader, .{}, "<OCR>");
+    try std.testing.expectEqualStrings("pdf_text", embedded.method);
+    try std.testing.expect(!embedded.ocr_used);
+    try std.testing.expectEqual(@as(usize, 1), embedded.text_regions.len);
+    try std.testing.expectEqual(original_regions[0], embedded.text_regions[0]);
+}
+
 test "document extraction generated OCR preserves short scan text and quality warnings transactionally" {
     const Runner = struct {
         fn run(alloc: Allocator) !void {
@@ -29072,7 +29495,7 @@ test "document extraction generated OCR preserves short scan text and quality wa
             defer unit.deinit(alloc);
             const text = "A short note with I and a reference";
             const produced = try alloc.dupe(u8, "{\"text\":\"" ++ text ++ "\",\"warning\":\"provider_warning\"}");
-            applyRuntimeGeneratedUnitText(alloc, alloc, &unit, produced, "reader", "completed", .ocr, .{}, "<OCR>") catch |err| {
+            applyRuntimeGeneratedUnitText(alloc, alloc, &unit, produced, "reader", "completed", .ocr, .plain_or_generator_object, .{}, "<OCR>") catch |err| {
                 try std.testing.expectEqualStrings("", unit.text);
                 try std.testing.expectEqualStrings("pdf_text", unit.method);
                 try std.testing.expectEqualStrings("pending_ocr", unit.extraction_status.?);
@@ -29106,7 +29529,7 @@ test "document extraction generated OCR rejects empty punctuation and prompt ech
         var unit = try cloneDocumentExtractionUnit(alloc, fixture);
         defer unit.deinit(alloc);
         const expected = if (std.mem.eql(u8, output, "<OCR>")) error.OcrPromptEcho else error.TrivialOcrOutput;
-        try std.testing.expectError(expected, applyRuntimeGeneratedUnitText(alloc, alloc, &unit, try alloc.dupe(u8, output), "reader", "completed", .ocr, .{}, "<OCR>"));
+        try std.testing.expectError(expected, applyRuntimeGeneratedUnitText(alloc, alloc, &unit, try alloc.dupe(u8, output), "reader", "completed", .ocr, .plain_or_generator_object, .{}, "<OCR>"));
         try std.testing.expectEqualStrings("", unit.text);
         try std.testing.expectEqualStrings("pending_ocr", unit.extraction_status.?);
         try std.testing.expect(!unit.ocr_used);
@@ -29146,8 +29569,11 @@ test "synchronous document extraction OCR batches honor request execution item c
                 }
                 a.free(out);
             }
-            for (out, 0..) |*item, idx| {
-                item.* = try std.fmt.allocPrint(a, "ocr text {d}", .{idx});
+            for (out, requests, 0..) |*item, request, idx| {
+                item.* = if (std.mem.eql(u8, request.content_type, "application/json"))
+                    try std.fmt.allocPrint(a, "[{{\"text\":\"ocr text {d}\"}}]", .{idx})
+                else
+                    try std.fmt.allocPrint(a, "ocr text {d}", .{idx});
             }
             return out;
         }
@@ -29314,8 +29740,11 @@ test "document extraction rejects and records Florence prompt echoes" {
             };
         }
 
-        fn produce(_: *anyopaque, a: Allocator, _: asset_producer_mod.Request) ![]u8 {
-            return try a.dupe(u8, document_extraction_mod.florence_ocr_canonical_prompt);
+        fn produce(_: *anyopaque, a: Allocator, request: asset_producer_mod.Request) ![]u8 {
+            return try a.dupe(u8, if (std.mem.eql(u8, request.content_type, "application/json"))
+                "[{\"text\":\"<OCR>\"}]"
+            else
+                document_extraction_mod.florence_ocr_canonical_prompt);
         }
 
         fn produceBatch(_: *anyopaque, a: Allocator, requests: []const asset_producer_mod.Request) ![][]u8 {
@@ -29323,8 +29752,11 @@ test "document extraction rejects and records Florence prompt echoes" {
             errdefer a.free(out);
             var initialized: usize = 0;
             errdefer for (out[0..initialized]) |item| a.free(item);
-            for (out) |*item| {
-                item.* = try a.dupe(u8, document_extraction_mod.florence_ocr_canonical_prompt);
+            for (out, requests) |*item, request| {
+                item.* = try a.dupe(u8, if (std.mem.eql(u8, request.content_type, "application/json"))
+                    "[{\"text\":\"<OCR>\"}]"
+                else
+                    document_extraction_mod.florence_ocr_canonical_prompt);
                 initialized += 1;
             }
             return out;
@@ -30273,8 +30705,8 @@ test "document extraction generated OCR bypasses unsupported native batch" {
             self.single_count += 1;
             const parts = request.source_parts_json orelse "";
             if (std.mem.indexOf(u8, parts, "unit:2") != null) return error.BadUnitInput;
-            if (std.mem.indexOf(u8, parts, "unit:1") != null) return try a.dupe(u8, "ok:unit:1");
-            if (std.mem.indexOf(u8, parts, "unit:3") != null) return try a.dupe(u8, "ok:unit:3");
+            if (std.mem.indexOf(u8, parts, "unit:1") != null) return try a.dupe(u8, "[{\"text\":\"ok:unit:1\"}]");
+            if (std.mem.indexOf(u8, parts, "unit:3") != null) return try a.dupe(u8, "[{\"text\":\"ok:unit:3\"}]");
             return error.BadUnitInput;
         }
 
@@ -30376,8 +30808,8 @@ test "document extraction generated OCR batch fallback isolates malformed batch 
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.single_count += 1;
             const parts = request.source_parts_json orelse "";
-            if (std.mem.indexOf(u8, parts, "unit:1") != null) return try a.dupe(u8, "ok:unit:1");
-            if (std.mem.indexOf(u8, parts, "unit:2") != null) return try a.dupe(u8, "ok:unit:2");
+            if (std.mem.indexOf(u8, parts, "unit:1") != null) return try a.dupe(u8, "[{\"text\":\"ok:unit:1\"}]");
+            if (std.mem.indexOf(u8, parts, "unit:2") != null) return try a.dupe(u8, "[{\"text\":\"ok:unit:2\"}]");
             return error.BadUnitInput;
         }
 

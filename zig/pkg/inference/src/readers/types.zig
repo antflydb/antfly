@@ -28,11 +28,22 @@ pub const Field = struct {
 pub const StructuredField = extractor_types.StructuredField;
 pub const StructuredValue = extractor_types.StructuredValue;
 
+/// Coordinate convention attached by a reader that can prove how its regions
+/// relate to the supplied image. Callers must not infer a convention when the
+/// reader leaves this as `unknown`.
+pub const RegionCoordinateSpace = enum {
+    unknown,
+    /// Pixel coordinates in `[left, top, right, bottom]` order with the origin
+    /// at the top-left of the exact input raster.
+    image_pixels_top_left,
+};
+
 pub const Region = struct {
     text: []const u8,
     bbox: [4]f64,
     confidence: ?f32 = null,
     label: ?[]const u8 = null,
+    coordinate_space: RegionCoordinateSpace = .unknown,
 
     pub fn deinit(self: *Region, allocator: std.mem.Allocator) void {
         allocator.free(self.text);

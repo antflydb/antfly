@@ -114,6 +114,7 @@ pub fn renderPageContentPngInBoxRotatedCancelable(
     try cancellation.check();
     return try image.png.encodeRgbaWithCancellation(
         alloc,
+        alloc,
         @intCast(raw.width),
         @intCast(raw.height),
         raw.rgba,
@@ -300,6 +301,7 @@ fn resizeDecodedRgbaToMaxDimensionAlloc(
         return .{
             .png = try image.png.encodeRgbaWithCancellation(
                 alloc,
+                alloc,
                 width,
                 height,
                 rgba,
@@ -364,6 +366,7 @@ fn resizeDecodedRgbaToMaxDimensionAlloc(
     try cancellation.check();
     return .{
         .png = try image.png.encodeRgbaWithCancellation(
+            alloc,
             alloc,
             target_width,
             target_height,

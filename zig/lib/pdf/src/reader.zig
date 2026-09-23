@@ -4505,6 +4505,8 @@ pub const Reader = struct {
             // preservation baseline. Real-world PDFs sometimes package
             // independently generated content streams whose inherited font
             // state would otherwise decode (and drop) different glyphs.
+            // Compare canonical bytes with this original run sequence before
+            // any extraction-only geometric permutation is applied.
             var text_parser = TextContentParser.init(self.alloc, &canonical);
             defer text_parser.deinit();
             try text_parser.consume(stream_content, fonts, forms, 0);
@@ -4513,15 +4515,14 @@ pub const Reader = struct {
 
         var owned_text = try canonical.toOwnedSlice(self.alloc);
         errdefer self.alloc.free(owned_text);
-        if (layout_runs.items.len > 0) {
+        if (layout_runs.items.len > 0 and
+            sameNonWhitespaceBytesAsTextRuns(owned_text, layout_runs.items))
+        {
             const reconstructed = try reconstructTextFromRunsAlloc(self.alloc, layout_runs.items);
-            if (sameNonWhitespaceBytes(owned_text, reconstructed)) {
-                self.alloc.free(owned_text);
-                owned_text = reconstructed;
-            } else {
-                self.alloc.free(reconstructed);
-                clearTextRunOutputSpans(layout_runs.items);
-            }
+            self.alloc.free(owned_text);
+            owned_text = reconstructed;
+        } else {
+            clearTextRunOutputSpans(layout_runs.items);
         }
         return owned_text;
     }
@@ -5945,7 +5946,8 @@ pub const Reader = struct {
             const stream_content = decoded[range.start..range.end];
             // Runs retain cross-stream graphics/text state for geometry, while
             // canonical bytes retain the legacy per-stream decoding behavior.
-            // Reconstruction is accepted only when it preserves those bytes.
+            // Validate against the original run sequence before ordering;
+            // ordered reconstruction is intentionally not content order.
             var text_parser = TextContentParser.init(self.alloc, &text);
             defer text_parser.deinit();
             try text_parser.consume(stream_content, fonts, forms, 0);
@@ -5954,15 +5956,14 @@ pub const Reader = struct {
 
         var owned_text = try text.toOwnedSlice(self.alloc);
         errdefer self.alloc.free(owned_text);
-        if (runs.items.len > 0) {
+        if (runs.items.len > 0 and
+            sameNonWhitespaceBytesAsTextRuns(owned_text, runs.items))
+        {
             const reconstructed = try reconstructTextFromRunsAlloc(self.alloc, runs.items);
-            if (sameNonWhitespaceBytes(owned_text, reconstructed)) {
-                self.alloc.free(owned_text);
-                owned_text = reconstructed;
-            } else {
-                self.alloc.free(reconstructed);
-                clearTextRunOutputSpans(runs.items);
-            }
+            self.alloc.free(owned_text);
+            owned_text = reconstructed;
+        } else {
+            clearTextRunOutputSpans(runs.items);
         }
         const owned_runs = try runs.toOwnedSlice(self.alloc);
         return .{ .text = owned_text, .runs = owned_runs };
@@ -8747,7 +8748,14 @@ pub const Reader = struct {
                 return error.PdfDecodeWorkingSetTooLarge;
             const raw = try self.readRawStreamDataWithLimit(obj, local_decode_limits.max_working_set_bytes);
             defer self.alloc.free(raw);
-            const filter_param = streamFilterParamFor(obj.get("Filter"), obj.get("DecodeParms"), "CCITTFaxDecode");
+            var resolved_decode_parms: ?syntax.Object = null;
+            defer if (resolved_decode_parms) |*value| value.deinit(self.alloc);
+            const decode_parms = blk: {
+                const parms = obj.get("DecodeParms") orelse break :blk null;
+                resolved_decode_parms = try self.resolveDecodeParmsAlloc(parms);
+                break :blk &resolved_decode_parms.?;
+            };
+            const filter_param = streamFilterParamFor(obj.get("Filter"), decode_parms, "CCITTFaxDecode");
             const gray = try decodeCcittGrayAlloc(self.alloc, raw, width, height, filter_param);
             defer self.alloc.free(gray);
             var reduced_gray: ?[]u8 = null;
@@ -17284,6 +17292,34 @@ fn sameNonWhitespaceBytes(left: []const u8, right: []const u8) bool {
     }
 }
 
+fn sameNonWhitespaceBytesAsTextRuns(canonical: []const u8, runs: anytype) bool {
+    var canonical_index: usize = 0;
+    var run_index: usize = 0;
+    var text_index: usize = 0;
+    while (true) {
+        while (canonical_index < canonical.len and std.ascii.isWhitespace(canonical[canonical_index])) canonical_index += 1;
+        while (run_index < runs.len) {
+            while (text_index < runs[run_index].text.len and std.ascii.isWhitespace(runs[run_index].text[text_index])) text_index += 1;
+            if (text_index < runs[run_index].text.len) break;
+            run_index += 1;
+            text_index = 0;
+        }
+        if (canonical_index == canonical.len or run_index == runs.len) {
+            while (canonical_index < canonical.len and std.ascii.isWhitespace(canonical[canonical_index])) canonical_index += 1;
+            while (run_index < runs.len) {
+                while (text_index < runs[run_index].text.len and std.ascii.isWhitespace(runs[run_index].text[text_index])) text_index += 1;
+                if (text_index < runs[run_index].text.len) return false;
+                run_index += 1;
+                text_index = 0;
+            }
+            return canonical_index == canonical.len;
+        }
+        if (canonical[canonical_index] != runs[run_index].text[text_index]) return false;
+        canonical_index += 1;
+        text_index += 1;
+    }
+}
+
 fn textRunAxisLength(run: anytype) f64 {
     return @sqrt(run.a * run.a + run.b * run.b);
 }
@@ -17322,12 +17358,529 @@ fn textRunForwardGap(previous: anytype, current: anytype) f64 {
         (current.y - previous_end_y) * (previous.b / axis);
 }
 
+const TextRunBounds = struct {
+    min_x: f64,
+    min_y: f64,
+    max_x: f64,
+    max_y: f64,
+
+    fn include(self: *TextRunBounds, other: TextRunBounds) void {
+        self.min_x = @min(self.min_x, other.min_x);
+        self.min_y = @min(self.min_y, other.min_y);
+        self.max_x = @max(self.max_x, other.max_x);
+        self.max_y = @max(self.max_y, other.max_y);
+    }
+};
+
+fn textRunBounds(run: anytype) TextRunBounds {
+    const end_x = run.x + run.a * run.advance_width;
+    const end_y = run.y + run.b * run.advance_width;
+    const top_x = run.c * run.ascent;
+    const top_y = run.d * run.ascent;
+    const bottom_x = -run.c * run.descent;
+    const bottom_y = -run.d * run.descent;
+    return .{
+        .min_x = @min(@min(run.x + top_x, run.x + bottom_x), @min(end_x + top_x, end_x + bottom_x)),
+        .min_y = @min(@min(run.y + top_y, run.y + bottom_y), @min(end_y + top_y, end_y + bottom_y)),
+        .max_x = @max(@max(run.x + top_x, run.x + bottom_x), @max(end_x + top_x, end_x + bottom_x)),
+        .max_y = @max(@max(run.y + top_y, run.y + bottom_y), @max(end_y + top_y, end_y + bottom_y)),
+    };
+}
+
+fn textRunIsVertical(run: anytype) bool {
+    return if (comptime @hasField(@TypeOf(run), "vertical"))
+        run.vertical
+    else
+        false;
+}
+
+fn textRunHasSupportedOrderingGeometry(run: anytype) bool {
+    if (textRunIsVertical(run)) return false;
+    if (!std.math.isFinite(run.x) or !std.math.isFinite(run.y) or
+        !std.math.isFinite(run.a) or !std.math.isFinite(run.b) or
+        !std.math.isFinite(run.c) or !std.math.isFinite(run.d) or
+        !std.math.isFinite(run.font_size) or !std.math.isFinite(run.horizontal_scale) or
+        !std.math.isFinite(run.advance_width) or !std.math.isFinite(run.ascent) or
+        !std.math.isFinite(run.descent))
+        return false;
+    const axis = textRunAxisLength(run);
+    const vertical_scale = textRunVerticalScale(run);
+    if (axis <= 0.000001 or vertical_scale <= 0.000001 or run.advance_width <= 0.000001) return false;
+    if (@abs(run.horizontal_scale) <= 0.000001 or
+        run.ascent < 0 or run.descent < 0 or run.ascent + run.descent <= 0.000001)
+        return false;
+    // The extraction ordering pass is deliberately limited to ordinary
+    // left-to-right, upright text. Rotated, mirrored, vertical, and
+    // mixed-direction text retains content-stream order.
+    if (run.a / axis < 0.984807753 or @abs(run.b) / axis > 0.173648178) return false;
+    if (run.d / vertical_scale < 0.984807753 or @abs(run.c) / vertical_scale > 0.173648178) return false;
+    const bounds = textRunBounds(run);
+    return std.math.isFinite(bounds.min_x) and std.math.isFinite(bounds.min_y) and
+        std.math.isFinite(bounds.max_x) and std.math.isFinite(bounds.max_y) and
+        bounds.max_x - bounds.min_x > 0.000001 and bounds.max_y - bounds.min_y > 0.000001;
+}
+
+fn textRunAxesCompatible(left: anytype, right: anytype) bool {
+    const left_axis = textRunAxisLength(left);
+    const right_axis = textRunAxisLength(right);
+    const left_vertical = textRunVerticalScale(left);
+    const right_vertical = textRunVerticalScale(right);
+    const axis_alignment = (left.a * right.a + left.b * right.b) / (left_axis * right_axis);
+    const vertical_alignment = (left.c * right.c + left.d * right.d) / (left_vertical * right_vertical);
+    return axis_alignment >= 0.995 and vertical_alignment >= 0.995;
+}
+
+const TextLayoutMetrics = struct {
+    median_height: f64,
+    median_space_advance: f64,
+};
+
+fn textLayoutMetricsAlloc(alloc: Allocator, runs: anytype, indices: []const usize) !TextLayoutMetrics {
+    const heights = try alloc.alloc(f64, indices.len);
+    defer alloc.free(heights);
+    const spaces = try alloc.alloc(f64, indices.len);
+    defer alloc.free(spaces);
+    for (indices, 0..) |run_index, metric_index| {
+        const run = runs[run_index];
+        const bounds = textRunBounds(run);
+        heights[metric_index] = bounds.max_y - bounds.min_y;
+        spaces[metric_index] = @max(
+            0.5,
+            @abs(run.font_size) * textRunAxisLength(run) * @abs(run.horizontal_scale) * 0.25,
+        );
+    }
+    std.mem.sort(f64, heights, {}, std.sort.asc(f64));
+    std.mem.sort(f64, spaces, {}, std.sort.asc(f64));
+    return .{
+        .median_height = heights[heights.len / 2],
+        .median_space_advance = spaces[spaces.len / 2],
+    };
+}
+
+const TextLayoutLine = struct {
+    run_indices: std.ArrayList(usize) = .empty,
+    anchor_index: usize,
+    first_index: usize,
+    bounds: TextRunBounds,
+
+    fn deinit(self: *TextLayoutLine, alloc: Allocator) void {
+        self.run_indices.deinit(alloc);
+    }
+};
+
+fn deinitTextLayoutLines(alloc: Allocator, lines: []TextLayoutLine) void {
+    for (lines) |*line| line.deinit(alloc);
+    alloc.free(lines);
+}
+
+fn collectTextLayoutLinesAlloc(alloc: Allocator, runs: anytype, indices: []const usize) ![]TextLayoutLine {
+    var lines = std.ArrayList(TextLayoutLine).empty;
+    errdefer {
+        for (lines.items) |*line| line.deinit(alloc);
+        lines.deinit(alloc);
+    }
+    for (indices) |run_index| {
+        const run = runs[run_index];
+        const bounds = textRunBounds(run);
+        var best_line_index: ?usize = null;
+        var best_baseline_gap = std.math.inf(f64);
+        for (lines.items, 0..) |line, line_index| {
+            const anchor = runs[line.anchor_index];
+            if (!textRunsShareLine(anchor, run)) continue;
+            const baseline_gap = @abs(anchor.y - run.y);
+            if (baseline_gap < best_baseline_gap) {
+                best_line_index = line_index;
+                best_baseline_gap = baseline_gap;
+            }
+        }
+        if (best_line_index) |line_index| {
+            try lines.items[line_index].run_indices.append(alloc, run_index);
+            lines.items[line_index].bounds.include(bounds);
+            lines.items[line_index].first_index = @min(lines.items[line_index].first_index, run_index);
+        } else {
+            var line = TextLayoutLine{
+                .anchor_index = run_index,
+                .first_index = run_index,
+                .bounds = bounds,
+            };
+            errdefer line.deinit(alloc);
+            try line.run_indices.append(alloc, run_index);
+            try lines.append(alloc, line);
+        }
+    }
+    for (lines.items) |*line| {
+        std.mem.sort(usize, line.run_indices.items, runs, struct {
+            fn lessThan(runs_inner: @TypeOf(runs), left_index: usize, right_index: usize) bool {
+                const left = textRunBounds(runs_inner[left_index]);
+                const right = textRunBounds(runs_inner[right_index]);
+                if (left.min_x != right.min_x) return left.min_x < right.min_x;
+                if (left.max_x != right.max_x) return left.max_x < right.max_x;
+                return left_index < right_index;
+            }
+        }.lessThan);
+    }
+    std.mem.sort(TextLayoutLine, lines.items, {}, struct {
+        fn lessThan(_: void, left: TextLayoutLine, right: TextLayoutLine) bool {
+            if (left.bounds.max_y != right.bounds.max_y)
+                return left.bounds.max_y > right.bounds.max_y;
+            return left.first_index < right.first_index;
+        }
+    }.lessThan);
+    return try lines.toOwnedSlice(alloc);
+}
+
+const TextLayoutGutter = struct {
+    left: f64,
+    right: f64,
+    body_bottom: f64,
+    body_top: f64,
+};
+const TextLayoutGutterCandidate = struct {
+    gutter: TextLayoutGutter,
+    blocked: bool,
+};
+
+const TextLayoutGutterSearch = struct {
+    best: ?TextLayoutGutter = null,
+
+    fn consider(self: *TextLayoutGutterSearch, candidate: ?TextLayoutGutterCandidate) void {
+        const value = candidate orelse return;
+        if (value.blocked) return;
+        if (self.best == null or value.gutter.right - value.gutter.left > self.best.?.right - self.best.?.left)
+            self.best = value.gutter;
+    }
+};
+
+fn textRunHasVisibleText(run: anytype) bool {
+    const view = std.unicode.Utf8View.init(run.text) catch return true;
+    var iterator = view.iterator();
+    while (iterator.nextCodepoint()) |cp| {
+        switch (cp) {
+            0x09...0x0d, 0x20, 0x85, 0xa0, 0x1680, 0x2000...0x200a, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000 => {},
+            else => return true,
+        }
+    }
+    return false;
+}
+
+fn countGutterSideLines(
+    lines: []const TextLayoutLine,
+    runs: anytype,
+    gutter_left: f64,
+    gutter_right: f64,
+    body_bottom: f64,
+    body_top: f64,
+    left_side: bool,
+) usize {
+    var count: usize = 0;
+    for (lines) |line| {
+        const center_y = (line.bounds.min_y + line.bounds.max_y) * 0.5;
+        if (center_y < body_bottom or center_y > body_top) continue;
+        for (line.run_indices.items) |run_index| {
+            // Blank positioning runs remain in the emitted stream, but they
+            // cannot establish a second column of content.
+            if (!textRunHasVisibleText(runs[run_index])) continue;
+            const bounds = textRunBounds(runs[run_index]);
+            const on_side = if (left_side) bounds.max_x <= gutter_left else bounds.min_x >= gutter_right;
+            if (on_side) {
+                count += 1;
+                break;
+            }
+        }
+    }
+    return count;
+}
+
+fn candidateTextLayoutGutter(
+    runs: anytype,
+    indices: []const usize,
+    lines: []const TextLayoutLine,
+    metrics: TextLayoutMetrics,
+    gutter_left: f64,
+    gutter_right: f64,
+) ?TextLayoutGutterCandidate {
+    const width = gutter_right - gutter_left;
+    // Two line heights distinguishes a persistent column gutter from an
+    // ordinary inter-word or table-cell separator. The median space advance
+    // supplies a scale floor for unusually short or synthetic font boxes.
+    const minimum_width = @max(metrics.median_height * 2.0, metrics.median_space_advance * 4.0);
+    if (width < minimum_width) return null;
+
+    var left_bottom = std.math.inf(f64);
+    var left_top = -std.math.inf(f64);
+    var right_bottom = std.math.inf(f64);
+    var right_top = -std.math.inf(f64);
+    for (indices) |run_index| {
+        const bounds = textRunBounds(runs[run_index]);
+        if (bounds.max_x <= gutter_left) {
+            left_bottom = @min(left_bottom, bounds.min_y);
+            left_top = @max(left_top, bounds.max_y);
+        } else if (bounds.min_x >= gutter_right) {
+            right_bottom = @min(right_bottom, bounds.min_y);
+            right_top = @max(right_top, bounds.max_y);
+        }
+    }
+    if (!std.math.isFinite(left_bottom) or !std.math.isFinite(right_bottom)) return null;
+    const body_bottom = @max(left_bottom, right_bottom);
+    const body_top = @min(left_top, right_top);
+    if (body_top - body_bottom < metrics.median_height * 2.0) return null;
+    if (countGutterSideLines(lines, runs, gutter_left, gutter_right, body_bottom, body_top, true) < 3 or
+        countGutterSideLines(lines, runs, gutter_left, gutter_right, body_bottom, body_top, false) < 3)
+        return null;
+
+    const gutter = TextLayoutGutter{
+        .left = gutter_left,
+        .right = gutter_right,
+        .body_bottom = body_bottom,
+        .body_top = body_top,
+    };
+    for (indices) |run_index| {
+        const bounds = textRunBounds(runs[run_index]);
+        if (bounds.max_x <= gutter_left or bounds.min_x >= gutter_right) continue;
+        // The cut has column-like support, but a run inside the common body
+        // crosses it. That makes the leaf ambiguous rather than single-column:
+        // sorting all its baselines would silently invent row-major order.
+        if (bounds.min_y < body_top and bounds.max_y > body_bottom)
+            return .{ .gutter = gutter, .blocked = true };
+    }
+    var top_line: ?*const TextLayoutLine = null;
+    var next_line_top = -std.math.inf(f64);
+    for (lines) |*line| {
+        if (top_line) |top| {
+            if (line.bounds.max_y > top.bounds.max_y) {
+                next_line_top = @max(next_line_top, top.bounds.max_y);
+                top_line = line;
+            } else {
+                next_line_top = @max(next_line_top, line.bounds.max_y);
+            }
+        } else {
+            top_line = line;
+        }
+        if (line.run_indices.items.len < 2 or
+            line.bounds.max_x <= gutter_left or line.bounds.min_x >= gutter_right) continue;
+        for (line.run_indices.items[0 .. line.run_indices.items.len - 1], line.run_indices.items[1..]) |previous_index, current_index| {
+            const previous = textRunBounds(runs[previous_index]);
+            const current = textRunBounds(runs[current_index]);
+            const separates_neighbors =
+                (previous.max_x <= gutter_left) != (current.max_x <= gutter_left) or
+                (previous.min_x >= gutter_right) != (current.min_x >= gutter_right);
+            // A short column does not turn adjacent word fragments below it
+            // into footer material. The cut must respect text continuity
+            // outside the shared column body as well as inside it.
+            if (separates_neighbors and textRunForwardGap(runs[previous_index], runs[current_index]) < minimum_width)
+                return .{ .gutter = gutter, .blocked = true };
+        }
+    }
+    if (top_line) |top| {
+        if (std.math.isFinite(next_line_top) and top.bounds.min_y - next_line_top > metrics.median_height) {
+            var has_left = false;
+            var has_right = false;
+            for (top.run_indices.items) |run_index| {
+                const bounds = textRunBounds(runs[run_index]);
+                has_left = has_left or bounds.max_x <= gutter_left;
+                has_right = has_right or bounds.min_x >= gutter_right;
+            }
+            // An isolated multipart running header can look like the first
+            // row of two columns. Do not split it across column traversals.
+            if (has_left and has_right)
+                return .{ .gutter = gutter, .blocked = true };
+        }
+    }
+    return .{ .gutter = gutter, .blocked = false };
+}
+
+fn findTextLayoutGutter(
+    runs: anytype,
+    indices: []const usize,
+    lines: []const TextLayoutLine,
+    metrics: TextLayoutMetrics,
+) TextLayoutGutterSearch {
+    var search = TextLayoutGutterSearch{};
+    for (lines) |line| {
+        if (line.run_indices.items.len < 2) continue;
+        for (line.run_indices.items[0 .. line.run_indices.items.len - 1], line.run_indices.items[1..]) |left_index, right_index| {
+            const left_bounds = textRunBounds(runs[left_index]);
+            const right_bounds = textRunBounds(runs[right_index]);
+            search.consider(candidateTextLayoutGutter(
+                runs,
+                indices,
+                lines,
+                metrics,
+                left_bounds.max_x,
+                right_bounds.min_x,
+            ));
+        }
+    }
+    // Column baselines do not have to align. A sweep from every right edge to
+    // the next run start finds the same geometric cut when no line contains
+    // fragments from both columns.
+    for (indices) |left_index| {
+        const left_bounds = textRunBounds(runs[left_index]);
+        var nearest_right = std.math.inf(f64);
+        for (indices) |right_index| {
+            const right_bounds = textRunBounds(runs[right_index]);
+            if (right_bounds.min_x > left_bounds.max_x)
+                nearest_right = @min(nearest_right, right_bounds.min_x);
+        }
+        if (!std.math.isFinite(nearest_right)) continue;
+        search.consider(candidateTextLayoutGutter(
+            runs,
+            indices,
+            lines,
+            metrics,
+            left_bounds.max_x,
+            nearest_right,
+        ));
+    }
+    return search;
+}
+
+fn appendOriginalTextRunIndices(alloc: Allocator, out: *std.ArrayList(usize), indices: []const usize) !void {
+    try out.appendSlice(alloc, indices);
+}
+
+fn textLayoutNeedsColumnReordering(
+    runs: anytype,
+    indices: []const usize,
+    lines: []const TextLayoutLine,
+    metrics: TextLayoutMetrics,
+    gutter: TextLayoutGutter,
+) bool {
+    // A gutter shared by vertically separated panels does not establish one
+    // page-wide pair of columns. Keep the authored block order in that case.
+    var previous_bottom = std.math.inf(f64);
+    for (lines) |line| {
+        if (std.math.isFinite(previous_bottom) and
+            previous_bottom <= gutter.body_top and line.bounds.max_y >= gutter.body_bottom and
+            previous_bottom - line.bounds.max_y > metrics.median_height)
+            return false;
+        previous_bottom = @min(previous_bottom, line.bounds.min_y);
+    }
+
+    // Repair demonstrably interleaved columns, not already grouped streams.
+    // A return from the right column to a later left-column row identifies
+    // row-major painting. Require repeated evidence; isolated margin text
+    // must not cause complete columns and their headers to be reshuffled.
+    var previous_right: ?bool = null;
+    var previous_y: f64 = 0;
+    var row_returns: usize = 0;
+    var saw_footer = false;
+    for (indices) |run_index| {
+        if (!textRunHasVisibleText(runs[run_index])) continue;
+        const bounds = textRunBounds(runs[run_index]);
+        const center_y = (bounds.min_y + bounds.max_y) * 0.5;
+        // Returning from an already painted footer to the body identifies
+        // separate authored blocks, not a single row-major column stream.
+        if (center_y < gutter.body_bottom) {
+            saw_footer = true;
+            continue;
+        }
+        if (center_y > gutter.body_top) continue;
+        if (saw_footer) return false;
+        const right = if (bounds.max_x <= gutter.left)
+            false
+        else if (bounds.min_x >= gutter.right)
+            true
+        else
+            continue;
+        if (previous_right) |was_right| {
+            if (was_right and !right and center_y <= previous_y + metrics.median_height * 0.45) {
+                row_returns += 1;
+            }
+        }
+        previous_right = right;
+        previous_y = center_y;
+    }
+    return row_returns >= 2;
+}
+
+fn appendPartitionedTextRunOrder(
+    alloc: Allocator,
+    out: *std.ArrayList(usize),
+    runs: anytype,
+    indices: []const usize,
+    metrics: TextLayoutMetrics,
+    depth: usize,
+) !void {
+    if (indices.len <= 1) return appendOriginalTextRunIndices(alloc, out, indices);
+    if (depth >= 32) return appendOriginalTextRunIndices(alloc, out, indices);
+
+    const lines = try collectTextLayoutLinesAlloc(alloc, runs, indices);
+    defer deinitTextLayoutLines(alloc, lines);
+    const gutter_search = findTextLayoutGutter(runs, indices, lines, metrics);
+    // Without positive evidence of interleaved columns, retain content order.
+    // Sorting an unpartitioned leaf can interleave overprinted glyphs or move
+    // marginal annotations into otherwise intact sentences.
+    const gutter = gutter_search.best orelse return appendOriginalTextRunIndices(alloc, out, indices);
+    if (!textLayoutNeedsColumnReordering(runs, indices, lines, metrics, gutter))
+        return appendOriginalTextRunIndices(alloc, out, indices);
+
+    var headings = std.ArrayList(usize).empty;
+    defer headings.deinit(alloc);
+    var left = std.ArrayList(usize).empty;
+    defer left.deinit(alloc);
+    var right = std.ArrayList(usize).empty;
+    defer right.deinit(alloc);
+    var footers = std.ArrayList(usize).empty;
+    defer footers.deinit(alloc);
+    for (indices) |run_index| {
+        const bounds = textRunBounds(runs[run_index]);
+        if (bounds.max_x <= gutter.left) {
+            try left.append(alloc, run_index);
+        } else if (bounds.min_x >= gutter.right) {
+            try right.append(alloc, run_index);
+        } else if (bounds.min_y >= gutter.body_top) {
+            try headings.append(alloc, run_index);
+        } else if (bounds.max_y <= gutter.body_bottom) {
+            try footers.append(alloc, run_index);
+        } else {
+            return appendOriginalTextRunIndices(alloc, out, indices);
+        }
+    }
+    if (left.items.len == 0 or right.items.len == 0)
+        return appendOriginalTextRunIndices(alloc, out, indices);
+    try appendPartitionedTextRunOrder(alloc, out, runs, headings.items, metrics, depth + 1);
+    try appendPartitionedTextRunOrder(alloc, out, runs, left.items, metrics, depth + 1);
+    try appendPartitionedTextRunOrder(alloc, out, runs, right.items, metrics, depth + 1);
+    try appendPartitionedTextRunOrder(alloc, out, runs, footers.items, metrics, depth + 1);
+}
+
+fn orderedTextRunIndicesAlloc(alloc: Allocator, runs: anytype) ![]usize {
+    var original = std.ArrayList(usize).empty;
+    defer original.deinit(alloc);
+    var ordering_supported = true;
+    var reference_index: ?usize = null;
+    for (runs, 0..) |run, run_index| {
+        if (run.text.len == 0) continue;
+        try original.append(alloc, run_index);
+        if (!textRunHasSupportedOrderingGeometry(run)) {
+            ordering_supported = false;
+            continue;
+        }
+        if (reference_index) |reference| {
+            if (!textRunAxesCompatible(runs[reference], run))
+                ordering_supported = false;
+        } else {
+            reference_index = run_index;
+        }
+    }
+    if (!ordering_supported or original.items.len <= 1)
+        return try original.toOwnedSlice(alloc);
+    const metrics = try textLayoutMetricsAlloc(alloc, runs, original.items);
+    var ordered = std.ArrayList(usize).empty;
+    errdefer ordered.deinit(alloc);
+    try appendPartitionedTextRunOrder(alloc, &ordered, runs, original.items, metrics, 0);
+    std.debug.assert(ordered.items.len == original.items.len);
+    return try ordered.toOwnedSlice(alloc);
+}
+
 fn clearTextRunOutputSpans(runs: anytype) void {
     for (runs) |*run| run.output_span = null;
 }
 
-fn clampTextRunOutputSpans(runs: anytype, output_len: usize) void {
-    for (runs) |*run| {
+fn clampEmittedTextRunOutputSpans(runs: anytype, emitted_indices: []const usize, output_len: usize) void {
+    for (emitted_indices) |run_index| {
+        const run = &runs[run_index];
         const span = run.output_span orelse continue;
         if (span.end <= output_len) continue;
         if (span.start >= output_len) {
@@ -17338,7 +17891,12 @@ fn clampTextRunOutputSpans(runs: anytype, output_len: usize) void {
     }
 }
 
-fn appendLayoutNewline(alloc: Allocator, out: *std.ArrayList(u8), runs: anytype) !void {
+fn appendLayoutNewline(
+    alloc: Allocator,
+    out: *std.ArrayList(u8),
+    runs: anytype,
+    emitted_indices: []const usize,
+) !void {
     const original_len = out.items.len;
     while (out.items.len > 0 and
         (out.items[out.items.len - 1] == ' ' or
@@ -17347,7 +17905,8 @@ fn appendLayoutNewline(alloc: Allocator, out: *std.ArrayList(u8), runs: anytype)
     {
         _ = out.pop();
     }
-    if (out.items.len != original_len) clampTextRunOutputSpans(runs, out.items.len);
+    if (out.items.len != original_len)
+        clampEmittedTextRunOutputSpans(runs, emitted_indices, out.items.len);
     try appendNewline(alloc, out);
 }
 
@@ -17361,15 +17920,17 @@ fn endsWithColon(text: []const u8) bool {
 
 fn reconstructTextFromRunsAlloc(alloc: Allocator, runs: anytype) ![]u8 {
     clearTextRunOutputSpans(runs);
+    const ordered_indices = try orderedTextRunIndicesAlloc(alloc, runs);
+    defer alloc.free(ordered_indices);
     var out = std.ArrayList(u8).empty;
     defer out.deinit(alloc);
     var previous_index: ?usize = null;
-    for (runs, 0..) |*run, run_index| {
-        if (run.text.len == 0) continue;
+    for (ordered_indices, 0..) |run_index, emitted_index| {
+        const run = &runs[run_index];
         if (previous_index) |prior_index| {
             const prior = runs[prior_index];
             if (!textRunsShareLine(prior, run.*)) {
-                try appendLayoutNewline(alloc, &out, runs[0..run_index]);
+                try appendLayoutNewline(alloc, &out, runs, ordered_indices[0..emitted_index]);
             } else if (!std.ascii.isWhitespace(out.items[out.items.len - 1]) and
                 !std.ascii.isWhitespace(run.text[0]))
             {
@@ -21157,6 +21718,23 @@ test "reader caches shared page fonts across text analysis" {
     try std.testing.expectEqualStrings("SECOND PAGE", std.mem.trim(u8, second.text, &std.ascii.whitespace));
 }
 
+fn buildTextOrderingTestPdfAlloc(alloc: Allocator, content: []const u8) ![]u8 {
+    const stream = try std.fmt.allocPrint(
+        alloc,
+        "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+        .{ content.len, content },
+    );
+    defer alloc.free(stream);
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 300] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        stream,
+        "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /StandardEncoding >>\nendobj\n",
+    };
+    return buildImageDecodeTestPdfAlloc(alloc, &objects);
+}
+
 test "reader reconstructs spaces and lines from positioned text runs" {
     const alloc = std.testing.allocator;
     var runs = [_]TextRun{
@@ -21241,6 +21819,224 @@ test "reader separates caption punctuation despite overlapping metrics" {
     const text = try reconstructTextFromRunsAlloc(alloc, &runs);
     defer alloc.free(text);
     try std.testing.expectEqualStrings("Figure 4: Statics\n", text);
+}
+
+test "reader extracts full-width heading and split-operator columns without changing run order" {
+    const alloc = std.testing.allocator;
+    const content =
+        "BT /F1 12 Tf 1 0 0 1 20 278 Tm (FULL WIDTH HEADING SPANS BOTH COLUMNS) Tj ET\n" ++
+        "BT /F1 10 Tf 1 0 0 1 20 240 Tm (LEF) Tj (T1) Tj 1 0 0 1 220 240 Tm (RIG) Tj (HT1) Tj ET\n" ++
+        "BT /F1 10 Tf 1 0 0 1 20 220 Tm (LEF) Tj (T2) Tj 1 0 0 1 220 220 Tm (RIG) Tj (HT2) Tj ET\n" ++
+        "BT /F1 10 Tf 1 0 0 1 20 200 Tm (LEF) Tj (T3) Tj 1 0 0 1 220 200 Tm (RIG) Tj (HT3) Tj ET\n";
+    const sample = try buildTextOrderingTestPdfAlloc(alloc, content);
+    defer alloc.free(sample);
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+
+    const expected =
+        "FULL WIDTH HEADING SPANS BOTH COLUMNS\n" ++
+        "LEFT1\nLEFT2\nLEFT3\n" ++
+        "RIGHT1\nRIGHT2\nRIGHT3\n";
+    var analysis = try reader.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(alloc);
+    try std.testing.expectEqualStrings(expected, analysis.text);
+    try std.testing.expectEqual(@as(usize, 13), analysis.runs.len);
+
+    // Runs remain in paint/content order even though extraction traverses an
+    // index permutation. Split operators stay adjacent within each line.
+    try std.testing.expectEqualStrings("RIG", analysis.runs[3].text);
+    try std.testing.expectEqualStrings("LEF", analysis.runs[5].text);
+    try std.testing.expect(analysis.runs[3].paint_order < analysis.runs[5].paint_order);
+    const left1_start = std.mem.indexOf(u8, analysis.text, "LEFT1").?;
+    const left2_start = std.mem.indexOf(u8, analysis.text, "LEFT2").?;
+    const right1_start = std.mem.indexOf(u8, analysis.text, "RIGHT1").?;
+    try std.testing.expectEqual(left1_start, analysis.runs[1].output_span.?.start);
+    try std.testing.expectEqual(left1_start + 3, analysis.runs[1].output_span.?.end);
+    try std.testing.expectEqual(analysis.runs[1].output_span.?.end, analysis.runs[2].output_span.?.start);
+    try std.testing.expectEqual(left2_start, analysis.runs[5].output_span.?.start);
+    try std.testing.expectEqual(right1_start, analysis.runs[3].output_span.?.start);
+
+    const plain = try reader.extractPageTextAlloc(1);
+    defer alloc.free(plain);
+    try std.testing.expectEqualStrings(expected, plain);
+    const stored_runs = try reader.extractPageTextRunsAlloc(1);
+    defer {
+        for (stored_runs) |*run| run.deinit(alloc);
+        alloc.free(stored_runs);
+    }
+    try std.testing.expectEqualStrings("RIG", stored_runs[3].text);
+    try std.testing.expectEqualStrings("LEF", stored_runs[5].text);
+    var render_runs = try reader.extractPageRenderRunsForRasterAlloc(1, 400, 300);
+    defer render_runs.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 13), render_runs.text_runs.len);
+    try std.testing.expectEqualStrings("RIG", render_runs.text_runs[3].text);
+    try std.testing.expectEqualStrings("LEF", render_runs.text_runs[5].text);
+}
+
+test "reader orders text columns emitted through form xobjects" {
+    const alloc = std.testing.allocator;
+    const page_content =
+        "q 1 0 0 1 20 240 cm /FL Do Q q 1 0 0 1 220 240 cm /FR Do Q\n" ++
+        "q 1 0 0 1 20 220 cm /FL Do Q q 1 0 0 1 220 220 cm /FR Do Q\n" ++
+        "q 1 0 0 1 20 200 cm /FL Do Q q 1 0 0 1 220 200 cm /FR Do Q\n";
+    const left_content = "BT /F1 10 Tf 1 0 0 1 0 0 Tm (LEFT) Tj ET\n";
+    const right_content = "BT /F1 10 Tf 1 0 0 1 0 0 Tm (RIGHT) Tj ET\n";
+    const page_stream = try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ page_content.len, page_content });
+    defer alloc.free(page_stream);
+    const left_form = try std.fmt.allocPrint(
+        alloc,
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 20] /Resources << /Font << /F1 7 0 R >> >> /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+        .{ left_content.len, left_content },
+    );
+    defer alloc.free(left_form);
+    const right_form = try std.fmt.allocPrint(
+        alloc,
+        "6 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 20] /Resources << /Font << /F1 7 0 R >> >> /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+        .{ right_content.len, right_content },
+    );
+    defer alloc.free(right_form);
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 300] /Resources << /XObject << /FL 5 0 R /FR 6 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        page_stream,
+        left_form,
+        right_form,
+        "7 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /StandardEncoding >>\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+
+    var analysis = try reader.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(alloc);
+    try std.testing.expectEqualStrings("LEFT\nLEFT\nLEFT\nRIGHT\nRIGHT\nRIGHT\n", analysis.text);
+    try std.testing.expectEqual(@as(usize, 6), analysis.runs.len);
+    try std.testing.expectEqualStrings("RIGHT", analysis.runs[1].text);
+    try std.testing.expectEqualStrings("LEFT", analysis.runs[2].text);
+    try std.testing.expect(analysis.runs[1].paint_order < analysis.runs[2].paint_order);
+}
+
+test "reader keeps ordinary single-column extraction stable" {
+    const alloc = std.testing.allocator;
+    const content =
+        "BT /F1 10 Tf 1 0 0 1 20 240 Tm (SINGLE ONE) Tj ET\n" ++
+        "BT /F1 10 Tf 1 0 0 1 20 220 Tm (SINGLE TWO) Tj ET\n" ++
+        "BT /F1 10 Tf 1 0 0 1 20 200 Tm (SINGLE THREE) Tj ET\n";
+    const sample = try buildTextOrderingTestPdfAlloc(alloc, content);
+    defer alloc.free(sample);
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    const text = try reader.extractPageTextAlloc(1);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("SINGLE ONE\nSINGLE TWO\nSINGLE THREE\n", text);
+}
+
+test "reader requires three lines and two line heights for a column gutter" {
+    const alloc = std.testing.allocator;
+    var exact_width = [_]TextRun{
+        .{ .text = "L1", .x = 0, .y = 100, .font_size = 10, .advance_width = 10, .ascent = 8, .descent = 2 },
+        .{ .text = "R1", .x = 30, .y = 100, .font_size = 10, .advance_width = 10, .ascent = 8, .descent = 2 },
+        .{ .text = "L2", .x = 0, .y = 80, .font_size = 10, .advance_width = 10, .ascent = 8, .descent = 2 },
+        .{ .text = "R2", .x = 30, .y = 80, .font_size = 10, .advance_width = 10, .ascent = 8, .descent = 2 },
+        .{ .text = "L3 ", .x = 0, .y = 60, .font_size = 10, .advance_width = 10, .ascent = 8, .descent = 2 },
+        .{ .text = "R3", .x = 30, .y = 60, .font_size = 10, .advance_width = 10, .ascent = 8, .descent = 2 },
+    };
+    const exact_text = try reconstructTextFromRunsAlloc(alloc, &exact_width);
+    defer alloc.free(exact_text);
+    try std.testing.expectEqualStrings("L1\nL2\nL3\nR1\nR2\nR3\n", exact_text);
+    try std.testing.expectEqual(TextOutputSpan{ .start = 6, .end = 8 }, exact_width[4].output_span.?);
+
+    var narrow = exact_width;
+    narrow[1].x = 29.5;
+    narrow[3].x = 29.5;
+    narrow[5].x = 29.5;
+    const narrow_text = try reconstructTextFromRunsAlloc(alloc, &narrow);
+    defer alloc.free(narrow_text);
+    try std.testing.expectEqualStrings("L1 R1\nL2 R2\nL3 R3\n", narrow_text);
+
+    var two_lines = [_]TextRun{
+        .{ .text = "L1", .x = 0, .y = 100, .font_size = 10, .advance_width = 10, .ascent = 8, .descent = 2 },
+        .{ .text = "R1", .x = 100, .y = 100, .font_size = 10, .advance_width = 10, .ascent = 8, .descent = 2 },
+        .{ .text = "L2", .x = 0, .y = 80, .font_size = 10, .advance_width = 10, .ascent = 8, .descent = 2 },
+        .{ .text = "R2", .x = 100, .y = 80, .font_size = 10, .advance_width = 10, .ascent = 8, .descent = 2 },
+    };
+    const two_line_text = try reconstructTextFromRunsAlloc(alloc, &two_lines);
+    defer alloc.free(two_line_text);
+    try std.testing.expectEqualStrings("L1 R1\nL2 R2\n", two_line_text);
+}
+
+test "reader leaves rotated and mixed-direction script runs in original order" {
+    const alloc = std.testing.allocator;
+    var quarter_turn = [_]TextRun{
+        .{ .text = "日本", .x = 0, .y = 0, .font_size = 10, .a = 0, .b = 1, .c = -1, .d = 0, .advance_width = 10, .ascent = 8, .descent = 2 },
+        .{ .text = "العربية", .x = 0, .y = 12, .font_size = 10, .a = 0, .b = 1, .c = -1, .d = 0, .advance_width = 10, .ascent = 8, .descent = 2 },
+    };
+    const quarter_text = try reconstructTextFromRunsAlloc(alloc, &quarter_turn);
+    defer alloc.free(quarter_text);
+    try std.testing.expectEqualStrings("日本 العربية\n", quarter_text);
+
+    var half_turn = [_]TextRun{
+        .{ .text = "日本", .x = 100, .y = 0, .font_size = 10, .a = -1, .b = 0, .c = 0, .d = -1, .advance_width = 10, .ascent = 8, .descent = 2 },
+        .{ .text = "العربية", .x = 88, .y = 0, .font_size = 10, .a = -1, .b = 0, .c = 0, .d = -1, .advance_width = 10, .ascent = 8, .descent = 2 },
+    };
+    const half_text = try reconstructTextFromRunsAlloc(alloc, &half_turn);
+    defer alloc.free(half_text);
+    try std.testing.expectEqualStrings("日本 العربية\n", half_text);
+
+    var three_quarter_turn = [_]TextRun{
+        .{ .text = "日本", .x = 0, .y = 100, .font_size = 10, .a = 0, .b = -1, .c = 1, .d = 0, .advance_width = 10, .ascent = 8, .descent = 2 },
+        .{ .text = "العربية", .x = 0, .y = 88, .font_size = 10, .a = 0, .b = -1, .c = 1, .d = 0, .advance_width = 10, .ascent = 8, .descent = 2 },
+    };
+    const three_quarter_text = try reconstructTextFromRunsAlloc(alloc, &three_quarter_turn);
+    defer alloc.free(three_quarter_text);
+    try std.testing.expectEqualStrings("日本 العربية\n", three_quarter_text);
+
+    var mixed_direction = [_]TextRun{
+        .{ .text = "Latin", .x = 0, .y = 60, .font_size = 10, .advance_width = 25, .ascent = 8, .descent = 2 },
+        .{ .text = "العربية", .x = 100, .y = 100, .font_size = 10, .a = -1, .advance_width = 30, .ascent = 8, .descent = 2 },
+    };
+    const mixed_text = try reconstructTextFromRunsAlloc(alloc, &mixed_direction);
+    defer alloc.free(mixed_text);
+    try std.testing.expectEqualStrings("Latin\nالعربية\n", mixed_text);
+
+    var unsupported_geometry = [_]TextRun{
+        .{ .text = "Nonfinite", .x = 0, .y = std.math.nan(f64), .font_size = 10, .advance_width = 20, .ascent = 8, .descent = 2 },
+        .{ .text = "Degenerate", .x = 0, .y = 20, .font_size = 10, .advance_width = 0, .ascent = 8, .descent = 2 },
+    };
+    const unsupported_text = try reconstructTextFromRunsAlloc(alloc, &unsupported_geometry);
+    defer alloc.free(unsupported_text);
+    try std.testing.expectEqualStrings("Nonfinite\nDegenerate\n", unsupported_text);
+}
+
+test "reader validates canonical decoded bytes against original run sequence" {
+    const runs = [_]TextRun{
+        .{ .text = "café", .x = 0, .y = 0, .font_size = 10, .advance_width = 20 },
+        .{ .text = "東京", .x = 20, .y = 0, .font_size = 10, .advance_width = 20 },
+    };
+    try std.testing.expect(sameNonWhitespaceBytesAsTextRuns("café \n 東京", &runs));
+    try std.testing.expect(!sameNonWhitespaceBytesAsTextRuns("東京 café", &runs));
+    try std.testing.expect(!sameNonWhitespaceBytesAsTextRuns("cafe 東京", &runs));
+}
+
+test "reader column ordering releases allocations on every failure" {
+    const Runner = struct {
+        fn run(failing_alloc: Allocator) !void {
+            var runs = [_]TextRun{
+                .{ .text = "L1", .x = 0, .y = 100, .font_size = 10, .advance_width = 10, .ascent = 8, .descent = 2 },
+                .{ .text = "R1", .x = 100, .y = 100, .font_size = 10, .advance_width = 10, .ascent = 8, .descent = 2 },
+                .{ .text = "L2", .x = 0, .y = 80, .font_size = 10, .advance_width = 10, .ascent = 8, .descent = 2 },
+                .{ .text = "R2", .x = 100, .y = 80, .font_size = 10, .advance_width = 10, .ascent = 8, .descent = 2 },
+                .{ .text = "L3", .x = 0, .y = 60, .font_size = 10, .advance_width = 10, .ascent = 8, .descent = 2 },
+                .{ .text = "R3", .x = 100, .y = 60, .font_size = 10, .advance_width = 10, .ascent = 8, .descent = 2 },
+            };
+            const text = try reconstructTextFromRunsAlloc(failing_alloc, &runs);
+            defer failing_alloc.free(text);
+            try std.testing.expectEqualStrings("L1\nL2\nL3\nR1\nR2\nR3\n", text);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "reader extracts positioned text runs from text matrix operators" {
@@ -24417,6 +25213,46 @@ test "reader decodes CCITTFaxDecode with singleton device color-space array" {
     try std.testing.expectEqual(@as(u8, 0xff), runs[0].rgba[4]);
     try std.testing.expectEqual(@as(u8, 0x00), runs[0].rgba[8]);
     try std.testing.expectEqual(@as(u8, 0x00), runs[0].rgba[12]);
+}
+
+test "reader resolves indirect CCITT Group 4 decode parameters" {
+    const alloc = std.testing.allocator;
+    const image_data = try packBitsMsbAlloc(alloc, "001011111001011111");
+    defer alloc.free(image_data);
+    const content = "q\n8 0 0 1 0 0 cm\n/Im0 Do\nQ\n";
+    const content_object = try std.fmt.allocPrint(
+        alloc,
+        "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+        .{ content.len, content },
+    );
+    defer alloc.free(content_object);
+    const image_object = try std.fmt.allocPrint(
+        alloc,
+        "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 8 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /CCITTFaxDecode /DecodeParms 6 0 R /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
+        .{ image_data.len, image_data },
+    );
+    defer alloc.free(image_object);
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &.{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 8 1] /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        content_object,
+        image_object,
+        "6 0 obj\n<< /K -1 /Columns 8 /EndOfBlock false >>\nendobj\n",
+    });
+    defer alloc.free(sample);
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    const runs = try reader.extractPageImageRunsAlloc(1);
+    defer {
+        for (runs) |*run| run.deinit(alloc);
+        alloc.free(runs);
+    }
+    try std.testing.expectEqual(@as(usize, 1), runs.len);
+    const expected = [_]u8{ 255, 255, 0, 0, 255, 255, 0, 0 };
+    for (expected, 0..) |value, index| {
+        try std.testing.expectEqualSlices(u8, &.{ value, value, value, 255 }, runs[0].rgba[index * 4 ..][0..4]);
+    }
 }
 
 test "reader decodes mixed-mode CCITTFaxDecode image xobject draw" {
@@ -29849,4 +30685,185 @@ test "font Differences own replacements safely and stop at byte 255" {
         }
     };
     try std.testing.checkAllAllocationFailures(alloc, Runner.run, .{});
+}
+
+test "reader preserves content order for card grids with blocked column cuts" {
+    const alloc = std.testing.allocator;
+    const content =
+        "BT /F1 12 Tf 1 0 0 1 20 278 Tm (CARD DIRECTORY SPANS ALL COLUMNS) Tj ET\n" ++
+        "BT /F1 10 Tf 1 0 0 1 20 220 Tm (L1) Tj ET\n" ++
+        "BT /F1 10 Tf 1 0 0 1 20 200 Tm (LEFT DETAIL REACHES CENTER) Tj ET\n" ++
+        "BT /F1 10 Tf 1 0 0 1 20 180 Tm (L3) Tj ET\n" ++
+        "BT /F1 10 Tf 1 0 0 1 20 160 Tm (L4) Tj ET\n" ++
+        "BT /F1 10 Tf 1 0 0 1 150 220 Tm (C1) Tj ET\n" ++
+        "BT /F1 10 Tf 1 0 0 1 150 200 Tm (CENTER DETAIL REACHES RIGHT) Tj ET\n" ++
+        "BT /F1 10 Tf 1 0 0 1 150 180 Tm (C3) Tj ET\n" ++
+        "BT /F1 10 Tf 1 0 0 1 150 160 Tm (C4) Tj ET\n" ++
+        "BT /F1 10 Tf 1 0 0 1 280 220 Tm (R1) Tj ET\n" ++
+        "BT /F1 10 Tf 1 0 0 1 280 200 Tm (R2) Tj ET\n" ++
+        "BT /F1 10 Tf 1 0 0 1 280 180 Tm (R3) Tj ET\n" ++
+        "BT /F1 10 Tf 1 0 0 1 280 160 Tm (R4) Tj ET\n";
+    const sample = try buildTextOrderingTestPdfAlloc(alloc, content);
+    defer alloc.free(sample);
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+
+    // The short rows support two apparent column cuts, but the long middle
+    // entries cross those cuts inside their shared body. With no persistent
+    // gutter, flattening baselines would invent row-major order.
+    const expected =
+        "CARD DIRECTORY SPANS ALL COLUMNS\n" ++
+        "L1\nLEFT DETAIL REACHES CENTER\nL3\nL4\n" ++
+        "C1\nCENTER DETAIL REACHES RIGHT\nC3\nC4\n" ++
+        "R1\nR2\nR3\nR4\n";
+    var analysis = try reader.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(alloc);
+    try std.testing.expectEqualStrings(expected, analysis.text);
+    try std.testing.expectEqual(@as(usize, 13), analysis.runs.len);
+    try std.testing.expectEqualStrings("L1", analysis.runs[1].text);
+    try std.testing.expectEqualStrings("C1", analysis.runs[5].text);
+    try std.testing.expectEqualStrings("R1", analysis.runs[9].text);
+    const center_start = std.mem.indexOf(u8, expected, "C1\nCENTER").?;
+    const right_start = std.mem.indexOf(u8, expected, "R1\nR2").?;
+    try std.testing.expectEqual(center_start, analysis.runs[5].output_span.?.start);
+    try std.testing.expectEqual(right_start, analysis.runs[9].output_span.?.start);
+
+    const plain = try reader.extractPageTextAlloc(1);
+    defer alloc.free(plain);
+    try std.testing.expectEqualStrings(expected, plain);
+    var render_runs = try reader.extractPageRenderRunsForRasterAlloc(1, 400, 300);
+    defer render_runs.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 13), render_runs.text_runs.len);
+    try std.testing.expectEqualStrings("L1", render_runs.text_runs[1].text);
+    try std.testing.expectEqualStrings("C1", render_runs.text_runs[5].text);
+    try std.testing.expectEqualStrings("R1", render_runs.text_runs[9].text);
+}
+
+test "reader keeps adjacent word fragments together below a shorter column" {
+    const alloc = std.testing.allocator;
+    var runs = [_]TextRun{
+        .{ .text = "L1", .x = 0, .y = 200, .font_size = 10, .advance_width = 50, .ascent = 8, .descent = 2 },
+        .{ .text = "L2", .x = 0, .y = 180, .font_size = 10, .advance_width = 50, .ascent = 8, .descent = 2 },
+        .{ .text = "L3", .x = 0, .y = 160, .font_size = 10, .advance_width = 50, .ascent = 8, .descent = 2 },
+        .{ .text = "MERGE", .x = 0, .y = 100, .font_size = 10, .advance_width = 50, .ascent = 8, .descent = 2 },
+        .{ .text = "TOKEN", .x = 50, .y = 100, .font_size = 10, .advance_width = 25, .ascent = 8, .descent = 2 },
+        .{ .text = "R1", .x = 200, .y = 200, .font_size = 10, .advance_width = 40, .ascent = 8, .descent = 2 },
+        .{ .text = "R2", .x = 200, .y = 180, .font_size = 10, .advance_width = 40, .ascent = 8, .descent = 2 },
+        .{ .text = "R3", .x = 200, .y = 160, .font_size = 10, .advance_width = 40, .ascent = 8, .descent = 2 },
+    };
+    const text = try reconstructTextFromRunsAlloc(alloc, &runs);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("L1\nL2\nL3\nMERGETOKEN\nR1\nR2\nR3\n", text);
+    try std.testing.expectEqual(runs[3].output_span.?.end, runs[4].output_span.?.start);
+}
+
+test "reader preserves an isolated multipart running header above marginal columns" {
+    const alloc = std.testing.allocator;
+    var runs = [_]TextRun{
+        .{ .text = "LEFT", .x = 0, .y = 180, .font_size = 10, .advance_width = 20, .ascent = 8, .descent = 2 },
+        .{ .text = "CENTER", .x = 100, .y = 180, .font_size = 10, .advance_width = 30, .ascent = 8, .descent = 2 },
+        .{ .text = "RIGHT", .x = 220, .y = 180, .font_size = 10, .advance_width = 25, .ascent = 8, .descent = 2 },
+        .{ .text = "4", .x = 110, .y = 150, .font_size = 10, .advance_width = 10, .ascent = 8, .descent = 2 },
+        .{ .text = "L1", .x = 0, .y = 100, .font_size = 10, .advance_width = 40, .ascent = 8, .descent = 2 },
+        .{ .text = "L2", .x = 0, .y = 80, .font_size = 10, .advance_width = 40, .ascent = 8, .descent = 2 },
+        .{ .text = "L3", .x = 0, .y = 60, .font_size = 10, .advance_width = 40, .ascent = 8, .descent = 2 },
+        .{ .text = "R1", .x = 100, .y = 100, .font_size = 10, .advance_width = 60, .ascent = 8, .descent = 2 },
+        .{ .text = "R2", .x = 100, .y = 80, .font_size = 10, .advance_width = 60, .ascent = 8, .descent = 2 },
+        .{ .text = "R3", .x = 100, .y = 60, .font_size = 10, .advance_width = 60, .ascent = 8, .descent = 2 },
+    };
+    const text = try reconstructTextFromRunsAlloc(alloc, &runs);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("LEFT CENTER RIGHT\n4\nL1\nL2\nL3\nR1\nR2\nR3\n", text);
+    try std.testing.expect(runs[2].output_span.?.end < runs[3].output_span.?.start);
+    try std.testing.expect(runs[3].output_span.?.end < runs[4].output_span.?.start);
+}
+
+test "reader preserves complete overlapping paint sequences" {
+    const alloc = std.testing.allocator;
+    var runs = [_]TextRun{
+        .{ .text = "OVER", .x = 0, .y = 100, .font_size = 10, .advance_width = 24, .ascent = 8, .descent = 2 },
+        .{ .text = "PRINT", .x = 24, .y = 100, .font_size = 10, .advance_width = 30, .ascent = 8, .descent = 2 },
+        .{ .text = "OVER", .x = 0, .y = 100, .font_size = 10, .advance_width = 24, .ascent = 8, .descent = 2 },
+        .{ .text = "PRINT", .x = 24, .y = 100, .font_size = 10, .advance_width = 30, .ascent = 8, .descent = 2 },
+    };
+    const text = try reconstructTextFromRunsAlloc(alloc, &runs);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("OVERPRINTOVERPRINT\n", text);
+    try std.testing.expectEqual(runs[1].output_span.?.end, runs[2].output_span.?.start);
+}
+
+test "reader preserves grouped columns with separate margin text" {
+    const alloc = std.testing.allocator;
+    var runs = [_]TextRun{
+        .{ .text = "TITLE", .x = 200, .y = 230, .font_size = 10, .advance_width = 30, .ascent = 8, .descent = 2 },
+        .{ .text = "L1", .x = 0, .y = 180, .font_size = 10, .advance_width = 40, .ascent = 8, .descent = 2 },
+        .{ .text = "L2", .x = 0, .y = 160, .font_size = 10, .advance_width = 40, .ascent = 8, .descent = 2 },
+        .{ .text = "L3", .x = 0, .y = 140, .font_size = 10, .advance_width = 40, .ascent = 8, .descent = 2 },
+        .{ .text = "R1", .x = 200, .y = 180, .font_size = 10, .advance_width = 40, .ascent = 8, .descent = 2 },
+        .{ .text = "R2", .x = 200, .y = 160, .font_size = 10, .advance_width = 40, .ascent = 8, .descent = 2 },
+        .{ .text = "R3", .x = 200, .y = 140, .font_size = 10, .advance_width = 40, .ascent = 8, .descent = 2 },
+        .{ .text = "FOOTER", .x = 0, .y = 20, .font_size = 10, .advance_width = 40, .ascent = 8, .descent = 2 },
+    };
+    const text = try reconstructTextFromRunsAlloc(alloc, &runs);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("TITLE\nL1\nL2\nL3\nR1\nR2\nR3\nFOOTER\n", text);
+}
+
+test "reader preserves vertically separated column groups" {
+    const alloc = std.testing.allocator;
+    var runs = [_]TextRun{
+        .{ .text = "A1", .x = 0, .y = 260, .font_size = 10, .advance_width = 40, .ascent = 8, .descent = 2 },
+        .{ .text = "A2", .x = 0, .y = 240, .font_size = 10, .advance_width = 40, .ascent = 8, .descent = 2 },
+        .{ .text = "A3", .x = 0, .y = 220, .font_size = 10, .advance_width = 40, .ascent = 8, .descent = 2 },
+        .{ .text = "B1", .x = 200, .y = 260, .font_size = 10, .advance_width = 40, .ascent = 8, .descent = 2 },
+        .{ .text = "B2", .x = 200, .y = 240, .font_size = 10, .advance_width = 40, .ascent = 8, .descent = 2 },
+        .{ .text = "B3", .x = 200, .y = 220, .font_size = 10, .advance_width = 40, .ascent = 8, .descent = 2 },
+        .{ .text = "C1", .x = 0, .y = 160, .font_size = 10, .advance_width = 40, .ascent = 8, .descent = 2 },
+        .{ .text = "C2", .x = 0, .y = 140, .font_size = 10, .advance_width = 40, .ascent = 8, .descent = 2 },
+        .{ .text = "C3", .x = 0, .y = 120, .font_size = 10, .advance_width = 40, .ascent = 8, .descent = 2 },
+        .{ .text = "D1", .x = 200, .y = 160, .font_size = 10, .advance_width = 40, .ascent = 8, .descent = 2 },
+        .{ .text = "D2", .x = 200, .y = 140, .font_size = 10, .advance_width = 40, .ascent = 8, .descent = 2 },
+        .{ .text = "D3", .x = 200, .y = 120, .font_size = 10, .advance_width = 40, .ascent = 8, .descent = 2 },
+        .{ .text = "E1", .x = 0, .y = 60, .font_size = 10, .advance_width = 40, .ascent = 8, .descent = 2 },
+        .{ .text = "E2", .x = 0, .y = 40, .font_size = 10, .advance_width = 40, .ascent = 8, .descent = 2 },
+        .{ .text = "E3", .x = 0, .y = 20, .font_size = 10, .advance_width = 40, .ascent = 8, .descent = 2 },
+        .{ .text = "F1", .x = 200, .y = 60, .font_size = 10, .advance_width = 40, .ascent = 8, .descent = 2 },
+        .{ .text = "F2", .x = 200, .y = 40, .font_size = 10, .advance_width = 40, .ascent = 8, .descent = 2 },
+        .{ .text = "F3", .x = 200, .y = 20, .font_size = 10, .advance_width = 40, .ascent = 8, .descent = 2 },
+    };
+    const text = try reconstructTextFromRunsAlloc(alloc, &runs);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("A1\nA2\nA3\nB1\nB2\nB3\nC1\nC2\nC3\nD1\nD2\nD3\nE1\nE2\nE3\nF1\nF2\nF3\n", text);
+}
+
+test "reader does not treat blank margin runs as a text column" {
+    const alloc = std.testing.allocator;
+    var runs = [_]TextRun{
+        .{ .text = "\u{a0}", .x = 0, .y = 100, .font_size = 10, .advance_width = 4, .ascent = 8, .descent = 2 },
+        .{ .text = "FIRST", .x = 100, .y = 100, .font_size = 10, .advance_width = 40, .ascent = 8, .descent = 2 },
+        .{ .text = "\u{a0}", .x = 0, .y = 80, .font_size = 10, .advance_width = 4, .ascent = 8, .descent = 2 },
+        .{ .text = "SECOND", .x = 100, .y = 80, .font_size = 10, .advance_width = 40, .ascent = 8, .descent = 2 },
+        .{ .text = "\u{a0}", .x = 0, .y = 60, .font_size = 10, .advance_width = 4, .ascent = 8, .descent = 2 },
+        .{ .text = "THIRD", .x = 100, .y = 60, .font_size = 10, .advance_width = 40, .ascent = 8, .descent = 2 },
+    };
+    const text = try reconstructTextFromRunsAlloc(alloc, &runs);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("\u{a0} FIRST\n\u{a0} SECOND\n\u{a0} THIRD\n", text);
+    try std.testing.expect(runs[1].output_span.?.end < runs[2].output_span.?.start);
+}
+
+test "reader preserves body rows painted after a separate footer block" {
+    const alloc = std.testing.allocator;
+    var runs = [_]TextRun{
+        .{ .text = "FOOTER", .x = 0, .y = 10, .font_size = 10, .advance_width = 40, .ascent = 8, .descent = 2 },
+        .{ .text = "A", .x = 0, .y = 100, .font_size = 10, .advance_width = 30, .ascent = 8, .descent = 2 },
+        .{ .text = "Value A", .x = 100, .y = 100, .font_size = 10, .advance_width = 40, .ascent = 8, .descent = 2 },
+        .{ .text = "B", .x = 0, .y = 80, .font_size = 10, .advance_width = 30, .ascent = 8, .descent = 2 },
+        .{ .text = "Value B", .x = 100, .y = 80, .font_size = 10, .advance_width = 40, .ascent = 8, .descent = 2 },
+        .{ .text = "C", .x = 0, .y = 60, .font_size = 10, .advance_width = 30, .ascent = 8, .descent = 2 },
+        .{ .text = "Value C", .x = 100, .y = 60, .font_size = 10, .advance_width = 40, .ascent = 8, .descent = 2 },
+    };
+    const text = try reconstructTextFromRunsAlloc(alloc, &runs);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("FOOTER\nA Value A\nB Value B\nC Value C\n", text);
 }

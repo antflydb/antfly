@@ -255,6 +255,10 @@ pub const LoadedMultiStageReader = struct {
             .detector = detector,
             .detection_preprocess = detection_preprocess,
             .post_processor = preflight.post_processor,
+            .recognition_crop_orientation = if (std.mem.eql(u8, metadata.model_type orelse "", "paddleocr"))
+                .rotate_tall_ccw
+            else
+                .preserve,
         };
         errdefer pipeline.deinit();
         detector_owned = false;
@@ -376,11 +380,18 @@ pub const LoadedMultiStageReader = struct {
         }
 
         for (ocr_result.regions) |region| {
+            const region_text = try self.allocator.dupe(u8, region.text);
+            errdefer self.allocator.free(region_text);
+            const label = if (region.label) |value| try self.allocator.dupe(u8, value) else null;
+            errdefer if (label) |value| self.allocator.free(value);
             try regions.append(self.allocator, .{
-                .text = try self.allocator.dupe(u8, region.text),
+                .text = region_text,
                 .bbox = region.bbox,
                 .confidence = @floatCast(if (region.rec_confidence != 0) region.rec_confidence else region.confidence),
-                .label = if (region.label) |label| try self.allocator.dupe(u8, label) else null,
+                .label = label,
+                // Detection post-processors scale these boxes back to the
+                // original decoded input raster before the Reader boundary.
+                .coordinate_space = .image_pixels_top_left,
             });
         }
 
@@ -438,6 +449,7 @@ const PreflightAssets = struct {
             result.char_dict = try ctc_decode.loadCharDictFile(
                 allocator,
                 char_dict_path,
+                recognition.use_space_char orelse std.mem.eql(u8, metadata.model_type orelse "", "paddleocr"),
             );
             return result;
         }
@@ -609,18 +621,20 @@ fn defaultPreprocessConfig(stage_kind: StageKind) multistage_ocr.PreprocessConfi
     };
 }
 
-fn applyModelTypeNormalization(model_type: []const u8, _: StageKind, config: *multistage_ocr.PreprocessConfig) void {
+fn applyModelTypeNormalization(model_type: []const u8, stage_kind: StageKind, config: *multistage_ocr.PreprocessConfig) void {
     if (std.mem.eql(u8, model_type, "paddleocr")) {
-        config.mean = .{ 0.485, 0.456, 0.406 };
-        config.std = .{ 0.229, 0.224, 0.225 };
+        config.mean = if (stage_kind == .recognition) .{ 0.5, 0.5, 0.5 } else .{ 0.485, 0.456, 0.406 };
+        config.std = if (stage_kind == .recognition) .{ 0.5, 0.5, 0.5 } else .{ 0.229, 0.224, 0.225 };
         config.rescale_factor = 1.0 / 255.0;
     }
 }
 
 fn applyModelTypeStageDefaults(model_type: []const u8, stage_kind: StageKind, config: *multistage_ocr.PreprocessConfig) void {
-    if (std.mem.eql(u8, model_type, "paddleocr") and stage_kind == .recognition) {
-        config.keep_aspect_ratio = true;
-        config.pad_value_rgb = .{ 255, 255, 255 };
+    if (!std.mem.eql(u8, model_type, "paddleocr")) return;
+    config.keep_aspect_ratio = true;
+    switch (stage_kind) {
+        .detection => config.resize_multiple = 32,
+        .recognition => config.pad_value_rgb = .{ 127.5, 127.5, 127.5 },
     }
 }
 
@@ -631,6 +645,8 @@ fn applySessionShapeOverrides(
     shape: []const i64,
 ) void {
     if (shape.len != 4) return;
+    if (stage_kind == .detection and (shape[2] > 0 or shape[3] > 0))
+        config.keep_aspect_ratio = false;
     const should_apply_session_shape = !loaded_stage_preprocessor or stage_kind == .recognition;
     if (!should_apply_session_shape) return;
 
@@ -807,19 +823,57 @@ test "parsePreprocessorConfig reads array size shortest-edge fallback and rescal
     try std.testing.expectEqual(@as(u32, 512), config.height);
 }
 
-test "applyModelTypeNormalization only provides fallback defaults" {
-    var config = multistage_ocr.PreprocessConfig{
-        .width = 320,
-        .height = 48,
-        .mean = .{ 0.1, 0.2, 0.3 },
-        .std = .{ 0.9, 0.8, 0.7 },
-        .rescale_factor = 1.0,
+test "Paddle stage normalization matches recognition and detection input ranges" {
+    var pixels = [_]u8{ 0, 0, 0, 255, 255, 255 };
+    const img = image.Image{ .data = &pixels, .width = 2, .height = 1, .channels = 3 };
+    const cases = [_]struct { stage: StageKind, expected: [6]f32 }{
+        .{ .stage = .recognition, .expected = .{ -1, 1, -1, 1, -1, 1 } },
+        .{ .stage = .detection, .expected = .{ -2.117904, 2.248908, -2.035714, 2.428571, -1.804444, 2.64 } },
     };
+    for (cases) |case| {
+        var config = multistage_ocr.PreprocessConfig{ .width = 2, .height = 1 };
+        applyModelTypeNormalization("paddleocr", case.stage, &config);
+        const actual = try image.preprocessDecodedRectScaledWithResample(
+            std.testing.allocator,
+            img,
+            config.width,
+            config.height,
+            config.mean,
+            config.std,
+            config.rescale_factor,
+            config.resample,
+        );
+        defer std.testing.allocator.free(actual);
+        for (case.expected, actual) |expected, value| try std.testing.expectApproxEqAbs(expected, value, 1e-5);
+    }
+}
 
+test "Paddle recognition padding is neutral in normalized model input" {
+    var pixels = [_]u8{0} ** 12;
+    const img = image.Image{ .data = &pixels, .width = 2, .height = 2, .channels = 3 };
+    var config = multistage_ocr.PreprocessConfig{ .width = 4, .height = 2 };
     applyModelTypeNormalization("paddleocr", .recognition, &config);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.485), config.mean[0], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.229), config.std[0], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0 / 255.0), config.rescale_factor, 1e-6);
+    applyModelTypeStageDefaults("paddleocr", .recognition, &config);
+    const actual = try image.preprocessDecodedRectKeepAspectPadRightScaledWithResample(
+        std.testing.allocator,
+        img,
+        config.width,
+        config.height,
+        config.mean,
+        config.std,
+        config.rescale_factor,
+        config.resample,
+        config.pad_value_rgb,
+    );
+    defer std.testing.allocator.free(actual);
+    for (0..3) |channel| {
+        for (0..2) |row| {
+            for (0..4) |column| {
+                const expected: f32 = if (column < 2) -1 else 0;
+                try std.testing.expectApproxEqAbs(expected, actual[channel * 8 + row * 4 + column], 1e-6);
+            }
+        }
+    }
 }
 
 test "detection stage keeps loaded preprocessor size while recognition still follows model shape" {

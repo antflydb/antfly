@@ -15030,7 +15030,13 @@ fn executeRuntimeConvGeneral(
     const weight = valueFor(values, inputs[1]) orelse return null;
     const input_shape = graph.node(inputs[0]).output_shape;
     const weight_shape = graph.node(inputs[1]).output_shape;
+    if (attrs.transposed) return null;
+    if (@as(usize, attrs.num_spatial) > attrs.dilations.len) return null;
     if (attrs.hasDilation()) return null;
+    for (0..attrs.num_spatial) |axis| {
+        if (attrs.output_padding[axis] != 0) return null;
+    }
+
     if (attrs.num_spatial == 1 and attrs.groups == 1 and input_shape.rank() == 3 and weight_shape.rank() == 3 and attrs.padding[0][0] == attrs.padding[0][1]) {
         const out_channels = shapeDimUsize(weight_shape, 0) orelse return null;
         const bias_data = try std.heap.page_allocator.alloc(f32, out_channels);
