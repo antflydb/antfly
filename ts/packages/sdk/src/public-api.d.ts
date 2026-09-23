@@ -8690,7 +8690,7 @@ export interface components {
              *     fields are encoded as TOON (Token-Oriented Object Notation), which
              *     carries the same structure as JSON in fewer tokens.
              *
-             *     Helpers: `encodeToon` (options `indent`, at least 1, default 2; and
+             *     Helpers: `encodeToon` (options `indent`, 1 to 16, default 2; and
              *     `delimiter`: `comma`, `tab`, or `pipe`), `scrubHtml`, `eq`, and
              *     `media`. Values in `{{...}}` are HTML-escaped; use `{{{...}}}` for
              *     raw text.

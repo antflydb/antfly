@@ -78,7 +78,7 @@ A template that fails to parse, or passes invalid `encodeToon` options anywhere 
 {{encodeToon this.fields delimiter="tab"}}
 ```
 
-- `indent`: spaces per nesting level, at least 1 (default 2)
+- `indent`: spaces per nesting level, 1 to 16 (default 2)
 - `delimiter`: separator for array values and table rows: `comma` (default), `tab`, or `pipe`
 
 The template helpers `scrubHtml`, `eq`, and `media` are also available.

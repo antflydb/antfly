@@ -24,7 +24,7 @@
 //!   {{encodeToon this.fields indent=4 delimiter="tab"}}
 //!
 //! `delimiter` accepts `comma` (default), `tab`, or `pipe` (or the literal
-//! characters). `indent` must be at least 1.
+//! characters). `indent` must be between 1 and 16.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -36,6 +36,9 @@ const Expression = @FieldType(hbs.Node, "expression");
 /// Source keys that carry retrieval metadata the prompt already states
 /// elsewhere, so the default rendering omits them.
 const omitted_default_keys = [_][]const u8{"_tree"};
+
+/// Deeper indentation only spends prompt tokens.
+const max_toon_indent = 16;
 
 /// Default rendering: the hit's source fields as TOON.
 pub fn renderDefault(alloc: Allocator, source: std.json.ObjectMap) ![]u8 {
@@ -162,7 +165,7 @@ fn validateEncodeToonOptions(expression: Expression) error{InvalidDocumentRender
                 .number_literal => |number| number,
                 else => return error.InvalidDocumentRenderer,
             };
-            if (!literal.is_int or literal.value < 1) return error.InvalidDocumentRenderer;
+            if (!literal.is_int or literal.value < 1 or literal.value > max_toon_indent) return error.InvalidDocumentRenderer;
         } else if (std.mem.eql(u8, pair.key, "delimiter")) {
             const literal = switch (pair.value.*) {
                 .string_literal => |string| string,
@@ -187,7 +190,7 @@ fn encodeToon(ctx: hbs.HelperContext) anyerror!hbs.Value {
     if (ctx.params.len == 0) return .{ .safe_string = "" };
     var options: toon.EncodeOptions = .{};
     if (ctx.hashGet("indent")) |value| options.indent = switch (value) {
-        .integer => |indent| if (indent >= 1) @intCast(indent) else return error.InvalidToonIndent,
+        .integer => |indent| if (indent >= 1 and indent <= max_toon_indent) @intCast(indent) else return error.InvalidToonIndent,
         else => return error.InvalidToonIndent,
     };
     if (ctx.hashGet("delimiter")) |value| options.delimiter = switch (value) {
@@ -292,6 +295,12 @@ test "validateTemplate rejects invalid templates and helper options" {
     try std.testing.expectError(error.InvalidDocumentRenderer, validateTemplate(std.testing.allocator, "{{#if this.fields.title}}{{encodeToon this.fields indent=0}}{{/if}}"));
     try std.testing.expectError(error.InvalidDocumentRenderer, validateTemplate(std.testing.allocator, "{{#each this.fields.items}}{{else}}{{encodeToon this indent=2.5}}{{/each}}"));
     try std.testing.expectError(error.InvalidDocumentRenderer, validateTemplate(std.testing.allocator, "{{#if this.fields.title}}{{eq (encodeToon this.fields delimiter=\"semicolon\") \"x\"}}{{/if}}"));
+    // Out-of-range indents are rejected without overflowing the evaluator.
+    try std.testing.expectError(error.InvalidDocumentRenderer, validateTemplate(std.testing.allocator, "{{encodeToon this.fields indent=99999999999999999999}}"));
+    try std.testing.expectError(error.InvalidDocumentRenderer, validateTemplate(std.testing.allocator, "{{encodeToon this.fields indent=17}}"));
+    try validateTemplate(std.testing.allocator, "{{encodeToon this.fields indent=16}}");
+    // Oversized integer literals elsewhere render as floats instead of trapping.
+    try validateTemplate(std.testing.allocator, "{{#if (eq this.id 99999999999999999999)}}x{{/if}}");
     // Options must be literals, and unknown options are rejected.
     try std.testing.expectError(error.InvalidDocumentRenderer, validateTemplate(std.testing.allocator, "{{encodeToon this.fields indent=this.fields.indent}}"));
     try std.testing.expectError(error.InvalidDocumentRenderer, validateTemplate(std.testing.allocator, "{{encodeToon this.fields lengthMarker=false}}"));

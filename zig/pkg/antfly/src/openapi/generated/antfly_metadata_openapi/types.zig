@@ -9600,7 +9600,7 @@ pub const RetrievalAgentRequest = struct {
     tools: ?antfly_generating_api_openapi.ChatToolsConfig = null,
     /// Step configuration
     steps: ?RetrievalAgentSteps = null,
-    /// Handlebars template that renders each retrieved document in the generation prompt. Requires steps.generation to be set. The template is rendered once per hit against `{id, score, fields}`, where `fields` is the hit's source. When omitted, each document's fields are encoded as TOON (Token-Oriented Object Notation), which carries the same structure as JSON in fewer tokens. Helpers: `encodeToon` (options `indent`, at least 1, default 2; and `delimiter`: `comma`, `tab`, or `pipe`), `scrubHtml`, `eq`, and `media`. Values in `{{...}}` are HTML-escaped; use `{{{...}}}` for raw text. Examples: - `{{encodeToon this.fields}}` - `{{encodeToon this.fields delimiter="tab"}}` - `Title: {{{this.fields.title}}}`
+    /// Handlebars template that renders each retrieved document in the generation prompt. Requires steps.generation to be set. The template is rendered once per hit against `{id, score, fields}`, where `fields` is the hit's source. When omitted, each document's fields are encoded as TOON (Token-Oriented Object Notation), which carries the same structure as JSON in fewer tokens. Helpers: `encodeToon` (options `indent`, 1 to 16, default 2; and `delimiter`: `comma`, `tab`, or `pipe`), `scrubHtml`, `eq`, and `media`. Values in `{{...}}` are HTML-escaped; use `{{{...}}}` for raw text. Examples: - `{{encodeToon this.fields}}` - `{{encodeToon this.fields delimiter="tab"}}` - `Title: {{{this.fields.title}}}`
     document_renderer: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
