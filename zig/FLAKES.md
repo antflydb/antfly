@@ -11,9 +11,9 @@ server logs identify `StorageBusy` during `authority_or_owner` staging.
 This is the remaining [#846](https://github.com/antflydb/antfly/issues/846)
 signature: the generic error mapping treated transient owner contention as
 `RestoreValidationPending`, requeued a fresh durable attempt, and applied
-repository-failure backoff. `StorageBusy` now takes the existing bounded
-same-attempt staging wait; ordinary repository errors still use their durable
-retry policy. The translator also preserves readiness waits raised directly
+repository-failure backoff. `StorageBusy` now takes the short cooperative
+same-attempt yield; ordinary repository errors still use their durable
+retry policy. The translator also preserves longer readiness waits raised directly
 by cutover fencing. The mapping regression checks all three classifications.
 
 In `test_progressive_publication_remains_queryable_across_process_restart`,

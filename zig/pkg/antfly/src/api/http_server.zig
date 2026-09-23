@@ -16540,11 +16540,10 @@ pub const ApiHttpServer = struct {
         return switch (err) {
             error.RestoreStagingYield => error.RestoreStagingYield,
             error.RestoreStagingWait => error.RestoreStagingWait,
-            // Owner transitions and publication drains can report StorageBusy
-            // while the pinned staging plan is still making ordinary progress.
-            // Preserve the durable attempt and its cursors rather than treating
-            // this as a repository failure with exponential retry backoff.
-            error.StorageBusy => error.RestoreStagingWait,
+            // Owner transitions can report StorageBusy while the pinned plan
+            // is progressing. Retry the next cooperative slice on the same
+            // durable attempt; a readiness fence uses the longer wait below.
+            error.StorageBusy => error.RestoreStagingYield,
             error.Cancelled => error.Cancelled,
             error.RestoreJobFenced, error.NotLeader => error.NotLeader,
             error.TableAlreadyExists => error.TableAlreadyExists,
@@ -20957,7 +20956,7 @@ test "busy staged restore owner retains its pinned attempt" {
         ApiHttpServer.stagedRestoreError(error.RestoreStagingWait),
     );
     try std.testing.expectEqual(
-        @as(cluster_api_http.ClusterApi.ExecuteRestoreError, error.RestoreStagingWait),
+        @as(cluster_api_http.ClusterApi.ExecuteRestoreError, error.RestoreStagingYield),
         ApiHttpServer.stagedRestoreError(error.StorageBusy),
     );
     try std.testing.expectEqual(
