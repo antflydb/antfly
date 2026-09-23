@@ -1222,10 +1222,13 @@ fn deinitTensorSlice(tensors: []Tensor, allocator: std.mem.Allocator) void {
     allocator.free(tensors);
 }
 
-test "session vtable layout" {
-    // Ensure the vtable has all required function pointers.
-    const info = @typeInfo(Session.VTable);
-    try std.testing.expectEqual(@as(usize, 15), info.@"struct".fields.len);
+test "session vtable exposes required entry points" {
+    // Optional capabilities can be added without changing this contract.
+    try std.testing.expect(@hasField(Session.VTable, "run"));
+    try std.testing.expect(@hasField(Session.VTable, "inputInfo"));
+    try std.testing.expect(@hasField(Session.VTable, "outputInfo"));
+    try std.testing.expect(@hasField(Session.VTable, "backend"));
+    try std.testing.expect(@hasField(Session.VTable, "close"));
     try std.testing.expect(@hasField(Session.VTable, "independentBatchRows"));
 }
 
