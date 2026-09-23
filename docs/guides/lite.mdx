@@ -12,7 +12,7 @@ tags: [lite, embedded, local-first, backup, migration]
 
 <Questions>
 - What is Antfly Lite and when should I use it instead of a server?
-- How do I embed Antfly in a Go or Zig application?
+- How do I embed Antfly in a Go, Python, Rust, TypeScript, or Zig application?
 - What is the difference between .aflite and .afb files?
 - How do I move a Lite database into a normal Antfly instance?
 - Does Antfly Lite need an inference runtime?
@@ -257,7 +257,7 @@ _ = try antfly.db.copyStableLiteSnapshotFile(
 
 `antfly.api.checkLiteFileJson` and `antfly.api.copyStableLiteSnapshotFileJson` return the same JSON reports the CLI and C ABI expose.
 
-Go is the first binding above Zig and C:
+Go, Python, Rust, and TypeScript bindings wrap the same `libantfly` C ABI. In Go:
 
 ```bash
 go get github.com/antflydb/antfly/go/pkg/lite
@@ -298,6 +298,37 @@ func main() {
 `Create` is the explicit first-use path; `Open` takes an existing file and never creates or upgrades one. Constants such as `lite.InferenceModeCallerSuppliedArtifacts` and `lite.InferenceModeDisabledDeferred` let you branch on status without hard-coding strings. Building from the source tree means building the C ABI first (see below, then `go test -tags libantfly ./...` in `go/pkg/lite`). Two runnable templates live in the repository: `examples/antfly-lite-go` (create, write, lookup, status, backup) and `examples/antfly-lite-retrieval-go` (schema, full-text and dense indexes with caller-supplied embeddings, hybrid search, backup). Both are gated by `zig build lite-test` against the built `libantfly`.
 
 A `*lite.DB` is safe to share across goroutines, like `*sql.DB`. Searches and lookups run in parallel with each other and with writes; concurrent `Batch` calls on one handle queue rather than fail. Only one writer handle can have a file open at a time, including across processes. Set `OpenOptions.BusyTimeout` to wait for the other writer to close instead of failing immediately with `lite.Busy`.
+
+The other bindings mirror the Go API in each language's idiom:
+
+```python
+# uv add antfly-lite
+import antfly_lite
+
+with antfly_lite.create("py-app.aflite") as db:
+    db.batch([antfly_lite.WriteIntent(key="doc:py:1", value={"title": "embedded python lite"})], timestamp=1)
+    print(db.status())
+```
+
+```rust
+// cargo add antfly-lite --features libantfly
+use antfly_lite::{Database, OpenOptions, WriteIntent};
+
+let db = Database::create("rs-app.aflite", &OpenOptions::new())?;
+db.batch(&[WriteIntent::put("doc:rs:1", r#"{"title":"embedded rust lite"}"#)], 1)?;
+println!("{:?}", db.status()?);
+```
+
+```typescript
+// npm install @antfly/lite
+import { create } from "@antfly/lite";
+
+await using db = await create("ts-app.aflite");
+await db.batch([{ key: "doc:ts:1", value: { title: "embedded typescript lite" } }], 1n);
+console.log(await db.status());
+```
+
+Every handle is safe to share across threads (Python, Rust) or concurrent promises (TypeScript), with the same semantics as Go. Threads that call into Lite need at least 8 MiB of native stack; Go, Python, and the TypeScript binding already arrange that, and Rust callers should spawn threads with `antfly_lite::MIN_THREAD_STACK_SIZE`. The shared conformance cases in `zig/pkg/antfly/capi-conformance` keep all four bindings behaviorally identical.
 
 ## Building from Source
 

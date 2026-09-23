@@ -17,12 +17,16 @@ go/pkg/
   proxy/             Antfly and Inference proxy packages
 ts/
   packages/sdk/      TypeScript SDK (@antfly/sdk)
+  packages/lite/     TypeScript Antfly Lite binding (@antfly/lite)
   packages/components/  React component library (@antfly/components)
   apps/antfarm/      Web dashboard (React + Vite)
 py/packages/sdk/     Python SDK
+py/packages/lite/    Python Antfly Lite binding (antfly-lite)
 rs/
   crates/pgaf/       PostgreSQL extension (Rust/pgrx)
   crates/sdk/        Generated Rust SDK (shared types with pgaf)
+  crates/lite/       Rust Antfly Lite binding (antfly-lite)
+  crates/lite-sys/   Raw libantfly C ABI declarations (antfly-lite-sys)
 configs/             Example configuration files
 devops/              Kubernetes manifests (minikube, etc.)
 scripts/             Build and utility scripts

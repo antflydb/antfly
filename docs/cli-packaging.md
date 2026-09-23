@@ -4,7 +4,8 @@ Antfly has separate packages for SDKs and CLI installation:
 
 - Python SDK: `antfly-sdk`
 - TypeScript SDK: `@antfly/sdk`
-- Go Antfly Lite binding: `github.com/antflydb/antfly/go/pkg/lite`
+- Antfly Lite bindings: Go `github.com/antflydb/antfly/go/pkg/lite`, Python
+  `antfly-lite`, Rust `antfly-lite`, and TypeScript `@antfly/lite`
 - Python CLI installer: `antfly-cli`
 - npm CLI installer: `@antfly/cli`
 
@@ -24,7 +25,8 @@ LICENSE
 ```
 
 `lib/` contains the platform-specific `libantfly` shared library. Language
-bindings that embed Lite, including the Go `lite` binding, link against
+bindings that embed Lite, including the Go, Python, Rust, and TypeScript Lite
+bindings, link against
 that library and include `include/antfly.h`.
 
 The Python, npm, and Homebrew CLI installer packages preserve the same Lite C

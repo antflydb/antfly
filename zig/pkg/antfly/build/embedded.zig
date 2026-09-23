@@ -107,6 +107,9 @@ pub const AddEmbeddedResult = struct {
     run_capi_smoke: *std.Build.Step.Run,
     run_capi_conformance: *std.Build.Step.Run,
     run_lite_go_tests: *std.Build.Step.Run,
+    run_lite_py_tests: *std.Build.Step.Run,
+    run_lite_rs_tests: *std.Build.Step.Run,
+    run_lite_ts_tests: *std.Build.Step.Run,
     run_lite_go_example: *std.Build.Step.Run,
     run_lite_go_retrieval_template: *std.Build.Step.Run,
     run_cabi_packaging_tests: *std.Build.Step.Run,
@@ -392,6 +395,59 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     const lite_go_test_step = b.step("lite-go-test", "Run Go Antfly Lite binding tests against libantfly");
     lite_go_test_step.dependOn(&run_lite_go_tests.step);
 
+    // The Python, Rust, and TypeScript bindings skip their native tests
+    // when libantfly is absent; ANTFLY_LITE_REQUIRE_LIBRARY turns that into
+    // a failure here, and ANTFLY_LIB_DIR points them at this build's copy.
+    const lite_lib_dir_env = b.fmt("ANTFLY_LIB_DIR={s}", .{b.getInstallPath(.lib, "")});
+    const run_lite_py_tests = b.addSystemCommand(&.{
+        "env",
+        "ANTFLY_LITE_REQUIRE_LIBRARY=1",
+        lite_lib_dir_env,
+        lite_go_worker_env,
+        "uv",
+        "run",
+        "--locked",
+        "pytest",
+        "-q",
+    });
+    run_lite_py_tests.setCwd(b.path("../py/packages/lite"));
+    run_lite_py_tests.step.dependOn(&install_libantfly.step);
+    const lite_py_test_step = b.step("lite-py-test", "Run Python Antfly Lite binding tests against libantfly");
+    lite_py_test_step.dependOn(&run_lite_py_tests.step);
+
+    const run_lite_rs_tests = b.addSystemCommand(&.{
+        "env",
+        lite_lib_dir_env,
+        lite_go_worker_env,
+        "cargo",
+        "test",
+        "--locked",
+        "--manifest-path",
+        "../rs/Cargo.toml",
+        "--package",
+        "antfly-lite",
+        "--features",
+        "libantfly",
+    });
+    run_lite_rs_tests.setCwd(b.path("."));
+    run_lite_rs_tests.step.dependOn(&install_libantfly.step);
+    const lite_rs_test_step = b.step("lite-rs-test", "Run Rust Antfly Lite binding tests against libantfly");
+    lite_rs_test_step.dependOn(&run_lite_rs_tests.step);
+
+    const run_lite_ts_tests = b.addSystemCommand(&.{
+        "env",
+        "ANTFLY_LITE_REQUIRE_LIBRARY=1",
+        lite_lib_dir_env,
+        lite_go_worker_env,
+        "pnpm",
+        "run",
+        "test",
+    });
+    run_lite_ts_tests.setCwd(b.path("../ts/packages/lite"));
+    run_lite_ts_tests.step.dependOn(&install_libantfly.step);
+    const lite_ts_test_step = b.step("lite-ts-test", "Run TypeScript Antfly Lite binding tests against libantfly (needs pnpm install in ts/)");
+    lite_ts_test_step.dependOn(&run_lite_ts_tests.step);
+
     const run_lite_go_example = b.addSystemCommand(&.{
         "env",
         "GOWORK=off",
@@ -495,6 +551,9 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .run_capi_smoke = run_capi_smoke,
         .run_capi_conformance = run_capi_conformance,
         .run_lite_go_tests = run_lite_go_tests,
+        .run_lite_py_tests = run_lite_py_tests,
+        .run_lite_rs_tests = run_lite_rs_tests,
+        .run_lite_ts_tests = run_lite_ts_tests,
         .run_lite_go_example = run_lite_go_example,
         .run_lite_go_retrieval_template = run_lite_go_retrieval_template,
         .run_cabi_packaging_tests = run_cabi_packaging_tests,

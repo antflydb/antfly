@@ -44,7 +44,7 @@ See the [quickstart guide](https://antfly.io/docs/guides/quickstart) for a full 
 - **CPU, Metal, and CUDA** — native kernels for [inference](zig/pkg/inference) and vector search: SIMD on x86 and ARM, Metal on Apple silicon, and [CUDA](zig/pkg/inference/CUDA.md) with a kernel JIT
 - **Distributed** — multi-Raft consensus, automatic sharding and replication, online shard splits, cross-shard transactions, horizontal scaling
 - **Runs anywhere** — [Antfly Lite](docs/guides/lite.mdx) as a single `.aflite` file, a single node with a [hot standby](zig/pkg/antfly/src/storage/hot_standby), a Raft cluster, or [serverless](zig/pkg/antfly/src/serverless) over object storage
-- **Embeddable** — a [C API](zig/pkg/antfly/src/capi) (`libantfly`), a [Go binding](go/pkg/lite), and an in-browser [WASM build](zig/pkg/antfly-embedded/WASM.md) so the engine runs in-process, in unit tests, or on the edge
+- **Embeddable** — a [C API](zig/pkg/antfly/src/capi) (`libantfly`), [Lite bindings](docs/sdks.mdx#embedded-lite-binding) for [Go](go/pkg/lite), [Python](py/packages/lite), [Rust](rs/crates/lite), and [TypeScript](ts/packages/lite), and an in-browser [WASM build](zig/pkg/antfly-embedded/WASM.md) so the engine runs in-process, in unit tests, or on the edge
 - **Extensions** — run your own code inside the engine with the [Wasmtime extension runtime](zig/pkg/antfly/src/extensions)
 - **Enrichment pipelines** — [configurable pipelines](zig/pkg/antfly/src/storage/db/enrichment) per index for embeddings, summaries, graph edges, and custom computed fields
 - **Bring your own models** — Ollama, OpenAI, Bedrock, Google, or run models locally with Antfly inference (GGUF, safetensors, and ONNX)
@@ -109,7 +109,7 @@ Antfly inference handles the ML side: embeddings, chunking, reranking, classific
 | evalaf | LLM/RAG/agent evaluation ("promptfoo for Go") | [`go/pkg/evalaf`](go/pkg/evalaf) |
 | Genkit plugin | Firebase Genkit integration for retrieval and docstore | [`go/pkg/genkit/antfly`](go/pkg/genkit/antfly) |
 | memoryaf | Shared long-term memory for AI agents over MCP and HTTP | [`go/pkg/memoryaf`](go/pkg/memoryaf) |
-| lite | Go binding for embedded `.aflite` databases over the C ABI | [`go/pkg/lite`](go/pkg/lite) |
+| lite | Go, Python, Rust, and TypeScript bindings for embedded `.aflite` databases over the C ABI | [`go/pkg/lite`](go/pkg/lite), [`py/packages/lite`](py/packages/lite), [`rs/crates/lite`](rs/crates/lite), [`ts/packages/lite`](ts/packages/lite) |
 
 ## Architecture
 

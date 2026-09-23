@@ -131,6 +131,35 @@ check_sdk() {
   section "Checking the Rust SDK"
   cargo fmt --manifest-path "$repo_root/rs/Cargo.toml" --all --check
   cargo test --locked --manifest-path "$repo_root/rs/Cargo.toml" --package antfly-sdk
+
+  check_lite_bindings
+}
+
+# The embedded Lite bindings need a built libantfly to run their native
+# tests; `zig build lite-test` covers those. Here they get static checks and
+# the tests that run without the library (native tests skip cleanly).
+check_lite_bindings() {
+  section "Checking the Go Lite binding"
+  (
+    cd "$repo_root/go/pkg/lite"
+    GOWORK=off go mod tidy
+    git diff --exit-code -- go.mod
+    CGO_ENABLED=1 GOWORK=off go vet ./...
+    CGO_ENABLED=1 GOWORK=off go vet -tags libantfly ./...
+  )
+
+  section "Checking the Python Lite binding"
+  (
+    cd "$repo_root/py/packages/lite"
+    uv run --locked ruff check .
+    uv run --locked pyright
+    ANTFLY_LIBRARY=/nonexistent uv run --locked pytest -q
+    uv build
+  )
+
+  section "Checking the Rust Lite binding"
+  cargo test --locked --manifest-path "$repo_root/rs/Cargo.toml" \
+    --package antfly-lite --package antfly-lite-sys
 }
 
 check_release() {
