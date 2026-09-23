@@ -45,6 +45,8 @@ APACHE_ROOTS = (
     "go/pkg/lite",
     "py/packages/lite",
     "ts/packages/lite",
+    "rs",
+    "examples",
     "go/pkg/docsaf",
     "go/pkg/evalaf",
     "go/pkg/genkit",
@@ -87,6 +89,8 @@ EXCLUDED_GLOBS = (
     "specs/tla/*etcdraft*",
     "scripts/uv.lock",
     "e2e/*/uv.lock",
+    # Its generator emits the Apache header; CI checks the file is current.
+    "rs/crates/sdk/src/graph_identifier_policy_generated.rs",
 )
 
 SLASH_EXTS = {
@@ -101,6 +105,7 @@ SLASH_EXTS = {
     ".m",
     ".metal",
     ".mjs",
+    ".rs",
     ".ts",
     ".tsx",
     ".wgsl",
@@ -243,7 +248,8 @@ def render_header(path: Path, header: Header) -> str:
 
 
 def insertion_offset(lines: list[str]) -> int:
-    if lines and lines[0].startswith("#!"):
+    # A shebang keeps its line; a Rust inner attribute (`#![...]`) does not.
+    if lines and lines[0].startswith("#!") and not lines[0].startswith("#!["):
         return 1
     return 0
 
@@ -285,6 +291,10 @@ def strip_existing_antfly_header(text: str, path: Path) -> tuple[str, int]:
 def apply_header(text: str, path: Path, header: Header) -> str:
     stripped, offset = strip_existing_antfly_header(text, path)
     lines = stripped.splitlines(keepends=True)
+    # The rendered header ends with its own blank line; drop any the body
+    # already starts with so applying twice gives the same result.
+    while offset < len(lines) and lines[offset].strip() == "":
+        del lines[offset]
     rendered = render_header(path, header)
     if not "".join(lines[offset:]).strip():
         rendered = rendered.rstrip("\n") + "\n"
