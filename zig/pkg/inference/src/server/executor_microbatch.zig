@@ -324,10 +324,10 @@ pub const ItemControl = struct {
     cancel_requested: ?*const std.atomic.Value(bool) = null,
 
     pub fn check(self: ItemControl) !void {
+        if (self.io) |io| if (deadlineExpired(io, self.deadline)) return error.DeadlineExceeded;
         if (self.cancellation.isCancelled() or
             (if (self.cancel_requested) |signal| signal.load(.acquire) else false))
             return error.Canceled;
-        if (self.io) |io| if (deadlineExpired(io, self.deadline)) return error.DeadlineExceeded;
     }
 };
 
@@ -970,6 +970,12 @@ test "fused execution stays live for healthy members and stops when all members 
     second_canceled.store(true, .release);
     items[0].control.io = std.testing.io;
     items[0].control.deadline = std.Io.Clock.Timestamp.now(std.testing.io, .awake);
+    try std.testing.expectError(error.DeadlineExceeded, ExecutionControl.check(&control));
+
+    // Once the same caller is both cancelled and expired, its deadline still
+    // wins so the watchdog cannot extend it with cancellation grace.
+    first_canceled.store(true, .release);
+    try std.testing.expectError(error.DeadlineExceeded, items[0].control.check());
     try std.testing.expectError(error.DeadlineExceeded, ExecutionControl.check(&control));
 }
 
