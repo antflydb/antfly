@@ -139,8 +139,11 @@ pub const Conflict = struct {
     arbiter_predicate: ?*const Scalar = null,
     assignments: []const Assignment = &.{},
     predicate: ?*const Scalar = null,
+    /// Hidden INSERT-source outputs for scalar assignment subqueries. Each
+    /// output is captured before conflict-owner reads and aligned by input row.
+    capture_count: usize = 0,
 };
-pub const Assignment = struct { field: []const u8, value: Value = .null, expression: ?*const Scalar = null, use_default: bool = false };
+pub const Assignment = struct { field: []const u8, value: Value = .null, expression: ?*const Scalar = null, use_default: bool = false, capture_ordinal: ?usize = null, capture_span: usize = 0, capture_expression: ?*const Scalar = null };
 pub const Update = struct { table: Name, alias: ?[]const u8 = null, source: ?*const Relation = null, ctes: []const Cte = &.{}, assignments: []const Assignment, predicate: ?*const Predicate = null, returning: ?[]const Projection = null };
 pub const Delete = struct { table: Name, alias: ?[]const u8 = null, source: ?*const Relation = null, ctes: []const Cte = &.{}, predicate: ?*const Predicate = null, returning: ?[]const Projection = null };
 pub const Merge = struct {

@@ -19,6 +19,7 @@ pub const PublicOperationPolicy = struct {
 /// that deliberately bypass foreground admission. A newly generated route
 /// therefore fails its contract test until its resource class is reviewed.
 pub const public_operation_policies = [_]PublicOperationPolicy{
+    .{ .operation_id = "administerSqlSettings", .class = .none },
     .{ .operation_id = "listDatabases", .class = .none },
     .{ .operation_id = "getDatabase", .class = .none },
     .{ .operation_id = "createDatabase", .class = .none },

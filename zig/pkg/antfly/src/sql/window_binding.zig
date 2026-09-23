@@ -269,10 +269,10 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, compiled: *const compile
     const output_programs = try alloc.alloc(scalar.Program, outputs.len);
     const names = try alloc.alloc([]const u8, outputs.len);
     for (outputs, output_programs, statement.columns, names) |node_, *program, projection, *name| {
-        program.* = try scalar.bind(alloc, node_, columns, parameters, .{});
+        program.* = try scalar.bindWithSettings(alloc, node_, columns, parameters, .{}, backend.settings_view);
         name.* = projection.alias orelse if (projection.field.len != 0) projection.field else if (projection.expression.?.* == .call) projection.expression.?.call.name else "?column?";
     }
     const order_programs = try alloc.alloc(scalar.Program, orders.len);
-    for (orders, order_programs) |node_, *program| program.* = try scalar.bind(alloc, node_, columns, parameters, .{});
+    for (orders, order_programs) |node_, *program| program.* = try scalar.bindWithSettings(alloc, node_, columns, parameters, .{}, backend.settings_view);
     return .{ .input = input, .statement = input_statement, .specs = specs, .sorts = builder.sorts.items, .outputs = output_programs, .orders = order_programs, .names = names };
 }

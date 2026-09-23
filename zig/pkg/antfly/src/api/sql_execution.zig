@@ -22,6 +22,7 @@ const operation = @import("operation.zig");
 const helpers = @import("http_route_helpers.zig");
 const wire = @import("antfly_metadata_openapi").types;
 const db_types = @import("../storage/db/types.zig");
+const setting_catalog = @import("../sql/setting_catalog.zig");
 
 fn supportsRangeGuards(server: *const http_server.ApiHttpServer) bool {
     const reads = server.table_reads orelse return false;
@@ -142,13 +143,14 @@ pub const Adapter = struct {
             }
             return result;
         }
-        const implicit_merge = compiled.statement == .merge and session.transaction_id == null;
-        if (implicit_merge) {
+        const captured_conflict = compiled.statement == .insert and compiled.statement.insert.conflict != null and compiled.statement.insert.conflict.?.capture_count != 0;
+        const implicit_guarded = (compiled.statement == .merge or captured_conflict) and session.transaction_id == null;
+        if (implicit_guarded) {
             if (!supportsRangeGuards(self.server)) return error.SqlRangeTrackingRequired;
             _ = try session.execute(.{ .begin = .{} });
         }
         var implicit_decided = false;
-        errdefer if (implicit_merge and !implicit_decided) {
+        errdefer if (implicit_guarded and !implicit_decided) {
             _ = session.execute(.rollback) catch session.deinit();
         };
         if (session.transaction_id != null) {
@@ -156,7 +158,7 @@ pub const Adapter = struct {
                 .select, .explain => false,
                 else => true,
             });
-            if (compiled.statement == .merge and transaction.isolation == .read_committed) return error.SqlRangeTrackingRequired;
+            if ((compiled.statement == .merge or captured_conflict) and transaction.isolation == .read_committed) return error.SqlRangeTrackingRequired;
             // DDL cannot bypass the native transaction's atomicity boundary.
             if (@import("../sql/ddl_runtime.zig").accepts(compiled.statement)) return error.UnsupportedSqlExecution;
             const id = session.transaction_id.?;
@@ -190,6 +192,7 @@ pub const Adapter = struct {
                     self.inserting = false;
                 }
                 var active_backend = guarded_backend orelse self.backend();
+                if (compiled.uses_current_setting and active_backend.setting_capture == null) active_backend.setting_capture = self.settingCapture();
                 if (guarded_backend != null) {
                     active_backend.atomic_statement_read_set = self.range_reads != null;
                     active_backend.coordinated_point_reads = self.range_reads != null;
@@ -204,7 +207,7 @@ pub const Adapter = struct {
                 break :statement output;
             };
             errdefer result.deinit();
-            if (implicit_merge) {
+            if (implicit_guarded) {
                 // The statement lease and borrowed read view are gone before
                 // commit admission. A decided/unknown outcome is never retried.
                 const decision = try session.execute(.commit);
@@ -221,11 +224,27 @@ pub const Adapter = struct {
             }
             return result;
         }
-        return @import("../sql/runtime.zig").execute(alloc, guarded_backend orelse self.backend(), compiled, parameters, limits);
+        var statement_backend = guarded_backend orelse self.backend();
+        if (compiled.uses_current_setting and statement_backend.setting_capture == null) statement_backend.setting_capture = self.settingCapture();
+        return @import("../sql/runtime.zig").execute(alloc, statement_backend, compiled, parameters, limits);
     }
 
     pub fn backend(self: *Adapter) catalog.Backend {
         return .{ .ptr = self, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .open_scan = openScan, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint } };
+    }
+
+    pub fn settingCapture(self: *Adapter) @FieldType(catalog.Backend, "setting_capture") {
+        return .{ .owner = .{ .ptr = self, .load = loadSettings }, .scope = .{ .principal = http_server.transactionPrincipal(self.identity.*) orelse "", .database = self.database } };
+    }
+
+    fn loadSettings(ptr: *anyopaque, alloc: std.mem.Allocator, scope: setting_catalog.Scope) !setting_catalog.RawSnapshot {
+        const self: *Adapter = @ptrCast(@alignCast(ptr));
+        if (scope.principal.len == 0 or !std.mem.eql(u8, scope.principal, http_server.transactionPrincipal(self.identity.*) orelse "") or !std.mem.eql(u8, scope.database, self.database)) return error.Forbidden;
+        var context = self.context;
+        context.setting_read_principal = scope.principal;
+        const bytes = try self.server.source.systemCatalog(alloc, context, .{ .setting_snapshot = scope });
+        defer alloc.free(bytes);
+        return std.json.parseFromSliceLeaky(setting_catalog.RawSnapshot, alloc, bytes, .{ .allocate = .alloc_always });
     }
 
     fn generateRowId(ptr: *anyopaque, alloc: std.mem.Allocator) ![]const u8 {
@@ -2019,6 +2038,199 @@ test "SQL unknown mutation keeps native reconciliation receipt without allocatio
     try std.testing.expectEqual(catalog.MutationOutcome.committed_repair_required, try committedMutationOutcome("{\"status\":\"committed_repair_required\"}"));
     try std.testing.expectEqual(catalog.MutationOutcome.committed_graph_metric_materialization_rejected, try committedMutationOutcome("{\"status\":\"committed_repair_required\",\"failure\":{\"code\":\"graph_metric_materialization_rejected\"}}"));
     try std.testing.expectError(error.SqlMutationOutcomeUnknown, committedMutationOutcome("{\"status\":\"unknown\"}"));
+}
+
+test "SQL original sql-1411 uses active native unique claim and one guarded commit" {
+    const alloc = std.testing.allocator;
+    const reads = @import("table_read_source.zig");
+    const contract = @import("distributed_txn_contract.zig");
+    const metadata = @import("../metadata/api.zig");
+    const compiler = @import("../sql/compiler.zig");
+    const integrity = @import("relational_integrity_commit.zig");
+    const activation = @import("../storage/db/relational_integrity_activation_contract.zig");
+    const native_catalog = @import("../storage/db/relational_integrity_catalog.zig");
+    const View = reads.RelationalReadView;
+    const Fake = struct {
+        const Self = @This();
+        const schema =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"quantity":{"type":"integer"},"amount":{"type":"integer"}},"additionalProperties":false}}}}
+        ;
+        const State = struct { point: bool = false, done: bool = false };
+        envelope: []const u8,
+        digest: [32]u8,
+        generation_set: [32]u8,
+        tuple: []const u8 = "",
+        claim: bool = false,
+        captures: usize = 0,
+        point_reads: usize = 0,
+        commits: usize = 0,
+        expect_status: bool = false,
+        views: [2]View = undefined,
+        states: [2]State = undefined,
+        records: [1]@import("../common/topology_records.zig").TableRecord = .{.{ .table_id = 3, .name = "physical_usage", .schema_json = schema }},
+        ranges: [1]@import("../common/topology_records.zig").RangeRecord = .{.{ .group_id = 5, .table_id = 3, .start_key = "" }},
+        fn status(_: *anyopaque) !metadata.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn resolve(_: *anyopaque, allocator: std.mem.Allocator, _: operation.RequestContext, call: system_catalog.Call) ![]u8 {
+            if (call == .write_validation) return std.json.Stringify.valueAlloc(allocator, .{ .schema_json = schema }, .{});
+            if (call != .resolve_many) return error.TestUnexpectedCatalogCall;
+            const request = call.resolve_many;
+            if (request.storage_names.len != 0) {
+                const names = try allocator.alloc(?[]const u8, request.storage_names.len);
+                for (request.storage_names, names) |physical, *name| {
+                    try std.testing.expectEqualStrings("physical_usage", physical);
+                    name.* = try (system_catalog.Target{ .table = "usage_records" }).resourceNameAlloc(allocator);
+                }
+                return std.json.Stringify.valueAlloc(allocator, system_catalog.ResolvedMany{ .revision = 2, .tables = &.{}, .logical_names = names }, .{});
+            }
+            const tables = try allocator.alloc(?system_catalog.ResolvedTable, request.targets.len);
+            for (request.targets, tables) |target, *table| {
+                try std.testing.expectEqualStrings("usage_records", target.table);
+                table.* = .{ .table_id = 3, .name = "physical_usage", .query_definition = if (request.include_query_definitions) .{ .table_id = 3, .schema_json = schema, .read_schema_json = "", .indexes_json = "{}" } else null };
+            }
+            return std.json.Stringify.valueAlloc(allocator, system_catalog.ResolvedMany{ .revision = 2, .tables = tables }, .{});
+        }
+        fn snapshot(ptr: *anyopaque) !metadata.AdminSnapshot {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            return .{ .status = try status(ptr), .tables = &self.records, .ranges = &self.ranges, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+        }
+        fn freeSnapshot(_: *anyopaque, _: *metadata.AdminSnapshot) void {}
+        fn lookup(ptr: *anyopaque, allocator: std.mem.Allocator, _: []const u8, key: []const u8, opts: db_types.LookupOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.LookupResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            if (opts.relational_integrity_catalog) return .{ .json = try allocator.dupe(u8, self.envelope), .version = 0 };
+            if (opts.relational_integrity_jobs_json.len != 0) {
+                if (!self.claim) return null;
+                const request = try std.json.parseFromSliceLeaky(struct { address: @import("../storage/db/relational_integrity_contract.zig").Address }, allocator, opts.relational_integrity_jobs_json, .{ .ignore_unknown_fields = true });
+                const owner: @import("../storage/db/relational_integrity_contract.zig").Claim = .{ .tuple = self.tuple, .parent_table = "physical_usage", .parent_key = "stored-1", .schema_version = 1 };
+                return .{ .json = try std.json.Stringify.valueAlloc(allocator, .{ .address = request.address, .claim = owner, .references = &[_]@import("../storage/db/relational_integrity_contract.zig").Reference{} }, .{}), .version = 0 };
+            }
+            if (opts.relational_activation_json.len == 0) {
+                if (std.mem.eql(u8, key, "stored-1")) return .{ .json = try allocator.dupe(u8, "{\"id\":\"u1\",\"status\":\"old\",\"quantity\":4}"), .version = 9, .expected_content_digest = @splat(9) };
+                return null;
+            }
+            try std.testing.expectEqualStrings("{\"mode\":\"status\"}", opts.relational_activation_json);
+            const coverage = .{ .schema_version = @as(u32, 1), .schema_digest = self.digest, .generation_set = self.generation_set, .owner = [_]u8{1} ** 32, .range_start = @as([]const u8, ""), .range_end = @as([]const u8, ""), .unique_covered = true, .state = activation.State.validating, .phase = activation.Phase.foreign_key, .rows_scanned = @as(u64, 1), .failure = @as([]const u8, "") };
+            try std.testing.expectEqualStrings("", key);
+            return .{ .json = try std.json.Stringify.valueAlloc(allocator, coverage, .{}), .version = 0 };
+        }
+        fn open(ptr: *anyopaque, _: std.mem.Allocator, scans: []const reads.RelationalStatementScan, _: @import("../raft/read_gate.zig").ReadConsistency) !reads.RelationalStatementRead {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(scans.len <= self.views.len);
+            self.captures += 1;
+            for (scans, self.states[0..scans.len], self.views[0..scans.len]) |scan, *state, *view| {
+                try std.testing.expectEqualStrings("physical_usage", scan.table);
+                state.* = .{ .point = std.mem.eql(u8, scan.from, "stored-1") };
+                if (state.point) self.point_reads += 1;
+                view.* = .{ .ptr = state, .vtable = &.{ .next = next, .close = close } };
+            }
+            return .{ .ptr = self, .views = self.views[0..scans.len], .vtable = &.{ .close = close, .range_proofs = proofs } };
+        }
+        fn proofs(_: *anyopaque, allocator: std.mem.Allocator, _: usize) ![]reads.RelationalStatementRead.OwnerRangeProof {
+            const observations = try allocator.dupe(@import("range_read_guards.zig").Proof, &.{.{ .bucket = 98, .generation = 1 }});
+            return allocator.dupe(reads.RelationalStatementRead.OwnerRangeProof, &.{.{ .fence = .{ .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .catalog_revision = 2, .table_id = 3, .topology_epoch = 4, .route = .{ .group_id = 5, .range_id = 6, .identity_namespace = .{ .table_id = 3, .shard_id = 5, .range_id = 6 } } }, .proofs = observations }});
+        }
+        fn next(ptr: *anyopaque, allocator: std.mem.Allocator, _: u32) !View.Page {
+            const state: *State = @ptrCast(@alignCast(ptr));
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            errdefer arena.deinit();
+            if (state.done) return .{ .arena = arena, .rows = &.{}, .after = null };
+            state.done = true;
+            const rows = try arena.allocator().alloc(View.Row, 1);
+            rows[0] = .{ .id = "stored-1", .version = 9, .schema_version = 1, .value = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), if (state.point) "{\"id\":\"u1\",\"status\":\"old\",\"quantity\":4,\"amount\":5}" else "{\"id\":\"u1\",\"status\":\"ready\",\"quantity\":8,\"amount\":5}", .{}), .expected_content_digest = @splat(9) };
+            return .{ .arena = arena, .rows = rows, .after = null };
+        }
+        fn normalize(_: *anyopaque, allocator: std.mem.Allocator, writes: []const db_types.BatchWrite) ![]db_types.BatchWrite {
+            return allocator.dupe(db_types.BatchWrite, writes);
+        }
+        fn openNormalize(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_types.ScanOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?View {
+            return .{ .ptr = ptr, .vtable = &.{ .next = undefined, .normalize = normalize, .close = close } };
+        }
+        fn close(_: *anyopaque) void {}
+        fn commit(ptr: *anyopaque, allocator: std.mem.Allocator, _: db_types.TxnId, _: u64, tables: []const contract.TableCommitRequest, _: db_types.SyncLevel) !?contract.CommitOutcome {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(usize, 1), tables.len);
+            const table = tables[0];
+            try std.testing.expectEqualStrings("physical_usage", table.table_name);
+            try std.testing.expectEqual(@as(usize, 1), table.writes.len);
+            try std.testing.expectEqualStrings("stored-1", table.writes[0].key);
+            try std.testing.expect(table.range_guards.len != 0);
+            try std.testing.expect(table.integrity_commands.len != 0);
+            try std.testing.expectEqualDeep(self.generation_set, table.relational_integrity_generation_set.?);
+            var saw_owner = false;
+            for (table.integrity_commands) |command| switch (command.operation) {
+                .compare_claim => |maybe_owner| if (maybe_owner) |owner| {
+                    try std.testing.expectEqualStrings("stored-1", owner.parent_key);
+                    try std.testing.expectEqualStrings("physical_usage", owner.parent_table);
+                    saw_owner = true;
+                },
+                else => {},
+            };
+            try std.testing.expect(saw_owner);
+            const row = try std.json.parseFromSlice(std.json.Value, allocator, table.writes[0].value, .{});
+            defer row.deinit();
+            if (self.expect_status) {
+                try std.testing.expectEqualStrings("ready", row.value.object.get("status").?.string);
+            } else try std.testing.expectEqual(@as(i64, 8), row.value.object.get("quantity").?.integer);
+            self.commits += 1;
+            return .{ .committed = .{ .participant_count = 1 } };
+        }
+    };
+    const envelope = try integrity.testCatalogEnvelope(alloc, 3, Fake.schema);
+    defer alloc.free(envelope);
+    const parsed = try std.json.parseFromSlice(struct { catalog: []const u8 }, alloc, envelope, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const decoded = try alloc.alloc(u8, try std.base64.standard.Decoder.calcSizeForSlice(parsed.value.catalog));
+    defer alloc.free(decoded);
+    try std.base64.standard.Decoder.decode(decoded, parsed.value.catalog);
+    var native = try native_catalog.decode(alloc, decoded);
+    defer native.deinit();
+    var fake: Fake = .{ .envelope = envelope, .digest = native.schema_digest, .generation_set = activation.generationSet(native) };
+    const source: reads.TableReadSource = .{ .ptr = &fake, .supports_sql_range_guards = true, .vtable = &.{ .lookup = Fake.lookup, .scan = undefined, .query = undefined, .open_relational_statement = Fake.open, .open_relational_read = Fake.openNormalize } };
+    var tuple_arena = std.heap.ArenaAllocator.init(alloc);
+    defer tuple_arena.deinit();
+    fake.tuple = try alloc.dupe(u8, try integrity.testConflictTuple(tuple_arena.allocator(), source, &fake.records, "physical_usage", &.{"id"}, .{ .key = "proposed-1", .value = "{\"id\":\"u1\",\"status\":\"ready\",\"quantity\":1}" }));
+    defer alloc.free(fake.tuple);
+    fake.claim = true;
+    var backend_runtime = try @import("../storage/background_runtime.zig").BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+    var prepared_backend = @import("../storage/mem_backend.zig").Backend.init(alloc, .{});
+    defer prepared_backend.close();
+    var prepared_store = try prepared_backend.runtimeStore(alloc, .{ .name = "native-conflict-capture-test" });
+    defer prepared_store.deinit();
+    var durable = @import("transactions.zig").DurableSessionStore.initRuntime(alloc, &prepared_store);
+    var server = http_server.ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr(), .session_store = &durable }, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .system_catalog = Fake.resolve, .supports_query_definitions = true, .admin_snapshot = Fake.snapshot, .free_admin_snapshot = Fake.freeSnapshot } }, source, .{ .ptr = &fake, .supports_sql_range_guards = true, .vtable = &.{ .batch = undefined, .commit_transaction_with_id = Fake.commit } });
+    defer server.deinit();
+    var permissions = [_]@import("../usermgr/mod.zig").Permission{ .{ .resource = @constCast("*"), .resource_type = .table, .type = .read }, .{ .resource = @constCast("*"), .resource_type = .table, .type = .write } };
+    var identity = try http_server.cloneCatalogIdentity(alloc, .{ .username = @constCast("native_conflict_writer"), .permissions = &permissions });
+    defer if (identity) |*owned| owned.deinit(alloc);
+    var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{} };
+    const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @embedFile("../sql/fixtures/sql_parity_inventory.json"), .{});
+    defer corpus.deinit();
+    const sql = for (corpus.value.object.get("entries").?.array.items) |entry| {
+        if (std.mem.eql(u8, entry.object.get("id").?.string, "sql-1411")) break entry.object.get("sql").?.string;
+    } else return error.TestMissingCorpusCase;
+    var compiled = try compiler.compile(alloc, sql, .{});
+    defer compiled.deinit();
+    var result = try adapter.execute(alloc, &compiled, &.{}, .{}, null);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), fake.captures);
+    try std.testing.expectEqual(@as(usize, 1), fake.point_reads);
+    try std.testing.expectEqual(@as(usize, 1), fake.commits);
+    try std.testing.expectEqualStrings("u1", result.output.rows[0][0].string);
+    const select_sql = for (corpus.value.object.get("entries").?.array.items) |entry| {
+        if (std.mem.eql(u8, entry.object.get("id").?.string, "sql-1440")) break entry.object.get("sql").?.string;
+    } else return error.TestMissingCorpusCase;
+    fake.expect_status = true;
+    var select_compiled = try compiler.compile(alloc, select_sql, .{});
+    defer select_compiled.deinit();
+    var select_result = try adapter.execute(alloc, &select_compiled, &.{}, .{}, null);
+    defer select_result.deinit();
+    try std.testing.expectEqual(@as(usize, 4), fake.captures);
+    try std.testing.expectEqual(@as(usize, 2), fake.point_reads);
+    try std.testing.expectEqual(@as(usize, 2), fake.commits);
+    try std.testing.expectEqualStrings("u1", select_result.output.rows[0][0].string);
+    try std.testing.expectEqualStrings("ready", select_result.output.rows[0][1].string);
 }
 
 test "SQL mutation classification preserves wrapped definite conflicts and constraints" {

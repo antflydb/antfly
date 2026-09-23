@@ -102,6 +102,34 @@ test "SQL pull stream releases pages and streams beyond materialized result limi
     std.debug.print("SQL pull stream: rows={d} peak_bytes={d} first_page_ns={d} elapsed_ns={d}\n", .{ seen, stream.budget.peak, first_page_ns, std.Io.Clock.awake.now(std.testing.io).nanoseconds - started });
 }
 
+test "SQL pull stream keeps one pinned policy setting across pages" {
+    const settings = @import("setting_catalog.zig");
+    const Owner = struct {
+        value: []const u8 = "tenant-a",
+        definition: settings.Definition = .{ .identity = .{ .id = 10, .generation = 1 }, .name = "app.tenant", .kind = .string, .policy_sensitive = true, .default = .{ .string = "tenant-a" } },
+        fn load(ptr: *anyopaque, _: std.mem.Allocator, scope: settings.Scope) !settings.RawSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.definition.default = .{ .string = self.value };
+            return .{ .scope = scope, .epoch = 2, .definitions = @as([*]const settings.Definition, @ptrCast(&self.definition))[0..1] };
+        }
+    };
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT current_setting('app.tenant') AS tenant FROM docs LIMIT 2", .{});
+    defer compiled.deinit();
+    var fixture: Fixture = .{ .count = 2 };
+    var owner: Owner = .{};
+    var backend = fixture.backend();
+    backend.setting_capture = .{ .owner = .{ .ptr = &owner, .load = Owner.load }, .scope = .{ .principal = "alice", .database = "main" } };
+    const stream = (try Stream.open(std.testing.allocator, backend, &compiled, &.{}, .{ .page_rows = 1 })).?;
+    defer stream.close();
+    var first = try stream.next(1);
+    defer first.deinit();
+    try std.testing.expectEqualStrings("tenant-a", first.output.rows[0][0].string);
+    owner.value = "tenant-b";
+    var second = try stream.next(1);
+    defer second.deinit();
+    try std.testing.expectEqualStrings("tenant-a", second.output.rows[0][0].string);
+}
+
 test "SQL pull stream keeps offset and residual state across pulls and closes on cancellation" {
     var compiled = try compiler.compile(std.testing.allocator, "SELECT n FROM docs WHERE n % 2 = 0 LIMIT 9 OFFSET 3", .{});
     defer compiled.deinit();
@@ -171,6 +199,7 @@ test "SQL pull stream unwinds every allocation failure" {
 pub const Stream = struct {
     budget: Budget,
     arena: std.heap.ArenaAllocator,
+    settings: ?*@import("setting_catalog.zig").View = null,
     context: runtime.Context,
     cursor: ?catalog.Cursor = null,
     fields: []const []const u8,
@@ -196,17 +225,27 @@ pub const Stream = struct {
         self.budget = .{ .backing = alloc, .limit = limits.retained_bytes };
         self.arena = std.heap.ArenaAllocator.init(self.budget.allocator());
         errdefer self.arena.deinit();
+        self.settings = null;
+        errdefer if (self.settings) |view| view.deinit();
         const arena = self.arena.allocator();
-        const binding = try describe.bind(arena, backend, compiled, &.{});
+        var statement_backend = backend;
+        if (backend.setting_capture) |capture| {
+            const view = try arena.create(@import("setting_catalog.zig").View);
+            view.* = try @import("setting_catalog.zig").View.capture(self.budget.allocator(), capture.owner, capture.scope, capture.overlay);
+            self.settings = view;
+            statement_backend.settings_view = view;
+        }
+        const binding = try describe.bind(arena, statement_backend, compiled, &.{});
         const statement = if (binding.relation) |relation| relation.statement else compiled.statement.select;
         if (binding.aggregate != null or binding.window != null or binding.table == null or
             statement.count_all or (binding.order_keys.len != 0 and !binding.primary_order))
         {
+            if (self.settings) |view| view.deinit();
             self.arena.deinit();
             alloc.destroy(self);
             return null;
         }
-        self.context = .{ .alloc = self.budget.allocator(), .arena = arena, .backend = backend, .binding = binding, .parameters = &.{}, .limits = limits, .typed_output = true };
+        self.context = .{ .alloc = self.budget.allocator(), .arena = arena, .backend = statement_backend, .binding = binding, .parameters = &.{}, .limits = limits, .typed_output = true };
         const params = try arena.alloc(Json, parameters.len);
         for (parameters, params) |value, *out| out.* = try self.context.outputValue(value);
         self.context.parameters = params;
@@ -262,6 +301,7 @@ pub const Stream = struct {
     pub fn close(self: *Stream) void {
         if (self.cursor) |cursor| cursor.close(cursor.ptr);
         if (self.after) |after| self.budget.allocator().free(after);
+        if (self.settings) |view| view.deinit();
         self.arena.deinit();
         std.debug.assert(self.budget.live == 0);
         self.budget.backing.destroy(self);

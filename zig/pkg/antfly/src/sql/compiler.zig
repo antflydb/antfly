@@ -44,6 +44,7 @@ pub const Compiled = struct {
     arena: std.heap.ArenaAllocator,
     statement: ast.Statement,
     parameter_count: u32,
+    uses_current_setting: bool = false,
 
     pub fn deinit(self: *Compiled) void {
         self.arena.deinit();
@@ -123,7 +124,16 @@ pub fn compileDiagnostic(allocator: std.mem.Allocator, sql: []const u8, limits: 
     const statement = try parser.statement();
     _ = parser.take(.semicolon);
     if (parser.pos != tokens.items.len) return parser.fail(error.UnsupportedSqlShape, "unexpected trailing SQL; only one supported statement is allowed");
-    return .{ .arena = arena, .statement = statement, .parameter_count = parser.parameter_count };
+    return .{ .arena = arena, .statement = statement, .parameter_count = parser.parameter_count, .uses_current_setting = parser.uses_current_setting };
+}
+
+test "setting authority capture follows parsed calls, not SQL text" {
+    var literal = try compile(std.testing.allocator, "SELECT 'current_setting(' AS note /* current_setting('app.tenant') */", .{});
+    defer literal.deinit();
+    try std.testing.expect(!literal.uses_current_setting);
+    var call = try compile(std.testing.allocator, "SELECT current_setting('app.tenant')", .{});
+    defer call.deinit();
+    try std.testing.expect(call.uses_current_setting);
 }
 
 test "SQL MERGE compiles ordered matched and unmatched mutation arms" {
@@ -237,6 +247,7 @@ const Parser = struct {
     pos: usize = 0,
     node_count: usize = 0,
     parameter_count: u32 = 0,
+    uses_current_setting: bool = false,
     relation_depth: usize = 0,
 
     fn fail(self: *Parser, err: Error, message: []const u8) Error {
@@ -440,6 +451,7 @@ const Parser = struct {
             self.pos += 2;
             const name_value = try self.alloc.dupe(u8, function.text);
             if (!function.owned) _ = std.ascii.lowerString(name_value, name_value);
+            if (std.mem.eql(u8, name_value, "current_setting")) self.uses_current_setting = true;
             var args: std.ArrayList(*const ast.Scalar) = .empty;
             const distinct = self.keyword(.distinct);
             const star = self.take(.star);
@@ -796,7 +808,12 @@ const Parser = struct {
                 try self.node();
                 const expression = try self.scalar(0, 0);
                 try self.checkScalarDepth(expression, 0);
-                const alias = if (self.keyword(.as)) try self.identifier() else null;
+                const alias = if (self.keyword(.as))
+                    try self.identifier()
+                else if (self.peek(.identifier) and (self.tokens[self.pos].owned or self.tokens[self.pos].keyword == null or token.keywordClass(self.tokens[self.pos].keyword.?) == .unreserved))
+                    try self.identifier()
+                else
+                    null;
                 try columns.append(self.alloc, if (expression.* == .column) .{ .field = expression.column, .alias = alias } else .{ .expression = expression, .alias = alias });
                 if (!self.take(.comma)) break;
             }
@@ -1017,7 +1034,20 @@ const Parser = struct {
             const statement_ = try self.statement();
             if (statement_ != .select) return self.fail(error.InvalidSqlSyntax, "INSERT source must be SELECT");
             source.* = statement_.select;
-            return .{ .table = table, .columns = try columns.toOwnedSlice(self.alloc), .source = source, .conflict = try self.conflict(), .returning = try self.returning() };
+            var conflict_clause = try self.conflict();
+            if (conflict_clause) |*clause| {
+                const captures = try self.conflictCaptures(clause);
+                if (captures.len != 0) {
+                    if (source.columns.len == 0 or source.set_operation != null or source.values_arms.len != 0) return self.fail(error.UnsupportedSqlShape, "conflict assignment subquery requires an explicit INSERT source projection");
+                    const projected = try self.alloc.alloc(ast.Projection, source.columns.len + captures.len);
+                    @memcpy(projected[0..source.columns.len], source.columns);
+                    for (captures, projected[source.columns.len..], 0..) |expression, *projection, ordinal| {
+                        projection.* = .{ .alias = try std.fmt.allocPrint(self.alloc, "$conflict_capture_{d}", .{ordinal}), .expression = expression };
+                    }
+                    source.columns = projected;
+                }
+            }
+            return .{ .table = table, .columns = try columns.toOwnedSlice(self.alloc), .source = source, .conflict = conflict_clause, .returning = try self.returning() };
         }
         try self.expectKeyword(.values);
         var rows = std.ArrayList([]const ast.Value).empty;
@@ -1054,13 +1084,14 @@ const Parser = struct {
         const values = try rows.toOwnedSlice(self.alloc);
         const cells = try expressions.toOwnedSlice(self.alloc);
         const default_cells = try defaults.toOwnedSlice(self.alloc);
-        const conflict_clause = try self.conflict();
+        var conflict_clause = try self.conflict();
         const returning_columns = try self.returning();
+        const captures = if (conflict_clause) |*clause| try self.conflictCaptures(clause) else &.{};
         var contains_subquery = false;
         for (cells) |row| for (row) |cell| if (cell) |expression| {
             contains_subquery = contains_subquery or @import("subquery_lowering.zig").has(expression);
         };
-        if (!contains_subquery) return .{ .table = table, .columns = names, .rows = values, .expressions = cells, .defaults = default_cells, .conflict = conflict_clause, .returning = returning_columns };
+        if (!contains_subquery and captures.len == 0) return .{ .table = table, .columns = names, .rows = values, .expressions = cells, .defaults = default_cells, .conflict = conflict_clause, .returning = returning_columns };
 
         // VALUES with scalar subqueries is one source relation, not a collection
         // of independent expression evaluations. Keep source arms flat and in
@@ -1069,13 +1100,16 @@ const Parser = struct {
         // target image, including when the source reads the target itself.
         var arms: std.ArrayList(*const ast.Select) = .empty;
         for (values, cells) |row, row_cells| {
-            const projections = try self.alloc.alloc(ast.Projection, names.len);
-            for (names, row, row_cells, projections) |column_name, literal_value, expression, *projection| {
+            const projections = try self.alloc.alloc(ast.Projection, names.len + captures.len);
+            for (names, row, row_cells, projections[0..names.len]) |column_name, literal_value, expression, *projection| {
                 const scalar_value = expression orelse blk: {
                     const literal = try self.scalarNode(.{ .literal = literal_value });
                     break :blk literal;
                 };
                 projection.* = .{ .alias = column_name, .expression = scalar_value };
+            }
+            for (captures, projections[names.len..], 0..) |expression, *projection, ordinal| {
+                projection.* = .{ .alias = try std.fmt.allocPrint(self.alloc, "$conflict_capture_{d}", .{ordinal}), .expression = expression };
             }
             const leaf = try self.alloc.create(ast.Select);
             leaf.* = .{ .columns = projections, .generated_values = true };
@@ -1084,6 +1118,111 @@ const Parser = struct {
         const source = try self.alloc.create(ast.Select);
         source.* = .{ .values_arms = try arms.toOwnedSlice(self.alloc), .generated_values = true };
         return .{ .table = table, .columns = names, .source = source, .values_source_rows = values, .defaults = default_cells, .conflict = conflict_clause, .returning = returning_columns };
+    }
+
+    fn conflictCaptures(self: *Parser, clause: *ast.Conflict) Error![]const *const ast.Scalar {
+        var captures: std.ArrayList(*const ast.Scalar) = .empty;
+        const assignments = try self.alloc.dupe(ast.Assignment, clause.assignments);
+        for (assignments) |*assignment| {
+            const expression = assignment.expression orelse continue;
+            if (!hasScalarSubquery(expression)) continue;
+            // A conflict-row reference outside the subquery must be evaluated
+            // after owner arbitration. It cannot be moved into the INSERT
+            // source without changing which row the reference denotes.
+            assignment.capture_ordinal = captures.items.len;
+            if (hasOuterColumn(expression)) {
+                assignment.capture_expression = try self.rewriteConflictHoles(expression, &captures);
+                assignment.capture_span = captures.items.len - assignment.capture_ordinal.?;
+            } else {
+                try captures.append(self.alloc, expression);
+                assignment.capture_span = 1;
+            }
+        }
+        clause.assignments = assignments;
+        clause.capture_count = captures.items.len;
+        return captures.toOwnedSlice(self.alloc);
+    }
+
+    fn rewriteConflictHoles(self: *Parser, expression: *const ast.Scalar, captures: *std.ArrayList(*const ast.Scalar)) Error!*const ast.Scalar {
+        if (expression.* == .call and expression.call.subquery != null) {
+            if (!std.mem.eql(u8, expression.call.name, "$scalar")) return self.fail(error.UnsupportedSqlShape, "conflict assignment subquery must be scalar");
+            const ordinal = captures.items.len;
+            try captures.append(self.alloc, expression);
+            const hole = try self.alloc.create(ast.Scalar);
+            hole.* = .{ .column = try std.fmt.allocPrint(self.alloc, "$conflict_capture_{d}", .{ordinal}) };
+            return hole;
+        }
+        if (expression.* == .case_when or (expression.* == .call and std.mem.eql(u8, expression.call.name, "coalesce"))) return self.fail(error.UnsupportedSqlShape, "lazy conflict expression requires conditional subquery Apply");
+        const rewritten = try self.alloc.create(ast.Scalar);
+        rewritten.* = switch (expression.*) {
+            .literal, .column => expression.*,
+            .unary => |part| .{ .unary = .{ .op = part.op, .operand = try self.rewriteConflictHoles(part.operand, captures) } },
+            .binary => |part| .{ .binary = .{ .op = part.op, .left = try self.rewriteConflictHoles(part.left, captures), .right = try self.rewriteConflictHoles(part.right, captures) } },
+            .cast => |part| .{ .cast = .{ .operand = try self.rewriteConflictHoles(part.operand, captures), .type = part.type } },
+            .in_list => |part| blk: {
+                const values = try self.alloc.alloc(*const ast.Scalar, part.values.len);
+                for (part.values, values) |value_, *out| out.* = try self.rewriteConflictHoles(value_, captures);
+                break :blk .{ .in_list = .{ .operand = try self.rewriteConflictHoles(part.operand, captures), .values = values, .negated = part.negated } };
+            },
+            .call => |part| blk: {
+                const args = try self.alloc.alloc(*const ast.Scalar, part.args.len);
+                for (part.args, args) |arg, *out| out.* = try self.rewriteConflictHoles(arg, captures);
+                var copy = part;
+                copy.args = args;
+                copy.filter = if (part.filter) |filter| try self.rewriteConflictHoles(filter, captures) else null;
+                break :blk .{ .call = copy };
+            },
+            .case_when => unreachable,
+        };
+        return rewritten;
+    }
+
+    fn hasScalarSubquery(expression: *const ast.Scalar) bool {
+        return switch (expression.*) {
+            .literal, .column => false,
+            .unary => |item| hasScalarSubquery(item.operand),
+            .binary => |item| hasScalarSubquery(item.left) or hasScalarSubquery(item.right),
+            .cast => |item| hasScalarSubquery(item.operand),
+            .case_when => |item| blk: {
+                for (item.branches) |branch| if (hasScalarSubquery(branch.condition) or hasScalarSubquery(branch.value)) break :blk true;
+                break :blk if (item.otherwise) |otherwise| hasScalarSubquery(otherwise) else false;
+            },
+            .in_list => |item| blk: {
+                if (hasScalarSubquery(item.operand)) break :blk true;
+                for (item.values) |candidate| if (hasScalarSubquery(candidate)) break :blk true;
+                break :blk false;
+            },
+            .call => |item| blk: {
+                if (item.subquery != null and std.mem.eql(u8, item.name, "$scalar")) break :blk true;
+                for (item.args) |argument| if (hasScalarSubquery(argument)) break :blk true;
+                break :blk if (item.filter) |filter| hasScalarSubquery(filter) else false;
+            },
+        };
+    }
+
+    fn hasOuterColumn(expression: *const ast.Scalar) bool {
+        return switch (expression.*) {
+            .literal => false,
+            .column => true,
+            .unary => |item| hasOuterColumn(item.operand),
+            .binary => |item| hasOuterColumn(item.left) or hasOuterColumn(item.right),
+            .cast => |item| hasOuterColumn(item.operand),
+            .case_when => |item| blk: {
+                for (item.branches) |branch| if (hasOuterColumn(branch.condition) or hasOuterColumn(branch.value)) break :blk true;
+                break :blk if (item.otherwise) |otherwise| hasOuterColumn(otherwise) else false;
+            },
+            .in_list => |item| blk: {
+                if (hasOuterColumn(item.operand)) break :blk true;
+                for (item.values) |candidate| if (hasOuterColumn(candidate)) break :blk true;
+                break :blk false;
+            },
+            .call => |item| blk: {
+                // A scalar subquery has its own column scope.
+                if (item.subquery != null and std.mem.eql(u8, item.name, "$scalar")) break :blk false;
+                for (item.args) |argument| if (hasOuterColumn(argument)) break :blk true;
+                break :blk if (item.filter) |filter| hasOuterColumn(filter) else false;
+            },
+        };
     }
 
     fn conflict(self: *Parser) Error!?ast.Conflict {
@@ -2115,6 +2254,64 @@ test "SQL original multi-output mutation selector rejects before backend access"
     }) |sql| {
         try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, sql, .{}));
     }
+}
+
+test "SQL original unsupported catalog object commands reject before backend access" {
+    // Event triggers, rules, transforms, ordinary triggers, foreign wrappers
+    // and mappings, operator classes and families, and text-search objects.
+    // sql-1141, sql-1142, sql-1143, sql-1144, sql-1145, sql-1146, sql-1147.
+    // sql-1148, sql-1149, sql-1150, sql-1151, sql-1152, sql-1153, sql-1154.
+    // sql-1155, sql-1156, sql-1157, sql-1158, sql-1159, sql-1160, sql-1161.
+    // sql-1162, sql-1163, sql-1164, sql-1165, sql-1166, sql-1167, sql-1168.
+    // sql-1169, sql-1170, sql-1171, sql-1172, sql-1173, sql-1174, sql-1175.
+    // sql-1176, sql-1177, sql-1178, sql-1179, sql-1180, sql-1181, sql-1182.
+    // sql-1185, sql-1186, sql-1187, sql-1188, sql-1189, sql-1190, sql-1191, sql-1192.
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, @embedFile("fixtures/sql_parity_inventory.json"), .{});
+    defer parsed.deinit();
+    var covered: usize = 0;
+    for (parsed.value.object.get("entries").?.array.items) |entry| {
+        const id = entry.object.get("id").?.string;
+        const ordinal = if (std.mem.startsWith(u8, id, "sql-")) std.fmt.parseInt(usize, id[4..], 10) catch continue else continue;
+        if (ordinal < 1141 or ordinal > 1192 or ordinal == 1183 or ordinal == 1184) continue;
+        try std.testing.expectEqualStrings("rejection", entry.object.get("source_expectation").?.string);
+        var diagnostic: Diagnostic = .{};
+        if (compileDiagnostic(std.testing.allocator, entry.object.get("sql").?.string, .{}, &diagnostic)) |compiled| {
+            var unexpected = compiled;
+            unexpected.deinit();
+            std.debug.print("unexpectedly compiled {s}\n", .{id});
+            return error.TestUnexpectedResult;
+        } else |err| {
+            try std.testing.expect(err == error.InvalidSqlSyntax or err == error.UnsupportedSqlShape);
+            try std.testing.expect(diagnostic.message.len > 0);
+        }
+        covered += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 50), covered);
+}
+
+test "compiler implicit projection aliases preserve clause and expression boundaries" {
+    var implicit = try compile(std.testing.allocator, "SELECT id match FROM usage_records", .{});
+    defer implicit.deinit();
+    try std.testing.expectEqualStrings("match", implicit.statement.select.columns[0].alias.?);
+    var quoted = try compile(std.testing.allocator, "SELECT id \"MixedCase\" FROM usage_records", .{});
+    defer quoted.deinit();
+    try std.testing.expectEqualStrings("MixedCase", quoted.statement.select.columns[0].alias.?);
+    var explicit = try compile(std.testing.allocator, "SELECT id AS match FROM usage_records", .{});
+    defer explicit.deinit();
+    try std.testing.expectEqualStrings("match", explicit.statement.select.columns[0].alias.?);
+    for ([_][]const u8{
+        "SELECT id FROM usage_records WHERE id = 1",
+        "SELECT id FROM usage_records GROUP BY id",
+        "SELECT id FROM usage_records ORDER BY id",
+        "SELECT id FROM usage_records LIMIT 2",
+        "SELECT id, name FROM usage_records",
+    }) |sql| {
+        var statement = try compile(std.testing.allocator, sql, .{});
+        defer statement.deinit();
+        try std.testing.expect(statement.statement.select.columns[0].alias == null);
+    }
+    try std.testing.expectError(error.UnsupportedSqlShape, compile(std.testing.allocator, "SELECT id name extra FROM usage_records", .{}));
+    try std.testing.expectError(error.UnsupportedSqlShape, compile(std.testing.allocator, "SELECT id 42 FROM usage_records", .{}));
 }
 
 test "compiler preserves keyword-named columns and quoted SQL-looking values" {

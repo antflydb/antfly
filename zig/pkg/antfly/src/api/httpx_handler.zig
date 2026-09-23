@@ -5083,7 +5083,9 @@ pub const AntflyApiHandler = struct {
                 self.adapter.collect_prepared_bindings = &bindings;
                 defer self.adapter.collect_prepared_bindings = null;
                 var binding_budget: SQLMemoryBudget = .{ .backing = std.heap.page_allocator, .limit = 32 << 20 };
-                var description = @import("../sql/describe.zig").describe(binding_budget.allocator(), self.adapter.backend(), compiled, &.{}) catch |err| return if (binding_budget.exhausted) error.SqlProgramLimitExceeded else err;
+                var describe_backend = self.adapter.backend();
+                if (compiled.uses_current_setting) describe_backend.setting_capture = self.adapter.settingCapture();
+                var description = @import("../sql/describe.zig").describe(binding_budget.allocator(), describe_backend, compiled, &.{}) catch |err| return if (binding_budget.exhausted) error.SqlProgramLimitExceeded else err;
                 defer description.deinit();
                 var bytes: [16]u8 = undefined;
                 try self.cache_io.randomSecure(&bytes);
@@ -5736,6 +5738,30 @@ pub const AntflyApiHandler = struct {
         }
         var response = try system_catalog_http.execute(self.api_server.source, ctx.allocator, operationContext(ctx, identity), target, action, body);
         return respondOwnedApiResponseWithAllocator(ctx, &response, ctx.allocator);
+    }
+
+    /// Public setting publication is separate from client SQL SET. Only a
+    /// wildcard cluster administrator can mint the request-lifetime grant;
+    /// the metadata service still performs Raft revision fencing.
+    pub fn administerSqlSettings(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*value| value.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const admitted = identity orelse return jsonErrorResponse(ctx, 403, "forbidden");
+        if (!http_server_mod.permissionsAllow(admitted.permissions, .@"*", "*", .admin)) return jsonErrorResponse(ctx, 403, "forbidden");
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing setting mutation");
+        if (body.len > system_catalog.max_command_bytes) return textResponse(ctx, 413, "setting request too large");
+        const settings = @import("../system_catalog/settings.zig");
+        var parsed = std.json.parseFromSlice(settings.Request, ctx.allocator, body, .{}) catch return textResponse(ctx, 400, "invalid setting mutation");
+        defer parsed.deinit();
+        var context = operationContext(ctx, identity);
+        context.setting_admin = true;
+        const result = self.api_server.source.systemCatalog(ctx.allocator, context, .{ .setting_mutate = parsed.value }) catch |err|
+            return textResponse(ctx, system_catalog.httpStatus(err), @errorName(err));
+        defer ctx.allocator.free(result);
+        try ctx.setHeader("content-type", "application/json");
+        _ = ctx.response.body(result);
+        return ctx.response.build();
     }
 
     const PublicTableBinding = struct {
@@ -8521,6 +8547,67 @@ const AuthStatusSource = struct {
     }
 };
 
+test "system catalog SQL setting publication requires cluster admin and forwards only an admitted grant" {
+    const alloc = std.testing.allocator;
+    var auth = try initTestAuthManager(alloc);
+    try bindTestAuthManager(alloc, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+    var admin_permission = try usermgr.Permission.initOwned(alloc, .@"*", "*", .admin);
+    defer admin_permission.deinit(alloc);
+    var admin = try auth.manager.createUser("settings_admin", "secret", &.{admin_permission});
+    defer admin.deinit(alloc);
+    var reader_permission = try usermgr.Permission.initOwned(alloc, .table, "*", .read);
+    defer reader_permission.deinit(alloc);
+    var reader = try auth.manager.createUser("settings_reader", "secret", &.{reader_permission});
+    defer reader.deinit(alloc);
+    const Source = struct {
+        calls: usize = 0,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{}, .projected_stores = 1 };
+        }
+        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, context: operation_contract.RequestContext, call: system_catalog.Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!context.setting_admin or call != .setting_mutate or call.setting_mutate != .put) return error.TestUnexpectedResult;
+            self.calls += 1;
+            return a.dupe(u8, "{\"revision\":1}");
+        }
+        fn iface(self: *@This()) http_server_mod.StatusSource {
+            return .{ .ptr = self, .vtable = &.{ .status = status, .system_catalog = catalog } };
+        }
+    };
+    var source = Source{};
+    var api_server = ApiHttpServer.init(alloc, .{ .auth_enabled = true, .user_manager = &auth.manager }, source.iface(), null, null);
+    defer api_server.deinit();
+    var e2e: HttpxE2eServer = undefined;
+    try e2e.init(alloc, &api_server);
+    defer e2e.deinit();
+    var io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io.deinit();
+    var client = httpx.Client.initWithConfig(alloc, io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base = try e2e.baseUrl(alloc);
+    defer alloc.free(base);
+    const url = try std.fmt.allocPrint(alloc, "{s}/db/v1/settings", .{base});
+    defer alloc.free(url);
+    const body = "{\"put\":{\"name\":\"app.tenant\",\"kind\":\"string\",\"policy_sensitive\":true,\"default\":{\"string\":\"none\"},\"role_defaults\":[{\"principal\":\"settings_reader\",\"database\":\"main\",\"value\":{\"string\":\"alpha\"}}]}}";
+    const reader_auth = try encodeBasicAuthorization(alloc, "settings_reader", "secret");
+    defer alloc.free(reader_auth);
+    const admin_auth = try encodeBasicAuthorization(alloc, "settings_admin", "secret");
+    defer alloc.free(admin_auth);
+    const reader_headers = [_][2][]const u8{ .{ "authorization", reader_auth }, .{ "content-type", "application/json" } };
+    var denied = try requestWithRetry(&client, io.io(), .POST, url, body, &reader_headers, 20);
+    defer denied.deinit();
+    try std.testing.expectEqual(@as(u16, 403), denied.status.code);
+    try std.testing.expectEqual(@as(usize, 0), source.calls);
+    const admin_headers = [_][2][]const u8{ .{ "authorization", admin_auth }, .{ "content-type", "application/json" } };
+    var allowed = try requestWithRetry(&client, io.io(), .POST, url, body, &admin_headers, 20);
+    defer allowed.deinit();
+    try std.testing.expectEqual(@as(u16, 200), allowed.status.code);
+    try std.testing.expectEqual(@as(usize, 1), source.calls);
+}
+
 test "compressed requests authenticate before decompression and reuse the identity" {
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
 
@@ -11269,6 +11356,60 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         try std.testing.expectEqualStrings("9007199254740993", result.value.rows[0][0].string);
         try std.testing.expectEqualStrings("exact", result.value.rows[0][1].string);
         try std.testing.expectEqual(sql_wire.SQLColumnType.integer, result.value.columns[0].type);
+    }
+    {
+        // sql-0438 through sql-0449 execute pinned source text over native
+        // rows, checking both projection aliases and complete set-operation
+        // output. Mixed-case and absent status cells distinguish each filter.
+        const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @embedFile("../sql/fixtures/sql_parity_inventory.json"), .{});
+        defer corpus.deinit();
+        const cases = [_]struct { id: []const u8, ids: []const []const u8, alias: bool = false }{
+            .{ .id = "sql-0438", .ids = &.{ "9007199254740993", "2", "3", "4", "5", "6", "7", "8", "9" }, .alias = true },
+            .{ .id = "sql-0439", .ids = &.{ "9007199254740993", "2", "3", "4", "5", "6", "7", "8", "9" }, .alias = true },
+            .{ .id = "sql-0440", .ids = &.{ "9007199254740993", "2", "4", "7" } },
+            .{ .id = "sql-0441", .ids = &.{ "2", "3", "4", "7" } },
+            .{ .id = "sql-0442", .ids = &.{ "2", "3", "4", "5", "7" } },
+            .{ .id = "sql-0443", .ids = &.{ "2", "3", "4", "5", "7" } },
+            .{ .id = "sql-0444", .ids = &.{ "2", "3", "4", "7" } },
+            .{ .id = "sql-0445", .ids = &.{ "2", "3", "4", "5", "7" } },
+            .{ .id = "sql-0446", .ids = &.{ "2", "3", "4", "7" } },
+            .{ .id = "sql-0447", .ids = &.{ "9007199254740993", "2", "3", "4", "5", "6", "7", "8" } },
+            .{ .id = "sql-0448", .ids = &.{"3"} },
+            .{ .id = "sql-0449", .ids = &.{ "2", "3", "4", "5", "7" } },
+        };
+        for (cases) |case| {
+            const exact_sql = for (corpus.value.object.get("entries").?.array.items) |entry| {
+                if (std.mem.eql(u8, entry.object.get("id").?.string, case.id)) break entry.object.get("sql").?.string;
+            } else return error.TestMissingCorpusCase;
+            const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = exact_sql }, .{});
+            defer alloc.free(body);
+            var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+            defer request.deinit();
+            request.body = body;
+            var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+            defer ctx.deinit();
+            var response = try handler.executeSQL(&ctx);
+            defer response.deinit();
+            if (response.status.code != 200) std.debug.print("{s}: {s}\n", .{ case.id, response.body orelse "" });
+            try std.testing.expectEqual(@as(u16, 200), response.status.code);
+            const result = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, response.body.?, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.value.columns.len);
+            try std.testing.expectEqualStrings(if (case.alias) "match" else "id", result.value.columns[0].name);
+            try std.testing.expectEqual(sql_wire.SQLColumnType.integer, result.value.columns[0].type);
+            try std.testing.expectEqual(case.ids.len, result.value.rows.len);
+            const seen = try alloc.alloc(bool, case.ids.len);
+            defer alloc.free(seen);
+            @memset(seen, false);
+            for (result.value.rows) |row| {
+                try std.testing.expectEqual(@as(usize, 1), row.len);
+                const position = for (case.ids, 0..) |expected, index| {
+                    if (std.mem.eql(u8, expected, row[0].string)) break index;
+                } else return error.TestUnexpectedResult;
+                try std.testing.expect(!seen[position]);
+                seen[position] = true;
+            }
+        }
     }
     {
         const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @embedFile("../sql/fixtures/sql_parity_inventory.json"), .{});

@@ -286,7 +286,9 @@ const OwnedRead = struct {
         }
         self.guarded = .{ .native = self.native_adapter.backend(), .authority = &self.authority, .revision = &self.native_adapter.revision, .expected_guard = self.authority.request.binding_guard };
         const parameters = try normalizeParameters(arena, request.parameters, request.parameter_types);
-        const opened = try Pull.Stream.open(alloc, self.guarded.backend(), plan.compiled(), parameters, .{ .result_rows = request.limit, .page_rows = 256 });
+        var stream_backend = self.guarded.backend();
+        if (plan.compiled().uses_current_setting) stream_backend.setting_capture = self.native_adapter.settingCapture();
+        const opened = try Pull.Stream.open(alloc, stream_backend, plan.compiled(), parameters, .{ .result_rows = request.limit, .page_rows = 256 });
         if (opened == null) {
             self.identity.?.deinit(server.alloc);
             self.arena.deinit();
@@ -687,7 +689,9 @@ const Job = struct {
                 .unknown => null,
                 inline else => |tag| @field(ast.ColumnType, @tagName(tag)),
             };
-            var description = try describe_sql.describe(self.alloc, guarded.backend(), compiled, hints);
+            var describe_backend = guarded.backend();
+            if (compiled.uses_current_setting) describe_backend.setting_capture = native_adapter.settingCapture();
+            var description = try describe_sql.describe(self.alloc, describe_backend, compiled, hints);
             defer description.deinit();
             const columns = try self.alloc.alloc(wire.Column, description.binding.columns.len);
             for (columns, description.binding.columns) |*out, column| out.* = .{ .name = try self.alloc.dupe(u8, column.name), .type = wireType(column.type) };

@@ -79,21 +79,23 @@ aggregates and ROWS/numeric RANGE frames preserve typed null/numeric semantics.
 Internal aggregate nodes use wider numeric state; only requested SQL results are
 range-checked. Omitted INSERT identities use the shared native secure row-ID
 generator. Primary-identity ON CONFLICT actions use exact observed row fences.
-Conflict-assignment scalar subqueries are not yet admitted. The reference
-branch lowers their hidden outputs into the INSERT source query, but its
-storage-side projection and mutation-expression machinery is not the current
-executor contract. Port this as a single bound source/capture containing both
-INSERT values and conflict read dependencies, then evaluate assignments from
-captured typed outputs before one guarded commit. Independent reads in the
-per-owner conflict loop would mix statement snapshots and scale with the number
-of conflicts. The current engine rejects this shape before preparing writes;
-the exact original `sql-1411` case remains unresolved.
+Conflict-assignment scalar subqueries now lower hidden typed outputs into the
+same INSERT source capture, then combine those outputs with the observed old
+row and `excluded` image before one guarded commit. This covers direct and
+mixed eager scalar expressions, including the original `sql-1411` and
+`sql-1440` cases. Multi-row captures retain each proposed row's result, and
+NULL/cardinality failures abort before mutation. Lazy CASE/COALESCE branches
+with subqueries still reject: eager source lowering could evaluate an untaken
+branch and change its error semantics. They require a masked conditional Apply
+operator in the relation binder and pull runtime.
 Existing conflict-owner point reads now use reclaimed cursor and page scratch
 per owner, resetting page scratch after empty progress pages. A 32-owner batch
 with three 64 KiB native continuation pages per owner fits a 512 KiB SQL
 memory admission budget while retaining all normalized images and
 version/claim guards for one atomic commit; page and cursor storage no longer
-accumulates with owners or progress pages.
+accumulates with owners or progress pages. Conflict point pages now consume one
+batch-wide page quota rather than restarting the allowance for every owner;
+captured INSERT-source pages and conflict pages still have separate admission.
 Ordinary composite-unique targets now use the native tuple codec, activation
 coverage, generation identity and durable compare-claim observations; those
 observations survive session merging and savepoints. Lite uses native durable
@@ -205,8 +207,9 @@ UTF-8 `application_name`, a single existing `search_path` namespace, and the
 immutable negotiated UTF-8 `client_encoding`.
 `SET NAMES` uses the same UTF-8-only connection-owned path.
 `RESET ALL` resets those connection-owned settings with transaction/savepoint
-semantics in simple and extended protocol; original custom `app.*` catalog
-settings are not implemented, so original case `sql-0045` remains unresolved.
+semantics in simple and extended protocol; custom `app.*` setting definitions
+now have a durable catalog owner, but pgwire SET/overlay semantics for them
+are not implemented, so original case `sql-0045` remains unresolved.
 Outside a transaction, `DISCARD ALL` additionally closes connection-owned
 prepared plans, portals and held cursors after the command reply; original
 case `sql-0047` also remains unresolved pending full catalog-setting parity.
@@ -315,7 +318,7 @@ introduced to claim parity.
 The original corpus includes `app.*` session variables, `current_setting`,
 role/database defaults, RLS policies, `RESET ALL`, and `DISCARD ALL`. A pgwire
 string map alone would be unsafe: policies must not silently trust a value a
-client can change. The remaining shape is a versioned setting registry in the
+client can change. The target shape uses a versioned setting registry in the
 SQL catalog with typed values, role/database defaults, explicit write authority,
 and an immutable request/session view. Each statement binds `current_setting`
 against that view alongside its schema epoch; native policy evaluation and SQL
@@ -327,6 +330,19 @@ Publication needs policy tests proving that unprivileged SET cannot widen row
 visibility, plus rollback, failover, cross-owner, and plan-invalidation tests.
 Until then, supported pgwire-only settings remain connection-scoped and the
 original `app.*`/policy/RESET ALL/DISCARD ALL cases remain unresolved.
+
+A typed, scoped setting snapshot/view pins names, identity generations,
+role/database defaults, and authorized session overlays. Constant and SQL
+scalar binding evaluate `current_setting('literal.name')` from that owner-captured
+view, including joined expressions and pull streams. Missing capture, stale
+generations, dynamic names, and client overlays on policy-sensitive values fail
+closed. Metadata Raft now owns durable setting records, revision-fenced
+publication, snapshot/import state, and an administrator-only public mutation
+route. The production SQL adapter obtains authenticated scoped snapshots; it
+does not grant SQL SET authority to mutate the durable registry. Native row
+policies, remote propagation, transaction/savepoint setting overlays, the
+complete RESET/DISCARD surface, and failover/security workload gates remain
+open. A durable setting registry alone is not policy parity.
 
 ### MERGE mutation lowering: partial
 
@@ -554,6 +570,17 @@ generation-level path without copying parent data requires a shared lifecycle:
    retain explicit work/cancellation budgets and cannot silently truncate a
    live-reference search.
 
+The owner-local pending record for step 2 is now encoded with a checksum and
+an exact topology fence, plan digest, child table, and FK generation. Restore
+plans pin untouched external parents, reserve their groups, and require parent
+fence receipts before child cutover. A private replicated control command stages
+pending retirement idempotently across restart; changed replays fail,
+cancellation removes it, and fence release and portable backup reject a
+retained pending record. Pending state has no read-side effect. Final-owner
+activation still needs an authenticated linearizable metadata publication
+proof; generation-aware native reference handling and resumable GC are also
+missing, so both SQL admission and metadata publication remain guarded.
+
 Acceptance needs crash/lost-ack tests at each fence, publication and activation
 boundary, cancellation on both sides of publication, parent mutations and new
 child inserts during cutover, stale prepared participants, nullable/MATCH PARTIAL
@@ -620,7 +647,7 @@ coordinator-only filter constitutes completion of this boundary.
   publication/restart evidence. `make sql-parity-evidence-check` runs referenced
   gates before the full corpus is resolved: the focused public API TRUNCATE
   suite passes eight tests without leaks and the staged-owner rewrite/empty-
-  generation driver passes two. The remaining 1,459 case dispositions still
+  generation driver passes two. The remaining 1,395 case dispositions still
   block release.
   The graph-index guard now inspects only selected tables after FK closure,
   so an unrelated graph table neither blocks admission nor incurs index-JSON

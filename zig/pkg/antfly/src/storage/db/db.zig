@@ -27381,6 +27381,7 @@ pub const DB = struct {
             std.mem.eql(u8, key, @import("relational_integrity_topology.zig").receipt_key) or
             std.mem.startsWith(u8, key, @import("relational_integrity_topology.zig").abort_prefix) or
             std.mem.eql(u8, key, @import("relational_integrity_retirement.zig").key) or
+            std.mem.eql(u8, key, @import("relational_integrity_generation_retirement.zig").key) or
             std.mem.eql(u8, key, @import("relational_integrity_handoff.zig").manifest_key) or
             std.mem.eql(u8, key, @import("relational_integrity_handoff.zig").progress_key) or
             std.mem.eql(u8, key, @import("relational_integrity_handoff.zig").prune_key);
@@ -28255,7 +28256,8 @@ pub const DB = struct {
             try txn.put(&internal_keys.identity_namespace_key, &namespace_bytes);
         }
         const topology = @import("relational_integrity_topology.zig");
-        if ((command.action == .transfer) != (command.transfer != null)) return error.InvalidBatchRequest;
+        if ((command.action == .transfer) != (command.transfer != null) or
+            (command.action == .stage_parent_retirement) != (command.parent_retirement != null)) return error.InvalidBatchRequest;
         switch (command.action) {
             .begin => {
                 if (try topology.current(&txn) == null) {
@@ -28359,6 +28361,12 @@ pub const DB = struct {
                 defer manager.deinit();
                 try topology.requireDrained(&txn, &manager, command.fence);
                 try @import("relational_integrity_handoff.zig").apply(self.alloc, &txn, command.fence, command.transfer.?);
+            },
+            .stage_parent_retirement => {
+                var manager = try self.core.initTxnManager();
+                defer manager.deinit();
+                const stage = command.parent_retirement.?;
+                try @import("relational_integrity_generation_retirement.zig").stagePending(self.alloc, &txn, &manager, command.fence, stage.plan_digest, stage.entries);
             },
             .prune => try @import("relational_integrity_handoff.zig").prune(self.alloc, &txn, command.fence, self.core.byteRange()),
         }

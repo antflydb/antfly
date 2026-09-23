@@ -11575,6 +11575,12 @@ pub const SortProfile = struct {
     }
 };
 
+/// Put a complete definition/default set or drop one by name.
+pub const SqlSettingMutationRequest = std.json.Value;
+
+/// One typed setting value, matching the declared kind.
+pub const SqlSettingValue = std.json.Value;
+
 /// Stateful Antfly query request. Canonical clients use graph_queries; deprecated graph_searches is retained only at the stateful public transport boundary for the v0.2 transition window.
 pub const StatefulQueryRequest = struct {
     table_target: ?CatalogTableTarget = null,

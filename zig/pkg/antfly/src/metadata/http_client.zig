@@ -124,6 +124,14 @@ pub const MetadataHttpClient = struct {
     alloc: std.mem.Allocator,
     executor: http_common.RequestExecutor,
     internal_service: ?internal_service_auth.Config = null,
+    setting_authority_secret: ?[]const u8 = null,
+    setting_authority_issuer: ?[]const u8 = null,
+
+    pub fn withSettingAuthority(self: *MetadataHttpClient, secret: ?[]const u8, issuer: ?[]const u8) *MetadataHttpClient {
+        self.setting_authority_secret = secret;
+        self.setting_authority_issuer = issuer;
+        return self;
+    }
 
     pub fn init(alloc: std.mem.Allocator, executor: http_common.RequestExecutor) MetadataHttpClient {
         return .{
@@ -1035,7 +1043,7 @@ pub const MetadataHttpClient = struct {
     /// Read-only retries are safe. The response proves the metadata identity;
     /// callers need no preceding status/discovery round trip on the happy path.
     pub fn readSystemCatalog(self: *MetadataHttpClient, base_uri: []const u8, input: system_catalog.Call, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !CatalogRead {
-        if (input == .mutate) return error.InvalidCatalogMutation;
+        if (input == .mutate or input == .setting_mutate) return error.InvalidCatalogMutation;
         if (remaining_ms == 0) return error.Timeout;
         if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
         const body = try std.json.Stringify.valueAlloc(self.alloc, input, .{});
@@ -1044,10 +1052,14 @@ pub const MetadataHttpClient = struct {
         const uri = try join(self.alloc, base_uri, "/internal/v1/system-catalog");
         defer self.alloc.free(uri);
         var remaining_buf: [10]u8 = undefined;
+        const authority = @import("../system_catalog/setting_authority.zig");
+        const grant = if (input == .setting_snapshot) try authority.sign(self.alloc, self.setting_authority_secret orelse return error.SettingAuthorityUnavailable, self.setting_authority_issuer orelse return error.SettingAuthorityUnavailable, .read, body, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s))) else null;
+        defer if (grant) |value| self.alloc.free(value);
         const headers = [_]http_common.RequestHeader{
             .{ .name = routes.Routes.raft_mutation_remaining_ms_header, .value = try std.fmt.bufPrint(&remaining_buf, "{d}", .{remaining_ms}) },
             .{ .name = routes.Routes.raft_mutation_forwards_remaining_header, .value = "0" },
             .{ .name = routes.Routes.raft_mutation_campaign_allowed_header, .value = "false" },
+            .{ .name = authority.header_name, .value = grant orelse "" },
         };
         var response = try internal_service_auth.executeRequest(self.alloc, self.executor, .{ .method = .POST, .uri = uri, .headers = &headers, .body = body, .content_type = "application/json", .timeout_ms = @min(default_request_timeout_ms, remaining_ms), .cancellation = cancellation }, self.internal_service);
         defer response.deinit(self.alloc);
@@ -1072,7 +1084,8 @@ pub const MetadataHttpClient = struct {
         };
     }
 
-    pub fn forwardSystemCatalog(self: *MetadataHttpClient, base_uri: []const u8, input: system_catalog.Call, forwarding: raft_mutation_forwarding.Context) ![]u8 {
+    pub fn forwardSystemCatalog(self: *MetadataHttpClient, base_uri: []const u8, input: system_catalog.Call, forwarding: raft_mutation_forwarding.Context, setting_admin: bool) ![]u8 {
+        if ((input == .setting_mutate) != setting_admin) return error.Forbidden;
         const body = try std.json.Stringify.valueAlloc(self.alloc, input, .{});
         defer self.alloc.free(body);
         if (body.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
@@ -1080,10 +1093,14 @@ pub const MetadataHttpClient = struct {
         defer self.alloc.free(uri);
         var remaining_buf: [10]u8 = undefined;
         var forwards_buf: [3]u8 = undefined;
+        const authority = @import("../system_catalog/setting_authority.zig");
+        const grant = if (setting_admin) try authority.sign(self.alloc, self.setting_authority_secret orelse return error.SettingAuthorityUnavailable, self.setting_authority_issuer orelse return error.SettingAuthorityUnavailable, .admin, body, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s))) else null;
+        defer if (grant) |value| self.alloc.free(value);
         const headers = [_]http_common.RequestHeader{
             .{ .name = routes.Routes.raft_mutation_remaining_ms_header, .value = try std.fmt.bufPrint(&remaining_buf, "{d}", .{forwarding.remaining_ms}) },
             .{ .name = routes.Routes.raft_mutation_forwards_remaining_header, .value = try std.fmt.bufPrint(&forwards_buf, "{d}", .{forwarding.forwards_remaining}) },
             .{ .name = routes.Routes.raft_mutation_campaign_allowed_header, .value = if (forwarding.campaign_allowed) "true" else "false" },
+            .{ .name = authority.header_name, .value = grant orelse "" },
         };
         var delivery: http_common.RequestDeliveryTracker = .{};
         var response = internal_service_auth.executeRequest(self.alloc, self.executor, .{ .method = .POST, .uri = uri, .headers = &headers, .body = body, .content_type = "application/json", .timeout_ms = @min(default_request_timeout_ms, forwarding.remaining_ms), .delivery_tracker = &delivery }, self.internal_service) catch |err| {

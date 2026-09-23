@@ -31,4 +31,5 @@ test {
     _ = @import("operators.zig");
     _ = @import("plan_cache.zig");
     _ = @import("session.zig");
+    _ = @import("setting_catalog.zig");
 }

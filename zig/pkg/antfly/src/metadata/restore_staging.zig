@@ -145,7 +145,27 @@ pub const Target = struct {
         fences: []const @import("../storage/db/relational_integrity_topology_contract.zig").Fence = &.{},
     } = null,
 };
+/// An untouched FK parent participates in an empty-generation cutover only to
+/// retire inverse references to the selected old child generations. Its rows
+/// and logical table identity remain unchanged.
+pub const ExternalFkParent = struct {
+    table: records.TableRecord,
+    ranges: []const records.RangeRecord,
+    fences: []const @import("../storage/db/relational_integrity_topology_contract.zig").Fence,
+    foreign_keys: []const struct {
+        child_table_id: u64,
+        child_table_name: []const u8,
+        constraint_name: []const u8,
+        generation: @import("../storage/db/relational_integrity_contract.zig").Generation,
+    },
+};
 pub const Plan = struct {
+    pub fn nativeJsonSkipField(self: @This(), comptime name: []const u8) bool {
+        // Preserve the canonical digest of in-flight plans created before
+        // external parents became an optional part of the envelope.
+        return std.mem.eql(u8, name, "external_fk_parents") and self.external_fk_parents.len == 0;
+    }
+
     id: Id,
     /// Authenticated server-issued aggregate manifest identity, not an
     /// independent set of user-selected table snapshot timestamps.
@@ -154,6 +174,7 @@ pub const Plan = struct {
     source_connection: []const u8 = "",
     skipped_tables: []const []const u8 = &.{},
     targets: []const Target,
+    external_fk_parents: []const ExternalFkParent = &.{},
     preparing_sources: bool = false,
 
     pub fn jsonStringify(self: Plan, jw: anytype) @TypeOf(jw.*).Error!void {
@@ -162,7 +183,7 @@ pub const Plan = struct {
 
     pub fn validate(self: Plan, alloc: std.mem.Allocator) !void {
         if (std.mem.allEqual(u8, &self.id, 0) or std.mem.allEqual(u8, &self.cohort_digest, 0) or
-            self.targets.len == 0 or self.targets.len > 128) return error.InvalidRestoreStaging;
+            self.targets.len == 0 or self.targets.len > 128 or self.external_fk_parents.len > 128) return error.InvalidRestoreStaging;
         if (self.skipped_tables.len > 128 or self.skipped_tables.len + self.targets.len > 128) return error.InvalidRestoreStaging;
         for (self.skipped_tables, 0..) |name, index| {
             if (name.len == 0 or name.len > 4096) return error.InvalidRestoreStaging;
@@ -183,6 +204,58 @@ pub const Plan = struct {
                 if (existing.found_existing) return error.InvalidRestoreStaging;
             }
         };
+        for (self.external_fk_parents, 0..) |parent, parent_index| {
+            if (self.preparing_sources or parent.table.table_id == 0 or parent.table.name.len == 0 or parent.table.relational_retirement_json.len != 0 or
+                parent.table.restore_backup_id.len != 0 or parent.ranges.len == 0 or parent.ranges.len > 4096 or parent.ranges.len != parent.table.min_ranges or parent.fences.len != parent.ranges.len or
+                parent.foreign_keys.len == 0 or parent.foreign_keys.len > 128) return error.InvalidRestoreStaging;
+            for (self.external_fk_parents[0..parent_index]) |previous| if (previous.table.table_id == parent.table.table_id or std.mem.eql(u8, previous.table.name, parent.table.name)) return error.InvalidRestoreStaging;
+            for (self.targets) |target| {
+                if (target.table.table_id == parent.table.table_id or target.source_table_id == parent.table.table_id or
+                    std.mem.eql(u8, target.table.name, parent.table.name)) return error.InvalidRestoreStaging;
+                if (target.replace) |old| if (old.table.table_id == parent.table.table_id) return error.InvalidRestoreStaging;
+            }
+            tables.validateCompleteKeyspaceRanges(parent.ranges) catch return error.InvalidRestoreStaging;
+            old_range_count = std.math.add(usize, old_range_count, parent.ranges.len) catch return error.InvalidRestoreStaging;
+            if (old_range_count > 4096) return error.InvalidRestoreStaging;
+            schema_bytes = std.math.add(usize, schema_bytes, parent.table.schema_json.len +| parent.table.read_schema_json.len +| parent.table.indexes_json.len) catch return error.InvalidRestoreStaging;
+            if (schema_bytes > 4 * 1024 * 1024) return error.InvalidRestoreStaging;
+            for (parent.ranges) |range| {
+                if (range.table_id != parent.table.table_id or range.restore_backup_id.len != 0) return error.InvalidRestoreStaging;
+                try @import("../common/group_ids.zig").requireDataGroupId(range.group_id);
+                if ((try group_ids.getOrPut(alloc, range.group_id)).found_existing) return error.InvalidRestoreStaging;
+                const fence = for (parent.fences) |item| {
+                    if (item.owner_group_id == range.group_id) break item;
+                } else return error.InvalidRestoreStaging;
+                _ = try fence.encode();
+                if (fence.role != .truncate_parent or fence.namespace.table_id != parent.table.table_id or
+                    fence.namespace.shard_id != tables.rangeDocIdentityShardId(range) or fence.namespace.range_id != tables.rangeDocIdentityRangeId(range) or
+                    fence.peer_group_id != range.group_id or fence.transition_id != std.mem.readInt(u64, self.id[0..8], .little) or
+                    fence.attempt != std.mem.readInt(u64, self.id[8..16], .little)) return error.InvalidRestoreStaging;
+            }
+            for (parent.fences, 0..) |fence, index| for (parent.fences[0..index]) |prior| if (prior.owner_group_id == fence.owner_group_id) return error.InvalidRestoreStaging;
+            for (parent.foreign_keys, 0..) |foreign, index| {
+                if (foreign.child_table_id == 0 or foreign.child_table_name.len == 0 or foreign.child_table_name.len > 256 or
+                    foreign.constraint_name.len == 0 or foreign.constraint_name.len > 256 or std.mem.allEqual(u8, &foreign.generation, 0)) return error.InvalidRestoreStaging;
+                for (parent.foreign_keys[0..index]) |prior| if ((prior.child_table_id == foreign.child_table_id and std.mem.eql(u8, prior.constraint_name, foreign.constraint_name)) or
+                    std.mem.eql(u8, &prior.generation, &foreign.generation)) return error.InvalidRestoreStaging;
+                for (self.external_fk_parents[0..parent_index]) |previous_parent| for (previous_parent.foreign_keys) |prior| if (std.mem.eql(u8, &prior.generation, &foreign.generation)) return error.InvalidRestoreStaging;
+                const child = for (self.targets) |target| {
+                    if (!target.empty_generation or target.source_table_id != foreign.child_table_id) continue;
+                    break target.replace.?.table;
+                } else return error.InvalidRestoreStaging;
+                if (!std.mem.eql(u8, child.name, foreign.child_table_name)) return error.InvalidRestoreStaging;
+                var found = false;
+                for ([_][]const u8{ child.schema_json, child.read_schema_json }) |definition| {
+                    if (definition.len == 0) continue;
+                    var schema = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, definition);
+                    defer schema.deinit(alloc);
+                    if (schema.foreign_keys) |fks| for (fks.value) |fk| if (std.mem.eql(u8, fk.name, foreign.constraint_name) and std.mem.eql(u8, fk.parent_table, parent.table.name)) {
+                        found = true;
+                    };
+                }
+                if (!found) return error.InvalidRestoreStaging;
+            }
+        }
         for (self.targets, 0..) |target, index| {
             const table = target.table;
             if (target.empty_generation) {
@@ -328,9 +401,14 @@ pub const Plan = struct {
                     if (schema.storage_mode != required_mode) return error.InvalidRestoreStaging;
                 }
                 if (schema.foreign_keys) |foreign_keys| for (foreign_keys.value) |fk| {
-                    const parent = for (self.targets) |candidate| {
-                        if (std.mem.eql(u8, candidate.table.name, fk.parent_table)) break candidate.table;
-                    } else return error.RestoreDependencyMissing;
+                    const parent = blk: {
+                        for (self.targets) |candidate| if (std.mem.eql(u8, candidate.table.name, fk.parent_table)) break :blk candidate.table;
+                        for (self.external_fk_parents) |external| if (std.mem.eql(u8, external.table.name, fk.parent_table)) {
+                            for (external.foreign_keys) |foreign| if (foreign.child_table_id == target.source_table_id and std.mem.eql(u8, foreign.constraint_name, fk.name)) break :blk external.table;
+                            return error.RestoreDependencyMissing;
+                        };
+                        return error.RestoreDependencyMissing;
+                    };
                     try @import("../schema/relational_foreign_key_target.zig").validate(alloc, schema_json, parent.name, parent.schema_json);
                 };
             }
@@ -504,7 +582,7 @@ pub const OwnerReceipt = struct {
 pub const Command = struct {
     id: Id,
     expected_revision: u64 = 0,
-    action: enum { reserve, cancel_reservation, imported, validated, begin_cutover, old_fenced, publish, begin_cancel, canceled, finish_cancel, freeze_rewrite, rewrite_source_ready },
+    action: enum { reserve, cancel_reservation, imported, validated, begin_cutover, old_fenced, publish, begin_cancel, canceled, finish_cancel, freeze_rewrite, rewrite_source_ready, parent_fenced },
     plan: ?Plan = null,
     receipt: ?OwnerReceipt = null,
     source_artifact: ?SourceArtifact = null,
@@ -538,7 +616,7 @@ pub const Command = struct {
                 !artifact.source_namespace.eql(scope.fence.namespace) or artifact.target_group_id != scope.fence.peer_group_id or
                 scope.fence.transition_id != std.mem.readInt(u64, self.id[0..8], .little) or scope.fence.attempt != std.mem.readInt(u64, self.id[8..16], .little)) return error.InvalidRestoreStaging;
         }
-        const needs_receipt = self.action == .imported or self.action == .validated or self.action == .old_fenced or self.action == .canceled;
+        const needs_receipt = self.action == .imported or self.action == .validated or self.action == .old_fenced or self.action == .canceled or self.action == .parent_fenced;
         if (needs_receipt != (self.receipt != null)) return error.InvalidRestoreStaging;
         if (self.receipt) |receipt| {
             if (receipt.group_id == 0 or receipt.range_id == 0 or std.mem.allEqual(u8, &receipt.plan_digest, 0) or
@@ -575,7 +653,7 @@ pub fn nameKey(buf: []u8, metadata_group_id: u64, name: []const u8) ![]const u8 
     return std.fmt.bufPrint(buf, "\x00\x00__metadata__:restore_staging:{d}:name:{s}", .{ metadata_group_id, name });
 }
 
-pub fn identityKey(buf: []u8, metadata_group_id: u64, kind: enum { table, group, old_table }, id: u64) ![]const u8 {
+pub fn identityKey(buf: []u8, metadata_group_id: u64, kind: enum { table, group, old_table, parent_table, parent_group }, id: u64) ![]const u8 {
     return std.fmt.bufPrint(buf, "\x00\x00__metadata__:restore_staging:{d}:{s}:{d}", .{ metadata_group_id, @tagName(kind), id });
 }
 
@@ -617,6 +695,44 @@ test "relational integrity restore staging empty generation binds old fences wit
     targets[0].replace.?.fences = &.{fence};
     targets[0].table.schema_json = "{\"version\":2}";
     try std.testing.expectError(error.InvalidRestoreStaging, plan.validate(alloc));
+}
+
+test "relational integrity restore staging pins an untouched FK parent and exact child generation" {
+    const alloc = std.testing.allocator;
+    const id = try idForAttempt(7, 1);
+    const child_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"fk","child_columns":["id"],"parent_table":"parents","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const parent_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const old: records.TableRecord = .{ .table_id = 9, .name = "children", .schema_json = child_schema };
+    const old_range: records.RangeRecord = .{ .table_id = 9, .group_id = 301, .start_key = "" };
+    const old_fence: @import("../storage/db/relational_integrity_topology_contract.zig").Fence = .{ .role = .rewrite_source, .transition_id = 7, .attempt = 1, .owner_group_id = 301, .peer_group_id = 401, .namespace = .{ .table_id = 9, .shard_id = 301, .range_id = 301 }, .catalog_digest = @splat(4) };
+    const target: Target = .{ .source_table_id = 9, .empty_generation = true, .table = .{ .table_id = 10, .name = "children", .schema_json = child_schema }, .ranges = &.{.{ .table_id = 10, .group_id = 401, .range_id = 401, .doc_identity_shard_id = 401, .doc_identity_range_id = 401, .start_key = "" }}, .replace = .{ .table = old, .ranges = &.{old_range}, .fences = &.{old_fence} } };
+    const parent_range: records.RangeRecord = .{ .table_id = 11, .group_id = 501, .start_key = "" };
+    const parent_fence: @import("../storage/db/relational_integrity_topology_contract.zig").Fence = .{ .role = .truncate_parent, .transition_id = 7, .attempt = 1, .owner_group_id = 501, .peer_group_id = 501, .namespace = .{ .table_id = 11, .shard_id = 501, .range_id = 501 }, .catalog_digest = @splat(6) };
+    const parent: ExternalFkParent = .{ .table = .{ .table_id = 11, .name = "parents", .schema_json = parent_schema }, .ranges = &.{parent_range}, .fences = &.{parent_fence}, .foreign_keys = &.{.{ .child_table_id = 9, .child_table_name = "children", .constraint_name = "fk", .generation = @splat(5) }} };
+    const plan: Plan = .{ .id = id, .cohort_digest = @splat(3), .targets = &.{target}, .external_fk_parents = &.{parent} };
+    try plan.validate(alloc);
+    var missing = plan;
+    missing.external_fk_parents = &.{};
+    try std.testing.expectError(error.RestoreDependencyMissing, missing.validate(alloc));
+    var wrong = parent;
+    wrong.foreign_keys = &.{.{ .child_table_id = 9, .child_table_name = "children", .constraint_name = "other", .generation = @splat(5) }};
+    var bad = plan;
+    bad.external_fk_parents = &.{wrong};
+    try std.testing.expectError(error.InvalidRestoreStaging, bad.validate(alloc));
+    wrong = parent;
+    wrong.foreign_keys = &.{.{ .child_table_id = 9, .child_table_name = "renamed_children", .constraint_name = "fk", .generation = @splat(5) }};
+    bad.external_fk_parents = &.{wrong};
+    try std.testing.expectError(error.InvalidRestoreStaging, bad.validate(alloc));
+    wrong = parent;
+    var wrong_fence = parent_fence;
+    wrong_fence.namespace.table_id = 12;
+    wrong.fences = &.{wrong_fence};
+    bad.external_fk_parents = &.{wrong};
+    try std.testing.expectError(error.InvalidRestoreStaging, bad.validate(alloc));
 }
 
 test "relational integrity restore staging shares one plan across document and typed tables" {

@@ -103,6 +103,12 @@ pub const RequestDiagnostics = struct {
 };
 
 pub const RequestContext = struct {
+    /// Granted only after administrator authentication by a trusted native
+    /// ingress. Metadata HTTP never reconstructs this from request JSON.
+    setting_admin: bool = false,
+    /// Exact authenticated SQL credential principal; distinct from username
+    /// for API keys and derived only by trusted API/pgwire ingress.
+    setting_read_principal: ?[]const u8 = null,
     /// Set only by the administrator-authorized relational recovery routes.
     relational_recovery: enum { none, repair, retry, retire } = .none,
     relational_retirement_target: ?[]const u8 = null,

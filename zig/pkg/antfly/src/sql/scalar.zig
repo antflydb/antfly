@@ -9,6 +9,7 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const datetime = @import("../datetime.zig");
 const json_order = @import("json_order.zig");
+const setting_catalog = @import("setting_catalog.zig");
 const Allocator = std.mem.Allocator;
 const Json = std.json.Value;
 pub const Datum = struct {
@@ -26,7 +27,7 @@ pub const Type = struct { kind: ?ast.ColumnType = null, nullable: bool = true };
 pub const Column = struct { name: []const u8, type: ast.ColumnType, nullable: bool = true };
 pub const BindLimits = struct { nodes: usize = 8192, depth: usize = 64, parameters: usize = 1024 };
 pub const EvalLimits = struct { steps: usize = 65_536, depth: usize = 64, output_bytes: usize = 1024 * 1024 };
-pub const Function = enum { abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, @"$single", @"$pattern_quantified" };
+pub const Function = enum { abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified" };
 
 pub const Instruction = struct {
     type: Type,
@@ -36,7 +37,7 @@ pub const Instruction = struct {
         parameter: u32,
         unary: struct { op: ast.Scalar.Unary, operand: u32 },
         binary: struct { op: ast.Scalar.Binary, left: u32, right: u32 },
-        call: struct { function: Function, args: []const u32 },
+        call: struct { function: Function, args: []const u32, setting_identity: ?setting_catalog.Identity = null },
         cast: struct { operand: u32, type: ast.ColumnType },
         case_when: struct { branches: []const Branch, otherwise: ?u32 },
         in_list: struct { operand: u32, values: []const u32, negated: bool },
@@ -51,6 +52,7 @@ pub const Program = struct {
     output_type: Type,
     parameter_types: []const ?ast.ColumnType,
     required_columns: []const u32,
+    settings: ?*const setting_catalog.View = null,
 
     pub fn deinit(self: *Program) void {
         self.arena.deinit();
@@ -70,6 +72,10 @@ pub const Program = struct {
 
 pub fn bind(alloc: Allocator, expression: *const ast.Scalar, columns: []const Column, parameter_hints: []const ?ast.ColumnType, limits: BindLimits) !Program {
     return bindExpected(alloc, expression, columns, parameter_hints, null, limits);
+}
+
+pub fn bindWithSettings(alloc: Allocator, expression: *const ast.Scalar, columns: []const Column, parameter_hints: []const ?ast.ColumnType, limits: BindLimits, settings: ?*const setting_catalog.View) !Program {
+    return bindExpectedWithSettings(alloc, expression, columns, parameter_hints, null, limits, settings);
 }
 
 /// Constraint pass for statement-wide inference. Unconstrained parameters
@@ -105,10 +111,14 @@ pub fn inferOutput(alloc: Allocator, expression: *const ast.Scalar, columns: []c
 }
 
 pub fn bindExpected(alloc: Allocator, expression: *const ast.Scalar, columns: []const Column, parameter_hints: []const ?ast.ColumnType, expected: ?ast.ColumnType, limits: BindLimits) !Program {
+    return bindExpectedWithSettings(alloc, expression, columns, parameter_hints, expected, limits, null);
+}
+
+pub fn bindExpectedWithSettings(alloc: Allocator, expression: *const ast.Scalar, columns: []const Column, parameter_hints: []const ?ast.ColumnType, expected: ?ast.ColumnType, limits: BindLimits, settings: ?*const setting_catalog.View) !Program {
     if (limits.parameters > 1024 or parameter_hints.len > limits.parameters or limits.nodes == 0) return error.SqlProgramLimitExceeded;
     var arena = std.heap.ArenaAllocator.init(alloc);
     errdefer arena.deinit();
-    var binder: Binder = .{ .alloc = arena.allocator(), .columns = columns, .limits = limits };
+    var binder: Binder = .{ .alloc = arena.allocator(), .columns = columns, .limits = limits, .settings = settings };
     for (columns, 0..) |column, i| {
         const entry = try binder.names.getOrPut(binder.alloc, column.name);
         if (entry.found_existing) return error.AmbiguousSqlColumn;
@@ -125,6 +135,7 @@ pub fn bindExpected(alloc: Allocator, expression: *const ast.Scalar, columns: []
         .output_type = output_type,
         .parameter_types = try binder.alloc.dupe(?ast.ColumnType, binder.parameters[0..binder.parameter_count]),
         .required_columns = try binder.dependencies.toOwnedSlice(binder.alloc),
+        .settings = settings,
     };
 }
 
@@ -154,7 +165,7 @@ fn functionId(name: []const u8) !Function {
 }
 fn arity(function: Function, count: usize) !void {
     const valid = switch (function) {
-        .abs, .lower, .upper, .length, .octet_length, .ceil, .floor, .round, .sqrt, .to_timestamp => count == 1,
+        .abs, .lower, .upper, .length, .octet_length, .ceil, .floor, .round, .sqrt, .to_timestamp, .current_setting => count == 1,
         .nullif, .power, .mod, .starts_with, .date_part, .date_trunc, .@"$single" => count == 2,
         .@"$pattern_quantified" => count == 5,
         .substring => count == 2 or count == 3,
@@ -177,6 +188,7 @@ const Binder = struct {
     parameters: [1024]?ast.ColumnType = @splat(null),
     parameter_count: usize = 0,
     allow_unresolved: bool = false,
+    settings: ?*const setting_catalog.View = null,
 
     fn infer(self: *Binder, expression: *const ast.Scalar, depth: usize) anyerror!Type {
         if (depth >= self.limits.depth) return error.SqlProgramLimitExceeded;
@@ -233,6 +245,11 @@ const Binder = struct {
                 }
                 const function = try functionId(call.name);
                 try arity(function, call.args.len);
+                if (function == .current_setting) {
+                    const name = call.args[0];
+                    if (name.* != .literal or name.literal != .string) return error.UnsupportedSqlShape;
+                    break :blk .{ .kind = .string, .nullable = false };
+                }
                 if (function == .@"$pattern_quantified") {
                     for (call.args, 0..) |arg, index| {
                         const actual = try self.infer(arg, depth + 1);
@@ -350,6 +367,13 @@ const Binder = struct {
                     break :blk .{ .literal = .{ .integer = 1 } };
                 }
                 const function = try functionId(call.name);
+                if (function == .current_setting) {
+                    if (self.allow_unresolved) break :blk .{ .literal = .{ .string = "" } };
+                    const view = self.settings orelse return error.SettingCatalogUnavailable;
+                    if (call.args[0].* != .literal or call.args[0].literal != .string) return error.UnsupportedSqlShape;
+                    const resolved = try view.resolve(call.args[0].literal.string);
+                    break :blk .{ .call = .{ .function = function, .args = &.{}, .setting_identity = resolved.identity } };
+                }
                 const args = try self.alloc.alloc(u32, call.args.len);
                 for (call.args, args, 0..) |arg, *out, i| {
                     const desired: ?ast.ColumnType = switch (function) {
@@ -480,6 +504,15 @@ const Evaluator = struct {
                 break :blk if (unknown) .{} else Datum.json(.{ .bool = list.negated });
             },
             .call => |call| blk: {
+                if (call.function == .current_setting) {
+                    const view = self.program.settings orelse return error.SettingCatalogUnavailable;
+                    const value = try view.resolveDependency(call.setting_identity orelse return error.InvalidSqlProgram);
+                    break :blk Datum.json(.{ .string = switch (value) {
+                        .string => |v| v,
+                        .boolean => |v| if (v) "true" else "false",
+                        .integer => |v| try std.fmt.allocPrint(self.alloc, "{d}", .{v}),
+                    } });
+                }
                 switch (call.function) {
                     .@"$single" => {
                         const count = try self.runDatum(call.args[1], depth + 1);

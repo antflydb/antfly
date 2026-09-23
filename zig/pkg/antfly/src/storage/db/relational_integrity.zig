@@ -718,6 +718,22 @@ test "relational integrity shared parent guards and fenced bounded action recove
         try std.testing.expectError(error.IntentConflict, testPrepareEffects(&store, &manager, @splat(4), stale_release.operations));
         try manager.resolveIntents(@splat(2), .committed, 2);
         try manager.resolveIntents(@splat(3), .committed, 2);
+        // A staged TRUNCATE parent tombstone is not a publication receipt.
+        // Native RESTRICT planning and participant validation still see the
+        // committed child references.
+        const topology = @import("relational_integrity_topology.zig");
+        const retirement = @import("relational_integrity_generation_retirement.zig");
+        const fence: topology.Fence = .{ .role = .truncate_parent, .transition_id = 11, .attempt = 1, .peer_group_id = 21, .owner_group_id = 31, .namespace = .{ .table_id = 41, .shard_id = 31, .range_id = 31 }, .catalog_digest = @splat(4) };
+        const encoded_fence = try fence.encode();
+        try store.put(topology.fence_key, &encoded_fence);
+        const pending = try retirement.encodePending(alloc, fence, @splat(5), &.{.{ .child_table_id = 51, .child_table_name = first.child_table, .constraint_name = first.constraint_name, .generation = first.constraint_generation }});
+        defer alloc.free(pending);
+        try store.put(retirement.key, pending);
+        var pending_read = try store.beginReadTxn();
+        defer pending_read.abort();
+        try std.testing.expectError(error.ForeignKeyReferenced, prepare(alloc, &pending_read, &.{
+            .{ .address = address, .operation = .{ .release = .{ .parent_table = "parent", .parent_key = "p" } } },
+        }));
         // Claim bytes did not change. Participant prefix proof must still
         // reject the release planned before the two child references existed.
         try std.testing.expectError(error.ForeignKeyReferenced, testPrepareEffects(&store, &manager, @splat(4), stale_release.operations));

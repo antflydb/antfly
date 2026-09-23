@@ -95,6 +95,9 @@ pub const StandaloneCatalogUpdate = struct {
     remove_ranges: []const u64 = &.{},
     auxiliary_json: ?[]const u8 = null,
     import_catalog: ?@import("../../system_catalog/domain.zig").State = null,
+    /// Applied in the same local transaction as the standalone revision and
+    /// mirrored outbox. Mutually exclusive with an ordinary logical delta.
+    setting_command: ?@import("../../system_catalog/settings.zig").Command = null,
     logical: ?struct {
         previous_revision: u64,
         delta: @import("../../system_catalog/domain.zig").Delta,

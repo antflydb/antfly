@@ -803,6 +803,9 @@ const LocalStandaloneMetadata = struct {
         previous_extensions: ?antfly.extensions.ExtensionCatalog = null,
         compare_and_replace_table: ?u64 = null,
         catalog_change: ?system_catalog.MutableState.Change = null,
+        setting_command: ?@import("../system_catalog/settings.zig").Command = null,
+        previous_settings: ?system_catalog.MutableState.OwnedSettings = null,
+        changed_settings: bool = false,
         previous_epoch: u64,
         committed: bool = false,
 
@@ -846,11 +849,37 @@ const LocalStandaloneMetadata = struct {
             if (metadata.system_catalog_state == null) metadata.system_catalog_state = try system_catalog.MutableState.clone(metadata.alloc, .{});
             self.catalog_change = try metadata.system_catalog_state.?.apply(delta);
         }
+        fn applySettings(self: *CatalogMutation, metadata: *LocalStandaloneMetadata, records: []const @import("../system_catalog/settings.zig").Record, command: @import("../system_catalog/settings.zig").Command) !void {
+            std.debug.assert(!self.changed_settings and self.catalog_change == null);
+            if (metadata.system_catalog_state == null) metadata.system_catalog_state = try system_catalog.MutableState.clone(metadata.alloc, .{});
+            const catalog = &metadata.system_catalog_state.?;
+            var replacement = try system_catalog.MutableState.cloneSettings(metadata.alloc, records);
+            errdefer replacement.deinit();
+            // The empty delta advances the shared catalog revision without
+            // changing resource bindings. Undo is allocation-free.
+            const next_id = if (command.change == .put and command.change.put.identity.id == catalog.value.next_id) try std.math.add(u64, catalog.value.next_id, 1) else catalog.value.next_id;
+            self.catalog_change = try catalog.apply(.{ .upserts = @constCast(&[_]system_catalog.Resource{}), .removes = @constCast(&[_]system_catalog.Resource{}), .next_id = next_id });
+            self.previous_settings = catalog.owned_settings;
+            catalog.owned_settings = replacement;
+            catalog.value.settings = catalog.owned_settings.?.value;
+            self.setting_command = command;
+            self.changed_settings = true;
+        }
         fn commit(self: *CatalogMutation, metadata: *LocalStandaloneMetadata) !void {
             try metadata.persistMutationLocked(self);
         }
         fn deinit(self: *CatalogMutation, metadata: *LocalStandaloneMetadata) void {
             if (self.catalog_change) |*change| change.finish(&metadata.system_catalog_state.?, self.committed);
+            if (self.changed_settings) {
+                const catalog = &metadata.system_catalog_state.?;
+                if (self.committed) {
+                    if (self.previous_settings) |*previous| previous.deinit();
+                } else {
+                    if (catalog.owned_settings) |*current| current.deinit();
+                    catalog.owned_settings = self.previous_settings;
+                    catalog.value.settings = if (catalog.owned_settings) |owned| owned.value else &.{};
+                }
+            }
             if (self.previous_extensions) |*previous| {
                 if (self.committed) previous.deinit() else {
                     metadata.extension_catalog.deinit();
@@ -2085,19 +2114,19 @@ const LocalStandaloneMetadata = struct {
         admitted.cancellation = .none;
         const result = try systemCatalogAdmitted(ptr, alloc, admitted, call);
         errdefer alloc.free(result);
-        if (call != .mutate) try context.ensureActive();
+        if (call != .mutate and call != .setting_mutate) try context.ensureActive();
         return result;
     }
 
     fn systemCatalogAdmitted(ptr: *anyopaque, alloc: std.mem.Allocator, context: antfly.public_api.operation.RequestContext, call: system_catalog.Call) ![]u8 {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         try context.ensureActive();
-        if (call == .mutate) if (self.ha_catalog_server) |server| {
+        if (call == .mutate or call == .setting_mutate) if (self.ha_catalog_server) |server| {
             try server.ha_public_gate_state.checkWrite(server.ha_public_gate_state.currentGeneration());
         };
-        var lease = if (call == .mutate) (if (self.ha_catalog_server) |server| server.ha_mutation_barrier.acquireShared() else null) else null;
+        var lease = if (call == .mutate or call == .setting_mutate) (if (self.ha_catalog_server) |server| server.ha_mutation_barrier.acquireShared() else null) else null;
         defer if (lease) |*value| value.release();
-        if (call == .mutate) if (self.ha_catalog_server) |server| {
+        if (call == .mutate or call == .setting_mutate) if (self.ha_catalog_server) |server| {
             try server.ha_public_gate_state.checkWrite(server.ha_public_gate_state.currentGeneration());
         };
         if (!lockAtomicUntil(&self.mutex, context.deadline_ns)) return error.DeadlineExceeded;
@@ -2115,6 +2144,60 @@ const LocalStandaloneMetadata = struct {
             return std.json.Stringify.valueAlloc(alloc, capture.value, .{});
         }
         switch (call) {
+            .setting_snapshot => |scope| {
+                const settings = @import("../system_catalog/settings.zig");
+                if (scope.principal.len == 0 or scope.database.len == 0) return error.InvalidSettingRecord;
+                if (context.principal != null) if (!std.mem.eql(u8, context.setting_read_principal orelse return error.Forbidden, scope.principal)) return error.Forbidden;
+                const state = self.systemCatalogState();
+                const definitions = try alloc.alloc(settings.Definition, state.settings.len);
+                defer alloc.free(definitions);
+                for (state.settings, definitions) |record, *definition| definition.* = record.effective(scope.principal, scope.database);
+                return std.json.Stringify.valueAlloc(alloc, settings.Snapshot{ .scope = scope, .epoch = @max(1, state.revision), .definitions = definitions }, .{});
+            },
+            .setting_mutate => |request| {
+                const settings = @import("../system_catalog/settings.zig");
+                if (!context.setting_admin) return error.Forbidden;
+                const state = self.systemCatalogState();
+                var command: settings.Command = .{ .expected_revision = state.revision, .change = undefined };
+                var arena = std.heap.ArenaAllocator.init(alloc);
+                defer arena.deinit();
+                const a = arena.allocator();
+                var records: std.ArrayList(settings.Record) = .empty;
+                try records.appendSlice(a, state.settings);
+                switch (request) {
+                    .put => |input| {
+                        var prior_index: ?usize = null;
+                        for (records.items, 0..) |record, i| if (std.ascii.eqlIgnoreCase(record.name, input.name)) {
+                            prior_index = i;
+                            break;
+                        };
+                        if (prior_index) |i| if (input.matches(records.items[i])) return std.json.Stringify.valueAlloc(alloc, system_catalog.Meta{ .revision = state.revision, .next_id = state.next_id }, .{});
+                        const identity: settings.Identity = if (prior_index) |i| .{ .id = records.items[i].identity.id, .generation = try std.math.add(u64, records.items[i].identity.generation, 1) } else .{ .id = state.next_id, .generation = 1 };
+                        const record = input.record(identity);
+                        try record.validate();
+                        if (prior_index) |i| records.items[i] = record else try records.append(a, record);
+                        command.change = .{ .put = record };
+                    },
+                    .drop => |name| {
+                        try settings.validateName(name);
+                        const prior_index = for (records.items, 0..) |record, i| {
+                            if (std.ascii.eqlIgnoreCase(record.name, name)) break i;
+                        } else return std.json.Stringify.valueAlloc(alloc, system_catalog.Meta{ .revision = state.revision, .next_id = state.next_id }, .{});
+                        command.change = .{ .drop = records.items[prior_index].identity };
+                        _ = records.orderedRemove(prior_index);
+                    },
+                }
+                const encoded = try std.json.Stringify.valueAlloc(a, command, .{});
+                if (encoded.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
+                var mutation = try self.beginCatalogMutationLocked();
+                defer mutation.deinit(self);
+                try mutation.applySettings(self, records.items, command);
+                self.epoch +|= 1;
+                try mutation.commit(self);
+                var hash: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(encoded, &hash, .{});
+                return std.json.Stringify.valueAlloc(alloc, system_catalog.Meta{ .revision = self.systemCatalogState().revision, .next_id = self.systemCatalogState().next_id, .last_command = hash }, .{});
+            },
             .table_status, .list_tables => unreachable,
             .export_snapshot => {
                 const tables = try self.manager.listTables(alloc);
@@ -3082,6 +3165,7 @@ const LocalStandaloneMetadata = struct {
         table: antfly.metadata.TableRecord,
         range: antfly.metadata.RangeRecord,
         resource: system_catalog.Resource,
+        setting: @import("../system_catalog/settings.zig").Record,
         extensions: PersistedCatalog,
     };
     const catalog_head_key = @import("catalog_format.zig").head_key;
@@ -3140,6 +3224,7 @@ const LocalStandaloneMetadata = struct {
         var tables: std.ArrayListUnmanaged(antfly.metadata.TableRecord) = .empty;
         var ranges: std.ArrayListUnmanaged(antfly.metadata.RangeRecord) = .empty;
         var resources: std.ArrayListUnmanaged(system_catalog.Resource) = .empty;
+        var settings: std.ArrayListUnmanaged(@import("../system_catalog/settings.zig").Record) = .empty;
         var extensions: PersistedCatalog = .{};
         var cursor = try txn.openCursor();
         defer cursor.close();
@@ -3153,13 +3238,14 @@ const LocalStandaloneMetadata = struct {
                 .table => |value| try tables.append(a, value),
                 .range => |value| try ranges.append(a, value),
                 .resource => |value| try resources.append(a, value),
+                .setting => |value| try settings.append(a, value),
                 .extensions => |value| extensions = value,
             }
         }
         const loaded = try self.manager.replaceProjectedTopology(tables.items, ranges.items);
         if (loaded.skipped_orphan_ranges != 0) return error.InvalidCatalogRecord;
         try self.extension_catalog.loadProjectedRows(extensions.extension_packages, extensions.installed_extensions, extensions.extension_members, extensions.extension_dependencies);
-        self.system_catalog_state = try system_catalog.MutableState.clone(self.alloc, .{ .revision = head.value.revision, .next_id = head.value.next_id, .resources = resources.items });
+        self.system_catalog_state = try system_catalog.MutableState.clone(self.alloc, .{ .revision = head.value.revision, .next_id = head.value.next_id, .resources = resources.items, .settings = settings.items });
         self.epoch = head.value.epoch;
         self.catalog_rows_initialized = true;
         return true;
@@ -3229,6 +3315,7 @@ const LocalStandaloneMetadata = struct {
             .table => |r| std.fmt.allocPrint(alloc, catalog_row_prefix ++ "table/{d}", .{r.table_id}),
             .range => |r| std.fmt.allocPrint(alloc, catalog_row_prefix ++ "range/{d}", .{r.group_id}),
             .resource => |r| std.fmt.allocPrint(alloc, catalog_row_prefix ++ "resource/{s}/{d}", .{ @tagName(r.kind), r.id }),
+            .setting => |r| std.fmt.allocPrint(alloc, catalog_row_prefix ++ "setting/{d}", .{r.identity.id}),
             .extensions => alloc.dupe(u8, catalog_row_prefix ++ "extensions"),
         };
     }
@@ -3448,7 +3535,8 @@ const LocalStandaloneMetadata = struct {
             .remove_tables = remove_tables.items,
             .remove_ranges = remove_ranges.items,
             .auxiliary_json = if (mutation.previous_extensions != null) try self.auxiliaryCatalogAlloc(a) else null,
-            .logical = if (mutation.catalog_change) |change| .{
+            .setting_command = mutation.setting_command,
+            .logical = if (mutation.setting_command != null) null else if (mutation.catalog_change) |change| .{
                 .previous_revision = change.revision,
                 .delta = .{ .removes = change.previous.items, .upserts = change.inserted.items, .next_id = self.systemCatalogState().next_id },
             } else null,
@@ -3482,6 +3570,7 @@ const LocalStandaloneMetadata = struct {
             var ranges = self.manager.ranges.valueIterator();
             while (ranges.next()) |row| try putCatalogRow(self.alloc, &txn, .{ .range = row.* });
             for (self.systemCatalogState().resources) |row| try putCatalogRow(self.alloc, &txn, .{ .resource = row });
+            for (self.systemCatalogState().settings) |row| try putCatalogRow(self.alloc, &txn, .{ .setting = row });
         } else {
             var tables = mutation.previous_tables.iterator();
             while (tables.next()) |entry| {
@@ -3494,6 +3583,12 @@ const LocalStandaloneMetadata = struct {
             if (mutation.catalog_change) |change| {
                 for (change.previous.items) |old| try removeCatalogRow(self.alloc, &txn, .{ .resource = old });
                 for (change.inserted.items) |row| try putCatalogRow(self.alloc, &txn, .{ .resource = row });
+            }
+            if (mutation.changed_settings) {
+                if (mutation.previous_settings) |previous| {
+                    for (previous.value) |row| try removeCatalogRow(self.alloc, &txn, .{ .setting = row });
+                }
+                for (self.systemCatalogState().settings) |row| try putCatalogRow(self.alloc, &txn, .{ .setting = row });
             }
         }
         if (!self.catalog_rows_initialized or mutation.previous_extensions != null) try putCatalogRow(self.alloc, &txn, .{ .extensions = .{
@@ -11895,11 +11990,15 @@ test "system catalog imports released row journal once into native authority" {
         defer metadata.deinit();
         const result = try metadata.statusSource().systemCatalog(alloc, .{}, .{ .mutate = .{ .mutation = .{ .action = .create, .kind = .database, .name = "imported" } } });
         alloc.free(result);
+        const setting = try metadata.statusSource().systemCatalog(alloc, .{ .setting_admin = true }, .{ .setting_mutate = .{ .put = .{ .name = "app.imported", .kind = .boolean, .default = .{ .boolean = true } } } });
+        alloc.free(setting);
     }
     {
         var native = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local);
         defer native.deinit();
         try std.testing.expect(native.system_catalog_state.?.index.find(.database, 0, "imported") != null);
+        try std.testing.expectEqual(@as(usize, 1), native.systemCatalogState().settings.len);
+        try std.testing.expectEqualStrings("app.imported", native.systemCatalogState().settings[0].name);
         try std.testing.expect(native.owned_catalog_store == null);
         const result = try native.statusSource().systemCatalog(alloc, .{}, .{ .mutate = .{ .mutation = .{ .action = .rename, .kind = .database, .name = "imported", .new_name = "native" } } });
         alloc.free(result);
@@ -11910,6 +12009,55 @@ test "system catalog imports released row journal once into native authority" {
     defer reopened.deinit();
     try std.testing.expect(reopened.system_catalog_state.?.index.find(.database, 0, "native") != null);
     try std.testing.expect(reopened.system_catalog_state.?.index.find(.database, 0, "imported") == null);
+    try std.testing.expectEqual(@as(usize, 1), reopened.systemCatalogState().settings.len);
+}
+
+test "system catalog standalone setting publication survives native restart and failed mutation rolls back" {
+    if (comptime control_only_storage_sources) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/settings-catalog.json", .{tmp.sub_path});
+    defer alloc.free(path);
+    var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend.deinit();
+    const request: system_catalog.Call = .{ .setting_mutate = .{ .put = .{
+        .name = "app.tenant",
+        .kind = .string,
+        .policy_sensitive = true,
+        .default = .{ .string = "none" },
+        .role_defaults = &.{.{ .principal = "alice", .database = "main", .value = .{ .string = "tenant-a" } }},
+    } } };
+    {
+        var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local);
+        defer metadata.deinit();
+        try std.testing.expectError(error.Forbidden, metadata.statusSource().systemCatalog(alloc, .{}, request));
+        const published = try metadata.statusSource().systemCatalog(alloc, .{ .setting_admin = true }, request);
+        alloc.free(published);
+        const revision = metadata.systemCatalogState().revision;
+        const repeated = try metadata.statusSource().systemCatalog(alloc, .{ .setting_admin = true }, request);
+        alloc.free(repeated);
+        try std.testing.expectEqual(revision, metadata.systemCatalogState().revision);
+        try std.testing.expectError(error.CatalogGenerationChanged, metadata.lifecycle_store.?.updateStandaloneCatalog(group_ids.main_metadata_group_id, metadata.durable_revision, .{ .setting_command = .{
+            .expected_revision = revision - 1,
+            .change = .{ .drop = metadata.systemCatalogState().settings[0].identity },
+        } }));
+        try std.testing.expectEqual(@as(usize, 1), metadata.systemCatalogState().settings.len);
+        const previous_store = metadata.lifecycle_store;
+        metadata.lifecycle_store = null;
+        defer metadata.lifecycle_store = previous_store;
+        try std.testing.expectError(error.CatalogStorageUnavailable, metadata.statusSource().systemCatalog(alloc, .{ .setting_admin = true }, .{ .setting_mutate = .{ .drop = "app.tenant" } }));
+        try std.testing.expectEqual(revision, metadata.systemCatalogState().revision);
+        try std.testing.expectEqual(@as(usize, 1), metadata.systemCatalogState().settings.len);
+    }
+    var reopened = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local);
+    defer reopened.deinit();
+    try std.testing.expectEqual(@as(usize, 1), reopened.systemCatalogState().settings.len);
+    const snapshot = try reopened.statusSource().systemCatalog(alloc, .{}, .{ .setting_snapshot = .{ .principal = "alice", .database = "main" } });
+    defer alloc.free(snapshot);
+    var parsed = try std.json.parseFromSlice(@import("../system_catalog/settings.zig").Snapshot, alloc, snapshot, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("tenant-a", parsed.value.definitions[0].role_default.?.string);
 }
 
 test "system catalog borrowed journal writes bounded deltas and recovers an ambiguous sync" {

@@ -23,6 +23,7 @@ const tables_api = @import("../api/tables.zig");
 const indexes_api = @import("../api/indexes.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const table_manager = @import("../metadata/table_manager.zig");
+const settings = @import("settings.zig");
 
 pub const Request = domain.Request;
 
@@ -95,6 +96,69 @@ pub fn snapshotJson(svc: anytype, alloc: std.mem.Allocator, context: operation.R
     return std.json.Stringify.valueAlloc(alloc, snapshot.value, .{});
 }
 
+pub fn settingSnapshotJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, scope: settings.Scope) ![]u8 {
+    try context.ensureActive();
+    if (scope.principal.len == 0 or scope.database.len == 0) return error.InvalidSettingRecord;
+    // Native callers carry the authenticated principal. The metadata HTTP
+    // transport drops that identity, but authenticates the internal service;
+    // public API ingress must derive Scope, never accept it from SQL text.
+    if (context.principal != null) {
+        const admitted = context.setting_read_principal orelse return error.Forbidden;
+        if (!std.mem.eql(u8, admitted, scope.principal)) return error.Forbidden;
+    }
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    return store.sqlSettingSnapshotJson(alloc, svc.metadata_group_id, scope);
+}
+
+pub fn mutateSetting(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: settings.Request) ![]u8 {
+    if (!context.setting_admin) return error.Forbidden;
+    try context.ensureActive();
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_setting_catalog_version);
+    svc.lockCatalogMutation();
+    defer svc.unlockCatalogMutation();
+    try svc.ensureLinearizableReadWithContext(context);
+    try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    var snapshot = try store.systemCatalogSnapshot(alloc, svc.metadata_group_id);
+    defer snapshot.deinit();
+    const state = snapshot.value;
+    var command: settings.Command = .{ .expected_revision = state.revision, .change = undefined };
+    switch (request) {
+        .put => |input| {
+            const prior = for (state.settings) |record| {
+                if (std.ascii.eqlIgnoreCase(record.name, input.name)) break record;
+            } else null;
+            if (prior) |record| if (input.matches(record)) return std.json.Stringify.valueAlloc(alloc, snapshot.meta, .{});
+            const identity: settings.Identity = if (prior) |record|
+                .{ .id = record.identity.id, .generation = try std.math.add(u64, record.identity.generation, 1) }
+            else
+                .{ .id = state.next_id, .generation = 1 };
+            const record = input.record(identity);
+            try record.validate();
+            command.change = .{ .put = record };
+        },
+        .drop => |name| {
+            try settings.validateName(name);
+            const prior = for (state.settings) |record| {
+                if (std.ascii.eqlIgnoreCase(record.name, name)) break record;
+            } else return std.json.Stringify.valueAlloc(alloc, snapshot.meta, .{});
+            command.change = .{ .drop = prior.identity };
+        },
+    }
+    const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
+    defer alloc.free(bytes);
+    if (bytes.len > domain.max_command_bytes) return error.CatalogCommandTooLarge;
+    try context.ensureActive();
+    const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_sql_settings = bytes });
+    svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
+    const observed = store.systemCatalogMeta(alloc, svc.metadata_group_id) catch return error.MetadataMutationOutcomeUnknown;
+    var expected_hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &expected_hash, .{});
+    if (observed.revision != command.expected_revision + 1 or !std.mem.eql(u8, &observed.last_command, &expected_hash)) return error.MetadataMutationOutcomeUnknown;
+    return std.json.Stringify.valueAlloc(alloc, observed, .{});
+}
+
 pub fn resolve(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, target: domain.Target) !?table_manager.TableRecord {
     try svc.ensureLinearizableReadWithContext(context);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
@@ -112,6 +176,8 @@ fn listTablesJson(svc: anytype, alloc: std.mem.Allocator, context: operation.Req
 
 pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, input: domain.Call) ![]u8 {
     return switch (input) {
+        .setting_snapshot => |scope| settingSnapshotJson(svc, alloc, context, scope),
+        .setting_mutate => |request| mutateSetting(svc, alloc, context, request),
         .write_validation_revision => blk: {
             try svc.ensureLinearizableReadWithContext(context);
             const store = svc.projectedStore() orelse return error.MissingMetadataStore;

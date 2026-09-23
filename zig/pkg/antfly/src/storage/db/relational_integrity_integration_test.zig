@@ -17,6 +17,66 @@ const integrity = @import("relational_integrity.zig");
 const catalog = @import("relational_integrity_catalog.zig");
 const tuples = @import("relational_index_keys.zig");
 
+test "relational integrity TRUNCATE parent pending generations survive restart and reject changed replay" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/truncate-parent", .{tmp.sub_path});
+    defer alloc.free(path);
+    const namespace: @import("doc_identity.zig").Namespace = .{ .table_id = 41, .shard_id = 31, .range_id = 31 };
+    const options: db_mod.OpenOptions = .{ .identity_namespace = namespace, .start_optional_runtimes = false, .start_index_workers = false };
+    const schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const topology = @import("relational_integrity_topology.zig");
+    const retirement = @import("relational_integrity_generation_retirement.zig");
+    const entry: @import("relational_integrity_topology_contract.zig").ParentRetirementEntry = .{ .child_table_id = 51, .child_table_name = "children", .constraint_name = "fk", .generation = @splat(3) };
+    var fence: topology.Fence = .{ .role = .truncate_parent, .transition_id = 11, .attempt = 1, .peer_group_id = 21, .owner_group_id = 31, .namespace = namespace, .catalog_digest = undefined };
+    const stage: @import("relational_integrity_topology_contract.zig").ParentRetirementStage = .{ .plan_digest = @splat(5), .entries = &.{entry} };
+    {
+        var db = try db_mod.DB.open(alloc, path, options);
+        defer db.close();
+        try db.setSchemaJson(alloc, schema);
+        const raw = try db.core.store.get(alloc, catalog.key);
+        defer alloc.free(raw);
+        std.crypto.hash.Blake3.hash(raw, &fence.catalog_digest, .{});
+        try db.applyRelationalTopologyControl(.{ .fence = fence, .action = .begin }, null);
+        try db.applyRelationalTopologyControl(.{ .fence = fence, .action = .stage_parent_retirement, .parent_retirement = stage }, null);
+        try db.applyRelationalTopologyControl(.{ .fence = fence, .action = .stage_parent_retirement, .parent_retirement = stage }, null);
+        try std.testing.expectError(error.GenerationRetirementChanged, db.applyRelationalTopologyControl(.{ .fence = fence, .action = .stage_parent_retirement, .parent_retirement = .{ .plan_digest = @splat(6), .entries = stage.entries } }, null));
+        try std.testing.expectError(error.IntegrityTopologyCutoverRequired, db.applyRelationalTopologyControl(.{ .fence = fence, .action = .release }, null));
+    }
+    {
+        var db = try db_mod.DB.open(alloc, path, options);
+        defer db.close();
+        try db.applyRelationalTopologyControl(.{ .fence = fence, .action = .stage_parent_retirement, .parent_retirement = stage }, null);
+        const changed: @import("relational_integrity_topology_contract.zig").ParentRetirementEntry = .{ .child_table_id = entry.child_table_id, .child_table_name = entry.child_table_name, .constraint_name = entry.constraint_name, .generation = @splat(4) };
+        try std.testing.expectError(error.GenerationRetirementChanged, db.applyRelationalTopologyControl(.{ .fence = fence, .action = .stage_parent_retirement, .parent_retirement = .{ .plan_digest = stage.plan_digest, .entries = &.{changed} } }, null));
+        var renamed = entry;
+        renamed.child_table_name = "renamed_children";
+        try std.testing.expectError(error.GenerationRetirementChanged, db.applyRelationalTopologyControl(.{ .fence = fence, .action = .stage_parent_retirement, .parent_retirement = .{ .plan_digest = stage.plan_digest, .entries = &.{renamed} } }, null));
+        renamed = entry;
+        renamed.constraint_name = "renamed_fk";
+        try std.testing.expectError(error.GenerationRetirementChanged, db.applyRelationalTopologyControl(.{ .fence = fence, .action = .stage_parent_retirement, .parent_retirement = .{ .plan_digest = stage.plan_digest, .entries = &.{renamed} } }, null));
+        try std.testing.expectError(error.IntegrityTopologyCutoverRequired, db.applyRelationalTopologyControl(.{ .fence = fence, .action = .release }, null));
+        const pending = try db.core.store.get(alloc, retirement.key);
+        defer alloc.free(pending);
+        try std.testing.expect((try retirement.Pending.decode(pending)).contains(entry.child_table_id, entry.generation));
+        try db.applyRelationalTopologyControl(.{ .fence = fence, .action = .cancel }, null);
+    }
+    {
+        var db = try db_mod.DB.open(alloc, path, options);
+        defer db.close();
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, retirement.key));
+        try db.applyRelationalTopologyControl(.{ .fence = fence, .action = .cancel }, null);
+        try std.testing.expectError(error.IntegrityTopologyCompleted, db.applyRelationalTopologyControl(.{ .fence = fence, .action = .begin }, null));
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, retirement.key));
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect((try topology.completed(&read)).?.eql(fence));
+    }
+}
+
 fn applyRestoreReplica(db: *db_mod.DB, request: @import("types.zig").BatchRequest, index: u64, ha: bool) !void {
     if (!ha) return db.batchRaftReplicatedApply(request, .{ .term = 1, .index = index });
     const alloc = std.testing.allocator;

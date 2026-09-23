@@ -224,6 +224,7 @@ pub const State = struct {
     revision: u64 = 0,
     next_id: u64 = 3,
     resources: []const Resource = &.{},
+    settings: []const @import("settings.zig").Record = &.{},
 
     pub fn find(self: @This(), kind: Kind, parent_id: u64, name: []const u8) ?Resource {
         for (self.resources) |r| if (r.kind == kind and r.parent_id == parent_id and std.mem.eql(u8, r.name, name)) return r;
@@ -419,11 +420,30 @@ pub const IndexedState = struct {
 /// transaction reserves indexes and clones only changed records before apply.
 /// Readers borrow it under the metadata mutex. Undo and commit cannot allocate.
 pub const MutableState = struct {
+    pub const OwnedSettings = std.json.Parsed([]const @import("settings.zig").Record);
     alloc: std.mem.Allocator,
     value: State,
     index: StateIndex,
     rows: std.ArrayListUnmanaged(Resource),
     positions: std.AutoHashMapUnmanaged(StateIndex.Id, usize),
+    // Settings in imported snapshots are normally backed by a temporary JSON
+    // arena. Keep an independent copy for the lifetime of the writer state.
+    owned_settings: ?OwnedSettings = null,
+
+    pub fn cloneSettings(alloc: std.mem.Allocator, records: []const @import("settings.zig").Record) !OwnedSettings {
+        if (records.len > 1024) return error.SettingLimitExceeded;
+        const bytes = try std.json.Stringify.valueAlloc(alloc, records, .{});
+        defer alloc.free(bytes);
+        var owned = try std.json.parseFromSlice([]const @import("settings.zig").Record, alloc, bytes, .{ .allocate = .alloc_always });
+        errdefer owned.deinit();
+        for (owned.value, 0..) |setting, i| {
+            try setting.validate();
+            for (owned.value[0..i]) |prior| {
+                if (prior.identity.id == setting.identity.id or std.ascii.eqlIgnoreCase(prior.name, setting.name)) return error.InvalidSettingRecord;
+            }
+        }
+        return owned;
+    }
 
     pub fn clone(alloc: std.mem.Allocator, state: State) !MutableState {
         var self = MutableState{ .alloc = alloc, .value = state, .index = .{}, .rows = .empty, .positions = .empty };
@@ -443,12 +463,17 @@ pub const MutableState = struct {
             self.positions.putAssumeCapacity(.{ .kind = r.kind, .id = r.id }, self.rows.items.len);
             self.rows.appendAssumeCapacity(owned);
         }
+        if (state.settings.len != 0) {
+            self.owned_settings = try cloneSettings(alloc, state.settings);
+            self.value.settings = self.owned_settings.?.value;
+        }
         self.value.resources = self.rows.items;
         self.index = try StateIndex.init(alloc, self.value);
         return self;
     }
     pub fn deinit(self: *MutableState) void {
         self.index.deinit(self.alloc);
+        if (self.owned_settings) |*settings| settings.deinit();
         for (self.rows.items) |r| freeResource(self.alloc, r);
         self.rows.deinit(self.alloc);
         self.positions.deinit(self.alloc);
@@ -864,6 +889,8 @@ pub const TableStatusTarget = union(enum) {
 };
 
 pub const Call = union(enum) {
+    setting_snapshot: @import("settings.zig").Scope,
+    setting_mutate: @import("settings.zig").Request,
     list_tables: TableList,
     export_snapshot: void,
     read: Read,
@@ -882,7 +909,7 @@ pub fn httpStatus(err: anyerror) u16 {
     return switch (err) {
         error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.CatalogNotFound, error.TableNotFound => 404,
         error.CatalogAlreadyExists, error.CatalogGenerationChanged, error.TablespaceInUse, error.NamespaceNotEmpty, error.DatabaseNotEmpty, error.ProtectedCatalogResource, error.TableAlreadyExists => 409,
-        error.InvalidCatalogName, error.InvalidCatalogMutation, error.InvalidTablespaceLocation, error.InvalidTablespacePlacementPolicy, error.InvalidCreateTableRequest => 400,
+        error.InvalidCatalogName, error.InvalidCatalogMutation, error.InvalidSettingRecord, error.InvalidSettingValue, error.InvalidTablespaceLocation, error.InvalidTablespacePlacementPolicy, error.InvalidCreateTableRequest => 400,
         error.CatalogCommandTooLarge, error.CreateTableRequestTooLarge => 413,
         error.TableTopologyProtocolUpgradeRequired => 426,
         error.Forbidden => 403,
@@ -994,6 +1021,21 @@ pub fn cloneStateAlloc(alloc: std.mem.Allocator, state: State) !std.json.Parsed(
     return std.json.parseFromSlice(State, alloc, bytes, .{ .allocate = .alloc_always });
 }
 
+test "standalone mutable catalog owns imported setting defaults" {
+    const alloc = std.testing.allocator;
+    var imported = try cloneStateAlloc(alloc, .{ .settings = &.{.{
+        .identity = .{ .id = 3, .generation = 1 },
+        .name = "app.tenant",
+        .kind = .string,
+        .default = .{ .string = "global" },
+        .role_defaults = &.{.{ .principal = "alice", .database = "main", .value = .{ .string = "private" } }},
+    }} });
+    var state = try MutableState.clone(alloc, imported.value);
+    imported.deinit();
+    defer state.deinit();
+    try std.testing.expectEqualStrings("private", state.value.settings[0].effective("alice", "main").role_default.?.string);
+}
+
 pub fn applyDeltaStateAlloc(alloc: std.mem.Allocator, state: State, delta: Delta) !std.json.Parsed(State) {
     var resources = std.ArrayListUnmanaged(Resource).empty;
     defer resources.deinit(alloc);
@@ -1007,7 +1049,7 @@ pub fn applyDeltaStateAlloc(alloc: std.mem.Allocator, state: State, delta: Delta
         if (!replaced.contains(.{ .kind = resource.kind, .id = resource.id })) try resources.append(alloc, resource);
     }
     try resources.appendSlice(alloc, delta.upserts);
-    return cloneStateAlloc(alloc, .{ .revision = try std.math.add(u64, state.revision, 1), .next_id = delta.next_id, .resources = resources.items });
+    return cloneStateAlloc(alloc, .{ .revision = try std.math.add(u64, state.revision, 1), .next_id = delta.next_id, .resources = resources.items, .settings = state.settings });
 }
 
 pub fn tableResourceMatches(grant: []const u8, target: []const u8) bool {

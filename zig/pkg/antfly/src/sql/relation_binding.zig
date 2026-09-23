@@ -102,7 +102,7 @@ pub const ResolveAdapter = struct {
     backend: catalog.Backend,
     table: catalog.Table,
     pub fn iface(self: *ResolveAdapter) catalog.Backend {
-        return .{ .ptr = self, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint } };
+        return .{ .ptr = self, .settings_view = self.backend.settings_view, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint } };
     }
     fn resolve(ptr: *anyopaque, _: Allocator, _: ast.Name, action: catalog.Action) !catalog.Table {
         if (action != .read) return error.UnsupportedSqlExecution;
@@ -133,7 +133,7 @@ pub const TargetResolveAdapter = struct {
     cache_sources: bool = false,
     source_tables: std.StringHashMapUnmanaged(catalog.Table) = .empty,
     pub fn iface(self: *@This()) catalog.Backend {
-        return .{ .ptr = self, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint } };
+        return .{ .ptr = self, .settings_view = self.backend.settings_view, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint } };
     }
     fn resolve(ptr: *anyopaque, alloc: Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
         // This adapter is only used while binding the read side of a mutation.
@@ -929,7 +929,7 @@ const Builder = struct {
                 if (expression_) |condition| try self.joinKeys(condition, left, right, &left_keys, &right_keys);
                 const column_types = try self.scalarColumns(columns);
                 if (expression_) |condition| _ = try scalar.inferParameters(self.alloc, condition, column_types, self.parameters, .boolean, .{});
-                const program = if (expression_) |condition| try scalar.bindExpected(self.alloc, condition, column_types, self.parameters, .boolean, .{}) else null;
+                const program = if (expression_) |condition| try scalar.bindExpectedWithSettings(self.alloc, condition, column_types, self.parameters, .boolean, .{}, self.backend.settings_view) else null;
                 if (program) |bound| if (bound.output_type.kind != null and bound.output_type.kind != .boolean) return error.SqlTypeMismatch;
                 break :blk try self.node(columns, .{ .join = .{ .kind = join.kind, .left = left, .right = right, .condition = program, .left_keys = try left_keys.toOwnedSlice(self.alloc), .right_keys = try right_keys.toOwnedSlice(self.alloc) } });
             },
@@ -948,8 +948,8 @@ const Builder = struct {
         var right_node = binary.right;
         if (!sideLocal(left.columns, left_node) or !sideLocal(right.columns, right_node)) std.mem.swap(*const ast.Scalar, &left_node, &right_node);
         if (!sideLocal(left.columns, left_node) or !sideLocal(right.columns, right_node)) return;
-        try left_keys.append(self.alloc, try scalar.bind(self.alloc, left_node, try self.scalarColumns(left.columns), self.parameters, .{}));
-        try right_keys.append(self.alloc, try scalar.bind(self.alloc, right_node, try self.scalarColumns(right.columns), self.parameters, .{}));
+        try left_keys.append(self.alloc, try scalar.bindWithSettings(self.alloc, left_node, try self.scalarColumns(left.columns), self.parameters, .{}, self.backend.settings_view));
+        try right_keys.append(self.alloc, try scalar.bindWithSettings(self.alloc, right_node, try self.scalarColumns(right.columns), self.parameters, .{}, self.backend.settings_view));
     }
 };
 /// Expressions whose inputs belong to one side are valid hash keys too.

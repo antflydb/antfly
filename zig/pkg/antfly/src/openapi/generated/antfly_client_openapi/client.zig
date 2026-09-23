@@ -2281,6 +2281,17 @@ pub const Client = struct {
         return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
     }
 
+    /// Publish or remove a durable SQL setting
+    /// POST /db/v1/settings
+    pub fn administerSqlSettings(self: *@This(), body: types.SqlSettingMutationRequest) !ApiResponse(std.json.ArrayHashMap(std.json.Value)) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/settings", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(std.json.ArrayHashMap(std.json.Value)).fromResponse(self.allocator, &resp);
+    }
+
     /// Execute a SQL statement
     /// POST /db/v1/sql
     pub fn executeSQL(self: *@This(), body: types.SQLRequest) !ApiResponse(types.SQLResponse) {

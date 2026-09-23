@@ -200,6 +200,16 @@ pub const DdlOutcome = struct { mutation_outcome: ?MutationOutcome = .committed,
 pub const Backend = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    /// Runtime captures a fresh owner-authorized view for each statement.
+    /// Overlay entries carry durable setting identities, never raw names.
+    setting_capture: ?struct {
+        owner: @import("setting_catalog.zig").Owner,
+        scope: @import("setting_catalog.zig").Scope,
+        overlay: []const @import("setting_catalog.zig").OverlayEntry = &.{},
+    } = null,
+    /// Authorized, immutable settings captured for this exact statement.
+    /// Providers must never populate this from pgwire-local string settings.
+    settings_view: ?*const @import("setting_catalog.zig").View = null,
     /// Only set when every page belongs to the same retained statement read
     /// view. Catalog revisions and per-page read_index are not such a view.
     pinned_statement_snapshot: bool = false,

@@ -153,6 +153,7 @@ fn isRawMetadataIntentKey(key: []const u8) bool {
         std.mem.startsWith(u8, key, "\x00\x00__metadata__:relational_integrity:") or
         std.mem.eql(u8, key, "\x00\x00__metadata__:relational_integrity_activation") or
         std.mem.eql(u8, key, "\x00\x00__metadata__:relational_integrity_retirement") or
+        std.mem.eql(u8, key, "\x00\x00__metadata__:relational_integrity_generation_retirement") or
         std.mem.eql(u8, key, "\x00\x00__metadata__:restore_staging_owner") or
         @import("db/relational_index_maintenance_contract.zig").isControlKey(key);
 }
@@ -3072,6 +3073,7 @@ test "retained transaction byte bounds count exact physical rows without parsing
     for ([_][]const u8{
         "\x00\x00__metadata__:relational_integrity_activation",
         "\x00\x00__metadata__:relational_integrity_retirement",
+        "\x00\x00__metadata__:relational_integrity_generation_retirement",
         "\x00\x00__metadata__:restore_staging_owner",
     }) |key| try std.testing.expectEqual(@as(u64, 0), try retainedIntentBytes(fixed.allocator(), .{ .key = key, .value = "binary\x00\\_edges" }));
 }

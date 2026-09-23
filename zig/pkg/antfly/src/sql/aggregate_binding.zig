@@ -185,6 +185,10 @@ const Builder = struct {
 };
 
 pub fn bind(alloc: Allocator, table: ?catalog.Table, statement: ast.Select, parameters: []?ast.ColumnType) !Bound {
+    return bindWithSettings(alloc, table, statement, parameters, null);
+}
+
+pub fn bindWithSettings(alloc: Allocator, table: ?catalog.Table, statement: ast.Select, parameters: []?ast.ColumnType, settings: ?*const @import("setting_catalog.zig").View) !Bound {
     if (statement.columns.len == 0) return error.SqlGroupingError;
     var builder: Builder = .{ .alloc = alloc, .groups = statement.group_by, .table = table, .output_columns = statement.columns };
     const projection_nodes = try alloc.alloc(*const ast.Scalar, statement.columns.len);
@@ -259,7 +263,7 @@ pub fn bind(alloc: Allocator, table: ?catalog.Table, statement: ast.Select, para
         if (!changed) break;
     }
     var predicate: ast.Predicate = if (statement.predicate) |node| .{ .scalar = try bound_scalars.predicateScalar(alloc, table, node) } else undefined;
-    const input = try bound_scalars.bind(alloc, table, .{ .select = .{ .table = statement.table, .columns = builder.arguments.items, .predicate = if (statement.predicate != null) &predicate else null, .limit = statement.limit, .offset = statement.offset } }, parameters);
+    const input = try bound_scalars.bindWithSettings(alloc, table, .{ .select = .{ .table = statement.table, .columns = builder.arguments.items, .predicate = if (statement.predicate != null) &predicate else null, .limit = statement.limit, .offset = statement.offset } }, parameters, settings);
     const columns = try alloc.alloc(scalar.Column, groups.len + builder.aggregates.items.len);
     for (columns, 0..) |*column, index| column.* = .{ .name = try std.fmt.allocPrint(alloc, "$grouped_{d}", .{index}), .type = .string };
     for (columns[0..groups.len], input.projections[0..groups.len]) |*column, program| column.type = program.?.output_type.kind orelse .string;
@@ -289,12 +293,12 @@ pub fn bind(alloc: Allocator, table: ?catalog.Table, statement: ast.Select, para
     const programs = try alloc.alloc(scalar.Program, outputs.len);
     const names = try alloc.alloc([]const u8, outputs.len);
     for (outputs, programs, statement.columns, names) |node, *program, projection, *name| {
-        program.* = try scalar.bind(alloc, node, columns, parameters, .{});
+        program.* = try scalar.bindWithSettings(alloc, node, columns, parameters, .{}, settings);
         name.* = try alloc.dupe(u8, projection.alias orelse if (projection.field.len != 0) projection.field else if (projection.expression.?.* == .call) projection.expression.?.call.name else "?column?");
     }
     const orders = try alloc.alloc(scalar.Program, order_nodes.len);
-    for (order_nodes, orders) |node, *program| program.* = try scalar.bind(alloc, node, columns, parameters, .{});
-    const having_program = if (having) |node| try scalar.bindExpected(alloc, node, columns, parameters, .boolean, .{}) else null;
+    for (order_nodes, orders) |node, *program| program.* = try scalar.bindWithSettings(alloc, node, columns, parameters, .{}, settings);
+    const having_program = if (having) |node| try scalar.bindExpectedWithSettings(alloc, node, columns, parameters, .boolean, .{}, settings) else null;
     if (having_program) |program| if (program.output_type.kind != null and program.output_type.kind != .boolean) return error.SqlTypeMismatch;
     for (builder.filters.items) |slot| if (slot) |index| {
         const kind = input.projections[index].?.output_type.kind;

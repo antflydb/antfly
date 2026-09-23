@@ -18,6 +18,7 @@
 const std = @import("std");
 const docstore = @import("../storage/docstore.zig");
 const domain = @import("domain.zig");
+const settings = @import("settings.zig");
 
 pub const Meta = domain.Meta;
 
@@ -33,6 +34,73 @@ fn keyAlloc(alloc: std.mem.Allocator, group_id: u64, suffix: []const u8) ![]u8 {
 
 fn recordKeyAlloc(alloc: std.mem.Allocator, group_id: u64, kind: domain.Kind, id: u64) ![]u8 {
     return std.fmt.allocPrint(alloc, "\x00\x00__metadata__:system_catalog:{d}:record:{s}:{d}", .{ group_id, @tagName(kind), id });
+}
+
+fn settingKeyAlloc(alloc: std.mem.Allocator, group_id: u64, id: u64) ![]u8 {
+    return std.fmt.allocPrint(alloc, "\x00\x00__metadata__:system_catalog:{d}:setting:{d}", .{ group_id, id });
+}
+
+pub fn loadSettings(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64) ![]const settings.Record {
+    const prefix = try keyAlloc(alloc, group_id, "setting:");
+    defer alloc.free(prefix);
+    const kvs = try docstore.DocStore.scanPrefixTxn(alloc, txn, prefix);
+    defer {
+        for (kvs) |kv| {
+            alloc.free(kv.key);
+            alloc.free(kv.value);
+        }
+        alloc.free(kvs);
+    }
+    if (kvs.len > 1024) return error.SettingLimitExceeded;
+    const records = try alloc.alloc(settings.Record, kvs.len);
+    for (kvs, records, 0..) |kv, *record, i| {
+        record.* = try std.json.parseFromSliceLeaky(settings.Record, alloc, kv.value, .{ .allocate = .alloc_always });
+        try record.validate();
+        const expected_key = try settingKeyAlloc(alloc, group_id, record.identity.id);
+        defer alloc.free(expected_key);
+        if (!std.mem.eql(u8, kv.key, expected_key)) return error.InvalidSettingRecord;
+        for (records[0..i]) |prior| if (prior.identity.id == record.identity.id or std.ascii.eqlIgnoreCase(prior.name, record.name)) return error.InvalidSettingRecord;
+    }
+    return records;
+}
+
+pub fn applySettingCommand(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, command: settings.Command, command_hash: [32]u8) !void {
+    if (command.version != 1) return error.InvalidSettingRecord;
+    const meta = try readMeta(alloc, txn, group_id);
+    if (meta.revision != command.expected_revision) return;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const records = try loadSettings(a, txn, group_id);
+    var next_id = meta.next_id;
+    switch (command.change) {
+        .put => |record| {
+            try record.validate();
+            var existing: ?settings.Record = null;
+            for (records) |prior| {
+                if (prior.identity.id == record.identity.id) existing = prior;
+                if (std.ascii.eqlIgnoreCase(prior.name, record.name) and prior.identity.id != record.identity.id) return error.InvalidSettingRecord;
+            }
+            if (existing) |prior| {
+                if (!std.mem.eql(u8, prior.name, record.name) or record.identity.generation != try std.math.add(u64, prior.identity.generation, 1)) return error.SettingCatalogChanged;
+            } else {
+                if (record.identity.id != meta.next_id or record.identity.generation != 1) return error.SettingCatalogChanged;
+                next_id = try std.math.add(u64, meta.next_id, 1);
+            }
+            const key = try settingKeyAlloc(a, group_id, record.identity.id);
+            const encoded = try std.json.Stringify.valueAlloc(a, record, .{});
+            try txn.put(key, encoded);
+        },
+        .drop => |identity| {
+            const prior = for (records) |record| {
+                if (record.identity.id == identity.id) break record;
+            } else return error.SettingCatalogChanged;
+            if (prior.identity.generation != identity.generation) return error.SettingCatalogChanged;
+            const key = try settingKeyAlloc(a, group_id, identity.id);
+            try txn.delete(key);
+        },
+    }
+    try applyDelta(alloc, txn, group_id, .{ .upserts = @constCast(&[_]domain.Resource{}), .removes = @constCast(&[_]domain.Resource{}), .next_id = next_id }, meta, command_hash);
 }
 
 pub fn nameKeyAlloc(alloc: std.mem.Allocator, group_id: u64, kind: domain.Kind, parent: u64, name: []const u8) ![]u8 {
@@ -68,7 +136,8 @@ pub fn loadState(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id
         const expected_key = try recordKeyAlloc(a, group_id, resource.kind, resource.id);
         if (!std.mem.eql(u8, expected_key, kv.key)) return error.InvalidCatalogRecord;
     }
-    return .{ .arena = arena, .meta = meta, .value = .{ .revision = meta.revision, .next_id = meta.next_id, .resources = resources } };
+    const loaded_settings = try loadSettings(a, txn, group_id);
+    return .{ .arena = arena, .meta = meta, .value = .{ .revision = meta.revision, .next_id = meta.next_id, .resources = resources, .settings = loaded_settings } };
 }
 
 pub fn getById(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, kind: domain.Kind, id: u64) !?std.json.Parsed(domain.Resource) {
@@ -378,6 +447,16 @@ pub fn importState(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_
     try writeResource(alloc, txn, group_id, domain.default_database);
     try writeResource(alloc, txn, group_id, domain.default_namespace);
     for (state.resources) |resource| try writeResource(alloc, txn, group_id, resource);
+    for (state.settings, 0..) |record, i| {
+        try record.validate();
+        if (record.identity.id >= state.next_id) return error.InvalidSettingRecord;
+        for (state.settings[0..i]) |prior| if (prior.identity.id == record.identity.id or std.ascii.eqlIgnoreCase(prior.name, record.name)) return error.InvalidSettingRecord;
+        const setting_key = try settingKeyAlloc(alloc, group_id, record.identity.id);
+        defer alloc.free(setting_key);
+        const encoded = try std.json.Stringify.valueAlloc(alloc, record, .{});
+        defer alloc.free(encoded);
+        try txn.put(setting_key, encoded);
+    }
     const key = try keyAlloc(alloc, group_id, "meta");
     defer alloc.free(key);
     const bytes = try std.json.Stringify.valueAlloc(alloc, Meta{ .revision = state.revision, .next_id = state.next_id }, .{});

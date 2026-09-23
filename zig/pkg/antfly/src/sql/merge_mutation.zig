@@ -305,7 +305,7 @@ const ProjectionBuilder = struct {
     }
 };
 
-fn bindArms(alloc: Allocator, target: catalog.Table, statement: ast.Merge, input: *const describe.BoundStatement) !struct { arms: []const BoundArm, parameters: []const ?ast.ColumnType } {
+fn bindArms(alloc: Allocator, backend: catalog.Backend, target: catalog.Table, statement: ast.Merge, input: *const describe.BoundStatement) !struct { arms: []const BoundArm, parameters: []const ?ast.ColumnType } {
     const relation = input.relation orelse return error.InvalidSqlBackendResponse;
     if (relation.statement.columns.len != input.columns.len) return error.InvalidSqlBackendResponse;
     const columns = try alloc.alloc(scalar.Column, input.columns.len);
@@ -355,13 +355,13 @@ fn bindArms(alloc: Allocator, target: catalog.Table, statement: ast.Merge, input
     const bound = try alloc.alloc(BoundArm, unbound.len);
     for (unbound, bound) |arm, *out| {
         out.matched = arm.matched;
-        out.predicate = if (arm.predicate) |predicate| try scalar.bindExpected(alloc, predicate, columns, parameters, .boolean, .{}) else null;
+        out.predicate = if (arm.predicate) |predicate| try scalar.bindExpectedWithSettings(alloc, predicate, columns, parameters, .boolean, .{}, backend.settings_view) else null;
         out.action = switch (arm.action) {
             .update, .insert => |values| blk: {
                 const assignments = try alloc.alloc(BoundAssignment, values.len);
                 for (values, assignments) |value, *assignment| assignment.* = .{
                     .column = value.column,
-                    .program = if (value.value) |expression| try scalar.bindExpected(alloc, expression, columns, parameters, value.column.type, .{}) else null,
+                    .program = if (value.value) |expression| try scalar.bindExpectedWithSettings(alloc, expression, columns, parameters, value.column.type, .{}, backend.settings_view) else null,
                 };
                 break :blk if (arm.action == .update) .{ .update = assignments } else .{ .insert = assignments };
             },
@@ -372,7 +372,7 @@ fn bindArms(alloc: Allocator, target: catalog.Table, statement: ast.Merge, input
     return .{ .arms = bound, .parameters = parameters };
 }
 
-fn bindReturning(alloc: Allocator, target: catalog.Table, statement: ast.Merge, input: *const describe.BoundStatement, parameters: []?ast.ColumnType) !Returning {
+fn bindReturning(alloc: Allocator, backend: catalog.Backend, target: catalog.Table, statement: ast.Merge, input: *const describe.BoundStatement, parameters: []?ast.ColumnType) !Returning {
     const relation = input.relation orelse return error.InvalidSqlBackendResponse;
     const projections = statement.returning orelse return error.InvalidSqlBackendResponse;
     const count = if (projections.len == 0) target.columns.len else projections.len;
@@ -406,7 +406,7 @@ fn bindReturning(alloc: Allocator, target: catalog.Table, statement: ast.Merge, 
     const programs = try alloc.alloc(scalar.Program, count);
     const columns = try alloc.alloc(describe.Column, count);
     for (lowered, names, programs, columns) |expression, name, *program, *column| {
-        program.* = try scalar.bind(alloc, expression, scalar_columns, parameters, .{});
+        program.* = try scalar.bindWithSettings(alloc, expression, scalar_columns, parameters, .{}, backend.settings_view);
         column.* = .{ .name = name, .type = program.output_type.kind orelse .string, .untyped_null = program.output_type.kind == null };
     }
     return .{ .columns = columns, .programs = programs };
@@ -603,9 +603,9 @@ pub fn bindCandidates(alloc: Allocator, backend: catalog.Backend, target: catalo
     const input = try alloc.create(describe.BoundStatement);
     input.* = try describe.bind(alloc, adapter.iface(), &selected, parameter_types);
     if (input.relation == null or input.relation.?.root.operation != .join or input.relation.?.root.operation.join.kind != .right) return error.InvalidSqlBackendResponse;
-    const arms = try bindArms(alloc, target, statement, input);
+    const arms = try bindArms(alloc, backend, target, statement, input);
     const parameters = try alloc.dupe(?ast.ColumnType, arms.parameters);
-    const returning_plan = if (statement.returning != null) try bindReturning(alloc, target, statement, input, parameters) else null;
+    const returning_plan = if (statement.returning != null) try bindReturning(alloc, backend, target, statement, input, parameters) else null;
     const field_ordinals = try alloc.alloc(?usize, target.columns.len);
     for (target.columns, field_ordinals) |field, *ordinal| {
         ordinal.* = null;

@@ -1751,7 +1751,7 @@ test "distributed txn primary prefetch owns observations and drains failed batch
     }
 }
 
-fn testCatalogEnvelope(alloc: Allocator, table_id: u64, json: []const u8) ![]u8 {
+pub fn testCatalogEnvelope(alloc: Allocator, table_id: u64, json: []const u8) ![]u8 {
     var parsed = try schema_api.parseValidatedTableSchema(alloc, json);
     defer parsed.deinit(alloc);
     const runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
@@ -1770,6 +1770,23 @@ fn testCatalogEnvelope(alloc: Allocator, table_id: u64, json: []const u8) ![]u8 
     const id = try std.fmt.allocPrint(alloc, "{d}", .{table_id});
     defer alloc.free(id);
     return std.json.Stringify.valueAlloc(alloc, .{ .catalog = encoded, .schema_version = runtime.version, .table_id = id }, .{});
+}
+
+/// Test fixture bridge: derive the native typed arbiter tuple from the same
+/// catalog and binding plan used by production owner resolution.
+pub fn testConflictTuple(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, name: []const u8, columns: []const []const u8, write: types.BatchWrite) ![]u8 {
+    var builder: Builder = .{ .alloc = alloc, .source = source, .metadata = metadata, .control = try boundedControl(.{}) };
+    defer builder.deinit();
+    const loaded = try builder.load(name);
+    var plan = try builder.bindingPlanSelected(loaded, true, false);
+    defer plan.deinit();
+    const selected = try plan.bindConflictExpressions(alloc, columns, &.{}, &.{});
+    defer alloc.free(selected);
+    var row = try mapper.PreparedRelationalWrite.initTyped(alloc, alloc, alloc, false, write.key, write.value, null, loaded.view.tableSchema().*, loaded.view.physicalLayout(), write.json_null_fields, false);
+    defer row.deinit(alloc);
+    const addresses = try plan.conflictAddresses(alloc, selected, try row.typedView(loaded.view.tableSchema().*, loaded.view.physicalLayout()));
+    if (addresses.len != 1) return error.TestUnexpectedArbiter;
+    return alloc.dupe(u8, addresses[0].tuple);
 }
 
 test "distributed txn global unique coverage checks every owner and rejects stale incomplete proofs" {

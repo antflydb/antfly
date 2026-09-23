@@ -1781,6 +1781,8 @@ pub const MetadataServiceConfig = struct {
     secret_store: ?*common_secrets.FileStore = null,
     internal_service_secret: ?[]const u8 = null,
     internal_service_issuer: ?[]const u8 = null,
+    setting_authority_secret: ?[]const u8 = null,
+    setting_authority_issuer: ?[]const u8 = null,
     destination_authorizer: ?stored_destination_authorization.Authorizer = null,
     reallocation_protocol_peers: []const ReallocationProtocolPeer = &.{},
 };
@@ -7517,6 +7519,8 @@ pub const MetadataHttpService = struct {
     secret_store: ?*common_secrets.FileStore = null,
     internal_service_secret: ?[]const u8 = null,
     internal_service_issuer: ?[]const u8 = null,
+    setting_authority_secret: ?[]const u8 = null,
+    setting_authority_issuer: ?[]const u8 = null,
     destination_authorizer: ?stored_destination_authorization.Authorizer = null,
     backend_runtime_mutex: std.Io.Mutex = .init,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
@@ -7580,6 +7584,8 @@ pub const MetadataHttpService = struct {
             .secret_store = cfg.secret_store,
             .internal_service_secret = cfg.internal_service_secret,
             .internal_service_issuer = cfg.internal_service_issuer,
+            .setting_authority_secret = cfg.setting_authority_secret,
+            .setting_authority_issuer = cfg.setting_authority_issuer,
             .destination_authorizer = cfg.destination_authorizer,
             .linearizable_read_tracker = read_tracker,
             .raft = try raft_service.ManagedHttpHostService.init(alloc, host_cfg, http_deps, cfg.raft, deps.raft),
@@ -9582,6 +9588,7 @@ pub const MetadataHttpService = struct {
             self.internal_service_secret,
             self.internal_service_issuer,
         );
+        _ = client.withSettingAuthority(self.setting_authority_secret, self.setting_authority_issuer);
         return client;
     }
 

@@ -60,6 +60,8 @@ fn validateForwardedCreateTableBodySize(body_len: usize) !void {
 }
 
 pub const MetadataHttpServerConfig = struct {
+    setting_authority_secret: ?[]const u8 = null,
+    setting_authority_issuer: ?[]const u8 = null,
     /// Non-secret capability marker used by deployment controllers to prove
     /// that every upgraded metadata process is actually enforcing the
     /// configured internal-service authentication rollout mode.
@@ -1819,6 +1821,8 @@ pub const MetadataHttpServer = struct {
     transfers: snapshot_transfer.Transfers = .{},
     source: AdminSource,
     internal_service_auth_capability: ?[]const u8 = null,
+    setting_authority_secret: ?[]const u8 = null,
+    setting_authority_issuer: ?[]const u8 = null,
     secret_store: ?*@import("../common/secrets.zig").FileStore = null,
 
     pub fn init(alloc: std.mem.Allocator, cfg: MetadataHttpServerConfig, source: AdminSource) MetadataHttpServer {
@@ -1826,6 +1830,8 @@ pub const MetadataHttpServer = struct {
             .alloc = alloc,
             .source = source,
             .internal_service_auth_capability = cfg.internal_service_auth_capability,
+            .setting_authority_secret = cfg.setting_authority_secret,
+            .setting_authority_issuer = cfg.setting_authority_issuer,
             .secret_store = cfg.secret_store,
         };
     }
@@ -1953,15 +1959,31 @@ pub const MetadataHttpServer = struct {
         if (body.len > system_catalog.max_command_bytes) return ctx.status(413).text("catalog request too large");
         var parsed = std.json.parseFromSlice(system_catalog.Call, ctx.allocator, body, .{}) catch return ctx.status(400).text("invalid catalog request");
         defer parsed.deinit();
+        // This transport authenticates the calling service, not a setting
+        // administrator. Never infer an admin grant from request JSON.
+        const authority = @import("../system_catalog/setting_authority.zig");
+        const admin_grant = parsed.value == .setting_mutate;
+        if (admin_grant or parsed.value == .setting_snapshot) {
+            if (ctx.header(@import("../api/internal_service_auth.zig").header_name) == null) return ctx.status(403).text("setting authority requires an authenticated service");
+            authority.verify(
+                self.setting_authority_secret orelse return ctx.status(403).text("setting authority unavailable"),
+                self.setting_authority_issuer orelse return ctx.status(403).text("setting authority unavailable"),
+                if (admin_grant) .admin else .read,
+                body,
+                @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)),
+                ctx.header(authority.header_name) orelse return ctx.status(403).text("setting authority grant required"),
+            ) catch return ctx.status(403).text("invalid setting authority grant");
+        }
         const forwarding = (raft_mutation_forwarding.parseValues(
             ctx.header(routes.Routes.raft_mutation_remaining_ms_header),
             ctx.header(routes.Routes.raft_mutation_forwards_remaining_header),
             ctx.header(routes.Routes.raft_mutation_campaign_allowed_header),
             .{ .max_remaining_ms = raft_mutation_forwarding.max_remaining_ms, .max_forwards = raft_mutation_forwarding.max_forwards },
         ) catch return ctx.status(400).text("invalid forwarding context")) orelse return ctx.status(400).text("missing forwarding context");
-        const context = systemCatalogRequestContext(ctx, forwarding.remaining_ms);
+        var context = systemCatalogRequestContext(ctx, forwarding.remaining_ms);
+        context.setting_admin = admin_grant;
         const callback = self.source.vtable.system_catalog orelse return ctx.status(426).text("catalog upgrade required");
-        const identity_reader = if (parsed.value != .mutate)
+        const identity_reader = if (parsed.value != .mutate and parsed.value != .setting_mutate)
             self.source.vtable.catalog_identity orelse return ctx.status(426).text("catalog identity upgrade required")
         else
             null;
@@ -5147,7 +5169,7 @@ test "system catalog read identity avoids diagnostic inventories and fences repl
         .system_catalog = Fixture.catalog,
         .catalog_identity = Fixture.identity,
     };
-    var server = MetadataHttpServer.init(alloc, .{}, .{ .ptr = &fixture, .vtable = &vtable });
+    var server = MetadataHttpServer.init(alloc, .{ .setting_authority_secret = "separate-setting-authority-secret", .setting_authority_issuer = "cluster-a" }, .{ .ptr = &fixture, .vtable = &vtable });
     const body = try std.json.Stringify.valueAlloc(alloc, @as(system_catalog.Call, .snapshot), .{});
     defer alloc.free(body);
     for ([_]u16{ 200, 503, 426 }) |expected| {
@@ -5171,6 +5193,55 @@ test "system catalog read identity avoids diagnostic inventories and fences repl
             try std.testing.expectEqualStrings("11111111111111111111111111111111", response.headers.get("x-antfly-catalog-metadata-incarnation").?);
         }
     }
+    // A caller cannot smuggle the native setting-admin capability through
+    // the service-authenticated catalog JSON route.
+    const admin_body = try std.json.Stringify.valueAlloc(alloc, system_catalog.Call{ .setting_mutate = .{ .drop = "app.tenant" } }, .{});
+    defer alloc.free(admin_body);
+    var admin_request = try httpx.Request.init(alloc, .POST, "/internal/v1/system-catalog");
+    defer admin_request.deinit();
+    try admin_request.setBody(admin_body);
+    var admin_ctx = httpx.Context.init(alloc, std.testing.io, &admin_request);
+    defer admin_ctx.deinit();
+    var rejected = try server.metadataSystemCatalog(&admin_ctx);
+    defer rejected.deinit();
+    try std.testing.expectEqual(@as(u16, 403), rejected.status.code);
+    // Even a service-authenticated caller cannot invent an administrator
+    // grant; the second proof is signed over this exact mutation body.
+    const service_auth = @import("../api/internal_service_auth.zig");
+    const service_token = try service_auth.tokenAlloc(alloc, .{ .secret = "0123456789abcdef0123456789abcdef", .issuer = "cluster-a" }, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
+    defer alloc.free(service_token);
+    try admin_request.headers.append(service_auth.header_name, service_token);
+    try admin_request.headers.append(@import("../system_catalog/setting_authority.zig").header_name, "v1:9999999999:0000");
+    var spoofed_ctx = httpx.Context.init(alloc, std.testing.io, &admin_request);
+    defer spoofed_ctx.deinit();
+    var spoofed = try server.metadataSystemCatalog(&spoofed_ctx);
+    defer spoofed.deinit();
+    try std.testing.expectEqual(@as(u16, 403), spoofed.status.code);
+    const scope_body = try std.json.Stringify.valueAlloc(alloc, system_catalog.Call{ .setting_snapshot = .{ .principal = "alice", .database = "main" } }, .{});
+    defer alloc.free(scope_body);
+    const authority = @import("../system_catalog/setting_authority.zig");
+    const read_grant = try authority.sign(alloc, "separate-setting-authority-secret", "cluster-a", .read, scope_body, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
+    defer alloc.free(read_grant);
+    var read_request = try httpx.Request.init(alloc, .POST, "/internal/v1/system-catalog");
+    defer read_request.deinit();
+    try read_request.setBody(scope_body);
+    try read_request.headers.append(service_auth.header_name, service_token);
+    try read_request.headers.append(authority.header_name, read_grant);
+    try read_request.headers.append(routes.Routes.raft_mutation_remaining_ms_header, "5000");
+    try read_request.headers.append(routes.Routes.raft_mutation_forwards_remaining_header, "0");
+    try read_request.headers.append(routes.Routes.raft_mutation_campaign_allowed_header, "false");
+    var read_ctx = httpx.Context.init(alloc, std.testing.io, &read_request);
+    defer read_ctx.deinit();
+    vtable.catalog_identity = Fixture.identity;
+    var read_response = try server.metadataSystemCatalog(&read_ctx);
+    defer read_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), read_response.status.code);
+    try read_request.setBody("{\"setting_snapshot\":{\"principal\":\"mallory\",\"database\":\"main\"}}");
+    var changed_ctx = httpx.Context.init(alloc, std.testing.io, &read_request);
+    defer changed_ctx.deinit();
+    var changed = try server.metadataSystemCatalog(&changed_ctx);
+    defer changed.deinit();
+    try std.testing.expectEqual(@as(u16, 403), changed.status.code);
 }
 
 test "system catalog forwarding retains its executor clock and tighter ingress deadline" {

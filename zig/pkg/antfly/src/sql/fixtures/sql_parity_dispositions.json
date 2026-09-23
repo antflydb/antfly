@@ -71,6 +71,11 @@
       "command": ["zig", "build", "public-api-parity-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "--", "--test-filter", "SQL API cross-table MERGE retains both source and target range proofs"],
       "cwd": "zig",
       "timeout_seconds": 600
+    },
+    "sql-mounted-conflict-capture": {
+      "command": ["zig", "build", "public-api-parity-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "--", "--test-filter", "SQL original sql-1411 uses active native unique claim and one guarded commit"],
+      "cwd": "zig",
+      "timeout_seconds": 600
     }
   },
   "entries": [
@@ -2340,63 +2345,147 @@
     },
     {
       "id": "sql-0438",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact original SELECT executes through mounted HTTP over native typed rows. The test checks the projected column, full result count, and every returned ID across mixed-case and absent status values.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL executes one relational page with exact integer parameters",
+          "gate": "sql-mounted-read-shapes"
+        }
+      ]
     },
     {
       "id": "sql-0439",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact implicit MATCH projection alias executes through mounted HTTP over native typed rows. The test checks the alias name, integer type, and all nine returned IDs.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL executes one relational page with exact integer parameters",
+          "gate": "sql-mounted-read-shapes"
+        }
+      ]
     },
     {
       "id": "sql-0440",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact original SELECT executes through mounted HTTP over native typed rows. The test checks the projected column, full result count, and every returned ID across mixed-case and absent status values.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL executes one relational page with exact integer parameters",
+          "gate": "sql-mounted-read-shapes"
+        }
+      ]
     },
     {
       "id": "sql-0441",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact original SELECT executes through mounted HTTP over native typed rows. The test checks the projected column, full result count, and every returned ID across mixed-case and absent status values.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL executes one relational page with exact integer parameters",
+          "gate": "sql-mounted-read-shapes"
+        }
+      ]
     },
     {
       "id": "sql-0442",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact original SELECT executes through mounted HTTP over native typed rows. The test checks the projected column, full result count, and every returned ID across mixed-case and absent status values.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL executes one relational page with exact integer parameters",
+          "gate": "sql-mounted-read-shapes"
+        }
+      ]
     },
     {
       "id": "sql-0443",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact original SELECT executes through mounted HTTP over native typed rows. The test checks the projected column, full result count, and every returned ID across mixed-case and absent status values.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL executes one relational page with exact integer parameters",
+          "gate": "sql-mounted-read-shapes"
+        }
+      ]
     },
     {
       "id": "sql-0444",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact original SELECT executes through mounted HTTP over native typed rows. The test checks the projected column, full result count, and every returned ID across mixed-case and absent status values.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL executes one relational page with exact integer parameters",
+          "gate": "sql-mounted-read-shapes"
+        }
+      ]
     },
     {
       "id": "sql-0445",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact original SELECT executes through mounted HTTP over native typed rows. The test checks the projected column, full result count, and every returned ID across mixed-case and absent status values.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL executes one relational page with exact integer parameters",
+          "gate": "sql-mounted-read-shapes"
+        }
+      ]
     },
     {
       "id": "sql-0446",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact original SELECT executes through mounted HTTP over native typed rows. The test checks the projected column, full result count, and every returned ID across mixed-case and absent status values.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL executes one relational page with exact integer parameters",
+          "gate": "sql-mounted-read-shapes"
+        }
+      ]
     },
     {
       "id": "sql-0447",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact original SELECT executes through mounted HTTP over native typed rows. The test checks the projected column, full result count, and every returned ID across mixed-case and absent status values.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL executes one relational page with exact integer parameters",
+          "gate": "sql-mounted-read-shapes"
+        }
+      ]
     },
     {
       "id": "sql-0448",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact original SELECT executes through mounted HTTP over native typed rows. The test checks the projected column, full result count, and every returned ID across mixed-case and absent status values.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL executes one relational page with exact integer parameters",
+          "gate": "sql-mounted-read-shapes"
+        }
+      ]
     },
     {
       "id": "sql-0449",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact original SELECT executes through mounted HTTP over native typed rows. The test checks the projected column, full result count, and every returned ID across mixed-case and absent status values.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL executes one relational page with exact integer parameters",
+          "gate": "sql-mounted-read-shapes"
+        }
+      ]
     },
     {
       "id": "sql-0450",
@@ -5877,213 +5966,507 @@
     },
     {
       "id": "sql-1141",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1142",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1143",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1144",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1145",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1146",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1147",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1148",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1149",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1150",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1151",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1152",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1153",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1154",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1155",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1156",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1157",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1158",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1159",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1160",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1161",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1162",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1163",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1164",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1165",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1166",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1167",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1168",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1169",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1170",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1171",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1172",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1173",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1174",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1175",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1176",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1177",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1178",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1179",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1180",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1181",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1182",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1183",
@@ -6097,43 +6480,99 @@
     },
     {
       "id": "sql-1185",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1186",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1187",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1188",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1189",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1190",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1191",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1192",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/sql/compiler.zig",
+          "test": "SQL original unsupported catalog object commands reject before backend access",
+          "gate": "sql-compiler-rejections"
+        }
+      ]
     },
     {
       "id": "sql-1193",
@@ -7389,8 +7828,9 @@
     },
     {
       "id": "sql-1411",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact original INSERT conflict scalar subquery runs through mounted SQL with an active native unique arbiter and typed owner claim. It captures the pre-conflict source value before the owner point read, commits once with range and native claim guards, and returns the matched id.",
+      "evidence": [{ "path": "zig/pkg/antfly/src/api/sql_execution.zig", "test": "SQL original sql-1411 uses active native unique claim and one guarded commit", "gate": "sql-mounted-conflict-capture" }, { "path": "zig/pkg/antfly/src/sql/conflict_test.zig", "test": "SQL original sql-1411 conflict scalar source captures before one guarded commit", "gate": "sql-compiler-rejections" }]
     },
     {
       "id": "sql-1412",
@@ -7535,8 +7975,9 @@
     },
     {
       "id": "sql-1440",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact same-table INSERT SELECT conflict subquery runs through mounted SQL with an active native unique arbiter. Source rows and the scalar assignment are captured together before the owner point read, then one guarded commit publishes the returned status.",
+      "evidence": [{ "path": "zig/pkg/antfly/src/api/sql_execution.zig", "test": "SQL original sql-1411 uses active native unique claim and one guarded commit", "gate": "sql-mounted-conflict-capture" }, { "path": "zig/pkg/antfly/src/sql/conflict_test.zig", "test": "SQL original sql-1411 conflict scalar source captures before one guarded commit", "gate": "sql-compiler-rejections" }]
     },
     {
       "id": "sql-1441",

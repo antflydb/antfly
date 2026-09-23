@@ -91,8 +91,10 @@ pub const BoundStatement = struct {
 pub const Description = struct {
     arena: std.heap.ArenaAllocator,
     binding: BoundStatement,
+    settings: ?*@import("setting_catalog.zig").View = null,
 
     pub fn deinit(self: *Description) void {
+        if (self.settings) |view| view.deinit();
         self.arena.deinit();
         self.* = undefined;
     }
@@ -101,8 +103,17 @@ pub const Description = struct {
 pub fn describe(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled, explicit_parameter_types: []const ?ast.ColumnType) !Description {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
-    const binding = try bind(arena.allocator(), backend, compiled, explicit_parameter_types);
-    return .{ .arena = arena, .binding = binding };
+    var statement_backend = backend;
+    var settings: ?*@import("setting_catalog.zig").View = null;
+    if (backend.setting_capture) |capture| {
+        const view = try arena.allocator().create(@import("setting_catalog.zig").View);
+        view.* = try @import("setting_catalog.zig").View.capture(allocator, capture.owner, capture.scope, capture.overlay);
+        settings = view;
+        statement_backend.settings_view = view;
+    }
+    errdefer if (settings) |view| view.deinit();
+    const binding = try bind(arena.allocator(), statement_backend, compiled, explicit_parameter_types);
+    return .{ .arena = arena, .binding = binding, .settings = settings };
 }
 
 fn assignmentLiteral(value: ast.Value, kind: ast.ColumnType) !ast.Value {
@@ -142,13 +153,13 @@ fn typedValuesSource(allocator: std.mem.Allocator, source: *const ast.Select, in
         };
         return result;
     }
-    if (row_index.* >= insertion.values_source_rows.len or source.columns.len != insertion.columns.len) return error.InvalidSqlParameters;
+    if (row_index.* >= insertion.values_source_rows.len or source.columns.len != insertion.columns.len + (if (insertion.conflict) |clause| clause.capture_count else @as(usize, 0))) return error.InvalidSqlParameters;
     const row = insertion.values_source_rows[row_index.*];
     const default_row = row_index.*;
     row_index.* += 1;
-    if (row.len != source.columns.len) return error.InvalidSqlParameters;
+    if (row.len != insertion.columns.len) return error.InvalidSqlParameters;
     const projections = try allocator.dupe(ast.Projection, source.columns);
-    for (projections, row, insertion.columns, 0..) |*projection, original, name, cell_index| {
+    for (projections[0..insertion.columns.len], row, insertion.columns, 0..) |*projection, original, name, cell_index| {
         if (insertion.isDefault(default_row, cell_index)) continue;
         const expression = projection.expression orelse return error.InvalidSqlBackendResponse;
         if (expression.* != .literal or original == .parameter) continue;
@@ -288,7 +299,7 @@ pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
         @memset(parameters, null);
         @memcpy(parameters[0..explicit_parameter_types.len], explicit_parameter_types);
         const aggregate = try allocator.create(@import("aggregate_binding.zig").Bound);
-        aggregate.* = try @import("aggregate_binding.zig").bind(allocator, table, compiled.statement.select, parameters);
+        aggregate.* = try @import("aggregate_binding.zig").bindWithSettings(allocator, table, compiled.statement.select, parameters, backend.settings_view);
         const columns = try allocator.alloc(Column, aggregate.outputs.len);
         for (columns, aggregate.names, aggregate.outputs) |*column, name, program| column.* = .{ .name = name, .type = program.output_type.kind orelse .string, .untyped_null = program.output_type.kind == null };
         var json_literals: std.StringHashMapUnmanaged(Json) = .empty;
@@ -303,7 +314,7 @@ pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
     }
     if (compiled.statement == .select and compiled.statement.select.table == null) {
         try backend.vtable.checkpoint(backend.ptr);
-        return bindConstantSelect(allocator, compiled, explicit_parameter_types);
+        return bindConstantSelect(allocator, compiled, explicit_parameter_types, backend.settings_view);
     }
     if (compiled.statement == .merge) {
         try backend.vtable.checkpoint(backend.ptr);
@@ -356,8 +367,7 @@ pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
     defer allocator.free(contexts);
     @memset(contexts, null);
     var context: Context = .{ .allocator = allocator, .backend = backend, .table = table, .parameters = parameters, .contexts = contexts };
-    const conflict_binding = if (compiled.statement == .insert and compiled.statement.insert.conflict != null) try @import("conflict.zig").bind(allocator, backend, table, target.name, compiled.statement.insert.conflict.?, parameters) else null;
-    if (!joined) context.scalars = try bound_scalars.bind(allocator, table, compiled.statement, parameters);
+    if (!joined) context.scalars = try bound_scalars.bindWithSettings(allocator, table, compiled.statement, parameters, backend.settings_view);
     const columns: []const Column = if (joined) &.{} else switch (compiled.statement) {
         .select => |statement| try context.select(statement),
         .insert => |statement| blk: {
@@ -375,7 +385,6 @@ pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
         else => unreachable,
     };
     var result: BoundStatement = .{ .table = table, .action = target.action, .columns = columns, .parameter_types = parameters, .json_literals = context.json_literals, .scalars = context.scalars, .order_keys = context.order_keys, .primary_order = context.primary_order };
-    result.conflict = conflict_binding;
     if (joined) {
         const bound = try allocator.create(@import("joined_mutation.zig").Bound);
         bound.* = try @import("joined_mutation.zig").bind(allocator, backend, table, compiled, parameters);
@@ -393,20 +402,32 @@ pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
         // Assignment context supplies the type of otherwise-untyped positional
         // parameters. The SELECT binder retains all source authorization and
         // immutable catalog identities separately from the target binding.
-        const expected = try allocator.alloc(ast.ColumnType, insertion.columns.len);
-        for (insertion.columns, expected) |name, *kind| kind.* = (try table.column(name)).type;
+        const capture_count = if (insertion.conflict) |clause| clause.capture_count else 0;
+        const expected = try allocator.alloc(ast.ColumnType, insertion.columns.len + capture_count);
+        for (insertion.columns, expected[0..insertion.columns.len]) |name, *kind| kind.* = (try table.column(name)).type;
+        if (capture_count != 0) for (insertion.conflict.?.assignments) |assignment| if (assignment.capture_ordinal) |ordinal| {
+            for (ordinal..ordinal + assignment.capture_span) |capture_index| expected[insertion.columns.len + capture_index] = (try table.column(assignment.field)).type;
+        };
         try @import("relation_binding.zig").inferExpected(allocator, backend, source_query, parameters, expected);
         const lowered: compiler.Compiled = .{ .arena = undefined, .statement = .{ .select = source_query }, .parameter_count = compiled.parameter_count };
         const bound = try allocator.create(BoundStatement);
         bound.* = try bind(allocator, backend, &lowered, parameters);
-        if (bound.columns.len != insertion.columns.len) return error.InvalidSqlParameters;
-        for (bound.columns, insertion.columns) |source_column, name| {
+        if (bound.columns.len != expected.len) return error.InvalidSqlParameters;
+        for (bound.columns[0..insertion.columns.len], insertion.columns) |source_column, name| {
             const destination = try table.column(name);
             const untyped_null = source_column.untyped_null;
             if (!untyped_null and source_column.type != destination.type and !(source_column.type == .integer and destination.type == .number) and !(insertion.values_source_rows.len != 0 and source_column.type == .string and (destination.type == .datetime or destination.type == .json))) return error.SqlTypeMismatch;
         }
         result.insert_source = bound;
         result.parameter_types = bound.parameter_types;
+    };
+    if (compiled.statement == .insert) if (compiled.statement.insert.conflict) |clause| {
+        const capture_types = try allocator.alloc(ast.ColumnType, clause.capture_count);
+        if (clause.capture_count != 0) {
+            const source = result.insert_source orelse return error.InvalidSqlBackendResponse;
+            for (source.columns[compiled.statement.insert.columns.len..], capture_types) |column, *kind| kind.* = column.type;
+        }
+        result.conflict = try @import("conflict.zig").bind(allocator, backend, table, target.name, clause, parameters, capture_types);
     };
     if (returning_select) |selection| {
         var adapter: @import("relation_binding.zig").ResolveAdapter = .{ .backend = backend, .table = table };
@@ -421,7 +442,7 @@ pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
     return result;
 }
 
-fn bindConstantSelect(alloc: std.mem.Allocator, compiled: *const compiler.Compiled, hints: []const ?ast.ColumnType) !BoundStatement {
+fn bindConstantSelect(alloc: std.mem.Allocator, compiled: *const compiler.Compiled, hints: []const ?ast.ColumnType, settings: ?*const @import("setting_catalog.zig").View) !BoundStatement {
     const statement = compiled.statement.select;
     if (!statement.count_all and statement.columns.len == 0) return error.UndefinedColumn;
     const parameters = try alloc.alloc(?ast.ColumnType, compiled.parameter_count);
@@ -438,7 +459,7 @@ fn bindConstantSelect(alloc: std.mem.Allocator, compiled: *const compiler.Compil
             else => return error.InvalidSqlLimit,
         }
     };
-    const scalars = try bound_scalars.bind(alloc, null, compiled.statement, parameters);
+    const scalars = try bound_scalars.bindWithSettings(alloc, null, compiled.statement, parameters, settings);
     const columns = try alloc.alloc(Column, if (statement.count_all) 1 else statement.columns.len);
     if (statement.count_all) {
         columns[0] = .{ .name = try alloc.dupe(u8, statement.count_alias orelse "count"), .type = .integer };

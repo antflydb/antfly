@@ -95,6 +95,7 @@ pub fn stageBegin(txn: anytype, fence: Fence) !void {
         if (!existing.eql(fence)) return error.IntegrityTopologyBusy;
         return;
     }
+    try @import("relational_integrity_generation_retirement.zig").requireClear(txn);
     if (try optional(txn, receipt_key)) |bytes| {
         const previous = try Fence.decode(bytes);
         if (previous.admission_epoch >= fence.admission_epoch)
@@ -139,7 +140,7 @@ fn abortedKey(fence: Fence) [abort_prefix.len + 9]u8 {
 /// horizon before collection; elapsed wall time is not a correctness proof.
 pub fn stageAbortTransition(txn: anytype, expected: Fence) !void {
     _ = try expected.encode();
-    if (expected.role != .split_source and expected.role != .split_destination and expected.role != .merge_source and expected.role != .merge_destination and expected.role != .rewrite_source) return error.InvalidIntegrityTopologyFence;
+    if (expected.role != .split_source and expected.role != .split_destination and expected.role != .merge_source and expected.role != .merge_destination and expected.role != .rewrite_source and expected.role != .truncate_parent) return error.InvalidIntegrityTopologyFence;
     const key = abortedKey(expected);
     const previous = if (try optional(txn, &key)) |bytes| blk: {
         if (bytes.len != 8) return error.InvalidIntegrityTopologyFence;
@@ -147,10 +148,11 @@ pub fn stageAbortTransition(txn: anytype, expected: Fence) !void {
     } else 0;
     if (try current(txn)) |fence| {
         if (fence.role == expected.role and fence.transition_id == expected.transition_id and fence.attempt <= expected.attempt) {
+            if (fence.role == .truncate_parent) try @import("relational_integrity_generation_retirement.zig").stageCancel(txn, fence) else try @import("relational_integrity_generation_retirement.zig").requireClear(txn);
             try stageReceipt(txn, fence);
             try txn.delete(fence_key);
         }
-    }
+    } else try @import("relational_integrity_generation_retirement.zig").requireClear(txn);
     var attempt: [8]u8 = undefined;
     std.mem.writeInt(u64, &attempt, @max(previous, expected.attempt), .little);
     try txn.put(&key, &attempt);
@@ -187,6 +189,9 @@ pub fn requireDrained(txn: anytype, manager: *transactions.TxnManager, expected:
 /// Final release must share the ownership/cutover transaction. Persist a
 /// checksummed receipt so delayed control commands cannot resurrect a fence.
 pub fn stageRelease(txn: anytype, expected: Fence) !void {
+    // Publication must activate the exact pending parent generations before
+    // lifting the write fence. Until that path exists, release fails closed.
+    try @import("relational_integrity_generation_retirement.zig").requireClear(txn);
     if (try current(txn)) |actual| {
         if (!actual.eql(expected)) return error.IntegrityTopologyChanged;
         try stageReceipt(txn, expected);
@@ -205,7 +210,12 @@ pub fn stageCancel(txn: anytype, expected: Fence) !void {
     _ = try expected.encode();
     if (try current(txn)) |actual| {
         if (actual.admission_epoch == expected.admission_epoch and !actual.eql(expected)) return error.IntegrityTopologyChanged;
-        if (actual.eql(expected)) try txn.delete(fence_key);
+        if (actual.eql(expected)) {
+            if (expected.role == .truncate_parent) try @import("relational_integrity_generation_retirement.zig").stageCancel(txn, expected) else try @import("relational_integrity_generation_retirement.zig").requireClear(txn);
+            try txn.delete(fence_key);
+        }
+    } else {
+        try @import("relational_integrity_generation_retirement.zig").requireClear(txn);
     }
     try stageReceipt(txn, expected);
 }
@@ -224,4 +234,65 @@ test "relational integrity topology fence codec detects corrupt ownership identi
     try std.testing.expect((try Fence.decode(&bytes)).eql(fence));
     bytes[40] ^= 1;
     try std.testing.expectError(error.InvalidIntegrityTopologyFence, Fence.decode(&bytes));
+}
+
+test "relational integrity topology pending inverse generation is owner bound and corruptions fail closed" {
+    const retirement = @import("relational_integrity_generation_retirement.zig");
+    const alloc = std.testing.allocator;
+    const fence: Fence = .{ .role = .truncate_parent, .transition_id = 11, .attempt = 1, .peer_group_id = 21, .owner_group_id = 31, .namespace = .{ .table_id = 41, .shard_id = 31, .range_id = 31 }, .catalog_digest = @splat(2) };
+    const entries = [_]retirement.Entry{ .{ .child_table_id = 51, .child_table_name = "children", .constraint_name = "fk1", .generation = @splat(3) }, .{ .child_table_id = 52, .child_table_name = "other_children", .constraint_name = "fk2", .generation = @splat(4) } };
+    const bytes = try retirement.encodePending(alloc, fence, @splat(5), &entries);
+    defer alloc.free(bytes);
+    const pending = try retirement.Pending.decode(bytes);
+    try std.testing.expect(pending.fence.eql(fence));
+    try std.testing.expect(pending.contains(51, @splat(3)));
+    try std.testing.expect(!pending.contains(51, @splat(4)));
+    const reference: @import("relational_integrity_contract.zig").Reference = .{ .child_table = "children", .child_key = "row", .constraint_name = "fk1", .constraint_generation = @splat(3) };
+    try std.testing.expect(pending.matchesReference(reference));
+    var wrong_reference = reference;
+    wrong_reference.child_table = "same_generation_wrong_child";
+    try std.testing.expect(!pending.matchesReference(wrong_reference));
+    wrong_reference = reference;
+    wrong_reference.constraint_name = "same_generation_wrong_fk";
+    try std.testing.expect(!pending.matchesReference(wrong_reference));
+    try std.testing.expectError(error.InvalidGenerationRetirement, retirement.encodePending(alloc, fence, @splat(5), &.{ entries[0], entries[0] }));
+    bytes[185] ^= 1;
+    try std.testing.expectError(error.InvalidGenerationRetirement, retirement.Pending.decode(bytes));
+}
+
+test "relational integrity topology cancels exact pending parent generation before fence release" {
+    const retirement = @import("relational_integrity_generation_retirement.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const Mock = struct {
+        alloc: Allocator,
+        fence: ?[]const u8 = null,
+        pending: ?[]const u8 = null,
+        receipt: ?[]const u8 = null,
+
+        pub fn get(self: *@This(), physical_key: []const u8) ![]const u8 {
+            const value = if (std.mem.eql(u8, physical_key, fence_key)) self.fence else if (std.mem.eql(u8, physical_key, retirement.key)) self.pending else if (std.mem.eql(u8, physical_key, receipt_key)) self.receipt else null;
+            return value orelse error.NotFound;
+        }
+        pub fn put(self: *@This(), physical_key: []const u8, value: []const u8) !void {
+            const copied = try self.alloc.dupe(u8, value);
+            if (std.mem.eql(u8, physical_key, fence_key)) self.fence = copied else if (std.mem.eql(u8, physical_key, retirement.key)) self.pending = copied else if (std.mem.eql(u8, physical_key, receipt_key)) self.receipt = copied else return error.InvalidTestKey;
+        }
+        pub fn delete(self: *@This(), physical_key: []const u8) !void {
+            if (std.mem.eql(u8, physical_key, fence_key)) self.fence = null else if (std.mem.eql(u8, physical_key, retirement.key)) self.pending = null else return error.InvalidTestKey;
+        }
+    };
+    const fence: Fence = .{ .role = .truncate_parent, .transition_id = 11, .attempt = 1, .peer_group_id = 21, .owner_group_id = 31, .namespace = .{ .table_id = 41, .shard_id = 31, .range_id = 31 }, .catalog_digest = @splat(2) };
+    const encoded_fence = try fence.encode();
+    var txn: Mock = .{ .alloc = alloc, .fence = &encoded_fence, .pending = try retirement.encodePending(alloc, fence, @splat(5), &.{.{ .child_table_id = 51, .child_table_name = "children", .constraint_name = "fk", .generation = @splat(3) }}) };
+    try std.testing.expectError(error.GenerationRetirementPending, stageRelease(&txn, fence));
+    var other = fence;
+    other.transition_id += 1;
+    try std.testing.expectError(error.IntegrityTopologyChanged, retirement.stageCancel(&txn, other));
+    try stageCancel(&txn, fence);
+    try std.testing.expect(txn.fence == null and txn.pending == null and txn.receipt != null);
+    try std.testing.expect((try completed(&txn)).?.eql(fence));
+    try stageCancel(&txn, fence);
+    try std.testing.expectEqual(@as(u64, 2), try nextEpoch(&txn));
 }

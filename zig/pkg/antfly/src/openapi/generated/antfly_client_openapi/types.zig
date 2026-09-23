@@ -35517,6 +35517,12 @@ pub const SortProfile = struct {
     }
 };
 
+/// Put a complete definition/default set or drop one by name.
+pub const SqlSettingMutationRequest = std.json.Value;
+
+/// One typed setting value, matching the declared kind.
+pub const SqlSettingValue = std.json.Value;
+
 /// Stateful graph results keyed by operation name. Legacy values are possible only when the corresponding request used graph_searches.
 pub const StatefulGraphQueryResults = std.json.ArrayHashMap(StatefulGraphResult);
 

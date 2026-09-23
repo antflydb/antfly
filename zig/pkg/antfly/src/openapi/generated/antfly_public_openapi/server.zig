@@ -809,6 +809,11 @@ pub const DeleteSecretPathParams = struct {
     key: []const u8,
 };
 
+/// Parse the JSON request body for administerSqlSettings.
+pub fn parseAdministerSqlSettingsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.SqlSettingMutationRequest) {
+    return std.json.parseFromSlice(types.SqlSettingMutationRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Parse the JSON request body for executeSQL.
 pub fn parseExecuteSQLBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.SQLRequest) {
     return std.json.parseFromSlice(types.SQLRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -1538,6 +1543,7 @@ pub const routes = [_]Route{
     .{ .method = "GET", .path = "/secrets", .operation_id = "listSecrets", .request_body = .none, .streaming_response = false },
     .{ .method = "PUT", .path = "/secrets/{key}", .operation_id = "putSecret", .request_body = .buffered, .streaming_response = false },
     .{ .method = "DELETE", .path = "/secrets/{key}", .operation_id = "deleteSecret", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/settings", .operation_id = "administerSqlSettings", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/sql", .operation_id = "executeSQL", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/sql/prepared", .operation_id = "prepareSQL", .request_body = .buffered, .streaming_response = false },
     .{ .method = "DELETE", .path = "/sql/prepared/{prepared_id}", .operation_id = "closePreparedSQL", .request_body = .none, .streaming_response = false },
@@ -1694,6 +1700,7 @@ pub const routes = [_]Route{
 //   fn listSecrets(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn putSecret(self: *Impl, ctx: *httpx.Context, key: []const u8) !httpx.Response
 //   fn deleteSecret(self: *Impl, ctx: *httpx.Context, key: []const u8) !httpx.Response
+//   fn administerSqlSettings(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn executeSQL(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn prepareSQL(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn closePreparedSQL(self: *Impl, ctx: *httpx.Context, prepared_id: []const u8) !httpx.Response

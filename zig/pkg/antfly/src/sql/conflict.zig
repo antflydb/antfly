@@ -9,13 +9,16 @@ const scalar = @import("scalar.zig");
 
 pub const Bound = struct {
     columns: []const scalar.Column,
-    assignments: []const scalar.Program,
+    row_width: usize,
+    assignments: []const ?scalar.Program,
     predicate: ?scalar.Program,
     arbiter_conditions: []const catalog.Condition = &.{},
     arbiter_expressions: []const catalog.ConflictExpression = &.{},
 };
 
-pub fn bind(alloc: std.mem.Allocator, backend: catalog.Backend, table: catalog.Table, name: ast.Name, clause: ast.Conflict, parameters: []?ast.ColumnType) !Bound {
+pub fn bind(alloc: std.mem.Allocator, backend: catalog.Backend, table: catalog.Table, name: ast.Name, clause: ast.Conflict, parameters: []?ast.ColumnType, capture_types: []const ast.ColumnType) !Bound {
+    if (clause.capture_count != 0 and (!backend.atomic_statement_read_set or backend.vtable.open_statement == null)) return error.SqlRangeTrackingRequired;
+    if (capture_types.len != clause.capture_count) return error.InvalidSqlBackendResponse;
     // Secondary unique arbiters require a native unique-key reservation, not
     // a scan of a possibly partial index. Refuse them until that authority is
     // exposed by the native coordinator.
@@ -34,12 +37,15 @@ pub fn bind(alloc: std.mem.Allocator, backend: catalog.Backend, table: catalog.T
         }
     }
     const count = table.columns.len + 1;
-    const columns = try alloc.alloc(scalar.Column, count * 3);
+    const columns = try alloc.alloc(scalar.Column, count * 3 + clause.capture_count);
     for (0..count) |i| {
         const column = if (i == table.columns.len) try table.column("_id") else table.columns[i];
         columns[i] = .{ .name = column.name, .type = column.type, .nullable = column.nullable };
         columns[count + i] = .{ .name = try std.fmt.allocPrint(alloc, "{s}\x00{s}", .{ name.table, column.name }), .type = column.type, .nullable = column.nullable };
         columns[count * 2 + i] = .{ .name = try std.fmt.allocPrint(alloc, "excluded\x00{s}", .{column.name}), .type = column.type, .nullable = column.nullable };
+    }
+    for (columns[count * 3 ..], capture_types, 0..) |*column, kind, ordinal| {
+        column.* = .{ .name = try std.fmt.allocPrint(alloc, "$conflict_capture_{d}", .{ordinal}), .type = kind, .nullable = true };
     }
     var pass: usize = 0;
     while (true) : (pass += 1) {
@@ -49,14 +55,18 @@ pub fn bind(alloc: std.mem.Allocator, backend: catalog.Backend, table: catalog.T
             const column = try table.column(assignment.field);
             if (column.generated or std.mem.eql(u8, column.name, "_id")) return error.UnsupportedSqlShape;
             const expression = assignment.expression orelse return error.InvalidSqlBackendResponse;
-            changed = try scalar.inferParameters(alloc, expression, columns, parameters, column.type, .{}) or changed;
+            if (assignment.capture_ordinal) |ordinal| {
+                if (ordinal + assignment.capture_span > clause.capture_count) return error.InvalidSqlBackendResponse;
+                if (assignment.capture_expression == null) continue;
+            }
+            changed = try scalar.inferParameters(alloc, assignment.capture_expression orelse expression, columns, parameters, column.type, .{}) or changed;
         }
         if (clause.predicate) |expression| changed = try scalar.inferParameters(alloc, expression, columns, parameters, .boolean, .{}) or changed;
         if (!changed) break;
     }
-    const assignments = try alloc.alloc(scalar.Program, clause.assignments.len);
-    for (clause.assignments, assignments) |assignment, *program| program.* = try scalar.bindExpected(alloc, assignment.expression.?, columns, parameters, (try table.column(assignment.field)).type, .{});
-    return .{ .columns = columns, .assignments = assignments, .predicate = if (clause.predicate) |expression| try scalar.bindExpected(alloc, expression, columns, parameters, .boolean, .{}) else null, .arbiter_conditions = arbiter_conditions, .arbiter_expressions = arbiter_expressions };
+    const assignments = try alloc.alloc(?scalar.Program, clause.assignments.len);
+    for (clause.assignments, assignments) |assignment, *program| program.* = if (assignment.capture_ordinal != null and assignment.capture_expression == null) null else try scalar.bindExpectedWithSettings(alloc, assignment.capture_expression orelse assignment.expression.?, columns, parameters, (try table.column(assignment.field)).type, .{}, backend.settings_view);
+    return .{ .columns = columns, .row_width = count, .assignments = assignments, .predicate = if (clause.predicate) |expression| try scalar.bindExpectedWithSettings(alloc, expression, columns, parameters, .boolean, .{}, backend.settings_view) else null, .arbiter_conditions = arbiter_conditions, .arbiter_expressions = arbiter_expressions };
 }
 
 fn bindArbiterPredicate(alloc: std.mem.Allocator, table: catalog.Table, expression: *const ast.Scalar) ![]const catalog.Condition {
@@ -131,7 +141,8 @@ pub fn allowsDuplicateKeys(clause: ast.Conflict) bool {
 /// A retained point snapshot plus an atomic version predicate is optimistic
 /// concurrency control, not a read-then-overwrite. A racing insert/update is a
 /// definite serialization conflict, never an automatically replayed mutation.
-pub fn resolve(context: anytype, table: catalog.Table, clause: ast.Conflict, binding: Bound, proposed: []const catalog.Mutation) ![]const catalog.Mutation {
+pub fn resolve(context: anytype, table: catalog.Table, clause: ast.Conflict, binding: Bound, proposed: []const catalog.Mutation, captured: []const []const scalar.Datum) ![]const catalog.Mutation {
+    if (clause.capture_count != 0 and captured.len != proposed.len) return error.InvalidSqlBackendResponse;
     if (!context.backend.predicate_only_mutations) return error.UnsupportedSqlExecution;
     if (table.storage_mode != .relational) return error.UnsupportedSqlExecution;
     const prepare = context.backend.vtable.prepare_mutations orelse return error.UnsupportedSqlExecution;
@@ -145,11 +156,12 @@ pub fn resolve(context: anytype, table: catalog.Table, clause: ast.Conflict, bin
         }
         return resolveAny(context, table, binding, normalized, owners.?);
     }
-    return resolvePrepared(context, table, clause, binding, proposed, normalized, owners);
+    return resolvePrepared(context, table, clause, binding, proposed, normalized, owners, captured);
 }
 
-fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict, binding: Bound, proposed: []const catalog.Mutation, normalized: []const catalog.Mutation, owners: ?[]const catalog.ConflictOwner) ![]const catalog.Mutation {
+fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict, binding: Bound, proposed: []const catalog.Mutation, normalized: []const catalog.Mutation, owners: ?[]const catalog.ConflictOwner, captured: []const []const scalar.Datum) ![]const catalog.Mutation {
     const buffer = try context.arena.alloc(catalog.Mutation, normalized.len);
+    const captured_buffer = try context.arena.alloc([]const scalar.Datum, normalized.len);
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     var owner_by_key: std.StringHashMapUnmanaged(catalog.ConflictOwner) = .empty;
     var count: usize = 0;
@@ -170,6 +182,7 @@ fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict,
             try owner_by_key.put(context.arena, mutation.key, item);
         }
         buffer[count] = mutation;
+        captured_buffer[count] = if (captured.len == 0) &.{} else captured[position];
         count += 1;
     }
     const result = buffer[0..count];
@@ -181,8 +194,8 @@ fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict,
             if (std.mem.eql(u8, assignment.field, column.name)) break true;
         } else false;
         var needed = !column.generated and !replaced;
-        const width = binding.columns.len / 3;
-        for (binding.assignments) |program| for (program.required_columns) |required| {
+        const width = binding.row_width;
+        for (binding.assignments) |program| if (program) |bound_program| for (bound_program.required_columns) |required| {
             if (required < width * 2 and required % width == ordinal) needed = true;
         };
         if (binding.predicate) |program| for (program.required_columns) |required| {
@@ -190,11 +203,16 @@ fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict,
         };
         if (needed) try fields.append(context.arena, column.path);
     };
-    for (result) |*mutation| {
+    // The conflict-resolution scan-page budget belongs to the whole mutation
+    // batch, not each conflicted key. Otherwise a bounded batch can multiply
+    // one expensive point cursor by the mutation-row limit before commit.
+    var point_pages: usize = 0;
+    for (result, captured_buffer[0..count]) |*mutation, captured_row| {
         try context.checkpoint();
         const conflict_owner = owner_by_key.get(mutation.key);
         if (conflict_owner) |owner| if (owner.key == null) continue;
         const lookup_key = if (conflict_owner) |owner| owner.key.? else mutation.key;
+        if (point_pages >= context.limits.scan_pages) return error.SqlProgramLimitExceeded;
         // A point read can carry a large native page/continuation even though
         // only its fenced row image survives this iteration. Reclaim that
         // scratch before opening the next owner in a large conflict batch.
@@ -208,18 +226,18 @@ fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict,
         defer cursor.close(cursor.ptr);
         var page = try cursor.next(cursor.ptr, page_alloc, 2);
         defer page.deinit();
-        var pages: usize = 1;
+        point_pages += 1;
         // Native point ranges may yield an empty progress page while skipping
         // expired rows; only exhaustion proves absence. A row-filled page can
         // carry continuation even though the exact key already resolves.
         while (page.rows.len == 0 and page.after != null) {
             try context.checkpoint();
-            if (pages >= context.limits.scan_pages) return error.SqlProgramLimitExceeded;
+            if (point_pages >= context.limits.scan_pages) return error.SqlProgramLimitExceeded;
             page.deinit();
             page = .{ .rows = &.{} };
             _ = page_arena.reset(.retain_capacity);
             page = try cursor.next(cursor.ptr, page_alloc, 2);
-            pages += 1;
+            point_pages += 1;
         }
         if (page.rows.len > 1) return error.InvalidSqlBackendResponse;
         if (page.rows.len == 0) {
@@ -240,7 +258,7 @@ fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict,
             mutation.json_null_fields = &.{};
             continue;
         }
-        const width = binding.columns.len / 3;
+        const width = binding.row_width;
         const cells = try page_alloc.alloc(scalar.Datum, binding.columns.len);
         for (0..width) |i| {
             const cell = try previous.cell(binding.columns[i].name);
@@ -254,6 +272,7 @@ fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict,
             };
             cells[width * 2 + i] = .{ .value = try @import("describe.zig").coerce(value, binding.columns[i].type), .sql_null = sql_null };
         }
+        for (captured_row, cells[width * 3 ..]) |capture, *cell| cell.* = capture;
         const matches = if (binding.predicate) |program| blk: {
             const value = try program.evaluate(page_alloc, cells, context.parameters, .{});
             break :blk !value.sql_null and value.value == .bool and value.value.bool;
@@ -273,7 +292,11 @@ fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict,
                 break :blk .{ .value = old.value, .sql_null = old.sql_null };
             };
             for (clause.assignments, binding.assignments) |assignment, program| if (std.mem.eql(u8, assignment.field, column.name)) {
-                datum = try program.evaluate(page_alloc, cells, context.parameters, .{});
+                datum = if (assignment.capture_ordinal != null and assignment.capture_expression == null) blk: {
+                    const ordinal = assignment.capture_ordinal.?;
+                    if (ordinal >= captured_row.len) return error.InvalidSqlBackendResponse;
+                    break :blk captured_row[ordinal];
+                } else try (program orelse return error.InvalidSqlBackendResponse).evaluate(page_alloc, cells, context.parameters, .{});
                 break;
             };
             if (datum.sql_null and !column.nullable) return error.SqlNotNullViolation;
@@ -307,7 +330,7 @@ fn resolveAny(context: anytype, table: catalog.Table, binding: Bound, proposed: 
         // A native unique owner alone is sufficient to skip the candidate.
         // Retain its point fence as well as all native claim comparisons.
         if (owner.key) |key| point.key = key;
-        const resolved = try resolvePrepared(context, table, .{ .columns = &.{"_id"} }, binding, &.{point}, &.{point}, null);
+        const resolved = try resolvePrepared(context, table, .{ .columns = &.{"_id"} }, binding, &.{point}, &.{point}, null, &.{});
         if (resolved.len != 1) return error.InvalidSqlBackendResponse;
         var mutation = resolved[0];
         if (owner.key != null and !mutation.predicate_only) return error.SqlWriteConflict;

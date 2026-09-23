@@ -33,7 +33,19 @@ pub const receipt_key = "\x00\x00__metadata__:relational_integrity_topology_rece
 
 pub const abort_prefix = "\x00\x00__metadata__:relational_integrity_topology_aborted:";
 
-pub const Role = enum(u8) { split_source = 1, split_destination = 2, merge_source = 3, merge_destination = 4, backup_snapshot = 5, rewrite_source = 6 };
+pub const Role = enum(u8) { split_source = 1, split_destination = 2, merge_source = 3, merge_destination = 4, backup_snapshot = 5, rewrite_source = 6, truncate_parent = 7 };
+
+pub const ParentRetirementEntry = struct {
+    child_table_id: u64,
+    child_table_name: []const u8,
+    constraint_name: []const u8,
+    generation: integrity.Generation,
+};
+
+pub const ParentRetirementStage = struct {
+    plan_digest: integrity.Digest,
+    entries: []const ParentRetirementEntry,
+};
 
 pub const Fence = struct {
     admission_epoch: u64 = 1,
@@ -97,8 +109,9 @@ pub const Fence = struct {
 
 pub const Command = struct {
     fence: Fence,
-    action: enum { begin, release, cancel, abort_transition, transfer, prune },
+    action: enum { begin, release, cancel, abort_transition, transfer, prune, stage_parent_retirement },
     transfer: ?@import("relational_integrity_handoff_contract.zig").Command = null,
+    parent_retirement: ?ParentRetirementStage = null,
     pub fn jsonStringify(self: Command, jw: anytype) @TypeOf(jw.*).Error!void {
         try @import("relational_integrity_json.zig").write(self, jw);
     }

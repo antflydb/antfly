@@ -575,6 +575,11 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
         else => return err,
     };
     if (retirement != null) return error.CoordinatedConstraintPortableBackupUnsupported;
+    const generation_retirement = scan.get(@import("db/relational_integrity_generation_retirement.zig").key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (generation_retirement != null) return error.CoordinatedConstraintPortableBackupUnsupported;
     const topology_fence = scan.get(@import("db/relational_integrity_topology.zig").fence_key) catch |err| switch (err) {
         error.NotFound => null,
         else => return err,
@@ -4819,7 +4824,7 @@ test "portable backup refuses retained retirement and topology authority without
     defer store.close();
     var output: ArrayList(u8) = .empty;
     defer output.deinit(alloc);
-    inline for (.{ @import("db/relational_integrity_retirement.zig").key, @import("db/relational_integrity_topology.zig").fence_key }) |key| {
+    inline for (.{ @import("db/relational_integrity_retirement.zig").key, @import("db/relational_integrity_generation_retirement.zig").key, @import("db/relational_integrity_topology.zig").fence_key }) |key| {
         try store.put(key, "retained authority");
         try std.testing.expectError(error.CoordinatedConstraintPortableBackupUnsupported, exportPortable(alloc, &store, &output));
         try std.testing.expectEqual(@as(usize, 0), output.items.len);

@@ -60,7 +60,11 @@ pub fn predicateScalar(alloc: Allocator, table: ?catalog.Table, predicate: *cons
 /// allocator is the bounded binding arena. Nested Program arenas allocate from
 /// it, so the enclosing binding owns every program and frees them together.
 pub fn bind(alloc: Allocator, table: ?catalog.Table, statement: ast.Statement, parameters: []?ast.ColumnType) !Bound {
-    if (statement == .insert) return bindInsert(alloc, table orelse return error.UndefinedTable, statement.insert, parameters);
+    return bindWithSettings(alloc, table, statement, parameters, null);
+}
+
+pub fn bindWithSettings(alloc: Allocator, table: ?catalog.Table, statement: ast.Statement, parameters: []?ast.ColumnType, settings: ?*const @import("setting_catalog.zig").View) !Bound {
+    if (statement == .insert) return bindInsert(alloc, table orelse return error.UndefinedTable, statement.insert, parameters, settings);
     const needed = switch (statement) {
         .select => |select| blk: {
             if (needsResidual(select.predicate)) break :blk true;
@@ -81,7 +85,7 @@ pub fn bind(alloc: Allocator, table: ?catalog.Table, statement: ast.Statement, p
     const columns = try alloc.alloc(scalar.Column, table_columns.len + @intFromBool(table != null));
     for (table_columns, columns[0..table_columns.len]) |column, *out| out.* = .{ .name = column.name, .type = column.type, .nullable = column.nullable };
     if (table != null) columns[table_columns.len] = .{ .name = "_id", .type = .string, .nullable = false };
-    var builder: Builder = .{ .alloc = alloc, .table = table, .columns = columns, .parameters = parameters };
+    var builder: Builder = .{ .alloc = alloc, .table = table, .columns = columns, .parameters = parameters, .settings = settings };
     var out: Bound = .{ .columns = columns };
     const predicate = switch (statement) {
         .select => |select| select.predicate,
@@ -164,14 +168,14 @@ pub fn bind(alloc: Allocator, table: ?catalog.Table, statement: ast.Statement, p
     return out;
 }
 
-fn bindInsert(alloc: Allocator, table: catalog.Table, statement: ast.Insert, parameters: []?ast.ColumnType) !Bound {
+fn bindInsert(alloc: Allocator, table: catalog.Table, statement: ast.Insert, parameters: []?ast.ColumnType, settings: ?*const @import("setting_catalog.zig").View) !Bound {
     if (statement.expressions.len == 0) return .{};
     if (statement.expressions.len != statement.rows.len) return error.InvalidSqlParameters;
     if (statement.defaults.len != 0) {
         if (statement.defaults.len != statement.rows.len) return error.InvalidSqlParameters;
         for (statement.defaults) |mask| if (mask.len != statement.columns.len) return error.InvalidSqlParameters;
     }
-    var builder: Builder = .{ .alloc = alloc, .table = null, .columns = &.{}, .parameters = parameters };
+    var builder: Builder = .{ .alloc = alloc, .table = null, .columns = &.{}, .parameters = parameters, .settings = settings };
     var pass: usize = 0;
     while (true) : (pass += 1) {
         if (pass > parameters.len + 1) return error.ConflictingSqlParameterTypes;
@@ -207,11 +211,12 @@ const Builder = struct {
     table: ?catalog.Table,
     columns: []const scalar.Column,
     parameters: []?ast.ColumnType,
+    settings: ?*const @import("setting_catalog.zig").View = null,
     required: std.ArrayList(u32) = .empty,
     seen: std.AutoHashMapUnmanaged(u32, void) = .empty,
 
     fn program(self: *Builder, expression: *const ast.Scalar, expected: ?ast.ColumnType) !scalar.Program {
-        const result = try scalar.bindExpected(self.alloc, expression, self.columns, self.parameters, expected, .{});
+        const result = try scalar.bindExpectedWithSettings(self.alloc, expression, self.columns, self.parameters, expected, .{}, self.settings);
         if (result.parameter_types.len > self.parameters.len) return error.InvalidSqlParameters;
         for (result.parameter_types, self.parameters[0..result.parameter_types.len]) |inferred, *existing| {
             if (inferred) |kind| {

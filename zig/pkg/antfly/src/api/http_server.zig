@@ -2361,7 +2361,7 @@ pub const StatusSource = struct {
             }
             pub fn forward(self: @This(), peer: metadata_service.ReallocationProtocolPeer, forwarding: raft_mutation_forwarding.Context) anyerror!void {
                 var client = self.svc.tableMutationForwardClient();
-                const response = try client.forwardSystemCatalog(peer.orchestration_url orelse return error.NotLeader, self.input, forwarding);
+                const response = try client.forwardSystemCatalog(peer.orchestration_url orelse return error.NotLeader, self.input, forwarding, self.request.setting_admin);
                 defer client.alloc.free(response);
                 self.result.* = try self.alloc.dupe(u8, response);
             }
@@ -16363,7 +16363,61 @@ pub const ApiHttpServer = struct {
             while (target_index < job.value.plan.targets.len and range_index >= job.value.plan.targets[target_index].ranges.len) : (target_index += 1) range_index -= job.value.plan.targets[target_index].ranges.len;
             if (target_index == job.value.plan.targets.len) {
                 if (phase == .cutover or phase == .canceling) {
-                    var old_index = range_index;
+                    var parent_index = range_index;
+                    const selected_parent: ?struct { parent: stages.ExternalFkParent, range: metadata_table_manager.RangeRecord, fence: @import("../storage/db/relational_integrity_topology.zig").Fence } = for (job.value.plan.external_fk_parents) |parent| {
+                        if (parent_index < parent.ranges.len) {
+                            const range = parent.ranges[parent_index];
+                            const fence = for (parent.fences) |item| {
+                                if (item.owner_group_id == range.group_id) break item;
+                            } else return error.RestoreSourceProofMissing;
+                            break .{ .parent = parent, .range = range, .fence = fence };
+                        }
+                        parent_index -= parent.ranges.len;
+                    } else null;
+                    if (selected_parent) |selected| {
+                        if (try self.source.getRestoreStagingReceipt(self.alloc, job.value.plan.id, phase, selected.range.group_id, context)) |receipt| {
+                            self.alloc.free(receipt);
+                            owner_cursor += 1;
+                            continue;
+                        }
+                        const writes = self.table_writes orelse return error.UnsupportedOperation;
+                        if (phase == .cutover) {
+                            // Parent admission closes before an old-child
+                            // fence can be acknowledged by metadata. A lost
+                            // begin or pending-stage reply is retried under
+                            // the identical owner-local fence and plan digest.
+                            _ = (try writes.batch(self.alloc, selected.parent.table.name, .{ .relational_topology = .{ .fence = selected.fence, .action = .begin } })) orelse return error.RestoreValidationPending;
+                            var entries: [128]@import("../storage/db/relational_integrity_topology_contract.zig").ParentRetirementEntry = undefined;
+                            for (selected.parent.foreign_keys, 0..) |foreign, index| entries[index] = .{ .child_table_id = foreign.child_table_id, .child_table_name = foreign.child_table_name, .constraint_name = foreign.constraint_name, .generation = foreign.generation };
+                            _ = (try writes.batch(self.alloc, selected.parent.table.name, .{ .relational_topology = .{ .fence = selected.fence, .action = .stage_parent_retirement, .parent_retirement = .{ .plan_digest = job.value.plan_digest, .entries = entries[0..selected.parent.foreign_keys.len] } } })) orelse return error.RestoreValidationPending;
+                        } else {
+                            _ = (try writes.batch(self.alloc, selected.parent.table.name, .{ .relational_topology = .{ .fence = selected.fence, .action = .cancel } })) orelse return error.RestoreValidationPending;
+                        }
+                        var digest: [32]u8 = undefined;
+                        var hash = std.crypto.hash.Blake3.init(.{});
+                        hash.update(if (phase == .cutover) "restore parent pending v1" else "restore parent canceled v1");
+                        hash.update(&try selected.fence.encode());
+                        hash.update(&job.value.plan_digest);
+                        for (selected.parent.foreign_keys) |foreign| {
+                            var child_id: [8]u8 = undefined;
+                            std.mem.writeInt(u64, &child_id, foreign.child_table_id, .little);
+                            hash.update(&child_id);
+                            var child_name_len: [8]u8 = undefined;
+                            std.mem.writeInt(u64, &child_name_len, foreign.child_table_name.len, .little);
+                            hash.update(&child_name_len);
+                            hash.update(foreign.child_table_name);
+                            var constraint_len: [8]u8 = undefined;
+                            std.mem.writeInt(u64, &constraint_len, foreign.constraint_name.len, .little);
+                            hash.update(&constraint_len);
+                            hash.update(foreign.constraint_name);
+                            hash.update(&foreign.generation);
+                        }
+                        hash.final(&digest);
+                        try self.stagingCommand(&job, if (phase == .cutover) .parent_fenced else .canceled, .{ .group_id = selected.range.group_id, .range_id = if (selected.range.range_id == 0) selected.range.group_id else selected.range.range_id, .plan_digest = job.value.plan_digest, .completion_digest = digest }, context);
+                        owner_cursor += 1;
+                        continue;
+                    }
+                    var old_index = parent_index;
                     const selected: ?struct { table: metadata_table_manager.TableRecord, range: metadata_table_manager.RangeRecord, fence: @import("../storage/db/relational_integrity_topology.zig").Fence, rewrite_source: ?@import("../storage/db/online_source_contract.zig").Scope } = for (job.value.plan.targets) |target| {
                         if (target.replace) |old| {
                             if (old.fences.len != old.ranges.len) return error.RestoreSourceProofMissing;
@@ -23435,6 +23489,7 @@ fn extensionDependencyExists(dependencies: []const extension_domain.ExtensionDep
 }
 
 pub fn requiresAdminPermission(path: []const u8) bool {
+    if (std.mem.eql(u8, path, "/settings")) return true;
     if (isHaAdminPath(path)) return true;
     if (isStorageMaintenancePath(path)) return true;
     if (std.mem.eql(u8, path, admin_routes.raft) or std.mem.startsWith(u8, path, admin_routes.raft ++ "/")) return true;
@@ -31411,6 +31466,7 @@ test "api http server treats only exact extension prefixes as admin routes" {
 
 test "api http server treats only the raft admin namespace as admin routes" {
     try std.testing.expect(requiresAdminPermission(admin_routes.raft));
+    try std.testing.expect(requiresAdminPermission("/settings"));
     try std.testing.expect(requiresAdminPermission(admin_routes.raft_quarantines));
     try std.testing.expect(requiresAdminPermission("/admin/v1/raft/groups/41/quarantine/resume"));
     try std.testing.expect(!requiresAdminPermission("/admin/v1/raftish"));

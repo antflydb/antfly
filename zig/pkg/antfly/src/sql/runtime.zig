@@ -86,13 +86,20 @@ pub fn execute(alloc: std.mem.Allocator, backend: catalog.Backend, compiled: *co
         limits.page_rows == 0 or limits.page_rows > 4096 or limits.scan_rows == 0) return error.InvalidSqlLimit;
     if (parameters.len != compiled.parameter_count) return error.InvalidSqlParameters;
     try backend.vtable.checkpoint(backend.ptr);
+    var pinned_settings: ?@import("setting_catalog.zig").View = null;
+    defer if (pinned_settings) |*view| view.deinit();
+    var statement_backend = backend;
+    if (backend.setting_capture) |capture| {
+        pinned_settings = try @import("setting_catalog.zig").View.capture(alloc, capture.owner, capture.scope, capture.overlay);
+        statement_backend.settings_view = &pinned_settings.?;
+    }
     const state = try alloc.create(Result.State);
     state.budget = .{ .backing = alloc, .limit = limits.retained_bytes };
     state.arena = std.heap.ArenaAllocator.init(state.budget.allocator());
     var result = Result{ .state = state, .output = undefined };
     errdefer result.deinit();
     const arena = state.arena.allocator();
-    result.output = runBound(state.budget.allocator(), arena, backend, compiled, parameters, limits) catch |err| {
+    result.output = runBound(state.budget.allocator(), arena, statement_backend, compiled, parameters, limits) catch |err| {
         if (err == error.OutOfMemory and state.budget.exhausted) return error.SqlProgramLimitExceeded;
         return err;
     };
@@ -513,7 +520,7 @@ pub const Context = struct {
             mutation.* = .{ .key = key.string, .expected_version = 0, .row = document, .json_null_fields = json_null_fields.items };
         }
         try self.checkpoint();
-        const resolved = if (statement.conflict) |clause| try @import("conflict.zig").resolve(self, table_def, clause, self.binding.conflict orelse return error.InvalidSqlBackendResponse, mutations) else mutations;
+        const resolved = if (statement.conflict) |clause| try @import("conflict.zig").resolve(self, table_def, clause, self.binding.conflict orelse return error.InvalidSqlBackendResponse, mutations, &.{}) else mutations;
         return self.commitMutations(table_def, resolved, "INSERT", statement.returning);
     }
 
@@ -530,19 +537,29 @@ pub const Context = struct {
         // also releases source cursors before writer admission and prevents
         // self-inserts from reading their own writes (Halloween problem).
         const selected = try input.select(source);
-        if (selected.columns.len != statement.columns.len or selected.rows.len > self.limits.mutation_rows) return error.InvalidSqlBackendResponse;
+        const capture_count = if (statement.conflict) |clause| clause.capture_count else 0;
+        if (selected.columns.len != statement.columns.len + capture_count or selected.rows.len > self.limits.mutation_rows) return error.InvalidSqlBackendResponse;
         if (statement.values_source_rows.len != 0 and selected.rows.len != statement.values_source_rows.len) return error.InvalidSqlBackendResponse;
         const flags = selected.sql_nulls orelse if (selected.rows.len == 0) &.{} else return error.InvalidSqlBackendResponse;
         if (flags.len != selected.rows.len) return error.InvalidSqlBackendResponse;
         const mutations = try self.arena.alloc(catalog.Mutation, selected.rows.len);
+        const captured = try self.arena.alloc([]const @import("scalar.zig").Datum, selected.rows.len);
         var keys: std.StringHashMapUnmanaged(void) = .empty;
         for (selected.rows, flags, mutations, 0..) |row, nulls, *mutation, row_index| {
             try self.checkpoint();
-            if (row.len != statement.columns.len or nulls.len != row.len) return error.InvalidSqlBackendResponse;
+            if (row.len != statement.columns.len + capture_count or nulls.len != row.len) return error.InvalidSqlBackendResponse;
+            if (capture_count != 0) {
+                const cells = try self.arena.alloc(@import("scalar.zig").Datum, capture_count);
+                for (cells, row[statement.columns.len..], nulls[statement.columns.len..]) |*cell, captured_value, sql_null| {
+                    if (sql_null and captured_value != .null) return error.InvalidSqlBackendResponse;
+                    cell.* = .{ .value = captured_value, .sql_null = sql_null };
+                }
+                captured[row_index] = cells;
+            } else captured[row_index] = &.{};
             var object: std.json.ObjectMap = .empty;
             var json_null_fields: std.ArrayList([]const u8) = .empty;
             var key: ?[]const u8 = null;
-            for (target_columns, selected.columns, row, nulls, 0..) |target, source_column, value_, sql_null, cell_index| {
+            for (target_columns, selected.columns[0..statement.columns.len], row[0..statement.columns.len], nulls[0..statement.columns.len], 0..) |target, source_column, value_, sql_null, cell_index| {
                 if (statement.isDefault(row_index, cell_index)) continue;
                 if (sql_null and value_ != .null) return error.InvalidSqlBackendResponse;
                 if (sql_null and !target.nullable) return error.SqlNotNullViolation;
@@ -566,7 +583,7 @@ pub const Context = struct {
             mutation.* = .{ .key = identity, .expected_version = 0, .row = .{ .object = object }, .json_null_fields = json_null_fields.items };
         }
         try self.checkpoint();
-        const resolved = if (statement.conflict) |clause| try @import("conflict.zig").resolve(self, table, clause, self.binding.conflict orelse return error.InvalidSqlBackendResponse, mutations) else mutations;
+        const resolved = if (statement.conflict) |clause| try @import("conflict.zig").resolve(self, table, clause, self.binding.conflict orelse return error.InvalidSqlBackendResponse, mutations, captured) else mutations;
         return self.commitMutations(table, resolved, "INSERT", statement.returning);
     }
 

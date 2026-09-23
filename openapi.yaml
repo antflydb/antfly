@@ -3572,6 +3572,46 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
+  /db/v1/settings:
+    post:
+      operationId: administerSqlSettings
+      summary: Publish or remove a durable SQL setting
+      tags:
+        - cluster_management
+      description: >
+        Cluster-administrator-only, revision-fenced publication of typed setting definitions and global,
+        database, and credential-role defaults. SQL SET cannot change policy-sensitive settings. Observe
+        an ambiguous mutation before retrying.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SqlSettingMutationRequest'
+      responses:
+        '200':
+          description: Setting catalog mutation committed
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '400':
+          description: Invalid setting definition or default
+        '401':
+          description: Authentication required
+        '403':
+          description: Cluster administrator permission required
+        '409':
+          description: Catalog revision or setting generation changed
+        '426':
+          description: Metadata peer upgrade required
+        '503':
+          description: Mutation outcome unknown or metadata unavailable
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
   /db/v1/sql:
     post:
       summary: Execute a SQL statement
@@ -11772,6 +11812,102 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/SQLColumn'
+    SqlSettingValue:
+      description: One typed setting value, matching the declared kind.
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required:
+            - boolean
+          properties:
+            boolean:
+              type: boolean
+        - type: object
+          additionalProperties: false
+          required:
+            - integer
+          properties:
+            integer:
+              type: integer
+              format: int64
+        - type: object
+          additionalProperties: false
+          required:
+            - string
+          properties:
+            string:
+              type: string
+              maxLength: 4096
+    SqlSettingMutationRequest:
+      description: Put a complete definition/default set or drop one by name.
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required:
+            - put
+          properties:
+            put:
+              type: object
+              additionalProperties: false
+              required:
+                - name
+                - kind
+                - default
+              properties:
+                name:
+                  type: string
+                  maxLength: 128
+                kind:
+                  type: string
+                  enum:
+                    - boolean
+                    - integer
+                    - string
+                policy_sensitive:
+                  type: boolean
+                session_writable:
+                  type: boolean
+                default:
+                  $ref: '#/components/schemas/SqlSettingValue'
+                database_defaults:
+                  type: array
+                  maxItems: 256
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required:
+                      - database
+                      - value
+                    properties:
+                      database:
+                        type: string
+                      value:
+                        $ref: '#/components/schemas/SqlSettingValue'
+                role_defaults:
+                  type: array
+                  maxItems: 1024
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required:
+                      - principal
+                      - database
+                      - value
+                    properties:
+                      principal:
+                        type: string
+                      database:
+                        type: string
+                      value:
+                        $ref: '#/components/schemas/SqlSettingValue'
+        - type: object
+          additionalProperties: false
+          required:
+            - drop
+          properties:
+            drop:
+              type: string
+              maxLength: 128
     SQLRequest:
       type: object
       additionalProperties: false

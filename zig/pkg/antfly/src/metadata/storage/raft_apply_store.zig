@@ -23,6 +23,7 @@ const system_catalog = @import("../../system_catalog/domain.zig");
 // Accommodate their bounded envelope as well as ordinary 255-byte names.
 const catalog_name_key_buffer_bytes = 2048;
 const system_catalog_storage = @import("../../system_catalog/storage.zig");
+const sql_settings = @import("../../system_catalog/settings.zig");
 const builtin = @import("builtin");
 const raft_engine = @import("raft_engine");
 const fs_paths = @import("../../common/fs_paths.zig");
@@ -219,6 +220,7 @@ pub const TransitionCommand = union(enum) {
     /// Versioned system catalog request, applied atomically with any table topology.
     activate_topology_protocol: []const u8,
     apply_system_catalog: []const u8,
+    apply_sql_settings: []const u8,
     publish_secret_collection: []const u8,
     initialize_metadata_incarnation: metadata_incarnation.MetadataClusterIncarnation,
     upsert_node: metadata.NodeRecord,
@@ -351,7 +353,7 @@ pub const TransitionCommand = union(enum) {
         switch (self.*) {
             .apply_restore_staging => |bytes| alloc.free(bytes),
             .upsert_schema_progress_batch => |records| alloc.free(records),
-            .publish_secret_collection, .activate_topology_protocol, .apply_system_catalog, .apply_store_report_update, .apply_store_report_baseline => |bytes| alloc.free(bytes),
+            .publish_secret_collection, .activate_topology_protocol, .apply_system_catalog, .apply_sql_settings, .apply_store_report_update, .apply_store_report_baseline => |bytes| alloc.free(bytes),
             .upsert_node, .register_node => |*record| {
                 metadata_table_manager.freeNode(alloc, record.*);
             },
@@ -2583,6 +2585,86 @@ test "relational integrity restore staging fences incoming dependency admission"
     try std.testing.expectError(error.NotFound, txn.get(try tableKeyForGroup(&buf, group_id, 8)));
 }
 
+test "relational integrity restore staging reserves external parent and rejects unproven publication" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/external-parent-reserve", .{tmp.sub_path});
+    defer alloc.free(root);
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer store.deinit();
+    const group_id = group_ids.main_metadata_group_id;
+    const id = try restore_staging.idForAttempt(7, 1);
+    const child_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"fk","child_columns":["id"],"parent_table":"parents","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const parent_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const old: metadata.TableRecord = .{ .table_id = 9, .name = "children", .schema_json = child_schema };
+    const old_range: metadata.RangeRecord = .{ .table_id = 9, .group_id = 301, .range_id = 301, .start_key = "" };
+    const old_fence: @import("../../storage/db/relational_integrity_topology_contract.zig").Fence = .{ .role = .rewrite_source, .transition_id = 7, .attempt = 1, .owner_group_id = 301, .peer_group_id = 401, .namespace = .{ .table_id = 9, .shard_id = 301, .range_id = 301 }, .catalog_digest = @splat(4) };
+    const target: restore_staging.Target = .{ .source_table_id = 9, .empty_generation = true, .table = .{ .table_id = 10, .name = "children", .schema_json = child_schema }, .ranges = &.{.{ .table_id = 10, .group_id = 401, .range_id = 401, .doc_identity_shard_id = 401, .doc_identity_range_id = 401, .start_key = "" }}, .replace = .{ .table = old, .ranges = &.{old_range}, .fences = &.{old_fence} } };
+    const parent_table: metadata.TableRecord = .{ .table_id = 11, .name = "parents", .schema_json = parent_schema };
+    const parent_range: metadata.RangeRecord = .{ .table_id = 11, .group_id = 501, .range_id = 501, .start_key = "" };
+    const parent_fence: @import("../../storage/db/relational_integrity_topology_contract.zig").Fence = .{ .role = .truncate_parent, .transition_id = 7, .attempt = 1, .owner_group_id = 501, .peer_group_id = 501, .namespace = .{ .table_id = 11, .shard_id = 501, .range_id = 501 }, .catalog_digest = @splat(6) };
+    const parent: restore_staging.ExternalFkParent = .{ .table = parent_table, .ranges = &.{parent_range}, .fences = &.{parent_fence}, .foreign_keys = &.{.{ .child_table_id = 9, .child_table_name = "children", .constraint_name = "fk", .generation = @splat(5) }} };
+    const plan: restore_staging.Plan = .{ .id = id, .cohort_digest = @splat(3), .targets = &.{target}, .external_fk_parents = &.{parent} };
+    var txn = try store.store.beginWriteTxn();
+    var txn_open = true;
+    defer if (txn_open) txn.abort();
+    var buf: [catalog_name_key_buffer_bytes]u8 = undefined;
+    try store.applyTransitionCommandTxn(&txn, group_id, .{ .upsert_table = parent_table });
+    try store.applyTransitionCommandTxn(&txn, group_id, .{ .upsert_range = parent_range });
+    try store.applyTransitionCommandTxn(&txn, group_id, .{ .upsert_table = old });
+    try store.applyTransitionCommandTxn(&txn, group_id, .{ .upsert_range = old_range });
+    _ = try txn.get(try tableKeyForGroup(&buf, group_id, old.table_id));
+    try std.testing.expect(try store.restoreReplacementMatchesTxn(&txn, group_id, target));
+    try std.testing.expect(try store.restoreExternalParentMatchesTxn(&txn, group_id, parent));
+    try std.testing.expect(try store.restoreIncomingDependenciesClosedTxn(&txn, group_id, plan));
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .reserve, .plan = plan });
+    _ = try txn.get(try restore_staging.jobKey(&buf, group_id, id));
+    try std.testing.expect(try restoreStagingLocksTableTxn(&txn, group_id, parent_table.table_id));
+    _ = try txn.get(try restore_staging.identityKey(&buf, group_id, .parent_group, parent_range.group_id));
+    try std.testing.expectError(error.NotFound, txn.get(try restore_staging.identityKey(&buf, group_id, .group, parent_range.group_id)));
+    try txn.commit();
+    txn_open = false;
+    txn = try store.store.beginWriteTxn();
+    txn_open = true;
+    try std.testing.expect(try restoreStagingLocksTableTxn(&txn, group_id, parent_table.table_id));
+    const digest = try plan.digest(alloc);
+    const new_receipt: restore_staging.OwnerReceipt = .{ .group_id = 401, .range_id = 401, .plan_digest = digest, .completion_digest = @splat(1) };
+    const parent_receipt: restore_staging.OwnerReceipt = .{ .group_id = 501, .range_id = 501, .plan_digest = digest, .completion_digest = @splat(2) };
+    const old_receipt: restore_staging.OwnerReceipt = .{ .group_id = 301, .range_id = 301, .plan_digest = digest, .completion_digest = @splat(3) };
+    // A parent acknowledgement cannot arrive before cutover.
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .parent_fenced, .expected_revision = 1, .receipt = parent_receipt });
+    try std.testing.expectError(error.NotFound, txn.get(try restore_staging.receiptKey(&buf, group_id, id, .cutover, 501)));
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .imported, .expected_revision = 1, .receipt = new_receipt });
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .validated, .expected_revision = 2, .receipt = new_receipt });
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .begin_cutover, .expected_revision = 2 });
+    // Old-child cutover cannot outrun the parent pending record.
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .old_fenced, .expected_revision = 3, .receipt = old_receipt });
+    try std.testing.expectError(error.NotFound, txn.get(try restore_staging.receiptKey(&buf, group_id, id, .cutover, 301)));
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .parent_fenced, .expected_revision = 3, .receipt = parent_receipt });
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .parent_fenced, .expected_revision = 3, .receipt = parent_receipt });
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .old_fenced, .expected_revision = 3, .receipt = old_receipt });
+    // Publication is still impossible without activation proof.
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .publish, .expected_revision = 3 });
+    try std.testing.expectError(error.NotFound, txn.get(try tableKeyForGroup(&buf, group_id, target.table.table_id)));
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .begin_cancel, .expected_revision = 3 });
+    for ([_]restore_staging.OwnerReceipt{ new_receipt, parent_receipt, old_receipt }, 0..) |receipt, index| {
+        try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .canceled, .expected_revision = 4, .receipt = receipt });
+        try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .canceled, .expected_revision = 4, .receipt = receipt });
+        if (index == 0) try std.testing.expect(try restoreStagingLocksTableTxn(&txn, group_id, parent_table.table_id));
+    }
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .finish_cancel, .expected_revision = 4 });
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .finish_cancel, .expected_revision = 4 });
+    try std.testing.expect(!try restoreStagingLocksTableTxn(&txn, group_id, parent_table.table_id));
+    try std.testing.expectError(error.NotFound, txn.get(try restore_staging.identityKey(&buf, group_id, .parent_group, parent_range.group_id)));
+    _ = try txn.get(try tableKeyForGroup(&buf, group_id, parent_table.table_id));
+    _ = try txn.get(try rangeKeyForGroup(&buf, group_id, parent_range.group_id));
+}
+
 test "metadata raft apply store restore job transition encoding is append-only compatible" {
     const encoded = try encodeTransitionCommand(std.testing.allocator, .{
         .upsert_restore_job = .{
@@ -4489,10 +4571,21 @@ pub const RaftApplyStore = struct {
         // Otherwise remove_table's automatic unbind advances the logical epoch
         // a second time, defeating the caller's single catalog-generation CAS.
         if (update.logical) |logical| {
-            if (bootstrap or update.import_catalog != null) return error.InvalidStandaloneCatalog;
+            if (bootstrap or update.import_catalog != null or update.setting_command != null) return error.InvalidStandaloneCatalog;
             const meta = try system_catalog_storage.readMeta(self.alloc, &txn, group_id);
             if (meta.revision != logical.previous_revision) return error.CatalogGenerationChanged;
             try system_catalog_storage.applyDelta(self.alloc, &txn, group_id, logical.delta, meta, @splat(0));
+        }
+        if (update.setting_command) |command| {
+            if (bootstrap or update.import_catalog != null or update.replace) return error.InvalidStandaloneCatalog;
+            const bytes = try std.json.Stringify.valueAlloc(self.alloc, command, .{});
+            defer self.alloc.free(bytes);
+            if (bytes.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
+            var hash: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
+            try system_catalog_storage.applySettingCommand(self.alloc, &txn, group_id, command, hash);
+            const observed = try system_catalog_storage.readMeta(self.alloc, &txn, group_id);
+            if (observed.revision != command.expected_revision + 1 or !std.mem.eql(u8, &observed.last_command, &hash)) return error.CatalogGenerationChanged;
         }
         const old_tables = if (update.replace) try self.listTablesTxn(self.alloc, &txn, group_id) else try self.alloc.alloc(metadata.TableRecord, 0);
         defer self.freeTables(self.alloc, old_tables);
@@ -5362,6 +5455,31 @@ pub const RaftApplyStore = struct {
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
         return system_catalog_storage.loadState(alloc, &txn, group_id);
+    }
+
+    pub fn sqlSettingSnapshotJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, scope: sql_settings.Scope) ![]u8 {
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const meta = try system_catalog_storage.readMeta(a, &txn, group_id);
+        const records = try system_catalog_storage.loadSettings(a, &txn, group_id);
+        const definitions = try a.alloc(sql_settings.Definition, records.len);
+        for (records, definitions) |record, *definition| definition.* = record.effective(scope.principal, scope.database);
+        return std.json.Stringify.valueAlloc(alloc, sql_settings.Snapshot{ .scope = scope, .epoch = @max(1, meta.revision), .definitions = definitions }, .{});
+    }
+
+    fn applySqlSettingsTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !void {
+        if (bytes.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
+        var parsed = try std.json.parseFromSlice(sql_settings.Command, self.alloc, bytes, .{});
+        defer parsed.deinit();
+        const previous = try system_catalog_storage.readMeta(self.alloc, txn, group_id);
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
+        try system_catalog_storage.applySettingCommand(self.alloc, txn, group_id, parsed.value, hash);
+        const observed = try system_catalog_storage.readMeta(self.alloc, txn, group_id);
+        if (observed.revision != previous.revision) self.notifyProjectionListeners(.{ .kind = .table, .metadata_group_id = group_id });
     }
 
     const CatalogReader = struct {
@@ -8758,6 +8876,7 @@ pub const RaftApplyStore = struct {
             .apply_system_catalog => metadataSnapshotProjectionBit(.system_catalog) |
                 metadataSnapshotProjectionBit(.table) | metadataSnapshotProjectionBit(.range) |
                 metadataSnapshotProjectionBit(.table_transition_fence) | metadataSnapshotProjectionBit(.catalog_revision),
+            .apply_sql_settings => metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.catalog_revision),
             .initialize_metadata_incarnation => metadataSnapshotProjectionBit(.metadata_incarnation) |
                 metadataSnapshotProjectionBit(.catalog_revision),
             .upsert_node, .register_node, .remove_node => metadataSnapshotProjectionBit(.node),
@@ -9272,6 +9391,7 @@ pub const RaftApplyStore = struct {
                 try txn.put(try topologyActivationKeyForGroup(&key_buf, group_id), bytes);
             },
             .apply_system_catalog => |bytes| try self.applySystemCatalogTxn(txn, group_id, bytes),
+            .apply_sql_settings => |bytes| try self.applySqlSettingsTxn(txn, group_id, bytes),
             .apply_store_report_update => |bytes| try self.applyStoreReportUpdateTxn(txn, group_id, bytes),
             .apply_store_report_baseline => |bytes| try self.applyStoreReportBaselineTxn(txn, group_id, bytes),
             .initialize_metadata_incarnation => |incarnation| {
@@ -10409,6 +10529,28 @@ pub const RaftApplyStore = struct {
         return membership.finish(old.table.table_id).eql(fence.membership(old.table.table_id));
     }
 
+    fn restoreExternalParentMatchesTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, parent: restore_staging.ExternalFkParent) !bool {
+        var key_buf: [catalog_name_key_buffer_bytes]u8 = undefined;
+        const name_value = (try stagingGet(txn, try tableNameIndexKey(&key_buf, group_id, parent.table.name))) orelse return false;
+        if (name_value.len != 8 or std.mem.readInt(u64, name_value[0..8], .little) != parent.table.table_id) return false;
+        const encoded = (try stagingGet(txn, try tableKeyForGroup(&key_buf, group_id, parent.table.table_id))) orelse return false;
+        const current = try decodeTableRecord(self.alloc, encoded);
+        defer metadata_table_manager.freeTable(self.alloc, current);
+        if (!metadata_table_manager.tableDefinitionsEqual(current, parent.table)) return false;
+        const transition = try self.loadTableTransitionFenceTxn(txn, group_id, parent.table.table_id);
+        if (transition.active() or try backupCohortLocksTableTxn(txn, group_id, parent.table.table_id) or
+            try self.extensionOwnsTableTxn(txn, group_id, parent.table.name)) return false;
+        var membership: topology_protocol.RangeMembershipAccumulator = .{};
+        for (parent.ranges) |range| {
+            const actual_bytes = (try stagingGet(txn, try rangeKeyForGroup(&key_buf, group_id, range.group_id))) orelse return false;
+            const actual = try decodeRangeRecord(self.alloc, actual_bytes);
+            defer metadata_table_manager.freeRange(self.alloc, actual);
+            if (!metadata_table_manager.rangeRecordsEqual(actual, range)) return false;
+            try membership.add(range.group_id);
+        }
+        return membership.finish(parent.table.table_id).eql(transition.membership(parent.table.table_id));
+    }
+
     fn applyRestoreJobWithStagingTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, record: RestoreJobWithStaging) !void {
         var logical_key_buf: [256]u8 = undefined;
         const logical_key = try restoreJobKeyForGroup(&logical_key_buf, group_id, record.key);
@@ -10570,6 +10712,13 @@ pub const RaftApplyStore = struct {
                         try stagingGet(txn, try restore_staging.identityKey(&key_buf, group_id, .group, range.group_id)) != null) return;
                 }
             }
+            for (plan.external_fk_parents) |parent| {
+                var key_buf: [catalog_name_key_buffer_bytes]u8 = undefined;
+                if (try restoreStagingLocksTableTxn(txn, group_id, parent.table.table_id) or
+                    try stagingGet(txn, try restore_staging.identityKey(&key_buf, group_id, .parent_table, parent.table.table_id)) != null or
+                    !try self.restoreExternalParentMatchesTxn(txn, group_id, parent)) return;
+                for (parent.ranges) |range| if (try stagingGet(txn, try restore_staging.identityKey(&key_buf, group_id, .parent_group, range.group_id)) != null) return;
+            }
             if (!try self.restoreIncomingDependenciesClosedTxn(txn, group_id, plan)) return;
             const initial_state: restore_staging.State = if (plan.preparing_sources) .preparing_sources else .importing;
             const job: restore_staging.Job = .{ .plan = plan, .plan_digest = try plan.digest(self.alloc), .state = initial_state };
@@ -10585,6 +10734,13 @@ pub const RaftApplyStore = struct {
                 if (target.replace) |old| try txn.put(try restore_staging.identityKey(&key_buf, group_id, .old_table, old.table.table_id), &command.id);
                 for (target.ranges) |range| try txn.put(try restore_staging.identityKey(&key_buf, group_id, .group, range.group_id), &command.id);
             }
+            for (plan.external_fk_parents) |parent| {
+                var key_buf: [catalog_name_key_buffer_bytes]u8 = undefined;
+                try txn.put(try restore_staging.identityKey(&key_buf, group_id, .parent_table, parent.table.table_id), &command.id);
+                // Existing parent owners must never acquire the restoration
+                // authority implied by a fresh target's `.group` reservation.
+                for (parent.ranges) |range| try txn.put(try restore_staging.identityKey(&key_buf, group_id, .parent_group, range.group_id), &command.id);
+            }
             const initial = try std.json.Stringify.valueAlloc(self.alloc, restore_staging.Progress{ .state = initial_state }, .{});
             defer self.alloc.free(initial);
             try txn.put(progress_key, initial);
@@ -10599,10 +10755,12 @@ pub const RaftApplyStore = struct {
             if (next.revision != command.expected_revision or next.state == .published or next.state == .canceled) return;
             var total: u32 = 0;
             var old_total: u32 = 0;
+            var parent_total: u32 = 0;
             for (job.value.plan.targets) |target| {
                 total += @intCast(target.ranges.len);
                 if (target.replace) |old| old_total += @intCast(old.ranges.len);
             }
+            for (job.value.plan.external_fk_parents) |parent| parent_total += @intCast(parent.ranges.len);
             switch (command.action) {
                 .reserve, .cancel_reservation => unreachable,
                 .rewrite_source_ready => {
@@ -10646,15 +10804,21 @@ pub const RaftApplyStore = struct {
                     next.completed_owners = 0;
                     next.revision += 1;
                 },
-                .imported, .validated, .old_fenced, .canceled => {
+                .imported, .validated, .old_fenced, .canceled, .parent_fenced => {
                     const expected_state: restore_staging.State = switch (command.action) {
                         .imported => .importing,
                         .validated => .validating,
-                        .old_fenced => .cutover,
+                        .old_fenced, .parent_fenced => .cutover,
                         .canceled => .canceling,
                         else => unreachable,
                     };
                     if (next.state != expected_state) return;
+                    // Old-child cutover may only start after every external
+                    // parent has durably fenced and staged its exact pending
+                    // generation set. Parent receipts cannot trail an old
+                    // owner receipt in this monotone counter.
+                    if (command.action == .old_fenced and next.completed_owners < parent_total) return;
+                    if (command.action == .parent_fenced and next.completed_owners >= parent_total) return;
                     const receipt = command.receipt.?;
                     if (!std.mem.eql(u8, &receipt.plan_digest, &job.value.plan_digest)) return;
                     const owner_matches = outer: for (job.value.plan.targets) |target| {
@@ -10664,7 +10828,12 @@ pub const RaftApplyStore = struct {
                         if (command.action == .old_fenced or command.action == .canceled) if (target.replace) |old| {
                             for (old.ranges) |range| if (range.group_id == receipt.group_id and (if (range.range_id == 0) range.group_id else range.range_id) == receipt.range_id) break :outer true;
                         };
-                    } else false;
+                    } else blk: {
+                        if (command.action == .parent_fenced or command.action == .canceled) for (job.value.plan.external_fk_parents) |parent| {
+                            for (parent.ranges) |range| if (range.group_id == receipt.group_id and (if (range.range_id == 0) range.group_id else range.range_id) == receipt.range_id) break :blk true;
+                        };
+                        break :blk false;
+                    };
                     if (!owner_matches) return;
                     var receipt_buf: [256]u8 = undefined;
                     const receipt_key = try restore_staging.receiptKey(&receipt_buf, group_id, command.id, next.state, receipt.group_id);
@@ -10690,7 +10859,11 @@ pub const RaftApplyStore = struct {
                     next.revision += 1;
                 },
                 .publish, .finish_cancel => {
-                    const required = if (command.action == .finish_cancel) (if (job.value.plan.preparing_sources) old_total else total + old_total) else if (old_total != 0) old_total else total;
+                    // Parent owner activation is not yet ordered with this
+                    // publication. A plan may reserve exact parents for
+                    // preflight, but cannot expose the new child generation.
+                    if (command.action == .publish and job.value.plan.external_fk_parents.len != 0) return;
+                    const required = if (command.action == .finish_cancel) (if (job.value.plan.preparing_sources) old_total else total + old_total + parent_total) else if (old_total != 0) old_total + parent_total else total + parent_total;
                     if (next.completed_owners != required or
                         (command.action == .publish and next.state != (if (old_total != 0) restore_staging.State.cutover else .validating)) or
                         (command.action == .finish_cancel and next.state != .canceling)) return;
@@ -10712,6 +10885,15 @@ pub const RaftApplyStore = struct {
                             const group_reservation = (try stagingGet(txn, try restore_staging.identityKey(&key_buf, group_id, .group, range.group_id))) orelse return;
                             if (!std.mem.eql(u8, group_reservation, &command.id)) return;
                             if (try stagingGet(txn, try rangeKeyForGroup(&key_buf, group_id, range.group_id)) != null) return;
+                        }
+                    }
+                    for (job.value.plan.external_fk_parents) |parent| {
+                        var key_buf: [catalog_name_key_buffer_bytes]u8 = undefined;
+                        const reservation = (try stagingGet(txn, try restore_staging.identityKey(&key_buf, group_id, .parent_table, parent.table.table_id))) orelse return;
+                        if (!std.mem.eql(u8, reservation, &command.id) or !try self.restoreExternalParentMatchesTxn(txn, group_id, parent)) return;
+                        for (parent.ranges) |range| {
+                            const group_reservation = (try stagingGet(txn, try restore_staging.identityKey(&key_buf, group_id, .parent_group, range.group_id))) orelse return;
+                            if (!std.mem.eql(u8, group_reservation, &command.id)) return;
                         }
                     }
                     if (command.action == .publish and !try self.restoreIncomingDependenciesClosedTxn(txn, group_id, job.value.plan)) return;
@@ -10778,6 +10960,11 @@ pub const RaftApplyStore = struct {
                             try txn.delete(try restore_staging.identityKey(&key_buf, group_id, .old_table, old.table.table_id));
                         };
                     }
+                    if (command.action == .finish_cancel) for (job.value.plan.external_fk_parents) |parent| {
+                        var key_buf: [catalog_name_key_buffer_bytes]u8 = undefined;
+                        try txn.delete(try restore_staging.identityKey(&key_buf, group_id, .parent_table, parent.table.table_id));
+                        for (parent.ranges) |range| try txn.delete(try restore_staging.identityKey(&key_buf, group_id, .parent_group, range.group_id));
+                    };
                     // Keep ID tombstones and completion receipts: delayed
                     // import or cancel commands cannot target a new job.
                     next.state = if (command.action == .publish) .published else .canceled;
@@ -13064,6 +13251,7 @@ const TransitionTag = enum(u8) {
     upsert_schema_progress_batch = 59,
     activate_topology_protocol = 57,
     apply_system_catalog = 54,
+    apply_sql_settings = 66,
     upsert_store_heartbeat = 55,
     apply_store_report_update = 56,
     apply_store_report_baseline = 58,
@@ -13160,6 +13348,11 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
         .apply_system_catalog => |bytes| {
             if (bytes.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
             try out.append(alloc, @intFromEnum(TransitionTag.apply_system_catalog));
+            try appendRequiredString(alloc, &out, bytes);
+        },
+        .apply_sql_settings => |bytes| {
+            if (bytes.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
+            try out.append(alloc, @intFromEnum(TransitionTag.apply_sql_settings));
             try appendRequiredString(alloc, &out, bytes);
         },
         .initialize_metadata_incarnation => |incarnation| {
@@ -13530,6 +13723,10 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
         .apply_system_catalog => blk: {
             if (encoded.len > system_catalog.max_command_bytes + 16) return error.CatalogCommandTooLarge;
             break :blk .{ .apply_system_catalog = try readRequiredString(alloc, encoded, &pos) };
+        },
+        .apply_sql_settings => blk: {
+            if (encoded.len > system_catalog.max_command_bytes + 16) return error.CatalogCommandTooLarge;
+            break :blk .{ .apply_sql_settings = try readRequiredString(alloc, encoded, &pos) };
         },
         .initialize_metadata_incarnation => blk: {
             if (pos + @sizeOf(metadata_incarnation.MetadataClusterIncarnation) != encoded.len) {
@@ -17327,11 +17524,16 @@ fn backupCohortLockKeyForGroup(buf: []u8, group_id: u64, table_id: u64) ![]const
 /// backup's source definitions cannot change until all owner fences retire.
 pub fn restoreStagingLocksTableTxn(txn: anytype, group_id: u64, table_id: u64) !bool {
     var buf: [256]u8 = undefined;
-    _ = txn.get(try restore_staging.identityKey(&buf, group_id, .old_table, table_id)) catch |err| switch (err) {
-        error.NotFound => return false,
+    const old = txn.get(try restore_staging.identityKey(&buf, group_id, .old_table, table_id)) catch |err| switch (err) {
+        error.NotFound => null,
         else => return err,
     };
-    return true;
+    if (old != null) return true;
+    const parent = txn.get(try restore_staging.identityKey(&buf, group_id, .parent_table, table_id)) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    return parent != null;
 }
 
 pub fn backupCohortLocksTableTxn(txn: anytype, group_id: u64, table_id: u64) !bool {
@@ -23106,6 +23308,75 @@ test "metadata raft apply store group status decoder accepts version one records
     try std.testing.expect(decoded.replay_caught_up);
     try std.testing.expect(decoded.voter_set_known);
     try std.testing.expectEqualSlices(u8, &fingerprint, &decoded.voter_set_fingerprint);
+}
+
+test "SQL settings apply through Raft and survive catalog restart" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/setting-catalog", .{tmp.sub_path});
+    defer alloc.free(root);
+    const command: sql_settings.Command = .{ .expected_revision = 0, .change = .{ .put = .{
+        .identity = .{ .id = 3, .generation = 1 },
+        .name = "app.tenant",
+        .kind = .string,
+        .policy_sensitive = true,
+        .default = .{ .string = "none" },
+        .role_defaults = &.{.{ .principal = "alice", .database = "main", .value = .{ .string = "alpha" } }},
+    } } };
+    const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
+    defer alloc.free(bytes);
+    {
+        var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+        defer store.deinit();
+        try store.applyStandaloneCommand(21, .{ .apply_sql_settings = bytes });
+        try store.applyStandaloneCommand(21, .{ .apply_sql_settings = bytes });
+        const stale: sql_settings.Command = .{ .expected_revision = 0, .change = .{ .drop = .{ .id = 3, .generation = 1 } } };
+        const stale_bytes = try std.json.Stringify.valueAlloc(alloc, stale, .{});
+        defer alloc.free(stale_bytes);
+        try store.applyStandaloneCommand(21, .{ .apply_sql_settings = stale_bytes });
+        const meta = try store.systemCatalogMeta(alloc, 21);
+        try std.testing.expectEqual(@as(u64, 1), meta.revision);
+        const snapshot_bytes = try store.sqlSettingSnapshotJson(alloc, 21, .{ .principal = "alice", .database = "main" });
+        defer alloc.free(snapshot_bytes);
+        var snapshot = try std.json.parseFromSlice(sql_settings.Snapshot, alloc, snapshot_bytes, .{});
+        defer snapshot.deinit();
+        try std.testing.expectEqualStrings("alpha", snapshot.value.definitions[0].role_default.?.string);
+        var exported = try store.systemCatalogSnapshot(alloc, 21);
+        defer exported.deinit();
+        try std.testing.expectEqual(@as(usize, 1), exported.value.settings.len);
+        const portable_bytes = try store.exportSystemCatalog(alloc, 21);
+        defer alloc.free(portable_bytes);
+        var portable = try std.json.parseFromSlice(@import("../../system_catalog/projection.zig").Export, alloc, portable_bytes, .{});
+        defer portable.deinit();
+        try std.testing.expectEqual(@as(usize, 1), portable.value.system_catalog.settings.len);
+    }
+    {
+        var reopened = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+        defer reopened.deinit();
+        var snapshot = try reopened.systemCatalogSnapshot(alloc, 21);
+        defer snapshot.deinit();
+        try std.testing.expectEqual(@as(u64, 1), snapshot.value.revision);
+        try std.testing.expectEqual(@as(usize, 1), snapshot.value.settings.len);
+        try std.testing.expectEqualStrings("app.tenant", snapshot.value.settings[0].name);
+    }
+}
+
+test "system catalog SQL settings load owns allocations from the final prefix scan" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/setting-scan-ownership", .{tmp.sub_path});
+    defer alloc.free(root);
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer store.deinit();
+    // Even an empty setting prefix allocates after resource decoding. A
+    // copied ArenaAllocator must therefore be returned only after this scan.
+    for (0..4) |_| {
+        var state = try store.systemCatalogSnapshot(alloc, group_ids.main_metadata_group_id);
+        try std.testing.expectEqual(@as(usize, 0), state.value.settings.len);
+        state.deinit();
+    }
 }
 
 test "metadata apply store replay is idempotent when applied watermark lags WAL state" {

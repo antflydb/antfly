@@ -21481,6 +21481,8 @@ pub const DataServer = struct {
             cfg.api_server_cfg.internal_service_secret,
             cfg.api_server_cfg.internal_service_issuer,
         );
+        remote_metadata.setting_authority_secret = cfg.api_server_cfg.trusted_principal_secret;
+        remote_metadata.setting_authority_issuer = cfg.api_server_cfg.trusted_principal_issuer;
         remote_metadata.local_node_id = if (cfg.store_registration) |registration| registration.node_id else 0;
         errdefer remote_metadata.deinit();
 
@@ -22192,6 +22194,8 @@ const RemoteMetadataSource = struct {
     next_http_executor: std.atomic.Value(usize) = .init(0),
     internal_service_secret: ?[]const u8 = null,
     internal_service_issuer: ?[]const u8 = null,
+    setting_authority_secret: ?[]const u8 = null,
+    setting_authority_issuer: ?[]const u8 = null,
     test_faults: TestFaults = .{},
 
     const ValidationSlot = struct {
@@ -22320,6 +22324,7 @@ const RemoteMetadataSource = struct {
     ) antfly.metadata_http_client.MetadataHttpClient {
         var client = antfly.metadata_http_client.MetadataHttpClient.init(alloc, self.httpExecutor());
         _ = client.withInternalServiceAuth(self.internal_service_secret, self.internal_service_issuer);
+        _ = client.withSettingAuthority(self.setting_authority_secret, self.setting_authority_issuer);
         return client;
     }
 
@@ -24462,10 +24467,10 @@ const RemoteMetadataSource = struct {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
         try request.ensureActive();
         if (input == .write_validation) return self.readWriteValidation(alloc, request, input.write_validation);
-        if (input != .mutate) return self.readSystemCatalog(alloc, request, input);
+        if (input != .mutate and input != .setting_mutate) return self.readSystemCatalog(alloc, request, input);
         // Even ambiguous writes may have committed new topology. Invalidate
         // cached snapshots without automatically replaying the mutation.
-        defer if (input == .mutate) self.invalidateCache();
+        defer if (input == .mutate or input == .setting_mutate) self.invalidateCache();
         return self.withMetadataMutationApiClient([]u8, struct {
             fn call(
                 _: *RemoteMetadataSource,
@@ -24484,10 +24489,10 @@ const RemoteMetadataSource = struct {
                     if (now >= deadline) return error.DeadlineExceeded;
                     bounded.remaining_ms = @intCast(@min(bounded.remaining_ms, @max(1, (deadline - now) / std.time.ns_per_ms)));
                 }
-                const bytes = try client.forwardSystemCatalog(base_uri, ctx.input, bounded);
+                const bytes = try client.forwardSystemCatalog(base_uri, ctx.input, bounded, ctx.request.setting_admin);
                 defer client.alloc.free(bytes);
                 return ctx.alloc.dupe(u8, bytes) catch |err| {
-                    if (ctx.input == .mutate) return error.MetadataMutationOutcomeUnknown;
+                    if (ctx.input == .mutate or ctx.input == .setting_mutate) return error.MetadataMutationOutcomeUnknown;
                     return err;
                 };
             }
