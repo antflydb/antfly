@@ -622,7 +622,7 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     try node.attachIo(io);
     try node.warmConfiguredGenerators(alloc);
     node.configureForcedRunAdmissionDenialsFromEnvironmentForTesting();
-    node.startReadinessInventory(io);
+    try node.startReadinessInventory(io);
 
     node.validateHttpBind(host) catch |err| {
         std.log.err(
@@ -696,7 +696,7 @@ pub fn spawnServerProcess(
     try node.validateHttpBind(host_dup);
     try node.attachIo(io);
     try node.warmConfiguredGenerators(alloc);
-    node.startReadinessInventory(io);
+    try node.startReadinessInventory(io);
 
     const server = try alloc.create(httpx.Server);
     errdefer alloc.destroy(server);

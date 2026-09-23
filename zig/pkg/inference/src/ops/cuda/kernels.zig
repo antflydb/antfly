@@ -1617,6 +1617,7 @@ pub const JitProductionRoutes = struct {
 pub const JitModelProfile = enum {
     clipclap,
     bert_encoder,
+    laya,
     deberta_reranker,
     gliner2,
     florence2,
@@ -1646,6 +1647,7 @@ pub const JitRouteScope = struct {
             // E2B/E4B Q4_0. Encoder models keep the bundled runtime.
             .clipclap,
             .bert_encoder,
+            .laya,
             .deberta_reranker,
             .gliner2,
             .florence2,
@@ -2274,6 +2276,10 @@ pub const KernelModule = struct {
     conv2d_f32: driver_mod.CUfunction = null,
     attention_f32: driver_mod.CUfunction = null,
     attention_f32_block: driver_mod.CUfunction = null,
+    laya_action_features_f32: driver_mod.CUfunction = null,
+    laya_local_attention_f32: driver_mod.CUfunction = null,
+    laya_packed_geglu_f32: driver_mod.CUfunction = null,
+    laya_attention_warp_f32: driver_mod.CUfunction = null,
     // BF16 tensor-core full attention for Qwen3-VL's token-major D=64 vision
     // tower.  Kept separate from the general attention dispatcher so only the
     // architecture with the qualified layout/semantics can select it.
@@ -3388,6 +3394,10 @@ pub const KernelModule = struct {
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&attention_f32, module, "termite_attention_f32"));
         var attention_f32_block: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&attention_f32_block, module, "termite_attention_f32_block"));
+        const laya_local_attention_f32 = loadOptionalFunction(ctx, module, "termite_laya_local_attention_f32");
+        const laya_packed_geglu_f32 = loadOptionalFunction(ctx, module, "termite_laya_packed_geglu_f32");
+        const laya_attention_warp_f32 = loadOptionalFunction(ctx, module, "termite_laya_attention_warp_f32");
+        const laya_action_features_f32 = loadOptionalFunction(ctx, module, "termite_laya_action_features_f32");
         const qwen3vl_vision_attention_tc_bf16_m32n16 = loadOptionalFunction(ctx, module, "termite_qwen3vl_vision_attention_tc_bf16_m32n16");
         const attention_f32_bert_prefill_s256_hd64 = loadOptionalFunction(ctx, module, "termite_attention_f32_bert_prefill_s256_hd64");
         const attention_f32_bert_prefill_s256_hd64_q8 = loadOptionalFunction(ctx, module, "termite_attention_f32_bert_prefill_s256_hd64_q8");
@@ -3896,6 +3906,10 @@ pub const KernelModule = struct {
             .conv2d_f32 = conv2d_f32,
             .attention_f32 = attention_f32,
             .attention_f32_block = attention_f32_block,
+            .laya_action_features_f32 = laya_action_features_f32,
+            .laya_local_attention_f32 = laya_local_attention_f32,
+            .laya_packed_geglu_f32 = laya_packed_geglu_f32,
+            .laya_attention_warp_f32 = laya_attention_warp_f32,
             .qwen3vl_vision_attention_tc_bf16_m32n16 = qwen3vl_vision_attention_tc_bf16_m32n16,
             .attention_f32_bert_prefill_s256_hd64 = attention_f32_bert_prefill_s256_hd64,
             .attention_f32_bert_prefill_s256_hd64_q8 = attention_f32_bert_prefill_s256_hd64_q8,
@@ -4565,6 +4579,12 @@ pub const KernelModule = struct {
         return self.linear_bf16_weight_f32_tiled != null and
             self.embedding_lookup_bf16_weight_f32 != null and
             self.linear_bf16_weight_f32_qkv_nobias_tiled != null;
+    }
+
+    pub fn hasLayaPrimitives(self: *const KernelModule) bool {
+        return self.hasClipClapPrimitives() and self.rope_f32 != null and
+            self.slice_last_dim_f32 != null and self.elementwise_f32 != null and
+            self.laya_local_attention_f32 != null and self.laya_action_features_f32 != null;
     }
 
     pub fn hasClipClapPrimitives(self: *const KernelModule) bool {
@@ -8718,6 +8738,79 @@ pub const KernelModule = struct {
         const blocks = try checkedTensorElements(try checkedTensorElements(batch, num_heads), query_tiles);
         try launchBlocks(function, ctx, blocks, 256, &params);
         return true;
+    }
+
+    pub fn launchLayaLocalAttentionF32(self: *KernelModule, ctx: *context_mod.CudaContext, dst: buffer_mod.DeviceBuffer, q: buffer_mod.DeviceBuffer, k: buffer_mod.DeviceBuffer, v: buffer_mod.DeviceBuffer, mask: buffer_mod.DeviceBuffer, batch: usize, seq: usize, heads: usize, dim: usize, radius: usize) driver_mod.Error!void {
+        if (batch == 0 or seq == 0 or seq > 512 or dim == 0 or dim > 128 or heads == 0) return error.InvalidCudaState;
+        const count = try checkedTensorElements(try checkedTensorElements(batch, seq), try checkedTensorElements(heads, dim));
+        try checkBytes(dst, count);
+        try checkBytes(q, count);
+        try checkBytes(k, count);
+        try checkBytes(v, count);
+        try checkRawBytes(mask, try checkedTensorElements(batch, seq) * @sizeOf(i64));
+        var dst_ptr = dst.ptr;
+        var q_ptr = q.ptr;
+        var k_ptr = k.ptr;
+        var v_ptr = v.ptr;
+        var mask_ptr = mask.ptr;
+        var batch_u32 = try toU32(batch);
+        var seq_u32 = try toU32(seq);
+        var heads_u32 = try toU32(heads);
+        var dim_u32 = try toU32(dim);
+        var radius_u32 = try toU32(radius);
+        var params = [_]?*anyopaque{ @ptrCast(&dst_ptr), @ptrCast(&q_ptr), @ptrCast(&k_ptr), @ptrCast(&v_ptr), @ptrCast(&mask_ptr), @ptrCast(&batch_u32), @ptrCast(&seq_u32), @ptrCast(&heads_u32), @ptrCast(&dim_u32), @ptrCast(&radius_u32) };
+        try launchBlocks(self.laya_local_attention_f32 orelse return error.CudaKernelUnavailable, ctx, try checkedTensorElements(try checkedTensorElements(batch, seq), heads), 128, &params);
+    }
+    pub fn launchLayaAttentionWarpF32(self: *KernelModule, ctx: *context_mod.CudaContext, dst: buffer_mod.DeviceBuffer, q: buffer_mod.DeviceBuffer, k: buffer_mod.DeviceBuffer, v: buffer_mod.DeviceBuffer, mask: buffer_mod.DeviceBuffer, batch: usize, seq: usize, heads: usize, dim: usize, radius: usize) driver_mod.Error!void {
+        if (batch == 0 or seq == 0 or seq > 512 or (dim != 64 and dim != 128) or heads == 0) return error.InvalidCudaState;
+        const count = try checkedTensorElements(try checkedTensorElements(batch, seq), try checkedTensorElements(heads, dim));
+        try checkBytes(dst, count);
+        try checkBytes(q, count);
+        try checkBytes(k, count);
+        try checkBytes(v, count);
+        try checkRawBytes(mask, try checkedTensorElements(batch, seq) * @sizeOf(i64));
+        var dst_ptr = dst.ptr;
+        var q_ptr = q.ptr;
+        var k_ptr = k.ptr;
+        var v_ptr = v.ptr;
+        var mask_ptr = mask.ptr;
+        var batch_u32 = try toU32(batch);
+        var seq_u32 = try toU32(seq);
+        var heads_u32 = try toU32(heads);
+        var dim_u32 = try toU32(dim);
+        var radius_u32 = try toU32(radius);
+        var params = [_]?*anyopaque{ @ptrCast(&dst_ptr), @ptrCast(&q_ptr), @ptrCast(&k_ptr), @ptrCast(&v_ptr), @ptrCast(&mask_ptr), @ptrCast(&batch_u32), @ptrCast(&seq_u32), @ptrCast(&heads_u32), @ptrCast(&dim_u32), @ptrCast(&radius_u32) };
+        try launchBlocks(self.laya_attention_warp_f32 orelse return error.CudaKernelUnavailable, ctx, try checkedTensorElements(try checkedTensorElements(batch, seq), heads), 128, &params);
+    }
+    pub fn launchLayaPackedGegluF32(self: *KernelModule, ctx: *context_mod.CudaContext, dst: buffer_mod.DeviceBuffer, src: buffer_mod.DeviceBuffer, rows: usize, width: usize) driver_mod.Error!void {
+        if (rows == 0 or width == 0) return error.InvalidCudaState;
+        const count = try checkedTensorElements(rows, width);
+        try checkBytes(dst, count);
+        try checkBytes(src, try checkedTensorElements(count, 2));
+        var dst_ptr = dst.ptr;
+        var src_ptr = src.ptr;
+        var rows_u32 = try toU32(rows);
+        var width_u32 = try toU32(width);
+        var params = [_]?*anyopaque{ @ptrCast(&dst_ptr), @ptrCast(&src_ptr), @ptrCast(&rows_u32), @ptrCast(&width_u32) };
+        try launch1d(self.laya_packed_geglu_f32 orelse return error.CudaKernelUnavailable, ctx, count, &params);
+    }
+
+    pub fn launchLayaActionFeaturesF32(self: *KernelModule, ctx: *context_mod.CudaContext, dst: buffer_mod.DeviceBuffer, hidden: buffer_mod.DeviceBuffer, logits: buffer_mod.DeviceBuffer, markers: buffer_mod.DeviceBuffer, batch: usize, seq: usize, count: usize, dim: usize) driver_mod.Error!void {
+        if (batch == 0 or seq == 0 or dim == 0 or count < 2 or count > 20) return error.InvalidCudaState;
+        try checkBytes(dst, try checkedTensorElements(batch, dim + 4));
+        try checkBytes(hidden, try checkedTensorElements(try checkedTensorElements(batch, seq), dim));
+        try checkBytes(logits, try checkedTensorElements(batch, count));
+        try checkRawBytes(markers, try checkedTensorElements(batch, count) * @sizeOf(i64));
+        var dst_ptr = dst.ptr;
+        var hidden_ptr = hidden.ptr;
+        var logits_ptr = logits.ptr;
+        var markers_ptr = markers.ptr;
+        var batch_u32 = try toU32(batch);
+        var seq_u32 = try toU32(seq);
+        var count_u32 = try toU32(count);
+        var dim_u32 = try toU32(dim);
+        var params = [_]?*anyopaque{ @ptrCast(&dst_ptr), @ptrCast(&hidden_ptr), @ptrCast(&logits_ptr), @ptrCast(&markers_ptr), @ptrCast(&batch_u32), @ptrCast(&seq_u32), @ptrCast(&count_u32), @ptrCast(&dim_u32) };
+        try launchBlocks(self.laya_action_features_f32 orelse return error.CudaKernelUnavailable, ctx, batch, 128, &params);
     }
 
     pub fn launchTokenMajorAttentionF32(
