@@ -297,7 +297,7 @@ pub const Provider = struct {
     source_table: ?[]u8 = null,
     capability_token: ?[]u8 = null,
     capability_revision: ?[]u8 = null,
-    request_header_storage: [7][2][]const u8 = undefined,
+    request_header_storage: [6][2][]const u8 = undefined,
     tools_json: ?[]const u8 = null,
     tool_choice_json: ?[]const u8 = null,
     max_tokens: ?i64 = null,
@@ -494,12 +494,6 @@ pub const Provider = struct {
         }
         if (self.capability_revision) |revision| {
             self.request_header_storage[count] = .{ "X-Antfly-Capability-Revision", revision };
-            count += 1;
-        }
-        if (self.cancellation != null) {
-            // The transport can otherwise mistake an orderly close of this
-            // request for a client still waiting to read its inference result.
-            self.request_header_storage[count] = .{ "X-Antfly-Cancel-On-Disconnect", "true" };
             count += 1;
         }
         return if (count == 0) null else self.request_header_storage[0..count];
@@ -923,17 +917,6 @@ test "antfly provider composes authorization and capability lease headers" {
     try std.testing.expectEqualStrings("X-Antfly-Capability-Token", headers[2][0]);
     try std.testing.expectEqualStrings("route-token", headers[2][1]);
     try std.testing.expectEqualStrings("X-Antfly-Capability-Revision", headers[3][0]);
-    const Cancellation = struct {
-        fn check(_: *const anyopaque) bool {
-            return false;
-        }
-    };
-    const state: u8 = 0;
-    provider.setRequestCancellation(.{ .ptr = &state, .is_cancelled_fn = Cancellation.check });
-    const cancellable_headers = provider.requestHeaders().?;
-    try std.testing.expectEqual(@as(usize, 5), cancellable_headers.len);
-    try std.testing.expectEqualStrings("X-Antfly-Cancel-On-Disconnect", cancellable_headers[4][0]);
-    try std.testing.expectEqualStrings("true", cancellable_headers[4][1]);
 }
 
 test "antfly embed request omits absent optional fields" {

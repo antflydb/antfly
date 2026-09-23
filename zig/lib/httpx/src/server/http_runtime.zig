@@ -54,7 +54,6 @@ pub const HttpRuntime = struct {
         listener_capacity: usize,
         active_h1_cancellation_observers: usize,
         h1_hard_disconnect_cancellations_total: u64,
-        h1_opted_in_half_close_cancellations_total: u64,
         h1_cancellation_observer_failures_total: u64,
         h1_cancellation_registration_failures_total: u64,
         healthy: bool,
@@ -80,10 +79,9 @@ pub const HttpRuntime = struct {
             self: *const ListenerLease,
             fd: std.posix.fd_t,
             cancellation: *std.atomic.Value(bool),
-            cancel_on_half_close: bool,
         ) !CancellationObserver.Registration {
             const runtime = self.runtime orelse return error.HttpRuntimeUnavailable;
-            return runtime.registerH1Request(fd, cancellation, cancel_on_half_close);
+            return runtime.registerH1Request(fd, cancellation);
         }
 
         pub fn listenerIo(self: *const ListenerLease) std.Io {
@@ -231,7 +229,6 @@ pub const HttpRuntime = struct {
             .active_h1_cancellation_observers = self.observer.activeCount(),
             .h1_hard_disconnect_cancellations_total = self.observer.cancellations() +|
                 self.borrowed_hard_disconnect_cancellations_total.load(.acquire),
-            .h1_opted_in_half_close_cancellations_total = self.observer.optedInHalfCloseCancellations(),
             .h1_cancellation_observer_failures_total = self.observer.failures(),
             .h1_cancellation_registration_failures_total = self.registration_failures_total.load(.acquire),
             .healthy = self.observer.isHealthy(),
@@ -242,11 +239,10 @@ pub const HttpRuntime = struct {
         self: *HttpRuntime,
         fd: std.posix.fd_t,
         cancellation: *std.atomic.Value(bool),
-        cancel_on_half_close: bool,
     ) !CancellationObserver.Registration {
         if (self.borrowed_io != null) return error.NativeCancellationObserverUnavailable;
         if (self.reserved_h1_request_capacity.load(.acquire) == 0) return error.HttpRuntimeUnavailable;
-        return self.observer.register(fd, cancellation, cancel_on_half_close) catch |err| {
+        return self.observer.register(fd, cancellation) catch |err| {
             _ = self.registration_failures_total.fetchAdd(1, .monotonic);
             return err;
         };

@@ -27,11 +27,16 @@ By default, an orderly TCP half-close (FIN) is not cancellation: an HTTP/1
 client may still be waiting to read the response. The embedding tests use RST
 to establish response abandonment, matching the default transport contract.
 
-The HTTP reranker and linked reranker cases opt into half-close cancellation with
-`X-Antfly-Cancel-On-Disconnect: true`. Its synthetic GPU batch returns only
+The HTTP reranker and linked reranker cases abort their requests with a TCP
+reset. Their synthetic GPU batch returns only
 after the test releases it. The worker must remain alive while the batch is
 in progress, then observe cancellation and release admission before the next
 rerank request.
+
+The embedding case exercises the same safe native-call grace through the
+shared inference control. A cancelled request releases at the end of its
+current call without replacing the worker; a genuinely stuck call still
+restarts the worker after the bounded grace.
 
 This covers transport-abort propagation through model execution. It does not
 exercise real GPU drivers, cold model loading, or application-deadline wiring;

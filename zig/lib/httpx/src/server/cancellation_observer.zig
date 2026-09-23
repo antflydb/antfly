@@ -3,10 +3,9 @@
 //! HTTP/2 has stream-local reset state. HTTP/1 has only a connection, so one
 //! bounded listener-owned Io future multiplexes hard transport-failure
 //! observation for every active H1 request. It never consumes bytes from the
-//! parser's socket. By default, an orderly FIN is not cancellation: TCP is
+//! parser's socket. In particular, an orderly FIN is not cancellation: TCP is
 //! full-duplex and a client may half-close its request direction while still
-//! waiting for the response (RFC 9112 section 9.6). Individual requests may
-//! opt into treating that signal as abandonment.
+//! waiting for the response (RFC 9112 section 9.6).
 
 const builtin = @import("builtin");
 const std = @import("std");
@@ -39,11 +38,10 @@ pub const Observer = struct {
         id: u64,
         fd: std.posix.fd_t,
         cancellation: *std.atomic.Value(bool),
-        cancel_on_half_close: bool = false,
-        /// Without request opt-in, an orderly half-close cannot establish
-        /// response abandonment. Stop watching and leave cancellation to
-        /// deadlines, explicit application cancellation, response-write
-        /// failure, or connection shutdown.
+        /// An orderly half-close cannot establish response abandonment. Stop
+        /// watching after one is observed and leave cancellation to deadlines,
+        /// explicit application cancellation, response-write failure, or
+        /// connection shutdown.
         watched: bool = true,
         /// Once input for a pipelined request is visible, polling readability
         /// would spin until the active handler finishes and the connection
@@ -80,7 +78,6 @@ pub const Observer = struct {
     kernel_fd: ?std.posix.fd_t = null,
     active: std.atomic.Value(usize) = .init(0),
     cancellations_total: std.atomic.Value(u64) = .init(0),
-    opted_in_half_close_cancellations_total: std.atomic.Value(u64) = .init(0),
     failures_total: std.atomic.Value(u64) = .init(0),
     healthy: std.atomic.Value(bool) = .init(true),
 
@@ -166,7 +163,6 @@ pub const Observer = struct {
         self: *Observer,
         fd: std.posix.fd_t,
         cancellation: *std.atomic.Value(bool),
-        cancel_on_half_close: bool,
     ) !Registration {
         if (comptime builtin.os.tag == .freestanding) return error.ObserverUnavailable;
         if (!self.running.load(.acquire) or self.stopping.load(.acquire) or !self.healthy.load(.acquire)) return error.ObserverUnavailable;
@@ -180,7 +176,6 @@ pub const Observer = struct {
             .id = id,
             .fd = fd,
             .cancellation = cancellation,
-            .cancel_on_half_close = cancel_on_half_close,
         });
         _ = self.active.fetchAdd(1, .release);
         return .{ .observer = self, .id = id };
@@ -192,10 +187,6 @@ pub const Observer = struct {
 
     pub fn cancellations(self: *const Observer) u64 {
         return self.cancellations_total.load(.acquire);
-    }
-
-    pub fn optedInHalfCloseCancellations(self: *const Observer) u64 {
-        return self.opted_in_half_close_cancellations_total.load(.acquire);
     }
 
     pub fn failures(self: *const Observer) u64 {
@@ -296,7 +287,7 @@ pub const Observer = struct {
                     self.probeWindowsLocked(index);
                     if (poll_fd.revents & WindowsPoll.poll_hup != 0) {
                         if (self.indexOfLocked(entry_id)) |remaining_index|
-                            self.handleHalfCloseLocked(remaining_index);
+                            self.stopWatchingLocked(remaining_index);
                     }
                 }
             }
@@ -383,7 +374,7 @@ pub const Observer = struct {
                     if (event.fflags != 0)
                         self.cancelLocked(index, true)
                     else
-                        self.handleHalfCloseLocked(index);
+                        self.stopWatchingLocked(index);
                 } else {
                     if (!self.entries.items[index].unread_input) self.probeLocked(index);
                 }
@@ -419,7 +410,7 @@ pub const Observer = struct {
             null,
             null,
         );
-        if (n == 0) return self.handleHalfCloseLocked(index);
+        if (n == 0) return self.stopWatchingLocked(index);
         if (n > 0) {
             entry.unread_input = true;
             return;
@@ -436,7 +427,7 @@ pub const Observer = struct {
         const entry = &self.entries.items[index];
         var byte: [1]u8 = undefined;
         const n = WindowsPoll.recv(entry.fd, &byte, byte.len, 0x2); // MSG_PEEK
-        if (n == 0) return self.handleHalfCloseLocked(index);
+        if (n == 0) return self.stopWatchingLocked(index);
         if (n > 0) {
             entry.unread_input = true;
             return;
@@ -456,16 +447,6 @@ pub const Observer = struct {
         if (!entry.watched) return;
         if (comptime builtin.os.tag == .macos) self.updateKqueue(entry.fd, entry.id, false) catch {};
         entry.watched = false;
-    }
-
-    fn handleHalfCloseLocked(self: *Observer, index: usize) void {
-        if (self.entries.items[index].cancel_on_half_close) {
-            self.entries.items[index].cancellation.store(true, .release);
-            _ = self.opted_in_half_close_cancellations_total.fetchAdd(1, .monotonic);
-            self.removeLocked(index);
-        } else {
-            self.stopWatchingLocked(index);
-        }
     }
 
     fn indexOfLocked(self: *Observer, id: u64) ?usize {
@@ -515,7 +496,7 @@ test "cancellation observer rolls back refused control capacity and restarts" {
     try std.testing.expect(observer.future == null);
     try std.testing.expect(observer.kernel_fd == null);
     var cancellation: std.atomic.Value(bool) = .init(false);
-    try std.testing.expectError(error.ObserverUnavailable, observer.register(undefined, &cancellation, false));
+    try std.testing.expectError(error.ObserverUnavailable, observer.register(undefined, &cancellation));
     for (0..3) |_| {
         try observer.start();
         try std.testing.expectError(error.AlreadyStarted, observer.start());
@@ -527,7 +508,7 @@ test "cancellation observer rolls back refused control capacity and restarts" {
         try std.testing.expect(observer.control_io == null);
         try std.testing.expect(observer.future == null);
         try std.testing.expect(observer.kernel_fd == null);
-        try std.testing.expectError(error.ObserverUnavailable, observer.register(undefined, &cancellation, false));
+        try std.testing.expectError(error.ObserverUnavailable, observer.register(undefined, &cancellation));
     }
 }
 

@@ -147,15 +147,6 @@ antfly query --table wikipedia \
 
 The reranker providers that execute are `antfly`, `cohere`, and `vertex`. With `antfly`, `model` may be omitted and the runtime picks a model from its reranker directory; set it when more than one reranker is installed. A larger window improves recall and costs latency, and on a hosted provider, money.
 
-For search-as-you-type clients using Antfly's standalone HTTP/1 listener, send
-`X-Antfly-Cancel-On-Disconnect: true` on query requests. When the client closes
-its request direction before receiving a response, Antfly treats that query as
-abandoned and cancels queued work and downstream inference. Without the header,
-an orderly TCP half-close still allows the client to read its response. A model
-run already executing on a GPU stops at its next safe batch boundary; the
-header does not interrupt a driver call in progress. HTTP/2 stream resets and
-abortive HTTP/1 disconnects already signal cancellation without this header.
-
 ### 4. Prune the Tail
 
 Pruning runs once at the coordinator after global fusion and reranking, before `offset` and `limit` select the page, so standalone and distributed deployments share one score domain. Instead of returning a fixed count, it returns only what clears a quality bar. The strategies combine in one `pruner` object:

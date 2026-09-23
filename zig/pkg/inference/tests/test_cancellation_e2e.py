@@ -210,10 +210,12 @@ class CancellationE2E(unittest.TestCase):
     def test_disconnect_replaces_uninterruptible_worker(self):
         self.exercise("hard")
 
-    def exercise_bounded_rerank(self, path):
-        initial = self.start("bounded_rerank")
+    def exercise_bounded_call(self, mode, path):
+        initial = self.start(mode)
         if path == "/ai/v1/rerank":
             expected = self.rerank()
+        elif path == "/ai/v1/embed":
+            expected = self.embed()
         else:
             status, expected = self.request("POST", path, {})
             self.assertEqual(status, 200, expected)
@@ -227,19 +229,24 @@ class CancellationE2E(unittest.TestCase):
         body = json.dumps(
             {"model": self.model, "query": "ab", "prompts": ["ab"] * 30}
             if path == "/ai/v1/rerank"
+            else {"model": self.model, "input": ["ab"]}
+            if path == "/ai/v1/embed"
             else {}
         ).encode()
         client.sendall(
             f"POST {path} HTTP/1.1\r\nHost: localhost\r\n".encode()
             + b"Content-Type: application/json\r\n"
-            b"X-Antfly-Cancel-On-Disconnect: true\r\nContent-Length: "
+            b"Content-Length: "
             + str(len(body)).encode()
             + b"\r\n\r\n"
             + body
         )
         running = self.wait_state(lambda s: s["active"] == 1)
         self.assertEqual(running["pid"], initial["pid"])
-        client.shutdown(socket.SHUT_WR)
+        # A TCP reset proves the client abandoned the response. An orderly
+        # HTTP/1 half-close can still leave the client reading it.
+        client.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        client.close()
         time.sleep(0.1)
         during = self.wait_state(lambda s: s["active"] == 1)
         self.assertEqual(during["pid"], initial["pid"])
@@ -257,16 +264,21 @@ class CancellationE2E(unittest.TestCase):
         self.assertEqual(completed["pid"], initial["pid"])
         if path == "/ai/v1/rerank":
             self.assertEqual(self.rerank(), expected)
+        elif path == "/ai/v1/embed":
+            self.assertEqual(self.embed(), expected)
         else:
             self.assertEqual(self.request("POST", path, {}), (200, expected))
 
-    def test_rerank_half_close_stops_at_batch_boundary_without_worker_restart(self):
-        self.exercise_bounded_rerank("/ai/v1/rerank")
+    def test_rerank_disconnect_stops_at_batch_boundary_without_worker_restart(self):
+        self.exercise_bounded_call("bounded_rerank", "/ai/v1/rerank")
 
-    def test_linked_rerank_half_close_stops_at_batch_boundary_without_worker_restart(
+    def test_linked_rerank_disconnect_stops_at_batch_boundary_without_worker_restart(
         self,
     ):
-        self.exercise_bounded_rerank("/_fixture/rerank_direct")
+        self.exercise_bounded_call("bounded_rerank", "/_fixture/rerank_direct")
+
+    def test_embedding_disconnect_finishes_native_call_without_worker_restart(self):
+        self.exercise_bounded_call("bounded_embed", "/ai/v1/embed")
 
 
 if __name__ == "__main__":

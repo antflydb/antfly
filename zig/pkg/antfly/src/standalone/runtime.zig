@@ -5059,9 +5059,6 @@ fn publicHttpServerConfig(bind_host: []const u8, bind_port: u16) httpx.ServerCon
         // This is a transport safeguard for every H1 request body. Keep it
         // independent from admission.query.max_concurrent_requests.
         .max_h1_inflight_bodies = public_http_max_h1_inflight_bodies,
-        // Interactive query clients may explicitly make a half-closed HTTP/1
-        // connection mean that the answer is no longer wanted.
-        .h1_cancel_on_half_close_header = "X-Antfly-Cancel-On-Disconnect",
         .header_read_timeout_ms = 300_000,
         .body_read_timeout_ms = 300_000,
         .response_write_timeout_ms = 300_000,
@@ -9962,7 +9959,6 @@ test "standalone public HTTP server is restart-safe and uses public API request 
     try std.testing.expect(cfg.max_connections <= public_http_connection_ceiling);
     try std.testing.expectEqual(cfg.max_connections, cfg.max_request_tasks);
     try std.testing.expectEqual(public_http_max_h1_inflight_bodies, cfg.max_h1_inflight_bodies);
-    try std.testing.expectEqualStrings("X-Antfly-Cancel-On-Disconnect", cfg.h1_cancel_on_half_close_header.?);
     try std.testing.expectEqual(@as(u32, 5), cfg.accept_error_backoff_initial_ms);
     try std.testing.expectEqual(@as(u32, 1_000), cfg.accept_error_backoff_max_ms);
     try std.testing.expectEqual(@as(u32, 256), publicHttpConnectionLimitForFdSoftLimit(1024));

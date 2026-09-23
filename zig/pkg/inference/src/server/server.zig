@@ -108,7 +108,7 @@ pub const ExecutorCancellation = executor_microbatch.Cancellation;
 const execution_control_mod = @import("../execution_control.zig");
 const InferenceExecutionControl = execution_control_mod.InferenceExecutionControl;
 const cancellable_rerank_batch_size: usize = 8;
-const rerank_driver_call_limit_ns: u64 = 120 * std.time.ns_per_s;
+const native_call_cancellation_grace_ns: u64 = 5 * std.time.ns_per_s;
 
 fn httpInferenceExecutionControl(node: *Node, ctx: *httpx.Context) InferenceExecutionControl {
     const Check = struct {
@@ -125,6 +125,7 @@ fn httpInferenceExecutionControl(node: *Node, ctx: *httpx.Context) InferenceExec
     return .{
         .io = ctx.io,
         .deadline_ns = ctx.application_deadline_ns,
+        .cancellation_grace_ns = native_call_cancellation_grace_ns,
         .ptr = ctx,
         .check_fn = Check.check,
         .hard_cancellation = if (node.hard_cancellation_watchdog) |watchdog|
@@ -4127,6 +4128,8 @@ pub const Node = struct {
         supplied: InferenceExecutionControl,
     ) InferenceExecutionControl {
         var control = supplied;
+        if (control.cancellation_grace_ns == null)
+            control.cancellation_grace_ns = native_call_cancellation_grace_ns;
         if (control.io == null) control.io = io orelse self.session_manager.io;
         if (control.hard_cancellation == null) {
             if (self.hard_cancellation_watchdog) |watchdog|
@@ -4584,7 +4587,7 @@ pub const Node = struct {
             .ptr = &deadline_control,
             .check_fn = DeadlineControl.check,
             .hard_cancellation = if (upstream_control) |control| control.hard_cancellation else null,
-        }).deferCancellationUntilSafeBoundary(rerank_driver_call_limit_ns);
+        });
         var model_handle = try self.model_manager.acquireFromDirWithControl(model_path, execution_control);
         defer model_handle.release();
         const model = model_handle.get();
@@ -10808,8 +10811,7 @@ pub const Node = struct {
         // A cancelled client must release the model between bounded batches.
         // Metal/CUDA cannot stop a driver call in place; restarting the worker
         // for every abandoned search would evict the model for the next one.
-        const execution_control = httpInferenceExecutionControl(self, ctx)
-            .deferCancellationUntilSafeBoundary(rerank_driver_call_limit_ns);
+        const execution_control = httpInferenceExecutionControl(self, ctx);
         var parsed = (try ctx.parseJson(api.RerankRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
@@ -10848,8 +10850,7 @@ pub const Node = struct {
     }
 
     pub fn rerankMultimodalPrompts(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        const execution_control = httpInferenceExecutionControl(self, ctx)
-            .deferCancellationUntilSafeBoundary(300 * std.time.ns_per_s);
+        const execution_control = httpInferenceExecutionControl(self, ctx);
         const uses_attachment_envelope = requestUsesAttachmentEnvelope(ctx);
         var attachment_envelope: ?httpx.attachment_envelope.Envelope = null;
         defer if (attachment_envelope) |*envelope| envelope.deinit();
@@ -19536,7 +19537,6 @@ pub const Node = struct {
             .port = port,
             .max_connections = self.config.http_max_connections,
             .max_request_tasks = self.config.http_max_request_tasks,
-            .h1_cancel_on_half_close_header = "X-Antfly-Cancel-On-Disconnect",
             // Generation can legitimately take longer than the generic 30s HTTP
             // default during cold model startup or first-token GPU execution.
             .header_read_timeout_ms = 300_000,

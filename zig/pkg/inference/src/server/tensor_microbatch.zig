@@ -402,18 +402,18 @@ fn executeGroup(items: []const micro.ExecuteItem) !void {
         if (!try (try admission.estimateRequest(request, first.session.outputInfo())).fitsLimits(admission.limits)) return subdivide(items);
     }
     var group = micro.ExecutionControl{ .items = items };
-    var all_deferred = true;
-    var group_run_limit_ns: ?u64 = null;
+    var all_grace = true;
+    var group_grace_ns: ?u64 = null;
     var earliest_deadline_ns: ?u64 = null;
     for (items) |item| {
         const item_control = item.payloadAs(Ticket).control orelse {
-            all_deferred = false;
+            all_grace = false;
             continue;
         };
-        if (item_control.max_uninterruptible_run_ns) |limit| {
-            group_run_limit_ns = if (group_run_limit_ns) |current| @min(current, limit) else limit;
+        if (item_control.cancellation_grace_ns) |grace_ns| {
+            group_grace_ns = if (group_grace_ns) |current| @min(current, grace_ns) else grace_ns;
         } else {
-            all_deferred = false;
+            all_grace = false;
         }
         if (item_control.deadline_ns) |deadline|
             earliest_deadline_ns = if (earliest_deadline_ns) |current| @min(current, deadline) else deadline;
@@ -424,7 +424,7 @@ fn executeGroup(items: []const micro.ExecuteItem) !void {
         .io = items[0].control.io,
         .deadline_ns = earliest_deadline_ns,
         .hard_cancellation = if (first.control) |active| active.hard_cancellation else null,
-        .max_uninterruptible_run_ns = if (all_deferred) group_run_limit_ns else null,
+        .cancellation_grace_ns = if (all_grace) group_grace_ns else null,
     };
     try control.lock(first.gate);
     var locked = true;

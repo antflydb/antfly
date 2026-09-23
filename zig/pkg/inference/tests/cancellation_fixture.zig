@@ -18,6 +18,7 @@ const Fixture = struct {
     model_name: []const u8,
     hard: bool,
     bounded_rerank: bool,
+    bounded_embed: bool,
     block_next: std.atomic.Value(bool) = .init(false),
     release_block: std.atomic.Value(bool) = .init(false),
     execution_gate: std.atomic.Mutex = .unlocked,
@@ -86,7 +87,7 @@ const Fixture = struct {
                 // restart request. Only the production watchdog can stop it.
                 while (true) std.atomic.spinLoopHint();
             }
-            if (self.bounded_rerank) {
+            if (self.bounded_rerank or self.bounded_embed) {
                 // Mimic one uninterruptible GPU batch which eventually
                 // returns. Cancellation must wait for that safe boundary.
                 while (!self.release_block.load(.acquire)) std.atomic.spinLoopHint();
@@ -136,7 +137,7 @@ const Fixture = struct {
     }
     fn interruption(raw: *anyopaque) inference.execution_control.Interruption {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        return if (self.hard or self.bounded_rerank) .process_required else .cooperative;
+        return if (self.hard or self.bounded_rerank or self.bounded_embed) .process_required else .cooperative;
     }
     fn close(_: *anyopaque) void {}
     const vtable = Session.VTable{
@@ -172,6 +173,7 @@ pub fn main(init: std.process.Init) !void {
         .model_name = std.fs.path.basename(model_dir),
         .hard = std.mem.eql(u8, mode, "hard"),
         .bounded_rerank = std.mem.eql(u8, mode, "bounded_rerank"),
+        .bounded_embed = std.mem.eql(u8, mode, "bounded_embed"),
     };
 
     const ModelPtr = @typeInfo(@TypeOf(node.model_manager.loaded.get(model_dir))).optional.child;

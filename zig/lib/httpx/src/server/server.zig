@@ -167,10 +167,6 @@ pub const ServerConfig = struct {
     /// callers must disable H1 disconnect cancellation or supply a probe.
     borrow_http_runtime_io: bool = false,
     h1_disconnect_cancellation: H1DisconnectCancellation = .required,
-    /// An application may allow a request header to opt into treating an
-    /// orderly HTTP/1 half-close as abandonment. Without this opt-in, FIN is
-    /// only the end of the request direction and the response may still be read.
-    h1_cancel_on_half_close_header: ?[]const u8 = null,
     /// Required when disconnect cancellation runs on borrowed std.Io lanes.
     /// Native runtimes leave this null and use their descriptor observer.
     h1_disconnect_probe: ?H1DisconnectProbe = null,
@@ -2438,11 +2434,6 @@ pub const Server = struct {
                     cancellation_registration = (self.config.http_runtime orelse &self.owned_http_runtime).registerH1Request(
                         sock.handle,
                         &connection.h1_request_cancellation,
-                        if (self.config.h1_cancel_on_half_close_header) |header|
-                            !ctx.h1_has_buffered_input and
-                                std.ascii.eqlIgnoreCase(req.headers.get(header) orelse "", "true")
-                        else
-                            false,
                     ) catch {
                         try self.sendError(&sock, 503);
                         return;
@@ -6068,7 +6059,6 @@ test "H1 context preserves buffered pipeline input across client SHUT_WR" {
     var server = Server.initWithConfig(allocator, io_impl.io(), .{
         .host = "127.0.0.1",
         .port = 0,
-        .h1_cancel_on_half_close_header = "X-Cancel-On-Disconnect",
     });
     defer server.deinit();
     try server.get("/a", State.handler);
@@ -6095,7 +6085,7 @@ test "H1 context preserves buffered pipeline input across client SHUT_WR" {
     // both complete requests are in flight, so EOF must not cancel A while B
     // is already held by the server's connection buffer.
     try client.sendAll(
-        "GET /a HTTP/1.1\r\nHost: test\r\nX-Cancel-On-Disconnect: true\r\n\r\n" ++
+        "GET /a HTTP/1.1\r\nHost: test\r\n\r\n" ++
             "GET /b HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n",
     );
     try client_io.vtable.netShutdown(client_io.userdata, client.handle, .send);
@@ -6113,7 +6103,6 @@ test "H1 context preserves buffered pipeline input across client SHUT_WR" {
     try std.testing.expect(State.second_handled.load(.acquire));
     try std.testing.expect(mem.indexOf(u8, response[0..response_len], "\r\n\r\nA") != null);
     try std.testing.expect(mem.indexOf(u8, response[0..response_len], "\r\n\r\nB") != null);
-    try std.testing.expectEqual(@as(u64, 0), server.httpRuntimeStats().h1_opted_in_half_close_cancellations_total);
 }
 
 test "H1 client cancellation reaches active server work" {
@@ -6246,66 +6235,6 @@ test "H1 orderly half close does not cancel an active response" {
     try std.testing.expect(mem.indexOf(u8, response[0..response_len], "complete") != null);
     try std.testing.expect(!State.canceled.load(.acquire));
     try std.testing.expectEqual(@as(u64, 0), server.httpRuntimeStats().h1_hard_disconnect_cancellations_total);
-}
-
-test "H1 opted-in half close cancels an active request" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
-
-    const State = struct {
-        var started = std.atomic.Value(bool).init(false);
-        var canceled = std.atomic.Value(bool).init(false);
-
-        fn handler(ctx: *Context) anyerror!Response {
-            started.store(true, .release);
-            while (!ctx.isCancellationRequested())
-                try ctx.io.sleep(.fromMilliseconds(1), .awake);
-            canceled.store(true, .release);
-            return error.Canceled;
-        }
-    };
-    State.started.store(false, .release);
-    State.canceled.store(false, .release);
-
-    const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    var server = Server.initWithConfig(alloc, io_impl.io(), .{
-        .host = "127.0.0.1",
-        .port = 0,
-        .h1_cancel_on_half_close_header = "X-Cancel-On-Disconnect",
-    });
-    defer server.deinit();
-    try server.get("/slow", State.handler);
-    try server.bind();
-
-    var listener = try std.testing.io.concurrent(struct {
-        fn run(s: *Server) void {
-            s.listen() catch {};
-        }
-    }.run, .{&server});
-    defer {
-        server.stop();
-        listener.await(std.testing.io);
-    }
-    while (!server.listen_started.load(.acquire))
-        try io_impl.io().sleep(.fromMilliseconds(1), .awake);
-
-    const client_io = std.Io.Threaded.global_single_threaded.io();
-    var client = try Socket.connect(server.boundAddress().?, client_io);
-    defer client.close();
-    try client.sendAll("GET /slow HTTP/1.1\r\nHost: test\r\nX-Cancel-On-Disconnect: true\r\n\r\n");
-    for (0..5000) |_| {
-        if (State.started.load(.acquire)) break;
-        try io_impl.io().sleep(.fromMilliseconds(1), .awake);
-    }
-    try std.testing.expect(State.started.load(.acquire));
-    try client_io.vtable.netShutdown(client_io.userdata, client.handle, .send);
-    for (0..5000) |_| {
-        if (State.canceled.load(.acquire)) break;
-        try io_impl.io().sleep(.fromMilliseconds(1), .awake);
-    }
-    try std.testing.expect(State.canceled.load(.acquire));
-    try std.testing.expectEqual(@as(u64, 1), server.httpRuntimeStats().h1_opted_in_half_close_cancellations_total);
 }
 
 test "H1 hard disconnect remains observable behind pipelined input" {
