@@ -10,26 +10,102 @@ export interface ReadRetryPolicy {
 const queryPath =
   /^\/db\/v1\/(query|tables\/[^/]+\/query|databases\/[^/]+\/namespaces\/[^/]+\/tables\/[^/]+\/query)$/;
 
+interface QueryBody {
+  text: string;
+  budget: number;
+  timeoutSpans: Array<[number, number]>;
+}
+
+function skipWhitespace(text: string, position: number): number {
+  while (/\s/.test(text[position] ?? "")) position++;
+  return position;
+}
+
+function stringEnd(text: string, position: number): number {
+  position++;
+  while (position < text.length) {
+    if (text[position] === "\\") position += 2;
+    else if (text[position++] === '"') return position;
+  }
+  throw new SyntaxError("Unterminated JSON string");
+}
+
+// The complete line is parsed first. This scanner only locates top-level
+// values, preserving exact bytes for large numbers and unfamiliar fields.
+function valueEnd(text: string, position: number): number {
+  let depth = 0;
+  let inString = false;
+  while (position < text.length) {
+    const character = text[position];
+    if (inString) {
+      if (character === "\\") position += 2;
+      else if (character === '"') {
+        inString = false;
+        position++;
+      } else position++;
+    } else if (character === '"') {
+      inString = true;
+      position++;
+    } else if (character === "{" || character === "[") {
+      depth++;
+      position++;
+    } else if (character === "}" || character === "]") {
+      if (depth === 0) break;
+      depth--;
+      position++;
+    } else if (character === "," && depth === 0) break;
+    else position++;
+  }
+  return position;
+}
+
 function bodyBudget(
   body: Uint8Array,
   contentType: string | null,
   maximum: number
-): number | undefined {
+): QueryBody | undefined {
   const text = new TextDecoder("utf-8", { fatal: true }).decode(body);
   const lines =
     contentType?.split(";", 1)[0]?.trim().toLowerCase() === "application/x-ndjson"
-      ? text.split("\n").filter((line) => line.trim())
+      ? (text.match(/[^\n]*\n|[^\n]+$/g) ?? [])
       : [text];
   if (!lines.length) return undefined;
+  const timeoutSpans: Array<[number, number]> = [];
+  let offset = 0;
+  let seen = false;
   for (const line of lines) {
+    if (!line.trim()) {
+      offset += line.length;
+      continue;
+    }
     const object = JSON.parse(line);
     if (!object || typeof object !== "object" || Array.isArray(object)) return undefined;
-    const timeout = object.timeout_ms;
-    if (timeout === undefined || timeout === null) continue;
-    if (!Number.isSafeInteger(timeout) || timeout < 0) return undefined;
-    maximum = Math.min(maximum, timeout);
+    seen = true;
+    let position = skipWhitespace(line, 0) + 1;
+    const keys = new Set<string>();
+    while (true) {
+      position = skipWhitespace(line, position);
+      if (line[position] === "}") break;
+      const keyEnd = stringEnd(line, position);
+      const key = JSON.parse(line.slice(position, keyEnd)) as string;
+      if (keys.has(key)) return undefined;
+      keys.add(key);
+      position = skipWhitespace(line, keyEnd) + 1;
+      position = skipWhitespace(line, position);
+      const start = position;
+      position = valueEnd(line, position);
+      if (key === "timeout_ms" && object.timeout_ms != null) {
+        if (!Number.isSafeInteger(object.timeout_ms) || object.timeout_ms < 0) return undefined;
+        maximum = Math.min(maximum, object.timeout_ms);
+        timeoutSpans.push([offset + start, offset + position]);
+      }
+      position = skipWhitespace(line, position);
+      if (line[position] === "}") break;
+      position++;
+    }
+    offset += line.length;
   }
-  return maximum;
+  return seen ? { text, budget: maximum, timeoutSpans } : undefined;
 }
 
 function validate(policy: ReadRetryPolicy): void {
@@ -126,20 +202,30 @@ export function readRetryFetch(
       body.set(chunk, offset);
       offset += chunk.byteLength;
     }
-    let budget: number | undefined;
+    let queryBody: QueryBody | undefined;
     try {
-      budget = bodyBudget(body, request.headers.get("Content-Type"), config.maxElapsedMs);
+      queryBody = bodyBudget(body, request.headers.get("Content-Type"), config.maxElapsedMs);
     } catch {
       /* Unknown body contracts bypass retries. */
     }
-    if (budget === undefined) return base(new Request(request, { body, signal: request.signal }));
-    deadline = started + budget;
+    if (queryBody === undefined)
+      return base(new Request(request, { body, signal: request.signal }));
+    deadline = started + queryBody.budget;
     const remaining = deadline - performance.now();
     if (remaining <= 0) throw new DOMException("Antfly query deadline expired", "TimeoutError");
     signal = AbortSignal.any([signal, AbortSignal.timeout(Math.ceil(remaining))]);
+    const replayHeaders = new Headers(request.headers);
+    replayHeaders.delete("Content-Length");
     for (let attempt = 1; ; attempt++) {
       signal.throwIfAborted();
-      const response = await base(new Request(request, { body, signal }));
+      const remainingMs = Math.max(0, Math.floor(deadline - performance.now()));
+      let attemptBody = queryBody.text;
+      for (const [start, end] of [...queryBody.timeoutSpans].reverse()) {
+        attemptBody = attemptBody.slice(0, start) + remainingMs + attemptBody.slice(end);
+      }
+      const response = await base(
+        new Request(request, { body: attemptBody, headers: replayHeaders, signal })
+      );
       if (signal.aborted) {
         void response.body?.cancel(signal.reason).catch(() => {});
         signal.throwIfAborted();

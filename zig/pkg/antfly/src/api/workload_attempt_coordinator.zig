@@ -95,9 +95,9 @@ pub const Store = struct {
         defer cursor.close();
         if (try cursor.seekAtOrAfter(prefix)) |row| {
             if (std.mem.startsWith(u8, row.key, prefix)) {
-                const record = try self.decode(Record, row.value, attempt_charge);
-                if (record.id.sequence == 0 or record.id.generation != self.generation or record.id.destination != destination_id) return error.InvalidCoordinatorJournal;
-                return record.id.sequence - 1;
+                const id = try self.attemptRow(row.key, row.value);
+                if (id.generation != self.generation or id.destination != destination_id) return error.InvalidCoordinatorJournal;
+                return id.sequence - 1;
             }
         }
         return target.sequence;
@@ -181,8 +181,8 @@ pub const Store = struct {
             if (!std.mem.startsWith(u8, row.key, prefix)) break;
             if (count >= hard_attempts) return error.InvalidCoordinatorJournal;
             count += 1;
-            const record = try self.decode(Record, row.value, attempt_charge);
-            if (record.id.destination == destination_id) try result.append(alloc, record.id);
+            const id = try self.attemptRow(row.key, row.value);
+            if (id.destination == destination_id) try result.append(alloc, id);
         }
         return try result.toOwnedSlice(alloc);
     }
@@ -220,6 +220,14 @@ pub const Store = struct {
     }
     fn attemptKey(self: *Store, buffer: *[key_capacity]u8, id: protocol.AttemptId) ![]const u8 {
         return std.fmt.bufPrint(buffer, "workload-attempt-coordinator/v2/{d}/attempt/{x:0>16}/{x:0>16}/{x:0>16}", .{ self.node_id, id.generation, id.destination, id.sequence });
+    }
+    fn attemptRow(self: *Store, name: []const u8, raw: []const u8) !protocol.AttemptId {
+        const record = try self.decode(Record, raw, attempt_charge);
+        const id = record.id;
+        var expected: [key_capacity]u8 = undefined;
+        if (id.coordinator != self.node_id or id.generation < 2 or id.sequence == 0 or id.destination == 0 or id.worker_incarnation == 0 or id.worker_namespace == 0 or id.operation == 0 or
+            !std.mem.eql(u8, name, try self.attemptKey(&expected, id))) return error.InvalidCoordinatorJournal;
+        return id;
     }
     fn decode(self: *Store, comptime T: type, raw: []const u8, maximum: u64) !T {
         if (raw.len > maximum) return error.InvalidCoordinatorJournal;
@@ -346,11 +354,8 @@ pub const Store = struct {
             while (entry) |row| : (entry = try cursor.next()) {
                 if (!std.mem.startsWith(u8, row.key, prefix)) break;
                 if (count >= hard_attempts) return error.InvalidCoordinatorJournal;
-                const record = try self.decode(Record, row.value, attempt_charge);
-                const id = record.id;
-                var expected: [key_capacity]u8 = undefined;
-                if (!existing or id.coordinator != self.node_id or id.generation > meta.generation or id.generation < 2 or id.sequence == 0 or id.sequence > meta.sequence or id.destination == 0 or id.worker_incarnation == 0 or id.operation == 0 or
-                    !std.mem.eql(u8, row.key, try self.attemptKey(&expected, id))) return error.InvalidCoordinatorJournal;
+                const id = try self.attemptRow(row.key, row.value);
+                if (!existing or id.generation > meta.generation or id.sequence > meta.sequence) return error.InvalidCoordinatorJournal;
                 const target = try self.destination(txn, id.destination) orelse return error.InvalidCoordinatorJournal;
                 if (id.worker_namespace == 0 or id.worker_namespace != target.namespace or id.worker_incarnation != target.incarnation) return error.InvalidCoordinatorJournal;
                 const value = try counts.getOrPut(self.allocator, id.destination);
@@ -392,8 +397,8 @@ pub const Store = struct {
                 if (!std.mem.startsWith(u8, row.key, prefix)) break;
                 if (count >= hard_attempts) return error.InvalidCoordinatorJournal;
                 count += 1;
-                const record = try self.decode(Record, row.value, attempt_charge);
-                if (record.id.destination == target.node and record.id.generation <= through) try ids.append(self.allocator, record.id);
+                const id = try self.attemptRow(row.key, row.value);
+                if (id.destination == target.node and id.generation <= through) try ids.append(self.allocator, id);
             }
         }
         for (ids.items) |id| {
@@ -463,4 +468,56 @@ test "workload admission durable coordinator preserves uncertainty and fences re
     const after = try next.begin(8, 10, 102);
     try std.testing.expect(after.generation > uncertain.generation);
     try next.terminal(after);
+}
+
+test "workload admission coordinator rejects mismatched live attempt rows before reconciliation" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../storage/mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    var storage = try backend.runtimeStore(alloc, .{ .name = "system/coordinator-attempts" });
+    defer storage.deinit();
+    var durable = transactions.DurableSessionStore.initRuntime(alloc, &storage);
+    var coordinator = try Store.init(alloc, &durable, 7, .{
+        .max_attempts = 2,
+        .max_bytes = 8192,
+        .max_destination_attempts = 2,
+        .max_destinations = 2,
+    });
+    defer coordinator.deinit();
+    const fence: protocol.Fence = .{
+        .version = 1,
+        .coordinator = 7,
+        .destination = 8,
+        .worker_namespace = 44,
+        .worker_incarnation = 10,
+        .fenced_through = 1,
+        .quiesced_through = 1,
+    };
+    try coordinator.ready(fence);
+    const owned = try coordinator.begin(8, 10, 100);
+    var key_buffer: [key_capacity]u8 = undefined;
+    const key = try coordinator.attemptKey(&key_buffer, owned);
+    {
+        var txn = try storage.beginWrite();
+        errdefer txn.abort();
+        var mismatched = owned;
+        mismatched.sequence += 1;
+        try coordinator.put(&txn, key, Record{ .id = mismatched }, attempt_charge);
+        try txn.commit();
+    }
+    try std.testing.expectError(error.InvalidCoordinatorJournal, coordinator.acknowledgedThrough(8));
+    try std.testing.expectError(error.InvalidCoordinatorJournal, coordinator.pending(alloc, 8));
+    try std.testing.expectError(error.InvalidCoordinatorJournal, coordinator.ready(fence));
+    try std.testing.expectEqual(@as(u32, 1), (try coordinator.usage()).attempts);
+    {
+        var txn = try storage.beginWrite();
+        errdefer txn.abort();
+        try coordinator.put(&txn, key, Record{ .id = owned }, attempt_charge);
+        try txn.commit();
+    }
+    try std.testing.expectEqual(@as(u64, 0), try coordinator.acknowledgedThrough(8));
+    const pending = try coordinator.pending(alloc, 8);
+    defer alloc.free(pending);
+    try std.testing.expectEqualSlices(protocol.AttemptId, &.{owned}, pending);
+    try coordinator.terminal(owned);
 }

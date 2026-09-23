@@ -18,7 +18,13 @@ const url = "http://test/db/v1/tables/docs/query";
 describe("query read retries", () => {
   it("includes the shortest body timeout in the original backoff budget", async () => {
     const base = vi.fn<typeof fetch>().mockImplementation(async (input) => {
-      expect(await (input as Request).text()).toBe('{"timeout_ms":800}\n{"timeout_ms":80}\n');
+      const lines = (await (input as Request).text()).trim().split("\n");
+      expect(lines.map((line) => JSON.parse(line).timeout_ms)).toEqual([
+        expect.any(Number),
+        expect.any(Number),
+      ]);
+      expect(JSON.parse(lines[0]).timeout_ms).toBeLessThanOrEqual(80);
+      expect(JSON.parse(lines[1]).timeout_ms).toBeLessThanOrEqual(80);
       return response(429, rejected);
     });
     const result = await readRetryFetch(base, {
@@ -33,6 +39,47 @@ describe("query read retries", () => {
     expect(result.status).toBe(429);
     expect(base).toHaveBeenCalledTimes(1);
     await result.body?.cancel();
+  });
+
+  it("forwards only remaining query time while preserving unknown JSON fields", async () => {
+    const submitted =
+      '{ "large": 12345678901234567890123456789, "decimal": 1.0000000000000000001, "nested": {"timeout_ms": 900}, "timeout_ms": 200 }';
+    const requests: string[] = [];
+    const base = vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      expect((input as Request).headers.has("Content-Length")).toBe(false);
+      requests.push(await (input as Request).text());
+      return response(requests.length === 1 ? 429 : 200, requests.length === 1 ? rejected : "ok");
+    });
+    const result = await readRetryFetch(base, {
+      ...policy,
+      initialBackoffMs: 40,
+      maxBackoffMs: 40,
+    })(url, {
+      method: "POST",
+      headers: { "Content-Length": String(submitted.length) },
+      body: submitted,
+    });
+    expect(result.status).toBe(200);
+    expect(requests).toHaveLength(2);
+    const first = JSON.parse(requests[0]).timeout_ms as number;
+    const second = JSON.parse(requests[1]).timeout_ms as number;
+    expect(first).toBeGreaterThan(0);
+    expect(first).toBeLessThanOrEqual(200);
+    expect(second).toBeGreaterThan(0);
+    expect(second).toBeLessThan(first - 20);
+    for (const request of requests)
+      expect(request).toContain(
+        '"large": 12345678901234567890123456789, "decimal": 1.0000000000000000001, "nested": {"timeout_ms": 900}'
+      );
+  });
+
+  it("does not retry duplicate top-level timeout fields", async () => {
+    const body = '{"timeout_ms":200,"timeout_ms":50}';
+    const base = vi.fn<typeof fetch>().mockResolvedValue(response(429, rejected));
+    const result = await readRetryFetch(base, policy)(url, { method: "POST", body });
+    expect(result.status).toBe(429);
+    expect(base).toHaveBeenCalledTimes(1);
+    expect(await (base.mock.calls[0][0] as Request).text()).toBe(body);
   });
   it("preserves oversized or chunked error bodies without retrying", async () => {
     for (const length of [undefined, "5"]) {

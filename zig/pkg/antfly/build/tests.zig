@@ -1621,6 +1621,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "api http client round-trips public status and internal capability routes",
         "api http client requires explicit not-proposed marker and tracks delivery phase",
         "workload admission coordinator late terminal",
+        "workload admission coordinator rejects mismatched live attempt rows",
         "stable distributed transaction retry resumes a durable commit decision",
         "distributed txn preserves original deadline across participant waves and cleanup",
         "transaction first decision distinguishes rejected admission from accepted and resumed recovery",
