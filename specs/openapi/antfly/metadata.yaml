@@ -119,7 +119,7 @@ tags:
       While optional, defining a schema provides several benefits:
 
       - **Type Safety**: Ensures data consistency across documents
-      - **Optimized Indexing**: Full Text Index uses type information for appropriate Bleve mappings
+      - **Optimized Indexing**: Full Text Index uses type information for appropriate field mappings in Antfly's native full-text index
       - **Better Search**: Type-aware indexing improves search relevance and performance
       - **Query Optimization**: Enables type-specific query operations
 
@@ -283,7 +283,7 @@ tags:
       - `geoshape` - Complex geographic shape. Use for boundaries, regions.
 
       ### Special Types
-      - `embedding` - Vector embeddings (not indexed in Bleve). Use for similarity search.
+      - `embedding` - Vector embeddings (not indexed in the full-text index). Use for similarity search.
       - `blob` - Binary data (not indexed). Use for images, files, binary content.
 
       ## Type Inference
@@ -737,7 +737,7 @@ tags:
       Antfly supports two primary index types:
 
       ### `full_text` - Full-Text Search Index
-      BM25-based full-text search using Bleve. Automatically uses schema information for field mappings.
+      BM25-based full-text search using Antfly's native Zig full-text index (a segmented, Lucene-style inverted index). Automatically uses schema information for field mappings.
 
       **Configuration**:
       ```json
@@ -965,34 +965,9 @@ tags:
 
          See: https://antfly.io/docs/configuration#security--cors
 
-      4. **encodeToon** - Encode data in TOON format (Token-Oriented Object Notation)
-         ```handlebars
-         {{encodeToon this.fields}}
-         {{encodeToon this.fields lengthMarker=false indent=4}}
-         {{encodeToon this.fields delimiter="\t"}}
-         ```
-
-         **TOON Format** provides **30-60% token reduction** compared to JSON:
-         - Compact syntax using `:` for key-value pairs
-         - Array length markers: `tags[#3]: ai,search,ml`
-         - Tabular format for uniform data structures
-         - Optimized for LLM parsing
-
-         Options:
-         - `lengthMarker` (bool): Add # prefix to array counts (default: true)
-         - `indent` (int): Indentation spacing (default: 2)
-         - `delimiter` (string): Field separator for tabular arrays (use `"\t"` for tabs)
-
-         Example output:
-         ```
-         title: Introduction to Vector Search
-         author: Jane Doe
-         tags[#3]: ai,search,ml
-         ```
-
-         **References:**
-         - TOON Specification: https://github.com/toon-format/toon
-         - Go Implementation: https://github.com/alpkeskin/gotoon
+      4. **encodeToon** is not available in these templates. It is a helper of the
+         retrieval agent's `document_renderer`, which renders documents into the
+         generation prompt as TOON by default.
 
       Without a template, the `field` value is used directly, or the entire document is serialized.
 
@@ -3990,7 +3965,7 @@ components:
       description: |
         Synchronization level for batch operations:
         - "propose": Wait for Raft proposal acceptance (fastest, default)
-        - "write": Wait for Pebble KV write
+        - "write": Wait for the write to be durably applied to the local key-value store
         - "full_text": Wait for full-text index WAL write
         - "enrichments": Precompute enrichments before committing the document. A synchronous
           producer failure rejects the write; post-commit worker failures retain the document
@@ -6863,8 +6838,9 @@ components:
         output:
           type: string
           description: |
-            Preferred output artifact. Suggested values are `query_request`, `bleve`, and
-            `filter_query`. The compatibility `query` field is still returned for existing clients.
+            Preferred output artifact. Suggested values are `query_request`, `bleve` (Antfly's
+            native, Bleve-compatible full-text query JSON), and `filter_query`. The compatibility
+            `query` field is still returned for existing clients.
           example: "query_request"
         constraints:
           type: object
@@ -6914,7 +6890,8 @@ components:
         query:
           type: object
           description: |
-            Generated search query in native Bleve format.
+            Generated search query in Antfly's native full-text query format (a Bleve-compatible
+            JSON query DSL: `match`, `term`, `conjuncts`, `disjuncts`, `must_not`, etc.).
             Can be used directly in QueryRequest.full_text_search or filter_query.
           additionalProperties: true
           example:
@@ -9996,8 +9973,8 @@ components:
         publication_filter:
           $ref: "#/components/schemas/RawQuery"
           description: |
-            Bleve-style filter query that gets translated to SQL and applied as a
-            WHERE clause on the PostgreSQL publication. This filters rows at the
+            Antfly's native filter query (see `RawQuery`) that gets translated to SQL and
+            applied as a WHERE clause on the PostgreSQL publication. This filters rows at the
             source before they are sent over the replication stream, reducing
             network and processing overhead.
 
@@ -10111,7 +10088,7 @@ components:
         where:
           $ref: "#/components/schemas/RawQuery"
           description: |
-            Bleve-style filter query evaluated against each CDC row. Only rows
+            Antfly's native filter query (see `RawQuery`) evaluated against each CDC row. Only rows
             matching this filter are written to `target_table`. If omitted,
             all rows match (equivalent to `match_all`).
         key_template:

@@ -6823,7 +6823,7 @@ pub const QueryBuilderRequest = struct {
     schema_fields: ?[]const []const u8 = null,
     /// Optional strategy hint for the coordinator. Suggested values are `auto`, `full_text`, `semantic`, `hybrid`, `filter`, `tree`, and `graph`. Unknown values are accepted for forward compatibility and may fall back to `auto`.
     mode: ?[]const u8 = null,
-    /// Preferred output artifact. Suggested values are `query_request`, `bleve`, and `filter_query`. The compatibility `query` field is still returned for existing clients.
+    /// Preferred output artifact. Suggested values are `query_request`, `bleve` (Antfly's native, Bleve-compatible full-text query JSON), and `filter_query`. The compatibility `query` field is still returned for existing clients.
     output: ?[]const u8 = null,
     /// Optional execution constraints for the coordinator, such as `limit`, `allowed_fields`, `prefer_indexes`, and `require_executable`.
     constraints: ?std.json.ArrayHashMap(std.json.Value) = null,
@@ -6935,7 +6935,7 @@ pub const QueryBuilderResult = struct {
     remaining_user_clarifications: ?i64 = null,
     /// Clarification questions exposed in the shared bounded-agent envelope.
     questions: ?[]const AgentQuestion = null,
-    /// Generated search query in native Bleve format. Can be used directly in QueryRequest.full_text_search or filter_query.
+    /// Generated search query in Antfly's native full-text query format (a Bleve-compatible JSON query DSL: `match`, `term`, `conjuncts`, `disjuncts`, `must_not`, etc.). Can be used directly in QueryRequest.full_text_search or filter_query.
     query: std.json.ArrayHashMap(std.json.Value),
     /// Antfly query request assembled by the coordinator. New clients should prefer this field when they want an executable Antfly query object.
     query_request: ?QueryRequest = null,
@@ -8958,7 +8958,7 @@ pub const RepairTarget = enum {
 pub const ReplicationRoute = struct {
     /// Name of the Antfly table to write matching rows to. The table must already exist.
     target_table: []const u8,
-    /// Bleve-style filter query evaluated against each CDC row. Only rows matching this filter are written to `target_table`. If omitted, all rows match (equivalent to `match_all`).
+    /// Antfly's native filter query (see `RawQuery`) evaluated against each CDC row. Only rows matching this filter are written to `target_table`. If omitted, all rows match (equivalent to `match_all`).
     where: ?RawQuery = null,
     /// Override the source-level `key_template` for this route. If omitted, the source-level template is used.
     key_template: ?[]const u8 = null,
@@ -9025,7 +9025,7 @@ pub const ReplicationSource = struct {
     on_update: ?[]const ReplicationTransformOp = null,
     /// Transform operations applied on DELETE events. If omitted, auto-derives `$unset` ops from `on_update`'s `$set` paths (safe for multi-source). Use `$delete_document` op to delete the entire Antfly document.
     on_delete: ?[]const ReplicationTransformOp = null,
-    /// Bleve-style filter query that gets translated to SQL and applied as a WHERE clause on the PostgreSQL publication. This filters rows at the source before they are sent over the replication stream, reducing network and processing overhead. Requires PostgreSQL 15 or newer and is applied only when Antfly creates the publication. Changing this value does not alter an existing publication; update or recreate that publication directly. Only a subset of filter types are supported (term, match, range, conjuncts, disjuncts, must_not). The filter is translated to SQL with inlined literal values. Example: `{"term": "active", "field": "status"}` becomes `WHERE ("status" = 'active')` on the publication.
+    /// Antfly's native filter query (see `RawQuery`) that gets translated to SQL and applied as a WHERE clause on the PostgreSQL publication. This filters rows at the source before they are sent over the replication stream, reducing network and processing overhead. Requires PostgreSQL 15 or newer and is applied only when Antfly creates the publication. Changing this value does not alter an existing publication; update or recreate that publication directly. Only a subset of filter types are supported (term, match, range, conjuncts, disjuncts, must_not). The filter is translated to SQL with inlined literal values. Example: `{"term": "active", "field": "status"}` becomes `WHERE ("status" = 'active')` on the publication.
     publication_filter: ?RawQuery = null,
     /// Conditional routes for fan-out replication. Each route evaluates its `where` filter against every CDC row and, on match, writes to the specified `target_table`. Multiple routes can match the same row. When routes are present, the top-level `on_update`/`on_delete` are ignored — each route defines its own transforms.
     routes: ?[]const ReplicationRoute = null,
@@ -11604,7 +11604,7 @@ pub const StorageStatus = struct {
     }
 };
 
-/// Synchronization level for batch operations: - "propose": Wait for Raft proposal acceptance (fastest, default) - "write": Wait for Pebble KV write - "full_text": Wait for full-text index WAL write - "enrichments": Precompute enrichments before committing the document. A synchronous producer failure rejects the write; post-commit worker failures retain the document and may return `committed_repair_required`. - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
+/// Synchronization level for batch operations: - "propose": Wait for Raft proposal acceptance (fastest, default) - "write": Wait for the write to be durably applied to the local key-value store - "full_text": Wait for full-text index WAL write - "enrichments": Precompute enrichments before committing the document. A synchronous producer failure rejects the write; post-commit worker failures retain the document and may return `committed_repair_required`. - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
 pub const SyncLevel = enum {
     propose,
     write,
