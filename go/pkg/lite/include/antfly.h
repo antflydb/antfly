@@ -37,6 +37,9 @@ typedef enum antfly_error_code {
     /* The operation requires a capability unavailable on this platform or
      * filesystem. Retrying unchanged will not succeed. */
     ANTFLY_UNSUPPORTED = 8,
+    /* A bounded drain such as run-until-idle found a managed index making no
+     * forward progress for its stall window and gave up. */
+    ANTFLY_STALLED = 9,
     ANTFLY_INTERNAL = 255,
 } antfly_error_code;
 
@@ -297,6 +300,14 @@ antfly_error_code antfly_lite_open_options_init(antfly_lite_open_options *option
  * or admin changes wait for in-flight calls. See zig/CAPI.md "Thread Safety".
  */
 #define ANTFLY_THREADING_SERIALIZED 1u
+/*
+ * Minimum native stack, in bytes, for any thread that calls into libantfly.
+ * The storage engine keeps sizable buffers on the stack; release builds use
+ * about 2 MiB at peak and debug builds more. 8 MiB is the Linux and macOS
+ * main-thread default, but secondary threads are often smaller (512 KiB for
+ * macOS pthreads, 2 MiB for Rust std threads): size them explicitly.
+ */
+#define ANTFLY_MIN_THREAD_STACK_SIZE (8u * 1024u * 1024u)
 uint32_t antfly_threading_mode(void);
 
 /*

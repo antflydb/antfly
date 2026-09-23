@@ -103,6 +103,25 @@ with `ANTFLY_BUSY` immediately, or, when `busy_timeout_ms` is set in
 exponential backoff until the timeout elapses, like `sqlite3_busy_timeout`.
 Read-only and status-only opens never contend for the writer lock.
 
+Every thread that calls into `libantfly` needs at least
+`ANTFLY_MIN_THREAD_STACK_SIZE` (8 MiB) of native stack. The storage engine
+keeps sizable buffers on the stack: release builds peak around 2 MiB and
+debug builds use more, and a smaller stack crashes inside the engine rather
+than returning an error. 8 MiB is the Linux and macOS main-thread default,
+but secondary threads are often smaller: macOS pthreads default to 512 KiB
+and Rust `std` threads to 2 MiB. How each binding meets the minimum:
+
+| Binding | How it gets the minimum |
+|---|---|
+| Go | cgo calls run on OS threads that inherit the 8 MiB main-thread stack |
+| Python | CPython threads use 8 MiB (Linux) or 16 MiB (macOS) |
+| Rust | caller's responsibility; spawn threads with `antfly_lite::MIN_THREAD_STACK_SIZE` |
+| TypeScript | configures koffi's call stacks to 8 MiB before loading the library |
+| C | size threads with `pthread_attr_setstacksize(&attr, ANTFLY_MIN_THREAD_STACK_SIZE)` |
+
+The Rust binding's tests run at exactly the minimum, so stack growth in the
+engine fails them.
+
 Handles must not be carried across `fork()`: close them before forking or
 open new ones in the child. The library may run background enrichment and
 maintenance work on its own threads for non-hosted handles; hosted handles
