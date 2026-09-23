@@ -5169,6 +5169,12 @@ pub const AntflyApiHandler = struct {
             error.DeadlineExceeded, error.PreDecisionDeadlineExceeded => textResponse(ctx, 504, "transaction preparation deadline exceeded before commit"),
             error.Forbidden => textResponse(ctx, 403, "forbidden"),
             error.TransactionTooLarge, error.SessionRecordTooLarge => textResponse(ctx, 413, "transaction exceeds preparation capacity"),
+            error.RecoveryCapacityExhausted, error.AdmissionBytesExhausted, error.AdmissionRequestTooLarge => httpx.Response.fromJson(ctx.allocator, 429, .{
+                .@"error" = "RecoveryCapacityExhausted",
+                .reason = "recovery_capacity_exhausted",
+                .stage = "admission",
+                .execution_started = false,
+            }),
             error.ForeignKeyParentMissing,
             error.ForeignKeyReferenced,
             error.UniqueConstraintViolation,
@@ -5362,6 +5368,15 @@ pub const AntflyApiHandler = struct {
         if (try self.acquirePublicOperation(ctx, "commitTransactionSession", &admission_lease)) |response| return response;
         defer self.releasePublicOperation("commitTransactionSession", &admission_lease);
 
+        const commit_request = operationContext(ctx, null);
+        if (execution_plan == null) {
+            var prepared = self.api_server.preparePublicCommitWithIntegrity(alloc, distributed_tables, commit_request) catch |err|
+                return self.transactionPreparationError(ctx, err);
+            defer prepared.deinit();
+            execution_plan = (self.api_server.txn_sessions.sealExecutionPlan(alloc, txn_id, prepared.tables) catch |err|
+                return self.transactionPreparationError(ctx, err)) orelse return textResponse(ctx, 404, "not found");
+        }
+
         // Persist the exact sealed request as recoverable work before 2PC can
         // choose a durable decision. This closes the response/crash window:
         // maintenance can replay the same transaction ID without duplicating
@@ -5389,7 +5404,6 @@ pub const AntflyApiHandler = struct {
             return ctx.text("not found");
         };
 
-        const commit_request = operationContext(ctx, null);
         const outcome = (source.commitTransactionWithIdWithContext(
             alloc,
             txn_id,
@@ -7425,7 +7439,8 @@ pub const AntflyApiHandler = struct {
         if (try self.acquirePublicOperation(ctx, "scanKeys", &admission_lease)) |response| return response;
         defer self.releasePublicOperation("scanKeys", &admission_lease);
         const alloc = ctx.response.bodyAllocator();
-        var scan_req = http_route_helpers.parseScanKeysRequest(alloc, body_data) catch |err| {
+        const parse = if (relational) http_route_helpers.parseRelationalRowQueryRequest else http_route_helpers.parseScanKeysRequest;
+        var scan_req = parse(alloc, body_data) catch |err| {
             if (try queryMemoryFailureResponse(ctx, err, "planning", false)) |response| return response;
             if (http_route_helpers.scanRequestError(err)) |response| {
                 if (relational) return jsonErrorResponse(ctx, response.status, response.message);
@@ -12769,6 +12784,64 @@ test "workload admission scan owns runtime buffers and honors optional body and 
     defer unsupported.deinit();
     try std.testing.expectEqual(@as(u16, 400), unsupported.status.code);
     try std.testing.expectEqualStrings("unsupported scan filter query", unsupported.body.?);
+}
+
+test "httpx lookup revalidates missing catalog bindings across restore" {
+    const Fake = struct {
+        replacement: []const u8,
+        missing_table: bool,
+        resolves: usize = 0,
+        lookups: usize = 0,
+
+        const original = "{\"table_id\":7,\"name\":\"physical-old\"}";
+
+        fn catalog(ptr: *anyopaque, alloc: std.mem.Allocator, _: operation_contract.RequestContext, call: system_catalog.Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const target = switch (call) {
+                .resolve => |target| target,
+                else => return error.UnexpectedTestCall,
+            };
+            try std.testing.expectEqualStrings("docs", target.table);
+            self.resolves += 1;
+            if (self.resolves > 1 and std.mem.eql(u8, self.replacement, "unavailable")) return error.CatalogRoutingUnavailable;
+            return alloc.dupe(u8, if (self.resolves == 1) original else self.replacement);
+        }
+
+        fn lookup(ptr: *anyopaque, _: std.mem.Allocator, name: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.lookups += 1;
+            try std.testing.expectEqualStrings("physical-old", name);
+            if (self.missing_table) return error.TableNotFound;
+            return null;
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return error.UnexpectedTestCall;
+        }
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return error.UnexpectedTestCall;
+        }
+    };
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ Fake.original, "null", "unavailable", "{\"table_id\":8,\"name\":\"physical-new\"}", "{\"table_id\":8,\"name\":\"physical-old\"}" }, 0..) |replacement, index| {
+        for ([_]bool{ false, true }) |missing_table| {
+            var fake = Fake{ .replacement = replacement, .missing_table = missing_table };
+            var server = ApiHttpServer.init(alloc, .{}, .{
+                .ptr = &fake,
+                .vtable = &.{ .status = LookupStatusSource.status, .system_catalog = Fake.catalog },
+            }, .{ .ptr = &fake, .vtable = &.{ .lookup = Fake.lookup, .scan = Fake.scan, .query = Fake.query } }, null);
+            var handler = AntflyApiHandler{ .api_server = &server };
+            var request = try httpx.Request.init(alloc, .GET, "http://127.0.0.1/db/v1/tables/docs/documents/key");
+            defer request.deinit();
+            var ctx = httpx.Context.init(alloc, undefined, &request);
+            defer ctx.deinit();
+            var response = try handler.lookupKey(&ctx, "docs", "key", .{});
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, if (index == 0) 404 else 503), response.status.code);
+            if (index != 0) try std.testing.expectEqualStrings("1", response.header("Retry-After").?);
+            try std.testing.expectEqual(@as(usize, 2), fake.resolves);
+            try std.testing.expectEqual(@as(usize, 1), fake.lookups);
+        }
+    }
 }
 
 test "httpx antfly lookup decodes percent-encoded path keys" {

@@ -1775,7 +1775,10 @@ pub const SessionRegistry = struct {
             probe.owner_node_id = std.math.maxInt(u64);
             probe.begin_timestamp = std.math.maxInt(u64);
             probe.last_touched_timestamp = std.math.maxInt(u64);
-            probe.commit_execution_started = false; // longest boolean spelling
+            // A sealed execution plan requires the started marker when the
+            // measured record is decoded below. Both boolean spellings have
+            // the same encoded length.
+            probe.commit_execution_started = candidate.execution_plan != null;
             var next = try probe.clone(measured_alloc);
             defer next.deinit(measured_alloc);
             const encoded = try encodeSessionRecord(measured_alloc, next);
@@ -2261,12 +2264,25 @@ pub const SessionRegistry = struct {
         candidate.execution_plan = try encodeExecutionPlan(alloc, selected orelse tables);
         var result = try parseExecutionPlan(alloc, candidate.execution_plan.?);
         errdefer result.deinit();
+        try self.reserveCompletion(&candidate, alloc);
         candidate.commit_execution_started = true;
         touchSession(&candidate);
         try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-        try self.persistLocked(candidate);
+        if (self.durable) |durable| {
+            try durable.saveRecoveryStart(candidate, self.max_record_bytes, self.recoveryLimits());
+        } else try self.persistLocked(alloc, candidate);
         self.mutex.lock();
         defer self.mutex.unlock();
+        if (self.durable == null) {
+            const limits = self.recoveryLimits();
+            if (limits.enabled()) {
+                var usage: RecoveryUsage = .{};
+                var it = self.sessions.valueIterator();
+                while (it.next()) |existing| if (sessionNeedsRecovery(existing.*)) usage.add(limits.record_bytes);
+                usage.add(limits.record_bytes);
+                try limits.check(usage);
+            }
+        }
         const target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
         self.publishCandidateLocked(alloc, target, &candidate);
         return result;

@@ -12217,7 +12217,7 @@ pub const ApiHttpServer = struct {
         if (snapshot_opt == null) snapshot_opt = try self.source.adminSnapshot();
         var snapshot = snapshot_opt orelse {
             _ = try integrity.metadataRequiresCoordination(alloc, null, tables);
-            return source.commitBatchWithCancellation(alloc, tables, sync_level, request.cancellation);
+            return source.commitBatchWithContext(alloc, tables, sync_level, .{ .deadline_ns = request.deadline_ns, .deadline_io = request.deadline_io, .cancellation = request.cancellation });
         };
         defer self.source.freeAdminSnapshot(&snapshot);
         const coordinated = try integrity.metadataRequiresCoordination(alloc, snapshot.tables, tables);
@@ -12233,7 +12233,7 @@ pub const ApiHttpServer = struct {
             else
                 table.relational_retirement_json.len != 0 or try integrity.requiresActivation(alloc, table.schema_json);
             if (!eligible) return error.InvalidBatchRequest;
-        } else if (!coordinated) return source.commitBatchWithCancellation(alloc, tables, sync_level, request.cancellation);
+        } else if (!coordinated) return source.commitBatchWithContext(alloc, tables, sync_level, .{ .deadline_ns = request.deadline_ns, .deadline_io = request.deadline_io, .cancellation = request.cancellation });
         ensureTableOperationActive(request) catch |err| return if (err == error.DeadlineExceeded) error.PreDecisionDeadlineExceeded else err;
         const reader = self.table_reads orelse return error.IntegrityCatalogUnavailable;
         if (request.relational_recovery == .retire) {
@@ -12295,7 +12295,7 @@ pub const ApiHttpServer = struct {
         const prepared = &retained_preparation.*.?;
         ensureTableOperationActive(request) catch |err| return if (err == error.DeadlineExceeded) error.PreDecisionDeadlineExceeded else err;
         try self.authorizeIntegrityMutations(request, prepared.tables);
-        return source.commitBatchWithCancellation(alloc, prepared.tables, sync_level, request.cancellation);
+        return source.commitBatchWithContext(alloc, prepared.tables, sync_level, .{ .deadline_ns = request.deadline_ns, .deadline_io = request.deadline_io, .cancellation = request.cancellation });
     }
 
     fn executePublicTableBatch(
@@ -12339,13 +12339,20 @@ pub const ApiHttpServer = struct {
         // the transaction protocol, preserve its typed outcome instead of
         // reporting cancellation for a write that may already be durable.
         try ensureTableOperationActive(request);
-        const outcome = (source.commitBatchWithContext(alloc, &tables, req.sync_level, .{ .deadline_ns = request.deadline_ns, .deadline_io = request.deadline_io, .cancellation = request.cancellation }) catch |err| switch (err) {
+        var retained_preparation: ?@import("relational_integrity_commit.zig").Prepared = null;
+        defer if (retained_preparation) |*prepared| prepared.deinit();
+        const outcome = (self.commitPublicTableBatchWithIntegrity(alloc, source, &tables, req.sync_level, request, &retained_preparation) catch |err| switch (err) {
             // The HTTP owner distinguishes configured pressure from backing
             // OOM, and conservatively marks this failure as execution started.
             error.OutOfMemory => return error.OutOfMemory,
             error.PreDecisionDeadlineExceeded => return error.DeadlineExceeded,
             error.Canceled => return error.Canceled,
             error.PreDecisionNotProposed => return error.WriteUnavailable,
+            error.RelationalIndexKeyTooLarge => return error.RelationalIndexKeyTooLarge,
+            error.UniqueConstraintViolation => return error.UniqueConstraintViolation,
+            error.ForeignKeyParentMissing => return error.ForeignKeyParentMissing,
+            error.ForeignKeyReferenced => return error.ForeignKeyReferenced,
+            error.Forbidden => return error.Forbidden,
             error.InvalidBatchRequest,
             error.RelationalCheckViolation,
             error.RelationalExpressionOverflow,
@@ -37153,6 +37160,7 @@ test "api http server routes table batches through the batch commit hook" {
                     .batch = batch,
                     .commit_transaction = commitTransaction,
                     .commit_batch = commitBatch,
+                    .commit_batch_with_context = commitBatchWithContext,
                 },
             };
         }
@@ -37177,6 +37185,17 @@ test "api http server routes table batches through the batch commit hook" {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.transaction_calls += 1;
             return error.TestUnexpectedResult;
+        }
+
+        fn commitBatchWithContext(
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            tables: []const distributed_txn.TableCommitRequest,
+            sync_level: db_mod.types.SyncLevel,
+            context: distributed_txn.PreDecisionContext,
+        ) anyerror!?distributed_txn.CommitOutcome {
+            try distributed_txn.ensurePreDecisionContextActive(context);
+            return commitBatch(ptr, alloc, tables, sync_level);
         }
 
         fn commitBatch(
@@ -37744,6 +37763,7 @@ test "api http server surfaces structured participant diagnostics for unavailabl
                 .vtable = &.{
                     .batch = batch,
                     .commit_transaction = commitTransaction,
+                    .commit_transaction_with_context = commitTransactionWithContext,
                     .commit_transaction_with_id = commitTransactionWithId,
                     .txn_begin_group_local = beginGroup,
                     .txn_prepare_group_local = prepareGroup,
@@ -37772,6 +37792,17 @@ test "api http server surfaces structured participant diagnostics for unavailabl
                     .phase = .prepare,
                 },
             };
+        }
+
+        fn commitTransactionWithContext(
+            ptr: *anyopaque,
+            txn_alloc: std.mem.Allocator,
+            tables: []const distributed_txn.TableCommitRequest,
+            sync_level: db_mod.types.SyncLevel,
+            context: distributed_txn.PreDecisionContext,
+        ) anyerror!?distributed_txn.CommitOutcome {
+            try distributed_txn.ensurePreDecisionContextActive(context);
+            return commitTransaction(ptr, txn_alloc, tables, sync_level);
         }
 
         fn commitTransactionWithId(
@@ -37861,6 +37892,7 @@ test "api http server surfaces structured decision conflicts for transaction com
                 .vtable = &.{
                     .batch = batch,
                     .commit_transaction = commitTransaction,
+                    .commit_transaction_with_context = commitTransactionWithContext,
                     .commit_transaction_with_id = commitTransactionWithId,
                     .txn_begin_group_local = beginGroup,
                     .txn_prepare_group_local = prepareGroup,
@@ -37881,6 +37913,17 @@ test "api http server surfaces structured decision conflicts for transaction com
             _: db_mod.types.SyncLevel,
         ) anyerror!?distributed_txn.CommitOutcome {
             return error.DecisionConflict;
+        }
+
+        fn commitTransactionWithContext(
+            ptr: *anyopaque,
+            txn_alloc: std.mem.Allocator,
+            tables: []const distributed_txn.TableCommitRequest,
+            sync_level: db_mod.types.SyncLevel,
+            context: distributed_txn.PreDecisionContext,
+        ) anyerror!?distributed_txn.CommitOutcome {
+            try distributed_txn.ensurePreDecisionContextActive(context);
+            return commitTransaction(ptr, txn_alloc, tables, sync_level);
         }
 
         fn commitTransactionWithId(
@@ -37968,6 +38011,7 @@ test "api http server surfaces structured doc identity conflicts for transaction
                 .vtable = &.{
                     .batch = batch,
                     .commit_transaction = commitTransaction,
+                    .commit_transaction_with_context = commitTransactionWithContext,
                     .commit_transaction_with_id = commitTransactionWithId,
                     .txn_begin_group_local = beginGroup,
                     .txn_prepare_group_local = prepareGroup,
@@ -37988,6 +38032,17 @@ test "api http server surfaces structured doc identity conflicts for transaction
             _: db_mod.types.SyncLevel,
         ) anyerror!?distributed_txn.CommitOutcome {
             return error.DocIdentityNamespaceMismatch;
+        }
+
+        fn commitTransactionWithContext(
+            ptr: *anyopaque,
+            txn_alloc: std.mem.Allocator,
+            tables: []const distributed_txn.TableCommitRequest,
+            sync_level: db_mod.types.SyncLevel,
+            context: distributed_txn.PreDecisionContext,
+        ) anyerror!?distributed_txn.CommitOutcome {
+            try distributed_txn.ensurePreDecisionContextActive(context);
+            return commitTransaction(ptr, txn_alloc, tables, sync_level);
         }
 
         fn commitTransactionWithId(
@@ -38077,6 +38132,7 @@ test "api http server surfaces structured torn-state conflicts when txn record i
                 .vtable = &.{
                     .batch = batch,
                     .commit_transaction = commitTransaction,
+                    .commit_transaction_with_context = commitTransactionWithContext,
                     .commit_transaction_with_id = commitTransactionWithId,
                     .txn_begin_group_local = beginGroup,
                     .txn_prepare_group_local = prepareGroup,
@@ -38097,6 +38153,17 @@ test "api http server surfaces structured torn-state conflicts when txn record i
             _: db_mod.types.SyncLevel,
         ) anyerror!?distributed_txn.CommitOutcome {
             return error.TxnNotFound;
+        }
+
+        fn commitTransactionWithContext(
+            ptr: *anyopaque,
+            txn_alloc: std.mem.Allocator,
+            tables: []const distributed_txn.TableCommitRequest,
+            sync_level: db_mod.types.SyncLevel,
+            context: distributed_txn.PreDecisionContext,
+        ) anyerror!?distributed_txn.CommitOutcome {
+            try distributed_txn.ensurePreDecisionContextActive(context);
+            return commitTransaction(ptr, txn_alloc, tables, sync_level);
         }
 
         fn commitTransactionWithId(
@@ -38183,6 +38250,7 @@ test "api http server surfaces structured torn-state conflicts when txn record i
                 .vtable = &.{
                     .batch = batch,
                     .commit_transaction = commitTransaction,
+                    .commit_transaction_with_context = commitTransactionWithContext,
                     .commit_transaction_with_id = commitTransactionWithId,
                     .txn_begin_group_local = beginGroup,
                     .txn_prepare_group_local = prepareGroup,
@@ -38203,6 +38271,17 @@ test "api http server surfaces structured torn-state conflicts when txn record i
             _: db_mod.types.SyncLevel,
         ) anyerror!?distributed_txn.CommitOutcome {
             return error.InvalidTxnRecord;
+        }
+
+        fn commitTransactionWithContext(
+            ptr: *anyopaque,
+            txn_alloc: std.mem.Allocator,
+            tables: []const distributed_txn.TableCommitRequest,
+            sync_level: db_mod.types.SyncLevel,
+            context: distributed_txn.PreDecisionContext,
+        ) anyerror!?distributed_txn.CommitOutcome {
+            try distributed_txn.ensurePreDecisionContextActive(context);
+            return commitTransaction(ptr, txn_alloc, tables, sync_level);
         }
 
         fn commitTransactionWithId(

@@ -1610,7 +1610,10 @@ fn topologyEpochFromSortedRangesWithBudget(
     for (ranges, 0..) |range, index| {
         try budget.checkpointIndex(index);
         hasher.update(std.mem.asBytes(&range.group_id));
-        hasher.update(std.mem.asBytes(&range.range_id));
+        // Catalog snapshots may retain the legacy implicit range ID, while
+        // routing snapshots materialize it when cloning the range.
+        const range_id = if (range.range_id == 0) range.group_id else range.range_id;
+        hasher.update(std.mem.asBytes(&range_id));
         const identity_shard_id = metadata_table_manager.rangeDocIdentityShardId(range.*);
         const identity_range_id = metadata_table_manager.rangeDocIdentityRangeId(range.*);
         hasher.update(std.mem.asBytes(&identity_shard_id));
@@ -3186,6 +3189,23 @@ fn consumerTests() type {
     const test_owner_root = @import("antfly_source_root");
     if (@hasDecl(test_owner_root, "implementation_tests_only") and test_owner_root.implementation_tests_only) return struct {};
     const Suite = struct {
+        test "routing topology epoch treats implicit and materialized range IDs equally" {
+            const table = metadata_table_manager.TableRecord{ .table_id = 7, .name = "docs" };
+            var implicit = metadata_table_manager.RangeRecord{
+                .group_id = 7002,
+                .table_id = 7,
+                .start_key = "m",
+            };
+            var materialized = implicit;
+            materialized.range_id = implicit.group_id;
+            const implicit_ranges = [_]*const metadata_table_manager.RangeRecord{&implicit};
+            const materialized_ranges = [_]*const metadata_table_manager.RangeRecord{&materialized};
+            try std.testing.expectEqual(
+                topologyEpochFromSortedRanges(table, &implicit_ranges),
+                topologyEpochFromSortedRanges(table, &materialized_ranges),
+            );
+        }
+
         test "routing topology epoch fences identity-only changes" {
             const table = metadata_table_manager.TableRecord{ .table_id = 7, .name = "docs" };
             var before = metadata_table_manager.RangeRecord{

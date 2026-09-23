@@ -23036,6 +23036,17 @@ pub const DB = struct {
 
     fn lookupWithReadDriver(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions) !?types.LookupResult {
         try checkLookupOptionsActive(opts);
+        if (self.restore_staging_required.load(.acquire) or opts.restore_staging_scope != null) {
+            var staging_read = try self.core.store.beginProbeTxn();
+            defer staging_read.abort();
+            try @import("restore_staging.zig").requireScope(alloc, &staging_read, opts.restore_staging_scope, false);
+        }
+        if (opts.relational_topology_json.len != 0) return self.lookupRelationalTopology(alloc, opts.relational_topology_json);
+        if (opts.relational_index_status_json.len != 0) return self.lookupRelationalIndexStatus(alloc, opts.relational_index_status_json, opts);
+        if (opts.relational_activation_json.len != 0) return self.lookupRelationalActivation(alloc, opts.relational_activation_json);
+        if (opts.relational_integrity_catalog) return self.lookupRelationalIntegrityCatalog(alloc);
+        if (opts.relational_integrity_action) return self.lookupRelationalIntegrityAction(alloc, key);
+        if (opts.relational_integrity_jobs_json.len != 0) return self.lookupRelationalIntegrityJobs(alloc, opts.relational_integrity_jobs_json);
         // Pin the schema once and keep the physical row intact through TTL and
         // projection. Relational rows carry their timestamp in the authenticated
         // AROW header, so a point read does not need a second store lookup.
@@ -23142,6 +23153,308 @@ pub const DB = struct {
             }
         }
         return .{ .json = stored, .version = version, .expected_content_digest = digest };
+    }
+
+    fn lookupRelationalIntegrityCatalog(self: *DB, alloc: Allocator) !?types.LookupResult {
+        const catalog_mod = @import("relational_integrity_catalog.zig");
+        self.core.lockApplyShared();
+        defer self.core.unlockApplyShared();
+        var pinned = self.core.acquireSchemaView() orelse return error.InvalidRelationalRowsRequest;
+        defer pinned.release();
+        if (pinned.storageMode() != .relational) return error.InvalidRelationalRowsRequest;
+        const bytes = (try self.core.getStoreValue(alloc, catalog_mod.key)) orelse return null;
+        defer alloc.free(bytes);
+        var catalog = try catalog_mod.decode(alloc, bytes);
+        defer catalog.deinit();
+        if (catalog.schema_version != pinned.version()) return error.IntegrityCatalogChanged;
+        const incarnation = try catalog_mod.incarnationFromTableId(self.core.identity_namespace.table_id);
+        if (!std.mem.eql(u8, &incarnation, &catalog.incarnation)) return error.IntegrityCatalogIncarnationMismatch;
+        const layout = try schema_mod.serializeSchema(alloc, pinned.tableSchema().*);
+        defer alloc.free(layout);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(layout, &digest, .{});
+        if (!std.mem.eql(u8, &digest, &catalog.schema_digest)) return error.IntegrityCatalogChanged;
+        const encoded = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
+        defer alloc.free(encoded);
+        _ = std.base64.standard.Encoder.encode(encoded, bytes);
+        return .{ .json = try std.fmt.allocPrint(alloc, "{{\"catalog\":{f},\"schema_version\":{d},\"table_id\":\"{d}\"}}", .{
+            std.json.fmt(encoded, .{}), pinned.version(), self.core.identity_namespace.table_id,
+        }) };
+    }
+
+    fn lookupRelationalIndexStatus(self: *DB, alloc: Allocator, bytes: []const u8, opts: types.LookupOptions) !?types.LookupResult {
+        const contract = @import("relational_index_status_contract.zig");
+        if (bytes.len > 4096) return error.InvalidArgument;
+        var request = try std.json.parseFromSlice(contract.Request, alloc, bytes, .{});
+        defer request.deinit();
+        if (request.value.name) |name| if (name.len == 0 or name.len > 1024) return error.InvalidArgument;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const temporary = arena.allocator();
+        var statuses: std.ArrayList(contract.NamedStatus) = .empty;
+        // Capture one owner snapshot, then release the apply lock and storage
+        // snapshot before JSON encoding/network delivery. All escaped slices
+        // below are request-owned, not borrowed from a retired schema plan.
+        {
+            try self.lockApplySharedForPortableRuntime();
+            defer self.core.unlockApplyShared();
+            var view = self.core.acquireSchemaView() orelse return error.RelationalTableRequired;
+            defer view.release();
+            if (view.storageMode() != .relational) return error.RelationalTableRequired;
+            if (view.version() != request.value.schema_version) return error.PreparedGenerationChanged;
+            var pinned = self.core.relational_indexes.acquire() orelse return error.IndexNotFound;
+            defer pinned.deinit();
+            if (pinned.plan.schemaView().epoch != view.epoch) return error.PreparedGenerationChanged;
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            const range = self.core.byteRange();
+            var admitted_bytes: usize = 0;
+            for (pinned.plan.boundIndexes()) |index| {
+                if (request.value.name) |name| if (!std.mem.eql(u8, index.name, name)) continue;
+                // JSON's worst case is six bytes per input byte. Admit before
+                // materializing status arrays or encoding escaped range keys.
+                admitted_bytes +|= 2048 +| (6 *| (index.name.len +| range.start.len +| range.end.len));
+                if (admitted_bytes > contract.max_response_bytes) return error.ResourceBudgetExceeded;
+            }
+            const range_start = try temporary.dupe(u8, range.start);
+            const range_end = try temporary.dupe(u8, range.end);
+            const ownership = try relational_index_jobs.ownership(&read);
+            for (pinned.plan.boundIndexes()) |index| {
+                try checkLookupOptionsActive(opts);
+                if (request.value.name) |name| if (!std.mem.eql(u8, index.name, name)) continue;
+                const proof = try relational_index_jobs.statusProofWithOwnership(&read, index, ownership);
+                const progress = proof.progress;
+                const value = contract.Status{
+                    .table_id = self.core.identity_namespace.table_id,
+                    .schema_version = view.version(),
+                    .generation = index.generation,
+                    .slot = index.slot,
+                    .catalog = pinned.head.blob_digest,
+                    .comparison = progress.comparison,
+                    .owner = progress.owner,
+                    .range_start = range_start,
+                    .range_end = range_end,
+                    .state = switch (progress.state) {
+                        .building => .building,
+                        .ready => .ready,
+                        .failed => .failed,
+                    },
+                    .rows_scanned = progress.rows_scanned,
+                    .progress_digest = proof.digest,
+                    .maintenance_epoch = proof.maintenance_epoch,
+                    .last_maintenance_request = proof.last_maintenance_request,
+                    .failure = switch (progress.failure) {
+                        .none => .none,
+                        .incompatible_schema => .incompatible_schema,
+                        .invalid_row => .invalid_row,
+                        .key_too_large => .key_too_large,
+                    },
+                };
+                try statuses.append(temporary, .{ .name = try temporary.dupe(u8, index.name), .status = value });
+            }
+        }
+        if (request.value.name != null and statuses.items.len == 0) return error.IndexNotFound;
+        try checkLookupOptionsActive(opts);
+        const json = if (request.value.name != null)
+            try std.json.Stringify.valueAlloc(alloc, statuses.items[0].status, .{})
+        else
+            try std.json.Stringify.valueAlloc(alloc, contract.Batch{ .statuses = statuses.items }, .{});
+        errdefer alloc.free(json);
+        if (json.len > contract.max_response_bytes) return error.ResourceBudgetExceeded;
+        try checkLookupOptionsActive(opts);
+        return .{ .json = json };
+    }
+
+    fn lookupRelationalIntegrityAction(self: *DB, alloc: Allocator, routing: []const u8) !?types.LookupResult {
+        const integrity = @import("relational_integrity.zig");
+        if (routing.len != 32) return error.InvalidIntegrityAddress;
+        try self.lockApplySharedForPortableRuntime();
+        defer self.core.unlockApplyShared();
+        var read = try integrity.CurrentView.init(self.core.store);
+        defer read.deinit();
+        try @import("online_integrity_shadow.zig").requireServing(&read, self.core.byteRange(), routing);
+        var prefix: [integrity.namespace.len + 1 + 32]u8 = undefined;
+        @memcpy(prefix[0..integrity.namespace.len], integrity.namespace);
+        prefix[integrity.namespace.len] = @intFromEnum(integrity.Kind.job);
+        @memcpy(prefix[integrity.namespace.len + 1 ..], routing);
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        const first = (try cursor.seekAtOrAfter(&prefix)) orelse return null;
+        if (!std.mem.startsWith(u8, first.key, &prefix)) return null;
+        const address = (try integrity.parseKey(first.key)).address;
+        const action_id = (try integrity.Job.decode(first.key, first.value)).action_id;
+        if (try cursor.next()) |next| if (std.mem.startsWith(u8, next.key, &prefix)) return error.IntegrityAddressMismatch;
+        var page = try integrity.actionPageWithBudget(alloc, self.backend_runtime.io(), &read, address, action_id, .{ .rows = 128 });
+        defer page.deinit();
+        const Response = struct {
+            address: integrity.Address,
+            page: *const integrity.ActionPage,
+
+            pub fn jsonStringify(response: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
+                try @import("relational_integrity_json.zig").write(.{
+                    .address = response.address,
+                    .claim = response.page.claim,
+                    .job = response.page.job,
+                    .references = response.page.references,
+                    .complete = response.page.complete,
+                    .next_cursor = response.page.next_cursor,
+                }, stream);
+            }
+        };
+        return .{ .json = try std.json.Stringify.valueAlloc(alloc, Response{ .address = address, .page = &page }, .{}) };
+    }
+
+    fn lookupRelationalIntegrityJobs(self: *DB, alloc: Allocator, request_json: []const u8) !?types.LookupResult {
+        const integrity = @import("relational_integrity.zig");
+        if (request_json.len > 4096) return error.InvalidIntegrityBudget;
+        var kind = try std.json.parseFromSlice(struct { kind: []const u8 = "discover" }, alloc, request_json, .{ .ignore_unknown_fields = true });
+        defer kind.deinit();
+        if (std.mem.eql(u8, kind.value.kind, "retirement")) return self.lookupRelationalRetirement(alloc, request_json);
+        var request = try std.json.parseFromSlice(struct {
+            kind: enum { discover, references } = .discover,
+            address: ?integrity.Address = null,
+            after: ?[]const u8 = null,
+            limit: u32 = 16,
+        }, alloc, request_json, .{ .allocate = .alloc_always });
+        defer request.deinit();
+        if (request.value.limit == 0 or request.value.limit > 128) return error.InvalidIntegrityBudget;
+        if (request.value.kind == .references) return self.lookupRelationalIntegrityReferences(alloc, request.value.address orelse return error.InvalidIntegrityAddress, request.value.after, request.value.limit);
+        if (request.value.address != null) return error.InvalidIntegrityAddress;
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        const owned = scratch.allocator();
+        const after = if (request.value.after) |encoded| after: {
+            const decoded = try owned.alloc(u8, try std.base64.standard.Decoder.calcSizeForSlice(encoded));
+            try std.base64.standard.Decoder.decode(decoded, encoded);
+            if ((try integrity.parseKey(decoded)).kind != .job) return error.InvalidIntegrityKey;
+            break :after decoded;
+        } else null;
+        try self.lockApplySharedForPortableRuntime();
+        defer self.core.unlockApplyShared();
+        var read = try integrity.CurrentView.init(self.core.store);
+        defer read.deinit();
+        const range = try @import("online_integrity_shadow.zig").servingRange(&read, self.core.byteRange());
+        const prefix = integrity.namespace ++ &[_]u8{@intFromEnum(integrity.Kind.job)};
+        const lower = try std.mem.concat(owned, u8, &.{ prefix, range.start });
+        const start = if (after) |key| if (std.mem.order(u8, key, lower) == .gt) key else lower else lower;
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        var entry = try cursor.seekAtOrAfter(start);
+        if (entry) |item| if (after) |key| if (std.mem.eql(u8, item.key, key)) {
+            entry = try cursor.next();
+        };
+        const Item = struct { address: integrity.Address, action_id: integrity.Generation };
+        var jobs: std.ArrayList(Item) = .empty;
+        var last_key: ?[]const u8 = null;
+        const started = platform_time.monotonicNs();
+        var more = false;
+        while (entry) |item| : (entry = try cursor.next()) {
+            if (!std.mem.startsWith(u8, item.key, prefix)) break;
+            const parsed = try integrity.parseKey(item.key);
+            if (!range.contains(&parsed.address.routing)) break;
+            if (jobs.items.len >= request.value.limit or (jobs.items.len != 0 and platform_time.monotonicNs() -| started >= 5 * std.time.ns_per_ms)) {
+                more = true;
+                break;
+            }
+            if (self.backend_runtime.io()) |io| try io.checkCancel();
+            const job = try integrity.Job.decode(item.key, item.value);
+            try jobs.append(owned, .{ .address = parsed.address, .action_id = job.action_id });
+            last_key = try owned.dupe(u8, item.key);
+        }
+        const next: ?[]const u8 = if (more) next: {
+            const raw = last_key orelse return error.InvalidIntegrityBudget;
+            const encoded = try owned.alloc(u8, std.base64.standard.Encoder.calcSize(raw.len));
+            break :next std.base64.standard.Encoder.encode(encoded, raw);
+        } else null;
+        const Response = struct {
+            jobs: []const Item,
+            next: ?[]const u8,
+
+            pub fn jsonStringify(response: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
+                try stream.beginObject();
+                try stream.objectField("jobs");
+                try @import("relational_integrity_json.zig").write(response.jobs, stream);
+                try stream.objectField("next");
+                try stream.write(response.next);
+                try stream.endObject();
+            }
+        };
+        return .{ .json = try std.json.Stringify.valueAlloc(alloc, Response{ .jobs = jobs.items, .next = next }, .{}) };
+    }
+
+    fn lookupRelationalIntegrityReferences(self: *DB, alloc: Allocator, address: @import("relational_integrity.zig").Address, after: ?[]const u8, limit: u32) !?types.LookupResult {
+        const integrity = @import("relational_integrity.zig");
+        const prefix = address.referencePrefix();
+        _ = try integrity.parseKey(&address.claimKey());
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        const owned = scratch.allocator();
+        const decoded_after = if (after) |encoded| decoded: {
+            const raw = try owned.alloc(u8, try std.base64.standard.Decoder.calcSizeForSlice(encoded));
+            try std.base64.standard.Decoder.decode(raw, encoded);
+            if ((try integrity.parseKey(raw)).kind != .reference or !std.mem.startsWith(u8, raw, &prefix)) return error.InvalidIntegrityKey;
+            break :decoded raw;
+        } else null;
+        try self.lockApplySharedForPortableRuntime();
+        defer self.core.unlockApplyShared();
+        var read = try integrity.CurrentView.init(self.core.store);
+        defer read.deinit();
+        try @import("online_integrity_shadow.zig").requireServing(&read, self.core.byteRange(), &address.routing);
+        const raw_claim = read.get(&address.claimKey()) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        const claim = try integrity.Claim.decode(&address.claimKey(), raw_claim);
+        if (claim.state != .live) return error.ForeignKeyActionInProgress;
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        var entry = try cursor.seekAtOrAfter(decoded_after orelse &prefix);
+        if (entry) |item| if (decoded_after) |key| if (std.mem.eql(u8, key, item.key)) {
+            entry = try cursor.next();
+        };
+        var references: std.ArrayList(integrity.Reference) = .empty;
+        var last_key: ?[]const u8 = null;
+        var more = false;
+        var bytes: usize = 0;
+        const started = platform_time.monotonicNs();
+        while (entry) |item| : (entry = try cursor.next()) {
+            if (!std.mem.startsWith(u8, item.key, &prefix)) break;
+            if (references.items.len >= limit or (references.items.len != 0 and platform_time.monotonicNs() -| started >= 5 * std.time.ns_per_ms) or item.value.len > 1024 * 1024 - bytes) {
+                if (references.items.len == 0) return error.IntegrityRecordTooLarge;
+                more = true;
+                break;
+            }
+            if (self.backend_runtime.io()) |io| try io.checkCancel();
+            const copy = try owned.dupe(u8, item.value);
+            try references.append(owned, try integrity.Reference.decode(item.key, copy));
+            last_key = try owned.dupe(u8, item.key);
+            bytes += copy.len;
+        }
+        const next: ?[]const u8 = if (more) next: {
+            const raw = last_key orelse return error.InvalidIntegrityBudget;
+            const encoded = try owned.alloc(u8, std.base64.standard.Encoder.calcSize(raw.len));
+            break :next std.base64.standard.Encoder.encode(encoded, raw);
+        } else null;
+        const Response = struct {
+            address: integrity.Address,
+            claim: integrity.Claim,
+            references: []const integrity.Reference,
+            next: ?[]const u8,
+
+            pub fn jsonStringify(response: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
+                try stream.beginObject();
+                try stream.objectField("address");
+                try @import("relational_integrity_json.zig").write(response.address, stream);
+                try stream.objectField("claim");
+                try @import("relational_integrity_json.zig").write(response.claim, stream);
+                try stream.objectField("references");
+                try @import("relational_integrity_json.zig").write(response.references, stream);
+                try stream.objectField("next");
+                try stream.write(response.next);
+                try stream.endObject();
+            }
+        };
+        return .{ .json = try std.json.Stringify.valueAlloc(alloc, Response{ .address = address, .claim = claim, .references = references.items, .next = next }, .{}) };
     }
 
     fn lookupRelationalRetirement(self: *DB, alloc: Allocator, request_json: []const u8) !?types.LookupResult {
@@ -41182,6 +41495,7 @@ pub const DB = struct {
         opts: types.ScanOptions,
         visitor: types.ScanVisitor,
     ) !void {
+        if (opts.relational_query_json.len != 0) return self.scanRelationalRowsVisit(alloc, from_key, to_key, opts, visitor);
         const projection_plan = db_query_projection.buildLookupFieldSelectionPlan(.{
             .fields = opts.fields,
             .include_all_fields = opts.include_all_fields,
