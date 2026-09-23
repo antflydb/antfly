@@ -3797,7 +3797,6 @@ fn convertAveragePool(builder: *Builder, node: *const NodeProto, inputs: []const
     }
     const ceil_mode = getInt(node.attributes, "ceil_mode", 0);
     if (ceil_mode != 0 and ceil_mode != 1) return error.InvalidAttribute;
-    if (ceil_mode == 1) return error.UnsupportedOp;
     const include_pad = getInt(node.attributes, "count_include_pad", 0);
     if (include_pad != 0 and include_pad != 1) return error.InvalidAttribute;
     var attrs = PoolAttrs{ .num_spatial = spatial, .count_include_pad = include_pad == 1 };
@@ -3814,7 +3813,6 @@ fn convertAveragePool(builder: *Builder, node: *const NodeProto, inputs: []const
         return error.InvalidAttribute;
     if (attrs.auto_pad != .explicit and pads.len != 0) return error.InvalidAttribute;
 
-    var output_shape = in_shape;
     for (0..spatial) |axis| {
         attrs.kernel[axis] = std.math.cast(u32, kernel[axis]) orelse return error.InvalidAttribute;
         if (strides.len != 0) attrs.strides[axis] = std.math.cast(u32, strides[axis]) orelse return error.InvalidAttribute;
@@ -3824,6 +3822,39 @@ fn convertAveragePool(builder: *Builder, node: *const NodeProto, inputs: []const
             attrs.padding[axis][0] = std.math.cast(u32, pads[axis]) orelse return error.InvalidAttribute;
             attrs.padding[axis][1] = std.math.cast(u32, pads[spatial + axis]) orelse return error.InvalidAttribute;
         }
+    }
+
+    // The graph pool operator uses floor output sizing. Preserve the exact
+    // ceil-mode lowering for unpadded, non-overlapping 1-D windows: complete
+    // windows are reshaped and averaged, and a partial final window is
+    // averaged over only the elements present in the input.
+    if (ceil_mode == 1) {
+        if (spatial != 1 or (attrs.auto_pad != .explicit and attrs.auto_pad != .valid) or
+            attrs.padding[0][0] != 0 or attrs.padding[0][1] != 0 or
+            attrs.dilations[0] != 1 or attrs.strides[0] != attrs.kernel[0] or in_shape.dim(2) <= 0)
+        {
+            return error.UnsupportedOp;
+        }
+        const length = in_shape.dim(2);
+        const k: i64 = attrs.kernel[0];
+        const n_full = @divTrunc(length, k);
+        const remainder = length - n_full * k;
+        var full: ?NodeId = null;
+        if (n_full > 0) {
+            const full_slice = try sliceAxisStatic(builder, inputs[0], 2, 0, n_full * k);
+            const windowed = try builder.reshape(full_slice, Shape.init(in_shape.dtype, &.{ in_shape.dim(0), in_shape.dim(1), n_full, k }));
+            const window_mean = try builder.reduceMean(windowed, &[_]u8{3});
+            full = try builder.reshape(window_mean, Shape.init(in_shape.dtype, &.{ in_shape.dim(0), in_shape.dim(1), n_full }));
+        }
+        if (remainder == 0) return full.?;
+        const tail_slice = try sliceAxisStatic(builder, inputs[0], 2, n_full * k, length);
+        const tail = try builder.reduceMean(tail_slice, &[_]u8{2});
+        if (full) |head| return builder.concat(head, tail, 2);
+        return tail;
+    }
+
+    var output_shape = in_shape;
+    for (0..spatial) |axis| {
         const input_dim = in_shape.dim(@intCast(axis + 2));
         output_shape.bounds[axis + 2] = 0;
         if (input_dim < 0) {
@@ -6560,7 +6591,26 @@ test "convertNode Quantize → Dequantize roundtrip preserves shape" {
     try std.testing.expectEqual(@as(i64, 4), dq_shape.dim(1));
 }
 
-test "AveragePool rejects unsupported ceil mode instead of approximating" {
+test "AveragePool keeps exact unpadded 1-D ceil-mode segment pooling" {
+    const allocator = std.testing.allocator;
+    var graph = Graph.init(allocator);
+    defer graph.deinit();
+    var builder = Builder.init(&graph);
+    const input = try builder.parameter("x", Shape.init(.f32, &.{ 1, 1, 5 }));
+    var kernel = [_]i64{2};
+    var strides = [_]i64{2};
+    var attributes = [_]AttributeProto{
+        .{ .name = "kernel_shape", .ints = &kernel, .attr_type = .ints },
+        .{ .name = "strides", .ints = &strides, .attr_type = .ints },
+        .{ .name = "ceil_mode", .i = 1, .attr_type = .int },
+    };
+    const node = NodeProto{ .op_type = "AveragePool", .attributes = &attributes };
+    const result = try convertNode(allocator, &builder, &node, &.{input}, null);
+    try std.testing.expectEqual(@as(i64, 3), graph.node(result).output_shape.dim(2));
+    try std.testing.expect(std.meta.activeTag(graph.node(result).op) == .concat_prim);
+}
+
+test "AveragePool rejects overlapping ceil-mode windows instead of approximating" {
     const allocator = std.testing.allocator;
     var graph = Graph.init(allocator);
     defer graph.deinit();
