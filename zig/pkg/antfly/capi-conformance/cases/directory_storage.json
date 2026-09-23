@@ -1,0 +1,21 @@
+{
+  "name": "directory_storage",
+  "description": "The same handle API over a normal Antfly directory: writes, lookups, scans, status, capabilities, and a round trip through a portable backup into a .aflite file.",
+  "open": {"storage": "directory", "path": "db-dir", "no_sync": true},
+  "steps": [
+    {"op": "status", "expect": {"json_subset": {"storage": {"format": "directory"}}}},
+    {"op": "capabilities", "expect": {"json_subset": {"threading": "serialized"}}},
+    {"op": "batch", "timestamp": 1, "writes": [
+      {"key": "doc:dir:1", "value": {"title": "stored in a directory", "body": "directory storage"}},
+      {"key": "doc:dir:2", "value": {"title": "second"}}
+    ]},
+    {"op": "lookup", "key": "doc:dir:1", "expect": {"json_subset": {"title": "stored in a directory"}}},
+    {"op": "lookup", "key": "doc:missing", "expect": {"error": "ANTFLY_NOT_FOUND"}},
+    {"op": "run_until_idle"},
+    {"op": "backup"},
+    {"op": "restore_open", "path": "restored.aflite", "storage": "lite", "no_sync": true},
+    {"op": "status", "expect": {"json_subset": {"storage": {"format": "aflite"}}}},
+    {"op": "lookup", "key": "doc:dir:1", "expect": {"json_subset": {"title": "stored in a directory"}}},
+    {"op": "lookup", "key": "doc:dir:2", "expect": {"json_subset": {"title": "second"}}}
+  ]
+}

@@ -49,11 +49,30 @@ Platform library names: `libantfly.dylib` (macOS), `libantfly.so` (Linux),
 `antfly.dll` (Windows).
 
 Call `antfly_lite.validate_abi()` at startup to fail fast when the loaded
-library's ABI version or `antfly_lite_open_options` struct size does not
-match the version this binding was written against. `create()`, `open()`,
+library's ABI version or `antfly_open_options` struct size does not match
+the version this binding was written against. `create()`, `open()`,
 `open_hosted()`, `create_hosted()`, `check_file()`, and
 `copy_stable_snapshot_file()` all validate the ABI automatically before
 touching the library.
+
+## Storage kinds
+
+`create()`/`open()`/`create_with_options()`/`open_with_options()` accept a
+`storage=` argument (an `antfly_lite.Storage`):
+
+- `Storage.LITE` (the default): a single-file `.aflite` database.
+- `Storage.DIRECTORY`: a normal single-node Antfly directory. Opening a
+  missing directory path creates it; `create_with_options()` only has
+  exclusive-create semantics for `Storage.LITE`, so creating directory
+  storage surfaces the library's own error rather than being special-cased
+  by this binding.
+
+A portable backup (`backup()`/`db.backup_to_file()`) works across storage
+kinds: `import_backup()` and the module-level `restore()`/`restore_file()`
+accept a backup of either kind and can write it into either kind (`restore`
+and `restore_file` take the destination's `storage=` too). `Storage.LITE`
+destinations still require a `.aflite` path client-side; `Storage.DIRECTORY`
+has no suffix requirement.
 
 ### Embedded inference worker resolution
 
@@ -115,8 +134,8 @@ to wait for another writer to close instead of failing immediately with
 - **Opening**: `create()`, `open()`, `open_readonly()`, `open_status_only()`,
   `open_hosted()`, `create_hosted()`, `open_with_options()`/
   `create_with_options()` (with an `OpenOptions` dataclass for advanced
-  settings: map size, TTL cleanup, inference resource budgets, busy
-  timeout).
+  settings: storage kind, map size, TTL cleanup, inference resource
+  budgets, busy timeout).
 - **Data**: `batch()`, `batch_json()`, `lookup()`, `get_raw()`, `scan()`,
   `search()`, `stats()`, `aggregate_hits()`, `lookup_artifact()`,
   `get_schema()`/`set_schema()`, `extract_enrichments()`,
@@ -133,10 +152,9 @@ to wait for another writer to close instead of failing immediately with
   `pending_work_stats()`, `run_until_idle()`, `run_until_idle_status()`,
   `check()`, `vacuum()`, `compact()`, `copy_stable_snapshot()`,
   `replay_generated_enrichments()`.
-- **Backup/restore**: `backup()`, `export()`, `import_backup()`,
-  `import_()`, `backup_to_file()`, `export_to_file()`; module-level
-  `restore()`, `restore_backup()`, `restore_file()`,
-  `restore_backup_file()`.
+- **Backup/restore**: `backup()`, `import_backup()`, `backup_to_file()`;
+  module-level `restore()`, `restore_file()` (both accept `storage=` to
+  select the destination kind).
 - **Module-level, no handle needed**: `check_file()`,
   `copy_stable_snapshot_file()`, `decode_artifact_id()`, `abi_version()`,
   `threading_mode()`, `THREADING_SERIALIZED`, `validate_abi()`.

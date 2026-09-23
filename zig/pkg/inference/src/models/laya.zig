@@ -92,6 +92,10 @@ test "laya calibration bucket takes precedence and invalid temperatures fail" {
 /// Initial support intentionally accepts one dense safetensors artifact.
 pub fn validateWeights(store: @import("tensor_store.zig").TensorStore, cfg: Config, encoder: anytype) !void {
     const reader = store.singleSafetensorsReader() orelse return error.UnsupportedLayaArtifact;
+    return validateReader(reader, cfg, encoder);
+}
+
+pub fn validateReader(reader: *const @import("safetensors.zig").MMapReader, cfg: Config, encoder: anytype) !void {
     const Check = struct {
         fn tensor(r: @TypeOf(reader), name: []const u8, shape: []const i64) !void {
             const meta = r.header.tensors.get(name) orelse return error.InvalidLayaWeights;

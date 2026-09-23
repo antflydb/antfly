@@ -29,9 +29,15 @@
 //! crate compiles (and its types can be named) but must not be linked into
 //! any binary that references these `extern "C"` items, or linking will
 //! fail.
+//!
+//! Naming (mirrors the header's own convention): `antfly_*` functions are
+//! library-level and take no database handle; `antfly_db_*` functions take
+//! an `antfly_db` handle of any storage kind; `antfly_lite_*` functions
+//! operate on the `.aflite` single-file format itself, plus shortcuts for
+//! opening one.
 #![allow(non_camel_case_types)]
 
-use std::ffi::{c_char, c_void};
+use std::ffi::c_char;
 
 // ---------------------------------------------------------------------
 // antfly_error_code
@@ -54,6 +60,19 @@ pub const ANTFLY_STALLED: antfly_error_code = 9;
 pub const ANTFLY_INTERNAL: antfly_error_code = 255;
 
 // ---------------------------------------------------------------------
+// antfly_db (opaque handle)
+// ---------------------------------------------------------------------
+
+/// An open database. Opaque; see `antfly_db_open_with_options`. Every
+/// handle-taking function in this crate takes `*mut antfly_db` /
+/// `*mut *mut antfly_db`, matching the header's typed opaque pointer (ABI
+/// version 2 replaced the untyped `void *` handle with this type).
+#[repr(C)]
+pub struct antfly_db {
+    _private: [u8; 0],
+}
+
+// ---------------------------------------------------------------------
 // antfly_txn_status
 // ---------------------------------------------------------------------
 
@@ -70,10 +89,6 @@ pub const ANTFLY_TXN_ABORTED: antfly_txn_status = 2;
 // Open mode / profile / storage kind / flag constants
 // ---------------------------------------------------------------------
 
-pub const ANTFLY_LITE_OPEN_MODE_WRITER: u32 = 0;
-pub const ANTFLY_LITE_OPEN_MODE_READONLY: u32 = 1;
-pub const ANTFLY_LITE_OPEN_MODE_STATUS_ONLY: u32 = 2;
-
 pub const ANTFLY_OPEN_MODE_WRITER: u32 = 0;
 pub const ANTFLY_OPEN_MODE_READONLY: u32 = 1;
 pub const ANTFLY_OPEN_MODE_STATUS_ONLY: u32 = 2;
@@ -84,28 +99,19 @@ pub const ANTFLY_STORAGE_KIND_LITE: u32 = 1;
 pub const ANTFLY_PROFILE_NATIVE: u32 = 0;
 pub const ANTFLY_PROFILE_HOSTED: u32 = 1;
 
-pub const ANTFLY_LITE_PROFILE_NATIVE: u32 = 0;
-pub const ANTFLY_LITE_PROFILE_HOSTED: u32 = 1;
-
 pub const ANTFLY_OPEN_FLAG_NO_SYNC: u32 = 1 << 0;
 pub const ANTFLY_OPEN_FLAG_TTL_CLEANUP: u32 = 1 << 1;
 pub const ANTFLY_OPEN_FLAG_REMOTE_PROVIDER_CONFIGURED: u32 = 1 << 2;
 pub const ANTFLY_OPEN_FLAG_LOCAL_RUNTIME_CONFIGURED: u32 = 1 << 3;
 pub const ANTFLY_OPEN_FLAG_GENERATED_ENRICHMENT_REPLAY: u32 = 1 << 4;
 
-pub const ANTFLY_LITE_OPEN_FLAG_NO_SYNC: u32 = 1 << 0;
-pub const ANTFLY_LITE_OPEN_FLAG_TTL_CLEANUP: u32 = 1 << 1;
-pub const ANTFLY_LITE_OPEN_FLAG_REMOTE_PROVIDER_CONFIGURED: u32 = 1 << 2;
-pub const ANTFLY_LITE_OPEN_FLAG_LOCAL_RUNTIME_CONFIGURED: u32 = 1 << 3;
-pub const ANTFLY_LITE_OPEN_FLAG_GENERATED_ENRICHMENT_REPLAY: u32 = 1 << 4;
-
-pub const ANTFLY_LITE_INFERENCE_MODE_CALLER_SUPPLIED_OR_DISABLED: &str =
-    "caller_supplied_or_disabled";
-pub const ANTFLY_LITE_INFERENCE_MODE_CALLER_SUPPLIED_ARTIFACTS: &str = "caller_supplied_artifacts";
-pub const ANTFLY_LITE_INFERENCE_MODE_REMOTE_PROVIDER: &str = "remote_provider";
-pub const ANTFLY_LITE_INFERENCE_MODE_LOCAL_EMBEDDED: &str = "local_embedded";
-pub const ANTFLY_LITE_INFERENCE_MODE_MANUAL_MAINTENANCE: &str = "manual_maintenance";
-pub const ANTFLY_LITE_INFERENCE_MODE_DISABLED_DEFERRED: &str = "disabled_deferred";
+/// `inference.mode` values reported by `antfly_db_status_json`.
+pub const ANTFLY_INFERENCE_MODE_CALLER_SUPPLIED_OR_DISABLED: &str = "caller_supplied_or_disabled";
+pub const ANTFLY_INFERENCE_MODE_CALLER_SUPPLIED_ARTIFACTS: &str = "caller_supplied_artifacts";
+pub const ANTFLY_INFERENCE_MODE_REMOTE_PROVIDER: &str = "remote_provider";
+pub const ANTFLY_INFERENCE_MODE_LOCAL_EMBEDDED: &str = "local_embedded";
+pub const ANTFLY_INFERENCE_MODE_MANUAL_MAINTENANCE: &str = "manual_maintenance";
+pub const ANTFLY_INFERENCE_MODE_DISABLED_DEFERRED: &str = "disabled_deferred";
 
 /// Threading contract, like `sqlite3_threadsafe()`. See `antfly_threading_mode`.
 pub const ANTFLY_THREADING_SERIALIZED: u32 = 1;
@@ -156,6 +162,12 @@ impl Default for antfly_buffer {
     }
 }
 
+/// One options struct for every storage kind. `storage_kind` (an
+/// `ANTFLY_STORAGE_KIND_*` value) picks a `.aflite` file or a normal
+/// directory; the inference budget fields, `busy_timeout_ms`, and
+/// `reserved[8]` layout must mirror the header exactly -- `tests/abi_sizes.rs`
+/// checks `size_of::<antfly_open_options>()` against
+/// `antfly_open_options_size()`.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct antfly_open_options {
@@ -173,30 +185,9 @@ pub struct antfly_open_options {
     pub ttl_cleanup_lease_ttl_ms: u64,
     pub ttl_cleanup_interval_ms: u64,
     pub ttl_cleanup_grace_period_ns: u64,
-    /// Milliseconds to keep retrying while another writer holds the writer
-    /// lock (`ANTFLY_BUSY`), like `sqlite3_busy_timeout`. 0 fails immediately.
-    pub busy_timeout_ms: u64,
-    pub reserved: [u64; 7],
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug)]
-pub struct antfly_lite_open_options {
-    pub abi_size: u32,
-    pub open_mode: u32,
-    pub profile: u32,
-    pub flags: u32,
-    pub map_size: u64,
-    pub ttl_cleanup_enabled: bool,
-    pub ttl_cleanup_lease_owned: bool,
-    pub ttl_cleanup_batch_size: u32,
-    pub ttl_cleanup_owner_id: antfly_slice,
-    pub ttl_cleanup_lease_ttl_ms: u64,
-    pub ttl_cleanup_interval_ms: u64,
-    pub ttl_cleanup_grace_period_ns: u64,
     /// Explicit embedded-inference resource-budget overrides in MiB, 0
     /// meaning automatic/host-detected sizing. Only consulted when `flags`
-    /// carries `ANTFLY_LITE_OPEN_FLAG_LOCAL_RUNTIME_CONFIGURED`.
+    /// carries `ANTFLY_OPEN_FLAG_LOCAL_RUNTIME_CONFIGURED`.
     pub inference_host_budget_mb: u32,
     pub inference_backend_budget_mb: u32,
     pub inference_process_memory_budget_mb: u32,
@@ -206,7 +197,7 @@ pub struct antfly_lite_open_options {
     /// Milliseconds to keep retrying while another writer holds the writer
     /// lock (`ANTFLY_BUSY`), like `sqlite3_busy_timeout`. 0 fails immediately.
     pub busy_timeout_ms: u64,
-    pub reserved: [u64; 7],
+    pub reserved: [u64; 8],
 }
 
 #[repr(C)]
@@ -371,106 +362,79 @@ impl Default for antfly_scan_hash_result {
 
 unsafe extern "C" {
     pub fn antfly_abi_version() -> u32;
-    pub fn antfly_lite_abi_version() -> u32;
     pub fn antfly_open_options_size() -> u32;
-    pub fn antfly_lite_open_options_size() -> u32;
     pub fn antfly_error_code_name(code: antfly_error_code) -> *const c_char;
     pub fn antfly_error_code_description(code: antfly_error_code) -> *const c_char;
     pub fn antfly_open_options_init(options: *mut antfly_open_options) -> antfly_error_code;
-    pub fn antfly_lite_open_options_init(
-        options: *mut antfly_lite_open_options,
-    ) -> antfly_error_code;
 
     pub fn antfly_threading_mode() -> u32;
 
-    pub fn antfly_db_open(path: *const c_char, out_handle: *mut *mut c_void) -> antfly_error_code;
+    pub fn antfly_db_open(path: *const c_char, out_db: *mut *mut antfly_db) -> antfly_error_code;
     pub fn antfly_db_open_with_options(
         path: *const c_char,
         options: *const antfly_open_options,
-        out_handle: *mut *mut c_void,
+        out_db: *mut *mut antfly_db,
     ) -> antfly_error_code;
     pub fn antfly_db_create_with_options(
         path: *const c_char,
         options: *const antfly_open_options,
-        out_handle: *mut *mut c_void,
+        out_db: *mut *mut antfly_db,
     ) -> antfly_error_code;
+    pub fn antfly_db_close(db: *mut antfly_db);
 
-    pub fn antfly_lite_open(path: *const c_char, out_handle: *mut *mut c_void)
-    -> antfly_error_code;
+    pub fn antfly_lite_open(path: *const c_char, out_db: *mut *mut antfly_db) -> antfly_error_code;
     pub fn antfly_lite_create(
         path: *const c_char,
-        out_handle: *mut *mut c_void,
-    ) -> antfly_error_code;
-    pub fn antfly_lite_open_with_options(
-        path: *const c_char,
-        options: *const antfly_lite_open_options,
-        out_handle: *mut *mut c_void,
-    ) -> antfly_error_code;
-    pub fn antfly_lite_create_with_options(
-        path: *const c_char,
-        options: *const antfly_lite_open_options,
-        out_handle: *mut *mut c_void,
+        out_db: *mut *mut antfly_db,
     ) -> antfly_error_code;
     pub fn antfly_lite_open_hosted(
         path: *const c_char,
-        out_handle: *mut *mut c_void,
+        out_db: *mut *mut antfly_db,
     ) -> antfly_error_code;
     pub fn antfly_lite_create_hosted(
         path: *const c_char,
-        out_handle: *mut *mut c_void,
+        out_db: *mut *mut antfly_db,
     ) -> antfly_error_code;
     pub fn antfly_lite_open_readonly(
         path: *const c_char,
-        out_handle: *mut *mut c_void,
+        out_db: *mut *mut antfly_db,
     ) -> antfly_error_code;
     pub fn antfly_lite_open_status_only(
         path: *const c_char,
-        out_handle: *mut *mut c_void,
+        out_db: *mut *mut antfly_db,
     ) -> antfly_error_code;
 
-    pub fn antfly_lite_status_json(
-        handle: *mut c_void,
+    pub fn antfly_db_status_json(db: *mut antfly_db, out: *mut antfly_buffer) -> antfly_error_code;
+    pub fn antfly_db_capabilities_json(
+        db: *mut antfly_db,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
-    pub fn antfly_lite_capabilities_json(
-        handle: *mut c_void,
-        out: *mut antfly_buffer,
-    ) -> antfly_error_code;
-    pub fn antfly_lite_backup(handle: *mut c_void, out: *mut antfly_buffer) -> antfly_error_code;
-    pub fn antfly_lite_export(handle: *mut c_void, out: *mut antfly_buffer) -> antfly_error_code;
-    pub fn antfly_lite_import_backup(
-        handle: *mut c_void,
-        backup: antfly_slice,
-    ) -> antfly_error_code;
-    pub fn antfly_lite_import(handle: *mut c_void, backup: antfly_slice) -> antfly_error_code;
-    pub fn antfly_lite_restore_backup_json(
+
+    pub fn antfly_db_backup(db: *mut antfly_db, out: *mut antfly_buffer) -> antfly_error_code;
+    pub fn antfly_db_import_backup(db: *mut antfly_db, backup: antfly_slice) -> antfly_error_code;
+    pub fn antfly_restore_backup_json(
         dest_path: *const c_char,
+        options: *const antfly_open_options,
         backup: antfly_slice,
         replace: bool,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
-    pub fn antfly_lite_restore_json(
+    pub fn antfly_restore_backup_file_json(
         dest_path: *const c_char,
-        backup: antfly_slice,
-        replace: bool,
-        out: *mut antfly_buffer,
-    ) -> antfly_error_code;
-    pub fn antfly_lite_restore_backup_file_json(
-        dest_path: *const c_char,
+        options: *const antfly_open_options,
         backup_path: *const c_char,
         replace: bool,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
-    pub fn antfly_lite_check_json(
-        handle: *mut c_void,
-        out: *mut antfly_buffer,
-    ) -> antfly_error_code;
+
+    pub fn antfly_lite_check_json(db: *mut antfly_db, out: *mut antfly_buffer)
+    -> antfly_error_code;
     pub fn antfly_lite_check_file_json(
         path: *const c_char,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
     pub fn antfly_lite_copy_stable_snapshot_json(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         dest_path: *const c_char,
         replace: bool,
         out: *mut antfly_buffer,
@@ -482,40 +446,22 @@ unsafe extern "C" {
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
     pub fn antfly_lite_compact_json(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
     pub fn antfly_lite_vacuum_json(
-        handle: *mut c_void,
-        out: *mut antfly_buffer,
-    ) -> antfly_error_code;
-    pub fn antfly_lite_run_until_idle(handle: *mut c_void) -> antfly_error_code;
-    pub fn antfly_lite_run_until_idle_json(
-        handle: *mut c_void,
-        out: *mut antfly_buffer,
-    ) -> antfly_error_code;
-    pub fn antfly_lite_replay_generated_enrichments_json(
-        handle: *mut c_void,
-        out: *mut antfly_buffer,
-    ) -> antfly_error_code;
-    pub fn antfly_lite_pending_work_stats_json(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
 
-    pub fn antfly_db_close(handle: *mut c_void);
     pub fn antfly_buffer_free(buffer: *mut antfly_buffer);
     pub fn antfly_buffer_free_zero(buffer: *mut antfly_buffer);
-    pub fn antfly_db_buffer_free(ptr: *mut u8, len: usize);
-    pub fn antfly_db_buffer_free_zero(buffer: *mut antfly_buffer);
-    pub fn antfly_db_dense_search_result_free(result: *mut antfly_dense_search_result);
-    pub fn antfly_db_packed_dense_search_result_free(
-        result: *mut antfly_packed_dense_search_result,
-    );
-    pub fn antfly_db_scan_hash_result_free(result: *mut antfly_scan_hash_result);
+    pub fn antfly_dense_search_result_free(result: *mut antfly_dense_search_result);
+    pub fn antfly_packed_dense_search_result_free(result: *mut antfly_packed_dense_search_result);
+    pub fn antfly_scan_hash_result_free(result: *mut antfly_scan_hash_result);
 
     pub fn antfly_db_batch(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         writes: *const antfly_write_intent,
         write_count: usize,
         predicates: *const antfly_version_predicate,
@@ -524,19 +470,19 @@ unsafe extern "C" {
         sync_level: u8,
     ) -> antfly_error_code;
     pub fn antfly_db_batch_json(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         request_json: antfly_slice,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
     pub fn antfly_db_begin_transaction_with_id(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         txn_id: *const [u8; 16],
         timestamp_ns: u64,
         participants: *const antfly_slice,
         participant_count: usize,
     ) -> antfly_error_code;
     pub fn antfly_db_write_transaction(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         txn_id: *const [u8; 16],
         writes: *const antfly_write_intent,
         write_count: usize,
@@ -544,98 +490,102 @@ unsafe extern "C" {
         predicate_count: usize,
     ) -> antfly_error_code;
     pub fn antfly_db_resolve_intents(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         txn_id: *const [u8; 16],
         status: u8,
         commit_version: u64,
     ) -> antfly_error_code;
     pub fn antfly_db_get_transaction_status(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         txn_id: *const [u8; 16],
         out_status: *mut u8,
     ) -> antfly_error_code;
     pub fn antfly_db_get_commit_version(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         txn_id: *const [u8; 16],
         out_commit_version: *mut u64,
     ) -> antfly_error_code;
     pub fn antfly_db_get_timestamp(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         key: antfly_slice,
         out_timestamp: *mut u64,
     ) -> antfly_error_code;
     pub fn antfly_db_lookup_json(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         key: antfly_slice,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
     pub fn antfly_db_get_raw(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         key: antfly_slice,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
     pub fn antfly_db_get_schema_json(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
     pub fn antfly_db_set_schema_json(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         schema_json: antfly_slice,
     ) -> antfly_error_code;
-    pub fn antfly_db_run_until_idle(handle: *mut c_void) -> antfly_error_code;
+    pub fn antfly_db_run_until_idle(db: *mut antfly_db) -> antfly_error_code;
     pub fn antfly_db_run_until_idle_json(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
     pub fn antfly_db_pending_work_stats_json(
-        handle: *mut c_void,
+        db: *mut antfly_db,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
+    pub fn antfly_db_replay_generated_enrichments_json(
+        db: *mut antfly_db,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
     pub fn antfly_db_list_indexes_json(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
     pub fn antfly_db_add_index_json(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         config_json: antfly_slice,
     ) -> antfly_error_code;
     pub fn antfly_db_delete_index(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         name: antfly_slice,
         out_deleted: *mut bool,
     ) -> antfly_error_code;
     pub fn antfly_db_list_enrichments_json(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
     pub fn antfly_db_add_enrichment_json(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         config_json: antfly_slice,
     ) -> antfly_error_code;
     pub fn antfly_db_delete_enrichment(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         kind: antfly_slice,
         name: antfly_slice,
         out_deleted: *mut bool,
     ) -> antfly_error_code;
     pub fn antfly_db_scan_json(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         request_json: antfly_slice,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
     pub fn antfly_db_scan_hashes(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         request_json: antfly_slice,
         out_result: *mut antfly_scan_hash_result,
     ) -> antfly_error_code;
-    pub fn antfly_db_stats_json(handle: *mut c_void, out: *mut antfly_buffer) -> antfly_error_code;
+    pub fn antfly_db_stats_json(db: *mut antfly_db, out: *mut antfly_buffer) -> antfly_error_code;
     pub fn antfly_db_search_json(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         request_json: antfly_slice,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
     pub fn antfly_db_search_dense(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         index_name: antfly_slice,
         vector_ptr: *const f32,
         vector_len: usize,
@@ -645,7 +595,7 @@ unsafe extern "C" {
         out_result: *mut antfly_packed_dense_search_result,
     ) -> antfly_error_code;
     pub fn antfly_db_search_dense_profile(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         index_name: antfly_slice,
         vector_ptr: *const f32,
         vector_len: usize,
@@ -655,18 +605,18 @@ unsafe extern "C" {
         out_profile: *mut antfly_dense_search_profile,
     ) -> antfly_error_code;
     pub fn antfly_db_search_dense_wire(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         request_buf: antfly_slice,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
     pub fn antfly_db_search_dense_wire_profile(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         request_buf: antfly_slice,
         out: *mut antfly_buffer,
         out_profile: *mut antfly_dense_wire_search_profile,
     ) -> antfly_error_code;
     pub fn antfly_db_search_text_match(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         index_name: antfly_slice,
         field: antfly_slice,
         text: antfly_slice,
@@ -675,52 +625,52 @@ unsafe extern "C" {
         out_result: *mut antfly_dense_search_result,
     ) -> antfly_error_code;
     pub fn antfly_db_search_text_match_wire(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         request_buf: antfly_slice,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
     pub fn antfly_db_search_text_term_wire(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         request_buf: antfly_slice,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
     pub fn antfly_db_search_text_match_phrase_wire(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         request_buf: antfly_slice,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
     pub fn antfly_db_search_hits_json(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         request_json: antfly_slice,
         out_result: *mut antfly_dense_search_result,
     ) -> antfly_error_code;
     pub fn antfly_db_aggregate_hits_json(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         request_json: antfly_slice,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
     pub fn antfly_db_lookup_artifact_json(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         artifact_id_b64: antfly_slice,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
-    pub fn antfly_db_decode_artifact_id_json(
+    pub fn antfly_decode_artifact_id_json(
         artifact_id_b64: antfly_slice,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
     pub fn antfly_db_extract_enrichments_json(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         request_json: antfly_slice,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
     pub fn antfly_db_compute_enrichments_json(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         request_json: antfly_slice,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
 
     pub fn antfly_db_get_edges_json(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         index_name: antfly_slice,
         key: antfly_slice,
         edge_type: antfly_slice,
@@ -728,17 +678,17 @@ unsafe extern "C" {
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
     pub fn antfly_db_traverse_edges_json(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         request_json: antfly_slice,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
     pub fn antfly_db_execute_graph_queries_json(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         request_json: antfly_slice,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
     pub fn antfly_db_get_neighbors_json(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         index_name: antfly_slice,
         key: antfly_slice,
         edge_type: antfly_slice,
@@ -746,17 +696,17 @@ unsafe extern "C" {
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
     pub fn antfly_db_find_shortest_path_json(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         request_json: antfly_slice,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
     pub fn antfly_db_find_k_shortest_paths_json(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         request_json: antfly_slice,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
     pub fn antfly_db_match_pattern_json(
-        handle: *mut c_void,
+        db: *mut antfly_db,
         request_json: antfly_slice,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;

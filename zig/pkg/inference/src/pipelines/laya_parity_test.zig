@@ -140,6 +140,7 @@ test "laya forward preprocessing and batching match the PyTorch reference" {
         try std.testing.expectEqualStrings(expected.label, actual.label);
         for (expected.probabilities, actual.probabilities) |want, got| try std.testing.expectApproxEqAbs(want, got, 2e-4);
     }
+    const resident_before = factory.layaResidentStats(session);
     // Different sequence lengths, question types, option counts, and row orders
     // must not couple independent decisions through padding or batch scheduling.
     for ([_]usize{ 1, 2, 3, 8, 16, 32, 128, 512 }) |batch_size| {
@@ -168,6 +169,76 @@ test "laya forward preprocessing and batching match the PyTorch reference" {
     // Repeated known tokens ensure this is token overflow, not one UNK token.
     const long_text = "hello " ** 150;
     try std.testing.expectError(error.ExtractionTextLimitExceeded, pipeline.prepare(alloc, tok, config, .{ .text = long_text, .question = questions[0] }));
+    if (resident_before) |before| {
+        const after = factory.layaResidentStats(session).?;
+        try std.testing.expectEqual(before.weight_upload_bytes, after.weight_upload_bytes);
+        try std.testing.expectEqual(before.weight_upload_calls, after.weight_upload_calls);
+        try std.testing.expectEqual(before.model_bytes, after.model_bytes);
+        try std.testing.expectEqual(@as(u64, 0), after.intermediate_readbacks);
+        try std.testing.expectEqual(@as(u64, 0), after.activation_host_accesses);
+        try std.testing.expectEqual(@as(u64, 0), after.host_fallbacks);
+        try std.testing.expectEqual(@as(u64, 0), after.cached_activation_bytes);
+        try std.testing.expect(after.requests > before.requests);
+        try std.testing.expectEqual(after.input_upload_bytes, after.physical_upload_bytes);
+        try std.testing.expectEqual(after.output_readback_bytes, after.physical_download_bytes);
+        try std.testing.expectEqual(after.requests, after.physical_download_calls);
+        // Allocation failures at different encoder/head depths must unwind
+        // submitted frames and leave the same owner reusable without uploads.
+        for ([_]usize{ 0, 1, 2, 4, 8, 16, 32, 64, 96, 128, 256 }) |fail_index| {
+            const live_before = @import("../backends/metal_tensor.zig").memoryStatsSnapshot().device_owned_live_bytes;
+            var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = fail_index });
+            const fa = failing.allocator();
+            if (session.vtable.runLayaDecisions.?(session.ptr, &inputs, fa, null)) |maybe_outputs| {
+                const completed = maybe_outputs orelse return error.TestUnexpectedResult;
+                for (completed) |*output| output.deinit();
+                fa.free(completed);
+            } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expectEqual(live_before, @import("../backends/metal_tensor.zig").memoryStatsSnapshot().device_owned_live_bytes);
+            _ = try pipeline.execute(alloc, session, tok, config, &tasks, null);
+            try std.testing.expectEqual(before.weight_upload_bytes, factory.layaResidentStats(session).?.weight_upload_bytes);
+        }
+        // Independent model owners must survive failed cold preparation and
+        // repeated unload without sharing slots or retaining partial uploads.
+        for ([_]usize{ 16, 32, 64 }) |fail_index| {
+            var failing = std.testing.FailingAllocator.init(a, .{});
+            const fa = failing.allocator();
+            var peer = try factory.createMetalSession(fa, model_path);
+            defer peer.close();
+            // Resident weights use the model allocator, not request scratch.
+            // Arm it only after loading, then require preparation to fail
+            // without publishing a partial owner.
+            failing.fail_index = failing.alloc_index + fail_index;
+            try std.testing.expectError(error.OutOfMemory, peer.vtable.runLayaDecisions.?(peer.ptr, &inputs, a, null));
+            try std.testing.expect(failing.has_induced_failure);
+            try std.testing.expect(factory.layaResidentStats(peer) == null);
+            failing.fail_index = std.math.maxInt(usize);
+            const retried = try pipeline.execute(alloc, peer, tok, config, &tasks, null);
+            for (result.decisions, retried.decisions) |want, got| {
+                for (want.probabilities, got.probabilities) |p, q| try std.testing.expectApproxEqAbs(p, q, 2e-4);
+            }
+            try std.testing.expectEqual(before.weight_upload_bytes, factory.layaResidentStats(session).?.weight_upload_bytes);
+        }
+        const CancellationProbe = struct {
+            checks: usize = 0,
+            cancel_at: usize,
+            fn check(ptr: ?*anyopaque) anyerror!void {
+                const probe: *@This() = @ptrCast(@alignCast(ptr.?));
+                probe.checks += 1;
+                if (probe.checks == probe.cancel_at) return error.Cancelled;
+            }
+        };
+        // Invoke the architecture callback under a test-owned synchronous GPU
+        // lifetime; cancel both an active frame and completed-frame boundaries.
+        // Public controlled APIs retain process-isolation policy.
+        for ([_]usize{ 3, 4, 5 }) |cancel_at| {
+            var probe = CancellationProbe{ .cancel_at = cancel_at };
+            const live_before = @import("../backends/metal_tensor.zig").memoryStatsSnapshot().device_owned_live_bytes;
+            try std.testing.expectError(error.Cancelled, session.vtable.runLayaDecisions.?(session.ptr, &inputs, a, .{ .ptr = &probe, .check_fn = CancellationProbe.check }));
+            try std.testing.expectEqual(live_before, @import("../backends/metal_tensor.zig").memoryStatsSnapshot().device_owned_live_bytes);
+            _ = try pipeline.execute(alloc, session, tok, config, &tasks, null);
+        }
+        std.debug.print("Laya resident model_bytes={d} requests={d} input_bytes={d} output_bytes={d} host_accesses={d}\n", .{ after.model_bytes, after.requests, after.input_upload_bytes, after.output_readback_bytes, after.activation_host_accesses });
+    }
 }
 
 const QualificationRow = struct {

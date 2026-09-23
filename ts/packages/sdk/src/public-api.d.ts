@@ -4829,50 +4829,9 @@ export interface components {
          *
          *        See: https://antfly.io/docs/configuration#security--cors
          *
-         *     4. **encodeToon** - Encode data in TOON format (Token-Oriented Object Notation)
-         *        ```handlebars
-         *        {{encodeToon this.fields}}
-         *        {{encodeToon this.fields lengthMarker=false indent=4}}
-         *        {{encodeToon this.fields delimiter="\t"}}
-         *        ```
-         *
-         *        **What is TOON?**
-         *        TOON is a compact, human-readable format designed for passing structured data to LLMs.
-         *        It provides **30-60% token reduction** compared to JSON while maintaining high LLM
-         *        comprehension accuracy.
-         *
-         *        **Key Features:**
-         *        - Compact syntax using `:` for key-value pairs
-         *        - Array length markers: `tags[#3]: ai,search,ml`
-         *        - Tabular format for uniform data structures
-         *        - Optimized for LLM parsing and understanding
-         *        - Maintains human readability
-         *
-         *        **Benefits:**
-         *        - **Lower API costs** - Reduced token usage means lower LLM API costs
-         *        - **Faster responses** - Less tokens to process
-         *        - **More context** - Fit more documents within token limits
-         *
-         *        **Options:**
-         *        - `lengthMarker` (bool): Add # prefix to array counts like `[#3]` (default: true)
-         *        - `indent` (int): Indentation spacing for nested objects (default: 2)
-         *        - `delimiter` (string): Field separator for tabular arrays (default: none, use `"\t"` for tabs)
-         *
-         *        **Example output:**
-         *        ```
-         *        title: Introduction to Vector Search
-         *        author: Jane Doe
-         *        tags[#3]: ai,search,ml
-         *        metadata:
-         *          edition: 2
-         *          pages: 450
-         *        ```
-         *
-         *        **Default in RAG:** TOON is the default format for document rendering in RAG queries.
-         *
-         *        **References:**
-         *        - TOON Specification: https://github.com/toon-format/toon
-         *        - Go Implementation: https://github.com/alpkeskin/gotoon
+         *     4. **encodeToon** is not available in these templates. It is a helper of the
+         *        retrieval agent's `document_renderer`, which renders documents into the
+         *        generation prompt as TOON by default.
          *
          *     **Template Examples:**
          *
@@ -6104,7 +6063,7 @@ export interface components {
         /**
          * @description Synchronization level for batch operations:
          *     - "propose": Wait for Raft proposal acceptance (fastest, default)
-         *     - "write": Wait for Pebble KV write
+         *     - "write": Wait for the write to be durably applied to the local key-value store
          *     - "full_text": Wait for full-text index WAL write
          *     - "enrichments": Precompute enrichments before committing the document. A synchronous
          *       producer failure rejects the write; post-commit worker failures retain the document
@@ -8232,8 +8191,9 @@ export interface components {
              */
             mode?: string;
             /**
-             * @description Preferred output artifact. Suggested values are `query_request`, `bleve`, and
-             *     `filter_query`. The compatibility `query` field is still returned for existing clients.
+             * @description Preferred output artifact. Suggested values are `query_request`, `bleve` (Antfly's
+             *     native, Bleve-compatible full-text query JSON), and `filter_query`. The compatibility
+             *     `query` field is still returned for existing clients.
              * @example query_request
              */
             output?: string;
@@ -8271,7 +8231,8 @@ export interface components {
             /** @description Clarification questions exposed in the shared bounded-agent envelope. */
             questions?: components["schemas"]["AgentQuestion"][];
             /**
-             * @description Generated search query in native Bleve format.
+             * @description Generated search query in Antfly's native full-text query format (a Bleve-compatible
+             *     JSON query DSL: `match`, `term`, `conjuncts`, `disjuncts`, `must_not`, etc.).
              *     Can be used directly in QueryRequest.full_text_search or filter_query.
              * @example {
              *       "conjuncts": [
@@ -8721,9 +8682,23 @@ export interface components {
             /** @description Step configuration */
             steps?: components["schemas"]["RetrievalAgentSteps"];
             /**
-             * @description Handlebars template for rendering documents in the generation prompt.
-             *     Default uses TOON format for token efficiency.
-             *     Requires steps.generation to be set.
+             * @description Handlebars template that renders each retrieved document in the
+             *     generation prompt. Requires steps.generation to be set.
+             *
+             *     The template is rendered once per hit against `{id, score, fields}`,
+             *     where `fields` is the hit's source. When omitted, each document's
+             *     fields are encoded as TOON (Token-Oriented Object Notation), which
+             *     carries the same structure as JSON in fewer tokens.
+             *
+             *     Helpers: `encodeToon` (options `indent`, 1 to 16, default 2; and
+             *     `delimiter`: `comma`, `tab`, or `pipe`), `scrubHtml`, `eq`, and
+             *     `media`. Values in `{{...}}` are HTML-escaped; use `{{{...}}}` for
+             *     raw text.
+             *
+             *     Examples:
+             *     - `{{encodeToon this.fields}}`
+             *     - `{{encodeToon this.fields delimiter="tab"}}`
+             *     - `Title: {{{this.fields.title}}}`
              * @example {{encodeToon this.fields}}
              */
             document_renderer?: string;
@@ -9446,41 +9421,9 @@ export interface components {
              */
             graph_queries?: components["schemas"]["GraphQueries"];
             /**
-             * @description Optional Handlebars template string for rendering document content in RAG queries.
-             *     Template has access to document fields via `{{this.fields.fieldName}}`.
-             *
-             *     **Default**: Uses TOON (Token-Oriented Object Notation) format for 30-60% token reduction:
-             *     ```handlebars
-             *     {{encodeToon this.fields}}
-             *     ```
-             *
-             *     **Available Helpers**:
-             *     - `encodeToon` - Renders fields in compact TOON format with configurable options:
-             *       - `lengthMarker` (bool): Add # prefix to array counts (default: true)
-             *       - `indent` (int): Indentation spacing (default: 2)
-             *       - `delimiter` (string): Field separator for tabular arrays
-             *     - `scrubHtml` - Removes HTML tags and extracts text
-             *     - `media` - Wraps data URIs for GenKit multimodal support
-             *     - `eq` - Equality comparison for conditionals
-             *
-             *     **Examples**:
-             *     - Basic TOON: `{{encodeToon this.fields}}`
-             *     - Compact TOON: `{{encodeToon this.fields lengthMarker=false indent=0}}`
-             *     - Tabular data: `{{encodeToon this.fields delimiter="\t"}}`
-             *     - Custom template: `Title: {{this.fields.title}}\nBody: {{this.fields.body}}`
-             *     - Traditional format: `{{#each this.fields}}{{@key}}: {{this}}\n{{/each}}`
-             *
-             *     TOON format produces compact, LLM-optimized output like:
-             *     ```
-             *     title: Introduction to Vector Search
-             *     author: Jane Doe
-             *     tags[#3]: ai,search,ml
-             *     ```
-             *
-             *     **References**:
-             *     - TOON Specification: https://github.com/toon-format/toon
-             *     - Go Implementation: https://github.com/alpkeskin/gotoon
-             * @example {{encodeToon this.fields}}
+             * @description Not supported on queries, which do not generate text; requests that
+             *     set it are rejected. Set `document_renderer` on a retrieval agent
+             *     request to control how documents appear in the generation prompt.
              */
             document_renderer?: string;
             /**
@@ -10733,8 +10676,8 @@ export interface components {
              */
             on_delete?: components["schemas"]["ReplicationTransformOp"][];
             /**
-             * @description Bleve-style filter query that gets translated to SQL and applied as a
-             *     WHERE clause on the PostgreSQL publication. This filters rows at the
+             * @description Antfly's native filter query (see `RawQuery`) that gets translated to SQL and
+             *     applied as a WHERE clause on the PostgreSQL publication. This filters rows at the
              *     source before they are sent over the replication stream, reducing
              *     network and processing overhead.
              *
@@ -10828,7 +10771,7 @@ export interface components {
              */
             target_table: string;
             /**
-             * @description Bleve-style filter query evaluated against each CDC row. Only rows
+             * @description Antfly's native filter query (see `RawQuery`) evaluated against each CDC row. Only rows
              *     matching this filter are written to `target_table`. If omitted,
              *     all rows match (equivalent to `match_all`).
              */
@@ -11420,13 +11363,12 @@ export interface components {
          * @description Configuration for the Antfly inference embedding provider.
          *
          *     Antfly inference is Antfly's built-in ML service for local embeddings using ONNX models.
-         *     It provides embedding generation with multi-tier caching (memory + persistent).
          *
          *     **Features:**
          *     - Local ONNX-based embedding generation
-         *     - L1 memory cache with configurable TTL
-         *     - L2 persistent Pebble database cache
-         *     - Singleflight deduplication for concurrent identical requests
+         *     - Query-time embeddings are served from an in-memory cache (64 MiB budget,
+         *       5-minute TTL by default) with concurrent identical requests coalesced onto
+         *       a single computation; there is no persistent on-disk cache tier
          *
          *     **Example Models:** bge-base-en-v1.5 (768 dims), all-MiniLM-L6-v2 (384 dims)
          *
@@ -11704,17 +11646,17 @@ export interface components {
         /**
          * @description Configuration for the Antfly inference chunking provider.
          *
-         *     Antfly inference is a centralized HTTP service that provides chunking with multi-tier caching.
+         *     Antfly inference is Antfly's built-in ML service for local chunking.
          *     The model name maps to ONNX model directory names (similar to how Ollama works).
          *
          *     **Chunking Models:**
          *     - fixed: Simple fixed-size chunking by token count (built-in, no ONNX required)
          *     - Any other name will attempt to load from models/chunkers/{name}/ directory
          *
-         *     **Caching:**
-         *     - L1: Memory cache with 2-minute TTL
-         *     - L2: Persistent Pebble database
-         *     - Singleflight deduplication for concurrent identical requests
+         *     **Deduplication:**
+         *     - Within a single document write, chunk results are deduplicated when multiple
+         *       indexes share the same source text and chunker configuration, so the source
+         *       is chunked at most once per write.
          * @example {
          *       "provider": "antfly",
          *       "api_url": "http://localhost:8080",
@@ -11765,9 +11707,9 @@ export interface components {
              */
             store_chunks?: boolean;
             /**
-             * @description Configuration for full-text indexing of chunks in Bleve.
-             *     When present (even if empty), chunks will be stored with :cft: suffix and indexed in Bleve's _chunks field.
-             *     When absent, chunks use :c: suffix and are only used for vector embeddings.
+             * @description Configuration for full-text indexing of chunks.
+             *     When present (even if empty), chunk artifacts are persisted and indexed in Antfly's native full-text index, queryable and projectable via the document's `_chunks` field.
+             *     When absent, chunks are generated only to drive vector embeddings and are not indexed for full-text search (unless `store_chunks` is also set).
              */
             full_text_index?: {
                 [key: string]: unknown;

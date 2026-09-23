@@ -68,11 +68,17 @@ class ZigValidationScopeTests(unittest.TestCase):
                 {path.decode() for path in selected.split(b"\0") if path}, inputs
             )
 
-    def test_codegen_inputs_select_zig_validation(self):
+    def test_codegen_and_laya_inputs_select_zig_validation(self):
         workflow = (ROOT / ".github/workflows/zig-tests.yml").read_text()
         command = workflow.split('if ! "$helper"', 1)[1].split("\n          then", 1)[0]
         pathspecs = shlex.split(command.split(" -- ", 1)[1].replace("\\\n", " "))
         inputs = {
+            "scripts/laya/prepare_laya_finetune.py",
+            "scripts/laya/qualify_laya_finetune_quality.py",
+            "scripts/laya/test_run_laya_qualification.py",
+            "scripts/laya/test_prepare_laya_finetune.py",
+            "scripts/laya/test_qualify_laya_finetune_quality.py",
+            "scripts/laya/test_benchmark_laya_metal.py",
             "scripts/openapi_inputs.py",
             "scripts/openapi_joiner.py",
             "scripts/join_openapi.py",
@@ -121,7 +127,7 @@ def embedded_helper() -> str:
     """
     workflow = (ROOT / ".github/workflows/zig-tests.yml").read_text()
     match = re.search(
-        r'cat > "\$helper" <<\'HELPER\'\n(.*?)\n {10}HELPER\n', workflow, re.S
+        r'cat > "\$helper" <<\'HELPER\'\n(.*?)\n {10}HELPER\n', workflow, re.DOTALL
     )
     assert match, "embedded zig-relevant-changes helper not found in zig-tests.yml"
     lines = [
@@ -137,6 +143,7 @@ def _relevant(root: Path, base: str, head: str, *pathspecs: str) -> int:
         cwd=root,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        check=False,
     ).returncode
 
 
@@ -237,6 +244,7 @@ class ZigRelevantChangesScriptTests(unittest.TestCase):
             cwd=self.root,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            check=False,
         ).returncode
         self.assertEqual(code, 2)
 

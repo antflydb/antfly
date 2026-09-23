@@ -436,7 +436,7 @@ const generator = {
 **Props:**
 - `id` (string, required): Unique identifier
 - `searchBoxId` (string, required): ID of the `QueryBox` that provides the search value
-- `generator` (object, required): LLM configuration — `{ provider: "antfly" | "ollama" | "openai" | "gemini" | "vertex", model, api_key? }`
+- `generator` (object, required): LLM configuration — `{ provider: "antfly" | "ollama" | "openai" | "openrouter" | "gemini" | "vertex", model, api_key? }`
 - `agentKnowledge` (string): Additional domain context passed to the agent
 - `systemPrompt` (string): Custom system prompt for the LLM
 - `generationContext` (string): Additional generation-step context
@@ -940,7 +940,7 @@ function MyComponent() {
           followup: {}
         }
       },
-      headers: { 'X-API-Key': 'key' }
+      headers: { Authorization: 'ApiKey <encoded>' } // base64(key_id:key_secret)
     });
   };
 
@@ -1202,16 +1202,11 @@ Implement custom query logic for complex search requirements. `customQuery` is a
 ```jsx
 const customQuery = (query, fields) => {
   return {
-    bool: {
-      should: fields.map(field => ({
-        match: {
-          [field]: {
-            query: query,
-            boost: field === "title" ? 2 : 1
-          }
-        }
-      }))
-    }
+    disjuncts: fields.map(field => ({
+      match: query,
+      field,
+      boost: field === "title" ? 2 : 1
+    }))
   };
 };
 
@@ -1233,7 +1228,6 @@ import '@antfly/components/styles';
 <Results
   id="results"
   searchBoxId="search"
-  className="my-results-container"
   items={(data) =>
     data.map(({ _source, _id }) => (
       <div key={_id} className="result-item">
