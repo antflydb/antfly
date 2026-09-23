@@ -88,6 +88,7 @@ AUTOSCHEMA_INDEXES = {
     },
 }
 
+
 def _kg_document(event_text: str) -> dict:
     return {
         "kg": {
@@ -172,8 +173,15 @@ def test_label_routed_autograph_promotes_events_and_entities(resolution_cluster)
     # sentence-hash design would mint two nodes, the compositional identity
     # (sorted participant segments + extractor-asserted predicate through
     # the `hash` helper) must converge them onto one.
-    api.insert("documents", "doc:a", _kg_document(EVENT_TEXT), deadline=_new_e2e_deadline())
-    api.insert("documents", "doc:b", _kg_document(EVENT_TEXT_REWORDED), deadline=_new_e2e_deadline())
+    api.insert(
+        "documents", "doc:a", _kg_document(EVENT_TEXT), deadline=_new_e2e_deadline()
+    )
+    api.insert(
+        "documents",
+        "doc:b",
+        _kg_document(EVENT_TEXT_REWORDED),
+        deadline=_new_e2e_deadline(),
+    )
 
     # Label routing: entity mentions promote into `entities` under the
     # x_-prefixed canonical keys.
@@ -242,9 +250,7 @@ def _one_query_walk(api: _Api, start_key: str, timeout: float) -> str | None:
             raise
         return None
     result = (
-        (response.get("responses") or [{}])[0]
-        .get("graph_results", {})
-        .get("walk", {})
+        (response.get("responses") or [{}])[0].get("graph_results", {}).get("walk", {})
     )
     nodes = {node.get("key"): node.get("table") for node in result.get("nodes", [])}
     event_keys = [
