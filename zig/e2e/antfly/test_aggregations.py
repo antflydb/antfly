@@ -198,9 +198,9 @@ def test_aggregation_full_result_budget(monkeypatch, request):
             api.query_table(name, query)
         response = failure.value.response
         assert response.status_code == 422, response.text
-        assert response.json()["error"] == "query_candidate_budget_exceeded", (
-            response.text
-        )
+        assert (
+            response.json()["error"] == "query_candidate_budget_exceeded"
+        ), response.text
 
 
 # Hybrid aggregation domain.
@@ -243,10 +243,11 @@ def _domain_vectors(i):
     return va, vb
 
 
-def _domain_top(pick, query, n):
+def _domain_top(pick, query, n, predicate=lambda _i: True):
     scored = sorted(
         (-sum(x * y for x, y in zip(_domain_vectors(i)[pick], query)), _domain_key(i))
         for i in range(_DOMAIN_DOCS)
+        if predicate(i)
     )
     return [key for _, key in scored[:n]]
 
@@ -261,6 +262,7 @@ def _create_domain_table(api, name, num_shards):
                     "properties": {
                         "body": {"type": "string", "x-antfly-types": ["text"]},
                         "key": {"type": "string", "x-antfly-types": ["keyword"]},
+                        "status": {"type": "string", "x-antfly-types": ["keyword"]},
                     },
                 }
             }
@@ -282,6 +284,7 @@ def _create_domain_table(api, name, num_shards):
             inserts[_domain_key(i)] = {
                 "body": ("needle " if i in _TEXT_IDS else "") + "filler words here",
                 "key": _domain_key(i),
+                "status": "active" if i % 2 == 0 else "inactive",
                 "_embeddings": {"va": va, "vb": vb},
             }
         result = api.batch_write(name, inserts=inserts, sync_level="full_index")
@@ -320,6 +323,8 @@ def test_hybrid_aggregation_domain(stateful_api, num_shards):
     _create_domain_table(stateful_api, name, num_shards)
     top_a = _domain_top(0, _QUERY_A, _DOMAIN_LIMIT)
     top_b = _domain_top(1, _QUERY_B, _DOMAIN_LIMIT)
+    active_a = _domain_top(0, _QUERY_A, _DOMAIN_LIMIT, lambda i: i % 2 == 0)
+    active_b = _domain_top(1, _QUERY_B, _DOMAIN_LIMIT, lambda i: i % 2 == 0)
     text_keys = {_domain_key(i) for i in _TEXT_IDS}
 
     # The fixture itself: single-index retrieval matches brute force.
@@ -343,24 +348,51 @@ def test_hybrid_aggregation_domain(stateful_api, num_shards):
             {"embeddings": {"va": _QUERY_A}, "indexes": ["va"]},
             set(top_a),
         ),
+        "semantic_multi": (
+            {
+                "embeddings": {"va": _QUERY_A, "vb": _QUERY_B},
+                "indexes": ["va", "vb"],
+                "merge_config": _DOMAIN_MERGE,
+            },
+            set(top_a) | set(top_b),
+        ),
+        "semantic_multi_default": (
+            {"embeddings": {"va": _QUERY_A, "vb": _QUERY_B}, "indexes": ["va", "vb"]},
+            set(top_a) | set(top_b),
+        ),
+        "semantic_multi_filtered": (
+            {
+                "embeddings": {"va": _QUERY_A, "vb": _QUERY_B},
+                "indexes": ["va", "vb"],
+                "merge_config": _DOMAIN_MERGE,
+                "filter_query": {"term": {"path": "/status", "value": "active"}},
+            },
+            set(active_a) | set(active_b),
+        ),
         "keyword": (
             {"full_text_search": {"match": "needle", "field": "body"}},
             text_keys,
         ),
-    }
-    beyond_window = {
-        _domain_key(i) for i in _NEAR_A[_DOMAIN_LIMIT:] + _NEAR_B[_DOMAIN_LIMIT:]
+        "explicit_match_all": (
+            {
+                "full_text_search": {"match_all": {}},
+                "embeddings": {"va": _QUERY_A, "vb": _QUERY_B},
+                "indexes": ["va", "vb"],
+                "merge_config": _DOMAIN_MERGE,
+            },
+            {_domain_key(i) for i in range(_DOMAIN_DOCS)},
+        ),
     }
     for label, (shape, expected) in shapes.items():
         page = _domain_query(stateful_api, name, shape)
         counted = _domain_query(stateful_api, name, shape, _DOMAIN_TERMS)
+        assert {hit["_id"] for hit in page["hits"]["hits"]} <= expected, label
         keys = {bucket["key"] for bucket in counted["aggregations"]["keys"]["buckets"]}
         assert keys == expected, (label, sorted(keys ^ expected)[:20])
         assert all(
             bucket["doc_count"] == 1
             for bucket in counted["aggregations"]["keys"]["buckets"]
         ), label
-        assert not (keys & beyond_window - text_keys), label
         # Aggregations never change the ranked page.
         assert [hit["_id"] for hit in counted["hits"]["hits"]] == [
             hit["_id"] for hit in page["hits"]["hits"]
@@ -391,6 +423,33 @@ def test_vector_aggregation_budget_counts_windows_not_index(monkeypatch, request
     keys = {bucket["key"] for bucket in semantic["aggregations"]["keys"]["buckets"]}
     assert keys == set(_domain_top(0, _QUERY_A, _DOMAIN_LIMIT)) | set(
         _domain_top(1, _QUERY_B, _DOMAIN_LIMIT)
+    )
+
+    # The index is much larger than the budget, but only 40 documents match.
+    # Block-Max scoring must prove this underfilled collection window exact.
+    text_keys = {_domain_key(i) for i in _TEXT_IDS}
+    keyword = _domain_query(
+        api,
+        name,
+        {"full_text_search": {"match": "needle", "field": "body"}},
+        _DOMAIN_TERMS,
+    )
+    assert {
+        bucket["key"] for bucket in keyword["aggregations"]["keys"]["buckets"]
+    } == text_keys
+    hybrid = _domain_query(
+        api,
+        name,
+        {
+            "full_text_search": {"match": "needle", "field": "body"},
+            "embeddings": {"va": _QUERY_A, "vb": _QUERY_B},
+            "indexes": ["va", "vb"],
+            "merge_config": _DOMAIN_MERGE,
+        },
+        _DOMAIN_TERMS,
+    )
+    assert {bucket["key"] for bucket in hybrid["aggregations"]["keys"]["buckets"]} == (
+        text_keys | keys
     )
 
     # Text matches still count against the budget.

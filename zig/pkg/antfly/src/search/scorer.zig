@@ -181,6 +181,10 @@ pub const TopKCollector = struct {
 
     pub fn finishOwned(self: *TopKCollector) !SearchResults {
         sortScoredHits(self.hits.items);
+        // A collector that never filled its window never raised the
+        // competitive threshold. Block-Max traversal may have been available,
+        // but it could not have pruned a matching hit from this result.
+        if (self.k > 0 and self.hits.items.len < self.k) self.total_relation = .exact;
         const hits = try self.hits.toOwnedSlice(self.alloc);
         return .{
             .hits = hits,
@@ -1168,4 +1172,36 @@ test "scorer executes into external top-k collector" {
     try std.testing.expectEqual(TotalHitsRelation.gte, results.total_relation);
     try std.testing.expectEqual(@as(usize, 3), results.hits.len);
     try std.testing.expectEqual(@as(u32, 7), results.hits[0].doc_id);
+}
+
+test "block-max scorer proves sparse matches complete below top-k" {
+    const alloc = std.testing.allocator;
+    var builder = inverted.InvertedIndexBuilder.init(alloc, .{ .chunk_size = 8 });
+    defer builder.deinit();
+    for (0..120) |i| {
+        try builder.addDocument(@intCast(i), if (i % 30 == 0)
+            &.{.{ .term = "needle", .freq = 1, .norm = 10 }}
+        else
+            &.{.{ .term = "filler", .freq = 1, .norm = 10 }});
+    }
+    const section = try builder.build();
+    defer alloc.free(section);
+    var reader = try inverted.InvertedIndexReader.init(alloc, section);
+    const lookup = reader.lookup("needle") orelse return error.TestExpectedEqual;
+    var scorer = WANDScorer.init(alloc, 100, reader.doc_count, reader.avgDocLen(), .{});
+    defer scorer.deinit();
+    try scorer.addTerm(
+        try lookup.iterator(alloc),
+        lookup.docFreq(),
+        switch (lookup) {
+            .postings => |postings| postings.block_max,
+            .one_hit => null,
+        },
+        8,
+        0,
+    );
+    const results = try scorer.execute();
+    defer alloc.free(results.hits);
+    try std.testing.expectEqual(@as(usize, 4), results.hits.len);
+    try std.testing.expectEqual(TotalHitsRelation.exact, results.total_relation);
 }

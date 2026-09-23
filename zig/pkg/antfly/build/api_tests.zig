@@ -174,6 +174,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "query parser treats explicit graph document fields as a projection",
         "api http server serves fielded full-text search through mcp tools",
         "api query contract canonicalizes public Query filter roots and compositions",
+        "api query contract keeps filter carriers out of vector fusion",
         "api query contract accepts multi_match bool_prefix full text",
         "api query contract bounds public fuzzy integers without narrowing traps",
         "api query contract preserves supported match options and rejects semantic loss",
@@ -1537,7 +1538,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const api_aggregation_tests = @import("linked_tests.zig").addPair(b, .{
         .name = "api-aggregation-tests",
         .root_module = api_table_reads_docid_test_mod,
-        .filters = &.{ "aggregation-only collection", "aggregation completeness", "aggregation context", "aggregation full-result rerun", "aggregation domain" },
+        .filters = &.{ "aggregation-only collection", "aggregation completeness", "aggregation context", "aggregation full-result rerun", "aggregation domain", "encode vector-only query does not create a match-all text component", "api query contract keeps filter carriers out of vector fusion" },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     }, write_implementation_tests);
     b.step("antfly-api-aggregation-test", "Run captured aggregation collection, completeness and generation regressions").dependOn(&api_aggregation_tests.run(b).step);

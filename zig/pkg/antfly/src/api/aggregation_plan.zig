@@ -157,9 +157,9 @@ fn sparseComponentCount(req: types.SearchRequest) usize {
     return @intFromBool(req.sparse != null);
 }
 
-/// Whether the request carries a full-text matching set. The public parser
-/// synthesizes a `match_all` full-text query for filter-only requests; that is a
-/// filter carrier, not a match set, and contributes no aggregation rows.
+/// Whether the request carries a full-text matching set. Explicit match-all
+/// vector requests are wrapped as a text boolean query by the public parser;
+/// a bare match-all is a filter carrier and contributes no aggregation rows.
 pub fn requestHasAggregationTextDomain(req: types.SearchRequest) bool {
     if (req.full_text_queries.len > 0) return true;
     if (req.full_text) |text| return text != .match_all;

@@ -27,6 +27,11 @@ All notable changes to Antfly will be documented in this file.
   full-text query contributes no extra rows. Separately, a vector search that
   exhausts its traversal with a truncated top-k window now reports its total as
   a lower bound instead of exact.
+- **Aggregation and semantic paging corrections** — full-text facets with fewer
+  matches than the collection budget now complete on larger tables. Explicit
+  `match_all` contributes its text domain to hybrid aggregations, while
+  filter-only vector requests no longer add a match-all retrieval lane to the
+  ranked page.
 - **`antfly standby` replaces `antfly ha`** — the hot-standby command is
   renamed; `antfly ha` remains a hidden alias for one minor release. It gains
   `--data-dir` (opens the node's standby state under `<dir>/ha/` and reads the

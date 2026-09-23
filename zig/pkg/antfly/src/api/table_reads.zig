@@ -19317,12 +19317,17 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(u32, 100), plan.vectorComponentRequest(0).dense_queries[0].query.k);
         }
 
-        test "aggregation domain omits match_all text carriers" {
+        test "aggregation domain distinguishes explicit match_all from filter carriers" {
             var semantic = aggregationDomainTestHybrid();
             semantic.full_text = .{ .match_all = {} };
             var plan = try aggregationDomainTestPlan(semantic);
             try std.testing.expect(plan.text_req == null);
             try std.testing.expectEqual(@as(usize, 2), plan.vectorComponentCount());
+
+            const explicit = [_]db_mod.types.TextQuery{.{ .match_all = {} }};
+            semantic.full_text = .{ .bool_query = .{ .must = &explicit } };
+            plan = try aggregationDomainTestPlan(semantic);
+            try std.testing.expect(plan.text_req != null);
 
             semantic.full_text = null;
             plan = try aggregationDomainTestPlan(semantic);
@@ -21885,6 +21890,26 @@ fn consumerTests() type {
             try std.testing.expectEqualStrings("semantic_idx", round_trip.req.dense_queries[0].index_name);
             try std.testing.expectEqual(@as(usize, 1), round_trip.req.sparse_queries.len);
             try std.testing.expectEqualStrings("sparse_idx", round_trip.req.sparse_queries[0].index_name);
+        }
+
+        test "encode vector-only query does not create a match-all text component" {
+            const alloc = std.testing.allocator;
+            const dense = [_]db_mod.types.NamedDenseQuery{
+                .{ .name = "a", .index_name = "a", .query = .{ .vector = &.{ 1, 0 }, .k = 10 } },
+                .{ .name = "b", .index_name = "b", .query = .{ .vector = &.{ 0, 1 }, .k = 10 } },
+            };
+            inline for (.{ "", "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}" }) |filter| {
+                const encoded = try encodeQueryRequest(alloc, .{
+                    .dense_queries = &dense,
+                    .filter_query_json = filter,
+                    .limit = 10,
+                });
+                defer alloc.free(encoded);
+                var parsed = try query_api.parseQueryRequest(alloc, null, "docs", encoded);
+                defer parsed.deinit(alloc);
+                try std.testing.expectEqual(@as(usize, 2), parsed.req.dense_queries.len);
+                try std.testing.expect(parsed.req.full_text == null);
+            }
         }
 
         test "encode query request includes merge config and pruner but omits reranker" {

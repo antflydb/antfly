@@ -506,6 +506,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
             "WAND pivot bound remains conservative across later high-impact blocks",
             "single-term block scan preserves a later higher-impact chunk",
             "single-term equality pruning retains earliest cutoff ties",
+            "block-max scorer proves sparse matches complete below top-k",
             "pure conjunction block pruning retains earliest cutoff ties",
             "pure conjunction metadata scan preserves later competitive block",
             "multi-segment filter execution",
