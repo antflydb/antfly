@@ -216,6 +216,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.db.test.db managed dense enrichment delete recreate recovers after corrupt artifact",
         "storage.db.db.test.db managed dense enrichment delete recreate recovers after corrupt artifact across reopen",
         "storage.db.db.test.db managed dense enrichment remains searchable after transient rate limits",
+        "storage.db.db.test.db chunked dense retry preserves published vectors until replacements succeed",
+        "storage.db.db.test.db synchronous chunk replacement retires stale embeddings in the same commit",
         "storage.db.db.test.db managed dense enrichment retries temporary model capacity without terminal coverage",
         "storage.db.db.test.db managed sparse enrichment retries temporary model capacity without terminal coverage",
         "storage.db.db.test.db managed vector admission durably seeds missing enrichment artifacts",

@@ -16539,6 +16539,11 @@ pub const ApiHttpServer = struct {
     fn stagedRestoreError(err: anyerror) cluster_api_http.ClusterApi.ExecuteRestoreError {
         return switch (err) {
             error.RestoreStagingYield => error.RestoreStagingYield,
+            // Owner transitions and publication drains can report StorageBusy
+            // while the pinned staging plan is still making ordinary progress.
+            // Preserve the durable attempt and its cursors rather than treating
+            // this as a repository failure with exponential retry backoff.
+            error.StorageBusy => error.RestoreStagingWait,
             error.Cancelled => error.Cancelled,
             error.RestoreJobFenced, error.NotLeader => error.NotLeader,
             error.TableAlreadyExists => error.TableAlreadyExists,
@@ -20943,6 +20948,17 @@ test "native restore validation uncertainty remains an asynchronous retry" {
     try std.testing.expect(restoreJobErrorIsRetryable(error.RestoreValidationPending));
     try std.testing.expect(restoreJobErrorIsRetryable(error.BackupRepositoryBusy));
     try std.testing.expect(!restoreJobErrorIsRetryable(error.BackupIntegrityFailure));
+}
+
+test "busy staged restore owner retains its pinned attempt" {
+    try std.testing.expectEqual(
+        @as(cluster_api_http.ClusterApi.ExecuteRestoreError, error.RestoreStagingWait),
+        ApiHttpServer.stagedRestoreError(error.StorageBusy),
+    );
+    try std.testing.expectEqual(
+        @as(cluster_api_http.ClusterApi.ExecuteRestoreError, error.RestoreValidationPending),
+        ApiHttpServer.stagedRestoreError(error.BackupRepositoryBusy),
+    );
 }
 
 test "restore worker authority is fenced across leadership reacquisition" {

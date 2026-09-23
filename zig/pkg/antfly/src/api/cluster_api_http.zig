@@ -50,6 +50,7 @@ pub const ClusterApi = struct {
         BackupRepositoryBusy,
         RestoreValidationPending,
         RestoreStagingYield,
+        RestoreStagingWait,
         BackupManifestTooLarge,
         BackupIntegrityFailure,
         RestoreDestinationReauthorizationRequired,

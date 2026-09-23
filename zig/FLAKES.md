@@ -1,5 +1,56 @@
 # Zig runtime flakes
 
+## 2026-09-23: restore staging contention and partial vector publication after restart
+
+[CI job 107069241819](https://github.com/antflydb/antfly/actions/runs/35823581381/job/107069241819)
+and [job 107085992226](https://github.com/antflydb/antfly/actions/runs/35826961268/job/107085992226)
+each failed the same two standalone E2E tests. In
+`test_cluster_restore_modes_with_concurrent_observers`, restore attempt 15
+reached neither publication nor a terminal error within 120 seconds. Both
+server logs identify `StorageBusy` during `authority_or_owner` staging.
+This is the remaining [#846](https://github.com/antflydb/antfly/issues/846)
+signature: the generic error mapping treated transient owner contention as
+`RestoreValidationPending`, requeued a fresh durable attempt, and applied
+repository-failure backoff. `StorageBusy` now takes the existing bounded
+same-attempt staging wait; ordinary repository errors still use their durable
+retry policy. The mapping regression checks both classifications.
+
+In `test_progressive_publication_remains_queryable_across_process_restart`,
+the same index incarnation had 160 searchable vectors before restart and 32
+afterward, while source coverage stayed at 80 of 100 documents. The generated
+replay and target counters advanced to reflect the reduction, so the failure
+is not just a stale status field. Two paths could withdraw old embeddings
+before replacement: the chunk producer deleted derived embedding artifacts
+while reconciling stale chunk rows, and the chunked dense worker could enqueue
+stale embedding deletions before its provider call succeeded. The chunk
+producer now cleans its own stored rows and targets only full-text deletions;
+the embedding consumer retires its artifacts after successful replacement,
+including the materialized chunk path's terminal-outcome check. Synchronous
+precomputation likewise retires stale embeddings only after replacement
+generation succeeds in the same commit. The restart
+regression keeps the provider blocked after a source change, checks that all
+previously published vectors survive retry and reopen, and then checks that
+the obsolete vectors retire after the provider recovers. This is tracked in
+[#867](https://github.com/antflydb/antfly/issues/867).
+With only the embedding-worker change, that deterministic test failed on
+reopen (`expected 3, found 1`); fixing the chunk producer made it pass.
+
+The unchanged `origin/main` binary passed 80 focused invocations across ten
+four-worker regression-loop repetitions, so neither CI timing failure was
+reproduced by that local soak. The deterministic regressions target the
+identified transitions. The fixed server passed eight focused E2E invocations
+across two two-worker repetitions, plus the targeted database tests for dense,
+sparse, full-text, and synchronous replacement. These passes do not prove the
+CI failures had no additional contributing cause.
+
+```sh
+SKIP_BUILD=1 ANTFLY_E2E_ENV_LOADED=1 \
+  ANTFLY_E2E_REGRESSION_WORKERS=4 ANTFLY_E2E_REGRESSION_REPEATS=10 \
+  scripts/ci/zig-e2e-regression-loop.sh \
+  e2e/antfly/test_backup_restore.py::test_cluster_restore_modes_with_concurrent_observers \
+  e2e/antfly/test_quickstart.py::test_progressive_publication_remains_queryable_across_process_restart
+```
+
 ## 2026-09-22: schema rewrite cutover readiness after coordinator crash
 
 [CI run 35813900420, job 107039234761](https://github.com/antflydb/antfly/actions/runs/35813900420/job/107039234761)

@@ -46371,12 +46371,11 @@ fn appendStaleChunkArtifactDeleteKeys(
     }
 
     for (existing) |entry| {
+        // A chunk producer may finish before a deferred embedding provider.
+        // Keep derived embeddings until their own consumer has successfully
+        // prepared the replacement in this commit or a later replay window.
+        if (internal_keys.isDerivedEmbeddingArtifactKey(entry)) continue;
         if (containsKey(desired_chunk_keys, entry)) continue;
-        if (internal_keys.isDerivedEmbeddingArtifactKey(entry)) {
-            const base_key = try internal_keys.derivedEmbeddingBaseKeyAlloc(alloc, entry);
-            defer if (base_key) |key| alloc.free(key);
-            if (base_key != null and containsKey(desired_chunk_keys, base_key.?)) continue;
-        }
         var already_deleted = false;
         for (artifact_delete_keys.items) |key| {
             if (std.mem.eql(u8, key, entry)) {
@@ -46385,6 +46384,41 @@ fn appendStaleChunkArtifactDeleteKeys(
             }
         }
         if (!already_deleted) try artifact_delete_keys.append(alloc, try alloc.dupe(u8, entry));
+    }
+}
+
+fn appendStalePrecomputedChunkEmbeddingDeletes(
+    alloc: Allocator,
+    db: *DB,
+    doc_value: []const u8,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    artifact_writes: []const types.BatchWrite,
+    cache: *std.ArrayListUnmanaged(ChunkCacheEntry),
+    artifact_delete_keys: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    if (!requestUsesChunkSource(request) or requestUsesPinnedMaterializedChunkArtifact(request)) return;
+
+    var chunks_created: usize = 0;
+    const sources = try chunkEmbeddingSourcesForRequest(alloc, db, doc_value, request, artifact_writes, cache, &chunks_created);
+    defer freeChunkEmbeddingSources(alloc, sources);
+    var desired = std.StringHashMapUnmanaged(void).empty;
+    defer desired.deinit(alloc);
+    for (sources) |source| try desired.put(alloc, source.key, {});
+
+    const prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "chunk", requestArtifactName(request));
+    defer alloc.free(prefix);
+    const existing = try db.core.store.scanPrefixKeysPage(alloc, prefix, null, std.math.maxInt(usize));
+    defer {
+        for (existing) |key| alloc.free(key);
+        alloc.free(existing);
+    }
+    for (existing) |key| {
+        if (!internal_keys.isDerivedEmbeddingArtifactKey(key) or
+            !internal_keys.matchesDerivedEmbeddingArtifactName(key, requestEmbeddingName(request))) continue;
+        const base_key = (try internal_keys.derivedEmbeddingBaseKeyAlloc(alloc, key)) orelse continue;
+        defer alloc.free(base_key);
+        if (desired.contains(base_key)) continue;
+        try artifact_delete_keys.append(alloc, try alloc.dupe(u8, key));
     }
 }
 
@@ -52494,6 +52528,7 @@ fn prepareGeneratedEnrichments(
                         },
                         else => return err,
                     };
+                    try appendStalePrecomputedChunkEmbeddingDeletes(alloc, self, cleaned, request, artifact_writes.items, &chunk_cache, &artifact_delete_keys);
                     try appendPrecomputedCoverageCandidate(
                         alloc,
                         &coverage_candidates,
@@ -52510,6 +52545,7 @@ fn prepareGeneratedEnrichments(
                         },
                         else => return err,
                     };
+                    try appendStalePrecomputedChunkEmbeddingDeletes(alloc, self, cleaned, request, artifact_writes.items, &chunk_cache, &artifact_delete_keys);
                     try appendPrecomputedCoverageCandidate(
                         alloc,
                         &coverage_candidates,
@@ -98680,6 +98716,104 @@ test "db reopened chunked dense HBC deletes stale vectors through artifact loade
         try std.testing.expectEqual(calls_after_first_open, counting.calls);
         try std.testing.expectEqual(@as(u64, 1), reopened.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
     }
+}
+
+test "db chunked dense retry preserves published vectors until replacements succeed" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var gated = GateDenseEmbedder{ .allowed_successes = .init(3) };
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .enrichment = .{
+                .owner_id = "worker-a",
+                .dense_embedder = gated.interface(),
+            },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
+        });
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"abcdefghijklmno\"}" }},
+            .sync_level = .write,
+        });
+        try db.runUntilIdle();
+        try std.testing.expectEqual(@as(u64, 3), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"qrstuvwx\"}" }},
+            .sync_level = .write,
+        });
+        var attempts: usize = 0;
+        while (attempts < 200 and gated.snapshot().blocked_requests == 0) : (attempts += 1)
+            sleepNs(10 * std.time.ns_per_ms);
+        try std.testing.expect(gated.snapshot().blocked_requests > 0);
+        try std.testing.expectEqual(@as(u64, 3), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+    }
+
+    {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{
+            .enrichment = .{
+                .owner_id = "worker-a",
+                .dense_embedder = gated.interface(),
+            },
+        });
+        defer reopened.close();
+        try std.testing.expectEqual(@as(u64, 3), reopened.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+        gated.allowAll();
+        try reopened.runUntilIdle();
+        try std.testing.expectEqual(@as(u64, 1), reopened.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+    }
+}
+
+test "db synchronous chunk replacement retires stale embeddings in the same commit" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var counting = CountingDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = counting.interface(),
+        },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"abcdefghijklmno\"}" }},
+        .sync_level = .full_index,
+    });
+    try std.testing.expectEqual(@as(u64, 3), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"qrstuvwx\"}" }},
+        .sync_level = .full_index,
+    });
+    try std.testing.expectEqual(@as(u64, 1), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+
+    const prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "body_chunks_v1");
+    defer alloc.free(prefix);
+    const artifacts = try db.core.store.scanPrefix(alloc, prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, artifacts);
+    var embeddings: usize = 0;
+    for (artifacts) |entry| {
+        if (internal_keys.isDerivedEmbeddingArtifactKey(entry.key)) embeddings += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), embeddings);
 }
 
 test "db chunked generated dense and sparse embeddings search as parent results" {

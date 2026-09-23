@@ -3648,7 +3648,7 @@ const StaleEmbeddingDeletes = struct {
     artifact_delete_keys: [][]u8 = &.{},
 
     fn deinit(self: *@This(), alloc: Allocator) void {
-        freeKeyList(alloc, self.artifact_delete_keys);
+        if (self.artifact_delete_keys.len > 0) freeKeyList(alloc, self.artifact_delete_keys);
         self.* = .{};
     }
 };
@@ -21736,7 +21736,8 @@ fn processMaterializedChunkDenseRequest(
         try backend_scan.scanWithContext(&runtime.store, lower, upper_bound, .{}, &collect, Collect.scan);
 
         try processCachedChunkDenseItems(runtime, request, consumer_indexes, window, &cached_items, max_window_items, scope);
-        _ = try flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, request.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true, scope);
+        const complete = try flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, request.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true, scope);
+        if (!complete) return;
         try flushGeneratedReplayWindowIfNeededWithIdentity(runtime, window, max_window_items, scope.completedFingerprint());
         batch_source_bytes = 0;
 
@@ -22357,16 +22358,15 @@ fn processChunkedDenseWindow(
 
             var source_set = try chunkEmbeddingSourceSetForRequest(runtime, request, chunk_artifact_name, chunk_cache);
             defer source_set.deinit(runtime.alloc);
-            const request_stale = try deleteStaleChunkEmbeddingArtifacts(runtime, request.doc_key, chunk_artifact_name, embedding_artifact_name, source_set.desired_chunk_keys);
-            var stale_deletes = request_stale;
-            errdefer stale_deletes.deinit(runtime.alloc);
-            try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes);
-            try flushGeneratedReplayWindowIfNeededWithIdentity(runtime, window, max_window_items, scope.completedFingerprint());
+            var stale_deletes = try deleteStaleChunkEmbeddingArtifacts(runtime, request.doc_key, chunk_artifact_name, embedding_artifact_name, source_set.desired_chunk_keys);
+            defer stale_deletes.deinit(runtime.alloc);
             if (source_set.sources.len == 0) {
+                try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes);
                 try markDerivedCoverageSkipped(runtime, window, request, consumer_indexes);
                 continue;
             }
 
+            var request_complete = true;
             source_loop: for (source_set.sources) |*source| {
                 if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
                 const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source.text, request.producer_json);
@@ -22434,8 +22434,35 @@ fn processChunkedDenseWindow(
                     // The failed batch already parked this logical request.
                     // Avoid paying for every remaining chunk after a terminal
                     // provider outcome; later requests retain independent work.
-                    if (!complete) break :source_loop;
+                    if (!complete) {
+                        request_complete = false;
+                        break :source_loop;
+                    }
                 }
+            }
+            if (!request_complete) continue;
+            if (stale_deletes.artifact_delete_keys.len > 0) {
+                // A provider retry must leave the previous published chunks
+                // intact. Finish this request's replacement embeddings before
+                // committing its obsolete artifact keys. Most requests have
+                // no stale keys and retain cross-request batching.
+                const complete = flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true, scope) catch |err| {
+                    if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
+                        return err;
+                    if (deferred_retry_error == null) {
+                        deferred_retry_error = err;
+                        scope.deferRetry(err);
+                    }
+                    var remaining = i + 1;
+                    while (remaining < requests.len) : (remaining += 1) {
+                        if (sameChunkedDenseBatchKey(seed, requests[remaining])) processed[remaining] = true;
+                    }
+                    continue :request_key;
+                };
+                if (!complete) continue;
+                batch_source_bytes = 0;
+                try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes);
+                try flushGeneratedReplayWindowIfNeededWithIdentity(runtime, window, max_window_items, scope.completedFingerprint());
             }
         }
 
@@ -22778,6 +22805,9 @@ fn mergeOwnedArtifactDeleteKeysIntoWindow(
     window: *GeneratedReplayWindow,
     keys: []const []u8,
 ) !void {
+    // Reserve before transferring ownership. A partial append failure would
+    // otherwise leave moved keys in both the window and the caller's cleanup.
+    try window.artifact_delete_keys.ensureUnusedCapacity(runtime.alloc, keys.len);
     defer runtime.alloc.free(keys);
     for (keys) |key| {
         try appendUniqueOwnedKey(runtime.alloc, &window.artifact_delete_keys, key);
@@ -23062,23 +23092,24 @@ fn processChunkText(
     const desired_chunk_keys = try chunkKeysForChunks(runtime.alloc, request.doc_key, artifact_name, chunks);
     defer freeKeyList(runtime.alloc, desired_chunk_keys);
     const desired_stored_chunk_keys: []const []const u8 = if (persist_chunks) desired_chunk_keys else &.{};
-    const stale_vector_keys = try deleteStaleChunkArtifacts(
+    const stale_chunk_keys = try deleteStaleChunkArtifacts(
         runtime,
         request.doc_key,
         artifact_name,
         desired_stored_chunk_keys,
         desired_chunk_keys,
     );
+    defer freeKeyList(runtime.alloc, stale_chunk_keys);
     // Graph reconciliation consumes the artifact journal, not the vector/text
     // deletion stream. Publish stale chunk identities there as well so graph
     // edges disappear when a source document shrinks or is rechunked.
-    for (stale_vector_keys) |key| {
-        if (internal_keys.isChunkArtifactRecordKey(key)) {
-            try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
-        }
+    for (stale_chunk_keys) |key| {
+        try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
+        // The chunk producer owns text and graph cleanup. Embedding consumers
+        // retire their own stale artifacts only after replacements succeed.
+        try appendFullTextDeleteDocumentToWindow(runtime, window, key, text_indexes);
     }
     if (chunks.len == 0) {
-        try mergeOwnedDeletedKeysIntoWindow(runtime, window, stale_vector_keys);
         // A source that chunks to nothing is intentional no-output for the
         // artifact's consumers.
         try queueArtifactCoverageOutcomeForRequest(runtime, window, request, .skipped);
@@ -23134,7 +23165,6 @@ fn processChunkText(
     }
 
     if (text_indexes.len == 0) {
-        try mergeOwnedDeletedKeysIntoWindow(runtime, window, stale_vector_keys);
         try queueArtifactCoverageOutcomeForRequest(runtime, window, request, .produced);
         return;
     }
@@ -23144,7 +23174,6 @@ fn processChunkText(
         if (chunk.isText()) text_chunk_count += 1;
     }
     if (text_chunk_count == 0) {
-        try mergeOwnedDeletedKeysIntoWindow(runtime, window, stale_vector_keys);
         try queueArtifactCoverageOutcomeForRequest(runtime, window, request, .produced);
         return;
     }
@@ -23201,7 +23230,6 @@ fn processChunkText(
         };
         initialized_docs += 1;
     }
-    try mergeOwnedDeletedKeysIntoWindow(runtime, window, stale_vector_keys);
     try appendOwnedDocumentsToWindow(runtime, window, &docs);
     initialized_docs = 0;
     try queueArtifactCoverageOutcomeForRequest(runtime, window, request, .produced);
@@ -26877,8 +26905,8 @@ fn deleteStaleChunkArtifacts(
         for (deletes.items) |key| runtime.alloc.free(@constCast(key));
         deletes.deinit(runtime.alloc);
     }
-    var stale_vector_keys = std.ArrayListUnmanaged([]u8).empty;
-    errdefer deinitOwnedKeyList(runtime.alloc, &stale_vector_keys);
+    var stale_chunk_keys = std.ArrayListUnmanaged([]u8).empty;
+    errdefer deinitOwnedKeyList(runtime.alloc, &stale_chunk_keys);
 
     for (existing) |entry| {
         if (internal_keys.isChunkArtifactRecordKey(entry.key)) {
@@ -26887,21 +26915,17 @@ fn deleteStaleChunkArtifacts(
             // logical identity. Only a chunk absent from the current chunking
             // result should be withdrawn from downstream indexes.
             if (!keyInList(entry.key, desired_logical_chunk_keys)) {
-                try appendUniqueDupeKey(runtime.alloc, &stale_vector_keys, entry.key);
+                try appendUniqueDupeKey(runtime.alloc, &stale_chunk_keys, entry.key);
             }
             try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, entry.key));
             continue;
         }
-        if (internal_keys.isDerivedEmbeddingArtifactKey(entry.key)) {
-            if (derivedEmbeddingBelongsToDesiredChunk(entry.key, desired_logical_chunk_keys)) continue;
-            if (try internal_keys.derivedEmbeddingBaseKeyAlloc(runtime.alloc, entry.key)) |base_key| {
-                try appendUniqueOwnedKey(runtime.alloc, &stale_vector_keys, base_key);
-            }
-            try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, entry.key));
-        }
+        // Derived embedding artifacts are owned by their embedding request.
+        // Deleting them here withdraws serving vectors before a retryable
+        // provider can produce replacements, including across process reopen.
     }
     if (deletes.items.len > 0) try storePutBatchWithRetry(runtime, &.{}, deletes.items);
-    return try stale_vector_keys.toOwnedSlice(runtime.alloc);
+    return try stale_chunk_keys.toOwnedSlice(runtime.alloc);
 }
 
 fn chunkArtifactSourceHash(runtime: *EnrichmentRuntime, chunk_key: []const u8, source_field: []const u8, producer_json: []const u8) !?u64 {
