@@ -107,7 +107,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const hash_mod = options.antfly_imports.hash;
     const vectorindex_mod = options.antfly_imports.vectorindex;
     const usermgr_mod = options.usermgr_mod;
-    const vellum_mod = options.antfly_imports.vellum;
+    const fst_mod = options.antfly_imports.fst;
     const regex_mod = options.antfly_imports.regex;
     const json_mod = options.antfly_imports.json;
     const matcher_mod = options.antfly_imports.matcher;
@@ -645,6 +645,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "inference runtime preload parser preserves registry variants and explicit backends",
             "inference run config",
             "inference list accepts models directory before or after flags",
+            "kernel JIT mode precedence is CLI then environment then config then default",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -1476,7 +1477,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // Keep retrieval's unit/contract gate independent of the HTTP-linked
     // serving harness pulled in by root-test. Reuse the same root module and
     // runner, with only retrieval tests selected for code generation.
-    const retrieval_filters = &[_][]const u8{ "api.retrieval_agent.", "api.web_search." };
+    const retrieval_filters = &[_][]const u8{ "api.retrieval_agent.", "api.document_renderer.", "api.web_search." };
     const retrieval_selected_filters = selectTestFilters(b, retrieval_filters);
     const retrieval_tests = b.addTest(.{
         .root_module = antfly_test_mod,
@@ -4615,7 +4616,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     persistent_test_mod.addImport("antfly_pdf", pdf_mod);
     persistent_test_mod.addImport("bloom", bloom_mod);
     persistent_test_mod.addImport("antfly_pdf", pdf_mod);
-    persistent_test_mod.addImport("antfly_vellum", vellum_mod);
+    persistent_test_mod.addImport("antfly_fst", fst_mod);
     persistent_test_mod.addImport("antfly_regex", regex_mod);
     persistent_test_mod.addImport("antfly_vector", vector_mod);
     persistent_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
@@ -4686,7 +4687,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const persistent_soak_engine_mod = makeLmdbEngineModule(b, target, optimize, true, persistent_soak_build_options);
     const persistent_soak_test_mod = makeLmdbModule(b, "pkg/antfly/src/persistent_test_root.zig", target, optimize, persistent_soak_build_options, persistent_soak_engine_mod, platform_mod, hash_mod);
     persistent_soak_test_mod.addImport("bloom", bloom_mod);
-    persistent_soak_test_mod.addImport("antfly_vellum", vellum_mod);
+    persistent_soak_test_mod.addImport("antfly_fst", fst_mod);
     persistent_soak_test_mod.addImport("antfly_regex", regex_mod);
     persistent_soak_test_mod.addImport("antfly_vector", vector_mod);
     persistent_soak_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
@@ -4704,7 +4705,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const index_manager_test_mod = makeLmdbModule(b, "pkg/antfly/src/index_manager_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     addSnowballModule(b, index_manager_test_mod);
     index_manager_test_mod.addImport("bloom", bloom_mod);
-    index_manager_test_mod.addImport("antfly_vellum", vellum_mod);
+    index_manager_test_mod.addImport("antfly_fst", fst_mod);
     index_manager_test_mod.addImport("antfly_vector", vector_mod);
     index_manager_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
     index_manager_test_mod.addImport("antfly_matcher", matcher_mod);
@@ -4782,7 +4783,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     addSnowballModule(b, db_test_mod);
     db_test_mod.addImport("bloom", bloom_mod);
     db_test_mod.addImport("handlebars", handlebars_mod);
-    db_test_mod.addImport("antfly_vellum", vellum_mod);
+    db_test_mod.addImport("antfly_fst", fst_mod);
     db_test_mod.addImport("antfly_vector", vector_mod);
     db_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
     db_test_mod.addImport("antfly_matcher", matcher_mod);

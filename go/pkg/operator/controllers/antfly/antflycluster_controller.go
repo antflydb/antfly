@@ -125,10 +125,20 @@ const (
 	antflyRuntimeUID int64 = 10001
 	antflyRuntimeGID int64 = 10001
 
-	antflySecretStoreVolumeName                   = "secret-store"
-	antflySecretStoreDefaultKey                   = "secrets.json"
-	antflySecretStoreDefaultPath                  = "/run/antfly/secrets/secrets.json" // #nosec G101 -- file path, not a credential
-	antflyExtensionPackageStoreEnvVar             = "ANTFLY_EXTENSION_PACKAGE_STORE"
+	antflySecretStoreVolumeName       = "secret-store"
+	antflySecretStoreDefaultKey       = "secrets.json"
+	antflySecretStoreDefaultPath      = "/run/antfly/secrets/secrets.json" // #nosec G101 -- file path, not a credential
+	antflyExtensionPackageStoreEnvVar = "ANTFLY_EXTENSION_PACKAGE_STORE"
+	// antflyProcessMemoryBudgetEnvVar tells the Antfly/inference runtime its
+	// process memory envelope in MiB. It matters for Burstable pods whose
+	// request is below the container's memory limit: Kubernetes still sets
+	// the cgroup hard limit to that (finite) Limits value, but does not
+	// otherwise expose the intended operating envelope, and a container with
+	// only a Requests value (no Limits) gets an unbounded ("max") cgroup. See
+	// zig/MANAGERS.md "Budget derivation". The operator sets this only when
+	// the pod has an explicit memory limit, to a value safely below it so the
+	// process throttles itself before the kernel OOM-kills the container.
+	antflyProcessMemoryBudgetEnvVar               = "ANTFLY_PROCESS_MEMORY_BUDGET_MB" // #nosec G101 -- environment variable name, not a credential
 	antflyStandaloneExtensionPackageStore         = "/antflydb/extensions"
 	antflyInternalServiceSecretEnvVar             = "ANTFLY_INTERNAL_SERVICE_SECRET"              // #nosec G101 -- environment variable name, not a credential
 	antflyInternalServiceVerificationSecretEnvVar = "ANTFLY_INTERNAL_SERVICE_VERIFICATION_SECRET" // #nosec G101 -- environment variable name, not a credential
@@ -1926,12 +1936,16 @@ func (r *AntflyClusterReconciler) applyDefaults(cluster *antflyv1.AntflyCluster)
 			cluster.Spec.Standalone.Health.Port = 4200
 		}
 		if cluster.Spec.Standalone.Inference == nil {
+			// Leave APIURL unset: standalone runs its embedded, in-process
+			// inference provider by default. In the Zig runtime, a set
+			// inference.api_url is a hard isolation contract that disables the
+			// embedded provider, preloads, and /ai/v1 routes, so the operator
+			// must never invent one. Only an explicit user-supplied APIURL (or
+			// a value already present in spec.config) should point standalone
+			// at an external/shared inference endpoint.
 			cluster.Spec.Standalone.Inference = &antflyv1.StandaloneInferenceSpec{
 				Enabled: true,
-				APIURL:  "http://0.0.0.0:11433",
 			}
-		} else if cluster.Spec.Standalone.Inference.APIURL == "" {
-			cluster.Spec.Standalone.Inference.APIURL = "http://0.0.0.0:11433"
 		}
 	}
 
@@ -4347,9 +4361,16 @@ func (r *AntflyClusterReconciler) generateStandaloneConfig(cluster *antflyv1.Ant
 		return "", fmt.Errorf("spec.standalone is required when spec.mode=Standalone")
 	}
 	inferenceEnabled := standalone.Inference == nil || standalone.Inference.Enabled
-	inferenceAPIURL := "http://0.0.0.0:11433"
-	if standalone.Inference != nil && standalone.Inference.APIURL != "" {
-		inferenceAPIURL = standalone.Inference.APIURL
+	// An explicit inference.apiURL is a hard isolation contract in the Zig
+	// runtime: when set, standalone disables its embedded, in-process
+	// inference provider (preloads and /ai/v1 routes included) and expects a
+	// real listener at that address. Only emit api_url when the user actually
+	// pinned one (spec.standalone.inference.apiURL) — never invent a value
+	// such as the old http://0.0.0.0:11433 default, which nothing listens on
+	// and which silently broke embedded inference.
+	inferenceAPIURL := ""
+	if standalone.Inference != nil {
+		inferenceAPIURL = strings.TrimSpace(standalone.Inference.APIURL)
 	}
 
 	// Parse user-provided configuration
@@ -4393,8 +4414,17 @@ func (r *AntflyClusterReconciler) generateStandaloneConfig(cluster *antflyv1.Ant
 		if userInference, ok := userConfig["inference"].(map[string]any); ok {
 			maps.Copy(inferenceConfig, userInference)
 		}
-		inferenceConfig["api_url"] = inferenceAPIURL
-		completeConfig["inference"] = inferenceConfig
+		if inferenceAPIURL != "" {
+			// spec.standalone.inference.apiURL always wins: it is the explicit,
+			// user-pinned external/shared endpoint.
+			inferenceConfig["api_url"] = inferenceAPIURL
+		}
+		// Otherwise leave api_url exactly as the user's raw spec.config set it
+		// (including unset), so embedded inference stays enabled unless the
+		// user explicitly opted out of it.
+		if len(inferenceConfig) > 0 {
+			completeConfig["inference"] = inferenceConfig
+		}
 	}
 
 	completeConfig["storage"] = standaloneRuntimeStorageConfig(cluster)
@@ -4943,6 +4973,17 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 				},
 			)
 		}
+		standaloneResources := r.buildResourceRequirements(standalone.Resources)
+		standaloneEnv := append(
+			append(append(haRuntimeAdminTokenEnv(cluster.Spec.HighAvailability), haPodUIDEnv()...), haRuntimeLeaseEnv(cluster)...),
+			corev1.EnvVar{
+				Name:  antflyExtensionPackageStoreEnvVar,
+				Value: antflyStandaloneExtensionPackageStore,
+			},
+		)
+		if budgetEnv := processMemoryBudgetEnvVar(standaloneResources.Limits); budgetEnv != nil {
+			standaloneEnv = append(standaloneEnv, *budgetEnv)
+		}
 		statefulSet.Spec.Template = corev1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{
 				Labels:      podLabels(cluster, component),
@@ -4960,13 +5001,7 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 						Image:           cluster.Spec.Image,
 						ImagePullPolicy: corev1.PullPolicy(cluster.Spec.ImagePullPolicy),
 						EnvFrom:         envFromSources,
-						Env: append(
-							append(append(haRuntimeAdminTokenEnv(cluster.Spec.HighAvailability), haPodUIDEnv()...), haRuntimeLeaseEnv(cluster)...),
-							corev1.EnvVar{
-								Name:  antflyExtensionPackageStoreEnvVar,
-								Value: antflyStandaloneExtensionPackageStore,
-							},
-						),
+						Env:             standaloneEnv,
 						Ports: []corev1.ContainerPort{
 							{
 								Name:          "metadata-api",
@@ -5011,7 +5046,7 @@ exec /antfly standalone --id %d --config /config/config.json \
 								standaloneHAStartupArgs(cluster),
 							),
 						},
-						Resources:    r.buildResourceRequirements(standalone.Resources),
+						Resources:    standaloneResources,
 						StartupProbe: buildHTTPStartupProbe(standalone.Health.Port, standalone.StartupProbe),
 						LivenessProbe: &corev1.Probe{
 							ProbeHandler: corev1.ProbeHandler{
@@ -5711,6 +5746,44 @@ func (r *AntflyClusterReconciler) buildResourceRequirements(resourceSpec antflyv
 	}
 
 	return requirements
+}
+
+// processMemoryBudgetMB derives the ANTFLY_PROCESS_MEMORY_BUDGET_MB value
+// from a container's memory limit, leaving 10% headroom below the cgroup hard
+// limit so the runtime throttles/rejects before the kernel OOM-kills the
+// container. It returns ok=false when no memory limit is set, since an
+// unbounded ("max") cgroup gives no safe envelope to derive from.
+func processMemoryBudgetMB(limits corev1.ResourceList) (int64, bool) {
+	if limits == nil {
+		return 0, false
+	}
+	qty, ok := limits[corev1.ResourceMemory]
+	if !ok {
+		return 0, false
+	}
+	limitBytes := qty.Value()
+	if limitBytes <= 0 {
+		return 0, false
+	}
+	const mib = 1024 * 1024
+	budget := (limitBytes * 9 / 10) / mib
+	if budget < 1 {
+		budget = 1
+	}
+	return budget, true
+}
+
+// processMemoryBudgetEnvVar builds the ANTFLY_PROCESS_MEMORY_BUDGET_MB
+// EnvVar for a container's resource limits, or nil when no budget applies.
+func processMemoryBudgetEnvVar(limits corev1.ResourceList) *corev1.EnvVar {
+	budgetMB, ok := processMemoryBudgetMB(limits)
+	if !ok {
+		return nil
+	}
+	return &corev1.EnvVar{
+		Name:  antflyProcessMemoryBudgetEnvVar,
+		Value: strconv.FormatInt(budgetMB, 10),
+	}
 }
 
 func buildHTTPStartupProbe(port int32, cfg *antflyv1.ProbeConfig) *corev1.Probe {

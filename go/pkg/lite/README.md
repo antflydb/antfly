@@ -100,10 +100,12 @@ re-execs `argv[0]`, itself), a Go binary linking `libantfly` has no
 executable itself, in order: the `ANTFLY_INFERENCE_WORKER` environment
 variable (a path to the worker executable, typically an `antfly` binary);
 otherwise an `antfly` binary next to the loaded `libantfly`; otherwise
-`antfly` on `PATH`. If none of these resolve, calls into a process-isolated
-backend fail with a clear error naming `ANTFLY_INFERENCE_WORKER` -- set it
-(or place an `antfly` binary next to `libantfly` or on `PATH`) before opening
-a `LocalRuntimeConfigured` handle that needs Metal/CUDA/ONNX/PJRT models. See
+`antfly` on `PATH`. In a build that includes Metal (the macOS default), CUDA,
+ONNX, or PJRT, opening a `LocalRuntimeConfigured` handle spawns the worker, and
+all local inference, CPU models included, runs there. If none of these
+resolve, the spawn fails with a clear error naming `ANTFLY_INFERENCE_WORKER` --
+set it (or place an `antfly` binary next to `libantfly` or on `PATH`) before
+opening the handle. See
 `zig/LITE.md`'s "Local Embedded Inference" section for the full resolution
 order and rationale.
 

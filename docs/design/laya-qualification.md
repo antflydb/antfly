@@ -110,7 +110,8 @@ affect throughput: the 16-question mixed batch achieves 46.40 questions/second.
 The corresponding CPU mixed medians are 249.897, 371.657, 691.859, 1847.814,
 and 3759.179 ms, with maximum probability error `0.0000032`.
 Large batches of the full checkpoint with long sequences have not been qualified
-through the 512-task API limit. CUDA is deferred.
+through the 512-task API limit. CUDA is qualified separately on NVIDIA L4
+(`scripts/laya_cuda_qualify.py`).
 
 The focused Metal suite passed all 11 selected tests, including the kernel
 threshold regression. Native CPU passed the nine pipeline/configuration tests;
