@@ -107,7 +107,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const hash_mod = options.antfly_imports.hash;
     const vectorindex_mod = options.antfly_imports.vectorindex;
     const usermgr_mod = options.usermgr_mod;
-    const vellum_mod = options.antfly_imports.vellum;
+    const fst_mod = options.antfly_imports.fst;
     const regex_mod = options.antfly_imports.regex;
     const json_mod = options.antfly_imports.json;
     const matcher_mod = options.antfly_imports.matcher;
@@ -645,6 +645,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "inference runtime preload parser preserves registry variants and explicit backends",
             "inference run config",
             "inference list accepts models directory before or after flags",
+            "kernel JIT mode precedence is CLI then environment then config then default",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -1437,11 +1438,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db graph shortest path searches through admitted alternatives",
         "db graph artifact external node targets return ids without document hydration",
         "db graph hydration rejects table-qualified entity nodes in local snapshots",
+        "db complete-snapshot scope expands graph traversal through tagged entity nodes",
         "db index repair streams graph artifact rebuild in batches",
         "api distributed graph cross-table hydrate enforces target authorization",
         "public table query handler maps exact graph execution failures",
         "unsupported graph diagnostics identify the rejected operation feature",
         "authenticated single-group graph queries require distributed coordination",
+        "single-group graph requests carry the complete-snapshot execution scope",
         "graph table queries have one fresh-topology retry",
         "generic shard query wire preserves admitted canonical graph operations without reparsing",
         "generic shard query wire fails closed without an admitted graph fragment",
@@ -1474,7 +1477,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // Keep retrieval's unit/contract gate independent of the HTTP-linked
     // serving harness pulled in by root-test. Reuse the same root module and
     // runner, with only retrieval tests selected for code generation.
-    const retrieval_filters = &[_][]const u8{ "api.retrieval_agent.", "api.web_search." };
+    const retrieval_filters = &[_][]const u8{ "api.retrieval_agent.", "api.document_renderer.", "api.web_search." };
     const retrieval_selected_filters = selectTestFilters(b, retrieval_filters);
     const retrieval_tests = b.addTest(.{
         .root_module = antfly_test_mod,
@@ -1527,6 +1530,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "table contract preserves typed artifact-backed graph configuration",
         "created index configs normalize single-source input forms",
         "merged index metadata validates artifact consumer references",
+        "index metadata closes neighbor context graph index references at admission",
         "graph config accepts canonical single-source mappings without a discriminator",
         "created graph index response projects closed nested schemas",
         "index encoders expose graph sources once in normalized config",
@@ -1686,8 +1690,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     secret_backend_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const secret_backend_tests = b.addTest(.{
         .root_module = secret_backend_test_mod,
-        // ReleaseSafe on macOS peaks above the aggregate 10 GiB estimate.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 13 else 7) * 1024 * 1024 * 1024,
+        // ReleaseSafe peaks above the aggregate estimates on both platforms:
+        // 12.88 GB measured on x86_64-linux in the VOPR qualification lane,
+        // above 10 GiB on macOS. Debug keeps the conservative default so the
+        // unit lanes retain their tighter scheduler claim.
+        .max_rss = @as(usize, switch (target.result.os.tag) {
+            .macos => 13,
+            else => if (optimize == .Debug) 7 else 14,
+        }) * 1024 * 1024 * 1024,
         .filters = &.{"secret backend"},
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
@@ -4606,7 +4616,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     persistent_test_mod.addImport("antfly_pdf", pdf_mod);
     persistent_test_mod.addImport("bloom", bloom_mod);
     persistent_test_mod.addImport("antfly_pdf", pdf_mod);
-    persistent_test_mod.addImport("antfly_vellum", vellum_mod);
+    persistent_test_mod.addImport("antfly_fst", fst_mod);
     persistent_test_mod.addImport("antfly_regex", regex_mod);
     persistent_test_mod.addImport("antfly_vector", vector_mod);
     persistent_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
@@ -4677,7 +4687,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const persistent_soak_engine_mod = makeLmdbEngineModule(b, target, optimize, true, persistent_soak_build_options);
     const persistent_soak_test_mod = makeLmdbModule(b, "pkg/antfly/src/persistent_test_root.zig", target, optimize, persistent_soak_build_options, persistent_soak_engine_mod, platform_mod, hash_mod);
     persistent_soak_test_mod.addImport("bloom", bloom_mod);
-    persistent_soak_test_mod.addImport("antfly_vellum", vellum_mod);
+    persistent_soak_test_mod.addImport("antfly_fst", fst_mod);
     persistent_soak_test_mod.addImport("antfly_regex", regex_mod);
     persistent_soak_test_mod.addImport("antfly_vector", vector_mod);
     persistent_soak_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
@@ -4695,7 +4705,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const index_manager_test_mod = makeLmdbModule(b, "pkg/antfly/src/index_manager_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     addSnowballModule(b, index_manager_test_mod);
     index_manager_test_mod.addImport("bloom", bloom_mod);
-    index_manager_test_mod.addImport("antfly_vellum", vellum_mod);
+    index_manager_test_mod.addImport("antfly_fst", fst_mod);
     index_manager_test_mod.addImport("antfly_vector", vector_mod);
     index_manager_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
     index_manager_test_mod.addImport("antfly_matcher", matcher_mod);
@@ -4773,7 +4783,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     addSnowballModule(b, db_test_mod);
     db_test_mod.addImport("bloom", bloom_mod);
     db_test_mod.addImport("handlebars", handlebars_mod);
-    db_test_mod.addImport("antfly_vellum", vellum_mod);
+    db_test_mod.addImport("antfly_fst", fst_mod);
     db_test_mod.addImport("antfly_vector", vector_mod);
     db_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
     db_test_mod.addImport("antfly_matcher", matcher_mod);
@@ -4953,6 +4963,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "query parser accepts direct graph metric reads",
         "query parser accepts graph metric rerank",
         "api query contract bounds graph metric top k",
+        "api query contract admits personalized graph metric seed fields",
+        "api query contract rejects malformed personalized graph metric shapes",
         "api query contract uses portable graph metric filter operators",
         "api query contract rejects oversized and duplicate graph metric clauses",
         "query encoder emits graph metric results",

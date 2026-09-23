@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
@@ -26,6 +26,13 @@ class GraphMetricQuery:
                 metric snapshot. Default: 10.
             metric_freshness (GraphMetricQueryMetricFreshness | Unset): Whether the latest published generation may be stale
                 or must match the graph edge generation. Default: GraphMetricQueryMetricFreshness.PUBLISHED.
+            seed_nodes (list[str] | Unset): Node keys receiving all teleport mass for query-seeded personalized PageRank
+                (HippoRAG-style retrieval). Only valid for pagerank metrics and requires metric_freshness=fresh: personalized
+                scores are computed at query time from the current edge snapshot, while published generations are global-only,
+                so seeded reads against published freshness are rejected. Seed keys absent from the graph are skipped; if none
+                resolve, ranking degenerates to global PageRank.
+            damping (float | Unset): Damping override for query-seeded personalized PageRank (typical HippoRAG-style
+                retrieval uses 0.9). Only valid together with seed_nodes; omitted reads keep the metric's configured damping.
     """
 
     index: str
@@ -33,6 +40,8 @@ class GraphMetricQuery:
     name: str | Unset = UNSET
     top_k: int | Unset = 10
     metric_freshness: GraphMetricQueryMetricFreshness | Unset = GraphMetricQueryMetricFreshness.PUBLISHED
+    seed_nodes: list[str] | Unset = UNSET
+    damping: float | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -48,6 +57,12 @@ class GraphMetricQuery:
         if not isinstance(self.metric_freshness, Unset):
             metric_freshness = self.metric_freshness.value
 
+        seed_nodes: list[str] | Unset = UNSET
+        if not isinstance(self.seed_nodes, Unset):
+            seed_nodes = self.seed_nodes
+
+        damping = self.damping
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -62,6 +77,10 @@ class GraphMetricQuery:
             field_dict["top_k"] = top_k
         if metric_freshness is not UNSET:
             field_dict["metric_freshness"] = metric_freshness
+        if seed_nodes is not UNSET:
+            field_dict["seed_nodes"] = seed_nodes
+        if damping is not UNSET:
+            field_dict["damping"] = damping
 
         return field_dict
 
@@ -83,12 +102,18 @@ class GraphMetricQuery:
         else:
             metric_freshness = GraphMetricQueryMetricFreshness(_metric_freshness)
 
+        seed_nodes = cast(list[str], d.pop("seed_nodes", UNSET))
+
+        damping = d.pop("damping", UNSET)
+
         graph_metric_query = cls(
             index=index,
             metric=metric,
             name=name,
             top_k=top_k,
             metric_freshness=metric_freshness,
+            seed_nodes=seed_nodes,
+            damping=damping,
         )
 
         graph_metric_query.additional_properties = d

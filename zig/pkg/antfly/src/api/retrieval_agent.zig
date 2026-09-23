@@ -29,12 +29,14 @@ const query_contract = @import("query_contract.zig");
 const query_builder_agent = @import("query_builder_agent.zig");
 const json_helpers = @import("json_helpers.zig");
 const wildcard_mod = @import("../search/wildcard.zig");
+const graph_query_mod = @import("../graph/query.zig");
 
 const AgentDecision = metadata_openapi.AgentDecision;
 const AgentQuestion = metadata_openapi.AgentQuestion;
 const AgentStatus = metadata_openapi.AgentStatus;
 const AgentStep = metadata_openapi.AgentStep;
 const QueryHit = metadata_openapi.QueryHit;
+const document_renderer = @import("document_renderer.zig");
 const QueryRequest = metadata_openapi.QueryRequest;
 const QueryResponses = metadata_openapi.QueryResponses;
 const GraphPath = indexes_openapi.GraphPath;
@@ -2799,6 +2801,8 @@ const ParsedGenerationConfig = struct {
     chain: []const generating.ChainLink,
     system_prompt: ?[]const u8,
     generation_context: ?[]const u8,
+    /// Per-hit Handlebars template for the prompt; null renders TOON.
+    document_renderer: ?[]const u8 = null,
 };
 
 const ParsedClassificationConfig = struct {
@@ -3432,7 +3436,26 @@ fn parseGenerationConfig(
     alloc: std.mem.Allocator,
     request: RetrievalAgentRequest,
 ) !?ParsedGenerationConfig {
-    if (request.document_renderer != null) return error.UnsupportedRetrievalAgentRequest;
+    // Validate before building the chain so a bad template leaks nothing.
+    if (request.document_renderer) |renderer| {
+        document_renderer.validateTemplate(alloc, renderer) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidRetrievalAgentRequest,
+        };
+    }
+    var parsed = try parseGenerationSteps(alloc, request) orelse {
+        // A renderer only shapes the generation prompt.
+        if (request.document_renderer != null) return error.InvalidRetrievalAgentRequest;
+        return null;
+    };
+    parsed.document_renderer = request.document_renderer;
+    return parsed;
+}
+
+fn parseGenerationSteps(
+    alloc: std.mem.Allocator,
+    request: RetrievalAgentRequest,
+) !?ParsedGenerationConfig {
     const steps = request.steps orelse {
         if (request.chain != null) return error.UnsupportedRetrievalAgentRequest;
         return null;
@@ -3802,7 +3825,7 @@ fn buildGenerationMessages(
     defer context_arena.deinit();
     const selected_hits = try selectHitsForGenerationContext(context_arena.allocator(), query, ordered_hits);
     try trimSelectedTreeBranches(context_arena.allocator(), selected_hits, ordered_hits);
-    const documents_context = try buildGenerationDocumentsContext(alloc, query, selected_hits);
+    const documents_context = try buildGenerationDocumentsContext(alloc, query, selected_hits, cfg.document_renderer);
     defer alloc.free(documents_context);
 
     const tree_context = try buildTreeGenerationContext(alloc, selected_hits);
@@ -3843,6 +3866,7 @@ fn buildGenerationDocumentsContext(
     alloc: std.mem.Allocator,
     query: []const u8,
     hits: []const QueryHit,
+    renderer: ?[]const u8,
 ) ![]u8 {
     const maybe_branches = try rankedTreeBranchesForQuery(alloc, query, hits);
     defer if (maybe_branches) |branches| alloc.free(branches);
@@ -3881,7 +3905,7 @@ fn buildGenerationDocumentsContext(
                 try out.appendSlice(alloc, " (id=");
                 try out.appendSlice(alloc, hit._id);
                 try out.appendSlice(alloc, "): ");
-                const description = try describeHitForGeneration(alloc, hit);
+                const description = try describeHitForPrompt(alloc, hit, renderer);
                 defer alloc.free(description);
                 try out.appendSlice(alloc, description);
                 try out.append(alloc, '\n');
@@ -3901,7 +3925,7 @@ fn buildGenerationDocumentsContext(
         try out.appendSlice(alloc, " (id=");
         try out.appendSlice(alloc, hit._id);
         try out.appendSlice(alloc, "): ");
-        const description = try describeHitForGeneration(alloc, hit);
+        const description = try describeHitForPrompt(alloc, hit, renderer);
         defer alloc.free(description);
         try out.appendSlice(alloc, description);
         try out.append(alloc, '\n');
@@ -4627,21 +4651,44 @@ fn compareTreeBranchSummaryForQuery(lhs: TreeBranchSummary, rhs: TreeBranchSumma
     return compareTreeBranchSummary(lhs, rhs);
 }
 
+/// Describe a hit for relevance scoring: tree position plus the source JSON.
 fn describeHitForGeneration(
     alloc: std.mem.Allocator,
     hit: QueryHit,
 ) ![]const u8 {
     const source = hit._source orelse return try alloc.dupe(u8, "null");
-    const object = source.map;
-    const tree_meta = object.get("_tree");
     // Use page_allocator to avoid @memcpy aliasing with arena-backed json strings.
-    const encoded_source = blk: {
-        var tmp: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
-        defer tmp.deinit();
-        try std.json.Stringify.value(source, .{}, &tmp.writer);
-        break :blk try alloc.dupe(u8, tmp.written());
-    };
-    if (tree_meta == null or tree_meta.? != .object) return encoded_source;
+    var tmp: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+    defer tmp.deinit();
+    try std.json.Stringify.value(source, .{}, &tmp.writer);
+    return try describeHitWithBody(alloc, hit, tmp.written());
+}
+
+/// Describe a hit for the generation prompt: tree position plus the source
+/// rendered as TOON, or through the request's `document_renderer`.
+fn describeHitForPrompt(
+    alloc: std.mem.Allocator,
+    hit: QueryHit,
+    renderer: ?[]const u8,
+) ![]const u8 {
+    const source_map: ?std.json.ObjectMap = if (hit._source) |source| source.map else null;
+    const body = if (renderer) |template_source|
+        try document_renderer.renderTemplate(alloc, template_source, hit._id, hit._score, source_map)
+    else if (source_map) |map|
+        try document_renderer.renderDefault(alloc, map)
+    else
+        try alloc.dupe(u8, "null");
+    defer alloc.free(body);
+    return try describeHitWithBody(alloc, hit, body);
+}
+
+fn describeHitWithBody(
+    alloc: std.mem.Allocator,
+    hit: QueryHit,
+    encoded_source: []const u8,
+) ![]const u8 {
+    const tree_meta = if (hit._source) |source| source.map.get("_tree") else null;
+    if (tree_meta == null or tree_meta.? != .object) return try alloc.dupe(u8, encoded_source);
 
     const meta = tree_meta.?.object;
     const depth = switch (meta.get("depth") orelse .null) {
@@ -6574,9 +6621,109 @@ fn encodeQueryValueForRetrievalQueryWithText(
         );
     }
 
+    // HippoRAG-style personalization: a fresh graph_metric_rerank carrying an
+    // explicit auto_seed=true opts this query into seeding the metric from its
+    // literal graph-search start-node keys — the resolved query entities.
+    // Caller-provided seed_nodes are authoritative and are never overwritten.
+    // Seeds are injected into the encoded object. Queries without literal
+    // start keys keep their unseeded (global) rerank behavior.
+    const seed_keys = try collectSeedMetricRerankKeys(arena, value, query_request);
+    // auto_seed is an agent-level directive; the engine hop never sees it.
+    if (query_request.graph_metric_rerank) |*rerank| rerank.auto_seed = null;
+
     // This is an internal request hop, so keep the canonical wire compact and
     // preserve the public absent-vs-null contract for optional fields.
-    return try std.json.Stringify.valueAlloc(alloc, query_request, .{ .emit_null_optional_fields = false });
+    const encoded = try std.json.Stringify.valueAlloc(alloc, query_request, .{ .emit_null_optional_fields = false });
+    if (seed_keys.len == 0) return encoded;
+    defer alloc.free(encoded);
+    return try injectSeedNodesIntoEncodedQuery(alloc, arena, encoded, seed_keys);
+}
+
+/// Literal graph-search start keys for personalized metric seeding. Seeding
+/// is explicit opt-in: it requires auto_seed=true on the raw rerank object.
+/// Caller-provided seed_nodes always win — an opted-in rerank that already
+/// carries seeds is left untouched. auto_seed is only valid for pagerank
+/// metrics with metric_freshness=fresh (personalization requires fresh
+/// reads), so an opted-in published-freshness rerank is rejected instead of
+/// silently ignoring the flag. The metric's configured kind is not visible
+/// through the agent's QueryRunner surface; a non-pagerank metric is
+/// rejected by the engine when the seeded rerank executes.
+fn collectSeedMetricRerankKeys(
+    arena: std.mem.Allocator,
+    raw_query: std.json.Value,
+    query_request: QueryRequest,
+) ![]const []const u8 {
+    const rerank = query_request.graph_metric_rerank orelse return &.{};
+    if (!rawRerankAutoSeedRequested(raw_query)) return &.{};
+    if (rerank.seed_nodes != null) return &.{};
+    if (!std.mem.eql(u8, rerank.metric_freshness orelse "published", "fresh"))
+        return error.InvalidRetrievalAgentRequest;
+    const graph_queries = query_request.graph_queries orelse return &.{};
+
+    var keys = std.ArrayListUnmanaged([]const u8).empty;
+    for (graph_queries.map.values()) |graph_query| {
+        switch (graph_query) {
+            .graph_traverse_query => |traverse| switch (traverse.traverse.start) {
+                .graph_key_node_selector => |selector| {
+                    for (selector.keys) |key| try appendUniqueSeedKey(arena, &keys, key);
+                },
+                else => {},
+            },
+            .graph_shortest_path_query => |path| {
+                try appendUniqueSeedKey(arena, &keys, path.shortest_path.from.key);
+                try appendUniqueSeedKey(arena, &keys, path.shortest_path.to.key);
+            },
+            .graph_k_shortest_paths_query => |paths| {
+                try appendUniqueSeedKey(arena, &keys, paths.k_shortest_paths.from.key);
+                try appendUniqueSeedKey(arena, &keys, paths.k_shortest_paths.to.key);
+            },
+            .graph_match_query => {},
+        }
+    }
+    return keys.items;
+}
+
+/// True only when the raw query's graph_metric_rerank object carries an
+/// explicit auto_seed=true. The caller clears the typed flag before the
+/// re-encode, so it never reaches the engine.
+fn rawRerankAutoSeedRequested(raw_query: std.json.Value) bool {
+    if (raw_query != .object) return false;
+    const rerank = raw_query.object.get("graph_metric_rerank") orelse return false;
+    if (rerank != .object) return false;
+    const flag = rerank.object.get("auto_seed") orelse return false;
+    return flag == .bool and flag.bool;
+}
+
+fn appendUniqueSeedKey(
+    arena: std.mem.Allocator,
+    keys: *std.ArrayListUnmanaged([]const u8),
+    key: []const u8,
+) !void {
+    if (key.len == 0) return;
+    // Deterministic first-seen truncation keeps the seed set inside the
+    // engine's bounded per-read limit instead of erroring the retrieval.
+    if (keys.items.len >= graph_query_mod.graph_metric_seed_limit) return;
+    for (keys.items) |existing| if (std.mem.eql(u8, existing, key)) return;
+    try keys.append(arena, key);
+}
+
+fn injectSeedNodesIntoEncodedQuery(
+    alloc: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    encoded: []const u8,
+    seed_keys: []const []const u8,
+) ![]u8 {
+    var parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, encoded, .{}) catch
+        return error.InvalidRetrievalAgentRequest;
+    if (parsed != .object) return error.InvalidRetrievalAgentRequest;
+    const rerank_value = parsed.object.getPtr("graph_metric_rerank") orelse
+        return error.InvalidRetrievalAgentRequest;
+    if (rerank_value.* != .object) return error.InvalidRetrievalAgentRequest;
+    var seeds = std.json.Array.init(arena);
+    try seeds.ensureTotalCapacity(seed_keys.len);
+    for (seed_keys) |key| seeds.appendAssumeCapacity(.{ .string = key });
+    try rerank_value.object.put(arena, "seed_nodes", .{ .array = seeds });
+    return try std.json.Stringify.valueAlloc(alloc, parsed, .{});
 }
 
 fn canonicalQueryRequestFromRetrieval(request: RetrievalQueryRequest) QueryRequest {
@@ -7920,6 +8067,104 @@ test "retrieval agent installs canonical mandatory predicates once" {
 
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, encoded, "\"tenant\""));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, encoded, "\"classification\""));
+}
+
+fn encodeSeedMetricRerankFixture(alloc: std.mem.Allocator, raw_json: []const u8) ![]u8 {
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    var raw = try std.json.parseFromSlice(std.json.Value, alloc, raw_json, .{});
+    defer raw.deinit();
+    var declared = try parseJsonBody(RetrievalQueryRequest, alloc, raw_json);
+    defer declared.deinit();
+    const queries = [_]RetrievalQueryRequest{declared.value};
+    const mandatory = try buildMandatoryPredicates(arena, &queries, &.{});
+
+    return try encodeQueryValueForRetrievalQuery(
+        alloc,
+        ValidationOnlyRunner.iface(),
+        raw.value,
+        declared.value,
+        mandatory[0],
+        &.{},
+        null,
+        0,
+        .initial,
+    );
+}
+
+test "retrieval agent seeds fresh graph metric rerank from graph search start nodes" {
+    const alloc = std.testing.allocator;
+    const encoded = try encodeSeedMetricRerankFixture(alloc,
+        \\{"table":"docs","graph_queries":{"related":{"index":"graph_idx","traverse":{"start":{"keys":["doc:a","doc:b","doc:a"]}}}},"graph_metric_rerank":{"index":"graph_idx","metric":"rank","metric_freshness":"fresh","auto_seed":true},"limit":5}
+    );
+    defer alloc.free(encoded);
+    // With explicit auto_seed opt-in, literal traversal start keys become the
+    // deduplicated teleport seeds of the fresh metric rerank.
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"seed_nodes\":[\"doc:a\",\"doc:b\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"metric_freshness\":\"fresh\"") != null);
+    // auto_seed is an agent-level directive; the typed re-encode drops it
+    // from the internal hop.
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "auto_seed") == null);
+}
+
+test "retrieval agent skips metric seeding without fresh rerank or literal start keys" {
+    const alloc = std.testing.allocator;
+
+    // A published-freshness rerank with an explicit auto_seed opt-in is a
+    // contradiction: personalization requires fresh reads, so the request is
+    // rejected instead of silently ignoring the flag.
+    try std.testing.expectError(error.InvalidRetrievalAgentRequest, encodeSeedMetricRerankFixture(alloc,
+        \\{"table":"docs","graph_queries":{"related":{"index":"graph_idx","traverse":{"start":{"keys":["doc:a"]}}}},"graph_metric_rerank":{"index":"graph_idx","metric":"rank","auto_seed":true},"limit":5}
+    ));
+
+    // An opted-in fresh rerank without literal start keys degrades to the
+    // unseeded request instead of failing the retrieval.
+    const unresolved = try encodeSeedMetricRerankFixture(alloc,
+        \\{"table":"docs","graph_queries":{"related":{"index":"graph_idx","traverse":{"start":{"result_ref":"$query_results","limit":4}}}},"graph_metric_rerank":{"index":"graph_idx","metric":"rank","metric_freshness":"fresh","auto_seed":true},"limit":5}
+    );
+    defer alloc.free(unresolved);
+    try std.testing.expect(std.mem.indexOf(u8, unresolved, "seed_nodes") == null);
+
+    // Without any graph search there is nothing to seed from.
+    const no_graph = try encodeSeedMetricRerankFixture(alloc,
+        \\{"table":"docs","graph_metric_rerank":{"index":"graph_idx","metric":"rank","metric_freshness":"fresh","auto_seed":true},"limit":5}
+    );
+    defer alloc.free(no_graph);
+    try std.testing.expect(std.mem.indexOf(u8, no_graph, "seed_nodes") == null);
+}
+
+test "retrieval agent never overwrites caller seed nodes when auto seeding" {
+    const alloc = std.testing.allocator;
+    const encoded = try encodeSeedMetricRerankFixture(alloc,
+        \\{"table":"docs","graph_queries":{"related":{"index":"graph_idx","traverse":{"start":{"keys":["doc:a","doc:b"]}}}},"graph_metric_rerank":{"index":"graph_idx","metric":"rank","metric_freshness":"fresh","auto_seed":true,"seed_nodes":["custom:x","custom:y"]},"limit":5}
+    );
+    defer alloc.free(encoded);
+    // Caller-provided seed_nodes are authoritative and pass through verbatim;
+    // the literal graph-search start keys are never injected over them.
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"seed_nodes\":[\"custom:x\",\"custom:y\"]") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, encoded, "\"seed_nodes\""));
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"seed_nodes\":[\"doc:a\"") == null);
+}
+
+test "retrieval agent skips metric seeding without explicit auto seed opt-in" {
+    const alloc = std.testing.allocator;
+
+    // A fresh rerank combined with literal graph-search start keys — the
+    // previously auto-seeded shape — stays unseeded when auto_seed is absent.
+    const absent = try encodeSeedMetricRerankFixture(alloc,
+        \\{"table":"docs","graph_queries":{"related":{"index":"graph_idx","traverse":{"start":{"keys":["doc:a","doc:b"]}}}},"graph_metric_rerank":{"index":"graph_idx","metric":"rank","metric_freshness":"fresh"},"limit":5}
+    );
+    defer alloc.free(absent);
+    try std.testing.expect(std.mem.indexOf(u8, absent, "seed_nodes") == null);
+
+    // An explicit auto_seed=false behaves like an absent flag.
+    const disabled = try encodeSeedMetricRerankFixture(alloc,
+        \\{"table":"docs","graph_queries":{"related":{"index":"graph_idx","traverse":{"start":{"keys":["doc:a"]}}}},"graph_metric_rerank":{"index":"graph_idx","metric":"rank","metric_freshness":"fresh","auto_seed":false},"limit":5}
+    );
+    defer alloc.free(disabled);
+    try std.testing.expect(std.mem.indexOf(u8, disabled, "seed_nodes") == null);
 }
 
 test "retrieval contains filter treats wildcard operators as literals" {
@@ -11006,6 +11251,64 @@ test "retrieval agent generation requires a canonical generator when the step is
         error.MissingGenerationConfig,
         parseGenerationConfig(std.testing.allocator, parsed.value),
     );
+}
+
+test "retrieval agent document_renderer requires generation and a valid template" {
+    const cases = [_]struct { body: []const u8, expected: ?anyerror }{
+        .{ .body =
+        \\{"query":"q","queries":[],"document_renderer":"{{encodeToon this.fields}}"}
+        , .expected = error.InvalidRetrievalAgentRequest },
+        .{ .body =
+        \\{"query":"q","queries":[],"document_renderer":"{{encodeToon this.fields indent=0}}","steps":{"generation":{"generator":{"provider":"antfly","model":"local"}}}}
+        , .expected = error.InvalidRetrievalAgentRequest },
+        .{ .body =
+        \\{"query":"q","queries":[],"document_renderer":"{{encodeToon this.fields}}","steps":{"generation":{"generator":{"provider":"antfly","model":"local"}}}}
+        , .expected = null },
+    };
+    for (cases) |case| {
+        var parsed = try parseJsonBody(RetrievalAgentRequest, std.testing.allocator, case.body);
+        defer parsed.deinit();
+        if (case.expected) |expected| {
+            try std.testing.expectError(expected, parseGenerationConfig(std.testing.allocator, parsed.value));
+            continue;
+        }
+        const config = (try parseGenerationConfig(std.testing.allocator, parsed.value)).?;
+        defer {
+            for (config.chain) |link| {
+                var owned = link;
+                owned.deinit(std.testing.allocator);
+            }
+            std.testing.allocator.free(config.chain);
+        }
+        try std.testing.expectEqualStrings("{{encodeToon this.fields}}", config.document_renderer.?);
+    }
+}
+
+test "build generation messages renders documents as TOON by default and through document_renderer" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var source = std.json.ObjectMap.empty;
+    try source.put(alloc, "title", .{ .string = "Vector search" });
+    try source.put(alloc, "year", .{ .integer = 2024 });
+    const hits = [_]QueryHit{.{ ._id = "doc:1", ._score = 1.0, ._source = .{ .map = source } }};
+    const chain = [_]generating.ChainLink{.{ .generator = .{ .provider = .antfly, .model = "local", .url = "http://127.0.0.1:8082" } }};
+
+    const default_messages = try buildGenerationMessages(alloc, "vector search", &hits, .{
+        .chain = &chain,
+        .system_prompt = null,
+        .generation_context = null,
+    });
+    try std.testing.expect(std.mem.indexOf(u8, default_messages[1].content.?.text, "Document 1 (id=doc:1): title: Vector search\nyear: 2024\n") != null);
+
+    const custom_messages = try buildGenerationMessages(alloc, "vector search", &hits, .{
+        .chain = &chain,
+        .system_prompt = null,
+        .generation_context = null,
+        .document_renderer = "{{this.id}} | {{this.fields.title}}",
+    });
+    try std.testing.expect(std.mem.indexOf(u8, custom_messages[1].content.?.text, "Document 1 (id=doc:1): doc:1 | Vector search\n") != null);
 }
 
 fn unreachableRunQuery(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) anyerror!query_api.QueryResponse {

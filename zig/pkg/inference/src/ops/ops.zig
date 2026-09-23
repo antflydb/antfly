@@ -1418,6 +1418,17 @@ pub const WorkloadRegime = enum(u8) {
     speculative_verify = 5,
 };
 
+/// Borrowed tensors and host marker metadata. The returned feature tensor is owned.
+pub const LayaActionFeaturesRequest = struct {
+    hidden: CT,
+    logits: CT,
+    markers: []const i64,
+    batch: usize,
+    sequence: usize,
+    options: usize,
+    hidden_size: usize,
+};
+
 /// Abstract compute backend for tensor operations.
 pub const ComputeBackend = struct {
     ptr: *anyopaque,
@@ -2188,6 +2199,12 @@ pub const ComputeBackend = struct {
         /// attn_bias: optional [num_heads, seq_len, seq_len] additive bias (e.g. T5 relative position bias), or null.
         /// Returns: [batch*seq_len, num_heads*head_dim].
         scaledDotProductAttention: *const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, mask: []const i64, attn_bias: ?CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT,
+
+        /// Inclusive symmetric window; padding masks keys, never introduces causality.
+        /// Token-major Q/K/V and output: [batch*seq_len, num_heads*head_dim].
+        encoderLocalAttention: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, mask: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize, radius: usize) anyerror!CT = null,
+        layaActionFeatures: ?*const fn (ctx: *anyopaque, request: *const LayaActionFeaturesRequest) anyerror!CT = null,
+        packedGegluExact: ?*const fn (ctx: *anyopaque, input: CT, rows: usize, width: usize) anyerror!?CT = null,
 
         /// Optional Qwen3-VL vision-attention route. It has the same unmasked,
         /// unbiased semantics as scaledDotProductAttention with an empty mask,
@@ -3953,6 +3970,22 @@ pub const ComputeBackend = struct {
 
     pub fn whereSelectConsumeFalse(self: *const ComputeBackend, cond: CT, on_true: CT, on_false: CT) !?CT {
         if (self.vtable.whereSelectConsumeFalse) |f| return f(self.ptr, cond, on_true, on_false);
+        return null;
+    }
+
+    pub fn encoderLocalAttention(self: *const ComputeBackend, Q: CT, K: CT, V: CT, mask: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize, radius: usize) !?CT {
+        if (self.vtable.encoderLocalAttention) |f| return try f(self.ptr, Q, K, V, mask, batch, seq_len, num_heads, head_dim, radius);
+        return null;
+    }
+
+    /// Optional exact GELU(gate) * value from [rows, 2*width], without slices.
+    pub fn packedGegluExact(self: *const ComputeBackend, input: CT, rows: usize, width: usize) !?CT {
+        const op = self.vtable.packedGegluExact orelse return null;
+        return op(self.ptr, input, rows, width);
+    }
+
+    pub fn layaActionFeatures(self: *const ComputeBackend, request: *const LayaActionFeaturesRequest) !?CT {
+        if (self.vtable.layaActionFeatures) |f| return try f(self.ptr, request);
         return null;
     }
 

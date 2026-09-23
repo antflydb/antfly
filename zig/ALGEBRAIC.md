@@ -1065,7 +1065,7 @@ graph layouts should eventually be physical access paths under one typed
 sparse-tensor query IR, not isolated query engines with separate semantics.
 
 The full-text term dictionary is a particularly useful physical layout for
-mapped string dimensions. Vellum/FST lookup, range iteration, and automaton
+mapped string dimensions. FST lookup, range iteration, and automaton
 search can implement label selection for dimensions such as `term{}` or
 `scalar{}`:
 
@@ -1504,7 +1504,7 @@ minmax:<expr_id>:<group>:<value> -> count-law support tensor for delete-safe ext
 joinfact:<join_name>:<side>:<fact_key> -> projected left/right contribution facts
 docjf:<doc_key>:<join_name>:<side>:<fact_key> -> per-document join fact references
 lexicon:<dictionary_identity>:<label> -> owned/shared dictionary metadata for that identity
-lexicon_fst:<dictionary_identity>   -> rebuildable Vellum/FST artifact only for the registry owner of row lexicons
+lexicon_fst:<dictionary_identity>   -> rebuildable FST artifact only for the registry owner of row lexicons
 postings:<dictionary_identity>:<label>:<doc_key> -> owned/shared candidate/posting payload for that identity
 symbol rows                        -> canonical token to compact id mapping
 status rows                        -> health, replay, and instrumentation data

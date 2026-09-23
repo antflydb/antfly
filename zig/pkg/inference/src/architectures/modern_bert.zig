@@ -462,30 +462,34 @@ fn encoderLayer(
     const K = try cb.rope(qkv.k, seq_len, head_dim, head_dim, rope_theta, 1.0, 0, config.rope_interleaved);
     defer cb.free(K);
 
-    // For local layers build a sliding-window additive attention bias.
-    // Shape: [num_heads * seq_len * seq_len] (shared across the batch).
-    // The BLAS sdpaOp detects len == num_heads*seq_len*seq_len and applies it
-    // as a per-head shared bias added to raw dot-product scores before softmax.
-    const window_bias: ?CT = if (!is_global) blk: {
-        const half: usize = @intCast(config.local_attention_window / 2);
-        break :blk try buildSlidingWindowBias(cb, allocator, seq_len, num_heads, half);
-    } else null;
-    defer if (window_bias) |wb| cb.free(wb);
+    const attn_out = if (!is_global and cb.kind() == .cuda)
+        (try cb.encoderLocalAttention(Q, K, qkv.v, attention_mask, batch, seq_len, num_heads, head_dim, config.local_attention_window / 2)) orelse return error.UnsupportedLayaBackend
+    else fallback: {
+        // For local layers build a sliding-window additive attention bias.
+        // Shape: [num_heads * seq_len * seq_len] (shared across the batch).
+        // The BLAS sdpaOp detects len == num_heads*seq_len*seq_len and applies it
+        // as a per-head shared bias added to raw dot-product scores before softmax.
+        const window_bias: ?CT = if (!is_global) blk: {
+            const half: usize = @intCast(config.local_attention_window / 2);
+            break :blk try buildSlidingWindowBias(cb, allocator, seq_len, num_heads, half);
+        } else null;
+        defer if (window_bias) |wb| cb.free(wb);
 
-    // Bidirectional scaled dot-product attention (encoder, no causal mask).
-    // The padding mask (attention_mask) is consumed by the backend: positions
-    // where mask[b*seq_len + ki] == 0 are set to -inf before softmax.
-    const attn_out = try cb.scaledDotProductAttention(
-        Q,
-        K,
-        qkv.v,
-        attention_mask,
-        window_bias,
-        batch,
-        seq_len,
-        num_heads,
-        head_dim,
-    );
+        // Bidirectional scaled dot-product attention (encoder, no causal mask).
+        // The padding mask (attention_mask) is consumed by the backend: positions
+        // where mask[b*seq_len + ki] == 0 are set to -inf before softmax.
+        break :fallback try cb.scaledDotProductAttention(
+            Q,
+            K,
+            qkv.v,
+            attention_mask,
+            window_bias,
+            batch,
+            seq_len,
+            num_heads,
+            head_dim,
+        );
+    };
     defer cb.free(attn_out);
 
     // Output projection
@@ -696,6 +700,13 @@ fn geGluFfn(
         wi_slot,
     );
     defer cb.free(gated_ct);
+
+    if (exact_gelu) {
+        if (try cb.packedGegluExact(gated_ct, total, intermediate_size)) |activated| {
+            defer cb.free(activated);
+            return linearNoBiasWithSlot(cb, activated, Wo_w, total, intermediate_size, hidden_size, wo_slot);
+        }
+    }
 
     const gate_ct = try cb.sliceLastDim(gated_ct, 0, intermediate_size);
     defer cb.free(gate_ct);

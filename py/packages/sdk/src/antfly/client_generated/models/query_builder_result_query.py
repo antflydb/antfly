@@ -11,7 +11,8 @@ T = TypeVar("T", bound="QueryBuilderResultQuery")
 
 @_attrs_define
 class QueryBuilderResultQuery:
-    """Generated search query in native Bleve format.
+    """Generated search query in Antfly's native full-text query format (a Bleve-compatible
+    JSON query DSL: `match`, `term`, `conjuncts`, `disjuncts`, `must_not`, etc.).
     Can be used directly in QueryRequest.full_text_search or filter_query.
 
         Example:

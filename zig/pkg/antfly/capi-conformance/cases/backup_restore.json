@@ -1,0 +1,17 @@
+{
+  "name": "backup_restore",
+  "description": "A portable backup restored into a new file keeps documents and the searchable default index.",
+  "open": {"create": true, "no_sync": true},
+  "steps": [
+    {"op": "batch", "timestamp": 1, "writes": [
+      {"key": "doc:keep", "value": {"title": "kept", "body": "portable backup survives restore"}}
+    ]},
+    {"op": "run_until_idle"},
+    {"op": "backup"},
+    {"op": "restore_open", "path": "restored.aflite", "no_sync": true},
+    {"op": "lookup", "key": "doc:keep", "expect": {"json_subset": {"title": "kept"}}},
+    {"op": "run_until_idle"},
+    {"op": "search", "request": {"full_text_search": {"match": {"field": "body", "text": "portable backup"}}, "limit": 5},
+      "expect": {"contains": ["doc:keep"]}}
+  ]
+}

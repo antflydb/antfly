@@ -17,4 +17,4 @@ pub const scorer = @import("search/scorer.zig");
 pub const analysis = @import("search/analysis.zig");
 pub const roaring = @import("encoding/roaring.zig");
 pub const platform_time = @import("antfly_platform").time;
-pub const vellum = @import("antfly_vellum");
+pub const fst = @import("antfly_fst");

@@ -57,7 +57,7 @@ preserving its tool budget for other candidate queries.
         "beam_width": 3
       }
     },
-    "generation": {"enabled": true}
+    "generation": {}
   }
 }
 ```

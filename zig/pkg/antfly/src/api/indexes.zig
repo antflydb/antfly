@@ -433,7 +433,23 @@ pub fn validateArtifactEnrichmentConfigs(
                     return error.InvalidEnrichmentConfig;
                 }
             },
-            .asset => {},
+            .asset => {
+                // Walk the asset-consumes-asset chain: every upstream must
+                // resolve to an admitted asset, and the chain must terminate
+                // without revisiting this config (self-reference is the
+                // one-hop cycle). A cycle that excludes `cfg` is caught when
+                // its own members are validated.
+                var hops: usize = 0;
+                var current: []const u8 = cfg.source_artifact_name;
+                while (current.len > 0) {
+                    if (std.mem.eql(u8, current, cfg.name)) return error.InvalidEnrichmentConfig;
+                    const upstream = findArtifactEnrichmentConfig(configs, .asset, current) orelse
+                        return error.InvalidEnrichmentConfig;
+                    current = upstream.source_artifact_name;
+                    hops += 1;
+                    if (hops > configs.len) return error.InvalidEnrichmentConfig;
+                }
+            },
         }
     }
 }
@@ -458,6 +474,14 @@ fn validateArtifactIndexReferences(
     configs: []const db_mod.types.EnrichmentConfig,
 ) !void {
     if (root != .object) return error.InvalidEnrichmentConfig;
+    // Neighbor context references a graph index by name and must be closed at
+    // admission: the runtime intentionally fails open with empty neighbors, so
+    // an unresolved reference would silently sample nothing forever.
+    for (configs) |cfg| {
+        const context = cfg.neighbor_context orelse continue;
+        if (!graphIndexExists(root.object, context.graph_index)) return error.InvalidEnrichmentConfig;
+    }
+    try validateGraphResolverLabelRouting(alloc, root.object);
     var it = root.object.iterator();
     while (it.next()) |entry| {
         if (std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
@@ -502,6 +526,53 @@ fn validateArtifactIndexReferences(
             }
         }
     }
+}
+
+/// Labeled resolvers sharing a source artifact must claim disjoint label
+/// sets, or the mention partition is ambiguous. The durable catalog enforces
+/// this at registration too, but registration runs during asynchronous shard
+/// provisioning; closing it here keeps the failure a synchronous 4xx on
+/// create/update instead of a provisioning stall. Checked across every graph
+/// index in the request because resolvers are table-scoped, not index-scoped.
+fn validateGraphResolverLabelRouting(alloc: std.mem.Allocator, indexes: std.json.ObjectMap) !void {
+    var seen = std.ArrayListUnmanaged(struct { source_artifact: []const u8, label: []const u8 }).empty;
+    defer seen.deinit(alloc);
+
+    var it = indexes.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .object) continue;
+        const object = entry.value_ptr.object;
+        const type_value = object.get("type") orelse continue;
+        if (type_value != .string or !std.mem.eql(u8, type_value.string, "graph")) continue;
+        const resolvers = object.get("resolvers") orelse continue;
+        if (resolvers != .array) continue;
+        for (resolvers.array.items) |resolver| {
+            if (resolver != .object) continue;
+            const source_artifact = resolver.object.get("source_artifact") orelse continue;
+            if (source_artifact != .string) continue;
+            const labels = resolver.object.get("labels") orelse continue;
+            if (labels != .array) continue;
+            for (labels.array.items) |label| {
+                if (label != .string) continue;
+                for (seen.items) |claimed| {
+                    if (std.mem.eql(u8, claimed.source_artifact, source_artifact.string) and
+                        std.mem.eql(u8, claimed.label, label.string))
+                        return error.InvalidEnrichmentConfig;
+                }
+                try seen.append(alloc, .{
+                    .source_artifact = source_artifact.string,
+                    .label = label.string,
+                });
+            }
+        }
+    }
+}
+
+fn graphIndexExists(indexes: std.json.ObjectMap, name: []const u8) bool {
+    const index = indexes.get(name) orelse return false;
+    if (index != .object) return false;
+    const type_value = index.object.get("type") orelse return false;
+    return type_value == .string and std.mem.eql(u8, type_value.string, "graph");
 }
 
 fn graphArtifactConfigExists(
@@ -722,7 +793,24 @@ fn artifactEnrichmentConfigsEqual(
         a.full_text_index == b.full_text_index and
         std.mem.eql(u8, a.content_type, b.content_type) and
         try enrichment_config_validation.producerJsonValuesEqual(alloc, a.producer_json, b.producer_json) and
+        neighborContextConfigsEqual(a.neighbor_context, b.neighbor_context) and
         std.meta.eql(a.execution, b.execution);
+}
+
+fn neighborContextConfigsEqual(
+    a: ?db_mod.types.EnrichmentNeighborContextConfig,
+    b: ?db_mod.types.EnrichmentNeighborContextConfig,
+) bool {
+    const lhs = a orelse return b == null;
+    const rhs = b orelse return false;
+    if (!std.mem.eql(u8, lhs.graph_index, rhs.graph_index) or
+        lhs.direction != rhs.direction or
+        lhs.limit != rhs.limit or
+        lhs.edge_types.len != rhs.edge_types.len) return false;
+    for (lhs.edge_types, rhs.edge_types) |lhs_type, rhs_type| {
+        if (!std.mem.eql(u8, lhs_type, rhs_type)) return false;
+    }
+    return true;
 }
 
 fn artifactEnrichmentLessThan(_: void, lhs: db_mod.types.EnrichmentConfig, rhs: db_mod.types.EnrichmentConfig) bool {
@@ -4034,6 +4122,74 @@ fn appendSingleIndexRuntimeStatusWithGraphMetricRuntime(
         }
         try out.appendSlice(alloc, ",\"complete\":");
         try out.appendSlice(alloc, if (coverage_complete) "true" else "false");
+        try out.appendSlice(alloc, ",\"healthy\":");
+        try out.appendSlice(alloc, if (coverage.healthy) "true" else "false");
+        try out.appendSlice(alloc, ",\"degraded\":");
+        try out.appendSlice(alloc, if (coverage.degraded) "true" else "false");
+        try out.append(alloc, '}');
+    } else if ((index_type == .graph or index_type == .full_text) and
+        @hasField(@TypeOf(item), "coverage_identity_ready") and item.coverage_identity_ready and
+        @hasField(@TypeOf(item), "coverage_summary_ready"))
+    {
+        // Artifact-fed graph and full-text projections record the same
+        // durable per-document generation outcomes as embeddings indexes
+        // (the autoschema knowledge graph in particular). Without this block
+        // a corpus of terminally failed extractions reported NOTHING on the
+        // consuming index: settled failures looked like invisible pending
+        // work. The shape matches the embeddings `coverage` object so
+        // consumers read one contract; embeddings-only publication and
+        // activity fields are simply absent.
+        const skipped_count = if (@hasField(@TypeOf(item), "coverage_skipped_count")) item.coverage_skipped_count else 0;
+        const terminal_failed_count = if (@hasField(@TypeOf(item), "coverage_terminal_failed_count")) item.coverage_terminal_failed_count else 0;
+        const produced_count = if (@hasField(@TypeOf(item), "coverage_produced_count")) item.coverage_produced_count else 0;
+        const counters_valid = coverageCountersValid(table_doc_count, produced_count, skipped_count, terminal_failed_count);
+        const replay_current = coverageReplayCurrent(replay_applied_sequence, replay_target_sequence, replay_catch_up_required);
+        const observation_complete = coverage_runtime_present and item.coverage_summary_ready and counters_valid;
+        const coverage = evaluateCoverage(
+            .strict,
+            table_doc_count,
+            produced_count,
+            skipped_count,
+            terminal_failed_count,
+            observation_complete,
+            replay_current,
+        );
+        try out.appendSlice(alloc, ",\"coverage\":{");
+        try appendJsonString(alloc, out, "policy");
+        try out.append(alloc, ':');
+        try appendJsonString(alloc, out, "strict");
+        try out.appendSlice(alloc, ",\"observation_complete\":");
+        try out.appendSlice(alloc, if (observation_complete) "true" else "false");
+        try out.appendSlice(alloc, ",\"config_fingerprint\":");
+        try appendCoverageFingerprint(alloc, out, coverage_config_hash);
+        try out.appendSlice(alloc, ",\"summary_ready\":");
+        try out.appendSlice(alloc, if (item.coverage_summary_ready) "true" else "false");
+        try out.appendSlice(alloc, ",\"source_total\":");
+        try appendIntValue(alloc, out, table_doc_count);
+        try out.appendSlice(alloc, ",\"produced\":");
+        try appendIntValue(alloc, out, produced_count);
+        try out.appendSlice(alloc, ",\"skipped\":");
+        try appendIntValue(alloc, out, skipped_count);
+        try out.appendSlice(alloc, ",\"terminal_failed\":");
+        try appendIntValue(alloc, out, terminal_failed_count);
+        try out.appendSlice(alloc, ",\"covered\":");
+        try appendIntValue(alloc, out, coverage.covered);
+        try out.appendSlice(alloc, ",\"settled\":");
+        try appendIntValue(alloc, out, coverage.settled);
+        try out.appendSlice(alloc, ",\"uncovered\":");
+        if (coverage.uncovered) |uncovered| {
+            try appendIntValue(alloc, out, uncovered);
+        } else {
+            try out.appendSlice(alloc, "null");
+        }
+        try out.appendSlice(alloc, ",\"pending\":");
+        if (coverage.pending) |pending| {
+            try appendIntValue(alloc, out, pending);
+        } else {
+            try out.appendSlice(alloc, "null");
+        }
+        try out.appendSlice(alloc, ",\"complete\":");
+        try out.appendSlice(alloc, if (coverage.complete) "true" else "false");
         try out.appendSlice(alloc, ",\"healthy\":");
         try out.appendSlice(alloc, if (coverage.healthy) "true" else "false");
         try out.appendSlice(alloc, ",\"degraded\":");
@@ -7950,6 +8106,43 @@ fn consumerTests() type {
             );
         }
 
+        test "index metadata closes neighbor context graph index references at admission" {
+            const conceptualizer =
+                \\{"name":"conceptualize_v1","kind":"asset","field":"name","producer_json":"{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\"}}","neighbor_context":{"graph_index":"taxonomy","edge_types":["started_by"],"direction":"out","limit":8}}
+            ;
+            // The referenced graph index exists on the same table: admitted.
+            const valid = try std.fmt.allocPrint(
+                std.testing.allocator,
+                "{{\"taxonomy\":{{\"type\":\"graph\"}},\"enrichments\":[{s}]}}",
+                .{conceptualizer},
+            );
+            defer std.testing.allocator.free(valid);
+            try validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator, valid);
+            // An unknown graph index is rejected at admission because the
+            // runtime fails open with empty neighbors.
+            const dangling = try std.fmt.allocPrint(
+                std.testing.allocator,
+                "{{\"enrichments\":[{s}]}}",
+                .{conceptualizer},
+            );
+            defer std.testing.allocator.free(dangling);
+            try std.testing.expectError(
+                error.InvalidEnrichmentConfig,
+                validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator, dangling),
+            );
+            // A same-named index of another kind does not satisfy the reference.
+            const wrong_kind = try std.fmt.allocPrint(
+                std.testing.allocator,
+                "{{\"taxonomy\":{{\"type\":\"full_text\"}},\"enrichments\":[{s}]}}",
+                .{conceptualizer},
+            );
+            defer std.testing.allocator.free(wrong_kind);
+            try std.testing.expectError(
+                error.InvalidEnrichmentConfig,
+                validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator, wrong_kind),
+            );
+        }
+
         test "merged index metadata validates artifact consumer references" {
             const existing =
                 \\{"enrichments":[{"name":"document_units_v1","kind":"asset","field":"url"},{"name":"document_chunks_v1","kind":"chunk","field":"text","source_artifact_name":"document_units_v1","chunk_size":512}]}
@@ -8101,6 +8294,34 @@ fn consumerTests() type {
             ));
             try std.testing.expectError(error.InvalidEnrichmentConfig, collectArtifactEnrichmentsFromTableIndexesJson(std.testing.allocator,
                 \\{"enrichments":[{"name":"t","kind":"asset","field":"url","transcriber":{"model":"m"}}]}
+            ));
+        }
+
+        test "asset enrichment may consume another asset artifact" {
+            // A valid producer-consumer chain admits.
+            try validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator,
+                \\{"enrichments":[{"name":"summary_text","kind":"asset","field":"summary"},{"name":"summary_echo","kind":"asset","source_artifact_name":"summary_text"}]}
+            );
+            // Self-reference is the one-hop cycle.
+            try std.testing.expectError(error.InvalidEnrichmentConfig, validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator,
+                \\{"enrichments":[{"name":"loop","kind":"asset","source_artifact_name":"loop"}]}
+            ));
+            // A two-hop cycle never terminates and is rejected.
+            try std.testing.expectError(error.InvalidEnrichmentConfig, validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator,
+                \\{"enrichments":[{"name":"a","kind":"asset","source_artifact_name":"b"},{"name":"b","kind":"asset","source_artifact_name":"a"}]}
+            ));
+            // The upstream must be an admitted asset.
+            try std.testing.expectError(error.InvalidEnrichmentConfig, validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator,
+                \\{"enrichments":[{"name":"echo","kind":"asset","source_artifact_name":"missing"}]}
+            ));
+            // Consuming assets read produced bytes; a field cannot also be set.
+            try std.testing.expectError(error.InvalidEnrichmentConfig, validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator,
+                \\{"enrichments":[{"name":"summary_text","kind":"asset","field":"summary"},{"name":"echo","kind":"asset","field":"summary","source_artifact_name":"summary_text"}]}
+            ));
+            // Media-locator producers dereference the source as a URL and
+            // stay closed to artifact consumption.
+            try std.testing.expectError(error.InvalidEnrichmentConfig, validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator,
+                \\{"enrichments":[{"name":"summary_text","kind":"asset","field":"summary"},{"name":"echo","kind":"asset","source_artifact_name":"summary_text","producer_json":"{\"type\":\"reader\",\"config\":{}}"}]}
             ));
         }
 

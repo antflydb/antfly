@@ -435,6 +435,7 @@ const CudaA4bRuntime = struct {
 pub const CapabilityProfile = enum {
     clipclap,
     bert_encoder,
+    laya,
     deberta_reranker,
     gliner2,
     gliner2_training,
@@ -451,6 +452,7 @@ fn jitModelProfile(profile: CapabilityProfile) kernels_mod.JitModelProfile {
     return switch (profile) {
         .clipclap => .clipclap,
         .bert_encoder => .bert_encoder,
+        .laya => .laya,
         .deberta_reranker => .deberta_reranker,
         .gliner2, .gliner2_training => .gliner2,
         .florence2 => .florence2,
@@ -1115,6 +1117,9 @@ const CudaDecoderRuntimeFamilyState = struct {
 
 pub const RuntimeStats = struct {
     pub const top_transfer_size_count = 8;
+
+    laya_warp_attention: usize = 0,
+    laya_packed_geglu: usize = 0,
 
     quant_ops: operator_plan.Stats = .{},
     quant_kernel_planned_ops: usize = 0,
@@ -2118,6 +2123,10 @@ test "CUDA Q4 route census aggregates by full launch identity" {
 }
 
 pub const CudaCompute = struct {
+    /// Laya parity requires FP32 execution even for reduced-storage source tensors.
+    strict_f32_weights: bool = false,
+    laya_optimizations: bool = false,
+    laya_fusion: bool = false,
     boundary_scope: ops.gliner_boundary_device.ScopeAccounting = .{},
     /// Training retains many small gradients alongside large model tensors.
     /// Exact reuse avoids pinning a large cached allocation to a scalar.
@@ -2574,6 +2583,7 @@ pub const CudaCompute = struct {
             // BERT/XLM-R uses the same dense encoder primitives as CLIP text,
             // plus the Q4_0 biased-linear adapter in this compute backend.
             .bert_encoder => self.kernels.hasClipClapPrimitives(),
+            .laya => self.kernels.hasLayaPrimitives(),
             .deberta_reranker => self.kernels.hasDebertaRerankerPrimitives(),
             .gliner2 => self.kernels.hasGliner2Primitives(),
             .gliner2_training => self.kernels.hasGliner2TrainingPrimitives(),
@@ -3326,6 +3336,13 @@ pub const CudaCompute = struct {
     }
 
     pub fn insertWeightFromLoaded(self: *CudaCompute, owned_key: []const u8, loaded: *const weight_source_mod.LoadedWeight) !void {
+        if (self.strict_f32_weights) {
+            if (loaded.quantized or loaded.quantized_storage != null) return error.UnsupportedTensorType;
+            if (loaded.tensor.dtype == .f32) return self.insertWeightFromTensor(owned_key, &loaded.tensor);
+            var converted = try weight_source_mod.convertToF32(self.allocator, &loaded.tensor);
+            defer converted.deinit();
+            return self.insertWeightFromTensor(owned_key, &converted);
+        }
         if (loaded.quantized_storage) |storage| {
             if (cudaShouldDequantizeQ4_0MatrixWeightToBf16OnUpload(owned_key, storage)) {
                 return self.insertBf16WeightFromQuantizedStorage(owned_key, storage);
@@ -7492,7 +7509,9 @@ fn tryCublasLtF32Linear(
 ) !bool {
     if (!cudaCublasLtEnabled()) return false;
     if (self.ctx.info.compute_major < 8) return false;
-    if (rows < 128 or in_dim < 64 or out_dim < 64) return false;
+    // Laya keeps FP32 weights resident, including short encoder sequences.
+    // Its wide projections benefit from cuBLASLt below the general 128-row gate.
+    if ((!self.strict_f32_weights and rows < 128) or in_dim < 64 or out_dim < 64) return false;
     const blas = &(self.cublaslt orelse return false);
     blas.matmulF32WeightF32Out(&self.ctx, dst, input, weight, rows, in_dim, out_dim) catch return false;
     return true;
@@ -17844,6 +17863,9 @@ fn siluMultiply(ctx: *anyopaque, gate: CT, up: CT) anyerror!?CT {
 }
 
 fn activationMultiply(ctx: *anyopaque, gate: CT, up: CT, activation: ops.DecoderRuntimeActivationKind) anyerror!?CT {
+    // The fused kernel only implements activation IDs 0..5. Let callers use
+    // resident exact GELU plus multiplication instead of treating ID 17 as ReLU².
+    if (activation == .gelu_exact) return null;
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const gate_tensor = tensorFromCt(gate);
     const up_tensor = tensorFromCt(up);
@@ -18330,6 +18352,82 @@ fn silu(ctx: *anyopaque, input: CT) anyerror!CT {
     self.stats.launch_elementwise += 1;
     return createTensor(self, device, shape, input_tensor.elem_count);
 }
+fn layaWarpEligible(self: *const CudaCompute, batch: usize, seq: usize, dim: usize) bool {
+    return self.laya_optimizations and self.ctx.info.compute_major == 8 and
+        self.ctx.info.compute_minor == 9 and batch >= 2 and seq > 0 and seq <= 512 and
+        (dim == 64 or dim == 128) and self.kernels.laya_attention_warp_f32 != null;
+}
+
+fn packedGegluExact(ctx: *anyopaque, input: CT, rows: usize, width: usize) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (!self.laya_fusion or self.kernels.laya_packed_geglu_f32 == null) return null;
+    const tensor = tensorFromCt(input);
+    try ensureF32(tensor);
+    const count = try checkedMul(rows, width);
+    try ensureCount(tensor, try checkedMul(count, 2));
+    const shape = try allocShape2(self.allocator, rows, width);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, try checkedMul(count, @sizeOf(f32)));
+    errdefer device.free(&self.ctx);
+    try self.kernels.launchLayaPackedGegluF32(&self.ctx, device, tensor.buffer, rows, width);
+    self.stats.laya_packed_geglu += 1;
+    self.stats.launch_elementwise += 1;
+    return createTensor(self, device, shape, count);
+}
+
+fn encoderLocalAttention(ctx: *anyopaque, q: CT, k: CT, v: CT, mask: []const i64, batch: usize, seq: usize, heads: usize, dim: usize, radius: usize) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const count = try checkedMul(try checkedMul(batch, seq), try checkedMul(heads, dim));
+    for ([_]CT{ q, k, v }) |value| {
+        try ensureF32(tensorFromCt(value));
+        try ensureCount(tensorFromCt(value), count);
+    }
+    if (mask.len != try checkedMul(batch, seq)) return error.InvalidShape;
+    const mask_device = try uploadCachedAttentionMaskI64(self, mask);
+    const shape = try dupeShape(self.allocator, tensorFromCt(q).shape);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    if (layaWarpEligible(self, batch, seq, dim)) {
+        try self.kernels.launchLayaAttentionWarpF32(&self.ctx, device, tensorFromCt(q).buffer, tensorFromCt(k).buffer, tensorFromCt(v).buffer, mask_device, batch, seq, heads, dim, radius);
+        self.stats.laya_warp_attention += 1;
+    } else {
+        try self.kernels.launchLayaLocalAttentionF32(&self.ctx, device, tensorFromCt(q).buffer, tensorFromCt(k).buffer, tensorFromCt(v).buffer, mask_device, batch, seq, heads, dim, radius);
+    }
+    self.stats.launch_attention += 1;
+    return createTensor(self, device, shape, count);
+}
+
+fn layaActionFeatures(ctx: *anyopaque, r: *const ops.LayaActionFeaturesRequest) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (r.batch == 0 or r.sequence == 0 or r.options < 2 or r.options > 20 or r.hidden_size == 0) return error.InvalidShape;
+    const marker_count = try checkedMul(r.batch, r.options);
+    if (r.markers.len != marker_count) return error.InvalidShape;
+    for (0..r.batch) |row| {
+        var valid: usize = 0;
+        for (r.markers[row * r.options ..][0..r.options]) |pos| {
+            if (pos < -1 or pos >= r.sequence) return error.InvalidLayaInputs;
+            valid += @intFromBool(pos >= 0);
+        }
+        if (valid < 2) return error.InvalidLayaInputs;
+    }
+    const hidden = tensorFromCt(r.hidden);
+    const logits = tensorFromCt(r.logits);
+    try ensureF32(hidden);
+    try ensureF32(logits);
+    try ensureCount(hidden, try checkedMul(try checkedMul(r.batch, r.sequence), r.hidden_size));
+    try ensureCount(logits, marker_count);
+    const markers = try uploadTempI64(self, r.markers);
+    const count = try checkedMul(r.batch, r.hidden_size + 4);
+    const shape = try allocShape2(self.allocator, r.batch, r.hidden_size + 4);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    try self.kernels.launchLayaActionFeaturesF32(&self.ctx, device, hidden.buffer, logits.buffer, markers, r.batch, r.sequence, r.options, r.hidden_size);
+    self.stats.launch_elementwise += 1;
+    return createTensor(self, device, shape, count);
+}
+
 fn sdpaLaunch(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: ?[]const i64, attn_bias_ct: ?CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const q_tensor = tensorFromCt(q_ct);
@@ -18364,7 +18462,12 @@ fn sdpaLaunch(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: ?[]const i64,
     errdefer device.free(&self.ctx);
     var prefill_profile_scope = beginPrefillProfile(self, .attention, token_count);
     defer if (prefill_profile_scope) |*scope| scope.end();
-    try self.kernels.launchTokenMajorAttentionF32(&self.ctx, device, q_tensor.buffer, k_tensor.buffer, v_tensor.buffer, mask_device, bias_buffer, batch, seq_len, num_heads, head_dim, false, has_mask, bias_mode);
+    if (has_mask and bias_mode == 0 and layaWarpEligible(self, batch, seq_len, head_dim)) {
+        try self.kernels.launchLayaAttentionWarpF32(&self.ctx, device, q_tensor.buffer, k_tensor.buffer, v_tensor.buffer, mask_device, batch, seq_len, num_heads, head_dim, seq_len);
+        self.stats.laya_warp_attention += 1;
+    } else {
+        try self.kernels.launchTokenMajorAttentionF32(&self.ctx, device, q_tensor.buffer, k_tensor.buffer, v_tensor.buffer, mask_device, bias_buffer, batch, seq_len, num_heads, head_dim, false, has_mask, bias_mode);
+    }
     self.stats.launch_attention += 1;
     return createTensor(self, device, shape, count);
 }
@@ -20411,7 +20514,7 @@ fn rope(ctx: *anyopaque, input: CT, seq_len: usize, head_dim: usize, rope_dim: u
     if (input_tensor.elem_count % head_dim != 0) return error.InvalidShape;
     const total_chunks = input_tensor.elem_count / head_dim;
     if (total_chunks % seq_len != 0) return error.InvalidShape;
-    const chunks_per_position = total_chunks / seq_len;
+    const chunks_per_position = native_compute_mod.ropeChunksPerToken(input_tensor.shape, total_chunks, seq_len, head_dim);
     if (chunks_per_position == 0) return error.InvalidShape;
 
     const shape = try dupeShape(self.allocator, input_tensor.shape);
@@ -23208,6 +23311,9 @@ const vtable = ops.ComputeBackend.VTable{
     .add = &add,
     .addBiasRowsConsume = &addBiasRowsConsume,
     .scaledDotProductAttention = &sdpa,
+    .encoderLocalAttention = &encoderLocalAttention,
+    .layaActionFeatures = &layaActionFeatures,
+    .packedGegluExact = &packedGegluExact,
     .scaledDotProductAttentionQwen3VlVision = &sdpaQwen3VlVision,
     .scaledDotProductAttentionFull = &sdpaFull,
     .causalSelfAttention = &causalSelfAttention,

@@ -7,7 +7,6 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@antfly/design-system";
-import Link from "next/link";
 import type { TensorShape } from "@/lib/schema";
 
 /** dtype/quant string -> precision-ramp CSS var (see globals.css). */

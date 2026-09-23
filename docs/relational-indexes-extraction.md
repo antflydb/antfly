@@ -1,7 +1,7 @@
 # Relational-indexes extraction status
 
 This is an implementation ledger, not a statement of available API features.
-The follow-up spans R3–R6 from `docs/restructure-prs`: relational indexes and
+The follow-up spans R3–R6 of the relational restructure (landed in #784): relational indexes and
 constraints, foreign-key integrity, shared row reads, and relational mutations.
 SQL ingress, sessions, pgwire, and unrelated lake/catalog changes remain outside
 this extraction.

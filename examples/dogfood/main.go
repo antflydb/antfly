@@ -36,7 +36,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/antflydb/antfly/go/pkg/antflylite"
+	"github.com/antflydb/antfly/go/pkg/lite"
 )
 
 const (
@@ -318,10 +318,10 @@ func runStatusCmd(args []string) error {
 // `antfly inference run` server and sets RemoteProviderConfigured so
 // Status().Inference.Mode reports "remote_provider" rather than the default
 // caller-supplied/deferred mode.
-func liteOpenOptions(inferenceURL string) antflylite.OpenOptions {
-	opts := antflylite.OpenOptions{
-		Mode:    antflylite.OpenModeWriter,
-		Profile: antflylite.ProfileNative,
+func liteOpenOptions(inferenceURL string) lite.OpenOptions {
+	opts := lite.OpenOptions{
+		Mode:    lite.OpenModeWriter,
+		Profile: lite.ProfileNative,
 	}
 	if inferenceURL == "" {
 		// libantfly links the standalone inference runtime, so a Lite handle
@@ -336,18 +336,18 @@ func liteOpenOptions(inferenceURL string) antflylite.OpenOptions {
 	return opts
 }
 
-func openOrCreateLite(path, inferenceURL string) (*antflylite.DB, error) {
+func openOrCreateLite(path, inferenceURL string) (*lite.DB, error) {
 	opts := liteOpenOptions(inferenceURL)
 	if _, err := os.Stat(path); err == nil {
-		return antflylite.OpenWithOptions(path, opts)
+		return lite.OpenWithOptions(path, opts)
 	} else if !os.IsNotExist(err) {
 		return nil, err
 	}
-	return antflylite.CreateWithOptions(path, opts)
+	return lite.CreateWithOptions(path, opts)
 }
 
-func openExistingLite(path, inferenceURL string) (*antflylite.DB, error) {
-	return antflylite.OpenWithOptions(path, liteOpenOptions(inferenceURL))
+func openExistingLite(path, inferenceURL string) (*lite.DB, error) {
+	return lite.OpenWithOptions(path, liteOpenOptions(inferenceURL))
 }
 
 // requireInferenceProvider fails fast with a clear message when the
@@ -357,7 +357,7 @@ func openExistingLite(path, inferenceURL string) (*antflylite.DB, error) {
 // comment). Without this check, ingest would silently accumulate enrichment
 // debt with no producer able to satisfy it, or fail deep inside RunUntilIdle
 // with a much less clear error.
-func requireInferenceProvider(db *antflylite.DB, inferenceURL, extractModel string) error {
+func requireInferenceProvider(db *lite.DB, inferenceURL, extractModel string) error {
 	if inferenceURL == "" {
 		caps, err := db.Capabilities()
 		if err != nil {
@@ -466,15 +466,19 @@ type indexBuildConfig struct {
 }
 
 type existingIndex struct {
-	Name string `json:"name"`
-	Kind string `json:"kind"`
+	Name       string `json:"name"`
+	Kind       string `json:"kind"`
+	ConfigJSON string `json:"config_json"`
 }
 
 // ensureSchemaAndIndexes sets the schema and adds any of the three indexes
 // (full_text, chunk_vectors, knowledge) that are not already present. Schema
 // application is idempotent; index creation is name-keyed and skipped when
-// the index already exists so `ingest` can be re-run without -reset.
-func ensureSchemaAndIndexes(db *antflylite.DB, cfg indexBuildConfig) error {
+// the index already exists so `ingest` can be re-run without -reset -- but an
+// existing index is verified against this run's settings (see verify.go), so
+// changed flags fail loudly with a rebuild instruction instead of silently
+// keeping the old configuration.
+func ensureSchemaAndIndexes(db *lite.DB, cfg indexBuildConfig) error {
 	if err := db.SetSchemaJSON(schemaJSON()); err != nil {
 		return fmt.Errorf("set schema: %w", err)
 	}
@@ -488,8 +492,10 @@ func ensureSchemaAndIndexes(db *antflylite.DB, cfg indexBuildConfig) error {
 		return fmt.Errorf("decode existing indexes: %w\nraw: %s", err, existingRaw)
 	}
 	have := make(map[string]bool, len(existing))
+	configFor := make(map[string]string, len(existing))
 	for _, idx := range existing {
 		have[idx.Name] = true
+		configFor[idx.Name] = idx.ConfigJSON
 	}
 
 	if have[fullTextIndexName] {
@@ -507,7 +513,11 @@ func ensureSchemaAndIndexes(db *antflylite.DB, cfg indexBuildConfig) error {
 		fmt.Printf("added index %q (this libantfly build did not auto-provision it)\n", fullTextIndexName)
 	}
 
-	if !have[chunkVectorsIndex] {
+	if have[chunkVectorsIndex] {
+		if err := verifyChunkPipelineEnrichments(db, configFor[chunkVectorsIndex], cfg); err != nil {
+			return err
+		}
+	} else {
 		config, err := chunkVectorsIndexJSON(cfg.EmbedModel, cfg.InferenceURL, cfg.TargetTokens, cfg.OverlapTokens)
 		if err != nil {
 			return err
@@ -518,7 +528,11 @@ func ensureSchemaAndIndexes(db *antflylite.DB, cfg indexBuildConfig) error {
 		fmt.Printf("added index %q (embedder=%s)\n", chunkVectorsIndex, cfg.EmbedModel)
 	}
 
-	if !have[knowledgeGraphIndex] {
+	if have[knowledgeGraphIndex] {
+		if err := verifyKnowledgeGraphConfig(configFor[knowledgeGraphIndex], cfg); err != nil {
+			return err
+		}
+	} else {
 		config, err := knowledgeGraphIndexJSON(cfg.ExtractModel, cfg.InferenceURL, cfg.Metrics)
 		if err != nil {
 			return err

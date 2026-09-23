@@ -70,11 +70,12 @@ pub const AntflyRootImports = struct {
     matcher: *std.Build.Module,
     resolver: *std.Build.Module,
     casbin: *std.Build.Module,
-    vellum: *std.Build.Module,
+    fst: *std.Build.Module,
     regex: *std.Build.Module,
     json: *std.Build.Module,
     jsonschema: *std.Build.Module,
     mcp: *std.Build.Module,
+    toon: *std.Build.Module,
     a2a: *std.Build.Module,
     generating: *std.Build.Module,
     reranking: *std.Build.Module,
@@ -144,11 +145,12 @@ pub const AntflyRootImports = struct {
         .{ .name = "antfly_matcher", .field = "matcher" },
         .{ .name = "antfly_resolver", .field = "resolver" },
         .{ .name = "antfly_casbin", .field = "casbin" },
-        .{ .name = "antfly_vellum", .field = "vellum" },
+        .{ .name = "antfly_fst", .field = "fst" },
         .{ .name = "antfly_regex", .field = "regex" },
         .{ .name = "antfly-json", .field = "json" },
         .{ .name = "antfly_jsonschema", .field = "jsonschema" },
         .{ .name = "antfly_mcp", .field = "mcp" },
+        .{ .name = "antfly_toon", .field = "toon" },
         .{ .name = "antfly_a2a", .field = "a2a" },
         .{ .name = "antfly_generating", .field = "generating" },
         .{ .name = "antfly_reranking", .field = "reranking" },
@@ -234,7 +236,7 @@ pub const AntflyRootImports = struct {
             "logging_openapi", "metadata_openapi",   "objectstore",       "openai_api",
             "pdf",             "query_openapi",      "reader_config",     "readers",
             "regex",           "reranking",          "scraping",          "synthesizing",
-            "transcribing",    "vector",             "vellum",            "schema_openapi",
+            "transcribing",    "vector",             "fst",               "schema_openapi",
         }) |field| self.addImport(mod, field);
     }
 
@@ -255,6 +257,7 @@ pub const AntflyRootImports = struct {
         "generating_openapi",
         "mcp",
         "raft_engine",
+        "toon",
         "usermgr_openapi",
     };
 

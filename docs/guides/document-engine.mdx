@@ -20,9 +20,11 @@ The pieces the planner composes:
 - **Documents** are the source payload returned to clients. Stored JSON is never the production search or sort index.
 - **Mappings** declare field types such as `text`, `keyword`, `number`, `date`, `boolean`, `embedding`, and `geo_point`.
 - **Full-text indexes** execute BM25 and phrase-style searches over analyzed text fields.
-- **Vector indexes** execute semantic nearest-neighbor search over embeddings.
+- **Vector indexes** execute approximate nearest-neighbor search over embeddings, using 1-bit RaBitQ codes with SPFresh-style incremental maintenance and an exact rerank. `search_effort` (0 to 1) trades recall for latency.
 - **Typed field values** power exact structured filters, aggregations, and field sort without parsing stored JSON on the hot path.
 - **Graph indexes** materialize relationships and run traversal or pattern queries over document ids.
+- **Algebraic indexes** derive aggregate and materialization sidecars from the schema.
+- **Relational indexes** are ordered composite-key indexes over relational tables.
 
 Indexes that union generated document, chunk, embedding, or relationship streams are covered in [Artifact-Backed Indexes](/docs/guides/artifact-indexes).
 
@@ -110,6 +112,8 @@ A query request combines several inputs:
 - `filter_query` is an AND condition over the main query.
 - `exclusion_query` removes matching documents.
 - `graph_queries` run graph traversals or patterns alongside document search.
+- `aggregations` compute bucket and metric aggregations over the matching documents.
+- `hierarchy` returns direct chunk matches or groups them under their parent documents.
 - `order_by`, `search_after`, and `search_before` control exact ordered pages.
 - `reranker` and `pruner` post-process the selected results.
 - `fields` controls the response projection.

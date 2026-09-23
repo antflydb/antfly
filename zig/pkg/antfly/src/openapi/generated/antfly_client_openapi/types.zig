@@ -1644,7 +1644,7 @@ pub const AnswerAgentSteps = struct {
     }
 };
 
-/// Configuration for the Antfly inference chunking provider. Antfly inference is a centralized HTTP service that provides chunking with multi-tier caching. The model name maps to ONNX model directory names (similar to how Ollama works). **Chunking Models:** - fixed: Simple fixed-size chunking by token count (built-in, no ONNX required) - Any other name will attempt to load from models/chunkers/{name}/ directory **Caching:** - L1: Memory cache with 2-minute TTL - L2: Persistent Pebble database - Singleflight deduplication for concurrent identical requests
+/// Configuration for the Antfly inference chunking provider. Antfly inference is Antfly's built-in ML service for local chunking. The model name maps to ONNX model directory names (similar to how Ollama works). **Chunking Models:** - fixed: Simple fixed-size chunking by token count (built-in, no ONNX required) - Any other name will attempt to load from models/chunkers/{name}/ directory **Deduplication:** - Within a single document write, chunk results are deduplicated when multiple indexes share the same source text and chunker configuration, so the source is chunked at most once per write.
 pub const AntflyChunkerConfig = struct {
     /// Maximum number of chunks to generate per document.
     max_chunks: ?i64 = null,
@@ -1705,7 +1705,7 @@ pub const AntflyChunkerConfig = struct {
     }
 };
 
-/// Configuration for the Antfly inference embedding provider. Antfly inference is Antfly's built-in ML service for local embeddings using ONNX models. It provides embedding generation with multi-tier caching (memory + persistent). **Features:** - Local ONNX-based embedding generation - L1 memory cache with configurable TTL - L2 persistent Pebble database cache - Singleflight deduplication for concurrent identical requests **Example Models:** bge-base-en-v1.5 (768 dims), all-MiniLM-L6-v2 (384 dims) Models are loaded from the `models/embedders/{name}/` directory.
+/// Configuration for the Antfly inference embedding provider. Antfly inference is Antfly's built-in ML service for local embeddings using ONNX models. **Features:** - Local ONNX-based embedding generation - Query-time embeddings are served from an in-memory cache (64 MiB budget, 5-minute TTL by default) with concurrent identical requests coalesced onto a single computation; there is no persistent on-disk cache tier **Example Models:** bge-base-en-v1.5 (768 dims), all-MiniLM-L6-v2 (384 dims) Models are loaded from the `models/embedders/{name}/` directory.
 pub const AntflyEmbedderConfig = struct {
     provider: []const u8,
     /// The embedding model name (maps to models/embedders/{name}/ directory).
@@ -3605,7 +3605,7 @@ pub const ChunkerConfig = struct {
     provider: ChunkerProvider,
     /// Controls whether chunk data is persisted to storage. When false (default), chunks are generated in memory and only embeddings are stored. When true, both chunks and embeddings are stored.
     store_chunks: ?bool = null,
-    /// Configuration for full-text indexing of chunks in Bleve. When present (even if empty), chunks will be stored with :cft: suffix and indexed in Bleve's _chunks field. When absent, chunks use :c: suffix and are only used for vector embeddings.
+    /// Configuration for full-text indexing of chunks. When present (even if empty), chunk artifacts are persisted and indexed in Antfly's native full-text index, queryable and projectable via the document's `_chunks` field. When absent, chunks are generated only to drive vector embeddings and are not indexed for full-text search (unless `store_chunks` is also set).
     full_text_index: ?std.json.ArrayHashMap(std.json.Value) = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -6246,6 +6246,7 @@ pub const CreatedEnrichmentConfig = struct {
     chunker_json: ?[]const u8 = null,
     full_text_index: ?bool = null,
     content_type: ?[]const u8 = null,
+    neighbor_context: ?EnrichmentNeighborContextConfig = null,
     execution: ?ExecutionPolicy = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -6262,6 +6263,7 @@ pub const CreatedEnrichmentConfig = struct {
         .{ "chunker_json", "chunker_json", true },
         .{ "full_text_index", "full_text_index", true },
         .{ "content_type", "content_type", true },
+        .{ "neighbor_context", "neighbor_context", true },
         .{ "execution", "execution", true },
     };
 
@@ -6317,6 +6319,10 @@ pub const CreatedEnrichmentConfig = struct {
         }
         if (self.content_type) |value| {
             try jw.objectField("content_type");
+            try jw.write(value);
+        }
+        if (self.neighbor_context) |value| {
+            try jw.objectField("neighbor_context");
             try jw.write(value);
         }
         if (self.execution) |value| {
@@ -8869,7 +8875,7 @@ pub const EdgesResponse = struct {
     }
 };
 
-/// A unified configuration for an embedding provider. Embedders can be configured with templates to customize how documents are converted to text before embedding. Templates use Handlebars syntax and support various built-in helpers. **Template System:** - **Syntax**: Handlebars templating (https://handlebarsjs.com/guide/) - **Caching**: Templates are automatically cached with configurable TTL (default: 5 minutes) - **Context**: Templates receive the full document as context **Built-in Helpers:** 1. **scrubHtml** - Remove script/style tags and extract clean text from HTML ```handlebars {{scrubHtml html_content}} ``` - Removes `<script>` and `<style>` tags - Adds newlines after block elements (p, div, h1-h6, li, etc.) - Returns plain text with preserved readability 2. **eq** - Equality comparison for conditionals ```handlebars {{#if (eq status "active")}}Active user{{/if}} {{#if (eq @key "special")}}Special field{{/if}} ``` 3. **media** - GenKit dotprompt media directive for multimodal content ```handlebars {{media url=imageDataURI}} {{media url=this.image_url}} {{media url="https://example.com/image.jpg"}} {{media url="s3://endpoint/bucket/image.png"}} {{media url="file:///path/to/image.jpg"}} ``` **Supported URL Schemes:** - `data:` - Base64 encoded data URIs (e.g., `data:image/jpeg;base64,...`) - `http://` / `https://` - Web URLs with automatic content type detection - `file://` - Local filesystem paths - `s3://` - S3-compatible storage (format: `s3://endpoint/bucket/key`) **Automatic Content Processing:** - **Images**: Downloaded, resized (if needed), converted to data URIs - **PDFs**: Text extracted or first page rendered as image - **HTML**: Readable text extracted using Mozilla Readability **Security Controls:** Downloads are protected by content security settings (see Configuration Reference): - Allowed host whitelist - Private IP blocking (prevents SSRF attacks) - Download size limits (default: 100MB) - HTTP downloads time out after 30 seconds by default; zero disables the deadline - Image dimension limits (default: 2048px, auto-resized) See: https://antfly.io/docs/configuration#security--cors 4. **encodeToon** - Encode data in TOON format (Token-Oriented Object Notation) ```handlebars {{encodeToon this.fields}} {{encodeToon this.fields lengthMarker=false indent=4}} {{encodeToon this.fields delimiter="\t"}} ``` **What is TOON?** TOON is a compact, human-readable format designed for passing structured data to LLMs. It provides **30-60% token reduction** compared to JSON while maintaining high LLM comprehension accuracy. **Key Features:** - Compact syntax using `:` for key-value pairs - Array length markers: `tags[#3]: ai,search,ml` - Tabular format for uniform data structures - Optimized for LLM parsing and understanding - Maintains human readability **Benefits:** - **Lower API costs** - Reduced token usage means lower LLM API costs - **Faster responses** - Less tokens to process - **More context** - Fit more documents within token limits **Options:** - `lengthMarker` (bool): Add # prefix to array counts like `[#3]` (default: true) - `indent` (int): Indentation spacing for nested objects (default: 2) - `delimiter` (string): Field separator for tabular arrays (default: none, use `"\t"` for tabs) **Example output:** ``` title: Introduction to Vector Search author: Jane Doe tags[#3]: ai,search,ml metadata: edition: 2 pages: 450 ``` **Default in RAG:** TOON is the default format for document rendering in RAG queries. **References:** - TOON Specification: https://github.com/toon-format/toon - Go Implementation: https://github.com/alpkeskin/gotoon **Template Examples:** Document with metadata: ```handlebars Title: {{metadata.title}} Date: {{metadata.date}} Tags: {{#each metadata.tags}}{{this}}, {{/each}} {{content}} ``` HTML content extraction: ```handlebars Product: {{name}} Description: {{scrubHtml description_html}} Price: ${{price}} ``` Multimodal with image: ```handlebars Product: {{title}} {{media url=image}} Description: {{description}} ``` Conditional formatting: ```handlebars {{title}} {{#if author}}By: {{author}}{{/if}} {{#if (eq category "premium")}}⭐ Premium Content{{/if}} {{body}} ``` **Environment Variables:** - `GEMINI_API_KEY` - API key for Google AI - `OPENAI_API_KEY` - API key for OpenAI - `OPENAI_BASE_URL` - Base URL for OpenAI-compatible APIs - `OLLAMA_HOST` - Ollama server URL (e.g., http://localhost:11434) **Importing Pre-computed Embeddings:** You can import existing embeddings (from OpenAI, Cohere, or any provider), but only for indexes configured with `external: true`. External indexes accept vectors written directly through the document `_embeddings` field and do not generate prompts from `field` or `template`. **Steps:** 1. Create an embeddings index with `external: true` 2. For dense indexes, set the index `dimension` 3. Write documents with `_embeddings: { "<indexName>": [...<embedding>...] }` **Example:** ```json { "title": "My Document", "content": "Document text...", "_embeddings": { "my_vector_index": [0.1, 0.2, 0.3, ...] } } ``` **Delete Behavior:** - Use `"_embeddings": { "<indexName>": null }` to delete a stored external vector - Omitting `_embeddings[<indexName>]` leaves the existing vector unchanged **Use Cases:** - Migrating from another vector database with existing embeddings - Using embeddings generated by external systems - Importing pre-computed OpenAI, Cohere, or other provider embeddings - Batch processing embeddings offline before ingestion
+/// A unified configuration for an embedding provider. Embedders can be configured with templates to customize how documents are converted to text before embedding. Templates use Handlebars syntax and support various built-in helpers. **Template System:** - **Syntax**: Handlebars templating (https://handlebarsjs.com/guide/) - **Caching**: Templates are automatically cached with configurable TTL (default: 5 minutes) - **Context**: Templates receive the full document as context **Built-in Helpers:** 1. **scrubHtml** - Remove script/style tags and extract clean text from HTML ```handlebars {{scrubHtml html_content}} ``` - Removes `<script>` and `<style>` tags - Adds newlines after block elements (p, div, h1-h6, li, etc.) - Returns plain text with preserved readability 2. **eq** - Equality comparison for conditionals ```handlebars {{#if (eq status "active")}}Active user{{/if}} {{#if (eq @key "special")}}Special field{{/if}} ``` 3. **media** - GenKit dotprompt media directive for multimodal content ```handlebars {{media url=imageDataURI}} {{media url=this.image_url}} {{media url="https://example.com/image.jpg"}} {{media url="s3://endpoint/bucket/image.png"}} {{media url="file:///path/to/image.jpg"}} ``` **Supported URL Schemes:** - `data:` - Base64 encoded data URIs (e.g., `data:image/jpeg;base64,...`) - `http://` / `https://` - Web URLs with automatic content type detection - `file://` - Local filesystem paths - `s3://` - S3-compatible storage (format: `s3://endpoint/bucket/key`) **Automatic Content Processing:** - **Images**: Downloaded, resized (if needed), converted to data URIs - **PDFs**: Text extracted or first page rendered as image - **HTML**: Readable text extracted using Mozilla Readability **Security Controls:** Downloads are protected by content security settings (see Configuration Reference): - Allowed host whitelist - Private IP blocking (prevents SSRF attacks) - Download size limits (default: 100MB) - HTTP downloads time out after 30 seconds by default; zero disables the deadline - Image dimension limits (default: 2048px, auto-resized) See: https://antfly.io/docs/configuration#security--cors 4. **encodeToon** is not available in these templates. It is a helper of the retrieval agent's `document_renderer`, which renders documents into the generation prompt as TOON by default. **Template Examples:** Document with metadata: ```handlebars Title: {{metadata.title}} Date: {{metadata.date}} Tags: {{#each metadata.tags}}{{this}}, {{/each}} {{content}} ``` HTML content extraction: ```handlebars Product: {{name}} Description: {{scrubHtml description_html}} Price: ${{price}} ``` Multimodal with image: ```handlebars Product: {{title}} {{media url=image}} Description: {{description}} ``` Conditional formatting: ```handlebars {{title}} {{#if author}}By: {{author}}{{/if}} {{#if (eq category "premium")}}⭐ Premium Content{{/if}} {{body}} ``` **Environment Variables:** - `GEMINI_API_KEY` - API key for Google AI - `OPENAI_API_KEY` - API key for OpenAI - `OPENAI_BASE_URL` - Base URL for OpenAI-compatible APIs - `OLLAMA_HOST` - Ollama server URL (e.g., http://localhost:11434) **Importing Pre-computed Embeddings:** You can import existing embeddings (from OpenAI, Cohere, or any provider), but only for indexes configured with `external: true`. External indexes accept vectors written directly through the document `_embeddings` field and do not generate prompts from `field` or `template`. **Steps:** 1. Create an embeddings index with `external: true` 2. For dense indexes, set the index `dimension` 3. Write documents with `_embeddings: { "<indexName>": [...<embedding>...] }` **Example:** ```json { "title": "My Document", "content": "Document text...", "_embeddings": { "my_vector_index": [0.1, 0.2, 0.3, ...] } } ``` **Delete Behavior:** - Use `"_embeddings": { "<indexName>": null }` to delete a stored external vector - Omitting `_embeddings[<indexName>]` leaves the existing vector unchanged **Use Cases:** - Migrating from another vector database with existing embeddings - Using embeddings generated by external systems - Importing pre-computed OpenAI, Cohere, or other provider embeddings - Batch processing embeddings offline before ingestion
 pub const EmbedderConfig = struct {
     provider: ?[]const u8 = null,
     /// The Google Cloud project ID (optional for Gemini API, required for Vertex AI).
@@ -9946,7 +9952,7 @@ pub const EnrichmentConfig = struct {
     field: ?[]const u8 = null,
     /// Optional template for generated text input.
     template: ?[]const u8 = null,
-    /// Existing artifact stream this enrichment consumes. Chunk enrichments may consume asset artifacts; embedding enrichments may consume chunk artifacts.
+    /// Existing artifact stream this enrichment consumes. Chunk enrichments may consume asset artifacts; embedding enrichments may consume chunk artifacts; asset enrichments may consume other asset artifacts (the upstream asset's produced bytes become this producer's source, so field and template must be omitted and the producer must consume text: copy, generator, or extractor).
     source_artifact_name: ?[]const u8 = null,
     /// Expected embedding dimension for embedding enrichments.
     expected_dims: ?i64 = null,
@@ -9964,6 +9970,8 @@ pub const EnrichmentConfig = struct {
     content_type: ?[]const u8 = null,
     /// Write-only serialized producer configuration. For managed embedding enrichments Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded.
     producer_json: ?[]const u8 = null,
+    /// Optional bounded sample of the document's graph neighbors appended to the producer input. Only valid on asset enrichments whose producer consumes rendered prompt text (generator or extractor); producers that treat the source as a media locator (copy, reader, transcriber, document_extraction) reject it. Only same-shard graph state is sampled; a graph index without local state for a document yields empty neighbors at runtime while the graph index reference itself is validated at admission.
+    neighbor_context: ?EnrichmentNeighborContextConfig = null,
     /// Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity.
     execution: ?ExecutionPolicy = null,
     /// Typed shorthand for a transcription asset enrichment. Only valid with kind=asset and without producer_json; Antfly expands it into a document_extraction producer whose audio route transcribes each recording with this speech-to-text provider. The produced units carry the transcript text, provider confidence, and per-phrase time offsets, and chunk enrichments that consume them emit _start_time_ms/_end_time_ms on every chunk. With diarization: true the phrases also carry who spoke them, and a chunk that does not straddle a turn emits _speaker. content_type defaults to application/json.
@@ -9984,6 +9992,7 @@ pub const EnrichmentConfig = struct {
         .{ "full_text_index", "full_text_index", true },
         .{ "content_type", "content_type", true },
         .{ "producer_json", "producer_json", true },
+        .{ "neighbor_context", "neighbor_context", true },
         .{ "execution", "execution", true },
         .{ "transcriber", "transcriber", true },
     };
@@ -10046,6 +10055,10 @@ pub const EnrichmentConfig = struct {
             try jw.objectField("producer_json");
             try jw.write(value);
         }
+        if (self.neighbor_context) |value| {
+            try jw.objectField("neighbor_context");
+            try jw.write(value);
+        }
         if (self.execution) |value| {
             try jw.objectField("execution");
             try jw.write(value);
@@ -10087,6 +10100,53 @@ pub const EnrichmentKind = enum {
     }
 };
 
+/// Bounded sample of the document's same-shard graph neighbors appended to an asset producer's rendered input as a compact JSON block ({"neighbors":[{"edge_type":...,"direction":...,"target":...,"weight":...}]}), ordered by edge type then target key. A conceptualizer enrichment on an entities table can thereby ground its abstractions in adjacent facts ("started_by -> John Andrew Rice"). The sampled block participates in the producer's skip state, so a changed adjacency re-runs the producer.
+pub const EnrichmentNeighborContextConfig = struct {
+    /// Name of a graph index on the same table whose local state is sampled. Validated at admission; cross-shard neighbors are not sampled.
+    graph_index: []const u8,
+    /// Edge types to sample. Empty admits every edge type.
+    edge_types: ?[]const []const u8 = null,
+    /// Adjacency orientation to sample relative to the document.
+    direction: ?[]const u8 = null,
+    /// Maximum neighbors rendered into the producer input, applied after deterministic ordering.
+    limit: ?u32 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "graph_index", "graph_index", false },
+        .{ "edge_types", "edge_types", true },
+        .{ "direction", "direction", true },
+        .{ "limit", "limit", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("graph_index");
+        try jw.write(self.graph_index);
+        if (self.edge_types) |value| {
+            try jw.objectField("edge_types");
+            try jw.write(value);
+        }
+        if (self.direction) |value| {
+            try jw.objectField("direction");
+            try jw.write(value);
+        }
+        if (self.limit) |value| {
+            try jw.objectField("limit");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Runtime state for the durable embeddings enrichment worker.
 pub const EnrichmentRuntimeStatus = struct {
     enabled: bool,
@@ -10103,6 +10163,7 @@ pub const EnrichmentRuntimeStatus = struct {
     processed_requests: u64,
     error_count: u64,
     retryable_error_count: u64,
+    /// Durable count of enrichment requests parked with a non-retryable (terminal) disposition, plus fatal worker failures. A terminally failed request never returns to pending; per-document terminal state is reported by the owning index's coverage counters (terminal_failed), and per-document diagnostics by the artifact repair issue listing.
     fatal_error_count: u64,
     /// Consecutive durable worker retries for the current failed request window.
     consecutive_retry_count: u32,
@@ -14872,14 +14933,14 @@ pub const GlobalStatefulQueryRequest = struct {
     profile: ?bool = null,
     /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Set `candidate_count` to the bounded retrieval window (often 50-100) and use the query `limit` for the final page size. Antfly retrieves and globally merges that window, calls the reranker once, then applies pruning, offset, and limit at the coordinator. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
     reranker: ?RerankerConfig = null,
-    /// Direct top-k read from a published graph metric generation. Results are returned in graph_metric_results under the requested name or the metric name when no explicit name is supplied.
+    /// Direct top-k read from a published graph metric generation. Results are returned in graph_metric_results under the requested name or the metric name when no explicit name is supplied. Supplying seed_nodes switches a pagerank metric to query-seeded personalized PageRank computed at query time; that form requires metric_freshness=fresh because published generations are global-only.
     graph_metric: ?GraphMetricQuery = null,
-    /// Blend a published graph metric feature into ordinary search hit scores. Requests may require either any published generation or a generation that is fresh with respect to graph writes.
+    /// Blend a published graph metric feature into ordinary search hit scores. Requests may require either any published generation or a generation that is fresh with respect to graph writes. Supplying seed_nodes switches a pagerank metric to a query-seeded personalized PageRank blend computed at query time; that form requires metric_freshness=fresh. Retrieval-agent queries may opt in to automatic seeding with auto_seed=true, which seeds the blend from the query's literal graph-search start keys; only valid for pagerank metrics with metric_freshness=fresh. Caller-supplied seed_nodes always take precedence and are never overwritten.
     graph_metric_rerank: ?GraphMetricRerank = null,
     analyses: ?Analyses = null,
     /// Declarative graph matching, traversal, and path queries. A nested node `filter` is a typed, non-scoring stored-document predicate. It shares familiar scalar syntax with document queries but deliberately excludes analyzer-backed and index-only clauses. A request may contain at most 64 named graph operations, of which at most 8 may be named `match` operations. Each operation key is a GraphIdentifier under the versioned policy published in the GraphIdentifier schema. Put multiple counts over one pattern in the same `match` return object so they share one complete anchor scan.
     graph_queries: ?GraphQueries = null,
-    /// Optional Handlebars template string for rendering document content in RAG queries. Template has access to document fields via `{{this.fields.fieldName}}`. **Default**: Uses TOON (Token-Oriented Object Notation) format for 30-60% token reduction: ```handlebars {{encodeToon this.fields}} ``` **Available Helpers**: - `encodeToon` - Renders fields in compact TOON format with configurable options: - `lengthMarker` (bool): Add # prefix to array counts (default: true) - `indent` (int): Indentation spacing (default: 2) - `delimiter` (string): Field separator for tabular arrays - `scrubHtml` - Removes HTML tags and extracts text - `media` - Wraps data URIs for GenKit multimodal support - `eq` - Equality comparison for conditionals **Examples**: - Basic TOON: `{{encodeToon this.fields}}` - Compact TOON: `{{encodeToon this.fields lengthMarker=false indent=0}}` - Tabular data: `{{encodeToon this.fields delimiter="\t"}}` - Custom template: `Title: {{this.fields.title}}\nBody: {{this.fields.body}}` - Traditional format: `{{#each this.fields}}{{@key}}: {{this}}\n{{/each}}` TOON format produces compact, LLM-optimized output like: ``` title: Introduction to Vector Search author: Jane Doe tags[#3]: ai,search,ml ``` **References**: - TOON Specification: https://github.com/toon-format/toon - Go Implementation: https://github.com/alpkeskin/gotoon
+    /// Not supported on queries, which do not generate text; requests that set it are rejected. Set `document_renderer` on a retrieval agent request to control how documents appear in the generation prompt.
     document_renderer: ?[]const u8 = null,
     /// Optional result pruning configuration to filter low-relevance results. Pruning helps detect "elbows" in score distributions and removes results that are significantly worse than top matches. It runs once on globally merged results, after optional reranking and before the final offset/limit page is selected. **Common patterns:** - RAG queries: Use `max_score_gap_percent: 30` to stop at quality drop-offs - Strict matching: Use `min_score_ratio: 0.7` for high-quality results only - Combine both for best results Example: ```json { "min_score_ratio": 0.5, "max_score_gap_percent": 25.0, "min_absolute_score": 0.3 } ```
     pruner: ?Pruner = null,
@@ -17303,6 +17364,10 @@ pub const GraphMetricQuery = struct {
     top_k: ?i32 = null,
     /// Whether the latest published generation may be stale or must match the graph edge generation.
     metric_freshness: ?[]const u8 = null,
+    /// Node keys receiving all teleport mass for query-seeded personalized PageRank (HippoRAG-style retrieval). Only valid for pagerank metrics and requires metric_freshness=fresh: personalized scores are computed at query time from the current edge snapshot, while published generations are global-only, so seeded reads against published freshness are rejected. Seed keys absent from the graph are skipped; if none resolve, ranking degenerates to global PageRank.
+    seed_nodes: ?[]const []const u8 = null,
+    /// Damping override for query-seeded personalized PageRank (typical HippoRAG-style retrieval uses 0.9). Only valid together with seed_nodes; omitted reads keep the metric's configured damping.
+    damping: ?f64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -17311,6 +17376,8 @@ pub const GraphMetricQuery = struct {
         .{ "metric", "metric", false },
         .{ "top_k", "top_k", true },
         .{ "metric_freshness", "metric_freshness", true },
+        .{ "seed_nodes", "seed_nodes", true },
+        .{ "damping", "damping", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -17339,6 +17406,14 @@ pub const GraphMetricQuery = struct {
             try jw.objectField("metric_freshness");
             try jw.write(value);
         }
+        if (self.seed_nodes) |value| {
+            try jw.objectField("seed_nodes");
+            try jw.write(value);
+        }
+        if (self.damping) |value| {
+            try jw.objectField("damping");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };
@@ -17359,6 +17434,12 @@ pub const GraphMetricRerank = struct {
     missing_score: ?f64 = null,
     /// Whether stale published generations are acceptable or the metric must be fresh.
     metric_freshness: ?[]const u8 = null,
+    /// Node keys receiving all teleport mass for a query-seeded personalized PageRank blend (HippoRAG-style retrieval). Only valid for pagerank metrics and requires metric_freshness=fresh: the blended feature scores are computed at query time from the current edge snapshot, while published generations are global-only, so seeded blends against published freshness are rejected. Seed keys absent from the graph are skipped; if none resolve, the blend degenerates to global PageRank.
+    seed_nodes: ?[]const []const u8 = null,
+    /// Damping override for the query-seeded personalized PageRank blend. Only valid together with seed_nodes; omitted blends keep the metric's configured damping.
+    damping: ?f64 = null,
+    /// Seed the personalized PageRank blend from the query's literal graph-search start keys; only valid for pagerank metrics with metric_freshness=fresh. Honored by retrieval-agent queries: caller-supplied seed_nodes always take precedence and are never overwritten, and queries without literal graph-search start keys keep their unseeded (global) blend.
+    auto_seed: ?bool = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -17369,6 +17450,9 @@ pub const GraphMetricRerank = struct {
         .{ "weight", "weight", true },
         .{ "missing_score", "missing_score", true },
         .{ "metric_freshness", "metric_freshness", true },
+        .{ "seed_nodes", "seed_nodes", true },
+        .{ "damping", "damping", true },
+        .{ "auto_seed", "auto_seed", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -17403,6 +17487,18 @@ pub const GraphMetricRerank = struct {
         }
         if (self.metric_freshness) |value| {
             try jw.objectField("metric_freshness");
+            try jw.write(value);
+        }
+        if (self.seed_nodes) |value| {
+            try jw.objectField("seed_nodes");
+            try jw.write(value);
+        }
+        if (self.damping) |value| {
+            try jw.objectField("damping");
+            try jw.write(value);
+        }
+        if (self.auto_seed) |value| {
+            try jw.objectField("auto_seed");
             try jw.write(value);
         }
         try jw.endObject();
@@ -18677,6 +18773,8 @@ pub const GraphResolverConfig = struct {
     source_artifact_kind: ?[]const u8 = null,
     resolution_artifact: []const u8,
     key_template: []const u8,
+    /// Mention labels this resolver consumes; empty consumes every label (catch-all). Labeled resolvers sharing a source artifact must claim disjoint label sets, and every catch-all on that artifact skips the labels claimed by labeled siblings, so extraction labels stay open-vocabulary while each mention routes to exactly one labeled resolver (label-routed tables, e.g. event mentions to an events table).
+    labels: ?[]const []const u8 = null,
     type_must_match: ?bool = null,
     scorer_json: ?[]const u8 = null,
     candidate_search: ?[]const u8 = null,
@@ -18688,6 +18786,8 @@ pub const GraphResolverConfig = struct {
     fusion_trust: ?f64 = null,
     fusion_prior: ?f64 = null,
     fusion_prior_weight: ?f64 = null,
+    /// Mention admission floor: mentions whose extractor-asserted confidence is below this are never resolved — no canonical entity key, no mention edge, and relation endpoints referencing them are withheld. The cheap post-extraction junk filter for score-carrying extractors; 0 (the default) admits everything.
+    min_confidence: ?f64 = null,
     config_generation: ?u64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -18698,6 +18798,7 @@ pub const GraphResolverConfig = struct {
         .{ "source_artifact_kind", "source_artifact_kind", true },
         .{ "resolution_artifact", "resolution_artifact", false },
         .{ "key_template", "key_template", false },
+        .{ "labels", "labels", true },
         .{ "type_must_match", "type_must_match", true },
         .{ "scorer_json", "scorer_json", true },
         .{ "candidate_search", "candidate_search", true },
@@ -18709,6 +18810,7 @@ pub const GraphResolverConfig = struct {
         .{ "fusion_trust", "fusion_trust", true },
         .{ "fusion_prior", "fusion_prior", true },
         .{ "fusion_prior_weight", "fusion_prior_weight", true },
+        .{ "min_confidence", "min_confidence", true },
         .{ "config_generation", "config_generation", true },
     };
 
@@ -18736,6 +18838,10 @@ pub const GraphResolverConfig = struct {
         try jw.write(self.resolution_artifact);
         try jw.objectField("key_template");
         try jw.write(self.key_template);
+        if (self.labels) |value| {
+            try jw.objectField("labels");
+            try jw.write(value);
+        }
         if (self.type_must_match) |value| {
             try jw.objectField("type_must_match");
             try jw.write(value);
@@ -18778,6 +18884,10 @@ pub const GraphResolverConfig = struct {
         }
         if (self.fusion_prior_weight) |value| {
             try jw.objectField("fusion_prior_weight");
+            try jw.write(value);
+        }
+        if (self.min_confidence) |value| {
+            try jw.objectField("min_confidence");
             try jw.write(value);
         }
         if (self.config_generation) |value| {
@@ -29147,7 +29257,7 @@ pub const QueryBuilderRequest = struct {
     schema_fields: ?[]const []const u8 = null,
     /// Optional strategy hint for the coordinator. Suggested values are `auto`, `full_text`, `semantic`, `hybrid`, `filter`, `tree`, and `graph`. Unknown values are accepted for forward compatibility and may fall back to `auto`.
     mode: ?[]const u8 = null,
-    /// Preferred output artifact. Suggested values are `query_request`, `bleve`, and `filter_query`. The compatibility `query` field is still returned for existing clients.
+    /// Preferred output artifact. Suggested values are `query_request`, `bleve` (Antfly's native, Bleve-compatible full-text query JSON), and `filter_query`. The compatibility `query` field is still returned for existing clients.
     output: ?[]const u8 = null,
     /// Optional execution constraints for the coordinator, such as `limit`, `allowed_fields`, `prefer_indexes`, and `require_executable`.
     constraints: ?std.json.ArrayHashMap(std.json.Value) = null,
@@ -29256,7 +29366,7 @@ pub const QueryBuilderResult = struct {
     remaining_user_clarifications: ?i64 = null,
     /// Clarification questions exposed in the shared bounded-agent envelope.
     questions: ?[]const AgentQuestion = null,
-    /// Generated search query in native Bleve format. Can be used directly in QueryRequest.full_text_search or filter_query.
+    /// Generated search query in Antfly's native full-text query format (a Bleve-compatible JSON query DSL: `match`, `term`, `conjuncts`, `disjuncts`, `must_not`, etc.). Can be used directly in QueryRequest.full_text_search or filter_query.
     query: std.json.ArrayHashMap(std.json.Value),
     /// Antfly query request assembled by the coordinator. New clients should prefer this field when they want an executable Antfly query object.
     query_request: ?QueryRequest = null,
@@ -29908,14 +30018,14 @@ pub const QueryRequest = struct {
     profile: ?bool = null,
     /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Set `candidate_count` to the bounded retrieval window (often 50-100) and use the query `limit` for the final page size. Antfly retrieves and globally merges that window, calls the reranker once, then applies pruning, offset, and limit at the coordinator. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
     reranker: ?RerankerConfig = null,
-    /// Direct top-k read from a published graph metric generation. Results are returned in graph_metric_results under the requested name or the metric name when no explicit name is supplied.
+    /// Direct top-k read from a published graph metric generation. Results are returned in graph_metric_results under the requested name or the metric name when no explicit name is supplied. Supplying seed_nodes switches a pagerank metric to query-seeded personalized PageRank computed at query time; that form requires metric_freshness=fresh because published generations are global-only.
     graph_metric: ?GraphMetricQuery = null,
-    /// Blend a published graph metric feature into ordinary search hit scores. Requests may require either any published generation or a generation that is fresh with respect to graph writes.
+    /// Blend a published graph metric feature into ordinary search hit scores. Requests may require either any published generation or a generation that is fresh with respect to graph writes. Supplying seed_nodes switches a pagerank metric to a query-seeded personalized PageRank blend computed at query time; that form requires metric_freshness=fresh. Retrieval-agent queries may opt in to automatic seeding with auto_seed=true, which seeds the blend from the query's literal graph-search start keys; only valid for pagerank metrics with metric_freshness=fresh. Caller-supplied seed_nodes always take precedence and are never overwritten.
     graph_metric_rerank: ?GraphMetricRerank = null,
     analyses: ?Analyses = null,
     /// Declarative graph matching, traversal, and path queries. A nested node `filter` is a typed, non-scoring stored-document predicate. It shares familiar scalar syntax with document queries but deliberately excludes analyzer-backed and index-only clauses. A request may contain at most 64 named graph operations, of which at most 8 may be named `match` operations. Each operation key is a GraphIdentifier under the versioned policy published in the GraphIdentifier schema. Put multiple counts over one pattern in the same `match` return object so they share one complete anchor scan.
     graph_queries: ?GraphQueries = null,
-    /// Optional Handlebars template string for rendering document content in RAG queries. Template has access to document fields via `{{this.fields.fieldName}}`. **Default**: Uses TOON (Token-Oriented Object Notation) format for 30-60% token reduction: ```handlebars {{encodeToon this.fields}} ``` **Available Helpers**: - `encodeToon` - Renders fields in compact TOON format with configurable options: - `lengthMarker` (bool): Add # prefix to array counts (default: true) - `indent` (int): Indentation spacing (default: 2) - `delimiter` (string): Field separator for tabular arrays - `scrubHtml` - Removes HTML tags and extracts text - `media` - Wraps data URIs for GenKit multimodal support - `eq` - Equality comparison for conditionals **Examples**: - Basic TOON: `{{encodeToon this.fields}}` - Compact TOON: `{{encodeToon this.fields lengthMarker=false indent=0}}` - Tabular data: `{{encodeToon this.fields delimiter="\t"}}` - Custom template: `Title: {{this.fields.title}}\nBody: {{this.fields.body}}` - Traditional format: `{{#each this.fields}}{{@key}}: {{this}}\n{{/each}}` TOON format produces compact, LLM-optimized output like: ``` title: Introduction to Vector Search author: Jane Doe tags[#3]: ai,search,ml ``` **References**: - TOON Specification: https://github.com/toon-format/toon - Go Implementation: https://github.com/alpkeskin/gotoon
+    /// Not supported on queries, which do not generate text; requests that set it are rejected. Set `document_renderer` on a retrieval agent request to control how documents appear in the generation prompt.
     document_renderer: ?[]const u8 = null,
     /// Optional result pruning configuration to filter low-relevance results. Pruning helps detect "elbows" in score distributions and removes results that are significantly worse than top matches. It runs once on globally merged results, after optional reranking and before the final offset/limit page is selected. **Common patterns:** - RAG queries: Use `max_score_gap_percent: 30` to stop at quality drop-offs - Strict matching: Use `min_score_ratio: 0.7` for high-quality results only - Combine both for best results Example: ```json { "min_score_ratio": 0.5, "max_score_gap_percent": 25.0, "min_absolute_score": 0.3 } ```
     pruner: ?Pruner = null,
@@ -32251,7 +32361,7 @@ pub const RepairTarget = enum {
 pub const ReplicationRoute = struct {
     /// Name of the Antfly table to write matching rows to. The table must already exist.
     target_table: []const u8,
-    /// Bleve-style filter query evaluated against each CDC row. Only rows matching this filter are written to `target_table`. If omitted, all rows match (equivalent to `match_all`).
+    /// Antfly's native filter query (see `RawQuery`) evaluated against each CDC row. Only rows matching this filter are written to `target_table`. If omitted, all rows match (equivalent to `match_all`).
     where: ?RawQuery = null,
     /// Override the source-level `key_template` for this route. If omitted, the source-level template is used.
     key_template: ?[]const u8 = null,
@@ -32318,7 +32428,7 @@ pub const ReplicationSource = struct {
     on_update: ?[]const ReplicationTransformOp = null,
     /// Transform operations applied on DELETE events. If omitted, auto-derives `$unset` ops from `on_update`'s `$set` paths (safe for multi-source). Use `$delete_document` op to delete the entire Antfly document.
     on_delete: ?[]const ReplicationTransformOp = null,
-    /// Bleve-style filter query that gets translated to SQL and applied as a WHERE clause on the PostgreSQL publication. This filters rows at the source before they are sent over the replication stream, reducing network and processing overhead. Requires PostgreSQL 15 or newer and is applied only when Antfly creates the publication. Changing this value does not alter an existing publication; update or recreate that publication directly. Only a subset of filter types are supported (term, match, range, conjuncts, disjuncts, must_not). The filter is translated to SQL with inlined literal values. Example: `{"term": "active", "field": "status"}` becomes `WHERE ("status" = 'active')` on the publication.
+    /// Antfly's native filter query (see `RawQuery`) that gets translated to SQL and applied as a WHERE clause on the PostgreSQL publication. This filters rows at the source before they are sent over the replication stream, reducing network and processing overhead. Requires PostgreSQL 15 or newer and is applied only when Antfly creates the publication. Changing this value does not alter an existing publication; update or recreate that publication directly. Only a subset of filter types are supported (term, match, range, conjuncts, disjuncts, must_not). The filter is translated to SQL with inlined literal values. Example: `{"term": "active", "field": "status"}` becomes `WHERE ("status" = 'active')` on the publication.
     publication_filter: ?RawQuery = null,
     /// Conditional routes for fan-out replication. Each route evaluates its `where` filter against every CDC row and, on match, writes to the specified `target_table`. Multiple routes can match the same row. When routes are present, the top-level `on_update`/`on_delete` are ignored — each route defines its own transforms.
     routes: ?[]const ReplicationRoute = null,
@@ -33048,7 +33158,7 @@ pub const RetrievalAgentRequest = struct {
     tools: ?ChatToolsConfig = null,
     /// Step configuration
     steps: ?RetrievalAgentSteps = null,
-    /// Handlebars template for rendering documents in the generation prompt. Default uses TOON format for token efficiency. Requires steps.generation to be set.
+    /// Handlebars template that renders each retrieved document in the generation prompt. Requires steps.generation to be set. The template is rendered once per hit against `{id, score, fields}`, where `fields` is the hit's source. When omitted, each document's fields are encoded as TOON (Token-Oriented Object Notation), which carries the same structure as JSON in fewer tokens. Helpers: `encodeToon` (options `indent`, 1 to 16, default 2; and `delimiter`: `comma`, `tab`, or `pipe`), `scrubHtml`, `eq`, and `media`. Values in `{{...}}` are HTML-escaped; use `{{{...}}}` for raw text. Examples: - `{{encodeToon this.fields}}` - `{{encodeToon this.fields delimiter="tab"}}` - `Title: {{{this.fields.title}}}`
     document_renderer: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -35054,14 +35164,14 @@ pub const StatefulQueryRequest = struct {
     profile: ?bool = null,
     /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Set `candidate_count` to the bounded retrieval window (often 50-100) and use the query `limit` for the final page size. Antfly retrieves and globally merges that window, calls the reranker once, then applies pruning, offset, and limit at the coordinator. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
     reranker: ?RerankerConfig = null,
-    /// Direct top-k read from a published graph metric generation. Results are returned in graph_metric_results under the requested name or the metric name when no explicit name is supplied.
+    /// Direct top-k read from a published graph metric generation. Results are returned in graph_metric_results under the requested name or the metric name when no explicit name is supplied. Supplying seed_nodes switches a pagerank metric to query-seeded personalized PageRank computed at query time; that form requires metric_freshness=fresh because published generations are global-only.
     graph_metric: ?GraphMetricQuery = null,
-    /// Blend a published graph metric feature into ordinary search hit scores. Requests may require either any published generation or a generation that is fresh with respect to graph writes.
+    /// Blend a published graph metric feature into ordinary search hit scores. Requests may require either any published generation or a generation that is fresh with respect to graph writes. Supplying seed_nodes switches a pagerank metric to a query-seeded personalized PageRank blend computed at query time; that form requires metric_freshness=fresh. Retrieval-agent queries may opt in to automatic seeding with auto_seed=true, which seeds the blend from the query's literal graph-search start keys; only valid for pagerank metrics with metric_freshness=fresh. Caller-supplied seed_nodes always take precedence and are never overwritten.
     graph_metric_rerank: ?GraphMetricRerank = null,
     analyses: ?Analyses = null,
     /// Declarative graph matching, traversal, and path queries. A nested node `filter` is a typed, non-scoring stored-document predicate. It shares familiar scalar syntax with document queries but deliberately excludes analyzer-backed and index-only clauses. A request may contain at most 64 named graph operations, of which at most 8 may be named `match` operations. Each operation key is a GraphIdentifier under the versioned policy published in the GraphIdentifier schema. Put multiple counts over one pattern in the same `match` return object so they share one complete anchor scan.
     graph_queries: ?GraphQueries = null,
-    /// Optional Handlebars template string for rendering document content in RAG queries. Template has access to document fields via `{{this.fields.fieldName}}`. **Default**: Uses TOON (Token-Oriented Object Notation) format for 30-60% token reduction: ```handlebars {{encodeToon this.fields}} ``` **Available Helpers**: - `encodeToon` - Renders fields in compact TOON format with configurable options: - `lengthMarker` (bool): Add # prefix to array counts (default: true) - `indent` (int): Indentation spacing (default: 2) - `delimiter` (string): Field separator for tabular arrays - `scrubHtml` - Removes HTML tags and extracts text - `media` - Wraps data URIs for GenKit multimodal support - `eq` - Equality comparison for conditionals **Examples**: - Basic TOON: `{{encodeToon this.fields}}` - Compact TOON: `{{encodeToon this.fields lengthMarker=false indent=0}}` - Tabular data: `{{encodeToon this.fields delimiter="\t"}}` - Custom template: `Title: {{this.fields.title}}\nBody: {{this.fields.body}}` - Traditional format: `{{#each this.fields}}{{@key}}: {{this}}\n{{/each}}` TOON format produces compact, LLM-optimized output like: ``` title: Introduction to Vector Search author: Jane Doe tags[#3]: ai,search,ml ``` **References**: - TOON Specification: https://github.com/toon-format/toon - Go Implementation: https://github.com/alpkeskin/gotoon
+    /// Not supported on queries, which do not generate text; requests that set it are rejected. Set `document_renderer` on a retrieval agent request to control how documents appear in the generation prompt.
     document_renderer: ?[]const u8 = null,
     /// Optional result pruning configuration to filter low-relevance results. Pruning helps detect "elbows" in score distributions and removes results that are significantly worse than top matches. It runs once on globally merged results, after optional reranking and before the final offset/limit page is selected. **Common patterns:** - RAG queries: Use `max_score_gap_percent: 30` to stop at quality drop-offs - Strict matching: Use `min_score_ratio: 0.7` for high-quality results only - Combine both for best results Example: ```json { "min_score_ratio": 0.5, "max_score_gap_percent": 25.0, "min_absolute_score": 0.3 } ```
     pruner: ?Pruner = null,
@@ -35523,7 +35633,7 @@ pub const SuccessMessage = struct {
     }
 };
 
-/// Synchronization level for batch operations: - "propose": Wait for Raft proposal acceptance (fastest, default) - "write": Wait for Pebble KV write - "full_text": Wait for full-text index WAL write - "enrichments": Precompute enrichments before committing the document. A synchronous producer failure rejects the write; post-commit worker failures retain the document and may return `committed_repair_required`. - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
+/// Synchronization level for batch operations: - "propose": Wait for Raft proposal acceptance (fastest, default) - "write": Wait for the write to be durably applied to the local key-value store - "full_text": Wait for full-text index WAL write - "enrichments": Precompute enrichments before committing the document. A synchronous producer failure rejects the write; post-commit worker failures retain the document and may return `committed_repair_required`. - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
 pub const SyncLevel = enum {
     propose,
     write,

@@ -21,13 +21,12 @@ class AntflyEmbedderConfig:
     """Configuration for the Antfly inference embedding provider.
 
     Antfly inference is Antfly's built-in ML service for local embeddings using ONNX models.
-    It provides embedding generation with multi-tier caching (memory + persistent).
 
     **Features:**
     - Local ONNX-based embedding generation
-    - L1 memory cache with configurable TTL
-    - L2 persistent Pebble database cache
-    - Singleflight deduplication for concurrent identical requests
+    - Query-time embeddings are served from an in-memory cache (64 MiB budget,
+      5-minute TTL by default) with concurrent identical requests coalesced onto
+      a single computation; there is no persistent on-disk cache tier
 
     **Example Models:** bge-base-en-v1.5 (768 dims), all-MiniLM-L6-v2 (384 dims)
 

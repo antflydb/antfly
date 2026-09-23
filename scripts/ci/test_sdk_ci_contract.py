@@ -31,6 +31,7 @@ class SdkCiContractTests(unittest.TestCase):
     def test_vitest_worker_counts_are_bounded(self) -> None:
         packages = (
             "ts/packages/sdk/package.json",
+            "ts/packages/lite/package.json",
             "ts/packages/components/package.json",
             "ts/apps/antfarm/package.json",
         )

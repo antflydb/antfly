@@ -9,6 +9,7 @@ from ..models.enrichment_kind import EnrichmentKind
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.enrichment_neighbor_context_config import EnrichmentNeighborContextConfig
     from ..models.execution_policy import ExecutionPolicy
 
 
@@ -32,6 +33,12 @@ class CreatedEnrichmentConfig:
         chunker_json (str | Unset):
         full_text_index (bool | Unset):  Default: False.
         content_type (str | Unset):
+        neighbor_context (EnrichmentNeighborContextConfig | Unset): Bounded sample of the document's same-shard graph
+            neighbors appended to an asset producer's rendered input as a compact JSON block
+            ({"neighbors":[{"edge_type":...,"direction":...,"target":...,"weight":...}]}), ordered by edge type then target
+            key. A conceptualizer enrichment on an entities table can thereby ground its abstractions in adjacent facts
+            ("started_by -> John Andrew Rice"). The sampled block participates in the producer's skip state, so a changed
+            adjacency re-runs the producer.
         execution (ExecutionPolicy | Unset): Non-semantic execution policy for one producer or index maintenance
             operation. These fields tune how work is batched and do not change generated artifact identity.
     """
@@ -48,6 +55,7 @@ class CreatedEnrichmentConfig:
     chunker_json: str | Unset = UNSET
     full_text_index: bool | Unset = False
     content_type: str | Unset = UNSET
+    neighbor_context: EnrichmentNeighborContextConfig | Unset = UNSET
     execution: ExecutionPolicy | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
@@ -74,6 +82,10 @@ class CreatedEnrichmentConfig:
         full_text_index = self.full_text_index
 
         content_type = self.content_type
+
+        neighbor_context: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.neighbor_context, Unset):
+            neighbor_context = self.neighbor_context.to_dict()
 
         execution: dict[str, Any] | Unset = UNSET
         if not isinstance(self.execution, Unset):
@@ -107,6 +119,8 @@ class CreatedEnrichmentConfig:
             field_dict["full_text_index"] = full_text_index
         if content_type is not UNSET:
             field_dict["content_type"] = content_type
+        if neighbor_context is not UNSET:
+            field_dict["neighbor_context"] = neighbor_context
         if execution is not UNSET:
             field_dict["execution"] = execution
 
@@ -114,6 +128,7 @@ class CreatedEnrichmentConfig:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.enrichment_neighbor_context_config import EnrichmentNeighborContextConfig
         from ..models.execution_policy import ExecutionPolicy
 
         d = dict(src_dict)
@@ -141,6 +156,13 @@ class CreatedEnrichmentConfig:
 
         content_type = d.pop("content_type", UNSET)
 
+        _neighbor_context = d.pop("neighbor_context", UNSET)
+        neighbor_context: EnrichmentNeighborContextConfig | Unset
+        if isinstance(_neighbor_context, Unset):
+            neighbor_context = UNSET
+        else:
+            neighbor_context = EnrichmentNeighborContextConfig.from_dict(_neighbor_context)
+
         _execution = d.pop("execution", UNSET)
         execution: ExecutionPolicy | Unset
         if isinstance(_execution, Unset):
@@ -161,6 +183,7 @@ class CreatedEnrichmentConfig:
             chunker_json=chunker_json,
             full_text_index=full_text_index,
             content_type=content_type,
+            neighbor_context=neighbor_context,
             execution=execution,
         )
 

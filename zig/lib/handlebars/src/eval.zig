@@ -769,9 +769,13 @@ pub const Eval = struct {
             .path => |p| self.resolvePath(&p),
             .string_literal => |s| Value.str(s.value),
             .boolean_literal => |b| Value.bln(b.value),
-            .number_literal => |n| if (n.is_int)
-                Value.int(@intFromFloat(n.value))
-            else
+            // Parse integers from the source text: the f64 value loses
+            // precision near the i64 limits and may not convert at all.
+            .number_literal => |n| if (!n.is_int)
+                Value.flt(n.value)
+            else if (std.fmt.parseInt(i64, n.original, 10)) |int|
+                Value.int(int)
+            else |_|
                 Value.flt(n.value),
             .sub_expression => |s| self.evalExpressionValue(&s.expression.expression),
             else => .undefined,

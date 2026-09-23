@@ -143,6 +143,9 @@ class HAStandaloneNode:
 
     def capture_catalog(self) -> dict[str, Any]:
         generation = f"catalog-{time.time_ns()}"
+        # The server allows 30 seconds just for seed snapshot preflight.
+        # Capture can commit before its reply, so a short transport timeout
+        # cannot be recovered by issuing the POST again.
         captured = self.admin_post(
             "/base-backups/capture",
             {
@@ -154,6 +157,8 @@ class HAStandaloneNode:
                 "target_pvc_name": "e2e-data",
                 "target_pvc_uid": "e2e-data-uid",
             },
+            timeout_s=60.0,
+            request_timeout_s=60.0,
         )
         topology = json.loads(
             (Path(captured["content_root"]) / "TOPOLOGY.json").read_text()
@@ -364,13 +369,22 @@ class HAStandaloneNode:
             # transient response without weakening any other failure signal.
             time.sleep(HA_TRANSITION_RETRY_INTERVAL_S)
 
-    def admin_post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        deadline = time.monotonic() + HA_TRANSITION_RETRY_TIMEOUT_S
+    def admin_post(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        *,
+        timeout_s: float = HA_TRANSITION_RETRY_TIMEOUT_S,
+        request_timeout_s: float = 10.0,
+    ) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout_s
         while True:
             response = self.admin_post_response(
                 path,
                 payload,
-                request_timeout_s=max(0.001, min(10.0, deadline - time.monotonic())),
+                request_timeout_s=max(
+                    0.001, min(request_timeout_s, deadline - time.monotonic())
+                ),
             )
             if not _is_ha_post_not_admitted(path, response):
                 return self._check(response)
@@ -571,6 +585,30 @@ def test_admin_capture_admission_budget_includes_request_and_sleep(
         node.admin_post("/base-backups/capture", {})
     assert timeouts == pytest.approx([10.0, 9.9])
     assert now[0] == pytest.approx(HA_TRANSITION_RETRY_TIMEOUT_S)
+
+
+def test_admin_capture_can_outlive_server_preflight_without_replay(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    node = object.__new__(HAStandaloneNode)
+    now = [0.0]
+    timeouts = []
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+
+    def captured(_path, _payload, *, request_timeout_s):
+        timeouts.append(request_timeout_s)
+        now[0] += 31.0
+        return _test_response(200, b"{}")
+
+    node.admin_post_response = captured
+    node._check = lambda response: response.json()
+    assert (
+        node.admin_post(
+            "/base-backups/capture", {}, timeout_s=60.0, request_timeout_s=60.0
+        )
+        == {}
+    )
+    assert timeouts == [60.0]
 
 
 class HACluster:

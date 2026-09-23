@@ -38,7 +38,7 @@ pub fn configureModule(
     vector_mod: *std.Build.Module,
     vectorindex_mod: *std.Build.Module,
     hash_mod: *std.Build.Module,
-    vellum_mod: *std.Build.Module,
+    fst_mod: *std.Build.Module,
     regex_mod: *std.Build.Module,
     image_mod: *std.Build.Module,
     font_mod: *std.Build.Module,
@@ -68,7 +68,7 @@ pub fn configureModule(
     mod.addImport("antfly_vector", vector_mod);
     mod.addImport("antfly_vectorindex", vectorindex_mod);
     mod.addImport("antfly_hash", hash_mod);
-    mod.addImport("antfly_vellum", vellum_mod);
+    mod.addImport("antfly_fst", fst_mod);
     mod.addImport("antfly_regex", regex_mod);
     mod.addImport("antfly_image", image_mod);
     mod.addImport("antfly_font", font_mod);
@@ -105,7 +105,11 @@ pub const AddEmbeddedResult = struct {
     install_libantfly: *std.Build.Step.InstallArtifact,
     install_capi_header: *std.Build.Step.InstallFile,
     run_capi_smoke: *std.Build.Step.Run,
+    run_capi_conformance: *std.Build.Step.Run,
     run_lite_go_tests: *std.Build.Step.Run,
+    run_lite_py_tests: *std.Build.Step.Run,
+    run_lite_rs_tests: *std.Build.Step.Run,
+    run_lite_ts_tests: *std.Build.Step.Run,
     run_lite_go_example: *std.Build.Step.Run,
     run_lite_go_retrieval_template: *std.Build.Step.Run,
     run_cabi_packaging_tests: *std.Build.Step.Run,
@@ -135,7 +139,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     const vector_mod = options.antfly_imports.vector;
     const hash_mod = options.antfly_imports.hash;
     const vectorindex_mod = options.antfly_imports.vectorindex;
-    const vellum_mod = options.antfly_imports.vellum;
+    const fst_mod = options.antfly_imports.fst;
     const regex_mod = options.antfly_imports.regex;
     const json_mod = options.antfly_imports.json;
     const matcher_mod = options.antfly_imports.matcher;
@@ -170,7 +174,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         vector_mod,
         vectorindex_mod,
         hash_mod,
-        vellum_mod,
+        fst_mod,
         regex_mod,
         image_mod,
         font_mod,
@@ -346,6 +350,28 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     const capi_smoke_step = b.step("capi-smoke", "Compile and run a C consumer smoke test for libantfly");
     capi_smoke_step.dependOn(&run_capi_smoke.step);
 
+    // Reference runner for the shared conformance cases every binding runs
+    // (pkg/antfly/capi-conformance/README.md). It calls libantfly only
+    // through the public header, so a case that fails here is an ABI bug
+    // rather than a binding bug.
+    const capi_conformance_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/capi/conformance_runner.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    capi_conformance_mod.link_libc = true;
+    capi_conformance_mod.addIncludePath(b.path("pkg/antfly/include"));
+    const capi_conformance = b.addExecutable(.{
+        .name = "antfly-capi-conformance",
+        .root_module = capi_conformance_mod,
+    });
+    capi_conformance.root_module.linkLibrary(libantfly);
+    const run_capi_conformance = b.addRunArtifact(capi_conformance);
+    run_capi_conformance.addDirectoryArg(b.path("pkg/antfly/capi-conformance/cases"));
+    _ = run_capi_conformance.addOutputDirectoryArg("capi-conformance-work");
+    const capi_conformance_step = b.step("capi-conformance", "Run the shared libantfly conformance cases against the C ABI");
+    capi_conformance_step.dependOn(&run_capi_conformance.step);
+
     // The Go test binary is not the `antfly` executable, so it cannot re-exec
     // itself the way the CLI does to spawn the sandboxed inference worker
     // (see inference_worker.zig's `resolveWorkerExecutable`). Point it at the
@@ -359,15 +385,68 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "go",
         "test",
         "-tags",
-        "antflylite_capi",
+        "libantfly",
         "-count=1",
         "./...",
     });
-    run_lite_go_tests.setCwd(b.path("../go/pkg/antflylite"));
+    run_lite_go_tests.setCwd(b.path("../go/pkg/lite"));
     run_lite_go_tests.step.dependOn(&install_libantfly.step);
     run_lite_go_tests.step.dependOn(&install_capi_header.step);
     const lite_go_test_step = b.step("lite-go-test", "Run Go Antfly Lite binding tests against libantfly");
     lite_go_test_step.dependOn(&run_lite_go_tests.step);
+
+    // The Python, Rust, and TypeScript bindings skip their native tests
+    // when libantfly is absent; ANTFLY_LITE_REQUIRE_LIBRARY turns that into
+    // a failure here, and ANTFLY_LIB_DIR points them at this build's copy.
+    const lite_lib_dir_env = b.fmt("ANTFLY_LIB_DIR={s}", .{b.getInstallPath(.lib, "")});
+    const run_lite_py_tests = b.addSystemCommand(&.{
+        "env",
+        "ANTFLY_LITE_REQUIRE_LIBRARY=1",
+        lite_lib_dir_env,
+        lite_go_worker_env,
+        "uv",
+        "run",
+        "--locked",
+        "pytest",
+        "-q",
+    });
+    run_lite_py_tests.setCwd(b.path("../py/packages/lite"));
+    run_lite_py_tests.step.dependOn(&install_libantfly.step);
+    const lite_py_test_step = b.step("lite-py-test", "Run Python Antfly Lite binding tests against libantfly");
+    lite_py_test_step.dependOn(&run_lite_py_tests.step);
+
+    const run_lite_rs_tests = b.addSystemCommand(&.{
+        "env",
+        lite_lib_dir_env,
+        lite_go_worker_env,
+        "cargo",
+        "test",
+        "--locked",
+        "--manifest-path",
+        "../rs/Cargo.toml",
+        "--package",
+        "antfly-lite",
+        "--features",
+        "libantfly",
+    });
+    run_lite_rs_tests.setCwd(b.path("."));
+    run_lite_rs_tests.step.dependOn(&install_libantfly.step);
+    const lite_rs_test_step = b.step("lite-rs-test", "Run Rust Antfly Lite binding tests against libantfly");
+    lite_rs_test_step.dependOn(&run_lite_rs_tests.step);
+
+    const run_lite_ts_tests = b.addSystemCommand(&.{
+        "env",
+        "ANTFLY_LITE_REQUIRE_LIBRARY=1",
+        lite_lib_dir_env,
+        lite_go_worker_env,
+        "pnpm",
+        "run",
+        "test",
+    });
+    run_lite_ts_tests.setCwd(b.path("../ts/packages/lite"));
+    run_lite_ts_tests.step.dependOn(&install_libantfly.step);
+    const lite_ts_test_step = b.step("lite-ts-test", "Run TypeScript Antfly Lite binding tests against libantfly (needs pnpm install in ts/)");
+    lite_ts_test_step.dependOn(&run_lite_ts_tests.step);
 
     const run_lite_go_example = b.addSystemCommand(&.{
         "env",
@@ -426,6 +505,10 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi system write cursor",
         "capi lite exposes hosted and status-only profiles",
         "capi lite open options validate and configure ttl cleanup",
+        "capi handle ids are safe to use after close and across slot reuse",
+        "capi handle registry retires a slot instead of wrapping its generation",
+        "capi concurrent calls and closes on one handle never touch freed memory",
+        "capi text and dense searches succeed while writes commit",
         "capi execute graph queries honors identity read generation",
         "capi search rejects stale identity generation before readable lease hook",
         "capi search json returns stamped identity generation",
@@ -440,6 +523,8 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "run until idle no-progress error maps to a dedicated stalled ABI code, not internal",
         "capi lite merged indexes JSON discovers a standalone asset extractor and chunk enrichment with no owning index",
         "capi lite run until idle drains a standalone chunk enrichment with no owning index",
+        "capi lite AddIndexJSON registers a graph config's nested resolvers",
+        "capi lite AddIndexJSON restores the enrichment catalog when admission rejects the index",
     };
     const capi_tests = b.addTest(.{
         .root_module = capi_mod,
@@ -470,7 +555,11 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .install_libantfly = install_libantfly,
         .install_capi_header = install_capi_header,
         .run_capi_smoke = run_capi_smoke,
+        .run_capi_conformance = run_capi_conformance,
         .run_lite_go_tests = run_lite_go_tests,
+        .run_lite_py_tests = run_lite_py_tests,
+        .run_lite_rs_tests = run_lite_rs_tests,
+        .run_lite_ts_tests = run_lite_ts_tests,
         .run_lite_go_example = run_lite_go_example,
         .run_lite_go_retrieval_template = run_lite_go_retrieval_template,
         .run_cabi_packaging_tests = run_cabi_packaging_tests,
