@@ -1,6 +1,6 @@
 # REGEX
 
-`lib/regex` is Antfly's regex engine. It backs `vellum` FST-based regexp
+`lib/regex` is Antfly's regex engine. It backs `lib/fst` FST-based regexp
 queries and the AST-based matcher used by JSON Schema and similar validation
 paths, with a portable Zig SIMD prefilter for plain (non-FST) haystack
 scanning.
@@ -9,8 +9,8 @@ scanning.
 
 - `src/automaton.zig`: compiles a regex to a Thompson NFA, then lazily
   determinizes it (on-the-fly powerset/subset construction) into a DFA used to
-  implement the `vellum.Automaton` interface. `pkg/antfly/src/search/query.zig`
-  uses this automaton to prune `vellum` FST traversal for regexp queries.
+  implement the `fst.Automaton` interface. `pkg/antfly/src/search/query.zig`
+  uses this automaton to prune FST traversal for regexp queries.
   - Bytes are grouped into equivalence classes so the DFA transition table is
     indexed by class rather than by raw byte, and per-state transitions are
     cached in a hashed DFA-state cache (keyed by NFA state set) instead of a
@@ -60,7 +60,7 @@ Regexes operate on raw bytes; there is no separate Unicode code-point mode.
 ## Matching Strategy
 
 - FST traversal (`automaton.zig`) never backtracks: the compiled automaton
-  exposes DFA-shaped `step`/`isMatch` behavior to `vellum`, with byte-class
+  exposes DFA-shaped `step`/`isMatch` behavior to `lib/fst`, with byte-class
   transitions and a hashed state cache keeping per-step cost low even though
   states are computed lazily.
 - Plain haystack scanning (`mod.zig`) is candidate-driven: the SIMD prefilter
@@ -71,7 +71,7 @@ Regexes operate on raw bytes; there is no separate Unicode code-point mode.
 ## Benchmarking
 
 `regex-bench` (`bench/regex_bench.zig`) measures haystack candidate filtering
-and `vellum` automaton traversal so further optimization work can be judged
+and FST automaton traversal so further optimization work can be judged
 from local numbers instead of guesses.
 
 ## Open Work
