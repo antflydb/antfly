@@ -35093,6 +35093,7 @@ pub const DB = struct {
         item.projection_checkpoint_applied_sequence = checkpoint.applied_sequence;
         item.projection_checkpoint_generation = checkpoint.generation;
         item.projection_checkpoint_config_hash = checkpoint.config_hash;
+        item.projection_checkpoint_published_count = checkpoint.published_count;
         item.checkpoint_replay_tail_sequence_count = target_sequence -| checkpoint.applied_sequence;
         switch (checkpoint.status) {
             .clean => {},
@@ -35161,14 +35162,38 @@ pub const DB = struct {
         kind: types.IndexKind,
         index_name: []const u8,
         preloaded_repair_state: ?*const index_repair_state.State,
+        published_count: ?u64,
+        produced_count: u64,
     ) bool {
         const installed = switch (kind) {
             .dense_vector => self.core.denseIndex(index_name) != null,
             .sparse_vector => self.core.sparseIndex(index_name) != null,
             else => false,
         };
-        return installed and
-            self.observeResidentIndexAdmission(alloc, index_name, preloaded_repair_state) == .admitted;
+        if (!installed or self.observeResidentIndexAdmission(alloc, index_name, preloaded_repair_state) != .admitted) return false;
+        if (kind == .dense_vector) {
+            if (published_count) |certified| {
+                const entry = self.core.denseIndex(index_name) orelse return false;
+                if (entry.index.stats().active_count != certified) return false;
+            } else if (produced_count != 0) {
+                if (self.core.index_manager.get(index_name)) |cfg| {
+                    // Older checkpoints have no count certificate. For managed
+                    // progressive indexes use the existing durable coverage
+                    // proof instead of treating an empty HBC as ready.
+                    const proof = self.observeProgressiveManagedGenerationQueryabilityAtLeast(
+                        alloc,
+                        index_name,
+                        types.indexConfigHash(cfg.*),
+                        0,
+                    ) catch return false;
+                    switch (proof) {
+                        .queryable, .atomic_publication, .external_coverage => {},
+                        else => return false,
+                    }
+                }
+            }
+        }
+        return true;
     }
 
     fn applyDurableIndexRepairStats(
@@ -36338,7 +36363,7 @@ pub const DB = struct {
                     self.async_context.index_repair_state_corrupt.load(.acquire),
                     item,
                 );
-                item.serving_snapshot_ready = self.vectorServingSnapshotReady(stats_alloc, item.kind, item.name, if (repairs) |*state| state else null);
+                item.serving_snapshot_ready = self.vectorServingSnapshotReady(stats_alloc, item.kind, item.name, if (repairs) |*state| state else null, item.projection_checkpoint_published_count, item.coverage_produced_count);
             }
             for (item.source_replay) |*source| {
                 source.target_sequence = try self.artifactSourceTargetSequence(
@@ -38155,6 +38180,8 @@ pub const DB = struct {
                     cfg.kind,
                     cfg.name,
                     if (durable_index_repairs) |*state| state else null,
+                    item.projection_checkpoint_published_count,
+                    item.coverage_produced_count,
                 );
             }
             // Coverage and rebuild accounting above describes serviceable
@@ -38410,6 +38437,8 @@ pub const DB = struct {
                     cfg.kind,
                     cfg.name,
                     if (durable_index_repairs) |*state| state else null,
+                    item.projection_checkpoint_published_count,
+                    item.coverage_produced_count,
                 );
             }
             if (item.load_error != null) applyTerminalLoadFailureStatus(&item);
@@ -58320,8 +58349,12 @@ fn saveAppliedSequencesBatchLockedContext(
         return;
     }
     if (async_ctx) |active_async_ctx| {
-        try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
+        // Never persist a source watermark in HBC metadata before the
+        // corresponding index WAL/posting effects are durable. A crash in that
+        // gap would make restart trust a checkpoint ahead of its physical
+        // snapshot.
         try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
+        try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
         try apply_state.saveAppliedSequencesWithCheckpoint(
             ctx.alloc,
             ctx.index_manager.checkpointIo(),
@@ -58343,8 +58376,8 @@ fn saveAppliedSequencesBatchLockedContext(
         );
         return;
     }
-    try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
     try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
+    try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
     try apply_state.saveAppliedSequencesWithCheckpoint(
         ctx.alloc,
         ctx.index_manager.checkpointIo(),
@@ -69145,12 +69178,12 @@ fn flushFinishedDenseAppliedSequenceLocked(
                 posting_publish_ns +|= elapsedSince(posting_started);
             }
         } else {
-            const metadata_started = monotonicTimeNs();
-            try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
-            projection_metadata_ns +|= elapsedSince(metadata_started);
             const posting_started = monotonicTimeNs();
             try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
             posting_publish_ns +|= elapsedSince(posting_started);
+            const metadata_started = monotonicTimeNs();
+            try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
+            projection_metadata_ns +|= elapsedSince(metadata_started);
             const checkpoint_started = monotonicTimeNs();
             try apply_state.saveAppliedSequencesWithCheckpoint(
                 ctx.alloc,
@@ -69233,12 +69266,12 @@ fn flushPendingAppliedSequencesLocked(
             }
         }
         if (generic_updates.items.len > 0) {
-            const metadata_started = monotonicTimeNs();
-            try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
-            projection_metadata_ns +|= elapsedSince(metadata_started);
             const posting_started = monotonicTimeNs();
             try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
             posting_publish_ns +|= elapsedSince(posting_started);
+            const metadata_started = monotonicTimeNs();
+            try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
+            projection_metadata_ns +|= elapsedSince(metadata_started);
             const checkpoint_started = monotonicTimeNs();
             try apply_state.saveAppliedSequencesWithCheckpoint(
                 ctx.alloc,
@@ -112933,6 +112966,21 @@ test "db progressive managed admission serves a checkpointed partial generation"
         .published_count = target_before + 1,
     });
     try std.testing.expect(!try db.managedAdmissionGenerationIsQueryable(alloc, repair.intent));
+    const mismatched_stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, mismatched_stats);
+    for (mismatched_stats.indexes) |index_stats| {
+        if (!std.mem.eql(u8, index_stats.name, cfg.name)) continue;
+        try std.testing.expect(!index_stats.serving_snapshot_ready);
+    }
+    var legacy_checkpoint = certified_checkpoint;
+    legacy_checkpoint.published_count = null;
+    try db.core.saveProjectionCheckpoint(cfg.name, legacy_checkpoint);
+    const legacy_stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, legacy_stats);
+    for (legacy_stats.indexes) |index_stats| {
+        if (!std.mem.eql(u8, index_stats.name, cfg.name)) continue;
+        try std.testing.expect(index_stats.serving_snapshot_ready);
+    }
     try db.core.saveProjectionCheckpoint(cfg.name, certified_checkpoint);
     try std.testing.expect(try db.managedAdmissionGenerationIsQueryable(alloc, repair.intent));
     var restored_target: [8]u8 = undefined;
