@@ -15,7 +15,7 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const regex = @import("antfly_regex");
-const vellum = @import("antfly_vellum");
+const fst = @import("antfly_fst");
 
 const Config = struct {
     samples: usize = 3,
@@ -27,7 +27,7 @@ const Config = struct {
 
 const BenchFst = struct {
     data: []u8,
-    fst: vellum.FST,
+    fst: fst.FST,
 
     fn deinit(self: *BenchFst, alloc: std.mem.Allocator) void {
         alloc.free(self.data);
@@ -151,7 +151,7 @@ fn benchHaystackCase(
 }
 
 fn runFstBenchmarks(alloc: std.mem.Allocator, cfg: Config) !void {
-    std.debug.print("Vellum\n", .{});
+    std.debug.print("FST\n", .{});
     std.debug.print("------\n", .{});
 
     var bench_fst = try buildBenchFst(alloc, cfg.fst_keys);
@@ -168,7 +168,7 @@ fn buildBenchFst(alloc: std.mem.Allocator, total_keys: usize) !BenchFst {
         "can", "cao", "cap", "caq", "car", "cas", "cat", "cau", "cav", "caw", "cax", "cay", "caz",
     };
 
-    var builder = try vellum.Builder.init(alloc, .{});
+    var builder = try fst.Builder.init(alloc, .{});
     defer builder.deinit();
 
     const base = total_keys / prefixes.len;
@@ -188,7 +188,7 @@ fn buildBenchFst(alloc: std.mem.Allocator, total_keys: usize) !BenchFst {
     const data = try builder.finish();
     return .{
         .data = data,
-        .fst = try vellum.FST.load(data),
+        .fst = try fst.FST.load(data),
     };
 }
 
@@ -202,15 +202,15 @@ fn benchFstCase(
     cfg: Config,
     label: []const u8,
     pattern: []const u8,
-    fst: *const vellum.FST,
+    dict: *const fst.FST,
     mode: FstBenchMode,
 ) !void {
     var compiled = try regex.compile(alloc, pattern);
     defer compiled.deinit();
 
     const warmup_matches = switch (mode) {
-        .raw => try countSearchMatches(alloc, fst, compiled.automaton()),
-        .bounded => try countSearchMatchesBounded(alloc, fst, &compiled),
+        .raw => try countSearchMatches(alloc, dict, compiled.automaton()),
+        .bounded => try countSearchMatchesBounded(alloc, dict, &compiled),
     };
     std.mem.doNotOptimizeAway(warmup_matches);
 
@@ -221,8 +221,8 @@ fn benchFstCase(
         var total_matches: usize = 0;
         for (0..cfg.fst_repeats) |_| {
             total_matches += switch (mode) {
-                .raw => try countSearchMatches(alloc, fst, compiled.automaton()),
-                .bounded => try countSearchMatchesBounded(alloc, fst, &compiled),
+                .raw => try countSearchMatches(alloc, dict, compiled.automaton()),
+                .bounded => try countSearchMatchesBounded(alloc, dict, &compiled),
             };
         }
         const elapsed = nowNs() - start;
@@ -234,8 +234,8 @@ fn benchFstCase(
     printRateWithCount(label, best_elapsed, cfg.fst_repeats, matches_per_search);
 }
 
-fn countSearchMatches(alloc: std.mem.Allocator, fst: *const vellum.FST, aut: vellum.Automaton) !usize {
-    var it = try fst.search(alloc, aut, null, null);
+fn countSearchMatches(alloc: std.mem.Allocator, dict: *const fst.FST, aut: fst.Automaton) !usize {
+    var it = try dict.search(alloc, aut, null, null);
     defer it.deinit();
 
     var count: usize = 0;
@@ -248,9 +248,9 @@ fn countSearchMatches(alloc: std.mem.Allocator, fst: *const vellum.FST, aut: vel
     return count;
 }
 
-fn countSearchMatchesBounded(alloc: std.mem.Allocator, fst: *const vellum.FST, compiled: *regex.RegexAutomaton) !usize {
+fn countSearchMatchesBounded(alloc: std.mem.Allocator, dict: *const fst.FST, compiled: *regex.RegexAutomaton) !usize {
     if (compiled.prefix_literals.len == 0) {
-        return countSearchMatches(alloc, fst, compiled.automaton());
+        return countSearchMatches(alloc, dict, compiled.automaton());
     }
 
     var total: usize = 0;
@@ -259,7 +259,7 @@ fn countSearchMatchesBounded(alloc: std.mem.Allocator, fst: *const vellum.FST, c
         if (prefixRangeCovered(prefix, compiled.prefix_literals, idx)) continue;
 
         const end = prefixRangeEnd(prefix, &end_buf);
-        var it = try fst.search(alloc, compiled.automaton(), prefix, end);
+        var it = try dict.search(alloc, compiled.automaton(), prefix, end);
         defer it.deinit();
 
         var current = it.current();

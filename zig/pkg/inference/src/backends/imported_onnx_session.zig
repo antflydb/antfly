@@ -264,13 +264,7 @@ const BackendContext = union(enum) {
                 ctx.compute.importHostTensor(tensor)
             else
                 unreachable,
-            .metal_hosted => |*ctx| {
-                const cb = if (comptime build_options.enable_metal)
-                    ctx.compute.computeBackend()
-                else
-                    unreachable;
-                return importTensorToBackend(allocator, &cb, tensor);
-            },
+            .metal_hosted => |*ctx| return importMetalTensor(allocator, ctx.compute, tensor),
             .wasm => |*ctx| {
                 const cb = if (comptime build_options.enable_wasm)
                     ctx.compute.computeBackend()
@@ -290,11 +284,7 @@ const BackendContext = union(enum) {
             .metal_hosted => |*ctx| {
                 var owned_tensor = tensor;
                 defer owned_tensor.deinit();
-                const cb = if (comptime build_options.enable_metal)
-                    ctx.compute.computeBackend()
-                else
-                    unreachable;
-                return importTensorToBackend(allocator, &cb, &owned_tensor);
+                return importMetalTensor(allocator, ctx.compute, &owned_tensor);
             },
             .wasm => |*ctx| {
                 var owned_tensor = tensor;
@@ -324,11 +314,10 @@ const BackendContext = union(enum) {
                 defer allocator.free(values);
                 const shape_i32 = try tensorShapeI32(allocator, shape);
                 defer allocator.free(shape_i32);
-                const cb = if (comptime build_options.enable_metal)
-                    ctx.compute.computeBackend()
+                return if (comptime build_options.enable_metal)
+                    ctx.compute.importResidentF32(values, shape_i32)
                 else
                     unreachable;
-                return cb.fromFloat32Shape(values, shape_i32);
             },
             .wasm => |*ctx| {
                 defer allocator.free(values);
@@ -653,13 +642,46 @@ fn tensorShapeI32(allocator: std.mem.Allocator, shape: []const i64) ![]i32 {
     return converted;
 }
 
+fn importMetalTensor(allocator: std.mem.Allocator, compute: *MetalCompute, tensor: *const Tensor) !ops_mod.CT {
+    if (comptime !build_options.enable_metal) unreachable;
+    const shape = try tensorShapeI32(allocator, tensor.shape);
+    defer allocator.free(shape);
+    switch (tensor.dtype) {
+        .i8, .i16, .i32, .i64, .u8, .bool_ => {
+            const cb = compute.computeBackend();
+            const dtype: ops_mod.GraphDType = switch (tensor.dtype) {
+                inline else => |tag| @field(ops_mod.GraphDType, @tagName(tag)),
+            };
+            return (try cb.fromConstantBytes(tensor.data, dtype, tensor.shape)) orelse error.UnsupportedTensorType;
+        },
+        else => {},
+    }
+    if (tensor.dtype == .f32 and @intFromPtr(tensor.data.ptr) % @alignOf(f32) == 0)
+        return compute.importResidentF32(std.mem.bytesAsSlice(f32, @as([]align(@alignOf(f32)) const u8, @alignCast(tensor.data))), shape);
+    const values = try tensorToOwnedF32(allocator, tensor);
+    defer allocator.free(values);
+    return compute.importResidentF32(values, shape);
+}
+
 fn importTensorToBackend(allocator: std.mem.Allocator, cb: *const ops_mod.ComputeBackend, tensor: *const Tensor) !ops_mod.CT {
+    switch (tensor.dtype) {
+        .i8, .i16, .i32, .i64, .u8, .bool_ => {
+            const dtype: ops_mod.GraphDType = switch (tensor.dtype) {
+                inline else => |tag| @field(ops_mod.GraphDType, @tagName(tag)),
+            };
+            if (try cb.fromConstantBytes(tensor.data, dtype, tensor.shape)) |value| return value;
+            // Backends without typed storage must decline instead of narrowing.
+            if (tensor.dtype != .i32) return error.UnsupportedTensorType;
+        },
+        else => {},
+    }
     if (tensorToOwnedI32(allocator, tensor)) |values| {
         defer allocator.free(values);
         const shape = try tensorShapeI32(allocator, tensor.shape);
         defer allocator.free(shape);
         if (try cb.fromInt32Shape(values, shape)) |ct| return ct;
     } else |_| {}
+    if (tensor.dtype == .i32) return error.UnsupportedTensorType;
 
     const values = try tensorToOwnedF32(allocator, tensor);
     defer allocator.free(values);
@@ -676,11 +698,31 @@ pub const ImportedOnnxSession = struct {
     input_info: []TensorInfo,
     output_info: []TensorInfo,
     static_runtime_inputs: []RuntimeInput,
+    static_names: [][]const u8 = &.{},
     shared_backend_ctx: *SharedBackendContext,
     cb: @import("../ops/ops.zig").ComputeBackend,
     runtime: graph_runtime_mod.Runtime,
+    source_path: ?[]u8 = null,
+    shape_template: ?[]u8 = null,
+    requested_strategy: graph_runtime_mod.Strategy = .interpreter,
+    io: ?std.Io = null,
+    specialization_mutex: std.atomic.Mutex = .unlocked,
+    execution_count: std.atomic.Value(u64) = .init(0),
+    last_batch: std.atomic.Value(u64) = .init(0),
+    specialization_builds: u64 = 0,
+    specialization_hits: u64 = 0,
+    specializations: std.ArrayListUnmanaged(Specialization) = .empty,
+    const Specialization = struct { shapes: []i64, session: *ImportedOnnxSession };
+    const max_specializations = 4;
 
     pub fn deinit(self: *ImportedOnnxSession) void {
+        for (self.specializations.items) |entry| {
+            self.allocator.free(entry.shapes);
+            entry.session.deinit();
+        }
+        self.specializations.deinit(self.allocator);
+        if (self.source_path) |path| self.allocator.free(path);
+        if (self.shape_template) |bytes| self.allocator.free(bytes);
         for (self.input_info) |info| {
             self.allocator.free(info.name);
             self.allocator.free(info.shape);
@@ -695,6 +737,8 @@ pub const ImportedOnnxSession = struct {
 
         for (self.static_runtime_inputs) |ri| self.cb.free(ri.value);
         self.allocator.free(self.static_runtime_inputs);
+        for (self.static_names) |name| self.allocator.free(name);
+        self.allocator.free(self.static_names);
         self.allocator.free(self.input_node_ids);
         self.cached_analysis.deinit(self.allocator);
         self.runtime.deinit();
@@ -878,10 +922,51 @@ pub fn inspectArtifactSet(
     };
 }
 
+/// Keep graph structure and shape constants immutable across cache misses, without
+/// retaining a second host copy of the model's large weights. All large weights
+/// are bound through the parent's resident handles. In particular, replacing a
+/// managed model directory must not mix new graph metadata with old weights.
+fn snapshotShapeTemplate(allocator: std.mem.Allocator, model: *onnx_graph.Model) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var graph = (model.graph() orelse return error.InvalidOnnxGraph).*;
+    graph.initializers = try scratch.alloc(onnx_graph.proto.TensorProto, model.initializer_map.count());
+    var names = model.initializer_map.keyIterator();
+    var i: usize = 0;
+    while (names.next()) |name| : (i += 1) {
+        const data = model.getInitializer(name.*) orelse return error.InvalidOnnxGraph;
+        const tensor = data.tensor;
+        const small_constant = onnx_graph.tensor.numElements(tensor.dims) <= 16 and
+            (tensor.data_type == .float32 or tensor.data_type == .int32 or tensor.data_type == .int64);
+        graph.initializers[i] = .{ .name = tensor.name, .dims = tensor.dims, .data_type = tensor.data_type };
+        if (small_constant) {
+            if (!tensor.isExternal()) {
+                graph.initializers[i] = tensor.*;
+            } else {
+                // An unresolved/unused external initializer must remain a
+                // parameter, just as it was in the original conversion.
+                const bytes = onnx_graph.tensor.extractNativeBytesWithExternal(scratch, tensor, model.base_dir) catch {
+                    graph.initializers[i].data_location = .external;
+                    continue;
+                };
+                graph.initializers[i].raw_data = bytes;
+            }
+        }
+    }
+    var snapshot = model.onnx;
+    snapshot.graph = graph;
+    return onnx_graph.serializeModel(allocator, &snapshot);
+}
+
 pub const ImportedOnnxSessionOptions = struct {
     graph_runtime_strategy: ?graph_runtime_mod.Strategy = null,
     shared_backend_ctx: ?*SharedBackendContext = null,
     dim_overrides: ?*const onnx_graph.DimOverrides = null,
+    /// Internal shape-plan construction. Weight handles are retained from the
+    /// source session, so cached shapes never duplicate the model's weights.
+    input_shapes: ?[]const Tensor = null,
+    static_source: ?*const ImportedOnnxSession = null,
     /// Caller's Io runtime, used by the compute backend for parallel GEMM
     /// dispatch via `linalg.sgemm*Io`.  When null, backends fall back to
     /// the void linalg API which uses a process-wide futex pool internally.
@@ -898,11 +983,18 @@ pub fn createSessionWithOptions(
         if (shared.backendType() != requested_backend) return error.SharedBackendContextMismatch;
     }
 
-    const model_bytes = try c_file.readFileMax(allocator, onnx_path, max_onnx_model_bytes);
-    defer allocator.free(model_bytes);
+    if (options.static_source) |source| {
+        if (options.shared_backend_ctx != source.shared_backend_ctx) return error.SharedBackendContextMismatch;
+    }
+
+    const model_bytes = if (options.static_source) |source|
+        source.shape_template orelse return error.MissingOnnxShapeTemplate
+    else
+        try c_file.readFileMax(allocator, onnx_path, max_onnx_model_bytes);
+    defer if (options.static_source == null) allocator.free(model_bytes);
 
     const model_dir = std.fs.path.dirname(onnx_path) orelse ".";
-    var model = try onnx_graph.parseLazyAsModelWithBaseDir(allocator, model_bytes, model_dir);
+    var model = try onnx_graph.parseLazyAsModelWithBaseDir(allocator, model_bytes, if (options.static_source == null) model_dir else null);
     defer model.deinit();
 
     var clipclap_dim_overrides: onnx_graph.DimOverrides = .empty;
@@ -919,7 +1011,14 @@ pub fn createSessionWithOptions(
     }
     const dim_overrides = options.dim_overrides orelse if (use_clipclap_dim_overrides) &clipclap_dim_overrides else null;
 
-    var converted = try model.convertToGraphWithDims(allocator, dim_overrides);
+    var concrete_inputs: std.StringHashMapUnmanaged(Shape) = .empty;
+    defer concrete_inputs.deinit(allocator);
+    if (options.input_shapes) |inputs| {
+        for (inputs) |input| {
+            try concrete_inputs.put(allocator, input.name, Shape.init(std.meta.stringToEnum(ml.graph.DType, @tagName(input.dtype)) orelse return error.UnsupportedTensorType, input.shape));
+        }
+    }
+    var converted = try model.convertToGraphWithInputShapes(allocator, dim_overrides, if (options.input_shapes != null) &concrete_inputs else null);
     errdefer converted.deinit(allocator);
 
     var folded = try ConstFoldPass.fold(allocator, &converted.graph);
@@ -1027,11 +1126,31 @@ pub fn createSessionWithOptions(
     }
 
     self.cb = self.shared_backend_ctx.computeBackend();
+    self.io = options.io;
+    self.requested_strategy = options.graph_runtime_strategy orelse graph_runtime_mod.strategyFromEnv();
+    if (requested_backend == .metal and options.graph_runtime_strategy == null and
+        @import("antfly_platform").env.getenv("TERMITE_GRAPH_RUNTIME") == null and
+        @import("antfly_platform").env.getenv("TERMITE_ONNX_GRAPH_RUNTIME") == null)
+        self.requested_strategy = .compiled_preferred;
+    if (requested_backend == .metal and options.input_shapes == null) {
+        for (self.input_node_ids) |node_id| {
+            if (node_id == ml.graph.null_node) continue;
+            const shape = self.graph.node(node_id).output_shape;
+            for (shape.dims[0..shape.rank()]) |dim| {
+                if (dim < 0) {
+                    self.source_path = try allocator.dupe(u8, onnx_path);
+                    break;
+                }
+            }
+            if (self.source_path != null) break;
+        }
+    }
+    errdefer if (self.source_path) |path| allocator.free(path);
     self.runtime = try graph_runtime_mod.Runtime.init(
         allocator,
         &self.graph,
         &self.cb,
-        options.graph_runtime_strategy orelse graph_runtime_mod.strategyFromEnv(),
+        if (self.source_path != null) .interpreter else self.requested_strategy,
     );
     errdefer self.runtime.deinit();
 
@@ -1051,12 +1170,23 @@ pub fn createSessionWithOptions(
     };
     errdefer freeTensorInfoList(allocator, self.output_info);
 
+    self.static_names = try allocator.alloc([]const u8, static_params.names.len);
+    var initialized_names: usize = 0;
+    errdefer {
+        for (self.static_names[0..initialized_names]) |name| allocator.free(name);
+        allocator.free(self.static_names);
+    }
+    for (static_params.names, self.static_names) |name, *owned| {
+        owned.* = try allocator.dupe(u8, name);
+        initialized_names += 1;
+    }
     self.static_runtime_inputs = buildStaticRuntimeInputs(
         allocator,
         &model,
         self.shared_backend_ctx,
         static_params.names,
         static_params.node_ids,
+        options.static_source,
     ) catch |err| {
         std.log.err("buildStaticRuntimeInputs failed: {}", .{err});
         return err;
@@ -1065,6 +1195,9 @@ pub fn createSessionWithOptions(
         for (self.static_runtime_inputs) |ri| self.cb.free(ri.value);
         allocator.free(self.static_runtime_inputs);
     }
+
+    if (self.source_path != null) self.shape_template = try snapshotShapeTemplate(allocator, &model);
+    errdefer if (self.shape_template) |bytes| allocator.free(bytes);
 
     self.cached_analysis = CachedAnalysis.compute(allocator, &self.graph) catch |err| {
         std.log.err("CachedAnalysis.compute failed: {}", .{err});
@@ -1110,6 +1243,32 @@ pub fn sharedBackendContext(session: Session) ?*SharedBackendContext {
     if (session.vtable != &imported_session_vtable) return null;
     const self: *ImportedOnnxSession = @ptrCast(@alignCast(session.ptr));
     return self.shared_backend_ctx;
+}
+
+pub const ExecutionStats = struct {
+    strategy: graph_runtime_mod.Strategy,
+    executions: u64,
+    last_batch: u64,
+    cached_plans: usize,
+    plan_builds: u64,
+    plan_hits: u64,
+    shared_initializers: usize,
+};
+
+pub fn executionStats(session: Session) ?ExecutionStats {
+    if (session.vtable != &imported_session_vtable) return null;
+    const self: *ImportedOnnxSession = @ptrCast(@alignCast(session.ptr));
+    @import("antfly_platform").sync.lockYielding(&self.specialization_mutex);
+    defer self.specialization_mutex.unlock();
+    return .{
+        .strategy = self.requested_strategy,
+        .executions = self.execution_count.load(.monotonic),
+        .last_batch = self.last_batch.load(.monotonic),
+        .cached_plans = self.specializations.items.len,
+        .plan_builds = self.specialization_builds,
+        .plan_hits = self.specialization_hits,
+        .shared_initializers = self.static_runtime_inputs.len,
+    };
 }
 
 fn importedOnnxTraceEnabled() bool {
@@ -1222,6 +1381,49 @@ fn runResidentInputsWithControl(
     return try runResidentImpl(self, null, inputs, allocator, control);
 }
 
+fn specializeForInputs(self: *ImportedOnnxSession, inputs: []const Tensor) !*ImportedOnnxSession {
+    if (inputs.len != self.input_info.len) return error.InputArityMismatch;
+    var key: std.ArrayListUnmanaged(i64) = .empty;
+    defer key.deinit(self.allocator);
+    for (inputs, self.input_info) |input, info| {
+        if (!std.mem.eql(u8, input.name, info.name) or input.dtype != info.dtype or input.shape.len != info.shape.len or input.shape.len > ml.graph.shape.max_rank)
+            return error.InvalidTensorShape;
+        try key.append(self.allocator, @intCast(input.shape.len));
+        for (input.shape, info.shape) |actual, declared| {
+            if (actual <= 0 or (declared > 0 and declared != actual)) return error.InvalidTensorShape;
+            try key.append(self.allocator, actual);
+        }
+    }
+    for (self.specializations.items, 0..) |entry, i| {
+        if (!std.mem.eql(i64, entry.shapes, key.items)) continue;
+        // Move a hit to the MRU end without reallocating or copying tensors.
+        self.specialization_hits += 1;
+        const hit = self.specializations.orderedRemove(i);
+        self.specializations.appendAssumeCapacity(hit);
+        return hit.session;
+    }
+    const session = try createSessionWithOptions(self.allocator, self.source_path.?, .metal, .{
+        .graph_runtime_strategy = self.requested_strategy,
+        .shared_backend_ctx = self.shared_backend_ctx,
+        .input_shapes = inputs,
+        .static_source = self,
+        .io = self.io,
+    });
+    const specialized: *ImportedOnnxSession = @ptrCast(@alignCast(session.ptr));
+    errdefer specialized.deinit();
+    const owned_key = try self.allocator.dupe(i64, key.items);
+    errdefer self.allocator.free(owned_key);
+    try self.specializations.ensureUnusedCapacity(self.allocator, 1);
+    if (self.specializations.items.len == ImportedOnnxSession.max_specializations) {
+        const oldest = self.specializations.orderedRemove(0);
+        oldest.session.deinit();
+        self.allocator.free(oldest.shapes);
+    }
+    self.specialization_builds += 1;
+    self.specializations.appendAssumeCapacity(.{ .shapes = owned_key, .session = specialized });
+    return specialized;
+}
+
 fn runResidentImpl(
     self: *ImportedOnnxSession,
     host_inputs: ?[]const Tensor,
@@ -1229,7 +1431,52 @@ fn runResidentImpl(
     allocator: std.mem.Allocator,
     control: ?InferenceExecutionControl,
 ) !ResidentOutputs {
+    _ = self.execution_count.fetchAdd(1, .monotonic);
+    if (host_inputs) |inputs| {
+        if (inputs.len > 0 and inputs[0].shape.len > 0 and inputs[0].shape[0] > 0)
+            self.last_batch.store(@intCast(inputs[0].shape[0]), .monotonic);
+    } else if (resident_inputs) |inputs| {
+        if (inputs.len > 0) {
+            const shape = try inputs[0].backend.tensorShape(inputs[0].value, allocator);
+            defer allocator.free(shape);
+            if (shape.len > 0 and shape[0] > 0) self.last_batch.store(@intCast(shape[0]), .monotonic);
+        }
+    }
     if (control) |active| try active.check();
+    if (self.source_path != null) {
+        @import("antfly_platform").sync.lockYielding(&self.specialization_mutex);
+        defer self.specialization_mutex.unlock();
+        // Shape metadata is sufficient to select a plan for device inputs;
+        // never download resident tensors merely to bind dynamic dimensions.
+        const metadata = if (host_inputs == null) try allocator.alloc(Tensor, if (resident_inputs) |inputs| inputs.len else 0) else null;
+        var initialized: usize = 0;
+        defer if (metadata) |inputs| {
+            for (inputs[0..initialized]) |input| allocator.free(input.shape);
+            allocator.free(inputs);
+        };
+        if (metadata) |inputs| {
+            if (inputs.len != self.input_info.len) return error.InputArityMismatch;
+            for (resident_inputs.?, self.input_info, inputs) |input, info, *meta| {
+                try validateResidentInput(self, input);
+                meta.* = .{
+                    .name = info.name,
+                    .dtype = info.dtype,
+                    .shape = try input.backend.tensorShape(input.value, allocator),
+                    .data = &.{},
+                    .allocator = allocator,
+                    .owns_data = false,
+                    .owns_shape = false,
+                };
+                initialized += 1;
+            }
+        }
+        const specialized = try specializeForInputs(self, host_inputs orelse metadata.?);
+        var outputs = try runResidentImpl(specialized, host_inputs, resident_inputs, allocator, control);
+        // The compute context is shared and owned by the parent; returned
+        // buffers remain valid even if the shape plan is subsequently evicted.
+        outputs.backend = &self.cb;
+        return outputs;
+    }
     const input_len = if (host_inputs) |inputs| inputs.len else if (resident_inputs) |inputs| inputs.len else 0;
     if (input_len != self.input_info.len) return error.InputArityMismatch;
 
@@ -1274,6 +1521,7 @@ fn runResidentImpl(
         .runtime_inputs = runtime_inputs,
         .sdpa_mask = sdpa_mask,
         .cached_analysis = self.cached_analysis,
+        .planned_device_execution = self.shared_backend_ctx.backendType() == .metal,
         .execution_control = control,
     });
     errdefer exec_result.deinit(&self.runtime);
@@ -1353,11 +1601,9 @@ fn validateImportedGraph(graph: *const Graph, stage: []const u8) !void {
 }
 
 fn validateRuntimeShapeBackend(graph: *const Graph, backend_type: BackendType) !void {
-    // Runtime-bound Slice is currently validated end-to-end only by the native
-    // imported graph runtime. Other graph backends still plan downstream ops
-    // from declared shapes, so accepting these graphs can turn a dynamic
-    // sequence dimension into an UnsupportedShape failure during execution.
-    if (backend_type == .native or backend_type == .onnx) return;
+    // Native and Metal execute imported Slice and its consumers using runtime
+    // dimensions. Other graph backends still require static downstream shapes.
+    if (backend_type == .native or backend_type == .onnx or backend_type == .metal) return;
 
     for (graph.nodes.items, 0..) |node, node_id| {
         const attrs = switch (node.op) {
@@ -1374,7 +1620,7 @@ fn validateRuntimeShapeBackend(graph: *const Graph, backend_type: BackendType) !
     }
 }
 
-test "runtime-bound ONNX slices use the native imported graph backend" {
+test "runtime-bound ONNX slices admit native and Metal imported graph backends" {
     var graph = Graph.init(std.testing.allocator);
     defer graph.deinit();
 
@@ -1387,7 +1633,7 @@ test "runtime-bound ONNX slices use the native imported graph backend" {
 
     try validateRuntimeShapeBackend(&graph, .native);
     try validateRuntimeShapeBackend(&graph, .onnx);
-    try std.testing.expectError(error.UnsupportedDynamicOnnxGraphBackend, validateRuntimeShapeBackend(&graph, .metal));
+    try validateRuntimeShapeBackend(&graph, .metal);
     try std.testing.expectError(error.UnsupportedDynamicOnnxGraphBackend, validateRuntimeShapeBackend(&graph, .wasm));
 }
 
@@ -1492,6 +1738,7 @@ fn buildStaticRuntimeInputs(
     backend_ctx: *SharedBackendContext,
     parameter_names: [][]const u8,
     parameter_node_ids: []const NodeId,
+    source: ?*const ImportedOnnxSession,
 ) ![]RuntimeInput {
     if (parameter_names.len != parameter_node_ids.len) return error.InvalidOnnxGraph;
     const runtime_inputs = try allocator.alloc(RuntimeInput, parameter_names.len);
@@ -1502,6 +1749,24 @@ fn buildStaticRuntimeInputs(
     }
 
     for (parameter_names, parameter_node_ids, 0..) |name, node_id, i| {
+        if (source) |parent| {
+            var retained: ?ops_mod.CT = null;
+            for (parent.static_runtime_inputs, parent.static_names) |input, original_name| {
+                if (!std.mem.eql(u8, name, original_name)) continue;
+                const dims = try parent.cb.tensorShape(input.value, allocator);
+                defer allocator.free(dims);
+                const shape = try tensorShapeI32(allocator, dims);
+                defer allocator.free(shape);
+                retained = try parent.cb.cloneTensorShape(input.value, shape);
+                break;
+            }
+            if (retained) |value| {
+                runtime_inputs[i] = .{ .node_id = node_id, .value = value };
+                initialized += 1;
+                continue;
+            }
+            return error.MissingSharedOnnxInitializer;
+        }
         const init = model.getInitializer(name) orelse return error.MissingWeight;
         if (try maybeDirectStaticTensor(allocator, model, init)) |tensor| {
             runtime_inputs[i] = .{
@@ -2153,15 +2418,14 @@ test "imported onnx session matches dynamic quantized integer matmul semantics" 
     }
 
     try std.testing.expectEqual(@as(usize, 4), outputs.len);
-    // Native graph execution stores intermediate integer tensors in numeric
-    // f32 buffers; the graph-declared u8/i32 dtypes still drive rounding and
-    // downstream conversion semantics.
-    try std.testing.expectEqual(DType.f32, outputs[0].dtype);
-    try std.testing.expectEqualSlices(f32, &.{ 0.0, 85.0, 170.0, 255.0 }, outputs[0].asFloat32());
+    // Graph outputs preserve their declared integer storage dtype, matching
+    // ONNX's DynamicQuantizeLinear contract and the typed intermediate values.
+    try std.testing.expectEqual(DType.u8, outputs[0].dtype);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 85, 170, 255 }, outputs[0].data);
     try std.testing.expectEqual(DType.f32, outputs[1].dtype);
     try std.testing.expectApproxEqAbs(@as(f32, 0.011764706), outputs[1].asFloat32()[0], 1e-8);
-    try std.testing.expectEqual(DType.f32, outputs[2].dtype);
-    try std.testing.expectEqual(@as(f32, 170.0), outputs[2].asFloat32()[0]);
+    try std.testing.expectEqual(DType.u8, outputs[2].dtype);
+    try std.testing.expectEqualSlices(u8, &.{170}, outputs[2].data);
     try std.testing.expectEqual(DType.f32, outputs[3].dtype);
     try std.testing.expectEqualSlices(f32, &.{ -425.0, 0.0, 255.0, 340.0 }, outputs[3].asFloat32());
 }
@@ -2843,4 +3107,101 @@ test "findSdpaMask returns borrowed attention_mask input" {
 
     const found = findSdpaMask(&.{ input_ids, attention_mask }).?;
     try std.testing.expectEqualSlices(i64, &mask, found);
+}
+
+test "imported ONNX preserves integer input storage on CPU and Metal" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var weights = @import("../ops/gpu_hosted_store.zig").WeightStore{ .allocator = a, .prefix = "", .lazy_weights = .empty };
+    defer weights.lazy_weights.deinit(a);
+    var metal = try MetalCompute.init(a, &weights, null);
+    defer metal.deinit();
+    var native_weights = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var native = NativeCompute.init(a, &native_weights, null);
+    defer native.deinit();
+    inline for (.{ i8, i16, i32, i64, u8 }) |T| {
+        const values = [_]T{ if (T == i64) 9007199254740993 else std.math.maxInt(T), std.math.minInt(T) };
+        const tensor = Tensor{ .name = "input", .data = @constCast(std.mem.sliceAsBytes(&values)), .dtype = @field(@import("tensor.zig").DType, @typeName(T)), .shape = &.{ 1, 2 }, .allocator = a, .owns_data = false, .owns_shape = false };
+        for ([_]bool{ false, true }) |gpu| {
+            const cb = if (gpu) metal.computeBackend() else native.computeBackend();
+            const ct = if (gpu) try importMetalTensor(a, &metal, &tensor) else try native.importHostTensor(&tensor);
+            defer cb.free(ct);
+            const raw = (try cb.exportTensorData(ct, a)).?;
+            defer a.free(raw.payload.bytes);
+            try std.testing.expectEqual(tensor.dtype, raw.dtype);
+            try std.testing.expectEqualSlices(u8, tensor.data, raw.payload.bytes);
+        }
+    }
+}
+
+test "imported ONNX Metal shape cache shares weights and survives eviction" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var graph = Graph.init(allocator);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const x = try builder.parameter("x", Shape.init(.f32, &.{ -1, 32 }));
+    const bias = try builder.parameter("bias", Shape.init(.f32, &.{32}));
+    const sum = try builder.add(x, bias);
+    try graph.markOutput(sum);
+    const bias_values = [_]f32{2} ** 32;
+    const bytes = try onnx_graph.exportGraph(allocator, &graph, .{ .parameter_initializers = &.{.{ .name = "bias", .shape = Shape.init(.f32, &.{32}), .data = .{ .f32 = &bias_values } }} });
+    defer allocator.free(bytes);
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "model.onnx", .data = bytes });
+    const path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..], "model.onnx" });
+    defer allocator.free(path);
+    var session = try createSessionWithOptions(allocator, path, .metal, .{ .graph_runtime_strategy = .partitioned });
+    defer session.close();
+    const parent: *ImportedOnnxSession = @ptrCast(@alignCast(session.ptr));
+    try std.testing.expect(parent.source_path != null);
+    // A new shape must keep working even after an atomic model replacement.
+    // The cache owns a compact immutable graph, not a path to reload later.
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "model.onnx", .data = "replaced model" });
+    var template = try onnx_graph.parseLazyAsModel(allocator, parent.shape_template.?);
+    defer template.deinit();
+    try std.testing.expectEqual(@as(usize, 0), template.getInitializer("bias").?.tensor.raw_data.len);
+    try std.testing.expectEqual(@as(usize, 1), parent.static_runtime_inputs.len);
+    // Revisit a cached shape, exceed capacity, then revisit the evicted shape.
+    for ([_]usize{ 1, 2, 1, 3, 4, 5, 1 }, 0..) |batch, iteration| {
+        const values = try allocator.alloc(f32, batch * 32);
+        defer allocator.free(values);
+        @memset(values, @floatFromInt(iteration));
+        var input = try Tensor.initFloat32(allocator, "x", &.{ @intCast(batch), 32 }, values);
+        defer input.deinit();
+        var outputs = try session.run(&.{input}, allocator);
+        defer {
+            for (outputs) |*output| output.deinit();
+            allocator.free(outputs);
+        }
+        for (outputs[0].asFloat32()) |value| try std.testing.expectEqual(@as(f32, @floatFromInt(iteration)) + 2, value);
+        try std.testing.expect(parent.specializations.items.len <= ImportedOnnxSession.max_specializations);
+        const child = parent.specializations.items[parent.specializations.items.len - 1].session;
+        try std.testing.expectEqual(parent.shared_backend_ctx, child.shared_backend_ctx);
+        try std.testing.expectEqual(@as(usize, 1), child.static_runtime_inputs.len);
+        // Runtime.init returns by value: the mesh must retain a heap-stable
+        // fallback backend, not an address in its initializer's stack frame.
+        try std.testing.expectEqual(&child.runtime.fallback_native.?.backend, child.runtime.mesh.?.device(1).?.backend);
+        const transfer = @import("../graph/multi_executor.zig").transferTensor;
+        const fallback = &child.runtime.fallback_native.?.backend;
+        const exact = (try parent.cb.fromInt32Shape(&.{ 16777217, -16777217 }, &.{2})) orelse return error.TestUnexpectedResult;
+        defer parent.cb.free(exact);
+        const host = try transfer(allocator, exact, &parent.cb, fallback);
+        defer fallback.free(host);
+        const roundtrip = try transfer(allocator, host, fallback, &parent.cb);
+        defer parent.cb.free(roundtrip);
+        const exported = (try parent.cb.exportTensorData(roundtrip, allocator)) orelse return error.TestUnexpectedResult;
+        defer allocator.free(exported.payload.bytes);
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]i32{ 16777217, -16777217 }), exported.payload.bytes);
+        const resident = try parent.shared_backend_ctx.importHostTensor(allocator, &input);
+        defer parent.cb.free(resident);
+        var resident_outputs = try runResidentImpl(parent, null, &.{.{ .value = resident, .backend = &parent.cb }}, allocator, null);
+        defer resident_outputs.deinit();
+        const result = try parent.cb.toFloat32(resident_outputs.outputs[0], allocator);
+        defer allocator.free(result);
+        try std.testing.expectEqualSlices(f32, outputs[0].asFloat32(), result);
+    }
 }

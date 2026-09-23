@@ -44,6 +44,8 @@ pub const Buffer = extern struct {
     len: usize = 0,
 };
 
+pub const threading_serialized: u32 = 1;
+
 pub const lite_open_mode_writer: u32 = 0;
 pub const lite_open_mode_readonly: u32 = 1;
 pub const lite_open_mode_status_only: u32 = 2;
@@ -88,7 +90,12 @@ pub const OpenOptions = extern struct {
     ttl_cleanup_lease_ttl_ms: u64 = 0,
     ttl_cleanup_interval_ms: u64 = 0,
     ttl_cleanup_grace_period_ns: u64 = 0,
-    reserved: [8]u64 = .{0} ** 8,
+    // Milliseconds to keep retrying an open while another writer holds the
+    // database's writer lock (ANTFLY_BUSY), like sqlite3_busy_timeout. 0
+    // fails immediately. Carved from the first reserved word, so the struct
+    // size is unchanged and older callers, which zero it, keep failing fast.
+    busy_timeout_ms: u64 = 0,
+    reserved: [7]u64 = .{0} ** 7,
 };
 
 pub const LiteOpenOptions = extern struct {
@@ -104,7 +111,27 @@ pub const LiteOpenOptions = extern struct {
     ttl_cleanup_lease_ttl_ms: u64 = 0,
     ttl_cleanup_interval_ms: u64 = 0,
     ttl_cleanup_grace_period_ns: u64 = 0,
-    reserved: [8]u64 = .{0} ** 8,
+    // Explicit embedded-inference resource-budget overrides in MiB, 0
+    // meaning automatic/host-detected sizing. Only consulted when `flags`
+    // carries `lite_open_flag_local_runtime_configured`; mirror the CLI's
+    // `--inference-host-budget-mb`/`--inference-backend-budget-mb`/
+    // `--process-memory-budget-mb` (see standalone/runtime.zig,
+    // inference_runtime/runtime.zig, and
+    // inference_provider.EmbeddedInferenceNodeOptions). Older callers built
+    // against a smaller `abi_size` implicitly get 0/automatic through
+    // `readOptionField`'s forward-compat size check.
+    inference_host_budget_mb: u32 = 0,
+    inference_backend_budget_mb: u32 = 0,
+    inference_process_memory_budget_mb: u32 = 0,
+    inference_combined_budget_mb: u32 = 0,
+    inference_kv_budget_mb: u32 = 0,
+    inference_scratch_budget_mb: u32 = 0,
+    // Milliseconds to keep retrying an open while another writer holds the
+    // database's writer lock (ANTFLY_BUSY), like sqlite3_busy_timeout. 0
+    // fails immediately. Carved from the first reserved word, so the struct
+    // size is unchanged and older callers, which zero it, keep failing fast.
+    busy_timeout_ms: u64 = 0,
+    reserved: [7]u64 = .{0} ** 7,
 };
 
 pub const DenseSearchHit = extern struct {
@@ -209,6 +236,14 @@ pub const ErrorCode = enum(c_int) {
     busy = 6,
     outcome_unknown = 7,
     unsupported = 8,
+    /// A bounded background/foreground drain (e.g. `antfly_db_run_until_idle`)
+    /// detected that a managed index made no forward progress for its
+    /// configured stall window and gave up instead of spinning forever. Not a
+    /// malformed request or a generic server fault: retrying after operator
+    /// intervention (or waiting for a slow-but-legitimate backlog) may
+    /// succeed. See `antfly_lite_run_until_idle_json`/`antfly_db_run_until_idle_json`
+    /// for the stuck index name and indexed/expected counters.
+    stalled = 9,
     internal = 255,
 };
 
@@ -223,6 +258,7 @@ pub fn errorCodeName(code: c_int) [*:0]const u8 {
         @intFromEnum(ErrorCode.busy) => "ANTFLY_BUSY",
         @intFromEnum(ErrorCode.outcome_unknown) => "ANTFLY_OUTCOME_UNKNOWN",
         @intFromEnum(ErrorCode.unsupported) => "ANTFLY_UNSUPPORTED",
+        @intFromEnum(ErrorCode.stalled) => "ANTFLY_STALLED",
         @intFromEnum(ErrorCode.internal) => "ANTFLY_INTERNAL",
         else => "ANTFLY_UNKNOWN_ERROR",
     };
@@ -239,6 +275,7 @@ pub fn errorCodeDescription(code: c_int) [*:0]const u8 {
         @intFromEnum(ErrorCode.busy) => "the requested resource is temporarily busy or changed during streaming; stabilize it and retry",
         @intFromEnum(ErrorCode.outcome_unknown) => "the operation was published, but crash durability could not be confirmed; inspect the destination and do not retry automatically",
         @intFromEnum(ErrorCode.unsupported) => "the operation requires a capability that is not supported by this platform or filesystem",
+        @intFromEnum(ErrorCode.stalled) => "a bounded drain made no forward progress for its configured stall window and gave up",
         @intFromEnum(ErrorCode.internal) => "an internal error occurred",
         else => "unknown Antfly error code",
     };
@@ -250,7 +287,7 @@ pub fn mapError(err: anyerror) ErrorCode {
         error.VersionConflict => .version_conflict,
         error.IntentConflict, error.DecisionConflict, error.SchemaInUse => .intent_conflict,
         error.TxnNotFound => .txn_not_found,
-        error.NotFound => .not_found,
+        error.NotFound, error.IndexNotFound, error.TableNotFound => .not_found,
         error.InvalidArgument,
         error.RelationalExpressionOverflow,
         error.RelationalExpressionDivisionByZero,
@@ -262,6 +299,7 @@ pub fn mapError(err: anyerror) ErrorCode {
         error.UnsupportedBatchRequestEncoding,
         error.ValueTooLong,
         error.InvalidQueryRequest,
+        error.InvalidSchemaUpdateRequest,
         error.UnsupportedQueryRequest,
         error.UnsupportedHierarchyGrouping,
         error.InvalidFilterQueryRequest,
@@ -316,6 +354,27 @@ pub fn mapError(err: anyerror) ErrorCode {
         error.InvalidDocIdentityBatch,
         error.InvalidInternalUserKey,
         error.InvalidMetadataBatch,
+        // Index/enrichment config translation and validation errors (see
+        // `table_index_config.zig`, `inference/managed_embedder.zig`, and
+        // `storage/db/catalog/index_manager.zig`'s enrichment catalog graph
+        // validation) are caller mistakes -- a malformed or self-inconsistent
+        // index/enrichment definition, not a server fault. Lite's native
+        // `antfly_db_add_index_json`/`antfly_db_add_enrichment_json` run the
+        // same translation and catalog validation the server runs during
+        // table provisioning, and previously fell through to the generic
+        // `else => .internal` below, which is indistinguishable from an
+        // actual bug from the caller's side of the C ABI.
+        error.InvalidCreateTableRequest,
+        error.UnsupportedCreateTableRequest,
+        error.InvalidIndexConfig,
+        error.InvalidEnrichmentConfig,
+        error.ConflictingEnrichmentConfig,
+        error.MissingEmbeddingArtifactEnrichment,
+        error.MissingEmbeddingArtifactProducer,
+        error.InvalidEmbeddingArtifactProducer,
+        error.EmbeddingArtifactDimensionRequired,
+        error.ConflictingEmbeddingArtifactDimensions,
+        error.ModelNotFound,
         => .invalid_argument,
         error.FileNotFound => .not_found,
         error.WouldBlock,
@@ -327,6 +386,29 @@ pub fn mapError(err: anyerror) ErrorCode {
         => .busy,
         error.FileLocksUnsupported => .unsupported,
         error.DurabilityOutcomeUnknown => .outcome_unknown,
-        else => .internal,
+        error.RunUntilIdleNoProgress => .stalled,
+        // A dimension probe against a live embedder hit an operational
+        // (network/transport) failure rather than a malformed request --
+        // matches `managed_embedder.isOperationalEmbeddingProbeError`'s
+        // retryable classification.
+        error.EmbeddingProbeUnavailable => .busy,
+        else => {
+            // The generic code is indistinguishable from a bug on the caller's
+            // side of the ABI, so leave the concrete name in the process log.
+            std.log.warn("unmapped error crossing the C ABI as ANTFLY_INTERNAL: {s}", .{@errorName(err)});
+            return .internal;
+        },
     };
+}
+
+test "run until idle no-progress error maps to a dedicated stalled ABI code, not internal" {
+    // Regression guard for the dogfood ingest livelock follow-up: a bounded
+    // stall must be distinguishable at the C ABI from an opaque server fault.
+    try std.testing.expectEqual(ErrorCode.stalled, mapError(error.RunUntilIdleNoProgress));
+    try std.testing.expect(ErrorCode.stalled != ErrorCode.internal);
+    try std.testing.expectEqualStrings("ANTFLY_STALLED", std.mem.span(errorCodeName(@intFromEnum(ErrorCode.stalled))));
+    try std.testing.expectEqualStrings(
+        "ANTFLY_INTERNAL",
+        std.mem.span(errorCodeName(@intFromEnum(ErrorCode.internal))),
+    );
 }

@@ -144,11 +144,24 @@ tags:
 
       **Dynamic Indexing** (`additionalProperties`):
 
-      - `"additionalProperties": false` - Only index fields defined in `properties` (recommended for performance)
+      - `"additionalProperties": false` - Reject documents that carry fields not defined in `properties`
+      (standard JSON Schema validation); only declared fields exist, so only declared fields are indexed
 
-      - `"additionalProperties": true` - Index all fields dynamically (flexible but slower)
+      - `"additionalProperties": true` - Store undeclared fields and index them dynamically (flexible
+      but slower)
 
-      - If not specified, dynamic indexing is disabled
+      - If not specified, undeclared fields are stored but not indexed
+
+
+      Dynamic indexing only ever applies to undeclared fields. A property
+
+      listed in `properties` is indexed exactly as its declaration says: one
+
+      declared with `x-antfly-index: false`, or with a non-text type such as
+
+      `blob` or `embedding`, stays out of the text index even when the
+
+      enclosing object sets `"additionalProperties": true`.
 
 
       **Nested Objects**:
@@ -262,6 +275,29 @@ tags:
       {"type": "string", "x-antfly-index": false}
 
       ```
+
+      The value is still stored and returned with the document, but nothing at
+
+      or below that path is indexed: no text postings, no typed doc values, and
+
+      no dynamic indexing even when the enclosing object sets
+
+      `"additionalProperties": true`. On an object or an array's `items` it
+
+      applies to the whole subtree. This is the way to keep a large field that
+
+      exists only as the source of an embeddings index out of the text index.
+
+
+      Adding `x-antfly-index: false` to an existing table is a schema
+
+      migration, not an in-place edit: the current full-text index keeps
+
+      serving the field's existing postings until the replacement index has
+
+      been rebuilt under the new schema, and only then are they gone. The
+
+      table does not shrink on the schema update itself.
 
 
       ### `x-antfly-include-in-all`
@@ -18434,6 +18470,8 @@ components:
                 omitted.
         error:
           type: string
+          description: Most recent retry or terminal failure reason. Retained while queued or running,
+            including across progress checkpoints and recovery; omitted after successful completion.
         created_at_ms:
           type: integer
           format: int64
@@ -20679,12 +20717,18 @@ components:
           $ref: '#/components/schemas/GraphMetricQuery'
           description: Direct top-k read from a published graph metric generation. Results are returned
             in graph_metric_results under the requested name or the metric name when no explicit name
-            is supplied.
+            is supplied. Supplying seed_nodes switches a pagerank metric to query-seeded personalized
+            PageRank computed at query time; that form requires metric_freshness=fresh because published
+            generations are global-only.
         graph_metric_rerank:
           $ref: '#/components/schemas/GraphMetricRerank'
           description: Blend a published graph metric feature into ordinary search hit scores. Requests
             may require either any published generation or a generation that is fresh with respect to
-            graph writes.
+            graph writes. Supplying seed_nodes switches a pagerank metric to a query-seeded personalized
+            PageRank blend computed at query time; that form requires metric_freshness=fresh. Retrieval-agent
+            queries may opt in to automatic seeding with auto_seed=true, which seeds the blend from the
+            query's literal graph-search start keys; only valid for pagerank metrics with metric_freshness=fresh.
+            Caller-supplied seed_nodes always take precedence and are never overwritten.
         analyses:
           $ref: '#/components/schemas/Analyses'
         graph_queries:
@@ -23728,6 +23772,47 @@ components:
         - asset
         - embedding
       description: Managed generated artifact kind.
+    EnrichmentNeighborContextConfig:
+      type: object
+      additionalProperties: false
+      required:
+        - graph_index
+      description: Bounded sample of the document's same-shard graph neighbors appended to an asset producer's
+        rendered input as a compact JSON block ({"neighbors":[{"edge_type":...,"direction":...,"target":...,"weight":...}]}),
+        ordered by edge type then target key. A conceptualizer enrichment on an entities table can thereby
+        ground its abstractions in adjacent facts ("started_by -> John Andrew Rice"). The sampled block
+        participates in the producer's skip state, so a changed adjacency re-runs the producer.
+      properties:
+        graph_index:
+          type: string
+          minLength: 1
+          description: Name of a graph index on the same table whose local state is sampled. Validated
+            at admission; cross-shard neighbors are not sampled.
+        edge_types:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            type: string
+            minLength: 1
+          description: Edge types to sample. Empty admits every edge type.
+        direction:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          enum:
+            - out
+            - in
+            - both
+          default: both
+          description: Adjacency orientation to sample relative to the document.
+        limit:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint32
+          minimum: 1
+          maximum: 64
+          default: 8
+          description: Maximum neighbors rendered into the producer input, applied after deterministic
+            ordering.
     ExecutionPolicy:
       type: object
       additionalProperties: false
@@ -23869,8 +23954,11 @@ components:
         source_artifact_name:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: Existing artifact stream this enrichment consumes. Chunk enrichments may consume
-            asset artifacts; embedding enrichments may consume chunk artifacts.
+          description: 'Existing artifact stream this enrichment consumes. Chunk enrichments may consume
+            asset artifacts; embedding enrichments may consume chunk artifacts; asset enrichments may
+            consume other asset artifacts (the upstream asset''s produced bytes become this producer''s
+            source, so field and template must be omitted and the producer must consume text: copy, generator,
+            or extractor).'
         expected_dims:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -23915,6 +24003,14 @@ components:
           description: Write-only serialized producer configuration. For managed embedding enrichments
             Antfly stores a canonical semantic producer identity here; credentials and execution policy
             are excluded.
+        neighbor_context:
+          $ref: '#/components/schemas/EnrichmentNeighborContextConfig'
+          description: Optional bounded sample of the document's graph neighbors appended to the producer
+            input. Only valid on asset enrichments whose producer consumes rendered prompt text (generator
+            or extractor); producers that treat the source as a media locator (copy, reader, transcriber,
+            document_extraction) reject it. Only same-shard graph state is sampled; a graph index without
+            local state for a document yields empty neighbors at runtime while the graph index reference
+            itself is validated at admission.
         execution:
           $ref: '#/components/schemas/ExecutionPolicy'
           description: Non-semantic execution policy for this enrichment producer. This does not participate
@@ -24936,6 +25032,15 @@ components:
           type: string
         key_template:
           type: string
+        labels:
+          type: array
+          items:
+            type: string
+          description: Mention labels this resolver consumes; empty consumes every label (catch-all).
+            Labeled resolvers sharing a source artifact must claim disjoint label sets, and every catch-all
+            on that artifact skips the labels claimed by labeled siblings, so extraction labels stay open-vocabulary
+            while each mention routes to exactly one labeled resolver (label-routed tables, e.g. event
+            mentions to an events table).
         type_must_match:
           type: boolean
           default: true
@@ -24981,6 +25086,15 @@ components:
           type: number
           format: double
           minimum: 0
+        min_confidence:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+          description: 'Mention admission floor: mentions whose extractor-asserted confidence is below
+            this are never resolved — no canonical entity key, no mention edge, and relation endpoints
+            referencing them are withheld. The cheap post-extraction junk filter for score-carrying extractors;
+            0 (the default) admits everything.'
         config_generation:
           type: integer
           format: uint64
@@ -26149,6 +26263,8 @@ components:
           default: false
         content_type:
           type: string
+        neighbor_context:
+          $ref: '#/components/schemas/EnrichmentNeighborContextConfig'
         execution:
           $ref: '#/components/schemas/ExecutionPolicy'
     CreatedIndexCommon:
@@ -27216,6 +27332,10 @@ components:
         fatal_error_count:
           type: integer
           format: uint64
+          description: Durable count of enrichment requests parked with a non-retryable (terminal) disposition,
+            plus fatal worker failures. A terminally failed request never returns to pending; per-document
+            terminal state is reported by the owning index's coverage counters (terminal_failed), and
+            per-document diagnostics by the artifact repair issue listing.
         consecutive_retry_count:
           type: integer
           format: uint32
@@ -30708,6 +30828,27 @@ components:
           default: published
           description: Whether the latest published generation may be stale or must match the graph edge
             generation.
+        seed_nodes:
+          type: array
+          maxItems: 128
+          items:
+            type: string
+            minLength: 1
+          description: 'Node keys receiving all teleport mass for query-seeded personalized PageRank (HippoRAG-style
+            retrieval). Only valid for pagerank metrics and requires metric_freshness=fresh: personalized
+            scores are computed at query time from the current edge snapshot, while published generations
+            are global-only, so seeded reads against published freshness are rejected. Seed keys absent
+            from the graph are skipped; if none resolve, ranking degenerates to global PageRank.'
+        damping:
+          type: number
+          format: double
+          minimum: 0
+          exclusiveMinimum: true
+          maximum: 1
+          exclusiveMaximum: true
+          description: Damping override for query-seeded personalized PageRank (typical HippoRAG-style
+            retrieval uses 0.9). Only valid together with seed_nodes; omitted reads keep the metric's
+            configured damping.
     GraphMetricRerank:
       type: object
       description: Blends a published graph metric into hit scores. Multi-shard tables require a globally
@@ -30755,6 +30896,34 @@ components:
             - fresh
           default: published
           description: Whether stale published generations are acceptable or the metric must be fresh.
+        seed_nodes:
+          type: array
+          maxItems: 128
+          items:
+            type: string
+            minLength: 1
+          description: 'Node keys receiving all teleport mass for a query-seeded personalized PageRank
+            blend (HippoRAG-style retrieval). Only valid for pagerank metrics and requires metric_freshness=fresh:
+            the blended feature scores are computed at query time from the current edge snapshot, while
+            published generations are global-only, so seeded blends against published freshness are rejected.
+            Seed keys absent from the graph are skipped; if none resolve, the blend degenerates to global
+            PageRank.'
+        damping:
+          type: number
+          format: double
+          minimum: 0
+          exclusiveMinimum: true
+          maximum: 1
+          exclusiveMaximum: true
+          description: Damping override for the query-seeded personalized PageRank blend. Only valid together
+            with seed_nodes; omitted blends keep the metric's configured damping.
+        auto_seed:
+          type: boolean
+          default: false
+          description: 'Seed the personalized PageRank blend from the query''s literal graph-search start
+            keys; only valid for pagerank metrics with metric_freshness=fresh. Honored by retrieval-agent
+            queries: caller-supplied seed_nodes always take precedence and are never overwritten, and
+            queries without literal graph-search start keys keep their unseeded (global) blend.'
     GraphIdentifier:
       type: string
       minLength: 1

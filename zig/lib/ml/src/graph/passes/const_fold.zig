@@ -121,6 +121,13 @@ pub fn fold(allocator: std.mem.Allocator, graph: *const Graph) !ConstFoldResult 
         }
         if (!all_const) continue;
 
+        if (try foldShapeTransform(allocator, &work, n, redirect)) |new_id| {
+            redirect[i] = new_id;
+            is_const[i] = true;
+            num_folded += 1;
+            continue;
+        }
+
         // Special paths for ops whose natural output dtype is something
         // other than f32 (so the f32-only `evalNode` path can't
         // represent the result). These read the inputs in their native
@@ -251,6 +258,15 @@ fn evalNode(
                 return @cos(x);
             }
         }.f),
+
+        .less_than => {
+            if (n.output_shape.dtype != .f32 or n.num_inputs < 2) return null;
+            const right = getConstData(graph, resolve(redirect, n.inputs[1])) orelse return null;
+            if ((in0_data.len != 1 and in0_data.len != num_elements) or (right.len != 1 and right.len != num_elements)) return null;
+            const result = try allocator.alloc(f32, num_elements);
+            for (result, 0..) |*value, i| value.* = if (in0_data[if (in0_data.len == 1) 0 else i] < right[if (right.len == 1) 0 else i]) 1 else 0;
+            return result;
+        },
 
         // ── Elementwise binary ─────────────────────────────────
         .add, .sub, .mul, .div => {
@@ -598,6 +614,54 @@ fn writeBool(comptime Src: type, src: []const Src, out_bytes: []u8) bool {
 
 // ── gather / argmax folding ───────────────────────────────────────────
 
+// Shape-only operations preserve bits for every dtype, including i64 shape
+// tensors. Folding through f32 would both miss these subgraphs and lose large
+// integer values. The evaluator is shared with ordinary f32 constant folding.
+fn foldShapeTransform(allocator: std.mem.Allocator, graph: *Graph, n: *const Node, redirect: []const NodeId) !?NodeId {
+    switch (n.op) {
+        .reshape, .slice, .broadcast_in_dim, .transpose => {},
+        else => return null,
+    }
+    const source = graph.node(resolve(redirect, n.inputs[0]));
+    if (source.op != .constant) return null;
+    var preserved = n.*;
+    preserved.output_shape.dtype = source.output_shape.dtype;
+    const transformed = (try switch (source.output_shape.dtype) {
+        .f32 => foldTypedShapeTransform(f32, allocator, graph, &preserved, source),
+        .f64 => foldTypedShapeTransform(f64, allocator, graph, &preserved, source),
+        .f16, .bf16, .i16 => foldTypedShapeTransform(u16, allocator, graph, &preserved, source),
+        .i64 => foldTypedShapeTransform(i64, allocator, graph, &preserved, source),
+        .i32 => foldTypedShapeTransform(i32, allocator, graph, &preserved, source),
+        .i8, .u8, .bool_ => foldTypedShapeTransform(u8, allocator, graph, &preserved, source),
+    }) orelse return null;
+    if (preserved.output_shape.dtype == n.output_shape.dtype) return transformed;
+    return foldConvertDtype(allocator, graph, n, transformed, preserved.output_shape, n.output_shape.dtype);
+}
+
+fn foldTypedShapeTransform(comptime T: type, allocator: std.mem.Allocator, graph: *Graph, n: *const Node, source: *const Node) !?NodeId {
+    const attrs = source.op.constant;
+    const input = graph.constantDataAs(T, attrs.data_offset, attrs.data_len);
+    const count = n.output_shape.numElements() orelse return null;
+    if (count < 0 or count > 16 * 1024 * 1024 / @sizeOf(T)) return null;
+    const result = switch (n.op) {
+        .reshape => |r| blk: {
+            if (r.runtime_shape or input.len != count) return null;
+            break :blk try allocator.dupe(T, input);
+        },
+        .slice => |a| blk: {
+            if (a.runtime_starts or a.runtime_limits) return null;
+            break :blk (try tensor_eval.evalSlice(T, allocator, input, source.output_shape, n.output_shape, a)) orelse return null;
+        },
+        .broadcast_in_dim => |a| (try tensor_eval.evalBroadcast(T, allocator, input, source.output_shape, n.output_shape, a)) orelse return null,
+        .transpose => |a| (try tensor_eval.evalTranspose(T, allocator, input, source.output_shape, n.output_shape, a)) orelse return null,
+        else => unreachable,
+    };
+    defer allocator.free(result);
+    const shape = n.output_shape;
+    const loc = try graph.internConstantBytes(std.mem.sliceAsBytes(result), shape.dtype);
+    return try graph.addNode(.{ .op = .{ .constant = .{ .data_offset = loc.offset, .data_len = loc.len } }, .output_shape = shape });
+}
+
 /// Fold `gather(table, indices)` along `axis`. Both inputs must be
 /// constants. Output's dtype = table's dtype, output's shape comes
 /// from `n.output_shape`. Handles the standard case of rank-1
@@ -633,10 +697,6 @@ fn foldGather(
     const axis = attrs.axis;
     const rank = table_shape.rank();
     if (axis >= rank) return null;
-    // Only handle rank-1 indices for now — that's the canonical
-    // embedding-lookup / shape-arithmetic shape and avoids tricky
-    // multi-dim index broadcasting.
-    if (idx_shape.rank() != 1) return null;
     const idx_count: usize = blk: {
         const ie = idx_shape.numElements() orelse return null;
         if (ie < 0) return null;
@@ -703,6 +763,7 @@ fn foldGather(
     for ((axis + 1)..rank) |k| inner_size *= @intCast(table_shape.dim(@intCast(k)));
     const axis_size: usize = @intCast(axis_dim);
 
+    if (out_elements != outer_size * idx_count * inner_size) return null;
     const block_bytes = inner_size * table_elem_bytes;
     for (0..outer_size) |o| {
         for (0..idx_count) |k| {
@@ -1813,4 +1874,34 @@ test "fold argmax along last axis (i64 output)" {
     try std.testing.expectEqual(shape_mod.DType.i64, out_node.output_shape.dtype);
     const data = result.graph.constantDataAs(i64, attrs.data_offset, attrs.data_len);
     try std.testing.expectEqualSlices(i64, &.{ 1, 2 }, data);
+}
+
+test "fold integer shape operations without floating point loss" {
+    const allocator = std.testing.allocator;
+    var graph = Graph.init(allocator);
+    defer graph.deinit();
+    var builder = @import("../builder.zig").Builder.init(&graph);
+    const large: i64 = 9007199254740993;
+    const input = try builder.tensorConstBytes(std.mem.sliceAsBytes(&[_]i64{ large, large + 1 }), Shape.init(.i64, &.{2}));
+    const reshaped = try builder.reshape(input, Shape.init(.i64, &.{ 1, 2 }));
+    const broadcast = try graph.addNode(.{
+        .op = .{ .broadcast_in_dim = .{ .target_shape = Shape.init(.i64, &.{ 3, 2 }), .num_axes = 2, .broadcast_axes = .{ 0, 1, 0, 0, 0, 0, 0, 0 } } },
+        .output_shape = Shape.init(.i64, &.{ 3, 2 }),
+        .inputs = .{ reshaped, null_node, null_node, null_node },
+        .num_inputs = 1,
+    });
+    const sliced = try builder.sliceLastDim(broadcast, 1, 2);
+    const index = try builder.scalarConst(.i64, 1);
+    const gathered = try graph.addNode(.{
+        .op = .{ .gather = .{ .axis = 0 } },
+        .output_shape = Shape.init(.i64, &.{1}),
+        .inputs = .{ sliced, index, null_node, null_node },
+        .num_inputs = 2,
+    });
+    try graph.markOutput(gathered);
+    var result = try fold(allocator, &graph);
+    defer result.deinit();
+    const output = result.graph.node(result.graph.outputs.items[0]);
+    try std.testing.expectEqual(.constant, std.meta.activeTag(output.op));
+    try std.testing.expectEqualSlices(i64, &.{large + 1}, result.graph.constantDataAs(i64, output.op.constant.data_offset, output.op.constant.data_len));
 }

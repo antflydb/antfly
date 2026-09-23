@@ -39,12 +39,12 @@ fn limits(scratch_bytes: usize) memory.Limits {
     };
 }
 
-fn config(directory: []const u8, scratch_bytes: usize) !server.NodeConfig {
+fn config(directory: []const u8, scratch_bytes: usize, max_concurrent_requests: u32) !server.NodeConfig {
     const bound = limits(scratch_bytes);
     return .{
         .models_dir = std.fs.path.dirname(directory) orelse return error.InvalidModelPath,
         .max_loaded_models = 1,
-        .max_concurrent_requests = 1,
+        .max_concurrent_requests = max_concurrent_requests,
         .keep_alive_ms = 30 * 60 * 1000,
         .process_termination_available = true,
         .generation_budget_overrides = .{
@@ -242,7 +242,7 @@ test "gliner boundary socket pinned small Metal managed HTTP success atomic reco
     defer a.free(raw);
     const original_physical = metal_tensor.memoryStatsSnapshot();
     {
-        var node = try Node.init(a, try config(directory, 3 * GiB));
+        var node = try Node.init(a, try config(directory, 3 * GiB, 1));
         defer node.deinit();
         requireMetal(&node);
         try node.attachIo(std.testing.io);
@@ -337,4 +337,163 @@ test "gliner boundary socket pinned small Metal managed HTTP success atomic reco
         final_physical.device_owned_bytes_released - original_physical.device_owned_bytes_released,
     );
     try shared.verifyFiles(a, directory, pins);
+}
+
+/// One HTTP post issued on its own driver lane so the test's main flow can
+/// submit a competing request while this one is in flight.
+const ConcurrentPost = struct {
+    transport: *socket.Loopback,
+    driver_io: Io,
+    url: []const u8,
+    body: []const u8,
+    cancelled: std.atomic.Value(bool) = .init(false),
+    completed: std.atomic.Value(bool) = .init(false),
+    future: ?Io.Future(anyerror!@import("httpx").Response) = null,
+
+    fn start(self: *ConcurrentPost) !void {
+        std.debug.assert(self.future == null);
+        self.future = try self.driver_io.concurrent(run, .{self});
+    }
+
+    fn run(self: *ConcurrentPost) anyerror!@import("httpx").Response {
+        defer self.completed.store(true, .release);
+        return self.transport.client.post(self.url, .{
+            .borrowed_body = self.body,
+            .headers = &.{.{ "Content-Type", "application/json" }},
+            .timeout_ms = 180_000,
+            .cancellation = .fromAtomic(&self.cancelled),
+        });
+    }
+
+    fn join(self: *ConcurrentPost) !@import("httpx").Response {
+        const future = if (self.future) |*value| value else return error.NoConcurrentPost;
+        defer self.future = null;
+        return future.await(self.driver_io);
+    }
+
+    fn deinit(self: *ConcurrentPost) void {
+        self.cancelled.store(true, .release);
+        if (self.future) |*future| {
+            if (future.await(self.driver_io)) |value| {
+                var response = value;
+                response.deinit();
+            } else |_| {}
+            self.future = null;
+        }
+    }
+};
+
+test "gliner boundary socket pinned small Metal admits concurrent extracts and serializes execution" {
+    // Regression for an externally reported crash class: "two concurrent
+    // /ai/v1/extract requests abort the engine outright with a Metal
+    // command-buffer assertion". The per-model execution mutex
+    // (targetInferenceExecutionMutex, held across the complete command-buffer
+    // lifetime in the extract path) is the guard; until this test, no
+    // automated coverage drove two SIMULTANEOUSLY ADMITTED requests into the
+    // Metal boundary path — the existing concurrency test pins
+    // max_concurrent_requests = 1 and qualifies admission rejection instead.
+    if (comptime !build_options.enable_metal or builtin.os.tag != .macos) return error.SkipZigTest;
+    const requested = platform.env.getenv("ANTFLY_GLINER25_SMALL_MODEL_DIR") orelse return error.SkipZigTest;
+    const httpx = @import("httpx");
+    const BoundedAlloc = BoundedAllocator;
+    const a = std.testing.allocator;
+    var path: [Io.Dir.max_path_bytes]u8 = undefined;
+    const length = if (std.fs.path.isAbsolute(requested))
+        try Io.Dir.realPathFileAbsolute(std.testing.io, requested, &path)
+    else
+        try Io.Dir.cwd().realPathFile(std.testing.io, requested, &path);
+    const directory = path[0..length];
+    const name = std.fs.path.basename(directory);
+    const bytes = try fixtures.fixtureBytes(a, "pipeline_cases.json");
+    defer a.free(bytes);
+    var fixture = try std.json.parseFromSlice(pipeline.ReferenceFixture, a, bytes, .{});
+    defer fixture.deinit();
+    const pins = fixture.value.model_files;
+    try shared.verifyFiles(a, directory, pins);
+    const case = fixture.value.cases[0];
+    const warm_raw = try shared.requestBytes(a, name, case.schema, &.{.{ .id = "warm", .content = case.text }});
+    defer a.free(warm_raw);
+    const race_a_raw = try shared.requestBytes(a, name, case.schema, &.{.{ .id = "race-a", .content = case.text }});
+    defer a.free(race_a_raw);
+    const race_b_raw = try shared.requestBytes(a, name, case.schema, &.{.{ .id = "race-b", .content = case.text }});
+    defer a.free(race_b_raw);
+
+    var node = try Node.init(a, try config(directory, 3 * GiB, 2));
+    defer node.deinit();
+    requireMetal(&node);
+    try node.attachIo(std.testing.io);
+    node.test_allow_unqualified_gliner_boundary = true;
+    const transport = try socket.Loopback.init(a, &node);
+    defer transport.deinit();
+    try transport.start();
+
+    // Warm the model first so both racing requests contend on EXECUTION,
+    // not on the (already registry-lock-serialized) cold load.
+    {
+        var response = try transport.post(warm_raw);
+        defer response.deinit();
+        _ = try shared.successfulResponse(a, &response, name, "warm", case.text, case.expected);
+    }
+    try transport.idle();
+
+    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/ai/v1/extract", .{transport.address.?.ip4.port});
+    defer a.free(url);
+    var second_budget = BoundedAlloc{ .backing = a, .limit = 4 * 1024 * 1024 };
+    defer std.debug.assert(second_budget.live == 0);
+    var driver = Io.Threaded.init(second_budget.allocator(), .{ .concurrent_limit = .limited(1) });
+    defer driver.deinit();
+    var second_io = Io.Threaded.init(second_budget.allocator(), .{ .concurrent_limit = .limited(4) });
+    defer second_io.deinit();
+    var second = httpx.Client.initWithConfig(second_budget.allocator(), second_io.io(), .{
+        .timeouts = .{ .connect_ms = 5_000, .read_ms = 180_000, .write_ms = 5_000, .request_ms = 180_000 },
+        .retry_policy = .noRetry(),
+        .redirect_policy = .{ .follow_redirects = false, .max_redirects = 0 },
+        .max_response_size = 1024 * 1024,
+        .max_response_headers = 64,
+        .keep_alive = false,
+        .pool_max_connections = 1,
+        .pool_max_per_host = 1,
+        .cookies_enabled = false,
+        .cancel_in_flight_on_shutdown = true,
+    });
+    defer second.deinit();
+
+    var first = ConcurrentPost{ .transport = transport, .driver_io = driver.io(), .url = url, .body = race_a_raw };
+    defer first.deinit();
+    try first.start();
+    // Hold the competing submission until race-a is admitted, so race-b's
+    // admission overlaps race-a's Metal execution deterministically.
+    {
+        const until = clock() + 30_000 * std.time.ns_per_ms;
+        while (node.inference_admission.stats().in_flight_requests == 0) {
+            if (first.completed.load(.acquire)) break;
+            if (clock() >= until) return error.RaceAdmissionTimeout;
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+    }
+    {
+        var response_b = try second.post(url, .{
+            .borrowed_body = race_b_raw,
+            .headers = &.{.{ "Content-Type", "application/json" }},
+            .timeout_ms = 180_000,
+        });
+        defer response_b.deinit();
+        _ = try shared.successfulResponse(a, &response_b, name, "race-b", case.text, case.expected);
+    }
+    {
+        var response_a = try first.join();
+        defer response_a.deinit();
+        _ = try shared.successfulResponse(a, &response_a, name, "race-a", case.text, case.expected);
+    }
+    try transport.idle();
+
+    // Both were admitted (never capacity-rejected): the crash-class scenario
+    // was actually exercised, and the per-model mutex serialized it safely.
+    const admission = node.inference_admission.stats();
+    try std.testing.expectEqual(@as(u64, 0), admission.rejected_requests_total);
+    try std.testing.expectEqual(@as(usize, 0), admission.in_flight_requests);
+    _ = try cachedModel(&node, directory, pins);
+    _ = try idle(&node);
+    try transport.finish();
+    _ = try idle(&node);
 }

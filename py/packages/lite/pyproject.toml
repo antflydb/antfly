@@ -1,0 +1,65 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "antfly-lite"
+version = "0.1.0"
+description = "Python binding for embedded Antfly Lite databases (libantfly C ABI)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "Antfly, Inc.", email = "ajroetker@antfly.io"},
+]
+keywords = ["antfly", "lite", "database", "search", "embedded", "vector"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://antfly.io"
+Documentation = "https://docs.antfly.io"
+Repository = "https://github.com/antflydb/antfly"
+Issues = "https://github.com/antflydb/antfly/issues"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+    "ruff>=0.13.0",
+    "pyright>=1.1.410",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/antfly_lite"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["F", "I", "UP"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+[tool.pyright]
+include = ["src", "tests"]
+pythonVersion = "3.11"
+reportMissingImports = "warning"
+reportUndefinedVariable = "warning"
+reportGeneralTypeIssues = "warning"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

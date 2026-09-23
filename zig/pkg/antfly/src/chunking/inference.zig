@@ -110,6 +110,15 @@ pub fn chunkInputWithProvider(
     input: RemoteInput,
     antfly_provider: ?chunk_provider.Provider,
 ) ![]RemoteChunk {
+    // An empty source has nothing to chunk. Short-circuit before any
+    // provider or remote dispatch: the inference endpoint rejects an empty
+    // input as a 400 that the retry classifier treats as transient, which
+    // turns a permanently empty document field into a retry loop instead of
+    // a clean zero-chunk skip.
+    switch (input) {
+        .text => |text| if (text.len == 0) return try alloc.alloc(RemoteChunk, 0),
+        .binary => |binary| if (binary.data.len == 0) return try alloc.alloc(RemoteChunk, 0),
+    }
     const execution: execution_context.Context = if (antfly_provider) |provider| provider.execution else .{};
     try execution.check(platform_time.monotonicNs());
     const linked_callback_available = if (antfly_provider) |provider|
@@ -142,8 +151,17 @@ pub fn chunkInputWithProvider(
         try request_context.check();
         return try cloneRemoteChunks(alloc, chunks);
     };
-    const endpoint = resolved_endpoint orelse return try chunkInputDirect(alloc, cfg, input);
+    const endpoint_raw = resolved_endpoint orelse return try chunkInputDirect(alloc, cfg, input);
     if (cfg.model.len == 0) return error.InvalidChunkerConfig;
+    // Unlike `managed_embedder.zig`'s embedder/extractor base URLs, a
+    // chunker's `api_url` reached this call unnormalized: a bare
+    // `host:port` (the natural way to configure "the same inference
+    // service" for embedder and chunker together) resolves to
+    // `{host:port}/chunk` instead of `{host:port}/ai/v1/chunk`, so the
+    // request 404s against the real joined API. Normalize the same way the
+    // embedder path does, leaving an already-pathed URL untouched.
+    const endpoint = try normalizedAntflyChunkEndpointAlloc(alloc, endpoint_raw);
+    defer alloc.free(endpoint);
 
     var fallback_io: ?std.Io.Threaded = null;
     defer if (fallback_io) |*io_impl| io_impl.deinit();
@@ -247,6 +265,18 @@ pub fn chunkInputWithProvider(
     });
     defer resp.deinit();
     if (!resp.ok()) {
+        // Never log the request payload (it embeds the full source document)
+        // or the unbounded response body; a routine 429/503 must not copy
+        // document contents into production logs. A bounded response prefix
+        // is enough to identify the provider error.
+        const error_body = resp.body orelse "<none>";
+        const bounded_len = @min(error_body.len, 256);
+        std.log.warn("chunk request failed url={s} status={d} response_prefix={s}{s}", .{
+            url,
+            resp.status.code,
+            error_body[0..bounded_len],
+            if (error_body.len > bounded_len) "..." else "",
+        });
         const stale = resp.headers.get(remote_capabilities.capability_stale_header);
         if (resp.status.code == 409 and stale != null and
             std.ascii.eqlIgnoreCase(std.mem.trim(u8, stale.?, " \t"), "true"))
@@ -261,6 +291,21 @@ pub fn chunkInputWithProvider(
     errdefer inference_chunker.types.freeChunks(alloc, chunks);
     try execution.check(platform_time.monotonicNs());
     return chunks;
+}
+
+/// Mirrors `managed_embedder.zig`'s `normalizeAntflyInferenceBaseUrl`: a bare
+/// `scheme://host:port` endpoint (no path) gets `/ai/v1` appended so it lands
+/// on the joined public API instead of the process root; an endpoint that
+/// already carries a path (including one already ending in `/ai/v1`) is left
+/// exactly as configured.
+fn normalizedAntflyChunkEndpointAlloc(alloc: Allocator, raw: []const u8) ![]u8 {
+    const trimmed = std.mem.trimEnd(u8, raw, "/");
+    if (std.mem.endsWith(u8, trimmed, "/ai/v1")) return try alloc.dupe(u8, trimmed);
+    const scheme_pos = std.mem.indexOf(u8, trimmed, "://");
+    const host_start = if (scheme_pos) |pos| pos + 3 else 0;
+    const path_pos = std.mem.indexOfPos(u8, trimmed, host_start, "/");
+    if (path_pos == null) return try std.fmt.allocPrint(alloc, "{s}/ai/v1", .{trimmed});
+    return try alloc.dupe(u8, trimmed);
 }
 
 fn chunkInputDirect(alloc: Allocator, cfg: chunking_types.Config, input: RemoteInput) ![]RemoteChunk {
@@ -487,6 +532,23 @@ test "antfly chunk request frames borrowed binary input without base64" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "empty chunk input short-circuits without provider or remote dispatch" {
+    const alloc = std.testing.allocator;
+    // An unreachable endpoint proves nothing was dispatched: a request
+    // would fail, an empty input returns zero chunks instead.
+    const cfg = chunking_types.Config{
+        .model = "fixed",
+        .api_url = "http://127.0.0.1:1/ai/v1/chunk",
+    };
+    const text_chunks = try chunkInput(alloc, cfg, .{ .text = "" });
+    defer freeRemoteChunks(alloc, text_chunks);
+    try std.testing.expectEqual(@as(usize, 0), text_chunks.len);
+
+    const binary_chunks = try chunkInput(alloc, cfg, .{ .binary = .{ .data = "", .mime_type = "application/pdf" } });
+    defer freeRemoteChunks(alloc, binary_chunks);
+    try std.testing.expectEqual(@as(usize, 0), binary_chunks.len);
 }
 
 test "antfly chunker text round trip" {

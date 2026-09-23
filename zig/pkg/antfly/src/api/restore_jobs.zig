@@ -116,6 +116,8 @@ pub const JobState = struct {
     destination_authorization_fingerprint: []const u8 = "",
     destination_authorization_principal: []const u8 = "",
     result_json: ?[]const u8 = null,
+    /// Most recent retry/failure reason, retained through running checkpoints
+    /// and recovery. Successful completion clears it.
     last_error: ?[]const u8 = null,
     created_at_ms: u64,
     updated_at_ms: u64,
@@ -632,7 +634,7 @@ pub const Store = struct {
                         .request_fingerprint = parsed.value.request_fingerprint,
                         .destination_authorization_fingerprint = parsed.value.destination_authorization_fingerprint,
                         .destination_authorization_principal = parsed.value.destination_authorization_principal,
-                        .last_error = "resuming_after_restart",
+                        .last_error = parsed.value.last_error orelse "resuming_after_restart",
                         .created_at_ms = parsed.value.created_at_ms,
                         .updated_at_ms = nowMillis(),
                         .expires_at_ms = parsed.value.expires_at_ms,
@@ -841,7 +843,7 @@ pub const Store = struct {
                 .phase = .queued,
                 .dispatch_sequence = dispatch_sequence,
                 .not_before_ms = not_before_ms,
-                .last_error = "resuming_after_leader_change",
+                .last_error = parsed.value.last_error orelse "resuming_after_leader_change",
             });
             alloc.free(encoded);
             try self.insertPendingSortedLocked(.{
@@ -929,7 +931,7 @@ pub const Store = struct {
                 .request_fingerprint = parsed.value.request_fingerprint,
                 .destination_authorization_fingerprint = parsed.value.destination_authorization_fingerprint,
                 .destination_authorization_principal = parsed.value.destination_authorization_principal,
-                .last_error = "resuming_after_restart",
+                .last_error = parsed.value.last_error orelse "resuming_after_restart",
                 .created_at_ms = parsed.value.created_at_ms,
                 .updated_at_ms = nowMillis(),
                 .expires_at_ms = parsed.value.expires_at_ms,
@@ -1915,10 +1917,11 @@ pub const Store = struct {
             });
         }
 
-        if (std.mem.eql(u8, err_name, "RestoreStagingYield")) {
-            // Yielding must not write running -> queued -> running for each
-            // bounded page. Those extra consensus/fsync barriers dominate small
-            // restores on high-latency disks and inflate failure backoff attempts.
+        if (std.mem.eql(u8, err_name, "RestoreStagingYield") or std.mem.eql(u8, err_name, "RestoreStagingWait")) {
+            // Cooperative pages and readiness waits must not write running ->
+            // queued -> running on every turn. Those extra consensus/fsync
+            // barriers dominate small restores on high-latency disks and
+            // inflate failure backoff attempts.
             // The actual progress has already been durably checkpointed.
             const encoded = try alloc.dupe(u8, current);
             errdefer alloc.free(encoded);
@@ -2069,7 +2072,7 @@ pub const Store = struct {
             .destination_authorization_fingerprint = current.destination_authorization_fingerprint,
             .destination_authorization_principal = current.destination_authorization_principal,
             .result_json = update.result_json orelse current.result_json,
-            .last_error = update.last_error,
+            .last_error = if (update.phase == .succeeded) null else update.last_error orelse current.last_error,
             .created_at_ms = current.created_at_ms,
             .updated_at_ms = nowMillis(),
             .expires_at_ms = if (isTerminal(update.phase) and !isTerminal(current.phase))
@@ -3826,8 +3829,8 @@ test "restore cooperative continuations preserve checkpoints without replicated 
     const writes = persistence.put_calls;
     // The caller may hold an older view than the latest checkpoint. Yield must
     // keep that checkpoint, and neither yield nor resume requires persistence.
-    for (0..100) |_| {
-        const yielded = try store.retryRunning(alloc, worker.value, "RestoreStagingYield", 0);
+    for (0..100) |iteration| {
+        const yielded = try store.retryRunning(alloc, worker.value, if (iteration % 2 == 0) "RestoreStagingYield" else "RestoreStagingWait", 0);
         defer alloc.free(yielded);
         try std.testing.expectEqualStrings(checkpoint, yielded);
         // A retiring worker that could not schedule the timer no longer owns
@@ -4045,6 +4048,20 @@ test "retryable restore contention durably requeues progress and honors cancella
         parsed_resumed.value.attempt_id,
     );
     try std.testing.expectEqual(@as(?u16, 0), parsed_resumed.value.active_table_index);
+    try std.testing.expectEqualStrings("BackupRepositoryBusy", parsed_resumed.value.last_error.?);
+
+    // Ordinary progress must not erase the diagnostic that explains why this
+    // running job has already needed multiple attempts.
+    const progressed = try store.recordTablePublished(std.testing.allocator, parsed_resumed.value.job_id, parsed_resumed.value.attempt_id, 0);
+    defer std.testing.allocator.free(progressed);
+    var parsed_progressed = try std.json.parseFromSlice(JobState, std.testing.allocator, progressed, .{});
+    defer parsed_progressed.deinit();
+    try std.testing.expectEqualStrings("BackupRepositoryBusy", parsed_progressed.value.last_error.?);
+
+    // A stale worker cannot overwrite the current attempt's diagnostic.
+    const stale = try store.retryRunning(std.testing.allocator, parsed_running.value, "NotLeader", 0);
+    defer std.testing.allocator.free(stale);
+    try std.testing.expectEqualStrings(progressed, stale);
 
     const cancelling = (try store.cancel(
         std.testing.allocator,
@@ -4070,6 +4087,58 @@ test "retryable restore contention durably requeues progress and honors cancella
         "cancel_requested",
         parsed_cancelled.value.last_error.?,
     );
+}
+
+test "restore retry diagnostics survive recovery and clear on success" {
+    const alloc = std.testing.allocator;
+    var persistence = TestReplicatedPersistence.init(alloc);
+    defer persistence.deinit();
+    var store = Store.initWithIo(alloc, std.testing.io);
+    defer store.deinit();
+    try store.attachReplicated(persistence.persistence());
+    const created = try store.start(alloc, .{
+        .scope = .table,
+        .table_name = "docs",
+        .backup_id = "daily",
+        .location = "s3://archive/daily",
+        .connection = "archive-reader",
+        .idempotency_namespace = "principal:admin:table:docs",
+    });
+    defer alloc.free(created);
+    var admitted = try std.json.parseFromSlice(JobState, alloc, created, .{});
+    defer admitted.deinit();
+    const running = (try store.begin(alloc, admitted.value.job_id)).?;
+    defer alloc.free(running);
+    var first = try std.json.parseFromSlice(JobState, alloc, running, .{});
+    defer first.deinit();
+    const queued = try store.retryRunning(alloc, first.value, "BackupRepositoryBusy", 0);
+    defer alloc.free(queued);
+    const resumed = (try store.begin(alloc, first.value.job_id)).?;
+    defer alloc.free(resumed);
+    var second = try std.json.parseFromSlice(JobState, alloc, resumed, .{});
+    defer second.deinit();
+    const retried = try store.retryRunning(alloc, second.value, "NotLeader", 0);
+    defer alloc.free(retried);
+    const interrupted = (try store.begin(alloc, first.value.job_id)).?;
+    defer alloc.free(interrupted);
+
+    // Recovery must retain the actual cause instead of replacing it with a
+    // generic restart marker. No extra diagnostic persistence is necessary.
+    var recovered = Store.initWithIo(alloc, std.testing.io);
+    defer recovered.deinit();
+    try recovered.attachReplicated(persistence.persistence());
+    try recovered.prepareReplicatedLeadership(alloc, 1);
+    const recovered_running = (try recovered.begin(alloc, first.value.job_id)).?;
+    defer alloc.free(recovered_running);
+    var current = try std.json.parseFromSlice(JobState, alloc, recovered_running, .{});
+    defer current.deinit();
+    try std.testing.expectEqualStrings("NotLeader", current.value.last_error.?);
+    const finished = try recovered.finish(alloc, current.value, "{}");
+    defer alloc.free(finished);
+    var terminal = try std.json.parseFromSlice(JobState, alloc, finished, .{});
+    defer terminal.deinit();
+    try std.testing.expectEqual(Phase.succeeded, terminal.value.phase);
+    try std.testing.expectEqual(@as(?[]const u8, null), terminal.value.last_error);
 }
 
 test "restore ownership loss requeues only the exact running attempt" {

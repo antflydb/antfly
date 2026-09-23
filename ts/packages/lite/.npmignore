@@ -1,0 +1,34 @@
+# Source files
+src/
+test/
+examples/
+
+# Config files
+.eslintrc.json
+.prettierrc
+jest.config.js
+tsconfig.json
+Makefile
+
+# Development files
+*.log
+*.tgz
+.env
+.env.*
+
+# CI/CD
+.github/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts (keep dist/)
+coverage/
+.nyc_output/

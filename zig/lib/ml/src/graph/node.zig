@@ -64,6 +64,7 @@ pub const PrimitiveOp = enum(u8) {
     concat,
     range,
     shape_of,
+    size_of,
 
     // Data movement
     gather,
@@ -617,6 +618,7 @@ pub const OpCode = union(enum) {
     reduce_sum: ReduceAttrs,
     reduce_max: ReduceAttrs,
     reduce_mean: ReduceAttrs,
+    cumulative_sum: struct { axis: u8, exclusive: bool = false, reverse: bool = false },
     argmax: ArgReduceAttrs,
     reshape: ReshapeAttrs,
     transpose: TransposeAttrs,
@@ -625,6 +627,7 @@ pub const OpCode = union(enum) {
     concat_prim: ConcatAttrs,
     range: void,
     shape_of: ShapeOfAttrs,
+    size_of: void,
     gather: GatherAttrs,
     scatter_add: ScatterAddAttrs,
     dot_general: DotGeneralAttrs,

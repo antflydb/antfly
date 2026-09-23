@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+trace_root="${ANTFLY_TLA_TRACE_DIR:-${RUNNER_TEMP:-/tmp}/antfly-tla-traces}"
+
 run_model_check="${ANTFLY_TLA_MODEL_CHECK:-false}"
 run_trace_validate="${ANTFLY_TLA_TRACE_VALIDATE:-false}"
 
@@ -41,27 +43,35 @@ download_tla_tools() {
 extract_raft_trace() {
   (
     cd zig
-    ANTFLY_TRACE_FILE=/tmp/raft-trace.ndjson zig build -Dwith_tla=true antfly-raft-test
+    ANTFLY_TRACE_DIR="$trace_run/raft" python3 tools/run_bounded_zig_build.py --zig zig -- build -Dwith_tla=true antfly-raft-test
   )
-  test -s /tmp/raft-trace.ndjson
-  echo "Raft trace lines: $(wc -l < /tmp/raft-trace.ndjson)"
+  collect_traces raft
 }
 
 validate_raft_trace() {
-  make -C zig tla-trace-raft TRACE_FILES=/tmp/raft-trace.ndjson
+  make -C zig tla-trace-raft TRACE_FILES="$trace_run/raft/*.ndjson"
 }
 
 extract_txn_trace() {
   (
     cd zig
-    ANTFLY_TRACE_FILE=/tmp/txn-trace.ndjson zig build -Dwith_tla=true antfly-storage-db-txn-test
+    ANTFLY_TRACE_DIR="$trace_run/txn" python3 tools/run_bounded_zig_build.py --zig zig -- build -Dwith_tla=true antfly-storage-db-txn-test
   )
-  test -s /tmp/txn-trace.ndjson
-  echo "Transaction trace lines: $(wc -l < /tmp/txn-trace.ndjson)"
+  collect_traces txn
 }
 
 validate_txn_trace() {
-  make -C zig tla-trace-txn TRACE_FILES=/tmp/txn-trace.ndjson
+  make -C zig tla-trace-txn TRACE_FILES="$trace_run/txn/*.ndjson"
+}
+
+collect_traces() {
+  local kind="$1"
+  local files=("$trace_run/$kind/"*.ndjson)
+  if [[ ! -s "${files[0]}" ]]; then
+    echo "No $kind traces produced in $trace_run/$kind" >&2
+    return 1
+  fi
+  wc -l "${files[@]}"
 }
 
 if [[ "$run_model_check" == "true" ]]; then
@@ -69,6 +79,11 @@ if [[ "$run_model_check" == "true" ]]; then
 fi
 
 if [[ "$run_trace_validate" == "true" ]]; then
+  mkdir -p "$trace_root"
+  trace_root="$(cd "$trace_root" && pwd)"
+  trace_run="$(mktemp -d "$trace_root/run.XXXXXX")"
+  mkdir "$trace_run/raft" "$trace_run/txn"
+  echo "Trace evidence: $trace_run"
   run_group "Download TLA+ tools" download_tla_tools
   run_group "Run raft tests and extract traces" extract_raft_trace
   run_group "Validate raft traces" validate_raft_trace

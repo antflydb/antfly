@@ -14,7 +14,7 @@
 
 //! Roaring Bitmap: compressed bitmap for document ID sets.
 //!
-//! Compatible with the roaring bitmap format used by bleve/zapx for posting lists.
+//! Compatible with the standard roaring bitmap serialization; used for posting lists.
 //! Uses SIMD (@Vector(8, u64)) for bulk bitwise operations on bitmap containers.
 //!
 //! Roaring bitmaps partition the 32-bit space into 16-bit "chunks" (high 16 bits).

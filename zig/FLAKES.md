@@ -1,5 +1,45 @@
 # Zig runtime flakes
 
+## 2026-09-22: schema rewrite cutover readiness after coordinator crash
+
+[CI run 35813900420, job 107039234761](https://github.com/antflydb/antfly/actions/runs/35813900420/job/107039234761)
+failed `test_schema_rewrite_recovers_dependency_cohort[publication-coordinator]`:
+the restore was still running with `RestoreValidationPending` after its
+180-second terminal wait. The retained server logs show import and validation
+progress, and the test's old-owner observations reached the fenced/drained
+state. The generic job error does not identify which cutover owner was pending;
+the stripped CI stacks do not establish a deadlock.
+
+Cutover polls each old owner's topology fence before recording its durable
+receipt. An absent write/status response or a not-yet-drained fence is expected
+readiness, but previously used `RestoreValidationPending`, which requeued a new
+replicated job attempt with exponential repository-failure backoff. Across six
+old owners, this can consume the test's recovery window without advancing the
+cutover cursor. These readiness checks now park a bounded 250-ms in-memory
+continuation of the same durable attempt. The owner receipt and cursor still
+advance only after the fence is observed drained; process loss reconstructs
+the running job from its durable checkpoint. A read-index status check first
+recognizes an already-applied begin, including one whose response was lost, so
+short polling does not resend a Raft write on each turn. Actual repository and
+validation errors retain their existing retry/fencing behavior.
+
+The unchanged `origin/main` binary passed six focused macOS Debug repetitions
+with two concurrent regression-loop workers (roughly 144–162 seconds each),
+so the exact CI failure was not reproduced locally. The store's continuation
+regression now exercises both yield and readiness-wait paths, including
+checkpoint preservation, zero scheduling writes, same-attempt resume, and
+leader-recovery fencing. The initial fixed binary passed four concurrent E2E
+repetitions; the final revision with read-before-resend passed two more. The
+focused restore-job suite passed 42/42. These runs validate integrated recovery
+but do not establish a latency speedup or prove the CI failure's exact cause.
+
+```sh
+SKIP_BUILD=1 ANTFLY_E2E_ENV_LOADED=1 \
+  ANTFLY_E2E_REGRESSION_WORKERS=2 ANTFLY_E2E_REGRESSION_REPEATS=3 \
+  scripts/ci/zig-e2e-regression-loop.sh \
+  'e2e/antfly/test_relational_integrity_recovery.py::test_schema_rewrite_recovers_dependency_cohort[publication-coordinator]'
+```
+
 See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
@@ -7,6 +47,231 @@ a passing soak alone does not establish a failure's cause.
 The later [Antfly E2E failures](e2e/FLAKES.md#2026-09-18-concurrent-aggregations-stalled-hydration-and-raced-primary-generations)
 add full-text hydration contention, aggregation generation races, and overlapping transaction session recovery;
 their deterministic regressions and native soak evidence are recorded there.
+
+## 2026-09-21: restore retry diagnostics vanished while running (#846)
+
+[Issue #846](https://github.com/antflydb/antfly/issues/846) records the concurrent
+restore/observer test exceeding its 120-second budget at attempt 15, with no
+published tables and no error in status. This is real retry churn, not merely
+the cooperative staging continuation (which preserves its attempt number).
+The retained CI log does not identify the retry cause or establish leadership
+instability; the test uses the standalone runtime.
+
+The job store cleared `last_error` both on begin and on ordinary progress
+checkpoints. It now retains the last retry reason until a newer reason replaces
+it or successful completion clears it. Recovery preserves the original reason,
+stale attempts remain fenced, and cancellation retains its explicit reason.
+This uses the existing durable record and public `error` field; it adds no
+extra persistence or polling. The polling timeout now includes the bounded
+server-log tail, just as terminal failures already include diagnostics.
+
+The deterministic negative control restores the old update behavior and fails
+because the resumed attempt has no retry reason. The corrected store suite
+passes 42 tests, including progress, stale-worker, recovery, and success cleanup
+coverage. Two polling tests verify bounded logs and the unchanged deadline even
+when every poll reports another attempt. Eight unchanged native macOS Debug
+observer runs on two workers pass; the rebuilt fixed server passes another
+20/20 on two workers. All 272 metadata logic tests also pass. These runs do
+**not** reproduce or prove a
+fix for the original CI stall. Keep #846 open for that investigation; no restore
+timeout, observer rate, or progress assertion was relaxed.
+
+Reproduce using an isolated local Zig cache and a fresh report directory:
+
+```sh
+cd zig
+zig build antfly-api-restore-jobs-test --cache-dir /tmp/antfly-832-local-cache
+uv run --project e2e/antfly pytest -q e2e/antfly/test_restore_wait.py
+cd ..
+SKIP_BUILD=1 ANTFLY_BIN=/absolute/path/to/antfly \
+  ANTFLY_E2E_REGRESSION_WORKERS=2 ANTFLY_E2E_REGRESSION_REPEATS=4 \
+  ANTFLY_E2E_REGRESSION_REPORT_DIR=/tmp/restore-846-fresh \
+  scripts/ci/zig-e2e-regression-loop.sh \
+  e2e/antfly/test_backup_restore.py::test_cluster_restore_modes_with_concurrent_observers
+```
+
+## 2026-09-21: source-vector status disappeared under contention (#845)
+
+[Issue #845](https://github.com/antflydb/antfly/issues/845) observed
+`MissingSourceVectorStatus` immediately after reopening an opaque owner under
+concurrent E2E load. Source storage was already open: `sourceVectorStats`
+returned null both when storage was disabled and when `tryStatsSnapshot` could
+not acquire its mutex. JSON omitted that null field and incorrectly reported a
+successful, incomplete observation.
+
+The DB observation now distinguishes disabled storage from `StorageBusy`.
+The owner ABI returns busy with no response bytes, allowing the existing bounded
+`ownerStatusEventually` retry to work. Fresh server status publication similarly
+retries contention through its existing `WriterLocked` path; best-effort cached
+overlays retain their previous observation. No source mutex wait is introduced
+under a shared owner lease, and the reopen test still rejects a successful
+response with missing source status.
+
+The deterministic C ABI regression holds the source mutex on the calling thread,
+requires busy and empty output, then releases it and requires source status
+without another query or write. It also checks a genuinely disabled source store
+and runs alongside the existing apply-writer contention regression. Both are
+registered in the default C API test selection.
+
+```sh
+cd zig
+zig build capi-test --cache-dir /tmp/antfly-832-local-cache -- \
+  --test-filter 'storage owner runtime status'
+zig build antfly-storage-owner-test --cache-dir /tmp/antfly-832-local-cache \
+  '-Dstorage-owner-test-filter=opaque storage owner preserves source-vector policy and status across reopen'
+```
+
+The old contention-to-null behavior fails the deterministic regression with
+`expected .busy, found .ok`. The corrected pair passes 20 invocations on two
+workers (40 tests), and the unchanged immediate-reopen test passes another
+20 invocations on two workers while compiler work is active. The original issue
+used `antfly-storage-test`; the focused current partitioned build target is
+`antfly-storage-owner-test`. A separate-cache qualification also passes all
+45 compiled owner tests and all 16 index-race/embedded lifecycle VOPR tests.
+Do not share a mutable local compiler cache with another active worktree: the
+initial broad run mixed consumer artifacts from a schema-format-14 worktree
+with this branch's format-13 provider and failed restore digest checks; the
+separate-cache build passes those same unchanged tests.
+
+## 2026-09-21: full-lane cache, VOPR storage, and extension failures
+
+[Full run 35641562828](https://github.com/antflydb/antfly/actions/runs/35641562828)
+contained independent failures; passing the smaller required lanes did not cover
+them. The full unit aggregate itself passed 2,120 tests (eight skipped).
+
+- The runtime-cache fixture selected an arbitrary compile artifact sharing the
+  HTTP runtime module. Different test runners produced different cache keys.
+  Select the intended simple-runner artifact before mutating its module. The
+  unchanged fixture reproduced its recompile failure; the corrected cache
+  contract passes, including the unchanged-build cache hit.
+- The index-manager and embedded VOPR roots omitted `antfly_schema_openapi`.
+  Register the dependency at each module boundary, including the WASM consumer
+  of the embedded configuration helper.
+- Native index-root validation consulted only the top-level storage override,
+  while backend open also honored nested LSM options. Canonicalize both onto
+  the same effective adapter. The regression covers nested configuration and
+  explicit-override precedence and later option reconfiguration. Main and WAL
+  adapters remain independent. The original exact-replay case reproduced
+  `InvalidIndexRootPointer`; advancing past it exposed wall-clock sleeping in
+  a virtual-time drain and real-clock validation of a virtual-time lease.
+  Drain through the owning I/O, carry the enrichment runtime's clock into its
+  transactional fence, and schedule readiness steps as recorded VOPR tasks.
+  All 13 index-race and three embedded lifecycle tests pass; exact replay
+  retains five repeats per scenario. No lease or timeout was relaxed.
+- The 49 GiB CI filesystem filled after the unit phase retained about 38 GiB
+  of compiler outputs. Linux self-hosted Debug often emits no disposable link
+  objects, so object-only pruning freed nothing. At completed full-job phase
+  boundaries, release the job-private `zig-local` outputs **and manifests**;
+  preserve global dependencies and installed artifacts. Tests cover symlink
+  rejection, sibling preservation, repeated release, and an actual Zig rebuild
+  after release. Never invoke phase release while a cache user is running.
+
+The extension failures are deterministic on the full Linux binary. Its static
+TLS is 2,099,440 bytes, already larger than Rayon's default 2 MiB compiler-worker
+stack. A diagnostic signal handler located the fault in Cranelift's
+`Compiler::compile_function` writing to its stack. An isolated invocation works
+with small TLS and exits 139 when given a matching large TLS reservation.
+Wasmtime core and component engines now disable the global parallel compiler
+pool and compile on the existing host worker. This bounds compilation fanout
+and uses the host's stack policy; it can reduce cold compilation parallelism.
+The large-TLS component invocation then passes, including host write and thread
+teardown. Existing full-server extension tests remain the integration gate.
+
+The retained isolated reproducer uses the real component, not a mocked engine:
+
+```sh
+cargo build --manifest-path extensions/memoryaf/Cargo.toml --release --target wasm32-wasip2
+# Set ANTFLY_WASMTIME_LIB to the pinned v45.0.2 C API shared library.
+zig test -O ReleaseSafe -lc --dep wasmtime \
+  -Mroot=zig/tools/fixtures/wasmtime_thread_stacks.zig \
+  -Mwasmtime=zig/pkg/antfly/src/extensions/wasmtime_runtime.zig
+```
+
+Run from the repository root on Linux/glibc. Restoring parallel compilation is
+the negative control. Local Linux evidence uses x86 emulation; ARC remains a
+separate qualification gate.
+
+## 2026-09-21: avoid duplicate recovery work during persistence pressure
+
+The [online-merge and #841 E2E records](e2e/FLAKES.md#2026-09-21-online-merge-recovery-exceeded-phase-deadlines-in-pr-832-ci)
+track the original failures, unchanged runs, and the limits of injected slow-sync
+experiments. The merge driver now borrows one step's validated observation,
+removes receiver dependencies from donor-only phases, and distinguishes fence
+installation from transaction drain. Relational maintenance schedules work on
+the current group leader and yields to a contended Raft host mutex. Durable
+receipt/authority checks remain responsible for safety across elections.
+
+The owning metadata and session-maintenance suites include regressions for
+observation lifetime, drain waiting, unavailable receiver routing, and ownership
+transfer without follower RPCs. The data-runtime suite covers the nonblocking
+host-lock check. `activation-ownership-negative.log` and
+`merge-fence-negative.log` under `.benchmark-results/issue-828/` retain the
+controlled old-behavior failures. Severe sustained slow-sync runs still fail;
+these changes are not evidence of an arbitrary disk-latency guarantee.
+
+## 2026-09-21: TLA trace producers truncated each other's output
+
+[Issue #828](https://github.com/antflydb/antfly/issues/828) records
+[run 35549453714's Raft validation failure](https://github.com/antflydb/antfly/actions/runs/35549453714/job/106181715054):
+282 Raft tests passed, but the 434-line trace failed JSON parsing at line 6.
+The original raw trace was not retained, so its exact bytes cannot be recovered.
+
+The defect remains on `origin/main` at `a032858819bd89ffcb31e5dcf7e76699babfdc3b`.
+`antfly-raft-test` launches multiple executables. Three emit traces, each opening
+the same `ANTFLY_TRACE_FILE` with `O_TRUNC` and an independent file offset.
+Twelve unchanged native macOS ARM64 Debug runs with `-j8` produced valid JSON,
+but retained only 445 events. Running the producers separately produced
+445 + 42 + 5 = 492 events: successful parsing concealed lost evidence.
+
+A controlled overlap of the unchanged producer executables reproduced malformed
+line 6. Pause the Raft producer after its file reaches 2,030 bytes, run the restore
+producer (which truncates it and writes 725 bytes), then resume the first
+producer. Both exit successfully; its old offset creates a NUL-filled hole after
+the restore producer's five lines. The production segmenter rejects line 6 with
+`invalid JSON trace event: Expecting value`. This establishes a producer-ownership
+bug with the reported signature, without asserting byte-for-byte identity with
+the missing CI artifact.
+
+CI extraction now owns a fresh run directory and each process exclusively creates
+its own PID-and-sequence file. PID reuse cannot overwrite earlier evidence.
+Raft and transaction loggers also share the mutex protecting their common
+buffered writer. Raft segmentation gives each input its own output directory,
+so equally named segments from different producers cannot overwrite one another.
+Invalid JSON remains fatal; existing model eligibility rules are unchanged.
+Both TLA CI jobs retain the raw directory as an artifact after success or failure.
+
+The owning Raft suite includes a regression that interleaves two producer
+identities, reuses one identity, resumes the original descriptor, and checks
+every file's exact contents. The fixed aggregate retains all 492 Raft events.
+Six fresh extraction/validation runs through `scripts/ci/zig-tla-verify.sh` pass,
+each validating 18 Raft and 22 transaction model segments. Run from the repository
+root with `ANTFLY_TLA_TRACE_VALIDATE=true` and a fresh
+`ANTFLY_TLA_TRACE_DIR`; extraction uses the bounded Zig build wrapper.
+After rebasing onto main at `227f2dc39c`, another full extraction/validation run
+passes all 18 Raft and 24 transaction segments (the additional transaction cases
+come from main).
+
+Local raw traces, producer commands, negative-control output, and validation logs
+are under `.benchmark-results/issue-828/` in `.worktrees/issue-828-flakes`.
+In particular, `raft-overlap-before-2.ndjson`, `trace-overlap-result-2.log`, and
+`negative-segment.log` retain the corruption; `tla-script/` and `tla-repeat/`
+retain all fixed producers. These are native macOS results, not Linux ARC
+qualification. The separate catalog readiness evidence is recorded in the
+[E2E history](e2e/FLAKES.md#2026-09-21-catalog-reporter-startup-preceded-protocol-readiness).
+
+PR #832's [first CI run](https://github.com/antflydb/antfly/actions/runs/35633482490/job/106446151397)
+exposed a test-registration mistake in this fix: the normal, non-TLA Raft gate
+rejected `trace files preserve overlapping producers` because no declared test
+matched that filter. The helper was reachable only through the enabled trace
+writer's function body. The standalone helper test and TLA-enabled runs passed,
+but did not exercise normal aggregate discovery. A focused non-TLA build
+reproduced the missing declaration locally. The tracing module now explicitly
+imports the helper in its test block so both build modes discover the regression;
+the required filter remains strict. CI evidence and local before/after logs are
+`ci-832-unit.log`, `ci-832-filter-negative.log`, `ci-832-raft-fixed.log`, and
+`ci-832-raft-tla-fixed.log` beside the other #828 evidence. Both complete native
+Raft aggregates pass after the correction, with and without `-Dwith_tla=true`;
+each discovers and executes the file-ownership regression.
 
 ## 2026-09-18: HTTP cancellation lost a socket published after the watchdog won
 

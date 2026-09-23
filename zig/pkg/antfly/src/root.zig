@@ -16,7 +16,7 @@ pub const build_options = @import("build_options");
 
 // Encoding & data structures
 pub const roaring = @import("encoding/roaring.zig");
-pub const vellum = @import("antfly_vellum");
+pub const fst = @import("antfly_fst");
 pub const snappy = @import("encoding/snappy.zig");
 pub const streamvbyte = @import("encoding/streamvbyte.zig");
 pub const simd_bitpack = @import("encoding/simd_bitpack.zig");
@@ -239,7 +239,7 @@ test {
 
     // Encoding
     _ = roaring;
-    _ = vellum;
+    _ = fst;
     _ = snappy;
     _ = streamvbyte;
     _ = simd_bitpack;

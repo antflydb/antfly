@@ -2069,39 +2069,114 @@ pub const ProvisionedKernelOwnerSource = struct {
         self.alloc.free(leases);
     }
 
+    fn maintenanceEntryLimit(self: *ProvisionedKernelOwnerSource, best_effort: bool) ?usize {
+        if (best_effort) {
+            if (!self.mutex.tryLock()) return null;
+        } else {
+            lock(&self.mutex);
+        }
+        defer self.mutex.unlock();
+        return self.entries.items.len;
+    }
+
+    /// Maintenance must never pin unrelated owners across a slow storage step.
+    /// The cursor may skip an entry removed during the round; the next round
+    /// will see it if it is still resident. Newly appended entries wait too.
+    fn nextMaintenanceLease(
+        self: *ProvisionedKernelOwnerSource,
+        cursor: *usize,
+        limit: usize,
+        best_effort: bool,
+        skip_bulk_ingest: bool,
+    ) ?Lease {
+        if (best_effort) {
+            if (!self.mutex.tryLock()) return null;
+        } else {
+            lock(&self.mutex);
+        }
+        defer self.mutex.unlock();
+        while (cursor.* < limit and cursor.* < self.entries.items.len) {
+            const entry = self.entries.items[cursor.*];
+            cursor.* += 1;
+            if (entry.retired or entry.transient_retirement_pending or entry.exclusive_pending or
+                entry.exclusive_active or (skip_bulk_ingest and entry.bulk_ingest_active.load(.acquire))) continue;
+            entry.active_users += 1;
+            return .{ .source = self, .entry = entry };
+        }
+        return null;
+    }
+
+    fn selectedMaintenanceLease(
+        self: *ProvisionedKernelOwnerSource,
+        group_id: u64,
+        table_name: []const u8,
+        generation: u64,
+        best_effort: bool,
+    ) ?Lease {
+        if (best_effort) {
+            if (!self.mutex.tryLock()) return null;
+        } else {
+            lock(&self.mutex);
+        }
+        defer self.mutex.unlock();
+        for (self.entries.items) |entry| {
+            if (entry.group_id != group_id or entry.generation != generation or
+                !std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (entry.retired or entry.transient_retirement_pending or entry.exclusive_pending or
+                entry.exclusive_active or entry.bulk_ingest_active.load(.acquire)) return null;
+            entry.active_users += 1;
+            return .{ .source = self, .entry = entry };
+        }
+        return null;
+    }
+
     fn runLsmMaintenanceRound(
         ptr: *anyopaque,
         best_effort: bool,
     ) !storage_maintenance_source.RoundResult {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
-        const maybe_leases = try self.snapshotOwnerLeases(best_effort, true);
-        const leases = maybe_leases orelse return .{};
-        defer self.releaseMaintenanceLeases(leases);
-
-        var selected_index: ?usize = null;
+        const limit = self.maintenanceEntryLimit(best_effort) orelse return .{};
+        var cursor: usize = 0;
+        var selected_name: ?[]u8 = null;
+        defer if (selected_name) |name| self.alloc.free(name);
+        var selected_group_id: u64 = 0;
+        var selected_generation: u64 = 0;
         var selected_score: u64 = 0;
         var selected_due = false;
-        for (leases, 0..) |*lease, index| {
+        while (self.nextMaintenanceLease(&cursor, limit, best_effort, true)) |borrowed| {
+            var lease = borrowed;
             const status = lease.owner().maintenance(
                 lease.entry.table_name,
                 if (best_effort) .inspect_best_effort else .inspect,
             ) catch |err| {
+                lease.deinit();
                 if (best_effort) continue;
                 return err;
             };
             const due = status.has_next_wake_delay != 0 and status.next_wake_delay_ns == 0;
-            if (!due and status.maintenance_score == 0) continue;
-            if (selected_index == null or
-                (due and !selected_due) or
-                (due == selected_due and status.maintenance_score > selected_score))
-            {
-                selected_index = index;
-                selected_score = status.maintenance_score;
-                selected_due = due;
+            if (due or status.maintenance_score != 0) {
+                if (selected_name == null or
+                    (due and !selected_due) or
+                    (due == selected_due and status.maintenance_score > selected_score))
+                {
+                    const name = self.alloc.dupe(u8, lease.entry.table_name) catch |err| {
+                        lease.deinit();
+                        return err;
+                    };
+                    if (selected_name) |previous| self.alloc.free(previous);
+                    selected_name = name;
+                    selected_group_id = lease.entry.group_id;
+                    selected_generation = lease.entry.generation;
+                    selected_score = status.maintenance_score;
+                    selected_due = due;
+                }
             }
+            lease.deinit();
         }
-        const index = selected_index orelse return .{};
-        const lease = &leases[index];
+        const name = selected_name orelse return .{};
+        var selected = self.selectedMaintenanceLease(selected_group_id, name, selected_generation, best_effort) orelse return .{};
+        defer selected.deinit();
+        const lease = &selected;
         const result = try lease.owner().maintenance(
             lease.entry.table_name,
             if (best_effort) .lsm_step_best_effort else .lsm_step,
@@ -2114,12 +2189,13 @@ pub const ProvisionedKernelOwnerSource = struct {
 
     fn runDensePostingMaintenanceRound(ptr: *anyopaque) !@import("storage_maintenance_source.zig").PostingRefreshProgress {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
-        const maybe_leases = try self.snapshotOwnerLeases(true, true);
-        const leases = maybe_leases orelse return .{ .pending = true };
-        defer self.releaseMaintenanceLeases(leases);
+        const limit = self.maintenanceEntryLimit(true) orelse return .{ .pending = true };
+        var cursor: usize = 0;
 
         var total: @import("storage_maintenance_source.zig").PostingRefreshProgress = .{};
-        for (leases) |*lease| {
+        while (self.nextMaintenanceLease(&cursor, limit, true, true)) |borrowed| {
+            var lease = borrowed;
+            defer lease.deinit();
             const result = lease.owner().maintenance(
                 lease.entry.table_name,
                 .dense_posting_idle,
@@ -2136,6 +2212,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             total.scanned +|= @intCast(result.dense_scanned);
             total.pending = total.pending or result.deferred != 0 or result.busy != 0;
         }
+        if (cursor < limit) total.pending = true;
         return total;
     }
 
@@ -2174,9 +2251,13 @@ pub const ProvisionedKernelOwnerSource = struct {
     fn publishRuntimeStatuses(ptr: *anyopaque) void {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
         if (self.runtime_status_cache == null) return;
-        const leases = (self.snapshotOwnerLeases(true, true) catch return) orelse return;
-        defer self.releaseMaintenanceLeases(leases);
-        for (leases) |*lease| self.refreshMaintenanceStatus(lease);
+        const limit = self.maintenanceEntryLimit(true) orelse return;
+        var cursor: usize = 0;
+        while (self.nextMaintenanceLease(&cursor, limit, true, true)) |borrowed| {
+            var lease = borrowed;
+            self.refreshMaintenanceStatus(&lease);
+            lease.deinit();
+        }
     }
 
     fn refreshMaintenanceStatus(self: *ProvisionedKernelOwnerSource, lease: *Lease) void {
@@ -2192,27 +2273,32 @@ pub const ProvisionedKernelOwnerSource = struct {
 
     fn publishDenseCheckpoints(ptr: *anyopaque) !db_types.NativePublicationResult {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
-        const leases = (try self.snapshotOwnerLeases(true, true)) orelse return .{ .busy = true };
-        defer self.releaseMaintenanceLeases(leases);
+        const limit = self.maintenanceEntryLimit(true) orelse return .{ .busy = true };
+        var cursor: usize = 0;
         var combined: db_types.NativePublicationResult = .{};
-        for (leases) |*lease| {
+        while (self.nextMaintenanceLease(&cursor, limit, true, true)) |borrowed| {
+            var lease = borrowed;
+            defer lease.deinit();
             const result = try lease.owner().maintenance(lease.entry.table_name, .publish_dense_checkpoints);
-            if (result.published != 0) self.refreshMaintenanceStatus(lease);
+            if (result.published != 0) self.refreshMaintenanceStatus(&lease);
             combined.published += @intCast(result.published);
             combined.busy = combined.busy or result.busy != 0;
             combined.deferred = combined.deferred or result.deferred != 0;
         }
+        if (cursor < limit) combined.busy = true;
         return combined;
     }
 
     fn runVectorBlockRound(ptr: *anyopaque) !usize {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
-        const leases = (try self.snapshotOwnerLeases(true, true)) orelse return 0;
-        defer self.releaseMaintenanceLeases(leases);
+        const limit = self.maintenanceEntryLimit(true) orelse return 0;
+        var cursor: usize = 0;
         var steps: usize = 0;
-        for (leases) |*lease| {
-            self.refreshMaintenanceStatus(lease);
-            defer self.refreshMaintenanceStatus(lease);
+        while (self.nextMaintenanceLease(&cursor, limit, true, true)) |borrowed| {
+            var lease = borrowed;
+            defer lease.deinit();
+            self.refreshMaintenanceStatus(&lease);
+            defer self.refreshMaintenanceStatus(&lease);
             const result = try lease.owner().maintenance(lease.entry.table_name, .vector_block_idle);
             steps += @intCast(result.dense_steps);
         }
@@ -2224,12 +2310,13 @@ pub const ProvisionedKernelOwnerSource = struct {
         best_effort: bool,
     ) !storage_maintenance_source.Snapshot {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
-        const maybe_leases = try self.snapshotOwnerLeases(best_effort, true);
-        const leases = maybe_leases orelse return .{};
-        defer self.releaseMaintenanceLeases(leases);
-
-        var result = storage_maintenance_source.Snapshot{ .owner_count = leases.len };
-        for (leases) |*lease| {
+        const limit = self.maintenanceEntryLimit(best_effort) orelse return .{};
+        var cursor: usize = 0;
+        var result = storage_maintenance_source.Snapshot{};
+        while (self.nextMaintenanceLease(&cursor, limit, best_effort, true)) |borrowed| {
+            var lease = borrowed;
+            defer lease.deinit();
+            result.owner_count += 1;
             const status = lease.owner().maintenance(
                 lease.entry.table_name,
                 if (best_effort) .inspect_best_effort else .inspect,
@@ -4876,12 +4963,12 @@ pub const ProvisionedKernelOwnerSource = struct {
         ptr: *anyopaque,
     ) text_memory.TextMemoryAttributionStats {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
-        const maybe_leases = self.snapshotOwnerLeases(true, false) catch return .{};
-        const leases = maybe_leases orelse return .{};
-        defer self.releaseMaintenanceLeases(leases);
-
+        const limit = self.maintenanceEntryLimit(true) orelse return .{};
+        var cursor: usize = 0;
         var result: text_memory.TextMemoryAttributionStats = .{};
-        for (leases) |*lease| {
+        while (self.nextMaintenanceLease(&cursor, limit, true, false)) |borrowed| {
+            var lease = borrowed;
+            defer lease.deinit();
             var response = lease.owner().textMemoryJson(lease.entry.table_name) catch continue;
             defer response.deinit();
             var parsed = std.json.parseFromSlice(
@@ -5558,6 +5645,48 @@ test "publication drains existing readers status and maintenance before reopenin
         defer replacement.deinit();
         try std.testing.expectEqual(@as(u64, 2), source.cacheStats().miss_count);
     }
+}
+
+test "maintenance on one owner does not pin another owner against publication" {
+    const alloc = std.testing.allocator;
+    const Source = ProvisionedKernelOwnerSource;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(root);
+    var source = Source.init(alloc, root, table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+    defer source.deinit();
+
+    for ([_]struct { group_id: u64, name: []const u8 }{
+        .{ .group_id = 1, .name = "busy" },
+        .{ .group_id = 2, .name = "restoring" },
+    }) |owner| {
+        const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ root, owner.group_id });
+        defer alloc.free(path);
+        var lease = try source.acquireDescriptor(owner.group_id, owner.name, path, .{
+            .lsm_root_generation = table_reads.backend_current_root_generation,
+            .identity = .{ .table_id = owner.group_id, .shard_id = owner.group_id, .range_id = owner.group_id },
+        });
+        lease.deinit();
+    }
+
+    const limit = source.maintenanceEntryLimit(false).?;
+    var cursor: usize = 0;
+    var slow_maintenance = source.nextMaintenanceLease(&cursor, limit, false, true).?;
+    defer slow_maintenance.deinit();
+    try std.testing.expectEqual(@as(u64, 1), slow_maintenance.entry.group_id);
+
+    var wait = PublicationWaitTest{};
+    var vtable: std.Io.VTable = undefined;
+    var publication = try source.snapshotSource().beginPublication(.{
+        .io = wait.io(&vtable),
+        .group_id = 2,
+        .table_name = "restoring",
+        .drain_timeout_ns = std.time.ns_per_ms,
+    });
+    defer publication.deinit();
+    try std.testing.expectEqual(@as(usize, 0), wait.sleeps);
+    try std.testing.expectEqual(@as(u64, 1), slow_maintenance.entry.group_id);
 }
 
 test "publication cancellation and timeout release admission without invalidating borrowers" {

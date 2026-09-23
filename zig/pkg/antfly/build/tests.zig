@@ -107,7 +107,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const hash_mod = options.antfly_imports.hash;
     const vectorindex_mod = options.antfly_imports.vectorindex;
     const usermgr_mod = options.usermgr_mod;
-    const vellum_mod = options.antfly_imports.vellum;
+    const fst_mod = options.antfly_imports.fst;
     const regex_mod = options.antfly_imports.regex;
     const json_mod = options.antfly_imports.json;
     const matcher_mod = options.antfly_imports.matcher;
@@ -470,6 +470,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "restore staging cohort proof binds every source identity and durable seal",
             "restore staging partial selection is dependency closed across both schema generations",
             "retryable restore contention durably requeues progress and honors cancellation",
+            "restore retry diagnostics",
             "restore cooperative continuation",
             "restore ownership loss requeues only the exact running attempt",
             "replicated restore mutations are rejected after leadership term changes",
@@ -832,10 +833,39 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "embedded api round-trips batch lookup scan and search over memory-backed durable lsm",
             "embedded api hosted profile drains derived indexing without native runtimes",
             "embedded api hosted profile persists text index across reopen over storage",
+            "embedded api createLite provisions default full text index",
+            "embedded api openLite round-trips batch lookup over aflite file",
+            "embedded api openLite manages index and enrichment definitions over aflite file",
+            "embedded api openLite persists schema json over aflite file",
+            "embedded api openLite resumes generated enrichment after hosted maintenance pause",
         },
     });
     const run_embedded_api_tests = addFilteredTestRunArtifact(b, embedded_api_tests);
     embedded_test_step.dependOn(&run_embedded_api_tests.step);
+    // db.zig is also its own module (embedded_db_mod) rather than a file
+    // reachable from embedded_mod's root, so its tests need the same
+    // explicit treatment as the API fixtures above.
+    const embedded_db_tests = b.addTest(.{
+        .root_module = embedded_db_mod,
+        .filters = &.{
+            "embedded db openLite persists documents in aflite file",
+            "embedded db openLite close syncs unsynced batch before readonly reopen",
+            "embedded db openLite propagates no_sync to aflite backend",
+            "embedded db openLite does not fall back to internal bridge files",
+            "embedded db liteStatus exposes storage stats work and capabilities",
+            "embedded db liteStatus reflects explicitly configured remote inference",
+            "embedded db liteStatus reports local inference request according to build support",
+            "embedded db openLite can run ttl cleanup over aflite file",
+            "embedded db openLiteHosted exposes manual maintenance capabilities",
+            "embedded db openLite query_readonly rejects writes",
+            "embedded db openLite persists schema json in aflite file",
+            "embedded db portable relational restore is immediately readable and validated",
+            "embedded db openLite persists index and enrichment catalogs in aflite file",
+            "embedded db createLite files are openable through the CLI's lite Connection and vice versa",
+        },
+    });
+    const run_embedded_db_tests = addFilteredTestRunArtifact(b, embedded_db_tests);
+    embedded_test_step.dependOn(&run_embedded_db_tests.step);
 
     const antfly_embedded_pkg_tests = b.addTest(.{
         .root_module = antfly_embedded_pkg_mod,
@@ -1023,6 +1053,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "public index config encoders redact coverage incarnation",
         "created nested response allowlists cover generated schemas",
         "public index config encoders redact nested credentials",
+        "public index config encoders preserve enrichment objects on read",
         "public index config encoders retain credential-free provider urls",
         "public index config encoders omit root write-only producer documents",
         "created graph index response projects closed nested schemas",
@@ -1408,11 +1439,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db graph shortest path searches through admitted alternatives",
         "db graph artifact external node targets return ids without document hydration",
         "db graph hydration rejects table-qualified entity nodes in local snapshots",
+        "db complete-snapshot scope expands graph traversal through tagged entity nodes",
         "db index repair streams graph artifact rebuild in batches",
         "api distributed graph cross-table hydrate enforces target authorization",
         "public table query handler maps exact graph execution failures",
         "unsupported graph diagnostics identify the rejected operation feature",
         "authenticated single-group graph queries require distributed coordination",
+        "single-group graph requests carry the complete-snapshot execution scope",
         "graph table queries have one fresh-topology retry",
         "generic shard query wire preserves admitted canonical graph operations without reparsing",
         "generic shard query wire fails closed without an admitted graph fragment",
@@ -1509,6 +1542,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "table contract preserves typed artifact-backed graph configuration",
         "created index configs normalize single-source input forms",
         "merged index metadata validates artifact consumer references",
+        "index metadata closes neighbor context graph index references at admission",
         "graph config accepts canonical single-source mappings without a discriminator",
         "created graph index response projects closed nested schemas",
         "index encoders expose graph sources once in normalized config",
@@ -1668,8 +1702,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     secret_backend_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const secret_backend_tests = b.addTest(.{
         .root_module = secret_backend_test_mod,
-        // ReleaseSafe on macOS peaks above the aggregate 10 GiB estimate.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 13 else 7) * 1024 * 1024 * 1024,
+        // ReleaseSafe peaks above the aggregate estimates on both platforms:
+        // 12.88 GB measured on x86_64-linux in the VOPR qualification lane,
+        // above 10 GiB on macOS. Debug keeps the conservative default so the
+        // unit lanes retain their tighter scheduler claim.
+        .max_rss = @as(usize, switch (target.result.os.tag) {
+            .macos => 13,
+            else => if (optimize == .Debug) 7 else 14,
+        }) * 1024 * 1024 * 1024,
         .filters = &.{"secret backend"},
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
@@ -1785,7 +1825,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const recall_test_step = b.step("antfly-storage-vectorindex-recall-test", "Run HBC vector recall quality tests");
 
-    const raft_unit_default_filters = [_][]const u8{"raft."};
+    const raft_unit_default_filters = [_][]const u8{ "raft.", "trace files preserve overlapping producers" };
     const raft_unit_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = selectTestFilters(b, &raft_unit_default_filters),
@@ -4589,7 +4629,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     persistent_test_mod.addImport("antfly_pdf", pdf_mod);
     persistent_test_mod.addImport("bloom", bloom_mod);
     persistent_test_mod.addImport("antfly_pdf", pdf_mod);
-    persistent_test_mod.addImport("antfly_vellum", vellum_mod);
+    persistent_test_mod.addImport("antfly_fst", fst_mod);
     persistent_test_mod.addImport("antfly_regex", regex_mod);
     persistent_test_mod.addImport("antfly_vector", vector_mod);
     persistent_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
@@ -4660,7 +4700,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const persistent_soak_engine_mod = makeLmdbEngineModule(b, target, optimize, true, persistent_soak_build_options);
     const persistent_soak_test_mod = makeLmdbModule(b, "pkg/antfly/src/persistent_test_root.zig", target, optimize, persistent_soak_build_options, persistent_soak_engine_mod, platform_mod, hash_mod);
     persistent_soak_test_mod.addImport("bloom", bloom_mod);
-    persistent_soak_test_mod.addImport("antfly_vellum", vellum_mod);
+    persistent_soak_test_mod.addImport("antfly_fst", fst_mod);
     persistent_soak_test_mod.addImport("antfly_regex", regex_mod);
     persistent_soak_test_mod.addImport("antfly_vector", vector_mod);
     persistent_soak_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
@@ -4678,13 +4718,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const index_manager_test_mod = makeLmdbModule(b, "pkg/antfly/src/index_manager_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     addSnowballModule(b, index_manager_test_mod);
     index_manager_test_mod.addImport("bloom", bloom_mod);
-    index_manager_test_mod.addImport("antfly_vellum", vellum_mod);
+    index_manager_test_mod.addImport("antfly_fst", fst_mod);
     index_manager_test_mod.addImport("antfly_vector", vector_mod);
     index_manager_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
     index_manager_test_mod.addImport("antfly_matcher", matcher_mod);
     index_manager_test_mod.addImport("antfly_resolver", resolver_mod);
     index_manager_test_mod.addImport("antfly_chunking", chunking_mod);
     index_manager_test_mod.addImport("antfly-json", json_mod);
+    index_manager_test_mod.addImport("antfly_schema_openapi", antfly_imports.schema_openapi);
     index_manager_test_mod.addImport("antfly_scraping", scraping_mod);
     index_manager_test_mod.addImport("antfly_image", image_mod);
     index_manager_test_mod.addImport("antfly_pdf", pdf_mod);
@@ -4755,7 +4796,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     addSnowballModule(b, db_test_mod);
     db_test_mod.addImport("bloom", bloom_mod);
     db_test_mod.addImport("handlebars", handlebars_mod);
-    db_test_mod.addImport("antfly_vellum", vellum_mod);
+    db_test_mod.addImport("antfly_fst", fst_mod);
     db_test_mod.addImport("antfly_vector", vector_mod);
     db_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
     db_test_mod.addImport("antfly_matcher", matcher_mod);
@@ -4935,6 +4976,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "query parser accepts direct graph metric reads",
         "query parser accepts graph metric rerank",
         "api query contract bounds graph metric top k",
+        "api query contract admits personalized graph metric seed fields",
+        "api query contract rejects malformed personalized graph metric shapes",
         "api query contract uses portable graph metric filter operators",
         "api query contract rejects oversized and duplicate graph metric clauses",
         "query encoder emits graph metric results",

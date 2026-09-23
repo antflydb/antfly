@@ -87,7 +87,7 @@ fn shouldPreferNativeSession(man: manifest_mod.ModelManifest) bool {
     }
     if (man.gliner_model_type.len > 0) return true;
     switch (man.model_type) {
-        .classifier, .recognizer => return true,
+        .classifier, .extractor => return true,
         else => {},
     }
     return switch (man.native_arch_hint) {
@@ -1657,29 +1657,34 @@ fn appendAddedToken(
 fn loadLegacyWordPieceTokenizerFromDir(allocator: std.mem.Allocator, model_dir: []const u8) !*hf_tokenizer.HfTokenizer {
     const vocab_path = try std.fmt.allocPrint(allocator, "{s}/vocab.txt", .{model_dir});
     defer allocator.free(vocab_path);
+    const config_path = try std.fs.path.join(allocator, &.{ model_dir, "tokenizer_config.json" });
+    defer allocator.free(config_path);
+    const special_path = try std.fs.path.join(allocator, &.{ model_dir, "special_tokens_map.json" });
+    defer allocator.free(special_path);
+    return loadLegacyWordPieceTokenizer(allocator, vocab_path, config_path, special_path);
+}
+
+fn loadLegacyWordPieceTokenizer(
+    allocator: std.mem.Allocator,
+    vocab_path: []const u8,
+    config_path: ?[]const u8,
+    special_path: ?[]const u8,
+) !*hf_tokenizer.HfTokenizer {
     const vocab_bytes = try c_file.readFile(allocator, vocab_path);
     defer allocator.free(vocab_bytes);
-
     var meta = LegacyWordPieceMeta{};
     defer meta.deinit(allocator);
-    var tokenizer_config_bytes_opt: ?[]u8 = null;
-    defer if (tokenizer_config_bytes_opt) |bytes| allocator.free(bytes);
-    var special_tokens_map_bytes_opt: ?[]u8 = null;
-    defer if (special_tokens_map_bytes_opt) |bytes| allocator.free(bytes);
-
-    const tokenizer_config_path = try std.fmt.allocPrint(allocator, "{s}/tokenizer_config.json", .{model_dir});
-    defer allocator.free(tokenizer_config_path);
-    if (c_file.readFile(allocator, tokenizer_config_path)) |tokenizer_config_bytes| {
-        tokenizer_config_bytes_opt = tokenizer_config_bytes;
-        applyLegacyTokenizerJson(&meta, tokenizer_config_bytes, allocator);
-    } else |_| {}
-
-    const special_tokens_map_path = try std.fmt.allocPrint(allocator, "{s}/special_tokens_map.json", .{model_dir});
-    defer allocator.free(special_tokens_map_path);
-    if (c_file.readFile(allocator, special_tokens_map_path)) |special_tokens_map_bytes| {
-        special_tokens_map_bytes_opt = special_tokens_map_bytes;
-        applyLegacyTokenizerJson(&meta, special_tokens_map_bytes, allocator);
-    } else |_| {}
+    var metadata_bytes: [2]?[]u8 = .{ null, null };
+    defer for (metadata_bytes) |bytes| {
+        if (bytes) |data| allocator.free(data);
+    };
+    for ([_]?[]const u8{ config_path, special_path }, 0..) |path, i| {
+        if (path) |selected| {
+            const bytes = c_file.readFile(allocator, selected) catch continue;
+            metadata_bytes[i] = bytes;
+            applyLegacyTokenizerJson(&meta, bytes, allocator);
+        }
+    }
 
     var vocab_entries = std.ArrayListUnmanaged([]const u8).empty;
     defer vocab_entries.deinit(allocator);
@@ -1774,6 +1779,19 @@ pub fn loadHuggingFaceTokenizerFromDirOrGguf(
         return loadHuggingFaceTokenizerFromGguf(allocator, path);
     }
 
+    return error.NoTokenizerFound;
+}
+
+fn loadHuggingFaceTokenizerFromManifest(allocator: std.mem.Allocator, man: *const manifest_mod.ModelManifest) !*hf_tokenizer.HfTokenizer {
+    if (man.tokenizer_json_path) |path| {
+        const bytes = try c_file.readFile(allocator, path);
+        defer allocator.free(bytes);
+        return hf_tokenizer.HfTokenizer.loadFromBytes(allocator, bytes);
+    }
+    if (man.vocab_txt_path) |path| {
+        return loadLegacyWordPieceTokenizer(allocator, path, man.tokenizer_config_path, man.special_tokens_map_path);
+    }
+    if (man.gguf_path) |path| return loadHuggingFaceTokenizerFromGguf(allocator, path);
     return error.NoTokenizerFound;
 }
 
@@ -1898,10 +1916,30 @@ fn unigramTokenizerJsonFromGguf(
         else
             "]},\"pre_tokenizer\":{\"type\":\"Metaspace\",\"replacement\":\"\\u2581\",\"prepend_scheme\":\"never\",\"split\":true},\"added_tokens\":[",
     );
-    // ponytail: precompiled SentencePiece normalization is intentionally left
-    // to a future shared normalizer; ordinary normalized UTF-8 needs no copy.
     try appendSpecialTokensFromMetadata(&tokenizer_json, allocator, parsed, tokens, token_types);
-    try tokenizer_json.appendSlice(allocator, "]}");
+    try tokenizer_json.appendSlice(allocator, "]");
+    if (findMetadataEntry(parsed, "tokenizer.ggml.precompiled_charsmap") != null) {
+        const map = try getRequiredMetadataArray(parsed, "tokenizer.ggml.precompiled_charsmap", .u8);
+        if (map.values.len > 12 * 1024 * 1024) return error.InvalidTokenizerMetadata;
+        if (map.values.len > 0) {
+            const bytes = try allocator.alloc(u8, map.values.len);
+            defer allocator.free(bytes);
+            for (map.values, bytes) |value, *byte| byte.* = switch (value) {
+                .u8 => |v| v,
+                else => return error.InvalidTokenizerMetadata,
+            };
+            const encoded = try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
+            defer allocator.free(encoded);
+            _ = std.base64.standard.Encoder.encode(encoded, bytes);
+            try tokenizer_json.appendSlice(allocator, ",\"normalizer\":{\"type\":\"Sequence\",\"normalizers\":[{\"type\":\"Precompiled\",\"precompiled_charsmap\":");
+            try appendJsonString(&tokenizer_json, allocator, encoded);
+            try tokenizer_json.appendSlice(allocator, "}");
+            if (gguf_metadata.View.init(parsed).getBool("tokenizer.ggml.remove_extra_whitespaces") orelse true)
+                try tokenizer_json.appendSlice(allocator, ",{\"type\":\"Replace\",\"pattern\":{\"Regex\":\" {2,}\"},\"content\":\" \"}");
+            try tokenizer_json.appendSlice(allocator, "]}");
+        }
+    }
+    try tokenizer_json.appendSlice(allocator, "}");
     return tokenizer_json.toOwnedSlice(allocator);
 }
 
@@ -2795,7 +2833,13 @@ pub const LoadedModel = struct {
                 .last => .last,
             },
             .text_prefix = self.manifest.embedding_profile.document.prefix,
+            // Admission wrappers and imported ONNX sessions do not expose the
+            // native architecture vtable. Use declared encoder semantics too,
+            // otherwise a short BGE-M3 request is padded to its full 8K window.
+            // The pipeline still preserves explicitly fixed input dimensions.
             .trim_padding_to_batch_max = isJinaStyleEmbeddingManifest(&self.manifest) or
+                @import("../models/bert.zig").isBertModel(self.manifest.config_model_arch) or
+                self.manifest.bert_model_type == .roberta or
                 generic_encoder != null or
                 session_factory.supportsResidentTextEncoder(self.session),
             .resident_qwen3_embedding = isJinaStyleEmbeddingManifest(&self.manifest),
@@ -7158,7 +7202,7 @@ pub const ModelManager = struct {
             try tokenizerLoadAdmissionPlan(
                 self.allocator,
                 model_dir,
-                man.gguf_path,
+                &man,
                 tokenizer_type,
             )
         else
@@ -7187,7 +7231,7 @@ pub const ModelManager = struct {
                     // separate pathname check leaves a replacement window.
                     try man.verifyBoundarySidecar("tokenizer.json", bytes);
                     break :blk try hf_tokenizer.HfTokenizer.loadFromBytesWithOptions(self.allocator, bytes, .{ .strict_unigram_normalizer = true });
-                } else try loadHuggingFaceTokenizerFromDirOrGguf(self.allocator, model_dir, man.gguf_path);
+                } else try loadHuggingFaceTokenizerFromManifest(self.allocator, &man);
                 try hf_tok.?.configureBpeCache(self.tokenizer_cache_config);
                 try hf_tok.?.configureParallelBpe(
                     self.tokenizer_parallel_bpe_config,
@@ -8401,11 +8445,6 @@ const TokenizerArtifactKind = enum {
     wordpiece,
 };
 
-const TokenizerArtifactCandidate = struct {
-    name: []const u8,
-    kind: TokenizerArtifactKind,
-};
-
 const tokenizer_fixed_resident_bytes = 16 * 1024 * 1024;
 const tokenizer_fixed_peak_bytes = 24 * 1024 * 1024;
 
@@ -8459,41 +8498,22 @@ fn tokenizerFileAdmissionPlan(
 fn tokenizerLoadAdmissionPlan(
     allocator: std.mem.Allocator,
     model_dir: []const u8,
-    gguf_path: ?[]const u8,
+    man: *const manifest_mod.ModelManifest,
     tokenizer_type: manifest_mod.TokenizerType,
 ) !ModelLoadAdmissionPlan {
+    // Admission and loading must inspect the same catalog-selected artifacts,
+    // including export-local vocabularies and root metadata fallbacks.
     if (tokenizer_type == .huggingface) {
-        const candidates = [_]TokenizerArtifactCandidate{
-            .{ .name = "tokenizer.json", .kind = .huggingface },
-            .{ .name = "vocab.txt", .kind = .wordpiece },
-        };
-        for (candidates) |candidate| {
-            const path = try std.fs.path.join(allocator, &.{ model_dir, candidate.name });
-            defer allocator.free(path);
-            if (!c_file.fileExists(allocator, path)) continue;
-            var encoded = std.math.cast(
-                usize,
-                try c_file.fileSize(allocator, path),
-            ) orelse return error.ResourceLimitExceeded;
-            // Legacy WordPiece additionally parses these optional JSON maps.
-            if (candidate.kind == .wordpiece) {
-                const sidecars = [_][]const u8{
-                    "tokenizer_config.json",
-                    "special_tokens_map.json",
-                };
-                for (sidecars) |name| {
-                    const sidecar = try std.fs.path.join(allocator, &.{ model_dir, name });
-                    defer allocator.free(sidecar);
-                    if (!c_file.fileExists(allocator, sidecar)) continue;
-                    const size = std.math.cast(
-                        usize,
-                        try c_file.fileSize(allocator, sidecar),
-                    ) orelse return error.ResourceLimitExceeded;
-                    encoded = std.math.add(usize, encoded, size) catch
-                        return error.ResourceLimitExceeded;
+        if (man.tokenizer_json_path) |path| return tokenizerFileAdmissionPlan(allocator, path, .huggingface);
+        if (man.vocab_txt_path) |path| {
+            var encoded: usize = 0;
+            for ([_]?[]const u8{ path, man.tokenizer_config_path, man.special_tokens_map_path }) |candidate| {
+                if (candidate) |selected| {
+                    const size = std.math.cast(usize, try c_file.fileSize(allocator, selected)) orelse return error.ResourceLimitExceeded;
+                    encoded = std.math.add(usize, encoded, size) catch return error.ResourceLimitExceeded;
                 }
             }
-            return tokenizerAdmissionPlan(encoded, candidate.kind);
+            return tokenizerAdmissionPlan(encoded, .wordpiece);
         }
     } else {
         var encoded: usize = 0;
@@ -8521,7 +8541,7 @@ fn tokenizerLoadAdmissionPlan(
             return tokenizerAdmissionPlan(encoded, .sentencepiece);
         }
     }
-    if (gguf_path) |path| {
+    if (man.gguf_path) |path| {
         var region = try c_file.MmapRegion.init(allocator, path);
         defer region.deinit();
         const encoded = try gguf_format.encodedMetadataBytesWithPrefix(
@@ -10101,7 +10121,7 @@ test "shouldPreferNativeSession prefers native CLIP, Whisper, and Florence weigh
     try std.testing.expect(shouldPreferNativeSession(florence));
 }
 
-test "shouldPreferNativeSession prefers native classifier and recognizer weights" {
+test "shouldPreferNativeSession prefers native classifier and extractor weights" {
     const allocator = std.testing.allocator;
 
     var classifier = manifest_mod.ModelManifest{ .allocator = allocator, .model_type = .classifier };
@@ -10110,11 +10130,11 @@ test "shouldPreferNativeSession prefers native classifier and recognizer weights
     classifier.safetensors_path = try allocator.dupe(u8, "model.safetensors");
     try std.testing.expect(shouldPreferNativeSession(classifier));
 
-    var recognizer = manifest_mod.ModelManifest{ .allocator = allocator, .model_type = .recognizer };
-    defer recognizer.deinit();
-    try std.testing.expect(!shouldPreferNativeSession(recognizer));
-    recognizer.safetensors_path = try allocator.dupe(u8, "model.safetensors");
-    try std.testing.expect(shouldPreferNativeSession(recognizer));
+    var extractor = manifest_mod.ModelManifest{ .allocator = allocator, .model_type = .extractor };
+    defer extractor.deinit();
+    try std.testing.expect(!shouldPreferNativeSession(extractor));
+    extractor.safetensors_path = try allocator.dupe(u8, "model.safetensors");
+    try std.testing.expect(shouldPreferNativeSession(extractor));
 }
 
 test "effectiveLoadBackends keeps gpu native backends ahead of cpu native before onnx" {
@@ -11450,7 +11470,7 @@ test "ModelManager loads split gliner bundle and exposes runtime pipeline" {
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "config.json",
         .data =
-        \\{"model_type":"recognizer","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":8,"vocab_size":16,"max_position_embeddings":16,"position_buckets":16}
+        \\{"model_type":"extractor","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":8,"vocab_size":16,"max_position_embeddings":16,"position_buckets":16}
         ,
     });
     try tmp.dir.writeFile(std.testing.io, .{
@@ -11459,7 +11479,7 @@ test "ModelManager loads split gliner bundle and exposes runtime pipeline" {
     });
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "model_manifest.json",
-        .data = "{\"type\":\"recognizer\",\"capabilities\":[\"extraction\"]}",
+        .data = "{\"type\":\"extractor\",\"capabilities\":[\"extraction\"]}",
     });
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "antfly_inference_bundle.json",
@@ -11634,7 +11654,7 @@ test "ModelManager loads split gliner gguf-head bundle and exposes runtime pipel
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "config.json",
         .data =
-        \\{"model_type":"recognizer","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":8,"vocab_size":16,"max_position_embeddings":16,"position_buckets":16}
+        \\{"model_type":"extractor","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":8,"vocab_size":16,"max_position_embeddings":16,"position_buckets":16}
         ,
     });
     try tmp.dir.writeFile(std.testing.io, .{
@@ -11643,7 +11663,7 @@ test "ModelManager loads split gliner gguf-head bundle and exposes runtime pipel
     });
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "model_manifest.json",
-        .data = "{\"type\":\"recognizer\",\"capabilities\":[\"extraction\"]}",
+        .data = "{\"type\":\"extractor\",\"capabilities\":[\"extraction\"]}",
     });
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "antfly_inference_bundle.json",
@@ -12791,4 +12811,124 @@ test "model manager teardown supervised child fixture" {
     }
     std.debug.print("teardown-fixture cleanup-returned\n", .{});
     return error.ExpectedTeardownWatchdogExit;
+}
+
+test "GGUF Unigram tokenizer consumes its embedded normalization map" {
+    const allocator = std.testing.allocator;
+    const bytes = try buildTestGgufWithT5Tokenizer(allocator);
+    defer allocator.free(bytes);
+    var parsed = try gguf_format.parse(allocator, bytes);
+    defer parsed.deinit(allocator);
+    // Minimal Darts map H -> h; the fixture's vocabulary contains 'hello'.
+    var map: [4 + 256 * 4 + 2]u8 = @splat(0);
+    std.mem.writeInt(u32, map[0..4], 256 * 4, .little);
+    std.mem.writeInt(u32, map[4..8], 1 << 10, .little);
+    std.mem.writeInt(u32, map[4 + 73 * 4 ..][0..4], 'H' | (1 << 8) | ((73 ^ 2) << 10), .little);
+    std.mem.writeInt(u32, map[4 + 2 * 4 ..][0..4], 0x80000000, .little);
+    map[4 + 256 * 4] = 'h';
+    const map_values = try allocator.alloc(gguf_format.MetadataValue, map.len);
+    defer allocator.free(map_values);
+    for (map, map_values) |byte, *value| value.* = .{ .u8 = byte };
+    const original = parsed.metadata;
+    const metadata = try allocator.alloc(gguf_format.MetadataEntry, original.len + 1);
+    defer allocator.free(metadata);
+    @memcpy(metadata[0..original.len], original);
+    metadata[original.len] = .{ .key = "tokenizer.ggml.precompiled_charsmap", .value = .{ .array = .{ .element_type = .u8, .values = map_values } } };
+    parsed.metadata = metadata;
+    defer parsed.metadata = original;
+    const tokenizer_json = try unigramTokenizerJsonFromGguf(allocator, &parsed);
+    defer allocator.free(tokenizer_json);
+    const tok = try hf_tokenizer.HfTokenizer.loadFromBytes(allocator, tokenizer_json);
+    defer tok.deinitSelf();
+    const ids = try tok.tokenizer().encode(allocator, "Hello world");
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i32, &.{ 4, 5 }, ids);
+}
+
+test "ONNX WordPiece loading and admission use export artifacts with root fallback" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |export_vocab| {
+        var dir = std.testing.tmpDir(.{});
+        defer dir.cleanup();
+        try dir.dir.createDirPath(io, "onnx");
+        const paths = [_][]const u8{ "onnx/model.onnx", "onnx/config.json", if (export_vocab) "onnx/vocab.txt" else "vocab.txt", "tokenizer_config.json" };
+        const bodies = [_][]const u8{ "onnx", "{\"model_type\":\"bert\",\"hidden_size\":8}", "[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\nhello\n", "{\"do_lower_case\":true}" };
+        var artifacts: [paths.len]managed_receipt.ArtifactReceipt = undefined;
+        for (paths, bodies, 0..) |path, body, i| {
+            try dir.dir.writeFile(io, .{ .sub_path = path, .data = body });
+            artifacts[i] = .{ .path = path, .size = body.len };
+        }
+        // An unreceipted JSON file must not shadow the selected vocabulary.
+        try dir.dir.writeFile(io, .{ .sub_path = "onnx/tokenizer.json", .data = "not a tokenizer" });
+        const receipt = try std.json.Stringify.valueAlloc(a, managed_receipt.DownloadReceipt{
+            .version = 2,
+            .source = .{ .owner = "owner", .name = "model", .variant = "onnx", .selected_format = "onnx" },
+            .artifacts = &artifacts,
+        }, .{});
+        defer a.free(receipt);
+        try dir.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt });
+        const root = try dir.dir.realPathFileAlloc(io, ".", a);
+        defer a.free(root);
+        var man = try manifest_mod.loadFromDir(a, root);
+        defer man.deinit();
+        try std.testing.expectEqual(.huggingface, man.tokenizer_type);
+        try std.testing.expect(man.tokenizer_json_path == null);
+        try std.testing.expect(std.mem.endsWith(u8, man.vocab_txt_path.?, paths[2]));
+        const expected_plan = try tokenizerAdmissionPlan(bodies[2].len + bodies[3].len, .wordpiece);
+        const actual_plan = try tokenizerLoadAdmissionPlan(a, root, &man, .huggingface);
+        try std.testing.expectEqualDeep(expected_plan, actual_plan);
+        const tok = try loadHuggingFaceTokenizerFromManifest(a, &man);
+        defer tok.deinitSelf();
+        var encoded = try tok.tokenizer().encodeForModel(a, "HELLO", 3);
+        defer encoded.deinit();
+        try std.testing.expectEqualSlices(i32, &.{ 2, 5, 3 }, encoded.ids);
+    }
+}
+
+test "ONNX export tokenizer format takes precedence over root JSON" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |export_json| {
+        var dir = std.testing.tmpDir(.{});
+        defer dir.cleanup();
+        try dir.dir.createDirPath(io, "onnx");
+        const paths = [_][]const u8{ "onnx/model.onnx", "onnx/config.json", "onnx/vocab.txt", "tokenizer_config.json", "tokenizer.json" };
+        const bodies = [_][]const u8{ "onnx", "{\"model_type\":\"bert\",\"hidden_size\":8}", "[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\nhello\n", "{\"do_lower_case\":true}", "{\"model\":{\"type\":\"WordPiece\",\"unk_token\":\"[UNK]\",\"vocab\":{\"[UNK]\":0,\"hello\":1}}}" };
+        var artifacts: [paths.len + 1]managed_receipt.ArtifactReceipt = undefined;
+        for (paths, bodies, 0..) |path, body, i| {
+            try dir.dir.writeFile(io, .{ .sub_path = path, .data = body });
+            artifacts[i] = .{ .path = path, .size = body.len };
+        }
+        const local_json = "{\"model\":{\"type\":\"WordPiece\",\"unk_token\":\"[UNK]\",\"vocab\":{\"[UNK]\":0,\"hello\":7}}}";
+        // An unreceipted JSON file must not shadow the export vocabulary.
+        try dir.dir.writeFile(io, .{ .sub_path = "onnx/tokenizer.json", .data = if (export_json) local_json else "not a tokenizer" });
+        artifacts[paths.len] = .{ .path = "onnx/tokenizer.json", .size = local_json.len };
+        const receipt = try std.json.Stringify.valueAlloc(a, managed_receipt.DownloadReceipt{
+            .version = 2,
+            .source = .{ .owner = "owner", .name = "model", .variant = "onnx", .selected_format = "onnx" },
+            .artifacts = artifacts[0 .. paths.len + @intFromBool(export_json)],
+        }, .{});
+        defer a.free(receipt);
+        try dir.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt });
+        const root = try dir.dir.realPathFileAlloc(io, ".", a);
+        defer a.free(root);
+        var man = try manifest_mod.loadFromDir(a, root);
+        defer man.deinit();
+        try std.testing.expectEqual(.huggingface, man.tokenizer_type);
+        var listing = try manifest_mod.loadListingFromDir(a, root);
+        defer listing.deinit();
+        try std.testing.expectEqual(export_json, man.tokenizer_json_path != null);
+        try std.testing.expectEqual(export_json, listing.tokenizer_json_path != null);
+        const expected_plan = if (export_json)
+            try tokenizerAdmissionPlan(local_json.len, .huggingface)
+        else
+            try tokenizerAdmissionPlan(bodies[2].len + bodies[3].len, .wordpiece);
+        try std.testing.expectEqualDeep(expected_plan, try tokenizerLoadAdmissionPlan(a, root, &man, .huggingface));
+        const tok = try loadHuggingFaceTokenizerFromManifest(a, &man);
+        defer tok.deinitSelf();
+        const ids = try tok.tokenizer().encode(a, "hello");
+        defer a.free(ids);
+        try std.testing.expectEqualSlices(i32, if (export_json) &.{7} else &.{5}, ids);
+    }
 }

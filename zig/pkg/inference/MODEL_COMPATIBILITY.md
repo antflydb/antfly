@@ -6,9 +6,13 @@ references, with an optional format, quantization, or revision:
 ```sh
 antfly inference pull Qwen/Qwen3-Embedding-0.6B-GGUF
 antfly inference pull Qwen/Qwen3-Embedding-0.6B:safetensors
+antfly inference pull BAAI/bge-m3@main
+antfly inference pull BAAI/bge-m3:onnx@main
 ```
 
-Pull does not accept short model aliases. Explicit pinned bundle variants remain
+Pull requires `owner/model` (optionally prefixed with `hf:`) and does not accept
+short model aliases. Qwen shortcuts such as `qwen3-embedding` and `qwen3-vl-2b`
+are no longer expanded by runtime lookup or chat either. Explicit pinned bundle variants remain
 available for reproducing qualification runs, but they are not required to serve
 a model. Local chat shortcuts are separate from the pull interface.
 

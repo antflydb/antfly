@@ -672,7 +672,7 @@ pub const ManagedDbEnrichmentSet = struct {
         self.generated = false;
     }
 
-    fn takeConfig(self: *@This()) db_mod.enrichment_runtime.Config {
+    pub fn takeConfig(self: *@This()) db_mod.enrichment_runtime.Config {
         const owned = self.config();
         self.forgetTransferred();
         return owned;

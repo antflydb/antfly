@@ -73,6 +73,8 @@ pub const Config = struct {
     num_labels: u32 = 1,
     pad_token_id: i64 = 0,
     position_id_mode: PositionIdMode = .absolute,
+    /// Number of reserved RoBERTa rows removed from the stored table (llama.cpp GGUF).
+    position_embedding_offset: u32 = 0,
 
     /// Returns the effective weight prefix for this config.
     pub fn effectivePrefix(self: Config) []const u8 {
@@ -91,7 +93,8 @@ pub const Config = struct {
         if (self.pad_token_id < 0) return 0;
         const first_position = std.math.add(i64, self.pad_token_id, 1) catch return 0;
         const reserved = std.math.cast(u32, first_position) orelse return 0;
-        return self.max_position_embeddings -| reserved;
+        if (self.position_embedding_offset > reserved) return 0;
+        return self.max_position_embeddings -| (reserved - self.position_embedding_offset);
     }
 };
 
@@ -174,6 +177,19 @@ pub fn parseGgufMetadata(view: gguf_metadata.View) ?Config {
     config.layer_norm_eps = view.getF32("bert.layer_norm_epsilon") orelse
         view.getF32("bert.attention.layer_norm_epsilon") orelse
         config.layer_norm_eps;
+    if (metaU32(view, "bert.position_embedding_offset")) |offset| {
+        config.position_embedding_offset = offset;
+    } else if (config.position_id_mode == .roberta_padding) {
+        // llama.cpp converts RoBERTa's position table by removing pad_token_id
+        // + 1 rows. Its canonical tensor name distinguishes it from Antfly's
+        // full-table exports, which preserve the Hugging Face tensor names.
+        for (view.file.tensors) |tensor| {
+            if (std.mem.eql(u8, tensor.name, "position_embd.weight")) {
+                config.position_embedding_offset = std.math.cast(u32, std.math.add(i64, config.pad_token_id, 1) catch return null) orelse return null;
+                break;
+            }
+        }
+    }
     config.num_labels = metaU32(view, "bert.label_count") orelse config.num_labels;
     if (view.getString("bert.hidden_act")) |value| {
         config.hidden_act = parseHiddenActivation(value) orelse return null;
@@ -654,4 +670,25 @@ test "normalize canonical BERT GGUF weight keys" {
         normalizeGgufWeightKey("blk.7.layer_output_norm.bias", &buf).?,
     );
     try std.testing.expect(normalizeGgufWeightKey("blk.0.unknown.weight", &buf) == null);
+}
+
+test "GGUF RoBERTa position tables distinguish cropped and full exports" {
+    const allocator = std.testing.allocator;
+    const format = @import("../gguf/format.zig");
+    const writer = @import("../gguf/writer.zig");
+    const metadata = [_]format.MetadataEntry{
+        .{ .key = "general.architecture", .value = .{ .string = "bert" } },
+        .{ .key = "bert.family", .value = .{ .string = "roberta" } },
+        .{ .key = "bert.context_length", .value = .{ .u32 = 4 } },
+        .{ .key = "bert.pad_token_id", .value = .{ .u32 = 1 } },
+    };
+    for ([_][]const u8{ "position_embd.weight", "embeddings.position_embeddings.weight" }, 0..) |name, i| {
+        var layout = try writer.buildLayout(allocator, &metadata, &.{.{ .name = name, .dimensions = &.{ 2, 4 }, .tensor_type = .{ .known = .F32 } }});
+        defer layout.deinit(allocator);
+        var parsed = try format.parse(allocator, layout.header_bytes);
+        defer parsed.deinit(allocator);
+        const config = parseGgufMetadata(gguf_metadata.View.init(&parsed)).?;
+        try std.testing.expectEqual(@as(u32, if (i == 0) 2 else 0), config.position_embedding_offset);
+        try std.testing.expectEqual(@as(u32, if (i == 0) 4 else 2), config.maxSequenceLength());
+    }
 }

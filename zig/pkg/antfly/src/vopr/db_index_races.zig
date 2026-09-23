@@ -783,7 +783,7 @@ const managed_readiness_atomic_config =
 
 pub const ManagedReadinessScenario = struct {
     pub const name: []const u8 = "managed-index-readiness";
-    pub const version: u32 = 2;
+    pub const version: u32 = 3;
 
     const fail_closed_id = vopr.id.stable(name, "atomic-and-initial-publication-fail-closed");
     const progressive_id = vopr.id.stable(name, "progressive-checkpoint-is-queryable");
@@ -845,6 +845,9 @@ pub const ManagedReadinessScenario = struct {
         final_hits: u32 = 0,
         replay_converged: bool = false,
         cleanup_sound: bool = false,
+        step_running: bool = false,
+        step_task: ?std.Io.Future(void) = null,
+        step_failure: ?anyerror = null,
 
         fn modeValue(self: *@This()) Mode {
             return self.mode.?;
@@ -1069,6 +1072,13 @@ pub const ManagedReadinessScenario = struct {
             self.stage = .complete;
         }
 
+        fn runStep(self: *@This()) void {
+            defer self.step_running = false;
+            self.executeStep() catch |err| {
+                self.step_failure = err;
+            };
+        }
+
         fn executeStep(self: *@This()) !void {
             switch (self.stage) {
                 .choose, .complete => return error.InvalidManagedIndexReadinessStage,
@@ -1099,6 +1109,7 @@ pub const ManagedReadinessScenario = struct {
     }
 
     pub fn deinit(world: *World, allocator: std.mem.Allocator) void {
+        if (world.state.step_task) |*task| task.cancel(world.state.fixture.sim.io());
         world.state.fixture.deinit();
         allocator.destroy(world.state.fixture);
         allocator.destroy(world.state);
@@ -1107,6 +1118,10 @@ pub const ManagedReadinessScenario = struct {
 
     pub fn enumerate(world: *World, list: *vopr.transition.List, allocator: std.mem.Allocator) !void {
         const state = world.state;
+        if (state.step_running) {
+            try state.fixture.sim.scheduler().enumerateReady(list, allocator);
+            return;
+        }
         if (state.stage == .complete) return;
         if (state.stage == .choose) {
             inline for (std.meta.tags(Mode), mode_ids, mode_names) |mode, id, transition_name| try list.append(allocator, .{
@@ -1129,6 +1144,15 @@ pub const ManagedReadinessScenario = struct {
 
     pub fn execute(world: *World, selected: vopr.transition.Transition, events: *vopr.event.Sink, allocator: std.mem.Allocator) !vopr.outcome.TransitionOutcome {
         const state = world.state;
+        if (state.step_running) {
+            try state.fixture.sim.scheduler().executeReady(selected.id, events, allocator);
+            if (!state.step_running) if (state.step_task) |*task| {
+                task.await(state.fixture.sim.io());
+                state.step_task = null;
+            };
+            if (state.step_failure) |err| return err;
+            return .applied();
+        }
         if (state.stage == .choose) {
             inline for (std.meta.tags(Mode), mode_ids) |mode, id| {
                 if (selected.id == id) {
@@ -1141,7 +1165,8 @@ pub const ManagedReadinessScenario = struct {
             return error.InvalidManagedIndexReadinessMode;
         }
         if (selected.id != step_id) return error.InvalidManagedIndexReadinessTransition;
-        try state.executeStep();
+        state.step_running = true;
+        state.step_task = state.fixture.sim.io().async(State.runStep, .{state});
         try events.emitNamed(allocator, .state_change, @tagName(state.stage), state.progress);
         return .applied();
     }
@@ -1241,19 +1266,11 @@ fn runAdmissionMode(allocator: std.mem.Allocator, mode_id: u64) !void {
 }
 
 fn runManagedReadinessMode(allocator: std.mem.Allocator, mode_id: u64) !void {
-    var script = [_]u64{ManagedReadinessScenario.step_id} ** 9;
-    script[0] = mode_id;
-    const script_len: usize = if (mode_id == ManagedReadinessScenario.mode_ids[0])
-        9
-    else if (mode_id == ManagedReadinessScenario.mode_ids[1])
-        7
-    else
-        8;
-    var scripted = vopr.choice.Scripted{ .selections = script[0..script_len] };
+    var scripted = vopr.choice.PrefixedFairSeeded.init(&.{mode_id}, 0x4d41_4e41);
     var artifact = try vopr.runner.run(ManagedReadinessScenario, allocator, scripted.source(), .{
         .system = "antfly",
-        .transition_budget = 12,
-        .source_revision = "managed-index-readiness-vopr-v2",
+        .transition_budget = 1024,
+        .source_revision = "managed-index-readiness-vopr-v3",
         .target = "native",
         .optimize = @tagName(builtin.mode),
     });
