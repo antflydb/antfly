@@ -73,9 +73,12 @@ class ZigValidationScopeTests(unittest.TestCase):
         command = workflow.split('if ! "$helper"', 1)[1].split("\n          then", 1)[0]
         pathspecs = shlex.split(command.split(" -- ", 1)[1].replace("\\\n", " "))
         inputs = {
-            "scripts/prepare_laya_finetune.py",
-            "scripts/qualify_laya_finetune_quality.py",
-            "scripts/test_run_laya_qualification.py",
+            "scripts/laya/prepare_laya_finetune.py",
+            "scripts/laya/qualify_laya_finetune_quality.py",
+            "scripts/laya/test_run_laya_qualification.py",
+            "scripts/laya/test_prepare_laya_finetune.py",
+            "scripts/laya/test_qualify_laya_finetune_quality.py",
+            "scripts/laya/test_benchmark_laya_metal.py",
             "scripts/openapi_inputs.py",
             "scripts/openapi_joiner.py",
             "scripts/join_openapi.py",

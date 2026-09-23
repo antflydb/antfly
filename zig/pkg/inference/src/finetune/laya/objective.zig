@@ -4,7 +4,7 @@
 //! Typed-decision soft CE and the notebook's detached, centered Gaussian
 //! policy-gradient estimator. The returned logit cotangent seeds native VJPs.
 const std = @import("std");
-const Kind = @import("../models/laya.zig").QuestionType;
+const Kind = @import("../../models/laya.zig").QuestionType;
 pub const Config = struct {
     group_size: usize = 4,
     sigma: f32 = 0.4,

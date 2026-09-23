@@ -3,15 +3,15 @@
 const std = @import("std");
 const platform = @import("antfly_platform");
 const ml = @import("ml").graph;
-const train = @import("laya_training.zig");
-const objective = @import("laya_objective.zig");
-const native = @import("../ops/native_compute.zig");
-const backend = @import("gliner/boundary_training_backend.zig");
-const run = @import("gliner/boundary_run.zig");
-const interpreter = @import("../graph/interpreter.zig");
-const safetensors = @import("../models/safetensors.zig");
-const files = @import("../util/c_file.zig");
-const modern = @import("../architectures/modern_bert.zig");
+const train = @import("training.zig");
+const objective = @import("objective.zig");
+const native = @import("../../ops/native_compute.zig");
+const backend = @import("../gliner/boundary_training_backend.zig");
+const run = @import("../gliner/boundary_run.zig");
+const interpreter = @import("../../graph/interpreter.zig");
+const safetensors = @import("../../models/safetensors.zig");
+const files = @import("../../util/c_file.zig");
+const modern = @import("../../architectures/modern_bert.zig");
 
 test "laya training ReLU uses the PyTorch zero subgradient" {
     const a = std.testing.allocator;
@@ -19,7 +19,7 @@ test "laya training ReLU uses the PyTorch zero subgradient" {
     defer graph.deinit();
     var b = ml.Builder.init(&graph);
     const x = try b.parameter("x", ml.Shape.init(.f32, &.{4}));
-    const y = try @import("laya_graph.zig").relu(&b, x);
+    const y = try @import("graph.zig").relu(&b, x);
     const loss = try b.reduceSum(y, &.{0});
     try graph.markOutput(loss);
     var gradients = try ml.autodiff.gradient(a, &graph, loss, &.{x});
@@ -78,8 +78,8 @@ test "laya training forward objective and every parameter gradient match PyTorch
     const execution: train.controller.Execution = if (platform.env.getenv("ANTFLY_LAYA_METAL") != null) .resident_metal else .native;
     const owner = try backend.Owner.init(a, &store, originals, parameters, execution, .{}, null);
     defer owner.deinit();
-    var cpu_vtable: @import("../ops/ops.zig").ComputeBackend.VTable = undefined;
-    @import("laya_cpu.zig").install(&owner.cb, &cpu_vtable);
+    var cpu_vtable: @import("../../ops/ops.zig").ComputeBackend.VTable = undefined;
+    @import("cpu.zig").install(&owner.cb, &cpu_vtable);
     const cb = &owner.cb;
     var trainer = try train.controller.Trainer.init(a, cb, parameters, .{ .execution = execution, .limits = .{ .max_state_bytes = 16 * 1024 * 1024 * 1024 }, .groups = &.{ .{ .schedule = .{ .constant = 0.000025 } }, .{ .schedule = .{ .constant = 0.0001 } } } });
     defer trainer.deinit();
@@ -147,7 +147,7 @@ test "laya training forward objective and every parameter gradient match PyTorch
     try std.testing.expectEqual(@as(usize, 0), mismatches);
 }
 
-fn compareTraces(a: std.mem.Allocator, root: []const u8, program: *const train.Program, cb: *const @import("../ops/ops.zig").ComputeBackend, outputs: []const @import("../ops/ops.zig").CT, phase: []const u8) !void {
+fn compareTraces(a: std.mem.Allocator, root: []const u8, program: *const train.Program, cb: *const @import("../../ops/ops.zig").ComputeBackend, outputs: []const @import("../../ops/ops.zig").CT, phase: []const u8) !void {
     var reader = try safetensors.MMapReader.openFileAbsolute(a, try std.fmt.allocPrint(a, "{s}/activations.safetensors", .{root}));
     defer reader.deinit();
     for (program.built.traces.items, outputs) |entry, output| {
@@ -170,7 +170,7 @@ fn compareTraces(a: std.mem.Allocator, root: []const u8, program: *const train.P
 
 test "laya training interrupted accumulation resumes to identical serving weights" {
     const root = platform.env.getenv("ANTFLY_LAYA_REFERENCE") orelse return error.SkipZigTest;
-    const job = @import("laya_job.zig");
+    const job = @import("job.zig");
     const a = std.testing.allocator;
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(a);
@@ -202,10 +202,10 @@ test "laya training interrupted accumulation resumes to identical serving weight
     c.stop_after_microbatches = null;
     try job.execute(a, io, c);
     const resumed_weights = try std.fs.path.join(scratch, &.{ c.output_dir, "model", "model.safetensors" });
-    const digest = @import("laya_data.zig").digest;
+    const digest = @import("data.zig").digest;
     try std.testing.expectEqual(digest(try files.readFile(scratch, full_weights)), digest(try files.readFile(scratch, resumed_weights)));
     // Reopen the exported artifact through the real serving factory.
-    const factory = @import("../architectures/session_factory.zig");
+    const factory = @import("../../architectures/session_factory.zig");
     var session = try factory.createNativeSession(a, try std.fs.path.join(scratch, &.{ c.output_dir, "model" }));
     defer session.close();
     const exported = factory.getLayaConfig(session) orelse return error.TestUnexpectedResult;
@@ -214,8 +214,8 @@ test "laya training interrupted accumulation resumes to identical serving weight
 
 test "laya finetuned export probabilities and tokenization match PyTorch" {
     const root = platform.env.getenv("ANTFLY_LAYA_EXPORT_REFERENCE") orelse return error.SkipZigTest;
-    const pipeline = @import("../pipelines/laya.zig");
-    const factory = @import("../architectures/session_factory.zig");
+    const pipeline = @import("../../pipelines/laya.zig");
+    const factory = @import("../../architectures/session_factory.zig");
     const hf = @import("inference_hf_tokenizer");
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
@@ -228,7 +228,7 @@ test "laya finetuned export probabilities and tokenization match PyTorch" {
         sequences: []const struct { ids: []const i64, markers: []const i64, qtype: u8 },
         probabilities: []const []const f32,
         act_probabilities: []const f32,
-        records: ?[]const @import("laya_data.zig").Record = null,
+        records: ?[]const @import("data.zig").Record = null,
     }, scratch, ref_bytes, .{ .ignore_unknown_fields = true });
     const ref = reference.value;
     try std.testing.expect(ref.states.len > 0);
@@ -274,7 +274,7 @@ test "laya finetuned export probabilities and tokenization match PyTorch" {
         const batch_tasks = try scratch.alloc(pipeline.Task, batch);
         const times = try scratch.alloc(u64, samples);
         var cold_ns: u64 = 0;
-        var resident_before: ?@import("../ops/laya_metal.zig").Stats = null;
+        var resident_before: ?@import("../../ops/laya_metal.zig").Stats = null;
         for (0..samples + 10) |iteration| {
             var request_arena = std.heap.ArenaAllocator.init(a);
             defer request_arena.deinit();

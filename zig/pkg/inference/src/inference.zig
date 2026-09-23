@@ -114,11 +114,11 @@ pub const native_compute = struct {
 
 test {
     _ = @import("models/laya.zig");
-    _ = @import("finetune/laya_graph.zig");
-    _ = @import("finetune/laya_objective.zig");
-    _ = @import("finetune/laya_training_test.zig");
-    _ = @import("finetune/laya_data.zig");
-    _ = @import("finetune/laya_job.zig");
+    _ = @import("finetune/laya/graph.zig");
+    _ = @import("finetune/laya/objective.zig");
+    _ = @import("finetune/laya/training_test.zig");
+    _ = @import("finetune/laya/data.zig");
+    _ = @import("finetune/laya/job.zig");
     _ = @import("pipelines/laya.zig");
     _ = @import("pipelines/laya_parity_test.zig");
     _ = @import("extractors/laya.zig");

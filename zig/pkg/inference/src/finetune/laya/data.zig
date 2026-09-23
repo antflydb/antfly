@@ -1,12 +1,12 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
 const std = @import("std");
-const pipeline = @import("../pipelines/laya.zig");
-const model = @import("../models/laya.zig");
-const objective = @import("laya_objective.zig");
-const training = @import("laya_training.zig");
+const pipeline = @import("../../pipelines/laya.zig");
+const model = @import("../../models/laya.zig");
+const objective = @import("objective.zig");
+const training = @import("training.zig");
 const Tokenizer = @import("inference_tokenizer").Tokenizer;
-const files = @import("../util/c_file.zig");
+const files = @import("../../util/c_file.zig");
 
 pub const Record = struct {
     id: []const u8,

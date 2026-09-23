@@ -8,7 +8,7 @@ Prepare a checkpoint from a local upstream download, or from a pinned Hugging
 Face revision:
 
 ```sh
-uv run scripts/prepare_laya.py convaiinnovations/laya \
+uv run scripts/laya/prepare_laya.py convaiinnovations/laya \
   --revision <full-hugging-face-commit-sha> \
   --output ./models/extractors/laya
 antfly standalone --models-dir ./models
@@ -99,7 +99,7 @@ It uses upstream source with small randomly initialized weights:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/NandhaKishorM/laya/6a5819129eb220570792e417e49723d697efd76f/laya/common.py -o /tmp/laya-common.py
-uv run scripts/laya_reference.py --common /tmp/laya-common.py --output /tmp/laya-reference
+uv run scripts/laya/laya_reference.py --common /tmp/laya-common.py --output /tmp/laya-reference
 cd zig
 ANTFLY_LAYA_REFERENCE=/tmp/laya-reference python3 tools/run_bounded_zig_build.py \
   build inference-test -Dmetal=false -Dcuda=false -Donnx=false -- --test-filter 'laya '
@@ -174,15 +174,15 @@ repeated unloads, and embedded/HTTP requests. Performance results apply to the
 tested artifacts, hardware, and profiles.
 
 To reproduce the comparison, generate a reference with
-`scripts/laya_export_reference.py`, then build `inference-test` with
+`scripts/laya/laya_export_reference.py`, then build `inference-test` with
 `-Dmetal=true -Dcuda=false -Donnx=false -Doptimize=ReleaseFast` and the `laya `
 test filter. Run each checkpoint precision separately:
 
 ```sh
-python3 scripts/benchmark_laya_metal.py --binary <test-binary> \
+python3 scripts/laya/benchmark_laya_metal.py --binary <test-binary> \
   --reference <reference-directory> --output <new-interactive-directory> \
   --batches 1 2 4 8 --profiles fixed mixed
-python3 scripts/benchmark_laya_metal.py --binary <test-binary> \
+python3 scripts/laya/benchmark_laya_metal.py --binary <test-binary> \
   --reference <reference-directory> --output <new-throughput-directory> \
   --batches 16 64 128 --profiles fixed
 ```
@@ -202,7 +202,7 @@ soft-target cross-entropy plus a centered Gaussian policy-gradient estimator
 with log, spherical, and ordinal ranked-probability rewards. `soft_ce` selects
 cross-entropy alone. This is full finetuning; it does not produce a LoRA adapter.
 
-Prepare the base checkpoint with `scripts/prepare_laya.py` as above. Supply
+Prepare the base checkpoint with `scripts/laya/prepare_laya.py` as above. Supply
 separate train and evaluation JSONL files, with one decision per line:
 
 ```json
@@ -220,8 +220,8 @@ To convert a JSONL export of `LocalLLaMA/typed-decisions`, including its
 JSON-encoded `state`, `questions`, and `gold` columns:
 
 ```sh
-python3 scripts/prepare_laya_finetune.py typed-decisions-train.jsonl --output train.jsonl
-python3 scripts/prepare_laya_finetune.py typed-decisions-eval.jsonl --output eval.jsonl
+python3 scripts/laya/prepare_laya_finetune.py typed-decisions-train.jsonl --output train.jsonl
+python3 scripts/laya/prepare_laya_finetune.py typed-decisions-eval.jsonl --output eval.jsonl
 ```
 
 Keep every question from a source case in the same split. The trainer rejects
@@ -283,7 +283,7 @@ from application-specific accuracy or throughput qualification.
 ### Training parity and lifecycle checks
 
 ```sh
-python3 scripts/laya_training_reference.py --common /tmp/laya-common.py --fixture /tmp/laya-reference
+python3 scripts/laya/laya_training_reference.py --common /tmp/laya-common.py --fixture /tmp/laya-reference
 cd zig
 ANTFLY_LAYA_REFERENCE=/tmp/laya-reference python3 tools/run_bounded_zig_build.py \
   --zig /path/to/zig-0.16.0 build inference-test -Dmetal=false -Dcuda=false -Donnx=false \

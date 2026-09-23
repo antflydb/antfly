@@ -2,19 +2,19 @@
 // SPDX-License-Identifier: Apache-2.0
 const std = @import("std");
 const ml = @import("ml").graph;
-const ops = @import("../ops/ops.zig");
-const interpreter = @import("../graph/interpreter.zig");
-const architecture = @import("laya_graph.zig");
-const objective = @import("laya_objective.zig");
-const modern = @import("../architectures/modern_bert.zig");
-const tensors = @import("../models/safetensors.zig");
-const Tensor = @import("../backends/tensor.zig").Tensor;
-pub const controller = @import("seeded_gradient_trainer.zig");
+const ops = @import("../../ops/ops.zig");
+const interpreter = @import("../../graph/interpreter.zig");
+const architecture = @import("graph.zig");
+const objective = @import("objective.zig");
+const modern = @import("../../architectures/modern_bert.zig");
+const tensors = @import("../../models/safetensors.zig");
+const Tensor = @import("../../backends/tensor.zig").Tensor;
+pub const controller = @import("../seeded_gradient_trainer.zig");
 
 pub const Example = struct {
     ids: []const i64,
     markers: []const i64,
-    kind: @import("../models/laya.zig").QuestionType,
+    kind: @import("../../models/laya.zig").QuestionType,
     target: []const f32,
 };
 

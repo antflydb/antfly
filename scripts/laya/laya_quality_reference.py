@@ -198,6 +198,9 @@ def main():
                 )
             )
         )
+        # Match the training reference even if upstream leaves padding logits
+        # unmasked; padded options must not enter the replay softmax.
+        logits = logits.masked_fill(~batch["marker_mask"].to(device), -1e4)
         return logits, actions
 
     def evaluate(split):

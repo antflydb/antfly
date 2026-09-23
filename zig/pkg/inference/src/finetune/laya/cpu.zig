@@ -4,8 +4,8 @@
 //! accumulation while using system BLAS for concrete matrix/batched products.
 const std = @import("std");
 const options = @import("build_options");
-const ops = @import("../ops/ops.zig");
-const native = @import("../ops/native_compute.zig");
+const ops = @import("../../ops/ops.zig");
+const native = @import("../../ops/native_compute.zig");
 const CT = ops.CT;
 
 extern "c" fn cblas_dgemm(layout: c_int, transa: c_int, transb: c_int, m: c_int, n: c_int, k: c_int, alpha: f64, a: [*]const f64, lda: c_int, b: [*]const f64, ldb: c_int, beta: f64, c_out: [*]f64, ldc: c_int) void;

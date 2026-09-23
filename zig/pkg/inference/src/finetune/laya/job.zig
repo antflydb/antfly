@@ -3,20 +3,20 @@
 //! Native Laya full finetuning, deterministic resume, and serving export.
 const std = @import("std");
 const ml = @import("ml").graph;
-const data = @import("laya_data.zig");
-const training = @import("laya_training.zig");
-const objective = @import("laya_objective.zig");
-const architecture = @import("laya_graph.zig");
-const modern = @import("../architectures/modern_bert.zig");
+const data = @import("data.zig");
+const training = @import("training.zig");
+const objective = @import("objective.zig");
+const architecture = @import("graph.zig");
+const modern = @import("../../architectures/modern_bert.zig");
 const hf = @import("inference_hf_tokenizer");
-const safetensors = @import("../models/safetensors.zig");
-const checkpoint = @import("safetensors_checkpoint.zig");
-const native = @import("../ops/native_compute.zig");
-const backend = @import("gliner/boundary_training_backend.zig");
-const run = @import("gliner/boundary_run.zig");
-const snapshot = @import("../runtime/file_snapshot.zig");
-const Assets = @import("laya_assets.zig").Assets;
-const Budget = @import("../runtime/bounded_allocator.zig").BoundedAllocator;
+const safetensors = @import("../../models/safetensors.zig");
+const checkpoint = @import("../safetensors_checkpoint.zig");
+const native = @import("../../ops/native_compute.zig");
+const backend = @import("../gliner/boundary_training_backend.zig");
+const run = @import("../gliner/boundary_run.zig");
+const snapshot = @import("../../runtime/file_snapshot.zig");
+const Assets = @import("assets.zig").Assets;
+const Budget = @import("../../runtime/bounded_allocator.zig").BoundedAllocator;
 
 pub const Config = struct {
     version: u32 = 1,
@@ -100,7 +100,7 @@ const Cache = struct {
     }
 };
 
-const Prediction = struct { id: ?[]const u8 = null, kind: @import("../models/laya.zig").QuestionType, logits: []const f32, target: []const f32 };
+const Prediction = struct { id: ?[]const u8 = null, kind: @import("../../models/laya.zig").QuestionType, logits: []const f32, target: []const f32 };
 const Metrics = struct { examples: usize, soft_ce: f64, accuracy: f64, ordinal_mae: ?f64 };
 fn predictions(a: std.mem.Allocator, cache: *Cache, trainer: *training.controller.Trainer, examples: []const training.Example) ![]Prediction {
     const result = try a.alloc(Prediction, examples.len);
@@ -213,7 +213,7 @@ fn exportModel(a: std.mem.Allocator, io: std.Io, c: Config, config_json: std.jso
     defer stage_dir.close(io);
     try assets.write(io, stage_dir);
     try writeJson(io, try path(a, stage, "model_manifest.json"), .{ .type = "classifier", .tasks = [_][]const u8{"extract"}, .capabilities = [_][]const u8{ "classification", "typed_decisions" }, .inputs = [_][]const u8{"text"}, .source = .{ .repository = c.model_dir, .revision = "antfly-laya-finetune-v1" } });
-    const publication = @import("../gliner_boundary_export.zig");
+    const publication = @import("../../gliner_boundary_export.zig");
     try publication.syncDirectory(io, stage);
     try publication.publishDirectory(a, io, stage, try path(a, c.output_dir, "model"));
     try publication.syncDirectory(io, c.output_dir);
@@ -336,7 +336,7 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config) !void {
         defer a.free(source_bytes);
         var source = try safetensors.MMapReader.fromBorrowedBytesLimited(a, source_bytes, 16 * 1024 * 1024);
         defer source.deinit();
-        try @import("../models/laya.zig").validateReader(&source, laya, encoder);
+        try @import("../../models/laya.zig").validateReader(&source, laya, encoder);
         if (source.header.tensors.get("temperature")) |meta| if (!std.mem.eql(i64, meta.shape, &.{3})) return error.InvalidLayaWeights;
         const initial = try cache.get(train.examples[0..@min(train.examples.len, c.batch_size)]);
         const selected = try training.parameters(permanent, &initial.graph, &source);
@@ -366,8 +366,8 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config) !void {
     const execution: training.controller.Execution = if (c.backend == .metal) .resident_metal else .native;
     const owner = try backend.Owner.init(a, &store, originals, selected, execution, .{}, null);
     defer owner.deinit();
-    var cpu_vtable: @import("../ops/ops.zig").ComputeBackend.VTable = undefined;
-    @import("laya_cpu.zig").install(&owner.cb, &cpu_vtable);
+    var cpu_vtable: @import("../../ops/ops.zig").ComputeBackend.VTable = undefined;
+    @import("cpu.zig").install(&owner.cb, &cpu_vtable);
     const batches = std.math.divCeil(usize, train.examples.len, c.batch_size) catch unreachable;
     const updates = std.math.divCeil(usize, batches, c.gradient_accumulation) catch unreachable;
     const steps = std.math.cast(u32, updates * c.epochs) orelse return error.InvalidLayaJob;

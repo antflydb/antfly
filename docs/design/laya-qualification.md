@@ -36,7 +36,7 @@ also passes with the same allocator change.
 Use 64 seeded (`714`) shuffled examples from each of AG News test, BoolQ
 validation, and SST-5 test. Questions, exact texts, token IDs, marker positions,
 raw logits, calibrated probabilities, and targets are captured by
-`scripts/laya_qualify.py`. Reject overlength examples rather than using
+`scripts/laya/laya_qualify.py`. Reject overlength examples rather than using
 upstream's silent truncation; no selected examples were excluded in this run.
 
 | Dataset / primitive | Upstream correct | Accuracy |
@@ -124,14 +124,14 @@ directory. Keep the generated model and datasets outside the repository.
 
 ```sh
 mkdir -p /tmp/laya-qualification
-uv run scripts/prepare_laya.py convaiinnovations/laya \
+uv run scripts/laya/prepare_laya.py convaiinnovations/laya \
   --revision c5d78730f3493e4fe16d61507ef4b78eef7318cf \
   --output /tmp/laya-qualification/model
 curl -fsSL https://raw.githubusercontent.com/NandhaKishorM/laya/6a5819129eb220570792e417e49723d697efd76f/laya/common.py -o /tmp/laya-qualification/common.py
 curl -fsSL https://huggingface.co/datasets/sh0416/ag_news/resolve/70e3fa1915be9a8daebec5e840f20df9a8e18793/test.jsonl -o /tmp/laya-qualification/ag-news.jsonl
 curl -fsSL https://huggingface.co/datasets/google/boolq/resolve/35b264d03638db9f4ce671b711558bf7ff0f80d5/data/validation-00000-of-00001.parquet -o /tmp/laya-qualification/boolq.parquet
 curl -fsSL https://huggingface.co/datasets/SetFit/sst5/resolve/e51bdcd8cd3a30da231967c1a249ba59361279a3/test.jsonl -o /tmp/laya-qualification/sst5.jsonl
-uv run scripts/laya_qualify.py \
+uv run scripts/laya/laya_qualify.py \
   --model /tmp/laya-qualification/model \
   --common /tmp/laya-qualification/common.py \
   --ag-news /tmp/laya-qualification/ag-news.jsonl \

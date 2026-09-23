@@ -51,6 +51,11 @@ def native_run_digest(job_path):
 
     job.json and the hashed identity use the same Zig serializer. Retain its
     float lexemes while removing whitespace and clearing relocation fields.
+
+    This consumes the trainer-written job.json, whose key order is the field
+    declaration order of finetune/laya/job.zig Config, not arbitrary JSON.
+    Preserve that order: sorting or hand-reordering keys changes the v1 hash
+    and validate_evidence rejects the edited artifact as an identity mismatch.
     """
 
     class FloatLexeme(str):

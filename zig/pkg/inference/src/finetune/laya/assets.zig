@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Admit auxiliary serving files once, then publish those exact bytes durably.
 const std = @import("std");
-const snapshot = @import("../runtime/file_snapshot.zig");
+const snapshot = @import("../../runtime/file_snapshot.zig");
 const names = [_][]const u8{ "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json" };
 pub const Assets = struct {
     bytes: [3]?[]const u8,

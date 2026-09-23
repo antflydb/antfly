@@ -6,7 +6,7 @@
 //! action head are not part of the typed-decision training objective.
 const std = @import("std");
 const ml = @import("ml").graph;
-const modern = @import("../architectures/modern_bert.zig");
+const modern = @import("../../architectures/modern_bert.zig");
 const B = ml.Builder;
 const Id = ml.NodeId;
 const Shape = ml.Shape;
