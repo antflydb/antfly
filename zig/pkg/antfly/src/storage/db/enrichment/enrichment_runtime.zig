@@ -27064,6 +27064,13 @@ fn chunkEmbeddingSourceSetForRequest(
         };
     }
 
+    // An inline source with no chunks is an intentional empty revision. The
+    // chunk producer may be running in another lane, so stored rows still
+    // describe the previous revision and must not become embedding inputs.
+    if (requestHasChunking(request)) return .{
+        .desired_chunk_keys = try runtime.alloc.alloc([]u8, 0),
+    };
+
     const sources = try storedChunkEmbeddingSourcesForRequest(runtime, request, artifact_name);
     errdefer freeChunkEmbeddingSources(runtime.alloc, sources);
     const keys = try runtime.alloc.alloc([]u8, sources.len);
