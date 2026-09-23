@@ -14,6 +14,11 @@
 
 package lite
 
+import (
+	"encoding/json"
+	"fmt"
+)
+
 // ErrorCode is a stable Antfly C ABI error code.
 type ErrorCode uint32
 
@@ -84,4 +89,53 @@ func (code ErrorCode) Description() string {
 		return description
 	}
 	return "unknown Antfly error code"
+}
+
+// InferenceAPIError is the JSON error body an Antfly inference call returns
+// on failure: {"error": "...", "message": "..."}. Code is a stable string
+// such as "MODEL_NOT_FOUND"; either field may be empty when the body was not
+// present or not in this shape.
+type InferenceAPIError struct {
+	Code    string `json:"error"`
+	Message string `json:"message"`
+}
+
+// InferenceError is returned by failed Inference JSON calls. It carries the
+// stable C ABI error code (see ErrorCode) plus the inference runtime's JSON
+// error body, when one was returned. errors.Is(err, code) and
+// errors.As(err, &inferenceErr) both work against it.
+type InferenceError struct {
+	// ErrorCode is the C ABI error code mapped from the call's HTTP-shaped
+	// failure (see antfly.h's "Embedded inference without a database").
+	ErrorCode ErrorCode
+	// API is the parsed JSON error body, when the body was valid JSON in the
+	// {"error":..., "message":...} shape.
+	API InferenceAPIError
+	// Body is the raw JSON error body returned by the call, if any.
+	Body []byte
+}
+
+func (e *InferenceError) Error() string {
+	if e.API.Code != "" || e.API.Message != "" {
+		return fmt.Sprintf("lite: inference %s: %s (%s)", e.API.Code, e.API.Message, e.ErrorCode.Name())
+	}
+	if len(e.Body) > 0 {
+		return fmt.Sprintf("lite: inference: %s: %s", e.ErrorCode.Error(), e.Body)
+	}
+	return "lite: inference: " + e.ErrorCode.Error()
+}
+
+// Unwrap exposes the underlying stable ErrorCode for errors.Is/errors.As.
+func (e *InferenceError) Unwrap() error {
+	return e.ErrorCode
+}
+
+// newInferenceError builds an InferenceError from a failed call's error code
+// and response body (which, per the C ABI contract, is filled with a JSON
+// error document on failure even though the call also returned a non-OK
+// code). code must not be OK.
+func newInferenceError(code ErrorCode, body []byte) error {
+	err := &InferenceError{ErrorCode: code, Body: body}
+	_ = json.Unmarshal(body, &err.API)
+	return err
 }

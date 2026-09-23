@@ -39,5 +39,10 @@ path = "tests/errors.rs"
 required-features = ["libantfly"]
 
 [[test]]
+name = "inference"
+path = "tests/inference.rs"
+required-features = ["libantfly"]
+
+[[test]]
 name = "pure"
 path = "tests/pure.rs"

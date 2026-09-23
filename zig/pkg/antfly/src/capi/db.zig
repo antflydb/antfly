@@ -2101,7 +2101,7 @@ const HandleGuard = struct {
 
 /// The handle locks are called from arbitrary foreign threads, so they use
 /// the process-wide threaded Io, whose waits block the calling OS thread.
-fn handleLockIo() std.Io {
+pub fn handleLockIo() std.Io {
     return std.Options.debug_io;
 }
 

@@ -1,5 +1,16 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 //! `antfly_inference_*`: the embedded inference runtime without a database.
 //! Each call takes the same request JSON and returns the same response JSON
@@ -239,29 +250,93 @@ pub export fn antfly_inference_list_models_json(h: ?*anyopaque, out: ?*capi.Buff
     return invoke(h, .get, "models", "", out);
 }
 
+/// The HTTP client streams downloads on its own tasks, so progress arrives on
+/// runtime threads. Callers are promised reports on their own thread (koffi,
+/// for one, deadlocks on a foreign-thread callback during a synchronous call),
+/// so the download runs on a helper thread while the calling thread waits
+/// here and delivers queued reports.
 const PullCall = struct {
-    progress: ?capi.InferencePullProgressFn,
-    progress_context: ?*anyopaque,
+    const Report = struct {
+        model: []u8,
+        file: []u8,
+        progress: capi.InferencePullProgress,
+    };
+
+    mutex: std.Io.Mutex = .init,
+    changed: std.Io.Condition = .init,
+    reports: std.ArrayListUnmanaged(Report) = .empty,
+    done: bool = false,
     result: ?[]u8 = null,
+    outcome: anyerror!void = {},
+    /// Whether the caller wants progress at all.
+    wants_progress: bool,
 
     fn onProgress(raw: ?*anyopaque, progress: *const inference_provider.inference_bridge.PullProgress) callconv(.c) void {
         const self: *PullCall = @ptrCast(@alignCast(raw.?));
-        const callback = self.progress orelse return;
-        const view = capi.InferencePullProgress{
-            .model = sliceOf(progress.model.slice()),
-            .file = sliceOf(progress.file.slice()),
-            .bytes_downloaded = progress.bytes_downloaded,
-            .total_bytes = progress.total_bytes,
-            .files_done = progress.files_done,
-            .files_total = progress.files_total,
-            .cached = progress.cached != 0,
+        if (!self.wants_progress) return;
+        const model = alloc.dupe(u8, progress.model.slice()) catch return;
+        const file = alloc.dupe(u8, progress.file.slice()) catch {
+            alloc.free(model);
+            return;
         };
-        callback(self.progress_context, &view);
+        const io = db.handleLockIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.reports.append(alloc, .{
+            .model = model,
+            .file = file,
+            .progress = .{
+                .bytes_downloaded = progress.bytes_downloaded,
+                .total_bytes = progress.total_bytes,
+                .files_done = progress.files_done,
+                .files_total = progress.files_total,
+                .cached = progress.cached != 0,
+            },
+        }) catch {
+            alloc.free(model);
+            alloc.free(file);
+            return;
+        };
+        self.changed.signal(io);
     }
 
     fn onResult(raw: ?*anyopaque, result: inference_provider.inference_bridge.String) callconv(.c) void {
         const self: *PullCall = @ptrCast(@alignCast(raw.?));
         self.result = alloc.dupe(u8, result.slice()) catch null;
+    }
+
+    fn run(self: *PullCall, io: std.Io, models_dir: ?[]const u8, request: []const u8) void {
+        const outcome = inference_provider.pullEmbeddedInferenceModels(io, models_dir, request, self, onProgress, self, onResult);
+        const lock_io = db.handleLockIo();
+        self.mutex.lockUncancelable(lock_io);
+        defer self.mutex.unlock(lock_io);
+        self.outcome = outcome;
+        self.done = true;
+        self.changed.signal(lock_io);
+    }
+
+    /// Delivers reports on the calling thread until the download finishes.
+    fn deliver(self: *PullCall, callback: ?capi.InferencePullProgressFn, context: ?*anyopaque) void {
+        const io = db.handleLockIo();
+        while (true) {
+            self.mutex.lockUncancelable(io);
+            while (self.reports.items.len == 0 and !self.done) self.changed.waitUncancelable(io, &self.mutex);
+            var batch = self.reports;
+            self.reports = .empty;
+            const finished = self.done;
+            self.mutex.unlock(io);
+            defer batch.deinit(alloc);
+            for (batch.items) |*report| {
+                defer {
+                    alloc.free(report.model);
+                    alloc.free(report.file);
+                }
+                report.progress.model = sliceOf(report.model);
+                report.progress.file = sliceOf(report.file);
+                if (callback) |call| call(context, &report.progress);
+            }
+            if (finished) return;
+        }
     }
 };
 
@@ -302,7 +377,7 @@ fn pullErrorCode(name: []const u8) capi.ErrorCode {
 }
 
 /// Downloads models into this handle's models directory, calling `progress`
-/// (if set) on the calling thread as files download.
+/// (if set) on the calling thread as files download. See `PullCall`.
 pub export fn antfly_inference_pull_json(
     handle_ptr: ?*anyopaque,
     request_json: capi.Slice,
@@ -313,16 +388,16 @@ pub export fn antfly_inference_pull_json(
     const out = db.resetOutBuffer(out_buf) orelse return .invalid_argument;
     const handle, const slot = registry.enter(handle_ptr) orelse return .invalid_argument;
     defer @TypeOf(registry).leave(slot);
-    var call = PullCall{ .progress = progress, .progress_context = progress_context };
-    const pulled = inference_provider.pullEmbeddedInferenceModels(
-        handle.io.io(),
-        handle.models_dir,
-        request_json.bytes(),
-        &call,
-        PullCall.onProgress,
-        &call,
-        PullCall.onResult,
-    );
+    var call = PullCall{ .wants_progress = progress != null };
+    // Downloads need a stack as deep as any other libantfly call.
+    const thread = std.Thread.spawn(
+        .{ .stack_size = 8 * 1024 * 1024 },
+        PullCall.run,
+        .{ &call, handle.io.io(), handle.models_dir, request_json.bytes() },
+    ) catch |err| return capi.mapError(err);
+    call.deliver(progress, progress_context);
+    thread.join();
+    const pulled = call.outcome;
     const result = call.result orelse return if (pulled) |_| .internal else |err| capi.mapError(err);
     out.* = .{ .ptr = result.ptr, .len = result.len };
     _ = pulled catch {
@@ -585,15 +660,18 @@ test "capi inference pulls a model with progress into the handle's models direct
     defer antfly_inference_close(handle);
 
     const Progress = struct {
+        caller: std.Thread.Id,
         reports: usize = 0,
         saw_model: bool = false,
+        off_thread: bool = false,
         fn report(raw: ?*anyopaque, progress: *const capi.InferencePullProgress) callconv(.c) void {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             self.reports += 1;
             if (progress.model.len > 0 and progress.file.len > 0) self.saw_model = true;
+            if (std.Thread.getCurrentId() != self.caller) self.off_thread = true;
         }
     };
-    var progress = Progress{};
+    var progress = Progress{ .caller = std.Thread.getCurrentId() };
     const request = try std.fmt.allocPrint(std.testing.allocator, "{{\"model\":\"{s}\"}}", .{model});
     defer std.testing.allocator.free(request);
     var out: capi.Buffer = .{};
@@ -602,6 +680,8 @@ test "capi inference pulls a model with progress into the handle's models direct
     if (code != .ok) std.debug.print("pull failed: {s}\n", .{testBuffer(out)});
     try std.testing.expectEqual(capi.ErrorCode.ok, code);
     try std.testing.expect(progress.reports > 0 and progress.saw_model);
+    // Reports arrive on the calling thread, as the header promises.
+    try std.testing.expect(!progress.off_thread);
 
     // The same handle sees the pulled model.
     var models: capi.Buffer = .{};

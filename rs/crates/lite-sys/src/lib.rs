@@ -37,7 +37,7 @@
 //! opening one.
 #![allow(non_camel_case_types)]
 
-use std::ffi::c_char;
+use std::ffi::{c_char, c_void};
 
 // ---------------------------------------------------------------------
 // antfly_error_code
@@ -71,6 +71,75 @@ pub const ANTFLY_INTERNAL: antfly_error_code = 255;
 pub struct antfly_db {
     _private: [u8; 0],
 }
+
+// ---------------------------------------------------------------------
+// antfly_inference (opaque handle) -- embedded inference without a database
+// ---------------------------------------------------------------------
+
+/// An open embedded inference runtime, with no database. Opaque; see
+/// `antfly_inference_open`. Models load on first use and stay cached until
+/// the handle closes. Handles have the same thread-safety guarantees as
+/// `antfly_db` (see `zig/CAPI.md`'s "Thread Safety" section): any thread may
+/// call concurrently, close waits for in-flight calls, and a closed or
+/// foreign handle is rejected with `ANTFLY_INVALID_ARGUMENT`.
+#[repr(C)]
+pub struct antfly_inference {
+    _private: [u8; 0],
+}
+
+/// Options for `antfly_inference_open`. `reserved`/`abi_size` layout must
+/// mirror the header exactly -- `tests/abi_sizes.rs` checks
+/// `size_of::<antfly_inference_options>()` against
+/// `antfly_inference_options_size()`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct antfly_inference_options {
+    pub abi_size: u32,
+    /// No flags are defined yet; must be zero.
+    pub flags: u32,
+    /// Models directory. Empty uses `$ANTFLY_INFERENCE_MODELS_DIR`, else
+    /// `~/.antfly/inference/models`.
+    pub models_dir: antfly_slice,
+    /// Resource budgets in MiB, 0 meaning automatic; the same knobs as the
+    /// `inference_*_budget_mb` fields of `antfly_open_options`.
+    pub host_budget_mb: u32,
+    pub backend_budget_mb: u32,
+    pub process_memory_budget_mb: u32,
+    pub combined_budget_mb: u32,
+    pub kv_budget_mb: u32,
+    pub scratch_budget_mb: u32,
+    /// Deadline for each call in milliseconds; 0 means none.
+    pub call_timeout_ms: u64,
+    pub reserved: [u64; 8],
+}
+
+/// One report to an `antfly_inference_pull_json` progress callback. The
+/// slices are valid only during the callback. Check `abi_size` before
+/// reading fields added in later versions.
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct antfly_inference_pull_progress {
+    pub abi_size: u32,
+    pub reserved0: u32,
+    /// The model reference being pulled (one per requested variant).
+    pub model: antfly_slice,
+    pub file: antfly_slice,
+    pub bytes_downloaded: u64,
+    /// 0 when unknown.
+    pub total_bytes: u64,
+    pub files_done: u64,
+    pub files_total: u64,
+    /// The file was already present and verified; nothing was downloaded.
+    pub cached: bool,
+}
+
+/// Progress callback for `antfly_inference_pull_json`. May be `None`
+/// (a NULL function pointer). Called synchronously on the calling thread;
+/// the `*const antfly_inference_pull_progress` it receives is only valid for
+/// the duration of the call.
+pub type antfly_inference_pull_progress_fn = Option<
+    unsafe extern "C" fn(context: *mut c_void, progress: *const antfly_inference_pull_progress),
+>;
 
 // ---------------------------------------------------------------------
 // antfly_txn_status
@@ -708,6 +777,84 @@ unsafe extern "C" {
     pub fn antfly_db_match_pattern_json(
         db: *mut antfly_db,
         request_json: antfly_slice,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
+
+    // -- Embedded inference without a database --------------------------
+
+    pub fn antfly_inference_options_size() -> u32;
+    pub fn antfly_inference_options_init(
+        options: *mut antfly_inference_options,
+    ) -> antfly_error_code;
+    /// `options` may be NULL for defaults.
+    pub fn antfly_inference_open(
+        options: *const antfly_inference_options,
+        out_inference: *mut *mut antfly_inference,
+    ) -> antfly_error_code;
+    pub fn antfly_inference_close(inference: *mut antfly_inference);
+
+    pub fn antfly_inference_embed_json(
+        inference: *mut antfly_inference,
+        request_json: antfly_slice,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
+    pub fn antfly_inference_rerank_json(
+        inference: *mut antfly_inference,
+        request_json: antfly_slice,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
+    pub fn antfly_inference_chunk_json(
+        inference: *mut antfly_inference,
+        request_json: antfly_slice,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
+    pub fn antfly_inference_generate_json(
+        inference: *mut antfly_inference,
+        request_json: antfly_slice,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
+    /// Up to 128 non-streaming generate requests in one call; per-item
+    /// failures are reported in the response.
+    pub fn antfly_inference_generate_batch_json(
+        inference: *mut antfly_inference,
+        request_json: antfly_slice,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
+    pub fn antfly_inference_rewrite_json(
+        inference: *mut antfly_inference,
+        request_json: antfly_slice,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
+    pub fn antfly_inference_extract_json(
+        inference: *mut antfly_inference,
+        request_json: antfly_slice,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
+    pub fn antfly_inference_read_json(
+        inference: *mut antfly_inference,
+        request_json: antfly_slice,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
+    pub fn antfly_inference_transcribe_json(
+        inference: *mut antfly_inference,
+        request_json: antfly_slice,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
+    /// The installed models, as returned by `GET /ai/v1/models`.
+    pub fn antfly_inference_list_models_json(
+        inference: *mut antfly_inference,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
+
+    /// Downloads a model from the Hugging Face Hub into the handle's models
+    /// directory, like `antfly inference pull`. `progress` (may be NULL) is
+    /// called on the calling thread as files download. The call cannot be
+    /// cancelled, and `antfly_inference_close` waits for it.
+    pub fn antfly_inference_pull_json(
+        inference: *mut antfly_inference,
+        request_json: antfly_slice,
+        progress: antfly_inference_pull_progress_fn,
+        progress_context: *mut c_void,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
 }
