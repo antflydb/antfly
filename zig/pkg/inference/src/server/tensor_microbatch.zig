@@ -404,7 +404,6 @@ fn executeGroup(items: []const micro.ExecuteItem) !void {
     var group = micro.ExecutionControl{ .items = items };
     var all_grace = true;
     var group_grace_ns: ?u64 = null;
-    var earliest_deadline_ns: ?u64 = null;
     for (items) |item| {
         const item_control = item.payloadAs(Ticket).control orelse {
             all_grace = false;
@@ -415,14 +414,14 @@ fn executeGroup(items: []const micro.ExecuteItem) !void {
         } else {
             all_grace = false;
         }
-        if (item_control.deadline_ns) |deadline|
-            earliest_deadline_ns = if (earliest_deadline_ns) |current| @min(current, deadline) else deadline;
     }
     const control = Control{
         .ptr = &group,
         .check_fn = micro.ExecutionControl.check,
         .io = items[0].control.io,
-        .deadline_ns = earliest_deadline_ns,
+        // The aggregate check keeps the forward alive while any caller is
+        // live. A scalar deadline from one caller would override that check.
+        .deadline_ns = null,
         .hard_cancellation = if (first.control) |active| active.hard_cancellation else null,
         .cancellation_grace_ns = if (all_grace) group_grace_ns else null,
     };
@@ -649,6 +648,35 @@ test "tensor microbatch executor deterministically fuses a complete window and r
     try std.testing.expectEqualSlices(f32, &.{ 2, 4, 6, 8 }, callers[7].output.?[0].asFloat32());
     callers[7].deinit();
     try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
+}
+
+test "tensor microbatch keeps a live caller after a peer deadline expires" {
+    var fake = TestSession{};
+    const session = session_mod.Session{ .ptr = &fake, .vtable = &TestSession.vtable };
+    var gate: std.atomic.Mutex = .unlocked;
+    var input = try Tensor.initFloat32(std.testing.allocator, "values", &.{ 1, 2 }, &.{ 1, 2 });
+    defer input.deinit();
+    var tickets = [_]Ticket{
+        .{ .session = session, .permit = null, .gate = &gate, .inputs = &.{input}, .control = .{ .deadline_ns = 0 }, .rows = 1 },
+        .{ .session = session, .permit = null, .gate = &gate, .inputs = &.{input}, .control = .{ .deadline_ns = std.math.maxInt(u64) }, .rows = 1 },
+    };
+    var outputs: [2][]Tensor = @splat(&.{});
+    var slots = [_]micro.ResultSlot{
+        .{ .output = @ptrCast(&outputs[0]) },
+        .{ .output = @ptrCast(&outputs[1]) },
+    };
+    defer for (slots, outputs) |slot, output| {
+        if (slot.completed and slot.err == null) destroy(std.heap.smp_allocator, output);
+    };
+    var items = [_]micro.ExecuteItem{
+        .{ .allocator = std.heap.smp_allocator, .identity = .{}, .payload = &tickets[0], .slot = &slots[0], .control = .{ .io = std.testing.io, .deadline = std.Io.Clock.Timestamp.now(std.testing.io, .awake) } },
+        .{ .allocator = std.heap.smp_allocator, .identity = .{}, .payload = &tickets[1], .slot = &slots[1], .control = .{ .io = std.testing.io } },
+    };
+    try executeGroup(&items);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls.load(.monotonic));
+    try std.testing.expectEqual(error.DeadlineExceeded, slots[0].err.?);
+    try std.testing.expect(slots[1].completed and slots[1].err == null);
+    try std.testing.expectEqualSlices(f32, &.{ 2, 4 }, outputs[1][0].asFloat32());
 }
 
 test "tensor microbatch broadcasts scalar controls and separates unequal values" {
