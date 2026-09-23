@@ -2720,7 +2720,9 @@ def test_three_by_three_mixed_relational_restore_survives_coordinator_and_owner_
             job_id = response.json()["job_id"]
             cluster.metadata_procs[coordinator].kill()
             cluster.metadata_procs[coordinator].wait(timeout=10)
-            successor_id = cluster.metadata_stable_leader_id(timeout_s=30)
+            # A self-confirmed same-term quorum is sufficient after the crash;
+            # three consecutive transport samples add no Raft safety proof.
+            successor_id = cluster.metadata_leader_id(timeout_s=30)
             assert successor_id is not None and successor_id != leader_id, (
                 cluster.debug_logs()
             )

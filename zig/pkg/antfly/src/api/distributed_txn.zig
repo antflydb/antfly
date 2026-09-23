@@ -978,6 +978,13 @@ fn beginDefinitelyCreatedNoState(err: anyerror) bool {
     return err == error.UnknownGroup or err == error.PreDecisionNotProposed;
 }
 
+fn retainedBeginOutcomeUnknown(err: anyerror) bool {
+    return err == error.RaftBatchWriteOutcomeUnknown or
+        err == error.UnexpectedHttpStatus or
+        err == error.ClientShuttingDown or
+        isPreDecisionTransportUnavailable(err);
+}
+
 fn isPreDecisionTransportUnavailable(err: anyerror) bool {
     return switch (err) {
         error.Timeout,
@@ -1531,6 +1538,14 @@ fn executeMultiTableCommitOnce(
                     .pending => {},
                 };
             }
+            if (options.retain_terminal and retainedBeginOutcomeUnknown(err)) {
+                // BEGIN is idempotent for the same stable ID and participant
+                // set. Preserve a pending record and let the session retry;
+                // aborting here turns a slow/unknown Raft reply into a
+                // permanent 409 on the next commit attempt.
+                abort_on_error = false;
+                return error.CommitDecisionUnknown;
+            }
             if (!options.retain_terminal and (err == error.UnknownGroup or err == error.PreDecisionNotProposed)) {
                 abort_on_error = false;
                 return .{ .conflict = participantUnavailableConflict(participant, .begin) };
@@ -1572,6 +1587,12 @@ fn executeMultiTableCommitOnce(
         if (firstFanoutError(fanout_slots[1..])) |failure_offset| {
             const participant_index = failure_offset + 1;
             const failure = fanout_slots[participant_index].err.?;
+            if (options.retain_terminal and retainedBeginOutcomeUnknown(failure)) {
+                // Every contacted participant may have persisted BEGIN. A
+                // stable-ID retry can safely finish those idempotent begins.
+                abort_on_error = false;
+                return error.CommitDecisionUnknown;
+            }
             if (!beginDefinitelyCreatedNoState(failure)) {
                 const participant = participants.items[participant_index];
                 std.log.warn("transaction begin failed table={s} group_id={} err={s}", .{
@@ -5837,6 +5858,7 @@ fn consumerTests() type {
                 follower_resolve_error: ?anyerror = null,
                 follower_resolved: bool = false,
                 follower_acknowledged: bool = false,
+                expect_live_topology: bool = false,
                 begin_calls: usize = 0,
                 prepare_calls: usize = 0,
                 resolve_calls: usize = 0,
@@ -5873,9 +5895,13 @@ fn consumerTests() type {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.resolve_calls += 1;
                     if (req.status == .aborted) self.abort_calls += 1;
-                    try std.testing.expectEqual(db_mod.types.TxnStatus.committed, req.status);
+                    try std.testing.expectEqual(if (self.observed_status == .pending) db_mod.types.TxnStatus.aborted else self.observed_status, req.status);
                     if (self.resolve_error) |err| return err;
-                    try std.testing.expectEqual(@as(u64, 0), req.topology_epoch);
+                    if (self.expect_live_topology) {
+                        try std.testing.expect(req.topology_epoch != 0);
+                    } else {
+                        try std.testing.expectEqual(@as(u64, 0), req.topology_epoch);
+                    }
                     if (group == 7002) {
                         if (self.follower_resolve_error) |err| return err;
                         self.follower_resolved = true;
@@ -5894,7 +5920,7 @@ fn consumerTests() type {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.status_calls += 1;
                     if (self.status_calls > 1 and (if (self.resolve_error) |err| err == error.ConnectionResetByPeer else false)) return .aborted;
-                    return .committed;
+                    return self.observed_status;
                 }
 
                 fn statusUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, deadline_ns: u64) !db_mod.types.TxnStatus {
@@ -5928,7 +5954,6 @@ fn consumerTests() type {
                 try std.testing.expectEqual(@as(usize, 0), recorder.prepare_calls);
                 try std.testing.expectEqual(@as(usize, 2), recorder.resolve_calls);
             }
-
             // A committed status was already observed. Even a subsequent
             // conflicting/missing/corrupt coordinator response cannot authorize
             // abort or dispatch follower decisions with unconfirmed metadata.
@@ -5964,6 +5989,76 @@ fn consumerTests() type {
                     try std.testing.expectEqual(@as(usize, 0), recorder.prepare_calls);
                     try std.testing.expectEqual(@as(usize, 1), recorder.resolve_calls);
                     try std.testing.expectEqual(@as(usize, 0), recorder.abort_calls);
+                }
+            }
+            {
+                // A lost BEGIN outcome on a stable session ID must remain
+                // retryable. In particular, an unknown Raft apply result is not
+                // evidence that the session should be durably aborted.
+                for ([_]u64{ 7001, 7002 }) |failed_group| {
+                    var recovery_recorder = Recorder{
+                        .failed_begin_group = failed_group,
+                        .begin_error = error.RaftBatchWriteOutcomeUnknown,
+                        .observed_status = .pending,
+                    };
+                    const recovery_txn_id = try parseTxnIdHex("0123456789abcdeffedcba9876543210");
+                    const request = &[_]TableCommitRequest{.{ .table_name = "docs", .writes = &.{
+                        .{ .key = "doc:a", .value = "{}" },
+                        .{ .key = "doc:z", .value = "{}" },
+                    } }};
+                    try std.testing.expectError(error.CommitDecisionUnknown, executeMultiTableCommitWithOptions(
+                        std.testing.allocator,
+                        FakeCatalog.iface(),
+                        recovery_recorder.worker(),
+                        recovery_txn_id,
+                        10_000,
+                        10_001,
+                        request,
+                        .write,
+                        null,
+                        .{ .retain_terminal = true },
+                    ));
+                    try std.testing.expectEqual(@as(usize, 0), recovery_recorder.resolve_calls);
+                    recovery_recorder.failed_begin_group = 0;
+                    recovery_recorder.observed_status = .committed;
+                    recovery_recorder.expect_live_topology = true;
+                    const resumed = try executeMultiTableCommitWithOptions(
+                        std.testing.allocator,
+                        FakeCatalog.iface(),
+                        recovery_recorder.worker(),
+                        recovery_txn_id,
+                        10_000,
+                        10_001,
+                        request,
+                        .write,
+                        null,
+                        .{ .retain_terminal = true },
+                    );
+                    try std.testing.expect(resumed == .committed);
+                }
+                // Model an earlier interrupted execution with a prepared follower.
+                // Neither coordinator BEGIN failure nor a follower's explicit
+                // not-proposed result proves that old participant has no intents.
+                for ([_]u64{ 7001, 7002 }) |failed_group| {
+                    for ([_]?anyerror{ null, error.Timeout, error.TxnNotFound }) |resolve_error| {
+                        var recovery_recorder = Recorder{ .failed_begin_group = failed_group, .begin_error = error.PreDecisionNotProposed, .observed_status = .pending, .follower_resolve_error = resolve_error };
+                        const result = executeMultiTableCommitWithOptions(
+                            std.testing.allocator,
+                            FakeCatalog.iface(),
+                            recovery_recorder.worker(),
+                            @splat(7),
+                            10_000,
+                            10_001,
+                            &.{.{ .table_name = "docs", .writes = &.{ .{ .key = "doc:a", .value = "{}" }, .{ .key = "doc:z", .value = "{}" } } }},
+                            .write,
+                            null,
+                            .{ .retain_terminal = true },
+                        );
+                        if (failed_group == 7001) try std.testing.expectError(error.TransactionBeginFailed, result) else try std.testing.expect((try result) == .conflict);
+                        try std.testing.expectEqual(@as(usize, 2), recovery_recorder.resolve_calls);
+                        try std.testing.expectEqual(resolve_error == null, recovery_recorder.follower_resolved);
+                        try std.testing.expectEqual(resolve_error == null, recovery_recorder.follower_acknowledged);
+                    }
                 }
             }
         }

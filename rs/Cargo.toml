@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/sdk", "crates/pgaf"]
+members = ["crates/sdk", "crates/pgaf", "crates/lite-sys", "crates/lite"]
 resolver = "3"
 
 [profile.dev]

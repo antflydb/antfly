@@ -1848,6 +1848,7 @@ fn freeGraphDeleteElements(alloc: std.mem.Allocator, deletes: []db_mod.types.Gra
         alloc.free(@constCast(delete.source));
         alloc.free(@constCast(delete.target));
         alloc.free(@constCast(delete.edge_type));
+        if (delete.owner.len > 0) alloc.free(@constCast(delete.owner));
     }
 }
 

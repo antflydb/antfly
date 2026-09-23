@@ -91,7 +91,8 @@ tags:
 
       - **Type Safety**: Ensures data consistency across documents
 
-      - **Optimized Indexing**: Full Text Index uses type information for appropriate Bleve mappings
+      - **Optimized Indexing**: Full Text Index uses type information for appropriate field mappings in
+      Antfly's native full-text index
 
       - **Better Search**: Type-aware indexing improves search relevance and performance
 
@@ -144,11 +145,24 @@ tags:
 
       **Dynamic Indexing** (`additionalProperties`):
 
-      - `"additionalProperties": false` - Only index fields defined in `properties` (recommended for performance)
+      - `"additionalProperties": false` - Reject documents that carry fields not defined in `properties`
+      (standard JSON Schema validation); only declared fields exist, so only declared fields are indexed
 
-      - `"additionalProperties": true` - Index all fields dynamically (flexible but slower)
+      - `"additionalProperties": true` - Store undeclared fields and index them dynamically (flexible
+      but slower)
 
-      - If not specified, dynamic indexing is disabled
+      - If not specified, undeclared fields are stored but not indexed
+
+
+      Dynamic indexing only ever applies to undeclared fields. A property
+
+      listed in `properties` is indexed exactly as its declaration says: one
+
+      declared with `x-antfly-index: false`, or with a non-text type such as
+
+      `blob` or `embedding`, stays out of the text index even when the
+
+      enclosing object sets `"additionalProperties": true`.
 
 
       **Nested Objects**:
@@ -263,6 +277,29 @@ tags:
 
       ```
 
+      The value is still stored and returned with the document, but nothing at
+
+      or below that path is indexed: no text postings, no typed doc values, and
+
+      no dynamic indexing even when the enclosing object sets
+
+      `"additionalProperties": true`. On an object or an array's `items` it
+
+      applies to the whole subtree. This is the way to keep a large field that
+
+      exists only as the source of an embeddings index out of the text index.
+
+
+      Adding `x-antfly-index: false` to an existing table is a schema
+
+      migration, not an in-place edit: the current full-text index keeps
+
+      serving the field's existing postings until the replacement index has
+
+      been rebuilt under the new schema, and only then are they gone. The
+
+      table does not shrink on the schema update itself.
+
 
       ### `x-antfly-include-in-all`
 
@@ -319,7 +356,7 @@ tags:
 
       ### Special Types
 
-      - `embedding` - Vector embeddings (not indexed in Bleve). Use for similarity search.
+      - `embedding` - Vector embeddings (not indexed in the full-text index). Use for similarity search.
 
       - `blob` - Binary data (not indexed). Use for images, files, binary content.
 
@@ -1032,7 +1069,8 @@ tags:
 
       ### `full_text` - Full-Text Search Index
 
-      BM25-based full-text search using Bleve. Automatically uses schema information for field mappings.
+      BM25-based full-text search using Antfly's native Zig full-text index (a segmented, Lucene-style
+      inverted index). Automatically uses schema information for field mappings.
 
 
       **Configuration**:
@@ -1370,34 +1408,9 @@ tags:
 
          See: https://antfly.io/docs/configuration#security--cors
 
-      4. **encodeToon** - Encode data in TOON format (Token-Oriented Object Notation)
-         ```handlebars
-         {{encodeToon this.fields}}
-         {{encodeToon this.fields lengthMarker=false indent=4}}
-         {{encodeToon this.fields delimiter="\t"}}
-         ```
-
-         **TOON Format** provides **30-60% token reduction** compared to JSON:
-         - Compact syntax using `:` for key-value pairs
-         - Array length markers: `tags[#3]: ai,search,ml`
-         - Tabular format for uniform data structures
-         - Optimized for LLM parsing
-
-         Options:
-         - `lengthMarker` (bool): Add # prefix to array counts (default: true)
-         - `indent` (int): Indentation spacing (default: 2)
-         - `delimiter` (string): Field separator for tabular arrays (use `"\t"` for tabs)
-
-         Example output:
-         ```
-         title: Introduction to Vector Search
-         author: Jane Doe
-         tags[#3]: ai,search,ml
-         ```
-
-         **References:**
-         - TOON Specification: https://github.com/toon-format/toon
-         - Go Implementation: https://github.com/alpkeskin/gotoon
+      4. **encodeToon** is not available in these templates. It is a helper of the
+         retrieval agent's `document_renderer`, which renders documents into the
+         generation prompt as TOON by default.
 
       Without a template, the `field` value is used directly, or the entire document is serialized.
 
@@ -12691,50 +12704,9 @@ components:
 
            See: https://antfly.io/docs/configuration#security--cors
 
-        4. **encodeToon** - Encode data in TOON format (Token-Oriented Object Notation)
-           ```handlebars
-           {{encodeToon this.fields}}
-           {{encodeToon this.fields lengthMarker=false indent=4}}
-           {{encodeToon this.fields delimiter="\t"}}
-           ```
-
-           **What is TOON?**
-           TOON is a compact, human-readable format designed for passing structured data to LLMs.
-           It provides **30-60% token reduction** compared to JSON while maintaining high LLM
-           comprehension accuracy.
-
-           **Key Features:**
-           - Compact syntax using `:` for key-value pairs
-           - Array length markers: `tags[#3]: ai,search,ml`
-           - Tabular format for uniform data structures
-           - Optimized for LLM parsing and understanding
-           - Maintains human readability
-
-           **Benefits:**
-           - **Lower API costs** - Reduced token usage means lower LLM API costs
-           - **Faster responses** - Less tokens to process
-           - **More context** - Fit more documents within token limits
-
-           **Options:**
-           - `lengthMarker` (bool): Add # prefix to array counts like `[#3]` (default: true)
-           - `indent` (int): Indentation spacing for nested objects (default: 2)
-           - `delimiter` (string): Field separator for tabular arrays (default: none, use `"\t"` for tabs)
-
-           **Example output:**
-           ```
-           title: Introduction to Vector Search
-           author: Jane Doe
-           tags[#3]: ai,search,ml
-           metadata:
-             edition: 2
-             pages: 450
-           ```
-
-           **Default in RAG:** TOON is the default format for document rendering in RAG queries.
-
-           **References:**
-           - TOON Specification: https://github.com/toon-format/toon
-           - Go Implementation: https://github.com/alpkeskin/gotoon
+        4. **encodeToon** is not available in these templates. It is a helper of the
+           retrieval agent's `document_renderer`, which renders documents into the
+           generation prompt as TOON by default.
 
         **Template Examples:**
 
@@ -14762,7 +14734,7 @@ components:
 
         - "propose": Wait for Raft proposal acceptance (fastest, default)
 
-        - "write": Wait for Pebble KV write
+        - "write": Wait for the write to be durably applied to the local key-value store
 
         - "full_text": Wait for full-text index WAL write
 
@@ -18167,9 +18139,11 @@ components:
         output:
           type: string
           description: >
-            Preferred output artifact. Suggested values are `query_request`, `bleve`, and
+            Preferred output artifact. Suggested values are `query_request`, `bleve` (Antfly's
 
-            `filter_query`. The compatibility `query` field is still returned for existing clients.
+            native, Bleve-compatible full-text query JSON), and `filter_query`. The compatibility
+
+            `query` field is still returned for existing clients.
           example: query_request
         constraints:
           type: object
@@ -18221,7 +18195,9 @@ components:
         query:
           type: object
           description: >
-            Generated search query in native Bleve format.
+            Generated search query in Antfly's native full-text query format (a Bleve-compatible
+
+            JSON query DSL: `match`, `term`, `conjuncts`, `disjuncts`, `must_not`, etc.).
 
             Can be used directly in QueryRequest.full_text_search or filter_query.
           additionalProperties: true
@@ -18918,11 +18894,36 @@ components:
         document_renderer:
           type: string
           description: >
-            Handlebars template for rendering documents in the generation prompt.
+            Handlebars template that renders each retrieved document in the
 
-            Default uses TOON format for token efficiency.
+            generation prompt. Requires steps.generation to be set.
 
-            Requires steps.generation to be set.
+
+            The template is rendered once per hit against `{id, score, fields}`,
+
+            where `fields` is the hit's source. When omitted, each document's
+
+            fields are encoded as TOON (Token-Oriented Object Notation), which
+
+            carries the same structure as JSON in fewer tokens.
+
+
+            Helpers: `encodeToon` (options `indent`, 1 to 16, default 2; and
+
+            `delimiter`: `comma`, `tab`, or `pipe`), `scrubHtml`, `eq`, and
+
+            `media`. Values in `{{...}}` are HTML-escaped; use `{{{...}}}` for
+
+            raw text.
+
+
+            Examples:
+
+            - `{{encodeToon this.fields}}`
+
+            - `{{encodeToon this.fields delimiter="tab"}}`
+
+            - `Title: {{{this.fields.title}}}`
           example: '{{encodeToon this.fields}}'
     RetrievalAgentResult:
       type: object
@@ -20214,12 +20215,18 @@ components:
           $ref: '#/components/schemas/GraphMetricQuery'
           description: Direct top-k read from a published graph metric generation. Results are returned
             in graph_metric_results under the requested name or the metric name when no explicit name
-            is supplied.
+            is supplied. Supplying seed_nodes switches a pagerank metric to query-seeded personalized
+            PageRank computed at query time; that form requires metric_freshness=fresh because published
+            generations are global-only.
         graph_metric_rerank:
           $ref: '#/components/schemas/GraphMetricRerank'
           description: Blend a published graph metric feature into ordinary search hit scores. Requests
             may require either any published generation or a generation that is fresh with respect to
-            graph writes.
+            graph writes. Supplying seed_nodes switches a pagerank metric to a query-seeded personalized
+            PageRank blend computed at query time; that form requires metric_freshness=fresh. Retrieval-agent
+            queries may opt in to automatic seeding with auto_seed=true, which seeds the blend from the
+            query's literal graph-search start keys; only valid for pagerank metrics with metric_freshness=fresh.
+            Caller-supplied seed_nodes always take precedence and are never overwritten.
         analyses:
           $ref: '#/components/schemas/Analyses'
         graph_queries:
@@ -20245,65 +20252,11 @@ components:
         document_renderer:
           type: string
           description: >
-            Optional Handlebars template string for rendering document content in RAG queries.
+            Not supported on queries, which do not generate text; requests that
 
-            Template has access to document fields via `{{this.fields.fieldName}}`.
+            set it are rejected. Set `document_renderer` on a retrieval agent
 
-
-            **Default**: Uses TOON (Token-Oriented Object Notation) format for 30-60% token reduction:
-
-            ```handlebars
-
-            {{encodeToon this.fields}}
-
-            ```
-
-
-            **Available Helpers**:
-
-            - `encodeToon` - Renders fields in compact TOON format with configurable options:
-              - `lengthMarker` (bool): Add # prefix to array counts (default: true)
-              - `indent` (int): Indentation spacing (default: 2)
-              - `delimiter` (string): Field separator for tabular arrays
-            - `scrubHtml` - Removes HTML tags and extracts text
-
-            - `media` - Wraps data URIs for GenKit multimodal support
-
-            - `eq` - Equality comparison for conditionals
-
-
-            **Examples**:
-
-            - Basic TOON: `{{encodeToon this.fields}}`
-
-            - Compact TOON: `{{encodeToon this.fields lengthMarker=false indent=0}}`
-
-            - Tabular data: `{{encodeToon this.fields delimiter="\t"}}`
-
-            - Custom template: `Title: {{this.fields.title}}\nBody: {{this.fields.body}}`
-
-            - Traditional format: `{{#each this.fields}}{{@key}}: {{this}}\n{{/each}}`
-
-
-            TOON format produces compact, LLM-optimized output like:
-
-            ```
-
-            title: Introduction to Vector Search
-
-            author: Jane Doe
-
-            tags[#3]: ai,search,ml
-
-            ```
-
-
-            **References**:
-
-            - TOON Specification: https://github.com/toon-format/toon
-
-            - Go Implementation: https://github.com/alpkeskin/gotoon
-          example: '{{encodeToon this.fields}}'
+            request to control how documents appear in the generation prompt.
         pruner:
           $ref: '#/components/schemas/Pruner'
           description: >
@@ -22238,9 +22191,9 @@ components:
         publication_filter:
           $ref: '#/components/schemas/RawQuery'
           description: >
-            Bleve-style filter query that gets translated to SQL and applied as a
+            Antfly's native filter query (see `RawQuery`) that gets translated to SQL and
 
-            WHERE clause on the PostgreSQL publication. This filters rows at the
+            applied as a WHERE clause on the PostgreSQL publication. This filters rows at the
 
             source before they are sent over the replication stream, reducing
 
@@ -22376,7 +22329,7 @@ components:
         where:
           $ref: '#/components/schemas/RawQuery'
           description: >
-            Bleve-style filter query evaluated against each CDC row. Only rows
+            Antfly's native filter query (see `RawQuery`) evaluated against each CDC row. Only rows
 
             matching this filter are written to `target_table`. If omitted,
 
@@ -23147,19 +23100,14 @@ components:
 
         Antfly inference is Antfly's built-in ML service for local embeddings using ONNX models.
 
-        It provides embedding generation with multi-tier caching (memory + persistent).
-
 
         **Features:**
 
         - Local ONNX-based embedding generation
 
-        - L1 memory cache with configurable TTL
-
-        - L2 persistent Pebble database cache
-
-        - Singleflight deduplication for concurrent identical requests
-
+        - Query-time embeddings are served from an in-memory cache (64 MiB budget,
+          5-minute TTL by default) with concurrent identical requests coalesced onto
+          a single computation; there is no persistent on-disk cache tier
 
         **Example Models:** bge-base-en-v1.5 (768 dims), all-MiniLM-L6-v2 (384 dims)
 
@@ -23263,6 +23211,47 @@ components:
         - asset
         - embedding
       description: Managed generated artifact kind.
+    EnrichmentNeighborContextConfig:
+      type: object
+      additionalProperties: false
+      required:
+        - graph_index
+      description: Bounded sample of the document's same-shard graph neighbors appended to an asset producer's
+        rendered input as a compact JSON block ({"neighbors":[{"edge_type":...,"direction":...,"target":...,"weight":...}]}),
+        ordered by edge type then target key. A conceptualizer enrichment on an entities table can thereby
+        ground its abstractions in adjacent facts ("started_by -> John Andrew Rice"). The sampled block
+        participates in the producer's skip state, so a changed adjacency re-runs the producer.
+      properties:
+        graph_index:
+          type: string
+          minLength: 1
+          description: Name of a graph index on the same table whose local state is sampled. Validated
+            at admission; cross-shard neighbors are not sampled.
+        edge_types:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            type: string
+            minLength: 1
+          description: Edge types to sample. Empty admits every edge type.
+        direction:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          enum:
+            - out
+            - in
+            - both
+          default: both
+          description: Adjacency orientation to sample relative to the document.
+        limit:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint32
+          minimum: 1
+          maximum: 64
+          default: 8
+          description: Maximum neighbors rendered into the producer input, applied after deterministic
+            ordering.
     ExecutionPolicy:
       type: object
       additionalProperties: false
@@ -23404,8 +23393,11 @@ components:
         source_artifact_name:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: Existing artifact stream this enrichment consumes. Chunk enrichments may consume
-            asset artifacts; embedding enrichments may consume chunk artifacts.
+          description: 'Existing artifact stream this enrichment consumes. Chunk enrichments may consume
+            asset artifacts; embedding enrichments may consume chunk artifacts; asset enrichments may
+            consume other asset artifacts (the upstream asset''s produced bytes become this producer''s
+            source, so field and template must be omitted and the producer must consume text: copy, generator,
+            or extractor).'
         expected_dims:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -23450,6 +23442,14 @@ components:
           description: Write-only serialized producer configuration. For managed embedding enrichments
             Antfly stores a canonical semantic producer identity here; credentials and execution policy
             are excluded.
+        neighbor_context:
+          $ref: '#/components/schemas/EnrichmentNeighborContextConfig'
+          description: Optional bounded sample of the document's graph neighbors appended to the producer
+            input. Only valid on asset enrichments whose producer consumes rendered prompt text (generator
+            or extractor); producers that treat the source as a media locator (copy, reader, transcriber,
+            document_extraction) reject it. Only same-shard graph state is sampled; a graph index without
+            local state for a document yields empty neighbors at runtime while the graph index reference
+            itself is validated at admission.
         execution:
           $ref: '#/components/schemas/ExecutionPolicy'
           description: Non-semantic execution policy for this enrichment producer. This does not participate
@@ -23616,7 +23616,7 @@ components:
         Configuration for the Antfly inference chunking provider.
 
 
-        Antfly inference is a centralized HTTP service that provides chunking with multi-tier caching.
+        Antfly inference is Antfly's built-in ML service for local chunking.
 
         The model name maps to ONNX model directory names (similar to how Ollama works).
 
@@ -23628,13 +23628,11 @@ components:
         - Any other name will attempt to load from models/chunkers/{name}/ directory
 
 
-        **Caching:**
+        **Deduplication:**
 
-        - L1: Memory cache with 2-minute TTL
-
-        - L2: Persistent Pebble database
-
-        - Singleflight deduplication for concurrent identical requests
+        - Within a single document write, chunk results are deduplicated when multiple
+          indexes share the same source text and chunker configuration, so the source
+          is chunked at most once per write.
       allOf:
         - $ref: '#/components/schemas/ChunkOptions'
         - type: object
@@ -23688,12 +23686,13 @@ components:
               x-go-type-skip-optional-pointer: true
               type: object
               description: >
-                Configuration for full-text indexing of chunks in Bleve.
+                Configuration for full-text indexing of chunks.
 
-                When present (even if empty), chunks will be stored with :cft: suffix and indexed in Bleve's
-                _chunks field.
+                When present (even if empty), chunk artifacts are persisted and indexed in Antfly's native
+                full-text index, queryable and projectable via the document's `_chunks` field.
 
-                When absent, chunks use :c: suffix and are only used for vector embeddings.
+                When absent, chunks are generated only to drive vector embeddings and are not indexed
+                for full-text search (unless `store_chunks` is also set).
               additionalProperties: true
             api_url:
               type: string
@@ -24471,6 +24470,15 @@ components:
           type: string
         key_template:
           type: string
+        labels:
+          type: array
+          items:
+            type: string
+          description: Mention labels this resolver consumes; empty consumes every label (catch-all).
+            Labeled resolvers sharing a source artifact must claim disjoint label sets, and every catch-all
+            on that artifact skips the labels claimed by labeled siblings, so extraction labels stay open-vocabulary
+            while each mention routes to exactly one labeled resolver (label-routed tables, e.g. event
+            mentions to an events table).
         type_must_match:
           type: boolean
           default: true
@@ -24516,6 +24524,15 @@ components:
           type: number
           format: double
           minimum: 0
+        min_confidence:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+          description: 'Mention admission floor: mentions whose extractor-asserted confidence is below
+            this are never resolved — no canonical entity key, no mention edge, and relation endpoints
+            referencing them are withheld. The cheap post-extraction junk filter for score-carrying extractors;
+            0 (the default) admits everything.'
         config_generation:
           type: integer
           format: uint64
@@ -25666,6 +25683,8 @@ components:
           default: false
         content_type:
           type: string
+        neighbor_context:
+          $ref: '#/components/schemas/EnrichmentNeighborContextConfig'
         execution:
           $ref: '#/components/schemas/ExecutionPolicy'
     CreatedIndexCommon:
@@ -26733,6 +26752,10 @@ components:
         fatal_error_count:
           type: integer
           format: uint64
+          description: Durable count of enrichment requests parked with a non-retryable (terminal) disposition,
+            plus fatal worker failures. A terminally failed request never returns to pending; per-document
+            terminal state is reported by the owning index's coverage counters (terminal_failed), and
+            per-document diagnostics by the artifact repair issue listing.
         consecutive_retry_count:
           type: integer
           format: uint32
@@ -30225,6 +30248,27 @@ components:
           default: published
           description: Whether the latest published generation may be stale or must match the graph edge
             generation.
+        seed_nodes:
+          type: array
+          maxItems: 128
+          items:
+            type: string
+            minLength: 1
+          description: 'Node keys receiving all teleport mass for query-seeded personalized PageRank (HippoRAG-style
+            retrieval). Only valid for pagerank metrics and requires metric_freshness=fresh: personalized
+            scores are computed at query time from the current edge snapshot, while published generations
+            are global-only, so seeded reads against published freshness are rejected. Seed keys absent
+            from the graph are skipped; if none resolve, ranking degenerates to global PageRank.'
+        damping:
+          type: number
+          format: double
+          minimum: 0
+          exclusiveMinimum: true
+          maximum: 1
+          exclusiveMaximum: true
+          description: Damping override for query-seeded personalized PageRank (typical HippoRAG-style
+            retrieval uses 0.9). Only valid together with seed_nodes; omitted reads keep the metric's
+            configured damping.
     GraphMetricRerank:
       type: object
       description: Blends a published graph metric into hit scores. Multi-shard tables require a globally
@@ -30272,6 +30316,34 @@ components:
             - fresh
           default: published
           description: Whether stale published generations are acceptable or the metric must be fresh.
+        seed_nodes:
+          type: array
+          maxItems: 128
+          items:
+            type: string
+            minLength: 1
+          description: 'Node keys receiving all teleport mass for a query-seeded personalized PageRank
+            blend (HippoRAG-style retrieval). Only valid for pagerank metrics and requires metric_freshness=fresh:
+            the blended feature scores are computed at query time from the current edge snapshot, while
+            published generations are global-only, so seeded blends against published freshness are rejected.
+            Seed keys absent from the graph are skipped; if none resolve, the blend degenerates to global
+            PageRank.'
+        damping:
+          type: number
+          format: double
+          minimum: 0
+          exclusiveMinimum: true
+          maximum: 1
+          exclusiveMaximum: true
+          description: Damping override for the query-seeded personalized PageRank blend. Only valid together
+            with seed_nodes; omitted blends keep the metric's configured damping.
+        auto_seed:
+          type: boolean
+          default: false
+          description: 'Seed the personalized PageRank blend from the query''s literal graph-search start
+            keys; only valid for pagerank metrics with metric_freshness=fresh. Honored by retrieval-agent
+            queries: caller-supplied seed_nodes always take precedence and are never overwritten, and
+            queries without literal graph-search start keys keep their unseeded (global) blend.'
     GraphIdentifier:
       type: string
       minLength: 1

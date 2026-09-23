@@ -45,6 +45,7 @@ pub const EmbeddingsIndexConfig = types.EmbeddingsIndexConfig;
 pub const EmbeddingsIndexStats = types.EmbeddingsIndexStats;
 pub const EnrichmentConfig = types.EnrichmentConfig;
 pub const EnrichmentKind = types.EnrichmentKind;
+pub const EnrichmentNeighborContextConfig = types.EnrichmentNeighborContextConfig;
 pub const EnrichmentRuntimeStatus = types.EnrichmentRuntimeStatus;
 pub const ExecutionPolicy = types.ExecutionPolicy;
 pub const FullTextArtifactIndexSource = types.FullTextArtifactIndexSource;

@@ -63,7 +63,8 @@ export function Qwen3EmbeddingChapters({ spec }: ChaptersProps) {
             The figure contrasts representative whitespace conventions, not actual tokenizer output.
           </p>
           <p>
-            The managed model profile formats queries as <code>Instruct: …\nQuery:…</code>;
+            The managed model profile formats queries as <code>Instruct: …\nQuery:…</code>
+            {";"}
             documents have an empty prefix. Choose the query or document task consistently when
             building and searching an index. The bundle declares last-token pooling and
             normalization, and the pipeline ensures a trailing EOS even when the tokenizer sidecar

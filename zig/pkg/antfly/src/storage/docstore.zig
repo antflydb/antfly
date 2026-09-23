@@ -113,7 +113,11 @@ fn appendReplayArtifactsForHint(
                 internal_keys.isAssetArtifactKey(key) or
                 internal_keys.isChunkArtifactRecordKey(key) or
                 internal_keys.isResolutionArtifactKey(key),
-            .resolution => internal_keys.isAssetArtifactKey(key),
+            // Resolution artifact keys reach the resolution stage too: a
+            // committed sibling resolution re-drives event-identity
+            // composition over the shared source artifact.
+            .resolution => internal_keys.isAssetArtifactKey(key) or
+                internal_keys.isResolutionArtifactKey(key),
             .promotion => internal_keys.isResolutionArtifactKey(key),
             .enrichment, .full_text, .algebraic => false,
         };

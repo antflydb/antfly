@@ -5437,15 +5437,60 @@ fn findDistributedShortestPath(
         const expansion_table = item.table orelse table_name;
         const table_state = try admission.ensureTable(expansion_table);
         if (!table_state.allowed) return error.TableNotFound;
-        if (!(try admission.graphIndexAvailable(table_state, graph_query.query.index_name))) continue;
-        const group_id = (try table_catalog.resolveGroupForKeyPinnedUntil(
-            alloc,
-            catalog,
-            expansion_table,
-            item.key,
-            table_state.topology_epoch,
-            worker.routingDeadline(catalog),
-        )) orelse return error.TableNotFound;
+        const tagged_index_available = try admission.graphIndexAvailable(table_state, graph_query.query.index_name);
+        const item_cross_table = item.table != null;
+        if (!tagged_index_available and !item_cross_table) continue;
+        // Mirror batchFrontierByGroup: a cross-table node's entity-sourced
+        // edges are owner-scoped rows scattered across the SOURCE table's
+        // groups, so the weighted search fans the expansion across them in
+        // addition to the tagged table's owner route. Pareto admission
+        // deduplicates the merged frontier.
+        const WeightedExpandRoute = struct {
+            table_state: *const GraphAdmissionTableState,
+            table_name: []const u8,
+            group_id: u64,
+        };
+        var expand_routes = std.ArrayListUnmanaged(WeightedExpandRoute).empty;
+        defer expand_routes.deinit(alloc);
+        if (tagged_index_available) {
+            const group_id = (try table_catalog.resolveGroupForKeyPinnedUntil(
+                alloc,
+                catalog,
+                expansion_table,
+                item.key,
+                table_state.topology_epoch,
+                worker.routingDeadline(catalog),
+            )) orelse return error.TableNotFound;
+            try expand_routes.append(alloc, .{
+                .table_state = table_state,
+                .table_name = expansion_table,
+                .group_id = group_id,
+            });
+        }
+        if (item_cross_table) {
+            const source_state = try admission.ensureTable(table_name);
+            if (!source_state.allowed) return error.TableNotFound;
+            if (try admission.graphIndexAvailable(source_state, graph_query.query.index_name)) {
+                const group_ids = try table_catalog.resolveGroupsForSpanPinnedUntil(
+                    alloc,
+                    catalog,
+                    table_name,
+                    "",
+                    "",
+                    source_state.topology_epoch,
+                    worker.routingDeadline(catalog),
+                );
+                defer if (group_ids.len > 0) alloc.free(group_ids);
+                if (group_ids.len == 0) return error.TableNotFound;
+                for (group_ids) |group_id| {
+                    try expand_routes.append(alloc, .{
+                        .table_state = source_state,
+                        .table_name = table_name,
+                        .group_id = group_id,
+                    });
+                }
+            }
+        }
         const frontier_ids = [_]u32{0};
         // The caller-facing slices and GraphExpandRequest each own one copy of
         // every exclusion. Reserve both peaks before the first allocation.
@@ -5469,68 +5514,70 @@ fn findDistributedShortestPath(
         }
         const exclude_edge_keys = try collectExcludedEdgeKeys(alloc, excluded_edges);
         defer freeKeys(alloc, exclude_edge_keys);
-        var one_frontier = [_]FrontierState{item};
-        var step_req = try makeGraphExpandRequestWithAlgebraicMode(alloc, graph_query, one_frontier[0..], frontier_ids[0..], exclude_node_refs, exclude_edge_keys, true, algebraic_semiring_selected);
-        step_req.topology_epoch = table_state.topology_epoch;
-        step_req.identity_read_generation = try table_state.generationForGroup(group_id);
-        defer step_req.deinit(alloc);
+        for (expand_routes.items) |route| {
+            var one_frontier = [_]FrontierState{item};
+            var step_req = try makeGraphExpandRequestWithAlgebraicMode(alloc, graph_query, one_frontier[0..], frontier_ids[0..], exclude_node_refs, exclude_edge_keys, true, algebraic_semiring_selected);
+            step_req.topology_epoch = route.table_state.topology_epoch;
+            step_req.identity_read_generation = try route.table_state.generationForGroup(route.group_id);
+            defer step_req.deinit(alloc);
 
-        var step_result = try worker.executeGraphExpand(alloc, group_id, expansion_table, step_req, consistency);
-        defer step_result.deinit(alloc);
-        try consumeDistributedExpansionWork(request_work_budget, step_result.expansions);
+            var step_result = try worker.executeGraphExpand(alloc, route.group_id, route.table_name, step_req, consistency);
+            defer step_result.deinit(alloc);
+            try consumeDistributedExpansionWork(request_work_budget, step_result.expansions);
 
-        if (step_result.expansions.len == 0) continue;
-        const step_graph = step_result.expansions[0].graph_result;
-        const admitted_nodes = try graphResultNodeAdmissionMaskAlloc(
-            alloc,
-            admission,
-            table_name,
-            expansion_table,
-            step_graph.nodes,
-        );
-        defer alloc.free(admitted_nodes);
-        for (step_graph.nodes, admitted_nodes) |node, allowed| {
-            if (!allowed) continue;
-            const node_table = canonicalExpandedNodeTable(
+            if (step_result.expansions.len == 0) continue;
+            const step_graph = step_result.expansions[0].graph_result;
+            const admitted_nodes = try graphResultNodeAdmissionMaskAlloc(
+                alloc,
+                admission,
                 table_name,
-                expansion_table,
-                node.table,
+                route.table_name,
+                step_graph.nodes,
             );
-            const node_ref = graph_node_identity.Ref{ .table = node_table, .key = node.key };
-            if (excluded_nodes) |set| {
-                if (set.contains(node_ref)) continue;
+            defer alloc.free(admitted_nodes);
+            for (step_graph.nodes, admitted_nodes) |node, allowed| {
+                if (!allowed) continue;
+                const node_table = canonicalExpandedNodeTable(
+                    table_name,
+                    route.table_name,
+                    node.table,
+                );
+                const node_ref = graph_node_identity.Ref{ .table = node_table, .key = node.key };
+                if (excluded_nodes) |set| {
+                    if (set.contains(node_ref)) continue;
+                }
+
+                const candidate_cost = item.cost + try edgeCost(
+                    item,
+                    node,
+                    graph_query.query.params.weight_mode,
+                );
+                const candidate_depth = item.depth + 1;
+                if (!try best_cost.recordIfPareto(alloc, node_ref, candidate_depth, candidate_cost)) continue;
+                const path_state_id = try appendPathStateFromWeightedStep(
+                    alloc,
+                    &state,
+                    item,
+                    node,
+                    node_table,
+                    graph_query.query.params.weight_mode,
+                );
+                const path_state = state.path_states.items[path_state_id];
+
+                var next_item = try initFrontierState(
+                    alloc,
+                    path_state.key,
+                    path_state.table,
+                    path_state.depth,
+                    path_state.distance,
+                    path_state.cost,
+                    path_state_id,
+                    request_work_budget,
+                );
+                errdefer next_item.deinit(alloc);
+                try frontier.push(alloc, next_item);
+                try request_work_budget.checkIntermediateStates(frontier.items.len, graph_pattern_mod.default_max_intermediate_states);
             }
-
-            const candidate_cost = item.cost + try edgeCost(
-                item,
-                node,
-                graph_query.query.params.weight_mode,
-            );
-            const candidate_depth = item.depth + 1;
-            if (!try best_cost.recordIfPareto(alloc, node_ref, candidate_depth, candidate_cost)) continue;
-            const path_state_id = try appendPathStateFromWeightedStep(
-                alloc,
-                &state,
-                item,
-                node,
-                node_table,
-                graph_query.query.params.weight_mode,
-            );
-            const path_state = state.path_states.items[path_state_id];
-
-            var next_item = try initFrontierState(
-                alloc,
-                path_state.key,
-                path_state.table,
-                path_state.depth,
-                path_state.distance,
-                path_state.cost,
-                path_state_id,
-                request_work_budget,
-            );
-            errdefer next_item.deinit(alloc);
-            try frontier.push(alloc, next_item);
-            try request_work_budget.checkIntermediateStates(frontier.items.len, graph_pattern_mod.default_max_intermediate_states);
         }
     }
 
@@ -5598,29 +5645,71 @@ fn batchFrontierByGroup(
         while (it.next()) |ids| ids.deinit(alloc);
         incoming_frontier_by_table.deinit(alloc);
     }
+    // Cross-table (tagged) frontier nodes carry adjacency in TWO places: the
+    // tagged table's identically named index owns adjacency written by that
+    // table's own documents, while entity-sourced edges produced by THIS
+    // table's documents are owner-scoped rows scattered across the SOURCE
+    // table's groups (the edge artifact key leads with the producing
+    // document). Owner-key routing in the tagged table alone therefore
+    // silently misses the source-table rows, and a tagged table without the
+    // index used to terminate the node entirely. Tagged nodes fan out across
+    // the source table's groups in addition to the tagged-table route; the
+    // hop merge deduplicates by canonical {table, key} identity. The span is
+    // resolved once per call.
+    var source_span_groups: ?[]u64 = null;
+    defer if (source_span_groups) |group_ids| {
+        if (group_ids.len > 0) alloc.free(group_ids);
+    };
 
     for (frontier, 0..) |item, i| {
         if (item.depth >= max_depth) continue;
         const table_name = item.table orelse source_table;
         const table_state = try admission.ensureTable(table_name);
         if (!table_state.allowed) return error.TableNotFound;
-        if (!(try admission.graphIndexAvailable(table_state, index_name))) continue;
+        const tagged_index_available = try admission.graphIndexAvailable(table_state, index_name);
+        const cross_table = item.table != null;
+        if (!tagged_index_available and !cross_table) continue;
         switch (direction) {
             .out => {
-                const group_id = (try table_catalog.resolveGroupForKeyPinnedUntil(
-                    alloc,
-                    catalog,
-                    table_name,
-                    item.key,
-                    table_state.topology_epoch,
-                    worker.routingDeadline(catalog),
-                )) orelse return error.TableNotFound;
-                try appendFrontierBatch(alloc, &batches, table_state, group_id, @intCast(i));
+                if (tagged_index_available) {
+                    const group_id = (try table_catalog.resolveGroupForKeyPinnedUntil(
+                        alloc,
+                        catalog,
+                        table_name,
+                        item.key,
+                        table_state.topology_epoch,
+                        worker.routingDeadline(catalog),
+                    )) orelse return error.TableNotFound;
+                    try appendFrontierBatch(alloc, &batches, table_state, group_id, @intCast(i));
+                }
+                if (cross_table) {
+                    const source_state = try admission.ensureTable(source_table);
+                    if (!source_state.allowed) return error.TableNotFound;
+                    if (try admission.graphIndexAvailable(source_state, index_name)) {
+                        const group_ids = source_span_groups orelse blk: {
+                            const resolved = try table_catalog.resolveGroupsForSpanPinnedUntil(
+                                alloc,
+                                catalog,
+                                source_table,
+                                "",
+                                "",
+                                source_state.topology_epoch,
+                                worker.routingDeadline(catalog),
+                            );
+                            source_span_groups = resolved;
+                            break :blk resolved;
+                        };
+                        if (group_ids.len == 0) return error.TableNotFound;
+                        for (group_ids) |group_id| {
+                            try appendFrontierBatch(alloc, &batches, source_state, group_id, @intCast(i));
+                        }
+                    }
+                }
             },
             .in, .both => {
                 // Preserve the target-owner route for `.both` so outgoing
                 // adjacency is read even when that shard has no reverse row.
-                if (direction == .both) {
+                if (direction == .both and tagged_index_available) {
                     const owner_group_id = (try table_catalog.resolveGroupForKeyPinnedUntil(
                         alloc,
                         catalog,
@@ -5631,9 +5720,23 @@ fn batchFrontierByGroup(
                     )) orelse return error.TableNotFound;
                     try appendFrontierBatch(alloc, &batches, table_state, owner_group_id, @intCast(i));
                 }
-                const gop = try incoming_frontier_by_table.getOrPut(alloc, table_state.table_name);
-                if (!gop.found_existing) gop.value_ptr.* = .empty;
-                try gop.value_ptr.append(alloc, @intCast(i));
+                if (tagged_index_available) {
+                    const gop = try incoming_frontier_by_table.getOrPut(alloc, table_state.table_name);
+                    if (!gop.found_existing) gop.value_ptr.* = .empty;
+                    try gop.value_ptr.append(alloc, @intCast(i));
+                }
+                // Reverse rows for a cross-table node's entity-target edges
+                // are colocated with the source-owned rows in the SOURCE
+                // table's groups; probe there too.
+                if (cross_table) {
+                    const source_state = try admission.ensureTable(source_table);
+                    if (!source_state.allowed) return error.TableNotFound;
+                    if (try admission.graphIndexAvailable(source_state, index_name)) {
+                        const gop = try incoming_frontier_by_table.getOrPut(alloc, source_state.table_name);
+                        if (!gop.found_existing) gop.value_ptr.* = .empty;
+                        try gop.value_ptr.append(alloc, @intCast(i));
+                    }
+                }
             },
         }
     }
@@ -14723,6 +14826,7 @@ test "distributed graph traverse routes cross-table frontier by table generation
     const TestState = struct {
         expand_calls: u32 = 0,
         hydrate_calls: u32 = 0,
+        source_fanout_calls: u32 = 0,
     };
 
     const FakeCatalog = struct {
@@ -14797,24 +14901,32 @@ test "distributed graph traverse routes cross-table frontier by table generation
             try std.testing.expect(req.topology_epoch != 0);
             state.expand_calls += 1;
 
-            const next_key: []const u8 = if (state.expand_calls == 1) blk: {
+            // Hop 2 reaches the cross-table node through TWO routes whose
+            // batch order is map-iteration order: the tagged table's owner
+            // group (its identically named index) and the source table's
+            // span fanout (the document-owned entity-sourced rows live
+            // there). The fanout leg returns no rows in this fixture.
+            var next_key: []const u8 = undefined;
+            var next_table: ?[]const u8 = null;
+            if (std.mem.eql(u8, req.frontier[0].key, "doc:a")) {
                 try std.testing.expectEqualStrings("docs", table_name);
                 try std.testing.expectEqual(@as(u64, 11), group_id);
-                try std.testing.expectEqualStrings("doc:a", req.frontier[0].key);
                 try std.testing.expect(req.frontier[0].table == null);
-                break :blk "shared";
-            } else blk: {
-                try std.testing.expectEqual(@as(u32, 2), state.expand_calls);
-                try std.testing.expectEqualStrings("entities", table_name);
-                try std.testing.expectEqual(@as(u64, 22), group_id);
+                next_key = "shared";
+                next_table = "entities";
+            } else {
                 try std.testing.expectEqualStrings("shared", req.frontier[0].key);
                 try std.testing.expectEqualStrings("entities", req.frontier[0].table.?);
-                break :blk "doc:c";
-            };
-            const next_table: ?[]const u8 = if (state.expand_calls == 1)
-                "entities"
-            else
-                null;
+                if (std.mem.eql(u8, table_name, "docs")) {
+                    try std.testing.expectEqual(@as(u64, 11), group_id);
+                    state.source_fanout_calls += 1;
+                    return .{ .expansions = try alloc.alloc(GraphExpansion, 0) };
+                }
+                try std.testing.expectEqualStrings("entities", table_name);
+                try std.testing.expectEqual(@as(u64, 22), group_id);
+                next_key = "doc:c";
+                next_table = null;
+            }
 
             const nodes = try alloc.alloc(graph_query_mod.GraphResultNode, 1);
             errdefer alloc.free(nodes);
@@ -14914,7 +15026,8 @@ test "distributed graph traverse routes cross-table frontier by table generation
         alloc.free(results);
     }
 
-    try std.testing.expectEqual(@as(u32, 2), state.expand_calls);
+    try std.testing.expectEqual(@as(u32, 3), state.expand_calls);
+    try std.testing.expectEqual(@as(u32, 1), state.source_fanout_calls);
     try std.testing.expectEqual(@as(u32, 1), state.hydrate_calls);
     try std.testing.expectEqual(@as(usize, 1), results[0].nodes.len);
     try std.testing.expectEqualStrings("entities", results[0].nodes[0].table.?);

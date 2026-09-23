@@ -52,7 +52,7 @@ pub const SharedModules = struct {
     json: ?*std.Build.Module = null,
     httpx: ?*std.Build.Module = null,
     platform: ?*std.Build.Module = null,
-    vellum: ?*std.Build.Module = null,
+    fst: ?*std.Build.Module = null,
     scraping: ?*std.Build.Module = null,
     google: ?*std.Build.Module = null,
     objectstore: ?*std.Build.Module = null,
@@ -105,7 +105,7 @@ pub const Graph = struct {
     httpx_mod: *std.Build.Module,
     platform_mod: *std.Build.Module,
     google_mod: *std.Build.Module,
-    vellum_mod: *std.Build.Module,
+    fst_mod: *std.Build.Module,
     scraping_mod: *std.Build.Module,
     objectstore_mod: *std.Build.Module,
     regex_mod: *std.Build.Module,
@@ -171,7 +171,7 @@ pub fn create(config: Config) Graph {
         break :blk mod;
     };
     const platform_mod = shared.platform orelse @panic("inference runtime requires a configured antfly_platform module");
-    const vellum_mod = shared.vellum orelse createSharedModule(config, "lib/vellum/src/mod.zig");
+    const fst_mod = shared.fst orelse createSharedModule(config, "lib/fst/src/mod.zig");
     const google_mod = shared.google orelse blk: {
         const mod = createSharedModule(config, "lib/google/src/root.zig");
         mod.addImport("httpx", httpx_mod);
@@ -193,7 +193,7 @@ pub fn create(config: Config) Graph {
     };
     const regex_mod = shared.regex orelse blk: {
         const mod = createSharedModule(config, "lib/regex/src/mod.zig");
-        mod.addImport("antfly_vellum", vellum_mod);
+        mod.addImport("antfly_fst", fst_mod);
         break :blk mod;
     };
     const jsonschema_mod = shared.jsonschema orelse blk: {
@@ -399,7 +399,7 @@ pub fn create(config: Config) Graph {
         .httpx_mod = httpx_mod,
         .platform_mod = platform_mod,
         .google_mod = google_mod,
-        .vellum_mod = vellum_mod,
+        .fst_mod = fst_mod,
         .scraping_mod = scraping_mod,
         .objectstore_mod = objectstore_mod,
         .regex_mod = regex_mod,

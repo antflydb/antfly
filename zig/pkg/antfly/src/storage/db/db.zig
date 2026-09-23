@@ -6499,6 +6499,11 @@ pub const DB = struct {
                 try db.core.loadIndexes();
                 profile.load_indexes_ns = elapsedSince(load_indexes_started_ns);
             }
+            // Validate the physical snapshot while the opened generation is
+            // still untouched by replay and background workers. Status can
+            // then retain this proof as live writes advance past the durable
+            // checkpoint's cardinality.
+            if (opts.open_mode != .status_only) db.validateOpenedDenseServingCertificates();
             if (!openModeRequiresReadOnlyBackends(opts.open_mode)) {
                 // Catalog admission and its outbox are one primary-store
                 // commit. Materialize any crash-surviving outbox before replay
@@ -14023,6 +14028,7 @@ pub const DB = struct {
         alloc.free(@constCast(write.target));
         alloc.free(@constCast(write.edge_type));
         if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
+        if (write.owner.len > 0) alloc.free(@constCast(write.owner));
         write.* = undefined;
     }
 
@@ -14031,6 +14037,7 @@ pub const DB = struct {
         alloc.free(@constCast(delete.source));
         alloc.free(@constCast(delete.target));
         alloc.free(@constCast(delete.edge_type));
+        if (delete.owner.len > 0) alloc.free(@constCast(delete.owner));
         delete.* = undefined;
     }
 
@@ -24756,6 +24763,7 @@ pub const DB = struct {
                     alloc.free(edge.index_name);
                     alloc.free(edge.edge_type);
                     alloc.free(edge.target_doc_key);
+                    if (edge.source_node) |source| alloc.free(source);
                 }
                 const index = self.core.index_manager.graphIndex(edge.index_name) orelse continue;
                 var decoded = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, row.value);
@@ -29879,6 +29887,7 @@ pub const DB = struct {
             max_weight,
             null,
             null,
+            "",
         );
     }
 
@@ -29921,6 +29930,7 @@ pub const DB = struct {
             max_weight,
             null,
             null,
+            "",
         );
     }
 
@@ -30041,6 +30051,7 @@ pub const DB = struct {
             true,
             null,
             &work_budget,
+            .{},
         );
     }
 
@@ -30057,6 +30068,7 @@ pub const DB = struct {
         include_paths: bool,
         node_admission: ?NodeAdmission,
         work_budget: *graph_pattern_mod.WorkBudget,
+        scope: graph_query_mod.ExecutionScope,
     ) ![]graph_pattern_mod.PatternMatch {
         if (start_keys.len == 0) return try alloc.alloc(graph_pattern_mod.PatternMatch, 0);
         var filter_ctx = PatternNodeFilterContext.init(self, alloc);
@@ -30073,6 +30085,7 @@ pub const DB = struct {
             },
             .node_admission = node_admission,
             .work_budget = work_budget,
+            .owning_table = scope.owning_table,
         });
     }
 
@@ -30086,6 +30099,7 @@ pub const DB = struct {
         return_aliases: []const []const u8,
         node_admission: ?NodeAdmission,
         work_budget: *graph_pattern_mod.WorkBudget,
+        scope: graph_query_mod.ExecutionScope,
     ) ![]graph_pattern_mod.PatternMatch {
         if (start_keys.len == 0) return try alloc.alloc(graph_pattern_mod.PatternMatch, 0);
         var filter_ctx = PatternNodeFilterContext.init(self, alloc);
@@ -30097,6 +30111,7 @@ pub const DB = struct {
             .evaluator = .{ .ctx = &filter_ctx, .func = patternNodeFilterEvaluator },
             .node_admission = node_admission,
             .work_budget = work_budget,
+            .owning_table = scope.owning_table,
         });
     }
 
@@ -30107,6 +30122,7 @@ pub const DB = struct {
         start_keys: []const []const u8,
         node_admission: ?NodeAdmission,
         budgets: db_query_graph.RequestGraphBudgets,
+        scope: graph_query_mod.ExecutionScope,
     ) ![]types.GraphAggregateResult {
         if (start_keys.len == 0) {
             const empty = try alloc.alloc(types.GraphAggregateResult, named.query.aggregates.len);
@@ -30141,6 +30157,7 @@ pub const DB = struct {
                 .node_admission = node_admission,
                 .work_budget = budgets.work,
                 .distinct_budget = budgets.distinct,
+                .owning_table = scope.owning_table,
             },
         );
         defer {
@@ -31922,6 +31939,7 @@ pub const DB = struct {
                 alloc.free(@constCast(write.target));
                 alloc.free(@constCast(write.edge_type));
                 if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
+                if (write.owner.len > 0) alloc.free(@constCast(write.owner));
             }
             graph_writes.deinit(alloc);
         }
@@ -31973,6 +31991,7 @@ pub const DB = struct {
                     .created_at = graph_write.created_at,
                     .updated_at = graph_write.updated_at,
                     .metadata_json = if (graph_write.metadata_json.len > 0) try alloc.dupe(u8, graph_write.metadata_json) else "",
+                    .owner = if (graph_write.owner.len > 0) try alloc.dupe(u8, graph_write.owner) else "",
                 });
             }
         }
@@ -32393,8 +32412,64 @@ pub const DB = struct {
             return;
         }
         self.executor.notifySequence(sequence);
+        if (options.no_progress_timeout_ns != 0) {
+            // The threaded executor's waitForAll has no deadline, and the
+            // post-wait stall check (checkTargetAdvanceNoProgress in
+            // runMaintenanceUntilWithOptions) only runs after this returns —
+            // a derived index that can never satisfy its replay target (for
+            // example an artifact-backed dense index whose indexed count
+            // diverges from its expected count) parked the wait forever and
+            // the guard it was configured with never executed. Feed the same
+            // per-index stuck diagnostic through the wait's cancellation
+            // checkpoint so the guard interrupts the wait it is meant to
+            // bound; a transient interrupt (the stuck record cleared between
+            // firing and re-check) resumes waiting.
+            var guard = TargetAdvanceStallGuard{ .db = self, .timeout_ns = options.no_progress_timeout_ns };
+            while (true) {
+                const outcome = self.executor.waitForAllWithVisibilityWait(sequence, .{
+                    .cancellation = guard.token(),
+                });
+                outcome catch |err| switch (err) {
+                    error.EnrichmentWaitCanceled => {
+                        try self.checkTargetAdvanceNoProgress(options.no_progress_timeout_ns);
+                        continue;
+                    },
+                    else => return err,
+                };
+                return;
+            }
+        }
         try self.executor.waitForAll(sequence);
     }
+
+    /// Cancellation checkpoint that interrupts a threaded derived wait when
+    /// any index's target advance has been stuck past `timeout_ns` (the same
+    /// diagnostic `checkTargetAdvanceNoProgress` reads after the wait).
+    /// Throttled: the executor's wait loop polls its checkpoint every
+    /// millisecond, and the stuck scan takes the diagnostic mutex and
+    /// allocates a name snapshot, so re-checking every poll would be pure
+    /// overhead on healthy drains.
+    const TargetAdvanceStallGuard = struct {
+        db: *DB,
+        timeout_ns: u64,
+        last_check_ns: std.atomic.Value(u64) = .init(0),
+
+        const recheck_interval_ns: u64 = 250 * std.time.ns_per_ms;
+
+        fn token(self: *TargetAdvanceStallGuard) types.CancellationToken {
+            return .{ .ptr = self, .check_fn = check };
+        }
+
+        fn check(ptr: *const anyopaque) anyerror!void {
+            const self: *TargetAdvanceStallGuard = @ptrCast(@alignCast(@constCast(ptr)));
+            const now_ns = monotonicTimeNs();
+            if (now_ns -| self.last_check_ns.load(.monotonic) < recheck_interval_ns) return;
+            self.last_check_ns.store(now_ns, .monotonic);
+            var stuck = (try oldestTargetAdvanceStuck(self.db.async_context, self.timeout_ns, now_ns)) orelse return;
+            stuck.deinit(self.db.async_context.alloc);
+            return error.DerivedTargetAdvanceStuck;
+        }
+    };
 
     pub fn runDerivedUntil(self: *DB, sequence: u64) !void {
         try self.runDerivedUntilWithOptions(sequence, .{});
@@ -36656,6 +36731,7 @@ pub const DB = struct {
         item.projection_checkpoint_applied_sequence = checkpoint.applied_sequence;
         item.projection_checkpoint_generation = checkpoint.generation;
         item.projection_checkpoint_config_hash = checkpoint.config_hash;
+        item.projection_checkpoint_published_count = checkpoint.published_count;
         item.checkpoint_replay_tail_sequence_count = target_sequence -| checkpoint.applied_sequence;
         switch (checkpoint.status) {
             .clean => {},
@@ -36714,6 +36790,14 @@ pub const DB = struct {
         return .admitted;
     }
 
+    /// Seed certificate validation before replay can advance live cardinality.
+    fn validateOpenedDenseServingCertificates(self: *DB) void {
+        for (self.core.index_manager.dense_indexes.items) |*entry| {
+            const checkpoint = self.core.loadProjectionCheckpoint(self.alloc, entry.config.name) catch continue;
+            _ = entry.validateServingCertificate(checkpoint);
+        }
+    }
+
     /// Project exact resident query admission. Presence alone is insufficient
     /// because managed admission installs a gated empty generation before its
     /// first safe snapshot; cardinality is insufficient because a published
@@ -36721,17 +36805,43 @@ pub const DB = struct {
     fn vectorServingSnapshotReady(
         self: *DB,
         alloc: Allocator,
-        kind: types.IndexKind,
-        index_name: []const u8,
+        item: *const types.DBIndexStats,
         preloaded_repair_state: ?*const index_repair_state.State,
     ) bool {
-        const installed = switch (kind) {
-            .dense_vector => self.core.denseIndex(index_name) != null,
-            .sparse_vector => self.core.sparseIndex(index_name) != null,
+        const installed = switch (item.kind) {
+            .dense_vector => self.core.denseIndex(item.name) != null,
+            .sparse_vector => self.core.sparseIndex(item.name) != null,
             else => false,
         };
-        return installed and
-            self.observeResidentIndexAdmission(alloc, index_name, preloaded_repair_state) == .admitted;
+        if (!installed or self.observeResidentIndexAdmission(alloc, item.name, preloaded_repair_state) != .admitted) return false;
+        if (item.kind == .dense_vector) {
+            if (item.projection_checkpoint_published_count) |certified| {
+                const entry = self.core.denseIndex(item.name) orelse return false;
+                if (!entry.hasValidatedServingCertificate(.{
+                    .applied_sequence = item.projection_checkpoint_applied_sequence,
+                    .generation = item.projection_checkpoint_generation,
+                    .config_hash = item.projection_checkpoint_config_hash,
+                    .published_count = certified,
+                })) return false;
+            } else if (item.coverage_produced_count != 0) {
+                if (self.core.index_manager.get(item.name)) |cfg| {
+                    // Older checkpoints have no count certificate. For managed
+                    // progressive indexes use the existing durable coverage
+                    // proof instead of treating an empty HBC as ready.
+                    const proof = self.observeProgressiveManagedGenerationQueryabilityAtLeast(
+                        alloc,
+                        item.name,
+                        types.indexConfigHash(cfg.*),
+                        0,
+                    ) catch return false;
+                    switch (proof) {
+                        .queryable, .atomic_publication, .external_coverage => {},
+                        else => return false,
+                    }
+                }
+            }
+        }
+        return true;
     }
 
     fn applyDurableIndexRepairStats(
@@ -37809,6 +37919,8 @@ pub const DB = struct {
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
                     }
                     item.text_merge = self.core.index_manager.textMergeStatsSnapshotForIndex(item.name);
+                    if (self.derivedCoverageAppliesToIndex(.full_text, item.name))
+                        try self.populateConfiguredDerivedCoverageCounts(item.name, item);
                 },
                 .dense_vector => {
                     if (self.core.denseIndex(item.name)) |entry| {
@@ -37843,6 +37955,8 @@ pub const DB = struct {
                         item.graph_counts_pending = graph_stats.counts_pending;
                         applyGraphAlgebraicRuntimeStats(item, &entry.index);
                     }
+                    if (self.derivedCoverageAppliesToIndex(.graph, item.name))
+                        try self.populateConfiguredDerivedCoverageCounts(item.name, item);
                     if (!item.graph_counts_pending) visible_doc_count = @max(visible_doc_count, item.doc_count);
                 },
                 .algebraic => {
@@ -37901,7 +38015,7 @@ pub const DB = struct {
                     self.async_context.index_repair_state_corrupt.load(.acquire),
                     item,
                 );
-                item.serving_snapshot_ready = self.vectorServingSnapshotReady(stats_alloc, item.kind, item.name, if (repairs) |*state| state else null);
+                item.serving_snapshot_ready = self.vectorServingSnapshotReady(stats_alloc, item, if (repairs) |*state| state else null);
             }
             for (item.source_replay) |*source| {
                 source.target_sequence = try self.artifactSourceTargetSequence(
@@ -39646,6 +39760,14 @@ pub const DB = struct {
                         term_doc_freq_cache_misses += text_snapshot.term_doc_freq_cache_misses;
                     }
                     item.text_merge = self.core.index_manager.textMergeStatsSnapshotForIndex(cfg.name);
+                    // Artifact-fed full-text projections carry the same
+                    // durable per-document generation outcomes as embeddings
+                    // indexes; surface them so terminal failures are settled
+                    // coverage, not invisible pending work. Direct-document
+                    // projections have no producer outcomes and stay
+                    // coverage-silent instead of eternally pending.
+                    if (self.derivedCoverageAppliesToIndex(.full_text, cfg.name))
+                        try self.populateConfiguredDerivedCoverageCounts(cfg.name, &item);
                 },
                 .dense_vector => {
                     if (self.core.denseIndex(cfg.name)) |entry| {
@@ -39718,6 +39840,14 @@ pub const DB = struct {
                         applyGraphAlgebraicRuntimeStats(&item, &entry.index);
                         try populateGraphMetricStatusStats(alloc, &item, &entry.index);
                     }
+                    // Extraction-fed graph indexes (the autoschema pipeline)
+                    // record per-document generation outcomes under the
+                    // consuming index's coverage generation; without this the
+                    // knowledge graph's terminal extraction failures were
+                    // reported nowhere on the index itself. Direct-document
+                    // graphs have no producer outcomes and stay silent.
+                    if (self.derivedCoverageAppliesToIndex(.graph, cfg.name))
+                        try self.populateConfiguredDerivedCoverageCounts(cfg.name, &item);
                 },
                 .algebraic => {
                     try self.populateAlgebraicIndexStats(alloc, cfg.name, &item, false);
@@ -39727,8 +39857,7 @@ pub const DB = struct {
             if (cfg.kind == .dense_vector or cfg.kind == .sparse_vector) {
                 item.serving_snapshot_ready = self.vectorServingSnapshotReady(
                     alloc,
-                    cfg.kind,
-                    cfg.name,
+                    &item,
                     if (durable_index_repairs) |*state| state else null,
                 );
             }
@@ -39982,8 +40111,7 @@ pub const DB = struct {
             if (cfg.kind == .dense_vector or cfg.kind == .sparse_vector) {
                 item.serving_snapshot_ready = self.vectorServingSnapshotReady(
                     alloc,
-                    cfg.kind,
-                    cfg.name,
+                    &item,
                     if (durable_index_repairs) |*state| state else null,
                 );
             }
@@ -40558,6 +40686,29 @@ pub const DB = struct {
         item.coverage_skipped_count = skipped orelse 0;
         item.coverage_terminal_failed_count = terminal_failed orelse 0;
         if (!item.coverage_summary_ready) item.repair_degraded = true;
+    }
+
+    /// Whether producer-outcome coverage is meaningful for a graph or
+    /// full_text index: only artifact-sourced projections have producers
+    /// that record per-document outcomes. Embeddings indexes always apply.
+    fn derivedCoverageAppliesToIndex(self: *DB, kind: types.IndexKind, index_name: []const u8) bool {
+        return switch (kind) {
+            .graph => blk: {
+                for (self.core.graphIndexes()) |entry| {
+                    if (std.mem.eql(u8, entry.config.name, index_name))
+                        break :blk entry.artifact_sources.len > 0;
+                }
+                break :blk false;
+            },
+            .full_text => blk: {
+                for (self.core.index_manager.text_indexes.items) |entry| {
+                    if (std.mem.eql(u8, entry.config.name, index_name))
+                        break :blk entry.chunk_name != null or entry.source_artifact_names.len > 0;
+                }
+                break :blk false;
+            },
+            else => true,
+        };
     }
 
     fn populateConfiguredDerivedCoverageCounts(self: *DB, index_name: []const u8, item: *types.DBIndexStats) !void {
@@ -41710,7 +41861,7 @@ pub const DB = struct {
         try self.populateCanonicalGroupedMatches(alloc, execution_req, exec_ctx, &base);
 
         if (execution_req.graph_metric_queries.len > 0) {
-            base.graph_metric_results = try self.executeGraphMetricQueries(alloc, execution_req.graph_metric_queries);
+            base.graph_metric_results = try self.executeGraphMetricQueries(alloc, execution_req.graph_metric_queries, execution_req.cancellation);
         }
         try self.applyGraphMetricRerank(&base, execution_req);
 
@@ -41729,6 +41880,7 @@ pub const DB = struct {
         self: *DB,
         alloc: Allocator,
         queries: []const types.NamedGraphMetricQuery,
+        cancellation: ?types.CancellationToken,
     ) ![]types.GraphMetricResult {
         if (queries.len == 0) return &.{};
         const results = try alloc.alloc(types.GraphMetricResult, queries.len);
@@ -41738,7 +41890,7 @@ pub const DB = struct {
             alloc.free(results);
         }
         for (queries, 0..) |named, i| {
-            results[i] = try self.executeGraphMetricQuery(alloc, named);
+            results[i] = try self.executeGraphMetricQuery(alloc, named, cancellation);
             initialized += 1;
         }
         return results;
@@ -41747,17 +41899,33 @@ pub const DB = struct {
     fn applyGraphMetricRerank(self: *DB, result: *types.SearchResult, req: types.SearchRequest) !void {
         const rerank = req.graph_metric_rerank orelse return;
         if (req.count_only) return error.UnsupportedQueryRequest;
+        if (rerank.damping != null and rerank.seed_nodes.len == 0) return error.InvalidQueryRequest;
         const entry = self.core.graphIndex(rerank.index_name) orelse return error.IndexNotFound;
         const node_ids = try result.alloc.alloc([]const u8, result.hits.len);
         defer result.alloc.free(node_ids);
         for (result.hits, 0..) |hit, i| node_ids[i] = hit.id;
-        var score_snapshot = try entry.index.graphMetricScoreSnapshotWithPolicyAlloc(rerank.metric_name, node_ids, .{
+        var score_snapshot = if (rerank.seed_nodes.len != 0) blk: {
+            // Personalized blends are computed fresh from the current edge
+            // snapshot; a published generation would silently return
+            // unpersonalized scores, so seeds require fresh and skip the
+            // publication requirements below.
+            if (rerank.freshness != .fresh) return error.GraphMetricPersonalizationRequiresFresh;
+            break :blk try entry.index.personalizedPageRankScoreSnapshotAllocWithControls(
+                rerank.metric_name,
+                rerank.seed_nodes,
+                rerank.damping,
+                node_ids,
+                .{ .cancellation = req.cancellation orelse .none },
+            );
+        } else try entry.index.graphMetricScoreSnapshotWithPolicyAlloc(rerank.metric_name, node_ids, .{
             .require_published = true,
             .require_fresh = rerank.freshness == .fresh,
         });
         defer score_snapshot.deinit(entry.index.alloc);
-        if (score_snapshot.status.published_generation == 0) return error.MetricNotReady;
-        if (rerank.freshness == .fresh and score_snapshot.status.state != .fresh) return error.MetricStale;
+        if (rerank.seed_nodes.len == 0) {
+            if (score_snapshot.status.published_generation == 0) return error.MetricNotReady;
+            if (rerank.freshness == .fresh and score_snapshot.status.state != .fresh) return error.MetricStale;
+        }
 
         var result_status = try cloneGraphMetricStatusFromGraph(result.alloc, score_snapshot.status);
         errdefer result_status.deinit(result.alloc);
@@ -41815,14 +41983,32 @@ pub const DB = struct {
         self: *DB,
         alloc: Allocator,
         named: types.NamedGraphMetricQuery,
+        cancellation: ?types.CancellationToken,
     ) !types.GraphMetricResult {
         const entry = self.core.graphIndex(named.query.index_name) orelse return error.IndexNotFound;
-        var metric_snapshot = try entry.index.graphMetricTopKSnapshotAlloc(
+        if (named.query.damping != null and named.query.seed_nodes.len == 0) return error.InvalidQueryRequest;
+        var metric_snapshot = if (named.query.seed_nodes.len != 0) blk: {
+            // Personalized rankings are computed fresh from the current edge
+            // snapshot; published generations are global-only, so seeded
+            // reads against published freshness fail closed and the fresh
+            // publication-state check below does not apply. The fresh
+            // computation scans the filtered edge snapshot BEFORE kernel
+            // admission, so it carries the request's cancellation and the
+            // default scan caps (PersonalizedReadControls).
+            if (named.query.freshness != .fresh) return error.GraphMetricPersonalizationRequiresFresh;
+            break :blk try entry.index.personalizedPageRankTopKSnapshotAllocWithControls(
+                named.query.metric_name,
+                named.query.seed_nodes,
+                named.query.damping,
+                named.query.top_k,
+                .{ .cancellation = cancellation orelse .none },
+            );
+        } else try entry.index.graphMetricTopKSnapshotAlloc(
             named.query.metric_name,
             named.query.top_k,
         );
         defer metric_snapshot.deinit(entry.index.alloc);
-        if (named.query.freshness == .fresh and metric_snapshot.status.state != .fresh) return error.MetricStale;
+        if (named.query.seed_nodes.len == 0 and named.query.freshness == .fresh and metric_snapshot.status.state != .fresh) return error.MetricStale;
 
         const raw_scores = metric_snapshot.scores;
         const scores = try alloc.alloc(types.GraphMetricScore, raw_scores.len);
@@ -44718,6 +44904,16 @@ pub const DB = struct {
         return try self.core.scanStoreRangeWithContext(lower, upper, options, scan_ctx, callback);
     }
 
+    /// Local graph execution scope from the request: the API read source
+    /// sets `graph_owning_table` and `graph_index_complete_snapshot` when it
+    /// admits a single-group query for local (non-coordinated) execution.
+    fn graphExecutionScope(req: types.SearchRequest) graph_query_mod.ExecutionScope {
+        return .{
+            .owning_table = req.graph_owning_table,
+            .expand_cross_table_local = req.graph_index_complete_snapshot,
+        };
+    }
+
     fn searchGraph(self: *DB, alloc: Allocator, req: types.SearchRequest, graph_query: graph_query_mod.GraphQuery, base_hits: ?[]const types.SearchHit) !types.SearchResult {
         _ = req.index_name;
         const predicate_aware = graphRequestRequiresAdmission(req, graph_query.params.node_filter);
@@ -44731,6 +44927,7 @@ pub const DB = struct {
             .ctx = self,
             .graph_ctx = if (predicate_aware) &execution else null,
             .predicate_aware = predicate_aware,
+            .scope = graphExecutionScope(req),
             .execute_graph_query = if (predicate_aware)
                 executeSearchGraphQueryWithAdmissionCallback
             else
@@ -44805,6 +45002,7 @@ pub const DB = struct {
                 .ctx = self,
                 .graph_ctx = if (predicate_aware) &execution else null,
                 .predicate_aware = predicate_aware,
+                .scope = graphExecutionScope(req),
                 .find_shortest_path = if (predicate_aware)
                     executeShortestPathWithAdmissionCallback
                 else
@@ -44962,6 +45160,7 @@ pub const DB = struct {
             .ctx = self,
             .graph_ctx = if (predicate_aware) execution else null,
             .predicate_aware = predicate_aware,
+            .scope = graphExecutionScope(req),
             .match_pattern = if (predicate_aware)
                 executePatternMatchWithAdmissionCallback
             else
@@ -45281,6 +45480,7 @@ pub const DB = struct {
         start_key_refs: []const []const u8,
         target_nodes: []const graph_node_identity.Ref,
         budgets: db_query_graph.RequestGraphBudgets,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror![]graph_pattern_mod.PatternMatch {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try self.matchPatternWithNodeAdmission(
@@ -45295,6 +45495,7 @@ pub const DB = struct {
             named.query.params.include_paths,
             null,
             budgets.work,
+            scope,
         );
     }
 
@@ -45305,6 +45506,7 @@ pub const DB = struct {
         start_key_refs: []const []const u8,
         target_nodes: []const graph_node_identity.Ref,
         budgets: db_query_graph.RequestGraphBudgets,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror![]graph_pattern_mod.PatternMatch {
         const execution: *GraphPredicateExecutionContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try execution.db.matchPatternWithNodeAdmission(
@@ -45319,6 +45521,7 @@ pub const DB = struct {
             named.query.params.include_paths,
             execution.admission.iface(),
             budgets.work,
+            scope,
         );
     }
 
@@ -45328,6 +45531,7 @@ pub const DB = struct {
         named: *const types.NamedGraphQuery,
         start_key_refs: []const []const u8,
         budgets: db_query_graph.RequestGraphBudgets,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror![]graph_pattern_mod.PatternMatch {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try self.matchConjunctivePatternWithNodeAdmission(
@@ -45339,6 +45543,7 @@ pub const DB = struct {
             named.query.return_aliases,
             null,
             budgets.work,
+            scope,
         );
     }
 
@@ -45348,6 +45553,7 @@ pub const DB = struct {
         named: *const types.NamedGraphQuery,
         start_key_refs: []const []const u8,
         budgets: db_query_graph.RequestGraphBudgets,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror![]graph_pattern_mod.PatternMatch {
         const execution: *GraphPredicateExecutionContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try execution.db.matchConjunctivePatternWithNodeAdmission(
@@ -45359,6 +45565,7 @@ pub const DB = struct {
             named.query.return_aliases,
             execution.admission.iface(),
             budgets.work,
+            scope,
         );
     }
 
@@ -45368,9 +45575,10 @@ pub const DB = struct {
         named: *const types.NamedGraphQuery,
         start_key_refs: []const []const u8,
         budgets: db_query_graph.RequestGraphBudgets,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror![]types.GraphAggregateResult {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try self.aggregateConjunctivePatternWithNodeAdmission(alloc, named, start_key_refs, null, budgets);
+        return try self.aggregateConjunctivePatternWithNodeAdmission(alloc, named, start_key_refs, null, budgets, scope);
     }
 
     fn executeConjunctiveAggregateWithAdmissionCallback(
@@ -45379,6 +45587,7 @@ pub const DB = struct {
         named: *const types.NamedGraphQuery,
         start_key_refs: []const []const u8,
         budgets: db_query_graph.RequestGraphBudgets,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror![]types.GraphAggregateResult {
         const execution: *GraphPredicateExecutionContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try execution.db.aggregateConjunctivePatternWithNodeAdmission(
@@ -45387,6 +45596,7 @@ pub const DB = struct {
             start_key_refs,
             execution.admission.iface(),
             budgets,
+            scope,
         );
     }
 
@@ -45439,6 +45649,7 @@ pub const DB = struct {
         source: []const u8,
         target: []const u8,
         work_budget: *graph_pattern_mod.WorkBudget,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror!?types.GraphPath {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try self.core.graphFindShortestPath(
@@ -45454,6 +45665,7 @@ pub const DB = struct {
             named.query.params.max_weight,
             null,
             work_budget,
+            scope.owning_table,
         );
     }
 
@@ -45464,6 +45676,7 @@ pub const DB = struct {
         source: []const u8,
         target: []const u8,
         work_budget: *graph_pattern_mod.WorkBudget,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror!?types.GraphPath {
         const execution: *GraphPredicateExecutionContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try execution.db.core.graphFindShortestPath(
@@ -45479,6 +45692,7 @@ pub const DB = struct {
             named.query.params.max_weight,
             execution.admission.iface(),
             work_budget,
+            scope.owning_table,
         );
     }
 
@@ -45489,6 +45703,7 @@ pub const DB = struct {
         source: []const u8,
         target: []const u8,
         work_budget: *graph_pattern_mod.WorkBudget,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror![]types.GraphPath {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try self.core.graphFindKShortestPaths(
@@ -45505,6 +45720,7 @@ pub const DB = struct {
             named.query.params.max_weight,
             null,
             work_budget,
+            scope.owning_table,
         );
     }
 
@@ -45515,6 +45731,7 @@ pub const DB = struct {
         source: []const u8,
         target: []const u8,
         work_budget: *graph_pattern_mod.WorkBudget,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror![]types.GraphPath {
         const execution: *GraphPredicateExecutionContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try execution.db.core.graphFindKShortestPaths(
@@ -45531,6 +45748,7 @@ pub const DB = struct {
             named.query.params.max_weight,
             execution.admission.iface(),
             work_budget,
+            scope.owning_table,
         );
     }
 
@@ -45541,9 +45759,10 @@ pub const DB = struct {
         start_key_refs: []const []const u8,
         target_keys: [][]u8,
         work_budget: *graph_pattern_mod.WorkBudget,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror!graph_query_mod.GraphQueryResult {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try executeGraphQueryWithTargets(self, alloc, named.query, start_key_refs, target_keys, work_budget);
+        return try executeGraphQueryWithTargets(self, alloc, named.query, start_key_refs, target_keys, work_budget, scope);
     }
 
     fn executeGraphQueryWithAdmissionCallback(
@@ -45553,6 +45772,7 @@ pub const DB = struct {
         start_key_refs: []const []const u8,
         target_keys: [][]u8,
         work_budget: *graph_pattern_mod.WorkBudget,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror!graph_query_mod.GraphQueryResult {
         const execution: *GraphPredicateExecutionContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try executeGraphQueryWithAdmission(
@@ -45563,6 +45783,7 @@ pub const DB = struct {
             target_keys,
             execution.admission.iface(),
             work_budget,
+            scope,
         );
     }
 
@@ -45636,9 +45857,10 @@ pub const DB = struct {
         graph_query: graph_query_mod.GraphQuery,
         start_key_refs: []const []const u8,
         target_keys: [][]u8,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror!graph_query_mod.GraphQueryResult {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try executeGraphQueryWithTargets(self, alloc, graph_query, start_key_refs, target_keys, null);
+        return try executeGraphQueryWithTargets(self, alloc, graph_query, start_key_refs, target_keys, null, scope);
     }
 
     fn executeSearchGraphQueryWithAdmissionCallback(
@@ -45647,6 +45869,7 @@ pub const DB = struct {
         graph_query: graph_query_mod.GraphQuery,
         start_key_refs: []const []const u8,
         target_keys: [][]u8,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror!graph_query_mod.GraphQueryResult {
         const execution: *GraphPredicateExecutionContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try executeGraphQueryWithAdmission(
@@ -45657,6 +45880,7 @@ pub const DB = struct {
             target_keys,
             execution.admission.iface(),
             null,
+            scope,
         );
     }
 
@@ -45703,6 +45927,7 @@ pub const DB = struct {
             .ctx = self,
             .graph_ctx = if (predicate_aware) &execution else null,
             .predicate_aware = predicate_aware,
+            .scope = graphExecutionScope(req),
             .execute_graph_query = if (predicate_aware)
                 executeSearchGraphQueryWithAdmissionCallback
             else
@@ -45736,6 +45961,7 @@ pub const DB = struct {
         start_key_refs: []const []const u8,
         target_keys: [][]u8,
         work_budget: ?*graph_pattern_mod.WorkBudget,
+        scope: graph_query_mod.ExecutionScope,
     ) !graph_query_mod.GraphQueryResult {
         const entry = self.core.graphIndex(graph_query.index_name) orelse {
             try self.failIfIndexQuarantined(graph_query.index_name);
@@ -45760,6 +45986,7 @@ pub const DB = struct {
         var graph_engine = graph_query_mod.GraphQueryEngine{
             .alloc = alloc,
             .work_budget = work_budget,
+            .scope = scope,
         };
         return try graph_engine.execute(&entry.index, resolved_query, start_key_refs);
     }
@@ -45772,6 +45999,7 @@ pub const DB = struct {
         target_keys: [][]u8,
         admission: NodeAdmission,
         work_budget: ?*graph_pattern_mod.WorkBudget,
+        scope: graph_query_mod.ExecutionScope,
     ) !graph_query_mod.GraphQueryResult {
         const entry = self.core.graphIndex(graph_query.index_name) orelse {
             try self.failIfIndexQuarantined(graph_query.index_name);
@@ -45794,6 +46022,7 @@ pub const DB = struct {
             .alloc = alloc,
             .node_admission = admission,
             .work_budget = work_budget,
+            .scope = scope,
         };
         return try graph_engine.execute(&entry.index, resolved_query, start_key_refs);
     }
@@ -46937,25 +47166,88 @@ fn encodeThinReplayRecordPayload(
         if (internal_keys.isAssetArtifactKey(key)) {
             try appendUniqueReplayRecordHint(alloc, &target_hints, .resolution);
         }
+        // A committed resolution artifact re-drives sibling resolvers over
+        // the same source (compositional event identity composes sibling
+        // canonical keys). The runtime maps the key back to its source
+        // extraction; byte-stable recomputes emit no further resolution
+        // record, so the fan-back terminates.
+        if (internal_keys.isResolutionArtifactKey(key)) {
+            try appendUniqueReplayRecordHint(alloc, &target_hints, .resolution);
+        }
     }
 
+    // Asset enrichments with `neighbor_context` sample a document's graph
+    // adjacency into the producer input, and that input participates in the
+    // producer skip-state hash. An edge-only mutation on a referenced graph
+    // index must therefore also wake the enrichment worker for the affected
+    // documents (the edge's topological source document, plus the target when
+    // a context samples reverse edges), or dependent artifacts stay stale
+    // until an unrelated document change. A target that is not a same-table
+    // document plans zero enrichment requests, so over-enqueueing it is a
+    // bounded no-op. Loop safety: the producer's own materialized edge
+    // artifacts commit through the materialized generated-batch record
+    // (`recordFromDerivedBatch`), never through this thin encoder, so a
+    // producer re-run can never re-emit this hint and producer<->edge
+    // scheduling cannot cycle; re-delivery of one hint converges via the
+    // skip-state hash once adjacency is stable. The catalog lookup is
+    // memoized per index name because batches overwhelmingly touch one graph
+    // index.
+    const NeighborContextHintMemo = struct {
+        index_name: ?[]const u8 = null,
+        directions: index_manager_mod.IndexManager.NeighborContextDirections = .{},
+
+        fn lookup(
+            memo: *@This(),
+            manager: ?*index_manager_mod.IndexManager,
+            gpa: Allocator,
+            graph_index_name: []const u8,
+        ) !index_manager_mod.IndexManager.NeighborContextDirections {
+            const active = manager orelse return .{};
+            if (memo.index_name) |cached| {
+                if (std.mem.eql(u8, cached, graph_index_name)) return memo.directions;
+            }
+            memo.directions = try active.assetNeighborContextDirectionsForGraphIndex(gpa, graph_index_name);
+            memo.index_name = graph_index_name;
+            return memo.directions;
+        }
+    };
+    var neighbor_context_hint_memo: NeighborContextHintMemo = .{};
+
     for (req.graph_writes) |write| {
-        try appendUniqueReplayRecordKeyWithSet(alloc, &changed_doc_keys, &changed_doc_key_set, write.source);
-        const artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, write.source, write.index_name, write.edge_type, write.target);
+        // The changed-doc classification follows the OWNING document, whose
+        // graph projection holds the row; an entity-sourced write's
+        // topological source is not a document of this table.
+        try appendUniqueReplayRecordKeyWithSet(alloc, &changed_doc_keys, &changed_doc_key_set, if (write.owner.len > 0) write.owner else write.source);
+        const artifact_key = try internal_keys.graphEdgeArtifactKeyWithSourceAlloc(alloc, if (write.owner.len > 0) write.owner else write.source, write.index_name, write.edge_type, write.target, write.source);
         defer alloc.free(artifact_key);
         try appendUniqueReplayRecordKeyWithSet(alloc, &thin_changed_artifact_keys, &thin_changed_artifact_key_set, artifact_key);
         try appendUniqueReplayRecordHint(alloc, &target_hints, .graph);
+        const neighbor_directions = try neighbor_context_hint_memo.lookup(index_manager, alloc, write.index_name);
+        if (neighbor_directions.any()) {
+            try appendUniqueReplayRecordHint(alloc, &target_hints, .enrichment);
+            if (neighbor_directions.in)
+                try appendUniqueReplayRecordKeyWithSet(alloc, &changed_doc_keys, &changed_doc_key_set, write.target);
+        }
     }
     for (req.graph_deletes) |delete| {
         // An edge deletion changes the source document's graph projection; it
         // does not delete the source document. Classifying it as a document
         // deletion makes graph replay clear every source edge before applying
-        // the targeted artifact delta.
-        try appendUniqueReplayRecordKeyWithSet(alloc, &changed_doc_keys, &changed_doc_key_set, delete.source);
-        const artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, delete.source, delete.index_name, delete.edge_type, delete.target);
+        // the targeted artifact delta. An entity-sourced deletion addresses
+        // the six-component artifact key under its OWNING document — a key
+        // rebuilt from the topological source alone would miss the durable
+        // row and strand its replay bookkeeping.
+        try appendUniqueReplayRecordKeyWithSet(alloc, &changed_doc_keys, &changed_doc_key_set, if (delete.owner.len > 0) delete.owner else delete.source);
+        const artifact_key = try internal_keys.graphEdgeArtifactKeyWithSourceAlloc(alloc, if (delete.owner.len > 0) delete.owner else delete.source, delete.index_name, delete.edge_type, delete.target, delete.source);
         defer alloc.free(artifact_key);
         try appendUniqueReplayRecordKeyWithSet(alloc, &thin_changed_artifact_keys, &thin_changed_artifact_key_set, artifact_key);
         try appendUniqueReplayRecordHint(alloc, &target_hints, .graph);
+        const neighbor_directions = try neighbor_context_hint_memo.lookup(index_manager, alloc, delete.index_name);
+        if (neighbor_directions.any()) {
+            try appendUniqueReplayRecordHint(alloc, &target_hints, .enrichment);
+            if (neighbor_directions.in)
+                try appendUniqueReplayRecordKeyWithSet(alloc, &changed_doc_keys, &changed_doc_key_set, delete.target);
+        }
     }
 
     for (req.deletes) |key| {
@@ -47197,6 +47489,7 @@ fn augmentExtractedWriteWithGraphFieldEdgesParsed(
             alloc.free(@constCast(write.target));
             alloc.free(@constCast(write.edge_type));
             if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
+            if (write.owner.len > 0) alloc.free(@constCast(write.owner));
         }
         extra_writes.deinit(alloc);
     }
@@ -47276,6 +47569,7 @@ fn augmentExtractedWriteWithGraphFieldEdgesFromSnapshotParsed(
             alloc.free(@constCast(write.target));
             alloc.free(@constCast(write.edge_type));
             if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
+            if (write.owner.len > 0) alloc.free(@constCast(write.owner));
         }
         extra_writes.deinit(alloc);
     }
@@ -47814,6 +48108,7 @@ fn computeAssetRequestDerived(
     deferred_asset_producer_items: ?*std.ArrayListUnmanaged(PrecomputeAssetProducerBatchItem),
     force_reprocess: bool,
     document_execution: ?*enrichment_runtime_mod.PrecommitDocumentExecution,
+    coverage_outcomes: *std.ArrayListUnmanaged(PrecomputedCoverageOutcome),
 ) !void {
     var producer_cfg = try asset_producer_mod.parseProducerConfig(alloc, request.producer_json);
     defer producer_cfg.deinit(alloc);
@@ -47824,7 +48119,30 @@ fn computeAssetRequestDerived(
 
     const text_indexes: []const []const u8 = request.consumer_indexes;
 
-    const source_text = try extractAssetSourceValue(alloc, db, doc_value, request);
+    // Asset-consumes-asset: the source is another asset's produced bytes.
+    // Requests are planned upstream-first, so a producer computed earlier in
+    // this same batch sits in `artifact_writes` rather than the store; the
+    // overlay scan (newest first) keeps the chain convergent within one
+    // synchronous pass. A missing upstream takes the delete path below and
+    // is re-driven by the per-document replay record once the upstream lands.
+    const consumes_upstream = request.upstream_artifact_name.len > 0 and
+        producer_cfg.type != .document_extraction;
+    const source_text: ?[]const u8 = if (consumes_upstream) blk: {
+        const upstream_key = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "asset", request.upstream_artifact_name);
+        defer alloc.free(upstream_key);
+        var i = artifact_writes.items.len;
+        while (i > 0) {
+            i -= 1;
+            const write = artifact_writes.items[i];
+            if (std.mem.eql(u8, write.key, upstream_key)) {
+                break :blk try alloc.dupe(u8, write.value);
+            }
+        }
+        for (artifact_delete_keys.items) |delete_key| {
+            if (std.mem.eql(u8, delete_key, upstream_key)) break :blk null;
+        }
+        break :blk try db.core.getStoreValue(alloc, upstream_key);
+    } else try extractAssetSourceValue(alloc, db, doc_value, request);
     if (source_text == null or source_text.?.len == 0) {
         if (source_text) |s| alloc.free(s);
         try appendFullTextDeleteDocument(alloc, documents, key, text_indexes);
@@ -47919,7 +48237,7 @@ fn computeAssetRequestDerived(
                 .state_key = item_state_key,
                 .state_value = item_state_value,
             };
-            try appendPrecomputeAssetProducerBatchItem(alloc, db, items, item, artifact_writes, documents);
+            try appendPrecomputeAssetProducerBatchItem(alloc, db, items, item, artifact_writes, documents, coverage_outcomes);
             return;
         }
     }
@@ -48045,6 +48363,7 @@ fn appendPrecomputeAssetProducerBatchItem(
     item: PrecomputeAssetProducerBatchItem,
     artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
     documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
+    coverage_outcomes: *std.ArrayListUnmanaged(PrecomputedCoverageOutcome),
 ) !void {
     const policy = enrichment_types.parseExecutionPolicyJson(alloc, item.request.execution_json) catch enrichment_types.ExecutionPolicy{};
     const max_items = @max(@as(usize, 1), policy.batch_items orelse 1);
@@ -48056,7 +48375,7 @@ fn appendPrecomputeAssetProducerBatchItem(
             items.items.len >= max_items or
             addPrecomputeAssetProducerBytes(current_bytes, item_bytes) > max_bytes)
         {
-            try flushPrecomputeAssetProducerBatch(alloc, db, items, artifact_writes, documents);
+            try flushPrecomputeAssetProducerBatch(alloc, db, items, artifact_writes, documents, coverage_outcomes);
         }
     }
     try items.append(alloc, item);
@@ -48069,6 +48388,7 @@ fn applyPrecomputeAssetProducerOutput(
     produced: []const u8,
     artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
     documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
+    coverage_outcomes: *std.ArrayListUnmanaged(PrecomputedCoverageOutcome),
 ) !void {
     try artifact_writes.append(alloc, .{
         .key = try alloc.dupe(u8, item.artifact_key),
@@ -48079,9 +48399,9 @@ fn applyPrecomputeAssetProducerOutput(
         .value = try alloc.dupe(u8, item.state_value),
     });
 
-    _ = db;
     const text_indexes: []const []const u8 = item.request.consumer_indexes;
     try appendInlineFullTextDocument(alloc, documents, item.artifact_key, produced, text_indexes);
+    try appendPrecomputedArtifactCoverageOutcomes(db, alloc, coverage_outcomes, item.request, .produced);
 }
 
 fn flushPrecomputeAssetProducerBatchSequential(
@@ -48091,6 +48411,7 @@ fn flushPrecomputeAssetProducerBatchSequential(
     db: *DB,
     artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
     documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
+    coverage_outcomes: *std.ArrayListUnmanaged(PrecomputedCoverageOutcome),
 ) !void {
     for (items) |item| {
         const produced = producer.produce(alloc, item.asRequest()) catch |err| {
@@ -48099,7 +48420,7 @@ fn flushPrecomputeAssetProducerBatchSequential(
             return err;
         };
         defer alloc.free(produced);
-        applyPrecomputeAssetProducerOutput(alloc, db, item, produced, artifact_writes, documents) catch |err| {
+        applyPrecomputeAssetProducerOutput(alloc, db, item, produced, artifact_writes, documents, coverage_outcomes) catch |err| {
             if (err == error.OutOfMemory) return err;
             if (isRetryableAssetProducerError(err)) return err;
             return err;
@@ -48113,6 +48434,7 @@ fn flushPrecomputeAssetProducerBatch(
     items: *std.ArrayListUnmanaged(PrecomputeAssetProducerBatchItem),
     artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
     documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
+    coverage_outcomes: *std.ArrayListUnmanaged(PrecomputedCoverageOutcome),
 ) !void {
     if (items.items.len == 0) return;
     defer clearPrecomputeAssetProducerBatchItems(alloc, items);
@@ -48126,22 +48448,22 @@ fn flushPrecomputeAssetProducerBatch(
     const can_batch = producer.canProduceBatch(alloc, requests) catch |err| {
         if (err == error.OutOfMemory) return err;
         if (isRetryableAssetProducerError(err)) return err;
-        return try flushPrecomputeAssetProducerBatchSequential(alloc, producer, items.items, db, artifact_writes, documents);
+        return try flushPrecomputeAssetProducerBatchSequential(alloc, producer, items.items, db, artifact_writes, documents, coverage_outcomes);
     };
     if (!can_batch)
-        return try flushPrecomputeAssetProducerBatchSequential(alloc, producer, items.items, db, artifact_writes, documents);
+        return try flushPrecomputeAssetProducerBatchSequential(alloc, producer, items.items, db, artifact_writes, documents, coverage_outcomes);
 
     var produced = producer.produceBatch(alloc, requests) catch |err| {
         if (err == error.OutOfMemory) return err;
         if (isRetryableAssetProducerError(err)) return err;
-        return try flushPrecomputeAssetProducerBatchSequential(alloc, producer, items.items, db, artifact_writes, documents);
+        return try flushPrecomputeAssetProducerBatchSequential(alloc, producer, items.items, db, artifact_writes, documents, coverage_outcomes);
     };
     if (produced.len != items.items.len) {
         for (produced) |output| {
             if (output.len > 0) alloc.free(output);
         }
         alloc.free(produced);
-        return try flushPrecomputeAssetProducerBatchSequential(alloc, producer, items.items, db, artifact_writes, documents);
+        return try flushPrecomputeAssetProducerBatchSequential(alloc, producer, items.items, db, artifact_writes, documents, coverage_outcomes);
     }
 
     defer alloc.free(produced);
@@ -48152,7 +48474,7 @@ fn flushPrecomputeAssetProducerBatch(
     }
 
     for (items.items, produced, 0..) |item, output, idx| {
-        applyPrecomputeAssetProducerOutput(alloc, db, item, output, artifact_writes, documents) catch |err| {
+        applyPrecomputeAssetProducerOutput(alloc, db, item, output, artifact_writes, documents, coverage_outcomes) catch |err| {
             alloc.free(output);
             produced[idx] = "";
             if (err == error.OutOfMemory) return err;
@@ -51831,7 +52153,7 @@ fn appendPreparedGraphEdgeArtifactWrite(
     write: types.GraphEdgeWrite,
     generation: u64,
 ) !void {
-    const key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, write.source, write.index_name, write.edge_type, write.target);
+    const key = try internal_keys.graphEdgeArtifactKeyWithSourceAlloc(alloc, if (write.owner.len > 0) write.owner else write.source, write.index_name, write.edge_type, write.target, write.source);
     defer alloc.free(key);
     const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, generation, write.weight, write.created_at, write.updated_at, write.metadata_json);
     var payload_owned = true;
@@ -53124,6 +53446,65 @@ fn appendPrecomputedCoverageCandidate(
     try out.append(alloc, .{ .request = cloned, .produced = produced });
 }
 
+fn sliceContainsWriteKey(writes: []const types.BatchWrite, key: []const u8) bool {
+    for (writes) |write| if (std.mem.eql(u8, write.key, key)) return true;
+    return false;
+}
+
+fn sliceContainsKey(keys: []const []const u8, key: []const u8) bool {
+    for (keys) |candidate| if (std.mem.eql(u8, candidate, key)) return true;
+    return false;
+}
+
+fn sliceContainsWriteKeyPrefix(writes: []const types.BatchWrite, prefix: []const u8) bool {
+    for (writes) |write| if (std.mem.startsWith(u8, write.key, prefix)) return true;
+    return false;
+}
+
+fn sliceContainsKeyPrefix(keys: []const []const u8, prefix: []const u8) bool {
+    for (keys) |candidate| if (std.mem.startsWith(u8, candidate, prefix)) return true;
+    return false;
+}
+
+fn sliceContainsDocKeyPrefix(docs: []const derived_types.DerivedDocument, prefix: []const u8) bool {
+    for (docs) |doc| if (std.mem.startsWith(u8, doc.key, prefix)) return true;
+    return false;
+}
+
+/// Coverage outcomes for artifact producers (assets, chunks): attributed to
+/// every index depending on the artifact — graph and full_text consumers —
+/// so the index-status coverage summary can complete beyond embeddings.
+fn appendPrecomputedArtifactCoverageOutcomes(
+    db: *DB,
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(PrecomputedCoverageOutcome),
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    outcome: DerivedCoverageOutcome,
+) !void {
+    const consumers = try db.core.index_manager.indexesDependingOnArtifact(alloc, requestArtifactName(request));
+    defer {
+        for (consumers) |name| alloc.free(name);
+        alloc.free(consumers);
+    }
+    for (consumers) |index_name| {
+        // A produced artifact says nothing about its dense/sparse
+        // consumers, whose embedding lanes settle their own outcomes; only
+        // graph and full_text consumers are settled by the producer.
+        const applies = db.derivedCoverageAppliesToIndex(.graph, index_name) or
+            db.derivedCoverageAppliesToIndex(.full_text, index_name);
+        if (!applies) continue;
+        const owned_index_name = try alloc.dupe(u8, index_name);
+        errdefer alloc.free(owned_index_name);
+        const owned_doc_key = try alloc.dupe(u8, request.doc_key);
+        errdefer alloc.free(owned_doc_key);
+        try out.append(alloc, .{
+            .index_name = owned_index_name,
+            .doc_key = owned_doc_key,
+            .outcome = outcome,
+        });
+    }
+}
+
 fn appendPrecomputedEmbeddingCoverageOutcomes(
     db: *DB,
     alloc: Allocator,
@@ -53720,30 +54101,66 @@ fn prepareGeneratedEnrichments(
                 try extracted[i].logicalJsonForField(request.source_field)).?;
 
             switch (request.kind) {
-                .asset => try computeAssetRequestDerived(
-                    alloc,
-                    self,
-                    cleaned,
-                    request,
-                    &artifact_writes,
-                    &artifact_delete_keys,
-                    &documents,
-                    &dense_embeddings,
-                    &sparse_embeddings,
-                    &deferred_asset_producer_items,
-                    containsName(force_generated_artifact_names, requestArtifactName(request)),
-                    document_execution,
-                ),
-                .chunk_text => try computeChunkRequestDerived(
-                    alloc,
-                    self,
-                    cleaned,
-                    request,
-                    &artifact_writes,
-                    &artifact_delete_keys,
-                    &documents,
-                    &chunk_cache,
-                ),
+                .asset => {
+                    // Synchronous asset production settles graph/full_text
+                    // consumer coverage in the same commit. Classification is
+                    // by THIS request's artifact key (a mid-batch producer
+                    // flush may append other requests' writes): its write is
+                    // produced, its delete alone is intentional no-output,
+                    // and a deferred prompt producer touches neither here —
+                    // it settles in the batch flush below or through replay.
+                    const writes_before = artifact_writes.items.len;
+                    const deletes_before = artifact_delete_keys.items.len;
+                    try computeAssetRequestDerived(
+                        alloc,
+                        self,
+                        cleaned,
+                        request,
+                        &artifact_writes,
+                        &artifact_delete_keys,
+                        &documents,
+                        &dense_embeddings,
+                        &sparse_embeddings,
+                        &deferred_asset_producer_items,
+                        containsName(force_generated_artifact_names, requestArtifactName(request)),
+                        document_execution,
+                        &coverage_outcomes,
+                    );
+                    const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "asset", requestArtifactName(request));
+                    defer alloc.free(asset_key);
+                    if (sliceContainsWriteKey(artifact_writes.items[writes_before..], asset_key)) {
+                        try appendPrecomputedArtifactCoverageOutcomes(self, alloc, &coverage_outcomes, request, .produced);
+                    } else if (sliceContainsKey(artifact_delete_keys.items[deletes_before..], asset_key)) {
+                        try appendPrecomputedArtifactCoverageOutcomes(self, alloc, &coverage_outcomes, request, .skipped);
+                    }
+                },
+                .chunk_text => {
+                    const writes_before = artifact_writes.items.len;
+                    const docs_before = documents.items.len;
+                    const deletes_before = artifact_delete_keys.items.len;
+                    try computeChunkRequestDerived(
+                        alloc,
+                        self,
+                        cleaned,
+                        request,
+                        &artifact_writes,
+                        &artifact_delete_keys,
+                        &documents,
+                        &chunk_cache,
+                    );
+                    // Chunk ids vary; within this request's appended slice
+                    // only its own chunk rows can carry the doc's chunk-kind
+                    // prefix, so that prefix classifies exactly.
+                    const chunk_prefix = try internal_keys.artifactTypePrefixAlloc(alloc, request.doc_key, "chunk");
+                    defer alloc.free(chunk_prefix);
+                    if (sliceContainsWriteKeyPrefix(artifact_writes.items[writes_before..], chunk_prefix) or
+                        sliceContainsDocKeyPrefix(documents.items[docs_before..], chunk_prefix))
+                    {
+                        try appendPrecomputedArtifactCoverageOutcomes(self, alloc, &coverage_outcomes, request, .produced);
+                    } else if (sliceContainsKeyPrefix(artifact_delete_keys.items[deletes_before..], chunk_prefix)) {
+                        try appendPrecomputedArtifactCoverageOutcomes(self, alloc, &coverage_outcomes, request, .skipped);
+                    }
+                },
                 .dense_embedding => {
                     const before = dense_embeddings.items.len;
                     computeDenseRequestDerived(alloc, self, cleaned, request, &artifact_writes, &dense_embeddings, &chunk_cache, generated_memo) catch |err| switch (err) {
@@ -53780,7 +54197,7 @@ fn prepareGeneratedEnrichments(
         }
     }
 
-    try flushPrecomputeAssetProducerBatch(alloc, self, &deferred_asset_producer_items, &artifact_writes, &documents);
+    try flushPrecomputeAssetProducerBatch(alloc, self, &deferred_asset_producer_items, &artifact_writes, &documents, &coverage_outcomes);
 
     // Resolve coverage only after every deferred producer has contributed its
     // manifest. This keeps terminal outcomes in the same primary commit while
@@ -54542,6 +54959,15 @@ fn appendPrecomputedGraphSourceArtifactKey(
                 relationalColumns(self) != null,
             );
             defer if (raw_doc) |doc_value| self.alloc.free(doc_value);
+            // No endpoint-resolution lookup here: this renders inside batch
+            // apply, where an extra store read is not safe, and resolution
+            // artifacts rarely exist at first artifact write anyway. The
+            // resolution-artifact replay re-renders these edges canonically
+            // once resolution lands (see materializeGraphSourceArtifactsForIndex).
+            // An empty map still marks that a resolver targets the artifact,
+            // so unresolved relation sources wait for it rather than falling
+            // back to the owning document.
+            const pending_resolutions: ?[]const u8 = if (resolverTargetsGraphArtifact(self.core.index_manager, source.artifact_name)) "{}" else null;
             const graph_writes = try graphWritesFromArtifactValueAlloc(
                 self.alloc,
                 graph_entry.config.name,
@@ -54550,11 +54976,12 @@ fn appendPrecomputedGraphSourceArtifactKey(
                 source,
                 graphArtifactContentType(self.core.index_manager, source.artifact_name),
                 raw_doc,
+                pending_resolutions,
                 graph_asset_state.effectiveEdgeLimit(graph_entry.max_edges_per_document),
             );
             defer freeGraphWrites(self.alloc, graph_writes);
             for (graph_writes) |write| {
-                const key = try internal_keys.graphEdgeArtifactKeyAlloc(self.alloc, write.source, write.index_name, write.edge_type, write.target);
+                const key = try internal_keys.graphEdgeArtifactKeyWithSourceAlloc(self.alloc, if (write.owner.len > 0) write.owner else write.source, write.index_name, write.edge_type, write.target, write.source);
                 var key_owned = true;
                 errdefer if (key_owned) self.alloc.free(key);
                 const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(
@@ -59996,8 +60423,12 @@ fn saveAppliedSequencesBatchLockedContext(
         return;
     }
     if (async_ctx) |active_async_ctx| {
-        try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
+        // Never persist a source watermark in HBC metadata before the
+        // corresponding index WAL/posting effects are durable. A crash in that
+        // gap would make restart trust a checkpoint ahead of its physical
+        // snapshot.
         try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
+        try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
         try apply_state.saveAppliedSequencesWithCheckpoint(
             ctx.alloc,
             ctx.index_manager.checkpointIo(),
@@ -60019,8 +60450,8 @@ fn saveAppliedSequencesBatchLockedContext(
         );
         return;
     }
-    try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
     try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
+    try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
     try apply_state.saveAppliedSequencesWithCheckpoint(
         ctx.alloc,
         ctx.index_manager.checkpointIo(),
@@ -62780,6 +63211,7 @@ fn managedIndexDeleteKeyAffectsProjection(
                     index_manager.alloc.free(parsed.index_name);
                     index_manager.alloc.free(parsed.edge_type);
                     index_manager.alloc.free(parsed.target_doc_key);
+                    if (parsed.source_node) |source| index_manager.alloc.free(source);
                 }
                 if (std.mem.eql(u8, parsed.index_name, index_ref.name)) break :blk true;
             }
@@ -62911,6 +63343,7 @@ fn managedIndexBatchApplicabilityWithEmbeddingNames(
                         index_manager.alloc.free(parsed.index_name);
                         index_manager.alloc.free(parsed.edge_type);
                         index_manager.alloc.free(parsed.target_doc_key);
+                        if (parsed.source_node) |source| index_manager.alloc.free(source);
                     }
                     if (std.mem.eql(u8, parsed.index_name, index_ref.name)) return .relevant;
                 }
@@ -63047,6 +63480,7 @@ fn managedIndexRecordApplicability(
                         index_manager.alloc.free(parsed.index_name);
                         index_manager.alloc.free(parsed.edge_type);
                         index_manager.alloc.free(parsed.target_doc_key);
+                        if (parsed.source_node) |source| index_manager.alloc.free(source);
                     }
                     if (std.mem.eql(u8, parsed.index_name, index_ref.name)) return .relevant;
                 }
@@ -64562,6 +64996,9 @@ fn materializeGraphArtifactValuePaged(
 
     var parsed_artifact = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
     defer parsed_artifact.deinit();
+    const endpoint_resolutions = try graphEndpointResolutionsJsonAlloc(alloc, store, index_manager, artifact_ref.document_id, source.artifact_name);
+    defer if (endpoint_resolutions) |value| alloc.free(value);
+    if (endpoint_resolutions) |res_raw| try injectGraphEndpointResolutions(&parsed_artifact, res_raw);
     const raw_doc = try storeDocumentValueForGraphSource(
         alloc,
         store,
@@ -64607,7 +65044,7 @@ fn materializeGraphArtifactValuePaged(
         var graph_write_positions = StoreWritePositions.empty;
         defer graph_write_positions.deinit(alloc);
         for (page.writes) |write| {
-            const key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, write.source, write.index_name, write.edge_type, write.target);
+            const key = try internal_keys.graphEdgeArtifactKeyWithSourceAlloc(alloc, if (write.owner.len > 0) write.owner else write.source, write.index_name, write.edge_type, write.target, write.source);
             var key_owned = true;
             errdefer if (key_owned) alloc.free(key);
             const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, generation, write.weight, write.created_at, write.updated_at, write.metadata_json);
@@ -64707,6 +65144,32 @@ fn materializeGraphSourceArtifactsForIndex(
                 };
             }
             for (changed.items) |key| try changed_set.put(alloc, key, {});
+            // Relation edges materialize when the extraction artifact is
+            // written, which is before its resolution artifacts exist, so
+            // their first render carries local-id endpoints. A landed
+            // resolution re-renders the owning extraction artifact with
+            // canonical endpoints (graphEndpointResolutionsJsonAlloc); the
+            // existing replacement semantics retire the stale local-id
+            // edges. Depth-one recursion: the synthesized key is an asset
+            // artifact, never another resolution key.
+            if (try resolutionOwningAssetArtifactKeyAlloc(alloc, index_manager, artifact_key)) |asset_key| {
+                defer alloc.free(asset_key);
+                const rerendered = try materializeGraphSourceArtifactsForIndex(alloc, store, index_manager, &.{asset_key}, index_name, options);
+                defer alloc.free(rerendered);
+                var idx: usize = 0;
+                errdefer for (rerendered[idx..]) |key| alloc.free(key);
+                while (idx < rerendered.len) {
+                    const key = rerendered[idx];
+                    if (changed_set.contains(key)) {
+                        alloc.free(key);
+                        idx += 1;
+                        continue;
+                    }
+                    try changed.append(alloc, key);
+                    idx += 1;
+                    try changed_set.put(alloc, key, {});
+                }
+            }
             continue;
         }
         var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, artifact_key)) orelse continue;
@@ -64742,6 +65205,8 @@ fn materializeGraphSourceArtifactsForIndex(
                 if (options.repair_ctx) |ctx| ctx.relational_base_rows else false,
             );
             defer if (raw_doc) |doc_value| alloc.free(doc_value);
+            const endpoint_resolutions = try graphEndpointResolutionsJsonAlloc(alloc, store, index_manager, artifact_ref.document_id, source.artifact_name);
+            defer if (endpoint_resolutions) |res_raw| alloc.free(res_raw);
             const graph_writes = graphWritesFromArtifactValueAlloc(
                 alloc,
                 index_name,
@@ -64750,6 +65215,7 @@ fn materializeGraphSourceArtifactsForIndex(
                 source,
                 graphArtifactContentType(index_manager, source.artifact_name),
                 raw_doc,
+                endpoint_resolutions,
                 options.max_relation_items,
             ) catch |err| switch (err) {
                 error.OutOfMemory => return err,
@@ -64763,7 +65229,7 @@ fn materializeGraphSourceArtifactsForIndex(
             };
             defer freeGraphWrites(alloc, graph_writes);
             for (graph_writes) |write| {
-                const key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, write.source, write.index_name, write.edge_type, write.target);
+                const key = try internal_keys.graphEdgeArtifactKeyWithSourceAlloc(alloc, if (write.owner.len > 0) write.owner else write.source, write.index_name, write.edge_type, write.target, write.source);
                 var key_owned = true;
                 errdefer if (key_owned) alloc.free(key);
                 const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(
@@ -65107,7 +65573,7 @@ fn materializeGraphSourceArtifactRestorePage(
     var write_positions = StoreWritePositions.empty;
     defer write_positions.deinit(alloc);
     for (page.writes) |write| {
-        const key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, write.source, write.index_name, write.edge_type, write.target);
+        const key = try internal_keys.graphEdgeArtifactKeyWithSourceAlloc(alloc, if (write.owner.len > 0) write.owner else write.source, write.index_name, write.edge_type, write.target, write.source);
         var key_owned = true;
         errdefer if (key_owned) alloc.free(key);
         const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, generation, write.weight, write.created_at, write.updated_at, write.metadata_json);
@@ -65256,6 +65722,13 @@ fn materializeMentionEdgesForResolutionKey(
     }
 
     const cfg = resolverConfigForResolution(index_manager, source.artifact_name, parsed_key.artifact_name) orelse {
+        // A multi-source graph pairs every changed resolution key with every
+        // mention-edge source. A resolution artifact owned by a different
+        // source's resolver (e.g. label-routed autoschema layouts with one
+        // resolver pair per extraction artifact) is that sibling source's to
+        // materialize, not a missing contract; only a resolution artifact no
+        // resolver owns fails closed.
+        if (resolverConfigForResolutionArtifact(index_manager, parsed_key.artifact_name) != null) return;
         if (options.require_resolution_contract) return error.MissingResolverArtifactContract;
         return;
     };
@@ -65302,7 +65775,7 @@ fn materializeMentionEdgesForResolutionKey(
         );
         defer freeGraphWrites(alloc, mention_edge_writes);
         for (mention_edge_writes) |write| {
-            const key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, write.source, write.index_name, write.edge_type, write.target);
+            const key = try internal_keys.graphEdgeArtifactKeyWithSourceAlloc(alloc, if (write.owner.len > 0) write.owner else write.source, write.index_name, write.edge_type, write.target, write.source);
             var key_owned = true;
             errdefer if (key_owned) alloc.free(key);
             const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, generation, write.weight, write.created_at, write.updated_at, write.metadata_json);
@@ -65424,6 +65897,7 @@ fn freeGraphWriteFields(alloc: Allocator, write: types.GraphEdgeWrite) void {
     alloc.free(@constCast(write.target));
     alloc.free(@constCast(write.edge_type));
     if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
+    if (write.owner.len > 0) alloc.free(@constCast(write.owner));
 }
 
 fn resolverConfigForResolution(
@@ -65785,10 +66259,12 @@ fn graphWritesFromArtifactValueAlloc(
     source: index_manager_mod.GraphArtifactSource,
     artifact_content_type: []const u8,
     raw_doc: ?[]const u8,
+    endpoint_resolutions_raw: ?[]const u8,
     edge_limit: usize,
 ) ![]types.GraphEdgeWrite {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
     defer parsed.deinit();
+    if (endpoint_resolutions_raw) |res_raw| try injectGraphEndpointResolutions(&parsed, res_raw);
     var parsed_doc = if (raw_doc) |doc| try std.json.parseFromSlice(std.json.Value, alloc, doc, .{}) else null;
     defer if (parsed_doc) |*doc| doc.deinit();
     const doc_value: ?std.json.Value = if (parsed_doc) |doc| doc.value else null;
@@ -66019,10 +66495,44 @@ fn appendRelationItem(
         jsonStringField(item, "type") orelse jsonStringField(item, "edge_type") orelse jsonStringField(item, "relation") orelse return;
     if (edge_type.len == 0) return;
 
-    // Materialized edges are routed and retired with their source document.
-    // Artifact payloads may describe a source endpoint, but allowing it to
-    // replace the owner would make writes and split ownership disagree.
-    const source_doc = doc_key;
+    // Materialized edges are routed and retired with their OWNING document —
+    // always the producer. The topological source may differ: a relation
+    // whose source endpoint canonically resolves (an extraction entity with a
+    // resolver-minted key, via the injected "_entities" map) starts from that
+    // canonical node, giving true entity->entity / entity->event topology
+    // (zig/AUTOSCHEMA.md). GraphEdgeWrite.owner carries the producer for
+    // artifact-key routing when the two diverge. A source referencing an
+    // extraction entity that has no canonical identity yet is dropped, like
+    // the matching target rule, when a resolver targets this artifact (the
+    // caller injected an "_entities" map, possibly empty): the resolution
+    // replay re-renders it. With no resolver configured no canonical key
+    // will ever arrive, so the source keeps the owning document instead of
+    // losing the edge (zig/GRAPH.md's V1 extractor-only graph). A source
+    // that matches no extraction entity keeps the legacy document source.
+    var source_table: ?[]const u8 = null;
+    const source_doc = blk: {
+        const source_value = item.object.get("source") orelse break :blk doc_key;
+        if (resolveGraphEndpointEntity(source_value, artifact_value)) |entity| {
+            const canonical = canonicalEntityDocumentId(entity) orelse {
+                if (artifact_value == .object and artifact_value.object.get("_entities") != null) return;
+                break :blk doc_key;
+            };
+            // The resolved SOURCE endpoint's home table must survive into
+            // edge metadata like the target's: a backward traversal from
+            // the target otherwise assigns the source an unqualified
+            // identity and hydrates it against the wrong table.
+            source_table = canonicalEntityTable(entity);
+            break :blk canonical;
+        }
+        // A plain-string source matching no extraction entity is an external
+        // node id; any other unresolvable shape (e.g. legacy inline endpoint
+        // objects) keeps the owning document as the source, the historical
+        // contract.
+        break :blk switch (source_value) {
+            .string => |external| if (external.len > 0) external else doc_key,
+            else => doc_key,
+        };
+    };
 
     const mapped_target = if (mapping.target_template.len > 0)
         try renderGraphArtifactTemplateAlloc(alloc, mapping.target_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
@@ -66037,6 +66547,11 @@ fn appendRelationItem(
         const target_value = item.object.get("target") orelse return;
         break :blk jsonEndpointDocumentIdResolved(target_value, artifact_value) orelse return;
     };
+    const target_table: ?[]const u8 = if (mapped_target != null) null else blk: {
+        const target_value = item.object.get("target") orelse break :blk null;
+        const entity = resolveGraphEndpointEntity(target_value, artifact_value) orelse break :blk null;
+        break :blk canonicalEntityTable(entity);
+    };
     if (writes.items.len >= edge_limit) return error.ResourceLimitExceeded;
 
     const weight = if (mapping.weight_template.len > 0) blk: {
@@ -66046,11 +66561,28 @@ fn appendRelationItem(
         break :blk if (trimmed.len > 0) try std.fmt.parseFloat(f64, trimmed) else 1.0;
     } else jsonFloatField(item, "weight") orelse jsonFloatField(item, "confidence") orelse 1.0;
     graph_mod.validateEdgeWeight(weight) catch return error.InvalidGraphEdges;
-    const metadata_json = if (mapping.metadata_template_json.len > 0)
-        try renderGraphArtifactMetadataTemplateAlloc(alloc, mapping.metadata_template_json, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
+    const metadata_json = if (mapping.metadata_template_json.len > 0) blk: {
+        const rendered = try renderGraphArtifactMetadataTemplateAlloc(alloc, mapping.metadata_template_json, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value);
+        // A custom metadata template must not silently strip the resolved
+        // endpoint's home-table tag: without it the node looks same-table to
+        // traversal identity, admission, routing, and hydration. An explicit
+        // target_table in the template wins.
+        const table = target_table orelse break :blk rendered;
+        defer alloc.free(rendered);
+        break :blk try prependTargetTableToMetadataJsonAlloc(alloc, table, rendered);
+    } else if (target_table) |table|
+        // The same cross-table endpoint tag mention edges carry: traversal
+        // and node admission route the resolved target to its home table.
+        try prependTargetTableToItemMetadataAlloc(alloc, table, item)
     else
         try std.json.Stringify.valueAlloc(alloc, item, .{});
-    errdefer alloc.free(metadata_json);
+    var owned_metadata = metadata_json;
+    errdefer alloc.free(owned_metadata);
+    if (source_table) |table| {
+        const tagged = try prependTableTagToMetadataJsonAlloc(alloc, "source_table", table, owned_metadata);
+        alloc.free(owned_metadata);
+        owned_metadata = tagged;
+    }
 
     const owned_index_name = try alloc.dupe(u8, index_name);
     errdefer alloc.free(owned_index_name);
@@ -66060,6 +66592,8 @@ fn appendRelationItem(
     errdefer alloc.free(owned_target);
     const owned_edge_type = try alloc.dupe(u8, edge_type);
     errdefer alloc.free(owned_edge_type);
+    const owned_owner = if (!std.mem.eql(u8, source_doc, doc_key)) try alloc.dupe(u8, doc_key) else "";
+    errdefer if (owned_owner.len > 0) alloc.free(@constCast(owned_owner));
     try writes.append(alloc, .{
         .index_name = owned_index_name,
         .source = owned_source,
@@ -66068,7 +66602,8 @@ fn appendRelationItem(
         .weight = weight,
         .created_at = 0,
         .updated_at = 0,
-        .metadata_json = metadata_json,
+        .metadata_json = owned_metadata,
+        .owner = owned_owner,
     });
 }
 
@@ -66279,20 +66814,215 @@ fn jsonEndpointDocumentId(value: std.json.Value) ?[]const u8 {
     };
 }
 
+/// The asset artifact key of the extraction artifact whose resolver owns the
+/// given resolution artifact key, or null when no resolver owns it (the
+/// materializer treats unowned resolution artifacts per its own contract
+/// options). Caller frees the returned key.
+fn resolutionOwningAssetArtifactKeyAlloc(
+    alloc: Allocator,
+    index_manager: *index_manager_mod.IndexManager,
+    resolution_key: []const u8,
+) !?[]u8 {
+    const parsed_key = (try internal_keys.parseResolutionArtifactKeyAlloc(alloc, resolution_key)) orelse return null;
+    defer alloc.free(parsed_key.doc_key);
+    defer alloc.free(parsed_key.artifact_name);
+    const cfg = resolverConfigForResolutionArtifact(index_manager, parsed_key.artifact_name) orelse return null;
+    return try internal_keys.artifactNamedPrefixAlloc(alloc, parsed_key.doc_key, "asset", cfg.source_artifact);
+}
+
+/// Canonical endpoint resolutions for one document's extraction artifact:
+/// {"<local_id>": {"key": "<canonical key>", "table": "<home table>"}, ...}
+/// built from every resolver consuming the source artifact (label-routed
+/// layouts split one artifact's mentions across several resolution
+/// artifacts). Null when no resolver has resolved anything yet — relation
+/// endpoints then render local ids, and the resolution-artifact replay
+/// re-renders them canonically once resolution lands.
+fn graphEndpointResolutionsJsonAlloc(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    index_manager: *index_manager_mod.IndexManager,
+    doc_key: []const u8,
+    source_artifact_name: []const u8,
+) !?[]u8 {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var map: std.json.ObjectMap = .empty;
+    var resolver_targets_artifact = false;
+
+    for (index_manager.resolvers.items) |*cfg| {
+        if (!std.mem.eql(u8, cfg.source_artifact, source_artifact_name)) continue;
+        resolver_targets_artifact = true;
+        const res_key = try internal_keys.resolutionArtifactKeyAlloc(a, doc_key, cfg.resolution_artifact);
+        const raw = store.get(a, res_key) catch |err| switch (err) {
+            error.NotFound => continue,
+            else => return err,
+        };
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) catch continue;
+        if (parsed != .object) continue;
+        const entities = parsed.object.get("entities") orelse continue;
+        if (entities != .array) continue;
+        for (entities.array.items) |entity| {
+            if (entity != .object) continue;
+            // Same human-review gate as the mention-edge path
+            // (resolutionDecisionCreatesCanonicalEdge): a review-band entry
+            // carries a PROVISIONAL doc key, and admitting it here would make
+            // relations traversable through that identity before a curator
+            // approves it. Only canonical decisions become endpoints; the
+            // relation stays absent (drop-before-resolution) and the
+            // approval's re-resolution replay renders it.
+            const decision = jsonStringField(entity, "decision") orelse continue;
+            if (!std.mem.eql(u8, decision, "new") and !std.mem.eql(u8, decision, "match")) continue;
+            const local_id = jsonStringField(entity, "local_id") orelse continue;
+            const doc_ref = entity.object.get("doc_ref") orelse continue;
+            if (doc_ref != .object) continue;
+            const key = jsonStringField(doc_ref, "key") orelse continue;
+            if (key.len == 0) continue;
+            var ref: std.json.ObjectMap = .empty;
+            try ref.put(a, "key", .{ .string = key });
+            if (jsonStringField(doc_ref, "table")) |table| try ref.put(a, "table", .{ .string = table });
+            try map.put(a, local_id, .{ .object = ref });
+        }
+    }
+    // No resolver targets this artifact: return null so relation sources
+    // keep their owning document (see appendRelationItem). A targeting
+    // resolver with nothing landed yet still yields an (empty) map, which
+    // tells the materializer canonical keys are coming.
+    if (!resolver_targets_artifact) return null;
+    return try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = map }, .{});
+}
+
+/// Whether any resolver consumes `artifact_name`, i.e. whether extraction
+/// entities in that artifact will eventually get canonical keys.
+fn resolverTargetsGraphArtifact(index_manager: *index_manager_mod.IndexManager, artifact_name: []const u8) bool {
+    for (index_manager.resolvers.items) |cfg| {
+        if (std.mem.eql(u8, cfg.source_artifact, artifact_name)) return true;
+    }
+    return false;
+}
+
+/// Attach canonical endpoint resolutions to a parsed extraction artifact as
+/// its "_entities" map, which findGraphArtifactEntity consults ahead of the
+/// artifact's own entities. Best-effort: malformed resolutions leave the
+/// artifact untouched (relation endpoints then fall back to local ids).
+fn injectGraphEndpointResolutions(parsed: *std.json.Parsed(std.json.Value), resolutions_raw: []const u8) !void {
+    if (parsed.value != .object) return;
+    const a = parsed.arena.allocator();
+    const res = std.json.parseFromSliceLeaky(std.json.Value, a, resolutions_raw, .{}) catch return;
+    if (res != .object) return;
+    try parsed.value.object.put(a, "_entities", res);
+}
+
 fn jsonEndpointDocumentIdResolved(value: std.json.Value, artifact_value: std.json.Value) ?[]const u8 {
-    return jsonEndpointDocumentId(value) orelse if (resolveGraphEndpointEntity(value, artifact_value)) |entity| jsonEndpointDocumentId(entity) else null;
+    // A relation endpoint referencing an extraction entity (a plain string
+    // like "e0" matching the artifact's entities, or {entity_id}/
+    // {entity_index}) renders the entity's canonical identity — fields on
+    // the entity entry itself or an injected "_entities" resolution map (see
+    // injectGraphEndpointResolutions) — or nothing at all: before resolution
+    // there is no durable node for a local mention, and rendering the local
+    // id would strand an orphan edge that no later replay retires. The
+    // resolution-artifact replay re-renders the artifact once canonical keys
+    // exist. Endpoints matching no extraction entity keep the legacy
+    // string-passthrough external-node behavior.
+    if (resolveGraphEndpointEntity(value, artifact_value)) |entity| {
+        return canonicalEntityDocumentId(entity);
+    }
+    return jsonEndpointDocumentId(value);
+}
+
+/// Canonical document identity of an extraction entity: unlike
+/// jsonEndpointDocumentId this never falls back to the entity's local
+/// id/local_id, which identifies a mention within one artifact, not a node.
+fn canonicalEntityDocumentId(entity: std.json.Value) ?[]const u8 {
+    if (entity != .object) return null;
+    if (jsonStringField(entity, "document_id") orelse jsonStringField(entity, "doc_key") orelse jsonStringField(entity, "key")) |id| return id;
+    if (entity.object.get("doc_ref")) |doc_ref| return jsonEndpointDocumentId(doc_ref);
+    return null;
+}
+
+/// Home table of a canonically resolved extraction entity (from the injected
+/// resolution map or a doc_ref), for the `target_table` cross-table endpoint
+/// tag traversal and node admission honor (see graph/traversal.zig
+/// edgeTargetTable and the mention-edge materializer precedent).
+fn canonicalEntityTable(entity: std.json.Value) ?[]const u8 {
+    if (entity != .object) return null;
+    if (jsonStringField(entity, "table")) |table| return table;
+    if (entity.object.get("doc_ref")) |doc_ref| return jsonStringField(doc_ref, "table");
+    return null;
+}
+
+/// Prepend a cross-table endpoint tag to an already-rendered metadata JSON
+/// object, preserving an explicit tag the template rendered itself.
+/// Non-object metadata passes through untouched (the tag has nowhere
+/// coherent to live, and traversal's substring scan would misread it).
+fn prependTableTagToMetadataJsonAlloc(alloc: Allocator, comptime tag: []const u8, table: []const u8, metadata_json: []const u8) ![]u8 {
+    if (metadata_json.len < 2 or metadata_json[0] != '{' or
+        std.mem.indexOf(u8, metadata_json, "\"" ++ tag ++ "\":") != null)
+        return try alloc.dupe(u8, metadata_json);
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "{\"" ++ tag ++ "\":");
+    const quoted = try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = table }, .{});
+    defer alloc.free(quoted);
+    try out.appendSlice(alloc, quoted);
+    if (!std.mem.eql(u8, metadata_json, "{}")) {
+        try out.append(alloc, ',');
+        try out.appendSlice(alloc, metadata_json[1..]);
+    } else {
+        try out.append(alloc, '}');
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn prependTargetTableToMetadataJsonAlloc(alloc: Allocator, target_table: []const u8, metadata_json: []const u8) ![]u8 {
+    return try prependTableTagToMetadataJsonAlloc(alloc, "target_table", target_table, metadata_json);
+}
+
+fn prependTargetTableToItemMetadataAlloc(alloc: Allocator, target_table: []const u8, item: std.json.Value) ![]u8 {
+    const item_json = try std.json.Stringify.valueAlloc(alloc, item, .{});
+    defer alloc.free(item_json);
+    std.debug.assert(item_json.len >= 2 and item_json[0] == '{');
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "{\"target_table\":");
+    const quoted = try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = target_table }, .{});
+    defer alloc.free(quoted);
+    try out.appendSlice(alloc, quoted);
+    if (!std.mem.eql(u8, item_json, "{}")) {
+        try out.append(alloc, ',');
+        try out.appendSlice(alloc, item_json[1..]);
+    } else {
+        try out.append(alloc, '}');
+    }
+    return try out.toOwnedSlice(alloc);
 }
 
 fn resolveGraphEndpointEntity(value: std.json.Value, artifact_value: std.json.Value) ?std.json.Value {
-    if (value != .object) return null;
-    if (jsonIntegerField(value, "entity_index")) |entity_index| return graphArtifactEntityAtIndex(artifact_value, entity_index);
-    const entity_id = jsonStringField(value, "entity_id") orelse jsonStringField(value, "id") orelse jsonStringField(value, "local_id") orelse return null;
-    return findGraphArtifactEntity(artifact_value, entity_id);
+    switch (value) {
+        .string => return findGraphArtifactEntity(artifact_value, value.string),
+        .object => {
+            if (jsonIntegerField(value, "entity_index")) |entity_index| return graphArtifactEntityAtIndex(artifact_value, entity_index);
+            const entity_id = jsonStringField(value, "entity_id") orelse jsonStringField(value, "id") orelse jsonStringField(value, "local_id") orelse return null;
+            return findGraphArtifactEntity(artifact_value, entity_id);
+        },
+        else => return null,
+    }
 }
 
 fn findGraphArtifactEntity(artifact_value: std.json.Value, entity_id: []const u8) ?std.json.Value {
     if (artifact_value != .object) return null;
-    const entities = artifact_value.object.get("_entities") orelse artifact_value.object.get("entities") orelse return null;
+    // The injected "_entities" resolution map wins, but a mention it does not
+    // cover (partial resolution) still matches the artifact's own entities so
+    // the canonical-only endpoint rule can drop it instead of leaking its
+    // local id as a node.
+    if (artifact_value.object.get("_entities")) |resolved| {
+        if (findGraphArtifactEntityIn(resolved, entity_id)) |entity| return entity;
+    }
+    const entities = artifact_value.object.get("entities") orelse return null;
+    return findGraphArtifactEntityIn(entities, entity_id);
+}
+
+fn findGraphArtifactEntityIn(entities: std.json.Value, entity_id: []const u8) ?std.json.Value {
     return switch (entities) {
         .array => |array| blk: {
             for (array.items) |entity| {
@@ -66308,11 +67038,29 @@ fn findGraphArtifactEntity(artifact_value: std.json.Value, entity_id: []const u8
 
 fn graphArtifactEntityAtIndex(artifact_value: std.json.Value, entity_index: i64) ?std.json.Value {
     if (entity_index < 0 or artifact_value != .object) return null;
-    const entities = artifact_value.object.get("_entities") orelse artifact_value.object.get("entities") orelse return null;
-    if (entities != .array) return null;
     const index: usize = @intCast(entity_index);
-    if (index >= entities.array.items.len) return null;
-    return entities.array.items[index];
+    const raw_entity: ?std.json.Value = blk: {
+        const entities = artifact_value.object.get("entities") orelse break :blk null;
+        if (entities != .array or index >= entities.array.items.len) break :blk null;
+        break :blk entities.array.items[index];
+    };
+    if (artifact_value.object.get("_entities")) |resolved| {
+        // The injected resolution map is keyed by mention local id. An
+        // id-less extraction entity (GLiNER2.5's positional payloads) was
+        // resolved under its decimal array position — the same identity
+        // lib/resolver's parseExtractionEntities assigns it.
+        var buf: [20]u8 = undefined;
+        const positional_id = std.fmt.bufPrint(&buf, "{d}", .{index}) catch unreachable;
+        const local_id = if (raw_entity) |entity|
+            jsonStringField(entity, "id") orelse jsonStringField(entity, "local_id") orelse positional_id
+        else
+            positional_id;
+        if (findGraphArtifactEntityIn(resolved, local_id)) |entity| return entity;
+        if (resolved == .array and index < resolved.array.items.len) return resolved.array.items[index];
+    }
+    // The raw positional entity carries no canonical identity; the
+    // canonical-only endpoint rule downstream drops it until resolution lands.
+    return raw_entity;
 }
 
 fn jsonStringField(value: std.json.Value, field: []const u8) ?[]const u8 {
@@ -66353,6 +67101,7 @@ const OwnedGraphMutations = struct {
             self.alloc.free(@constCast(write.target));
             self.alloc.free(@constCast(write.edge_type));
             if (write.metadata_json.len > 0) self.alloc.free(@constCast(write.metadata_json));
+            if (write.owner.len > 0) self.alloc.free(@constCast(write.owner));
         }
         if (self.writes.len > 0) self.alloc.free(self.writes);
 
@@ -66361,6 +67110,7 @@ const OwnedGraphMutations = struct {
             self.alloc.free(@constCast(delete.source));
             self.alloc.free(@constCast(delete.target));
             self.alloc.free(@constCast(delete.edge_type));
+            if (delete.owner.len > 0) self.alloc.free(@constCast(delete.owner));
         }
         if (self.deletes.len > 0) self.alloc.free(self.deletes);
 
@@ -66394,6 +67144,7 @@ fn collectGraphMutationsForArtifacts(
             alloc.free(@constCast(write.target));
             alloc.free(@constCast(write.edge_type));
             if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
+            if (write.owner.len > 0) alloc.free(@constCast(write.owner));
         }
         writes.deinit(alloc);
     }
@@ -66404,6 +67155,7 @@ fn collectGraphMutationsForArtifacts(
             alloc.free(@constCast(delete.source));
             alloc.free(@constCast(delete.target));
             alloc.free(@constCast(delete.edge_type));
+            if (delete.owner.len > 0) alloc.free(@constCast(delete.owner));
         }
         deletes.deinit(alloc);
     }
@@ -66426,8 +67178,13 @@ fn collectGraphMutationsForArtifacts(
             alloc.free(parsed.index_name);
             alloc.free(parsed.edge_type);
             alloc.free(parsed.target_doc_key);
+            if (parsed.source_node) |source| alloc.free(source);
         }
         if (!std.mem.eql(u8, parsed.index_name, index_name)) continue;
+        // The key's owner routes and retires the row; the applied edge starts
+        // from the explicit source node when one is embedded (entity-sourced
+        // relations, zig/AUTOSCHEMA.md).
+        const edge_source = parsed.source_node orelse parsed.doc_key;
 
         const raw = txn.get(artifact_key) catch |err| switch (err) {
             error.NotFound => null,
@@ -66472,9 +67229,10 @@ fn collectGraphMutationsForArtifacts(
                 decoded.deinit(alloc);
                 try deletes.append(alloc, .{
                     .index_name = try alloc.dupe(u8, parsed.index_name),
-                    .source = try alloc.dupe(u8, parsed.doc_key),
+                    .source = try alloc.dupe(u8, edge_source),
                     .target = try alloc.dupe(u8, parsed.target_doc_key),
                     .edge_type = try alloc.dupe(u8, parsed.edge_type),
+                    .owner = if (parsed.source_node != null) try alloc.dupe(u8, parsed.doc_key) else "",
                 });
                 continue;
             }
@@ -66492,7 +67250,8 @@ fn collectGraphMutationsForArtifacts(
             errdefer decoded.deinit(alloc);
             try writes.append(alloc, .{
                 .index_name = try alloc.dupe(u8, parsed.index_name),
-                .source = try alloc.dupe(u8, parsed.doc_key),
+                .source = try alloc.dupe(u8, edge_source),
+                .owner = if (parsed.source_node != null) try alloc.dupe(u8, parsed.doc_key) else "",
                 .target = try alloc.dupe(u8, parsed.target_doc_key),
                 .edge_type = try alloc.dupe(u8, parsed.edge_type),
                 .weight = decoded.weight,
@@ -66505,9 +67264,10 @@ fn collectGraphMutationsForArtifacts(
         } else {
             try deletes.append(alloc, .{
                 .index_name = try alloc.dupe(u8, parsed.index_name),
-                .source = try alloc.dupe(u8, parsed.doc_key),
+                .source = try alloc.dupe(u8, edge_source),
                 .target = try alloc.dupe(u8, parsed.target_doc_key),
                 .edge_type = try alloc.dupe(u8, parsed.edge_type),
+                .owner = if (parsed.source_node != null) try alloc.dupe(u8, parsed.doc_key) else "",
             });
         }
     }
@@ -68296,17 +69056,23 @@ fn applySplitGraphArtifactsStreaming(
             try buffer.writes.ensureUnusedCapacity(state.alloc, 1);
             const index_name = try state.alloc.dupe(u8, parsed.index_name);
             errdefer state.alloc.free(index_name);
-            const source = try state.alloc.dupe(u8, parsed.doc_key);
+            // The applied edge starts from the explicit source node when the
+            // key embeds one (entity-sourced relations); the owner stays the
+            // key's leading document component.
+            const source = try state.alloc.dupe(u8, parsed.source_node orelse parsed.doc_key);
             errdefer state.alloc.free(source);
             const target = try state.alloc.dupe(u8, parsed.target_doc_key);
             errdefer state.alloc.free(target);
             const edge_type = try state.alloc.dupe(u8, parsed.edge_type);
             errdefer state.alloc.free(edge_type);
+            const owner = if (parsed.source_node != null) try state.alloc.dupe(u8, parsed.doc_key) else "";
+            errdefer if (owner.len > 0) state.alloc.free(owner);
             buffer.writes.appendAssumeCapacity(.{
                 .index_name = index_name,
                 .source = source,
                 .target = target,
                 .edge_type = edge_type,
+                .owner = owner,
                 .weight = decoded.weight,
                 .created_at = decoded.created_at,
                 .updated_at = decoded.updated_at,
@@ -68325,6 +69091,7 @@ fn applySplitGraphArtifactsStreaming(
                 state.alloc.free(parsed.index_name);
                 state.alloc.free(parsed.edge_type);
                 state.alloc.free(parsed.target_doc_key);
+                if (parsed.source_node) |source| state.alloc.free(source);
             }
             const buffer_index = state.indexes_by_name.get(parsed.index_name) orelse return .@"continue";
             var decoded = try enrichment_artifact_codec.decodeGraphEdgeAlloc(state.alloc, value);
@@ -68383,6 +69150,7 @@ fn applySplitGraphArtifactsForIndexStreamingContext(
                 state.ctx.alloc.free(@constCast(write.target));
                 state.ctx.alloc.free(@constCast(write.edge_type));
                 if (write.metadata_json.len > 0) state.ctx.alloc.free(@constCast(write.metadata_json));
+                if (write.owner.len > 0) state.ctx.alloc.free(@constCast(write.owner));
             }
             state.writes.clearRetainingCapacity();
         }
@@ -68428,6 +69196,7 @@ fn applySplitGraphArtifactsForIndexStreamingContext(
                 state.ctx.alloc.free(parsed.index_name);
                 state.ctx.alloc.free(parsed.edge_type);
                 state.ctx.alloc.free(parsed.target_doc_key);
+                if (parsed.source_node) |source| state.ctx.alloc.free(source);
             }
             if (!std.mem.eql(u8, parsed.index_name, state.index_name)) return .@"continue";
 
@@ -68477,7 +69246,10 @@ fn applySplitGraphArtifactsForIndexStreamingContext(
             errdefer decoded.deinit(state.ctx.alloc);
             try state.writes.append(state.ctx.alloc, .{
                 .index_name = try state.ctx.alloc.dupe(u8, parsed.index_name),
-                .source = try state.ctx.alloc.dupe(u8, parsed.doc_key),
+                // Entity-sourced relations rebuild from the key's embedded
+                // source node; the owning document keys the rebuilt row.
+                .source = try state.ctx.alloc.dupe(u8, parsed.source_node orelse parsed.doc_key),
+                .owner = if (parsed.source_node != null) try state.ctx.alloc.dupe(u8, parsed.doc_key) else "",
                 .target = try state.ctx.alloc.dupe(u8, parsed.target_doc_key),
                 .edge_type = try state.ctx.alloc.dupe(u8, parsed.edge_type),
                 .weight = decoded.weight,
@@ -68579,6 +69351,15 @@ fn finalizeSplitLocked(self: *DB, new_range: types.ByteRange) !void {
     // Prepare all private ownership tasks before the authoritative range can
     // narrow. Partial preparation/failure leaves the old graph visible, and
     // primary range adoption activates the prepared fences infallibly.
+    //
+    // Entity-sourced edges first: their physical rows are keyed by the
+    // canonical SOURCE entity, which can fall outside the moved document
+    // range, so the source-keyed fence below never retires them. Withdraw
+    // each moved document's contribution explicitly (owner-scoped deletes;
+    // graph membership keeps edges that a remaining document still asserts)
+    // while the moved owners are still inside this shard's range and before
+    // the fence starts rejecting out-of-scope sources.
+    try retireSplitEntitySourcedEdgesLocked(self, split_state);
     try self.core.index_manager.fenceGraphSplitRange(split_state.split_key, split_state.original_range_end);
     const split_lower = try documentRangeLowerAlloc(self.alloc, split_state.split_key);
     defer self.alloc.free(split_lower);
@@ -68598,6 +69379,59 @@ fn finalizeSplitLocked(self: *DB, new_range: types.ByteRange) !void {
     try self.refreshManagedIndexWorkersLocked();
     try self.closeShadowIndexManagerLocked();
     try self.refreshManagedIndexWorkersLocked();
+}
+
+/// Withdraw every moved document's entity-sourced edge contributions from
+/// this (source) shard. The destination re-applies them from the copied
+/// owner-scoped artifacts; without this sweep the source shard strands
+/// physical rows whose source key lies outside the moved range (the
+/// source-keyed split fence cannot see them) while their owning documents
+/// leave.
+fn retireSplitEntitySourcedEdgesLocked(self: *DB, split_state: shard_mod.SplitState) !void {
+    const alloc = self.alloc;
+    const lower = try documentRangeLowerAlloc(alloc, split_state.split_key);
+    defer alloc.free(lower);
+    const upper = if (split_state.original_range_end.len > 0)
+        try documentRangeUpperAlloc(alloc, split_state.original_range_end)
+    else
+        null;
+    defer if (upper) |key| alloc.free(key);
+
+    const scanned = try self.core.scanStoreRange(alloc, lower, if (upper) |key| key else "");
+    defer docstore_mod.DocStore.freeResults(alloc, scanned);
+
+    var deletes = std.ArrayListUnmanaged(types.GraphEdgeDelete).empty;
+    defer {
+        for (deletes.items) |delete| {
+            alloc.free(@constCast(delete.index_name));
+            alloc.free(@constCast(delete.source));
+            alloc.free(@constCast(delete.target));
+            alloc.free(@constCast(delete.edge_type));
+            if (delete.owner.len > 0) alloc.free(@constCast(delete.owner));
+        }
+        deletes.deinit(alloc);
+    }
+    for (scanned) |row| {
+        if (!internal_keys.isGraphEdgeArtifactKey(row.key)) continue;
+        const parsed = (try internal_keys.parseGraphEdgeArtifactKeyAlloc(alloc, row.key)) orelse continue;
+        defer {
+            alloc.free(parsed.doc_key);
+            alloc.free(parsed.index_name);
+            alloc.free(parsed.edge_type);
+            alloc.free(parsed.target_doc_key);
+            if (parsed.source_node) |source| alloc.free(source);
+        }
+        const source_node = parsed.source_node orelse continue;
+        try deletes.append(alloc, .{
+            .index_name = try alloc.dupe(u8, parsed.index_name),
+            .source = try alloc.dupe(u8, source_node),
+            .target = try alloc.dupe(u8, parsed.target_doc_key),
+            .edge_type = try alloc.dupe(u8, parsed.edge_type),
+            .owner = try alloc.dupe(u8, parsed.doc_key),
+        });
+    }
+    if (deletes.items.len == 0) return;
+    try self.core.index_manager.applyGraphDeletes(deletes.items);
 }
 
 fn markSplitOffDocumentArtifactChildRangesLocked(
@@ -70821,12 +71655,12 @@ fn flushFinishedDenseAppliedSequenceLocked(
                 posting_publish_ns +|= elapsedSince(posting_started);
             }
         } else {
-            const metadata_started = monotonicTimeNs();
-            try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
-            projection_metadata_ns +|= elapsedSince(metadata_started);
             const posting_started = monotonicTimeNs();
             try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
             posting_publish_ns +|= elapsedSince(posting_started);
+            const metadata_started = monotonicTimeNs();
+            try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
+            projection_metadata_ns +|= elapsedSince(metadata_started);
             const checkpoint_started = monotonicTimeNs();
             try apply_state.saveAppliedSequencesWithCheckpoint(
                 ctx.alloc,
@@ -70909,12 +71743,12 @@ fn flushPendingAppliedSequencesLocked(
             }
         }
         if (generic_updates.items.len > 0) {
-            const metadata_started = monotonicTimeNs();
-            try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
-            projection_metadata_ns +|= elapsedSince(metadata_started);
             const posting_started = monotonicTimeNs();
             try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
             posting_publish_ns +|= elapsedSince(posting_started);
+            const metadata_started = monotonicTimeNs();
+            try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
+            projection_metadata_ns +|= elapsedSince(metadata_started);
             const checkpoint_started = monotonicTimeNs();
             try apply_state.saveAppliedSequencesWithCheckpoint(
                 ctx.alloc,
@@ -86742,6 +87576,143 @@ test "db direct generated chunks feed multi-source text and graph indexes" {
     try std.testing.expectEqual(@as(usize, 0), after_delete.len);
 }
 
+test "db asset consumes another asset artifact and re-derives on upstream change" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .enable_without_producers = true,
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "summary_text_v1",
+        .kind = .asset,
+        .field = "summary",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"copy\"}",
+    });
+    try db.addEnrichment(.{
+        .name = "summary_echo_v1",
+        .kind = .asset,
+        .source_artifact_name = "summary_text_v1",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"copy\"}",
+    });
+    try db.addIndex(.{
+        .name = "echo_text",
+        .kind = .full_text,
+        .config_json = "{\"sources\":[{\"artifact\":\"summary_echo_v1\"}]}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"summary\":\"firstupstreamtoken concise summary\"}",
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const echo_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "summary_echo_v1");
+    defer alloc.free(echo_key);
+    const first = try db.core.store.get(alloc, echo_key);
+    defer alloc.free(first);
+    try std.testing.expectEqualStrings("firstupstreamtoken concise summary", first);
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"summary\":\"secondupstreamtoken concise summary\"}",
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+    const second = try db.core.store.get(alloc, echo_key);
+    defer alloc.free(second);
+    try std.testing.expectEqualStrings("secondupstreamtoken concise summary", second);
+
+    // Removing the upstream source retires the producer and, through the
+    // same batch's delete overlay, the consumer.
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{}",
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, echo_key));
+}
+
+test "db asset consuming asset validates upstream references at admission" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .enable_without_producers = true,
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "a_v1",
+        .kind = .asset,
+        .field = "summary",
+        .producer_json = "{\"type\":\"copy\"}",
+    });
+    // Self-reference is the one-hop cycle.
+    try std.testing.expectError(error.InvalidEnrichmentConfig, db.addEnrichment(.{
+        .name = "self_v1",
+        .kind = .asset,
+        .source_artifact_name = "self_v1",
+        .producer_json = "{\"type\":\"copy\"}",
+    }));
+    // The upstream must already be an admitted asset.
+    try std.testing.expectError(error.InvalidEnrichmentConfig, db.addEnrichment(.{
+        .name = "b_v1",
+        .kind = .asset,
+        .source_artifact_name = "missing_v1",
+        .producer_json = "{\"type\":\"copy\"}",
+    }));
+    // Consuming assets read produced bytes; a document field cannot also be
+    // the source.
+    try std.testing.expectError(error.InvalidEnrichmentConfig, db.addEnrichment(.{
+        .name = "c_v1",
+        .kind = .asset,
+        .field = "summary",
+        .source_artifact_name = "a_v1",
+        .producer_json = "{\"type\":\"copy\"}",
+    }));
+    // Media-locator producers dereference the source as a URL and stay closed.
+    try std.testing.expectError(error.InvalidEnrichmentConfig, db.addEnrichment(.{
+        .name = "r_v1",
+        .kind = .asset,
+        .source_artifact_name = "a_v1",
+        .producer_json = "{\"type\":\"reader\"}",
+    }));
+    // A valid chain admits.
+    try db.addEnrichment(.{
+        .name = "d_v1",
+        .kind = .asset,
+        .source_artifact_name = "a_v1",
+        .producer_json = "{\"type\":\"copy\"}",
+    });
+}
+
 test "db multi-source full text unions chunk and textual asset streams across deletion and reopen" {
     const alloc = std.testing.allocator;
 
@@ -87189,6 +88160,181 @@ test "db materializes doc->entity mention edges as provenance and clears them on
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolution_handoff_key));
 }
 
+test "db materializes entity-sourced relation edges once resolution lands" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    // extraction_graph relations reference extraction entities by local id;
+    // once the resolver mints canonical keys, the relation edges re-render
+    // with the canonical ENTITY as their topological source while the
+    // producing document keeps artifact-key ownership (zig/AUTOSCHEMA.md).
+    try db.addIndex(.{
+        .name = "kg_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"artifact":"kg_v1","mention_edge_type":"mentions","format":"extraction_graph"},
+        \\  "artifact":{"name":"kg_v1","kind":"asset","source":{"type":"field","value":"kg"},"content_type":"application/json"},
+        \\  "edge_types":[{"name":"mentions"},{"name":"works_at"}]
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "kg_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"kg":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"},{"id":"e1","label":"org","text":"Antfly"}],"relations":[{"type":"works_at","source":"e0","target":"e1"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    // The entity-sourced edge: person --works_at--> org, applied from the
+    // canonical source node, owned by doc:a in the artifact key.
+    {
+        const out = try waitForGraphEdges(alloc, &db, "kg_graph", "person/ada_lovelace", "works_at", .out, 1);
+        defer graph_mod.GraphIndex.freeEdges(alloc, out);
+        try std.testing.expectEqual(@as(usize, 1), out.len);
+        try std.testing.expectEqualStrings("org/antfly", out[0].target);
+    }
+    const owned_key = try internal_keys.graphEdgeArtifactKeyWithSourceAlloc(alloc, "doc:a", "kg_graph", "works_at", "org/antfly", "person/ada_lovelace");
+    defer alloc.free(owned_key);
+    {
+        const raw = try db.core.store.get(alloc, owned_key);
+        defer alloc.free(raw);
+        // The resolved endpoint's home table rides the edge metadata so
+        // traversal and node admission hydrate the cross-table target, the
+        // same contract mention edges carry.
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"target_table\":\"entities\"") != null);
+    }
+    // No document-sourced or local-id-sourced variant of the relation exists.
+    {
+        const doc_sourced = try db.getEdges(alloc, "kg_graph", "doc:a", "works_at", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, doc_sourced);
+        try std.testing.expectEqual(@as(usize, 0), doc_sourced.len);
+        const local_sourced = try db.getEdges(alloc, "kg_graph", "e0", "works_at", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, local_sourced);
+        try std.testing.expectEqual(@as(usize, 0), local_sourced.len);
+    }
+
+    // Deleting the producing document retires the entity-sourced edge with
+    // its owner.
+    try db.batch(.{ .deletes = &.{"doc:a"}, .sync_level = .enrichments });
+    try db.runUntilIdle();
+    {
+        const out = try db.getEdges(alloc, "kg_graph", "person/ada_lovelace", "works_at", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, out);
+        try std.testing.expectEqual(@as(usize, 0), out.len);
+    }
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, owned_key));
+}
+
+test "db canonicalizes positional extractor endpoints once resolution lands" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    // GLiNER2.5 boundary payloads carry no per-entity ids: relations
+    // reference entities positionally through `entity_index` endpoint
+    // objects, and confidence is spelled "score". The resolver assigns each
+    // id-less mention its decimal array position as the local id, and the
+    // materializer derives the same identity for `entity_index` endpoints,
+    // so resolution injection canonicalizes them like id-carrying payloads
+    // (the examples/dogfood extractor shape).
+    try db.addIndex(.{
+        .name = "gliner_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation","mention_edge_type":"mentions"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"extraction"},"content_type":"application/json"},
+        \\  "edge_types":[{"name":"mentions"},{"name":"tested_by"}]
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"extraction":{"entities":[{"label":"component","text":"DataServer","score":0.69,"start":64,"end":74},{"label":"test","text":"VOPR","score":0.98,"start":45,"end":49}],"relations":[{"type":"tested_by","source":{"entity_index":0},"target":{"entity_index":1},"score":0.9}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    // The relation edge starts from the canonical source ENTITY resolved
+    // through its positional identity, not from the producing document.
+    {
+        const out = try waitForGraphEdges(alloc, &db, "gliner_graph", "component/dataserver", "tested_by", .out, 1);
+        defer graph_mod.GraphIndex.freeEdges(alloc, out);
+        try std.testing.expectEqual(@as(usize, 1), out.len);
+        try std.testing.expectEqualStrings("test/vopr", out[0].target);
+    }
+    // Both positional mentions also produced document-owned mention edges.
+    {
+        const mentions = try db.getEdges(alloc, "gliner_graph", "doc:a", "mentions", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, mentions);
+        try std.testing.expectEqual(@as(usize, 2), mentions.len);
+    }
+    // The edge is owned by the producing document in the artifact key, and no
+    // document-sourced variant of the relation leaked.
+    const owned_key = try internal_keys.graphEdgeArtifactKeyWithSourceAlloc(alloc, "doc:a", "gliner_graph", "tested_by", "test/vopr", "component/dataserver");
+    defer alloc.free(owned_key);
+    {
+        const raw = try db.core.store.get(alloc, owned_key);
+        defer alloc.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"target_table\":\"entities\"") != null);
+    }
+    {
+        const doc_sourced = try db.getEdges(alloc, "gliner_graph", "doc:a", "tested_by", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, doc_sourced);
+        try std.testing.expectEqual(@as(usize, 0), doc_sourced.len);
+    }
+
+    // Document deletion retires the entity-sourced edge with its owner.
+    try db.batch(.{ .deletes = &.{"doc:a"}, .sync_level = .enrichments });
+    try db.runUntilIdle();
+    {
+        const out = try db.getEdges(alloc, "gliner_graph", "component/dataserver", "tested_by", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, out);
+        try std.testing.expectEqual(@as(usize, 0), out.len);
+    }
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, owned_key));
+}
+
 test "db resolver removal retires resolution artifacts and mention graph state" {
     const alloc = std.testing.allocator;
 
@@ -87384,7 +88530,7 @@ test "db does not materialize review-band resolution as canonical mention edges"
         .writes = &.{.{
             .key = "doc:a",
             .value =
-            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"},{"id":"e1","label":"person","text":"Charles Babbage"}],"relations":[{"type":"knows","source":"e1","target":"e0"}]}}
             ,
         }},
         .sync_level = .enrichments,
@@ -87401,9 +88547,29 @@ test "db does not materialize review-band resolution as canonical mention edges"
     try std.testing.expectEqualStrings("review", ent.get("decision").?.string);
     try std.testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
 
-    const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
-    defer graph_mod.GraphIndex.freeEdges(alloc, out);
-    try std.testing.expectEqual(@as(usize, 0), out.len);
+    // Only the cleanly resolved mention has a canonical edge; the reviewed
+    // one is withheld.
+    {
+        const out = try waitForGraphEdges(alloc, &db, "prov_graph", "doc:a", "mentions", .out, 1);
+        defer graph_mod.GraphIndex.freeEdges(alloc, out);
+        try std.testing.expectEqual(@as(usize, 1), out.len);
+        try std.testing.expectEqualStrings("person/charles_babbage", out[0].target);
+    }
+    // The relation references the reviewed entity, and a review entry
+    // carries a PROVISIONAL key: the relation must stay absent until a
+    // curator approves — from the canonical source, the producing document,
+    // and the local id alike.
+    {
+        const knows = try db.getEdges(alloc, "prov_graph", "person/charles_babbage", "knows", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, knows);
+        try std.testing.expectEqual(@as(usize, 0), knows.len);
+        const doc_sourced = try db.getEdges(alloc, "prov_graph", "doc:a", "knows", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, doc_sourced);
+        try std.testing.expectEqual(@as(usize, 0), doc_sourced.len);
+        const local_sourced = try db.getEdges(alloc, "prov_graph", "e1", "knows", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, local_sourced);
+        try std.testing.expectEqual(@as(usize, 0), local_sourced.len);
+    }
 
     _ = try db.recordReviewDecision("doc:a", "relations_v1", "resolution_v1", "e0", .match, "entities", "person/ada_lovelace");
     try db.runUntilIdle();
@@ -87418,10 +88584,21 @@ test "db does not materialize review-band resolution as canonical mention edges"
 
     // runUntilIdle is the lifecycle fence: a blocked promotion sink must not
     // prevent the independent graph consumer from publishing this edge.
-    const curated_edges = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+    const curated_edges = try waitForGraphEdges(alloc, &db, "prov_graph", "doc:a", "mentions", .out, 2);
     defer graph_mod.GraphIndex.freeEdges(alloc, curated_edges);
-    try std.testing.expectEqual(@as(usize, 1), curated_edges.len);
-    try std.testing.expectEqualStrings("person/ada_lovelace", curated_edges[0].target);
+    try std.testing.expectEqual(@as(usize, 2), curated_edges.len);
+    var saw_ada = false;
+    for (curated_edges) |edge| {
+        if (std.mem.eql(u8, edge.target, "person/ada_lovelace")) saw_ada = true;
+    }
+    try std.testing.expect(saw_ada);
+
+    // Approval also releases the withheld relation, entity-sourced from the
+    // canonical endpoint.
+    const curated_knows = try waitForGraphEdges(alloc, &db, "prov_graph", "person/charles_babbage", "knows", .out, 1);
+    defer graph_mod.GraphIndex.freeEdges(alloc, curated_knows);
+    try std.testing.expectEqual(@as(usize, 1), curated_knows.len);
+    try std.testing.expectEqualStrings("person/ada_lovelace", curated_knows[0].target);
 }
 
 test "db mention edge weight is fused from extractor trust and mention confidence" {
@@ -87580,6 +88757,105 @@ test "db rewriteEntityEdges repoints provenance edges to a merge survivor" {
         try std.testing.expectEqual(@as(usize, 1), new_inbound.len);
         try std.testing.expectEqualStrings("doc:a", new_inbound[0].source);
         try std.testing.expectEqualStrings("person/ada_canonical", new_inbound[0].target);
+    }
+}
+
+test "db complete-snapshot scope expands graph traversal through tagged entity nodes" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "prov_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"artifact":"relations_v1","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{
+                .key = "doc:a",
+                .value =
+                \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+                ,
+            },
+            .{
+                .key = "doc:b",
+                .value =
+                \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+                ,
+            },
+        },
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const walk = graph_query_mod.GraphQuery{
+        .query_type = .traverse,
+        .index_name = "prov_graph",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+        .params = .{
+            .edge_types = &.{"mentions"},
+            .direction = .both,
+            .max_depth = 2,
+            .deduplicate = true,
+        },
+    };
+
+    // Without the scope the tagged entity node stays terminal: doc:b is
+    // unreachable through it.
+    {
+        var result = try db.search(alloc, .{
+            .graph_queries = &.{.{ .name = "walk", .query = walk }},
+        });
+        defer result.deinit();
+        for (result.graph_results[0].nodes) |node| {
+            try std.testing.expect(!std.mem.eql(u8, node.key, "doc:b"));
+        }
+    }
+
+    // The API read source marks admitted single-group requests as
+    // complete-snapshot; the local executor then walks doc -> entity -> doc
+    // THROUGH the tagged node in one traversal.
+    {
+        var result = try db.search(alloc, .{
+            .graph_queries = &.{.{ .name = "walk", .query = walk }},
+            .graph_owning_table = "docs",
+            .graph_index_complete_snapshot = true,
+        });
+        defer result.deinit();
+        var saw_entity = false;
+        var saw_doc_b = false;
+        for (result.graph_results[0].nodes) |node| {
+            if (std.mem.eql(u8, node.key, "person/ada_lovelace")) {
+                try std.testing.expectEqualStrings("entities", node.table.?);
+                saw_entity = true;
+            }
+            if (std.mem.eql(u8, node.key, "doc:b")) {
+                try std.testing.expect(node.table == null);
+                saw_doc_b = true;
+            }
+        }
+        try std.testing.expect(saw_entity and saw_doc_b);
     }
 }
 
@@ -87790,6 +89066,7 @@ test "graph artifact materializer rejects non-finite mapped weights" {
             source,
             "application/json",
             null,
+            null,
             1,
         ));
     }
@@ -87809,8 +89086,96 @@ test "graph artifact parser enforces its independent raw item safety limit" {
         source,
         "application/json",
         null,
+        null,
         1,
     ));
+}
+
+test "graph relation endpoints canonicalize through injected resolutions" {
+    const alloc = std.testing.allocator;
+    const source = index_manager_mod.GraphArtifactSource{
+        .artifact_name = @constCast("kg_v1"),
+        .format = .extraction_graph,
+    };
+    const raw =
+        \\{"entities":[
+        \\  {"id":"e0","label":"person","text":"Ada Lovelace"},
+        \\  {"id":"v0","label":"event","text":"Ada writes the first program"}
+        \\],"relations":[
+        \\  {"type":"participates_in","source":"e0","target":"v0"},
+        \\  {"type":"mentions_external","source":"e0","target":"ext-node"}
+        \\]}
+    ;
+
+    // With a resolver targeting the artifact but no resolution landed (an
+    // empty "_entities" map), any endpoint referencing an extraction entity
+    // — source or target — drops the edge (no durable node exists yet; the
+    // resolution replay re-renders it canonically). Both relations here
+    // carry the extraction-entity source "e0", so nothing materializes.
+    {
+        const writes = try graphWritesFromArtifactValueAlloc(alloc, "kg", "doc:a", raw, source, "application/json", null, "{}", 100);
+        defer freeGraphWrites(alloc, writes);
+        try std.testing.expectEqual(@as(usize, 0), writes.len);
+    }
+
+    // With no resolver configured, canonical keys never arrive, so an
+    // unresolved source keeps the owning document instead of losing the
+    // edge. An unresolved extraction-entity target still drops ("v0"), but
+    // the external target survives.
+    {
+        const writes = try graphWritesFromArtifactValueAlloc(alloc, "kg", "doc:a", raw, source, "application/json", null, null, 100);
+        defer freeGraphWrites(alloc, writes);
+        try std.testing.expectEqual(@as(usize, 1), writes.len);
+        try std.testing.expectEqualStrings("doc:a", writes[0].source);
+        try std.testing.expectEqualStrings("ext-node", writes[0].target);
+    }
+
+    // With resolutions injected, resolved local ids render the resolver's
+    // canonical keys for BOTH endpoints: the topological source becomes the
+    // canonical entity while the owning document moves to `owner` for
+    // artifact-key routing. External endpoints keep the passthrough with the
+    // document as source.
+    {
+        const resolutions =
+            \\{"e0":{"key":"person/ada_lovelace","table":"entities"},"v0":{"key":"event/7f3a","table":"events"}}
+        ;
+        const writes = try graphWritesFromArtifactValueAlloc(alloc, "kg", "doc:a", raw, source, "application/json", null, resolutions, 100);
+        defer freeGraphWrites(alloc, writes);
+        try std.testing.expectEqual(@as(usize, 2), writes.len);
+        try std.testing.expectEqualStrings("person/ada_lovelace", writes[0].source);
+        try std.testing.expectEqualStrings("event/7f3a", writes[0].target);
+        try std.testing.expectEqualStrings("doc:a", writes[0].owner);
+        try std.testing.expectEqualStrings("person/ada_lovelace", writes[1].source);
+        try std.testing.expectEqualStrings("ext-node", writes[1].target);
+
+        // The artifact key routes by owner while embedding the source.
+        const key = try internal_keys.graphEdgeArtifactKeyWithSourceAlloc(alloc, writes[0].owner, writes[0].index_name, writes[0].edge_type, writes[0].target, writes[0].source);
+        defer alloc.free(key);
+        const parsed = (try internal_keys.parseGraphEdgeArtifactKeyAlloc(alloc, key)).?;
+        defer {
+            alloc.free(parsed.doc_key);
+            alloc.free(parsed.index_name);
+            alloc.free(parsed.edge_type);
+            alloc.free(parsed.target_doc_key);
+            if (parsed.source_node) |s| alloc.free(s);
+        }
+        try std.testing.expectEqualStrings("doc:a", parsed.doc_key);
+        try std.testing.expectEqualStrings("person/ada_lovelace", parsed.source_node.?);
+    }
+
+    // A legacy inline endpoint object that matches no extraction entity keeps
+    // the owning document as the source (historical extraction_relation
+    // contract), with no owner split.
+    {
+        const legacy_raw =
+            \\{"relations":[{"type":"mentions","source":{"id":"inline","label":"person","text":"Ada"},"target":"ext-node"}]}
+        ;
+        const writes = try graphWritesFromArtifactValueAlloc(alloc, "kg", "doc:a", legacy_raw, source, "application/json", null, null, 100);
+        defer freeGraphWrites(alloc, writes);
+        try std.testing.expectEqual(@as(usize, 1), writes.len);
+        try std.testing.expectEqualStrings("doc:a", writes[0].source);
+        try std.testing.expectEqual(@as(usize, 0), writes[0].owner.len);
+    }
 }
 
 test "db graph visible edge limit applies after identity deduplication" {
@@ -91828,6 +93193,91 @@ test "runUntilIdle no-progress guard fails fast with a named stuck-index diagnos
     clearTargetAdvanceStuck(db.async_context, "chunk_vectors");
     try noteTargetAdvanceStuck(db.async_context, "chunk_vectors", now_ns, 12, 0);
     try db.checkTargetAdvanceNoProgress(60 * std.time.ns_per_s);
+}
+
+test "runUntilIdle no-progress guard interrupts the threaded derived wait" {
+    // Reviewer-reported P2: with background index workers the guard only ran
+    // AFTER runDerivedUntilWithOptions returned, and the threaded
+    // waitForAll has no deadline — a derived index that can never satisfy
+    // its replay target parked the wait forever and the configured timeout
+    // never fired. The stall diagnostic now rides the wait's cancellation
+    // checkpoint, so the wait itself is interrupted. This test exercises the
+    // real threaded wait path: workers enabled, a target the workers cannot
+    // reach, and a stuck record older than the timeout. Environments whose io
+    // backend starts no derived workers skip (the guard mechanics have their
+    // own unit test below); the expected-error-log declaration must come
+    // AFTER the skip decision or the boundary check flags the skip itself.
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    if (!db.executor.hasWorkers()) return error.SkipZigTest;
+    @import("../../test_error_logs.zig").expectErrorLogs(1);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"a\"}" }},
+        .sync_level = .write,
+    });
+
+    const now_ns = monotonicTimeNs();
+    try noteTargetAdvanceStuck(db.async_context, "chunk_vectors", now_ns -| (2 * std.time.ns_per_s), 5017, 0);
+    // A target far past anything committed: without the in-wait guard this
+    // call never returns on a stuck index.
+    const unreachable_sequence = db.core.nextDerivedSequence() + 1_000_000;
+    try std.testing.expectError(error.RunUntilIdleNoProgress, db.runDerivedUntilWithOptions(unreachable_sequence, .{
+        .no_progress_timeout_ns = 1 * std.time.ns_per_s,
+    }));
+
+    const diagnostic = db.lastRunUntilIdleNoProgressDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("chunk_vectors", diagnostic.index_name);
+    clearTargetAdvanceStuck(db.async_context, "chunk_vectors");
+}
+
+test "runUntilIdle stall guard checkpoint fires on a stuck index and stays quiet otherwise" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    var guard = DB.TargetAdvanceStallGuard{ .db = &db, .timeout_ns = 1 * std.time.ns_per_s };
+    const token = guard.token();
+
+    // Healthy: the checkpoint is silent, so the wait keeps waiting.
+    try token.check();
+
+    const now_ns = monotonicTimeNs();
+    try noteTargetAdvanceStuck(db.async_context, "chunk_vectors", now_ns -| (2 * std.time.ns_per_s), 5017, 0);
+    guard.last_check_ns.store(0, .monotonic);
+    try std.testing.expectError(error.DerivedTargetAdvanceStuck, token.check());
+    // The wait layer sees the interrupt as a cancellation, which is what
+    // breaks waitForAllWithVisibilityWait out of its poll loop.
+    guard.last_check_ns.store(0, .monotonic);
+    try std.testing.expect(token.isCancelled());
+
+    // Under the recheck throttle the checkpoint stays quiet even while stuck.
+    guard.last_check_ns.store(monotonicTimeNs(), .monotonic);
+    try token.check();
+
+    // Stuck record cleared: the guard goes quiet again (a transient interrupt
+    // resumes the wait).
+    clearTargetAdvanceStuck(db.async_context, "chunk_vectors");
+    guard.last_check_ns.store(0, .monotonic);
+    try token.check();
 }
 
 test "db applies document artifact child range batch without source row write" {
@@ -109633,6 +111083,65 @@ test "db thin replay marks artifact-derived target hints" {
     try std.testing.expect(journalRecordHasHint(decoded.record, .graph));
 }
 
+test "db thin replay addresses entity-sourced edge mutations by owner key" {
+    const alloc = std.testing.allocator;
+
+    // An entity-sourced write and its deletion must both address the
+    // six-component artifact key under the OWNING document; rebuilding the
+    // key from the topological source alone would miss the durable row and
+    // strand its replay bookkeeping.
+    const payload = try encodeThinReplayRecordPayload(
+        alloc,
+        .{
+            .graph_writes = &.{.{
+                .index_name = "kg_graph",
+                .source = "person/ada_lovelace",
+                .target = "org/antfly",
+                .edge_type = "works_at",
+                .owner = "doc:a",
+            }},
+            .graph_deletes = &.{.{
+                .index_name = "kg_graph",
+                .source = "person/ada_lovelace",
+                .target = "event/first_program",
+                .edge_type = "participates_in",
+                .owner = "doc:a",
+            }},
+        },
+        &.{},
+        &.{},
+        &.{},
+        &.{},
+        &.{},
+        45,
+        false,
+        null,
+        null,
+    );
+    defer alloc.free(payload);
+
+    var decoded = try change_journal_mod.decodeRecord(alloc, payload);
+    defer decoded.deinit();
+
+    const write_key = try internal_keys.graphEdgeArtifactKeyWithSourceAlloc(alloc, "doc:a", "kg_graph", "works_at", "org/antfly", "person/ada_lovelace");
+    defer alloc.free(write_key);
+    const delete_key = try internal_keys.graphEdgeArtifactKeyWithSourceAlloc(alloc, "doc:a", "kg_graph", "participates_in", "event/first_program", "person/ada_lovelace");
+    defer alloc.free(delete_key);
+    try std.testing.expectEqual(@as(usize, 2), decoded.record.changed_artifact_keys.len);
+    try std.testing.expectEqualStrings(write_key, decoded.record.changed_artifact_keys[0]);
+    try std.testing.expectEqualStrings(delete_key, decoded.record.changed_artifact_keys[1]);
+
+    // The deletion's changed-doc classification follows the owner, whose
+    // graph projection holds the row, not the entity source key.
+    var saw_owner = false;
+    for (decoded.record.changed_doc_keys) |key| {
+        if (std.mem.eql(u8, key, "doc:a")) saw_owner = true;
+        try std.testing.expect(!std.mem.eql(u8, key, "event/first_program"));
+        try std.testing.expect(!std.mem.eql(u8, key, "person/ada_lovelace"));
+    }
+    try std.testing.expect(saw_owner);
+}
+
 test "db thin replay marks document deletes for managed index replay" {
     const alloc = std.testing.allocator;
 
@@ -114637,6 +116146,21 @@ test "db progressive managed admission serves a checkpointed partial generation"
     }
     try db.failIfIndexQuarantined(cfg.name);
 
+    // Model a newer live count before its next checkpoint. Native generations
+    // reject direct HBC writes, so change only the published stats observation.
+    {
+        const entry = db.core.denseIndex(cfg.name) orelse return error.IndexNotFound;
+        entry.index.published_active_count.store(target_before + 1, .release);
+        defer entry.index.published_active_count.store(target_before, .release);
+        try std.testing.expectEqual(target_before + 1, entry.index.stats().active_count);
+        const ahead_stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, ahead_stats);
+        for (ahead_stats.indexes) |index_stats| {
+            if (!std.mem.eql(u8, index_stats.name, cfg.name)) continue;
+            try std.testing.expect(index_stats.serving_snapshot_ready);
+        }
+    }
+
     // The certificate is not a blanket cardinality bypass: if the loaded
     // physical snapshot no longer matches the exact published count, fail
     // closed even though source coverage and the live target look healthy.
@@ -114648,6 +116172,35 @@ test "db progressive managed admission serves a checkpointed partial generation"
         .published_count = target_before + 1,
     });
     try std.testing.expect(!try db.managedAdmissionGenerationIsQueryable(alloc, repair.intent));
+    const mismatched_stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, mismatched_stats);
+    for (mismatched_stats.indexes) |index_stats| {
+        if (!std.mem.eql(u8, index_stats.name, cfg.name)) continue;
+        try std.testing.expect(!index_stats.serving_snapshot_ready);
+    }
+    // A later live write can happen to reach the invalid certificate's
+    // cardinality. Status may observe it, but only a publication boundary may
+    // establish a new durable proof for this checkpoint identity.
+    {
+        const entry = db.core.denseIndex(cfg.name) orelse return error.IndexNotFound;
+        entry.index.published_active_count.store(target_before + 1, .release);
+        defer entry.index.published_active_count.store(target_before, .release);
+        const coincidental_stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, coincidental_stats);
+        for (coincidental_stats.indexes) |index_stats| {
+            if (!std.mem.eql(u8, index_stats.name, cfg.name)) continue;
+            try std.testing.expect(!index_stats.serving_snapshot_ready);
+        }
+    }
+    var legacy_checkpoint = certified_checkpoint;
+    legacy_checkpoint.published_count = null;
+    try db.core.saveProjectionCheckpoint(cfg.name, legacy_checkpoint);
+    const legacy_stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, legacy_stats);
+    for (legacy_stats.indexes) |index_stats| {
+        if (!std.mem.eql(u8, index_stats.name, cfg.name)) continue;
+        try std.testing.expect(index_stats.serving_snapshot_ready);
+    }
     try db.core.saveProjectionCheckpoint(cfg.name, certified_checkpoint);
     try std.testing.expect(try db.managedAdmissionGenerationIsQueryable(alloc, repair.intent));
     var restored_target: [8]u8 = undefined;

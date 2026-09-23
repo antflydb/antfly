@@ -224,6 +224,7 @@ jobs:
             scripts/uv.lock \
             scripts/ci/test_zig_validation_scope.py \
             ':(glob)scripts/bench/pdf/**' \
+            ':(glob)scripts/laya/**' \
             Makefile \
             .github/workflows/zig-tests.yml \
             .github/workflows/antfly-container.yml
@@ -506,7 +507,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb file
 
       - name: Install uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
 
       - name: Set up Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
@@ -575,7 +576,16 @@ jobs:
         run: |
           python3 -m unittest discover -s scripts -p test_run_db_query_matrix.py
           python3 -m unittest discover -s scripts -p test_conformance_fixtures.py
+          python3 -m unittest discover -s scripts -p 'test_laya_cuda*.py'
           python3 -m unittest discover -s scripts/bench/pdf -p 'test_*.py'
+
+      - name: Test Laya data and qualification contracts
+        run: |
+          PYTHONPATH=scripts/laya python3 -m unittest \
+            scripts/laya/test_prepare_laya_finetune.py \
+            scripts/laya/test_qualify_laya_finetune_quality.py \
+            scripts/laya/test_run_laya_qualification.py \
+            scripts/laya/test_benchmark_laya_metal.py
 
       - name: Check inference kernels through the root build graph
         working-directory: zig
@@ -857,7 +867,7 @@ jobs:
 
       - name: Set up Java for TLA+
         if: needs.changes.outputs.model_check == 'true' || needs.changes.outputs.trace_validate == 'true'
-        uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v6.0.0
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
           distribution: "temurin"
           java-version: "21"
@@ -916,7 +926,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb file
 
       - name: Install uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
 
       - name: Install Nix
         uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
@@ -973,7 +983,16 @@ jobs:
         run: |
           python3 -m unittest discover -s scripts -p test_run_db_query_matrix.py
           python3 -m unittest discover -s scripts -p test_conformance_fixtures.py
+          python3 -m unittest discover -s scripts -p 'test_laya_cuda*.py'
           python3 -m unittest discover -s scripts/bench/pdf -p 'test_*.py'
+
+      - name: Test Laya data and qualification contracts
+        run: |
+          PYTHONPATH=scripts/laya python3 -m unittest \
+            scripts/laya/test_prepare_laya_finetune.py \
+            scripts/laya/test_qualify_laya_finetune_quality.py \
+            scripts/laya/test_run_laya_qualification.py \
+            scripts/laya/test_benchmark_laya_metal.py
 
       # Keep normal build-step parallelism while bounding aggregate compiler
       # memory to the pod's cgroup budget and the 22 GiB largest-step claim.
@@ -1044,7 +1063,7 @@ jobs:
           --maxrss ${{ steps.cpus.outputs.max_rss }}
 
       - name: Set up Java for TLA+
-        uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v6.0.0
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
           distribution: "temurin"
           java-version: "21"
@@ -1189,7 +1208,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
 
       - name: Install uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
 
       - name: Set up Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
@@ -1441,7 +1460,7 @@ jobs:
           ln -s "/mnt/cache/antfly/zig/home-antfly-${{ matrix.suite }}" ~/.antfly
 
       - name: Install uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
 
       - name: Compute CPU bound for E2E
         id: e2e_cpus
@@ -1690,7 +1709,7 @@ jobs:
           ln -s "/mnt/cache/antfly/zig/home-antfly-full-${{ matrix.suite }}" ~/.antfly
 
       - name: Install uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
 
       - name: Compute CPU bound for E2E
         id: e2e_cpus

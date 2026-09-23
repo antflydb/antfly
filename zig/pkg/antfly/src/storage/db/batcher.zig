@@ -1154,6 +1154,7 @@ fn cloneGraphWrite(alloc: Allocator, write: types.GraphEdgeWrite) !types.GraphEd
         .created_at = write.created_at,
         .updated_at = write.updated_at,
         .metadata_json = if (write.metadata_json.len > 0) try alloc.dupe(u8, write.metadata_json) else "",
+        .owner = if (write.owner.len > 0) try alloc.dupe(u8, write.owner) else "",
     };
 }
 
@@ -1163,6 +1164,7 @@ fn deinitGraphWrite(alloc: Allocator, write: *types.GraphEdgeWrite) void {
     alloc.free(@constCast(write.target));
     alloc.free(@constCast(write.edge_type));
     if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
+    if (write.owner.len > 0) alloc.free(@constCast(write.owner));
     write.* = undefined;
 }
 
@@ -1172,6 +1174,7 @@ fn cloneGraphDelete(alloc: Allocator, delete: types.GraphEdgeDelete) !types.Grap
         .source = try alloc.dupe(u8, delete.source),
         .target = try alloc.dupe(u8, delete.target),
         .edge_type = try alloc.dupe(u8, delete.edge_type),
+        .owner = if (delete.owner.len > 0) try alloc.dupe(u8, delete.owner) else "",
     };
 }
 
@@ -1180,5 +1183,6 @@ fn deinitGraphDelete(alloc: Allocator, delete: *types.GraphEdgeDelete) void {
     alloc.free(@constCast(delete.source));
     alloc.free(@constCast(delete.target));
     alloc.free(@constCast(delete.edge_type));
+    if (delete.owner.len > 0) alloc.free(@constCast(delete.owner));
     delete.* = undefined;
 }

@@ -22,12 +22,12 @@ Antfly is a distributed key-value store and vector search engine built on a **mu
 
 - **BM25 + Vector Similarity**: Full-text search with vector embeddings using Reciprocal Rank Fusion (RRF)
 - **Multimodal**: Index and search text, images, and audio with native Antfly models or application-managed vectors
-- **Managed Index Embedders**: Antfly Inference, Ollama, OpenAI, and AWS Bedrock
+- **Managed Index Embedders**: Antfly Inference, Ollama, OpenAI, OpenRouter, Cohere, Gemini, Vertex AI, and AWS Bedrock
 
 ### Distributed Consensus
 
 - **Multi-Raft Design**: Separate consensus groups for metadata (single cluster) and storage (one per shard)
-- **Horizontal Sharding**: Data automatically partitioned across shards with configurable replication
+- **Horizontal Sharding**: Tables partitioned by key range across shards with configurable replication
 - **Fine-Grained Durability**: Control write consistency with sync levels (propose, write, full_text, enrichments, full_index)
 
 ### AI-Native Features
@@ -47,7 +47,7 @@ Antfly is a distributed key-value store and vector search engine built on a **mu
 
 ### Flexible Indexing
 
-- **Index Types**: `full_text` (BM25), `embeddings` (vector with RaBitQ), `graph` (relationship traversal)
+- **Index Types**: `full_text` (BM25), `embeddings` (dense, sparse, and late-interaction vectors), `graph` (traversal and pathfinding), `algebraic` (aggregates and materializations), `relational` (ordered composite keys over typed rows)
 - **Enrichers**: summaries, embeddings, chunking (async background processing)
 - **Query Processors**: `chunker` (semantic document splitting), `pruner` (result filtering), `reranker` (relevance re-scoring)
 - **Multimodal**: Native ClipClap embeddings, durable extraction, or application-managed vectors
@@ -94,11 +94,7 @@ Antfly stores data as JSON documents with:
 
 ### Sharding Strategy
 
-Data is automatically distributed across shards using:
-- Consistent hashing for even distribution
-- Configurable replication factor
-- Automatic rebalancing
-- Hot shard detection and splitting
+Tables are divided into shards by key range, and each shard is replicated by its own Raft group with a configurable replication factor. Size-based automatic split and merge (`max_shard_size_bytes`, default 64 MiB) is opt-in: set `disable_shard_alloc: false` in the shard allocation config to enable it.
 
 ## Indexing Architecture
 
@@ -112,12 +108,12 @@ Implemented natively in Zig (`zig/pkg/antfly/src/search`) as a Lucene-style segm
 
 ### Vector Indexing
 
-Our SPANN-based vector index implementation offers:
-- Approximate nearest neighbor search
-- Configurable precision/performance tradeoffs
+Dense vectors are indexed in postings (leaf clusters of vectors) under a hierarchical balanced clustering (HBC) centroid tree (`zig/lib/vectorindex`). Once an index grows past about 1,024 postings, the default `centroid_directory_mode: auto` routes through a flat centroid directory instead of the tree. The index offers:
+- Approximate nearest neighbor search that scans the closest leaves, then reranks candidates with exact distances
+- Configurable precision/performance tradeoffs (search effort, leaf size, rerank policy)
 - Support for high-dimensional vectors
-- Incremental index updates
-- Quantization using [RaBitQ](https://arxiv.org/pdf/2405.12497)
+- Incremental updates with [SPFresh](https://arxiv.org/abs/2410.14452)-style local maintenance: an insert touches one posting, oversized leaves split, undersized leaves merge into a sibling, and a background pass moves boundary vectors between sibling leaves. Updates never trigger a full rebuild
+- Quantization using [RaBitQ](https://arxiv.org/abs/2405.12497): each leaf stores 1-bit codes of vector residuals against the leaf centroid, and full-precision vectors are kept for reranking
 
 ### Hybrid Search Engine
 
@@ -146,27 +142,15 @@ Every operation is logged before execution:
 - Efficient batch commits
 - Configurable sync policies
 
-### BASE Consistency Model
+### Write Visibility
 
-Antfly follows the BASE model for distributed operations:
-- **Basically Available**: System remains operational during partial failures
-- **Soft State**: Data may be in flux during replication
-- **Eventually Consistent**: All replicas converge to the same state
-
-This model allows for:
-- High availability during network partitions
-- Better performance for read-heavy workloads
-- Tunable consistency levels per operation
+Writes commit through the shard's Raft log. Secondary indexes and enrichments are applied asynchronously after commit. The per-request `sync_level` (`propose` by default, then `write`, `full_text`, `enrichments`, and `full_index`) chooses how far a write progresses before the request returns.
 
 ## Network Architecture
 
-### QUIC for Raft Transport
+### Raft Transport
 
-Antfly's Raft transport (`zig/pkg/antfly/src/raft`) recognizes QUIC as a peer endpoint protocol, backed by a native QUIC/HTTP-3 implementation (`zig/lib/httpx`), for node-to-node communication:
-- Reduced connection establishment time
-- Better performance over lossy networks
-- Multiplexed streams without head-of-line blocking
-- Built-in encryption
+Raft messages and snapshots travel between nodes over HTTP (`zig/pkg/antfly/src/raft/transport`). The peer endpoint schema can describe HTTP/2, HTTP/3, and QUIC endpoints, and the HTTP stack (`zig/lib/httpx`) implements QUIC/HTTP-3, but the Raft transport currently uses HTTP.
 
 ### API Design
 
@@ -181,8 +165,7 @@ The REST API is designed for:
 ### Standalone Mode
 
 For development and small deployments:
-- Single binary runs all components
-- Automatic node discovery
+- Single binary runs metadata, data, and Antfly Inference
 - Zero configuration required
 
 **Minimum Requirements (Standalone Mode):**
@@ -194,9 +177,8 @@ For development and small deployments:
 ### Production Mode
 
 For scale and reliability:
-- Separate metadata and storage nodes
+- Separate `antfly metadata` and `antfly data` nodes
 - Configurable replication topology
-- Multi-datacenter support
 - Rolling upgrade capability
 
 **Recommended Requirements (Production):**
@@ -204,9 +186,14 @@ For scale and reliability:
 - Storage nodes: 8+ CPU cores, 16GB+ RAM, SSD storage
 - Network: Low-latency connections between nodes
 
+### Other Modes
+
+- **Antfly Lite**: the engine embedded in a single `.aflite` file (`antfly lite`, C ABI bindings)
+- **Hot standby**: a single node plus an `antfly standby` replica
+- **Serverless**: `antfly serverless` over S3-compatible or GCS object storage
+
 ## Performance Optimizations
 
-- **Adaptive Indexing**: Automatically adjusts index structures based on query patterns
 - **Query Planning**: Cost-based optimizer for complex queries
 - **Connection Pooling**: Efficient resource management for concurrent requests
 - **Memory Management**: Careful control of memory usage with configurable limits

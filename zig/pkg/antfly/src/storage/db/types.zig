@@ -26,6 +26,7 @@ const shard_mod = @import("../shard.zig");
 const transactions_mod = @import("../transactions.zig");
 const reranking_mod = @import("antfly_reranking");
 const doc_identity_mod = @import("doc_identity.zig");
+const enrichment_neighbor_context = @import("enrichment/neighbor_context.zig");
 const graph_edge_types = @import("graph_edge_types.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
 const index_repair_status = @import("../../common/index_repair_status.zig");
@@ -601,6 +602,7 @@ pub const EnrichmentConfig = struct {
     full_text_index: bool = false,
     content_type: []const u8 = "",
     producer_json: []const u8 = "",
+    neighbor_context: ?EnrichmentNeighborContextConfig = null,
     execution: ?EnrichmentExecutionConfig = null,
 
     pub fn clone(alloc: Allocator, cfg: EnrichmentConfig) !EnrichmentConfig {
@@ -619,6 +621,7 @@ pub const EnrichmentConfig = struct {
             .full_text_index = cfg.full_text_index,
             .content_type = if (cfg.content_type.len > 0) try alloc.dupe(u8, cfg.content_type) else "",
             .producer_json = if (cfg.producer_json.len > 0) try alloc.dupe(u8, cfg.producer_json) else "",
+            .neighbor_context = if (cfg.neighbor_context) |context| try EnrichmentNeighborContextConfig.clone(alloc, context) else null,
             .execution = cfg.execution,
         };
     }
@@ -632,6 +635,46 @@ pub const EnrichmentConfig = struct {
         if (self.chunker_json.len > 0) alloc.free(self.chunker_json);
         if (self.content_type.len > 0) alloc.free(self.content_type);
         if (self.producer_json.len > 0) alloc.free(self.producer_json);
+        if (self.neighbor_context) |*context| context.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+/// Bounded same-shard graph adjacency sampled into an asset producer's
+/// rendered input. Only valid on asset enrichments whose producer consumes
+/// rendered text; bounds and the graph index reference are enforced at
+/// admission while a missing runtime state fails open with empty neighbors.
+pub const EnrichmentNeighborContextConfig = struct {
+    graph_index: []const u8 = "",
+    edge_types: []const []const u8 = &.{},
+    direction: enrichment_neighbor_context.Direction = .both,
+    limit: u32 = enrichment_neighbor_context.default_limit,
+
+    pub fn clone(alloc: Allocator, cfg: EnrichmentNeighborContextConfig) !EnrichmentNeighborContextConfig {
+        const graph_index = if (cfg.graph_index.len > 0) try alloc.dupe(u8, cfg.graph_index) else "";
+        errdefer if (graph_index.len > 0) alloc.free(graph_index);
+        const edge_types = try alloc.alloc([]const u8, cfg.edge_types.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (edge_types[0..initialized]) |edge_type| alloc.free(edge_type);
+            alloc.free(edge_types);
+        }
+        for (cfg.edge_types, 0..) |edge_type, i| {
+            edge_types[i] = try alloc.dupe(u8, edge_type);
+            initialized += 1;
+        }
+        return .{
+            .graph_index = graph_index,
+            .edge_types = edge_types,
+            .direction = cfg.direction,
+            .limit = cfg.limit,
+        };
+    }
+
+    pub fn deinit(self: *EnrichmentNeighborContextConfig, alloc: Allocator) void {
+        if (self.graph_index.len > 0) alloc.free(self.graph_index);
+        for (self.edge_types) |edge_type| alloc.free(edge_type);
+        if (self.edge_types.len > 0) alloc.free(self.edge_types);
         self.* = undefined;
     }
 };
@@ -657,6 +700,12 @@ pub fn enrichmentConfigHash(cfg: EnrichmentConfig) u64 {
     hashBool(&hasher, cfg.full_text_index);
     hashLengthPrefixedBytes(&hasher, cfg.content_type);
     hashLengthPrefixedBytes(&hasher, cfg.producer_json);
+    if (cfg.neighbor_context) |context| {
+        hashLengthPrefixedBytes(&hasher, context.graph_index);
+        for (context.edge_types) |edge_type| hashLengthPrefixedBytes(&hasher, edge_type);
+        hashLengthPrefixedBytes(&hasher, @tagName(context.direction));
+        hashU32(&hasher, context.limit);
+    }
     return hasher.final();
 }
 
@@ -746,6 +795,7 @@ pub const ExtractEnrichmentsResult = struct {
             alloc.free(@constCast(write.target));
             alloc.free(@constCast(write.edge_type));
             if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
+            if (write.owner.len > 0) alloc.free(@constCast(write.owner));
         }
         if (self.graph_writes.len > 0) alloc.free(self.graph_writes);
 
@@ -1620,6 +1670,21 @@ pub const SearchRequest = struct {
     document_lookup_groups: []const u64 = &.{},
     /// Borrowed coordinator label; routing and storage continue using immutable identities.
     response_table_name: ?[]const u8 = null,
+    /// Borrowed physical name of the queried table, set by the API read
+    /// source together with `graph_index_complete_snapshot`. Graph executors
+    /// canonicalize a `target_table` tag naming this table to the local
+    /// (null) identity, mirroring the distributed coordinator's
+    /// canonicalGraphNodeTable, so a self-table tag never stops expansion or
+    /// splits node identity. Never populated by public JSON.
+    graph_owning_table: []const u8 = "",
+    /// True when the executing snapshot holds the graph index's COMPLETE
+    /// row set: the table has exactly one group and the query was admitted
+    /// for local (non-coordinated) graph execution. Local graph executors
+    /// may then expand THROUGH cross-table tagged nodes — entity-sourced
+    /// edges are document-owned rows in this same index, so the walk is a
+    /// same-snapshot single-index read (the embedded DBCore entry points'
+    /// justification). Never populated by public JSON.
+    graph_index_complete_snapshot: bool = false,
     query: Query = .{ .match_all = {} },
     index_name: ?[]const u8 = null,
     primary_text_index_name: ?[]const u8 = null,
@@ -1772,6 +1837,8 @@ const hierarchy_children_supported_internal_fields = [_][]const u8{
     "read_execution",
     "cancellation",
     "graph_execution_limits",
+    "graph_owning_table",
+    "graph_index_complete_snapshot",
 };
 
 const hierarchy_children_rejected_fields = [_][]const u8{
@@ -2047,6 +2114,14 @@ pub const GraphMetricQuery = struct {
     metric_name: []const u8,
     top_k: u32 = 10,
     freshness: GraphMetricFreshness = .published,
+    /// Query-seeded personalized PageRank: teleport mass restricted to these
+    /// node keys. The ranking is computed at query time from the current edge
+    /// snapshot, so seeds require freshness=fresh; published generations are
+    /// global-only. Seed keys absent from the graph are skipped, not errors.
+    seed_nodes: []const []const u8 = &.{},
+    /// Damping override for personalized reads. Null keeps the metric's
+    /// configured damping. Only valid together with seed_nodes.
+    damping: ?f64 = null,
 };
 
 pub const NamedGraphMetricQuery = struct {
@@ -2062,6 +2137,12 @@ pub const GraphMetricRerank = struct {
     base_weight: f64 = 1.0,
     weight: f64 = 1.0,
     missing_score: f64 = 0.0,
+    /// Query-seeded personalized PageRank blend: metric feature scores are
+    /// computed at query time with teleport mass restricted to these node
+    /// keys. Requires freshness=fresh; published generations are global-only.
+    seed_nodes: []const []const u8 = &.{},
+    /// Damping override for personalized blends. Only valid with seed_nodes.
+    damping: ?f64 = null,
 };
 
 pub const graph_metric_rerank_max_candidates: u32 = 10_000;
@@ -2834,6 +2915,12 @@ pub const EnrichmentStats = struct {
     processed_requests: u64 = 0,
     error_count: u64 = 0,
     retryable_error_count: u64 = 0,
+    /// Durable count of requests parked with a terminal (non-retryable)
+    /// disposition plus fatal worker failures — despite the name, this is
+    /// NOT only worker deaths. A terminally parked request never returns to
+    /// pending; per-document terminal state lives in the derived-coverage
+    /// counters (DBIndexStats.coverage_terminal_failed_count) and the
+    /// artifact repair ledger.
     fatal_error_count: u64 = 0,
     consecutive_retry_count: u32 = 0,
     next_retry_at_ms: u64 = 0,
@@ -3986,6 +4073,9 @@ pub const DBIndexStats = struct {
     projection_checkpoint_applied_sequence: u64 = 0,
     projection_checkpoint_generation: u64 = 0,
     projection_checkpoint_config_hash: u64 = 0,
+    // Internal physical publication certificate. A reopened index must not
+    // report a serving snapshot when its loaded cardinality differs.
+    projection_checkpoint_published_count: ?u64 = null,
     replay_applied_sequence: u64 = 0,
     replay_target_sequence: u64 = 0,
     source_replay: []IndexSourceReplayStatus = &.{},

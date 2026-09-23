@@ -144,27 +144,27 @@
   "server-generate": {
    "path": "zig/pkg/inference/src/server/server.zig",
    "anchor": "fn generateContent(",
-   "line": 11239
+   "line": 11241
   },
   "server-embeddings": {
    "path": "zig/pkg/inference/src/server/server.zig",
    "anchor": "fn generateEmbeddings(",
-   "line": 10245
+   "line": 10247
   },
   "server-rerank": {
    "path": "zig/pkg/inference/src/server/server.zig",
    "anchor": "fn rerankPrompts(",
-   "line": 10801
+   "line": 10803
   },
   "server-chat": {
    "path": "zig/pkg/inference/src/server/server.zig",
    "anchor": "fn chatCompletions(",
-   "line": 14798
+   "line": 14800
   },
   "ops-compute-backend": {
    "path": "zig/pkg/inference/src/ops/ops.zig",
    "anchor": "pub const ComputeBackend = struct {",
-   "line": 1398
+   "line": 1409
   },
   "node-primitive-op": {
    "path": "zig/lib/ml/src/graph/node.zig",

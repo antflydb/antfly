@@ -56,6 +56,20 @@ pub const ExtractedEntity = struct {
     /// 1.0 when the extractor omits it (legacy mentions are fully trusted). Fed
     /// into provenance-edge confidence fusion.
     confidence: f64 = 1.0,
+    /// Optional normalized predicate (main verb lemma) the extractor asserted
+    /// for an event mention. Feeds `event_identity`.
+    predicate: []const u8 = "",
+    /// Compositional event identity computed by `parseExtractionEntities`
+    /// from the artifact's relations: the sorted, comma-joined slugs of the
+    /// NON-event mentions related to this mention, then `|`, then the
+    /// slugged predicate (or the raw text when no predicate was asserted).
+    /// Two differently worded sentences about the same participants and
+    /// action converge on the same identity; with no related participants it
+    /// degrades to the mention text, i.e. exactly the per-sentence identity
+    /// a plain `{{ hash _entity.text }}` template produces. Empty when the
+    /// mention was constructed without relation context — `_entity.event_identity`
+    /// then renders the mention text.
+    event_identity: []const u8 = "",
 };
 
 /// A resolution candidate fetched by blocking. `record` is scored against the
@@ -159,8 +173,20 @@ pub const Resolver = struct {
     arena: std.heap.ArenaAllocator,
     table: []const u8,
     key_template: []const u8,
+    /// Mention labels this resolver consumes; empty is a catch-all. Lets
+    /// several resolvers partition one extraction artifact by label (e.g.
+    /// `event` mentions to an events table, everything else to entities).
+    labels: []const []const u8,
+    /// Mention labels this resolver must NOT consume. For a catch-all resolver
+    /// sharing a source artifact with labeled siblings, the runtime derives
+    /// this from the siblings' claimed labels so extraction labels stay
+    /// open-vocabulary (unlisted labels fall through to the catch-all instead
+    /// of being dropped).
+    exclude_labels: []const []const u8,
     type_must_match: bool,
     scorer: ?matcher.Scorer,
+    /// Mention admission floor; see LabelRouting.min_confidence.
+    min_confidence: f64 = 0,
 
     pub fn parse(gpa: std.mem.Allocator, json_bytes: []const u8) !Resolver {
         var parsed = try std.json.parseFromSlice(std.json.Value, gpa, json_bytes, .{});
@@ -186,6 +212,35 @@ pub const Resolver = struct {
             if (v == .bool) type_must_match = v.bool;
         }
 
+        var labels: []const []const u8 = &.{};
+        if (obj.get("labels")) |lv| {
+            if (lv != .array) return error.InvalidConfig;
+            const owned = try a.alloc([]const u8, lv.array.items.len);
+            for (lv.array.items, 0..) |item, i| {
+                owned[i] = try a.dupe(u8, jsonString(item) orelse return error.InvalidConfig);
+            }
+            labels = owned;
+        }
+        var exclude_labels: []const []const u8 = &.{};
+        if (obj.get("exclude_labels")) |lv| {
+            if (lv != .array) return error.InvalidConfig;
+            const owned = try a.alloc([]const u8, lv.array.items.len);
+            for (lv.array.items, 0..) |item, i| {
+                owned[i] = try a.dupe(u8, jsonString(item) orelse return error.InvalidConfig);
+            }
+            exclude_labels = owned;
+        }
+
+        var min_confidence: f64 = 0;
+        if (obj.get("min_confidence")) |mv| {
+            min_confidence = switch (mv) {
+                .float => |f| f,
+                .integer => |n| @floatFromInt(n),
+                else => return error.InvalidConfig,
+            };
+            if (!(min_confidence >= 0 and min_confidence <= 1)) return error.InvalidConfig;
+        }
+
         var scorer: ?matcher.Scorer = null;
         errdefer if (scorer) |*s| s.deinit();
         if (obj.get("scorer")) |sv| {
@@ -196,18 +251,37 @@ pub const Resolver = struct {
             .arena = arena,
             .table = table,
             .key_template = key_template,
+            .labels = labels,
+            .exclude_labels = exclude_labels,
             .type_must_match = type_must_match,
             .scorer = scorer,
+            .min_confidence = min_confidence,
         };
     }
 
     /// Build a resolver directly from its parts (the durable catalog config),
     /// parsing `scorer_json` if present. An empty `scorer_json` means a purely
     /// deterministic resolver that mints canonical keys from `key_template`.
+    /// Label routing for `initFromParts`: which mention labels this resolver
+    /// consumes (`labels` allowlist, empty = catch-all) and which it must skip
+    /// (`exclude_labels`, typically the labels claimed by sibling resolvers on
+    /// the same source artifact).
+    pub const LabelRouting = struct {
+        labels: []const []const u8 = &.{},
+        exclude_labels: []const []const u8 = &.{},
+        /// Mention admission floor: mentions whose extractor-asserted
+        /// confidence is below this never resolve — no canonical key, no
+        /// mention edge, and (through the canonical-only endpoint rule) no
+        /// relation edge endpoint. The cheap post-extraction junk filter for
+        /// score-carrying extractors (GLiNER); 0 admits everything.
+        min_confidence: f64 = 0,
+    };
+
     pub fn initFromParts(
         gpa: std.mem.Allocator,
         table: []const u8,
         key_template: []const u8,
+        routing: LabelRouting,
         type_must_match: bool,
         scorer_json: []const u8,
     ) !Resolver {
@@ -216,6 +290,18 @@ pub const Resolver = struct {
         const a = arena.allocator();
         const owned_table = try a.dupe(u8, table);
         const owned_template = try a.dupe(u8, key_template);
+        var owned_labels: []const []const u8 = &.{};
+        if (routing.labels.len > 0) {
+            const out = try a.alloc([]const u8, routing.labels.len);
+            for (routing.labels, 0..) |l, i| out[i] = try a.dupe(u8, l);
+            owned_labels = out;
+        }
+        var owned_excludes: []const []const u8 = &.{};
+        if (routing.exclude_labels.len > 0) {
+            const out = try a.alloc([]const u8, routing.exclude_labels.len);
+            for (routing.exclude_labels, 0..) |l, i| out[i] = try a.dupe(u8, l);
+            owned_excludes = out;
+        }
 
         var scorer: ?matcher.Scorer = null;
         errdefer if (scorer) |*s| s.deinit();
@@ -227,9 +313,39 @@ pub const Resolver = struct {
             .arena = arena,
             .table = owned_table,
             .key_template = owned_template,
+            .labels = owned_labels,
+            .exclude_labels = owned_excludes,
             .type_must_match = type_must_match,
             .scorer = scorer,
+            .min_confidence = routing.min_confidence,
         };
+    }
+
+    /// Whether this resolver consumes mentions with the given label; exclusions
+    /// win, then an empty `labels` set consumes everything else.
+    pub fn consumesLabel(self: *const Resolver, label: []const u8) bool {
+        for (self.exclude_labels) |l| if (std.mem.eql(u8, l, label)) return false;
+        if (self.labels.len == 0) return true;
+        for (self.labels) |l| if (std.mem.eql(u8, l, label)) return true;
+        return false;
+    }
+
+    /// In-place compaction of `entities` down to the mentions this resolver
+    /// consumes. Returns the kept prefix. Used before candidate blocking so
+    /// filtered mentions never pay for embedding backfill or candidate search.
+    pub fn filterEntitiesByLabel(self: *const Resolver, entities: []ExtractedEntity) []ExtractedEntity {
+        if (self.labels.len == 0 and self.exclude_labels.len == 0 and self.min_confidence <= 0) return entities;
+        var kept: usize = 0;
+        for (entities) |entity| {
+            if (!self.consumesLabel(entity.label)) continue;
+            // Below-floor mentions never resolve: no canonical key, no
+            // mention edge, and relation endpoints referencing them stay
+            // unresolvable (the canonical-only rule drops those edges).
+            if (entity.confidence < self.min_confidence) continue;
+            entities[kept] = entity;
+            kept += 1;
+        }
+        return entities[0..kept];
     }
 
     pub fn deinit(self: *Resolver) void {
@@ -439,6 +555,13 @@ fn entityVar(entity: ExtractedEntity, name: []const u8) ![]const u8 {
     if (std.mem.eql(u8, name, "_entity.canonical_text")) return entity.text;
     if (std.mem.eql(u8, name, "_entity.local_id")) return entity.local_id;
     if (std.mem.eql(u8, name, "_entity.id")) return entity.local_id;
+    if (std.mem.eql(u8, name, "_entity.predicate")) return entity.predicate;
+    // Compositional event identity; degrades to the mention text when no
+    // relation context was available (see ExtractedEntity.event_identity),
+    // so `event/{{ hash _entity.event_identity }}` is never weaker than the
+    // per-sentence `event/{{ hash _entity.text }}` it replaces.
+    if (std.mem.eql(u8, name, "_entity.event_identity"))
+        return if (entity.event_identity.len > 0) entity.event_identity else entity.text;
     return error.InvalidTemplate;
 }
 
@@ -464,15 +587,51 @@ fn applyHelper(
         try appendSlug(a, out, value);
         return;
     }
+    if (std.mem.eql(u8, helper, "hash")) {
+        try appendStableHash(a, out, value);
+        return;
+    }
     return error.InvalidTemplate;
 }
 
+/// 16 lowercase hex chars of xxhash64 (fixed seed 0) over the raw value.
+/// Deterministic across replays and platforms so re-extraction of the same
+/// normalized text (e.g. an event sentence) mints the same canonical key.
+fn appendStableHash(a: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
+    const digest = std.hash.XxHash64.hash(0, value);
+    var buf: [16]u8 = undefined;
+    const hex = std.fmt.bufPrint(&buf, "{x:0>16}", .{digest}) catch unreachable;
+    try out.appendSlice(a, hex);
+}
+
 /// lowercased, alphanumeric runs separated by single '_', no leading/trailing
-/// separators. "A. Lovelace" -> "a_lovelace".
+/// separators. "A. Lovelace" -> "a_lovelace". English possessives are
+/// stripped ("Epstein's island" -> "epstein_island", not "epstein_s_island"),
+/// for both ASCII apostrophe and U+2019, so possessive and bare mentions of
+/// the same name converge on one canonical key.
 fn appendSlug(a: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
     var wrote = false;
     var pending_sep = false;
-    for (value) |c| {
+    var i: usize = 0;
+    while (i < value.len) : (i += 1) {
+        const c = value[i];
+        const apostrophe_len: usize = if (c == '\'')
+            1
+        else if (c == 0xE2 and i + 2 < value.len and value[i + 1] == 0x80 and value[i + 2] == 0x99)
+            3
+        else
+            0;
+        if (apostrophe_len > 0 and wrote and !pending_sep) {
+            const s_index = i + apostrophe_len;
+            const after_s = s_index + 1;
+            const s_is_possessive = s_index < value.len and
+                (value[s_index] == 's' or value[s_index] == 'S') and
+                (after_s >= value.len or !std.ascii.isAlphanumeric(value[after_s]));
+            if (s_is_possessive) {
+                i = s_index; // consume the apostrophe and the trailing s
+                continue;
+            }
+        }
         const lc = std.ascii.toLower(c);
         if (std.ascii.isAlphanumeric(lc)) {
             if (pending_sep and wrote) try out.append(a, '_');
@@ -482,6 +641,7 @@ fn appendSlug(a: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: []c
         } else if (wrote) {
             pending_sep = true;
         }
+        if (apostrophe_len == 3) i += 2;
     }
 }
 
@@ -664,6 +824,21 @@ pub fn parseResolution(gpa: std.mem.Allocator, json_bytes: []const u8) !ParsedRe
 /// needed here -- they are consumed by the graph materializer, which reads the
 /// extraction artifact plus this resolver's resolution artifact.
 pub fn parseExtractionEntities(gpa: std.mem.Allocator, json_bytes: []const u8) !ParsedEntities {
+    return try parseExtractionEntitiesWithResolutions(gpa, json_bytes, null);
+}
+
+/// `sibling_resolutions_json`, when provided, is a map of mention local id to
+/// `{"key": <canonical doc key>, "table": ...}` — the same shape the graph
+/// materializer injects into an artifact as `_entities`. Event identity then
+/// composes from the participants' CANONICAL keys instead of their raw
+/// mention text, so a matcher-scorer merge ("A. Lovelace" into
+/// entity/ada_lovelace) re-keys the events it participates in rather than
+/// leaving them pinned to the stale surface-form slug.
+pub fn parseExtractionEntitiesWithResolutions(
+    gpa: std.mem.Allocator,
+    json_bytes: []const u8,
+    sibling_resolutions_json: ?[]const u8,
+) !ParsedEntities {
     var parsed = try std.json.parseFromSlice(std.json.Value, gpa, json_bytes, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidExtraction;
@@ -674,7 +849,7 @@ pub fn parseExtractionEntities(gpa: std.mem.Allocator, json_bytes: []const u8) !
 
     if (isDedicatedMentionArtifact(parsed.value.object)) {
         const out = try a.alloc(ExtractedEntity, 1);
-        out[0] = try parseExtractedEntityObject(a, parsed.value.object);
+        out[0] = try parseExtractedEntityObject(a, parsed.value.object, null);
         return .{ .arena = arena, .entities = out };
     }
 
@@ -684,9 +859,148 @@ pub fn parseExtractionEntities(gpa: std.mem.Allocator, json_bytes: []const u8) !
     const out = try a.alloc(ExtractedEntity, entities_v.array.items.len);
     for (entities_v.array.items, 0..) |ev, i| {
         if (ev != .object) return error.InvalidExtraction;
-        out[i] = try parseExtractedEntityObject(a, ev.object);
+        out[i] = try parseExtractedEntityObject(a, ev.object, i);
     }
+    // An explicit sibling map wins; an artifact that already carries an
+    // injected `_entities` map (the materializer's convention) composes from
+    // it the same way. Malformed resolutions degrade to raw mention text.
+    const resolutions: ?std.json.Value = blk: {
+        if (sibling_resolutions_json) |raw| {
+            const value = std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) catch break :blk null;
+            if (value == .object) break :blk value;
+            break :blk null;
+        }
+        break :blk parsed.value.object.get("_entities");
+    };
+    try computeEventIdentities(a, parsed.value.object, resolutions, out);
     return .{ .arena = arena, .entities = out };
+}
+
+/// Compositional event identity (see ExtractedEntity.event_identity): for
+/// every mention, gather the OTHER mentions it is related to through the
+/// artifact's `relations`, keep the non-"event" ones (an event related to
+/// other events would otherwise fold their unstable sentence texts into its
+/// own identity), and join their sorted slugs with the mention's asserted
+/// predicate (or its text when no predicate was asserted). Two differently
+/// worded event sentences with the same participants and predicate then mint
+/// the same canonical key, which is what lets `participates_in` mass
+/// accumulate on shared event nodes across documents. A participant covered
+/// by `resolutions` (the `_entities` map shape) contributes its canonical
+/// key's final path segment instead of its raw text, so entity merges re-key
+/// the events they touch (see canonicalParticipantSegment). Endpoints are
+/// matched the way the graph materializer matches them: local-id strings,
+/// `{entity_id|id|local_id}` objects, or positional `{entity_index}` objects.
+fn computeEventIdentities(a: std.mem.Allocator, root: std.json.ObjectMap, resolutions: ?std.json.Value, out: []ExtractedEntity) !void {
+    if (out.len == 0) return;
+    const relations_v = root.get("relations") orelse return;
+    if (relations_v != .array) return;
+
+    var related = try a.alloc(std.ArrayListUnmanaged(usize), out.len);
+    for (related) |*list| list.* = .empty;
+
+    for (relations_v.array.items) |rv| {
+        if (rv != .object) continue;
+        const source = resolveRelationEndpointIndex(rv.object.get("source"), out) orelse continue;
+        const target = resolveRelationEndpointIndex(rv.object.get("target"), out) orelse continue;
+        if (source == target) continue;
+        try related[source].append(a, target);
+        try related[target].append(a, source);
+    }
+
+    for (out, 0..) |*entity, i| {
+        var slugs = std.ArrayListUnmanaged([]const u8).empty;
+        for (related[i].items) |other| {
+            if (std.ascii.eqlIgnoreCase(out[other].label, "event")) continue;
+            var slug = std.ArrayListUnmanaged(u8).empty;
+            // Prefer the participant's canonical key from the resolution
+            // map: its final path segment IS the slug the entity key
+            // template minted (`entity/{{ slug _entity.text }}` and
+            // friends), so pre- and post-resolution identities agree until
+            // a merge actually moves the mention — and then the event
+            // re-keys with the survivor instead of staying pinned to the
+            // stale surface-form slug.
+            if (canonicalParticipantSegment(resolutions, out[other].local_id)) |segment| {
+                try appendSlug(a, &slug, segment);
+            } else {
+                try appendSlug(a, &slug, out[other].text);
+            }
+            if (slug.items.len == 0) continue;
+            try slugs.append(a, try slug.toOwnedSlice(a));
+        }
+        std.mem.sort([]const u8, slugs.items, {}, struct {
+            fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+                return std.mem.order(u8, lhs, rhs) == .lt;
+            }
+        }.lessThan);
+
+        // The composite identity requires at least one non-event
+        // participant. A predicate alone is NOT identifying — "|meet" would
+        // merge every participant-less meeting in the corpus into one node
+        // (the event-event pass, whose related mentions are all events,
+        // would produce exactly that). Without participants the identity
+        // stays empty and `_entity.event_identity` degrades to the raw
+        // sentence text — uniformly, whether the artifact carried an empty
+        // relations array or none at all.
+        if (slugs.items.len == 0) continue;
+
+        var identity = std.ArrayListUnmanaged(u8).empty;
+        var previous: ?[]const u8 = null;
+        for (slugs.items) |slug| {
+            if (previous) |seen| if (std.mem.eql(u8, seen, slug)) continue;
+            if (identity.items.len > 0) try identity.append(a, ',');
+            try identity.appendSlice(a, slug);
+            previous = slug;
+        }
+        try identity.append(a, '|');
+        if (entity.predicate.len > 0) {
+            try appendSlug(a, &identity, entity.predicate);
+        } else {
+            try identity.appendSlice(a, entity.text);
+        }
+        entity.event_identity = try identity.toOwnedSlice(a);
+    }
+}
+
+/// The canonical-key path segment an event identity composes for a resolved
+/// participant: the substring after the key's last '/'. Null when the
+/// resolution map is absent, does not cover the mention, or carries no key —
+/// the caller then falls back to the raw mention text.
+fn canonicalParticipantSegment(resolutions: ?std.json.Value, local_id: []const u8) ?[]const u8 {
+    const res = resolutions orelse return null;
+    if (res != .object) return null;
+    const entry = res.object.get(local_id) orelse return null;
+    if (entry != .object) return null;
+    const key = entry.object.get("key") orelse return null;
+    if (key != .string or key.string.len == 0) return null;
+    const segment = if (std.mem.lastIndexOfScalar(u8, key.string, '/')) |idx|
+        key.string[idx + 1 ..]
+    else
+        key.string;
+    return if (segment.len > 0) segment else null;
+}
+
+fn resolveRelationEndpointIndex(value: ?std.json.Value, out: []ExtractedEntity) ?usize {
+    const endpoint = value orelse return null;
+    switch (endpoint) {
+        .string => |id| return mentionIndexForLocalId(out, id),
+        .object => |o| {
+            if (o.get("entity_index")) |index_value| {
+                if (index_value == .integer and index_value.integer >= 0 and index_value.integer < out.len)
+                    return @intCast(index_value.integer);
+                return null;
+            }
+            const id = jsonString(o.get("entity_id") orelse o.get("id") orelse o.get("local_id") orelse return null) orelse return null;
+            return mentionIndexForLocalId(out, id);
+        },
+        else => return null,
+    }
+}
+
+fn mentionIndexForLocalId(out: []ExtractedEntity, id: []const u8) ?usize {
+    for (out, 0..) |entity, i| {
+        if (std.mem.eql(u8, entity.local_id, id)) return i;
+    }
+    return null;
 }
 
 fn isDedicatedMentionArtifact(obj: std.json.ObjectMap) bool {
@@ -694,18 +1008,29 @@ fn isDedicatedMentionArtifact(obj: std.json.ObjectMap) bool {
     return std.mem.eql(u8, schema, "antfly.entity_mention.v1");
 }
 
-fn parseExtractedEntityObject(a: std.mem.Allocator, o: std.json.ObjectMap) !ExtractedEntity {
-    const id_value = o.get("id") orelse o.get("local_id") orelse return error.InvalidExtraction;
+fn parseExtractedEntityObject(a: std.mem.Allocator, o: std.json.ObjectMap, array_index: ?usize) !ExtractedEntity {
+    // Extractor payloads whose entities carry no local id (GLiNER2.5's
+    // boundary responses reference entities positionally, via each relation's
+    // `entity_index`) resolve under their decimal array position, the same
+    // identity the graph materializer derives for `entity_index` endpoints.
+    const local_id = if (o.get("id") orelse o.get("local_id")) |id_value|
+        try a.dupe(u8, jsonString(id_value) orelse return error.InvalidExtraction)
+    else if (array_index) |index|
+        try std.fmt.allocPrint(a, "{d}", .{index})
+    else
+        return error.InvalidExtraction;
     return .{
-        .local_id = try a.dupe(u8, jsonString(id_value) orelse return error.InvalidExtraction),
+        .local_id = local_id,
         .label = try a.dupe(u8, jsonString(o.get("label") orelse return error.InvalidExtraction) orelse return error.InvalidExtraction),
         .text = try a.dupe(u8, jsonString(o.get("text") orelse return error.InvalidExtraction) orelse return error.InvalidExtraction),
         .embedding = try parseEmbedding(a, o.get("embedding")),
-        .confidence = switch (o.get("confidence") orelse std.json.Value{ .float = 1.0 }) {
+        // "score" is the GLiNER extractor's spelling of the same measure.
+        .confidence = switch (o.get("confidence") orelse o.get("score") orelse std.json.Value{ .float = 1.0 }) {
             .float => |f| f,
             .integer => |n| @floatFromInt(n),
             else => 1.0,
         },
+        .predicate = if (o.get("predicate")) |p| try a.dupe(u8, jsonString(p) orelse "") else "",
     };
 }
 
@@ -847,6 +1172,13 @@ pub const ResolutionStage = struct {
     /// review decision takes that decision/endpoint instead of the scorer's, so
     /// a curated link survives re-resolution (replay-stable curation).
     overrides: ?OverrideProvider = null,
+    /// Optional sibling resolutions (local id -> {"key", "table"}, the
+    /// `_entities` shape) from OTHER resolvers over the same extraction
+    /// artifact. Compositional event identity then composes participants'
+    /// canonical keys, so entity merges re-key the events they touch. The
+    /// runtime re-drives this stage when a sibling resolution artifact
+    /// changes; recomputing with an unchanged map is byte-stable.
+    sibling_resolutions_json: ?[]const u8 = null,
 
     /// Allocate the canonical resolution bytes for `extraction_key` without
     /// mutating the store. The caller owns a non-null result and must free it
@@ -864,8 +1196,14 @@ pub const ResolutionStage = struct {
         defer if (extraction) |e| gpa.free(e);
         if (extraction == null) return null;
 
-        var parsed = try parseExtractionEntities(gpa, extraction.?);
+        var parsed = try parseExtractionEntitiesWithResolutions(gpa, extraction.?, self.sibling_resolutions_json);
         defer parsed.deinit();
+
+        // Label routing: drop mentions this resolver does not consume before
+        // any per-mention work (embedding backfill, candidate blocking). The
+        // sibling resolver that owns those labels resolves them from the same
+        // extraction artifact into its own resolution artifact.
+        parsed.entities = self.resolver.filterEntitiesByLabel(parsed.entities);
 
         // Backfill name embeddings for mentions that arrived without one, using
         // the parse arena so the vectors outlive scoring. Embedding failures are
@@ -956,12 +1294,12 @@ pub const ResolutionStage = struct {
 const testing = std.testing;
 
 test "initFromParts builds a deterministic resolver and one with a scorer" {
-    var deterministic = try Resolver.initFromParts(testing.allocator, "entities", "{{ slug _entity.text }}", true, "");
+    var deterministic = try Resolver.initFromParts(testing.allocator, "entities", "{{ slug _entity.text }}", .{}, true, "");
     defer deterministic.deinit();
     try testing.expectEqualStrings("entities", deterministic.table);
     try testing.expect(deterministic.scorer == null);
 
-    var scored = try Resolver.initFromParts(testing.allocator, "entities", "{{ slug _entity.text }}", false,
+    var scored = try Resolver.initFromParts(testing.allocator, "entities", "{{ slug _entity.text }}", .{}, false,
         \\{ "comparisons": [ { "name": "n", "left": "canonical_text", "right": "canonical_name",
         \\  "levels": [ { "when": "exact", "weight": 8.0 }, { "else": true, "weight": -6.0 } ] } ],
         \\  "combine": { "bias": -3.0 }, "decision": { "match": 0.9 } }
@@ -994,6 +1332,69 @@ test "deterministic resolver mints a canonical key for each entity" {
     try testing.expectEqualStrings("person/ada_lovelace", res.entities[0].doc_ref.key);
     try testing.expectEqual(Decision.new, res.entities[0].decision);
     try testing.expectEqualStrings("org/antfly_inc", res.entities[1].doc_ref.key);
+}
+
+test "min_confidence floors mention admission before resolution" {
+    var resolver = try Resolver.initFromParts(
+        testing.allocator,
+        "entities",
+        "entity/{{ slug _entity.text }}",
+        .{ .min_confidence = 0.5 },
+        true,
+        "",
+    );
+    defer resolver.deinit();
+
+    var entities = [_]ExtractedEntity{
+        .{ .local_id = "0", .label = "person", .text = "Ada Lovelace", .confidence = 0.9 },
+        .{ .local_id = "1", .label = "date", .text = "b2a6-4f", .confidence = 0.2 },
+        .{ .local_id = "2", .label = "org", .text = "Antfly", .confidence = 0.5 },
+    };
+    const kept = resolver.filterEntitiesByLabel(&entities);
+    try testing.expectEqual(@as(usize, 2), kept.len);
+    try testing.expectEqualStrings("Ada Lovelace", kept[0].text);
+    try testing.expectEqualStrings("Antfly", kept[1].text);
+}
+
+test "slug strips English possessives so mention variants converge" {
+    var resolver = try Resolver.parse(testing.allocator,
+        \\{ "table": "entities", "key_template": "entity/{{ slug _entity.text }}" }
+    );
+    defer resolver.deinit();
+
+    const entities = [_]ExtractedEntity{
+        .{ .local_id = "e0", .label = "person", .text = "Epstein's island" },
+        .{ .local_id = "e1", .label = "person", .text = "Epstein\u{2019}s Island" },
+        .{ .local_id = "e2", .label = "org", .text = "O'Brien & Sons" },
+    };
+    var res = try resolver.resolve(testing.allocator, 1, &entities, &[_][]const Candidate{});
+    defer res.deinit();
+    try testing.expectEqualStrings("entity/epstein_island", res.entities[0].doc_ref.key);
+    try testing.expectEqualStrings("entity/epstein_island", res.entities[1].doc_ref.key);
+    // A non-possessive apostrophe (contraction/name) keeps its letters.
+    try testing.expectEqualStrings("entity/o_brien_sons", res.entities[2].doc_ref.key);
+}
+
+test "hash helper mints a stable event key from normalized text" {
+    var resolver = try Resolver.parse(testing.allocator,
+        \\{ "table": "events", "key_template": "event/{{ hash _entity.text }}" }
+    );
+    defer resolver.deinit();
+
+    const entities = [_]ExtractedEntity{
+        .{ .local_id = "v0", .label = "event", .text = "Ada Lovelace writes the first program" },
+        .{ .local_id = "v1", .label = "event", .text = "Ada Lovelace writes the first program" },
+        .{ .local_id = "v2", .label = "event", .text = "Babbage designs the Analytical Engine" },
+    };
+    var res = try resolver.resolve(testing.allocator, 1, &entities, &[_][]const Candidate{});
+    defer res.deinit();
+
+    try testing.expectEqual(@as(usize, 3), res.entities.len);
+    // "event/" + 16 hex chars, identical text -> identical key, replay-stable.
+    try testing.expectEqual(@as(usize, "event/".len + 16), res.entities[0].doc_ref.key.len);
+    try testing.expect(std.mem.startsWith(u8, res.entities[0].doc_ref.key, "event/"));
+    try testing.expectEqualStrings(res.entities[0].doc_ref.key, res.entities[1].doc_ref.key);
+    try testing.expect(!std.mem.eql(u8, res.entities[0].doc_ref.key, res.entities[2].doc_ref.key));
 }
 
 test "resolver links a mention to a matching candidate" {
@@ -1119,6 +1520,210 @@ test "parseExtractionEntities reads the documented extraction shape" {
     try testing.expectEqualStrings("Antfly", parsed.entities[1].text);
 }
 
+test "parseExtractionEntities assigns positional local ids to id-less extractor entities" {
+    // GLiNER2.5 boundary responses carry no per-entity ids; relations
+    // reference entities positionally via `entity_index`, and "score" is the
+    // extractor's confidence spelling.
+    var parsed = try parseExtractionEntities(testing.allocator,
+        \\{
+        \\  "entities": [
+        \\    {"label": "component", "text": "metadata server", "score": 0.83, "start": 4, "end": 19},
+        \\    {"label": "test", "text": "VOPR", "score": 0.98, "start": 45, "end": 49}
+        \\  ],
+        \\  "relations": [
+        \\    {"type": "tested_by", "source": {"entity_index": 0}, "target": {"entity_index": 1}, "score": 0.9}
+        \\  ]
+        \\}
+    );
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 2), parsed.entities.len);
+    try testing.expectEqualStrings("0", parsed.entities[0].local_id);
+    try testing.expectEqualStrings("metadata server", parsed.entities[0].text);
+    try testing.expectEqual(@as(f64, 0.83), parsed.entities[0].confidence);
+    try testing.expectEqualStrings("1", parsed.entities[1].local_id);
+    try testing.expectEqualStrings("VOPR", parsed.entities[1].text);
+}
+
+test "event identity composes participants and predicate across wordings" {
+    // Two artifacts describe the same event with different sentence wording.
+    // The per-sentence hash diverges; the compositional identity converges.
+    const artifact_a =
+        \\{
+        \\  "entities": [
+        \\    {"id": "e0", "label": "person", "text": "Ada Lovelace"},
+        \\    {"id": "e1", "label": "person", "text": "Charles Babbage"},
+        \\    {"id": "v0", "label": "event", "text": "Ada Lovelace met Charles Babbage at a salon.", "predicate": "meet"}
+        \\  ],
+        \\  "relations": [
+        \\    {"type": "participates_in", "source": "e0", "target": "v0"},
+        \\    {"type": "participates_in", "source": "e1", "target": "v0"}
+        \\  ]
+        \\}
+    ;
+    const artifact_b =
+        \\{
+        \\  "entities": [
+        \\    {"id": "e0", "label": "person", "text": "Charles Babbage"},
+        \\    {"id": "e1", "label": "person", "text": "Ada Lovelace"},
+        \\    {"id": "v9", "label": "event", "text": "Babbage and Lovelace were introduced.", "predicate": "meet"}
+        \\  ],
+        \\  "relations": [
+        \\    {"type": "participates_in", "source": "e0", "target": "v9"},
+        \\    {"type": "participates_in", "source": "e1", "target": "v9"}
+        \\  ]
+        \\}
+    ;
+    var parsed_a = try parseExtractionEntities(testing.allocator, artifact_a);
+    defer parsed_a.deinit();
+    var parsed_b = try parseExtractionEntities(testing.allocator, artifact_b);
+    defer parsed_b.deinit();
+
+    try testing.expectEqualStrings("ada_lovelace,charles_babbage|meet", parsed_a.entities[2].event_identity);
+    try testing.expectEqualStrings(parsed_a.entities[2].event_identity, parsed_b.entities[2].event_identity);
+
+    // Same participants, different action: distinct identities.
+    const artifact_c =
+        \\{
+        \\  "entities": [
+        \\    {"id": "e0", "label": "person", "text": "Ada Lovelace"},
+        \\    {"id": "e1", "label": "person", "text": "Charles Babbage"},
+        \\    {"id": "v0", "label": "event", "text": "Ada Lovelace hired Charles Babbage.", "predicate": "hire"}
+        \\  ],
+        \\  "relations": [
+        \\    {"type": "participates_in", "source": "e0", "target": "v0"},
+        \\    {"type": "participates_in", "source": "e1", "target": "v0"}
+        \\  ]
+        \\}
+    ;
+    var parsed_c = try parseExtractionEntities(testing.allocator, artifact_c);
+    defer parsed_c.deinit();
+    try testing.expect(!std.mem.eql(u8, parsed_a.entities[2].event_identity, parsed_c.entities[2].event_identity));
+
+    // No participants keeps the identity empty — the template variable then
+    // degrades to the mention text (the legacy per-sentence identity),
+    // identically with or without a relations array, and EVEN WITH a
+    // predicate: "|meet" alone would merge every participant-less meeting
+    // in the corpus into one node.
+    const artifact_d =
+        \\{"entities": [{"id": "v0", "label": "event", "text": "Something happened.", "predicate": "happen"}]}
+    ;
+    var parsed_d = try parseExtractionEntities(testing.allocator, artifact_d);
+    defer parsed_d.deinit();
+    try testing.expectEqualStrings("", parsed_d.entities[0].event_identity);
+    const artifact_e =
+        \\{"entities": [{"id": "v0", "label": "event", "text": "Something happened.", "predicate": "happen"}], "relations": []}
+    ;
+    var parsed_e = try parseExtractionEntities(testing.allocator, artifact_e);
+    defer parsed_e.deinit();
+    try testing.expectEqualStrings("", parsed_e.entities[0].event_identity);
+    // Event-event relations (all mentions labeled event) contribute no
+    // participants, so verb-sharing events keep distinct sentence identities.
+    const artifact_f =
+        \\{
+        \\  "entities": [
+        \\    {"id": "v0", "label": "event", "text": "Ada met Babbage.", "predicate": "meet"},
+        \\    {"id": "v1", "label": "event", "text": "Curie met Langevin.", "predicate": "meet"}
+        \\  ],
+        \\  "relations": [{"type": "before", "source": "v0", "target": "v1"}]
+        \\}
+    ;
+    var parsed_f = try parseExtractionEntities(testing.allocator, artifact_f);
+    defer parsed_f.deinit();
+    try testing.expectEqualStrings("", parsed_f.entities[0].event_identity);
+    try testing.expectEqualStrings("", parsed_f.entities[1].event_identity);
+}
+
+test "event identity composes canonical participant keys from a resolution map" {
+    // "A. Lovelace" resolved (merged) into entity/ada_lovelace: identity must
+    // follow the survivor key, not the stale surface-form slug.
+    const artifact =
+        \\{
+        \\  "entities": [
+        \\    {"id": "e0", "label": "person", "text": "A. Lovelace"},
+        \\    {"id": "e1", "label": "person", "text": "Charles Babbage"},
+        \\    {"id": "v0", "label": "event", "text": "A. Lovelace met Charles Babbage.", "predicate": "meet"}
+        \\  ],
+        \\  "relations": [
+        \\    {"type": "participates_in", "source": "e0", "target": "v0"},
+        \\    {"type": "participates_in", "source": "e1", "target": "v0"}
+        \\  ]
+        \\}
+    ;
+    const resolutions =
+        \\{
+        \\  "e0": {"key": "entity/ada_lovelace", "table": "entities"},
+        \\  "e1": {"key": "entity/charles_babbage", "table": "entities"}
+        \\}
+    ;
+    var resolved = try parseExtractionEntitiesWithResolutions(testing.allocator, artifact, resolutions);
+    defer resolved.deinit();
+    try testing.expectEqualStrings("ada_lovelace,charles_babbage|meet", resolved.entities[2].event_identity);
+
+    // Without the map the identity uses the raw mention slug: the two agree
+    // exactly when the entity key template minted the same slug (the
+    // no-merge fast path re-resolves to identical bytes), and diverge to the
+    // survivor only when a merge actually moved the mention.
+    var unresolved = try parseExtractionEntities(testing.allocator, artifact);
+    defer unresolved.deinit();
+    try testing.expectEqualStrings("a_lovelace,charles_babbage|meet", unresolved.entities[2].event_identity);
+
+    // A partial map falls back per participant, and an artifact carrying the
+    // materializer-injected `_entities` map composes the same way without an
+    // explicit sibling map.
+    const partial =
+        \\{"e1": {"key": "entity/charles_babbage", "table": "entities"}}
+    ;
+    var partially = try parseExtractionEntitiesWithResolutions(testing.allocator, artifact, partial);
+    defer partially.deinit();
+    try testing.expectEqualStrings("a_lovelace,charles_babbage|meet", partially.entities[2].event_identity);
+
+    const injected =
+        \\{
+        \\  "entities": [
+        \\    {"id": "e0", "label": "person", "text": "A. Lovelace"},
+        \\    {"id": "v0", "label": "event", "text": "A. Lovelace spoke.", "predicate": "speak"}
+        \\  ],
+        \\  "relations": [{"type": "participates_in", "source": "e0", "target": "v0"}],
+        \\  "_entities": {"e0": {"key": "entity/ada_lovelace", "table": "entities"}}
+        \\}
+    ;
+    var embedded = try parseExtractionEntities(testing.allocator, injected);
+    defer embedded.deinit();
+    try testing.expectEqualStrings("ada_lovelace|speak", embedded.entities[1].event_identity);
+}
+
+test "event identity template variable renders through the hash helper" {
+    var resolver = try Resolver.parse(testing.allocator,
+        \\{ "table": "events", "key_template": "event/{{ hash _entity.event_identity }}", "labels": ["event"] }
+    );
+    defer resolver.deinit();
+
+    const with_identity = [_]ExtractedEntity{.{
+        .local_id = "v0",
+        .label = "event",
+        .text = "Ada met Babbage.",
+        .event_identity = "ada_lovelace,charles_babbage|meet",
+    }};
+    var res_a = try resolver.resolve(testing.allocator, 1, &with_identity, &[_][]const Candidate{});
+    defer res_a.deinit();
+
+    const reworded = [_]ExtractedEntity{.{
+        .local_id = "v3",
+        .label = "event",
+        .text = "Babbage and Lovelace were introduced.",
+        .event_identity = "ada_lovelace,charles_babbage|meet",
+    }};
+    var res_b = try resolver.resolve(testing.allocator, 1, &reworded, &[_][]const Candidate{});
+    defer res_b.deinit();
+    try testing.expectEqualStrings(res_a.entities[0].doc_ref.key, res_b.entities[0].doc_ref.key);
+
+    // Without relation context the variable degrades to the mention text.
+    const bare = [_]ExtractedEntity{.{ .local_id = "v0", .label = "event", .text = "Something happened." }};
+    var res_c = try resolver.resolve(testing.allocator, 1, &bare, &[_][]const Candidate{});
+    defer res_c.deinit();
+    try testing.expect(std.mem.startsWith(u8, res_c.entities[0].doc_ref.key, "event/"));
+}
+
 test "parseExtractionEntities reads a dedicated mention artifact" {
     var parsed = try parseExtractionEntities(testing.allocator,
         \\{
@@ -1209,6 +1814,56 @@ test "resolution stage writes, then skips when unchanged" {
     try testing.expectEqual(@as(usize, 2), ents.len);
     try testing.expectEqualStrings("person/ada_lovelace", ents[0].object.get("doc_ref").?.object.get("key").?.string);
     try testing.expectEqualStrings("new", ents[0].object.get("decision").?.string);
+}
+
+test "label-routed resolvers partition one extraction artifact" {
+    // The AutoSchemaKG event/entity split: one artifact carries both event
+    // mentions and entity mentions; an `event`-labeled resolver and a
+    // catch-all... the catch-all consumes everything, so the entity resolver
+    // must not double-resolve events. Partition = event resolver takes
+    // label "event"; the entity resolver lists the entity labels explicitly.
+    const kg_extraction =
+        \\{ "entities": [
+        \\  { "id": "e0", "label": "person", "text": "Ada Lovelace" },
+        \\  { "id": "v0", "label": "event", "text": "Ada Lovelace writes the first program" }
+        \\] }
+    ;
+
+    var event_resolver = try Resolver.parse(testing.allocator,
+        \\{ "table": "events", "key_template": "event/{{ hash _entity.text }}", "labels": ["event"] }
+    );
+    defer event_resolver.deinit();
+    var entity_resolver = try Resolver.parse(testing.allocator,
+        \\{ "table": "entities", "key_template": "{{ lower _entity.label }}/{{ slug _entity.text }}", "labels": ["person", "org"] }
+    );
+    defer entity_resolver.deinit();
+
+    var map = MapStore{ .alloc = testing.allocator };
+    defer map.deinit();
+    try map.store().put("ext:doc1", kg_extraction);
+
+    const event_stage = ResolutionStage{ .resolver = &event_resolver, .config_generation = 1 };
+    const entity_stage = ResolutionStage{ .resolver = &entity_resolver, .config_generation = 1 };
+    try testing.expectEqual(RunResult.written, try event_stage.run(testing.allocator, map.store(), null, "ext:doc1", "res:events"));
+    try testing.expectEqual(RunResult.written, try entity_stage.run(testing.allocator, map.store(), null, "ext:doc1", "res:entities"));
+
+    const events_res = (try map.store().get(testing.allocator, "res:events")).?;
+    defer testing.allocator.free(events_res);
+    var events_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, events_res, .{});
+    defer events_parsed.deinit();
+    const event_ents = events_parsed.value.object.get("entities").?.array.items;
+    try testing.expectEqual(@as(usize, 1), event_ents.len);
+    try testing.expectEqualStrings("v0", event_ents[0].object.get("local_id").?.string);
+    try testing.expectEqualStrings("events", event_ents[0].object.get("doc_ref").?.object.get("table").?.string);
+
+    const entities_res = (try map.store().get(testing.allocator, "res:entities")).?;
+    defer testing.allocator.free(entities_res);
+    var entities_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, entities_res, .{});
+    defer entities_parsed.deinit();
+    const entity_ents = entities_parsed.value.object.get("entities").?.array.items;
+    try testing.expectEqual(@as(usize, 1), entity_ents.len);
+    try testing.expectEqualStrings("e0", entity_ents[0].object.get("local_id").?.string);
+    try testing.expectEqualStrings("person/ada_lovelace", entity_ents[0].object.get("doc_ref").?.object.get("key").?.string);
 }
 
 test "resolution stage clears the artifact when the source is gone" {
@@ -1311,7 +1966,7 @@ const FixedOverride = struct {
 };
 
 test "a human-curation override replaces the resolver's decision for a mention" {
-    var resolver = try Resolver.initFromParts(testing.allocator, "entities", "{{ slug _entity.text }}", true, "");
+    var resolver = try Resolver.initFromParts(testing.allocator, "entities", "{{ slug _entity.text }}", .{}, true, "");
     defer resolver.deinit();
 
     var map = MapStore{ .alloc = testing.allocator };
@@ -1579,7 +2234,7 @@ test "deterministic resolution skips candidate and embedding IO but retains dest
         }
     };
     var ports: Ports = .{};
-    var resolver = try Resolver.initFromParts(alloc, "entities", "{{ slug _entity.text }}", false, "");
+    var resolver = try Resolver.initFromParts(alloc, "entities", "{{ slug _entity.text }}", .{}, false, "");
     defer resolver.deinit();
     var store = MapStore{ .alloc = alloc };
     defer store.deinit();

@@ -559,6 +559,109 @@ const max_pending_table_reclaims_per_target: usize = 128;
 const backup_maintenance_target_retention_ns: u64 = 7 * std.time.ns_per_day;
 const restore_repository_retry_min_ms: u64 = 100;
 const restore_repository_retry_max_ms: u64 = 5_000;
+const restore_staging_wait_ns: u64 = 250 * std.time.ns_per_ms;
+
+fn restoreRetryDelayNs(err: anyerror, job_id: u64, attempt_id: u64) u64 {
+    return switch (err) {
+        error.RestoreStagingYield => 10 * std.time.ns_per_ms,
+        error.RestoreStagingWait => restore_staging_wait_ns,
+        else => restoreRepositoryRetryDelayNs(job_id, attempt_id),
+    };
+}
+
+fn waitForRestoreCutoverFence(
+    alloc: std.mem.Allocator,
+    reads: table_reads.TableReadSource,
+    writes: table_writes.TableWriteSource,
+    table_name: []const u8,
+    range_key: []const u8,
+    expected: @import("../storage/db/relational_integrity_topology.zig").Fence,
+) !void {
+    // A read-index status can prove that an earlier begin reached the owner
+    // even if its response was lost. Reissuing begin on every readiness poll
+    // would amplify Raft writes across the cohort.
+    var began_in_this_slice = false;
+    while (true) {
+        var response = (try reads.topologyStatus(alloc, table_name, range_key, "{\"mode\":\"status\"}")) orelse return error.RestoreStagingWait;
+        defer response.deinit(alloc);
+        const status = try std.json.parseFromSlice(@import("../metadata/backup_cohort.zig").Observation, alloc, response.json, .{});
+        defer status.deinit();
+        if (status.value.fence) |fence| {
+            if (fence.eql(expected)) {
+                if (!status.value.drained) return error.RestoreStagingWait;
+                return;
+            }
+        }
+        if (began_in_this_slice) return error.RestoreStagingScopeChanged;
+        _ = (try writes.batch(alloc, table_name, .{ .relational_topology = .{ .fence = expected, .action = .begin } })) orelse return error.RestoreStagingWait;
+        began_in_this_slice = true;
+    }
+}
+
+test "restore cutover readiness waits without exponential retry" {
+    try std.testing.expectEqual(10 * std.time.ns_per_ms, restoreRetryDelayNs(error.RestoreStagingYield, 42, 8));
+    try std.testing.expectEqual(restore_staging_wait_ns, restoreRetryDelayNs(error.RestoreStagingWait, 42, 8));
+    try std.testing.expect(restoreRetryDelayNs(error.RestoreValidationPending, 42, 8) > restore_staging_wait_ns);
+    try std.testing.expect(restoreJobErrorIsRetryable(error.RestoreStagingWait));
+}
+
+test "restore cutover lost begin reply waits for the same fence to drain" {
+    const alloc = std.testing.allocator;
+    const Fence = @import("../storage/db/relational_integrity_topology.zig").Fence;
+    const expected: Fence = .{
+        .transition_id = 7,
+        .attempt = 1,
+        .peer_group_id = 401,
+        .owner_group_id = 301,
+        .role = .rewrite_source,
+        .namespace = .{ .table_id = 9, .shard_id = 301, .range_id = 301 },
+        .catalog_digest = @splat(4),
+    };
+    const Fake = struct {
+        fence: ?Fence = null,
+        drained: bool = false,
+        begin_count: usize = 0,
+        read_count: usize = 0,
+
+        fn lookup(ptr: *anyopaque, a: std.mem.Allocator, table_name: []const u8, key: []const u8, opts: db_mod.types.LookupOptions, consistency: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqualStrings("range", key);
+            try std.testing.expectEqualStrings("{\"mode\":\"status\"}", opts.relational_topology_json);
+            try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
+            self.read_count += 1;
+            return .{ .json = try std.json.Stringify.valueAlloc(a, @import("../metadata/backup_cohort.zig").Observation{ .fence = self.fence, .drained = self.drained }, .{}), .version = 0 };
+        }
+
+        fn batch(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, req: db_mod.types.BatchRequest) !?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            const command = req.relational_topology orelse return error.TestUnexpectedResult;
+            try std.testing.expect(command.action == .begin);
+            try std.testing.expect(command.fence.eql(expected));
+            self.begin_count += 1;
+            self.fence = command.fence;
+            // The owner applied begin, but the caller lost its response.
+            return null;
+        }
+    };
+    var fake: Fake = .{};
+    const reads: table_reads.TableReadSource = .{ .ptr = &fake, .vtable = &.{ .lookup = Fake.lookup, .scan = undefined, .query = undefined } };
+    const writes: table_writes.TableWriteSource = .{ .ptr = &fake, .vtable = &.{ .batch = Fake.batch } };
+
+    try std.testing.expectError(error.RestoreStagingWait, waitForRestoreCutoverFence(alloc, reads, writes, "docs", "range", expected));
+    try std.testing.expectEqual(@as(usize, 1), fake.begin_count);
+    // Each resumed slice sees the applied fence but must keep waiting while
+    // the source has not drained, without replaying the Raft mutation.
+    for (0..3) |_| {
+        try std.testing.expectError(error.RestoreStagingWait, waitForRestoreCutoverFence(alloc, reads, writes, "docs", "range", expected));
+        try std.testing.expectEqual(@as(usize, 1), fake.begin_count);
+    }
+    fake.drained = true;
+    try waitForRestoreCutoverFence(alloc, reads, writes, "docs", "range", expected);
+    try std.testing.expectEqual(@as(usize, 1), fake.begin_count);
+    try std.testing.expectEqual(@as(usize, 5), fake.read_count);
+}
 
 fn restoreRepositoryRetryDelayNs(job_id: u64, attempt_id: u64) u64 {
     const exponent: u6 = @intCast(@min(attempt_id -| 1, 6));
@@ -12425,6 +12528,7 @@ pub const ApiHttpServer = struct {
             error.DeadlineExceeded,
             => return @errorCast(err),
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
+            error.GraphMetricPersonalizationRequiresFresh, error.UnsupportedGraphMetric => return error.InvalidQueryRequest,
             error.InvalidFilterQueryRequest => return error.InvalidFilterQueryRequest,
             error.InvalidExclusionQueryRequest => return error.InvalidExclusionQueryRequest,
             error.UnsupportedFilterQueryRequest => return error.UnsupportedFilterQueryRequest,
@@ -12712,6 +12816,10 @@ pub const ApiHttpServer = struct {
                 error.UnsupportedFilterQueryRequest,
                 error.UnsupportedExclusionQueryRequest,
                 => return err,
+                // Seeded personalization is a request-shape contract: seeds
+                // require fresh reads and a pagerank metric. Surface both as
+                // client errors rather than internal failures.
+                error.GraphMetricPersonalizationRequiresFresh, error.UnsupportedGraphMetric => return error.InvalidQueryRequest,
                 error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
                 error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
                 error.UnsupportedExactSort => return error.UnsupportedExactSort,
@@ -12784,6 +12892,7 @@ pub const ApiHttpServer = struct {
         var foreign_execution = CatalogJoinExecution{ .server = self, .resolver = resolver, .identity = authenticated_identity };
         if (self.executeForeignPublicTableQueryIfAny(alloc, source, table_name, body, row_filter_json, authenticated_identity, request_deadline_ns, cancellation, bound_join, foreign_execution.context()) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
+            error.GraphMetricPersonalizationRequiresFresh, error.UnsupportedGraphMetric => return error.InvalidQueryRequest,
             // Foreign-source capability validation is part of the public
             // request contract. Keep its historical 400 classification;
             // exact-sort rejection is already carried by its distinct error.
@@ -12890,6 +12999,10 @@ pub const ApiHttpServer = struct {
             error.UnsupportedFilterQueryRequest,
             error.UnsupportedExclusionQueryRequest,
             => return err,
+            // Seeded personalization is a request-shape contract: seeds
+            // require fresh reads and a pagerank metric. Surface both as
+            // client errors rather than internal failures.
+            error.GraphMetricPersonalizationRequiresFresh, error.UnsupportedGraphMetric => return error.InvalidQueryRequest,
             error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
             error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
@@ -16434,14 +16547,10 @@ pub const ApiHttpServer = struct {
                             owner_cursor += 1;
                             continue;
                         }
-                        _ = (try (self.table_writes orelse return error.UnsupportedOperation).batch(self.alloc, old.table.name, .{ .relational_topology = .{ .fence = old.fence, .action = if (phase == .cutover) .begin else .cancel } })) orelse return error.RestoreValidationPending;
                         if (phase == .cutover) {
-                            var response = (try (self.table_reads orelse return error.UnsupportedOperation).topologyStatus(self.alloc, old.table.name, old.range.start_key, "{\"mode\":\"status\"}")) orelse return error.RestoreValidationPending;
-                            defer response.deinit(self.alloc);
-                            const status = try std.json.parseFromSlice(@import("../metadata/backup_cohort.zig").Observation, self.alloc, response.json, .{});
-                            defer status.deinit();
-                            if (status.value.fence == null or !status.value.fence.?.eql(old.fence)) return error.RestoreStagingScopeChanged;
-                            if (!status.value.drained) return error.RestoreValidationPending;
+                            try waitForRestoreCutoverFence(self.alloc, self.table_reads orelse return error.UnsupportedOperation, self.table_writes orelse return error.UnsupportedOperation, old.table.name, old.range.start_key, old.fence);
+                        } else {
+                            _ = (try (self.table_writes orelse return error.UnsupportedOperation).batch(self.alloc, old.table.name, .{ .relational_topology = .{ .fence = old.fence, .action = .cancel } })) orelse return error.RestoreValidationPending;
                         }
                         if (old.rewrite_source) |source_scope| {
                             // Targets already applied final cuts before global
@@ -18631,6 +18740,11 @@ pub const ApiHttpServer = struct {
                 try contextualUnsupportedExactSortResponse(self.alloc)
             else
                 try contextual_operations.textAlloc(self.alloc, 400, "invalid query request"),
+            // Seeded personalization contract failures (seeds without fresh
+            // reads, or a non-pagerank metric) are client errors.
+            error.GraphMetricPersonalizationRequiresFresh,
+            error.UnsupportedGraphMetric,
+            => try contextual_operations.textAlloc(self.alloc, 400, "invalid query request"),
             error.InvalidFilterQueryRequest => try contextualPublicFilterQueryErrorResponseForBody(self.alloc, body, "filter_query", .invalid),
             error.InvalidExclusionQueryRequest => try contextualPublicFilterQueryErrorResponseForBody(self.alloc, body, "exclusion_query", .invalid),
             error.UnsupportedFilterQueryRequest => try contextualPublicFilterQueryErrorResponseForBody(self.alloc, body, "filter_query", .unsupported),
@@ -20381,7 +20495,7 @@ pub const ApiHttpServer = struct {
                     return;
                 }
                 if (restoreJobErrorIsFenced(err)) return error.RestoreJobFenced;
-                const retry = try self.restore_job_store.retryRunning(self.alloc, state, @errorName(err), if (err == error.RestoreStagingYield) 10 * std.time.ns_per_ms else restoreRepositoryRetryDelayNs(state.job_id, state.attempt_id));
+                const retry = try self.restore_job_store.retryRunning(self.alloc, state, @errorName(err), restoreRetryDelayNs(err, state.job_id, state.attempt_id));
                 self.alloc.free(retry);
                 self.wakeRequeuedRestoreJobs();
                 return;
@@ -20422,7 +20536,7 @@ pub const ApiHttpServer = struct {
                     }, &location, state.restore_mode, state.destination_authorization_principal, .{ .job_id = state.job_id, .attempt_id = state.attempt_id }, state.active_table_index, state.durability_pending_table_ranges orelse &.{}, state.published_table_ranges orelse &.{}) catch |err| {
                         if (restoreJobErrorIsFenced(err)) return error.RestoreJobFenced;
                         if (restoreJobErrorIsRetryable(err)) {
-                            const encoded = try self.restore_job_store.retryRunning(self.alloc, state, @errorName(err), if (err == error.RestoreStagingYield) 10 * std.time.ns_per_ms else restoreRepositoryRetryDelayNs(state.job_id, state.attempt_id));
+                            const encoded = try self.restore_job_store.retryRunning(self.alloc, state, @errorName(err), restoreRetryDelayNs(err, state.job_id, state.attempt_id));
                             self.alloc.free(encoded);
                             self.wakeRequeuedRestoreJobs();
                             return;
@@ -20488,10 +20602,7 @@ pub const ApiHttpServer = struct {
                         else => {
                             if (restoreJobErrorIsFenced(err)) return error.RestoreJobFenced;
                             if (restoreJobErrorIsRetryable(err)) {
-                                const retry_delay_ns = restoreRepositoryRetryDelayNs(
-                                    state.job_id,
-                                    state.attempt_id,
-                                );
+                                const retry_delay_ns = restoreRetryDelayNs(err, state.job_id, state.attempt_id);
                                 const retried = try self.restore_job_store.retryRunning(
                                     self.alloc,
                                     state,
@@ -20552,10 +20663,7 @@ pub const ApiHttpServer = struct {
                 .restore_mode = state.restore_mode,
             }, &location, state.restore_mode, state.destination_authorization_principal, .{ .job_id = state.job_id, .attempt_id = state.attempt_id }, state.active_table_index, state.durability_pending_table_ranges orelse &.{}, state.published_table_ranges orelse &.{}) catch |err| {
                 if (restoreJobErrorIsRetryable(err)) {
-                    const retry_delay_ns = if (err == error.RestoreStagingYield) 10 * std.time.ns_per_ms else restoreRepositoryRetryDelayNs(
-                        state.job_id,
-                        state.attempt_id,
-                    );
+                    const retry_delay_ns = restoreRetryDelayNs(err, state.job_id, state.attempt_id);
                     const retried = try self.restore_job_store.retryRunning(
                         self.alloc,
                         state,
@@ -21161,6 +21269,7 @@ fn restoreJobErrorIsFenced(err: anyerror) bool {
 fn restoreJobErrorIsRetryable(err: anyerror) bool {
     return err == error.BackupRepositoryBusy or
         err == error.RestoreStagingYield or
+        err == error.RestoreStagingWait or
         err == error.RestoreValidationPending;
 }
 

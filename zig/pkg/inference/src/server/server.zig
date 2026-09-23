@@ -4169,7 +4169,7 @@ pub const Node = struct {
     /// Build the initial readiness view before listener publication and start
     /// one runtime-owned refresher for model changes made by external pull
     /// commands. Repeated calls are harmless (the runtime cannot be replaced).
-    pub fn startReadinessInventory(self: *Node, io: std.Io) void {
+    pub fn startReadinessInventory(self: *Node, io: std.Io) !void {
         if (self.readiness_refresh_started) return;
         self.refreshReadinessInventory(io) catch |err| {
             // Liveness should still come up when a model volume is temporarily
@@ -4180,9 +4180,11 @@ pub const Node = struct {
                 .{@errorName(err)},
             );
         };
+        // This loop lives until shutdown. Group.async may run inline when the
+        // worker pool is full, which would prevent publishing the HTTP listener.
+        try self.readiness_refresh_group.concurrent(io, readinessRefreshLoop, .{ self, io });
         self.readiness_refresh_started = true;
         self.readiness_refresh_io = io;
-        self.readiness_refresh_group.async(io, readinessRefreshLoop, .{ self, io });
     }
 
     pub fn detachPromptCacheResourceUsageObserver(self: *Node) void {
@@ -8873,7 +8875,7 @@ pub const Node = struct {
         defer handle.release();
         const loaded = handle.get();
         const config = session_factory.getLayaConfig(loaded.session) orelse return error.UnsupportedExtractionModel;
-        if (loaded.session.backend() != .native and loaded.session.backend() != .metal) return error.UnsupportedExtractionBackend;
+        if (loaded.session.backend() != .native and loaded.session.backend() != .metal and loaded.session.backend() != .cuda) return error.UnsupportedExtractionBackend;
         const mutex = loaded.targetInferenceExecutionMutex();
         if (mutex) |lock| try effective.lock(lock);
         defer if (mutex) |lock| lock.unlock();
@@ -19543,7 +19545,7 @@ pub const Node = struct {
             return err;
         };
         try self.attachIo(io);
-        self.startReadinessInventory(io);
+        try self.startReadinessInventory(io);
         var server = httpx.Server.initWithConfig(allocator, io, self.httpServerConfig(host, port));
         defer server.deinit();
 
@@ -27828,14 +27830,29 @@ test "readiness inventory initializes once and owns its refresh task" {
 
     var node = try Node.init(allocator, .{ .models_dir = models_path });
     defer node.deinit();
-    node.startReadinessInventory(std.testing.io);
-    node.startReadinessInventory(std.testing.io);
+    try node.startReadinessInventory(std.testing.io);
+    try node.startReadinessInventory(std.testing.io);
 
     const snapshot = node.readiness_inventory.load();
     try std.testing.expect(snapshot.initialized);
     try std.testing.expectEqual(@as(usize, 0), snapshot.counts.total());
     try std.testing.expect(node.readiness_refresh_started);
     try std.testing.expect(node.readiness_refresh_io != null);
+}
+
+test "readiness inventory starts with no async worker capacity" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{ .async_limit = .nothing });
+    defer threaded.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(path);
+    var node = try Node.init(allocator, .{ .models_dir = path });
+    defer node.deinit();
+    try node.startReadinessInventory(threaded.io());
+    try std.testing.expect(node.readiness_refresh_started);
+    try std.testing.expect(node.readiness_inventory.load().initialized);
 }
 
 test "internal error response hides implementation error names" {
@@ -33753,10 +33770,13 @@ test "boundary qualification model listings withhold every unqualified gliner2.5
 test "laya extraction v2 serves typed decisions over HTTP and embedded calls" {
     const root = platform.env.getenv("ANTFLY_LAYA_QUALIFICATION") orelse platform.env.getenv("ANTFLY_LAYA_REFERENCE") orelse return error.SkipZigTest;
     const a = std.testing.allocator;
-    var node = try Node.init(a, .{ .models_dir = root, .allow_unknown_models = true, .max_concurrent_requests = 1, .process_termination_available = true });
+    // Real FP32 fixtures and the 192-question batch need explicit qualification
+    // capacity. The separate denied node below exercises insufficient budgets.
+    const gib: usize = 1024 * 1024 * 1024;
+    var node = try Node.init(a, .{ .models_dir = root, .allow_unknown_models = true, .max_concurrent_requests = 1, .process_termination_available = true, .generation_budget_overrides = .{ .host_limit_bytes = 6 * gib, .backend_limit_bytes = 12 * gib, .combined_limit_bytes = 18 * gib, .scratch_limit_bytes = 8 * gib } });
     defer node.deinit();
     try node.attachIo(std.testing.io);
-    const backend: backends_mod.BackendType = if (platform.env.getenv("ANTFLY_LAYA_METAL") != null) .metal else .native;
+    const backend = try @import("../util/laya_test_support.zig").selectedBackend();
     node.session_manager.required_backend = backend;
     node.model_manager.session_manager.required_backend = backend;
     const body =
@@ -33764,6 +33784,34 @@ test "laya extraction v2 serves typed decisions over HTTP and embedded calls" {
     ;
     var direct = try node.extractV2DirectJsonWithControl(a, body, null);
     defer direct.deinit();
+    if (backend == .metal and @import("../ops/laya_metal.zig").enabled()) {
+        const model_path = try std.fs.path.join(a, &.{ root, "model" });
+        defer a.free(model_path);
+        var handle = try node.model_manager.acquireFromDirWithControl(model_path, .{});
+        defer handle.release();
+        const loaded = handle.get();
+        const mutex = loaded.targetInferenceExecutionMutex();
+        if (mutex) |lock| try std.testing.expect(lock.tryLock());
+        defer if (mutex) |lock| lock.unlock();
+        const stats = session_factory.layaResidentStats(loaded.session) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(stats.prepared);
+        try std.testing.expect(stats.requests > 0);
+        try std.testing.expectEqual(@as(u64, 0), stats.activation_host_accesses);
+        std.debug.print("Laya managed resident requests={d} model_bytes={d}\n", .{ stats.requests, stats.model_bytes });
+    }
+    if (backend == .metal and @import("../ops/laya_metal.zig").enabled()) {
+        var denied = try Node.init(a, .{ .models_dir = root, .allow_unknown_models = true, .max_concurrent_requests = 1, .process_termination_available = true, .generation_budget_overrides = .{ .backend_limit_bytes = 1 } });
+        defer denied.deinit();
+        try denied.attachIo(std.testing.io);
+        // A CPU candidate exists; strict residency must still reject the
+        // Metal admission failure rather than select that fallback.
+        denied.session_manager.preferred_backends = &.{ .metal, .native };
+        denied.model_manager.session_manager.preferred_backends = &.{ .metal, .native };
+        const before = @import("../backends/metal_tensor.zig").memoryStatsSnapshot().device_owned_buffers_created;
+        try std.testing.expectError(error.ResourceLimitExceeded, denied.extractV2DirectJsonWithControl(a, body, null));
+        try std.testing.expectEqual(before, @import("../backends/metal_tensor.zig").memoryStatsSnapshot().device_owned_buffers_created);
+        try std.testing.expectEqual(@as(usize, 0), denied.inference_admission.inFlightUnits());
+    }
     const parsed = try std.json.parseFromSlice(std.json.Value, a, direct.json, .{});
     defer parsed.deinit();
     const item = parsed.value.object.get("data").?.array.items[0].object;

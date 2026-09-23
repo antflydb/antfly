@@ -12,7 +12,7 @@ tags: [lite, embedded, local-first, backup, migration]
 
 <Questions>
 - What is Antfly Lite and when should I use it instead of a server?
-- How do I embed Antfly in a Go or Zig application?
+- How do I embed Antfly in a Go, Python, Rust, TypeScript, or Zig application?
 - What is the difference between .aflite and .afb files?
 - How do I move a Lite database into a normal Antfly instance?
 - Does Antfly Lite need an inference runtime?
@@ -39,6 +39,7 @@ antfly lite status app.aflite
     "available_modes": [
       "caller_supplied_artifacts",
       "remote_provider",
+      "local_embedded",
       "disabled_deferred"
     ],
     "configured": false,
@@ -257,10 +258,10 @@ _ = try antfly.db.copyStableLiteSnapshotFile(
 
 `antfly.api.checkLiteFileJson` and `antfly.api.copyStableLiteSnapshotFileJson` return the same JSON reports the CLI and C ABI expose.
 
-Go is the first binding above Zig and C:
+Go, Python, Rust, and TypeScript bindings wrap the same `libantfly` C ABI. In Go:
 
 ```bash
-go get github.com/antflydb/antfly/go/pkg/antflylite
+go get github.com/antflydb/antfly/go/pkg/lite
 ```
 
 ```go
@@ -269,17 +270,17 @@ package main
 import (
 	"log"
 
-	"github.com/antflydb/antfly/go/pkg/antflylite"
+	"github.com/antflydb/antfly/go/pkg/lite"
 )
 
 func main() {
-	db, err := antflylite.Create("go-app.aflite")
+	db, err := lite.Create("go-app.aflite")
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
 
-	err = db.Batch([]antflylite.WriteIntent{{
+	err = db.Batch([]lite.WriteIntent{{
 		Key:   "doc:go:1",
 		Value: []byte(`{"title":"embedded go lite"}`),
 	}}, 1)
@@ -295,7 +296,40 @@ func main() {
 }
 ```
 
-`Create` is the explicit first-use path; `Open` takes an existing file and never creates or upgrades one. Constants such as `antflylite.InferenceModeCallerSuppliedArtifacts` and `antflylite.InferenceModeDisabledDeferred` let you branch on status without hard-coding strings. Building from the source tree means building the C ABI first (see below, then `go test -tags antflylite_capi ./...` in `go/pkg/antflylite`). Two runnable templates live in the repository: `examples/antfly-lite-go` (create, write, lookup, status, backup) and `examples/antfly-lite-retrieval-go` (schema, full-text and dense indexes with caller-supplied embeddings, hybrid search, backup). Both are gated by `zig build lite-test` against the built `libantfly`.
+`Create` is the explicit first-use path; `Open` takes an existing file and never creates or upgrades one. Constants such as `lite.InferenceModeCallerSuppliedArtifacts` and `lite.InferenceModeDisabledDeferred` let you branch on status without hard-coding strings. Building from the source tree means building the C ABI first (see below, then `go test -tags libantfly ./...` in `go/pkg/lite`). Two runnable templates live in the repository: `examples/antfly-lite-go` (create, write, lookup, status, backup) and `examples/antfly-lite-retrieval-go` (schema, full-text and dense indexes with caller-supplied embeddings, hybrid search, backup). Both are gated by `zig build lite-test` against the built `libantfly`.
+
+A `*lite.DB` is safe to share across goroutines, like `*sql.DB`. Searches and lookups run in parallel with each other and with writes; concurrent `Batch` calls on one handle queue rather than fail. Only one writer handle can have a file open at a time, including across processes. Set `OpenOptions.BusyTimeout` to wait for the other writer to close instead of failing immediately with `lite.Busy`.
+
+The other bindings mirror the Go API in each language's idiom:
+
+```python
+# uv add antfly-lite
+import antfly_lite
+
+with antfly_lite.create("py-app.aflite") as db:
+    db.batch([antfly_lite.WriteIntent(key="doc:py:1", value={"title": "embedded python lite"})], timestamp=1)
+    print(db.status())
+```
+
+```rust
+// cargo add antfly-lite --features libantfly
+use antfly_lite::{Database, OpenOptions, WriteIntent};
+
+let db = Database::create("rs-app.aflite", &OpenOptions::new())?;
+db.batch(&[WriteIntent::put("doc:rs:1", r#"{"title":"embedded rust lite"}"#)], 1)?;
+println!("{:?}", db.status()?);
+```
+
+```typescript
+// npm install @antfly/lite
+import { create } from "@antfly/lite";
+
+await using db = await create("ts-app.aflite");
+await db.batch([{ key: "doc:ts:1", value: { title: "embedded typescript lite" } }], 1n);
+console.log(await db.status());
+```
+
+Every handle is safe to share across threads (Python, Rust) or concurrent promises (TypeScript), with the same semantics as Go. Threads that call into Lite need at least 8 MiB of native stack; Go, Python, and the TypeScript binding already arrange that, and Rust callers should spawn threads with `antfly_lite::MIN_THREAD_STACK_SIZE`. The same bindings also open a normal Antfly directory (for example `lite.OpenOptions{Storage: lite.StorageDirectory}` in Go), and a portable `.afb` backup restores or imports into either kind, so moving between a `.aflite` file and a directory is one backup and one restore. The shared conformance cases in `zig/pkg/antfly/capi-conformance` keep all four bindings behaviorally identical.
 
 ## Building from Source
 
@@ -305,7 +339,7 @@ From the `zig` directory, `zig build lite` installs the Lite-only CLI as `zig-ou
 zig build antfly capi
 ```
 
-When you embed a local inference runtime, pass `-Dlite-local-inference-runtime=true` so Lite status and the bindings advertise it; the flag declares the capability and does not package a separate runtime. `zig build wasm` builds and installs the embedded database and inference WASM bundle, and `zig build wasm-test` runs its Node smoke test. `zig build lite-test` runs the Lite backend, CLI, C ABI, Go binding, embedded example, and packaging checks in one pass.
+Lite builds embed the local inference runtime, and status advertises it by default (`-Dlite-local-inference-runtime=false` hides it). Builds with Metal (the macOS default), CUDA, ONNX, or PJRT run all local inference, CPU models included, in an `antfly inference _worker` child process that starts when a local-runtime handle opens. A host process other than the `antfly` binary must set `ANTFLY_INFERENCE_WORKER` or ship `antfly` next to `libantfly` or on `PATH`. `zig build wasm` builds and installs the embedded database and inference WASM bundle, and `zig build wasm-test` runs its Node smoke test. `zig build lite-test` runs the Lite backend, CLI, C ABI, Go binding, embedded example, and packaging checks in one pass.
 
 ## Maintenance
 

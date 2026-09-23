@@ -15,19 +15,17 @@
 //! Inverted text index section for full-text search.
 //!
 //! Builds and queries an inverted index using:
-//!   - Blocked term dictionary indexed by a Vellum FST (block ceiling → block offset)
+//!   - Blocked term dictionary indexed by an FST (block ceiling → block offset)
 //!   - Roaring bitmaps for posting lists (document ID sets)
 //!   - Chunked int encoder for term frequencies and field norms
 //!   - BM25 scoring
-//!
-//! Wire-compatible with zapx SectionInvertedTextIndex.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const roaring = @import("../encoding/roaring.zig");
 const chunked = @import("../encoding/chunked_coder.zig");
 const simd_bitpack = @import("../encoding/simd_bitpack.zig");
-const vellum = @import("antfly_vellum");
+const fst = @import("antfly_fst");
 const bloom = @import("bloom");
 const platform_time = @import("antfly_platform").time;
 
@@ -354,7 +352,7 @@ fn writeCurrentHeader(
     doc_count: u32,
     total_field_len: u64,
     chunk_size: u32,
-    vellum_len: u32,
+    fst_len: u32,
     bloom_len: u32,
     norms_len: u32,
 ) void {
@@ -364,7 +362,7 @@ fn writeCurrentHeader(
     dst[5..9].* = @bitCast(std.mem.nativeToLittle(u32, doc_count));
     dst[9..17].* = @bitCast(std.mem.nativeToLittle(u64, total_field_len));
     dst[17..21].* = @bitCast(std.mem.nativeToLittle(u32, chunk_size));
-    dst[21..25].* = @bitCast(std.mem.nativeToLittle(u32, vellum_len));
+    dst[21..25].* = @bitCast(std.mem.nativeToLittle(u32, fst_len));
     dst[25..29].* = @bitCast(std.mem.nativeToLittle(u32, bloom_len));
     dst[29..33].* = @bitCast(std.mem.nativeToLittle(u32, norms_len));
 }
@@ -557,7 +555,7 @@ fn encodeBlockedTermDictionary(alloc: Allocator, entries: []const TermDictEntry)
     try index_terms.ensureTotalCapacity(alloc, estimated_block_count * (term_bytes.max +| 5));
 
     const fst_registry_size: usize = std.math.clamp(entries.len, 64, 65_536);
-    var block_fst_builder = try vellum.Builder.init(alloc, .{
+    var block_fst_builder = try fst.Builder.init(alloc, .{
         .registry_table_size = fst_registry_size,
     });
     defer block_fst_builder.deinit();
@@ -640,7 +638,7 @@ const StreamingTermDictionaryBuilder = struct {
     pending_count: usize = 0,
     term_count: usize = 0,
     block_count: u32 = 0,
-    block_fst_builder: vellum.Builder,
+    block_fst_builder: fst.Builder,
     finalized_blocks: bool = false,
 
     fn init(alloc: Allocator) !StreamingTermDictionaryBuilder {
@@ -649,7 +647,7 @@ const StreamingTermDictionaryBuilder = struct {
             // Large merges benefit from the maximum bounded registry. This is
             // independent of vocabulary size and avoids resizing the FST
             // builder while keeping its working set predictable.
-            .block_fst_builder = try vellum.Builder.init(alloc, .{
+            .block_fst_builder = try fst.Builder.init(alloc, .{
                 .registry_table_size = 65_536,
             }),
         };
@@ -960,7 +958,7 @@ pub const InvertedIndexBuilder = struct {
     /// chunk-framed positions):
     ///   [header: 33 bytes]
     ///   [postings_data]
-    ///   [vellum FST data]
+    ///   [FST data]
     ///
     /// Header:
     ///   magic: "INVT" (4 bytes)
@@ -2158,7 +2156,7 @@ pub const InvertedIndexReader = struct {
     dict_block_count: u32,
     dict_blocks: []const u8,
     dict_index: []const u8,
-    dict_fst: vellum.FST,
+    dict_fst: fst.FST,
     /// Optional per-segment term bloom filter. When present, callers can
     /// reject absent terms before walking the FST. Borrows into `data`.
     term_bloom: ?bloom.BorrowedFilter,
@@ -2195,7 +2193,7 @@ pub const InvertedIndexReader = struct {
         const block_data = dict_data[term_dict_header_size..][0..block_data_len];
         const block_index_data = dict_data[term_dict_header_size + @as(usize, block_data_len) ..][0..block_index_len];
         const block_fst_data = dict_data[term_dict_header_size + @as(usize, block_data_len) + @as(usize, block_index_len) ..];
-        const dict_fst = try vellum.FST.load(block_fst_data);
+        const dict_fst = try fst.FST.load(block_fst_data);
 
         var term_bloom: ?bloom.BorrowedFilter = null;
         if (bloom_len > 0) {
@@ -2425,7 +2423,7 @@ pub const InvertedIndexReader = struct {
 
     /// Iterate terms matching an automaton. Blocks are enumerated by prefix FST,
     /// then the automaton is checked against full terms inside each block.
-    pub fn fstSearchIterator(self: *const InvertedIndexReader, aut: vellum.Automaton) !TermIterator {
+    pub fn fstSearchIterator(self: *const InvertedIndexReader, aut: fst.Automaton) !TermIterator {
         return .{
             .alloc = self.alloc,
             .reader = self,
@@ -2681,14 +2679,14 @@ pub const InvertedIndexReader = struct {
 pub const TermIterator = struct {
     alloc: Allocator,
     reader: *const InvertedIndexReader,
-    block_iter: vellum.FSTIterator,
+    block_iter: fst.FSTIterator,
     current_block_prefix: []const u8 = &.{},
     current_block_cursor: usize = 0,
     current_block_remaining: u32 = 0,
     current_block_last_postings_offset: u64 = 0,
     start: ?[]const u8 = null,
     end: ?[]const u8 = null,
-    automaton: ?vellum.Automaton = null,
+    automaton: ?fst.Automaton = null,
     // We must copy the key before advancing, because block parsing reuses section slices.
     current_key: std.ArrayListUnmanaged(u8) = .empty,
 
@@ -2769,7 +2767,7 @@ pub const TermIterator = struct {
     }
 };
 
-fn termMatchesAutomaton(aut: vellum.Automaton, term: []const u8) bool {
+fn termMatchesAutomaton(aut: fst.Automaton, term: []const u8) bool {
     var state = aut.start();
     for (term) |b| {
         if (!aut.canMatch(state)) return false;
@@ -4636,7 +4634,7 @@ fn rebuildShiftedBlockMax(
 }
 
 // ============================================================================
-// 1-Hit Encoding (zapx-compatible)
+// 1-Hit Encoding
 // ============================================================================
 
 /// Mask for the encoding type in FST values (bits 63-62).
@@ -4669,7 +4667,7 @@ pub fn fstValIs1Hit(v: u64) bool {
 }
 
 // ============================================================================
-// freqHasLocs Encoding (zapx-compatible)
+// freqHasLocs Encoding
 // ============================================================================
 
 /// Encode frequency and hasLocs flag into a single value.
@@ -5159,7 +5157,7 @@ fn singleContributorIndex(current_entries: []const ?TermIterator.Entry, term: []
 
 fn appendSingleContributorTerm(
     alloc: Allocator,
-    fst_builder: *vellum.Builder,
+    fst_builder: *fst.Builder,
     postings_data: *std.ArrayListUnmanaged(u8),
     entry: TermIterator.Entry,
     deleted_docs: ?[]const ?roaring.RoaringBitmap,
@@ -7017,7 +7015,7 @@ test "v6 below bloom threshold skips bloom payload" {
 test "legacy section versions are rejected by current reader" {
     const alloc = std.testing.allocator;
 
-    var fst_builder = try vellum.Builder.init(alloc, .{});
+    var fst_builder = try fst.Builder.init(alloc, .{});
     defer fst_builder.deinit();
     try fst_builder.insert("hello", 0);
     const fst_bytes = try fst_builder.finish();

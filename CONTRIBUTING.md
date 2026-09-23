@@ -7,7 +7,7 @@ zig/pkg/antfly/      Antfly server, CLI, storage, Raft, and embedded runtime
 zig/pkg/inference/   Local inference runtime
 zig/e2e/             Zig runtime end-to-end suites
 go/pkg/
-  antflylite/         Go binding for embedded Antfly Lite
+  lite/              Go binding for embedded Antfly Lite
   sdk/               Go SDK
   docsaf/            Content ingestion (filesystem, web crawl, git, S3)
   evalaf/            LLM/RAG evaluation framework
@@ -17,12 +17,16 @@ go/pkg/
   proxy/             Antfly and Inference proxy packages
 ts/
   packages/sdk/      TypeScript SDK (@antfly/sdk)
+  packages/lite/     TypeScript Antfly Lite binding (@antfly/lite)
   packages/components/  React component library (@antfly/components)
   apps/antfarm/      Web dashboard (React + Vite)
 py/packages/sdk/     Python SDK
+py/packages/lite/    Python Antfly Lite binding (antfly-lite)
 rs/
   crates/pgaf/       PostgreSQL extension (Rust/pgrx)
   crates/sdk/        Generated Rust SDK (shared types with pgaf)
+  crates/lite/       Rust Antfly Lite binding (antfly-lite)
+  crates/lite-sys/   Raw libantfly C ABI declarations (antfly-lite-sys)
 configs/             Example configuration files
 devops/              Kubernetes manifests (minikube, etc.)
 scripts/             Build and utility scripts
@@ -102,7 +106,7 @@ The repository contains multiple independent Go modules (no `go.work`). Each mus
 
 | Module | Directory |
 |--------|-----------|
-| Antfly Lite binding | `go/pkg/antflylite/` |
+| Antfly Lite binding | `go/pkg/lite/` |
 | Go SDK | `go/pkg/sdk/` |
 | Operator | `go/pkg/operator/` |
 | Proxies (Antfly gateway, inference) | `go/pkg/proxy/` |

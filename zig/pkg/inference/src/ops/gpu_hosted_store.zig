@@ -231,6 +231,7 @@ pub const WeightStore = struct {
     /// Immutable physical FP32 weights/relative constants. Request ComputeBackend
     /// wrappers borrow this owner; it is destroyed before the shared provider.
     boundary_resident: ?*@import("gliner_boundary_resident.zig").Owner = null,
+    laya_resident: if (supports_native_metal_provider) ?*@import("laya_metal.zig").Owner else void = if (supports_native_metal_provider) null else {},
     jina_lora_adapter: ?*JinaLoraAdapter = null,
 };
 
