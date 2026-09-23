@@ -126,7 +126,7 @@ data: [DONE]
 
 Show the raw transcript from the first event immediately, then replace it with the deltas. If the generator fails after the transcript event, an `error` event follows and the raw transcript is still usable.
 
-The prompt KV cache is on by default in `antfly inference run` and off by default in `antfly standalone`, where `"inference": {"prompt_cache": {"enabled": true}}` turns it on. With the cache on, the fixed rule set is served from the prefix cache after the first request with a given dictionary, context, and style, and `usage.cached_prompt_tokens` reports how much of the prompt was reused.
+The prompt KV cache is on by default in `antfly inference run` and off by default in `antfly standalone`, where `"inference": {"prompt_cache": {"enabled": true}}` turns it on; the same `--config` key works for `antfly inference run` too, and there it can also turn the cache off (`"prompt_cache": {"enabled": false}`). With the cache on, the fixed rule set is served from the prefix cache after the first request with a given dictionary, context, and style, and `usage.cached_prompt_tokens` reports how much of the prompt was reused.
 
 ### 4. Open a Streaming Session
 

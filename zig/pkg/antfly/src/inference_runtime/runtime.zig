@@ -150,14 +150,36 @@ fn parseKernelJitMode(value: []const u8) !inference.graph.kernel_jit.Mode {
     return std.meta.stringToEnum(inference.graph.kernel_jit.Mode, value) orelse error.InvalidArguments;
 }
 
+fn kernelJitModeFromConfig(mode: common_config.Config.InferenceConfig.KernelJitConfig.Mode) inference.graph.kernel_jit.Mode {
+    return switch (mode) {
+        .off => .off,
+        .shadow => .shadow,
+        .on => .on,
+        .required => .required,
+    };
+}
+
+// Precedence, field by field: CLI flag, then (mode only) the
+// ANTFLY_INFERENCE_KERNEL_JIT_MODE env var, then the `--config` file's
+// `kernel_jit` (nested `inference.kernel_jit` or the operator's flat
+// top-level spelling; nested wins), then the hardcoded default. When no
+// config was loaded, `config_kernel_jit` is the zero-value default, which
+// already matches `inference.graph.kernel_jit.Config{}`'s own defaults, so
+// that tier is a no-op.
 fn resolveKernelJitConfig(
     env_mode: ?[]const u8,
     cli_mode: ?inference.graph.kernel_jit.Mode,
     cli_cache_dir: ?[]const u8,
     cli_max_cache_bytes_mb: ?usize,
     cli_preload_budget_ms: ?u64,
+    config_kernel_jit: common_config.Config.InferenceConfig.KernelJitConfig,
 ) !inference.graph.kernel_jit.Config {
-    var resolved = inference.graph.kernel_jit.Config{};
+    var resolved = inference.graph.kernel_jit.Config{
+        .mode = kernelJitModeFromConfig(config_kernel_jit.mode),
+        .cache_dir = config_kernel_jit.cache_dir,
+        .max_cache_bytes_mb = config_kernel_jit.max_cache_bytes_mb,
+        .preload_budget_ms = config_kernel_jit.preload_budget_ms,
+    };
     if (cli_mode) |value|
         resolved.mode = value
     else if (env_mode) |value|
@@ -167,6 +189,81 @@ fn resolveKernelJitConfig(
     if (cli_preload_budget_ms) |value| resolved.preload_budget_ms = value;
     try resolved.validate();
     return resolved;
+}
+
+fn promptCacheFromConfig(cfg: common_config.Config.InferenceConfig.PromptCacheConfig) inference.server.PromptCacheConfig {
+    return .{
+        .enabled = cfg.enabled,
+        .mode = switch (cfg.mode) {
+            .simple => .simple,
+            .block_hash => .block_hash,
+            .radix => .radix,
+        },
+        .max_bytes_mb = cfg.max_bytes_mb,
+        .min_tokens = cfg.min_tokens,
+        .ttl_ms = cfg.ttl_ms,
+    };
+}
+
+// `antfly inference run`'s own default prompt cache is enabled; only follow
+// the config file's `prompt_cache` (which itself defaults `enabled` to false
+// once present) when the key was actually configured, nested or flat.
+fn resolveRunPromptCache(config: ?*const common_config.Config) inference.server.PromptCacheConfig {
+    const cfg = config orelse return .{};
+    if (!cfg.inference.prompt_cache_configured) return .{};
+    return promptCacheFromConfig(cfg.inference.prompt_cache);
+}
+
+const default_run_keep_alive_ms: u64 = 300_000;
+
+// Mirrors zig/pkg/antfly/src/standalone/inference_host.zig's parseKeepAliveMs.
+// Duplicated rather than imported: standalone already depends on
+// inference_runtime for path helpers, so importing standalone code back here
+// would create a module cycle.
+fn parseRunKeepAliveMs(raw: []const u8) !u64 {
+    if (std.mem.eql(u8, raw, "0")) return 0;
+    if (raw.len == 0) return error.InvalidInferenceModelCacheConfig;
+    var i: usize = 0;
+    var total_ns: u64 = 0;
+    while (i < raw.len) {
+        const start = i;
+        while (i < raw.len and std.ascii.isDigit(raw[i])) : (i += 1) {}
+        if (i == start) return error.InvalidInferenceModelCacheConfig;
+        const value = std.fmt.parseUnsigned(u64, raw[start..i], 10) catch
+            return error.InvalidInferenceModelCacheConfig;
+        const unit_ns: u64 = if (std.mem.startsWith(u8, raw[i..], "ms")) blk: {
+            i += 2;
+            break :blk std.time.ns_per_ms;
+        } else if (i < raw.len and raw[i] == 's') blk: {
+            i += 1;
+            break :blk std.time.ns_per_s;
+        } else if (i < raw.len and raw[i] == 'm') blk: {
+            i += 1;
+            break :blk std.time.ns_per_min;
+        } else if (i < raw.len and raw[i] == 'h') blk: {
+            i += 1;
+            break :blk std.time.ns_per_hour;
+        } else return error.InvalidInferenceModelCacheConfig;
+        const part_ns = std.math.mul(u64, value, unit_ns) catch
+            return error.InvalidInferenceModelCacheConfig;
+        total_ns = std.math.add(u64, total_ns, part_ns) catch
+            return error.InvalidInferenceModelCacheConfig;
+    }
+    if (total_ns == 0) return 0;
+    return @max(@as(u64, 1), total_ns / std.time.ns_per_ms);
+}
+
+// Precedence: the config file's `keep_alive` duration string (nested or
+// flat, nested wins) wins over `keep_alive_ms` (nested or flat, nested
+// wins) when both are set anywhere in the merged config, because it already
+// has a well-tested parser shared with `antfly standalone`. Falls back to
+// the run server's built-in default (matches `inference.server.NodeConfig`'s
+// own `keep_alive_ms` default) when neither is set.
+fn resolveRunKeepAliveMs(config: ?*const common_config.Config) !u64 {
+    const cfg = config orelse return default_run_keep_alive_ms;
+    if (cfg.inference.keep_alive) |value| return try parseRunKeepAliveMs(value);
+    if (cfg.inference.keep_alive_ms) |value| return value;
+    return default_run_keep_alive_ms;
 }
 
 fn parsePreloadModelKind(value: []const u8) ?inference.server.WarmModelKind {
@@ -306,11 +403,28 @@ fn parseRunConfig(alloc: std.mem.Allocator, raw: []const u8) !common_config.Conf
         .object => value.object,
         else => return error.InvalidConfig,
     } else std.json.ObjectMap{};
-    for ([_][]const u8{ "models_dir", "ml_dir", "max_loaded_models", "preload" }) |key| {
+    for ([_][]const u8{
+        "models_dir",
+        "ml_dir",
+        "max_loaded_models",
+        "preload",
+        "keep_alive",
+        "keep_alive_ms",
+        "prompt_cache",
+        "kernel_jit",
+    }) |key| {
         if (!model_config.contains(key)) {
             if (root.get(key)) |value| try model_config.put(scratch, key, value);
         }
     }
+    // `keep_alive_ms` (operator-emitted integer milliseconds) is not part of
+    // the shared openapi inference schema, so it survives the parse below
+    // only as an unrecognized field. Read the merged (nested-wins-over-flat)
+    // value here and thread it onto the config by hand. Track whether
+    // `prompt_cache` was configured at all so the caller can preserve
+    // `antfly inference run`'s enabled-by-default behavior when it is absent.
+    const keep_alive_ms_value = model_config.get("keep_alive_ms");
+    const prompt_cache_configured = model_config.contains("prompt_cache");
     // The shared schema requires a client API URL, which is not needed when
     // starting this local server. Model artifact tags also have a wider CLI
     // vocabulary than the shared schema enum (e.g. Q4_K_M). Reuse the raw
@@ -329,6 +443,13 @@ fn parseRunConfig(alloc: std.mem.Allocator, raw: []const u8) !common_config.Conf
         config.inference.preload = try common_config.parseInferencePreloadModels(alloc, .{ .object = preload_object });
     }
     for (config.inference.preload) |*model| try normalizeRunPreloadName(alloc, model);
+    if (keep_alive_ms_value) |value| {
+        config.inference.keep_alive_ms = switch (value) {
+            .integer => |i| std.math.cast(u64, i) orelse return error.InvalidConfig,
+            else => return error.InvalidConfig,
+        };
+    }
+    config.inference.prompt_cache_configured = prompt_cache_configured;
     return config;
 }
 
@@ -577,7 +698,10 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         kernel_jit_cache_dir_override,
         kernel_jit_max_cache_bytes_mb_override,
         kernel_jit_preload_budget_ms_override,
+        if (loaded_config) |*config| config.inference.kernel_jit else .{},
     );
+    const keep_alive_ms = try resolveRunKeepAliveMs(if (loaded_config) |*config| config else null);
+    const prompt_cache = resolveRunPromptCache(if (loaded_config) |*config| config else null);
 
     std.debug.print("antfly inference\n", .{});
     std.debug.print("ai models: {s}\n", .{models_dir});
@@ -587,6 +711,8 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         kernel_jit.max_cache_bytes_mb,
         kernel_jit.preload_budget_ms,
     });
+    std.debug.print("keep alive: {d}ms\n", .{keep_alive_ms});
+    std.debug.print("prompt cache: enabled={} mode={s}\n", .{ prompt_cache.enabled, @tagName(prompt_cache.mode) });
     std.log.info(
         "process memory policy input_source={s} effective_source={s} configured_limit_bytes={d} effective_limit_bytes={d}",
         .{
@@ -609,6 +735,8 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         ),
         .preload = model_settings.preload,
         .kernel_jit = kernel_jit,
+        .keep_alive_ms = keep_alive_ms,
+        .prompt_cache = prompt_cache,
         .allow_insecure_public_bind = allow_insecure_public_bind,
         .allow_unknown_models = allow_unknown_models,
         .process_termination_available = platform.env.getenvBool(
@@ -1208,6 +1336,146 @@ test "inference run config defaults and invalid model policies" {
     }
 }
 
+test "inference run config keep_alive_ms accepts nested and flat spellings, nested wins" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{
+        \\{"keep_alive_ms":60000}
+        ,
+        \\{"inference":{"keep_alive_ms":60000}}
+        ,
+    }) |raw| {
+        var config = try parseRunConfig(alloc, raw);
+        defer config.deinit();
+        try std.testing.expectEqual(@as(?u64, 60_000), config.inference.keep_alive_ms);
+        try std.testing.expectEqual(@as(u64, 60_000), try resolveRunKeepAliveMs(&config));
+    }
+
+    var nested_wins = try parseRunConfig(alloc,
+        \\{"keep_alive_ms":60000,"inference":{"keep_alive_ms":5000}}
+    );
+    defer nested_wins.deinit();
+    try std.testing.expectEqual(@as(?u64, 5_000), nested_wins.inference.keep_alive_ms);
+}
+
+test "inference run config keep_alive duration string wins over keep_alive_ms when both are set" {
+    const alloc = std.testing.allocator;
+    var config = try parseRunConfig(alloc,
+        \\{"inference":{"keep_alive":"90s","keep_alive_ms":5000}}
+    );
+    defer config.deinit();
+    try std.testing.expectEqualStrings("90s", config.inference.keep_alive.?);
+    try std.testing.expectEqual(@as(?u64, 5_000), config.inference.keep_alive_ms);
+    try std.testing.expectEqual(@as(u64, 90_000), try resolveRunKeepAliveMs(&config));
+}
+
+test "inference run config keep_alive_ms rejects non-integer values" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidConfig, parseRunConfig(alloc,
+        \\{"keep_alive_ms":"5m"}
+    ));
+    try std.testing.expectError(error.InvalidConfig, parseRunConfig(alloc,
+        \\{"keep_alive_ms":-1}
+    ));
+}
+
+test "inference run config defaults keep_alive_ms to the run server default when absent" {
+    try std.testing.expectEqual(@as(u64, 300_000), try resolveRunKeepAliveMs(null));
+    const alloc = std.testing.allocator;
+    var empty_config = try parseRunConfig(alloc, "{}");
+    defer empty_config.deinit();
+    try std.testing.expectEqual(@as(u64, 300_000), try resolveRunKeepAliveMs(&empty_config));
+}
+
+test "inference run config prompt_cache accepts nested and flat spellings, nested wins, and stays enabled by default" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(resolveRunPromptCache(null).enabled);
+    var absent_config = try parseRunConfig(alloc, "{}");
+    defer absent_config.deinit();
+    try std.testing.expect(!absent_config.inference.prompt_cache_configured);
+    try std.testing.expect(resolveRunPromptCache(&absent_config).enabled);
+
+    for ([_][]const u8{
+        \\{"prompt_cache":{"enabled":false,"mode":"radix","max_bytes_mb":128,"min_tokens":16,"ttl_ms":9000}}
+        ,
+        \\{"inference":{"prompt_cache":{"enabled":false,"mode":"radix","max_bytes_mb":128,"min_tokens":16,"ttl_ms":9000}}}
+        ,
+    }) |raw| {
+        var config = try parseRunConfig(alloc, raw);
+        defer config.deinit();
+        try std.testing.expect(config.inference.prompt_cache_configured);
+        const resolved = resolveRunPromptCache(&config);
+        try std.testing.expect(!resolved.enabled);
+        try std.testing.expectEqual(@as(usize, 128), resolved.max_bytes_mb);
+        try std.testing.expectEqual(@as(usize, 16), resolved.min_tokens);
+        try std.testing.expectEqual(@as(u64, 9_000), resolved.ttl_ms);
+    }
+
+    var nested_wins = try parseRunConfig(alloc,
+        \\{"prompt_cache":{"enabled":false},"inference":{"prompt_cache":{"enabled":true}}}
+    );
+    defer nested_wins.deinit();
+    try std.testing.expect(resolveRunPromptCache(&nested_wins).enabled);
+}
+
+test "inference run config kernel_jit accepts nested and flat spellings, nested wins" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{
+        \\{"kernel_jit":{"mode":"on","cache_dir":"/tmp/flat-jit","max_cache_bytes_mb":64,"preload_budget_ms":5000}}
+        ,
+        \\{"inference":{"kernel_jit":{"mode":"on","cache_dir":"/tmp/flat-jit","max_cache_bytes_mb":64,"preload_budget_ms":5000}}}
+        ,
+    }) |raw| {
+        var config = try parseRunConfig(alloc, raw);
+        defer config.deinit();
+        try std.testing.expectEqual(common_config.Config.InferenceConfig.KernelJitConfig.Mode.on, config.inference.kernel_jit.mode);
+        try std.testing.expectEqualStrings("/tmp/flat-jit", config.inference.kernel_jit.cache_dir.?);
+        try std.testing.expectEqual(@as(usize, 64), config.inference.kernel_jit.max_cache_bytes_mb);
+        try std.testing.expectEqual(@as(u64, 5_000), config.inference.kernel_jit.preload_budget_ms);
+        const resolved = try resolveKernelJitConfig(null, null, null, null, null, config.inference.kernel_jit);
+        try std.testing.expectEqual(inference.graph.kernel_jit.Mode.on, resolved.mode);
+    }
+
+    var nested_wins = try parseRunConfig(alloc,
+        \\{"kernel_jit":{"mode":"shadow"},"inference":{"kernel_jit":{"mode":"required"}}}
+    );
+    defer nested_wins.deinit();
+    try std.testing.expectEqual(common_config.Config.InferenceConfig.KernelJitConfig.Mode.required, nested_wins.inference.kernel_jit.mode);
+}
+
+test "inference run config CLI kernel_jit and keep_alive_ms flags override config regardless of argument order" {
+    const alloc = std.testing.allocator;
+    var config = try parseRunConfig(alloc,
+        \\{"kernel_jit":{"mode":"on"},"keep_alive_ms":5000}
+    );
+    defer config.deinit();
+
+    // CLI kernel-jit flags win over the config file's kernel_jit tier.
+    const cli_over_config = try resolveKernelJitConfig(null, .off, null, null, null, config.inference.kernel_jit);
+    try std.testing.expectEqual(inference.graph.kernel_jit.Mode.off, cli_over_config.mode);
+
+    // There is no CLI flag for keep_alive/keep_alive_ms on `antfly inference
+    // run` today; the config value is used as-is regardless of where
+    // `--config` appears among other flags.
+    try std.testing.expectEqual(@as(u64, 5_000), try resolveRunKeepAliveMs(&config));
+
+    // `--kernel-jit-mode` before `--config` and after `--config` both parse
+    // (argument order independence); a real invocation would then have the
+    // CLI value win over the loaded config's kernel_jit tier, as above.
+    for ([_][]const u8{
+        "before",
+        "after",
+    }) |order| {
+        var argv = if (std.mem.eql(u8, order, "before"))
+            [_][*:0]const u8{ "--kernel-jit-mode", "required", "--config", "/nonexistent-config.json" }
+        else
+            [_][*:0]const u8{ "--config", "/nonexistent-config.json", "--kernel-jit-mode", "required" };
+        var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+        // Reaching the (expected) file-read failure, rather than
+        // error.InvalidArguments, proves both flags were accepted.
+        try std.testing.expectError(error.FileNotFound, runServer(std.heap.page_allocator, std.testing.io, &iter));
+    }
+}
+
 test "inference runtime preload parser preserves registry variants and explicit backends" {
     const variant = try parsePreloadModelFlag("embedder:BAAI/bge-small-en-v1.5:i8");
     try std.testing.expectEqual(.embedder, variant.kind);
@@ -1318,23 +1586,47 @@ test "parseBackendType accepts warm generator backends" {
     try std.testing.expect(try parseOptionalBackendType("auto") == null);
 }
 
-test "kernel JIT mode precedence is CLI then environment then default" {
-    const from_env = try resolveKernelJitConfig("on", null, null, null, null);
+test "kernel JIT mode precedence is CLI then environment then config then default" {
+    const from_env = try resolveKernelJitConfig("on", null, null, null, null, .{});
     try std.testing.expectEqual(inference.graph.kernel_jit.Mode.on, from_env.mode);
 
-    const from_cli = try resolveKernelJitConfig("shadow", .required, "/tmp/jit", 256, 120_000);
+    const from_cli = try resolveKernelJitConfig("shadow", .required, "/tmp/jit", 256, 120_000, .{});
     try std.testing.expectEqual(inference.graph.kernel_jit.Mode.required, from_cli.mode);
     try std.testing.expectEqualStrings("/tmp/jit", from_cli.cache_dir.?);
     try std.testing.expectEqual(@as(usize, 256), from_cli.max_cache_bytes_mb);
     try std.testing.expectEqual(@as(u64, 120_000), from_cli.preload_budget_ms);
 
-    const from_cli_over_invalid_env = try resolveKernelJitConfig("invalid", .required, null, null, null);
+    const from_cli_over_invalid_env = try resolveKernelJitConfig("invalid", .required, null, null, null, .{});
     try std.testing.expectEqual(inference.graph.kernel_jit.Mode.required, from_cli_over_invalid_env.mode);
 
-    const defaults = try resolveKernelJitConfig(null, null, null, null, null);
+    const defaults = try resolveKernelJitConfig(null, null, null, null, null, .{});
     try std.testing.expectEqual(inference.graph.kernel_jit.Mode.off, defaults.mode);
-    try std.testing.expectError(error.InvalidArguments, resolveKernelJitConfig("invalid", null, null, null, null));
-    try std.testing.expectError(error.InvalidKernelJitCacheDir, resolveKernelJitConfig(null, null, "", null, null));
+    try std.testing.expectError(error.InvalidArguments, resolveKernelJitConfig("invalid", null, null, null, null, .{}));
+    try std.testing.expectError(error.InvalidKernelJitCacheDir, resolveKernelJitConfig(null, null, "", null, null, .{}));
+
+    // Config file wins over the hardcoded default but loses to env and CLI.
+    const config_kernel_jit = common_config.Config.InferenceConfig.KernelJitConfig{
+        .mode = .shadow,
+        .cache_dir = @constCast("/tmp/config-jit"),
+        .max_cache_bytes_mb = 512,
+        .preload_budget_ms = 60_000,
+    };
+    const from_config = try resolveKernelJitConfig(null, null, null, null, null, config_kernel_jit);
+    try std.testing.expectEqual(inference.graph.kernel_jit.Mode.shadow, from_config.mode);
+    try std.testing.expectEqualStrings("/tmp/config-jit", from_config.cache_dir.?);
+    try std.testing.expectEqual(@as(usize, 512), from_config.max_cache_bytes_mb);
+    try std.testing.expectEqual(@as(u64, 60_000), from_config.preload_budget_ms);
+
+    const env_over_config = try resolveKernelJitConfig("on", null, null, null, null, config_kernel_jit);
+    try std.testing.expectEqual(inference.graph.kernel_jit.Mode.on, env_over_config.mode);
+    // Env only overrides mode; the other config-sourced fields survive.
+    try std.testing.expectEqualStrings("/tmp/config-jit", env_over_config.cache_dir.?);
+
+    const cli_over_config = try resolveKernelJitConfig(null, .required, "/tmp/cli-jit", 128, 30_000, config_kernel_jit);
+    try std.testing.expectEqual(inference.graph.kernel_jit.Mode.required, cli_over_config.mode);
+    try std.testing.expectEqualStrings("/tmp/cli-jit", cli_over_config.cache_dir.?);
+    try std.testing.expectEqual(@as(usize, 128), cli_over_config.max_cache_bytes_mb);
+    try std.testing.expectEqual(@as(u64, 30_000), cli_over_config.preload_budget_ms);
 }
 
 test "inference run rejects unknown flags instead of silently disabling policy" {

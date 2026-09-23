@@ -645,6 +645,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "inference runtime preload parser preserves registry variants and explicit backends",
             "inference run config",
             "inference list accepts models directory before or after flags",
+            "kernel JIT mode precedence is CLI then environment then config then default",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

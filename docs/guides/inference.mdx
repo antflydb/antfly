@@ -43,7 +43,15 @@ Setting `inference.api_url` disables embedded inference. It is not a fallback. S
 ## Configuring a Separate Inference Process
 
 `antfly inference run --config inference.json` reads admission settings and the
-model settings `models_dir`, `ml_dir`, `max_loaded_models`, and `preload`. It does not read `keep_alive`, `prompt_cache`, or `kernel_jit` from the file: idle models unload after 5 minutes, the prompt KV cache is on, and kernel JIT is set only through the `--kernel-jit-*` flags or `ANTFLY_INFERENCE_KERNEL_JIT_MODE`:
+model settings `models_dir`, `ml_dir`, `max_loaded_models`, `preload`, `keep_alive`,
+`prompt_cache`, and `kernel_jit`. `keep_alive` is the same duration string standalone
+uses (default `5m`; `"0"` disables idle unloading); the operator's flat integer-millisecond
+`keep_alive_ms` is also accepted, and if both are set, `keep_alive` wins. `prompt_cache`
+takes the same fields as standalone's (`enabled`, `mode`, `max_bytes_mb`, `min_tokens`,
+`ttl_ms`); the prompt KV cache stays on by default when `prompt_cache` is omitted entirely,
+matching prior behavior. `kernel_jit` takes the same fields as standalone's
+(`mode`, `cache_dir`, `max_cache_bytes_mb`, `preload_budget_ms`); the
+`--kernel-jit-*` flags and `ANTFLY_INFERENCE_KERNEL_JIT_MODE` still override it:
 
 ```json
 {
@@ -59,10 +67,11 @@ model settings `models_dir`, `ml_dir`, `max_loaded_models`, and `preload`. It do
 ```
 
 Pull the referenced models into that directory before starting the process.
-The operator's flat config spelling (those four fields at the top level) is
-also accepted. If both spellings exist, the nested `inference` value wins for
-each field, including an explicit empty `preload` list. No `api_url` is required
-to start the server; configure the listener with `--host` and `--port`.
+The operator's flat config spelling (those fields at the top level, including
+`keep_alive_ms`) is also accepted. If both spellings exist, the nested
+`inference` value wins for each field, including an explicit empty `preload`
+list. No `api_url` is required to start the server; configure the listener
+with `--host` and `--port`.
 
 Explicit CLI options override config regardless of argument order. Supplying
 one or more `--preload-model` flags replaces the config preload list rather than
@@ -191,7 +200,7 @@ The chunkers `fixed_bert` and `fixed_bpe` are built in and need no download. Chu
 ## Capacity, Admission, and Memory
 
 - **Request admission.** `admission.inference.max_concurrent_requests` (default 32; `--max-concurrent-requests` on `antfly inference run`; 0 disables the limit) bounds concurrent inference requests. The same value sizes a weighted work budget, so a few heavy requests can exhaust capacity before the count is reached. Standalone shares one budget across direct enrichment and query calls, `/ai/v1`, and `/ml/v1`. Requests are never queued. When capacity is exhausted, HTTP callers get `503` with `Retry-After: 1` and a JSON body carrying `retryable: true`.
-- **Model residency.** At most `max_loaded_models` models stay loaded (default 10; 0 means unlimited), and the least recently used idle model is evicted to make room. Idle models unload after `inference.keep_alive` (default `5m`; `"0"` disables idle unloading). Concurrent requests for the same unloaded model share one load.
+- **Model residency.** At most `max_loaded_models` models stay loaded (default 10; 0 means unlimited), and the least recently used idle model is evicted to make room. Idle models unload after `inference.keep_alive` (default `5m`; `"0"` disables idle unloading); `antfly inference run` also accepts the operator's flat `keep_alive_ms` spelling (integer milliseconds; `0` disables idle unloading), and `keep_alive` wins if both are set. Concurrent requests for the same unloaded model share one load.
 - **Memory.** Model loads and requests reserve memory before they allocate. The reservation comes from one process envelope shared with storage and caches. Set the envelope with `--process-memory-budget-mb` or `ANTFLY_PROCESS_MEMORY_BUDGET_MB` on `antfly standalone` or `antfly inference run`. Otherwise the cgroup limit is used, and host memory without a cgroup limit. In Kubernetes Burstable pods, set it below the container limit. A request that can never fit returns `MODEL_RESOURCE_LIMIT`. Temporary pressure returns a retryable `MODEL_RESOURCE_BUSY` once idle models have been evicted.
 - **Query priority.** Background enrichment yields to query-time work in the same database process. Embedding backfill pauses (up to 5 s) while a query-time embed is running, and background generation pauses while an interactive generate or chat request is in flight. Backfill that receives `503` retries with backoff.
 
