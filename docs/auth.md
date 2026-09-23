@@ -1,8 +1,84 @@
-# Antfly Authorization Design
+# Antfly Authorization
 
-This document describes the intended Antfly data-plane authorization model. It
-is provider-neutral: Antfly can receive principal context from an embedded auth
-module, a trusted gateway, a managed control plane, or a self-hosted deployment.
+This document describes Antfly's data-plane authorization model: what is
+implemented today, then the design for join-aware enforcement that is still
+planned. The model is provider-neutral: Antfly can receive principal context
+from its built-in user manager, a trusted gateway, a managed control plane, or
+a self-hosted deployment.
+
+## Current Implementation
+
+### Credentials
+
+When `auth_enabled` is true, public routes authenticate through the built-in
+user manager (`/auth/v1`) with one of:
+
+- `Authorization: Basic <base64(username:password)>`
+- `Authorization: ApiKey <base64(key_id:key_secret)>`
+- `Authorization: Bearer <base64(key_id:key_secret)>`
+
+An API key can only narrow its owner's permissions, and that narrowing is
+re-applied on every use.
+
+### Trusted Principal Tokens
+
+A gateway in front of Antfly can instead send an HS256-signed JWT in the
+`X-Antfly-Trusted-Principal` header. Antfly verifies it with the keystore secret
+`antfly.trusted_principal.secret` and, when `antfly.trusted_principal.issuer` is
+set, requires a matching `iss`. The claims are:
+
+```json
+{
+  "iss": "gateway",
+  "sub": "user_123",
+  "exp": 1790000000,
+  "iat": 1789996400,
+  "tables": ["orders", "customers"],
+  "operations": ["read"],
+  "row_filter": {
+    "orders": { "term": { "tenant_id": { "$auth": "metadata.tenant_id" } } },
+    "*": { "term": { "region": "na" } }
+  },
+  "metadata": { "tenant_id": "tenant_abc" }
+}
+```
+
+- `sub` and `exp` are required; a token whose `iat` is more than 60 seconds in
+  the future is rejected.
+- `admin: true` grants admin on every table. Otherwise `operations` (`read`,
+  `write`, `admin`, or `*`) is granted on each table in `tables`, or on every
+  table when `tables` is absent or empty.
+- `row_filter` maps a table name, or `*` for every table, to a row filter.
+- `metadata` supplies the values that `$auth` references resolve against.
+
+### Row Filters
+
+Row filters are query JSON stored per table, with `*` as a fallback for every
+table. They are attached to users, roles, and groups through
+`/auth/v1/users/{user}/row-filters/{table}` and
+`/auth/v1/subjects/{subject}/row-filters/{table}`, or carried in a trusted
+principal token. A filter references trusted values with `$auth` nodes:
+
+```json
+{ "term": { "tenant_id": { "$auth": "metadata.tenant_id" } } }
+```
+
+`$auth` accepts `username`, `roles` (the user's inherited role and group
+subjects, for array-aware operators such as `terms`), and `metadata.<path>`.
+Filters are validated before they are stored.
+
+At read time, Antfly:
+
+1. Selects the table-specific filter if one exists, and otherwise the `*`
+   filter. The two are not combined.
+2. Combines filters from the same table with `AND`: the user's own filter, the
+   filters of every role and group the user inherits, and an API key's own
+   filter.
+3. Resolves `$auth` references against the authenticated identity.
+4. Combines the result with the caller's query with `AND`.
+
+Queries, document scans, lookups, and retrieval-agent queries apply these
+filters. In a join, the right table's filter is applied as well.
 
 ## Goals
 
@@ -22,13 +98,21 @@ The authorization system should support:
   retrieval workflows.
 - Fail-closed behavior when policy context is missing or invalid.
 
-## Principal Context
+## Planned: Join-Aware Enforcement
+
+The rest of this document is the design for enforcing authorization inside the
+query planner, for cross-table queries such as SQL joins, subqueries, and views.
+It is not implemented yet. Where it differs from the current behavior above,
+the current behavior is what Antfly does today.
+
+### Principal Context
 
 Requests should carry a trusted principal context. The context may be created by
 Antfly itself or by a trusted component in front of Antfly, but clients must not
 be able to forge it.
 
-Example:
+Proposed shape (the shipped token claims are listed under Trusted Principal
+Tokens above):
 
 ```json
 {
@@ -62,7 +146,7 @@ Example:
 The trusted context should include enough information for Antfly to authorize
 without making per-row callbacks to an external policy service.
 
-## Operations
+### Operations
 
 Antfly should distinguish at least:
 
@@ -74,7 +158,7 @@ Antfly should distinguish at least:
 Authorization should be checked against the operation actually executed, not
 only the HTTP method or top-level API route.
 
-## Row Filters
+### Row Filters
 
 Row filters are mandatory security predicates. They are not user preferences,
 default filters, or ranking hints.
@@ -99,7 +183,7 @@ Before execution, Antfly should compile the template against:
 Unknown fields, missing attributes, unsupported operators, and type mismatches
 must fail closed.
 
-## Join-Aware Enforcement
+### Join-Aware Enforcement
 
 A cross-table query is a request against every table it references. A principal
 with access to one table must not be able to infer restricted rows from another
@@ -113,8 +197,10 @@ Antfly should enforce joins with these rules:
 - Each table's row filter must be attached to that table's logical scan node.
 - Filters must be bound through the table alias used in the query plan.
 - User predicates and security predicates combine with `AND`.
-- Multiple grant filters for the same table and operation combine with `OR`,
-  then the result is `AND`ed with the caller's predicate.
+- Multiple grant filters for the same table and operation combine with `AND`
+  today (see Row Filters above), then the result is `AND`ed with the caller's
+  predicate. Whether separate grants should instead widen access with `OR` is
+  an open design question.
 - If any referenced table lacks permission, deny the entire query.
 - Outer joins must filter the restricted side before join evaluation while
   preserving normal join semantics for rows that pass authorization.
@@ -125,7 +211,7 @@ Antfly should enforce joins with these rules:
   nodes or be denied unless Antfly can prove the saved object already carries an
   equivalent authorization policy.
 
-## Planning Boundary
+### Planning Boundary
 
 Authorization should run after parsing and before physical planning or
 execution.
@@ -145,7 +231,7 @@ handle joins safely. Rewriting request bodies at a proxy or route layer is not
 sufficient for cross-table authorization because it cannot reliably see every
 logical table access.
 
-## Performance
+### Performance
 
 The authorization path should be efficient enough for production query traffic.
 
@@ -159,7 +245,7 @@ Recommended approach:
 - Avoid per-row calls to external authorization systems.
 - Include policy IDs or versions in audit metadata for explainability.
 
-## V1 Implementation Checklist
+### V1 Implementation Checklist
 
 For a first join-aware version:
 
