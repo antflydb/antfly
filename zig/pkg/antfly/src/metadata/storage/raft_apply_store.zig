@@ -24,6 +24,7 @@ const system_catalog = @import("../../system_catalog/domain.zig");
 const catalog_name_key_buffer_bytes = 2048;
 const system_catalog_storage = @import("../../system_catalog/storage.zig");
 const sql_settings = @import("../../system_catalog/settings.zig");
+const sql_policies = @import("../../system_catalog/policies.zig");
 const builtin = @import("builtin");
 const raft_engine = @import("raft_engine");
 const fs_paths = @import("../../common/fs_paths.zig");
@@ -221,6 +222,7 @@ pub const TransitionCommand = union(enum) {
     activate_topology_protocol: []const u8,
     apply_system_catalog: []const u8,
     apply_sql_settings: []const u8,
+    apply_sql_policies: []const u8,
     publish_secret_collection: []const u8,
     initialize_metadata_incarnation: metadata_incarnation.MetadataClusterIncarnation,
     upsert_node: metadata.NodeRecord,
@@ -353,7 +355,7 @@ pub const TransitionCommand = union(enum) {
         switch (self.*) {
             .apply_restore_staging => |bytes| alloc.free(bytes),
             .upsert_schema_progress_batch => |records| alloc.free(records),
-            .publish_secret_collection, .activate_topology_protocol, .apply_system_catalog, .apply_sql_settings, .apply_store_report_update, .apply_store_report_baseline => |bytes| alloc.free(bytes),
+            .publish_secret_collection, .activate_topology_protocol, .apply_system_catalog, .apply_sql_settings, .apply_sql_policies, .apply_store_report_update, .apply_store_report_baseline => |bytes| alloc.free(bytes),
             .upsert_node, .register_node => |*record| {
                 metadata_table_manager.freeNode(alloc, record.*);
             },
@@ -4606,19 +4608,30 @@ pub const RaftApplyStore = struct {
         // Otherwise remove_table's automatic unbind advances the logical epoch
         // a second time, defeating the caller's single catalog-generation CAS.
         if (update.logical) |logical| {
-            if (bootstrap or update.import_catalog != null or update.setting_command != null) return error.InvalidStandaloneCatalog;
+            if (bootstrap or update.import_catalog != null or update.setting_command != null or update.policy_command != null) return error.InvalidStandaloneCatalog;
             const meta = try system_catalog_storage.readMeta(self.alloc, &txn, group_id);
             if (meta.revision != logical.previous_revision) return error.CatalogGenerationChanged;
             try system_catalog_storage.applyDelta(self.alloc, &txn, group_id, logical.delta, meta, @splat(0));
         }
         if (update.setting_command) |command| {
-            if (bootstrap or update.import_catalog != null or update.replace) return error.InvalidStandaloneCatalog;
+            if (bootstrap or update.import_catalog != null or update.replace or update.policy_command != null) return error.InvalidStandaloneCatalog;
             const bytes = try std.json.Stringify.valueAlloc(self.alloc, command, .{});
             defer self.alloc.free(bytes);
             if (bytes.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
             var hash: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
             try system_catalog_storage.applySettingCommand(self.alloc, &txn, group_id, command, hash);
+            const observed = try system_catalog_storage.readMeta(self.alloc, &txn, group_id);
+            if (observed.revision != command.expected_revision + 1 or !std.mem.eql(u8, &observed.last_command, &hash)) return error.CatalogGenerationChanged;
+        }
+        if (update.policy_command) |command| {
+            if (bootstrap or update.import_catalog != null or update.replace) return error.InvalidStandaloneCatalog;
+            const bytes = try std.json.Stringify.valueAlloc(self.alloc, command, .{});
+            defer self.alloc.free(bytes);
+            if (bytes.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
+            var hash: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
+            try system_catalog_storage.applyPolicyCommand(self.alloc, &txn, group_id, command, hash);
             const observed = try system_catalog_storage.readMeta(self.alloc, &txn, group_id);
             if (observed.revision != command.expected_revision + 1 or !std.mem.eql(u8, &observed.last_command, &hash)) return error.CatalogGenerationChanged;
         }
@@ -5503,6 +5516,51 @@ pub const RaftApplyStore = struct {
         const definitions = try a.alloc(sql_settings.Definition, records.len);
         for (records, definitions) |record, *definition| definition.* = record.effective(scope.principal, scope.database);
         return std.json.Stringify.valueAlloc(alloc, sql_settings.Snapshot{ .scope = scope, .epoch = @max(1, meta.revision), .definitions = definitions }, .{});
+    }
+
+    pub fn sqlPolicySnapshotJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, table_id: u64, principal: []const u8, database: []const u8) ![]u8 {
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const meta = try system_catalog_storage.readMeta(a, &txn, group_id);
+        const all = try system_catalog_storage.loadPolicies(a, &txn, group_id);
+        var records: std.ArrayList(sql_policies.Record) = .empty;
+        defer records.deinit(a);
+        var schema_version: u32 = 0;
+        var schema_digest: [32]u8 = @splat(0);
+        for (all) |record| if (record.table_id == table_id) {
+            if (schema_version != 0 and (schema_version != record.schema_version or !std.mem.eql(u8, &schema_digest, &record.schema_digest))) return error.RowPolicyCatalogChanged;
+            schema_version = record.schema_version;
+            schema_digest = record.schema_digest;
+            try records.append(a, record);
+        };
+        // An empty set cannot prove whether RLS is disabled. Keep capture
+        // fail-closed until table-level enablement and owner enforcement exist.
+        if (records.items.len == 0) return error.RowPolicyUnsupported;
+        return std.json.Stringify.valueAlloc(alloc, sql_policies.Snapshot{
+            .table_id = table_id,
+            .schema_version = schema_version,
+            .schema_digest = schema_digest,
+            .policy_generation = meta.revision,
+            .catalog_epoch = @max(1, meta.revision),
+            .principal = principal,
+            .database = database,
+            .records = records.items,
+        }, .{});
+    }
+
+    fn applySqlPoliciesTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !void {
+        if (bytes.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
+        var parsed = try std.json.parseFromSlice(sql_policies.Command, self.alloc, bytes, .{});
+        defer parsed.deinit();
+        const previous = try system_catalog_storage.readMeta(self.alloc, txn, group_id);
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
+        try system_catalog_storage.applyPolicyCommand(self.alloc, txn, group_id, parsed.value, hash);
+        const observed = try system_catalog_storage.readMeta(self.alloc, txn, group_id);
+        if (observed.revision != previous.revision) self.notifyProjectionListeners(.{ .kind = .table, .metadata_group_id = group_id });
     }
 
     fn applySqlSettingsTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !void {
@@ -8912,6 +8970,7 @@ pub const RaftApplyStore = struct {
                 metadataSnapshotProjectionBit(.table) | metadataSnapshotProjectionBit(.range) |
                 metadataSnapshotProjectionBit(.table_transition_fence) | metadataSnapshotProjectionBit(.catalog_revision),
             .apply_sql_settings => metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.catalog_revision),
+            .apply_sql_policies => metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.catalog_revision),
             .initialize_metadata_incarnation => metadataSnapshotProjectionBit(.metadata_incarnation) |
                 metadataSnapshotProjectionBit(.catalog_revision),
             .upsert_node, .register_node, .remove_node => metadataSnapshotProjectionBit(.node),
@@ -9427,6 +9486,7 @@ pub const RaftApplyStore = struct {
             },
             .apply_system_catalog => |bytes| try self.applySystemCatalogTxn(txn, group_id, bytes),
             .apply_sql_settings => |bytes| try self.applySqlSettingsTxn(txn, group_id, bytes),
+            .apply_sql_policies => |bytes| try self.applySqlPoliciesTxn(txn, group_id, bytes),
             .apply_store_report_update => |bytes| try self.applyStoreReportUpdateTxn(txn, group_id, bytes),
             .apply_store_report_baseline => |bytes| try self.applyStoreReportBaselineTxn(txn, group_id, bytes),
             .initialize_metadata_incarnation => |incarnation| {
@@ -13326,6 +13386,7 @@ const TransitionTag = enum(u8) {
     activate_topology_protocol = 57,
     apply_system_catalog = 54,
     apply_sql_settings = 66,
+    apply_sql_policies = 67,
     upsert_store_heartbeat = 55,
     apply_store_report_update = 56,
     apply_store_report_baseline = 58,
@@ -13427,6 +13488,11 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
         .apply_sql_settings => |bytes| {
             if (bytes.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
             try out.append(alloc, @intFromEnum(TransitionTag.apply_sql_settings));
+            try appendRequiredString(alloc, &out, bytes);
+        },
+        .apply_sql_policies => |bytes| {
+            if (bytes.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
+            try out.append(alloc, @intFromEnum(TransitionTag.apply_sql_policies));
             try appendRequiredString(alloc, &out, bytes);
         },
         .initialize_metadata_incarnation => |incarnation| {
@@ -13801,6 +13867,10 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
         .apply_sql_settings => blk: {
             if (encoded.len > system_catalog.max_command_bytes + 16) return error.CatalogCommandTooLarge;
             break :blk .{ .apply_sql_settings = try readRequiredString(alloc, encoded, &pos) };
+        },
+        .apply_sql_policies => blk: {
+            if (encoded.len > system_catalog.max_command_bytes + 16) return error.CatalogCommandTooLarge;
+            break :blk .{ .apply_sql_policies = try readRequiredString(alloc, encoded, &pos) };
         },
         .initialize_metadata_incarnation => blk: {
             if (pos + @sizeOf(metadata_incarnation.MetadataClusterIncarnation) != encoded.len) {
@@ -23433,6 +23503,76 @@ test "SQL settings apply through Raft and survive catalog restart" {
         try std.testing.expectEqual(@as(u64, 1), snapshot.value.revision);
         try std.testing.expectEqual(@as(usize, 1), snapshot.value.settings.len);
         try std.testing.expectEqualStrings("app.tenant", snapshot.value.settings[0].name);
+    }
+}
+
+test "inert SQL policy definitions survive standalone replay, snapshot, and restart" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/policy-catalog", .{tmp.sub_path});
+    defer alloc.free(root);
+    const group = group_ids.main_metadata_group_id;
+    const table: metadata.TableRecord = .{ .table_id = 7, .name = "table:policies", .schema_json = "{\"storage_mode\":\"relational\"}" };
+    const binding: system_catalog.Resource = .{ .kind = .table, .id = 7, .parent_id = system_catalog.default_namespace_id, .name = "policies", .storage_name = table.name };
+    var object_literal = try std.json.parseFromSlice(std.json.Value, alloc, "{\"tenant\":\"alpha\"}", .{});
+    defer object_literal.deinit();
+    var array_literal = try std.json.parseFromSlice(std.json.Value, alloc, "[1,2]", .{});
+    defer array_literal.deinit();
+    const predicate: sql_policies.Predicate = .{ .instructions = &.{
+        .{ .type = .{ .kind = .string }, .operation = .{ .literal = .{ .string = "alpha" } } },
+        .{ .type = .{ .kind = .json }, .operation = .{ .literal = object_literal.value } },
+        .{ .type = .{ .kind = .json }, .operation = .{ .literal = array_literal.value } },
+        .{ .type = .{ .kind = .boolean, .nullable = false }, .operation = .{ .literal = .{ .bool = true } } },
+    }, .root = 3 };
+    const record: sql_policies.Record = .{ .id = 8, .generation = 1, .table_id = 7, .schema_version = 1, .schema_digest = @splat(5), .name = "owner_filter", .commands = .{ .select = true }, .roles = &.{"alice"}, .using = predicate };
+    const command: sql_policies.Command = .{ .expected_revision = 1, .change = .{ .put = record } };
+    const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
+    defer alloc.free(bytes);
+    // Standalone's opaque metadata transport uses the integrity JSON writer.
+    // Its policy payload must round-trip as typed logical JSON, never as the
+    // pointer-bearing representation of std.json.Value.
+    var wire: std.Io.Writer.Allocating = .init(alloc);
+    defer wire.deinit();
+    var stream: std.json.Stringify = .{ .writer = &wire.writer, .options = .{} };
+    try @import("../../storage/db/relational_integrity_json.zig").write(@import("raft_apply_contract.zig").StandaloneCatalogUpdate{ .policy_command = command }, &stream);
+    var decoded = try std.json.parseFromSlice(@import("raft_apply_contract.zig").StandaloneCatalogUpdate, alloc, wire.written(), .{});
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(u64, 8), decoded.value.policy_command.?.change.put.id);
+    const restored = decoded.value.policy_command.?.change.put.using.?.instructions;
+    try std.testing.expectEqualStrings("alpha", restored[0].operation.literal.string);
+    try std.testing.expectEqualStrings("alpha", restored[1].operation.literal.object.get("tenant").?.string);
+    try std.testing.expectEqual(@as(usize, 2), restored[2].operation.literal.array.items.len);
+    try std.testing.expectEqual(@as(i64, 1), restored[2].operation.literal.array.items[0].integer);
+    try std.testing.expect(restored[3].operation.literal.bool);
+    {
+        var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+        defer store.deinit();
+        try store.updateStandaloneCatalog(group, 0, .{ .tables = &.{table}, .auxiliary_json = "{}", .import_catalog = .{ .revision = 1, .next_id = 8, .resources = &.{binding} } });
+        try store.applyStandaloneCommand(group, .{ .apply_sql_policies = bytes });
+        try store.applyStandaloneCommand(group, .{ .apply_sql_policies = bytes });
+        const stale: sql_policies.Command = .{ .expected_revision = 1, .change = .{ .drop = .{ .id = 8, .generation = 1, .table_id = 7 } } };
+        const stale_bytes = try std.json.Stringify.valueAlloc(alloc, stale, .{});
+        defer alloc.free(stale_bytes);
+        try store.applyStandaloneCommand(group, .{ .apply_sql_policies = stale_bytes });
+        var state = try store.systemCatalogSnapshot(alloc, group);
+        defer state.deinit();
+        try std.testing.expectEqual(@as(u64, 2), state.value.revision);
+        try std.testing.expectEqual(@as(usize, 1), state.value.policies.len);
+        const portable_bytes = try store.exportSystemCatalog(alloc, group);
+        defer alloc.free(portable_bytes);
+        var portable = try std.json.parseFromSlice(@import("../../system_catalog/projection.zig").Export, alloc, portable_bytes, .{});
+        defer portable.deinit();
+        try std.testing.expectEqual(@as(usize, 1), portable.value.system_catalog.policies.len);
+    }
+    {
+        var reopened = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+        defer reopened.deinit();
+        var state = try reopened.systemCatalogSnapshot(alloc, group);
+        defer state.deinit();
+        try std.testing.expectEqual(@as(usize, 1), state.value.policies.len);
+        try std.testing.expectEqualStrings("owner_filter", state.value.policies[0].name);
+        try std.testing.expectEqual(@as(u64, 1), state.value.policies[0].generation);
     }
 }
 

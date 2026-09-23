@@ -26,6 +26,7 @@
 const std = @import("std");
 const time = @import("antfly_platform").time;
 const transactions = @import("../transactions.zig");
+const generation_retirement = @import("relational_integrity_generation_retirement.zig");
 const Allocator = std.mem.Allocator;
 pub const Operation = @import("types.zig").TransactionIntegrityOperation;
 pub const namespace = @import("relational_integrity_contract.zig").namespace;
@@ -166,7 +167,8 @@ const Builder = struct {
         while (entry) |item| : (entry = try cursor.next()) {
             if (!std.mem.startsWith(u8, item.key, &prefix)) break;
             if (self.positions.get(item.key)) |position| if (self.operations.items[position].kind == .delete) continue;
-            _ = try Reference.decode(item.key, item.value);
+            const reference = try Reference.decode(item.key, item.value);
+            if (try generation_retirement.isRetired(txn, reference)) continue;
             return error.ForeignKeyReferenced;
         }
     }
@@ -241,6 +243,7 @@ pub fn prepare(alloc: Allocator, txn: anytype, commands: []const Command) !Effec
                     try builder.add(txn, address, &claim_key, .put, try claim.encode(owned, address));
                 },
                 .attach => |reference| {
+                    if (try generation_retirement.isRetired(txn, reference)) return error.GenerationRetired;
                     const raw = try builder.current(txn, &claim_key) orelse return error.ForeignKeyParentMissing;
                     const claim = try Claim.decode(&claim_key, raw);
                     if (claim.state != .live) return error.ForeignKeyActionInProgress;
@@ -366,7 +369,8 @@ fn requireEmptyOperations(txn: anytype, address: Address, operations: []const Op
     while (entry) |item| : (entry = try cursor.next()) {
         if (!std.mem.startsWith(u8, item.key, &prefix)) break;
         if (overlay.get(item.key)) |position| if (operations[position].kind == .delete) continue;
-        _ = try Reference.decode(item.key, item.value);
+        const reference = try Reference.decode(item.key, item.value);
+        if (try generation_retirement.isRetired(txn, reference)) continue;
         return error.ForeignKeyReferenced;
     }
 }
@@ -378,7 +382,8 @@ fn requireReboundReferences(txn: anytype, address: Address, operations: []const 
     var entry = try cursor.seekAtOrAfter(&prefix);
     while (entry) |item| : (entry = try cursor.next()) {
         if (!std.mem.startsWith(u8, item.key, &prefix)) break;
-        _ = try Reference.decode(item.key, item.value);
+        const reference = try Reference.decode(item.key, item.value);
+        if (try generation_retirement.isRetired(txn, reference)) continue;
         const position = overlay.get(item.key) orelse return error.ForeignKeyReferenced;
         // A guard-only attach is not a reference rebind. Only a detached old
         // relationship, optionally reattached to the final tuple owner, may
@@ -407,6 +412,7 @@ pub fn validatePreparedEffects(alloc: Allocator, txn: anytype, operations: []con
         const claim_key = parsed.address.claimKey();
         switch (parsed.kind) {
             .reference => {
+                if (op.kind == .put and try generation_retirement.isRetired(txn, try Reference.decode(op.key, op.value.?))) return error.GenerationRetired;
                 const claim_op = operations[overlay.get(&claim_key) orelse return error.IntegrityClaimGuardRequired];
                 const current_claim = if (claim_op.kind == .put) claim_op.value else claim_op.expected_value;
                 const claim = try Claim.decode(&claim_key, current_claim orelse return error.ForeignKeyParentMissing);
@@ -528,6 +534,7 @@ pub fn actionPageWithBudget(alloc: Allocator, io: ?std.Io, txn: anytype, address
     defer cursor.close();
     var references: std.ArrayList(Reference) = .empty;
     var bytes: usize = 0;
+    var inspected: usize = 0;
     var entry = try cursor.seekAtOrAfter(if (job.phase == .validating and job.cursor.len != 0) job.cursor else &prefix);
     if (entry) |item| if (job.phase == .validating and std.mem.eql(u8, item.key, job.cursor)) {
         entry = try cursor.next();
@@ -538,17 +545,25 @@ pub fn actionPageWithBudget(alloc: Allocator, io: ?std.Io, txn: anytype, address
         if (!std.mem.startsWith(u8, item.key, &prefix)) break;
         if (io) |runtime_io| try runtime_io.checkCancel();
         const item_bytes = std.math.add(usize, item.key.len, item.value.len) catch return error.IntegrityRecordTooLarge;
-        if (references.items.len == max_rows or item_bytes > max_bytes - bytes or
-            (references.items.len != 0 and time.monotonicNs() -| started >= budget.time_ns))
+        if (inspected == max_rows or item_bytes > max_bytes - bytes or
+            (inspected != 0 and time.monotonicNs() -| started >= budget.time_ns))
         {
-            if (references.items.len == 0) return error.IntegrityRecordTooLarge;
+            if (inspected == 0) return error.IntegrityRecordTooLarge;
             complete = false;
             break;
+        }
+        const reference = try Reference.decode(item.key, item.value);
+        if (try generation_retirement.isRetired(txn, reference)) {
+            next_cursor = try owned.dupe(u8, item.key);
+            bytes += item_bytes;
+            inspected += 1;
+            continue;
         }
         const value = try owned.dupe(u8, item.value);
         try references.append(owned, try Reference.decode(item.key, value));
         next_cursor = try owned.dupe(u8, item.key);
         bytes += item_bytes;
+        inspected += 1;
     }
     const reference_items = try references.toOwnedSlice(owned);
     return .{ .arena = arena, .claim = claim, .job = job, .next_cursor = next_cursor, .references = reference_items, .complete = complete };

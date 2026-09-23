@@ -5722,15 +5722,45 @@ pub const DB = struct {
 
     pub const RelationalRows = @import("relational_rows.zig");
 
+    /// One owner-local immutable visibility cut for delayed SQL scans. The
+    /// caller must obtain it under a statement capture fence after read-index
+    /// admission. It deliberately cannot be serialized across owners.
+    pub const RelationalStatementSnapshot = struct {
+        read: docstore_mod.DocStore.Txn,
+        schema_version: u32,
+
+        pub fn deinit(self: *@This()) void {
+            self.read.abort();
+            self.* = undefined;
+        }
+    };
+
+    pub fn captureRelationalStatementSnapshot(self: *DB) !RelationalStatementSnapshot {
+        try self.lockApplySharedForPortableRuntime();
+        defer self.core.unlockApplyShared();
+        var view = self.core.acquireSchemaView() orelse return error.RelationalTableRequired;
+        defer view.release();
+        if (view.storageMode() != .relational) return error.RelationalTableRequired;
+        return .{ .read = try self.core.store.beginReadTxn(), .schema_version = view.version() };
+    }
+
     pub fn beginRelationalRows(self: *DB, alloc: Allocator, request: RelationalRows.Request) !RelationalRows.Reader {
+        return self.beginRelationalRowsAtSnapshot(alloc, request, null);
+    }
+
+    fn beginRelationalRowsAtSnapshot(self: *DB, alloc: Allocator, request: RelationalRows.Request, statement: ?*RelationalStatementSnapshot) !RelationalRows.Reader {
+        // A delayed scan may use only the primary path. READY index state and
+        // auto-index plans can change after the original visibility cut.
+        if (statement != null and (request.index != null or request.auto_index)) return error.SqlStatementSnapshotRequired;
         try self.lockApplySharedForPortableRuntime();
         var locked = true;
         defer if (locked) self.core.unlockApplyShared();
         var view = self.core.acquireSchemaView() orelse return error.RelationalTableRequired;
         defer view.release();
+        if (statement) |cut| if (view.version() != cut.schema_version) return error.PreparedGenerationChanged;
         var indexes = self.core.relational_indexes.acquire();
         defer if (indexes) |*pinned| pinned.deinit();
-        const read_snapshot = try self.core.store.beginReadTxn();
+        const read_snapshot = if (statement) |cut| try cut.read.forkRead() else try self.core.store.beginReadTxn();
         const authenticated = self.core.store.valuesAreAuthenticated();
         const now = currentTimeNs();
         self.core.unlockApplyShared();
@@ -39837,6 +39867,10 @@ pub const DB = struct {
     }
 
     pub fn openRelationalReadSession(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) !*RelationalReadSession {
+        return self.openRelationalReadSessionAtSnapshot(alloc, from_key, to_key, opts, null);
+    }
+
+    pub fn openRelationalReadSessionAtSnapshot(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions, statement: ?*RelationalStatementSnapshot) !*RelationalReadSession {
         if (opts.relational_query_json.len > 1024 * 1024 or opts.limit > 4096) return error.InvalidRelationalRowsRequest;
         const session = try alloc.create(RelationalReadSession);
         errdefer alloc.destroy(session);
@@ -39932,7 +39966,7 @@ pub const DB = struct {
             break :blk active;
         } else null;
         errdefer if (filter) |active| Filter.destroy(alloc, active);
-        session.reader = try self.beginRelationalRows(alloc, .{
+        session.reader = try self.beginRelationalRowsAtSnapshot(alloc, .{
             .index = parsed.value.index,
             .auto_index = parsed.value.auto_index,
             .include_primary_digest = opts.include_content_hashes,
@@ -39946,7 +39980,7 @@ pub const DB = struct {
             .primary_upper = if (to_key.len != 0) .{ .key = to_key, .inclusive = !opts.exclusive_to } else null,
             .expected_schema_version = parsed.value.schema_version orelse view.version(),
             .row_filter = if (filter) |active| .{ .context = active, .matches = Filter.matches } else null,
-        });
+        }, statement);
         session.filter_context = filter;
         session.destroy_filter = Filter.destroy;
         errdefer session.reader.deinit();

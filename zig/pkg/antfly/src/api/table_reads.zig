@@ -2457,6 +2457,7 @@ pub const BoundTableReadSource = struct {
             .vtable = &.{
                 .open_relational_read = if (control_only_storage_sources) null else openRelationalRead,
                 .open_relational_statement = if (control_only_storage_sources) null else openRelationalStatement,
+                .open_relational_statement_snapshot = if (control_only_storage_sources) null else openRelationalStatementSnapshot,
                 .lookup = lookup,
                 .scan = scan,
                 .scan_stream = scanStream,
@@ -2605,6 +2606,75 @@ pub const BoundTableReadSource = struct {
         }
     };
 
+    const DynamicStatementSnapshot = struct {
+        alloc: std.mem.Allocator,
+        source: *BoundTableReadSource,
+        table_name: []u8,
+        snapshot: db_mod.DB.RelationalStatementSnapshot,
+        consistency: raft_mod.ReadConsistency,
+        cancellation: ?@import("../common/cancellation.zig").CancellationToken,
+        deadline_ns: ?u64,
+        opened: usize = 0,
+
+        fn check(self: *@This()) !void {
+            if (self.cancellation) |token| try token.check();
+            if (self.deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+        }
+
+        fn open(raw: *anyopaque, alloc: std.mem.Allocator, input: @import("table_read_source.zig").RelationalStatementScan) !@import("table_read_source.zig").RelationalReadView {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.check();
+            if (!std.mem.eql(u8, input.table, self.table_name)) return error.TableNotFound;
+            if (self.opened >= 64) return error.SqlProgramLimitExceeded;
+            if (!input.opts.include_range_proofs) return error.SqlRangeTrackingRequired;
+            // This first implementation is primary-only. A secondary-index
+            // plan created after capture cannot certify its old membership.
+            const row_query = input.opts.relational_query orelse return error.SqlStatementSnapshotRequired;
+            if (row_query.index != null or row_query.auto_index) return error.SqlStatementSnapshotRequired;
+            var opts = input.opts;
+            opts.cancellation = self.cancellation;
+            opts.execution_deadline_ns = if (self.deadline_ns) |deadline| if (opts.execution_deadline_ns) |requested| @min(deadline, requested) else deadline else opts.execution_deadline_ns;
+            try self.source.reads.reads.prepareScanWithConsistency(self.source.reads.group_id, input.from, input.to, opts, self.consistency);
+            try self.check();
+            const session = try self.source.db.openRelationalReadSessionAtSnapshot(alloc, input.from, input.to, opts, &self.snapshot);
+            self.opened += 1;
+            return .{ .ptr = session, .vtable = &.{ .next = nextRelationalPage, .close = closeRelationalRead, .normalize = normalizeRelationalRows, .range_proofs = relationalRangeProofs } };
+        }
+
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.snapshot.deinit();
+            self.alloc.free(self.table_name);
+            self.alloc.destroy(self);
+        }
+    };
+
+    fn openRelationalStatementSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, consistency: raft_mod.ReadConsistency, cancellation: ?@import("../common/cancellation.zig").CancellationToken, deadline_ns: ?u64) !@import("table_read_source.zig").RelationalStatementSnapshot {
+        const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, self.table_name, table)) return error.TableNotFound;
+        if (consistency != .read_index) return error.SqlStatementSnapshotRequired;
+        if (cancellation) |token| try token.check();
+        if (deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+        const opts: db_mod.types.ScanOptions = .{ .cancellation = cancellation, .execution_deadline_ns = deadline_ns };
+        try self.reads.reads.prepareScanWithConsistency(self.reads.group_id, "", "", opts, consistency);
+        var fence = (try self.db.tryStatementReadFence()) orelse return error.Backpressured;
+        const snapshot = self.db.captureRelationalStatementSnapshot() catch |err| {
+            fence.release();
+            return err;
+        };
+        fence.release();
+        errdefer {
+            var owned = snapshot;
+            owned.deinit();
+        }
+        try self.reads.reads.prepareScanWithConsistency(self.reads.group_id, "", "", opts, consistency);
+        const retained = try alloc.create(DynamicStatementSnapshot);
+        errdefer alloc.destroy(retained);
+        const owned_name = try alloc.dupe(u8, table);
+        retained.* = .{ .alloc = alloc, .source = self, .table_name = owned_name, .snapshot = snapshot, .consistency = consistency, .cancellation = cancellation, .deadline_ns = deadline_ns };
+        return .{ .ptr = retained, .vtable = &.{ .open = DynamicStatementSnapshot.open, .close = DynamicStatementSnapshot.close } };
+    }
+
     fn openRelationalStatement(ptr: *anyopaque, alloc: std.mem.Allocator, scans: []const @import("table_read_source.zig").RelationalStatementScan, consistency: raft_mod.ReadConsistency) !@import("table_read_source.zig").RelationalStatementRead {
         const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
         if (scans.len == 0 or scans.len > 64) return error.SqlProgramLimitExceeded;
@@ -2672,6 +2742,11 @@ pub const BoundTableReadSource = struct {
     fn closeRelationalRead(ptr: *anyopaque) void {
         const session: *db_mod.DB.RelationalReadSession = @ptrCast(@alignCast(ptr));
         session.deinit();
+    }
+
+    fn relationalRangeProofs(ptr: *anyopaque, alloc: std.mem.Allocator) ![]@import("../storage/range_protection.zig").Proof {
+        const session: *db_mod.DB.RelationalReadSession = @ptrCast(@alignCast(ptr));
+        return session.rangeProofs(alloc);
     }
 
     fn normalizeRelationalRows(ptr: *anyopaque, alloc: std.mem.Allocator, writes: []const db_mod.types.BatchWrite) ![]db_mod.types.BatchWrite {
@@ -25776,6 +25851,61 @@ fn implementationTests() type {
                 std.Io.Limit.limited(threaded_io_limits.service),
                 cache.threaded.concurrent_limit,
             );
+        }
+
+        test "owner-local delayed statement scans fork one visibility cut and retain range proofs" {
+            const alloc = std.testing.allocator;
+            var directory = try TestDirectory.init("antfly-delayed-statement-snapshot");
+            defer directory.cleanup();
+            var db = try db_mod.DB.open(alloc, directory.path(), .{});
+            defer db.close();
+            try db.setSchemaJson(alloc,
+                \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"name":{"type":"keyword"}},"additionalProperties":false}}}}
+            );
+            try db.batch(.{ .activate_range_tracking = true });
+            try db.batch(.{ .timestamp_ns = 1, .writes = &.{.{ .key = "a", .value = "{\"name\":\"before\"}" }} });
+            var source = BoundTableReadSource.init("rows", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
+            const iface = source.source();
+            var pinned = try iface.openRelationalStatementSnapshot(alloc, "rows", .read_index, null, null);
+            defer pinned.deinit();
+            try db.batch(.{ .timestamp_ns = 2, .writes = &.{
+                .{ .key = "a", .value = "{\"name\":\"after\"}" },
+                .{ .key = "b", .value = "{\"name\":\"new\"}" },
+            } });
+            const input: table_read_source.RelationalStatementScan = .{ .table = "rows", .opts = .{
+                .relational_query = .{ .fields = &.{"name"}, .schema_version = 1 },
+                .include_range_proofs = true,
+                .limit = 4,
+            } };
+            // Raw owner-local counters are not an authenticated routed
+            // commit proof. The SQL mutation path must fail closed here.
+            try std.testing.expectError(error.SqlRangeTrackingRequired, pinned.openGuarded(alloc, input));
+            try std.testing.expectError(error.TableNotFound, pinned.open(alloc, .{ .table = "other", .opts = input.opts }));
+            var first = try pinned.open(alloc, input);
+            defer first.deinit();
+            var second = try pinned.open(alloc, input);
+            defer second.deinit();
+            for ([_]table_read_source.RelationalReadView{ first, second }) |view| {
+                const proofs = try view.rangeProofs(alloc);
+                defer alloc.free(proofs);
+                try std.testing.expect(proofs.len != 0);
+                var page = try view.next(alloc, 4);
+                defer page.deinit();
+                try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+                try std.testing.expectEqualStrings("a", page.rows[0].id);
+                try std.testing.expectEqualStrings("before", page.rows[0].value.object.get("name").?.string);
+            }
+            const secondary = table_read_source.RelationalStatementScan{ .table = "rows", .opts = .{
+                .relational_query = .{ .fields = &.{"name"}, .index = "by_name", .schema_version = 1 },
+                .include_range_proofs = true,
+            } };
+            try std.testing.expectError(error.SqlStatementSnapshotRequired, pinned.open(alloc, secondary));
+            for (0..62) |_| {
+                const extra = try pinned.open(alloc, input);
+                extra.deinit();
+            }
+            try std.testing.expectError(error.SqlProgramLimitExceeded, pinned.open(alloc, input));
+            try std.testing.expectError(error.DeadlineExceeded, iface.openRelationalStatementSnapshot(alloc, "rows", .read_index, null, 0));
         }
 
         test "hosted distributed grouped hierarchy expands the globally selected shard page" {

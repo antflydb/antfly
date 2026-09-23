@@ -225,6 +225,7 @@ pub const State = struct {
     next_id: u64 = 3,
     resources: []const Resource = &.{},
     settings: []const @import("settings.zig").Record = &.{},
+    policies: []const @import("policies.zig").Record = &.{},
 
     pub fn find(self: @This(), kind: Kind, parent_id: u64, name: []const u8) ?Resource {
         for (self.resources) |r| if (r.kind == kind and r.parent_id == parent_id and std.mem.eql(u8, r.name, name)) return r;
@@ -421,6 +422,7 @@ pub const IndexedState = struct {
 /// Readers borrow it under the metadata mutex. Undo and commit cannot allocate.
 pub const MutableState = struct {
     pub const OwnedSettings = std.json.Parsed([]const @import("settings.zig").Record);
+    pub const OwnedPolicies = std.json.Parsed([]const @import("policies.zig").Record);
     alloc: std.mem.Allocator,
     value: State,
     index: StateIndex,
@@ -429,6 +431,20 @@ pub const MutableState = struct {
     // Settings in imported snapshots are normally backed by a temporary JSON
     // arena. Keep an independent copy for the lifetime of the writer state.
     owned_settings: ?OwnedSettings = null,
+    owned_policies: ?OwnedPolicies = null,
+
+    pub fn clonePolicies(alloc: std.mem.Allocator, records: []const @import("policies.zig").Record) !OwnedPolicies {
+        if (records.len > 1024) return error.RowPolicyLimitExceeded;
+        const bytes = try std.json.Stringify.valueAlloc(alloc, records, .{});
+        defer alloc.free(bytes);
+        var owned = try std.json.parseFromSlice([]const @import("policies.zig").Record, alloc, bytes, .{ .allocate = .alloc_always });
+        errdefer owned.deinit();
+        for (owned.value, 0..) |policy, i| {
+            try policy.validateShape();
+            for (owned.value[0..i]) |prior| if (prior.id == policy.id or (prior.table_id == policy.table_id and std.ascii.eqlIgnoreCase(prior.name, policy.name))) return error.InvalidRowPolicyRecord;
+        }
+        return owned;
+    }
 
     pub fn cloneSettings(alloc: std.mem.Allocator, records: []const @import("settings.zig").Record) !OwnedSettings {
         if (records.len > 1024) return error.SettingLimitExceeded;
@@ -467,6 +483,10 @@ pub const MutableState = struct {
             self.owned_settings = try cloneSettings(alloc, state.settings);
             self.value.settings = self.owned_settings.?.value;
         }
+        if (state.policies.len != 0) {
+            self.owned_policies = try clonePolicies(alloc, state.policies);
+            self.value.policies = self.owned_policies.?.value;
+        }
         self.value.resources = self.rows.items;
         self.index = try StateIndex.init(alloc, self.value);
         return self;
@@ -474,6 +494,7 @@ pub const MutableState = struct {
     pub fn deinit(self: *MutableState) void {
         self.index.deinit(self.alloc);
         if (self.owned_settings) |*settings| settings.deinit();
+        if (self.owned_policies) |*policies| policies.deinit();
         for (self.rows.items) |r| freeResource(self.alloc, r);
         self.rows.deinit(self.alloc);
         self.positions.deinit(self.alloc);
@@ -1049,7 +1070,7 @@ pub fn applyDeltaStateAlloc(alloc: std.mem.Allocator, state: State, delta: Delta
         if (!replaced.contains(.{ .kind = resource.kind, .id = resource.id })) try resources.append(alloc, resource);
     }
     try resources.appendSlice(alloc, delta.upserts);
-    return cloneStateAlloc(alloc, .{ .revision = try std.math.add(u64, state.revision, 1), .next_id = delta.next_id, .resources = resources.items, .settings = state.settings });
+    return cloneStateAlloc(alloc, .{ .revision = try std.math.add(u64, state.revision, 1), .next_id = delta.next_id, .resources = resources.items, .settings = state.settings, .policies = state.policies });
 }
 
 pub fn tableResourceMatches(grant: []const u8, target: []const u8) bool {

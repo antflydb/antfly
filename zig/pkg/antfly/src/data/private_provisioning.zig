@@ -29,19 +29,26 @@ pub fn validate(alloc: std.mem.Allocator, public_tables: []const tables.TableRec
         try parsed.value.plan.validate(alloc);
         if (!std.mem.eql(u8, &parsed.value.plan_digest, &(try parsed.value.plan.digest(alloc)))) return error.InvalidRestoreStaging;
         switch (parsed.value.state) {
-            .importing, .validating, .cutover, .canceling => {},
+            .importing, .validating, .cutover, .activating, .canceling => {},
             .published, .canceled, .preparing_sources => return error.InvalidRestoreStaging,
         }
         if (parsed.value.revision == 0) return error.InvalidRestoreStaging;
         var new_owners: usize = 0;
         var old_owners: usize = 0;
+        var parent_owners: usize = 0;
         for (parsed.value.plan.targets) |target| {
             new_owners += target.ranges.len;
             if (target.replace) |old| old_owners += old.ranges.len;
         }
+        for (parsed.value.plan.external_fk_parents) |parent| parent_owners += parent.ranges.len;
+        // The metadata progress counter is reused for each phase: parent
+        // fences precede old-owner cutover, then activation counts parents
+        // alone. Match that state machine even though only hidden target
+        // owners are projected into this private routing view.
         const maximum = switch (parsed.value.state) {
-            .cutover => old_owners,
-            .canceling => new_owners + old_owners,
+            .cutover => old_owners + parent_owners,
+            .activating => parent_owners,
+            .canceling => new_owners + old_owners + parent_owners,
             else => new_owners,
         };
         if (parsed.value.completed_owners > maximum) return error.InvalidRestoreStaging;

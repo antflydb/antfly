@@ -454,6 +454,29 @@ pub const DocStore = struct {
         columnar_mutation: ?internal_keys.ColumnarMutationToken = null,
         columnar_owner: ?*DocStore = null,
 
+        /// Fork an immutable runtime read at the same visibility cut. Each
+        /// fork has independent cursor scratch while the erased backend pins
+        /// the original snapshot until its last child closes. Callers must
+        /// serialize use of the payload session, which is shared for the
+        /// lifetime of this read family. LMDB does not provide this contract.
+        pub fn forkRead(self: *Txn) !Txn {
+            if (self.raw != null or self.write != null or self.probe != null or self.current_scan != null)
+                return error.ReadSnapshotForkUnsupported;
+            const parent = if (self.read) |*read| read else return error.ReadSnapshotForkUnsupported;
+            const owner = self.portable_import_reader_owner orelse return error.ReadSnapshotForkUnsupported;
+            try owner.acquirePortableImportReader();
+            errdefer owner.releasePortableImportReader();
+            var fork = try parent.forkRead();
+            errdefer fork.abort();
+            if (self.payload_session) |session| session.retain();
+            return .{
+                .alloc = self.alloc,
+                .read = fork,
+                .payload_session = self.payload_session,
+                .portable_import_reader_owner = owner,
+            };
+        }
+
         pub const CursorAdapter = backend_erased.Cursor;
         pub const ReadAdapter = backend_adapter.ReadTxn(Txn, CursorAdapter, .{
             .abort = Txn.abort,

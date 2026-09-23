@@ -91,6 +91,11 @@ read or write. Eager source lowering could evaluate an untaken branch and
 change its error semantics. Full masked Apply and owner-dependent correlation
 need a transaction-scoped snapshot/read-set handle that allows scans opened
 after owner binding and atomically commits their point/range/absence proofs.
+An owner-local LSM snapshot can now fork delayed primary scans from one pinned
+visibility cut, with bounded lifetime and raw range proofs. It is read-only
+for SQL: the local source has no authenticated route fence, so guarded reads
+and lazy conflict Apply remain disabled. Multi-owner captures also need a
+coordinated immutable cut before this capability can be advertised.
 Existing conflict-owner point reads now use reclaimed cursor and page scratch
 per owner, resetting page scratch after empty progress pages. A 32-owner batch
 with three 64 KiB native continuation pages per owner fits a 512 KiB SQL
@@ -351,6 +356,10 @@ checks. Those overlays belong to one connection; they are not restart-durable
 or available to HTTP durable sessions. Native row policies, remote propagation,
 durable-session overlays, and failover/security workload gates remain open. A
 durable setting registry alone is not policy parity.
+Inert, schema-bound policy definitions now survive catalog Raft replay,
+snapshot/import, and table retirement. Their typed programs and setting
+dependencies are validated at capture, but no route enables RLS and no data
+owner evaluates them; policy records do not grant access or alter visibility.
 
 The native policy boundary must be catalog-versioned authority, not a SQL
 projection filter. A policy record needs the bound table ID/schema epoch,
@@ -604,8 +613,12 @@ activation now has an irreversible metadata decision after old/parent fencing
 and topology/dependency recheck. A direct leader-linearizable authority response
 can be validated against the exact parent fence and child FK generations, but
 the final data-group leader does not yet fetch it or persist an activated
-generation registry. Generation-aware native reference handling and resumable
-GC are also missing, so both SQL admission and metadata publication remain
+generation registry. The owner-local registry and bounded resumable GC contract
+now exist: immutable generation tombstones reject stale attachments, and native
+reference reads skip retired generations. Portable backup and range handoff
+reject active authority until they can transfer it correctly. The activation
+command, authenticated leader proof fetch, replicated GC worker and tombstone
+handoff remain missing, so both SQL admission and metadata publication remain
 guarded; no coordinator-supplied receipt is trusted as activation evidence.
 
 Acceptance needs crash/lost-ack tests at each fence, publication and activation

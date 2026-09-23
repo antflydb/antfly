@@ -96,6 +96,10 @@ pub fn stageBegin(txn: anytype, fence: Fence) !void {
         return;
     }
     try @import("relational_integrity_generation_retirement.zig").requireClear(txn);
+    if (fence.role == .split_source or fence.role == .split_destination or
+        fence.role == .merge_source or fence.role == .merge_destination or
+        fence.role == .rewrite_source)
+        try @import("relational_integrity_generation_retirement.zig").requireNoActive(txn);
     if (try optional(txn, receipt_key)) |bytes| {
         const previous = try Fence.decode(bytes);
         if (previous.admission_epoch >= fence.admission_epoch)

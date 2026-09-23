@@ -149,6 +149,48 @@ pub const RelationalStatementRead = struct {
     }
 };
 
+/// A transaction-scoped, owner-local visibility cut. Unlike a collection of
+/// fresh open_relational_read calls, later open() calls fork one immutable
+/// storage snapshot. Providers may return this only when writes between opens
+/// cannot alter the observed cut. Each returned cursor must be closed before
+/// the snapshot, and the SQL transaction must retain its range proofs through
+/// the same atomic commit as its mutations.
+pub const RelationalStatementSnapshot = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+    boundary_dispatch: Abi.Dispatch = Abi.local_dispatch,
+    pub const GuardedRead = struct {
+        view: RelationalReadView,
+        /// Issued by the authenticated routed owner for this exact delayed
+        /// scan, not assembled from a logical table name or a raw counter.
+        /// The callback allocates this slice and nested proofs in `alloc`.
+        owner_proofs: []const @import("range_read_guards.zig").OwnerRangeProof,
+    };
+    pub const VTable = struct {
+        open: *const fn (*anyopaque, std.mem.Allocator, RelationalStatementScan) anyerror!RelationalReadView,
+        /// SQL mutation consumers require this stronger entry point. An
+        /// owner-local snapshot without a route-fenced commit proof is useful
+        /// for read-only scans but is NOT a serializable SQL read set.
+        open_guarded: ?*const fn (*anyopaque, std.mem.Allocator, RelationalStatementScan) anyerror!GuardedRead = null,
+        close: *const fn (*anyopaque) void,
+    };
+    const Abi = @import("../runtime_callback_abi.zig").Boundary(VTable);
+
+    pub fn open(self: @This(), alloc: std.mem.Allocator, scan: RelationalStatementScan) !RelationalReadView {
+        return Abi.call("open", self.boundary_dispatch, self.vtable.open, .{ self.ptr, alloc, scan });
+    }
+    pub fn openGuarded(self: @This(), alloc: std.mem.Allocator, scan: RelationalStatementScan) !GuardedRead {
+        const callback = self.vtable.open_guarded orelse return error.SqlRangeTrackingRequired;
+        const result = try Abi.call("open_guarded", self.boundary_dispatch, callback, .{ self.ptr, alloc, scan });
+        errdefer result.view.deinit();
+        try @import("range_read_guards.zig").validate(result.owner_proofs);
+        return result;
+    }
+    pub fn deinit(self: @This()) void {
+        Abi.call("close", self.boundary_dispatch, self.vtable.close, .{self.ptr}) catch unreachable;
+    }
+};
+
 pub const TableReadSource = struct {
     /// Read authoritative generations through the same routed ownership/read
     /// barrier as point reads. Empty is the exact first-range logical key;
@@ -193,6 +235,9 @@ pub const TableReadSource = struct {
     route_fence: ?metadata_api.CatalogRouteFence = null,
 
     pub const VTable = struct {
+        /// Optional owner-local dynamic read set. A distributed router must
+        /// not implement this with independently captured shard snapshots.
+        open_relational_statement_snapshot: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, read_gate.ReadConsistency, ?CancellationToken, ?u64) anyerror!RelationalStatementSnapshot = null,
         open_relational_statement: ?*const fn (*anyopaque, std.mem.Allocator, []const RelationalStatementScan, read_gate.ReadConsistency) anyerror!RelationalStatementRead = null,
         open_relational_read: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8, []const u8, db_types.ScanOptions, read_gate.ReadConsistency) anyerror!?RelationalReadView = null,
         open_relational_read_group_local_routed: ?*const fn (*anyopaque, std.mem.Allocator, metadata_api.CatalogRouteFence, u64, []const u8, []const u8, []const u8, db_types.ScanOptions, read_gate.ReadConsistency) anyerror!?RelationalReadView = null,
@@ -540,6 +585,12 @@ pub const TableReadSource = struct {
         if (self.route_fence != null) return error.SqlStatementSnapshotRequired;
         const callback = self.vtable.open_relational_statement orelse return error.SqlStatementSnapshotRequired;
         return BoundaryAbi.call("open_relational_statement", self.boundary_dispatch, callback, .{ self.ptr, alloc, scans, consistency });
+    }
+
+    pub fn openRelationalStatementSnapshot(self: TableReadSource, alloc: std.mem.Allocator, table: []const u8, consistency: read_gate.ReadConsistency, cancellation: ?CancellationToken, deadline_ns: ?u64) !RelationalStatementSnapshot {
+        if (self.route_fence != null) return error.SqlStatementSnapshotRequired;
+        const callback = self.vtable.open_relational_statement_snapshot orelse return error.SqlStatementSnapshotRequired;
+        return BoundaryAbi.call("open_relational_statement_snapshot", self.boundary_dispatch, callback, .{ self.ptr, alloc, table, consistency, cancellation, deadline_ns });
     }
 
     pub fn openRelationalReadGroupLocal(self: TableReadSource, alloc: std.mem.Allocator, group: u64, table: []const u8, from: []const u8, to: []const u8, opts: db_types.ScanOptions, consistency: read_gate.ReadConsistency) !?RelationalReadView {

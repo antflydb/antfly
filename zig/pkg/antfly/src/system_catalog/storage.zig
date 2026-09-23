@@ -19,6 +19,7 @@ const std = @import("std");
 const docstore = @import("../storage/docstore.zig");
 const domain = @import("domain.zig");
 const settings = @import("settings.zig");
+const policies = @import("policies.zig");
 
 pub const Meta = domain.Meta;
 
@@ -38,6 +39,78 @@ fn recordKeyAlloc(alloc: std.mem.Allocator, group_id: u64, kind: domain.Kind, id
 
 fn settingKeyAlloc(alloc: std.mem.Allocator, group_id: u64, id: u64) ![]u8 {
     return std.fmt.allocPrint(alloc, "\x00\x00__metadata__:system_catalog:{d}:setting:{d}", .{ group_id, id });
+}
+
+fn policyKeyAlloc(alloc: std.mem.Allocator, group_id: u64, id: u64) ![]u8 {
+    return std.fmt.allocPrint(alloc, "\x00\x00__metadata__:system_catalog:{d}:policy:{d}", .{ group_id, id });
+}
+
+pub fn loadPolicies(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64) ![]const policies.Record {
+    const prefix = try keyAlloc(alloc, group_id, "policy:");
+    defer alloc.free(prefix);
+    const kvs = try docstore.DocStore.scanPrefixTxn(alloc, txn, prefix);
+    defer {
+        for (kvs) |kv| {
+            alloc.free(kv.key);
+            alloc.free(kv.value);
+        }
+        alloc.free(kvs);
+    }
+    if (kvs.len > 1024) return error.RowPolicyLimitExceeded;
+    const records = try alloc.alloc(policies.Record, kvs.len);
+    for (kvs, records, 0..) |kv, *record, i| {
+        record.* = try std.json.parseFromSliceLeaky(policies.Record, alloc, kv.value, .{ .allocate = .alloc_always });
+        try record.validateShape();
+        const expected_key = try policyKeyAlloc(alloc, group_id, record.id);
+        defer alloc.free(expected_key);
+        if (!std.mem.eql(u8, kv.key, expected_key)) return error.InvalidRowPolicyRecord;
+        for (records[0..i]) |prior| if (prior.id == record.id or (prior.table_id == record.table_id and std.ascii.eqlIgnoreCase(prior.name, record.name))) return error.InvalidRowPolicyRecord;
+    }
+    return records;
+}
+
+/// Only trusted admin admission may propose this internal transition. The
+/// deterministic apply path checks revision and table identity again; it does
+/// not activate policy enforcement merely by storing a definition.
+pub fn applyPolicyCommand(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, command: policies.Command, command_hash: [32]u8) !void {
+    if (command.version != 1) return error.InvalidRowPolicyRecord;
+    const meta = try readMeta(alloc, txn, group_id);
+    if (meta.revision != command.expected_revision) return;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const records = try loadPolicies(a, txn, group_id);
+    var next_id = meta.next_id;
+    switch (command.change) {
+        .put => |record| {
+            try record.validateShape();
+            const table = (try getById(a, txn, group_id, .table, record.table_id)) orelse return error.TableNotFound;
+            defer table.deinit();
+            var existing: ?policies.Record = null;
+            for (records) |prior| {
+                if (prior.id == record.id) existing = prior;
+                if (prior.table_id == record.table_id and std.ascii.eqlIgnoreCase(prior.name, record.name) and prior.id != record.id) return error.InvalidRowPolicyRecord;
+            }
+            if (existing) |prior| {
+                if (prior.table_id != record.table_id or !std.mem.eql(u8, prior.name, record.name) or record.generation != try std.math.add(u64, prior.generation, 1)) return error.RowPolicyCatalogChanged;
+            } else {
+                if (record.id != meta.next_id or record.generation != 1) return error.RowPolicyCatalogChanged;
+                next_id = try std.math.add(u64, next_id, 1);
+            }
+            const key = try policyKeyAlloc(a, group_id, record.id);
+            const encoded = try std.json.Stringify.valueAlloc(a, record, .{});
+            try txn.put(key, encoded);
+        },
+        .drop => |identity| {
+            const prior = for (records) |record| {
+                if (record.id == identity.id) break record;
+            } else return error.RowPolicyCatalogChanged;
+            if (prior.generation != identity.generation or prior.table_id != identity.table_id) return error.RowPolicyCatalogChanged;
+            const key = try policyKeyAlloc(a, group_id, identity.id);
+            try txn.delete(key);
+        },
+    }
+    try applyDelta(alloc, txn, group_id, .{ .upserts = @constCast(&[_]domain.Resource{}), .removes = @constCast(&[_]domain.Resource{}), .next_id = next_id }, meta, command_hash);
 }
 
 pub fn loadSettings(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64) ![]const settings.Record {
@@ -137,7 +210,8 @@ pub fn loadState(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id
         if (!std.mem.eql(u8, expected_key, kv.key)) return error.InvalidCatalogRecord;
     }
     const loaded_settings = try loadSettings(a, txn, group_id);
-    return .{ .arena = arena, .meta = meta, .value = .{ .revision = meta.revision, .next_id = meta.next_id, .resources = resources, .settings = loaded_settings } };
+    const loaded_policies = try loadPolicies(a, txn, group_id);
+    return .{ .arena = arena, .meta = meta, .value = .{ .revision = meta.revision, .next_id = meta.next_id, .resources = resources, .settings = loaded_settings, .policies = loaded_policies } };
 }
 
 pub fn getById(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, kind: domain.Kind, id: u64) !?std.json.Parsed(domain.Resource) {
@@ -429,6 +503,23 @@ pub fn applyDelta(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_i
         try writeResource(alloc, txn, group_id, domain.default_database);
         try writeResource(alloc, txn, group_id, domain.default_namespace);
     }
+    var removed_tables: bool = false;
+    for (delta.removes) |resource| if (resource.kind == .table) {
+        removed_tables = true;
+        break;
+    };
+    if (removed_tables) {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const policy_records = try loadPolicies(a, txn, group_id);
+        for (delta.removes) |resource| if (resource.kind == .table) {
+            for (policy_records) |record| if (record.table_id == resource.id) {
+                const policy_key = try policyKeyAlloc(a, group_id, record.id);
+                try txn.delete(policy_key);
+            };
+        };
+    }
     for (delta.removes) |resource| try removeResource(alloc, txn, group_id, resource);
     for (delta.upserts) |resource| try writeResource(alloc, txn, group_id, resource);
     const meta: Meta = .{ .revision = try std.math.add(u64, previous.revision, 1), .next_id = delta.next_id, .last_command = command_hash };
@@ -456,6 +547,22 @@ pub fn importState(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_
         const encoded = try std.json.Stringify.valueAlloc(alloc, record, .{});
         defer alloc.free(encoded);
         try txn.put(setting_key, encoded);
+    }
+    for (state.policies, 0..) |record, i| {
+        try record.validateShape();
+        if (record.id >= state.next_id) return error.InvalidRowPolicyRecord;
+        var bound = false;
+        for (state.resources) |resource| if (resource.kind == .table and resource.id == record.table_id) {
+            bound = true;
+            break;
+        };
+        if (!bound) return error.InvalidRowPolicyRecord;
+        for (state.policies[0..i]) |prior| if (prior.id == record.id or (prior.table_id == record.table_id and std.ascii.eqlIgnoreCase(prior.name, record.name))) return error.InvalidRowPolicyRecord;
+        const policy_key = try policyKeyAlloc(alloc, group_id, record.id);
+        defer alloc.free(policy_key);
+        const encoded = try std.json.Stringify.valueAlloc(alloc, record, .{});
+        defer alloc.free(encoded);
+        try txn.put(policy_key, encoded);
     }
     const key = try keyAlloc(alloc, group_id, "meta");
     defer alloc.free(key);

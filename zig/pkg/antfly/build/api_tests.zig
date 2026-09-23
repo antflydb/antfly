@@ -1089,6 +1089,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "relational row query response budget",
             "relational row query full-key index proof requires every routed owner",
             "relational row query executes typed projection",
+            "owner-local delayed statement scans",
             "relational row query retained owner holds admission and releases failed opens",
             "table reads translate request deadlines into the routing clock",
             "distributed reranking widens retrieval and stays coordinator owned",

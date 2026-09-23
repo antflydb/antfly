@@ -77,6 +77,92 @@ test "relational integrity TRUNCATE parent pending generations survive restart a
     }
 }
 
+test "relational integrity verified generation tombstone survives restart and bounded GC never resurrects references" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/retired-parent", .{tmp.sub_path});
+    defer alloc.free(path);
+    const namespace: @import("doc_identity.zig").Namespace = .{ .table_id = 41, .shard_id = 31, .range_id = 31 };
+    const options: db_mod.OpenOptions = .{ .identity_namespace = namespace, .start_optional_runtimes = false, .start_index_workers = false };
+    const schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const topology = @import("relational_integrity_topology.zig");
+    const retirement = @import("relational_integrity_generation_retirement.zig");
+    const address = try integrity.Address.init(@splat(7), "parent-tuple");
+    const claim: integrity.Claim = .{ .tuple = "parent-tuple", .parent_table = "parents", .parent_key = "p", .schema_version = 1 };
+    const old: integrity.Reference = .{ .child_table = "children", .child_key = "old", .constraint_name = "fk", .constraint_generation = @splat(3) };
+    const live: integrity.Reference = .{ .child_table = "children", .child_key = "live", .constraint_name = "other_fk", .constraint_generation = @splat(4) };
+    const old_key = try old.key(address);
+    const live_key = try live.key(address);
+    var fence: topology.Fence = .{ .role = .truncate_parent, .transition_id = 11, .attempt = 1, .peer_group_id = 21, .owner_group_id = 31, .namespace = namespace, .catalog_digest = undefined };
+    {
+        var db = try db_mod.DB.open(alloc, path, options);
+        defer db.close();
+        try db.setSchemaJson(alloc, schema);
+        const raw = try db.core.store.get(alloc, catalog.key);
+        defer alloc.free(raw);
+        std.crypto.hash.Blake3.hash(raw, &fence.catalog_digest, .{});
+        const claim_bytes = try claim.encode(alloc, address);
+        defer alloc.free(claim_bytes);
+        const old_bytes = try old.encode(alloc, address);
+        defer alloc.free(old_bytes);
+        const live_bytes = try live.encode(alloc, address);
+        defer alloc.free(live_bytes);
+        try db.core.store.put(&address.claimKey(), claim_bytes);
+        try db.core.store.put(&old_key, old_bytes);
+        try db.core.store.put(&live_key, live_bytes);
+        try db.applyRelationalTopologyControl(.{ .fence = fence, .action = .begin }, null);
+        try db.applyRelationalTopologyControl(.{ .fence = fence, .action = .stage_parent_retirement, .parent_retirement = .{ .plan_digest = @splat(5), .entries = &.{.{ .child_table_id = 51, .child_table_name = "children", .constraint_name = "fk", .generation = old.constraint_generation }} } }, null);
+        // Model only the trusted owner-local effect of a verified metadata
+        // publication; the public control path still rejects unproven release.
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try retirement.stageVerifiedActivation(alloc, &txn, fence, @splat(5), @splat(6));
+        try topology.stageRelease(&txn, fence);
+        try txn.commit();
+    }
+    {
+        var db = try db_mod.DB.open(alloc, path, options);
+        defer db.close();
+        var split = fence;
+        split.role = .split_source;
+        split.transition_id += 1;
+        split.admission_epoch += 1;
+        try std.testing.expectError(error.GenerationRetirementHandoffRequired, db.applyRelationalTopologyControl(.{ .fence = split, .action = .begin }, null));
+        var read = try integrity.CurrentView.init(db.core.store);
+        defer read.deinit();
+        try std.testing.expect(try retirement.isRetired(&read, old));
+        try std.testing.expect(!(try retirement.isRetired(&read, live)));
+        try std.testing.expectError(error.GenerationRetired, integrity.prepare(alloc, &read, &.{.{ .address = address, .operation = .{ .attach = old } }}));
+        try std.testing.expectError(error.ForeignKeyReferenced, integrity.prepare(alloc, &read, &.{.{ .address = address, .operation = .{ .release = .{ .parent_table = "parents", .parent_key = "p" } } }}));
+        // Exactly one reference is examined per page, including live rows;
+        // each committed progress record survives an owner reopen.
+        var pages: usize = 0;
+        while (pages < 3) : (pages += 1) {
+            var page = (try retirement.prepareGcPage(alloc, &read, 1, 1024 * 1024)) orelse break;
+            defer page.deinit();
+            var write = try db.core.store.beginWriteTxn();
+            errdefer write.abort();
+            try retirement.applyGcPage(&write, page);
+            try write.commit();
+            // A duplicate page is rejected after its progress commit.
+            var duplicate = try db.core.store.beginWriteTxn();
+            defer duplicate.abort();
+            try std.testing.expectError(error.GenerationRetirementChanged, retirement.applyGcPage(&duplicate, page));
+            read.deinit();
+            read = try integrity.CurrentView.init(db.core.store);
+            if ((try retirement.GcProgress.decode(try read.get(retirement.gc_progress_key))).complete) break;
+        }
+        try std.testing.expect(pages < 3);
+        try std.testing.expectError(error.NotFound, read.get(&old_key));
+        _ = try integrity.Reference.decode(&live_key, try read.get(&live_key));
+        try std.testing.expect(try retirement.isRetired(&read, old));
+        try std.testing.expectError(error.GenerationRetired, integrity.prepare(alloc, &read, &.{.{ .address = address, .operation = .{ .attach = old } }}));
+    }
+}
+
 fn applyRestoreReplica(db: *db_mod.DB, request: @import("types.zig").BatchRequest, index: u64, ha: bool) !void {
     if (!ha) return db.batchRaftReplicatedApply(request, .{ .term = 1, .index = index });
     const alloc = std.testing.allocator;

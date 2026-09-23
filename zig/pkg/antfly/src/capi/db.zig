@@ -11605,7 +11605,7 @@ test "capi SQL reserved receipt preserves every known mutation outcome without a
         var reserved: ?[]u8 = try std.heap.c_allocator.alloc(u8, 512);
         defer if (reserved) |buffer| std.heap.c_allocator.free(buffer);
         const receipt = embeddedSqlCommitReceipt(&reserved, .{ .command_tag = "DELETE", .rows_affected = std.math.maxInt(u64), .mutation_outcome = outcome });
-        defer antfly_db_buffer_free(receipt.ptr, receipt.len);
+        defer freeRawBuffer(receipt.ptr, receipt.len);
         try std.testing.expect(reserved == null);
         const decoded = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, receipt.ptr.?[0..receipt.len], .{ .parse_numbers = false });
         defer decoded.deinit();
@@ -11619,7 +11619,7 @@ test "capi SQL unknown commit receipt retains native transaction identity withou
     var reserved: ?[]u8 = try std.heap.c_allocator.alloc(u8, 512);
     defer if (reserved) |buffer| std.heap.c_allocator.free(buffer);
     const receipt = embeddedSqlUnknownReceipt(&reserved, @splat(0xab));
-    defer antfly_db_buffer_free(receipt.ptr, receipt.len);
+    defer freeRawBuffer(receipt.ptr, receipt.len);
     try std.testing.expect(reserved == null);
     const decoded = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, receipt.ptr.?[0..receipt.len], .{});
     defer decoded.deinit();
@@ -14524,10 +14524,10 @@ test "capi SQL document mutations preserve undeclared fields and typed null sema
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_set_schema_json(handle, .fromSlice(schema)));
     var inserted: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch_json(handle, .fromSlice("{\"inserts\":{\"a\":{\"n\":9007199254740993,\"extra\":true}}}"), &inserted));
-    defer antfly_db_buffer_free(inserted.ptr, inserted.len);
+    defer freeRawBuffer(inserted.ptr, inserted.len);
     var response: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(handle, .fromSlice("items"), .fromSlice("{\"statement\":\"SELECT n FROM items WHERE _id='a'\"}"), &response));
-    defer antfly_db_buffer_free(response.ptr, response.len);
+    defer freeRawBuffer(response.ptr, response.len);
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.ptr.?[0..response.len], .{});
     defer parsed.deinit();
     const rows = parsed.value.object.get("rows").?.array.items;
@@ -14543,13 +14543,13 @@ test "capi SQL document mutations preserve undeclared fields and typed null sema
         defer alloc.free(body);
         var updated: capi.Buffer = .{};
         const status = antfly_db_sql_json(handle, .fromSlice("items"), .fromSlice(body), &updated);
-        defer antfly_db_buffer_free(updated.ptr, updated.len);
+        defer freeRawBuffer(updated.ptr, updated.len);
         if (status != .ok) std.debug.print("document mutation error: {s}\n", .{updated.ptr.?[0..updated.len]});
         try std.testing.expectEqual(capi.ErrorCode.ok, status);
     }
     var stored: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(handle, .fromSlice("a"), &stored));
-    defer antfly_db_buffer_free(stored.ptr, stored.len);
+    defer freeRawBuffer(stored.ptr, stored.len);
     const document = try std.json.parseFromSlice(std.json.Value, alloc, stored.ptr.?[0..stored.len], .{});
     defer document.deinit();
     try std.testing.expectEqual(@as(i64, 9007199254740994), document.value.object.get("n").?.integer);
@@ -14560,14 +14560,14 @@ test "capi SQL document mutations preserve undeclared fields and typed null sema
     for ([_][]const u8{ "b", "c" }) |key| {
         var row: capi.Buffer = .{};
         try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(handle, .fromSlice(key), &row));
-        defer antfly_db_buffer_free(row.ptr, row.len);
+        defer freeRawBuffer(row.ptr, row.len);
         const value = try std.json.parseFromSlice(std.json.Value, alloc, row.ptr.?[0..row.len], .{});
         defer value.deinit();
         try std.testing.expect(!value.value.object.contains("j"));
     }
     var deleted: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(handle, .fromSlice("items"), .fromSlice("{\"statement\":\"DELETE FROM items WHERE _id='a' RETURNING n\"}"), &deleted));
-    defer antfly_db_buffer_free(deleted.ptr, deleted.len);
+    defer freeRawBuffer(deleted.ptr, deleted.len);
 }
 
 test "capi SQL document validation rejects an entire mutation before publication" {
@@ -14584,11 +14584,11 @@ test "capi SQL document validation rejects an entire mutation before publication
     )));
     var response: capi.Buffer = .{};
     const status = antfly_db_sql_json(handle, .fromSlice("items"), .fromSlice("{\"statement\":\"INSERT INTO items (_id,n) VALUES ('valid',1),('invalid',-1) RETURNING n\"}"), &response);
-    defer antfly_db_buffer_free(response.ptr, response.len);
+    defer freeRawBuffer(response.ptr, response.len);
     try std.testing.expect(status != .ok);
     var count: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(handle, .fromSlice("items"), .fromSlice("{\"statement\":\"SELECT COUNT(*) FROM items\"}"), &count));
-    defer antfly_db_buffer_free(count.ptr, count.len);
+    defer freeRawBuffer(count.ptr, count.len);
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, count.ptr.?[0..count.len], .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("0", parsed.value.object.get("rows").?.array.items[0].array.items[0].string);
@@ -14776,7 +14776,7 @@ test "capi SQL RETURNING uses native defaults generated values and versioned pre
         defer alloc.free(request);
         var response: capi.Buffer = .{};
         const status = antfly_db_sql_json(handle, .fromSlice("items"), .fromSlice(request), &response);
-        defer antfly_db_buffer_free(response.ptr, response.len);
+        defer freeRawBuffer(response.ptr, response.len);
         if (status != .ok) std.debug.print("SQL RETURNING native failure: {s}\n", .{response.ptr.?[0..response.len]});
         try std.testing.expectEqual(capi.ErrorCode.ok, status);
         const parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.ptr.?[0..response.len], .{});
@@ -14792,7 +14792,7 @@ test "capi SQL RETURNING uses native defaults generated values and versioned pre
     }
     var generated: capi.Buffer = .{};
     const status = antfly_db_sql_json(handle, .fromSlice("items"), .fromSlice("{\"statement\":\"INSERT INTO items (a) VALUES (3),(3) RETURNING _id,total\"}"), &generated);
-    defer antfly_db_buffer_free(generated.ptr, generated.len);
+    defer freeRawBuffer(generated.ptr, generated.len);
     try std.testing.expectEqual(capi.ErrorCode.ok, status);
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, generated.ptr.?[0..generated.len], .{});
     defer parsed.deinit();
@@ -14831,13 +14831,13 @@ test "capi SQL uses native typed snapshots and atomic mutations" {
     for (requests, 0..) |request, index| {
         var out: capi.Buffer = .{};
         try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(handle_ptr, .fromSlice("items"), .fromSlice(request), &out));
-        defer antfly_db_buffer_free(out.ptr, out.len);
+        defer freeRawBuffer(out.ptr, out.len);
         if (index == 1) try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "9007199254740993") != null);
         if (index == 3) try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "9007199254740994") != null);
     }
     var joined: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(handle_ptr, .fromSlice("items"), .fromSlice("{\"statement\":\"SELECT l.id, r.id FROM items AS l JOIN items AS r ON l.id=r.id\"}"), &joined));
-    defer antfly_db_buffer_free(joined.ptr, joined.len);
+    defer freeRawBuffer(joined.ptr, joined.len);
     const joined_json = try std.json.parseFromSlice(std.json.Value, alloc, joined.ptr.?[0..joined.len], .{});
     defer joined_json.deinit();
     const joined_rows = joined_json.value.object.get("rows").?.array.items;
@@ -14846,10 +14846,10 @@ test "capi SQL uses native typed snapshots and atomic mutations" {
     try std.testing.expectEqualStrings("9007199254740994", joined_rows[0].array.items[1].string);
     var inserted_json_null: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(handle_ptr, .fromSlice("items"), .fromSlice("{\"statement\":\"INSERT INTO items (_id,id,j) VALUES ('b',2,CAST('null' AS json))\"}"), &inserted_json_null));
-    defer antfly_db_buffer_free(inserted_json_null.ptr, inserted_json_null.len);
+    defer freeRawBuffer(inserted_json_null.ptr, inserted_json_null.len);
     var null_projection: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(handle_ptr, .fromSlice("items"), .fromSlice("{\"statement\":\"SELECT j FROM items ORDER BY _id\"}"), &null_projection));
-    defer antfly_db_buffer_free(null_projection.ptr, null_projection.len);
+    defer freeRawBuffer(null_projection.ptr, null_projection.len);
     const projected = try std.json.parseFromSlice(std.json.Value, alloc, null_projection.ptr.?[0..null_projection.len], .{});
     defer projected.deinit();
     const projected_rows = projected.value.object.get("rows").?.array.items;
@@ -14861,7 +14861,7 @@ test "capi SQL uses native typed snapshots and atomic mutations" {
     try std.testing.expect(!projected_nulls[1].array.items[0].bool);
     var rejected: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.unsupported, antfly_db_sql_json(handle_ptr, .fromSlice("items"), .fromSlice("{\"statement\":\"BEGIN\"}"), &rejected));
-    defer antfly_db_buffer_free(rejected.ptr, rejected.len);
+    defer freeRawBuffer(rejected.ptr, rejected.len);
     try std.testing.expect(std.mem.indexOf(u8, rejected.ptr.?[0..rejected.len], "0A000") != null);
 }
 
