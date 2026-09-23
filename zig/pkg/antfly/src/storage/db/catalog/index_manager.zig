@@ -2135,17 +2135,21 @@ pub const IndexManager = struct {
         ordinal_vector_ids: std.AutoHashMapUnmanaged(doc_identity.DocOrdinal, u64) = .empty,
         vector_ordinals: std.AutoHashMapUnmanaged(u64, doc_identity.DocOrdinal) = .empty,
 
-        pub fn servingCertificateReady(self: *DenseIndex, checkpoint: apply_state.ProjectionCheckpoint) bool {
+        fn matchesVerifiedServingCertificate(self: *const DenseIndex, checkpoint: apply_state.ProjectionCheckpoint, certified_count: u64) bool {
+            const verified = self.verified_serving_certificate orelse return false;
+            return verified.capture_incarnation == self.capture_incarnation and
+                verified.applied_sequence == checkpoint.applied_sequence and
+                verified.generation == checkpoint.generation and
+                verified.config_hash == checkpoint.config_hash and
+                verified.published_count == certified_count;
+        }
+
+        /// Only an open or publication boundary may establish this proof.
+        pub fn validateServingCertificate(self: *DenseIndex, checkpoint: apply_state.ProjectionCheckpoint) bool {
             const certified_count = checkpoint.published_count orelse return false;
             while (!self.serving_certificate_mutex.tryLock()) std.atomic.spinLoopHint();
             defer self.serving_certificate_mutex.unlock();
-            if (self.verified_serving_certificate) |verified| {
-                if (verified.capture_incarnation == self.capture_incarnation and
-                    verified.applied_sequence == checkpoint.applied_sequence and
-                    verified.generation == checkpoint.generation and
-                    verified.config_hash == checkpoint.config_hash and
-                    verified.published_count == certified_count) return true;
-            }
+            if (self.matchesVerifiedServingCertificate(checkpoint, certified_count)) return true;
             if (self.index.stats().active_count != certified_count) return false;
             self.verified_serving_certificate = .{
                 .capture_incarnation = self.capture_incarnation,
@@ -2155,6 +2159,15 @@ pub const IndexManager = struct {
                 .published_count = certified_count,
             };
             return true;
+        }
+
+        /// Status reads must never turn a previously failed certificate into
+        /// a valid one just because later live writes reach the same count.
+        pub fn hasValidatedServingCertificate(self: *DenseIndex, checkpoint: apply_state.ProjectionCheckpoint) bool {
+            const certified_count = checkpoint.published_count orelse return false;
+            while (!self.serving_certificate_mutex.tryLock()) std.atomic.spinLoopHint();
+            defer self.serving_certificate_mutex.unlock();
+            return self.matchesVerifiedServingCertificate(checkpoint, certified_count);
         }
     };
 
@@ -8841,7 +8854,7 @@ pub const IndexManager = struct {
         });
         // Verify at publication time. A status request may arrive only after
         // the next live mutation has already advanced the resident count.
-        _ = entry.servingCertificateReady(checkpoint);
+        _ = entry.validateServingCertificate(checkpoint);
     }
 
     pub fn denseProjectionCheckpointMetadata(

@@ -35161,7 +35161,7 @@ pub const DB = struct {
     fn validateOpenedDenseServingCertificates(self: *DB) void {
         for (self.core.index_manager.dense_indexes.items) |*entry| {
             const checkpoint = self.core.loadProjectionCheckpoint(self.alloc, entry.config.name) catch continue;
-            _ = entry.servingCertificateReady(checkpoint);
+            _ = entry.validateServingCertificate(checkpoint);
         }
     }
 
@@ -35184,7 +35184,7 @@ pub const DB = struct {
         if (item.kind == .dense_vector) {
             if (item.projection_checkpoint_published_count) |certified| {
                 const entry = self.core.denseIndex(item.name) orelse return false;
-                if (!entry.servingCertificateReady(.{
+                if (!entry.hasValidatedServingCertificate(.{
                     .applied_sequence = item.projection_checkpoint_applied_sequence,
                     .generation = item.projection_checkpoint_generation,
                     .config_hash = item.projection_checkpoint_config_hash,
@@ -112995,6 +112995,20 @@ test "db progressive managed admission serves a checkpointed partial generation"
     for (mismatched_stats.indexes) |index_stats| {
         if (!std.mem.eql(u8, index_stats.name, cfg.name)) continue;
         try std.testing.expect(!index_stats.serving_snapshot_ready);
+    }
+    // A later live write can happen to reach the invalid certificate's
+    // cardinality. Status may observe it, but only a publication boundary may
+    // establish a new durable proof for this checkpoint identity.
+    {
+        const entry = db.core.denseIndex(cfg.name) orelse return error.IndexNotFound;
+        entry.index.published_active_count.store(target_before + 1, .release);
+        defer entry.index.published_active_count.store(target_before, .release);
+        const coincidental_stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, coincidental_stats);
+        for (coincidental_stats.indexes) |index_stats| {
+            if (!std.mem.eql(u8, index_stats.name, cfg.name)) continue;
+            try std.testing.expect(!index_stats.serving_snapshot_ready);
+        }
     }
     var legacy_checkpoint = certified_checkpoint;
     legacy_checkpoint.published_count = null;
