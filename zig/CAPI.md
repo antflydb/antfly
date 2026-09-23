@@ -8,6 +8,19 @@ The public header, `include/antfly.h`, is Apache-2.0 so bindings can vendor
 or transcribe it; the Lite bindings built on it are Apache-2.0 too. The
 `libantfly` library itself is ELv2 like the rest of the core.
 
+## Naming
+
+- `antfly_*`: library-level calls that take no database handle (ABI version,
+  threading mode, errors, options, buffer and result frees, artifact ID
+  decoding, restoring a backup to a new path).
+- `antfly_db_*`: calls on an `antfly_db *` handle, for any storage kind.
+- `antfly_lite_*`: operations on the `.aflite` single-file format itself
+  (integrity checks, compaction, vacuum, stable snapshots), plus shortcuts
+  that open one with default options.
+
+Each operation has one name. ABI version 2 removed the earlier `antfly_lite_*`
+duplicates of storage-neutral calls and the separate Lite options struct.
+
 ## ABI Contract
 
 - `antfly_abi_version()` returns the ABI version supported by the library.
@@ -17,7 +30,7 @@ or transcribe it; the Lite bindings built on it are Apache-2.0 too. The
 - Readers of options structs must only read fields fully covered by `abi_size`.
 - Reserved fields must be zero when present.
 - New fields may be appended to options structs without breaking older callers.
-- Handles are opaque `void *` values and must be closed with
+- Handles are opaque `antfly_db *` values and must be closed with
   `antfly_db_close`.
 - Returned buffers are owned by the caller and must be released with
   `antfly_buffer_free`.
@@ -38,16 +51,34 @@ The primary embedded open surface is storage-neutral:
 - `profile`: native or hosted/manual maintenance.
 - `flags`: `NO_SYNC`, `TTL_CLEANUP`, remote/local inference capability state,
   and generated-enrichment replay.
-- storage sizing and TTL cleanup tuning fields.
+- storage sizing, TTL cleanup tuning, embedded-inference resource budgets,
+  and `busy_timeout_ms`.
 
-Directory storage is the default for the generic open APIs. Lite-specific
-helpers such as `antfly_lite_open_with_options` remain source-compatible
-wrappers that set `storage_kind` to Lite and use the same handle model.
+Directory storage is the default for the generic open APIs. The
+`antfly_lite_open*` / `antfly_lite_create*` shortcuts open a `.aflite` file
+with default options; pass `antfly_open_options` with
+`ANTFLY_STORAGE_KIND_LITE` for anything else.
 `antfly_db_create_with_options` currently provides exclusive create semantics
 for `ANTFLY_STORAGE_KIND_LITE` only. Directory storage should use
 `antfly_db_open_with_options`, which preserves the existing directory
 open-or-create behavior until the directory backend exposes an exclusive create
 primitive.
+
+## Backup and Restore
+
+Portable `.afb` backups are storage-neutral:
+
+- `antfly_db_backup` writes a backup of any handle.
+- `antfly_db_import_backup` imports one into an empty database of either kind.
+- `antfly_restore_backup_json` and `antfly_restore_backup_file_json` create a
+  new database at a path, of the storage kind in the passed
+  `antfly_open_options` (NULL means directory storage). The database is built
+  beside the destination and published by rename, so a failed restore never
+  leaves a partial destination; `replace` swaps out an existing one.
+
+A backup of either kind restores or imports into either kind.
+`antfly_db_status_json` and `antfly_db_capabilities_json` likewise report on
+any handle; the status `storage.format` is `"aflite"` or `"directory"`.
 
 ## Read-Only Modes
 
@@ -81,8 +112,8 @@ export has one of four access classes:
 |---|---|---|
 | read | lookup, get_raw, scan, search (JSON, dense, text, wire, hits), graph queries, aggregates, stats, schema/index/enrichment listing, status, capabilities, check, pending-work stats, enrichment extract/compute | everything except exclusive calls |
 | write | batch, transactions and intent resolution, compact, vacuum, snapshot | reads and maintenance; one write at a time per handle |
-| maintain | run-until-idle, generated-enrichment replay, backup/export, stable snapshot copy | reads and writes; one maintenance call at a time per handle |
-| exclusive | set schema, add/delete index or enrichment, import/restore into a handle, range and split changes, shadow index managers, readable lease hook | nothing; waits for in-flight calls |
+| maintain | run-until-idle, generated-enrichment replay, backup, stable snapshot copy | reads and writes; one maintenance call at a time per handle |
+| exclusive | set schema, add/delete index or enrichment, import a backup into a handle, range and split changes, shadow index managers, readable lease hook | nothing; waits for in-flight calls |
 
 Concurrent writes on one handle queue behind each other instead of failing
 with `ANTFLY_BUSY`. Reads run against pinned storage snapshots while a write
@@ -122,7 +153,7 @@ Across handles and processes the Lite model matches SQLite in WAL mode: one
 writer and any number of readers per file. The writer lock is taken when a
 writer handle opens and held until it closes. A second writer open fails
 with `ANTFLY_BUSY` immediately, or, when `busy_timeout_ms` is set in
-`antfly_open_options` or `antfly_lite_open_options`, retries with capped
+`antfly_open_options`, retries with capped
 exponential backoff until the timeout elapses, like `sqlite3_busy_timeout`.
 Read-only and status-only opens never contend for the writer lock.
 
@@ -150,21 +181,21 @@ open new ones in the child. The library may run background enrichment and
 maintenance work on its own threads for non-hosted handles; hosted handles
 leave that work to explicit run-until-idle calls.
 
-## Lite Compatibility Helpers
+## Lite File Operations
 
-The `antfly_lite_*` functions are convenience APIs in `libantfly`, not a
-separate Lite ABI. They are appropriate for operations that are inherently Lite
-specific:
+The `antfly_lite_*` functions are not a separate Lite ABI. Besides the open
+shortcuts, they cover only operations on the `.aflite` format itself:
 
-- Lite status and capability JSON.
-- `.aflite` integrity checks, including path-level checks for files that may
-  not open successfully.
-- Lite backup/export and restore/import helpers.
-- Stable snapshot, compact, vacuum, and run-until-idle maintenance.
-- Generated-enrichment replay for hosted/manual Lite workflows.
+- Integrity checks (`antfly_lite_check_json`), including path-level checks for
+  files that may not open (`antfly_lite_check_file_json`).
+- Physical stable snapshots of the file (`antfly_lite_copy_stable_snapshot_json`,
+  `antfly_lite_copy_stable_snapshot_file_json`).
+- Compaction and vacuum of the file (`antfly_lite_compact_json`,
+  `antfly_lite_vacuum_json`).
 
-Bindings should prefer the storage-neutral open surface for new generic open
-paths, then expose Lite helpers for these Lite-only workflows.
+Everything else, including status, backup, import, restore, drains, and
+generated-enrichment replay, is storage-neutral and named `antfly_db_*` or
+`antfly_*`.
 
 ## Testing Expectations
 
