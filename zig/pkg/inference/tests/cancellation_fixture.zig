@@ -15,8 +15,12 @@ const Control = inference.InferenceExecutionControl;
 
 const Fixture = struct {
     node: *inference.server.Node,
+    model_name: []const u8,
     hard: bool,
+    bounded_rerank: bool,
+    bounded_embed: bool,
     block_next: std.atomic.Value(bool) = .init(false),
+    release_block: std.atomic.Value(bool) = .init(false),
     active: std.atomic.Value(usize) = .init(0),
     cancelled: std.atomic.Value(usize) = .init(0),
     entered: std.atomic.Value(usize) = .init(0),
@@ -35,8 +39,36 @@ const Fixture = struct {
     }
 
     fn arm(self: *@This(), ctx: *httpx.Context) !httpx.Response {
+        self.release_block.store(false, .release);
         self.block_next.store(true, .release);
         return ctx.json(.{ .armed = true });
+    }
+
+    fn releaseBlock(self: *@This(), ctx: *httpx.Context) !httpx.Response {
+        self.release_block.store(true, .release);
+        return ctx.json(.{ .released = true });
+    }
+
+    fn rerankDirect(self: *@This(), ctx: *httpx.Context) !httpx.Response {
+        const Check = struct {
+            fn check(raw: ?*anyopaque) !void {
+                const request: *httpx.Context = @ptrCast(@alignCast(raw.?));
+                if (request.isCancellationRequested()) return error.Cancelled;
+            }
+        };
+        const control = Control{ .io = ctx.io, .ptr = ctx, .check_fn = Check.check };
+        const documents = [_][]const u8{"ab"} ** 30;
+        const scores = try self.node.rerankTextsDirectWithContext(
+            ctx.allocator,
+            ctx.io,
+            ctx.application_deadline_ns,
+            control,
+            self.model_name,
+            "ab",
+            &documents,
+        );
+        defer ctx.allocator.free(scores);
+        return ctx.json(.{ .count = scores.len });
     }
 
     fn run(_: *anyopaque, _: []const Tensor, _: std.mem.Allocator) ![]Tensor {
@@ -54,23 +86,34 @@ const Fixture = struct {
                 // restart request. Only the production watchdog can stop it.
                 while (true) std.atomic.spinLoopHint();
             }
-            while (true) {
-                control.check() catch |err| {
-                    _ = self.cancelled.fetchAdd(1, .acq_rel);
-                    return err;
-                };
-                try control.io.?.sleep(.fromMilliseconds(1), .awake);
+            if (self.bounded_rerank or self.bounded_embed) {
+                // Mimic an uninterruptible batch that eventually returns.
+                while (!self.release_block.load(.acquire)) std.atomic.spinLoopHint();
+            } else {
+                while (true) {
+                    control.check() catch |err| {
+                        _ = self.cancelled.fetchAdd(1, .acq_rel);
+                        return err;
+                    };
+                    try control.io.?.sleep(.fromMilliseconds(1), .awake);
+                }
             }
         }
-        try control.check();
+        control.check() catch |err| {
+            _ = self.cancelled.fetchAdd(1, .acq_rel);
+            return err;
+        };
         const batch = inputs[0].shape[0];
         const sequence = inputs[0].shape[1];
-        const values = try alloc.alloc(f32, @intCast(batch * sequence * 4));
+        const values = try alloc.alloc(f32, @intCast(if (self.bounded_rerank) batch else batch * sequence * 4));
         defer alloc.free(values);
         @memset(values, 1);
         const outputs = try alloc.alloc(Tensor, 1);
         errdefer alloc.free(outputs);
-        outputs[0] = try Tensor.initFloat32(alloc, "last_hidden_state", &.{ batch, sequence, 4 }, values);
+        outputs[0] = if (self.bounded_rerank)
+            try Tensor.initFloat32(alloc, "logits", &.{ batch, 1 }, values)
+        else
+            try Tensor.initFloat32(alloc, "last_hidden_state", &.{ batch, sequence, 4 }, values);
         return outputs;
     }
 
@@ -80,15 +123,19 @@ const Fixture = struct {
             .{ .name = "attention_mask", .dtype = .i64, .shape = &.{ -1, -1 } },
         };
     }
-    fn outputInfo(_: *anyopaque) []const TensorInfo {
-        return &.{.{ .name = "last_hidden_state", .dtype = .f32, .shape = &.{ -1, -1, 4 } }};
+    fn outputInfo(raw: *anyopaque) []const TensorInfo {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return if (self.bounded_rerank)
+            &.{.{ .name = "logits", .dtype = .f32, .shape = &.{ -1, 1 } }}
+        else
+            &.{.{ .name = "last_hidden_state", .dtype = .f32, .shape = &.{ -1, -1, 4 } }};
     }
     fn backend(_: *anyopaque) inference.backends.BackendType {
         return .native;
     }
     fn interruption(raw: *anyopaque) inference.execution_control.Interruption {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        return if (self.hard) .process_required else .cooperative;
+        return if (self.hard or self.bounded_rerank or self.bounded_embed) .process_required else .cooperative;
     }
     fn close(_: *anyopaque) void {}
     const vtable = Session.VTable{
@@ -118,7 +165,14 @@ pub fn main(init: std.process.Init) !void {
     defer node.deinit();
     try node.attachIo(init.io);
     try node.model_manager.ensureResourceOwnerReady();
-    var fixture = Fixture{ .node = &node, .hard = std.mem.eql(u8, init.environ_map.get("FIXTURE_MODE") orelse "", "hard") };
+    const mode = init.environ_map.get("FIXTURE_MODE") orelse "";
+    var fixture = Fixture{
+        .node = &node,
+        .model_name = std.fs.path.basename(model_dir),
+        .hard = std.mem.eql(u8, mode, "hard"),
+        .bounded_rerank = std.mem.eql(u8, mode, "bounded_rerank"),
+        .bounded_embed = std.mem.eql(u8, mode, "bounded_embed"),
+    };
 
     const ModelPtr = @typeInfo(@TypeOf(node.model_manager.loaded.get(model_dir))).optional.child;
     const model = try alloc.create(std.meta.Child(ModelPtr));
@@ -153,5 +207,7 @@ pub fn main(init: std.process.Init) !void {
     try node.registerHttpRoutes(&server);
     try server.get("/_fixture/state", httpx.Handler.bind(&fixture, Fixture.state));
     try server.post("/_fixture/arm", httpx.Handler.bind(&fixture, Fixture.arm));
+    try server.post("/_fixture/release", httpx.Handler.bind(&fixture, Fixture.releaseBlock));
+    try server.post("/_fixture/rerank_direct", httpx.Handler.bind(&fixture, Fixture.rerankDirect));
     try server.listen();
 }

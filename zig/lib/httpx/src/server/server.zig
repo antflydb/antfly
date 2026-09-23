@@ -1830,16 +1830,27 @@ pub const Server = struct {
             try sock.setSendTimeout(self.config.response_write_timeout_ms);
         }
 
-        // Peek at the first bytes to detect HTTP/2 "prior knowledge" (RFC 7540 §3.4).
+        // Read enough bytes to distinguish HTTP/2 prior knowledge from HTTP/1.
+        // A single TCP recv may return only part of the 24-byte H2 preface.
         // The h2 preface is "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" (24 bytes).
         var peek_buf: [8192]u8 = undefined;
         const first_header_deadline_ms = deadlineAfter(self.io, self.config.header_read_timeout_ms);
         try applyReadDeadline(&sock, self.io, first_header_deadline_ms);
-        const first_n = try sock.recv(&peek_buf);
+        var first_n = try sock.recv(&peek_buf);
         if (first_n == 0) return;
+        while (first_n < http.HTTP2_PREFACE.len and
+            mem.eql(u8, peek_buf[0..first_n], http.HTTP2_PREFACE[0..first_n]))
+        {
+            try applyReadDeadline(&sock, self.io, first_header_deadline_ms);
+            const received = try sock.recv(peek_buf[first_n..]);
+            if (received == 0) return;
+            first_n += received;
+        }
 
-        if (first_n >= 24 and mem.eql(u8, peek_buf[0..24], http.HTTP2_PREFACE)) {
-            return self.handleH2Connection(&connection.control, &sock, peek_buf[24..first_n]);
+        if (first_n >= http.HTTP2_PREFACE.len and
+            mem.eql(u8, peek_buf[0..http.HTTP2_PREFACE.len], http.HTTP2_PREFACE))
+        {
+            return self.handleH2Connection(&connection.control, &sock, peek_buf[http.HTTP2_PREFACE.len..first_n]);
         }
 
         // HTTP/1.1 path — feed the already-read bytes to the parser.
@@ -3955,6 +3966,51 @@ test "H1 oversized content length returns 413 before handler admission" {
         try std.testing.expect(mem.indexOf(u8, bytes, "HTTP/1.1 413 ") != null);
         try std.testing.expectEqual(@as(usize, 1), State.handled.load(.acquire));
     }
+}
+
+test "HTTP/2 prior-knowledge preface can arrive in separate TCP reads" {
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    var server = Server.initWithConfig(allocator, io_impl.io(), .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .header_read_timeout_ms = 1_000,
+    });
+    defer server.deinit();
+    try server.bind();
+
+    var listener = try std.testing.io.concurrent(struct {
+        fn run(s: *Server) void {
+            s.listen() catch {};
+        }
+    }.run, .{&server});
+    defer {
+        server.stop();
+        listener.await(std.testing.io);
+    }
+    while (!server.listen_started.load(.acquire))
+        try io_impl.io().sleep(.fromMilliseconds(1), .awake);
+
+    const client_io = std.Io.Threaded.global_single_threaded.io();
+    var client = try Socket.connect(server.boundAddress().?, client_io);
+    defer client.close();
+    try client.setRecvTimeout(5_000);
+    try client.sendAll(http.HTTP2_PREFACE[0..11]);
+    try io_impl.io().sleep(.fromMilliseconds(100), .awake);
+    try client.sendAll(http.HTTP2_PREFACE[11..]);
+    var h2 = H2Connection.initClient(allocator, client_io);
+    defer h2.deinit();
+    try h2.sendSettings(&client);
+
+    var frame_header: [9]u8 = undefined;
+    var received: usize = 0;
+    while (received < frame_header.len) {
+        const count = try client.recv(frame_header[received..]);
+        if (count == 0) return error.UnexpectedEof;
+        received += count;
+    }
+    try std.testing.expectEqual(@intFromEnum(http.Http2FrameType.settings), frame_header[3]);
 }
 
 test "HTTP streaming headers and automatic preflight preserve middleware policy" {

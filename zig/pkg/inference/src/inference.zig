@@ -100,6 +100,7 @@ pub const native_compute = struct {
 test {
     _ = backends;
     _ = execution_control;
+    _ = @import("hard_cancellation_watchdog.zig");
     _ = sentencepiece;
     _ = hf_tokenizer;
     _ = tokenizer;
