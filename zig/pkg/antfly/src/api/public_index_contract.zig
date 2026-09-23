@@ -61,6 +61,7 @@ pub const CreatedObjectShape = enum {
     chunker_audio,
     index_execution,
     execution_policy,
+    enrichment_neighbor_context,
     relational_keys,
     relational_key,
     relational_predicates,
@@ -243,6 +244,7 @@ fn createdObjectHasRequiredFields(shape: CreatedObjectShape, object: std.json.Ob
         .relational_predicate => &.{ "column", "op" },
         .relational_keys, .relational_predicates => &.{},
         .graph_metrics, .graph_metric, .graph_metric_filter => &.{},
+        .enrichment_neighbor_context => &.{"graph_index"},
         .unrestricted, .enrichments, .artifact_sources, .full_text_sources, .graph_sources, .edge_types, .graph_resolvers, .graph_nodes, .graph_edge, .graph_context, .graph_algebraic_planning, .chunker_text, .chunker_audio, .index_execution, .execution_policy => &.{},
     };
     for (required_fields) |field| {
@@ -258,7 +260,12 @@ pub fn createdObjectShapeForChild(parent: CreatedObjectShape, field: []const u8)
         .relational_expression => if (std.mem.eql(u8, field, "args")) .relational_expression_args else .unrestricted,
         .graph_metrics => .graph_metric,
         .graph_metric => if (std.mem.eql(u8, field, "edge_filter")) .graph_metric_filter else .unrestricted,
-        .enrichment => if (std.mem.eql(u8, field, "execution")) .execution_policy else .unrestricted,
+        .enrichment => if (std.mem.eql(u8, field, "execution"))
+            .execution_policy
+        else if (std.mem.eql(u8, field, "neighbor_context"))
+            .enrichment_neighbor_context
+        else
+            .unrestricted,
         .chunker => if (std.mem.eql(u8, field, "text"))
             .chunker_text
         else if (std.mem.eql(u8, field, "audio"))
@@ -318,6 +325,7 @@ pub fn isAllowedCreatedObjectField(shape: CreatedObjectShape, field: []const u8)
         .chunker_audio => isAllowedChunkerAudioField(field),
         .index_execution => isAllowedIndexExecutionField(field),
         .execution_policy => isAllowedExecutionPolicyField(field),
+        .enrichment_neighbor_context => isAllowedEnrichmentNeighborContextField(field),
     };
 }
 
@@ -434,7 +442,20 @@ pub fn createdFieldValueMatches(shape: CreatedObjectShape, field: []const u8, va
         .chunker_audio => isInteger(value),
         .index_execution => value == .object,
         .execution_policy => isInteger(value),
+        .enrichment_neighbor_context => enrichmentNeighborContextFieldValueMatches(field, value),
     };
+}
+
+fn enrichmentNeighborContextFieldValueMatches(field: []const u8, value: std.json.Value) bool {
+    if (std.mem.eql(u8, field, "graph_index")) return isNonEmptyString(value);
+    if (std.mem.eql(u8, field, "edge_types")) return isNonEmptyStringArray(value);
+    if (std.mem.eql(u8, field, "direction"))
+        return value == .string and
+            (std.mem.eql(u8, value.string, "out") or
+                std.mem.eql(u8, value.string, "in") or
+                std.mem.eql(u8, value.string, "both"));
+    if (std.mem.eql(u8, field, "limit")) return value == .integer and value.integer >= 1 and value.integer <= 64;
+    return false;
 }
 
 fn graphMetricFieldValueMatches(field: []const u8, value: std.json.Value) bool {
@@ -480,7 +501,9 @@ fn enrichmentFieldValueMatches(field: []const u8, value: std.json.Value) bool {
         std.mem.eql(u8, field, "chunk_size") or
         std.mem.eql(u8, field, "chunk_overlap")) return isInteger(value);
     if (std.mem.eql(u8, field, "full_text_index")) return isBool(value);
-    if (std.mem.eql(u8, field, "execution") or std.mem.eql(u8, field, "transcriber")) return value == .object;
+    if (std.mem.eql(u8, field, "execution") or
+        std.mem.eql(u8, field, "transcriber") or
+        std.mem.eql(u8, field, "neighbor_context")) return value == .object;
     if (std.mem.eql(u8, field, "vector_space")) return isNonEmptyString(value);
     return isString(value);
 }
@@ -493,13 +516,19 @@ fn edgeTypeFieldValueMatches(field: []const u8, value: std.json.Value) bool {
 }
 
 fn graphResolverFieldValueMatches(field: []const u8, value: std.json.Value) bool {
+    if (std.mem.eql(u8, field, "labels")) {
+        if (value != .array) return false;
+        for (value.array.items) |item| if (!isNonEmptyString(item)) return false;
+        return true;
+    }
     if (std.mem.eql(u8, field, "type_must_match")) return isBool(value);
     if (std.mem.eql(u8, field, "candidate_limit") or
         std.mem.eql(u8, field, "name_embedding_dims") or
         std.mem.eql(u8, field, "config_generation")) return isInteger(value);
     if (std.mem.eql(u8, field, "fusion_trust") or
         std.mem.eql(u8, field, "fusion_prior") or
-        std.mem.eql(u8, field, "fusion_prior_weight")) return isNumber(value);
+        std.mem.eql(u8, field, "fusion_prior_weight") or
+        std.mem.eql(u8, field, "min_confidence")) return isNumber(value);
     return isString(value);
 }
 
@@ -669,6 +698,7 @@ pub fn isAllowedGraphResolverField(field: []const u8) bool {
         std.mem.eql(u8, field, "source_artifact_kind") or
         std.mem.eql(u8, field, "resolution_artifact") or
         std.mem.eql(u8, field, "key_template") or
+        std.mem.eql(u8, field, "labels") or
         std.mem.eql(u8, field, "type_must_match") or
         std.mem.eql(u8, field, "scorer_json") or
         std.mem.eql(u8, field, "candidate_search") or
@@ -680,6 +710,7 @@ pub fn isAllowedGraphResolverField(field: []const u8) bool {
         std.mem.eql(u8, field, "fusion_trust") or
         std.mem.eql(u8, field, "fusion_prior") or
         std.mem.eql(u8, field, "fusion_prior_weight") or
+        std.mem.eql(u8, field, "min_confidence") or
         std.mem.eql(u8, field, "config_generation");
 }
 
@@ -696,7 +727,15 @@ pub fn isAllowedCreatedEnrichmentField(field: []const u8) bool {
         std.mem.eql(u8, field, "chunker_json") or
         std.mem.eql(u8, field, "full_text_index") or
         std.mem.eql(u8, field, "content_type") or
+        std.mem.eql(u8, field, "neighbor_context") or
         std.mem.eql(u8, field, "execution");
+}
+
+pub fn isAllowedEnrichmentNeighborContextField(field: []const u8) bool {
+    return std.mem.eql(u8, field, "graph_index") or
+        std.mem.eql(u8, field, "edge_types") or
+        std.mem.eql(u8, field, "direction") or
+        std.mem.eql(u8, field, "limit");
 }
 
 /// Request-only enrichment fields: `producer_json` is write-only, and the

@@ -8538,13 +8538,24 @@ components:
           description: >-
             Direct top-k read from a published graph metric generation. Results
             are returned in graph_metric_results under the requested name or the
-            metric name when no explicit name is supplied.
+            metric name when no explicit name is supplied. Supplying seed_nodes
+            switches a pagerank metric to query-seeded personalized PageRank
+            computed at query time; that form requires metric_freshness=fresh
+            because published generations are global-only.
         graph_metric_rerank:
           $ref: "indexes.yaml#/components/schemas/GraphMetricRerank"
           description: >-
             Blend a published graph metric feature into ordinary search hit
             scores. Requests may require either any published generation or a
-            generation that is fresh with respect to graph writes.
+            generation that is fresh with respect to graph writes. Supplying
+            seed_nodes switches a pagerank metric to a query-seeded
+            personalized PageRank blend computed at query time; that form
+            requires metric_freshness=fresh. Retrieval-agent queries may opt
+            in to automatic seeding with auto_seed=true, which seeds the
+            blend from the query's literal graph-search start keys; only
+            valid for pagerank metrics with metric_freshness=fresh.
+            Caller-supplied seed_nodes always take precedence and are never
+            overwritten.
         analyses:
           $ref: "#/components/schemas/Analyses"
         graph_queries:

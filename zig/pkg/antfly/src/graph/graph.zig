@@ -36,6 +36,7 @@ const adjacency_blocks = @import("adjacency.zig");
 const topology_owner = @import("topology_owner.zig");
 const typed_edges = @import("typed_edges.zig");
 const maintenance = @import("maintenance.zig");
+const cancellation_mod = @import("../common/cancellation.zig");
 const backend_erased = @import("../storage/backend_erased.zig");
 const backend_scan = @import("../storage/backend_scan.zig");
 const docstore = @import("../storage/docstore.zig");
@@ -122,12 +123,22 @@ pub const BatchWrite = struct {
     created_at: u64 = 0,
     updated_at: u64 = 0,
     metadata_json: []const u8 = "",
+    /// Owning document of an entity-sourced contribution (zig/AUTOSCHEMA.md).
+    /// Non-empty registers this owner as a member of the physical edge, so
+    /// several documents asserting one canonical edge are refcounted: the
+    /// row survives until its LAST owner retires. Empty keeps the legacy
+    /// source-owned contract (no membership accounting).
+    owner: []const u8 = "",
 };
 
 pub const BatchDelete = struct {
     source: []const u8,
     target: []const u8,
     edge_type: []const u8,
+    /// See BatchWrite.owner: a non-empty owner withdraws only this owner's
+    /// contribution — the physical edge is deleted only when no other owner
+    /// still asserts it.
+    owner: []const u8 = "",
 };
 
 const edge_value_header_len: usize = 24;
@@ -821,6 +832,33 @@ const graph_meta_prefix = "meta:";
 const graph_edge_count_key = "meta:edge_count";
 const graph_node_count_key = "meta:node_count";
 const graph_edge_generation_key = "meta:edge_generation";
+
+/// Owner-membership rows for entity-sourced edges live in the reverse
+/// store's metadata namespace ("meta:" sorts before every edge record, and
+/// edge/metric scans skip the whole ["meta:", "meta;") band with one seek).
+/// One row per (edge identity, owning document); the physical edge is
+/// retired only when the last member withdraws.
+const owner_member_prefix = "meta:owner_member:v1:";
+
+fn ownerMemberEdgePrefixAlloc(alloc: Allocator, source: []const u8, edge_type: []const u8, target: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, owner_member_prefix);
+    try internal_keys.appendEncodedComponent(&list, alloc, source);
+    try internal_keys.appendEncodedComponent(&list, alloc, edge_type);
+    try internal_keys.appendEncodedComponent(&list, alloc, target);
+    return try list.toOwnedSlice(alloc);
+}
+
+fn ownerMemberKeyAlloc(alloc: Allocator, source: []const u8, edge_type: []const u8, target: []const u8, owner: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    const prefix = try ownerMemberEdgePrefixAlloc(alloc, source, edge_type, target);
+    defer alloc.free(prefix);
+    try list.appendSlice(alloc, prefix);
+    try internal_keys.appendEncodedComponent(&list, alloc, owner);
+    return try list.toOwnedSlice(alloc);
+}
 const graph_metric_type_epoch_floor_key = "meta:metric_type_epoch_floor:v1";
 const graph_metric_key_prefix = "meta:metric:";
 const graph_metric_control_key_prefix = "meta:metric_control:";
@@ -6805,6 +6843,89 @@ pub const GraphIndex = struct {
         for (deletes) |delete| try edge_type_mod.validateStored(delete.edge_type);
         try self.validateTreeBatchWrites(writes, deletes);
 
+        // Owner-membership pre-pass (entity-sourced edges): withdrawing one
+        // owner's contribution must not erase another document's surviving
+        // assertion of the same physical edge. Snapshot the persisted member
+        // set per owner-scoped delete (callers serialize graph apply, so the
+        // snapshot is current), overlay this batch's own member additions
+        // and removals, and suppress the PHYSICAL delete when any member
+        // survives — the departing owner's member row is removed either way.
+        var member_arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer member_arena.deinit();
+        const member_alloc = member_arena.allocator();
+        var suppressed: []bool = &.{};
+        var membership_active = false;
+        for (writes) |write| membership_active = membership_active or write.owner.len > 0;
+        for (deletes) |delete| membership_active = membership_active or delete.owner.len > 0;
+        if (membership_active) {
+            suppressed = try member_alloc.alloc(bool, deletes.len);
+            @memset(suppressed, false);
+            // Batch-local overlay: edge identity -> owner -> asserted?
+            var overlay = std.StringHashMapUnmanaged(std.StringHashMapUnmanaged(bool)).empty;
+            for (writes) |write| {
+                if (write.owner.len == 0) continue;
+                const edge_id = try edgeKeyAlloc(member_alloc, write.source, self.index_name, write.edge_type, write.target);
+                const entry = try overlay.getOrPutValue(member_alloc, edge_id, .empty);
+                try entry.value_ptr.put(member_alloc, try member_alloc.dupe(u8, write.owner), true);
+            }
+            for (deletes) |delete| {
+                if (delete.owner.len == 0) continue;
+                const edge_id = try edgeKeyAlloc(member_alloc, delete.source, self.index_name, delete.edge_type, delete.target);
+                const entry = try overlay.getOrPutValue(member_alloc, edge_id, .empty);
+                try entry.value_ptr.put(member_alloc, try member_alloc.dupe(u8, delete.owner), false);
+            }
+            var member_txn = try self.beginReadReverseTxn();
+            defer member_txn.abort();
+            for (deletes, 0..) |delete, delete_index| {
+                if (delete.owner.len == 0) continue;
+                const edge_id = try edgeKeyAlloc(member_alloc, delete.source, self.index_name, delete.edge_type, delete.target);
+                const edge_overlay = overlay.getPtr(edge_id);
+                var survivor = false;
+                if (edge_overlay) |map| {
+                    var overlay_it = map.iterator();
+                    while (overlay_it.next()) |member| {
+                        if (member.value_ptr.* and !std.mem.eql(u8, member.key_ptr.*, delete.owner)) {
+                            survivor = true;
+                            break;
+                        }
+                    }
+                }
+                if (!survivor) {
+                    const prefix = try ownerMemberEdgePrefixAlloc(member_alloc, delete.source, delete.edge_type, delete.target);
+                    var cursor = try member_txn.openCursor();
+                    defer cursor.close();
+                    var entry_opt = try cursor.seekAtOrAfter(prefix);
+                    while (entry_opt) |member_entry| : (entry_opt = try cursor.next()) {
+                        if (!std.mem.startsWith(u8, member_entry.key, prefix)) break;
+                        const encoded_owner = member_entry.key[prefix.len..];
+                        // A persisted member survives unless this batch
+                        // withdraws it (overlay entry false).
+                        var withdrawn = false;
+                        if (edge_overlay) |map| {
+                            var overlay_it = map.iterator();
+                            while (overlay_it.next()) |member| {
+                                if (member.value_ptr.*) continue;
+                                const withdrawn_key = try ownerMemberKeyAlloc(member_alloc, delete.source, delete.edge_type, delete.target, member.key_ptr.*);
+                                if (std.mem.eql(u8, member_entry.key, withdrawn_key)) {
+                                    withdrawn = true;
+                                    break;
+                                }
+                            }
+                        }
+                        _ = encoded_owner;
+                        if (!withdrawn) {
+                            survivor = true;
+                            break;
+                        }
+                    }
+                }
+                suppressed[delete_index] = survivor;
+            }
+        }
+        // The physical mutation loops below honor the suppression mask; the
+        // member-row puts/deletes are appended to the reverse batch after it
+        // opens, so membership and edge rows commit atomically.
+
         var main_batch = try self.beginWriteOutgoingBatch();
         var main_active = true;
         errdefer if (main_active) main_batch.abort();
@@ -6824,7 +6945,10 @@ pub const GraphIndex = struct {
         // Compare original and final identity sets, not intermediate delete /
         // insert operations. Replacing attributes or replaying an identical
         // batch must not retire immutable topology or restart numerical jobs.
-        for (deletes) |item| try self.rememberTopologyMutation(&topology_changes, item.source, item.target, item.edge_type, false);
+        for (deletes, 0..) |item, item_index| {
+            if (suppressed.len > 0 and suppressed[item_index]) continue;
+            try self.rememberTopologyMutation(&topology_changes, item.source, item.target, item.edge_type, false);
+        }
         for (writes) |item| try self.rememberTopologyMutation(&topology_changes, item.source, item.target, item.edge_type, true);
         try self.resolveTopologyMutationPresence(&reverse_batch, &topology_changes, coalesced);
         var changed_types = std.StringHashMapUnmanaged(void).empty;
@@ -6837,7 +6961,18 @@ pub const GraphIndex = struct {
         const prev_edge_count = counters.edge_count;
         const prev_edge_generation = counters.edge_generation;
 
-        for (deletes) |delete| {
+        for (deletes, 0..) |delete, delete_index| {
+            if (delete.owner.len > 0) {
+                // The departing owner's member row goes regardless of
+                // whether the physical edge survives for other owners.
+                const member_key = try ownerMemberKeyAlloc(self.alloc, delete.source, delete.edge_type, delete.target, delete.owner);
+                defer self.alloc.free(member_key);
+                reverse_batch.delete(member_key) catch |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                };
+            }
+            if (suppressed.len > 0 and suppressed[delete_index]) continue;
             const out_key = try edgeKeyAlloc(self.alloc, delete.source, self.index_name, delete.edge_type, delete.target);
             defer self.alloc.free(out_key);
             main_batch.delete(out_key) catch |err| switch (err) {
@@ -6872,6 +7007,12 @@ pub const GraphIndex = struct {
             defer self.alloc.free(rev_key);
             if (!coalesced) try self.accountReverseInsert(&reverse_batch, &counters, write.source, write.target, rev_key);
             try reverse_batch.put(rev_key, edge_val);
+
+            if (write.owner.len > 0) {
+                const member_key = try ownerMemberKeyAlloc(self.alloc, write.source, write.edge_type, write.target, write.owner);
+                defer self.alloc.free(member_key);
+                try reverse_batch.put(member_key, "1");
+            }
         }
 
         if (coalesced) try self.accountTopologyMutations(&reverse_batch, &counters, &topology_changes);
@@ -9973,6 +10114,19 @@ pub const GraphIndex = struct {
         nodes: *std.ArrayListUnmanaged(PageRankNode),
         edges: *std.ArrayListUnmanaged(PageRankEdge),
     ) !void {
+        try self.collectPageRankGraphBounded(filter, nodes, edges, .{
+            .max_nodes = std.math.maxInt(usize),
+            .max_edges = std.math.maxInt(usize),
+        });
+    }
+
+    fn collectPageRankGraphBounded(
+        self: *GraphIndex,
+        filter: GraphMetricEdgeFilter,
+        nodes: *std.ArrayListUnmanaged(PageRankNode),
+        edges: *std.ArrayListUnmanaged(PageRankEdge),
+        controls: PersonalizedReadControls,
+    ) !void {
         var map = std.StringHashMapUnmanaged(usize).empty;
         defer map.deinit(self.alloc);
 
@@ -9980,8 +10134,14 @@ pub const GraphIndex = struct {
         defer txn.abort();
         var cur = try txn.openCursor();
         defer cur.close();
+        var scanned: usize = 0;
         var entry_opt = try cur.first();
         while (entry_opt) |entry| : (entry_opt = try cur.next()) {
+            // The scan is the expensive phase of a query-time personalized
+            // read; honor request cancellation at a bounded stride instead
+            // of only after the whole graph has been materialized.
+            scanned += 1;
+            if (scanned % 1024 == 0) try controls.cancellation.check();
             if (std.mem.startsWith(u8, entry.key, graph_meta_prefix)) continue;
             var parsed = (try parseMetricReverseEdgeKeyView(self.alloc, entry.key, self.index_name)) orelse continue;
             defer parsed.deinit(self.alloc);
@@ -9989,8 +10149,11 @@ pub const GraphIndex = struct {
             const source_idx = try self.getOrPutPageRankNode(&map, nodes, parsed.source.bytes);
             const target_idx = try self.getOrPutPageRankNode(&map, nodes, parsed.target.bytes);
             if (source_idx > std.math.maxInt(u32) or target_idx > std.math.maxInt(u32)) return error.GraphMetricBuildBudgetExceeded;
+            if (nodes.items.len > controls.max_nodes) return error.GraphMetricBuildBudgetExceeded;
             try edges.append(self.alloc, .{ .source = @intCast(source_idx), .target = @intCast(target_idx) });
+            if (edges.items.len > controls.max_edges) return error.GraphMetricBuildBudgetExceeded;
         }
+        try controls.cancellation.check();
     }
 
     fn collectDegreeGraph(
@@ -18247,6 +18410,7 @@ pub const GraphIndex = struct {
     /// eventual row selection is empty. Never reopen between query stages.
     pub const GraphMetricReadSession = struct {
         alloc: Allocator,
+        graph_index: *GraphIndex,
         txn: backend_erased.ReadTxn,
         statuses: []GraphMetricStatus,
         prefixes: []?[]const u8,
@@ -18274,6 +18438,26 @@ pub const GraphIndex = struct {
             const read_stats = try score_read.populate(alloc, &self.txn, prefixes, nodes, columns);
             self.reads.keys += read_stats.keys;
             self.reads.batches += read_stats.batches;
+        }
+
+        /// Query-seeded personalized PageRank column. Computed fresh from the
+        /// current edge snapshot (never from a published generation), so this
+        /// read deliberately ignores the session's pinned publication
+        /// prefixes; the metric must still be one of the session's declared
+        /// dependencies so status reporting stays coherent.
+        pub fn readPersonalizedColumn(
+            self: *@This(),
+            alloc: Allocator,
+            metric_name: []const u8,
+            seed_nodes: []const []const u8,
+            damping: ?f64,
+            nodes: []const []const u8,
+            column: []?f64,
+        ) !void {
+            for (self.statuses) |status| {
+                if (std.mem.eql(u8, status.name, metric_name)) break;
+            } else return error.InvalidQueryRequest;
+            _ = try self.graph_index.personalizedPageRankColumnInto(alloc, metric_name, seed_nodes, damping, nodes, column);
         }
     };
 
@@ -18310,7 +18494,247 @@ pub const GraphIndex = struct {
                 prefix.* = try graphMetricKeyWithAllocator(alloc, &.{ name, "score", generation });
             }
         }
-        return .{ .alloc = alloc, .txn = txn, .statuses = statuses, .prefixes = prefixes };
+        return .{ .alloc = alloc, .graph_index = self, .txn = txn, .statuses = statuses, .prefixes = prefixes };
+    }
+
+    /// How many personalized seed keys resolved against the metric topology.
+    /// Unresolved seeds are skipped by design: retrieval queries seed with
+    /// best-effort entity resolutions and must not fail when one misses.
+    pub const PersonalizedSeedResolution = struct {
+        requested: usize,
+        matched: usize,
+
+        pub fn skipped(self: @This()) usize {
+            return self.requested - self.matched;
+        }
+    };
+
+    /// Query-seeded personalized PageRank over the current edge snapshot:
+    /// teleport mass restricted to the seed nodes (uniform per seed), with an
+    /// optional per-query damping override. This is a fresh read-side
+    /// computation — published generations remain global-only. When no seed
+    /// resolves the ranking degenerates to global PageRank, mirroring the
+    /// kernel's empty-seed contract. Requested nodes absent from the topology
+    /// score null, matching published column reads.
+    /// Request-scoped controls for the query-time personalized kernel. The
+    /// complete filtered-graph scan happens BEFORE kernel admission, so the
+    /// caller's limits and cancellation must bound the scan itself — the
+    /// kernel's own work ceiling cannot.
+    pub const PersonalizedReadControls = struct {
+        max_nodes: usize = default_personalized_read_max_nodes,
+        max_edges: usize = default_personalized_read_max_edges,
+        cancellation: cancellation_mod.CancellationToken = .none,
+    };
+
+    /// Defaults sized for interactive query reads: far above any healthy
+    /// same-shard autoschema graph, far below letting one request allocate
+    /// unbounded memory against a pathological one.
+    pub const default_personalized_read_max_nodes: usize = 1 << 20;
+    pub const default_personalized_read_max_edges: usize = 1 << 23;
+
+    pub fn personalizedPageRankColumnInto(
+        self: *GraphIndex,
+        alloc: Allocator,
+        metric_name: []const u8,
+        seed_nodes: []const []const u8,
+        damping: ?f64,
+        nodes: []const []const u8,
+        column: []?f64,
+    ) !PersonalizedSeedResolution {
+        return try self.personalizedPageRankColumnIntoWithControls(alloc, metric_name, seed_nodes, damping, nodes, column, .{});
+    }
+
+    pub fn personalizedPageRankColumnIntoWithControls(
+        self: *GraphIndex,
+        alloc: Allocator,
+        metric_name: []const u8,
+        seed_nodes: []const []const u8,
+        damping: ?f64,
+        nodes: []const []const u8,
+        column: []?f64,
+        controls: PersonalizedReadControls,
+    ) !PersonalizedSeedResolution {
+        if (column.len != nodes.len) return error.InvalidQueryRequest;
+        const cfg = self.metricConfig(metric_name) orelse return error.MetricNotReady;
+        if (cfg.kind != .pagerank) return error.UnsupportedGraphMetric;
+        if (damping) |value| {
+            if (!std.math.isFinite(value) or value <= 0 or value >= 1) return error.InvalidQueryRequest;
+        }
+
+        var graph_nodes = std.ArrayListUnmanaged(PageRankNode).empty;
+        defer {
+            self.freePageRankNodes(graph_nodes.items);
+            graph_nodes.deinit(self.alloc);
+        }
+        var graph_edges = std.ArrayListUnmanaged(PageRankEdge).empty;
+        defer graph_edges.deinit(self.alloc);
+        try self.collectPageRankGraphBounded(cfg.edge_filter, &graph_nodes, &graph_edges, controls);
+        try controls.cancellation.check();
+
+        var ordinals = std.StringHashMapUnmanaged(u32).empty;
+        defer ordinals.deinit(alloc);
+        try ordinals.ensureTotalCapacity(alloc, @intCast(graph_nodes.items.len));
+        for (graph_nodes.items, 0..) |node, i| ordinals.putAssumeCapacity(node.key, @intCast(i));
+
+        const seed_ordinals = try alloc.alloc(u32, seed_nodes.len);
+        defer alloc.free(seed_ordinals);
+        var matched: usize = 0;
+        for (seed_nodes) |seed| {
+            if (ordinals.get(seed)) |ordinal| {
+                seed_ordinals[matched] = ordinal;
+                matched += 1;
+            }
+        }
+
+        var result = try metric_kernels.personalizedPageRankAlloc(alloc, graph_nodes.items.len, graph_edges.items, seed_ordinals[0..matched], .{
+            .damping = damping orelse cfg.damping,
+            .tolerance = cfg.tolerance,
+            .max_iterations = cfg.max_iterations,
+            .max_nodes = @max(graph_nodes.items.len, 1),
+            .max_edges = @max(graph_edges.items.len, 1),
+        });
+        defer result.deinit(alloc);
+        for (nodes, column) |key, *out| {
+            out.* = if (ordinals.get(key)) |ordinal| result.scores[ordinal] else null;
+        }
+        return .{ .requested = seed_nodes.len, .matched = matched };
+    }
+
+    /// Point-lookup companion to personalizedPageRankColumnInto that carries
+    /// the metric's status snapshot, mirroring the published score snapshot
+    /// used by metric rerank. The scores themselves are computed fresh from
+    /// the current edge snapshot, so no publication is required.
+    pub fn personalizedPageRankScoreSnapshotAlloc(
+        self: *GraphIndex,
+        metric_name: []const u8,
+        seed_nodes: []const []const u8,
+        damping: ?f64,
+        nodes: []const []const u8,
+    ) !GraphMetricScoreSnapshot {
+        return try self.personalizedPageRankScoreSnapshotAllocWithControls(metric_name, seed_nodes, damping, nodes, .{});
+    }
+
+    pub fn personalizedPageRankScoreSnapshotAllocWithControls(
+        self: *GraphIndex,
+        metric_name: []const u8,
+        seed_nodes: []const []const u8,
+        damping: ?f64,
+        nodes: []const []const u8,
+        controls: PersonalizedReadControls,
+    ) !GraphMetricScoreSnapshot {
+        var status = blk: {
+            var txn = try self.beginReadReverseTxn();
+            defer txn.abort();
+            break :blk try self.graphMetricSnapshotStatusInTxn(metric_name, &txn, .query);
+        };
+        errdefer status.deinit(self.alloc);
+        const scores = try self.alloc.alloc(?f64, nodes.len);
+        errdefer self.alloc.free(scores);
+        _ = try self.personalizedPageRankColumnIntoWithControls(self.alloc, metric_name, seed_nodes, damping, nodes, scores, controls);
+        return .{ .status = status, .scores = scores };
+    }
+
+    /// Ranked view of a query-seeded personalized PageRank computed fresh
+    /// from the current edge snapshot. Unlike published top-K reads this
+    /// requires no published generation; the attached status still reports
+    /// the metric's materialization state for observability. Ordering is
+    /// deterministic: score descending with node key ascending tie-breaks.
+    pub fn personalizedPageRankTopKSnapshotAlloc(
+        self: *GraphIndex,
+        metric_name: []const u8,
+        seed_nodes: []const []const u8,
+        damping: ?f64,
+        limit: usize,
+    ) !GraphMetricTopKSnapshot {
+        return try self.personalizedPageRankTopKSnapshotAllocWithControls(metric_name, seed_nodes, damping, limit, .{});
+    }
+
+    pub fn personalizedPageRankTopKSnapshotAllocWithControls(
+        self: *GraphIndex,
+        metric_name: []const u8,
+        seed_nodes: []const []const u8,
+        damping: ?f64,
+        limit: usize,
+        controls: PersonalizedReadControls,
+    ) !GraphMetricTopKSnapshot {
+        if (limit > graph_metric_rank_entry_limit) return error.InvalidGraphMetricTopK;
+        const cfg = self.metricConfig(metric_name) orelse return error.MetricNotReady;
+        if (cfg.kind != .pagerank) return error.UnsupportedGraphMetric;
+        if (damping) |value| {
+            if (!std.math.isFinite(value) or value <= 0 or value >= 1) return error.InvalidQueryRequest;
+        }
+        var status = blk: {
+            var txn = try self.beginReadReverseTxn();
+            defer txn.abort();
+            break :blk try self.graphMetricSnapshotStatusInTxn(metric_name, &txn, .query);
+        };
+        errdefer status.deinit(self.alloc);
+
+        var graph_nodes = std.ArrayListUnmanaged(PageRankNode).empty;
+        defer {
+            self.freePageRankNodes(graph_nodes.items);
+            graph_nodes.deinit(self.alloc);
+        }
+        var graph_edges = std.ArrayListUnmanaged(PageRankEdge).empty;
+        defer graph_edges.deinit(self.alloc);
+        try self.collectPageRankGraphBounded(cfg.edge_filter, &graph_nodes, &graph_edges, controls);
+        try controls.cancellation.check();
+
+        var ordinals = std.StringHashMapUnmanaged(u32).empty;
+        defer ordinals.deinit(self.alloc);
+        try ordinals.ensureTotalCapacity(self.alloc, @intCast(graph_nodes.items.len));
+        for (graph_nodes.items, 0..) |node, i| ordinals.putAssumeCapacity(node.key, @intCast(i));
+
+        const seed_ordinals = try self.alloc.alloc(u32, seed_nodes.len);
+        defer self.alloc.free(seed_ordinals);
+        var matched: usize = 0;
+        for (seed_nodes) |seed| {
+            if (ordinals.get(seed)) |ordinal| {
+                seed_ordinals[matched] = ordinal;
+                matched += 1;
+            }
+        }
+
+        var result = try metric_kernels.personalizedPageRankAlloc(self.alloc, graph_nodes.items.len, graph_edges.items, seed_ordinals[0..matched], .{
+            .damping = damping orelse cfg.damping,
+            .tolerance = cfg.tolerance,
+            .max_iterations = cfg.max_iterations,
+            .max_nodes = @max(graph_nodes.items.len, 1),
+            .max_edges = @max(graph_edges.items.len, 1),
+        });
+        defer result.deinit(self.alloc);
+
+        const order = try self.alloc.alloc(u32, graph_nodes.items.len);
+        defer self.alloc.free(order);
+        for (order, 0..) |*slot, i| slot.* = @intCast(i);
+        const OrderContext = struct {
+            nodes: []const PageRankNode,
+            scores: []const f64,
+
+            fn lessThan(ctx: @This(), a: u32, b: u32) bool {
+                return graphMetricScoreComesBefore(
+                    .{ .node = ctx.nodes[a].key, .score = ctx.scores[a] },
+                    .{ .node = ctx.nodes[b].key, .score = ctx.scores[b] },
+                );
+            }
+        };
+        std.mem.sort(u32, order, OrderContext{ .nodes = graph_nodes.items, .scores = result.scores }, OrderContext.lessThan);
+
+        const take = @min(limit, graph_nodes.items.len);
+        const scores = try self.alloc.alloc(GraphMetricScore, take);
+        var initialized: usize = 0;
+        errdefer {
+            for (scores[0..initialized]) |*score| score.deinit(self.alloc);
+            self.alloc.free(scores);
+        }
+        for (order[0..take], scores) |ordinal, *out| {
+            out.* = .{
+                .node = try self.alloc.dupe(u8, graph_nodes.items[ordinal].key),
+                .score = result.scores[ordinal],
+            };
+            initialized += 1;
+        }
+        return .{ .status = status, .scores = scores };
     }
 
     pub fn graphMetricColumnsSnapshotAlloc(
@@ -34646,6 +35070,95 @@ test "graph batchApply applies writes and deletes together" {
     defer GraphIndex.freeEdges(alloc, in_edges);
     try std.testing.expectEqual(@as(usize, 1), in_edges.len);
     try std.testing.expectEqualStrings("d", in_edges[0].source);
+}
+
+test "graph owner membership keeps a shared edge until the last owner retires" {
+    const alloc = std.testing.allocator;
+    var store_buf: [256]u8 = undefined;
+    const store_path = tmpPath(&store_buf, "store-member");
+    defer cleanupTmp(store_path);
+    var rev_buf: [256]u8 = undefined;
+    const rev_path = tmpPath(&rev_buf, "rev-member");
+    defer cleanupTmp(rev_path);
+
+    var store = try docstore.DocStore.open(alloc, store_path, .{});
+    defer store.close();
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{});
+    defer graph.close();
+
+    // Two documents assert the same canonical entity-sourced edge.
+    try graph.batchApply(&.{
+        .{ .source = "entity/ada", .target = "entity/antfly", .edge_type = "works_at", .owner = "doc:a" },
+    }, &.{});
+    try graph.batchApply(&.{
+        .{ .source = "entity/ada", .target = "entity/antfly", .edge_type = "works_at", .owner = "doc:b" },
+    }, &.{});
+
+    // Withdrawing one owner's contribution must not erase the survivor's.
+    try graph.batchApply(&.{}, &.{
+        .{ .source = "entity/ada", .target = "entity/antfly", .edge_type = "works_at", .owner = "doc:a" },
+    });
+    {
+        const edges = try graph.getEdges(alloc, "entity/ada", "works_at", .out);
+        defer GraphIndex.freeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, 1), edges.len);
+        try std.testing.expectEqualStrings("entity/antfly", edges[0].target);
+    }
+    // Replaying the same withdrawal is idempotent.
+    try graph.batchApply(&.{}, &.{
+        .{ .source = "entity/ada", .target = "entity/antfly", .edge_type = "works_at", .owner = "doc:a" },
+    });
+    {
+        const edges = try graph.getEdges(alloc, "entity/ada", "works_at", .out);
+        defer GraphIndex.freeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, 1), edges.len);
+    }
+    // The last owner retiring removes the physical edge.
+    try graph.batchApply(&.{}, &.{
+        .{ .source = "entity/ada", .target = "entity/antfly", .edge_type = "works_at", .owner = "doc:b" },
+    });
+    {
+        const edges = try graph.getEdges(alloc, "entity/ada", "works_at", .out);
+        defer GraphIndex.freeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, 0), edges.len);
+    }
+
+    // Same-batch churn: one owner withdraws while another asserts — the
+    // edge stays, then the remaining owner's withdrawal retires it.
+    try graph.batchApply(&.{
+        .{ .source = "entity/x", .target = "entity/y", .edge_type = "cites", .owner = "doc:a" },
+    }, &.{});
+    try graph.batchApply(&.{
+        .{ .source = "entity/x", .target = "entity/y", .edge_type = "cites", .owner = "doc:b" },
+    }, &.{
+        .{ .source = "entity/x", .target = "entity/y", .edge_type = "cites", .owner = "doc:a" },
+    });
+    {
+        const edges = try graph.getEdges(alloc, "entity/x", "cites", .out);
+        defer GraphIndex.freeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, 1), edges.len);
+    }
+    try graph.batchApply(&.{}, &.{
+        .{ .source = "entity/x", .target = "entity/y", .edge_type = "cites", .owner = "doc:b" },
+    });
+    {
+        const edges = try graph.getEdges(alloc, "entity/x", "cites", .out);
+        defer GraphIndex.freeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, 0), edges.len);
+    }
+
+    // Legacy owner-less mutations keep the unconditional contract.
+    try graph.batchApply(&.{
+        .{ .source = "doc:p", .target = "doc:q", .edge_type = "cites" },
+    }, &.{});
+    try graph.batchApply(&.{}, &.{
+        .{ .source = "doc:p", .target = "doc:q", .edge_type = "cites" },
+    });
+    {
+        const edges = try graph.getEdges(alloc, "doc:p", "cites", .out);
+        defer GraphIndex.freeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, 0), edges.len);
+    }
 }
 
 test "graph edge encoding round-trip" {

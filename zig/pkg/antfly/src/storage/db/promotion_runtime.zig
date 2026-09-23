@@ -89,6 +89,49 @@ fn buildEntityDocAlloc(alloc: std.mem.Allocator, e: resolver_lib.ResolvedEntity)
     return try std.json.Stringify.valueAlloc(alloc, doc, .{});
 }
 
+/// Companion state row: the entity keys this resolution artifact's canonical
+/// mentions last promoted, keyed by mention local id. Compositional event
+/// identity makes re-keying a designed convergence path (a participant merge
+/// re-keys the events it touches), and promotion is upsert-only — without
+/// this diff every re-key would strand the previously promoted document as
+/// a dead node. The diff writes a merged_into tombstone instead, the same
+/// redirect the matcher-scorer machinery already follows.
+fn promotedKeysStateKeyAlloc(alloc: Allocator, resolution_key: []const u8) ![]u8 {
+    var key = std.ArrayListUnmanaged(u8).empty;
+    defer key.deinit(alloc);
+    try key.appendSlice(alloc, &.{ internal_keys.replay_namespace, 0xff, internal_keys.promoted_keys_state_kind });
+    try internal_keys.appendEncodedComponent(&key, alloc, resolution_key);
+    return try key.toOwnedSlice(alloc);
+}
+
+const PromotedRef = struct {
+    table: []const u8,
+    key: []const u8,
+};
+
+fn parsePromotedKeysState(a: Allocator, raw: []const u8) !std.StringArrayHashMapUnmanaged(PromotedRef) {
+    var map = std.StringArrayHashMapUnmanaged(PromotedRef).empty;
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) catch return map;
+    if (parsed != .object) return map;
+    var it = parsed.object.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .object) continue;
+        const table = entry.value_ptr.object.get("table") orelse continue;
+        const key = entry.value_ptr.object.get("key") orelse continue;
+        if (table != .string or key != .string) continue;
+        try map.put(a, entry.key_ptr.*, .{ .table = table.string, .key = key.string });
+    }
+    return map;
+}
+
+fn buildMergedTombstoneDocAlloc(alloc: Allocator, e: resolver_lib.ResolvedEntity) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .entity_type = e.label,
+        .canonical_name = e.canonical_name,
+        .merged_into = e.doc_ref.key,
+    }, .{});
+}
+
 fn isPromotableDecision(decision: resolver_lib.Decision) bool {
     return switch (decision) {
         .new, .match => true,
@@ -155,20 +198,51 @@ fn processResolutionArtifactWithCatalog(
     defer arena.deinit();
     const a = arena.allocator();
 
+    const state_key = try promotedKeysStateKeyAlloc(a, resolution_key);
+    const prior_raw = try store.get(a, state_key);
+    var prior = if (prior_raw) |state_raw| try parsePromotedKeysState(a, state_raw) else std.StringArrayHashMapUnmanaged(PromotedRef).empty;
+    defer prior.deinit(a);
+
     var entries = std.ArrayListUnmanaged(EntityUpsert).empty;
+    var next_state: std.json.ObjectMap = .empty;
     for (parsed.entities) |e| {
         if (!isPromotableDecision(e.decision)) continue;
         // Need at least a canonical name to mint/merge a meaningful entity.
         if (e.canonical_name.len == 0) continue;
+        // A mention that previously promoted a DIFFERENT key in the same
+        // table has re-keyed (compositional identity following a merge):
+        // tombstone the old document with a merged_into redirect so it
+        // never lingers as a dead node, in the same atomic batch as the
+        // survivor's upsert.
+        if (prior.get(e.local_id)) |previous| {
+            if (std.mem.eql(u8, previous.table, e.doc_ref.table) and
+                !std.mem.eql(u8, previous.key, e.doc_ref.key))
+            {
+                try entries.append(a, .{
+                    .table = previous.table,
+                    .storage_table = e.doc_ref.storage_table,
+                    .key = previous.key,
+                    .doc_json = try buildMergedTombstoneDocAlloc(a, e),
+                });
+            }
+        }
         try entries.append(a, .{
             .table = e.doc_ref.table,
             .storage_table = e.doc_ref.storage_table,
             .key = e.doc_ref.key,
             .doc_json = try buildEntityDocAlloc(a, e),
         });
+        var ref: std.json.ObjectMap = .empty;
+        try ref.put(a, "table", .{ .string = e.doc_ref.table });
+        try ref.put(a, "key", .{ .string = e.doc_ref.key });
+        try next_state.put(a, e.local_id, .{ .object = ref });
     }
     if (entries.items.len == 0) return 0;
     try sink.upsertBatch(gpa, entries.items);
+    // State follows the successful batch: a crash between the two re-emits
+    // the same idempotent tombstones on the next replay.
+    const state_value = try std.json.Stringify.valueAlloc(a, std.json.Value{ .object = next_state }, .{});
+    try store.put(state_key, state_value);
     return entries.items.len;
 }
 
@@ -820,6 +894,44 @@ test "processResolutionArtifact upserts a canonical entity per resolved mention"
 
     // A missing artifact promotes nothing.
     try testing.expectEqual(@as(usize, 0), try processResolutionArtifact(alloc, map.store(), "no-such-key", capture.sink()));
+}
+
+test "processResolutionArtifact tombstones the prior key when a mention re-keys" {
+    const alloc = testing.allocator;
+    var map = MapStore{ .alloc = alloc };
+    defer map.deinit();
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "events_resolution_v1");
+    defer alloc.free(resolution_key);
+    try map.put(resolution_key,
+        \\{"config_generation":1,"entities":[
+        \\  {"local_id":"v0","doc_ref":{"table":"events","key":"event/provisional"},"confidence":1.0,"decision":"new","label":"event","canonical_name":"Ada spoke.","surface_form":"Ada spoke."}
+        \\]}
+    );
+    var capture = CaptureSink{ .alloc = alloc };
+    defer capture.deinit();
+    try testing.expectEqual(@as(usize, 1), try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
+
+    // The sibling re-drive re-keys the mention onto its canonical
+    // compositional identity. Promotion is upsert-only, so without the
+    // promoted-keys diff the provisional document would linger as a dead
+    // node; instead it becomes a merged_into redirect in the same batch as
+    // the survivor's upsert.
+    try map.put(resolution_key,
+        \\{"config_generation":1,"entities":[
+        \\  {"local_id":"v0","doc_ref":{"table":"events","key":"event/canonical"},"confidence":1.0,"decision":"new","label":"event","canonical_name":"Ada spoke.","surface_form":"Ada spoke."}
+        \\]}
+    );
+    try testing.expectEqual(@as(usize, 2), try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
+    try testing.expectEqual(@as(usize, 3), capture.keys.items.len);
+    try testing.expectEqualStrings("event/provisional", capture.keys.items[1]);
+    try testing.expect(std.mem.indexOf(u8, capture.docs.items[1], "\"merged_into\":\"event/canonical\"") != null);
+    try testing.expectEqualStrings("event/canonical", capture.keys.items[2]);
+
+    // A byte-stable replay re-emits no tombstone.
+    try testing.expectEqual(@as(usize, 1), try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
+    try testing.expectEqual(@as(usize, 4), capture.keys.items.len);
+    try testing.expectEqualStrings("event/canonical", capture.keys.items[3]);
 }
 
 test "processResolutionArtifact leaves review-band mentions unpromoted" {

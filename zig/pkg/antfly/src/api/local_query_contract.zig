@@ -6232,7 +6232,29 @@ pub fn appendGraphMetricRerankField(
         .published => "published",
         .fresh => "fresh",
     });
+    try appendGraphMetricPersonalizationFields(alloc, out, &rerank_first, rerank.seed_nodes, rerank.damping);
     try out.append(alloc, '}');
+}
+
+fn appendGraphMetricPersonalizationFields(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first: *bool,
+    seed_nodes: []const []const u8,
+    damping: ?f64,
+) !void {
+    if (seed_nodes.len != 0) {
+        try appendJsonFieldName(alloc, out, first, "seed_nodes");
+        try out.append(alloc, '[');
+        for (seed_nodes, 0..) |seed, i| {
+            if (i > 0) try out.append(alloc, ',');
+            try appendJsonString(alloc, out, seed);
+        }
+        try out.append(alloc, ']');
+    }
+    if (damping) |value| {
+        try appendJsonFieldF64(alloc, out, first, "damping", value);
+    }
 }
 
 pub fn appendGraphMetricQueryField(
@@ -6260,6 +6282,7 @@ pub fn appendGraphMetricQueryField(
                 .published => "published",
                 .fresh => "fresh",
             });
+            try appendGraphMetricPersonalizationFields(alloc, out, &metric_first, named.query.seed_nodes, named.query.damping);
             try out.append(alloc, '}');
         }
         try out.append(alloc, ']');
@@ -6278,6 +6301,7 @@ pub fn appendGraphMetricQueryField(
         .published => "published",
         .fresh => "fresh",
     });
+    try appendGraphMetricPersonalizationFields(alloc, out, &metric_first, named.query.seed_nodes, named.query.damping);
     try out.append(alloc, '}');
 }
 

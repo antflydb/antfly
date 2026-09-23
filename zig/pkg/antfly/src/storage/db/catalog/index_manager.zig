@@ -45,6 +45,7 @@ pub const ResolverConfig = resolver_catalog.ResolverConfig;
 const enrichment_types = @import("../enrichment/enrichment_types.zig");
 const enrichment_artifact_codec = @import("../enrichment/artifact_codec.zig");
 const enrichment_config_validation = @import("../enrichment/config_validation.zig");
+const enrichment_neighbor_context = @import("../enrichment/neighbor_context.zig");
 const asset_producer_mod = @import("../enrichment/asset_producer.zig");
 const backfill_state_mod = @import("../backfill_state.zig");
 const db_config = @import("../config.zig");
@@ -11648,9 +11649,38 @@ pub const IndexManager = struct {
         return existing.eql(cfg);
     }
 
+    fn resolverLabelSetsEqual(a: []const []const u8, b: []const []const u8) bool {
+        if (a.len != b.len) return false;
+        for (a, b) |as, bs| if (!std.mem.eql(u8, as, bs)) return false;
+        return true;
+    }
+
+    /// Label-routing admission: labeled resolvers sharing a source artifact
+    /// must claim disjoint label sets, otherwise the mention partition is
+    /// ambiguous. Catch-alls (empty `labels`) are unrestricted — multiple
+    /// catch-alls per artifact remain admitted for compatibility with
+    /// intentional double-resolution setups, and each catch-all skips the
+    /// labels claimed by labeled siblings at runtime. Caller holds the
+    /// catalog mutex.
+    fn resolverLabelRoutingConflicts(self: *const IndexManager, cfg: resolver_catalog.ResolverConfig) bool {
+        if (cfg.labels.len == 0) return false;
+        for (self.resolvers.items) |entry| {
+            if (std.mem.eql(u8, entry.name, cfg.name)) continue;
+            if (entry.labels.len == 0) continue;
+            if (!std.mem.eql(u8, entry.source_artifact, cfg.source_artifact)) continue;
+            if (!entry.source_artifact_kind.matches(cfg.source_artifact_kind) and
+                !cfg.source_artifact_kind.matches(entry.source_artifact_kind)) continue;
+            for (entry.labels) |claimed| {
+                if (cfg.resolvesLabel(claimed)) return true;
+            }
+        }
+        return false;
+    }
+
     fn resolverMaterialConfigChanged(existing: resolver_catalog.ResolverConfig, next: resolver_catalog.ResolverConfig) bool {
         return !std.mem.eql(u8, existing.table, next.table) or
             !std.mem.eql(u8, existing.key_template, next.key_template) or
+            !resolverLabelSetsEqual(existing.labels, next.labels) or
             existing.type_must_match != next.type_must_match or
             !std.mem.eql(u8, existing.scorer_json, next.scorer_json) or
             !std.mem.eql(u8, existing.candidate_search, next.candidate_search) or
@@ -11662,6 +11692,10 @@ pub const IndexManager = struct {
             existing.fusion_trust != next.fusion_trust or
             existing.fusion_prior != next.fusion_prior or
             existing.fusion_prior_weight != next.fusion_prior_weight or
+            // A changed admission floor re-resolves the corpus: raising it
+            // must retire existing low-confidence resolutions and their
+            // edges, not leave them in place until an unrelated change.
+            existing.min_confidence != next.min_confidence or
             existing.config_generation != next.config_generation;
     }
 
@@ -11670,6 +11704,7 @@ pub const IndexManager = struct {
         defer self.catalog_mutex.unlockExclusive();
         if (self.getResolver(cfg.name) != null) return error.ResolverAlreadyExists;
         if (self.resolverResolutionArtifactInUse(cfg.resolution_artifact, null)) return error.ResolverArtifactAlreadyExists;
+        if (self.resolverLabelRoutingConflicts(cfg)) return error.ResolverLabelRoutingConflict;
 
         const checkpoint = self.resolvers.items.len;
         errdefer self.truncateResolvers(checkpoint);
@@ -11691,6 +11726,7 @@ pub const IndexManager = struct {
             if (entry.source_artifact_kind != cfg.source_artifact_kind) return error.ResolverSourceArtifactImmutable;
             if (!std.mem.eql(u8, entry.resolution_artifact, cfg.resolution_artifact)) return error.ResolverArtifactImmutable;
             if (self.resolverResolutionArtifactInUse(cfg.resolution_artifact, cfg.name)) return error.ResolverArtifactAlreadyExists;
+            if (self.resolverLabelRoutingConflicts(cfg)) return error.ResolverLabelRoutingConflict;
             const material_changed = resolverMaterialConfigChanged(entry.*, cfg);
             var previous = entry.*;
             entry.* = try resolver_catalog.ResolverConfig.clone(self.alloc, cfg);
@@ -11703,6 +11739,7 @@ pub const IndexManager = struct {
             return if (material_changed) .updated_backfill_required else .updated_no_backfill;
         }
         if (self.resolverResolutionArtifactInUse(cfg.resolution_artifact, null)) return error.ResolverArtifactAlreadyExists;
+        if (self.resolverLabelRoutingConflicts(cfg)) return error.ResolverLabelRoutingConflict;
         const checkpoint = self.resolvers.items.len;
         errdefer self.truncateResolvers(checkpoint);
         try self.resolvers.append(self.alloc, try resolver_catalog.ResolverConfig.clone(self.alloc, cfg));
@@ -13269,6 +13306,59 @@ pub const IndexManager = struct {
         return self.cached_has_generated_enrichment_targets.load(.acquire);
     }
 
+    /// Which adjacency orientations asset enrichments sample from one graph
+    /// index via `neighbor_context`. `out` means some enrichment samples a
+    /// document's outgoing edges (direction `out` or `both`), `in` means some
+    /// enrichment samples reverse edges (direction `in` or `both`).
+    pub const NeighborContextDirections = struct {
+        out: bool = false,
+        in: bool = false,
+
+        pub fn any(self: @This()) bool {
+            return self.out or self.in;
+        }
+    };
+
+    /// Read-only scheduling lookup for graph-edge mutations: does any
+    /// admitted asset enrichment sample `neighbor_context` adjacency from the
+    /// named graph index, and in which orientations? An edge write or delete
+    /// on a referenced index must wake the enrichment worker for the affected
+    /// documents, because the sampled adjacency participates in the producer
+    /// skip-state hash. Catalogs hold few enrichments and the stored
+    /// neighbor-context JSON is small and admission-validated, so this parses
+    /// on demand instead of maintaining another invalidated cache; callers on
+    /// the batch-apply path memoize per index name. A stored config that no
+    /// longer parses contributes nothing (fail open-empty, matching the
+    /// runtime's empty-neighbors fallback).
+    pub fn assetNeighborContextDirectionsForGraphIndex(
+        self: *const IndexManager,
+        alloc: Allocator,
+        graph_index_name: []const u8,
+    ) !NeighborContextDirections {
+        var directions: NeighborContextDirections = .{};
+        if (graph_index_name.len == 0) return directions;
+        for (self.enrichments.items) |entry| {
+            if (entry.kind != .asset) continue;
+            if (entry.neighbor_context_json.len == 0) continue;
+            var context = enrichment_neighbor_context.parseConfigJson(alloc, entry.neighbor_context_json) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => continue,
+            };
+            defer context.deinit(alloc);
+            if (!std.mem.eql(u8, context.graph_index, graph_index_name)) continue;
+            switch (context.direction) {
+                .out => directions.out = true,
+                .in => directions.in = true,
+                .both => {
+                    directions.out = true;
+                    directions.in = true;
+                },
+            }
+            if (directions.out and directions.in) break;
+        }
+        return directions;
+    }
+
     pub fn has(self: *const IndexManager, name: []const u8) bool {
         return self.get(name) != null;
     }
@@ -13575,20 +13665,49 @@ pub const IndexManager = struct {
             requests.deinit(alloc);
         }
 
-        for (self.enrichments.items) |entry| {
-            if (entry.kind != .asset) continue;
-            try requests.append(alloc, .{
-                .kind = .asset,
-                .index_name = try alloc.dupe(u8, entry.name),
-                .artifact_name = try alloc.dupe(u8, entry.name),
-                .doc_key = try alloc.dupe(u8, doc_key),
-                .source_field = try alloc.dupe(u8, entry.source_field),
-                .source_template = if (entry.source_template.len > 0) try alloc.dupe(u8, entry.source_template) else "",
-                .full_text_index = entry.full_text_index,
-                .content_type = if (entry.content_type.len > 0) try alloc.dupe(u8, entry.content_type) else "",
-                .producer_json = if (entry.producer_json.len > 0) try alloc.dupe(u8, entry.producer_json) else "",
-                .execution_json = if (entry.execution_json.len > 0) try alloc.dupe(u8, entry.execution_json) else "",
-            });
+        // Assets are emitted upstream-first so a consumer that names another
+        // asset via `source_artifact_name` runs after its producer in the
+        // same quantum. Entries whose upstream cannot be scheduled first
+        // (defensive: admission rejects cycles) fall out in catalog order.
+        const asset_emitted = try alloc.alloc(bool, self.enrichments.items.len);
+        defer alloc.free(asset_emitted);
+        @memset(asset_emitted, false);
+        var emit_final_pass = false;
+        emit_loop: while (true) {
+            var emit_progress = false;
+            for (self.enrichments.items, 0..) |entry, entry_index| {
+                if (entry.kind != .asset or asset_emitted[entry_index]) continue;
+                if (!emit_final_pass and entry.source_artifact_name.len > 0) {
+                    var upstream_pending = false;
+                    for (self.enrichments.items, 0..) |candidate, candidate_index| {
+                        if (candidate.kind != .asset or asset_emitted[candidate_index]) continue;
+                        if (candidate_index == entry_index) continue;
+                        if (std.mem.eql(u8, candidate.name, entry.source_artifact_name)) {
+                            upstream_pending = true;
+                            break;
+                        }
+                    }
+                    if (upstream_pending) continue;
+                }
+                asset_emitted[entry_index] = true;
+                emit_progress = true;
+                try requests.append(alloc, .{
+                    .kind = .asset,
+                    .index_name = try alloc.dupe(u8, entry.name),
+                    .artifact_name = try alloc.dupe(u8, entry.name),
+                    .doc_key = try alloc.dupe(u8, doc_key),
+                    .source_field = try alloc.dupe(u8, entry.source_field),
+                    .source_template = if (entry.source_template.len > 0) try alloc.dupe(u8, entry.source_template) else "",
+                    .upstream_artifact_name = if (entry.source_artifact_name.len > 0) try alloc.dupe(u8, entry.source_artifact_name) else "",
+                    .full_text_index = entry.full_text_index,
+                    .content_type = if (entry.content_type.len > 0) try alloc.dupe(u8, entry.content_type) else "",
+                    .producer_json = if (entry.producer_json.len > 0) try alloc.dupe(u8, entry.producer_json) else "",
+                    .neighbor_context_json = if (entry.neighbor_context_json.len > 0) try alloc.dupe(u8, entry.neighbor_context_json) else "",
+                    .execution_json = if (entry.execution_json.len > 0) try alloc.dupe(u8, entry.execution_json) else "",
+                });
+            }
+            if (emit_final_pass) break :emit_loop;
+            if (!emit_progress) emit_final_pass = true;
         }
 
         for (self.text_indexes.items) |entry| {
@@ -21188,8 +21307,10 @@ pub const IndexManager = struct {
         if (self.getEnrichment(.asset, cfg.name)) |existing| {
             if (!std.mem.eql(u8, existing.source_field, cfg.source_field) or
                 !std.mem.eql(u8, existing.source_template, cfg.source_template) or
+                !std.mem.eql(u8, existing.source_artifact_name, cfg.source_artifact_name) or
                 !std.mem.eql(u8, existing.content_type, cfg.content_type) or
                 !try enrichment_config_validation.producerJsonValuesEqual(self.alloc, existing.producer_json, cfg.producer_json) or
+                !std.mem.eql(u8, existing.neighbor_context_json, cfg.neighbor_context_json) or
                 !std.mem.eql(u8, existing.execution_json, cfg.execution_json))
             {
                 return error.ConflictingEnrichmentConfig;
@@ -21202,7 +21323,9 @@ pub const IndexManager = struct {
     }
 
     fn validateEnrichmentConfig(self: *const IndexManager, cfg: enrichment_catalog.EnrichmentConfig) !void {
-        if (cfg.name.len == 0 or (cfg.source_field.len == 0 and cfg.source_template.len == 0)) return error.InvalidEnrichmentConfig;
+        if (cfg.name.len == 0) return error.InvalidEnrichmentConfig;
+        const consumes_asset_artifact = cfg.kind == .asset and cfg.source_artifact_name.len > 0;
+        if (cfg.source_field.len == 0 and cfg.source_template.len == 0 and !consumes_asset_artifact) return error.InvalidEnrichmentConfig;
         if (cfg.execution_json.len > 0) _ = try enrichment_types.parseExecutionPolicyJson(self.alloc, cfg.execution_json);
         if (cfg.full_text_index and cfg.kind == .embedding) return error.InvalidEnrichmentConfig;
         switch (cfg.kind) {
@@ -21224,6 +21347,27 @@ pub const IndexManager = struct {
             },
             .asset => {
                 try enrichment_config_validation.validateAssetProducerConfig(self.alloc, cfg.producer_json);
+                if (cfg.neighbor_context_json.len > 0) {
+                    var context = try enrichment_neighbor_context.parseConfigJson(self.alloc, cfg.neighbor_context_json);
+                    context.deinit(self.alloc);
+                }
+                if (cfg.source_artifact_name.len > 0) {
+                    // Asset-consumes-asset: the upstream chain must resolve
+                    // to admitted assets and terminate without revisiting
+                    // this config. Cycles that exclude `cfg` are caught when
+                    // their own members are validated.
+                    if (cfg.source_field.len > 0 or cfg.source_template.len > 0) return error.InvalidEnrichmentConfig;
+                    try enrichment_config_validation.validateUpstreamAssetProducer(self.alloc, cfg.producer_json);
+                    var hops: usize = 0;
+                    var current: []const u8 = cfg.source_artifact_name;
+                    while (current.len > 0) {
+                        if (std.mem.eql(u8, current, cfg.name)) return error.InvalidEnrichmentConfig;
+                        const upstream = self.getEnrichment(.asset, current) orelse return error.InvalidEnrichmentConfig;
+                        current = upstream.source_artifact_name;
+                        hops += 1;
+                        if (hops > self.enrichments.items.len) return error.InvalidEnrichmentConfig;
+                    }
+                }
             },
         }
     }
@@ -24547,7 +24691,13 @@ pub const IndexManager = struct {
         defer batch_deletes.deinit(self.alloc);
 
         for (writes) |write| {
-            if (!self.keyInRange(write.source)) continue;
+            // Range admission follows the OWNING document, exactly like the
+            // artifact key: an entity-sourced edge's canonical source key
+            // (write.owner non-empty) can hash into a different shard range
+            // than the producing document, and filtering by it would make
+            // the owner's shard silently drop the mutation.
+            const range_key = if (write.owner.len > 0) write.owner else write.source;
+            if (!self.keyInRange(range_key)) continue;
             if (!std.mem.eql(u8, write.index_name, entry.config.name)) continue;
             try batch_writes.append(self.alloc, .{
                 .source = write.source,
@@ -24557,16 +24707,19 @@ pub const IndexManager = struct {
                 .created_at = write.created_at,
                 .updated_at = write.updated_at,
                 .metadata_json = write.metadata_json,
+                .owner = write.owner,
             });
         }
 
         for (deletes) |delete| {
-            if (!self.keyInRange(delete.source)) continue;
+            const range_key = if (delete.owner.len > 0) delete.owner else delete.source;
+            if (!self.keyInRange(range_key)) continue;
             if (!std.mem.eql(u8, delete.index_name, entry.config.name)) continue;
             try batch_deletes.append(self.alloc, .{
                 .source = delete.source,
                 .target = delete.target,
                 .edge_type = delete.edge_type,
+                .owner = delete.owner,
             });
         }
 
@@ -29918,6 +30071,14 @@ fn enrichmentFromPublic(alloc: Allocator, cfg: types.EnrichmentConfig) !enrichme
         break :blk json;
     } else "";
     errdefer if (execution_json.len > 0) alloc.free(execution_json);
+    const neighbor_context_json = if (cfg.neighbor_context) |context| blk: {
+        const json = try std.json.Stringify.valueAlloc(alloc, context, .{});
+        errdefer alloc.free(json);
+        var parsed = try enrichment_neighbor_context.parseConfigJson(alloc, json);
+        parsed.deinit(alloc);
+        break :blk json;
+    } else "";
+    errdefer if (neighbor_context_json.len > 0) alloc.free(neighbor_context_json);
     return .{
         .name = try alloc.dupe(u8, cfg.name),
         .kind = publicEnrichmentKindToInternal(cfg.kind),
@@ -29933,6 +30094,7 @@ fn enrichmentFromPublic(alloc: Allocator, cfg: types.EnrichmentConfig) !enrichme
         .full_text_index = cfg.full_text_index,
         .content_type = if (cfg.content_type.len > 0) try alloc.dupe(u8, cfg.content_type) else "",
         .producer_json = if (cfg.producer_json.len > 0) try alloc.dupe(u8, cfg.producer_json) else "",
+        .neighbor_context_json = neighbor_context_json,
         .execution_json = execution_json,
     };
 }
@@ -29952,6 +30114,7 @@ fn internalEnrichmentConfigsEqual(alloc: Allocator, a: enrichment_catalog.Enrich
         a.full_text_index == b.full_text_index and
         std.mem.eql(u8, a.content_type, b.content_type) and
         try enrichment_config_validation.producerJsonValuesEqual(alloc, a.producer_json, b.producer_json) and
+        std.mem.eql(u8, a.neighbor_context_json, b.neighbor_context_json) and
         std.mem.eql(u8, a.execution_json, b.execution_json);
 }
 
@@ -29968,6 +30131,15 @@ fn enrichmentToPublic(alloc: Allocator, cfg: enrichment_catalog.EnrichmentConfig
         try parsePublicExecutionConfig(alloc, cfg.execution_json)
     else
         null;
+    const neighbor_context: ?types.EnrichmentNeighborContextConfig = if (cfg.neighbor_context_json.len > 0) blk: {
+        const parsed = try enrichment_neighbor_context.parseConfigJson(alloc, cfg.neighbor_context_json);
+        break :blk .{
+            .graph_index = parsed.graph_index,
+            .edge_types = parsed.edge_types,
+            .direction = parsed.direction,
+            .limit = parsed.limit,
+        };
+    } else null;
     const out = types.EnrichmentConfig{
         .name = try alloc.dupe(u8, cfg.name),
         .kind = internalEnrichmentKindToPublic(cfg.kind),
@@ -29983,6 +30155,7 @@ fn enrichmentToPublic(alloc: Allocator, cfg: enrichment_catalog.EnrichmentConfig
         .full_text_index = cfg.full_text_index,
         .content_type = if (cfg.content_type.len > 0) try alloc.dupe(u8, cfg.content_type) else "",
         .producer_json = if (cfg.producer_json.len > 0) try alloc.dupe(u8, cfg.producer_json) else "",
+        .neighbor_context = neighbor_context,
         .execution = execution,
     };
     return out;

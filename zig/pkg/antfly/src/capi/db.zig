@@ -877,7 +877,7 @@ fn liteManagedEmbeddingIndexConfigJson(
 /// `db.upsertEnrichment` is idempotent for an unchanged config. Scoped to the
 /// native profile: a hosted Lite handle's owning process reconciles its own
 /// enrichments the same way the server does.
-fn registerLiteIndexEnrichments(handle: *Handle, config_json: []const u8) !void {
+fn registerLiteIndexEnrichments(handle: *Handle, config_json: []const u8, rollback: *LiteCatalogRollback) !void {
     var arena_impl = std.heap.ArenaAllocator.init(handle.alloc);
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
@@ -898,7 +898,145 @@ fn registerLiteIndexEnrichments(handle: *Handle, config_json: []const u8) !void 
     );
     if (collected.items.len == 0) return;
     indexes_api.sortArtifactEnrichmentsByDependency(collected.items);
-    for (collected.items) |cfg| _ = try handle.db.upsertEnrichment(cfg);
+    for (collected.items) |cfg| {
+        // Record the touch before mutating, so a mid-loop failure still rolls
+        // back every enrichment this call may have changed.
+        try rollback.willTouchEnrichment(cfg.kind, cfg.name);
+        _ = try handle.db.upsertEnrichment(cfg);
+    }
+}
+
+/// Undo buffer for the catalog mutations a native Lite AddIndex performs
+/// before (nested enrichments) and after (nested resolvers) `db.addIndex`.
+/// The C ABI admits one index per call with no transaction around the
+/// enrichment/resolver catalogs, so a rejected or partially failed AddIndex
+/// must restore the pre-call configuration itself: durably upserting an
+/// existing enrichment's changed geometry and then failing index admission
+/// (for example with IndexAlreadyExists) must not leave the changed
+/// enrichment active.
+const LiteCatalogRollback = struct {
+    const TouchedEnrichment = struct {
+        kind: db_mod.types.EnrichmentKind,
+        name: []u8,
+    };
+
+    handle: *Handle,
+    /// Full pre-call enrichment catalog (owned).
+    prior: []db_mod.types.EnrichmentConfig,
+    /// Full pre-call resolver catalog (owned).
+    prior_resolvers: []db_mod.ResolverConfig,
+    touched: std.ArrayListUnmanaged(TouchedEnrichment) = .empty,
+    touched_resolvers: std.ArrayListUnmanaged([]u8) = .empty,
+
+    fn init(handle: *Handle) !LiteCatalogRollback {
+        const prior = try handle.db.listEnrichments(handle.alloc);
+        errdefer db_mod.types.freeEnrichmentConfigs(handle.alloc, prior);
+        return .{
+            .handle = handle,
+            .prior = prior,
+            .prior_resolvers = try handle.db.listResolvers(handle.alloc),
+        };
+    }
+
+    fn deinit(self: *LiteCatalogRollback) void {
+        const alloc = self.handle.alloc;
+        db_mod.types.freeEnrichmentConfigs(alloc, self.prior);
+        for (self.prior_resolvers) |*cfg| cfg.deinit(alloc);
+        alloc.free(self.prior_resolvers);
+        for (self.touched.items) |touch| alloc.free(touch.name);
+        self.touched.deinit(alloc);
+        for (self.touched_resolvers.items) |name| alloc.free(name);
+        self.touched_resolvers.deinit(alloc);
+    }
+
+    fn willTouchEnrichment(self: *LiteCatalogRollback, kind: db_mod.types.EnrichmentKind, name: []const u8) !void {
+        const alloc = self.handle.alloc;
+        for (self.touched.items) |touch| {
+            if (touch.kind == kind and std.mem.eql(u8, touch.name, name)) return;
+        }
+        try self.touched.append(alloc, .{ .kind = kind, .name = try alloc.dupe(u8, name) });
+    }
+
+    fn willTouchResolver(self: *LiteCatalogRollback, name: []const u8) !void {
+        const alloc = self.handle.alloc;
+        for (self.touched_resolvers.items) |touched| {
+            if (std.mem.eql(u8, touched, name)) return;
+        }
+        try self.touched_resolvers.append(alloc, try alloc.dupe(u8, name));
+    }
+
+    /// Best-effort restore of every touched enrichment to its pre-call
+    /// configuration: re-upsert the prior config, or delete an enrichment
+    /// this call introduced. Restore failures are logged, never masked over
+    /// the admission error the caller is already returning.
+    fn restore(self: *LiteCatalogRollback) void {
+        for (self.touched_resolvers.items) |name| {
+            const prior = blk: {
+                for (self.prior_resolvers) |cfg| {
+                    if (std.mem.eql(u8, cfg.name, name)) break :blk cfg;
+                }
+                break :blk null;
+            };
+            if (prior) |cfg| {
+                _ = self.handle.db.upsertResolverWithResultOptions(cfg, .{ .drain_backfill = false }) catch |err| {
+                    std.log.warn("lite AddIndex rollback failed to restore resolver {s}: {s}", .{ name, @errorName(err) });
+                };
+            } else {
+                _ = self.handle.db.removeResolverWithoutDrain(name) catch |err| {
+                    std.log.warn("lite AddIndex rollback failed to remove resolver {s}: {s}", .{ name, @errorName(err) });
+                };
+            }
+        }
+        for (self.touched.items) |touch| {
+            const prior = blk: {
+                for (self.prior) |cfg| {
+                    if (cfg.kind == touch.kind and std.mem.eql(u8, cfg.name, touch.name)) break :blk cfg;
+                }
+                break :blk null;
+            };
+            if (prior) |cfg| {
+                _ = self.handle.db.upsertEnrichment(cfg) catch |err| {
+                    std.log.warn("lite AddIndex rollback failed to restore enrichment {s}: {s}", .{ touch.name, @errorName(err) });
+                };
+            } else {
+                _ = self.handle.db.deleteEnrichment(touch.kind, touch.name) catch |err| {
+                    std.log.warn("lite AddIndex rollback failed to remove enrichment {s}: {s}", .{ touch.name, @errorName(err) });
+                };
+            }
+        }
+    }
+};
+
+/// Register the entity resolvers nested in this index's own raw config, the
+/// way `registerLiteIndexEnrichments` harvests nested `"enrichments"`. The
+/// server registers resolvers from the whole table's indexes JSON
+/// (`metadata_table_provisioner.ensureResolversWithOptions`) after index
+/// provisioning; a native Lite handle admits one index at a time, so this
+/// harvests the graph config's `"resolvers"` array after the index itself is
+/// admitted. Add/update only — a single index's config never proves another
+/// index's resolvers are gone, so nothing is removed here. `upsertResolver`
+/// is idempotent for an unchanged config; backfill is deferred to the
+/// resolver workers (or the next `antfly_lite_run_until_idle`).
+fn registerLiteIndexResolvers(handle: *Handle, config_json: []const u8, rollback: *LiteCatalogRollback) !void {
+    var arena_impl = std.heap.ArenaAllocator.init(handle.alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    var parsed = std.json.parseFromSlice(std.json.Value, arena, config_json, .{}) catch return;
+    if (parsed.value != .object) return;
+    const resolvers = parsed.value.object.get("resolvers") orelse return;
+    if (resolvers != .array) return;
+    for (resolvers.array.items) |item| {
+        if (item != .object) continue;
+        const cfg = try std.json.parseFromValue(db_mod.ResolverConfig, arena, item, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        });
+        // Record the touch before mutating, so a mid-loop failure (an
+        // invalid later resolver, a label conflict) still restores every
+        // earlier insertion or replacement this call made.
+        try rollback.willTouchResolver(cfg.value.name);
+        _ = try handle.db.upsertResolverWithResultOptions(cfg.value, .{ .drain_backfill = false });
+    }
 }
 
 test "capi lite AddIndexJSON registers the server's nested artifact-sourced enrichment shape" {
@@ -966,6 +1104,111 @@ test "capi lite AddIndexJSON registers the server's nested artifact-sourced enri
     // (config_json is itself JSON-encoded as a string, so its embedded quotes
     // are backslash-escaped here rather than literal).
     try std.testing.expect(std.mem.indexOf(u8, indexes_json, "\\\"sources\\\":[{\\\"artifact\\\":\\\"document_chunk_dense_v1\\\"") != null);
+}
+
+test "capi lite AddIndexJSON restores the enrichment catalog when admission rejects the index" {
+    // Reviewer-reported P2: registerLiteIndexEnrichments durably upserted
+    // every nested enrichment BEFORE db.addIndex validated the index, so
+    // re-adding an existing index with a changed chunk_size updated the
+    // active enrichment and then failed with IndexAlreadyExists — the caller
+    // saw an error while the configuration had silently changed. AddIndex is
+    // now all-or-nothing: the pre-call enrichment catalog is restored on any
+    // admission failure.
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-addindex-rollback");
+    defer alloc.free(path);
+    cleanupTestFile(path);
+    defer cleanupTestFile(path);
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &handle));
+    defer antfly_db_close(handle);
+
+    const original_index_json =
+        \\{"name":"document_text_chunks","kind":"full_text","config_json":"{\"chunk_name\":\"document_chunks_v1\",\"enrichments\":[{\"name\":\"document_chunks_v1\",\"kind\":\"chunk\",\"field\":\"body\",\"chunk_size\":64}]}"}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle, .{
+        .ptr = original_index_json,
+        .len = original_index_json.len,
+    }));
+
+    // Same index name, changed chunk geometry: admission must reject it AND
+    // the active chunk enrichment must keep chunk_size 64.
+    const changed_index_json =
+        \\{"name":"document_text_chunks","kind":"full_text","config_json":"{\"chunk_name\":\"document_chunks_v1\",\"enrichments\":[{\"name\":\"document_chunks_v1\",\"kind\":\"chunk\",\"field\":\"body\",\"chunk_size\":128}]}"}
+    ;
+    try std.testing.expect(antfly_db_add_index_json(handle, .{
+        .ptr = changed_index_json,
+        .len = changed_index_json.len,
+    }) != .ok);
+
+    {
+        const enrichments = try asHandle(handle).?.db.listEnrichments(alloc);
+        defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
+        try std.testing.expectEqual(@as(usize, 1), enrichments.len);
+        try std.testing.expectEqualStrings("document_chunks_v1", enrichments[0].name);
+        try std.testing.expectEqual(@as(u32, 64), enrichments[0].chunk_size);
+    }
+}
+
+test "capi lite AddIndexJSON registers a graph config's nested resolvers" {
+    // The server registers entity resolvers from the whole table's indexes
+    // JSON (metadata_table_provisioner.ensureResolvers); a native Lite
+    // handle admits one index at a time, so registerLiteIndexResolvers
+    // harvests the graph config's own "resolvers" array — the shape
+    // examples/dogfood's knowledgeGraphIndexJSON declares. Re-adding the
+    // same index must be idempotent (upsertResolver observes an unchanged
+    // config), matching the enrichment path's contract.
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-graph-resolvers");
+    defer alloc.free(path);
+    cleanupTestFile(path);
+    defer cleanupTestFile(path);
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &handle));
+    defer antfly_db_close(handle);
+
+    const graph_index_json =
+        \\{"name":"knowledge","kind":"graph","config_json":"{\"source\":{\"artifact\":\"relations_v1\",\"path\":\"$.relations[*]\",\"format\":\"extraction_relation\",\"mention_edge_type\":\"mentions\"},\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"source\":{\"type\":\"field\",\"value\":\"body\"},\"content_type\":\"application/json\"},\"resolvers\":[{\"name\":\"entities\",\"table\":\"entities\",\"source_artifact\":\"relations_v1\",\"resolution_artifact\":\"entities_resolution_v1\",\"key_template\":\"{{ lower _entity.label }}/{{ slug _entity.text }}\",\"config_generation\":1}]}"}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle, .{
+        .ptr = graph_index_json,
+        .len = graph_index_json.len,
+    }));
+
+    {
+        const resolvers = try asHandle(handle).?.db.listResolvers(alloc);
+        defer {
+            for (resolvers) |*cfg| cfg.deinit(alloc);
+            alloc.free(resolvers);
+        }
+        try std.testing.expectEqual(@as(usize, 1), resolvers.len);
+        try std.testing.expectEqualStrings("entities", resolvers[0].name);
+        try std.testing.expectEqualStrings("relations_v1", resolvers[0].source_artifact);
+        try std.testing.expectEqualStrings("entities_resolution_v1", resolvers[0].resolution_artifact);
+        try std.testing.expectEqual(@as(u64, 1), resolvers[0].config_generation);
+    }
+
+    // Re-adding the identical index (whatever its own admission outcome)
+    // must not duplicate or corrupt the resolver catalog: an unchanged
+    // config upserts as a no-op.
+    _ = antfly_db_add_index_json(handle, .{
+        .ptr = graph_index_json,
+        .len = graph_index_json.len,
+    });
+    {
+        const resolvers = try asHandle(handle).?.db.listResolvers(alloc);
+        defer {
+            for (resolvers) |*cfg| cfg.deinit(alloc);
+            alloc.free(resolvers);
+        }
+        try std.testing.expectEqual(@as(usize, 1), resolvers.len);
+    }
 }
 
 test "capi lite AddIndexJSON surfaces an unresolvable source_artifact_name as invalid_argument, not internal" {
@@ -1841,6 +2084,14 @@ const JsonDBIndexStats = struct {
     repair_issue_count: u64,
     repair_summary_ready: bool,
     repair_issue_count_estimated: bool,
+    // Durable per-document generation-outcome coverage (produced / skipped /
+    // terminal_failed markers), so an embedded consumer can report honest
+    // coverage: documents that failed non-retryably are settled failures,
+    // not pending work. Mirrors the server's index-status coverage block.
+    coverage_produced_count: u64,
+    coverage_skipped_count: u64,
+    coverage_terminal_failed_count: u64,
+    coverage_summary_ready: bool,
 };
 
 const JsonEnrichmentStats = struct {
@@ -1856,10 +2107,15 @@ const JsonEnrichmentStats = struct {
     processed_requests: u64,
     error_count: u64,
     retryable_error_count: u64,
+    // Durable count of requests parked non-retryably (terminal disposition);
+    // per-document terminal state lives in the index coverage counters.
     fatal_error_count: u64,
     retrying: bool,
     worker_failed: bool,
+    stalled: bool,
+    stall_reason: []const u8,
     skip_by_hash_count: u64,
+    skipped_source_count: u64,
     codec_decode_failures: u64,
     dense_artifact_bytes_written: u64,
     sparse_artifact_bytes_written: u64,
@@ -10284,6 +10540,10 @@ fn dbIndexStatsProjectionAlloc(alloc: Allocator, stats: db_mod.types.DBStats) ![
             .repair_issue_count = item.repair_issue_count,
             .repair_summary_ready = item.repair_summary_ready,
             .repair_issue_count_estimated = item.repair_issue_count_estimated,
+            .coverage_produced_count = item.coverage_produced_count,
+            .coverage_skipped_count = item.coverage_skipped_count,
+            .coverage_terminal_failed_count = item.coverage_terminal_failed_count,
+            .coverage_summary_ready = item.coverage_summary_ready,
         };
     }
     return indexes;
@@ -10314,7 +10574,10 @@ fn jsonDBStatsProjection(stats: db_mod.types.DBStats, indexes: []JsonDBIndexStat
             .fatal_error_count = stats.enrichment.fatal_error_count,
             .retrying = stats.enrichment.retrying,
             .worker_failed = stats.enrichment.worker_failed,
+            .stalled = stats.enrichment.stalled,
+            .stall_reason = stats.enrichment.stall_reason,
             .skip_by_hash_count = stats.enrichment.skip_by_hash_count,
+            .skipped_source_count = stats.enrichment.skipped_source_count,
             .codec_decode_failures = stats.enrichment.codec_decode_failures,
             .dense_artifact_bytes_written = stats.enrichment.dense_artifact_bytes_written,
             .sparse_artifact_bytes_written = stats.enrichment.sparse_artifact_bytes_written,
@@ -12841,16 +13104,30 @@ pub export fn antfly_db_add_index_json(
     // shape on this index's own config (see `registerLiteIndexEnrichments`),
     // registering every declared producer before the index below is admitted
     // so an artifact-sourced `sources`/`embedding_name` reference already
-    // resolves.
+    // resolves. The server's atomic table-create request has no such
+    // pre-admission catalog mutation, so this call carries its own undo: a
+    // rejected admission (IndexAlreadyExists, invalid config) or a partial
+    // enrichment/resolver registration restores the pre-call enrichment
+    // catalog instead of leaving durably changed producers behind a caller
+    // who was told the AddIndex failed.
+    var rollback: ?LiteCatalogRollback = null;
+    defer if (rollback) |*undo| undo.deinit();
     if (handle.lite_profile == .native) {
-        registerLiteIndexEnrichments(handle, parsed.value.config_json) catch |err| return capi.mapError(err);
+        rollback = LiteCatalogRollback.init(handle) catch |err| return capi.mapError(err);
+        registerLiteIndexEnrichments(handle, parsed.value.config_json, &rollback.?) catch |err| {
+            rollback.?.restore();
+            return capi.mapError(err);
+        };
     }
     // Only a native Lite handle calls `db.addIndex` directly with a raw
     // public-shaped dense/sparse config; the server always translates first
     // (see `litePhysicalIndexConfigJson`). Every other handle keeps calling
     // `db.addIndex` with exactly the config it was given, unchanged.
     const stored_config_json = if (handle.lite_profile == .native)
-        litePhysicalIndexConfigJson(handle.alloc, kind, parsed.value.name, parsed.value.config_json, handle.liteAntflyProvider()) catch |err| return capi.mapError(err)
+        litePhysicalIndexConfigJson(handle.alloc, kind, parsed.value.name, parsed.value.config_json, handle.liteAntflyProvider()) catch |err| {
+            if (rollback) |*undo| undo.restore();
+            return capi.mapError(err);
+        }
     else
         parsed.value.config_json;
     defer if (handle.lite_profile == .native) handle.alloc.free(@constCast(stored_config_json));
@@ -12858,7 +13135,25 @@ pub export fn antfly_db_add_index_json(
         .name = parsed.value.name,
         .kind = kind,
         .config_json = stored_config_json,
-    }) catch |err| return capi.mapError(err);
+    }) catch |err| {
+        if (rollback) |*undo| undo.restore();
+        return capi.mapError(err);
+    };
+    // A native handle also registers the entity resolvers a graph config
+    // declares inline, after the index (and its source artifact's enrichment)
+    // is admitted, the way the server's provisioner runs ensureResolvers
+    // after index reconciliation. A resolver registration failure unwinds
+    // the just-admitted index and the enrichment catalog so the call is
+    // all-or-nothing.
+    if (handle.lite_profile == .native and kind == .graph) {
+        registerLiteIndexResolvers(handle, parsed.value.config_json, &rollback.?) catch |err| {
+            _ = handle.db.deleteIndex(parsed.value.name) catch |delete_err| {
+                std.log.warn("lite AddIndex rollback failed to remove index {s}: {s}", .{ parsed.value.name, @errorName(delete_err) });
+            };
+            if (rollback) |*undo| undo.restore();
+            return capi.mapError(err);
+        };
+    }
     refreshLiteManagedEmbeddingRuntime(handle) catch |err| return capi.mapError(err);
     return .ok;
 }

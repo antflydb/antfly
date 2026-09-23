@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
@@ -32,6 +32,17 @@ class GraphMetricRerank:
                 metric generation. Default: 0.0.
             metric_freshness (GraphMetricRerankMetricFreshness | Unset): Whether stale published generations are acceptable
                 or the metric must be fresh. Default: GraphMetricRerankMetricFreshness.PUBLISHED.
+            seed_nodes (list[str] | Unset): Node keys receiving all teleport mass for a query-seeded personalized PageRank
+                blend (HippoRAG-style retrieval). Only valid for pagerank metrics and requires metric_freshness=fresh: the
+                blended feature scores are computed at query time from the current edge snapshot, while published generations
+                are global-only, so seeded blends against published freshness are rejected. Seed keys absent from the graph are
+                skipped; if none resolve, the blend degenerates to global PageRank.
+            damping (float | Unset): Damping override for the query-seeded personalized PageRank blend. Only valid together
+                with seed_nodes; omitted blends keep the metric's configured damping.
+            auto_seed (bool | Unset): Seed the personalized PageRank blend from the query's literal graph-search start keys;
+                only valid for pagerank metrics with metric_freshness=fresh. Honored by retrieval-agent queries: caller-supplied
+                seed_nodes always take precedence and are never overwritten, and queries without literal graph-search start keys
+                keep their unseeded (global) blend. Default: False.
     """
 
     index: str
@@ -41,6 +52,9 @@ class GraphMetricRerank:
     weight: float | Unset = 1.0
     missing_score: float | Unset = 0.0
     metric_freshness: GraphMetricRerankMetricFreshness | Unset = GraphMetricRerankMetricFreshness.PUBLISHED
+    seed_nodes: list[str] | Unset = UNSET
+    damping: float | Unset = UNSET
+    auto_seed: bool | Unset = False
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -60,6 +74,14 @@ class GraphMetricRerank:
         if not isinstance(self.metric_freshness, Unset):
             metric_freshness = self.metric_freshness.value
 
+        seed_nodes: list[str] | Unset = UNSET
+        if not isinstance(self.seed_nodes, Unset):
+            seed_nodes = self.seed_nodes
+
+        damping = self.damping
+
+        auto_seed = self.auto_seed
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -78,6 +100,12 @@ class GraphMetricRerank:
             field_dict["missing_score"] = missing_score
         if metric_freshness is not UNSET:
             field_dict["metric_freshness"] = metric_freshness
+        if seed_nodes is not UNSET:
+            field_dict["seed_nodes"] = seed_nodes
+        if damping is not UNSET:
+            field_dict["damping"] = damping
+        if auto_seed is not UNSET:
+            field_dict["auto_seed"] = auto_seed
 
         return field_dict
 
@@ -103,6 +131,12 @@ class GraphMetricRerank:
         else:
             metric_freshness = GraphMetricRerankMetricFreshness(_metric_freshness)
 
+        seed_nodes = cast(list[str], d.pop("seed_nodes", UNSET))
+
+        damping = d.pop("damping", UNSET)
+
+        auto_seed = d.pop("auto_seed", UNSET)
+
         graph_metric_rerank = cls(
             index=index,
             metric=metric,
@@ -111,6 +145,9 @@ class GraphMetricRerank:
             weight=weight,
             missing_score=missing_score,
             metric_freshness=metric_freshness,
+            seed_nodes=seed_nodes,
+            damping=damping,
+            auto_seed=auto_seed,
         )
 
         graph_metric_rerank.additional_properties = d

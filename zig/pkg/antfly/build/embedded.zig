@@ -440,6 +440,8 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "run until idle no-progress error maps to a dedicated stalled ABI code, not internal",
         "capi lite merged indexes JSON discovers a standalone asset extractor and chunk enrichment with no owning index",
         "capi lite run until idle drains a standalone chunk enrichment with no owning index",
+        "capi lite AddIndexJSON registers a graph config's nested resolvers",
+        "capi lite AddIndexJSON restores the enrichment catalog when admission rejects the index",
     };
     const capi_tests = b.addTest(.{
         .root_module = capi_mod,

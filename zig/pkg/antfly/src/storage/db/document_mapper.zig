@@ -191,12 +191,15 @@ pub const ExtractedWrite = struct {
                 const edge_type = try alloc.dupe(u8, write.edge_type);
                 errdefer alloc.free(edge_type);
                 const metadata_json = if (write.metadata_json.len > 0) try alloc.dupe(u8, write.metadata_json) else "";
+                errdefer if (metadata_json.len > 0) alloc.free(@constCast(metadata_json));
+                const owner = if (write.owner.len > 0) try alloc.dupe(u8, write.owner) else "";
                 break :blk .{
                     .index_name = index_name,
                     .source = source,
                     .target = target,
                     .edge_type = edge_type,
                     .metadata_json = metadata_json,
+                    .owner = owner,
                 };
             };
             graph_initialized += 1;
@@ -286,6 +289,7 @@ pub const ExtractedWrite = struct {
             alloc.free(@constCast(graph_write.target));
             alloc.free(@constCast(graph_write.edge_type));
             if (graph_write.metadata_json.len > 0) alloc.free(@constCast(graph_write.metadata_json));
+            if (graph_write.owner.len > 0) alloc.free(@constCast(graph_write.owner));
         }
         if (self.graph_writes.len > 0) alloc.free(self.graph_writes);
         for (self.mentioned_graph_indexes) |index_name| alloc.free(index_name);
@@ -2174,6 +2178,7 @@ fn extractWriteFromParsedPrepared(
             alloc.free(@constCast(graph_write.target));
             alloc.free(@constCast(graph_write.edge_type));
             if (graph_write.metadata_json.len > 0) alloc.free(@constCast(graph_write.metadata_json));
+            if (graph_write.owner.len > 0) alloc.free(@constCast(graph_write.owner));
         }
         graph_writes.deinit(alloc);
     }

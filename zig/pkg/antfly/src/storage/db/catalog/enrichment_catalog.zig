@@ -40,6 +40,9 @@ pub const EnrichmentConfig = struct {
     full_text_index: bool = false,
     content_type: []const u8 = "",
     producer_json: []const u8 = "",
+    /// Canonicalized neighbor-context configuration for asset producers.
+    /// Empty means the producer input carries no graph adjacency sample.
+    neighbor_context_json: []const u8 = "",
     execution_json: []const u8 = "",
 
     pub fn clone(alloc: Allocator, cfg: EnrichmentConfig) !EnrichmentConfig {
@@ -58,6 +61,7 @@ pub const EnrichmentConfig = struct {
             .full_text_index = cfg.full_text_index,
             .content_type = if (cfg.content_type.len > 0) try alloc.dupe(u8, cfg.content_type) else "",
             .producer_json = if (cfg.producer_json.len > 0) try alloc.dupe(u8, cfg.producer_json) else "",
+            .neighbor_context_json = if (cfg.neighbor_context_json.len > 0) try alloc.dupe(u8, cfg.neighbor_context_json) else "",
             .execution_json = if (cfg.execution_json.len > 0) try alloc.dupe(u8, cfg.execution_json) else "",
         };
     }
@@ -71,6 +75,7 @@ pub const EnrichmentConfig = struct {
         if (self.chunker_json.len > 0) alloc.free(@constCast(self.chunker_json));
         if (self.content_type.len > 0) alloc.free(@constCast(self.content_type));
         if (self.producer_json.len > 0) alloc.free(@constCast(self.producer_json));
+        if (self.neighbor_context_json.len > 0) alloc.free(@constCast(self.neighbor_context_json));
         if (self.execution_json.len > 0) alloc.free(@constCast(self.execution_json));
         self.* = undefined;
     }
@@ -113,6 +118,13 @@ test "enrichment catalog round trip" {
             .chunker_json = "{\"provider\":\"antfly\",\"text\":{\"target_tokens\":512,\"overlap_tokens\":64}}",
         },
         .{
+            .name = "conceptualize_v1",
+            .kind = .asset,
+            .source_field = "name",
+            .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\"}}",
+            .neighbor_context_json = "{\"graph_index\":\"taxonomy\",\"edge_types\":[\"started_by\"],\"direction\":\"out\",\"limit\":8}",
+        },
+        .{
             .name = "body_dense_v1",
             .kind = .embedding,
             .source_field = "body",
@@ -129,18 +141,25 @@ test "enrichment catalog round trip" {
         alloc.free(decoded);
     }
 
-    try std.testing.expectEqual(@as(usize, 2), decoded.len);
+    try std.testing.expectEqual(@as(usize, 3), decoded.len);
     try std.testing.expectEqual(.chunk, decoded[0].kind);
     try std.testing.expectEqualStrings("body_chunks_v1", decoded[0].name);
     try std.testing.expectEqualStrings("body", decoded[0].source_field);
     try std.testing.expectEqualStrings("{{title}}\n{{body}}", decoded[0].source_template);
     try std.testing.expectEqualStrings("{\"provider\":\"antfly\",\"text\":{\"target_tokens\":512,\"overlap_tokens\":64}}", decoded[0].chunker_json);
-    try std.testing.expectEqual(.embedding, decoded[1].kind);
-    try std.testing.expectEqualStrings("body_dense_v1", decoded[1].name);
-    try std.testing.expectEqualStrings("body", decoded[1].source_field);
-    try std.testing.expectEqualStrings("{{title}}\n{{body}}", decoded[1].source_template);
-    try std.testing.expectEqualStrings("body_chunks_v1", decoded[1].source_artifact_name);
-    try std.testing.expectEqual(@as(u32, 768), decoded[1].expected_dims);
+    try std.testing.expectEqual(@as(usize, 0), decoded[0].neighbor_context_json.len);
+    try std.testing.expectEqual(.asset, decoded[1].kind);
+    try std.testing.expectEqualStrings("conceptualize_v1", decoded[1].name);
+    try std.testing.expectEqualStrings(
+        "{\"graph_index\":\"taxonomy\",\"edge_types\":[\"started_by\"],\"direction\":\"out\",\"limit\":8}",
+        decoded[1].neighbor_context_json,
+    );
+    try std.testing.expectEqual(.embedding, decoded[2].kind);
+    try std.testing.expectEqualStrings("body_dense_v1", decoded[2].name);
+    try std.testing.expectEqualStrings("body", decoded[2].source_field);
+    try std.testing.expectEqualStrings("{{title}}\n{{body}}", decoded[2].source_template);
+    try std.testing.expectEqualStrings("body_chunks_v1", decoded[2].source_artifact_name);
+    try std.testing.expectEqual(@as(u32, 768), decoded[2].expected_dims);
 }
 
 test "enrichment catalog round trip without source_template" {
