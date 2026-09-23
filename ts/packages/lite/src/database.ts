@@ -39,7 +39,7 @@ import {
   txnIdBytes,
   type Uint64Like,
 } from "./marshal.js";
-import { loadNative, type NativeLibrary } from "./native.js";
+import { loadNative, type NativeLibrary, storageKind } from "./native.js";
 import {
   type Capabilities,
   type CheckReport,
@@ -66,8 +66,9 @@ type NativeOptionsStruct = Record<string, unknown>;
 
 function buildOpenOptionsStruct(native: NativeLibrary, opts: OpenOptions): NativeOptionsStruct {
   const options: NativeOptionsStruct = {};
-  checkCode(native.liteOpenOptionsInit(options));
+  checkCode(native.openOptionsInit(options));
 
+  options.storage_kind = storageKind(opts.storage);
   options.open_mode = opts.mode ?? OpenMode.Writer;
   options.profile = opts.profile ?? Profile.Native;
 
@@ -219,14 +220,14 @@ export class Database implements AsyncDisposable {
   // --- Status / capabilities / maintenance ---
 
   statusRaw(): Promise<Buffer> {
-    return this.#invokeBuffer(this.#native.liteStatusJson);
+    return this.#invokeBuffer(this.#native.dbStatusJson);
   }
   async status(): Promise<Status> {
     return parseJson(await this.statusRaw()) as Status;
   }
 
   capabilitiesRaw(): Promise<Buffer> {
-    return this.#invokeBuffer(this.#native.liteCapabilitiesJson);
+    return this.#invokeBuffer(this.#native.dbCapabilitiesJson);
   }
   async capabilities(): Promise<Capabilities> {
     return parseJson(await this.capabilitiesRaw()) as Capabilities;
@@ -264,7 +265,7 @@ export class Database implements AsyncDisposable {
   }
 
   pendingWorkStatsRaw(): Promise<Buffer> {
-    return this.#invokeBuffer(this.#native.litePendingWorkStatsJson);
+    return this.#invokeBuffer(this.#native.dbPendingWorkStatsJson);
   }
   async pendingWorkStats(): Promise<PendingWorkStatus> {
     return parseJson(await this.pendingWorkStatsRaw()) as PendingWorkStatus;
@@ -272,17 +273,17 @@ export class Database implements AsyncDisposable {
 
   /** Drains pending enrichment and index work; returns no result (see runUntilIdleStatus for the post-drain report). */
   runUntilIdle(): Promise<void> {
-    return this.#invokeCode(this.#native.liteRunUntilIdle);
+    return this.#invokeCode(this.#native.dbRunUntilIdle);
   }
   runUntilIdleStatusRaw(): Promise<Buffer> {
-    return this.#invokeBuffer(this.#native.liteRunUntilIdleJson);
+    return this.#invokeBuffer(this.#native.dbRunUntilIdleJson);
   }
   async runUntilIdleStatus(): Promise<PendingWorkStatus> {
     return parseJson(await this.runUntilIdleStatusRaw()) as PendingWorkStatus;
   }
 
   replayGeneratedEnrichmentsRaw(): Promise<Buffer> {
-    return this.#invokeBuffer(this.#native.liteReplayGeneratedEnrichmentsJson);
+    return this.#invokeBuffer(this.#native.dbReplayGeneratedEnrichmentsJson);
   }
   async replayGeneratedEnrichments(): Promise<ReplayGeneratedEnrichmentsResult> {
     return parseJson(
@@ -290,31 +291,21 @@ export class Database implements AsyncDisposable {
     ) as ReplayGeneratedEnrichmentsResult;
   }
 
-  // --- Backup / export / import ---
+  // --- Backup / import ---
 
+  /** Returns a portable Antfly backup archive (.afb) of this database, which restores or imports into either storage kind. */
   backup(): Promise<Buffer> {
-    return this.#invokeBuffer(this.#native.liteBackup);
-  }
-  export(): Promise<Buffer> {
-    return this.#invokeBuffer(this.#native.liteExport);
+    return this.#invokeBuffer(this.#native.dbBackup);
   }
 
-  /** OutcomeUnknown means the live handle adopted the imported generation, but crash durability could not be confirmed; inspect the handle and do not retry automatically. */
+  /** Imports a portable Antfly backup archive into this empty database. OutcomeUnknown means the live handle adopted the imported generation, but crash durability could not be confirmed; inspect the handle and do not retry automatically. */
   importBackup(backup: Uint8Array): Promise<void> {
-    return this.#invokeCode(this.#native.liteImportBackup, sliceOf(toRawBytes(backup)));
-  }
-  /** See importBackup. */
-  import(backup: Uint8Array): Promise<void> {
-    return this.#invokeCode(this.#native.liteImport, sliceOf(toRawBytes(backup)));
+    return this.#invokeCode(this.#native.dbImportBackup, sliceOf(toRawBytes(backup)));
   }
 
   async backupToFile(path: string): Promise<void> {
     if (!path.endsWith(".afb")) throw new InvalidArgumentError("path must end with .afb");
     await writeFileAtomically(path, await this.backup());
-  }
-  async exportToFile(path: string): Promise<void> {
-    if (!path.endsWith(".afb")) throw new InvalidArgumentError("path must end with .afb");
-    await writeFileAtomically(path, await this.export());
   }
 
   // --- Documents ---
@@ -658,7 +649,7 @@ async function openOrCreate(path: string, opts: OpenOptions, create: boolean): P
   const native = loadNative();
   const options = buildOpenOptionsStruct(native, opts);
   const outHandle: unknown[] = [null];
-  const fn = create ? native.liteCreateWithOptions : native.liteOpenWithOptions;
+  const fn = create ? native.dbCreateWithOptions : native.dbOpenWithOptions;
   const code = await callAsync(fn, path, options, outHandle);
   checkCode(code);
   return new Database(native, outHandle[0]);

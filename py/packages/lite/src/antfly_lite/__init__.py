@@ -64,6 +64,7 @@ __all__ = [
     "GraphDirection",
     "OpenMode",
     "Profile",
+    "Storage",
     "OpenOptions",
     "TTLCleanupOptions",
     "LibraryNotFoundError",
@@ -99,9 +100,7 @@ __all__ = [
     "create_hosted",
     "check_file",
     "restore",
-    "restore_backup",
     "restore_file",
-    "restore_backup_file",
     "copy_stable_snapshot_file",
     "decode_artifact_id",
 ]
@@ -137,6 +136,15 @@ class Profile(enum.IntEnum):
     HOSTED = _ffi.PROFILE_HOSTED
 
 
+class Storage(enum.IntEnum):
+    """Selects how a database is stored (antfly_open_options.storage_kind).
+    The default, LITE, is a single-file .aflite database; DIRECTORY is a
+    normal single-node Antfly directory."""
+
+    DIRECTORY = _ffi.STORAGE_KIND_DIRECTORY
+    LITE = _ffi.STORAGE_KIND_LITE
+
+
 @dataclass
 class TTLCleanupOptions:
     """Configures the optional Lite TTL cleanup runtime."""
@@ -154,6 +162,12 @@ class TTLCleanupOptions:
 class OpenOptions:
     """Configures open_with_options()/create_with_options().
 
+    storage selects a .aflite file (the default, Storage.LITE) or a normal
+    Antfly directory (Storage.DIRECTORY). Directory storage is created by
+    opening a missing path; create_with_options() has exclusive-create
+    semantics only for Storage.LITE, so creating directory storage surfaces
+    the library's own error rather than being special-cased here.
+
     busy_timeout, like sqlite3_busy_timeout, keeps retrying a writer open
     while another process or handle holds the database's writer lock. None
     or zero fails immediately with BusyError. Accepts a number of seconds
@@ -167,6 +181,7 @@ class OpenOptions:
     consulted when local_runtime_configured is set.
     """
 
+    storage: Storage = Storage.LITE
     mode: OpenMode = OpenMode.WRITER
     profile: Profile = Profile.NATIVE
     no_sync: bool = False
@@ -220,14 +235,15 @@ def _busy_timeout_ms(value: float | int | timedelta | None) -> int:
     return math.ceil(seconds * 1000)
 
 
-def _build_c_options(opts: OpenOptions) -> tuple[_ffi.LiteOpenOptions, object]:
+def _build_c_options(opts: OpenOptions) -> tuple[_ffi.AntflyOpenOptions, object]:
     """Build the C options struct. Returns a keep-alive object that must
     stay referenced for the duration of the call using the returned
     struct (it backs the ttl_cleanup owner-id slice, if any)."""
     lib = _ffi.get_lib()
-    c_opts = _ffi.LiteOpenOptions()
-    errors.raise_for_code(lib.antfly_lite_open_options_init(_ctypes.byref(c_opts)))
+    c_opts = _ffi.AntflyOpenOptions()
+    errors.raise_for_code(lib.antfly_open_options_init(_ctypes.byref(c_opts)))
 
+    c_opts.storage_kind = int(opts.storage)
     c_opts.open_mode = int(opts.mode)
     c_opts.profile = int(opts.profile)
     c_opts.map_size = opts.map_size
@@ -265,12 +281,16 @@ def _build_c_options(opts: OpenOptions) -> tuple[_ffi.LiteOpenOptions, object]:
 
 
 def open_with_options(path: str | os.PathLike[str], options: OpenOptions) -> Database:
-    """Open an Antfly Lite database using explicit options."""
+    """Open a database of the storage kind `options.storage` selects, using
+    explicit options. A directory is created if the path is missing; a
+    missing .aflite path fails (use create_with_options() to create one)."""
     return _open_with_options(path, options, create=False)
 
 
 def create_with_options(path: str | os.PathLike[str], options: OpenOptions) -> Database:
-    """Create an Antfly Lite database using explicit options."""
+    """Create a database using explicit options. Exclusive-create semantics
+    only apply to Storage.LITE; creating Storage.DIRECTORY surfaces the
+    library's own error."""
     return _open_with_options(path, options, create=True)
 
 
@@ -281,7 +301,7 @@ def _open_with_options(path: str | os.PathLike[str], opts: OpenOptions, create: 
 
     c_path = _ffi.path_to_bytes(path)
     handle = _ctypes.c_void_p()
-    fn = lib.antfly_lite_create_with_options if create else lib.antfly_lite_open_with_options
+    fn = lib.antfly_db_create_with_options if create else lib.antfly_db_open_with_options
     code = fn(c_path, _ctypes.byref(c_opts), _ctypes.byref(handle))
     errors.raise_for_code(code)
     return _new_database(handle)
@@ -290,6 +310,7 @@ def _open_with_options(path: str | os.PathLike[str], opts: OpenOptions, create: 
 def create(
     path: str | os.PathLike[str],
     *,
+    storage: Storage = Storage.LITE,
     mode: OpenMode = OpenMode.WRITER,
     profile: Profile = Profile.NATIVE,
     no_sync: bool = False,
@@ -306,8 +327,11 @@ def create(
     scratch_budget_mb: int = 0,
     process_memory_budget_mb: int = 0,
 ) -> Database:
-    """Create a new Antfly Lite database file."""
+    """Create a new Antfly database: a .aflite file (storage=Storage.LITE,
+    the default) or a directory (storage=Storage.DIRECTORY, which surfaces
+    the library's own error since directories aren't exclusively created)."""
     opts = OpenOptions(
+        storage=storage,
         mode=mode,
         profile=profile,
         no_sync=no_sync,
@@ -330,6 +354,7 @@ def create(
 def open(
     path: str | os.PathLike[str],
     *,
+    storage: Storage = Storage.LITE,
     mode: OpenMode = OpenMode.WRITER,
     profile: Profile = Profile.NATIVE,
     no_sync: bool = False,
@@ -346,8 +371,11 @@ def open(
     scratch_budget_mb: int = 0,
     process_memory_budget_mb: int = 0,
 ) -> Database:
-    """Open an existing Antfly Lite database file."""
+    """Open an existing Antfly database: a .aflite file (storage=Storage.LITE,
+    the default) or a directory (storage=Storage.DIRECTORY, created
+    automatically if the path is missing)."""
     opts = OpenOptions(
+        storage=storage,
         mode=mode,
         profile=profile,
         no_sync=no_sync,
@@ -428,58 +456,61 @@ def copy_stable_snapshot_file(
     return decode_json_response(_ffi.take_buffer(out), raw)
 
 
-def restore_backup(path: str | os.PathLike[str], backup: bytes, replace: bool = False) -> None:
-    """Create or replace a Lite database from a portable Antfly backup
-    archive held in memory."""
-    if not str(path).endswith(".aflite") or not backup:
+def _restore_c_options(storage: Storage) -> _ffi.AntflyOpenOptions:
+    lib = _ffi.get_lib()
+    c_opts = _ffi.AntflyOpenOptions()
+    errors.raise_for_code(lib.antfly_open_options_init(_ctypes.byref(c_opts)))
+    c_opts.storage_kind = int(storage)
+    return c_opts
+
+
+def restore(
+    path: str | os.PathLike[str],
+    backup: bytes,
+    *,
+    storage: Storage = Storage.LITE,
+    replace: bool = False,
+) -> None:
+    """Create a database at `path` from a portable Antfly backup archive
+    held in memory. A backup of either storage kind restores into either
+    kind; `storage` selects the destination kind (the default, Storage.LITE,
+    still requires a `.aflite` path client-side; Storage.DIRECTORY has no
+    suffix requirement)."""
+    if not backup or (storage == Storage.LITE and not str(path).endswith(".aflite")):
         raise errors.InvalidArgumentError()
     lib = _ffi.get_lib()
+    c_opts = _restore_c_options(storage)
     sl, _keep = _ffi.make_slice(bytes(backup))
     out = _ffi.AntflyBuffer()
-    code = lib.antfly_lite_restore_backup_json(
-        _ffi.path_to_bytes(path), sl, _ctypes.c_bool(replace), _ctypes.byref(out)
+    code = lib.antfly_restore_backup_json(
+        _ffi.path_to_bytes(path), _ctypes.byref(c_opts), sl, _ctypes.c_bool(replace), _ctypes.byref(out)
     )
     errors.raise_for_code(code)
     _ffi.take_buffer(out)
 
 
-def restore(path: str | os.PathLike[str], backup: bytes, replace: bool = False) -> None:
-    """Create or replace a Lite database from a portable Antfly backup
-    archive held in memory."""
-    if not str(path).endswith(".aflite") or not backup:
-        raise errors.InvalidArgumentError()
-    lib = _ffi.get_lib()
-    sl, _keep = _ffi.make_slice(bytes(backup))
-    out = _ffi.AntflyBuffer()
-    code = lib.antfly_lite_restore_json(_ffi.path_to_bytes(path), sl, _ctypes.c_bool(replace), _ctypes.byref(out))
-    errors.raise_for_code(code)
-    _ffi.take_buffer(out)
-
-
-def restore_backup_file(
-    path: str | os.PathLike[str], backup_path: str | os.PathLike[str], replace: bool = False
+def restore_file(
+    path: str | os.PathLike[str],
+    backup_path: str | os.PathLike[str],
+    *,
+    storage: Storage = Storage.LITE,
+    replace: bool = False,
 ) -> None:
-    """Stream-restore a Lite database from a portable Antfly backup archive
-    file with bounded memory use."""
-    if not str(path).endswith(".aflite") or not str(backup_path).endswith(".afb"):
+    """Stream-restore a database at `path` from a portable Antfly backup
+    archive file with bounded memory use. `storage` selects the destination
+    kind (the default, Storage.LITE, still requires a `.aflite` path
+    client-side; Storage.DIRECTORY has no suffix requirement)."""
+    if not str(backup_path).endswith(".afb") or (storage == Storage.LITE and not str(path).endswith(".aflite")):
         raise errors.InvalidArgumentError()
-    _restore_backup_file_to_file(path, backup_path, replace)
-
-
-def restore_file(path: str | os.PathLike[str], backup_path: str | os.PathLike[str], replace: bool = False) -> None:
-    """Stream-restore a Lite database from a portable Antfly backup archive
-    file with bounded memory use (alias of restore_backup_file, matching the
-    Go binding's Restore/RestoreFile naming)."""
-    if not str(path).endswith(".aflite") or not str(backup_path).endswith(".afb"):
-        raise errors.InvalidArgumentError()
-    _restore_backup_file_to_file(path, backup_path, replace)
-
-
-def _restore_backup_file_to_file(path, backup_path, replace: bool) -> None:
     lib = _ffi.get_lib()
+    c_opts = _restore_c_options(storage)
     out = _ffi.AntflyBuffer()
-    code = lib.antfly_lite_restore_backup_file_json(
-        _ffi.path_to_bytes(path), _ffi.path_to_bytes(backup_path), _ctypes.c_bool(replace), _ctypes.byref(out)
+    code = lib.antfly_restore_backup_file_json(
+        _ffi.path_to_bytes(path),
+        _ctypes.byref(c_opts),
+        _ffi.path_to_bytes(backup_path),
+        _ctypes.c_bool(replace),
+        _ctypes.byref(out),
     )
     errors.raise_for_code(code)
     _ffi.take_buffer(out)
@@ -490,5 +521,5 @@ def decode_artifact_id(artifact_id_b64: str, *, raw: bool = False):
     lib = _ffi.get_lib()
     sl, _keep = _ffi.make_slice(encode_text(artifact_id_b64))
     out = _ffi.AntflyBuffer()
-    errors.raise_for_code(lib.antfly_db_decode_artifact_id_json(sl, _ctypes.byref(out)))
+    errors.raise_for_code(lib.antfly_decode_artifact_id_json(sl, _ctypes.byref(out)))
     return decode_json_response(_ffi.take_buffer(out), raw)

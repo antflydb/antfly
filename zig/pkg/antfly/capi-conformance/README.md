@@ -41,15 +41,17 @@ existing one is opened. Every field of `open` is optional:
 
 | Field | Default | Meaning |
 |---|---|---|
-| `create` | `false` | Create a new database instead of opening one |
+| `storage` | `"lite"` | `"lite"` (a `.aflite` file) or `"directory"` (a normal Antfly directory) |
+| `create` | `false` | Create a new database instead of opening one. Lite only: directory storage is created by opening a missing path |
 | `mode` | `"writer"` | `"writer"`, `"readonly"`, or `"status_only"` |
 | `profile` | `"native"` | `"native"` or `"hosted"` |
 | `no_sync` | `false` | Skip fsync (tests use `true`) |
 | `busy_timeout_ms` | `0` | Wait this long for another writer's lock |
-| `path` | `"db.aflite"` | File name inside the case directory |
+| `path` | `"db.aflite"` | File or directory name inside the case directory |
 
 Runners open with the binding's options-taking open/create call, which maps
-to `antfly_lite_open_with_options` / `antfly_lite_create_with_options`.
+to `antfly_db_open_with_options` / `antfly_db_create_with_options` with an
+`antfly_open_options` built from these fields.
 
 ## Expectations
 
@@ -77,8 +79,8 @@ Values written as JSON objects in a case (`value`, `request`, `config`,
 | `scan` | `request` | `antfly_db_scan_json` | JSON |
 | `search` | `request` | `antfly_db_search_json` | JSON |
 | `stats` | | `antfly_db_stats_json` | JSON |
-| `status` | | `antfly_lite_status_json` | JSON |
-| `capabilities` | | `antfly_lite_capabilities_json` | JSON |
+| `status` | | `antfly_db_status_json` | JSON |
+| `capabilities` | | `antfly_db_capabilities_json` | JSON |
 | `check` | | `antfly_lite_check_json` | JSON |
 | `pending_work_stats` | | `antfly_db_pending_work_stats_json` | JSON |
 | `run_until_idle` | | `antfly_db_run_until_idle` | none |
@@ -96,8 +98,9 @@ Values written as JSON objects in a case (`value`, `request`, `config`,
 | `resolve_transaction` | `txn_id`, `status` (`"committed"`/`"aborted"`), `commit_version` | `antfly_db_resolve_intents` | none |
 | `transaction_status` | `txn_id` | `antfly_db_get_transaction_status` | string: `"pending"`, `"committed"`, or `"aborted"` |
 | `commit_version` | `txn_id` | `antfly_db_get_commit_version` | integer |
-| `backup` | | `antfly_lite_backup` | none; the runner keeps the bytes |
-| `restore_open` | `path`, open fields | `antfly_lite_restore_backup_json` of the kept bytes to `path` (no replace), then closes the current handle and opens `path` as the current handle | none |
+| `backup` | | `antfly_db_backup` | none; the runner keeps the bytes |
+| `import_backup` | | `antfly_db_import_backup` of the kept bytes into the current handle | none |
+| `restore_open` | `path`, open fields | `antfly_restore_backup_json` of the kept bytes to `path` with options built from the open fields (so `storage` picks the destination kind; no replace), then closes the current handle and opens `path` as the current handle | none |
 | `reopen` | open fields | closes the current handle, then opens with these fields (default path: the current handle's path) | none |
 | `open_second` | open fields | opens another handle while the current one stays open, then closes it if the open succeeded | none |
 | `close` | | closes the current handle; only `reopen` or `restore_open` may follow | none |

@@ -71,6 +71,7 @@ type conformanceCase struct {
 }
 
 type conformanceOpen struct {
+	Storage       string `json:"storage"`
 	Create        bool   `json:"create"`
 	Mode          string `json:"mode"`
 	Profile       string `json:"profile"`
@@ -129,6 +130,11 @@ func (r *conformanceRunner) resolvePath(name string) string {
 
 func conformanceOpenOptions(o conformanceOpen) (OpenOptions, error) {
 	opts := OpenOptions{NoSync: o.NoSync, BusyTimeout: time.Duration(o.BusyTimeoutMS) * time.Millisecond}
+	storage, err := conformanceStorage(o.Storage)
+	if err != nil {
+		return opts, err
+	}
+	opts.Storage = storage
 	switch o.Mode {
 	case "", "writer":
 		opts.Mode = OpenModeWriter
@@ -148,6 +154,17 @@ func conformanceOpenOptions(o conformanceOpen) (OpenOptions, error) {
 		return opts, fmt.Errorf("unknown profile %q", o.Profile)
 	}
 	return opts, nil
+}
+
+func conformanceStorage(name string) (Storage, error) {
+	switch name {
+	case "", "lite":
+		return StorageLite, nil
+	case "directory":
+		return StorageDirectory, nil
+	default:
+		return 0, fmt.Errorf("unknown storage %q", name)
+	}
 }
 
 func conformanceOpenDB(path string, o conformanceOpen) (*DB, error) {
@@ -358,9 +375,15 @@ func (r *conformanceRunner) execute(step conformanceStep) (any, error) {
 		backup, err := db.Backup()
 		r.backup = backup
 		return nil, err
+	case "import_backup":
+		return nil, db.ImportBackup(r.backup)
 	case "restore_open":
 		path := r.resolvePath(step.Path)
-		if err := RestoreBackup(path, r.backup, false); err != nil {
+		storage, err := conformanceStorage(step.Storage)
+		if err != nil {
+			return nil, err
+		}
+		if err := Restore(path, r.backup, RestoreOptions{Storage: storage}); err != nil {
 			return nil, err
 		}
 		r.closeCurrent()

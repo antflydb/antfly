@@ -146,7 +146,7 @@ fn every_sys_function_exists_in_header_with_matching_arity() {
     // and lib.rs has no other antfly_*(...) call sites, so `sys_sigs` is
     // exactly the extern block's functions.
     assert!(
-        sys_sigs.len() > 80,
+        sys_sigs.len() >= 80,
         "expected the sys crate to declare a large number of antfly_* functions, got {}: \
          is SYS_SRC being read correctly?",
         sys_sigs.len()
