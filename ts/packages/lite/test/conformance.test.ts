@@ -33,8 +33,8 @@ import { fileURLToPath } from "node:url";
 import { expect, it } from "vitest";
 import { createWithOptions, type Database, openWithOptions } from "../src/database.js";
 import { AntflyError } from "../src/errors.js";
-import { restoreBackup } from "../src/files.js";
-import { GraphDirection, OpenMode, Profile, TxnStatus } from "../src/types.js";
+import { restore } from "../src/files.js";
+import { GraphDirection, OpenMode, Profile, Storage, TxnStatus } from "../src/types.js";
 import { describeWithLibrary } from "./helpers.js";
 
 const packageDir = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -51,6 +51,7 @@ const casesDir = join(
 );
 
 interface ConformanceOpen {
+  storage?: "lite" | "directory";
   create?: boolean;
   mode?: "writer" | "readonly" | "status_only";
   profile?: "native" | "hosted";
@@ -99,8 +100,26 @@ interface ConformanceCase {
   steps: ConformanceStep[];
 }
 
+function conformanceStorage(name: ConformanceOpen["storage"]): Storage {
+  switch (name ?? "lite") {
+    case "lite":
+      return Storage.Lite;
+    case "directory":
+      return Storage.Directory;
+    default:
+      throw new Error(`unknown storage ${name}`);
+  }
+}
+
 function conformanceOpenOptions(o: ConformanceOpen) {
-  const opts: { mode: OpenMode; profile: Profile; noSync: boolean; busyTimeoutMs: number } = {
+  const opts: {
+    storage: Storage;
+    mode: OpenMode;
+    profile: Profile;
+    noSync: boolean;
+    busyTimeoutMs: number;
+  } = {
+    storage: conformanceStorage(o.storage),
     mode: OpenMode.Writer,
     profile: Profile.Native,
     noSync: Boolean(o.no_sync),
@@ -334,10 +353,14 @@ class ConformanceRunner {
         this.backup = await db().backup();
         return null;
       }
+      case "import_backup": {
+        if (!this.backup) throw new Error("no backup captured yet");
+        return db().importBackup(this.backup);
+      }
       case "restore_open": {
         const path = this.resolvePath(step.path);
         if (!this.backup) throw new Error("no backup captured yet");
-        await restoreBackup(path, this.backup, false);
+        await restore(path, this.backup, { storage: conformanceStorage(step.storage) });
         await this.closeCurrent();
         await this.openCurrent(step);
         return null;

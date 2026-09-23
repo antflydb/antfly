@@ -1,9 +1,10 @@
 # antfly-lite
 
 Safe Rust binding for Antfly Lite, the embedded `libantfly` C ABI. It wraps
-the Lite open/storage profile in that ABI, so applications embed a live
-`.aflite` database directly instead of talking to the network SDK
-(`antfly-sdk`).
+that ABI's `antfly_db` handle, so applications embed a live database
+directly instead of talking to the network SDK (`antfly-sdk`) -- either a
+single-file `.aflite` database (the default, [`Storage::Lite`]) or a normal
+Antfly directory ([`Storage::Directory`]), selected on [`OpenOptions`].
 
 This crate mirrors the reference Go binding (`go/pkg/lite`) idiomatically:
 [`Database`] is a `Send + Sync` handle safe for concurrent use from any
@@ -134,9 +135,11 @@ failing immediately with `Busy`, like `sqlite3_busy_timeout`.
   `copy_stable_snapshot`, `pending_work_stats`, ...) parse those JSON
   payloads into typed structs, returning `TypedResult<T>` (an FFI error or a
   JSON decode error).
-- `restore`/`restore_backup`/`restore_file`/`restore_backup_file` stage a
-  portable `.afb` backup into a new `.aflite` database; `Database::backup`/
-  `export`/`backup_to_file`/`export_to_file` produce one.
+- `restore`/`restore_file` stage a portable `.afb` backup into a new
+  database, of the storage kind `RestoreOptions::storage` selects (a
+  backup of either kind restores into either kind); `Database::backup`/
+  `backup_to_file` produce one, and `Database::import_backup` imports one
+  directly into an empty, already-open handle.
 
 See the crate's rustdoc for the full method list.
 
@@ -154,7 +157,9 @@ See the crate's rustdoc for the full method list.
     calls, and `busy_timeout` behavior.
   - `tests/conformance.rs`: runs every case under
     `zig/pkg/antfly/capi-conformance/cases/*.json` (see that directory's
-    README), the same declarative suite every language binding runs.
+    README), the same declarative suite every language binding runs, plus a
+    standalone test that restores a backup into directory storage and
+    reopens it.
 
 Some conformance/concurrency cases (full-text search under concurrent write
 pressure) need substantially more native stack than a typical fixed-size OS

@@ -19,7 +19,7 @@ T = TypeVar("T", bound="EmbedderConfig")
 
 @_attrs_define
 class EmbedderConfig:
-    r"""A unified configuration for an embedding provider.
+    """A unified configuration for an embedding provider.
 
     Embedders can be configured with templates to customize how documents are
     converted to text before embedding. Templates use Handlebars syntax and
@@ -76,50 +76,9 @@ class EmbedderConfig:
 
        See: https://antfly.io/docs/configuration#security--cors
 
-    4. **encodeToon** - Encode data in TOON format (Token-Oriented Object Notation)
-       ```handlebars
-       {{encodeToon this.fields}}
-       {{encodeToon this.fields lengthMarker=false indent=4}}
-       {{encodeToon this.fields delimiter="\t"}}
-       ```
-
-       **What is TOON?**
-       TOON is a compact, human-readable format designed for passing structured data to LLMs.
-       It provides **30-60% token reduction** compared to JSON while maintaining high LLM
-       comprehension accuracy.
-
-       **Key Features:**
-       - Compact syntax using `:` for key-value pairs
-       - Array length markers: `tags[#3]: ai,search,ml`
-       - Tabular format for uniform data structures
-       - Optimized for LLM parsing and understanding
-       - Maintains human readability
-
-       **Benefits:**
-       - **Lower API costs** - Reduced token usage means lower LLM API costs
-       - **Faster responses** - Less tokens to process
-       - **More context** - Fit more documents within token limits
-
-       **Options:**
-       - `lengthMarker` (bool): Add # prefix to array counts like `[#3]` (default: true)
-       - `indent` (int): Indentation spacing for nested objects (default: 2)
-       - `delimiter` (string): Field separator for tabular arrays (default: none, use `"\t"` for tabs)
-
-       **Example output:**
-       ```
-       title: Introduction to Vector Search
-       author: Jane Doe
-       tags[#3]: ai,search,ml
-       metadata:
-         edition: 2
-         pages: 450
-       ```
-
-       **Default in RAG:** TOON is the default format for document rendering in RAG queries.
-
-       **References:**
-       - TOON Specification: https://github.com/toon-format/toon
-       - Go Implementation: https://github.com/alpkeskin/gotoon
+    4. **encodeToon** is not available in these templates. It is a helper of the
+       retrieval agent's `document_renderer`, which renders documents into the
+       generation prompt as TOON by default.
 
     **Template Examples:**
 

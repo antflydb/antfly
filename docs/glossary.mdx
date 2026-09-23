@@ -20,7 +20,7 @@ See: [Chunking Strategies for LLM Applications](https://www.pinecone.io/learn/ch
 
 ### Embeddings
 
-Dense vector representations of text, images, or other data that capture semantic meaning. Similar concepts have similar embeddings (close in vector space). Managed index creation supports Antfly Inference, Ollama, OpenAI, and AWS Bedrock; broader inference APIs expose additional providers without implying managed-index support. Used by [AKNN](#aknn-approximate-k-nearest-neighbors) indexes for similarity search.
+Dense vector representations of text, images, or other data that capture semantic meaning. Similar concepts have similar embeddings (close in vector space). Managed index creation supports Antfly Inference, Ollama, OpenAI, OpenRouter, Cohere, Gemini, Vertex AI, and AWS Bedrock. Used by [AKNN](#aknn-approximate-k-nearest-neighbors) indexes for similarity search.
 
 See: [Word2Vec](https://arxiv.org/abs/1301.3781) | [Sentence-BERT](https://arxiv.org/abs/1908.10084) | [MTEB Leaderboard](https://huggingface.co/spaces/mteb/leaderboard)
 
@@ -94,7 +94,7 @@ See: [Toolformer](https://arxiv.org/abs/2302.04761) | [Anthropic Tool Use](https
 
 ### Indexing
 
-The process of analyzing documents and building data structures for efficient search. Indexes trade storage space and write-time processing for fast query performance. Antfly supports multiple index types: [full-text](#full-text-search-bm25) (BM25), [vector](#aknn-approximate-k-nearest-neighbors) (AKNN), and graph.
+The process of analyzing documents and building data structures for efficient search. Indexes trade storage space and write-time processing for fast query performance. Antfly supports multiple index types: [full-text](#full-text-search-bm25) (BM25), [vector](#aknn-approximate-k-nearest-neighbors) (dense AKNN, sparse, and late interaction), graph, algebraic, and relational.
 
 ### Agentic Search
 
@@ -106,13 +106,13 @@ Algorithms that find the K most similar vectors to a query vector, trading perfe
 
 **Key techniques used in Antfly's AKNN implementation:**
 
-- **HBC (Hierarchical Balanced Clustering)**: A clustering algorithm that organizes vectors into a tree structure for efficient search. HBC creates balanced clusters at multiple levels, enabling logarithmic search time. Used in SPANN-style vector indexes.
+- **HBC (Hierarchical Balanced Clustering)**: A clustering algorithm that organizes vectors into a tree structure for efficient search. HBC creates balanced clusters at multiple levels, enabling logarithmic search time. Antfly's dense index routes vectors through an HBC centroid tree to posting lists; large indexes switch routing to a flat centroid directory.
 - **RaBitQ (Randomized Bit Quantization)**: A vector quantization technique that compresses high-dimensional vectors into compact binary representations while preserving distance relationships. RaBitQ enables memory-efficient vector search with minimal accuracy loss.
 - **SPFresh**: A technique for maintaining fresh vector indexes in the presence of updates. Traditional ANNS indexes degrade with updates; SPFresh provides mechanisms for efficient incremental updates while maintaining search quality.
 
 Hardware acceleration via [SIMD/SME](#simd-sme) provides significant performance improvements for distance calculations.
 
-See: [Annoy](https://github.com/spotify/annoy) | [FAISS](https://github.com/facebookresearch/faiss) | [ANN Benchmarks](http://ann-benchmarks.com/) | [SPANN Paper](https://arxiv.org/abs/2111.08566) | [RaBitQ Paper](https://arxiv.org/abs/2405.12497) | [SPFresh Paper](https://arxiv.org/abs/2410.18970)
+See: [Annoy](https://github.com/spotify/annoy) | [FAISS](https://github.com/facebookresearch/faiss) | [ANN Benchmarks](http://ann-benchmarks.com/) | [SPANN Paper](https://arxiv.org/abs/2111.08566) | [RaBitQ Paper](https://arxiv.org/abs/2405.12497) | [SPFresh Paper](https://arxiv.org/abs/2410.14452)
 
 ### Answerbar & Searchbar
 
@@ -206,7 +206,7 @@ Storing data as self-contained JSON documents rather than rows in tables. Docume
 
 ### Linear Merge
 
-A technique for bulk importing sorted data into an LSM-tree storage engine. By providing pre-sorted records, linear merge bypasses the normal write path and directly creates [SSTable](#lsm--sstables) files. This is dramatically faster for bulk imports. Antfly supports linear merge for efficient data ingestion from external sources.
+A stateless way to sync sorted records from an external source. Antfly's linear merge (`POST /db/v1/tables/{table}/merge`) takes a sorted page of source records and performs a three-way sync over that key range: it inserts new keys, updates changed ones, and deletes Antfly keys missing from the page.
 
 ### LSM & SSTables
 
@@ -238,13 +238,13 @@ See: [ONNX](https://onnx.ai/) | [ONNX Runtime](https://onnxruntime.ai/)
 
 ### OpenAPI Specification
 
-A standard for describing REST APIs in a machine-readable format. OpenAPI specs enable automatic generation of documentation, client SDKs, and server stubs. Antfly's APIs are defined via OpenAPI, with auto-generated Go, TypeScript, and Python clients.
+A standard for describing REST APIs in a machine-readable format. OpenAPI specs enable automatic generation of documentation, client SDKs, and server stubs. Antfly's APIs are defined via OpenAPI, with auto-generated Go, TypeScript, Python, and Rust clients.
 
 See: [OpenAPI Specification](https://spec.openapis.org/oas/latest.html) | [Swagger](https://swagger.io/specification/)
 
 ### QUIC (HTTP/3)
 
-A transport protocol that runs over UDP, providing faster connection establishment, better performance over lossy networks, and multiplexed streams without head-of-line blocking. Antfly supports QUIC for reduced latency in distributed communication between [Raft](#raft--multiraft) nodes.
+A transport protocol that runs over UDP, providing faster connection establishment, better performance over lossy networks, and multiplexed streams without head-of-line blocking. Antfly's HTTP stack (`zig/lib/httpx`) includes a native QUIC/HTTP-3 implementation; [Raft](#raft--multiraft) node-to-node traffic currently uses HTTP.
 
 See: [RFC 9000: QUIC](https://www.rfc-editor.org/rfc/rfc9000.html) | [HTTP/3 Explained](https://http3-explained.haxx.se/)
 

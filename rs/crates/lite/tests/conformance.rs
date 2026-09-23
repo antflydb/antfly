@@ -20,7 +20,8 @@
 use std::path::{Path, PathBuf};
 
 use antfly_lite::{
-    Database, Error, GraphDirection, OpenMode, OpenOptions, Profile, TxnId, TxnStatus, WriteIntent,
+    Database, Error, GraphDirection, OpenMode, OpenOptions, Profile, RestoreOptions, Storage,
+    TxnId, TxnStatus, WriteIntent,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -36,6 +37,99 @@ fn conformance_cases() {
         .expect("spawn thread")
         .join()
         .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+}
+
+/// Beyond the shared conformance suite: a `.aflite` backup restores into a
+/// normal Antfly directory (`RestoreOptions { storage: Storage::Directory,
+/// .. }`), and the resulting directory database survives a close/reopen
+/// cycle with its documents intact. See `zig/pkg/antfly/capi-conformance/
+/// cases/directory_storage.json` and `backup_across_storage.json` for the
+/// declarative cases this exercises via other bindings too; this test adds
+/// an explicit reopen after the restore, which the shared cases do not.
+#[test]
+fn restore_into_directory_storage_and_reopen() {
+    std::thread::Builder::new()
+        .stack_size(antfly_lite::MIN_THREAD_STACK_SIZE)
+        .spawn(restore_into_directory_storage_and_reopen_inner)
+        .expect("spawn thread")
+        .join()
+        .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+}
+
+fn restore_into_directory_storage_and_reopen_inner() {
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "antfly-lite-restore-directory-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    ));
+    std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
+
+    // Build a small .aflite source database and take a portable backup.
+    let source_path = tmp_dir.join("source.aflite");
+    let source = Database::create(&source_path, &OpenOptions::new().no_sync(true))
+        .expect("create source .aflite database");
+    source
+        .batch(
+            &[WriteIntent::put(
+                "doc:restore-directory",
+                r#"{"title":"restored into a directory"}"#,
+            )],
+            1,
+        )
+        .expect("batch");
+    source.run_until_idle().expect("run until idle");
+    let backup = source.backup().expect("backup");
+    source.close().expect("close source");
+
+    // Restore the backup into a directory-storage destination.
+    let dest_path = tmp_dir.join("restored-dir");
+    antfly_lite::restore(
+        &dest_path,
+        &backup,
+        &RestoreOptions {
+            storage: Storage::Directory,
+            replace: false,
+        },
+    )
+    .expect("restore into directory storage");
+
+    // The restored directory database opens directly (Restore leaves it
+    // ready to open, matching the conformance `restore_open` step) and
+    // contains the document.
+    let restored = Database::open(&dest_path, &OpenOptions::new().storage(Storage::Directory))
+        .expect("open restored directory database");
+    let doc = restored
+        .lookup_json("doc:restore-directory")
+        .expect("lookup after restore");
+    assert!(
+        String::from_utf8_lossy(&doc).contains("restored into a directory"),
+        "lookup after restore = {}",
+        String::from_utf8_lossy(&doc)
+    );
+    let status = restored.status_json().expect("status");
+    assert!(
+        String::from_utf8_lossy(&status).contains(r#""format":"directory""#),
+        "status after restore = {}",
+        String::from_utf8_lossy(&status)
+    );
+    restored.close().expect("close restored");
+
+    // Reopening the same directory (a plain Database::open, since directory
+    // storage is opened rather than created) still has the document.
+    let reopened = Database::open(&dest_path, &OpenOptions::new().storage(Storage::Directory))
+        .expect("reopen restored directory database");
+    let doc = reopened
+        .lookup_json("doc:restore-directory")
+        .expect("lookup after reopen");
+    assert!(
+        String::from_utf8_lossy(&doc).contains("restored into a directory"),
+        "lookup after reopen = {}",
+        String::from_utf8_lossy(&doc)
+    );
+    reopened.close().expect("close reopened");
 }
 
 fn conformance_cases_inner() {
@@ -107,6 +201,8 @@ struct ConformanceCase {
 
 #[derive(Debug, Default, Deserialize)]
 struct ConformanceOpen {
+    #[serde(default)]
+    storage: String,
     #[serde(default)]
     create: bool,
     #[serde(default)]
@@ -218,6 +314,7 @@ impl Runner {
     }
 
     fn open_options(o: &ConformanceOpen) -> Result<OpenOptions, ExecError> {
+        let storage = parse_storage(&o.storage)?;
         let mode = match o.mode.as_str() {
             "" | "writer" => OpenMode::Writer,
             "readonly" => OpenMode::Readonly,
@@ -230,6 +327,7 @@ impl Runner {
             other => return Err(ExecError::Other(format!("unknown profile {other:?}"))),
         };
         let mut opts = OpenOptions::new()
+            .storage(storage)
             .mode(mode)
             .profile(profile)
             .no_sync(o.no_sync);
@@ -370,9 +468,21 @@ impl Runner {
                 self.backup = backup;
                 Ok(StepOutput::None)
             }
+            "import_backup" => {
+                self.db()?.import_backup(&self.backup)?;
+                Ok(StepOutput::None)
+            }
             "restore_open" => {
                 let path = self.resolve_path(&step.open.path);
-                antfly_lite::restore_backup(&path, &self.backup, false)?;
+                let storage = parse_storage(&step.open.storage)?;
+                antfly_lite::restore(
+                    &path,
+                    &self.backup,
+                    &RestoreOptions {
+                        storage,
+                        replace: false,
+                    },
+                )?;
                 self.close_current();
                 self.open_current(&step.open)?;
                 Ok(StepOutput::None)
@@ -462,12 +572,21 @@ impl Runner {
 
 fn copy_open(o: &ConformanceOpen) -> ConformanceOpen {
     ConformanceOpen {
+        storage: o.storage.clone(),
         create: o.create,
         mode: o.mode.clone(),
         profile: o.profile.clone(),
         no_sync: o.no_sync,
         busy_timeout_ms: o.busy_timeout_ms,
         path: o.path.clone(),
+    }
+}
+
+fn parse_storage(s: &str) -> Result<Storage, ExecError> {
+    match s {
+        "" | "lite" => Ok(Storage::Lite),
+        "directory" => Ok(Storage::Directory),
+        other => Err(ExecError::Other(format!("unknown storage {other:?}"))),
     }
 }
 

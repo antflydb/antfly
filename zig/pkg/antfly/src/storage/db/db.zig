@@ -53716,6 +53716,10 @@ fn appendPrecomputedGraphSourceArtifactKey(
             // artifacts rarely exist at first artifact write anyway. The
             // resolution-artifact replay re-renders these edges canonically
             // once resolution lands (see materializeGraphSourceArtifactsForIndex).
+            // An empty map still marks that a resolver targets the artifact,
+            // so unresolved relation sources wait for it rather than falling
+            // back to the owning document.
+            const pending_resolutions: ?[]const u8 = if (resolverTargetsGraphArtifact(self.core.index_manager, source.artifact_name)) "{}" else null;
             const graph_writes = try graphWritesFromArtifactValueAlloc(
                 self.alloc,
                 graph_entry.config.name,
@@ -53724,7 +53728,7 @@ fn appendPrecomputedGraphSourceArtifactKey(
                 source,
                 graphArtifactContentType(self.core.index_manager, source.artifact_name),
                 raw_doc,
-                null,
+                pending_resolutions,
                 graph_asset_state.effectiveEdgeLimit(graph_entry.max_edges_per_document),
             );
             defer freeGraphWrites(self.alloc, graph_writes);
@@ -65258,13 +65262,20 @@ fn appendRelationItem(
     // (zig/AUTOSCHEMA.md). GraphEdgeWrite.owner carries the producer for
     // artifact-key routing when the two diverge. A source referencing an
     // extraction entity that has no canonical identity yet is dropped, like
-    // the matching target rule: the resolution replay re-renders it. A source
+    // the matching target rule, when a resolver targets this artifact (the
+    // caller injected an "_entities" map, possibly empty): the resolution
+    // replay re-renders it. With no resolver configured no canonical key
+    // will ever arrive, so the source keeps the owning document instead of
+    // losing the edge (zig/GRAPH.md's V1 extractor-only graph). A source
     // that matches no extraction entity keeps the legacy document source.
     var source_table: ?[]const u8 = null;
     const source_doc = blk: {
         const source_value = item.object.get("source") orelse break :blk doc_key;
         if (resolveGraphEndpointEntity(source_value, artifact_value)) |entity| {
-            const canonical = canonicalEntityDocumentId(entity) orelse return;
+            const canonical = canonicalEntityDocumentId(entity) orelse {
+                if (artifact_value == .object and artifact_value.object.get("_entities") != null) return;
+                break :blk doc_key;
+            };
             // The resolved SOURCE endpoint's home table must survive into
             // edge metadata like the target's: a backward traversal from
             // the target otherwise assigns the source an unqualified
@@ -65596,9 +65607,11 @@ fn graphEndpointResolutionsJsonAlloc(
     defer arena.deinit();
     const a = arena.allocator();
     var map: std.json.ObjectMap = .empty;
+    var resolver_targets_artifact = false;
 
     for (index_manager.resolvers.items) |*cfg| {
         if (!std.mem.eql(u8, cfg.source_artifact, source_artifact_name)) continue;
+        resolver_targets_artifact = true;
         const res_key = try internal_keys.resolutionArtifactKeyAlloc(a, doc_key, cfg.resolution_artifact);
         const raw = store.get(a, res_key) catch |err| switch (err) {
             error.NotFound => continue,
@@ -65630,8 +65643,21 @@ fn graphEndpointResolutionsJsonAlloc(
             try map.put(a, local_id, .{ .object = ref });
         }
     }
-    if (map.count() == 0) return null;
+    // No resolver targets this artifact: return null so relation sources
+    // keep their owning document (see appendRelationItem). A targeting
+    // resolver with nothing landed yet still yields an (empty) map, which
+    // tells the materializer canonical keys are coming.
+    if (!resolver_targets_artifact) return null;
     return try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = map }, .{});
+}
+
+/// Whether any resolver consumes `artifact_name`, i.e. whether extraction
+/// entities in that artifact will eventually get canonical keys.
+fn resolverTargetsGraphArtifact(index_manager: *index_manager_mod.IndexManager, artifact_name: []const u8) bool {
+    for (index_manager.resolvers.items) |cfg| {
+        if (std.mem.eql(u8, cfg.source_artifact, artifact_name)) return true;
+    }
+    return false;
 }
 
 /// Attach canonical endpoint resolutions to a parsed extraction artifact as
@@ -87877,14 +87903,27 @@ test "graph relation endpoints canonicalize through injected resolutions" {
         \\]}
     ;
 
-    // Without resolutions, any endpoint referencing an extraction entity —
-    // source or target — drops the edge (no durable node exists yet; the
+    // With a resolver targeting the artifact but no resolution landed (an
+    // empty "_entities" map), any endpoint referencing an extraction entity
+    // — source or target — drops the edge (no durable node exists yet; the
     // resolution replay re-renders it canonically). Both relations here
     // carry the extraction-entity source "e0", so nothing materializes.
     {
-        const writes = try graphWritesFromArtifactValueAlloc(alloc, "kg", "doc:a", raw, source, "application/json", null, null, 100);
+        const writes = try graphWritesFromArtifactValueAlloc(alloc, "kg", "doc:a", raw, source, "application/json", null, "{}", 100);
         defer freeGraphWrites(alloc, writes);
         try std.testing.expectEqual(@as(usize, 0), writes.len);
+    }
+
+    // With no resolver configured, canonical keys never arrive, so an
+    // unresolved source keeps the owning document instead of losing the
+    // edge. An unresolved extraction-entity target still drops ("v0"), but
+    // the external target survives.
+    {
+        const writes = try graphWritesFromArtifactValueAlloc(alloc, "kg", "doc:a", raw, source, "application/json", null, null, 100);
+        defer freeGraphWrites(alloc, writes);
+        try std.testing.expectEqual(@as(usize, 1), writes.len);
+        try std.testing.expectEqualStrings("doc:a", writes[0].source);
+        try std.testing.expectEqualStrings("ext-node", writes[0].target);
     }
 
     // With resolutions injected, resolved local ids render the resolver's

@@ -1130,7 +1130,8 @@ class AntflyClient:
             analyses: Analysis configuration
             graph_queries: Named canonical graph operations. Accepts generated graph query models,
                 ``GraphQueries``, or raw mappings.
-            document_renderer: Handlebars document renderer
+            document_renderer: Not supported on queries; set it on a retrieval
+                agent request instead
             pruner: Result pruning configuration
             join: Join configuration
             foreign_sources: Query-time foreign source configuration

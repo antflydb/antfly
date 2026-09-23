@@ -19,6 +19,26 @@ use std::time::Duration;
 
 use antfly_lite_sys as sys;
 
+/// Selects how a database is stored. The default is a single-file `.aflite`
+/// database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Storage {
+    /// A single-file `.aflite` database.
+    #[default]
+    Lite,
+    /// A normal single-node Antfly directory.
+    Directory,
+}
+
+impl Storage {
+    pub(crate) fn as_u32(self) -> u32 {
+        match self {
+            Storage::Lite => sys::ANTFLY_STORAGE_KIND_LITE,
+            Storage::Directory => sys::ANTFLY_STORAGE_KIND_DIRECTORY,
+        }
+    }
+}
+
 /// Controls how an Antfly Lite file is opened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OpenMode {
@@ -31,9 +51,9 @@ pub enum OpenMode {
 impl OpenMode {
     pub(crate) fn as_u32(self) -> u32 {
         match self {
-            OpenMode::Writer => sys::ANTFLY_LITE_OPEN_MODE_WRITER,
-            OpenMode::Readonly => sys::ANTFLY_LITE_OPEN_MODE_READONLY,
-            OpenMode::StatusOnly => sys::ANTFLY_LITE_OPEN_MODE_STATUS_ONLY,
+            OpenMode::Writer => sys::ANTFLY_OPEN_MODE_WRITER,
+            OpenMode::Readonly => sys::ANTFLY_OPEN_MODE_READONLY,
+            OpenMode::StatusOnly => sys::ANTFLY_OPEN_MODE_STATUS_ONLY,
         }
     }
 }
@@ -49,8 +69,8 @@ pub enum Profile {
 impl Profile {
     pub(crate) fn as_u32(self) -> u32 {
         match self {
-            Profile::Native => sys::ANTFLY_LITE_PROFILE_NATIVE,
-            Profile::Hosted => sys::ANTFLY_LITE_PROFILE_HOSTED,
+            Profile::Native => sys::ANTFLY_PROFILE_NATIVE,
+            Profile::Hosted => sys::ANTFLY_PROFILE_HOSTED,
         }
     }
 }
@@ -63,13 +83,13 @@ pub mod inference_mode {
     use antfly_lite_sys as sys;
 
     pub const CALLER_SUPPLIED_OR_DISABLED: &str =
-        sys::ANTFLY_LITE_INFERENCE_MODE_CALLER_SUPPLIED_OR_DISABLED;
+        sys::ANTFLY_INFERENCE_MODE_CALLER_SUPPLIED_OR_DISABLED;
     pub const CALLER_SUPPLIED_ARTIFACTS: &str =
-        sys::ANTFLY_LITE_INFERENCE_MODE_CALLER_SUPPLIED_ARTIFACTS;
-    pub const REMOTE_PROVIDER: &str = sys::ANTFLY_LITE_INFERENCE_MODE_REMOTE_PROVIDER;
-    pub const LOCAL_EMBEDDED: &str = sys::ANTFLY_LITE_INFERENCE_MODE_LOCAL_EMBEDDED;
-    pub const MANUAL_MAINTENANCE: &str = sys::ANTFLY_LITE_INFERENCE_MODE_MANUAL_MAINTENANCE;
-    pub const DISABLED_DEFERRED: &str = sys::ANTFLY_LITE_INFERENCE_MODE_DISABLED_DEFERRED;
+        sys::ANTFLY_INFERENCE_MODE_CALLER_SUPPLIED_ARTIFACTS;
+    pub const REMOTE_PROVIDER: &str = sys::ANTFLY_INFERENCE_MODE_REMOTE_PROVIDER;
+    pub const LOCAL_EMBEDDED: &str = sys::ANTFLY_INFERENCE_MODE_LOCAL_EMBEDDED;
+    pub const MANUAL_MAINTENANCE: &str = sys::ANTFLY_INFERENCE_MODE_MANUAL_MAINTENANCE;
+    pub const DISABLED_DEFERRED: &str = sys::ANTFLY_INFERENCE_MODE_DISABLED_DEFERRED;
 }
 
 /// Configures the optional Lite TTL cleanup runtime.
@@ -99,6 +119,10 @@ pub struct TtlCleanupOptions {
 /// only consulted when `local_runtime_configured` is set.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OpenOptions {
+    /// Selects a `.aflite` file (the default) or a directory. Directory
+    /// storage is created by opening a missing path; [`crate::Database::create`]
+    /// only creates `.aflite` files.
+    pub storage: Storage,
     pub mode: OpenMode,
     pub profile: Profile,
     pub no_sync: bool,
@@ -121,6 +145,11 @@ impl OpenOptions {
     /// cleanup, automatic inference budgets).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn storage(mut self, storage: Storage) -> Self {
+        self.storage = storage;
+        self
     }
 
     pub fn mode(mut self, mode: OpenMode) -> Self {
@@ -211,6 +240,16 @@ impl OpenOptions {
             _ => 0,
         }
     }
+}
+
+/// Configures [`crate::restore`] and [`crate::restore_file`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RestoreOptions {
+    /// Selects the kind of database created at the destination: a `.aflite`
+    /// file (the default) or a directory.
+    pub storage: Storage,
+    /// Atomically replaces an existing destination.
+    pub replace: bool,
 }
 
 /// Direction for [`crate::Database::edges_json`] and

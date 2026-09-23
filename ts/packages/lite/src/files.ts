@@ -23,7 +23,6 @@
 import { validateAbi } from "./abi.js";
 import { checkCode, InvalidArgumentError } from "./errors.js";
 import {
-  type AnyNativeFn,
   callAsync,
   newBufferOut,
   parseJson,
@@ -32,8 +31,26 @@ import {
   takeBuffer,
   toRawBytes,
 } from "./marshal.js";
-import { loadNative } from "./native.js";
-import type { CheckReport, StableSnapshotReport } from "./types.js";
+import { loadNative, type NativeLibrary, storageKind } from "./native.js";
+import {
+  type CheckReport,
+  type RestoreOptions,
+  type StableSnapshotReport,
+  Storage,
+} from "./types.js";
+
+/**
+ * Builds the antfly_open_options struct for a restore destination: its
+ * storage_kind selects the kind of database created at dest_path (NULL means
+ * directory per antfly.h, so this binding always passes an explicit struct
+ * defaulting to Storage.Lite, matching the Go binding's restoreCOptions).
+ */
+function restoreOpenOptions(native: NativeLibrary, storage: Storage | undefined): object {
+  const options: Record<string, unknown> = {};
+  checkCode(native.openOptionsInit(options));
+  options.storage_kind = storageKind(storage);
+  return options;
+}
 
 /** Runs Lite integrity checks for path without opening a database handle and returns the raw JSON result. */
 export async function checkFileRaw(path: string): Promise<Buffer> {
@@ -86,78 +103,79 @@ export async function copyStableSnapshotFile(
   ) as StableSnapshotReport;
 }
 
-async function restoreViaFn(fn: AnyNativeFn, args: unknown[]): Promise<void> {
+/**
+ * Creates a database at path from a portable Antfly backup archive, of the
+ * storage kind opts.storage selects (default Storage.Lite). A backup of
+ * either kind restores into either kind. For Lite destinations path must end
+ * with .aflite (checked client-side only). OutcomeUnknown means the
+ * destination was published but crash durability could not be confirmed;
+ * inspect it and do not retry automatically.
+ */
+export async function restore(
+  path: string,
+  backup: Uint8Array,
+  opts: RestoreOptions = {}
+): Promise<void> {
+  if ((opts.storage ?? Storage.Lite) === Storage.Lite && !path.endsWith(".aflite")) {
+    throw new InvalidArgumentError("path must end with .aflite for Storage.Lite");
+  }
+  if (backup.length === 0) {
+    throw new InvalidArgumentError("backup must be non-empty");
+  }
   const native = loadNative();
+  const options = restoreOpenOptions(native, opts.storage);
   const out = newBufferOut();
-  const code = await callAsync(fn, ...args, out);
+  const code = await callAsync(
+    native.restoreBackupJson,
+    path,
+    options,
+    sliceOf(toRawBytes(backup)),
+    Boolean(opts.replace),
+    out
+  );
   checkCode(code);
   takeBuffer(native, out); // discard the JSON result, matching go/pkg/lite/files.go
 }
 
 /**
- * Creates or replaces a Lite database at path from an in-memory portable
- * Antfly backup archive. OutcomeUnknown means the destination was published
- * but crash durability could not be confirmed; inspect it and do not retry
- * automatically.
- */
-export function restoreBackup(path: string, backup: Uint8Array, replace: boolean): Promise<void> {
-  if (!path.endsWith(".aflite") || backup.length === 0) {
-    return Promise.reject(
-      new InvalidArgumentError("path must end with .aflite and backup must be non-empty")
-    );
-  }
-  const native = loadNative();
-  return restoreViaFn(native.liteRestoreBackupJson, [path, sliceOf(toRawBytes(backup)), replace]);
-}
-
-/**
- * Creates or replaces a Lite database at path from an in-memory portable
- * Antfly backup archive (antfly_lite_restore_json). See restoreBackup.
- */
-export function restore(path: string, backup: Uint8Array, replace: boolean): Promise<void> {
-  if (!path.endsWith(".aflite") || backup.length === 0) {
-    return Promise.reject(
-      new InvalidArgumentError("path must end with .aflite and backup must be non-empty")
-    );
-  }
-  const native = loadNative();
-  return restoreViaFn(native.liteRestoreJson, [path, sliceOf(toRawBytes(backup)), replace]);
-}
-
-/**
- * Creates or replaces a Lite database by streaming a portable Antfly backup
- * archive file with bounded memory use. Busy means the source changed during
+ * restore() reading the archive from backupPath. For Lite destinations it
+ * streams with bounded memory use. Busy means the source changed during
  * streaming or the source/destination is concurrently locked; retry after
  * the files are stable and no writer is active. Unsupported means the source
  * filesystem lacks required advisory locking; copy the archive to a
- * supported local filesystem. OutcomeUnknown means the destination was
- * published but crash durability could not be confirmed; inspect it and do
- * not retry automatically.
+ * supported local filesystem.
  */
-export function restoreBackupFile(
+export async function restoreFile(
   path: string,
   backupPath: string,
-  replace: boolean
+  opts: RestoreOptions = {}
 ): Promise<void> {
-  if (!path.endsWith(".aflite") || !backupPath.endsWith(".afb")) {
-    return Promise.reject(
-      new InvalidArgumentError("path must end with .aflite and backupPath with .afb")
-    );
+  if (!backupPath.endsWith(".afb")) {
+    throw new InvalidArgumentError("backupPath must end with .afb");
+  }
+  if ((opts.storage ?? Storage.Lite) === Storage.Lite && !path.endsWith(".aflite")) {
+    throw new InvalidArgumentError("path must end with .aflite for Storage.Lite");
   }
   const native = loadNative();
-  return restoreViaFn(native.liteRestoreBackupFileJson, [path, backupPath, replace]);
-}
-
-/** Alias of restoreBackupFile, matching go/pkg/lite/files.go's RestoreFile. */
-export function restoreFile(path: string, backupPath: string, replace: boolean): Promise<void> {
-  return restoreBackupFile(path, backupPath, replace);
+  const options = restoreOpenOptions(native, opts.storage);
+  const out = newBufferOut();
+  const code = await callAsync(
+    native.restoreBackupFileJson,
+    path,
+    options,
+    backupPath,
+    Boolean(opts.replace),
+    out
+  );
+  checkCode(code);
+  takeBuffer(native, out); // discard the JSON result, matching go/pkg/lite/files.go
 }
 
 /** Decodes a base64 artifact ID without opening a database. */
 export async function decodeArtifactIdRaw(artifactIdBase64: string): Promise<Buffer> {
   const native = loadNative();
   const out = newBufferOut();
-  const code = await callAsync(native.dbDecodeArtifactIdJson, stringSlice(artifactIdBase64), out);
+  const code = await callAsync(native.decodeArtifactIdJson, stringSlice(artifactIdBase64), out);
   checkCode(code);
   return takeBuffer(native, out);
 }

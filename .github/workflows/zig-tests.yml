@@ -224,6 +224,7 @@ jobs:
             scripts/uv.lock \
             scripts/ci/test_zig_validation_scope.py \
             ':(glob)scripts/bench/pdf/**' \
+            ':(glob)scripts/laya/**' \
             Makefile \
             .github/workflows/zig-tests.yml \
             .github/workflows/antfly-container.yml
@@ -577,6 +578,14 @@ jobs:
           python3 -m unittest discover -s scripts -p test_conformance_fixtures.py
           python3 -m unittest discover -s scripts -p 'test_laya_cuda*.py'
           python3 -m unittest discover -s scripts/bench/pdf -p 'test_*.py'
+
+      - name: Test Laya data and qualification contracts
+        run: |
+          PYTHONPATH=scripts/laya python3 -m unittest \
+            scripts/laya/test_prepare_laya_finetune.py \
+            scripts/laya/test_qualify_laya_finetune_quality.py \
+            scripts/laya/test_run_laya_qualification.py \
+            scripts/laya/test_benchmark_laya_metal.py
 
       - name: Check inference kernels through the root build graph
         working-directory: zig
@@ -976,6 +985,14 @@ jobs:
           python3 -m unittest discover -s scripts -p test_conformance_fixtures.py
           python3 -m unittest discover -s scripts -p 'test_laya_cuda*.py'
           python3 -m unittest discover -s scripts/bench/pdf -p 'test_*.py'
+
+      - name: Test Laya data and qualification contracts
+        run: |
+          PYTHONPATH=scripts/laya python3 -m unittest \
+            scripts/laya/test_prepare_laya_finetune.py \
+            scripts/laya/test_qualify_laya_finetune_quality.py \
+            scripts/laya/test_run_laya_qualification.py \
+            scripts/laya/test_benchmark_laya_metal.py
 
       # Keep normal build-step parallelism while bounding aggregate compiler
       # memory to the pod's cgroup budget and the 22 GiB largest-step claim.

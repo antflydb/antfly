@@ -51,7 +51,7 @@ testing the binding against the source-tree C library.
 
 The open helpers call `ValidateABI` before filling C option structures or
 creating handles. Applications can call `ValidateABI` at startup to fail fast
-when the loaded `libantfly` ABI version or `antfly_lite_open_options` size
+when the loaded `libantfly` ABI version or `antfly_open_options` size
 does not match the header used to build the Go binding.
 
 The binding exposes raw JSON methods such as `StatusJSON` and `CapabilitiesJSON`
@@ -100,10 +100,12 @@ re-execs `argv[0]`, itself), a Go binary linking `libantfly` has no
 executable itself, in order: the `ANTFLY_INFERENCE_WORKER` environment
 variable (a path to the worker executable, typically an `antfly` binary);
 otherwise an `antfly` binary next to the loaded `libantfly`; otherwise
-`antfly` on `PATH`. If none of these resolve, calls into a process-isolated
-backend fail with a clear error naming `ANTFLY_INFERENCE_WORKER` -- set it
-(or place an `antfly` binary next to `libantfly` or on `PATH`) before opening
-a `LocalRuntimeConfigured` handle that needs Metal/CUDA/ONNX/PJRT models. See
+`antfly` on `PATH`. In a build that includes Metal (the macOS default), CUDA,
+ONNX, or PJRT, opening a `LocalRuntimeConfigured` handle spawns the worker, and
+all local inference, CPU models included, runs there. If none of these
+resolve, the spawn fails with a clear error naming `ANTFLY_INFERENCE_WORKER` --
+set it (or place an `antfly` binary next to `libantfly` or on `PATH`) before
+opening the handle. See
 `zig/LITE.md`'s "Local Embedded Inference" section for the full resolution
 order and rationale.
 
@@ -126,10 +128,17 @@ Use `BeginTransaction`, `WriteTransaction`, `ResolveTransaction`,
 `TransactionStatus`, and `CommitVersion` when an embedded application needs the
 local transaction/OCC path exposed by the Antfly C ABI.
 
-Use `ExportToFile` or `BackupToFile` to write a portable `.afb` archive from an
-open Lite handle. Use `RestoreFile`, `Restore`, `RestoreBackupFile`,
-`RestoreBackup`, or handle-level `Import` to stage a portable backup into a new
-`.aflite` database without publishing a partial target on import failure.
+`OpenOptions.Storage` selects a `.aflite` file (`StorageLite`, the default)
+or a normal Antfly directory (`StorageDirectory`); every method works on
+either. `CreateWithOptions` only creates `.aflite` files; open a missing
+directory path to create one.
+
+Use `Backup` or `BackupToFile` to write a portable `.afb` archive from any
+handle. Use `Restore` or `RestoreFile` to create a new database from one
+without publishing a partial target on failure; `RestoreOptions.Storage`
+selects a `.aflite` file (the default) or a directory, and a backup of either
+kind restores into either kind. `ImportBackup` imports into an empty open
+database.
 Use `CopyStableSnapshot` or `CopyStableSnapshotFile` when you want a physical
 `.aflite` database snapshot rather than a portable `.afb` backup archive.
 

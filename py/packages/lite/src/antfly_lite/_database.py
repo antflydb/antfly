@@ -220,29 +220,29 @@ class Database:
     # -- status / capabilities / maintenance -------------------------------
 
     def status(self, *, raw: bool = False) -> Any:
-        return self._json_read(self._lib.antfly_lite_status_json, raw=raw)
+        return self._json_read(self._lib.antfly_db_status_json, raw=raw)
 
     def capabilities(self, *, raw: bool = False) -> Any:
-        return self._json_read(self._lib.antfly_lite_capabilities_json, raw=raw)
+        return self._json_read(self._lib.antfly_db_capabilities_json, raw=raw)
 
     def replay_generated_enrichments(self, *, raw: bool = False) -> Any:
-        return self._json_read(self._lib.antfly_lite_replay_generated_enrichments_json, raw=raw)
+        return self._json_read(self._lib.antfly_db_replay_generated_enrichments_json, raw=raw)
 
     def pending_work_stats(self, *, raw: bool = False) -> Any:
-        return self._json_read(self._lib.antfly_lite_pending_work_stats_json, raw=raw)
+        return self._json_read(self._lib.antfly_db_pending_work_stats_json, raw=raw)
 
     def run_until_idle(self) -> None:
         """Drain pending enrichment and index work."""
         handle = self._acquire()
         try:
-            errors.raise_for_code(self._lib.antfly_lite_run_until_idle(ctypes.c_void_p(handle)))
+            errors.raise_for_code(self._lib.antfly_db_run_until_idle(ctypes.c_void_p(handle)))
         finally:
             self._release()
 
     def run_until_idle_status(self, *, raw: bool = False) -> Any:
         """Drain pending enrichment and index work, returning the post-drain
         pending-work readiness document."""
-        return self._json_read(self._lib.antfly_lite_run_until_idle_json, raw=raw)
+        return self._json_read(self._lib.antfly_db_run_until_idle_json, raw=raw)
 
     def check(self, *, raw: bool = False) -> Any:
         return self._json_read(self._lib.antfly_lite_check_json, raw=raw)
@@ -267,29 +267,24 @@ class Database:
         finally:
             self._release()
 
-    # -- backup / export / import ------------------------------------------
+    # -- backup / import ----------------------------------------------------
 
     def backup(self) -> bytes:
-        return self._read_buffer(self._lib.antfly_lite_backup)
-
-    def export(self) -> bytes:
-        return self._read_buffer(self._lib.antfly_lite_export)
+        """Return a portable Antfly backup archive (.afb) of this database,
+        which restores or imports into either storage kind."""
+        return self._read_buffer(self._lib.antfly_db_backup)
 
     def import_backup(self, backup: bytes) -> None:
-        self._with_input(self._lib.antfly_lite_import_backup, bytes(backup))
-
-    def import_(self, backup: bytes) -> None:
-        self._with_input(self._lib.antfly_lite_import, bytes(backup))
+        """Import a portable Antfly backup archive into this empty
+        database. OutcomeUnknownError means the live handle adopted the
+        imported generation, but crash durability could not be confirmed;
+        inspect the handle and do not retry automatically."""
+        self._with_input(self._lib.antfly_db_import_backup, bytes(backup))
 
     def backup_to_file(self, path: str) -> None:
         if not str(path).endswith(".afb"):
             raise errors.InvalidArgumentError()
         _write_file_atomically(path, self.backup())
-
-    def export_to_file(self, path: str) -> None:
-        if not str(path).endswith(".afb"):
-            raise errors.InvalidArgumentError()
-        _write_file_atomically(path, self.export())
 
     # -- data ---------------------------------------------------------------
 

@@ -107,6 +107,8 @@ All three authentication methods are supported across SDKs: basic auth, API key,
 
 ### Token
 
+The bearer token is an API key encoded as `base64(key_id:key_secret)`, the same value the `ApiKey` scheme takes (the key's `encoded` field when it is created).
+
 <CodeTabs persistKey="sdk-lang" samples={[
   {
     language: "Go",

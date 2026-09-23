@@ -285,6 +285,55 @@ pub const Trainer = struct {
         return result;
     }
 
+    /// Restore at process startup without allocating an unused live device
+    /// epoch. The immutable snapshot is freed before any device state upload.
+    /// Existing live trainers continue to use transactional restoreValidated.
+    pub fn initRestored(a: Allocator, cb: *const ops.ComputeBackend, parameters: []const Parameter, config: Config, path: []const u8, run: [32]u8, control: ?Control) !Trainer {
+        return initRestoredValidated(a, cb, parameters, config, path, run, control, null);
+    }
+
+    pub fn initRestoredValidated(a: Allocator, cb: *const ops.ComputeBackend, parameters: []const Parameter, config: Config, path: []const u8, run: [32]u8, control: ?Control, validation: ?RestoreValidation) !Trainer {
+        try check(control);
+        var result = try initOwnedHost(a, cb, parameters, config);
+        errdefer result.deinit();
+        {
+            var host_bytes: usize = 0;
+            for (parameters) |p| {
+                host_bytes = std.math.add(usize, host_bytes, std.math.mul(usize, p.values.len, 4 * @sizeOf(f32)) catch return error.TrainingOptimizerLimitExceeded) catch return error.TrainingOptimizerLimitExceeded;
+                host_bytes = std.math.add(usize, host_bytes, p.name.len * 2 + p.dimensions.len * @sizeOf(i32) + 1024) catch return error.TrainingOptimizerLimitExceeded;
+            }
+            if (host_bytes >= config.limits.max_transaction_bytes) return error.TrainingOptimizerLimitExceeded;
+            const file = try snapshot_file.openRegular(compat.io(), compat.cwd(), path, control);
+            defer file.close(compat.io());
+            const bytes = std.math.cast(usize, (try file.stat(compat.io())).size) orelse return error.TrainingOptimizerLimitExceeded;
+            const remaining = config.limits.max_transaction_bytes - host_bytes;
+            if (bytes >= remaining) return error.TrainingOptimizerLimitExceeded;
+            var prefix: [8]u8 = undefined;
+            if (try file.readPositionalAll(compat.io(), &prefix, 0) != prefix.len) return error.FileTooSmall;
+            if (std.mem.readInt(u64, &prefix, .little) > config.limits.max_checkpoint_header_bytes) return error.TrainingOptimizerLimitExceeded;
+            const snapshot = try snapshot_file.readOpened(a, compat.io(), file, bytes, control);
+            defer a.free(snapshot);
+            var digest = std.crypto.hash.sha2.Sha256.init(.{});
+            var offset: usize = 0;
+            while (offset < snapshot.len) {
+                try check(control);
+                const end = @min(snapshot.len, offset +| (256 * 1024));
+                digest.update(snapshot[offset..end]);
+                offset = end;
+            }
+            const header_limit = @min(config.limits.max_checkpoint_header_heap_bytes, remaining - bytes);
+            if (header_limit == 0) return error.TrainingOptimizerLimitExceeded;
+            var header_budget = Budget{ .backing = a, .limit = header_limit };
+            var reader = try safetensors.MMapReader.fromBorrowedBytesLimited(header_budget.allocator(), snapshot, config.limits.max_checkpoint_header_bytes);
+            defer reader.deinit();
+            const state_digest = try result.loadHostState(&reader, run, control, validation);
+            result.last_restore_receipt = .{ .state_sha256 = state_digest, .identity = result.identity(), .accumulated_microbatches = result.owner.accum_count, .checkpoint = .{ .size_bytes = snapshot.len, .sha256 = digest.finalResult() } };
+        }
+        if (config.execution != .native) try result.initializeDevice(control);
+        try check(control);
+        return result;
+    }
+
     fn initOwnedHost(a: Allocator, cb: *const ops.ComputeBackend, parameters: []const Parameter, config: Config) !Trainer {
         if ((config.execution == .native and cb.kind() != .native) or (config.execution != .native and cb.kind() != config.execution.backendKind())) return error.UnsupportedSeededTrainingBackend;
         if (parameters.len == 0 or parameters.len > config.limits.max_parameters or config.groups.len == 0 or config.groups.len > config.limits.max_groups or config.grad_accum_steps == 0 or config.grad_accum_steps > 65536 or !std.math.isFinite(config.max_grad_norm) or config.max_grad_norm < 0) return error.InvalidSeededTrainerConfig;
@@ -458,25 +507,37 @@ pub const Trainer = struct {
         try check(control);
         var staged = try initOwnedHost(a, self.owner.compute_backend, parameters, .{ .groups = self.groups, .grad_accum_steps = self.owner.config.grad_accum_steps, .max_grad_norm = self.owner.config.max_grad_norm, .limits = self.limits, .execution = self.execution, .pytorch_clip_order = self.pytorch_clip_order });
         errdefer staged.deinit();
-        staged.owner.optimizer_state.deinit();
-        staged.owner.optimizer_state = optimizers.OptimizerState.init(a);
+        const state_digest = try staged.loadHostState(&reader, run, control, validation);
+        staged.last_restore_receipt = .{ .state_sha256 = state_digest, .identity = staged.identity(), .accumulated_microbatches = staged.owner.accum_count, .checkpoint = .{ .size_bytes = snapshot.len, .sha256 = snapshot_hash.finalResult() } };
+        if (self.execution != .native) try staged.initializeDevice(control);
+        try check(control);
+        self.deinit();
+        self.* = staged;
+    }
+
+    /// Load only a newly owned host epoch. The caller publishes it after every
+    /// counter, fingerprint, finite-state and accumulation validation passes.
+    fn loadHostState(self: *Trainer, reader: *safetensors.MMapReader, run: [32]u8, control: ?Control, validation: ?RestoreValidation) ![32]u8 {
+        const a = self.owner.allocator;
+        self.owner.optimizer_state.deinit();
+        self.owner.optimizer_state = optimizers.OptimizerState.init(a);
         const digest = try self.fingerprint(run);
-        try staged.owner.loadTrainingStateFromReader(&reader, &digest);
+        try self.owner.loadTrainingStateFromReader(reader, &digest);
         var counters = try reader.readTensor("__extension.seeded.counters");
         defer counters.deinit();
         if (counters.dtype != .f32 or counters.asFloat32().len != 3) return error.InvalidTrainingAccumulation;
         const c = counters.asFloat32();
         try finite(c);
-        if (c[0] != 1 or c[1] < 0 or c[1] != @floor(c[1]) or c[1] >= @as(f32, @floatFromInt(staged.owner.config.grad_accum_steps)) or c[2] != @as(f32, @floatFromInt(staged.owner.config.grad_accum_steps))) return error.InvalidTrainingAccumulation;
-        staged.owner.accum_count = @intFromFloat(c[1]);
-        if (staged.owner.accum_count > staged.owner.step_count) return error.InvalidTrainingAccumulation;
+        if (c[0] != 1 or c[1] < 0 or c[1] != @floor(c[1]) or c[1] >= @as(f32, @floatFromInt(self.owner.config.grad_accum_steps)) or c[2] != @as(f32, @floatFromInt(self.owner.config.grad_accum_steps))) return error.InvalidTrainingAccumulation;
+        self.owner.accum_count = @intFromFloat(c[1]);
+        if (self.owner.accum_count > self.owner.step_count) return error.InvalidTrainingAccumulation;
         var presence = try reader.readTensor("__extension.seeded.presence");
         defer presence.deinit();
-        if (presence.dtype != .f32 or presence.asFloat32().len != staged.present.len) return error.InvalidTrainingAccumulation;
-        for (staged.owner.regular_params.items, staged.present, presence.asFloat32(), 0..) |slot, *present, value, i| {
+        if (presence.dtype != .f32 or presence.asFloat32().len != self.present.len) return error.InvalidTrainingAccumulation;
+        for (self.owner.regular_params.items, self.present, presence.asFloat32(), 0..) |slot, *present, value, i| {
             if (value != 0 and value != 1) return error.InvalidTrainingAccumulation;
             present.* = value == 1;
-            if (staged.owner.accum_count == 0 and present.*) return error.InvalidTrainingAccumulation;
+            if (self.owner.accum_count == 0 and present.*) return error.InvalidTrainingAccumulation;
             const name = try std.fmt.allocPrint(a, "__extension.seeded.gradient.{d}", .{i});
             defer a.free(name);
             var gradient = try reader.readTensor(name);
@@ -485,22 +546,18 @@ pub const Trainer = struct {
             try finite(gradient.asFloat32());
             if (!present.*) for (gradient.asFloat32()) |element| if (element != 0) return error.InvalidTrainingAccumulation;
             @memcpy(slot.grad_accum, gradient.asFloat32());
-            const state = staged.owner.optimizer_state.param_states.get(slot.name).?;
-            if (state.step_count != slot.adam_step_count or state.step_count > staged.owner.optimizer_step_count) return error.InvalidOptimizerState;
+            const state = self.owner.optimizer_state.param_states.get(slot.name).?;
+            if (state.step_count != slot.adam_step_count or state.step_count > self.owner.optimizer_step_count) return error.InvalidOptimizerState;
             try finite(slot.weights);
             try finite(state.m);
             try finite(state.v);
             for (state.v) |element| if (element < 0) return error.InvalidOptimizerState;
             try check(control);
         }
-        if (validation) |v| try v.validate(v.context, staged.identity(), staged.owner.accum_count);
-        const state_digest = try staged.stateFingerprint(run, control);
+        if (validation) |v| try v.validate(v.context, self.identity(), self.owner.accum_count);
+        const state_digest = try self.stateFingerprint(run, control);
         if (validation) |v| if (v.expected_state_sha256) |expected| if (!std.mem.eql(u8, &expected, &state_digest)) return error.TrainingRestoreStateMismatch;
-        staged.last_restore_receipt = .{ .state_sha256 = state_digest, .identity = staged.identity(), .accumulated_microbatches = staged.owner.accum_count, .checkpoint = .{ .size_bytes = snapshot.len, .sha256 = snapshot_hash.finalResult() } };
-        if (self.execution != .native) try staged.initializeDevice(control);
-        try check(control);
-        self.deinit();
-        self.* = staged;
+        return state_digest;
     }
 
     /// Owned CT bindings must outlive the retained tape. Their lease prevents
@@ -1296,6 +1353,40 @@ test "seeded gradient trainer matches pinned Torch AdamW groups clipping moments
         }
     }
     try std.testing.expectEqual(f.flushes.len, flush_index);
+}
+
+test "seeded gradient trainer startup restore preserves partial accumulation and rejects mismatches" {
+    const a = std.testing.allocator;
+    const native = @import("../ops/native_compute.zig");
+    var store = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = native.NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    var cb = compute.computeBackend();
+    const config = Config{ .groups = &restore_groups, .grad_accum_steps = 2 };
+    var trainer = try Trainer.init(a, &cb, &restore_parameters, config);
+    defer trainer.deinit();
+    for (0..3) |_| _ = try trainer.submit(trainer.identity(), 1, &.{.{ .name = "restore.weight", .values = &.{ 2, -1 } }}, null);
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/startup.safetensors", .{temp.sub_path});
+    defer a.free(path);
+    try trainer.save(path, @splat(69), null);
+    var restored = try Trainer.initRestored(a, &cb, &restore_parameters, config, path, @splat(69), null);
+    defer restored.deinit();
+    try std.testing.expectEqual(@as(u32, 1), restored.owner.accum_count);
+    try std.testing.expectEqual(try trainer.stateFingerprint(@splat(69), null), try restored.stateFingerprint(@splat(69), null));
+    try std.testing.expectError(error.TrainingStateFingerprintMismatch, Trainer.initRestored(a, &cb, &restore_parameters, config, path, @splat(70), null));
+    const Reject = struct {
+        fn validate(_: ?*const anyopaque, identity: Identity, accumulated: u32) !void {
+            try std.testing.expectEqual(@as(u64, 3), identity.microbatch_step);
+            try std.testing.expectEqual(@as(u32, 1), accumulated);
+            return error.RejectedStartupPosition;
+        }
+    };
+    try std.testing.expectError(error.RejectedStartupPosition, Trainer.initRestoredValidated(a, &cb, &restore_parameters, config, path, @splat(69), null, .{ .context = null, .validate = Reject.validate }));
+    var limited = config;
+    limited.limits.max_transaction_bytes = 1024;
+    try std.testing.expectError(error.TrainingOptimizerLimitExceeded, Trainer.initRestored(a, &cb, &restore_parameters, limited, path, @splat(69), null));
 }
 
 test "seeded gradient trainer checkpoint preserves all Adam counter bits beyond f32 precision" {

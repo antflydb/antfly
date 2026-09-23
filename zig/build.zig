@@ -790,6 +790,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .json = json_mod,
         .jsonschema = jsonschema_mod,
         .mcp = mcp_mod,
+        .toon = toon_mod,
         .a2a = a2a_mod,
         .generating = generating_mod,
         .reranking = reranking_mod,

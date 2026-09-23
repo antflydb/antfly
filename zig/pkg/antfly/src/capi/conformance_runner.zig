@@ -100,7 +100,7 @@ const Runner = struct {
     arena: Allocator,
     io: std.Io,
     dir: []const u8,
-    handle: ?*anyopaque = null,
+    handle: ?*c.antfly_db = null,
     path: []const u8 = "",
     backup: []const u8 = "",
     failure: ?[]const u8 = null,
@@ -170,8 +170,8 @@ const Runner = struct {
         if (eql(op, "scan")) return self.withInput(c.antfly_db_scan_json, try self.encoded(step, "request"));
         if (eql(op, "search")) return self.withInput(c.antfly_db_search_json, try self.encoded(step, "request"));
         if (eql(op, "stats")) return self.output(c.antfly_db_stats_json);
-        if (eql(op, "status")) return self.output(c.antfly_lite_status_json);
-        if (eql(op, "capabilities")) return self.output(c.antfly_lite_capabilities_json);
+        if (eql(op, "status")) return self.output(c.antfly_db_status_json);
+        if (eql(op, "capabilities")) return self.output(c.antfly_db_capabilities_json);
         if (eql(op, "check")) return self.output(c.antfly_lite_check_json);
         if (eql(op, "pending_work_stats")) return self.output(c.antfly_db_pending_work_stats_json);
         if (eql(op, "run_until_idle")) return .{ .code = c.antfly_db_run_until_idle(h) };
@@ -253,14 +253,16 @@ const Runner = struct {
         }
         if (eql(op, "backup")) {
             var buf: c.antfly_buffer = .{ .ptr = null, .len = 0 };
-            const code = c.antfly_lite_backup(h, &buf);
+            const code = c.antfly_db_backup(h, &buf);
             if (code == c.ANTFLY_OK) self.backup = try self.take(buf);
             return .{ .code = code };
         }
+        if (eql(op, "import_backup")) return .{ .code = c.antfly_db_import_backup(h, slice(self.backup)) };
         if (eql(op, "restore_open")) {
             const path = try self.resolvePath(str(step, "path"));
+            var opts = try self.openOptions(step);
             var buf: c.antfly_buffer = .{ .ptr = null, .len = 0 };
-            const code = c.antfly_lite_restore_backup_json(path.ptr, slice(self.backup), false, &buf);
+            const code = c.antfly_restore_backup_json(path.ptr, &opts, slice(self.backup), false, &buf);
             if (code != c.ANTFLY_OK) return .{ .code = code };
             _ = try self.take(buf);
             self.closeCurrent();
@@ -273,7 +275,7 @@ const Runner = struct {
         }
         if (eql(op, "open_second")) {
             const path = try self.resolvePath(str(step, "path"));
-            var second: ?*anyopaque = null;
+            var second: ?*c.antfly_db = null;
             const code = try self.openRaw(step, path, &second);
             if (code == c.ANTFLY_OK) c.antfly_db_close(second);
             return .{ .code = code };
@@ -301,31 +303,44 @@ const Runner = struct {
         return .{ .code = code };
     }
 
-    fn openRaw(self: *Runner, fields: Value, path: [:0]const u8, out: *?*anyopaque) StepError!c.antfly_error_code {
-        var opts: c.antfly_lite_open_options = undefined;
-        if (c.antfly_lite_open_options_init(&opts) != c.ANTFLY_OK) return self.fail("open options init failed", .{});
+    /// Builds antfly_open_options from a case's open fields.
+    fn openOptions(self: *Runner, fields: Value) StepError!c.antfly_open_options {
+        var opts: c.antfly_open_options = undefined;
+        if (c.antfly_open_options_init(&opts) != c.ANTFLY_OK) return self.fail("open options init failed", .{});
+        const storage = str(fields, "storage") orelse "lite";
+        opts.storage_kind = if (eql(storage, "lite"))
+            c.ANTFLY_STORAGE_KIND_LITE
+        else if (eql(storage, "directory"))
+            c.ANTFLY_STORAGE_KIND_DIRECTORY
+        else
+            return self.fail("unknown storage {s}", .{storage});
         const mode = str(fields, "mode") orelse "writer";
         opts.open_mode = if (eql(mode, "writer"))
-            c.ANTFLY_LITE_OPEN_MODE_WRITER
+            c.ANTFLY_OPEN_MODE_WRITER
         else if (eql(mode, "readonly"))
-            c.ANTFLY_LITE_OPEN_MODE_READONLY
+            c.ANTFLY_OPEN_MODE_READONLY
         else if (eql(mode, "status_only"))
-            c.ANTFLY_LITE_OPEN_MODE_STATUS_ONLY
+            c.ANTFLY_OPEN_MODE_STATUS_ONLY
         else
             return self.fail("unknown mode {s}", .{mode});
         const profile = str(fields, "profile") orelse "native";
         opts.profile = if (eql(profile, "native"))
-            c.ANTFLY_LITE_PROFILE_NATIVE
+            c.ANTFLY_PROFILE_NATIVE
         else if (eql(profile, "hosted"))
-            c.ANTFLY_LITE_PROFILE_HOSTED
+            c.ANTFLY_PROFILE_HOSTED
         else
             return self.fail("unknown profile {s}", .{profile});
-        if (boolean(fields, "no_sync")) opts.flags |= c.ANTFLY_LITE_OPEN_FLAG_NO_SYNC;
+        if (boolean(fields, "no_sync")) opts.flags |= c.ANTFLY_OPEN_FLAG_NO_SYNC;
         opts.busy_timeout_ms = uint(fields, "busy_timeout_ms");
+        return opts;
+    }
+
+    fn openRaw(self: *Runner, fields: Value, path: [:0]const u8, out: *?*c.antfly_db) StepError!c.antfly_error_code {
+        var opts = try self.openOptions(fields);
         return if (boolean(fields, "create"))
-            c.antfly_lite_create_with_options(path.ptr, &opts, out)
+            c.antfly_db_create_with_options(path.ptr, &opts, out)
         else
-            c.antfly_lite_open_with_options(path.ptr, &opts, out);
+            c.antfly_db_open_with_options(path.ptr, &opts, out);
     }
 
     fn closeCurrent(self: *Runner) void {
