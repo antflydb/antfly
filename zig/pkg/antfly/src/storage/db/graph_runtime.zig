@@ -356,3 +356,204 @@ test "db graph runtime algebraic shortest path applies exact min-hop edge weight
     try std.testing.expectEqualStrings("c", algebraic_k_one[0].nodes[1]);
     try std.testing.expectEqualStrings("d", algebraic_k_one[0].nodes[3]);
 }
+
+test "db graph runtime personalized graph metric seeds shape top-k and rerank ordering" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{\"store\":true}",
+    });
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"rank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"manual\",\"edge_filter\":{\"types\":[\"cites\"]}},\"deg\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"manual\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    // Seed cluster a<->b bridged through c to hub, which dominates global
+    // PageRank with four in-edges.
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:a\",\"weight\":1.0},{\"target\":\"doc:c\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:hub\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:hub\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:e", .value = "{\"title\":\"epsilon\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:hub\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:f", .value = "{\"title\":\"zeta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:hub\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:hub", .value = "{\"title\":\"hub\"}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    const seed_a = [_][]const u8{"doc:a"};
+    const seed_f = [_][]const u8{"doc:f"};
+
+    // Personalized rankings are computed fresh from the edge snapshot and
+    // need no published generation. Seeding near the a<->b cluster keeps the
+    // one-hop neighbor above the globally dominant hub.
+    var seeded_a = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "rank",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "rank",
+                .top_k = 7,
+                .freshness = .fresh,
+                .seed_nodes = &seed_a,
+                .damping = 0.9,
+            },
+        }},
+        .limit = 0,
+    });
+    defer seeded_a.deinit();
+    try std.testing.expectEqual(@as(usize, 1), seeded_a.graph_metric_results.len);
+    const seeded_a_scores = seeded_a.graph_metric_results[0].scores;
+    try std.testing.expectEqual(@as(usize, 7), seeded_a_scores.len);
+    var position_b: usize = seeded_a_scores.len;
+    var position_hub: usize = seeded_a_scores.len;
+    for (seeded_a_scores, 0..) |score, i| {
+        if (std.mem.eql(u8, score.node, "doc:b")) position_b = i;
+        if (std.mem.eql(u8, score.node, "doc:hub")) position_hub = i;
+    }
+    try std.testing.expect(position_b < position_hub);
+
+    // A different seed set concentrates mass elsewhere and flips the order.
+    var seeded_f = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "rank",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "rank",
+                .top_k = 7,
+                .freshness = .fresh,
+                .seed_nodes = &seed_f,
+            },
+        }},
+        .limit = 0,
+    });
+    defer seeded_f.deinit();
+    const seeded_f_scores = seeded_f.graph_metric_results[0].scores;
+    var f_position_b: usize = seeded_f_scores.len;
+    var f_position_hub: usize = seeded_f_scores.len;
+    for (seeded_f_scores, 0..) |score, i| {
+        if (std.mem.eql(u8, score.node, "doc:b")) f_position_b = i;
+        if (std.mem.eql(u8, score.node, "doc:hub")) f_position_hub = i;
+    }
+    try std.testing.expect(f_position_hub < f_position_b);
+
+    // Global published ranking is dominated by the hub, unlike the seeded one.
+    var refreshed = try db.refreshGraphMetric(alloc, "graph_idx", "rank");
+    defer refreshed.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, refreshed.state);
+    var global = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "rank",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "rank",
+                .top_k = 1,
+                .freshness = .published,
+            },
+        }},
+        .limit = 0,
+    });
+    defer global.deinit();
+    try std.testing.expectEqualStrings("doc:hub", global.graph_metric_results[0].scores[0].node);
+
+    // Seeded rerank blends the personalized column into search hits: with a
+    // zero base weight, ordering is exactly the personalized metric order.
+    var seeded_rerank = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match_all = {} },
+        .graph_metric_rerank = .{
+            .index_name = "graph_idx",
+            .metric_name = "rank",
+            .freshness = .fresh,
+            .base_weight = 0.0,
+            .weight = 1.0,
+            .seed_nodes = &seed_a,
+            .damping = 0.9,
+        },
+        .limit = 7,
+        .include_stored = false,
+    });
+    defer seeded_rerank.deinit();
+    try std.testing.expectEqual(@as(usize, 7), seeded_rerank.hits.len);
+    var rerank_position_b: usize = seeded_rerank.hits.len;
+    var rerank_position_hub: usize = seeded_rerank.hits.len;
+    for (seeded_rerank.hits, 0..) |hit, i| {
+        if (std.mem.eql(u8, hit.id, "doc:b")) rerank_position_b = i;
+        if (std.mem.eql(u8, hit.id, "doc:hub")) rerank_position_hub = i;
+    }
+    try std.testing.expect(rerank_position_b < rerank_position_hub);
+
+    var global_rerank = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match_all = {} },
+        .graph_metric_rerank = .{
+            .index_name = "graph_idx",
+            .metric_name = "rank",
+            .freshness = .published,
+            .base_weight = 0.0,
+            .weight = 1.0,
+        },
+        .limit = 7,
+        .include_stored = false,
+    });
+    defer global_rerank.deinit();
+    try std.testing.expectEqualStrings("doc:hub", global_rerank.hits[0].id);
+
+    // Personalization contract failures stay client errors: published
+    // freshness with seeds, damping without seeds, and non-pagerank metrics.
+    try std.testing.expectError(error.GraphMetricPersonalizationRequiresFresh, db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "rank",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "rank",
+                .top_k = 1,
+                .freshness = .published,
+                .seed_nodes = &seed_a,
+            },
+        }},
+        .limit = 0,
+    }));
+    try std.testing.expectError(error.InvalidQueryRequest, db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "rank",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "rank",
+                .top_k = 1,
+                .freshness = .fresh,
+                .damping = 0.9,
+            },
+        }},
+        .limit = 0,
+    }));
+    try std.testing.expectError(error.UnsupportedGraphMetric, db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "deg",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "deg",
+                .top_k = 1,
+                .freshness = .fresh,
+                .seed_nodes = &seed_a,
+            },
+        }},
+        .limit = 0,
+    }));
+}

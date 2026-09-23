@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import json
-import shutil
 import subprocess
 from pathlib import Path
 
@@ -29,6 +28,9 @@ from test_standby import (
     _promotion_fence_request,
     _wait_for_standby_applied,
     _wait_for_standby_lookup,
+    _write_and_wait_for_standby_durability,
+)
+from test_standby import (
     ha_cluster as standby_cluster_fixture,
 )
 
@@ -338,7 +340,9 @@ def test_catalog_authority_survives_crash_and_obsolete_json(ha_cluster: HACluste
     authority = cluster.primary.catalog_path.parent / "local-state"
     assert authority.is_dir()
     cluster.primary.create_table("replay_table")
-    cluster.primary.batch_write("replay_table", {"saved": {"title": "durable data"}})
+    _write_and_wait_for_standby_durability(
+        cluster, "replay_table", {"saved": {"title": "durable data"}}
+    )
     # Catalog publication and its outbox now share a durable transaction; the
     # former JSON/WAL split cannot occur. Crash without a graceful checkpoint
     # and leave a stale legacy JSON catalog to prove it cannot replace the

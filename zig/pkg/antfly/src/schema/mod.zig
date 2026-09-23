@@ -1167,6 +1167,8 @@ fn freeRuntimeFullTextDocuments(alloc: std.mem.Allocator, docs: []storage_schema
         if (doc.open_dynamic_paths.len > 0) alloc.free(doc.open_dynamic_paths);
         for (doc.infer_type_dynamic_paths) |infer_path| alloc.free(infer_path);
         if (doc.infer_type_dynamic_paths.len > 0) alloc.free(doc.infer_type_dynamic_paths);
+        storage_schema.freeOwnedPaths(alloc, doc.declared_paths);
+        storage_schema.freeOwnedPaths(alloc, doc.unindexed_paths);
     }
     if (docs.len > 0) alloc.free(docs);
 }
@@ -1260,6 +1262,8 @@ fn deriveRuntimeFullTextDocuments(alloc: std.mem.Allocator, schema: ParsedTableS
             if (doc.open_dynamic_paths.len > 0) alloc.free(doc.open_dynamic_paths);
             for (doc.infer_type_dynamic_paths) |infer_path| alloc.free(infer_path);
             if (doc.infer_type_dynamic_paths.len > 0) alloc.free(doc.infer_type_dynamic_paths);
+            storage_schema.freeOwnedPaths(alloc, doc.declared_paths);
+            storage_schema.freeOwnedPaths(alloc, doc.unindexed_paths);
         }
         alloc.free(docs);
     }
@@ -1279,6 +1283,8 @@ fn deriveRuntimeFullTextDocument(
     var dynamic_rules = std.ArrayListUnmanaged(storage_schema.FullTextDynamicRule).empty;
     var open_dynamic_paths = std.ArrayListUnmanaged([]const u8).empty;
     var infer_type_dynamic_paths = std.ArrayListUnmanaged([]const u8).empty;
+    var declared_paths = std.ArrayListUnmanaged([]const u8).empty;
+    var unindexed_paths = std.ArrayListUnmanaged([]const u8).empty;
     errdefer {
         for (fields.items) |field| {
             alloc.free(field.path);
@@ -1301,6 +1307,10 @@ fn deriveRuntimeFullTextDocument(
         open_dynamic_paths.deinit(alloc);
         for (infer_type_dynamic_paths.items) |infer_path| alloc.free(infer_path);
         infer_type_dynamic_paths.deinit(alloc);
+        for (declared_paths.items) |declared_path| alloc.free(declared_path);
+        declared_paths.deinit(alloc);
+        for (unindexed_paths.items) |unindexed_path| alloc.free(unindexed_path);
+        unindexed_paths.deinit(alloc);
     }
 
     for (document_schema.properties) |property| {
@@ -1314,6 +1324,7 @@ fn deriveRuntimeFullTextDocument(
         try deriveRuntimeFullTextDynamicProperty(alloc, property.name, property, &dynamic_rules);
         try deriveRuntimeFullTextOpenDynamicProperty(alloc, property.name, property, &open_dynamic_paths);
         try deriveRuntimeFullTextInferTypeDynamicProperty(alloc, property.name, property, &infer_type_dynamic_paths);
+        try deriveRuntimeFullTextDeclaredProperty(alloc, property.name, property, &declared_paths, &unindexed_paths);
     }
     for (document_schema.pattern_properties) |pattern_property| {
         try appendDynamicRuleFromProperty(alloc, "", pattern_property.pattern, pattern_property.property.*, &dynamic_rules);
@@ -1336,13 +1347,48 @@ fn deriveRuntimeFullTextDocument(
     const owned_open_paths = try open_dynamic_paths.toOwnedSlice(alloc);
     errdefer open_dynamic_paths = .fromOwnedSlice(owned_open_paths);
     const owned_infer_paths = try infer_type_dynamic_paths.toOwnedSlice(alloc);
+    errdefer infer_type_dynamic_paths = .fromOwnedSlice(owned_infer_paths);
+    const owned_declared_paths = try declared_paths.toOwnedSlice(alloc);
+    errdefer declared_paths = .fromOwnedSlice(owned_declared_paths);
+    const owned_unindexed_paths = try unindexed_paths.toOwnedSlice(alloc);
     return .{
         .name = name,
         .fields = owned_fields,
         .dynamic_rules = owned_rules,
         .open_dynamic_paths = owned_open_paths,
         .infer_type_dynamic_paths = owned_infer_paths,
+        .declared_paths = owned_declared_paths,
+        .unindexed_paths = owned_unindexed_paths,
     };
+}
+
+/// Record every declared property path and the subtrees whose declaration
+/// disables indexing. Declarations that emit no text field (numeric shorthand,
+/// `blob`, `embedding`, `x-antfly-index: false`, ...) are otherwise invisible
+/// to the runtime, and the dynamic mapper would treat them as undeclared
+/// fields whenever the enclosing object opts into dynamic indexing.
+fn deriveRuntimeFullTextDeclaredProperty(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    property: impl.DocumentProperty,
+    declared_paths: *std.ArrayListUnmanaged([]const u8),
+    unindexed_paths: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    try appendUniqueOwnedPath(alloc, declared_paths, path);
+
+    const item_unindexed = if (property.item) |item| item.antfly_index != null and !item.antfly_index.? else false;
+    if ((property.antfly_index != null and !property.antfly_index.?) or item_unindexed) {
+        // The subtree is excluded wholesale; its children need no entries.
+        try appendUniqueOwnedPath(alloc, unindexed_paths, path);
+        return;
+    }
+
+    const children = if (property.item) |item| item.properties else property.properties;
+    for (children) |child| {
+        const child_path = try appendPath(alloc, path, child.name);
+        defer alloc.free(child_path);
+        try deriveRuntimeFullTextDeclaredProperty(alloc, child_path, child, declared_paths, unindexed_paths);
+    }
 }
 
 fn deriveRuntimeFullTextProperty(
@@ -1797,7 +1843,9 @@ fn appendUniqueOwnedPath(
     for (paths.items) |existing| {
         if (std.mem.eql(u8, existing, value)) return;
     }
-    try paths.append(alloc, try alloc.dupe(u8, value));
+    const owned = try alloc.dupe(u8, value);
+    errdefer alloc.free(owned);
+    try paths.append(alloc, owned);
 }
 
 fn fieldNameFromPath(path: []const u8) []const u8 {
@@ -1847,6 +1895,64 @@ test "runtime schema materializes default-analyzed search-as-you-type root prefi
     }
     try std.testing.expect(html_index_prefix);
     try std.testing.expect(!html_root_prefix);
+}
+
+test "runtime schema records declared and unindexed paths for the dynamic mapper" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseValidatedTableSchema(alloc,
+        \\{
+        \\  "document_schemas": {
+        \\    "doc": {"schema": {"type":"object", "additionalProperties": true, "properties": {
+        \\      "body": {"type":"string", "x-antfly-types":["text"]},
+        \\      "stored_only": {"type":"string", "x-antfly-index": false},
+        \\      "attachment": {"type":"string", "x-antfly-types":["blob"]},
+        \\      "count": {"type":"integer"},
+        \\      "meta": {"type":"object", "properties": {
+        \\        "label": {"type":"string"},
+        \\        "secret": {"type":"object", "x-antfly-index": false, "properties": {"token": {"type":"string"}}}
+        \\      }},
+        \\      "notes": {"type":"array", "items": {"type":"string", "x-antfly-index": false}},
+        \\      "entries": {"type":"array", "items": {"type":"object", "properties": {"name": {"type":"string"}}}}
+        \\    }}}
+        \\  }
+        \\}
+    );
+    defer parsed.deinit(alloc);
+
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, runtime);
+    const document = runtime.full_text_documents[0];
+
+    // Only `body` and `meta.label` and `entries.name` emit text fields; the rest
+    // is invisible to the mapper unless it is recorded as declared.
+    try std.testing.expectEqual(@as(usize, 3), document.fields.len);
+    try std.testing.expectEqual(@as(usize, 1), document.open_dynamic_paths.len);
+    try std.testing.expectEqualStrings("", document.open_dynamic_paths[0]);
+
+    const expected_declared = [_][]const u8{
+        "body",       "stored_only", "attachment", "count",   "meta",
+        "meta.label", "meta.secret", "notes",      "entries", "entries.name",
+    };
+    try std.testing.expectEqual(expected_declared.len, document.declared_paths.len);
+    for (expected_declared) |path| {
+        try std.testing.expect(storage_schema.containsPath(document.declared_paths, path));
+    }
+    // Children of an unindexed subtree are covered by the subtree entry.
+    try std.testing.expect(!storage_schema.containsPath(document.declared_paths, "meta.secret.token"));
+
+    try std.testing.expectEqual(@as(usize, 3), document.unindexed_paths.len);
+    try std.testing.expect(storage_schema.containsPath(document.unindexed_paths, "stored_only"));
+    try std.testing.expect(storage_schema.containsPath(document.unindexed_paths, "meta.secret"));
+    try std.testing.expect(storage_schema.containsPath(document.unindexed_paths, "notes"));
+
+    // The lists round-trip through the durable runtime schema encoding.
+    const encoded = try storage_schema.serializeSchema(alloc, runtime);
+    defer alloc.free(encoded);
+    const loaded = try storage_schema.deserializeSchema(alloc, encoded);
+    defer storage_schema.freeSchema(alloc, loaded);
+    try std.testing.expect(try storage_schema.schemasEqual(alloc, runtime, loaded));
+    try std.testing.expectEqual(document.declared_paths.len, loaded.full_text_documents[0].declared_paths.len);
+    try std.testing.expectEqual(document.unindexed_paths.len, loaded.full_text_documents[0].unindexed_paths.len);
 }
 
 test "runtime schema derives authoritative relational columns" {

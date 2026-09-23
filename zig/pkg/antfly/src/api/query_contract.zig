@@ -2756,7 +2756,7 @@ pub fn parseQueryRequestWithDeadline(
         try applyInternalEmbeddingLimits(alloc, effective_body, &req);
     req.graph_queries = try buildGraphQueries(alloc, request);
     req.graph_metric_queries = try parseGraphMetricQueriesAlloc(alloc, effective_body);
-    req.graph_metric_rerank = try parseGraphMetricRerankAlloc(alloc, request.graph_metric_rerank);
+    req.graph_metric_rerank = try parseGraphMetricRerankAlloc(alloc, request.graph_metric_rerank, effective_body);
     if (req.graph_metric_rerank) |rerank| {
         try db_mod.types.validateGraphMetricRerankWindow(rerank, req.offset, req.limit);
     }
@@ -8781,6 +8781,7 @@ fn parseGraphMetricQueriesAlloc(
                 alloc.free(item.name);
                 alloc.free(item.query.index_name);
                 alloc.free(item.query.metric_name);
+                freeOwnedStringSlice(alloc, item.query.seed_nodes);
             }
             alloc.free(items);
         }
@@ -8800,6 +8801,8 @@ fn parseGraphMetricQueriesAlloc(
                 try parseGraphMetricFreshness(raw)
             else
                 db_mod.types.GraphMetricFreshness.published;
+            const personalization = try parseGraphMetricPersonalizationAlloc(alloc, value.object, freshness);
+            errdefer freeOwnedStringSlice(alloc, personalization.seed_nodes);
             const owned_name = try alloc.dupe(u8, result_name);
             errdefer alloc.free(owned_name);
             const owned_index_name = try alloc.dupe(u8, index_name);
@@ -8813,6 +8816,8 @@ fn parseGraphMetricQueriesAlloc(
                     .metric_name = owned_metric_name,
                     .top_k = top_k,
                     .freshness = freshness,
+                    .seed_nodes = personalization.seed_nodes,
+                    .damping = personalization.damping,
                 },
             };
             initialized += 1;
@@ -8838,6 +8843,8 @@ fn parseGraphMetricQueriesAlloc(
         try parseGraphMetricFreshness(value)
     else
         db_mod.types.GraphMetricFreshness.published;
+    const personalization = try parseGraphMetricPersonalizationAlloc(alloc, metric_value.object, freshness);
+    errdefer freeOwnedStringSlice(alloc, personalization.seed_nodes);
     const items = try alloc.alloc(db_mod.types.NamedGraphMetricQuery, 1);
     errdefer alloc.free(items);
     const owned_name = try alloc.dupe(u8, result_name);
@@ -8853,14 +8860,71 @@ fn parseGraphMetricQueriesAlloc(
             .metric_name = owned_metric_name,
             .top_k = top_k,
             .freshness = freshness,
+            .seed_nodes = personalization.seed_nodes,
+            .damping = personalization.damping,
         },
     };
     return items;
 }
 
+const ParsedGraphMetricPersonalization = struct {
+    seed_nodes: []const []const u8 = &.{},
+    damping: ?f64 = null,
+};
+
+/// Shared seed_nodes/damping admission for the hand-parsed graph_metric and
+/// graph_metric_rerank wire objects. Enforces the same shape rules as
+/// graph/query.zig: bounded non-empty seed keys, damping only with seeds and
+/// strictly inside (0, 1), and fresh-only personalization because published
+/// generations are global-only.
+fn parseGraphMetricPersonalizationAlloc(
+    alloc: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    freshness: db_mod.types.GraphMetricFreshness,
+) !ParsedGraphMetricPersonalization {
+    const seeds_value = object.get("seed_nodes");
+    const damping_value = object.get("damping");
+    if (seeds_value == null and damping_value == null) return .{};
+
+    var parsed = ParsedGraphMetricPersonalization{};
+    errdefer freeOwnedStringSlice(alloc, parsed.seed_nodes);
+    if (seeds_value) |value| {
+        if (value != .array) return error.InvalidQueryRequest;
+        if (value.array.items.len > graph_query_mod.graph_metric_seed_limit) return error.InvalidQueryRequest;
+        const seeds = try alloc.alloc([]const u8, value.array.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (seeds[0..initialized]) |seed| alloc.free(seed);
+            alloc.free(seeds);
+        }
+        for (value.array.items, seeds) |item, *out| {
+            if (item != .string or item.string.len == 0) return error.InvalidQueryRequest;
+            out.* = try alloc.dupe(u8, item.string);
+            initialized += 1;
+        }
+        parsed.seed_nodes = seeds;
+    }
+    if (damping_value) |value| {
+        const damping: f64 = switch (value) {
+            .float => |float| float,
+            .integer => |integer| @floatFromInt(integer),
+            else => return error.InvalidQueryRequest,
+        };
+        if (parsed.seed_nodes.len == 0 or !std.math.isFinite(damping) or damping <= 0 or damping >= 1)
+            return error.InvalidQueryRequest;
+        parsed.damping = damping;
+    }
+    // Published generations are global-only; a seeded read against one would
+    // silently return unpersonalized scores. Fail closed instead.
+    if (parsed.seed_nodes.len != 0 and freshness != .fresh)
+        return error.GraphMetricPersonalizationRequiresFresh;
+    return parsed;
+}
+
 fn parseGraphMetricRerankAlloc(
     alloc: std.mem.Allocator,
     maybe_rerank: ?indexes_openapi.GraphMetricRerank,
+    body: []const u8,
 ) !?db_mod.types.GraphMetricRerank {
     const rerank = maybe_rerank orelse return null;
     if (rerank.index.len == 0 or rerank.metric.len == 0) return error.InvalidQueryRequest;
@@ -8868,11 +8932,13 @@ fn parseGraphMetricRerankAlloc(
     const weight = rerank.weight orelse 1.0;
     const missing_score = rerank.missing_score orelse 0.0;
     if (!std.math.isFinite(base_weight) or !std.math.isFinite(weight) or !std.math.isFinite(missing_score)) return error.InvalidQueryRequest;
+    const freshness = if (rerank.metric_freshness) |value| try parseGraphMetricFreshnessStringForRequest(value) else .published;
+    const personalization = try parseGraphMetricRerankPersonalizationAlloc(alloc, body, freshness);
+    errdefer freeOwnedStringSlice(alloc, personalization.seed_nodes);
     const index_name = try alloc.dupe(u8, rerank.index);
     errdefer alloc.free(index_name);
     const metric_name = try alloc.dupe(u8, rerank.metric);
     errdefer alloc.free(metric_name);
-    const freshness = if (rerank.metric_freshness) |value| try parseGraphMetricFreshnessStringForRequest(value) else .published;
     return .{
         .index_name = index_name,
         .metric_name = metric_name,
@@ -8884,7 +8950,26 @@ fn parseGraphMetricRerankAlloc(
         .base_weight = base_weight,
         .weight = weight,
         .missing_score = missing_score,
+        .seed_nodes = personalization.seed_nodes,
+        .damping = personalization.damping,
     };
+}
+
+/// The generated GraphMetricRerank wire type predates seed personalization,
+/// so its personalization fields are admitted from the raw request object,
+/// mirroring the hand-parsed graph_metric extension.
+fn parseGraphMetricRerankPersonalizationAlloc(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    freshness: db_mod.types.GraphMetricFreshness,
+) !ParsedGraphMetricPersonalization {
+    if (body.len == 0) return .{};
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidQueryRequest;
+    const rerank_value = parsed.value.object.get("graph_metric_rerank") orelse return .{};
+    if (rerank_value != .object) return .{};
+    return try parseGraphMetricPersonalizationAlloc(alloc, rerank_value.object, freshness);
 }
 
 /// Parse only graph-metric extensions without invoking semantic embedding or
@@ -8899,6 +8984,7 @@ pub const OwnedGraphMetricRequests = struct {
         if (self.rerank) |rerank| {
             alloc.free(@constCast(rerank.index_name));
             alloc.free(@constCast(rerank.metric_name));
+            freeOwnedStringSlice(alloc, rerank.seed_nodes);
         }
         self.* = undefined;
     }
@@ -8915,7 +9001,7 @@ pub fn parseGraphMetricRequestsAlloc(alloc: std.mem.Allocator, body: []const u8)
     errdefer freeNamedGraphMetricQueries(alloc, queries);
     return .{
         .queries = queries,
-        .rerank = try parseGraphMetricRerankAlloc(alloc, parsed.value.graph_metric_rerank),
+        .rerank = try parseGraphMetricRerankAlloc(alloc, parsed.value.graph_metric_rerank, body),
     };
 }
 
@@ -10121,6 +10207,7 @@ fn freeSearchRequest(alloc: std.mem.Allocator, req: *db_mod.types.SearchRequest)
     if (req.graph_metric_rerank) |rerank| {
         alloc.free(@constCast(rerank.index_name));
         alloc.free(@constCast(rerank.metric_name));
+        freeOwnedStringSlice(alloc, rerank.seed_nodes);
     }
     if (req.graph_query_transport) |*transport| transport.deinit(alloc);
     freeNamedDocFilterBindings(alloc, req.doc_filter_bindings);
@@ -12023,6 +12110,7 @@ fn freeNamedGraphMetricQueries(alloc: std.mem.Allocator, items: []const db_mod.t
         alloc.free(item.name);
         alloc.free(item.query.index_name);
         alloc.free(item.query.metric_name);
+        freeOwnedStringSlice(alloc, item.query.seed_nodes);
     }
     if (items.len > 0) alloc.free(items);
 }
@@ -17801,6 +17889,61 @@ fn consumerTests() type {
             try std.testing.expectError(error.InvalidQueryRequest, parseGraphMetricQueriesAlloc(alloc,
                 \\{"graph_metric":{"index":"graph_idx","metric":"pagerank","top_k":10001}}
             ));
+        }
+
+        test "api query contract admits personalized graph metric seed fields" {
+            const alloc = std.testing.allocator;
+            const accepted = try parseGraphMetricQueriesAlloc(alloc,
+                \\{"graph_metric":{"index":"graph_idx","metric":"pagerank","metric_freshness":"fresh","seed_nodes":["doc:a","doc:b"],"damping":0.9}}
+            );
+            defer freeNamedGraphMetricQueries(alloc, accepted);
+            try std.testing.expectEqual(@as(usize, 1), accepted.len);
+            try std.testing.expectEqual(db_mod.types.GraphMetricFreshness.fresh, accepted[0].query.freshness);
+            try std.testing.expectEqual(@as(usize, 2), accepted[0].query.seed_nodes.len);
+            try std.testing.expectEqualStrings("doc:a", accepted[0].query.seed_nodes[0]);
+            try std.testing.expectEqualStrings("doc:b", accepted[0].query.seed_nodes[1]);
+            try std.testing.expectEqual(@as(?f64, 0.9), accepted[0].query.damping);
+
+            var rerank_requests = try parseGraphMetricRequestsAlloc(alloc,
+                \\{"graph_metric_rerank":{"index":"graph_idx","metric":"pagerank","metric_freshness":"fresh","seed_nodes":["doc:a"],"damping":0.9}}
+            );
+            defer rerank_requests.deinit(alloc);
+            const rerank = rerank_requests.rerank orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(@as(usize, 1), rerank.seed_nodes.len);
+            try std.testing.expectEqualStrings("doc:a", rerank.seed_nodes[0]);
+            try std.testing.expectEqual(@as(?f64, 0.9), rerank.damping);
+            try std.testing.expectEqual(db_mod.types.GraphMetricFreshness.fresh, rerank.freshness);
+        }
+
+        test "api query contract rejects malformed personalized graph metric shapes" {
+            const alloc = std.testing.allocator;
+            // Published generations are global-only; seeded reads against
+            // them fail closed with the dedicated personalization error.
+            try std.testing.expectError(error.GraphMetricPersonalizationRequiresFresh, parseGraphMetricQueriesAlloc(alloc,
+                \\{"graph_metric":{"index":"graph_idx","metric":"pagerank","seed_nodes":["doc:a"]}}
+            ));
+            try std.testing.expectError(error.GraphMetricPersonalizationRequiresFresh, parseGraphMetricRequestsAlloc(alloc,
+                \\{"graph_metric_rerank":{"index":"graph_idx","metric":"pagerank","seed_nodes":["doc:a"]}}
+            ));
+            try std.testing.expectError(error.InvalidQueryRequest, parseGraphMetricQueriesAlloc(alloc,
+                \\{"graph_metric":{"index":"graph_idx","metric":"pagerank","metric_freshness":"fresh","seed_nodes":[""]}}
+            ));
+            try std.testing.expectError(error.InvalidQueryRequest, parseGraphMetricQueriesAlloc(alloc,
+                \\{"graph_metric":{"index":"graph_idx","metric":"pagerank","metric_freshness":"fresh","damping":0.9}}
+            ));
+            try std.testing.expectError(error.InvalidQueryRequest, parseGraphMetricQueriesAlloc(alloc,
+                \\{"graph_metric":{"index":"graph_idx","metric":"pagerank","metric_freshness":"fresh","seed_nodes":["doc:a"],"damping":1.0}}
+            ));
+
+            var oversized_body = std.ArrayListUnmanaged(u8).empty;
+            defer oversized_body.deinit(alloc);
+            try oversized_body.appendSlice(alloc, "{\"graph_metric\":{\"index\":\"graph_idx\",\"metric\":\"pagerank\",\"metric_freshness\":\"fresh\",\"seed_nodes\":[");
+            for (0..graph_query_mod.graph_metric_seed_limit + 1) |i| {
+                if (i > 0) try oversized_body.appendSlice(alloc, ",");
+                try oversized_body.appendSlice(alloc, "\"doc:a\"");
+            }
+            try oversized_body.appendSlice(alloc, "]}}");
+            try std.testing.expectError(error.InvalidQueryRequest, parseGraphMetricQueriesAlloc(alloc, oversized_body.items));
         }
 
         test "api query contract uses portable graph metric filter operators" {

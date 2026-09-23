@@ -1476,9 +1476,15 @@ func loadCmd(args []string) error {
 	artifactExtractorModel := fs.String("artifact-extractor-model", DefaultAutographModel, "Antfly model for artifact relation extraction")
 	artifactLabels := fs.String("artifact-labels", DefaultEntityLabels, "Artifact extractor entity labels (comma-separated)")
 	artifactRelationLabels := fs.String("artifact-relation-labels", DefaultRelationLabels, "Artifact extractor relation labels (comma-separated)")
+	autoschema := fs.Bool("autoschema", false, "Provision the AutoSchemaKG pipeline: entity/event extraction, resolution, and conceptualization (requires --create-table)")
+	autoschemaModel := fs.String("autoschema-model", DefaultAutoschemaModel, "Antfly generative model shared by the AutoSchemaKG extractors and conceptualizer")
+	autoschemaGlinerModel := fs.String("autoschema-gliner-model", DefaultAutoschemaGlinerModel, "GLiNER2.5 extraction model for the fast closed-schema autoschema lane (empty disables the lane)")
 
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("failed to parse flags: %w", err)
+	}
+	if *autoschema && !*createTable {
+		return fmt.Errorf("--autoschema requires --create-table: the AutoSchemaKG pipeline is provisioned as part of table creation")
 	}
 	syncLevel, err := parseSyncLevelFlag(*syncLevelFlag)
 	if err != nil {
@@ -1527,15 +1533,47 @@ func loadCmd(args []string) error {
 			}
 			indexes[*artifactGraphIndex] = *graphRequest
 		}
+		var autoschemaDocIndexes []autoschemaRequiredIndex
+		if *autoschema {
+			if err := provisionAutoschemaTables(ctx, client, *autoschemaModel, *inferenceURL); err != nil {
+				return fmt.Errorf("failed to provision autoschema tables: %w", err)
+			}
+			kgIndex, err := createAutoschemaKnowledgeGraphIndex(*autoschemaModel, *autoschemaGlinerModel, *inferenceURL)
+			if err != nil {
+				return fmt.Errorf("failed to create knowledge graph index config: %w", err)
+			}
+			kgRequest, err := antfly.NewCreateIndexRequest(kgIndex)
+			if err != nil {
+				return fmt.Errorf("failed to create knowledge graph index request: %w", err)
+			}
+			indexes[AutoschemaKnowledgeGraphIndex] = *kgRequest
+			autoschemaDocIndexes = []autoschemaRequiredIndex{{
+				name:        AutoschemaKnowledgeGraphIndex,
+				request:     *kgRequest,
+				enrichments: autoschemaRequiredEnrichments(*autoschemaGlinerModel),
+			}}
+		}
 
 		err = client.CreateTable(ctx, *tableName, antfly.CreateTableRequest{
 			NumShards: uint(*numShards),
 			Indexes:   indexes,
 		})
-		if err != nil {
-			log.Printf("Warning: Failed to create table (may already exist): %v\n", err)
-		} else {
+		switch {
+		case err == nil:
 			fmt.Printf("Table created with BM25 and embedding indexes\n\n")
+		case *autoschema:
+			// A pre-existing documents table must still carry the
+			// knowledge_graph extraction index; silently loading without it
+			// would skip the AutoSchemaKG pipeline entirely.
+			if _, getErr := client.GetTable(ctx, *tableName); getErr != nil {
+				return fmt.Errorf("failed to create table %q: %w", *tableName, err)
+			}
+			fmt.Printf("Table '%s' already exists; verifying required autoschema configuration...\n", *tableName)
+			if err := ensureAutoschemaIndexes(ctx, client, *tableName, autoschemaDocIndexes); err != nil {
+				return err
+			}
+		default:
+			log.Printf("Warning: Failed to create table (may already exist): %v\n", err)
 		}
 
 		if err := client.WaitForTable(ctx, *tableName, 30*time.Second); err != nil {
@@ -1594,6 +1632,9 @@ func syncCmd(args []string) error {
 	artifactExtractorModel := fs.String("artifact-extractor-model", DefaultAutographModel, "Antfly model for artifact relation extraction")
 	artifactLabels := fs.String("artifact-labels", DefaultEntityLabels, "Artifact extractor entity labels (comma-separated)")
 	artifactRelationLabels := fs.String("artifact-relation-labels", DefaultRelationLabels, "Artifact extractor relation labels (comma-separated)")
+	autoschema := fs.Bool("autoschema", false, "Provision the AutoSchemaKG pipeline: entity/event extraction, resolution, and conceptualization (requires --create-table)")
+	autoschemaModel := fs.String("autoschema-model", DefaultAutoschemaModel, "Antfly generative model shared by the AutoSchemaKG extractors and conceptualizer")
+	autoschemaGlinerModel := fs.String("autoschema-gliner-model", DefaultAutoschemaGlinerModel, "GLiNER2.5 extraction model for the fast closed-schema autoschema lane (empty disables the lane)")
 	noHeaderFooter := fs.Bool("no-header-footer-detection", false, "Disable header/footer detection (faster)")
 	noMirroredRepair := fs.Bool("no-mirrored-text-repair", false, "Disable mirrored text repair (faster)")
 	var zipPaths StringSliceFlag
@@ -1601,6 +1642,9 @@ func syncCmd(args []string) error {
 
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("failed to parse flags: %w", err)
+	}
+	if *autoschema && !*createTable {
+		return fmt.Errorf("--autoschema requires --create-table: the AutoSchemaKG pipeline is provisioned as part of table creation")
 	}
 	syncLevel, err := parseSyncLevelFlag(*syncLevelFlag)
 	if err != nil {
@@ -1652,12 +1696,46 @@ func syncCmd(args []string) error {
 			}
 			indexes[*artifactGraphIndex] = *graphRequest
 		}
+		var autoschemaDocIndexes []autoschemaRequiredIndex
+		if *autoschema {
+			if err := provisionAutoschemaTables(ctx, client, *autoschemaModel, *inferenceURL); err != nil {
+				return fmt.Errorf("failed to provision autoschema tables: %w", err)
+			}
+			kgIndex, err := createAutoschemaKnowledgeGraphIndex(*autoschemaModel, *autoschemaGlinerModel, *inferenceURL)
+			if err != nil {
+				return fmt.Errorf("failed to create knowledge graph index config: %w", err)
+			}
+			kgRequest, err := antfly.NewCreateIndexRequest(kgIndex)
+			if err != nil {
+				return fmt.Errorf("failed to create knowledge graph index request: %w", err)
+			}
+			indexes[AutoschemaKnowledgeGraphIndex] = *kgRequest
+			autoschemaDocIndexes = []autoschemaRequiredIndex{{
+				name:        AutoschemaKnowledgeGraphIndex,
+				request:     *kgRequest,
+				enrichments: autoschemaRequiredEnrichments(*autoschemaGlinerModel),
+			}}
+		}
 
 		err = client.CreateTable(ctx, *tableName, antfly.CreateTableRequest{
 			NumShards: uint(*numShards),
 			Indexes:   indexes,
 		})
-		if err != nil {
+		switch {
+		case err == nil:
+			fmt.Printf("Table created\n\n")
+		case *autoschema:
+			// A pre-existing documents table must still carry the
+			// knowledge_graph extraction index; silently syncing without it
+			// would skip the AutoSchemaKG pipeline entirely.
+			if _, getErr := client.GetTable(ctx, *tableName); getErr != nil {
+				return fmt.Errorf("failed to create table %q: %w", *tableName, err)
+			}
+			fmt.Printf("Table '%s' already exists; verifying required autoschema configuration...\n", *tableName)
+			if err := ensureAutoschemaIndexes(ctx, client, *tableName, autoschemaDocIndexes); err != nil {
+				return err
+			}
+		default:
 			log.Printf("Warning: %v\n", err)
 		}
 
@@ -2278,7 +2356,7 @@ func createEmbeddingIndex(embeddingModel, inferenceURL, chunkerModel string, tar
 		Type: antfly.IndexTypeEmbeddings,
 	}
 
-	embedder, err := antfly.NewEmbedderConfig(antfly.AntflyEmbedderConfig{
+	embedder, err := antfly.NewIndexEmbedderConfig(antfly.AntflyEmbedderConfig{
 		Model: embeddingModel,
 	})
 	if err != nil {
@@ -2556,12 +2634,12 @@ func truncateContent(content string, maxLen int) string {
 // pages of batchSize entries. The input file must have keys in sorted order
 // (as produced by writeJSONSorted) so that sequential pages form valid
 // non-overlapping ranges for linear merge.
-func streamJSONPages(r io.Reader, batchSize int) iter.Seq[map[string]any] {
+func streamJSONPages(r io.Reader, batchSize int) iter.Seq[antfly.LinearMergeRecords] {
 	return streamJSONPagesWithLimit(r, batchSize, 0)
 }
 
-func streamJSONPagesWithLimit(r io.Reader, batchSize int, limit int) iter.Seq[map[string]any] {
-	return func(yield func(map[string]any) bool) {
+func streamJSONPagesWithLimit(r io.Reader, batchSize int, limit int) iter.Seq[antfly.LinearMergeRecords] {
+	return func(yield func(antfly.LinearMergeRecords) bool) {
 		dec := json.NewDecoder(bufio.NewReaderSize(r, 256*1024))
 		dec.UseNumber()
 
@@ -2571,7 +2649,7 @@ func streamJSONPagesWithLimit(r io.Reader, batchSize int, limit int) iter.Seq[ma
 			return
 		}
 
-		page := make(map[string]any, batchSize)
+		page := make(antfly.LinearMergeRecords, batchSize)
 		loaded := 0
 		for dec.More() {
 			// Read key
@@ -2590,14 +2668,18 @@ func streamJSONPagesWithLimit(r io.Reader, batchSize int, limit int) iter.Seq[ma
 				return
 			}
 
-			value = normalizePreparedRecordForLoad(value)
-			page[key] = value
+			record, ok := normalizePreparedRecordForLoad(value).(map[string]any)
+			if !ok {
+				// Linear merge records must be JSON objects.
+				return
+			}
+			page[key] = record
 			loaded++
 			if len(page) >= batchSize {
 				if !yield(page) {
 					return
 				}
-				page = make(map[string]any, batchSize)
+				page = make(antfly.LinearMergeRecords, batchSize)
 			}
 			if limit > 0 && loaded >= limit {
 				break

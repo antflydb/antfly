@@ -12171,6 +12171,7 @@ pub const ApiHttpServer = struct {
         try ensureTableOperationActive(request);
         const response = self.executePublicTableQueryDispatchWithReadinessRetry(alloc, source, table_name, body, row_filter_json, null, request.cancellation, null, null, null) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
+            error.GraphMetricPersonalizationRequiresFresh, error.UnsupportedGraphMetric => return error.InvalidQueryRequest,
             error.InvalidFilterQueryRequest => return error.InvalidFilterQueryRequest,
             error.InvalidExclusionQueryRequest => return error.InvalidExclusionQueryRequest,
             error.UnsupportedFilterQueryRequest => return error.UnsupportedFilterQueryRequest,
@@ -12454,6 +12455,10 @@ pub const ApiHttpServer = struct {
                 error.UnsupportedFilterQueryRequest,
                 error.UnsupportedExclusionQueryRequest,
                 => return err,
+                // Seeded personalization is a request-shape contract: seeds
+                // require fresh reads and a pagerank metric. Surface both as
+                // client errors rather than internal failures.
+                error.GraphMetricPersonalizationRequiresFresh, error.UnsupportedGraphMetric => return error.InvalidQueryRequest,
                 error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
                 error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
                 error.UnsupportedExactSort => return error.UnsupportedExactSort,
@@ -12526,6 +12531,7 @@ pub const ApiHttpServer = struct {
         var foreign_execution = CatalogJoinExecution{ .server = self, .resolver = resolver, .identity = authenticated_identity };
         if (self.executeForeignPublicTableQueryIfAny(alloc, source, table_name, body, row_filter_json, authenticated_identity, request_deadline_ns, cancellation, bound_join, foreign_execution.context()) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
+            error.GraphMetricPersonalizationRequiresFresh, error.UnsupportedGraphMetric => return error.InvalidQueryRequest,
             // Foreign-source capability validation is part of the public
             // request contract. Keep its historical 400 classification;
             // exact-sort rejection is already carried by its distinct error.
@@ -12633,6 +12639,10 @@ pub const ApiHttpServer = struct {
             error.UnsupportedFilterQueryRequest,
             error.UnsupportedExclusionQueryRequest,
             => return err,
+            // Seeded personalization is a request-shape contract: seeds
+            // require fresh reads and a pagerank metric. Surface both as
+            // client errors rather than internal failures.
+            error.GraphMetricPersonalizationRequiresFresh, error.UnsupportedGraphMetric => return error.InvalidQueryRequest,
             error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
             error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
@@ -18078,6 +18088,11 @@ pub const ApiHttpServer = struct {
                 try contextualUnsupportedExactSortResponse(self.alloc)
             else
                 try contextual_operations.textAlloc(self.alloc, 400, "invalid query request"),
+            // Seeded personalization contract failures (seeds without fresh
+            // reads, or a non-pagerank metric) are client errors.
+            error.GraphMetricPersonalizationRequiresFresh,
+            error.UnsupportedGraphMetric,
+            => try contextual_operations.textAlloc(self.alloc, 400, "invalid query request"),
             error.InvalidFilterQueryRequest => try contextualPublicFilterQueryErrorResponseForBody(self.alloc, body, "filter_query", .invalid),
             error.InvalidExclusionQueryRequest => try contextualPublicFilterQueryErrorResponseForBody(self.alloc, body, "exclusion_query", .invalid),
             error.UnsupportedFilterQueryRequest => try contextualPublicFilterQueryErrorResponseForBody(self.alloc, body, "filter_query", .unsupported),

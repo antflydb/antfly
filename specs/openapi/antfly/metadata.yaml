@@ -163,9 +163,15 @@ tags:
       ```
 
       **Dynamic Indexing** (`additionalProperties`):
-      - `"additionalProperties": false` - Only index fields defined in `properties` (recommended for performance)
-      - `"additionalProperties": true` - Index all fields dynamically (flexible but slower)
-      - If not specified, dynamic indexing is disabled
+      - `"additionalProperties": false` - Reject documents that carry fields not defined in `properties` (standard JSON Schema validation); only declared fields exist, so only declared fields are indexed
+      - `"additionalProperties": true` - Store undeclared fields and index them dynamically (flexible but slower)
+      - If not specified, undeclared fields are stored but not indexed
+
+      Dynamic indexing only ever applies to undeclared fields. A property
+      listed in `properties` is indexed exactly as its declaration says: one
+      declared with `x-antfly-index: false`, or with a non-text type such as
+      `blob` or `embedding`, stays out of the text index even when the
+      enclosing object sets `"additionalProperties": true`.
 
       **Nested Objects**:
       - Use `"type": "object"` with nested `properties` for structured data
@@ -234,6 +240,18 @@ tags:
       ```json
       {"type": "string", "x-antfly-index": false}
       ```
+      The value is still stored and returned with the document, but nothing at
+      or below that path is indexed: no text postings, no typed doc values, and
+      no dynamic indexing even when the enclosing object sets
+      `"additionalProperties": true`. On an object or an array's `items` it
+      applies to the whole subtree. This is the way to keep a large field that
+      exists only as the source of an embeddings index out of the text index.
+
+      Adding `x-antfly-index: false` to an existing table is a schema
+      migration, not an in-place edit: the current full-text index keeps
+      serving the field's existing postings until the replacement index has
+      been rebuilt under the new schema, and only then are they gone. The
+      table does not shrink on the schema update itself.
 
       ### `x-antfly-include-in-all`
       Schema-level array of field names to include in the special `_all` field for cross-field search:
@@ -8520,13 +8538,24 @@ components:
           description: >-
             Direct top-k read from a published graph metric generation. Results
             are returned in graph_metric_results under the requested name or the
-            metric name when no explicit name is supplied.
+            metric name when no explicit name is supplied. Supplying seed_nodes
+            switches a pagerank metric to query-seeded personalized PageRank
+            computed at query time; that form requires metric_freshness=fresh
+            because published generations are global-only.
         graph_metric_rerank:
           $ref: "indexes.yaml#/components/schemas/GraphMetricRerank"
           description: >-
             Blend a published graph metric feature into ordinary search hit
             scores. Requests may require either any published generation or a
-            generation that is fresh with respect to graph writes.
+            generation that is fresh with respect to graph writes. Supplying
+            seed_nodes switches a pagerank metric to a query-seeded
+            personalized PageRank blend computed at query time; that form
+            requires metric_freshness=fresh. Retrieval-agent queries may opt
+            in to automatic seeding with auto_seed=true, which seeds the
+            blend from the query's literal graph-search start keys; only
+            valid for pagerank metrics with metric_freshness=fresh.
+            Caller-supplied seed_nodes always take precedence and are never
+            overwritten.
         analyses:
           $ref: "#/components/schemas/Analyses"
         graph_queries:

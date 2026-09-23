@@ -90,6 +90,44 @@ build_args+=(
   --summary all
   "${build_steps[@]}"
 )
+
+if [[ "$enable_cuda" == "true" ]]; then
+  # This script comes from the candidate checkout even when approved PR CI
+  # uses main's workflow. Retain progress before an outer timeout can kill Zig
+  # without its per-archive build summary. RSS is in KiB; cgroup memory is bytes.
+  report_build_resources() {
+    date -u '+CUDA build resources: %Y-%m-%dT%H:%M:%SZ'
+    ps -C zig -o pid,ppid,etime,time,pcpu,rss,stat,wchan,comm || true
+    ps -C zig -o pid=,args= | awk '{
+      for (i = 2; i < NF; i++)
+        if ($i == "--name") print "compile pid=" $1 " name=" $(i + 1)
+    }' || true
+    free -m || true
+    for metric in memory.max memory.current memory.peak memory.events cpu.max cpu.stat; do
+      if [[ -r "/sys/fs/cgroup/$metric" ]]; then
+        echo "cgroup $metric:"
+        cat "/sys/fs/cgroup/$metric" || true
+      fi
+    done
+  }
+  echo "CUDA build scheduler budget (bytes):"
+  python3 tools/run_bounded_zig_build.py --print-max-rss
+  report_build_resources
+  (
+    sleep_pid=''
+    trap '[[ -z "$sleep_pid" ]] || kill "$sleep_pid" 2>/dev/null || true; exit 0' TERM INT
+    while true; do
+      sleep 60 &
+      sleep_pid=$!
+      wait "$sleep_pid"
+      sleep_pid=''
+      report_build_resources
+    done
+  ) &
+  monitor_pid=$!
+  trap 'kill "$monitor_pid" 2>/dev/null || true; wait "$monitor_pid" 2>/dev/null || true' EXIT
+fi
+
 python3 tools/run_bounded_zig_build.py --zig zig -- "${build_args[@]}"
 
 chmod +x zig-out/bin/antfly

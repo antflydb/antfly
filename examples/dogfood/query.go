@@ -18,6 +18,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"sort"
+	"strings"
 
 	"github.com/antflydb/antfly/go/pkg/lite"
 )
@@ -185,10 +187,7 @@ func runQuery(db *lite.DB, text string, limit int) error {
 		}
 	}
 
-	entities, edges, err := collectGraphNeighborhood(db, nodeKeys)
-	if err != nil {
-		return fmt.Errorf("collect graph neighborhood: %w", err)
-	}
+	entities, edges, failures := collectGraphNeighborhood(db, nodeKeys)
 
 	fmt.Printf("\nEntities reached (%d):\n", len(entities))
 	for _, entity := range entities {
@@ -198,6 +197,13 @@ func runQuery(db *lite.DB, text string, limit int) error {
 	fmt.Printf("\nEdges (%d):\n", len(edges))
 	for _, edge := range edges {
 		fmt.Printf("  %s --[%s]--> %s (weight=%.3f)\n", edge.source, edge.edgeType, edge.target, edge.weight)
+	}
+	if failures.reads > 0 || failures.decodes > 0 {
+		fmt.Printf("\n(warning: %d edge reads and %d result decodes failed while collecting the neighborhood; last error: %v)\n",
+			failures.reads, failures.decodes, failures.last)
+	}
+	if failures.truncated {
+		fmt.Printf("(neighborhood truncated at %d edges; narrow the query or raise maxNeighborhoodEdges to see more)\n", maxNeighborhoodEdges)
 	}
 	return nil
 }
@@ -242,35 +248,79 @@ type resolvedEdge struct {
 	weight                   float64
 }
 
+// maxNeighborhoodEdges bounds the total edge output of
+// collectGraphNeighborhood, so one high-degree node cannot expand the printed
+// neighborhood far beyond the traversal's own caps.
+const maxNeighborhoodEdges = 200
+
+// neighborhoodFailures reports what went wrong (and what was withheld) while
+// collecting the neighborhood, so a broken graph looks broken rather than
+// empty.
+type neighborhoodFailures struct {
+	reads     int
+	decodes   int
+	last      error
+	truncated bool
+}
+
 // collectGraphNeighborhood fetches the direct edges (both directions) of
 // every node in nodeKeys and returns the deduplicated entity node set
-// (non-"doc:" keys) and the deduplicated edge set.
-func collectGraphNeighborhood(db *lite.DB, nodeKeys map[string]bool) ([]string, []resolvedEdge, error) {
+// (non-"doc:" keys) and the deduplicated edge set. Only edges with at least
+// one endpoint inside the traversal-reached node set are admitted (a direct
+// edge of a reached node always qualifies through that node itself; its far
+// endpoint is listed but never expanded), the total output is capped at
+// maxNeighborhoodEdges, and read/decode failures are counted instead of
+// silently swallowed. Iteration is sorted so output and truncation are
+// deterministic.
+func collectGraphNeighborhood(db *lite.DB, nodeKeys map[string]bool) ([]string, []resolvedEdge, neighborhoodFailures) {
 	entitySet := make(map[string]bool)
 	edgeSeen := make(map[string]bool)
 	var edges []resolvedEdge
+	var failures neighborhoodFailures
 
+	orderedKeys := make([]string, 0, len(nodeKeys))
 	for key := range nodeKeys {
+		orderedKeys = append(orderedKeys, key)
+	}
+	sort.Strings(orderedKeys)
+
+collect:
+	for _, key := range orderedKeys {
 		raw, err := db.EdgesJSON(knowledgeGraphIndex, key, "", edgeDirectionBoth)
 		if err != nil {
+			failures.reads++
+			failures.last = err
 			continue
 		}
 		var rawEdges []graphEdge
 		if err := json.Unmarshal(raw, &rawEdges); err != nil {
+			failures.decodes++
+			failures.last = err
 			continue
 		}
 		for _, edge := range rawEdges {
 			source, err1 := base64.StdEncoding.DecodeString(edge.SourceB64)
 			target, err2 := base64.StdEncoding.DecodeString(edge.TargetB64)
 			if err1 != nil || err2 != nil {
+				failures.decodes++
+				if err1 != nil {
+					failures.last = err1
+				} else {
+					failures.last = err2
+				}
 				continue
 			}
 			sourceKey, targetKey := string(source), string(target)
 			dedupeKey := sourceKey + "\x00" + edge.EdgeType + "\x00" + targetKey
-			if !edgeSeen[dedupeKey] {
-				edgeSeen[dedupeKey] = true
-				edges = append(edges, resolvedEdge{source: sourceKey, target: targetKey, edgeType: edge.EdgeType, weight: edge.Weight})
+			if edgeSeen[dedupeKey] {
+				continue
 			}
+			if len(edges) >= maxNeighborhoodEdges {
+				failures.truncated = true
+				break collect
+			}
+			edgeSeen[dedupeKey] = true
+			edges = append(edges, resolvedEdge{source: sourceKey, target: targetKey, edgeType: edge.EdgeType, weight: edge.Weight})
 			if !isDocumentKey(sourceKey) {
 				entitySet[sourceKey] = true
 			}
@@ -284,7 +334,8 @@ func collectGraphNeighborhood(db *lite.DB, nodeKeys map[string]bool) ([]string, 
 	for entity := range entitySet {
 		entities = append(entities, entity)
 	}
-	return entities, edges, nil
+	sort.Strings(entities)
+	return entities, edges, failures
 }
 
 func isDocumentKey(key string) bool {
@@ -292,27 +343,106 @@ func isDocumentKey(key string) bool {
 }
 
 // runEntity prints the direct (both-direction) edges of a named entity node
-// in the knowledge graph.
+// in the knowledge graph. Entity nodes live under the resolver's canonical
+// `label/slug` keys (e.g. component/metadata_server), so a bare name like
+// "metadata server" is slugified and probed under every extraction label; an
+// exact key is used as-is.
 func runEntity(db *lite.DB, name string) error {
-	raw, err := db.EdgesJSON(knowledgeGraphIndex, name, "", edgeDirectionBoth)
+	candidates := entityKeyCandidates(name)
+	for _, key := range candidates {
+		edges, err := entityEdges(db, key)
+		if err != nil {
+			return fmt.Errorf("get edges for %q: %w", key, err)
+		}
+		if len(edges) == 0 {
+			continue
+		}
+		fmt.Printf("Entity: %s (%d edges)\n\n", key, len(edges))
+		for _, edge := range edges {
+			source, _ := base64.StdEncoding.DecodeString(edge.SourceB64)
+			target, _ := base64.StdEncoding.DecodeString(edge.TargetB64)
+			fmt.Printf("  %s --[%s]--> %s (weight=%.3f)\n", source, edge.EdgeType, target, edge.Weight)
+			if edge.MetadataJSON != "" && edge.MetadataJSON != "{}" {
+				fmt.Printf("      metadata: %s\n", edge.MetadataJSON)
+			}
+		}
+		return nil
+	}
+	fmt.Printf("Entity %q: no edges found (tried %s)\n", name, strings.Join(candidates, ", "))
+	return nil
+}
+
+func entityEdges(db *lite.DB, key string) ([]graphEdge, error) {
+	raw, err := db.EdgesJSON(knowledgeGraphIndex, key, "", edgeDirectionBoth)
 	if err != nil {
-		return fmt.Errorf("get edges for %q: %w", name, err)
+		return nil, err
 	}
 	var edges []graphEdge
 	if err := json.Unmarshal(raw, &edges); err != nil {
-		return fmt.Errorf("decode edges: %w\nraw: %s", err, raw)
+		return nil, fmt.Errorf("decode edges: %w\nraw: %s", err, raw)
 	}
+	return edges, nil
+}
 
-	fmt.Printf("Entity: %s (%d edges)\n\n", name, len(edges))
-	for _, edge := range edges {
-		source, _ := base64.StdEncoding.DecodeString(edge.SourceB64)
-		target, _ := base64.StdEncoding.DecodeString(edge.TargetB64)
-		fmt.Printf("  %s --[%s]--> %s (weight=%.3f)\n", source, edge.EdgeType, target, edge.Weight)
-		if edge.MetadataJSON != "" && edge.MetadataJSON != "{}" {
-			fmt.Printf("      metadata: %s\n", edge.MetadataJSON)
+// entityKeyCandidates expands a user-supplied entity name into the canonical
+// keys it may live under. A name already containing '/' is treated as an
+// exact canonical key; otherwise the name is slugified with the same rules as
+// the resolver's `slug` template helper (lowercased alphanumeric runs joined
+// by '_', possessives stripped) and probed under the label-free `entity/`
+// namespace the resolver mints.
+func entityKeyCandidates(name string) []string {
+	if strings.Contains(name, "/") {
+		return []string{name}
+	}
+	return []string{"entity/" + slugify(name)}
+}
+
+// slugify mirrors zig/lib/resolver's `slug` template helper byte-for-byte:
+// ASCII-lowercased alphanumeric runs separated by single '_', no
+// leading/trailing separators, English possessives stripped
+// ("A. Lovelace" -> "a_lovelace", "Epstein's island" -> "epstein_island").
+func slugify(value string) string {
+	var b strings.Builder
+	pendingSep := false
+	wrote := false
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		apostropheLen := 0
+		if c == '\'' {
+			apostropheLen = 1
+		} else if c == 0xE2 && i+2 < len(value) && value[i+1] == 0x80 && value[i+2] == 0x99 {
+			apostropheLen = 3
+		}
+		if apostropheLen > 0 && wrote && !pendingSep {
+			sIndex := i + apostropheLen
+			afterS := sIndex + 1
+			isAlnum := func(b byte) bool {
+				return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
+			}
+			if sIndex < len(value) && (value[sIndex] == 's' || value[sIndex] == 'S') &&
+				(afterS >= len(value) || !isAlnum(value[afterS])) {
+				i = sIndex
+				continue
+			}
+		}
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') {
+			if pendingSep && wrote {
+				b.WriteByte('_')
+			}
+			b.WriteByte(c)
+			wrote = true
+			pendingSep = false
+		} else {
+			pendingSep = true
+		}
+		if apostropheLen == 3 {
+			i += 2
 		}
 	}
-	return nil
+	return b.String()
 }
 
 func firstNonEmpty(values ...string) string {
