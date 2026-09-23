@@ -1715,13 +1715,19 @@ const HandleRegistry = struct {
         return .{ handle, id };
     }
 
-    /// Retires a slot claimed by `beginClose` after its handle is freed.
+    /// Releases a slot claimed by `beginClose` after its handle is freed.
     fn finishClose(self: *HandleRegistry, id: Id) void {
         const slot = self.slotFor(id.index).?;
         antfly.platform_sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
-        const next_generation = (id.generation +% 1) & self.generationMask();
-        slot.state.store(next_generation << 1, .release);
+        if (id.generation >= self.generationMask()) {
+            // The slot has used every generation an id can encode. Wrapping
+            // would let an old id match a future handle, so retire it: the
+            // state stays claimed (closing bit set), which no id can enter or
+            // close, and the slot never returns to the free list.
+            return;
+        }
+        slot.state.store((id.generation + 1) << 1, .release);
         slot.next_free = if (self.free_head) |free| free + 1 else 0;
         self.free_head = id.index;
     }
@@ -1729,7 +1735,9 @@ const HandleRegistry = struct {
 
 var handle_registry: HandleRegistry = .{};
 
-/// Registers a newly opened handle, closing it if registration fails.
+/// Registers a newly opened handle, closing it if registration fails. Only for
+/// callers that own `handle` outright and have no cleanup of their own left;
+/// storageOwnerOpen registers directly so its defers stay the only cleanup.
 fn publishHandle(handle: *Handle) !*anyopaque {
     return handle_registry.register(handle) catch |err| {
         closeHandle(handle);
@@ -5765,8 +5773,13 @@ pub fn storageOwnerOpen(
         handle.db.activateResolverReplayRuntimes() catch |err| return storageOwnerStatusFromError(err);
         handle.db.startResidentBackgroundWorkersIfNeeded();
     }
+    // Register as the last fallible step: on failure the defers above close
+    // the DB and release the borrowed context exactly once, as for every
+    // earlier failure. (publishHandle's close-on-failure would release the
+    // context a second time.)
+    const owner_id = handle_registry.register(handle) catch |err| return storageOwnerStatusFromError(err);
     success = true;
-    out_owner.* = publishHandle(handle) catch |err| return storageOwnerStatusFromError(err);
+    out_owner.* = owner_id;
     context_borrowed = false;
     return .ok;
 }
@@ -15027,6 +15040,37 @@ test "capi handle ids are safe to use after close and across slot reuse" {
     // Values that were never issued fail cleanly too.
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_status_json(null, &out));
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_status_json(@ptrFromInt(0x7fff_0000), &out));
+}
+
+test "capi handle registry retires a slot instead of wrapping its generation" {
+    var first = Handle{ .alloc = std.testing.allocator, .db = undefined };
+    var second = Handle{ .alloc = std.testing.allocator, .db = undefined };
+    var third = Handle{ .alloc = std.testing.allocator, .db = undefined };
+
+    // Put a slot at the front of the free list, then move it to the last
+    // generation an id can encode.
+    const first_id = try registerTestHandle(&first);
+    const index = HandleRegistry.decode(first_id).?.index;
+    unregisterTestHandle(first_id);
+    const slot = handle_registry.slotFor(index).?;
+    const last_generation = handle_registry.generationMask();
+    slot.state.store(last_generation << 1, .release);
+
+    const second_id = try registerTestHandle(&second);
+    try std.testing.expectEqual(index, HandleRegistry.decode(second_id).?.index);
+    try std.testing.expectEqual(last_generation, HandleRegistry.decode(second_id).?.generation);
+    unregisterTestHandle(second_id);
+
+    // Retired: still claimed, unusable by any id, and never handed out again.
+    try std.testing.expectEqual(last_generation << 1 | 1, slot.state.load(.acquire));
+    try std.testing.expect(asHandle(second_id) == null);
+    try std.testing.expect(enterHandle(second_id, .read) == null);
+    unregisterTestHandle(second_id);
+    const third_id = try registerTestHandle(&third);
+    defer unregisterTestHandle(third_id);
+    try std.testing.expect(HandleRegistry.decode(third_id).?.index != index);
+    const wrapped = handle_registry.encode(.{ .index = index, .generation = 0 });
+    try std.testing.expect(enterHandle(wrapped, .read) == null);
 }
 
 test "capi concurrent calls and closes on one handle never touch freed memory" {

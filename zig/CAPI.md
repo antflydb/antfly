@@ -104,7 +104,9 @@ generation, so every handle value a caller passes is safe to use at any time:
   before its call reached the handle.
 - Concurrent and repeated `antfly_db_close` calls are no-ops after the first.
 - A slot reused by a later open gets a new generation, so an old handle value
-  can never reach the new database.
+  can never reach the new database. A slot that has used every generation a
+  handle value can encode is retired for the life of the process instead of
+  wrapping, so generations never repeat.
 
 On 64-bit POSIX targets a handle value is also a genuine address inside an
 inaccessible region the library reserves (no memory is committed), so it is
