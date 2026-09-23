@@ -18,7 +18,7 @@ tags: [inference, embeddings, reranking, models]
 - Why is my index stuck with pending enrichments?
 </Questions>
 
-Antfly Inference is the model runtime inside Antfly. It runs embedding, chunking, reranking, extraction, transcription, reading, and generation models (text generation from text, image, and audio prompts) in the same process as the database, so index enrichers and query processors call it without a network hop and nothing leaves the machine. It executes model artifacts through native (CPU/Metal/CUDA), ONNX, and `ortgenai` backends without external API dependencies. The decision it puts in front of you is which model to pull for each job; the [Local Model Compatibility](/docs/guides/supported-models) page holds the verified list, and this page covers how the runtime finds, stores, and serves them.
+Antfly Inference is the model runtime inside Antfly. It runs embedding, chunking, reranking, extraction, transcription, reading, and generation models (text generation from text, image, and audio prompts) on the same machine as the database, with no external API and nothing leaving the host. It executes model artifacts through the native backend (CPU, Metal on macOS, CUDA in CUDA builds), plus ONNX Runtime and `ortgenai` in builds compiled with ONNX support. The decision it puts in front of you is which model to pull for each job; the [Local Model Compatibility](/docs/guides/supported-models) page holds the verified list, and this page covers how the runtime finds, stores, and serves them.
 
 Pull a model, then embed a sentence through the running engine:
 
@@ -36,10 +36,14 @@ The response is a 512-dimension vector in the OpenAI embeddings shape (`{"object
 
 In standalone mode the runtime is served on the API port under `/ai/v1`, beside `/db/v1`. Run as its own process with `antfly inference run`, it listens on `127.0.0.1:8090` by default, and a database points at it with the `inference.api_url` config key. External providers (Ollama, OpenAI, Bedrock) plug into the same embedder, reranker, and generator interfaces, so an index config names a provider and a model and never cares which process answers.
 
+In a CPU-only build, standalone runs models inside the database process. A build that includes a GPU or driver-backed backend (Metal, which is on by default on macOS, or CUDA, ONNX Runtime, or PJRT) starts a supervised child worker (`antfly inference _worker`) at startup and sends all embedded inference to it, CPU models included. A driver call cannot be interrupted safely, so a wedged or crashed worker is killed and respawned without taking the database down.
+
+Setting `inference.api_url` disables embedded inference. It is not a fallback. Standalone then keeps no embedded provider, loads no preloads, and serves no `/ai/v1` routes on its own port, and every `provider: antfly` call goes to that URL. `antfly inference run` refuses a non-loopback `--host` unless you also pass `--allow-insecure-public-bind`, because the listener has no built-in auth or TLS.
+
 ## Configuring a Separate Inference Process
 
 `antfly inference run --config inference.json` reads admission settings and the
-model settings `models_dir`, `ml_dir`, `max_loaded_models`, and `preload`:
+model settings `models_dir`, `ml_dir`, `max_loaded_models`, and `preload`. It does not read `keep_alive`, `prompt_cache`, or `kernel_jit` from the file: idle models unload after 5 minutes, the prompt KV cache is on, and kernel JIT is set only through the `--kernel-jit-*` flags or `ANTFLY_INFERENCE_KERNEL_JIT_MODE`:
 
 ```json
 {
@@ -158,7 +162,7 @@ Models live under `$ANTFLY_INFERENCE_MODELS_DIR`, else `~/.antfly/inference/mode
   BAAI/bge-small-en-v1.5/
 ```
 
-An explicit variant gets its own distinct leaf directory beside the plain one, so quantizations cannot be mixed accidentally. Older per-task subdirectories (`embedders/`, `chunkers/`, `rerankers/`, `generators/`) are still discovered. Antfly Inference loads what it finds there when standalone mode starts.
+An explicit variant gets its own distinct leaf directory beside the plain one, so quantizations cannot be mixed accidentally. Older per-task subdirectories (`embedders/`, `chunkers/`, `rerankers/`, `generators/`) are still discovered. Antfly Inference discovers what it finds there. A model loads on its first request unless it is listed in `preload` or `--preload-model`.
 
 Traditional ML predictors use the parallel `~/.antfly/inference/ml/` directory; `--ml-dir` overrides it. Neither inference asset directory follows the database `--data-dir` implicitly.
 
@@ -170,7 +174,7 @@ The provider name is `antfly`. The same three shapes appear in table, index, and
 { "provider": "antfly", "model": "BAAI/bge-small-en-v1.5" }
 ```
 
-The API uses one `EmbedderProvider` and one canonical `EmbedderConfig` across inference features. Index creation accepts the purpose-specific `IndexEmbedderConfig` subset (`antfly`, `ollama`, `openai`, or `bedrock`), so generated clients cannot advertise providers that the indexing runtime cannot execute.
+The API uses one `EmbedderProvider` and one canonical `EmbedderConfig` across inference features. Index creation accepts the purpose-specific `IndexEmbedderConfig` subset (`antfly`, `ollama`, `openai`, `openrouter`, `cohere`, `gemini`, `vertex`, or `bedrock`), so generated clients cannot advertise providers that the indexing runtime cannot execute.
 
 ```json
 { "provider": "antfly", "model": "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0", "field": "body" }
@@ -183,6 +187,23 @@ Reranking supports `antfly`, `cohere`, and `vertex`. Ollama reranking is not adv
 ```
 
 The chunkers `fixed_bert` and `fixed_bpe` are built in and need no download. Chunk sizing nests under `text`, and `target_tokens` must be larger than `overlap_tokens` or the request fails with `InvalidChunkOverlap`.
+
+## Capacity, Admission, and Memory
+
+- **Request admission.** `admission.inference.max_concurrent_requests` (default 32; `--max-concurrent-requests` on `antfly inference run`; 0 disables the limit) bounds concurrent inference requests. The same value sizes a weighted work budget, so a few heavy requests can exhaust capacity before the count is reached. Standalone shares one budget across direct enrichment and query calls, `/ai/v1`, and `/ml/v1`. Requests are never queued. When capacity is exhausted, HTTP callers get `503` with `Retry-After: 1` and a JSON body carrying `retryable: true`.
+- **Model residency.** At most `max_loaded_models` models stay loaded (default 10; 0 means unlimited), and the least recently used idle model is evicted to make room. Idle models unload after `inference.keep_alive` (default `5m`; `"0"` disables idle unloading). Concurrent requests for the same unloaded model share one load.
+- **Memory.** Model loads and requests reserve memory before they allocate. The reservation comes from one process envelope shared with storage and caches. Set the envelope with `--process-memory-budget-mb` or `ANTFLY_PROCESS_MEMORY_BUDGET_MB` on `antfly standalone` or `antfly inference run`. Otherwise the cgroup limit is used, and host memory without a cgroup limit. In Kubernetes Burstable pods, set it below the container limit. A request that can never fit returns `MODEL_RESOURCE_LIMIT`. Temporary pressure returns a retryable `MODEL_RESOURCE_BUSY` once idle models have been evicted.
+- **Query priority.** Background enrichment yields to query-time work in the same database process. Embedding backfill pauses (up to 5 s) while a query-time embed is running, and background generation pauses while an interactive generate or chat request is in flight. Backfill that receives `503` retries with backoff.
+
+### When to Split Inference Out
+
+Embedded inference suits a single machine and models that fit comfortably beside the database's caches. Run `antfly inference run` (or an operator `InferencePool`) and point `inference.api_url` at it when:
+
+- models are large enough to crowd the database's memory envelope
+- you want to scale or restart GPU capacity independently of storage
+- several database nodes should share one pool of loaded models
+
+Query-over-backfill priority applies within one database process. Admission and memory limits apply within one inference process.
 
 ## When Enrichment Falls Behind
 
