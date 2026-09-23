@@ -14,18 +14,17 @@
 
 //! The embedded Antfly Lite database handle and its core operations.
 
-use std::ffi::c_void;
 use std::path::Path;
 use std::sync::{Condvar, Mutex, PoisonError};
 
-use antfly_lite_sys::{self as sys, antfly_buffer, antfly_error_code, antfly_slice};
+use antfly_lite_sys::{self as sys, antfly_buffer, antfly_db, antfly_error_code, antfly_slice};
 
 use crate::error::{Error, Result};
 use crate::ffi::{borrow_slice, check, path_has_suffix, path_to_cstring, take_buffer};
 use crate::options::{GraphDirection, OpenOptions, WriteIntent};
 
 /// The Antfly C ABI version this binding expects.
-pub const SUPPORTED_ABI_VERSION: u32 = 1;
+pub const SUPPORTED_ABI_VERSION: u32 = 2;
 
 /// The only threading mode libantfly provides: any thread may call any
 /// method on a [`Database`] concurrently. See [`threading_mode`].
@@ -48,13 +47,13 @@ pub fn abi_version() -> u32 {
     unsafe { sys::antfly_abi_version() }
 }
 
-/// Returns the loaded C ABI size of `antfly_lite_open_options`.
+/// Returns the loaded C ABI size of `antfly_open_options`.
 pub fn open_options_size() -> u32 {
-    unsafe { sys::antfly_lite_open_options_size() }
+    unsafe { sys::antfly_open_options_size() }
 }
 
 fn compiled_open_options_size() -> u32 {
-    std::mem::size_of::<sys::antfly_lite_open_options>() as u32
+    std::mem::size_of::<sys::antfly_open_options>() as u32
 }
 
 /// Verifies that the loaded C library matches the header this binding was
@@ -76,7 +75,7 @@ pub fn validate_abi() -> Result<()> {
 /// once closed) plus the bookkeeping needed for a writer-preferring
 /// reader/writer gate.
 struct GateState {
-    handle: Option<*mut c_void>,
+    handle: Option<*mut antfly_db>,
     readers: u32,
     /// Set while at least one thread is waiting to close. Blocks *new*
     /// reader acquisitions so that a sustained stream of reads cannot starve
@@ -103,7 +102,7 @@ struct HandleGate {
 }
 
 impl HandleGate {
-    fn new(handle: *mut c_void) -> HandleGate {
+    fn new(handle: *mut antfly_db) -> HandleGate {
         HandleGate {
             state: Mutex::new(GateState {
                 handle: Some(handle),
@@ -117,7 +116,7 @@ impl HandleGate {
 
     /// Runs `f` with the live handle, or returns [`Error::InvalidArgument`]
     /// if the database has already been closed or a close is in progress.
-    fn with_handle<T>(&self, f: impl FnOnce(*mut c_void) -> Result<T>) -> Result<T> {
+    fn with_handle<T>(&self, f: impl FnOnce(*mut antfly_db) -> Result<T>) -> Result<T> {
         let handle = {
             let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             loop {
@@ -158,7 +157,7 @@ impl HandleGate {
     /// Waits for every call already in flight to finish, then closes the
     /// handle (a no-op if it is already closed, whether by this call or a
     /// concurrent one). Safe to call concurrently and more than once.
-    fn close(&self, close_fn: impl FnOnce(*mut c_void)) {
+    fn close(&self, close_fn: impl FnOnce(*mut antfly_db)) {
         let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if guard.handle.is_none() {
             return;
@@ -219,12 +218,12 @@ pub struct Database {
 // queue behind each other, and schema/admin changes wait for in-flight
 // calls. `HandleGate` above only prevents calling into a handle after
 // `antfly_db_close` has returned (a use-after-free libantfly itself cannot
-// guard against); nothing about `*mut c_void` here is thread-affine.
+// guard against); nothing about `*mut antfly_db` here is thread-affine.
 unsafe impl Send for Database {}
 unsafe impl Sync for Database {}
 
 impl Database {
-    fn from_handle(handle: *mut c_void) -> Database {
+    fn from_handle(handle: *mut antfly_db) -> Database {
         Database {
             gate: HandleGate::new(handle),
         }
@@ -232,13 +231,13 @@ impl Database {
 
     /// Runs `f` with the live handle, or returns [`Error::InvalidArgument`]
     /// if the database has already been closed. See [`HandleGate`].
-    pub(crate) fn with_handle<T>(&self, f: impl FnOnce(*mut c_void) -> Result<T>) -> Result<T> {
+    pub(crate) fn with_handle<T>(&self, f: impl FnOnce(*mut antfly_db) -> Result<T>) -> Result<T> {
         self.gate.with_handle(f)
     }
 
     pub(crate) fn read_buffer(
         &self,
-        f: impl FnOnce(*mut c_void, *mut antfly_buffer) -> antfly_error_code,
+        f: impl FnOnce(*mut antfly_db, *mut antfly_buffer) -> antfly_error_code,
     ) -> Result<Vec<u8>> {
         self.with_handle(|handle| {
             let mut out = antfly_buffer::default();
@@ -250,7 +249,7 @@ impl Database {
     pub(crate) fn with_input(
         &self,
         input: &[u8],
-        f: impl FnOnce(*mut c_void, antfly_slice) -> antfly_error_code,
+        f: impl FnOnce(*mut antfly_db, antfly_slice) -> antfly_error_code,
     ) -> Result<()> {
         self.with_handle(|handle| check(f(handle, borrow_slice(input))))
     }
@@ -258,7 +257,7 @@ impl Database {
     pub(crate) fn with_input_output(
         &self,
         input: &[u8],
-        f: impl FnOnce(*mut c_void, antfly_slice, *mut antfly_buffer) -> antfly_error_code,
+        f: impl FnOnce(*mut antfly_db, antfly_slice, *mut antfly_buffer) -> antfly_error_code,
     ) -> Result<Vec<u8>> {
         self.with_handle(|handle| {
             let mut out = antfly_buffer::default();
@@ -274,7 +273,7 @@ impl Database {
         edge_type: &str,
         direction: u8,
         f: impl FnOnce(
-            *mut c_void,
+            *mut antfly_db,
             antfly_slice,
             antfly_slice,
             antfly_slice,
@@ -348,7 +347,7 @@ impl Database {
     pub fn open_hosted(path: impl AsRef<Path>) -> Result<Database> {
         validate_abi()?;
         let c_path = path_to_cstring(path.as_ref())?;
-        let mut handle: *mut c_void = std::ptr::null_mut();
+        let mut handle: *mut antfly_db = std::ptr::null_mut();
         check(unsafe { sys::antfly_lite_open_hosted(c_path.as_ptr(), &mut handle) })?;
         Ok(Database::from_handle(handle))
     }
@@ -359,7 +358,7 @@ impl Database {
     pub fn create_hosted(path: impl AsRef<Path>) -> Result<Database> {
         validate_abi()?;
         let c_path = path_to_cstring(path.as_ref())?;
-        let mut handle: *mut c_void = std::ptr::null_mut();
+        let mut handle: *mut antfly_db = std::ptr::null_mut();
         check(unsafe { sys::antfly_lite_create_hosted(c_path.as_ptr(), &mut handle) })?;
         Ok(Database::from_handle(handle))
     }
@@ -368,23 +367,24 @@ impl Database {
         validate_abi()?;
         let c_path = path_to_cstring(path)?;
 
-        let mut c_opts: sys::antfly_lite_open_options = unsafe { std::mem::zeroed() };
-        check(unsafe { sys::antfly_lite_open_options_init(&mut c_opts) })?;
+        let mut c_opts: sys::antfly_open_options = unsafe { std::mem::zeroed() };
+        check(unsafe { sys::antfly_open_options_init(&mut c_opts) })?;
 
+        c_opts.storage_kind = options.storage.as_u32();
         c_opts.open_mode = options.mode.as_u32();
         c_opts.profile = options.profile.as_u32();
         c_opts.map_size = options.map_size;
         if options.no_sync {
-            c_opts.flags |= sys::ANTFLY_LITE_OPEN_FLAG_NO_SYNC;
+            c_opts.flags |= sys::ANTFLY_OPEN_FLAG_NO_SYNC;
         }
         if options.remote_provider_configured {
-            c_opts.flags |= sys::ANTFLY_LITE_OPEN_FLAG_REMOTE_PROVIDER_CONFIGURED;
+            c_opts.flags |= sys::ANTFLY_OPEN_FLAG_REMOTE_PROVIDER_CONFIGURED;
         }
         if options.local_runtime_configured {
-            c_opts.flags |= sys::ANTFLY_LITE_OPEN_FLAG_LOCAL_RUNTIME_CONFIGURED;
+            c_opts.flags |= sys::ANTFLY_OPEN_FLAG_LOCAL_RUNTIME_CONFIGURED;
         }
         if options.generated_enrichment_replay {
-            c_opts.flags |= sys::ANTFLY_LITE_OPEN_FLAG_GENERATED_ENRICHMENT_REPLAY;
+            c_opts.flags |= sys::ANTFLY_OPEN_FLAG_GENERATED_ENRICHMENT_REPLAY;
         }
         c_opts.inference_host_budget_mb = options.host_budget_mb;
         c_opts.inference_backend_budget_mb = options.backend_budget_mb;
@@ -395,7 +395,7 @@ impl Database {
         c_opts.busy_timeout_ms = options.busy_timeout_ms();
 
         if let Some(ttl) = &options.ttl_cleanup {
-            c_opts.flags |= sys::ANTFLY_LITE_OPEN_FLAG_TTL_CLEANUP;
+            c_opts.flags |= sys::ANTFLY_OPEN_FLAG_TTL_CLEANUP;
             c_opts.ttl_cleanup_enabled = ttl.enabled;
             c_opts.ttl_cleanup_lease_owned = ttl.lease_owned;
             c_opts.ttl_cleanup_lease_ttl_ms = ttl.lease_ttl_ms;
@@ -407,11 +407,11 @@ impl Database {
             c_opts.ttl_cleanup_owner_id = borrow_slice(ttl.owner_id.as_bytes());
         }
 
-        let mut handle: *mut c_void = std::ptr::null_mut();
+        let mut handle: *mut antfly_db = std::ptr::null_mut();
         let code = if create {
-            unsafe { sys::antfly_lite_create_with_options(c_path.as_ptr(), &c_opts, &mut handle) }
+            unsafe { sys::antfly_db_create_with_options(c_path.as_ptr(), &c_opts, &mut handle) }
         } else {
-            unsafe { sys::antfly_lite_open_with_options(c_path.as_ptr(), &c_opts, &mut handle) }
+            unsafe { sys::antfly_db_open_with_options(c_path.as_ptr(), &c_opts, &mut handle) }
         };
         check(code)?;
         Ok(Database::from_handle(handle))
@@ -444,46 +444,32 @@ impl Database {
     // -- Status / maintenance JSON -----------------------------------------
 
     pub fn status_json(&self) -> Result<Vec<u8>> {
-        self.read_buffer(|h, out| unsafe { sys::antfly_lite_status_json(h, out) })
+        self.read_buffer(|h, out| unsafe { sys::antfly_db_status_json(h, out) })
     }
 
     pub fn capabilities_json(&self) -> Result<Vec<u8>> {
-        self.read_buffer(|h, out| unsafe { sys::antfly_lite_capabilities_json(h, out) })
+        self.read_buffer(|h, out| unsafe { sys::antfly_db_capabilities_json(h, out) })
     }
 
     pub fn replay_generated_enrichments_json(&self) -> Result<Vec<u8>> {
         self.read_buffer(|h, out| unsafe {
-            sys::antfly_lite_replay_generated_enrichments_json(h, out)
+            sys::antfly_db_replay_generated_enrichments_json(h, out)
         })
     }
 
-    /// Returns a portable Antfly backup archive for this Lite database.
+    /// Returns a portable Antfly backup archive (`.afb`) of this database,
+    /// which restores or imports into either storage kind.
     pub fn backup(&self) -> Result<Vec<u8>> {
-        self.read_buffer(|h, out| unsafe { sys::antfly_lite_backup(h, out) })
+        self.read_buffer(|h, out| unsafe { sys::antfly_db_backup(h, out) })
     }
 
-    /// Returns a portable Antfly backup archive for this Lite database.
-    /// Kept alongside [`Database::backup`] for parity with the Go binding's
-    /// in-progress backup/export naming migration; both call the same
-    /// underlying semantics through distinct C ABI entry points.
-    pub fn export(&self) -> Result<Vec<u8>> {
-        self.read_buffer(|h, out| unsafe { sys::antfly_lite_export(h, out) })
-    }
-
-    /// Imports a portable Antfly backup archive into this Lite database.
+    /// Imports a portable Antfly backup archive into this empty database.
     /// [`Error::OutcomeUnknown`] means the live handle adopted the imported
     /// generation, but crash durability could not be confirmed; inspect the
     /// handle and do not retry automatically.
     pub fn import_backup(&self, backup: impl AsRef<[u8]>) -> Result<()> {
         self.with_input(backup.as_ref(), |h, input| unsafe {
-            sys::antfly_lite_import_backup(h, input)
-        })
-    }
-
-    /// See [`Database::import_backup`].
-    pub fn import(&self, backup: impl AsRef<[u8]>) -> Result<()> {
-        self.with_input(backup.as_ref(), |h, input| unsafe {
-            sys::antfly_lite_import(h, input)
+            sys::antfly_db_import_backup(h, input)
         })
     }
 
@@ -600,17 +586,17 @@ impl Database {
 
     /// Drains pending enrichment and index work.
     pub fn run_until_idle(&self) -> Result<()> {
-        self.with_handle(|handle| check(unsafe { sys::antfly_lite_run_until_idle(handle) }))
+        self.with_handle(|handle| check(unsafe { sys::antfly_db_run_until_idle(handle) }))
     }
 
     /// Drains pending enrichment and index work and returns the post-drain
     /// pending work stats JSON.
     pub fn run_until_idle_json(&self) -> Result<Vec<u8>> {
-        self.read_buffer(|h, out| unsafe { sys::antfly_lite_run_until_idle_json(h, out) })
+        self.read_buffer(|h, out| unsafe { sys::antfly_db_run_until_idle_json(h, out) })
     }
 
     pub fn pending_work_stats_json(&self) -> Result<Vec<u8>> {
-        self.read_buffer(|h, out| unsafe { sys::antfly_lite_pending_work_stats_json(h, out) })
+        self.read_buffer(|h, out| unsafe { sys::antfly_db_pending_work_stats_json(h, out) })
     }
 
     pub fn indexes_json(&self) -> Result<Vec<u8>> {
@@ -820,10 +806,7 @@ impl std::fmt::Debug for Database {
 pub fn decode_artifact_id_json(artifact_id_base64: &str) -> Result<Vec<u8>> {
     let mut out = antfly_buffer::default();
     check(unsafe {
-        sys::antfly_db_decode_artifact_id_json(
-            borrow_slice(artifact_id_base64.as_bytes()),
-            &mut out,
-        )
+        sys::antfly_decode_artifact_id_json(borrow_slice(artifact_id_base64.as_bytes()), &mut out)
     })?;
     Ok(unsafe { take_buffer(out) })
 }

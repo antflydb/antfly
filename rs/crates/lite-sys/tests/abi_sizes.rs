@@ -12,13 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Verifies the hand-written `#[repr(C)]` option structs match the loaded
-//! `libantfly`'s notion of their size. Requires linking against the real
+//! Verifies the hand-written `#[repr(C)]` option struct matches the loaded
+//! `libantfly`'s notion of its size. Requires linking against the real
 //! library (`--features libantfly`).
-use antfly_lite_sys::{
-    antfly_lite_open_options, antfly_lite_open_options_size, antfly_open_options,
-    antfly_open_options_size,
-};
+use antfly_lite_sys::{antfly_open_options, antfly_open_options_size};
 
 #[test]
 fn open_options_size_matches_library() {
@@ -27,15 +24,5 @@ fn open_options_size_matches_library() {
     assert_eq!(
         got, want,
         "antfly_open_options size mismatch: Rust repr(C) says {got}, library says {want}"
-    );
-}
-
-#[test]
-fn lite_open_options_size_matches_library() {
-    let want = unsafe { antfly_lite_open_options_size() } as usize;
-    let got = std::mem::size_of::<antfly_lite_open_options>();
-    assert_eq!(
-        got, want,
-        "antfly_lite_open_options size mismatch: Rust repr(C) says {got}, library says {want}"
     );
 }

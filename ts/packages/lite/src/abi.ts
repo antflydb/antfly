@@ -21,7 +21,7 @@
 //     http://www.apache.org/licenses/LICENSE-2.0
 
 import koffi from "koffi";
-import { AntflyLiteOpenOptions, loadNative } from "./native.js";
+import { AntflyOpenOptions, loadNative } from "./native.js";
 import { SUPPORTED_ABI_VERSION } from "./types.js";
 
 /** Thrown by validateAbi() when the loaded libantfly does not match the header this binding was written against. */
@@ -47,9 +47,9 @@ export function threadingMode(): number {
 
 /**
  * Verifies that the loaded C library matches the header this binding was
- * compiled against: antfly_abi_version() and the antfly_lite_open_options
- * struct size. Called automatically by every open/create/checkFile call;
- * exposed so applications can fail fast at startup too.
+ * compiled against: antfly_abi_version() and the antfly_open_options struct
+ * size. Called automatically by every open/create/checkFile call; exposed so
+ * applications can fail fast at startup too.
  */
 export function validateAbi(): void {
   const native = loadNative();
@@ -59,8 +59,8 @@ export function validateAbi(): void {
       `lite: unsupported C ABI version ${gotVersion}, want ${SUPPORTED_ABI_VERSION}`
     );
   }
-  const gotSize = native.liteOpenOptionsSize();
-  const wantSize = koffi.sizeof(AntflyLiteOpenOptions);
+  const gotSize = native.openOptionsSize();
+  const wantSize = koffi.sizeof(AntflyOpenOptions);
   if (gotSize !== wantSize) {
     throw new AbiMismatchError(
       `lite: C ABI open options size ${gotSize}, compiled header size ${wantSize}`

@@ -22,14 +22,25 @@
 
 import type { Uint64Like } from "./marshal.js";
 
-/** How an Antfly Lite file is opened (antfly_lite_open_mode_* in antfly.h). */
+/** How a database is opened (antfly_open_mode_* in antfly.h). */
 export enum OpenMode {
   Writer = 0,
   Readonly = 1,
   StatusOnly = 2,
 }
 
-/** The Lite runtime profile (antfly_lite_profile_* in antfly.h). */
+/**
+ * How a database is stored (antfly_storage_kind_* in antfly.h). The zero
+ * value, Lite, is a single-file .aflite database.
+ */
+export enum Storage {
+  /** A single-file .aflite database. */
+  Lite = 0,
+  /** A normal single-node Antfly directory. */
+  Directory = 1,
+}
+
+/** The Lite runtime profile (antfly_profile_* in antfly.h). */
 export enum Profile {
   Native = 0,
   Hosted = 1,
@@ -63,7 +74,7 @@ export const InferenceMode = {
 export const THREADING_SERIALIZED = 1;
 
 /** The Antfly C ABI version this binding was written against (antfly_abi_version()). */
-export const SUPPORTED_ABI_VERSION = 1;
+export const SUPPORTED_ABI_VERSION = 2;
 
 /** Configures TTL cleanup for a native-profile Lite handle. */
 export interface TTLCleanupOptions {
@@ -77,11 +88,13 @@ export interface TTLCleanupOptions {
 }
 
 /**
- * Configures open/create. See antfly_lite_open_options in antfly.h and
+ * Configures open/create. See antfly_open_options in antfly.h and
  * zig/LITE.md's "Local Embedded Inference" section for the inference budget
  * fields. All fields are optional; unset numeric budgets mean "automatic".
  */
 export interface OpenOptions {
+  /** Selects a .aflite file (the default) or a directory. Directory storage is created by opening a missing path; createWithOptions only creates .aflite files. */
+  storage?: Storage;
   mode?: OpenMode;
   profile?: Profile;
   noSync?: boolean;
@@ -105,6 +118,14 @@ export interface WriteIntent {
   key: string;
   value?: Uint8Array | Record<string, unknown>;
   delete?: boolean;
+}
+
+/** Configures restore() and restoreFile(). */
+export interface RestoreOptions {
+  /** Selects the kind of database created at the destination: a .aflite file (the default) or a directory. */
+  storage?: Storage;
+  /** Atomically replaces an existing destination. */
+  replace?: boolean;
 }
 
 // --- Typed status/capabilities/report shapes (mirrors go/pkg/lite/status.go and maintenance.go) ---

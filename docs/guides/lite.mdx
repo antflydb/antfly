@@ -328,7 +328,7 @@ await db.batch([{ key: "doc:ts:1", value: { title: "embedded typescript lite" } 
 console.log(await db.status());
 ```
 
-Every handle is safe to share across threads (Python, Rust) or concurrent promises (TypeScript), with the same semantics as Go. Threads that call into Lite need at least 8 MiB of native stack; Go, Python, and the TypeScript binding already arrange that, and Rust callers should spawn threads with `antfly_lite::MIN_THREAD_STACK_SIZE`. The shared conformance cases in `zig/pkg/antfly/capi-conformance` keep all four bindings behaviorally identical.
+Every handle is safe to share across threads (Python, Rust) or concurrent promises (TypeScript), with the same semantics as Go. Threads that call into Lite need at least 8 MiB of native stack; Go, Python, and the TypeScript binding already arrange that, and Rust callers should spawn threads with `antfly_lite::MIN_THREAD_STACK_SIZE`. The same bindings also open a normal Antfly directory (for example `lite.OpenOptions{Storage: lite.StorageDirectory}` in Go), and a portable `.afb` backup restores or imports into either kind, so moving between a `.aflite` file and a directory is one backup and one restore. The shared conformance cases in `zig/pkg/antfly/capi-conformance` keep all four bindings behaviorally identical.
 
 ## Building from Source
 

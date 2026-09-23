@@ -40,7 +40,7 @@ import {
   UnsupportedError,
   VersionConflictError,
 } from "../src/errors.js";
-import { AntflyLiteOpenOptions, loadNative } from "../src/native.js";
+import { AntflyOpenOptions, loadNative } from "../src/native.js";
 import { SUPPORTED_ABI_VERSION, THREADING_SERIALIZED } from "../src/types.js";
 import { describeWithLibrary } from "./helpers.js";
 
@@ -125,8 +125,8 @@ describeWithLibrary("native ABI cross-checks", () => {
     expect(() => validateAbi()).not.toThrow();
   });
 
-  it("antfly_lite_open_options_size() agrees with the compiled struct size", () => {
+  it("antfly_open_options_size() agrees with the compiled struct size", () => {
     const native = loadNative();
-    expect(native.liteOpenOptionsSize()).toBe(koffi.sizeof(AntflyLiteOpenOptions));
+    expect(native.openOptionsSize()).toBe(koffi.sizeof(AntflyOpenOptions));
   });
 });

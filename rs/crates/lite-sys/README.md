@@ -45,11 +45,19 @@ archive containing `lib/libantfly.*`, then set `ANTFLY_LIB_DIR` to that
   it never references an `extern "C"` item, so it needs no dylib.
 - `cargo test -p antfly-lite-sys --features libantfly` additionally runs
   `tests/abi_sizes.rs`, which links against the real library and checks that
-  this crate's `#[repr(C)]` option structs agree with
-  `antfly_open_options_size()`/`antfly_lite_open_options_size()`.
+  this crate's `#[repr(C)]` `antfly_open_options` struct agrees with
+  `antfly_open_options_size()`.
 
 ## ABI coverage
 
 This crate declares every function in `antfly.h`, plus every
 `ANTFLY_*`/`antfly_*` constant and `#[repr(C)]` type the header defines --
-not just the subset `antfly-lite`'s safe API currently wraps.
+not just the subset `antfly-lite`'s safe API currently wraps. This is ABI
+version 2: `antfly_db` is a typed opaque handle (`*mut antfly_db`, not
+`*mut c_void`); `antfly_*` functions are library-level and take no handle,
+`antfly_db_*` functions take an `antfly_db` handle of any storage kind
+(`.aflite` file or a normal Antfly directory, selected by
+`antfly_open_options.storage_kind`), and `antfly_lite_*` functions are
+`.aflite` file-format operations plus shortcuts for opening one. There is a
+single `antfly_open_options` struct (no more separate
+`antfly_lite_open_options`).
