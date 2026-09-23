@@ -292,6 +292,20 @@ pub fn reclaimStaleNativeSnapshotAttempts(
 }
 
 pub const local_schema_json_key = "\x00\x00__metadata__:schema_json";
+const owner_catalog_initialized_key = "\x00\x00__metadata__:owner_catalog_initialized";
+
+fn ownerCatalogInitialized(alloc: std.mem.Allocator, db: *db_mod.DB) !bool {
+    const value = db.core.store.get(alloc, owner_catalog_initialized_key) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    alloc.free(value);
+    return true;
+}
+
+fn ensureOwnerCatalogInitialized(alloc: std.mem.Allocator, db: *db_mod.DB) !void {
+    if (!try ownerCatalogInitialized(alloc, db)) try db.core.store.put(owner_catalog_initialized_key, "1");
+}
 
 pub fn applyStorageKernelReplicatedBatch(
     alloc: std.mem.Allocator,
@@ -1749,6 +1763,33 @@ pub fn configureStorageKernelOwnerDb(
     remote_content: ?*const scraping.RemoteContentConfig,
     installed: ?*OwnerManagedConfig,
 ) !void {
+    return configureStorageKernelOwnerDbAtOpen(alloc, db, table_name, schema_json, indexes_json, backend_runtime, antfly_provider, secret_store, remote_content, installed, false);
+}
+
+/// A pinned Raft descriptor is write-admission history, not current catalog
+/// authority. Once a physical owner has been configured, replay must leave
+/// its index catalog alone; the current metadata reconciler owns later DDL.
+pub fn configureStorageKernelOwnerDbAtOpen(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    table_name: []const u8,
+    schema_json: []const u8,
+    indexes_json: []const u8,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    antfly_provider: ?managed_embedder.AntflyProvider,
+    secret_store: ?*common_secrets.FileStore,
+    remote_content: ?*const scraping.RemoteContentConfig,
+    installed: ?*OwnerManagedConfig,
+    historical_raft_apply: bool,
+) !void {
+    if (historical_raft_apply) {
+        if (try ownerCatalogInitialized(alloc, db) or try db.raftAppliedEntry() != null) return;
+        // Older physical roots predate the marker. Existing index definitions
+        // still prove that replay must not replace their current catalog.
+        const indexes = try db.listIndexes(alloc);
+        defer db_mod.types.freeIndexConfigs(alloc, indexes);
+        if (indexes.len != 0) return;
+    }
     // Catch-up may request an owner using an older Raft entry's pinned
     // descriptor after this physical generation has a newer durable schema.
     // Never roll back its schema, managed runtimes, or index definitions.
@@ -1781,6 +1822,7 @@ pub fn configureStorageKernelOwnerDb(
         });
         if (replace) try db.resumeEnrichmentRuntimeAfterReconfigure("owner configuration", "*");
         if (installed) |state| state.publish(indexes_json);
+        try ensureOwnerCatalogInitialized(alloc, db);
     }
 }
 
@@ -1900,6 +1942,7 @@ pub fn reconcileStorageKernelOwnerDb(
     } else metadata_table_provisioner.ProvisionSummary{};
     if (replace) try db.resumeEnrichmentRuntimeAfterReconfigure("owner reconciliation", target_index_name orelse "*");
     if (indexes_json.len > 0) if (installed) |state| state.publish(indexes_json);
+    if (indexes_json.len > 0) try ensureOwnerCatalogInitialized(alloc, db);
 
     var result = StorageKernelReconcileResult{
         .indexes_added = provisioned.indexes_added,

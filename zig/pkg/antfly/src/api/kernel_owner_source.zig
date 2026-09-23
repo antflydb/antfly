@@ -1227,7 +1227,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         // checkpoint. Yield admission conflicts to it immediately: waiting for
         // another owner lease here stalls unrelated groups and can deadlock a
         // maintenance callback waiting for this same progress driver.
-        var lease = self.acquireDescriptorOnce(group_id, table_name, path, descriptor, .shared, .resident, .{}) catch |err| switch (err) {
+        var lease = self.acquireDescriptorOnce(group_id, table_name, path, descriptor, .shared, .resident, .{ .historical_raft_apply = true }) catch |err| switch (err) {
             error.StorageKernelOwnerTransitionRequired => return error.StorageBusy,
             else => return err,
         };
@@ -2343,6 +2343,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         execution_deadline_ns: ?u64 = null,
         execution_io: ?@import("../runtime_io_abi.zig").Borrow = null,
         cancellation: ?db_types.CancellationToken = null,
+        historical_raft_apply: bool = false,
 
         fn from(req: anytype) ReadControls {
             return .{ .execution_deadline_ns = req.execution_deadline_ns, .execution_io = if (@hasField(@TypeOf(req), "execution_io")) req.execution_io else null, .cancellation = req.cancellation };
@@ -3123,6 +3124,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .restore_cancel_recovery = @intFromBool(descriptor.restore_cancel_recovery),
             .restore_ha_replay = @intFromBool(descriptor.restore_ha_replay),
             .online_source_authority = @intFromEnum(self.online_source_authority),
+            .historical_raft_apply = @intFromBool(controls.historical_raft_apply),
             .dense_embedding_storage = if (descriptor.table_storage) |settings| switch (settings.dense_embeddings) {
                 .primary_lsm => .primary_lsm,
                 .vector_store => .vector_store,
@@ -5256,6 +5258,56 @@ test "committed catch-up retains newer durable schema across an older pinned des
     var first = try lease.owner().lookupJson("docs", "{\"key\":\"doc:first\"}");
     defer first.deinit();
     try std.testing.expect(std.mem.indexOf(u8, first.bytes(), "duplicate") == null);
+    var second = try lease.owner().lookupJson("docs", "{\"key\":\"doc:second\"}");
+    defer second.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, second.bytes(), "second") != null);
+}
+
+test "committed catch-up does not reconcile an older index-only descriptor" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(root);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-1/table-db", .{root});
+    defer alloc.free(path);
+    var source = ProvisionedKernelOwnerSource.init(alloc, root, table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+    defer source.deinit();
+    const old: descriptor_contract.Descriptor = .{
+        .lsm_root_generation = table_reads.backend_current_root_generation,
+        .identity = .{ .table_id = 1, .shard_id = 1, .range_id = 1 },
+        .schema_json = "{\"version\":0}",
+        .indexes_json = "{}",
+    };
+    const current: descriptor_contract.Descriptor = .{
+        .lsm_root_generation = old.lsm_root_generation,
+        .identity = old.identity,
+        .schema_json = old.schema_json,
+        .indexes_json = "{\"new_idx\":{\"type\":\"full_text\"}}",
+    };
+    try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", old, .{
+        .writes = &.{.{ .key = "doc:first", .value = "{\"title\":\"first\"}" }},
+    }, 1, 1);
+    {
+        var lease = try source.acquireDescriptor(1, "docs", path, current);
+        lease.deinit();
+    }
+    for (0..4) |_| {
+        source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", old, .{
+            .writes = &.{.{ .key = "doc:second", .value = "{\"title\":\"second\"}" }},
+        }, 1, 2) catch |err| switch (err) {
+            error.StorageBusy => continue,
+            else => return err,
+        };
+        break;
+    } else return error.TestOwnerAdmissionDidNotRecover;
+    var lease = try source.acquireDescriptor(1, "docs", path, old);
+    defer lease.deinit();
+    // Reconciliation would have to add this index again if historical open
+    // retired it. Querying the existing owner avoids an intervening reopen.
+    const reconciled = try lease.owner().reconcile("docs", current.schema_json, current.indexes_json, null, false);
+    try std.testing.expectEqual(@as(u64, 0), reconciled.indexes_added);
+    try std.testing.expectEqual(@as(u64, 0), reconciled.indexes_removed);
     var second = try lease.owner().lookupJson("docs", "{\"key\":\"doc:second\"}");
     defer second.deinit();
     try std.testing.expect(std.mem.indexOf(u8, second.bytes(), "second") != null);
