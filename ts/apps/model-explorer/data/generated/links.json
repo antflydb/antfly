@@ -164,7 +164,7 @@
   "ops-compute-backend": {
    "path": "zig/pkg/inference/src/ops/ops.zig",
    "anchor": "pub const ComputeBackend = struct {",
-   "line": 1398
+   "line": 1422
   },
   "node-primitive-op": {
    "path": "zig/lib/ml/src/graph/node.zig",
@@ -589,7 +589,7 @@
   "gliner25-stop-gradient": {
    "path": "zig/lib/ml/src/graph/node.zig",
    "anchor": "stop_gradient: void,",
-   "line": 695
+   "line": 706
   },
   "gliner25-adamw-renorm": {
    "path": "zig/pkg/inference/src/finetune/seeded_gradient_trainer.zig",
@@ -614,12 +614,12 @@
   "train-graph-backward": {
    "path": "zig/lib/ml/src/graph/autodiff.zig",
    "anchor": "pub fn gradient(",
-   "line": 85
+   "line": 87
   },
   "train-real-autodiff-trainer": {
    "path": "zig/pkg/inference/src/finetune/real_autodiff_trainer.zig",
    "anchor": "pub const RealAutodiffTrainer = struct {",
-   "line": 520
+   "line": 671
   },
   "train-max-grad-norm": {
    "path": "zig/pkg/inference/src/finetune/real_autodiff_trainer.zig",
@@ -639,12 +639,12 @@
   "train-executor-flag": {
    "path": "zig/pkg/inference/src/graph/training.zig",
    "anchor": "if (!platform.env.getenvBoolDefault(\"TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR\", false)) return error.TrainingGraphExecutorUnavailable;",
-   "line": 652
+   "line": 747
   },
   "gemma4-train-dpo-loss": {
    "path": "zig/pkg/inference/src/finetune/preference_loss.zig",
    "anchor": "pub fn pairedPreferenceLoss(",
-   "line": 145
+   "line": 202
   },
   "gemma4-train-loss-kinds": {
    "path": "zig/pkg/inference/src/finetune/preference_loss.zig",
@@ -664,72 +664,72 @@
   "gemma4-train-dpo-recipe": {
    "path": "zig/pkg/inference/src/finetune/recipe.zig",
    "anchor": "fn runOptimizerBackedGemmaDpo(",
-   "line": 3661
+   "line": 3805
   },
   "gemma4-train-dpo-gate": {
    "path": "zig/pkg/inference/src/finetune/recipe.zig",
    "anchor": "fn shouldRunOptimizerBackedGemmaDpo(",
-   "line": 3426
+   "line": 3567
   },
   "gemma4-train-ce-inject": {
    "path": "zig/pkg/inference/src/finetune/gemma4_real_autodiff.zig",
    "anchor": "pub fn makeTrainerInputForLogprobCoeff(",
-   "line": 381
+   "line": 623
   },
   "gemma4-train-seq-logprob": {
    "path": "zig/pkg/inference/src/finetune/gemma4_real_autodiff.zig",
-   "anchor": "pub fn sequenceLogprobForExample(",
-   "line": 849
+   "line": 1233,
+   "anchor": "pub fn sequenceLogprobForExample("
   },
   "gemma4-train-grpo-adv": {
    "path": "zig/pkg/inference/src/finetune/grpo.zig",
    "anchor": "pub fn computeAdvantages(",
-   "line": 90
+   "line": 123
   },
   "gemma4-train-grpo-loss": {
    "path": "zig/pkg/inference/src/finetune/grpo.zig",
    "anchor": "pub fn grpoLoss(",
-   "line": 152
+   "line": 198
   },
   "gemma4-train-grpo-recipe": {
    "path": "zig/pkg/inference/src/finetune/recipe.zig",
    "anchor": "fn runOptimizerBackedGemmaGrpo(",
-   "line": 4080
+   "line": 4314
   },
   "gemma4-train-grpo-sampler": {
    "path": "zig/pkg/inference/src/finetune/recipe.zig",
    "anchor": "const DecoderGrpoSampler = struct {",
-   "line": 3222
+   "line": 3339
   },
   "gemma4-train-rank-rollout": {
    "path": "zig/pkg/inference/src/finetune/gemma4_real_autodiff.zig",
    "anchor": "pub fn sampleCompletionRanked(",
-   "line": 419
+   "line": 667
   },
   "gemma4-train-mm-grpo": {
    "path": "zig/pkg/inference/src/finetune/recipe.zig",
    "anchor": "fn runOptimizerBackedGemmaMultimodalGrpo(",
-   "line": 4549
+   "line": 4895
   },
   "gemma4-train-ref-path-guard": {
    "path": "zig/pkg/inference/src/finetune/recipe.zig",
    "anchor": "return error.UnsupportedReferencePath;",
-   "line": 4566
+   "line": 4912
   },
   "gemma4-train-reward-mode": {
    "path": "zig/pkg/inference/src/finetune/recipe.zig",
    "anchor": "return error.UnsupportedRewardMode;",
-   "line": 4077
+   "line": 4311
   },
   "gemma4-train-dpo-report": {
    "path": "zig/pkg/inference/src/finetune/recipe.zig",
    "anchor": "antfly_inference_finetune_dpo_report/v1",
-   "line": 351
+   "line": 360
   },
   "gemma4-train-grpo-report": {
    "path": "zig/pkg/inference/src/finetune/recipe.zig",
    "anchor": "antfly_inference_finetune_grpo_report/v1",
-   "line": 369
+   "line": 387
   },
   "gliner2-ft-objectives": {
    "path": "zig/pkg/inference/src/finetune/gliner2_real_autodiff.zig",
@@ -744,12 +744,12 @@
   "gliner2-ft-masked-bce": {
    "path": "zig/lib/ml/src/graph/builder.zig",
    "anchor": "pub fn maskedBceWithLogitsLoss(",
-   "line": 697
+   "line": 719
   },
   "gliner2-ft-attn-vjp": {
    "path": "zig/lib/ml/src/graph/autodiff.zig",
    "anchor": ".op = .{ .fused_disentangled_attention_backward = attrs },",
-   "line": 908
+   "line": 1171
   },
   "gliner2-ft-bwd-kernel": {
    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
@@ -779,7 +779,7 @@
   "gliner2-ft-recipe-steps": {
    "path": "zig/pkg/inference/src/finetune/recipe.zig",
    "anchor": "\"materialize-gliner2-lora\", model_path, out_dir, materialized_dir,",
-   "line": 1325
+   "line": 1418
   },
   "gliner2-ft-tensors-doc": {
    "path": "zig/pkg/inference/models/gliner2/FINETUNING.md",
@@ -854,7 +854,7 @@
   "gliner25-ft-attn-vjp": {
    "path": "zig/lib/ml/src/graph/autodiff.zig",
    "anchor": ".op = .{ .fused_deberta_training_attention_backward_v1 = attrs },",
-   "line": 947
+   "line": 1210
   },
   "gliner25-ft-dt-kernel": {
    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
