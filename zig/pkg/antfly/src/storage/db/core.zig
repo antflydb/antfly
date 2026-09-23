@@ -1107,16 +1107,16 @@ pub const DBCore = struct {
                 entry.index.stats().active_count
             else
                 null;
+            try self.index_manager.checkpointLsmWalForManagedIndex(.{
+                .name = index_name,
+                .kind = .dense_vector,
+            });
             try self.index_manager.saveDenseProjectionCheckpointMetadata(index_name, .{
                 .applied_sequence = sequence,
                 .status = checkpoint.status,
                 .generation = checkpoint.generation,
                 .config_hash = if (config_hash != 0) config_hash else checkpoint.config_hash,
                 .published_count = published_count,
-            });
-            try self.index_manager.checkpointLsmWalForManagedIndex(.{
-                .name = index_name,
-                .kind = .dense_vector,
             });
             try self.index_manager.ensureDensePostingCoverageByName(index_name, sequence);
         } else if (cfg) |value| {
@@ -1157,11 +1157,11 @@ pub const DBCore = struct {
                     checkpoint_with_identity.published_count = entry.index.stats().active_count;
                 }
             }
-            try self.index_manager.saveDenseProjectionCheckpointMetadata(index_name, checkpoint_with_identity);
             try self.index_manager.checkpointLsmWalForManagedIndex(.{
                 .name = index_name,
                 .kind = .dense_vector,
             });
+            try self.index_manager.saveDenseProjectionCheckpointMetadata(index_name, checkpoint_with_identity);
         }
         try apply_state.saveProjectionCheckpointWithSidecar(
             self.alloc,

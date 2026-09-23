@@ -1,5 +1,80 @@
 # Zig E2E flakes
 
+## 2026-09-22: #846 restore staging and #856 standby failures
+
+[Issue #846](https://github.com/antflydb/antfly/issues/846) recurred in
+[run 35780419851](https://github.com/antflydb/antfly/actions/runs/35780419851):
+the restore job stayed in `running` through attempt 15, with zero tables
+published. The retained restore log reports `RestoreValidationPending` and
+`StorageBusy` during `authority_or_owner` staging. This identifies a storage
+admission retry, but does not prove which caller held the target owner.
+
+The owner source's background maintenance took leases on *all* resident owners
+for an entire round, including slow storage work on other tables. Publication
+needs exclusive admission to the target owner; those unrelated leases can
+exhaust its five-second drain. Maintenance now leases one owner at a time.
+LSM candidate selection retains only an identity and re-leases the chosen
+owner if it is still the same generation. A deterministic owner-source test
+holds one owner's maintenance lease while publishing another owner. This
+removes one cross-table source of `StorageBusy`; the CI failure was not
+reproduced locally before the change.
+
+[Issue #856](https://github.com/antflydb/antfly/issues/856) collects distinct
+signatures, not one established cause. In the same run, two standby-startup
+tests timed out at `capture_catalog()`: its request timeout was ten seconds,
+while the server permits thirty seconds for capture preflight alone. Capture
+now gets a sixty-second request budget without replaying an uncertain POST.
+The catalog-authority test's write instead received the explicit
+locally-committed/standby-ACK-pending 503. It now uses the existing one-write
+reconciliation helper, requiring both standby apply and the primary's durable
+ACK before proceeding. Other 503 responses remain failures.
+
+The earlier relational-session failure has a separate retained server log:
+`RaftBatchWriteOutcomeUnknown` during participant BEGIN, then
+`TransactionBeginFailed`, followed by a permanent `409 decision conflict` on
+the stable session ID. Stable-ID BEGIN is idempotent for the same timestamp and
+participant set. An ambiguous BEGIN now leaves those records pending and asks
+the session to retry the same ID. It no longer sends an abort solely because a
+Raft reply was lost; actual aborted decisions still report a conflict.
+Deterministic tests cover both coordinator and follower BEGIN outcome loss.
+
+The baseline flake loop passed 16/16 targeted restore/standby cases on two
+workers and two repetitions. After the first owner-lease change, the rebuilt
+server passed 36/36 on three workers and three repetitions. A final loop with
+the transaction change passed 24/24 across restore, standby, catalog authority,
+relational sessions, and publication reply loss. These passes exercise the
+paths but do not reproduce the CI pressure.
+
+The publication-coordinator failure in run 35671650044 had a self-confirmed
+successor leader on node 1, with node 3 reporting the same term. The test's
+extra requirement for three consecutive successful status polls falsely
+reported no successor under intermittent CI status reads. Both recovery
+tests now accept the existing same-term quorum proof directly. The affected
+publication-coordinator case passed 4/4 on two workers and two repetitions;
+the mixed relational restore's native and portable crash cases passed 2/2;
+the four quorum-discovery unit cases passed. The publication-reply-loss
+failure in run 35780419851 had a healthy node-2 leader while its restore job
+remained in validation; follower `metadata leader unavailable` responses were
+symptoms rather than proof of lost leadership. The owner-lease fix removes a
+cross-table storage admission blocker on that path, but this particular
+validation stall has not been reproduced or isolated.
+
+The progressive-index restart failure in run 35780419851 loaded zero HBC
+vectors with projection checkpoint sequence 66 and 64 produced source items.
+The status API nevertheless said `queryable=true`. Readiness now compares a
+loaded dense generation with its publication count certificate, falling back
+to the existing durable coverage proof for older checkpoints that have
+produced sources. An empty new index remains serviceable; a previously
+populated index with missing physical state cannot claim queryability.
+Generic projection checkpointing also now persists index effects before
+advancing HBC projection metadata; the prior order allowed a crash to leave
+metadata ahead of its index. The restart test requires a fresh, advanced
+*shard-level* checkpoint before stopping the process and includes the
+pre-restart status in any future failure. This corrected test passed 6/6 on
+two workers and 32/32 on four workers. The original physical-vector loss has
+not been reproduced locally; the status and ordering fixes close two concrete
+unsafe paths but do not prove the CI loss had no other cause.
+
 ## 2026-09-21: #842 donor readiness and concurrent restore observations
 
 [Issue #842](https://github.com/antflydb/antfly/issues/842) failed the

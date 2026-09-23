@@ -3990,6 +3990,9 @@ pub const DBIndexStats = struct {
     projection_checkpoint_applied_sequence: u64 = 0,
     projection_checkpoint_generation: u64 = 0,
     projection_checkpoint_config_hash: u64 = 0,
+    // Internal physical publication certificate. A reopened index must not
+    // report a serving snapshot when its loaded cardinality differs.
+    projection_checkpoint_published_count: ?u64 = null,
     replay_applied_sequence: u64 = 0,
     replay_target_sequence: u64 = 0,
     source_replay: []IndexSourceReplayStatus = &.{},
