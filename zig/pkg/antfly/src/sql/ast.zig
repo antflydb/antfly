@@ -74,6 +74,10 @@ pub const Window = struct {
     pub const Frame = struct { mode: enum { rows, range, groups }, start: Bound, end: Bound = .current, exclusion: Exclusion = .no_others };
 };
 pub const Select = struct {
+    /// Compiler-owned INSERT VALUES source, bounded by max_insert_rows. Its
+    /// additional relation nodes must not raise the budget for user SQL.
+    generated_values: bool = false,
+    values_arms: []const *const Select = &.{},
     windows: []const NamedWindow = &.{},
     set_operation: ?struct { kind: SetKind, all: bool, left: *const Select, right: *const Select } = null,
     table: ?Name = null,
@@ -92,10 +96,17 @@ pub const Select = struct {
 };
 pub const NamedWindow = struct { name: []const u8, window: Window };
 pub const SetKind = enum { @"union", intersect, except };
-pub const Cte = struct { name: []const u8, columns: []const []const u8 = &.{}, query: *const Select };
+pub const Cte = struct {
+    pub const Materialization = enum { automatic, materialized, not_materialized };
+    name: []const u8,
+    columns: []const []const u8 = &.{},
+    query: *const Select,
+    recursive: bool = false,
+    materialization: Materialization = .automatic,
+};
 pub const Relation = union(enum) {
-    table: struct { name: Name, alias: ?[]const u8 = null },
-    derived: struct { query: *const Select, alias: []const u8, hidden: bool = false },
+    table: struct { name: Name, alias: ?[]const u8 = null, mutation_target: bool = false, mutation_document: bool = false, mutation_presence: bool = false },
+    derived: struct { query: *const Select, alias: []const u8, columns: []const []const u8 = &.{}, hidden: bool = false },
     join: struct { kind: JoinKind, left: *const Relation, right: *const Relation, condition: ?*const Scalar = null },
 };
 pub const JoinKind = enum { inner, left, right, full, cross };
@@ -105,36 +116,74 @@ pub const Insert = struct {
     table: Name,
     columns: []const []const u8,
     rows: []const []const Value = &.{},
+    /// Per-cell native DEFAULT markers for VALUES, including generated VALUES
+    /// sources. Omitted cells are normalized with the rest of the row image.
+    defaults: []const []const bool = &.{},
     source: ?*const Select = null,
+    /// Original literal cells retained only when VALUES subqueries are lowered
+    /// through the bounded INSERT-source path. Target binding applies the
+    /// same assignment coercion as ordinary VALUES before set type inference.
+    values_source_rows: []const []const Value = &.{},
     /// Aligned with rows/cells. Literal cells keep the direct binding path.
     expressions: []const []const ?*const Scalar = &.{},
+
+    pub fn isDefault(self: Insert, row: usize, cell: usize) bool {
+        return self.defaults.len != 0 and self.defaults[row][cell];
+    }
 };
 pub const Conflict = struct {
     columns: []const []const u8,
+    expressions: []const *const Scalar = &.{},
+    /// Optional predicate used to infer partial unique arbiters. It is distinct
+    /// from the DO UPDATE predicate, which runs only after an arbiter conflict.
+    arbiter_predicate: ?*const Scalar = null,
     assignments: []const Assignment = &.{},
     predicate: ?*const Scalar = null,
 };
-pub const Assignment = struct { field: []const u8, value: Value = .null, expression: ?*const Scalar = null };
-pub const Update = struct { table: Name, assignments: []const Assignment, predicate: ?*const Predicate = null, returning: ?[]const Projection = null };
-pub const Delete = struct { table: Name, predicate: ?*const Predicate = null, returning: ?[]const Projection = null };
+pub const Assignment = struct { field: []const u8, value: Value = .null, expression: ?*const Scalar = null, use_default: bool = false };
+pub const Update = struct { table: Name, alias: ?[]const u8 = null, source: ?*const Relation = null, ctes: []const Cte = &.{}, assignments: []const Assignment, predicate: ?*const Predicate = null, returning: ?[]const Projection = null };
+pub const Delete = struct { table: Name, alias: ?[]const u8 = null, source: ?*const Relation = null, ctes: []const Cte = &.{}, predicate: ?*const Predicate = null, returning: ?[]const Projection = null };
+pub const Merge = struct {
+    table: Name,
+    alias: ?[]const u8 = null,
+    source: *const Relation,
+    ctes: []const Cte = &.{},
+    condition: *const Scalar,
+    arms: []const Arm,
+    returning: ?[]const Projection = null,
+    pub const Arm = struct {
+        matched: bool,
+        predicate: ?*const Scalar = null,
+        action: Action,
+        pub const Action = union(enum) {
+            update: []const Assignment,
+            delete,
+            insert: struct { columns: []const []const u8, values: []const ?*const Scalar },
+            nothing,
+        };
+    };
+};
 pub const ColumnType = enum { string, integer, number, boolean, datetime, json };
 pub const Column = struct { name: []const u8, type: ColumnType, nullable: bool = true, default_value: ?Value = null };
 pub const CreateTable = struct { table: Name, columns: []const Column, constraints: []const SchemaChange = &.{}, if_not_exists: bool = false, tablespace: ?[]const u8 = null };
 pub const DropTable = struct { table: Name, if_exists: bool = false };
 pub const CatalogDdl = struct {
     kind: enum { database, namespace, tablespace, table },
-    action: enum { create, drop, rename, set_tablespace, alter_schema },
+    action: enum { create, drop, rename, set_tablespace, alter_schema, truncate },
     name: Name,
     new_name: ?[]const u8 = null,
     tablespace: ?[]const u8 = null,
     location: ?[]const u8 = null,
     conditional: bool = false,
     schema_change: ?SchemaChange = null,
+    truncate_tables: []const Name = &.{},
+    restart_identity: bool = false,
+    cascade: bool = false,
 };
 pub const SchemaChange = union(enum) {
     drop_constraint: []const u8,
     validate_constraint: []const u8,
-    add_unique: struct { name: []const u8, columns: []const []const u8, primary: bool = false },
+    add_unique: struct { name: []const u8, columns: []const []const u8, primary: bool = false, deferrable: bool = false, timing: []const u8 = "immediate" },
     add_check: struct { name: []const u8, expression: *const Scalar },
     add_foreign_key: struct {
         name: []const u8,
@@ -155,10 +204,12 @@ pub const SchemaChange = union(enum) {
     drop_default: []const u8,
 };
 pub const Statement = union(enum) {
+    explain: struct { statement: *const Statement, format: enum { text, json } = .text, verbose: bool = false },
     select: Select,
     insert: Insert,
     update: Update,
     delete: Delete,
+    merge: Merge,
     create_table: CreateTable,
     drop_table: DropTable,
     catalog_ddl: CatalogDdl,
@@ -168,4 +219,5 @@ pub const Statement = union(enum) {
     savepoint: []const u8,
     rollback_to_savepoint: []const u8,
     release_savepoint: []const u8,
+    set_constraints: struct { names: []const []const u8, deferred: bool },
 };

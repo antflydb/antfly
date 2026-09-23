@@ -178,11 +178,13 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     if (identity) |authenticated| if (!server_mod.permissionsAllow(authenticated.permissions, permission_kind, resource, .admin)) return error.Forbidden;
     if (input == .catalog_ddl and input.catalog_ddl.action == .alter_schema)
         return alterSchema(server, identity, context, alloc, target, input.catalog_ddl);
+    if (input == .catalog_ddl and input.catalog_ddl.action == .truncate)
+        return @import("sql_truncate.zig").execute(server, identity, context, database, namespace, alloc, input.catalog_ddl);
     var request: domain.Request = .{ .mutation = .{ .action = switch (input) {
         .create_table => .create,
         .drop_table => .drop,
         .catalog_ddl => |ddl| switch (ddl.action) {
-            .alter_schema => unreachable,
+            .alter_schema, .truncate => unreachable,
             inline else => |tag| @field(domain.Action, @tagName(tag)),
         },
     }, .kind = kind, .database = target.database, .namespace = target.namespace, .name = target.table } };

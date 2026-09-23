@@ -25,6 +25,16 @@ func main() {
 		{`func \(c \*Client\) ExecuteSQL\(`, "return c.Client.Do(req)", "return executeSQLRequest(c.Client, req)"},
 		{`func NewExecuteSQLRequest\(`, "json.Marshal(body)", "marshalSQLRequest(body)"},
 		{`func ParseExecuteSQLResponse\(`, "io.ReadAll(rsp.Body)", "readSQLResponseBody(rsp.Body)"},
+		{`func \(c \*Client\) PrepareSQLWithBody\(`, "return c.Client.Do(req)", "return executeSQLRequest(c.Client, req)"},
+		{`func \(c \*Client\) PrepareSQL\(`, "return c.Client.Do(req)", "return executeSQLRequest(c.Client, req)"},
+		{`func NewPrepareSQLRequest\(`, "json.Marshal(body)", "marshalSQLRequest(body)"},
+		{`func ParsePrepareSQLResponse\(`, "io.ReadAll(rsp.Body)", "readSQLResponseBody(rsp.Body)"},
+		{`func \(c \*Client\) ExecutePreparedSQLWithBody\(`, "return c.Client.Do(req)", "return executeSQLRequest(c.Client, req)"},
+		{`func \(c \*Client\) ExecutePreparedSQL\(`, "return c.Client.Do(req)", "return executeSQLRequest(c.Client, req)"},
+		{`func NewExecutePreparedSQLRequest\(`, "json.Marshal(body)", "marshalSQLRequest(body)"},
+		{`func ParseExecutePreparedSQLResponse\(`, "io.ReadAll(rsp.Body)", "readSQLResponseBody(rsp.Body)"},
+		{`func \(c \*Client\) ClosePreparedSQL\(`, "return c.Client.Do(req)", "return executeSQLRequest(c.Client, req)"},
+		{`func ParseClosePreparedSQLResponse\(`, "io.ReadAll(rsp.Body)", "readSQLResponseBody(rsp.Body)"},
 	} {
 		re := regexp.MustCompile(`(?s)` + change.function + `.*?\n}`)
 		matches := re.FindAllIndex(source, -1)

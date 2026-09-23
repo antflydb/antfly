@@ -2,6 +2,7 @@ SHELL := /bin/bash
 ZIG_MAKE := $(MAKE) -C ./zig
 ZIG_BUILD_FLAGS ?=
 SCRIPTS_PY ?= uv run --project scripts --locked python
+
 # ====================================================================================
 # Go Version Configuration
 # ====================================================================================
@@ -368,3 +369,14 @@ sdk-test: ## Run SDK tests
 
 sdk-lint: ## Run SDK linter
 	(cd ./go/pkg/sdk && $(GO) vet ./...)
+
+# Explicit SQL extraction audits; intentionally outside default build/test gates.
+.PHONY: sql-parity-inventory-check sql-parity-evidence-check sql-parity-release-check
+sql-parity-inventory-check:
+	python3 scripts/check_sql_parity_inventory.py
+
+sql-parity-evidence-check:
+	python3 scripts/check_sql_parity_inventory.py --evidence
+
+sql-parity-release-check:
+	python3 scripts/check_sql_parity_inventory.py --release

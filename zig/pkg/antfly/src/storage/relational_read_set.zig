@@ -143,7 +143,15 @@ pub const Set = struct {
             const index = (try self.selected()) orelse break;
             const source = self.row(index);
             const id = try owned.dupe(u8, source.id);
-            try rows.append(owned, .{ .id = id, .version = source.version, .schema_version = source.schema_version, .value = try typed_json.clone(owned, source.value), .sql_nulls = if (source.sql_nulls) |flags| try owned.dupe(bool, flags) else null });
+            try rows.append(owned, .{
+                .id = id,
+                .version = source.version,
+                .schema_version = source.schema_version,
+                .value = try typed_json.clone(owned, source.value),
+                .expected_content_digest = source.expected_content_digest,
+                .document = if (source.document) |document| try typed_json.clone(owned, document) else null,
+                .sql_nulls = if (source.sql_nulls) |flags| try owned.dupe(bool, flags) else null,
+            });
             try self.advance(index, id);
         }
         const more = (try self.selected()) != null;
@@ -173,6 +181,8 @@ pub const Set = struct {
 
 const Fixture = struct {
     ids: []const []const u8,
+    digest: ?[32]u8 = null,
+    document: ?std.json.Value = null,
     position: usize = 0,
     closed: bool = false,
     fetches: usize = 0,
@@ -195,7 +205,7 @@ const Fixture = struct {
         // refills and source-page release, not just a merge of two arrays.
         const count = @min(@min(limit, 1), self.ids.len - self.position);
         const result = try owned.alloc(View.Row, count);
-        for (result, 0..) |*out, offset| out.* = .{ .id = try owned.dupe(u8, self.ids[self.position + offset]), .version = 9, .schema_version = 4, .value = .{ .number_string = try owned.dupe(u8, "9007199254740993") } };
+        for (result, 0..) |*out, offset| out.* = .{ .id = try owned.dupe(u8, self.ids[self.position + offset]), .version = 9, .schema_version = 4, .value = .{ .number_string = try owned.dupe(u8, "9007199254740993") }, .expected_content_digest = self.digest, .document = self.document };
         self.position += count;
         self.fetches += 1;
         return .{ .arena = arena, .rows = result, .after = if (self.position < self.ids.len) result[count - 1].id else null };
@@ -206,6 +216,17 @@ const Fixture = struct {
         self.closed = true;
     }
 };
+
+test "relational index system coordinated read set retains mutation digest and document preimage across page release" {
+    var source: Fixture = .{ .ids = &.{"row"}, .digest = @splat(9), .document = .{ .string = "before" } };
+    const merged = try Set.create(std.testing.allocator, &.{source.view()}, false);
+    defer merged.deinit();
+    var page = try merged.next(std.testing.allocator, 1);
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+    try std.testing.expectEqual(@as(?[32]u8, @splat(9)), page.rows[0].expected_content_digest);
+    try std.testing.expectEqualStrings("before", page.rows[0].document.?.string);
+}
 
 fn mergeFixture(alloc: std.mem.Allocator) !void {
     var left: Fixture = .{ .ids = &.{ "a", "c", "e" } };

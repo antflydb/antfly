@@ -638,6 +638,49 @@ func (c *AntflyClient) ExecuteSQL(ctx context.Context, request SQLRequest) (*SQL
 	if err != nil {
 		return nil, fmt.Errorf("executing SQL: %w", err)
 	}
+	return parseSQLResponse(resp)
+}
+
+// PrepareSQL creates an owner-bound durable resource independent of transactions.
+func (c *AntflyClient) PrepareSQL(ctx context.Context, request SQLPrepareRequest) (*SQLPreparedResponse, error) {
+	resp, err := c.client.PrepareSQL(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	body, err := readSQLResourceResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var result SQLPreparedResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, err
+	}
+	if len(result.PreparedId) != 32 || result.Columns == nil || result.ParameterTypes == nil {
+		return nil, fmt.Errorf("invalid prepared SQL response")
+	}
+	return &result, nil
+}
+
+// ExecutePreparedSQL executes once using the resource's stored namespace.
+func (c *AntflyClient) ExecutePreparedSQL(ctx context.Context, preparedID string, request SQLPreparedExecutionRequest) (*SQLResponse, error) {
+	resp, err := c.client.ExecutePreparedSQL(ctx, preparedID, request)
+	if err != nil {
+		return nil, err
+	}
+	return parseSQLResponse(resp)
+}
+
+// ClosePreparedSQL releases a resource without canceling admitted executions.
+func (c *AntflyClient) ClosePreparedSQL(ctx context.Context, preparedID string) error {
+	resp, err := c.client.ClosePreparedSQL(ctx, preparedID)
+	if err != nil {
+		return err
+	}
+	_, err = readSQLResourceResponse(resp)
+	return err
+}
+
+func readSQLResourceResponse(resp *http.Response) ([]byte, error) {
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		body, truncated, err := readLimitedBody(resp.Body, maxErrorResponseBytes)
@@ -656,6 +699,14 @@ func (c *AntflyClient) ExecuteSQL(ctx context.Context, request SQLRequest) (*SQL
 	}
 	if truncated {
 		return nil, fmt.Errorf("SQL response exceeds 16 MiB")
+	}
+	return body, nil
+}
+
+func parseSQLResponse(resp *http.Response) (*SQLResponse, error) {
+	body, err := readSQLResourceResponse(resp)
+	if err != nil {
+		return nil, err
 	}
 	var result SQLResponse
 	if err := json.Unmarshal(body, &result); err != nil {

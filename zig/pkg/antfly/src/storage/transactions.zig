@@ -77,7 +77,7 @@ const read_guards_prefix = "\x00\x00__txn_read_guards__:";
 const read_members_prefix = "\x00\x00__txn_read_members__:";
 const read_admission_prefix = "\x00\x00__txn_read_admission__:";
 const read_guard_count_key = "\x00\x00__txn_read_guard_count";
-const max_read_guards_per_transaction = 65_536;
+pub const max_read_guards_per_transaction = 65_536;
 // Durable epoch leases. A prepare vote and its schema identity are one atomic
 // mutation; resolution retires both. Historical immutable schemas remain
 // usable after a new active epoch is published and after participant restart.
@@ -149,11 +149,19 @@ pub fn intentAdmissionBytes(intent: WriteIntent) !u64 {
 /// stripping serializes JSON; count its exact output with a bounded writer.
 fn isRawMetadataIntentKey(key: []const u8) bool {
     return range_protection.counterBucket(key) != null or
+        range_protection.indexCounterDigest(key) != null or
         std.mem.startsWith(u8, key, "\x00\x00__metadata__:relational_integrity:") or
         std.mem.eql(u8, key, "\x00\x00__metadata__:relational_integrity_activation") or
         std.mem.eql(u8, key, "\x00\x00__metadata__:relational_integrity_retirement") or
         std.mem.eql(u8, key, "\x00\x00__metadata__:restore_staging_owner") or
         @import("db/relational_index_maintenance_contract.zig").isControlKey(key);
+}
+
+fn isRawMetadataPredicateKey(key: []const u8) bool {
+    return isRawMetadataIntentKey(key) or
+        std.mem.eql(u8, key, @import("db/relational_index_catalog.zig").head_key) or
+        (key.len == @import("db/relational_index_jobs.zig").progress_prefix.len + range_protection.index_id_bytes and
+            std.mem.startsWith(u8, key, @import("db/relational_index_jobs.zig").progress_prefix));
 }
 
 fn retainedIntentBytes(alloc: Allocator, intent: WriteIntent) !u64 {
@@ -334,6 +342,9 @@ pub const MutationExtraBatch = struct {
     /// DB callers supply the replicated catalog policy, never local capacity.
     max_intent_admission_bytes: u64 = 0,
     preparation_allocator: ?Allocator = null,
+    /// Exact old/new index tuple spans derived under the pinned index plan.
+    /// Each prepared primary writer reserves its spans before publication.
+    index_span_digests: []const [range_protection.index_span_digest_bytes]u8 = &.{},
 };
 
 pub const SchemaBinding = struct {
@@ -645,6 +656,7 @@ pub const TxnManager = struct {
         predicates: []const VersionPredicate,
         extra_batch: MutationExtraBatch,
     ) !void {
+        if (extra_batch.index_span_digests.len > max_read_guards_per_transaction) return error.TransactionTooLarge;
         for (intents) |intent| if (intent.json_null_fields.len != 0 and intent.prepared_row == null) return error.PreparedIntentRequiresMaterialization;
         var record = try self.loadTransactionRecord(txn_id);
         if (record.status != .pending) return TxnError.DecisionConflict;
@@ -681,6 +693,7 @@ pub const TxnManager = struct {
             self.traceWriteIntentFails(txn_id, intents, "IntentConflict");
             return err;
         };
+        try self.checkIndexSpanGuardConflicts(extra_batch.index_span_digests, txn_id);
 
         const previous_admission = try self.loadIntentAdmission(self.alloc, txn_id);
         var admission = previous_admission orelse IntentAdmission{};
@@ -768,17 +781,27 @@ pub const TxnManager = struct {
         try range_reservations.appendSlice(self.alloc, predicates);
         var writer_keys: [range_protection.bucket_count][range_protection.writer_prefix.len + 2]u8 = undefined;
         var writer_buckets: std.StaticBitSet(range_protection.bucket_count) = .initEmpty();
+        const index_writer_keys = try self.alloc.alloc([range_protection.index_writer_prefix.len + range_protection.index_span_digest_bytes]u8, extra_batch.index_span_digests.len);
+        defer self.alloc.free(index_writer_keys);
         {
             var probe = try self.store.beginProbe();
             defer probe.abort();
-            if (try range_protection.isActive(&probe)) for (intents) |intent| {
-                if (std.mem.startsWith(u8, intent.key, "\x00\x00")) continue;
-                const id = range_protection.bucket(intent.key);
-                if (writer_buckets.isSet(id)) continue;
-                writer_buckets.set(id);
-                writer_keys[id] = range_protection.writerKey(id);
-                try range_reservations.append(self.alloc, .{ .key = &writer_keys[id], .expected_version = 0, .comparison = .exact_value, .expected_value = null });
-            };
+            const tracking_active = try range_protection.isActive(&probe);
+            if (!tracking_active and extra_batch.index_span_digests.len != 0) return error.SqlRangeTrackingRequired;
+            if (tracking_active) {
+                for (intents) |intent| {
+                    if (std.mem.startsWith(u8, intent.key, "\x00\x00")) continue;
+                    const id = range_protection.bucket(intent.key);
+                    if (writer_buckets.isSet(id)) continue;
+                    writer_buckets.set(id);
+                    writer_keys[id] = range_protection.writerKey(id);
+                    try range_reservations.append(self.alloc, .{ .key = &writer_keys[id], .expected_version = 0, .comparison = .exact_value, .expected_value = null });
+                }
+                for (extra_batch.index_span_digests, 0..) |digest, i| {
+                    index_writer_keys[i] = range_protection.indexWriterKey(digest);
+                    try range_reservations.append(self.alloc, .{ .key = &index_writer_keys[i], .expected_version = 0, .comparison = .exact_value, .expected_value = null });
+                }
+            }
         }
         const read_admission = try self.stageReadGuards(txn_id, range_reservations.items, &last_intents, &write_keys, &write_vals, &writes);
         const total_bytes = std.math.add(u64, admission.bytes, read_admission.next.bytes) catch return error.TransactionTooLarge;
@@ -1359,6 +1382,15 @@ pub const TxnManager = struct {
         return (try self.listTransactionsPage(alloc, null, std.math.maxInt(usize))).items;
     }
 
+    /// Index READY publication needs to drain outstanding row intents, not
+    /// idle/read-only sessions or already resolved HA outboxes. Admission and
+    /// publication are serialized by the DB apply fence.
+    pub fn hasPendingIntents(self: *TxnManager) !bool {
+        var read = try self.store.beginRead();
+        defer read.abort();
+        return readHasPrefix(&read, intents_prefix);
+    }
+
     /// Returns whether a topology transition would strand transaction state.
     /// This stays allocation-free and uses a single backend read snapshot:
     /// transitions are cold-path operations, but retained terminal decisions
@@ -1762,7 +1794,7 @@ pub const TxnManager = struct {
                     }
                 },
                 .exact_value => {
-                    if (!isRawMetadataIntentKey(pred.key)) return error.InvalidArgument;
+                    if (!isRawMetadataPredicateKey(pred.key)) return error.InvalidArgument;
                     if (range_protection.counterBucket(pred.key)) |id| {
                         var probe = try self.store.beginProbe();
                         defer probe.abort();
@@ -1772,6 +1804,17 @@ pub const TxnManager = struct {
                         var cursor = try read.openCursor();
                         defer cursor.close();
                         const writer_key = range_protection.writerKey(id);
+                        try self.checkReadGuardCursor(&cursor, &writer_key, exclude_txn);
+                    }
+                    if (range_protection.indexCounterDigest(pred.key)) |digest| {
+                        var probe = try self.store.beginProbe();
+                        defer probe.abort();
+                        if (!try range_protection.isActive(&probe)) return error.SqlRangeTrackingRequired;
+                        var read = try self.store.beginCurrentScan();
+                        defer read.abort();
+                        var cursor = try read.openCursor();
+                        defer cursor.close();
+                        const writer_key = range_protection.indexWriterKey(digest);
                         try self.checkReadGuardCursor(&cursor, &writer_key, exclude_txn);
                     }
                     const current = self.getAlloc(self.alloc, pred.key) catch |err| switch (err) {
@@ -1899,6 +1942,41 @@ pub const TxnManager = struct {
                 const counter = range_protection.counterKey(id);
                 try self.checkReadGuardCursor(&cursor, &counter, null);
             }
+        }
+    }
+
+    /// Forward-index effects are computed under the DB apply fence after the
+    /// final row image is known. Check their exact tuple spans before the same
+    /// atomic batch publishes the primary and index records.
+    pub fn checkIndexForwardWriteConflicts(self: *TxnManager, physical_keys: []const []const u8) !void {
+        if (physical_keys.len == 0 or try self.readGuardCount() == 0) return;
+        var scan = try self.store.beginCurrentScan();
+        defer scan.abort();
+        var cursor = try scan.openCursor();
+        defer cursor.close();
+        var seen = std.AutoHashMapUnmanaged([range_protection.index_span_digest_bytes]u8, void).empty;
+        defer seen.deinit(self.alloc);
+        for (physical_keys) |key| {
+            const digest = (try range_protection.indexSpanDigest(key)) orelse continue;
+            if ((try seen.getOrPut(self.alloc, digest)).found_existing) continue;
+            const counter = range_protection.indexCounterKey(digest);
+            try self.checkReadGuardCursor(&cursor, &counter, null);
+        }
+    }
+
+    fn checkIndexSpanGuardConflicts(
+        self: *TxnManager,
+        digests: []const [range_protection.index_span_digest_bytes]u8,
+        exclude_txn: ?TxnId,
+    ) !void {
+        if (digests.len == 0 or try self.readGuardCount() == 0) return;
+        var scan = try self.store.beginCurrentScan();
+        defer scan.abort();
+        var cursor = try scan.openCursor();
+        defer cursor.close();
+        for (digests) |digest| {
+            const counter = range_protection.indexCounterKey(digest);
+            try self.checkReadGuardCursor(&cursor, &counter, exclude_txn);
         }
     }
 
@@ -3663,6 +3741,53 @@ test "transaction activated range guards fence pending writers without serializi
     try manager.checkOrdinaryWriteConflict("different-bucket");
     try manager.resolveIntents(reader, .aborted, 3);
     try manager.checkOrdinaryWriteConflict("absent-phantom");
+    try std.testing.expectEqual(@as(u64, 0), try manager.readGuardCount());
+}
+
+test "transaction index span guards fence pending and later writers without blocking disjoint tuples" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    var manager = try TxnManager.init(alloc, &store);
+    defer manager.deinit();
+    try store.put(range_protection.activation_key, range_protection.activation_value);
+    const writer: TxnId = @splat(101);
+    const reader: TxnId = @splat(102);
+    const unrelated: TxnId = @splat(103);
+    const later_writer: TxnId = @splat(104);
+    try manager.initTransaction(writer, 1);
+    try manager.initTransaction(reader, 1);
+    try manager.initTransaction(unrelated, 1);
+    try manager.initTransaction(later_writer, 1);
+    var component: std.ArrayList(u8) = .empty;
+    defer component.deinit(alloc);
+    try internal_keys.appendDocumentPrefix(&component, alloc, "primary");
+    var forward: std.ArrayList(u8) = .empty;
+    defer forward.deinit(alloc);
+    const forward_prefix = try @import("db/relational_index_records.zig").forwardPrefix(.{ .generation = 7, .slot = 2 });
+    try forward.appendSlice(alloc, &forward_prefix);
+    try forward.appendSlice(alloc, &.{ 0x80, 'x', 0, 0 });
+    try forward.appendSlice(alloc, component.items[1..]);
+    var footer: [4]u8 = undefined;
+    std.mem.writeInt(u32, &footer, @intCast(component.items.len - 1), .big);
+    try forward.appendSlice(alloc, &footer);
+    const span = (try range_protection.indexSpanDigest(forward.items)).?;
+    const other_span: [range_protection.index_span_digest_bytes]u8 = @splat(8);
+    const counter = range_protection.indexCounterKey(span);
+    const proof: VersionPredicate = .{ .key = &counter, .expected_version = 0, .comparison = .exact_value, .expected_value = null };
+    try manager.writeIntentsExtraBatch(writer, &.{.{ .key = "primary", .value = "{}" }}, &.{}, .{ .index_span_digests = &.{span} });
+    try std.testing.expectError(error.IntentConflict, manager.writeIntents(reader, &.{}, &.{proof}));
+    try manager.resolveIntents(writer, .aborted, 2);
+    try manager.writeIntents(reader, &.{}, &.{proof});
+    try std.testing.expectError(error.IntentConflict, manager.checkIndexForwardWriteConflicts(&.{forward.items}));
+    try std.testing.expectError(error.IntentConflict, manager.writeIntentsExtraBatch(later_writer, &.{.{ .key = "another", .value = "{}" }}, &.{}, .{ .index_span_digests = &.{span} }));
+    try manager.writeIntentsExtraBatch(unrelated, &.{.{ .key = "another", .value = "{}" }}, &.{}, .{ .index_span_digests = &.{other_span} });
+    try manager.resolveIntents(reader, .aborted, 3);
+    try manager.checkIndexForwardWriteConflicts(&.{forward.items});
+    try manager.resolveIntents(unrelated, .aborted, 3);
+    try manager.resolveIntents(later_writer, .aborted, 3);
     try std.testing.expectEqual(@as(u64, 0), try manager.readGuardCount());
 }
 

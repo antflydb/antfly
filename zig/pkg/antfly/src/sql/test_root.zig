@@ -15,6 +15,8 @@
 test {
     _ = @import("window_test.zig");
     _ = @import("subquery_test.zig");
+    _ = @import("recursive_test.zig");
+    _ = @import("merge_test.zig");
     _ = @import("aggregate_binding.zig");
     _ = @import("compiler.zig");
     _ = @import("scalar.zig");

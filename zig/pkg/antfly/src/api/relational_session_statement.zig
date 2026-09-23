@@ -88,7 +88,7 @@ pub fn validate(server: anytype, alloc: std.mem.Allocator, previous: ?*const ses
     defer before.deinit(alloc);
     const staged = try before.distributedTables(alloc);
     defer alloc.free(staged);
-    var prepared = try integrity.prepareSessionStatement(alloc, server.table_reads orelse return error.IntegrityCatalogUnavailable, snapshot.tables, snapshot.ranges, staged, incoming, context);
+    var prepared = try integrity.prepareSessionStatementWithTiming(alloc, server.table_reads orelse return error.IntegrityCatalogUnavailable, snapshot.tables, snapshot.ranges, staged, incoming, context, candidate.constraint_timing.items);
     defer prepared.deinit();
     try server.authorizeAndBindIntegrityMutations(alloc, context, prepared.tables, candidate);
     try server.validateCommitTablesAgainstSchema(context, prepared.tables);

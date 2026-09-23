@@ -10347,8 +10347,8 @@ pub const DB = struct {
         const scoped_restore_ha_apply = opts.ha_applied_lsn_marker != null and effective_req.restore_staging_scope != null and opts.restore_staging == null;
         const live_ha_apply = opts.ha_applied_lsn_marker != null and effective_req.restore_staging_scope == null and opts.restore_staging == null;
         if (opts.transaction_resolution == null and !scoped_restore_ha_apply and !live_ha_apply) {
-            for (effective_ops.writes) |write| if (isProtectedIntegrityKey(write.key)) return error.InvalidIntegrityOperation;
-            for (effective_ops.deletes) |key| if (isProtectedIntegrityKey(key)) return error.InvalidIntegrityOperation;
+            for (effective_ops.writes) |write| if (isProtectedIntegrityKey(write.key) or isProtectedRangeWriteKey(write.key)) return error.InvalidIntegrityOperation;
+            for (effective_ops.deletes) |key| if (isProtectedIntegrityKey(key) or isProtectedRangeWriteKey(key)) return error.InvalidIntegrityOperation;
             if (hasCoordinatedConstraints(request_schema_view) and opts.restore_staging == null and req.split_replication == null and req.merge_replication == null and (effective_ops.writes.len != 0 or effective_ops.deletes.len != 0))
                 return error.ForeignKeyCoordinationRequired;
         }
@@ -12007,6 +12007,19 @@ pub const DB = struct {
         try delete_keys.appendSlice(self.alloc, opts.extra_store_deletes);
         if (index_stage) |*stage| {
             const effects = try stage.seal();
+            if (opts.transaction_resolution == null and !live_ha_apply and !scoped_restore_ha_apply) {
+                var forward_keys = std.ArrayListUnmanaged([]const u8).empty;
+                defer forward_keys.deinit(self.alloc);
+                for (effects.writes) |effect| if (relational_index_records.isForwardKey(effect.key))
+                    try forward_keys.append(self.alloc, effect.key);
+                for (effects.deletes) |key| if (relational_index_records.isForwardKey(key))
+                    try forward_keys.append(self.alloc, key);
+                if (forward_keys.items.len != 0) {
+                    var manager = try self.core.initTxnManager();
+                    defer manager.deinit();
+                    try manager.checkIndexForwardWriteConflicts(forward_keys.items);
+                }
+            }
             try store_writes.appendSlice(self.alloc, effects.writes);
             try delete_keys.appendSlice(self.alloc, effects.deletes);
         }
@@ -23032,11 +23045,11 @@ pub const DB = struct {
             if (view.version() != progress.schema_version or !std.mem.eql(u8, &progress.generation_set, &activation.generationSet(bindings))) return error.ConstraintRetirementChanged;
             var fields = std.ArrayList([]const u8).empty;
             var selected = std.StringHashMapUnmanaged(void).empty;
-            if (public_schema.unique_constraints) |definitions| for (definitions.value) |definition| {
+            for (try public_schema.relationalUniqueDefinitions(owned)) |definition| {
                 const binding = bindings.find(.unique, definition.name) orelse return error.IntegrityCatalogChanged;
                 if (progress.phase != .unique or !progress.includes(binding.generation)) continue;
-                for (definition.columns) |column| if (!(try selected.getOrPut(owned, column)).found_existing) try fields.append(owned, column);
-            };
+                for (try @import("../../schema/relational_declarations.zig").uniqueFields(owned, view.tableSchema().*, view.physicalLayout(), definition)) |column| if (!(try selected.getOrPut(owned, column)).found_existing) try fields.append(owned, column);
+            }
             if (public_schema.foreign_keys) |definitions| for (definitions.value) |definition| {
                 const binding = bindings.find(.foreign_key, definition.name) orelse return error.IntegrityCatalogChanged;
                 if (progress.phase != .foreign_keys or !progress.includes(binding.generation)) continue;
@@ -26843,7 +26856,7 @@ pub const DB = struct {
         var view = try self.acquireTransactionSchemaView(preparation_alloc, binding);
         defer if (view) |*pinned| pinned.release();
         for (intents) |intent| {
-            if (isProtectedIntegrityKey(intent.key)) return error.InvalidIntegrityOperation;
+            if (isProtectedIntegrityKey(intent.key) or isProtectedRangeWriteKey(intent.key)) return error.InvalidIntegrityOperation;
             if (hasCoordinatedConstraints(view) and !isMetadataKey(intent.key)) return error.ForeignKeyCoordinationRequired;
         }
         for (predicates) |predicate| if (isProtectedIntegrityKey(predicate.key)) return error.InvalidIntegrityOperation;
@@ -26862,9 +26875,12 @@ pub const DB = struct {
             try @import("relational_integrity_topology.zig").admitPrepare(&topology_read, &topology_manager, preparation_alloc, txn_id);
         }
         try self.failIfIdentityOrdinalExhaustedForNewUpserts(identity_upsert_keys.items);
+        const index_spans = try self.collectIndexSpanReservations(preparation_alloc, prepared_intents, view);
+        defer if (index_spans.len != 0) preparation_alloc.free(index_spans);
         try self.core.writeIntentsExtraBatch(txn_id, prepared_intents, predicates, .{
             .preparation_allocator = preparation_alloc,
             .schema_binding = .{ .version = if (view) |pinned| pinned.version() else null },
+            .index_span_digests = index_spans,
         });
     }
 
@@ -26958,7 +26974,7 @@ pub const DB = struct {
         defer predicates.deinit(preparation_alloc);
 
         for (effective_ops.writes) |write| {
-            if (isProtectedIntegrityKey(write.key)) return error.InvalidIntegrityOperation;
+            if (isProtectedIntegrityKey(write.key) or isProtectedRangeWriteKey(write.key)) return error.InvalidIntegrityOperation;
             try intents.append(preparation_alloc, .{
                 .key = write.key,
                 .value = write.value,
@@ -26966,7 +26982,7 @@ pub const DB = struct {
             });
         }
         for (effective_ops.deletes) |key| {
-            if (isProtectedIntegrityKey(key)) return error.InvalidIntegrityOperation;
+            if (isProtectedIntegrityKey(key) or isProtectedRangeWriteKey(key)) return error.InvalidIntegrityOperation;
             try intents.append(preparation_alloc, .{
                 .key = key,
                 .value = null,
@@ -26984,19 +27000,28 @@ pub const DB = struct {
         // These internal observations address this exact owner's metadata,
         // never document keyspace. The coordinator routes them by owner fence.
         const tracking = @import("../range_protection.zig");
-        if (req.range_guards.len > tracking.bucket_count) return error.TransactionTooLarge;
+        if (req.range_guards.len > @import("../../api/range_read_guards.zig").max_proofs) return error.TransactionTooLarge;
         const range_keys = try preparation_alloc.alloc([tracking.counter_prefix.len + 2]u8, req.range_guards.len);
         defer preparation_alloc.free(range_keys);
+        const index_range_keys = try preparation_alloc.alloc([tracking.index_counter_prefix.len + tracking.index_span_digest_bytes]u8, req.range_guards.len);
+        defer preparation_alloc.free(index_range_keys);
         const range_values = try preparation_alloc.alloc([8]u8, req.range_guards.len);
         defer preparation_alloc.free(range_values);
         var observed_buckets = std.StaticBitSet(tracking.bucket_count).initEmpty();
         for (req.range_guards, 0..) |guard, i| {
-            if (guard.bucket >= tracking.bucket_count or observed_buckets.isSet(guard.bucket)) return error.InvalidBatchRequest;
-            observed_buckets.set(guard.bucket);
-            range_keys[i] = tracking.counterKey(guard.bucket);
+            tracking.validateProof(guard) catch return error.InvalidBatchRequest;
+            const key: []const u8 = if (guard.index) |span| blk: {
+                index_range_keys[i] = tracking.indexCounterKey(span.digest);
+                break :blk &index_range_keys[i];
+            } else blk: {
+                if (observed_buckets.isSet(guard.bucket)) return error.InvalidBatchRequest;
+                observed_buckets.set(guard.bucket);
+                range_keys[i] = tracking.counterKey(guard.bucket);
+                break :blk &range_keys[i];
+            };
             if (guard.generation) |generation| std.mem.writeInt(u64, &range_values[i], generation, .little);
             try predicates.append(preparation_alloc, .{
-                .key = &range_keys[i],
+                .key = key,
                 .expected_version = 0,
                 .comparison = .exact_value,
                 .expected_value = if (guard.generation != null) &range_values[i] else null,
@@ -27024,6 +27049,55 @@ pub const DB = struct {
             const view = prepared_schema_view orelse return error.InvalidRelationalRowsRequest;
             if (view.storageMode() != .relational) return error.InvalidRelationalRowsRequest;
             if (view.version() != version) return error.PreparedGenerationChanged;
+        }
+        // Exact index-span proofs remain valid only while the observed READY
+        // generation is the current catalog generation. Fence all three
+        // pieces of that state in the same prepare as the span counter.
+        var range_metadata_buffers: std.ArrayList([]u8) = .empty;
+        defer {
+            for (range_metadata_buffers.items) |bytes| preparation_alloc.free(bytes);
+            range_metadata_buffers.deinit(preparation_alloc);
+        }
+        const CaptureMetadata = struct {
+            fn add(alloc: Allocator, buffers: *std.ArrayList([]u8), output: *std.ArrayListUnmanaged(transactions_mod.VersionPredicate), read: anytype, key: []const u8) !void {
+                try buffers.ensureUnusedCapacity(alloc, 2);
+                const owned_key = try alloc.dupe(u8, key);
+                buffers.appendAssumeCapacity(owned_key);
+                const raw = read.get(key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                const value = if (raw) |bytes| try alloc.dupe(u8, bytes) else null;
+                if (value) |bytes| buffers.appendAssumeCapacity(bytes);
+                try output.append(alloc, .{ .key = owned_key, .comparison = .exact_value, .expected_value = value });
+            }
+        };
+        var guarded_indexes: std.AutoHashMapUnmanaged([tracking.index_id_bytes]u8, void) = .empty;
+        defer guarded_indexes.deinit(preparation_alloc);
+        var index_plan: ?@import("relational_index_catalog.zig").WriteSnapshot = null;
+        defer if (index_plan) |*plan| plan.deinit();
+        var index_read: ?docstore_mod.DocStore.Txn = null;
+        defer if (index_read) |*read| read.abort();
+        for (req.range_guards) |guard| {
+            const span = guard.index orelse continue;
+            const seen = try guarded_indexes.getOrPut(preparation_alloc, span.id);
+            if (seen.found_existing) continue;
+            if (index_plan == null) {
+                index_plan = self.core.relational_indexes.acquire() orelse return error.PreparedGenerationChanged;
+                index_read = try self.core.store.beginProbeTxn();
+                const head_raw = try index_read.?.get(@import("relational_index_catalog.zig").head_key);
+                if (!(try @import("relational_index_catalog.zig").Head.decode(head_raw)).eql(index_plan.?.head)) return error.PreparedGenerationChanged;
+                try CaptureMetadata.add(preparation_alloc, &range_metadata_buffers, &predicates, &index_read.?, @import("relational_index_catalog.zig").head_key);
+            }
+            const index = for (index_plan.?.plan.boundIndexes()) |candidate| {
+                const candidate_id = candidate.id().encode();
+                if (std.mem.eql(u8, &candidate_id, &span.id)) break candidate;
+            } else return error.PreparedGenerationChanged;
+            if ((try relational_index_jobs.status(&index_read.?, index)).state != .ready) return error.RelationalIndexNotReady;
+            const progress_key = relational_index_jobs.progressKey(index.id());
+            const control_key = @import("relational_index_maintenance_contract.zig").controlKey(index.id());
+            try CaptureMetadata.add(preparation_alloc, &range_metadata_buffers, &predicates, &index_read.?, &progress_key);
+            try CaptureMetadata.add(preparation_alloc, &range_metadata_buffers, &predicates, &index_read.?, &control_key);
         }
         defer freePreparedIntentRows(preparation_alloc, intents.items);
         try self.prepareTransactionRows(preparation_alloc, intents.items, prepared_schema_view);
@@ -27168,6 +27242,8 @@ pub const DB = struct {
         }
         try self.validateTransformReadSnapshot(transform_snapshot);
         try self.failIfIdentityOrdinalExhaustedForNewUpserts(identity_upsert_keys.items);
+        const index_spans = try self.collectIndexSpanReservations(preparation_alloc, intents.items, prepared_schema_view);
+        defer if (index_spans.len != 0) preparation_alloc.free(index_spans);
         if (raft_entry) |identity| {
             switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(preparation_alloc, self.core.store), identity)) {
                 .already_applied => return,
@@ -27179,12 +27255,13 @@ pub const DB = struct {
                 txn_id,
                 intents.items,
                 predicates.items,
-                .{ .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc },
+                .{ .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans },
             );
         } else {
             try self.core.writeIntentsExtraBatch(txn_id, intents.items, predicates.items, .{
                 .preparation_allocator = preparation_alloc,
                 .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null },
+                .index_span_digests = index_spans,
             });
         }
     }
@@ -27210,6 +27287,15 @@ pub const DB = struct {
             std.mem.eql(u8, key, @import("relational_integrity_handoff.zig").prune_key);
     }
 
+    fn isProtectedRangeWriteKey(key: []const u8) bool {
+        const protection = @import("../range_protection.zig");
+        return std.mem.eql(u8, key, protection.activation_key) or
+            std.mem.startsWith(u8, key, protection.counter_prefix) or
+            std.mem.startsWith(u8, key, protection.writer_prefix) or
+            std.mem.startsWith(u8, key, protection.index_counter_prefix) or
+            std.mem.startsWith(u8, key, protection.index_writer_prefix);
+    }
+
     fn hasCoordinatedConstraints(view: ?schema_registry_mod.SchemaView) bool {
         const validator = (view orelse return false).validator() orelse return false;
         return (if (validator.schema.unique_constraints) |constraints| constraints.value.len != 0 else false) or
@@ -27231,6 +27317,73 @@ pub const DB = struct {
             alloc.free(@constCast(row));
             alloc.free(@constCast(intent.value.?));
         };
+    }
+
+    /// Called under apply after row preparation. Prior reverse companions are
+    /// the authoritative old tuples, including retired generations; the pinned
+    /// plan produces candidate tuples from canonical AROW without reparsing JSON.
+    /// Reserve both sides before publishing a primary intent so an empty index
+    /// equality read cannot pass between prepare and index-effect commit.
+    fn collectIndexSpanReservations(
+        self: *DB,
+        alloc: Allocator,
+        intents: []const transactions_mod.WriteIntent,
+        schema_view: ?schema_registry_mod.SchemaView,
+    ) ![]const [@import("../range_protection.zig").index_span_digest_bytes]u8 {
+        const protection = @import("../range_protection.zig");
+        const view = schema_view orelse return &.{};
+        if (view.storageMode() != .relational) return &.{};
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        if (!try protection.isActive(&read)) return &.{};
+        var plan_snapshot = self.core.relational_indexes.acquire();
+        defer if (plan_snapshot) |*pinned_plan| pinned_plan.deinit();
+        if (plan_snapshot) |pinned_plan| if (pinned_plan.plan.schemaView().epoch != view.epoch) return error.PreparedGenerationChanged;
+        var index_keys: ?relational_index_plans.Batch = if (plan_snapshot) |pinned_plan| relational_index_plans.Batch.init(alloc, pinned_plan.plan) else null;
+        defer if (index_keys) |*keys| keys.deinit();
+        var seen = std.AutoHashMapUnmanaged([protection.index_span_digest_bytes]u8, void).empty;
+        defer seen.deinit(alloc);
+        var spans = std.ArrayListUnmanaged([protection.index_span_digest_bytes]u8).empty;
+        errdefer spans.deinit(alloc);
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        var prefix = std.ArrayList(u8).empty;
+        defer prefix.deinit(alloc);
+        var inspected: usize = 0;
+        for (intents) |intent| {
+            if (isMetadataKey(intent.key)) continue;
+            prefix.clearRetainingCapacity();
+            try internal_keys.appendDocumentPrefix(&prefix, alloc, intent.key);
+            try prefix.append(alloc, internal_keys.relational_index_reverse_kind);
+            var entry = try cursor.seekAtOrAfter(prefix.items);
+            while (entry) |record| : (entry = try cursor.next()) {
+                if (!std.mem.startsWith(u8, record.key, prefix.items)) break;
+                inspected = std.math.add(usize, inspected, 1) catch return error.TransactionTooLarge;
+                if (inspected > transactions_mod.max_read_guards_per_transaction) return error.TransactionTooLarge;
+                const reverse = try relational_index_records.parseReverseKey(record.key);
+                const tuple = try relational_index_records.reverseTuple(record.key, record.value);
+                const digest = try protection.indexTupleSpanDigest(reverse.id.encode(), tuple);
+                if (!(try seen.getOrPut(alloc, digest)).found_existing) {
+                    if (spans.items.len == transactions_mod.max_read_guards_per_transaction) return error.TransactionTooLarge;
+                    try spans.append(alloc, digest);
+                }
+            }
+            if (intent.prepared_row) |encoded_row| if (index_keys) |*keys| {
+                keys.reset();
+                const row = try relational_row_codec.ordinalRowViewTrusted(encoded_row, view.tableSchema().*, view.physicalLayout());
+                const position = try keys.append(row);
+                for (keys.view.boundIndexes(), 0..) |index, i| {
+                    const candidate = try keys.key(position, i);
+                    if (!candidate.member) continue;
+                    const digest = try protection.indexTupleSpanDigest(index.id().encode(), candidate.bytes);
+                    if (!(try seen.getOrPut(alloc, digest)).found_existing) {
+                        if (spans.items.len == transactions_mod.max_read_guards_per_transaction) return error.TransactionTooLarge;
+                        try spans.append(alloc, digest);
+                    }
+                }
+            };
+        }
+        return try spans.toOwnedSlice(alloc);
     }
 
     fn prepareTransactionRows(
@@ -37194,11 +37347,21 @@ pub const DB = struct {
             }
         }
         if (self.core.table_catalog.row_count != 0) return error.RestoreStagingTargetNotEmpty;
+        if (scope.empty_generation) {
+            // These global secondary records lie outside document identity's
+            // user-key proof. A fresh generation must not inherit claims or
+            // ordered-index entries even if a corrupt counter says zero.
+            var cursor = try txn.openPhysicalCursorAdapter();
+            defer cursor.close();
+            for ([_][]const u8{ @import("relational_integrity_contract.zig").namespace, @import("relational_index_records.zig").forward_namespace, @import("relational_index_records.zig").ownership_namespace }) |prefix| {
+                if (try cursor.seekAtOrAfter(prefix)) |entry| if (std.mem.startsWith(u8, entry.key, prefix)) return error.RestoreStagingTargetNotEmpty;
+            }
+        }
         const schema_bytes = try schema_mod.serializeSchema(alloc, self.core.schema orelse .{});
         defer alloc.free(schema_bytes);
         if (!std.mem.eql(u8, &staging.digest(schema_bytes), &scope.target_schema_digest)) return error.RestoreStagingScopeChanged;
         var initial_identity_summary: ?doc_identity.VisibilitySummary = null;
-        if (scope.preserve_artifacts) {
+        if (scope.preserve_artifacts or scope.empty_generation) {
             // Native cache pages precede primary rows. Bind a proven-pristine
             // identity root and exact zero cardinality before those artifacts
             // make an absent visibility summary ambiguous. Keep these facts
@@ -37223,7 +37386,7 @@ pub const DB = struct {
                 try txn.put(@import("relational_integrity_activation.zig").key, coverage);
             }
         }
-        const initial = try (staging.Progress{ .scope = scope, .rewrite = if (scope.rewrite) |rewrite| .{ .sequence = rewrite.retained_start } else null }).encode(alloc);
+        const initial = try (staging.Progress{ .scope = scope, .phase = if (scope.empty_generation) .imported else .importing, .rewrite = if (scope.rewrite) |rewrite| .{ .sequence = rewrite.retained_start } else null }).encode(alloc);
         defer alloc.free(initial);
         try txn.put(staging.key, initial);
         try self.stageRestoreStagingHAOutbox(&txn, ha_payload);
@@ -37256,7 +37419,7 @@ pub const DB = struct {
     }
 
     pub fn prepareRestoreStagingPage(self: *DB, alloc: Allocator, scope: @import("restore_staging.zig").Scope, source: *DB, max_rows: usize, cancellation: types.CancellationToken) !@import("restore_staging.zig").PreparedPage {
-        if (scope.rewrite != null) return error.InvalidRestoreStagingCommand;
+        if (scope.rewrite != null or scope.empty_generation) return error.InvalidRestoreStagingCommand;
         return self.prepareRestoreStagingPageInternal(alloc, scope, source, max_rows, cancellation, null);
     }
 
@@ -39422,7 +39585,25 @@ pub const DB = struct {
         session.filter_context = filter;
         session.destroy_filter = Filter.destroy;
         errdefer session.reader.deinit();
-        if (opts.include_range_proofs) session.range_proofs = try @import("../range_protection.zig").capture(alloc, &session.reader.read, from_key, to_key);
+        if (opts.include_range_proofs) {
+            const tracking = @import("../range_protection.zig");
+            if (session.reader.index) |index| {
+                const prefix = try @import("relational_index_records.zig").forwardPrefix(index.id());
+                const next = if (parsed.value.after == null and lower != null and upper != null and
+                    lower.?.inclusive and upper.?.inclusive and
+                    lower.?.values.len == index.tuple.keys.len and upper.?.values.len == index.tuple.keys.len and
+                    std.mem.startsWith(u8, session.reader.lower, &prefix) and session.reader.lower.len > prefix.len)
+                    try internal_keys.nextPrefixAlloc(scratch, session.reader.lower)
+                else
+                    null;
+                if (next) |exclusive_end| {
+                    if (std.mem.eql(u8, exclusive_end, session.reader.upper)) {
+                        session.range_proofs = try tracking.captureIndex(alloc, &session.reader.read, index.id().encode(), session.reader.lower[prefix.len..]);
+                    }
+                }
+            }
+            if (session.range_proofs == null) session.range_proofs = try tracking.capture(alloc, &session.reader.read, from_key, to_key);
+        }
         return session;
     }
 
@@ -54766,6 +54947,13 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
     }
     if (index_stage) |*stage| {
         const effects = try stage.seal();
+        var forward_keys = std.ArrayListUnmanaged([]const u8).empty;
+        defer forward_keys.deinit(ctx.alloc);
+        for (effects.writes) |effect| if (relational_index_records.isForwardKey(effect.key))
+            try forward_keys.append(ctx.alloc, effect.key);
+        for (effects.deletes) |key| if (relational_index_records.isForwardKey(key))
+            try forward_keys.append(ctx.alloc, key);
+        try manager.checkIndexForwardWriteConflicts(forward_keys.items);
         try store_writes.appendSlice(ctx.alloc, effects.writes);
         try delete_keys.appendSlice(ctx.alloc, effects.deletes);
     }

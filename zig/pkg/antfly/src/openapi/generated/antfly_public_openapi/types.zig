@@ -10980,7 +10980,7 @@ pub const SQLColumnType = enum {
     }
 };
 
-/// Durable DDL declaration receipt. Pending or invalid means the declaration committed but validation has not established an active constraint. Do not replay it. Inspect table constraint status using this immutable table identity and schema generation; a later generation supersedes this receipt.
+/// Durable DDL declaration receipt. admission_unknown means admission has not been confirmed; reconcile restore_job_id without replaying DDL. Pending or invalid means the declaration committed but validation has not established an active constraint. Do not replay it. Inspect table constraint status using this immutable table identity and schema generation; a later generation supersedes this receipt.
 pub const SQLDDLReceipt = struct {
     database: []const u8,
     namespace: []const u8,
@@ -10989,7 +10989,7 @@ pub const SQLDDLReceipt = struct {
     schema_version: i64,
     state: SQLDDLReceiptState,
     diagnostic: ?[]const u8 = null,
-    /// Native restore job for an atomic schema rewrite. Until publication table_id identifies the source generation. Poll the restore job; do not replay this DDL.
+    /// Native staging job for an atomic schema rewrite or TRUNCATE generation barrier. table_id identifies the source generation. Poll the job; pending or admission_unknown is not completed DDL and must not be replayed.
     restore_job_id: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -11042,12 +11042,14 @@ pub const SQLDDLReceiptState = enum {
     ready,
     pending,
     invalid,
+    admission_unknown,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .ready => "ready",
             .pending => "pending",
             .invalid => "invalid",
+            .admission_unknown => "admission_unknown",
         };
         try jw.write(s);
     }
@@ -11061,6 +11063,7 @@ pub const SQLDDLReceiptState = enum {
             .{ "ready", .ready },
             .{ "pending", .pending },
             .{ "invalid", .invalid },
+            .{ "admission_unknown", .admission_unknown },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -11153,6 +11156,90 @@ pub const SQLMutationOutcome = enum {
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
+};
+
+pub const SQLPrepareRequest = struct {
+    statement: []const u8,
+    database: ?[]const u8 = null,
+    namespace: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "statement", "statement", false },
+        .{ "database", "database", true },
+        .{ "namespace", "namespace", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("statement");
+        try jw.write(self.statement);
+        if (self.database) |value| {
+            try jw.objectField("database");
+            try jw.write(value);
+        }
+        if (self.namespace) |value| {
+            try jw.objectField("namespace");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const SQLPreparedExecutionRequest = struct {
+    parameters: ?[]const std.json.Value = null,
+    limit: ?i64 = null,
+    /// Optional durable transaction session, independent of the prepared resource lifetime.
+    session_id: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "parameters", "parameters", true },
+        .{ "limit", "limit", true },
+        .{ "session_id", "session_id", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.parameters) |value| {
+            try jw.objectField("parameters");
+            try jw.write(value);
+        }
+        if (self.limit) |value| {
+            try jw.objectField("limit");
+            try jw.write(value);
+        }
+        if (self.session_id) |value| {
+            try jw.objectField("session_id");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const SQLPreparedResponse = struct {
+    prepared_id: []const u8,
+    expires_at_ms: i64,
+    /// Exact decimal API owner identifier, preserved by JavaScript clients.
+    owner_node_id: []const u8,
+    parameter_types: []const SQLColumnType,
+    columns: []const SQLColumn,
 };
 
 /// Execute one SQL statement. Parameters are positional (`$1`, `$2`, ...), never interpolated into SQL text. To preserve integer precision in JavaScript clients, supply integers outside the exact JSON number range as decimal strings; binding coerces parameters to the expected type. The result limit is an admission bound, not an implicit SQL LIMIT: statements whose results exceed it fail instead of silently truncating. Request bodies are limited to 4 MiB, preparation to 8 MiB of allocated memory, and encoded results to a 16 MiB allocation budget.

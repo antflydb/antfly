@@ -87,9 +87,12 @@ pub const public_operation_policies = [_]PublicOperationPolicy{
     .{ .operation_id = "invokeInferenceConnection", .class = .inference },
     .{ .operation_id = "evaluate", .class = .none },
     .{ .operation_id = "globalQuery", .class = .query },
-    // SQL selects query/write admission only after bounded compilation. It
-    // owns that reservation until its offloaded native operation completes.
+    // SQL execution selects query/write admission after bounded compilation
+    // or prepared-plan lookup; preparation/close do not execute data work.
     .{ .operation_id = "executeSQL", .class = .none },
+    .{ .operation_id = "prepareSQL", .class = .none },
+    .{ .operation_id = "closePreparedSQL", .class = .none },
+    .{ .operation_id = "executePreparedSQL", .class = .none },
     .{ .operation_id = "restore", .class = .none },
     .{ .operation_id = "listRestoreJobs", .class = .none },
     .{ .operation_id = "getRestoreJob", .class = .none },

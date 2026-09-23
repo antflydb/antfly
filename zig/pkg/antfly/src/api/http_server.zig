@@ -14716,7 +14716,7 @@ pub const ApiHttpServer = struct {
         return alloc.dupe(u8, plan.schema_json);
     }
 
-    fn logicalTableNamesInArena(self: *ApiHttpServer, arena: std.mem.Allocator, context: api_operation.RequestContext, names: []const []const u8) ![]const []const u8 {
+    pub fn logicalTableNamesInArena(self: *ApiHttpServer, arena: std.mem.Allocator, context: api_operation.RequestContext, names: []const []const u8) ![]const []const u8 {
         if (self.source.vtable.system_catalog == null) return names;
         const out = try arena.alloc([]const u8, names.len);
         var offset: usize = 0;
@@ -14738,6 +14738,14 @@ pub const ApiHttpServer = struct {
     /// Long-lived DDL rechecks the original credential's current admin grants.
     /// Cleanup after cancellation/publication is independent of this grant.
     pub fn requireSchemaRewriteAuthority(self: *ApiHttpServer, principal: []const u8, names: []const []const u8) !void {
+        return self.requireGenerationAuthority(principal, names, false);
+    }
+
+    pub fn requireEmptyGenerationAuthority(self: *ApiHttpServer, principal: []const u8, names: []const []const u8) !void {
+        return self.requireGenerationAuthority(principal, names, true);
+    }
+
+    fn requireGenerationAuthority(self: *ApiHttpServer, principal: []const u8, names: []const []const u8, whole_table: bool) !void {
         if (std.mem.eql(u8, principal, stored_destination_authorization.auth_disabled_principal)) {
             if (!self.cfg.auth_enabled) return;
             return error.StoredDestinationAuthorizationRevoked;
@@ -14761,8 +14769,18 @@ pub const ApiHttpServer = struct {
         }
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
-        for (try self.logicalTableNamesInArena(arena.allocator(), .{}, names)) |name|
+        const restrictions: []usermgr.RowFilterEntry = if (whole_table) manager.durableCredentialRowFilters(principal) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.StoredDestinationAuthorizationRevoked,
+        } else &.{};
+        defer if (whole_table) {
+            for (restrictions) |*entry| entry.deinit(manager.alloc);
+            manager.alloc.free(restrictions);
+        };
+        for (try self.logicalTableNamesInArena(arena.allocator(), .{}, names)) |name| {
             if (!permissionsAllow(permissions, .table, name, .admin)) return error.StoredDestinationAuthorizationRevoked;
+            for (restrictions) |entry| if (system_catalog.tableResourceMatches(entry.table, name)) return error.StoredDestinationAuthorizationRevoked;
+        }
     }
 
     /// Explicit fresh-generation DDL. This path never mutates a live schema or
@@ -16076,7 +16094,9 @@ pub const ApiHttpServer = struct {
         if (is_rewrite) rewrite_diagnostic = worker_state.value.rewrite_progress;
         const failed = worker_state.value.staging_failure.len != 0;
         if (!failed and !worker_state.value.cancel_requested and job.value.state != .published and job.value.state != .canceled) {
-            if (is_rewrite) try self.requireSchemaRewriteAuthority(worker_state.value.destination_authorization_principal, worker_state.value.table_names orelse return error.CorruptRestoreJobStore);
+            if (worker_state.value.source_kind == .empty_generation) {
+                try self.requireEmptyGenerationAuthority(worker_state.value.destination_authorization_principal, worker_state.value.table_names orelse return error.CorruptRestoreJobStore);
+            } else if (is_rewrite) try self.requireSchemaRewriteAuthority(worker_state.value.destination_authorization_principal, worker_state.value.table_names orelse return error.CorruptRestoreJobStore);
             const authorizer: stored_destination_authorization.Authorizer = .{ .manager = self.cfg.user_manager, .auth_enabled = self.cfg.auth_enabled };
             for (job.value.plan.targets) |target| {
                 try stored_destination_authorization.authorizeReplicationSourcesJson(self.alloc, target.table.replication_sources_json, target.table.name, authorizer);
@@ -16266,17 +16286,17 @@ pub const ApiHttpServer = struct {
                 }
             }
             const scope = try stages.ownerScope(self.alloc, job.value.plan, job.value.plan_digest, target, range);
-            const artifact = for (target.source_artifacts) |item| {
-                if (item.target_group_id == range.group_id) break item;
-            } else return error.RestoreSourceProofMissing;
             var request: owners.Request = .{ .scope = scope, .action = switch (phase) {
-                .importing => .import_page,
+                .importing => if (target.empty_generation) .begin else .import_page,
                 .validating => .validate,
                 .published => .publish,
                 .canceling => .cancel,
                 else => unreachable,
             } };
-            if (phase == .importing) {
+            if (phase == .importing and !target.empty_generation) {
+                const artifact = for (target.source_artifacts) |item| {
+                    if (item.target_group_id == range.group_id) break item;
+                } else return error.RestoreSourceProofMissing;
                 if (begun_group != range.group_id) {
                     _ = try self.executeRestoreOwner(self.alloc, target.table.name, range.group_id, .{ .scope = scope, .action = .begin }, context);
                     begun_group = range.group_id;
@@ -16284,6 +16304,10 @@ pub const ApiHttpServer = struct {
                 request.source = .{ .location = job.value.plan.source_location, .connection = job.value.plan.source_connection, .artifact = artifact };
             }
             const result = self.executeRestoreOwner(self.alloc, target.table.name, range.group_id, request, context) catch |err| {
+                // A fixed fresh identity cannot become a valid empty owner by
+                // retrying after contradictory durable rows/indexes are found.
+                // Retire this attempt through the existing cancellation path.
+                if (target.empty_generation and err == error.RestoreStagingTargetNotEmpty) return error.BackupIntegrityFailure;
                 if (@import("restore_source_errors.zig").permanent(err)) return error.BackupIntegrityFailure;
                 return @as(anyerror![]u8, err);
             };
@@ -19539,7 +19563,7 @@ pub const ApiHttpServer = struct {
         if (!self.restore_job_store.hasPersistence()) return error.RestoreJobPersistenceUnavailable;
     }
 
-    fn schedulePendingRestoreJobs(self: *ApiHttpServer) !void {
+    pub fn schedulePendingRestoreJobs(self: *ApiHttpServer) !void {
         self.restore_dispatch_requested.store(true, .release);
         while (true) {
             if (self.restore_jobs_closing.load(.acquire) or self.restore_dispatch_paused.load(.acquire)) return;
@@ -19783,7 +19807,7 @@ pub const ApiHttpServer = struct {
             self.alloc.free(failed);
             return;
         }
-        if (state.staging_attempt_id != 0 and (state.source_kind == .schema_rewrite or state.cancel_requested or state.staging_failure.len != 0 or state.staging_resolution == .published)) {
+        if (state.staging_attempt_id != 0 and (state.source_kind == .schema_rewrite or state.source_kind == .empty_generation or state.cancel_requested or state.staging_failure.len != 0 or state.staging_resolution == .published)) {
             // Owner cleanup/publication never requires source repository
             // credentials or availability after a staging attempt exists.
             const result = self.resolveStagedRestoreWithoutSource(state) catch |err| {
@@ -20168,7 +20192,7 @@ pub const ApiHttpServer = struct {
         // not the whole cluster. Polling/listing/cancellation must use that same
         // scope, and must stop being available after any table permission is
         // revoked. Ordinary cluster restores still require cluster admin.
-        if (state.source_kind == .schema_rewrite and state.scope == .cluster) {
+        if ((state.source_kind == .schema_rewrite or state.source_kind == .empty_generation) and state.scope == .cluster) {
             const names = state.table_names orelse return false;
             if (names.len == 0) return false;
             for (names) |name| if (!permissionsAllow(identity.permissions, .table, try catalog_names.resolve(name), .admin)) return false;
@@ -20530,6 +20554,13 @@ fn wakeRestoreRetry(host: anytype) void {
     // failure: completion and the supervisor retry it without terminalizing
     // a healthy durable job when the executor is temporarily full.
     host.ensureRestoreRetryWakeup() catch |err| {
+        // Restore can be staged before an asynchronous executor is attached.
+        // This is a normal deferred-admission state, often retried many times
+        // by the supervisor; warning on every wakeup drowns actionable logs.
+        if (err == error.AsyncRestoreUnavailable) {
+            std.log.debug("restore retry wakeup awaiting asynchronous executor", .{});
+            return;
+        }
         std.log.warn("restore retry wakeup admission deferred err={s}", .{@errorName(err)});
     };
 }
@@ -20625,6 +20656,9 @@ test "staged restore worker publishes a dependency complete mixed native cohort"
 }
 
 test "staged restore worker rewrites retained acknowledged writes and reopens hidden mixed owners" {
+    // Empty-generation branch provides publication/recovery evidence for
+    // sql-0160 sql-0161 sql-0162 sql-0163 sql-0164 sql-0165 sql-1101
+    // after SQL admission is tested.
     try @import("restore_worker_fixture.zig").runRewrite(RestoreWorkerTestDriver);
 }
 

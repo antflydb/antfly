@@ -230,6 +230,7 @@ test "join inequality: incomparable types return 0" {
 }
 
 test "api module compiles" {
+    _ = @import("sql_truncate.zig");
     _ = sql_execution;
     _ = @import("sql_schema_cache.zig");
     _ = sql_pgwire;

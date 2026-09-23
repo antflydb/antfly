@@ -26,7 +26,7 @@ pub const Type = struct { kind: ?ast.ColumnType = null, nullable: bool = true };
 pub const Column = struct { name: []const u8, type: ast.ColumnType, nullable: bool = true };
 pub const BindLimits = struct { nodes: usize = 8192, depth: usize = 64, parameters: usize = 1024 };
 pub const EvalLimits = struct { steps: usize = 65_536, depth: usize = 64, output_bytes: usize = 1024 * 1024 };
-pub const Function = enum { abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, @"$single" };
+pub const Function = enum { abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, @"$single", @"$pattern_quantified" };
 
 pub const Instruction = struct {
     type: Type,
@@ -156,6 +156,7 @@ fn arity(function: Function, count: usize) !void {
     const valid = switch (function) {
         .abs, .lower, .upper, .length, .octet_length, .ceil, .floor, .round, .sqrt, .to_timestamp => count == 1,
         .nullif, .power, .mod, .starts_with, .date_part, .date_trunc, .@"$single" => count == 2,
+        .@"$pattern_quantified" => count == 5,
         .substring => count == 2 or count == 3,
         .replace => count == 3,
         .trim, .ltrim, .rtrim => count == 1 or count == 2,
@@ -225,8 +226,21 @@ const Binder = struct {
             },
             .call => |call| blk: {
                 if (call.subquery != null or call.window != null or call.star or call.distinct or call.filter != null) return error.UnsupportedSqlShape;
+                if (std.mem.eql(u8, call.name, "$validate")) {
+                    if (call.args.len == 0) return error.InvalidSqlParameters;
+                    for (call.args) |arg| _ = try self.infer(arg, depth + 1);
+                    break :blk .{ .kind = .integer, .nullable = false };
+                }
                 const function = try functionId(call.name);
                 try arity(function, call.args.len);
+                if (function == .@"$pattern_quantified") {
+                    for (call.args, 0..) |arg, index| {
+                        const actual = try self.infer(arg, depth + 1);
+                        const required: ast.ColumnType = if (index == 0) .string else if (index == 1) .json else .boolean;
+                        if (actual.kind != null and actual.kind != required) return error.SqlTypeMismatch;
+                    }
+                    break :blk .{ .kind = .boolean, .nullable = true };
+                }
                 var merged: Type = .{};
                 switch (function) {
                     .@"$single" => merged = try self.infer(call.args[0], depth + 1),
@@ -242,7 +256,7 @@ const Binder = struct {
                 }
                 break :blk .{ .kind = switch (function) {
                     .length, .octet_length => .integer,
-                    .starts_with => .boolean,
+                    .starts_with, .@"$pattern_quantified" => .boolean,
                     .sqrt, .power, .date_part => .number,
                     .date_trunc, .to_timestamp => .datetime,
                     .coalesce, .nullif, .greatest, .least, .abs, .ceil, .floor, .round, .mod, .@"$single" => merged.kind,
@@ -315,11 +329,32 @@ const Binder = struct {
                 break :blk .{ .binary = .{ .op = binary.op, .left = try self.compile(binary.left, operand_kind, depth + 1), .right = try self.compile(binary.right, operand_kind, depth + 1) } };
             },
             .call => |call| blk: {
+                if (std.mem.eql(u8, call.name, "$validate")) {
+                    // Discarded EXISTS projections still bind names, types,
+                    // functions and parameters. Their code and column reads
+                    // must not become runtime dependencies of the count.
+                    var scratch = std.heap.ArenaAllocator.init(self.alloc);
+                    defer scratch.deinit();
+                    var validator: Binder = .{
+                        .alloc = scratch.allocator(),
+                        .columns = self.columns,
+                        .limits = self.limits,
+                        .names = self.names,
+                        .parameters = self.parameters,
+                        .parameter_count = self.parameter_count,
+                        .allow_unresolved = self.allow_unresolved,
+                    };
+                    for (call.args) |arg| _ = try validator.compile(arg, null, depth + 1);
+                    self.parameters = validator.parameters;
+                    self.parameter_count = validator.parameter_count;
+                    break :blk .{ .literal = .{ .integer = 1 } };
+                }
                 const function = try functionId(call.name);
                 const args = try self.alloc.alloc(u32, call.args.len);
                 for (call.args, args, 0..) |arg, *out, i| {
                     const desired: ?ast.ColumnType = switch (function) {
                         .@"$single" => if (i == 0) kind.kind else .integer,
+                        .@"$pattern_quantified" => if (i == 0) .string else if (i == 1) .json else .boolean,
                         .lower, .upper, .length, .octet_length, .trim, .ltrim, .rtrim, .replace, .starts_with => .string,
                         .substring => if (i == 0) .string else .integer,
                         .date_part, .date_trunc => if (i == 0) .string else .datetime,
@@ -662,6 +697,30 @@ const Evaluator = struct {
     }
 
     fn invokeFunction(self: *Evaluator, function: Function, args: []const u32, depth: usize) anyerror!Json {
+        if (function == .@"$pattern_quantified") {
+            const operand = try self.run(args[0], depth + 1);
+            const set = try self.run(args[1], depth + 1);
+            const all = try self.run(args[2], depth + 1);
+            const insensitive = try self.run(args[3], depth + 1);
+            const negated = try self.run(args[4], depth + 1);
+            if (all != .bool or insensitive != .bool or negated != .bool) return error.SqlTypeMismatch;
+            if (set != .null and set != .array) return error.SqlTypeMismatch;
+            const patterns: []const Json = if (set == .null) &.{} else set.array.items;
+            if (patterns.len == 0) return .{ .bool = all.bool };
+            if (operand == .null) return .null;
+            var saw_null = false;
+            for (patterns) |pattern| {
+                if (self.steps >= self.limits.steps) return error.SqlProgramLimitExceeded;
+                self.steps += 1;
+                if (pattern == .null) {
+                    saw_null = true;
+                    continue;
+                }
+                const matches = (try self.like(operand, pattern, insensitive.bool)) != negated.bool;
+                if (matches != all.bool) return .{ .bool = matches };
+            }
+            return if (saw_null) .null else .{ .bool = all.bool };
+        }
         if (function == .@"$single") {
             const count = try self.run(args[1], depth + 1);
             if (count != .null and (count != .integer or count.integer > 1)) return error.SqlCardinalityViolation;
@@ -999,6 +1058,17 @@ test "SQL scalar binding resolves ordinals and parameter types once" {
     try std.testing.expectEqual(@as(i64, 23), (try program.evaluate(std.testing.allocator, &.{Datum.json(.{ .integer = 7 })}, &.{.{ .integer = 3 }}, .{})).value.integer);
     try std.testing.expectError(error.SqlNumericOutOfRange, program.evaluate(std.testing.allocator, &.{Datum.json(.{ .integer = std.math.maxInt(i64) })}, &.{.{ .integer = 3 }}, .{}));
     try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(std.testing.allocator, &.{Datum.json(.{ .integer = 7 })}, &.{.{ .integer = 3 }}, .{ .steps = 1 }));
+}
+
+test "SQL discarded EXISTS projection binds parameters without retaining column dependencies" {
+    var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, "\"$validate\"(price / $1, lower(payload), CAST('bad' AS BIGINT))", .{});
+    defer compiled.deinit();
+    var program = try bind(std.testing.allocator, compiled.expression, &.{ .{ .name = "price", .type = .integer, .nullable = false }, .{ .name = "payload", .type = .string } }, &.{}, .{});
+    defer program.deinit();
+    try std.testing.expectEqual(ast.ColumnType.integer, program.parameter_types[0].?);
+    try std.testing.expectEqual(@as(usize, 0), program.required_columns.len);
+    // No row payload is needed, and a zero divisor must never be evaluated.
+    try std.testing.expectEqual(@as(i64, 1), (try program.evaluate(std.testing.allocator, &.{}, &.{.{ .integer = 0 }}, .{})).value.integer);
 }
 
 test "SQL scalar JSON null remains distinct from SQL NULL through casts and lazy branches" {

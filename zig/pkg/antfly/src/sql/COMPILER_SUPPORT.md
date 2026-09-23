@@ -1,6 +1,6 @@
 # SQL compiler boundary
 
-This is an executable, bounded subset of S2, not a claim of parity with the
+This is an executable, bounded subset of SQL extraction, not a claim of parity with the
 combined SQL branch. Parsing a statement does not imply the current backend can
 execute it: catalog binding and backend capabilities must admit the complete
 statement before any mutation.
@@ -14,6 +14,10 @@ statement before any mutation.
   ASC/DESC and NULLS FIRST/LAST; LIMIT/OFFSET accept nonnegative integers/parameters.
 - Inner/outer joins with source aliases, derived tables and nonrecursive CTEs;
   grouping, aggregate FILTER/DISTINCT, HAVING, and bounded aggregate ordering.
+- Linear recursive CTEs with seed-typed outputs, delta worklists, UNION ALL or
+  typed distinct visited sets. Physical inputs share one statement capture;
+  static-side hash indexes are reused across iterations. Work, cancellation
+  and retained-memory quotas also bound nonterminating recursion.
 - Window ranking, offset/value functions and aggregates with PARTITION BY,
   ORDER BY, peer-aware RANGE, ROWS and GROUPS frames and frame exclusions.
   Query-local WINDOW definitions support checked inheritance and sort sharing.
@@ -21,7 +25,7 @@ statement before any mutation.
   sorting; moving aggregates use bounded indexed state. Window evaluation runs
   after grouping/HAVING and before final ordering/limits under the same budget.
 - Equality-correlated EXISTS/NOT EXISTS and scalar subqueries, including direct
-  scalar aggregates, lower to grouped hash joins rather than per-row reads.
+  and composed scalar aggregates, lower to grouped hash joins rather than per-row reads.
   All physical tables participate in the same authorized statement capture.
   Scalar subqueries preserve zero-row NULL and SQLSTATE 21000 for multiple rows.
 - Scalar IN/NOT IN subqueries use grouped hash membership and per-correlation
@@ -37,10 +41,25 @@ statement before any mutation.
   null distinct from SQL NULL; set operands share the statement memory budget.
 - `INSERT INTO ... (columns) VALUES (...) [, ...]` with scalar expressions and
   parameters. All rows are prepared and validated before one atomic mutation.
+- Scalar subqueries inside multi-row `INSERT ... VALUES` use a flat generated
+  source AST and bound VALUES node, with balanced cross-arm type inference.
+  Adjacent literal rows share one typed block; only one nonliteral arm iterator
+  is active at a time. Source reads (including self-reads) close before commit;
+  assignment-literal coercion and scalar cardinality are preserved. The
+  1,000-row parser limit remains subject to the request memory budget.
 - `INSERT INTO ... (columns) SELECT ...` with typed source values, assignment
   checks and bounded whole-statement preparation. Source cursors close before
   commit, including self-inserts; source failure cannot publish a partial batch.
 - `UPDATE ... SET column = expression [, ...] [WHERE ...]`.
+- Joined `UPDATE ... FROM`/explicit JOIN and `DELETE ... USING`/explicit JOIN,
+  including CTE sources. Target provenance is retained from the joined snapshot;
+  source readers close before native atomic commit. UPDATE rejects multiple
+  matches per target with SQLSTATE 21000; DELETE deduplicates target images
+  before applying the mutation-row quota. Equality predicates select hash joins.
+- Target-only UPDATE predicate and assignment subqueries, and DELETE predicate
+  subqueries, use the same decorrelated joined-mutation planner. Their bounded
+  scans share one captured statement view before atomic commit; correlated
+  scalar cardinality and mutation-row quotas still apply.
 - `INSERT ... ON CONFLICT (_id) DO NOTHING` and `DO UPDATE SET ... [WHERE ...]`.
   Assignments bind old-row and `excluded` values once, with native defaults and
   generated values. Skipped rows remain atomic read-set fences, never deletes;
@@ -50,6 +69,10 @@ statement before any mutation.
   native tuple codec and generation-bound claim authority, including composite
   keys and native NULL-distinct behavior. Exact claim/absence guards travel with
   the atomic mutation and survive session staging, savepoints, and recovery.
+  `ON CONFLICT (columns) WHERE predicate` also infers partial unique arbiters
+  when the bounded conjunction of typed column/literal comparisons and NULL
+  tests proves the native index predicate. Membership is evaluated from typed
+  rows when constructing claims; unsupported inference expressions fail closed.
   Targetless `ON CONFLICT DO NOTHING` checks all supported native immediate
   unique constraints plus `_id`; skipped candidates do not reserve identities
   against later VALUES rows. Targetless UPDATE, unsupported native constraint
@@ -68,6 +91,22 @@ statement before any mutation.
   pending receipt is not a successful CREATE acknowledgement.
 - `BEGIN`/`START TRANSACTION` isolation/read modes, `COMMIT`, `ROLLBACK`, named
   SAVEPOINT/ROLLBACK TO/RELEASE, backed by durable native session ownership.
+- Deferrable UNIQUE and `SET CONSTRAINTS ... IMMEDIATE/DEFERRED`, with durable
+  timing overrides and final-overlay native commit validation. IMMEDIATE is
+  retroactive and cannot publish its mode change while pending data violates it.
+- Native `TRUNCATE [TABLE] ... [RESTART|CONTINUE IDENTITY] [CASCADE|RESTRICT]` admits a
+  fresh-generation barrier through shared distributed restore staging. Pending
+  or unknown admission returns a reconciliation receipt, not completion. The
+  current safe execution boundary requires an FK-closed cohort; untouched-parent
+  inverse-witness retirement and graph boundaries are not yet implemented.
+  RESTART IDENTITY resets the fresh owner generation; the current SQL catalog
+  has no owned sequences or serial columns, so there is no sequence counter to
+  restart. DDL inside an explicit transaction remains rejected.
+- Dry-run `EXPLAIN` for admitted SELECT/INSERT/UPDATE/DELETE/MERGE binds the
+  underlying statement with its normal authority and emits bounded text or
+  versioned JSON. `FORMAT JSON`, `VERBOSE`, and `COSTS OFF` are supported;
+  `ANALYZE` and requested cost estimates reject until instrumentation and a
+  cost model exist. EXPLAIN never opens row cursors or publishes mutations.
 
 Names can be `table`, `namespace.table`, or `database.namespace.table`. Unquoted
 identifiers fold ASCII case; quoted identifiers preserve their exact names.
@@ -79,19 +118,51 @@ explicit `_id`. Integer literals are signed 64-bit values parsed exactly.
 
 ## Deliberate exclusions
 
-DISTINCT window aggregates remain unsupported. Subquery ANY/ALL, multi-column
-membership, non-equality correlation, nested subquery
-expressions inside an inner subquery, per-key ORDER/LIMIT, set/group/HAVING/window
-subquery forms, complex aggregate expressions, lazy CASE/COALESCE subquery
-branches, and mutation-expression subqueries
-remain unsupported. EXISTS currently admits literal/field projections; richer
-expressions need a validation-only binding domain to avoid evaluating discarded
-values. Partial/expression/deferrable conflict arbiters and
-SQL-language cursors remain a separate capability gate. Pgwire SQL
+`MERGE` has a bounded compiler AST for ordered MATCHED/NOT MATCHED arms,
+conditional UPDATE/DELETE/INSERT/DO NOTHING, source relations, CTEs and
+RETURNING. MERGE binds lazy ordered arm programs
+and one projected source-preserving candidate join. It executes only when a
+durable serializable transaction retains source/target range proofs with the
+mutation; API autocommit opens an implicit such transaction. Plain batch
+backends and read-committed sessions reject without reading candidates.
+RETURNING projects native-prepared target postimages and captured source values
+before mutation admission, so expression failures cannot obscure a committed
+outcome. Explicit MERGE DEFAULT cells use the native absent-field preparation
+path. Small identity-key sources use deduplicated, guarded primary point scans.
+Small sources with complete equality on a declared total multicolumn index
+use deduplicated, guarded secondary-index probes; a saturated nonunique probe
+falls back to the coordinated full join. Partial, expression, and general
+residual index lookups and full execution parity remain incomplete.
+
+Ordered ANY/SOME/ALL comparisons use grouped extrema and NULL/count evidence.
+LIKE/ILIKE quantifiers use quota-bound distinct pattern sets per correlation
+key, with step-limited matching, empty/NULL truth tables and per-pattern NOT.
+EXISTS supports one correlated ordered comparison in addition to computed equality
+keys; its discarded projections are validated without runtime evaluation or
+scan payload dependencies.
+Uncorrelated scalar/membership/quantified value relations can contain set
+operations, CTEs, grouping/HAVING, windows and ORDER/LIMIT/OFFSET. An independently
+bound derived-query boundary preserves those semantics and rejects outer
+references. Derived relations also accept positional column alias lists.
+Nonrecursive CTEs accept `MATERIALIZED` and `NOT MATERIALIZED`: the former
+shares a bounded typed producer, the latter inlines each reference. An unhinted
+CTE materializes when referenced more than once and otherwise stays pipelined.
+
+DISTINCT window aggregates remain unsupported. Multi-column
+membership, multiple correlated ranges, nested subquery
+expressions requiring outer bindings, per-key ORDER/LIMIT, correlated set/group/HAVING/window
+subquery forms, lazy CASE/COALESCE subquery
+branches, and non-decorrelatable mutation-expression subqueries
+remain unsupported. Typed expression and partial conflict arbiters share native
+uniqueness authority; deferrable conflict arbiters are deliberately rejected.
+Mutual/nonlinear recursion, aggregate/window recursive terms and nullable-side
+self joins remain unsupported; recursive output widening requires a seed cast.
+Pgwire SQL
 PREPARE/EXECUTE/DEALLOCATE uses connection-owned prepared state shared with
 Parse/Bind, typed scalar argument evaluation, binding identity checks and pull
-execution. This does not expose durable prepared state through stateless HTTP.
-These implemented forms do not constitute the complete S2 parity gate.
+execution. HTTP prepare/execute/close exposes bounded durable owner-scoped
+resources with identity-fenced rebinding and independent transaction lifetime.
+These implemented forms do not constitute the complete SQL extraction parity gate.
 Unsupported tails and additional statements are rejected, never
 ignored. The existing generated grammar remains a syntax oracle, not a
 production semantic parser with implicit conflict resolution.

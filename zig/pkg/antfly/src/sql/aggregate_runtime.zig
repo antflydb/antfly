@@ -86,7 +86,10 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
     const orders = try context.arena.alloc(operators.Order, statement.order_by.len);
     for (statement.order_by, orders) |order, *out| out.* = .{ .descending = order.descending, .nulls_first = order.nulls_first };
     const capacity = std.math.add(usize, offset, limit + @intFromBool(statement.limit == null)) catch return error.SqlProgramLimitExceeded;
-    var top = try operators.TopK.init(context.alloc, capacity, orders, context.limits.retained_bytes);
+    // Grouping is complete here: allocating for the requested limit when only
+    // a few groups exist wastes memory (especially for scalar subqueries in a
+    // large INSERT source) without changing which rows can be returned.
+    var top = try operators.TopK.init(context.alloc, @min(capacity, grouped.groupCount()), orders, context.limits.retained_bytes);
     defer top.deinit();
     for (0..grouped.groupCount()) |index| {
         try context.checkpoint();

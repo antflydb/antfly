@@ -26,25 +26,48 @@ const Mock = struct {
     fail_execute: bool = false,
     json_null_results: bool = false,
     ddl_pending: bool = false,
+    ddl_unknown: bool = false,
     unknown_outcome: bool = false,
     mutation_outcome: ?backend.MutationOutcome = null,
     owned_results: bool = false,
     result_releases: usize = 0,
     saw_binding_guard: bool = false,
     seen_parameter: ?i64 = null,
+    expected_text_parameter: ?[]const u8 = null,
+    saw_text_parameter: bool = false,
     saw_statement_unchanged: bool = false,
     entered: ?*std.Io.Event = null,
     blocked: bool = false,
     stream_rows: usize = 0,
+    expected_stream_statement: ?[]const u8 = null,
+    expected_execute_statement: ?[]const u8 = null,
+    setting_stream_opens: usize = 0,
     stream_offset: usize = 0,
     stream_closes: usize = 0,
     stream_pulls: usize = 0,
+    stream_detaches: usize = 0,
+    stream_validations: usize = 0,
+    revoke_after_commit: bool = false,
+    unknown_commit: bool = false,
+    cursor_revoked: bool = false,
     stream_fail_at: ?usize = null,
     failed_transactions: usize = 0,
     canceled: std.atomic.Value(bool) = .init(false),
+    namespace_log: [16]@import("session_commands.zig").Namespace = undefined,
+    namespace_count: usize = 0,
+    namespace_checks: usize = 0,
+    saw_distinct_owner_namespace: bool = false,
+    expected_cursor_namespace: ?[]const u8 = null,
 
     fn source(self: *Mock) backend.Backend {
-        return .{ .context = self, .vtable = &.{ .authenticate = authenticate, .describe = describe, .execute = Mock.execute, .evaluate_parameters = evaluateParameters, .fail_transaction = failTransaction, .open_stream = openStream, .disconnect = disconnect } };
+        return .{ .context = self, .vtable = &.{ .authenticate = authenticate, .describe = describe, .execute = Mock.execute, .validate_namespace = validateNamespace, .evaluate_parameters = evaluateParameters, .fail_transaction = failTransaction, .open_stream = openStream, .disconnect = disconnect } };
+    }
+    fn validateNamespace(raw: *anyopaque, _: std.mem.Allocator, _: backend.Identity, request: backend.Request) !void {
+        const self: *Mock = @ptrCast(@alignCast(raw));
+        try request.check();
+        self.namespace_checks += 1;
+        const name = request.namespace orelse "public";
+        if (!std.mem.eql(u8, name, "public") and !std.mem.eql(u8, name, "analytics") and !std.mem.eql(u8, name, "tenant")) return error.Forbidden;
     }
     fn failTransaction(raw: *anyopaque, _: backend.Identity, _: backend.Request) anyerror!void {
         const self: *Mock = @ptrCast(@alignCast(raw));
@@ -53,16 +76,34 @@ const Mock = struct {
     fn evaluateParameters(_: *anyopaque, alloc: std.mem.Allocator, _: backend.Identity, request: backend.Request, expressions: []const []const u8) ![]const std.json.Value {
         try request.check();
         const result = try alloc.alloc(std.json.Value, expressions.len);
-        for (expressions, result) |expression, *value| value.* = .{ .integer = try std.fmt.parseInt(i64, expression, 10) };
+        for (expressions, result) |expression, *value| {
+            value.* = if (expression.len >= 2 and expression[0] == '\'' and expression[expression.len - 1] == '\'')
+                .{ .string = expression[1 .. expression.len - 1] }
+            else
+                .{ .integer = try std.fmt.parseInt(i64, expression, 10) };
+        }
         return result;
     }
     fn openStream(raw: *anyopaque, _: std.mem.Allocator, _: backend.Identity, request: backend.Request) !?backend.ReadStream {
         const self: *Mock = @ptrCast(@alignCast(raw));
+        if (std.mem.indexOf(u8, request.statement, "application_name") != null or std.mem.indexOf(u8, request.statement, "client_encoding") != null) self.setting_stream_opens += 1;
         if (self.stream_rows == 0 or !std.mem.startsWith(u8, std.mem.trimStart(u8, request.statement, " \t\r\n"), "SELECT")) return null;
+        if (self.expected_stream_statement) |expected| try std.testing.expectEqualStrings(expected, request.statement);
         try request.check();
         if (request.parameters.len > 0) self.seen_parameter = request.parameters[0].integer;
         self.saw_binding_guard = if (request.binding_guard) |guard| std.mem.eql(u8, guard, "immutable-catalog-binding") else false;
-        return .{ .context = self, .columns = &.{.{ .name = "n", .type = .integer }}, .next = nextPage, .close = closeStream };
+        return .{ .context = self, .columns = &.{.{ .name = "n", .type = .integer }}, .next = nextPage, .close = closeStream, .detach = detachStream, .validate = validateStream };
+    }
+    fn detachStream(raw: *anyopaque) void {
+        const self: *Mock = @ptrCast(@alignCast(raw));
+        self.stream_detaches += 1;
+    }
+    fn validateStream(raw: *anyopaque, _: std.mem.Allocator, request: backend.Request) !void {
+        const self: *Mock = @ptrCast(@alignCast(raw));
+        try request.check();
+        if (self.expected_cursor_namespace) |expected| if (!std.mem.eql(u8, expected, request.namespace orelse "public")) return error.CatalogGenerationChanged;
+        self.stream_validations += 1;
+        if (self.cursor_revoked) return error.Forbidden;
     }
     fn nextPage(raw: *anyopaque, alloc: std.mem.Allocator, request: backend.Request, wanted: u32) !backend.StreamPage {
         const self: *Mock = @ptrCast(@alignCast(raw));
@@ -90,14 +131,30 @@ const Mock = struct {
         const self: *Mock = @ptrCast(@alignCast(raw));
         self.describes += 1;
         try request.check();
+        if (self.cursor_revoked) return error.Forbidden;
+        if (self.ddl_pending or self.ddl_unknown) return .{ .columns = &.{} };
         if (self.json_null_results) return .{ .columns = &.{.{ .name = "j", .type = .json }} };
-        return .{ .columns = &.{.{ .name = "n", .type = .integer }}, .parameter_types = if (std.mem.indexOf(u8, request.statement, "$1") != null) &.{.integer} else &.{}, .binding_guard = "immutable-catalog-binding" };
+        return .{ .columns = &.{.{ .name = "n", .type = .integer }}, .parameter_types = if (std.mem.indexOf(u8, request.statement, "$1") != null) (if (std.mem.indexOf(u8, request.statement, "usage_records") != null) &.{.string} else &.{.integer}) else &.{}, .binding_guard = "immutable-catalog-binding" };
     }
     fn execute(raw: *anyopaque, alloc: std.mem.Allocator, _: backend.Identity, request: backend.Request) !backend.Result {
         const self: *Mock = @ptrCast(@alignCast(raw));
+        if (self.expected_execute_statement) |expected| if (std.mem.startsWith(u8, request.statement, "SELECT")) try std.testing.expectEqualStrings(expected, request.statement);
         self.executions += 1;
         if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, request.statement, " \t\r\n;"), "begin")) return .{ .command_tag = "BEGIN", .transaction_status = .in_transaction, .session_id = "0123456789abcdef0123456789abcdef" };
-        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, request.statement, " \t\r\n;"), "commit")) return .{ .command_tag = "COMMIT", .transaction_status = .idle };
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, request.statement, " \t\r\n;"), "commit")) {
+            if (self.unknown_commit) {
+                request.diagnostics.?.transaction_status = .idle;
+                return error.SqlTransactionOutcomeUnknown;
+            }
+            if (self.revoke_after_commit) self.cursor_revoked = true;
+            return .{ .command_tag = "COMMIT", .transaction_status = .idle };
+        }
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, request.statement, " \t\r\n;"), "rollback")) return .{ .command_tag = "ROLLBACK", .transaction_status = .idle };
+        if (try @import("session_commands.zig").control(alloc, request.statement)) |command| return .{ .command_tag = switch (command) {
+            .savepoint => "SAVEPOINT",
+            .rollback_to => "ROLLBACK",
+            .release => "RELEASE",
+        }, .transaction_status = .in_transaction, .session_id = "0123456789abcdef0123456789abcdef" };
         self.saw_binding_guard = if (request.binding_guard) |guard| std.mem.eql(u8, guard, "immutable-catalog-binding") else false;
         if (self.entered) |event| event.set(request.io);
         while (self.blocked) {
@@ -113,6 +170,7 @@ const Mock = struct {
             return error.SqlMutationOutcomeUnknown;
         }
         try request.check();
+        if (self.ddl_unknown) return .{ .command_tag = "DDL PENDING", .ddl_receipt_json = "{\"state\":\"admission_unknown\",\"restore_job_id\":\"job-1\"}" };
         if (self.ddl_pending) return .{ .command_tag = "DDL PENDING", .mutation_outcome = .committed_pending, .ddl_receipt_json = "{\"table_id\":\"17\",\"schema_version\":8,\"state\":\"pending\"}" };
         if (self.json_null_results) return .{
             .columns = &.{.{ .name = "j", .type = .json }},
@@ -121,7 +179,19 @@ const Mock = struct {
             .command_tag = "SELECT 2",
         };
         self.saw_statement_unchanged = std.mem.eql(u8, request.statement, "SELECT $1");
-        if (request.parameters.len > 0) self.seen_parameter = request.parameters[0].integer;
+        if (self.namespace_count < self.namespace_log.len) {
+            self.namespace_log[self.namespace_count] = try @import("session_commands.zig").Namespace.init(request.namespace orelse "public");
+            self.namespace_count += 1;
+        }
+        if (request.session_namespace) |owner| if (std.mem.eql(u8, owner, "public") and !std.mem.eql(u8, owner, request.namespace orelse "public")) {
+            self.saw_distinct_owner_namespace = true;
+        };
+        if (request.parameters.len > 0) {
+            if (self.expected_text_parameter) |expected| {
+                try std.testing.expectEqualStrings(expected, request.parameters[0].string);
+                self.saw_text_parameter = true;
+            } else self.seen_parameter = request.parameters[0].integer;
+        }
         const rows = try alloc.alloc([]const std.json.Value, 2);
         rows[0] = try alloc.dupe(std.json.Value, &.{.{ .integer = self.seen_parameter orelse 9007199254740993 }});
         rows[1] = try alloc.dupe(std.json.Value, &.{.{ .integer = 2 }});
@@ -129,6 +199,8 @@ const Mock = struct {
             .columns = &.{.{ .name = "n", .type = .integer }},
             .rows = rows,
             .command_tag = "SELECT 2",
+            .transaction_status = if (request.session_id != null) .in_transaction else .idle,
+            .session_id = request.session_id,
             .mutation_outcome = self.mutation_outcome,
             .transaction_id = if (self.mutation_outcome != null) "0123456789abcdef0123456789abcdef".* else null,
             .owner = if (self.owned_results) .{ .context = self, .release = releaseResult } else null,
@@ -276,6 +348,149 @@ test "pgwire forward cursors stream bounded fetches and close with transaction" 
     try std.testing.expectEqual(@as(usize, 2), mock.executions);
 }
 
+test "pgwire original cursor declaration and fetch retain one bounded result" {
+    // sql-0048 and sql-0050: exact original SQL, exercised through the
+    // PostgreSQL simple-query protocol with transaction-owned cursor state.
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    try frame(&input.writer, 'Q', "BEGIN\x00");
+    try frame(&input.writer, 'Q', "DECLARE usage_cursor CURSOR FOR SELECT id FROM usage_records ORDER BY id\x00");
+    try frame(&input.writer, 'Q', "FETCH NEXT FROM usage_cursor\x00");
+    try frame(&input.writer, 'Q', "CLOSE usage_cursor\x00");
+    try frame(&input.writer, 'Q', "COMMIT\x00");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .expected_execute_statement = "SELECT id FROM usage_records ORDER BY id" };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    const messages = try tags(std.testing.allocator, output.written());
+    defer std.testing.allocator.free(messages);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, messages, "D"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, messages, "E"));
+    try std.testing.expectEqual(@as(usize, 0), mock.stream_pulls);
+    try std.testing.expectEqual(@as(usize, 0), mock.stream_closes);
+    try std.testing.expectEqual(@as(usize, 3), mock.executions);
+}
+
+test "pgwire original forward fetch forms and cursor close commands" {
+    // sql-0051, sql-0052, sql-0053, sql-0054, sql-0061, sql-0062, sql-0063. The exact
+    // original commands must consume one cursor position, not rerun SELECT.
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    for ([_][]const u8{
+        "BEGIN\x00",
+        "DECLARE usage_cursor CURSOR FOR SELECT id FROM usage_records ORDER BY id\x00",
+        "FETCH FORWARD 10 IN usage_cursor\x00",
+        "FETCH usage_cursor\x00",
+        "FETCH 10 usage_cursor\x00",
+        "FETCH FORWARD usage_cursor\x00",
+        "FETCH ALL FROM usage_cursor\x00",
+        "CLOSE usage_cursor\x00",
+        "DECLARE usage_cursor CURSOR FOR SELECT id FROM usage_records ORDER BY id\x00",
+        "CLOSE ALL\x00",
+        "COMMIT\x00",
+    }) |statement| try frame(&input.writer, 'Q', statement);
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .stream_rows = 30, .expected_stream_statement = "SELECT id FROM usage_records ORDER BY id" };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    const expected_rows = [_]usize{ 0, 0, 10, 1, 10, 1, 8, 0, 0, 0, 0 };
+    var query_index: usize = 0;
+    var rows: usize = 0;
+    var startup_ready = false;
+    var cursor: protocol.Cursor = .{ .bytes = output.written() };
+    while (cursor.offset < cursor.bytes.len) {
+        const tag = try cursor.int(u8);
+        const length = try cursor.int(u32);
+        _ = try cursor.take(length - 4);
+        try std.testing.expect(tag != 'E');
+        if (tag == 'D') rows += 1;
+        if (tag == 'Z') {
+            if (!startup_ready) {
+                startup_ready = true;
+            } else {
+                try std.testing.expect(query_index < expected_rows.len);
+                try std.testing.expectEqual(expected_rows[query_index], rows);
+                query_index += 1;
+                rows = 0;
+            }
+        }
+    }
+    try std.testing.expectEqual(expected_rows.len, query_index);
+    try std.testing.expectEqual(@as(usize, 30), mock.stream_offset);
+    try std.testing.expectEqual(@as(usize, 2), mock.stream_closes);
+}
+
+test "pgwire original directional fetch forms preserve scroll position" {
+    // sql-0055, sql-0056, sql-0057, sql-0058, sql-0059, sql-0060 use the exact original FETCH statements.
+    // A SCROLL declaration is required for backward and absolute motion.
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    for ([_][]const u8{
+        "BEGIN\x00",
+        "DECLARE usage_cursor SCROLL CURSOR FOR SELECT id FROM usage_records ORDER BY id\x00",
+        "FETCH FORWARD 6 FROM usage_cursor\x00",
+        "FETCH BACKWARD 5 FROM usage_cursor\x00",
+        "MOVE ABSOLUTE 0 FROM usage_cursor\x00",
+        "FETCH FIRST FROM usage_cursor\x00",
+        "FETCH LAST FROM usage_cursor\x00",
+        "FETCH ABSOLUTE 3 FROM usage_cursor\x00",
+        "FETCH RELATIVE 2 FROM usage_cursor\x00",
+        "FETCH PRIOR FROM usage_cursor\x00",
+        "CLOSE ALL\x00",
+        "COMMIT\x00",
+    }) |statement| try frame(&input.writer, 'Q', statement);
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .stream_rows = 10, .expected_stream_statement = "SELECT id FROM usage_records ORDER BY id" };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    const expected = [_][]const u8{ "0", "1", "2", "3", "4", "5", "4", "3", "2", "1", "0", "0", "9", "2", "4", "3" };
+    var row_index: usize = 0;
+    var cursor: protocol.Cursor = .{ .bytes = output.written() };
+    while (cursor.offset < cursor.bytes.len) {
+        const tag = try cursor.int(u8);
+        const length = try cursor.int(u32);
+        var payload: protocol.Cursor = .{ .bytes = try cursor.take(length - 4) };
+        try std.testing.expect(tag != 'E');
+        if (tag == 'D') {
+            try std.testing.expectEqual(@as(u16, 1), try payload.int(u16));
+            const cell_length = try payload.int(u32);
+            try std.testing.expect(row_index < expected.len);
+            try std.testing.expectEqualStrings(expected[row_index], try payload.take(cell_length));
+            row_index += 1;
+        }
+    }
+    try std.testing.expectEqual(expected.len, row_index);
+    try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
+}
+
+test "pgwire materialized cursor enforces quota and reauthorizes held fetch" {
+    for ([_]bool{ false, true }) |revoke| {
+        var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer input.deinit();
+        try startup(&input.writer);
+        try frame(&input.writer, 'Q', "BEGIN\x00");
+        try frame(&input.writer, 'Q', "DECLARE rows CURSOR WITH HOLD FOR SELECT id FROM usage_records ORDER BY id\x00");
+        try frame(&input.writer, 'Q', "COMMIT\x00");
+        try frame(&input.writer, 'Q', "FETCH NEXT FROM rows\x00");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .revoke_after_commit = revoke, .expected_execute_statement = "SELECT id FROM usage_records ORDER BY id" };
+        var output = try run(&mock, input.written(), .{ .cursor_bytes = if (revoke) 4096 else 16 });
+        defer output.deinit();
+        const messages = try tags(std.testing.allocator, output.written());
+        defer std.testing.allocator.free(messages);
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, messages, "D"));
+        try std.testing.expect(std.mem.count(u8, messages, "E") >= 1);
+        if (revoke) {
+            try std.testing.expect(std.mem.indexOf(u8, output.written(), "42501") != null);
+        } else {
+            try std.testing.expect(std.mem.indexOf(u8, output.written(), "54000") != null);
+        }
+    }
+}
+
 test "pgwire failed cursor fetch marks transaction aborted and releases retained stream" {
     var input = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer input.deinit();
@@ -294,6 +509,396 @@ test "pgwire failed cursor fetch marks transaction aborted and releases retained
     try std.testing.expectEqual(@as(usize, 1), mock.failed_transactions);
     try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
     try std.testing.expectEqual(@as(usize, 2), mock.executions);
+}
+
+test "pgwire scroll hold cursor materializes before commit and retains exact position" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    for ([_][]const u8{
+        "BEGIN\x00",                       "DECLARE rows SCROLL CURSOR WITH HOLD FOR SELECT n FROM t\x00",
+        "FETCH FORWARD 2 FROM rows\x00",   "FETCH PRIOR FROM rows\x00",
+        "COMMIT\x00",                      "FETCH LAST FROM rows\x00",
+        "FETCH ABSOLUTE -2 FROM rows\x00", "MOVE ABSOLUTE 0 FROM rows\x00",
+        "FETCH NEXT FROM rows\x00",        "BEGIN\x00",
+        "ROLLBACK\x00",                    "FETCH RELATIVE 1 FROM rows\x00",
+        "CLOSE rows\x00",
+    }) |statement| try frame(&input.writer, 'Q', statement);
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .stream_rows = 5 };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    const messages = try tags(std.testing.allocator, output.written());
+    defer std.testing.allocator.free(messages);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, messages, "E"));
+    try std.testing.expectEqual(@as(usize, 7), std.mem.count(u8, messages, "D"));
+    var wire_cursor: protocol.Cursor = .{ .bytes = output.written() };
+    var row_index: usize = 0;
+    const expected = [_][]const u8{ "0", "1", "0", "4", "3", "0", "1" };
+    while (wire_cursor.offset < wire_cursor.bytes.len) {
+        const tag = try wire_cursor.int(u8);
+        const length = try wire_cursor.int(u32);
+        var payload: protocol.Cursor = .{ .bytes = try wire_cursor.take(length - 4) };
+        if (tag == 'D') {
+            try std.testing.expectEqual(@as(u16, 1), try payload.int(u16));
+            const cell_length = try payload.int(u32);
+            try std.testing.expectEqualStrings(expected[row_index], try payload.take(cell_length));
+            row_index += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), mock.stream_detaches);
+    try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
+    try std.testing.expect(mock.stream_validations >= 6);
+    try std.testing.expectEqual(@as(usize, 4), mock.executions);
+}
+
+test "pgwire rollback to savepoint closes only later cursors and preserves earlier position" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    for ([_][]const u8{
+        "BEGIN\x00",                                           "DECLARE earlier SCROLL CURSOR FOR SELECT n FROM t\x00",
+        "SAVEPOINT \"point\"\x00",                             "FETCH NEXT FROM earlier\x00",
+        "DECLARE later SCROLL CURSOR FOR SELECT n FROM t\x00", "ROLLBACK TO SAVEPOINT \"point\"\x00",
+        "FETCH NEXT FROM earlier\x00",                         "RELEASE \"point\"\x00",
+        "COMMIT\x00",
+    }) |statement| try frame(&input.writer, 'Q', statement);
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .stream_rows = 5 };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    const messages = try tags(std.testing.allocator, output.written());
+    defer std.testing.allocator.free(messages);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, messages, "E"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, messages, "D"));
+    try std.testing.expectEqual(@as(usize, 2), mock.stream_closes);
+    try std.testing.expectEqual(@as(usize, 5), mock.executions);
+}
+
+test "pgwire held cursor commit spool quota and revoked grants fail closed" {
+    for ([_]bool{ false, true }) |revoke| {
+        var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer input.deinit();
+        try startup(&input.writer);
+        for ([_][]const u8{ "BEGIN\x00", "DECLARE rows CURSOR WITH HOLD FOR SELECT n FROM t\x00", "COMMIT\x00", "FETCH ALL FROM rows\x00" }) |statement| try frame(&input.writer, 'Q', statement);
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .stream_rows = 5, .revoke_after_commit = revoke };
+        var output = try run(&mock, input.written(), .{ .cursor_rows = if (revoke) 5 else 2 });
+        defer output.deinit();
+        const messages = try tags(std.testing.allocator, output.written());
+        defer std.testing.allocator.free(messages);
+        try std.testing.expect(std.mem.count(u8, messages, "E") >= 1);
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, messages, "D"));
+        try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
+        try std.testing.expectEqual(@as(usize, if (revoke) 2 else 1), mock.executions);
+    }
+}
+
+test "pgwire statement timeout settings preserve transaction local and savepoint semantics" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    for ([_][]const u8{
+        "SET statement_timeout TO '4s'\x00", "BEGIN\x00",                  "SET LOCAL statement_timeout = 100\x00",
+        "SHOW statement_timeout\x00",        "SAVEPOINT point\x00",        "SET SESSION statement_timeout = 200\x00",
+        "ROLLBACK TO point\x00",             "SHOW statement_timeout\x00", "COMMIT\x00",
+        "SHOW statement_timeout\x00",        "BEGIN\x00",                  "SET statement_timeout = 300\x00",
+        "ROLLBACK\x00",                      "SHOW statement_timeout\x00", "RESET statement_timeout\x00",
+        "SHOW statement_timeout\x00",
+    }) |statement| try frame(&input.writer, 'Q', statement);
+    try parse(&input.writer, "timeout", "SHOW statement_timeout", false);
+    try bind(&input.writer, "timeout_portal", "timeout", null);
+    try execute(&input.writer, "timeout_portal", 0);
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{};
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    const expected = [_][]const u8{ "100ms", "100ms", "4000ms", "4000ms", "30000ms", "30000ms" };
+    var index: usize = 0;
+    var cursor: protocol.Cursor = .{ .bytes = output.written() };
+    while (cursor.offset < cursor.bytes.len) {
+        const tag = try cursor.int(u8);
+        const length = try cursor.int(u32);
+        var payload: protocol.Cursor = .{ .bytes = try cursor.take(length - 4) };
+        try std.testing.expect(tag != 'E');
+        if (tag == 'D') {
+            try std.testing.expectEqual(@as(u16, 1), try payload.int(u16));
+            const n = try payload.int(u32);
+            try std.testing.expect(index < expected.len);
+            try std.testing.expectEqualStrings(expected[index], try payload.take(n));
+            index += 1;
+        }
+    }
+    try std.testing.expectEqual(expected.len, index);
+    try std.testing.expectEqual(@as(usize, 6), mock.executions);
+}
+
+test "pgwire original public search path and timeout session commands" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    // sql-0037, sql-0039, sql-0041, sql-0043, sql-0046 are exact
+    // original statements. The intervening change makes LOCAL rollback
+    // observable instead of merely accepting its syntax.
+    for ([_][]const u8{
+        "SET search_path TO analytics\x00",
+        "SET search_path TO public;\x00",
+        "SHOW search_path;\x00",
+        "SET search_path TO analytics\x00",
+        "BEGIN\x00",
+        "SET LOCAL search_path TO public;\x00",
+        "SHOW search_path;\x00",
+        "ROLLBACK\x00",
+        "SHOW search_path;\x00",
+        "RESET search_path;\x00",
+        "SHOW search_path;\x00",
+        "SET statement_timeout = '1ms';\x00",
+        "SHOW statement_timeout\x00",
+    }) |statement| try frame(&input.writer, 'Q', statement);
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{};
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    const expected = [_][]const u8{ "public", "public", "analytics", "public", "1ms" };
+    var index: usize = 0;
+    var cursor: protocol.Cursor = .{ .bytes = output.written() };
+    while (cursor.offset < cursor.bytes.len) {
+        const tag = try cursor.int(u8);
+        const length = try cursor.int(u32);
+        var payload: protocol.Cursor = .{ .bytes = try cursor.take(length - 4) };
+        try std.testing.expect(tag != 'E');
+        if (tag == 'D') {
+            try std.testing.expectEqual(@as(u16, 1), try payload.int(u16));
+            const n = try payload.int(u32);
+            try std.testing.expect(index < expected.len);
+            try std.testing.expectEqualStrings(expected[index], try payload.take(n));
+            index += 1;
+        }
+    }
+    try std.testing.expectEqual(expected.len, index);
+}
+
+test "pgwire application name preserves transaction local and savepoint semantics" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    for ([_][]const u8{
+        "SET application_name TO 'base client'\x00",       "BEGIN\x00",
+        "SET LOCAL application_name = 'local client'\x00", "SHOW application_name\x00",
+        "SAVEPOINT point\x00",                             "SET SESSION application_name = 'new client'\x00",
+        "ROLLBACK TO point\x00",                           "SHOW application_name\x00",
+        "COMMIT\x00",                                      "SHOW application_name\x00",
+        "BEGIN\x00",                                       "SET application_name = 'other client'\x00",
+        "ROLLBACK\x00",                                    "SHOW application_name\x00",
+        "RESET application_name\x00",                      "SHOW application_name\x00",
+    }) |statement| try frame(&input.writer, 'Q', statement);
+    try parse(&input.writer, "app", "SHOW application_name", false);
+    try bind(&input.writer, "app_portal", "app", null);
+    try execute(&input.writer, "app_portal", 0);
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{};
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    const expected = [_][]const u8{ "local client", "local client", "base client", "base client", "", "" };
+    var index: usize = 0;
+    var cursor: protocol.Cursor = .{ .bytes = output.written() };
+    while (cursor.offset < cursor.bytes.len) {
+        const tag = try cursor.int(u8);
+        const length = try cursor.int(u32);
+        var payload: protocol.Cursor = .{ .bytes = try cursor.take(length - 4) };
+        try std.testing.expect(tag != 'E');
+        if (tag == 'D') {
+            try std.testing.expectEqual(@as(u16, 1), try payload.int(u16));
+            const n = try payload.int(u32);
+            try std.testing.expect(index < expected.len);
+            try std.testing.expectEqualStrings(expected[index], try payload.take(n));
+            index += 1;
+        }
+    }
+    try std.testing.expectEqual(expected.len, index);
+    try std.testing.expectEqual(@as(usize, 6), mock.executions);
+    try std.testing.expectEqual(@as(usize, 0), mock.setting_stream_opens);
+}
+
+test "pgwire UTF-8 encoding setting stays connection owned in simple and extended paths" {
+    // sql-0778: mounted wire proof for the original statement, including
+    // simple and extended routing without a SQL storage cursor.
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    for ([_][]const u8{
+        "SET client_encoding = 'UTF8';\x00", "SET NAMES 'UTF8'\x00",                     "SHOW client_encoding\x00",
+        "BEGIN\x00",                         "SET LOCAL client_encoding TO 'UTF-8'\x00", "COMMIT\x00",
+        "RESET client_encoding\x00",         "SHOW client_encoding\x00",
+    }) |statement| try frame(&input.writer, 'Q', statement);
+    try parse(&input.writer, "encoding", "SHOW client_encoding", false);
+    try bind(&input.writer, "encoding_portal", "encoding", null);
+    try execute(&input.writer, "encoding_portal", 0);
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{};
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    var rows: usize = 0;
+    var cursor: protocol.Cursor = .{ .bytes = output.written() };
+    while (cursor.offset < cursor.bytes.len) {
+        const tag = try cursor.int(u8);
+        const length = try cursor.int(u32);
+        var payload: protocol.Cursor = .{ .bytes = try cursor.take(length - 4) };
+        try std.testing.expect(tag != 'E');
+        if (tag == 'D') {
+            try std.testing.expectEqual(@as(u16, 1), try payload.int(u16));
+            const n = try payload.int(u32);
+            try std.testing.expectEqualStrings("UTF8", try payload.take(n));
+            rows += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), rows);
+    try std.testing.expectEqual(@as(usize, 0), mock.setting_stream_opens);
+}
+
+test "pgwire RESET ALL restores supported settings with transaction rollback and commit" {
+    // sql-0045: exact command with current settings. Original custom app.*
+    // catalog semantics still need a separate implementation and parity gate.
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    for ([_][]const u8{
+        "SET application_name = 'base'\x00",
+        "SET statement_timeout = 100\x00",
+        "SET search_path = tenant\x00",
+        "BEGIN\x00",
+        "SET application_name = 'tx'\x00",
+        "SAVEPOINT before_reset\x00",
+        "RESET ALL;\x00",
+        "SHOW application_name\x00",
+        "SHOW search_path\x00",
+        "ROLLBACK TO before_reset\x00",
+        "SHOW application_name\x00",
+        "SHOW search_path\x00",
+        "RESET ALL;\x00",
+        "COMMIT\x00",
+        "SHOW application_name\x00",
+        "SHOW statement_timeout\x00",
+        "SHOW search_path\x00",
+        "SET application_name = 'later'\x00",
+        "BEGIN\x00",
+        "RESET ALL;\x00",
+        "ROLLBACK\x00",
+        "SHOW application_name\x00",
+    }) |statement| try frame(&input.writer, 'Q', statement);
+    try parse(&input.writer, "reset", "RESET ALL;", false);
+    try bind(&input.writer, "reset_portal", "reset", null);
+    try execute(&input.writer, "reset_portal", 0);
+    try frame(&input.writer, 'S', "");
+    try frame(&input.writer, 'Q', "SHOW application_name\x00");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{};
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    const expected = [_][]const u8{ "", "public", "tx", "tenant", "", "30000ms", "public", "later", "" };
+    var index: usize = 0;
+    var cursor: protocol.Cursor = .{ .bytes = output.written() };
+    while (cursor.offset < cursor.bytes.len) {
+        const tag = try cursor.int(u8);
+        const length = try cursor.int(u32);
+        var payload: protocol.Cursor = .{ .bytes = try cursor.take(length - 4) };
+        try std.testing.expect(tag != 'E');
+        if (tag == 'D') {
+            try std.testing.expectEqual(@as(u16, 1), try payload.int(u16));
+            const n = try payload.int(u32);
+            try std.testing.expect(index < expected.len);
+            try std.testing.expectEqualStrings(expected[index], try payload.take(n));
+            index += 1;
+        }
+    }
+    try std.testing.expectEqual(expected.len, index);
+}
+
+test "pgwire DISCARD ALL releases active portal after extended reply" {
+    // sql-0047: current connection-resource lifecycle only. Original custom
+    // setting and broader catalog semantics remain unresolved.
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    try parse(&input.writer, "old", "SELECT n FROM t", false);
+    try bind(&input.writer, "live", "old", null);
+    try execute(&input.writer, "live", 1);
+    try parse(&input.writer, "discard", "DISCARD ALL;", false);
+    try bind(&input.writer, "command", "discard", null);
+    try execute(&input.writer, "command", 0);
+    // Reusing the old name proves the DISCARD reply released prepared plans.
+    try parse(&input.writer, "old", "SHOW client_encoding", false);
+    try bind(&input.writer, "fresh", "old", null);
+    try execute(&input.writer, "fresh", 0);
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .stream_rows = 4 };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    var saw_encoding = false;
+    var cursor: protocol.Cursor = .{ .bytes = output.written() };
+    while (cursor.offset < cursor.bytes.len) {
+        const tag = try cursor.int(u8);
+        const length = try cursor.int(u32);
+        var payload: protocol.Cursor = .{ .bytes = try cursor.take(length - 4) };
+        try std.testing.expect(tag != 'E');
+        if (tag == 'D') {
+            try std.testing.expectEqual(@as(u16, 1), try payload.int(u16));
+            const n = try payload.int(u32);
+            if (std.mem.eql(u8, try payload.take(n), "UTF8")) saw_encoding = true;
+        }
+    }
+    try std.testing.expect(saw_encoding);
+    try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
+}
+
+test "pgwire DISCARD ALL inside a transaction leaves prepared plans intact" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    try parse(&input.writer, "keep", "SHOW client_encoding", false);
+    try frame(&input.writer, 'Q', "BEGIN\x00");
+    try frame(&input.writer, 'Q', "DISCARD ALL;\x00");
+    try frame(&input.writer, 'Q', "ROLLBACK\x00");
+    try bind(&input.writer, "kept", "keep", null);
+    try execute(&input.writer, "kept", 0);
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{};
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    var errors: usize = 0;
+    var rows: usize = 0;
+    var cursor: protocol.Cursor = .{ .bytes = output.written() };
+    while (cursor.offset < cursor.bytes.len) {
+        const tag = try cursor.int(u8);
+        const length = try cursor.int(u32);
+        var payload: protocol.Cursor = .{ .bytes = try cursor.take(length - 4) };
+        if (tag == 'E') errors += 1;
+        if (tag == 'D') {
+            try std.testing.expectEqual(@as(u16, 1), try payload.int(u16));
+            const n = try payload.int(u32);
+            try std.testing.expectEqualStrings("UTF8", try payload.take(n));
+            rows += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), errors);
+    try std.testing.expectEqual(@as(usize, 1), rows);
+}
+
+test "pgwire unknown commit cannot publish held cursor rows" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    for ([_][]const u8{ "BEGIN\x00", "DECLARE rows SCROLL CURSOR WITH HOLD FOR SELECT n FROM t\x00", "COMMIT\x00", "FETCH NEXT FROM rows\x00" }) |statement| try frame(&input.writer, 'Q', statement);
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .stream_rows = 5, .unknown_commit = true };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    const messages = try tags(std.testing.allocator, output.written());
+    defer std.testing.allocator.free(messages);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, messages, "D"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, messages, "E"));
+    try std.testing.expectEqual(@as(usize, 1), mock.stream_detaches);
+    try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
 }
 
 test "pgwire pull failure and disconnect close snapshots before releasing identity" {
@@ -417,6 +1022,113 @@ test "pgwire pending DDL returns error receipt without successful command comple
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "do not replay") != null);
 }
 
+test "pgwire unknown DDL admission never claims a committed declaration" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    try frame(&input.writer, 'Q', "TRUNCATE TABLE t\x00");
+    try frame(&input.writer, 'X', "");
+    var mock = Mock{ .ddl_unknown = true };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    const observed = try tags(std.testing.allocator, output.written());
+    defer std.testing.allocator.free(observed);
+    try std.testing.expect(std.mem.indexOfScalar(u8, observed, 'E') != null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, observed, 'C') == null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "40003") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "committed") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "job-1") != null);
+}
+
+test "pgwire unknown DDL admission drains extended execution until Sync without replay" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    try parse(&input.writer, "ddl", "TRUNCATE TABLE t", false);
+    try bind(&input.writer, "ddl_portal", "ddl", null);
+    try execute(&input.writer, "ddl_portal", 0);
+    try execute(&input.writer, "ddl_portal", 0);
+    try frame(&input.writer, 'S', "");
+    try frame(&input.writer, 'X', "");
+    var mock = Mock{ .ddl_unknown = true };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    const observed = try tags(std.testing.allocator, output.written());
+    defer std.testing.allocator.free(observed);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, observed, "E"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, observed, "C"));
+    try std.testing.expectEqual(@as(usize, 1), mock.executions);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "40003") != null);
+}
+
+test "pgwire scoped search path pins prepared namespaces and restores transactional settings" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    try frame(&input.writer, 'Q', "SET search_path = analytics\x00");
+    try frame(&input.writer, 'Q', "PREPARE pinned AS SELECT n FROM t\x00");
+    try parse(&input.writer, "wire_pinned", "SELECT n FROM t", false);
+    try frame(&input.writer, 'Q', "SET search_path = public\x00");
+    try frame(&input.writer, 'Q', "EXECUTE pinned\x00");
+    try bind(&input.writer, "wire_portal", "wire_pinned", null);
+    try execute(&input.writer, "wire_portal", 0);
+    for ([_][]const u8{
+        "BEGIN\x00",           "SET LOCAL search_path = analytics\x00", "SELECT n FROM t\x00",
+        "SAVEPOINT point\x00", "SET search_path = tenant\x00",          "ROLLBACK TO point\x00",
+        "SELECT n FROM t\x00", "COMMIT\x00",                            "SELECT n FROM t\x00",
+        "BEGIN\x00",           "SET search_path = analytics\x00",       "ROLLBACK\x00",
+        "SELECT n FROM t\x00", "SHOW search_path\x00",                  "RESET search_path\x00",
+    }) |statement| try frame(&input.writer, 'Q', statement);
+    try parse(&input.writer, "show_path", "SHOW search_path", false);
+    try bind(&input.writer, "show_path_portal", "show_path", null);
+    try execute(&input.writer, "show_path_portal", 0);
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{};
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    const observed = try tags(std.testing.allocator, output.written());
+    defer std.testing.allocator.free(observed);
+    try std.testing.expect(std.mem.indexOfScalar(u8, observed, 'E') == null);
+    const expected = [_][]const u8{ "analytics", "analytics", "analytics", "analytics", "public", "public" };
+    try std.testing.expectEqual(expected.len, mock.namespace_count);
+    for (expected, 0..) |value, index| try std.testing.expectEqualStrings(value, mock.namespace_log[index].slice());
+    try std.testing.expect(mock.saw_distinct_owner_namespace);
+    try std.testing.expectEqual(@as(usize, 6), mock.namespace_checks);
+}
+
+test "pgwire held cursor keeps declaration namespace after mutable search path changes" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    for ([_][]const u8{ "SET search_path = analytics\x00", "BEGIN\x00", "DECLARE rows SCROLL CURSOR WITH HOLD FOR SELECT n FROM t\x00", "COMMIT\x00", "SET search_path = public\x00", "FETCH NEXT FROM rows\x00" }) |statement| try frame(&input.writer, 'Q', statement);
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .stream_rows = 2, .expected_cursor_namespace = "analytics" };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    const observed = try tags(std.testing.allocator, output.written());
+    defer std.testing.allocator.free(observed);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, observed, "E"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, observed, "D"));
+    try std.testing.expect(mock.stream_validations != 0);
+}
+
+test "pgwire denied namespace setting fails native transaction and rollback restores scope" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    for ([_][]const u8{ "BEGIN\x00", "SET LOCAL search_path = forbidden\x00", "SHOW search_path\x00", "ROLLBACK\x00", "SELECT n FROM t\x00" }) |statement| try frame(&input.writer, 'Q', statement);
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{};
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    const observed = try tags(std.testing.allocator, output.written());
+    defer std.testing.allocator.free(observed);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, observed, "E"));
+    try std.testing.expectEqual(@as(usize, 1), mock.failed_transactions);
+    try std.testing.expectEqual(@as(usize, 1), mock.namespace_count);
+    try std.testing.expectEqualStrings("public", mock.namespace_log[0].slice());
+}
+
 test "pgwire simple query releases native result owner exactly once" {
     var input = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer input.deinit();
@@ -471,6 +1183,28 @@ test "pgwire SQL prepare execute deallocate share connection ownership with wire
     try std.testing.expectEqual(@as(i64, 7), mock.seen_parameter.?);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "42P05") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "26000") != null);
+    try std.testing.expectEqual(@as(usize, 1), mock.disconnects);
+}
+
+test "pgwire original prepared read executes text and deallocates connection state" {
+    // sql-0001, sql-0034, sql-0035, sql-0036: exact original statements.
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    try frame(&input.writer, 'Q', "PREPARE usage_plan(text) AS SELECT id FROM usage_records WHERE status = $1\x00");
+    try frame(&input.writer, 'Q', "EXECUTE usage_plan('open')\x00");
+    try frame(&input.writer, 'Q', "DEALLOCATE usage_plan\x00");
+    try frame(&input.writer, 'Q', "EXECUTE usage_plan('open')\x00");
+    try frame(&input.writer, 'Q', "PREPARE usage_plan(text) AS SELECT id FROM usage_records WHERE status = $1\x00");
+    try frame(&input.writer, 'Q', "DEALLOCATE ALL\x00");
+    try frame(&input.writer, 'Q', "EXECUTE usage_plan('open')\x00");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .expected_text_parameter = "open" };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    try std.testing.expect(mock.saw_text_parameter);
+    try std.testing.expectEqual(@as(usize, 1), mock.executions);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, output.written(), "26000"));
     try std.testing.expectEqual(@as(usize, 1), mock.disconnects);
 }
 

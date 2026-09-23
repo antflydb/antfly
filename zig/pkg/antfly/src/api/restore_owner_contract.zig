@@ -54,6 +54,7 @@ pub const Request = struct {
     }
     pub fn validate(self: Request, group_id: u64) !void {
         try self.scope.validate();
+        if (self.scope.empty_generation and (self.action == .import_page or self.source != null or self.source_chunk != null or self.rewrite != null or self.rewrite_tail != null or self.rewrite_finish != null)) return error.InvalidRestoreStagingCommand;
         if (self.scope.target_namespace.shard_id != group_id or self.max_rows == 0 or self.max_rows > 128) return error.InvalidRestoreStagingCommand;
         if (self.source_chunk != null and (self.action != .import_page or self.source == null or self.source.?.peer_descriptor == null or self.rewrite_tail != null or self.rewrite_finish != null)) return error.InvalidRestoreStagingCommand;
         if (self.rewrite) |intent| {

@@ -100,6 +100,14 @@ pub fn execute(alloc: std.mem.Allocator, backend: catalog.Backend, compiled: *co
 }
 
 fn runBound(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled, parameters: []const Json, limits: Limits) !Output {
+    if (compiled.statement == .explain) {
+        const explanation = compiled.statement.explain;
+        const inner: compiler.Compiled = .{ .arena = undefined, .statement = explanation.statement.*, .parameter_count = compiled.parameter_count };
+        const binding = try describe.bind(arena, backend, &inner, &.{});
+        const rendered = try @import("explain.zig").render(arena, explanation, binding);
+        const row = try arena.dupe(Json, &.{.{ .string = rendered }});
+        return .{ .columns = try arena.dupe(Column, &.{.{ .name = "QUERY PLAN", .type = .string }}), .rows = try arena.dupe([]const Json, &.{row}), .command_tag = "EXPLAIN" };
+    }
     const ddl = @import("ddl_runtime.zig");
     if (ddl.accepts(compiled.statement)) {
         const result = try ddl.execute(arena, backend, compiled.statement);
@@ -149,6 +157,8 @@ pub const Context = struct {
     };
 
     fn run(context: Context, input: ast.Statement) !Output {
+        if (context.binding.joined_mutation) |joined| return @import("joined_mutation.zig").execute(context, joined.*);
+        if (context.binding.merge_mutation) |merge| return @import("merge_mutation.zig").execute(context, merge.*);
         return switch (input) {
             .select => |statement| try context.select(statement),
             .insert => |statement| try context.insert(statement),
@@ -477,7 +487,10 @@ pub const Context = struct {
         for (statement.rows, mutations, 0..) |row, *mutation, row_index| {
             try self.checkpoint();
             if (row.len != columns.len) return error.InvalidSqlParameters;
-            const key_datum: @import("scalar.zig").Datum = if (key_index) |key_at| try self.insertValue(row[key_at], columns[key_at], row_index, key_at) else .{ .value = .{ .string = try (self.backend.vtable.generate_row_id orelse return error.SqlRowIdentityRequired)(self.backend.ptr, self.arena) }, .sql_null = false };
+            const key_datum: @import("scalar.zig").Datum = if (key_index) |key_at| blk: {
+                if (!statement.isDefault(row_index, key_at)) break :blk try self.insertValue(row[key_at], columns[key_at], row_index, key_at);
+                break :blk .{ .value = .{ .string = try (self.backend.vtable.generate_row_id orelse return error.SqlRowIdentityRequired)(self.backend.ptr, self.arena) }, .sql_null = false };
+            } else .{ .value = .{ .string = try (self.backend.vtable.generate_row_id orelse return error.SqlRowIdentityRequired)(self.backend.ptr, self.arena) }, .sql_null = false };
             const key = key_datum.value;
             if (key_datum.sql_null or key != .string or key.string.len == 0) return error.SqlRowIdentityRequired;
             if (!std.unicode.utf8ValidateSlice(key.string)) return error.SqlTypeMismatch;
@@ -486,6 +499,7 @@ pub const Context = struct {
             var json_null_fields: std.ArrayList([]const u8) = .empty;
             for (columns, row, 0..) |column, item, i| {
                 if (key_index != null and i == key_index.?) continue;
+                if (statement.isDefault(row_index, i)) continue;
                 const datum = try self.insertValue(item, column, row_index, i);
                 const typed = datum.value;
                 const json_null = typed == .null and !datum.sql_null;
@@ -517,20 +531,22 @@ pub const Context = struct {
         // self-inserts from reading their own writes (Halloween problem).
         const selected = try input.select(source);
         if (selected.columns.len != statement.columns.len or selected.rows.len > self.limits.mutation_rows) return error.InvalidSqlBackendResponse;
+        if (statement.values_source_rows.len != 0 and selected.rows.len != statement.values_source_rows.len) return error.InvalidSqlBackendResponse;
         const flags = selected.sql_nulls orelse if (selected.rows.len == 0) &.{} else return error.InvalidSqlBackendResponse;
         if (flags.len != selected.rows.len) return error.InvalidSqlBackendResponse;
         const mutations = try self.arena.alloc(catalog.Mutation, selected.rows.len);
         var keys: std.StringHashMapUnmanaged(void) = .empty;
-        for (selected.rows, flags, mutations) |row, nulls, *mutation| {
+        for (selected.rows, flags, mutations, 0..) |row, nulls, *mutation, row_index| {
             try self.checkpoint();
             if (row.len != statement.columns.len or nulls.len != row.len) return error.InvalidSqlBackendResponse;
             var object: std.json.ObjectMap = .empty;
             var json_null_fields: std.ArrayList([]const u8) = .empty;
             var key: ?[]const u8 = null;
-            for (target_columns, selected.columns, row, nulls) |target, source_column, value_, sql_null| {
+            for (target_columns, selected.columns, row, nulls, 0..) |target, source_column, value_, sql_null, cell_index| {
+                if (statement.isDefault(row_index, cell_index)) continue;
                 if (sql_null and value_ != .null) return error.InvalidSqlBackendResponse;
                 if (sql_null and !target.nullable) return error.SqlNotNullViolation;
-                if (!sql_null and source_column.type != target.type and !(source_column.type == .integer and target.type == .number)) return error.SqlTypeMismatch;
+                if (!sql_null and source_column.type != target.type and !(source_column.type == .integer and target.type == .number) and !(statement.values_source_rows.len != 0 and source_column.type == .string and (target.type == .datetime or target.type == .json))) return error.SqlTypeMismatch;
                 const typed = try coerce(value_, target.type);
                 if (std.mem.eql(u8, target.name, "_id")) {
                     if (sql_null or typed != .string or typed.string.len == 0) return error.SqlRowIdentityRequired;
@@ -708,7 +724,17 @@ pub const Context = struct {
         return self.commitMutations(table_def, mutations.items, if (assignments != null) "UPDATE" else "DELETE", returning);
     }
 
-    fn commitMutations(self: Context, table: catalog.Table, all: []const catalog.Mutation, tag: []const u8, returning: ?[]const ast.Projection) !Output {
+    pub fn commitMutations(self: Context, table: catalog.Table, all: []const catalog.Mutation, tag: []const u8, returning: ?[]const ast.Projection) !Output {
+        return self.commitMutationsInner(table, all, tag, returning, false);
+    }
+
+    /// Call only after native preparation has produced all postimages and the
+    /// caller has built any source-aware RETURNING result before admission.
+    pub fn commitPreparedMutations(self: Context, table: catalog.Table, all: []const catalog.Mutation, tag: []const u8) !Output {
+        return self.commitMutationsInner(table, all, tag, null, true);
+    }
+
+    fn commitMutationsInner(self: Context, table: catalog.Table, all: []const catalog.Mutation, tag: []const u8, returning: ?[]const ast.Projection, already_prepared: bool) !Output {
         var fences: std.ArrayList(catalog.Mutation) = .empty;
         for (all) |mutation| if (mutation.predicate_only) {
             try fences.append(self.arena, mutation);
@@ -724,9 +750,11 @@ pub const Context = struct {
         };
         var output: Output = .{ .command_tag = tag, .rows_affected = input.len };
         var prepared = input;
-        if (table.storage_mode == .document and input.len != 0) {
+        var did_prepare = already_prepared;
+        if (!already_prepared and table.storage_mode == .document and input.len != 0) {
             const prepare = self.backend.vtable.prepare_mutations orelse return error.UnsupportedSqlExecution;
             prepared = try prepare(self.backend.ptr, self.arena, table, input);
+            did_prepare = true;
             if (prepared.len != input.len) return error.InvalidSqlBackendResponse;
         }
         if (returning != null) {
@@ -736,6 +764,7 @@ pub const Context = struct {
             if (input.len != 0 and table.storage_mode != .document and !std.mem.eql(u8, tag, "DELETE")) {
                 const prepare = self.backend.vtable.prepare_mutations orelse return error.UnsupportedSqlExecution;
                 prepared = try prepare(self.backend.ptr, self.arena, table, input);
+                did_prepare = true;
                 if (prepared.len != input.len) return error.InvalidSqlBackendResponse;
             }
             var context = self;
@@ -788,7 +817,10 @@ pub const Context = struct {
             try fences.appendSlice(self.arena, prepared);
             break :blk fences.items;
         };
-        output.mutation_outcome = if (committed.len == 0) .committed else try self.backend.vtable.mutate(self.backend.ptr, self.arena, table, committed);
+        output.mutation_outcome = if (committed.len == 0) .committed else if (did_prepare)
+            try (self.backend.vtable.mutate_prepared orelse return error.UnsupportedSqlExecution)(self.backend.ptr, self.arena, table, committed)
+        else
+            try self.backend.vtable.mutate(self.backend.ptr, self.arena, table, committed);
         return output;
     }
 };
@@ -865,6 +897,7 @@ const TestBackend = struct {
     primary_order: bool = false,
     statement_opens: usize = 0,
     statement_closes: usize = 0,
+    statement_scan_count: usize = 0,
 
     fn iface(self: *TestBackend) catalog.Backend {
         return .{ .ptr = self, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint } };
@@ -916,6 +949,7 @@ const TestBackend = struct {
             cursor.* = .{ .ptr = state, .next = Statement.next, .close = Statement.closeCursor };
         }
         backend.statement_opens += 1;
+        backend.statement_scan_count = scans.len;
         return .{ .ptr = owner, .cursors = cursors, .close = Statement.close };
     }
     fn resolve(_: *anyopaque, _: std.mem.Allocator, _: ast.Name, _: catalog.Action) !catalog.Table {
@@ -955,6 +989,298 @@ const TestBackend = struct {
     }
 };
 
+test "SQL EXPLAIN binds authorized plans without reading or writing rows" {
+    const Authority = struct {
+        scans: usize = 0,
+        writes: usize = 0,
+        write_authorizations: usize = 0,
+        last_action: ?catalog.Action = null,
+        deny_write: bool = false,
+        fn iface(self: *@This()) catalog.Backend {
+            return .{ .ptr = self, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint, .generate_row_id = generateRowId } };
+        }
+        fn resolve(ptr: *anyopaque, _: std.mem.Allocator, _: ast.Name, action: catalog.Action) !catalog.Table {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.last_action = action;
+            if (action != .read) self.write_authorizations += 1;
+            if (self.deny_write and action != .read) return error.Forbidden;
+            return .{ .id = 19, .physical_name = "table:stable", .schema_version = 7, .columns = &.{
+                .{ .name = "id", .path = "id", .type = .string, .nullable = false },
+                .{ .name = "status", .path = "status", .type = .string },
+            } };
+        }
+        fn scan(ptr: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.scans += 1;
+            return error.UnexpectedScan;
+        }
+        fn mutate(ptr: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.writes += 1;
+            return error.UnexpectedMutation;
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+        fn generateRowId(_: *anyopaque, _: std.mem.Allocator) ![]const u8 {
+            return error.UnexpectedRowIdGeneration;
+        }
+    };
+    var backend: Authority = .{};
+    for ([_]struct { sql: []const u8, contains: []const u8, action: catalog.Action }{
+        .{ .sql = "EXPLAIN SELECT id FROM things WHERE id = '1'", .contains = "Select on table:stable", .action = .read },
+        .{ .sql = "EXPLAIN INSERT INTO things (_id, id) VALUES ('new', '1')", .contains = "Insert on table:stable", .action = .write },
+        .{ .sql = "EXPLAIN (FORMAT JSON, VERBOSE, COSTS OFF) SELECT id FROM things", .contains = "\"schema_version\":7", .action = .read },
+        .{ .sql = "EXPLAIN (FORMAT JSON, COSTS OFF) SELECT a.id FROM things a JOIN things b ON a.id = b.id", .contains = "Hash Join", .action = .read },
+        .{ .sql = "EXPLAIN WITH c AS MATERIALIZED (SELECT id FROM things) SELECT a.id FROM c a JOIN c b ON a.id = b.id", .contains = "Materialized Reference", .action = .read },
+    }) |case| {
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, backend.iface(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqualStrings("EXPLAIN", result.output.command_tag);
+        try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+        try std.testing.expectEqual(@as(usize, 1), result.output.rows[0].len);
+        try std.testing.expect(std.mem.indexOf(u8, result.output.rows[0][0].string, case.contains) != null);
+        try std.testing.expectEqual(case.action, backend.last_action.?);
+    }
+    try std.testing.expectEqual(@as(usize, 0), backend.scans);
+    try std.testing.expectEqual(@as(usize, 0), backend.writes);
+    const corpus = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, @embedFile("fixtures/sql_parity_inventory.json"), .{});
+    defer corpus.deinit();
+    for ([_]struct { id: []const u8, kind: []const u8 }{
+        .{ .id = "sql-0066", .kind = "Insert" },
+        .{ .id = "sql-0068", .kind = "Update" },
+        .{ .id = "sql-0069", .kind = "Merge" },
+    }) |case| {
+        backend.write_authorizations = 0;
+        const exact_sql = for (corpus.value.object.get("entries").?.array.items) |entry| {
+            if (std.mem.eql(u8, entry.object.get("id").?.string, case.id)) break entry.object.get("sql").?.string;
+        } else return error.TestMissingCorpusCase;
+        var compiled = try compiler.compile(std.testing.allocator, exact_sql, .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, backend.iface(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expect(std.mem.indexOf(u8, result.output.rows[0][0].string, case.kind) != null);
+        try std.testing.expect(backend.write_authorizations > 0);
+    }
+    try std.testing.expectEqual(@as(usize, 0), backend.scans);
+    try std.testing.expectEqual(@as(usize, 0), backend.writes);
+    backend.deny_write = true;
+    var denied = try compiler.compile(std.testing.allocator, "EXPLAIN INSERT INTO things (_id, id) VALUES ('denied', '1')", .{});
+    defer denied.deinit();
+    try std.testing.expectError(error.Forbidden, execute(std.testing.allocator, backend.iface(), &denied, &.{}, .{}));
+    try std.testing.expectEqual(@as(usize, 0), backend.writes);
+    for ([_][]const u8{ "EXPLAIN ANALYZE SELECT id FROM things", "EXPLAIN (COSTS ON) SELECT id FROM things", "EXPLAIN DROP TABLE things" }) |sql| {
+        try std.testing.expectError(error.UnsupportedSqlShape, compiler.compile(std.testing.allocator, sql, .{}));
+    }
+}
+
+test "SQL INSERT VALUES scalar subqueries prepare a bounded source before writing" {
+    const ValuesBackend = struct {
+        writes: usize = 0,
+        large: bool = false,
+        checkpoints: usize = 0,
+        cancel_after: usize = std.math.maxInt(usize),
+        fn iface(self: *@This()) catalog.Backend {
+            return .{ .ptr = self, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint } };
+        }
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, _: ast.Name, action: catalog.Action) !catalog.Table {
+            try std.testing.expectEqual(catalog.Action.write, action);
+            return .{ .id = 19, .physical_name = "things", .schema_version = 1, .columns = &.{
+                .{ .name = "n", .path = "n", .type = .integer, .nullable = false },
+                .{ .name = "created_at", .path = "created_at", .type = .datetime },
+                .{ .name = "payload", .path = "payload", .type = .json },
+            } };
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
+            return error.UnexpectedIndependentScan;
+        }
+        fn mutate(ptr: *anyopaque, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.large) {
+                try std.testing.expectEqual(@as(usize, 1000), mutations.len);
+                for (mutations, 0..) |mutation, index| {
+                    var key_buffer: [32]u8 = undefined;
+                    const expected_key = try std.fmt.bufPrint(&key_buffer, "r{d}", .{index});
+                    try std.testing.expectEqualStrings(expected_key, mutation.key);
+                    try std.testing.expectEqual(@as(i64, if (index == 0) 7 else 8), mutation.row.?.object.get("n").?.integer);
+                }
+                self.writes += mutations.len;
+                return .committed;
+            }
+            try std.testing.expectEqual(@as(usize, 2), mutations.len);
+            for (mutations, [_][]const u8{ "a", "b" }, [_]i64{ 7, 8 }) |mutation, key, value| {
+                try std.testing.expectEqualStrings(key, mutation.key);
+                try std.testing.expectEqual(value, mutation.row.?.object.get("n").?.integer);
+                if (mutation.row.?.object.get("payload")) |payload| try std.testing.expectEqualStrings(if (std.mem.eql(u8, key, "a")) "hello" else "world", payload.string);
+            }
+            self.writes += mutations.len;
+            return .committed;
+        }
+        fn checkpoint(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.checkpoints += 1;
+            if (self.checkpoints > self.cancel_after) return error.Canceled;
+        }
+    };
+    for ([_]struct { sql: []const u8, params: []const Json }{
+        .{ .sql = "INSERT INTO things (_id,n) VALUES ('a',(SELECT $1)),('b',(SELECT 8))", .params = &.{.{ .integer = 7 }} },
+        .{ .sql = "INSERT INTO things (_id,n) VALUES ('a',(SELECT 7)),('b','8')", .params = &.{} },
+        .{ .sql = "INSERT INTO things (_id,n,created_at,payload) VALUES ('a',(SELECT 7),'2026-01-01T00:00:00Z','hello'),('b','8','2026-01-02T00:00:00Z','world')", .params = &.{} },
+    }) |case| {
+        var backend: ValuesBackend = .{};
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        try std.testing.expect(compiled.statement.insert.source != null);
+        var result = try execute(std.testing.allocator, backend.iface(), &compiled, case.params, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u64, 2), result.output.rows_affected);
+        try std.testing.expectEqual(@as(usize, 2), backend.writes);
+    }
+    var rejected_backend: ValuesBackend = .{};
+    var invalid = try compiler.compile(std.testing.allocator, "INSERT INTO things (_id,n) VALUES ('a',(SELECT 7)),('b',TRUE)", .{});
+    defer invalid.deinit();
+    try std.testing.expectError(error.SqlTypeMismatch, execute(std.testing.allocator, rejected_backend.iface(), &invalid, &.{}, .{}));
+    try std.testing.expectEqual(@as(usize, 0), rejected_backend.writes);
+    var empty_backend: ValuesBackend = .{};
+    var empty = try compiler.compile(std.testing.allocator, "INSERT INTO things (_id,n) VALUES ('a',(SELECT 7 WHERE FALSE)),('b',8)", .{});
+    defer empty.deinit();
+    try std.testing.expectError(error.SqlNotNullViolation, execute(std.testing.allocator, empty_backend.iface(), &empty, &.{}, .{}));
+    try std.testing.expectEqual(@as(usize, 0), empty_backend.writes);
+    var null_backend: ValuesBackend = .{};
+    var null_row = try compiler.compile(std.testing.allocator, "INSERT INTO things (_id,n) VALUES ('a',(SELECT 7)),('b',NULL)", .{});
+    defer null_row.deinit();
+    try std.testing.expectError(error.SqlNotNullViolation, execute(std.testing.allocator, null_backend.iface(), &null_row, &.{}, .{}));
+    try std.testing.expectEqual(@as(usize, 0), null_backend.writes);
+    var large_sql: std.ArrayList(u8) = .empty;
+    defer large_sql.deinit(std.testing.allocator);
+    try large_sql.appendSlice(std.testing.allocator, "INSERT INTO things (_id,n) VALUES ");
+    for (0..1000) |index| {
+        const row = try std.fmt.allocPrint(std.testing.allocator, "{s}('r{d}',{s})", .{ if (index == 0) "" else ",", index, if (index == 0) "(SELECT 7)" else "8" });
+        defer std.testing.allocator.free(row);
+        try large_sql.appendSlice(std.testing.allocator, row);
+    }
+    var large = try compiler.compile(std.testing.allocator, large_sql.items, .{});
+    defer large.deinit();
+    var backend: ValuesBackend = .{ .large = true };
+    var bound = try describe.describe(std.testing.allocator, backend.iface(), &large, &.{});
+    defer bound.deinit();
+    try std.testing.expect(bound.binding.insert_source != null);
+    switch (bound.binding.insert_source.?.relation.?.root.operation) {
+        .values => |arms| {
+            try std.testing.expectEqual(@as(usize, 2), arms.len);
+            switch (arms[1].operation) {
+                .literal_rows => |rows| try std.testing.expectEqual(@as(usize, 999), rows.len),
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(usize, 0), backend.writes);
+    var limited: ValuesBackend = .{ .large = true };
+    try std.testing.expectError(error.SqlProgramLimitExceeded, execute(std.testing.allocator, limited.iface(), &large, &.{}, .{ .retained_bytes = 1024 * 1024 }));
+    try std.testing.expectEqual(@as(usize, 0), limited.writes);
+    var canceled: ValuesBackend = .{ .large = true, .cancel_after = 8 };
+    try std.testing.expectError(error.Canceled, execute(std.testing.allocator, canceled.iface(), &large, &.{}, .{ .retained_bytes = 4 * 1024 * 1024 }));
+    try std.testing.expectEqual(@as(usize, 0), canceled.writes);
+    var large_result = try execute(std.testing.allocator, backend.iface(), &large, &.{}, .{ .retained_bytes = 4 * 1024 * 1024 });
+    defer large_result.deinit();
+    try std.testing.expectEqual(@as(u64, 1000), large_result.output.rows_affected);
+    try std.testing.expectEqual(@as(usize, 1000), backend.writes);
+    var late_parameter_sql: std.ArrayList(u8) = .empty;
+    defer late_parameter_sql.deinit(std.testing.allocator);
+    try late_parameter_sql.appendSlice(std.testing.allocator, "INSERT INTO things (_id,n) VALUES ");
+    for (0..128) |index| {
+        const row = try std.fmt.allocPrint(std.testing.allocator, "{s}('p{d}',{s})", .{ if (index == 0) "" else ",", index, if (index == 0) "(SELECT 7)" else if (index == 127) "$1" else "8" });
+        defer std.testing.allocator.free(row);
+        try late_parameter_sql.appendSlice(std.testing.allocator, row);
+    }
+    var late_parameter = try compiler.compile(std.testing.allocator, late_parameter_sql.items, .{});
+    defer late_parameter.deinit();
+    var late_bound = try describe.describe(std.testing.allocator, backend.iface(), &late_parameter, &.{});
+    defer late_bound.deinit();
+    try std.testing.expectEqual(@as(?ast.ColumnType, .integer), late_bound.binding.parameter_types[0]);
+}
+
+test "SQL INSERT VALUES self-subquery closes its captured read before commit" {
+    const SelfBackend = struct {
+        const Self = @This();
+        const CursorState = struct {
+            owner: *Self,
+            done: bool = false,
+            fn next(ptr: *anyopaque, alloc: std.mem.Allocator, _: u32) !catalog.Page {
+                const state: *@This() = @ptrCast(@alignCast(ptr));
+                if (state.done) return .{ .rows = &.{} };
+                state.done = true;
+                const rows = try alloc.alloc(catalog.Row, state.owner.source_rows);
+                for (rows, 0..) |*row, index| {
+                    var object: std.json.ObjectMap = .empty;
+                    try object.put(alloc, "n", .{ .integer = @intCast(7 + index) });
+                    row.* = .{ .id = if (index == 0) "old" else "other", .version = 1, .value = .{ .object = object } };
+                }
+                return .{ .rows = rows };
+            }
+            fn close(_: *anyopaque) void {}
+        };
+        captures: usize = 0,
+        source_rows: usize = 1,
+        closes: usize = 0,
+        writes: usize = 0,
+        states: [4]CursorState = undefined,
+        cursors: [4]catalog.Cursor = undefined,
+        fn iface(self: *@This()) catalog.Backend {
+            return .{ .ptr = self, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .open_statement = open, .mutate = mutate, .checkpoint = checkpoint } };
+        }
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, _: ast.Name, action: catalog.Action) !catalog.Table {
+            try std.testing.expect(action == .read or action == .write);
+            return .{ .id = 19, .physical_name = "things", .schema_version = 1, .columns = &.{.{ .name = "n", .path = "n", .type = .integer, .nullable = false }} };
+        }
+        fn open(ptr: *anyopaque, _: std.mem.Allocator, scans: []const catalog.StatementScan) !catalog.StatementRead {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (scans.len == 0 or scans.len > self.states.len) return error.TestUnexpectedScanCount;
+            self.captures += 1;
+            for (scans, self.states[0..scans.len], self.cursors[0..scans.len]) |request, *state, *cursor| {
+                try std.testing.expectEqual(@as(u64, 19), request.table.id);
+                state.* = .{ .owner = self };
+                cursor.* = .{ .ptr = state, .next = CursorState.next, .close = CursorState.close };
+            }
+            return .{ .ptr = self, .cursors = self.cursors[0..scans.len], .close = close };
+        }
+        fn close(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.closes += 1;
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
+            return error.UnexpectedIndependentScan;
+        }
+        fn mutate(ptr: *anyopaque, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(self.captures, self.closes);
+            try std.testing.expectEqual(@as(usize, 1), mutations.len);
+            try std.testing.expectEqualStrings("new", mutations[0].key);
+            try std.testing.expectEqual(@as(i64, 7), mutations[0].row.?.object.get("n").?.integer);
+            self.writes += 1;
+            return .committed;
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+    };
+    var backend: SelfBackend = .{};
+    var compiled = try compiler.compile(std.testing.allocator, "INSERT INTO things (_id,n) VALUES ('new',(SELECT n FROM things WHERE _id='old'))", .{});
+    defer compiled.deinit();
+    var result = try execute(std.testing.allocator, backend.iface(), &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u64, 1), result.output.rows_affected);
+    try std.testing.expectEqual(@as(usize, 1), backend.captures);
+    try std.testing.expectEqual(@as(usize, 1), backend.closes);
+    try std.testing.expectEqual(@as(usize, 1), backend.writes);
+    var multiple: SelfBackend = .{ .source_rows = 2 };
+    var invalid = try compiler.compile(std.testing.allocator, "INSERT INTO things (_id,n) VALUES ('new',(SELECT n FROM things))", .{});
+    defer invalid.deinit();
+    try std.testing.expectError(error.SqlCardinalityViolation, execute(std.testing.allocator, multiple.iface(), &invalid, &.{}, .{}));
+    try std.testing.expectEqual(@as(usize, 1), multiple.captures);
+    try std.testing.expectEqual(@as(usize, 1), multiple.closes);
+    try std.testing.expectEqual(@as(usize, 0), multiple.writes);
+}
+
 test "SQL grouped aggregation streams pages then applies HAVING ORDER OFFSET and LIMIT" {
     var backend: TestBackend = .{ .row_count = 8 };
     var compiled = try compiler.compile(std.testing.allocator, "SELECT _id::bigint % 2 AS bucket, sum(_id::bigint) AS amount, count(*) AS n FROM things WHERE _id != '0' GROUP BY bucket HAVING sum(_id::bigint) > 5 ORDER BY amount DESC LIMIT 1 OFFSET 1", .{});
@@ -966,6 +1292,16 @@ test "SQL grouped aggregation streams pages then applies HAVING ORDER OFFSET and
     try std.testing.expectEqualStrings("0", result.output.rows[0][0].string);
     try std.testing.expectEqualStrings("12", result.output.rows[0][1].string);
     try std.testing.expectEqualStrings("3", result.output.rows[0][2].string);
+}
+
+test "SQL aggregate admission sizes TopK by observed groups rather than result cap" {
+    var backend: TestBackend = .{ .row_count = 8 };
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT count(*) FROM things", .{});
+    defer compiled.deinit();
+    var result = try execute(std.testing.allocator, backend.iface(), &compiled, &.{}, .{ .result_rows = 4096, .retained_bytes = 128 * 1024 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+    try std.testing.expectEqualStrings("8", result.output.rows[0][0].string);
 }
 
 test "SQL joins use one coordinated cut and preserve typed outer nulls across pages" {
@@ -994,6 +1330,68 @@ test "SQL CTE aliases feed hash joins and grouped projection without stringifyin
     try std.testing.expectEqualStrings("2", result.output.rows[0][0].string);
     try std.testing.expectEqualStrings("1", result.output.rows[0][1].string);
     try std.testing.expectEqual(@as(usize, 1), backend.statement_closes);
+}
+
+test "SQL CTE materialization shares one bounded producer while inline hints retain independent scans" {
+    // sql-1221, sql-1258, sql-1262: the mounted cases establish exact SQL
+    // output; this producer-work test establishes the hint execution policy.
+    const Case = struct { hint: []const u8, scans: usize };
+    var materialized_pages: usize = 0;
+    for ([_]Case{
+        .{ .hint = "MATERIALIZED", .scans = 1 },
+        .{ .hint = "", .scans = 1 },
+        .{ .hint = "NOT MATERIALIZED", .scans = 2 },
+    }) |case| {
+        var backend: TestBackend = .{ .row_count = 4 };
+        const sql = try std.fmt.allocPrint(std.testing.allocator, "WITH q(k) AS {s} (SELECT _id FROM things WHERE _id != '3') SELECT a.k FROM q AS a JOIN q AS b ON a.k = b.k ORDER BY a.k", .{case.hint});
+        defer std.testing.allocator.free(sql);
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{ .page_rows = 1 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 3), result.output.rows.len);
+        for (result.output.rows, [_][]const u8{ "0", "1", "2" }) |row, expected| try std.testing.expectEqualStrings(expected, row[0].string);
+        try std.testing.expectEqual(case.scans, backend.statement_scan_count);
+        try std.testing.expectEqual(@as(usize, 1), backend.statement_opens);
+        try std.testing.expectEqual(@as(usize, 1), backend.statement_closes);
+        if (case.scans == 1) materialized_pages = backend.pages else try std.testing.expect(backend.pages > materialized_pages);
+    }
+    {
+        var backend: TestBackend = .{};
+        var compiled = try compiler.compile(std.testing.allocator, "WITH q(v) AS MATERIALIZED (SELECT $1::bigint) SELECT a.v FROM q AS a JOIN q AS b ON a.v = b.v WHERE a.v = $2", .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, backend.coordinated(), &compiled, &.{ .{ .integer = 7 }, .{ .integer = 7 } }, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+        try std.testing.expectEqualStrings("7", result.output.rows[0][0].string);
+    }
+    {
+        // Each alias consumes different producer columns. The one retained
+        // producer must keep both columns even if the first alias uses one.
+        var backend: TestBackend = .{ .row_count = 3 };
+        var compiled = try compiler.compile(std.testing.allocator, "WITH q AS MATERIALIZED (SELECT _id AS k, id AS v FROM things) SELECT a.k, b.v FROM q AS a JOIN q AS b ON a.k = b.k ORDER BY a.k", .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{ .page_rows = 1 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 3), result.output.rows.len);
+        for (result.output.rows, [_][]const u8{ "0", "1", "2" }) |row, expected| {
+            try std.testing.expectEqualStrings(expected, row[0].string);
+            try std.testing.expectEqualStrings("9007199254740993", row[1].string);
+        }
+        try std.testing.expectEqual(@as(usize, 1), backend.statement_scan_count);
+    }
+    {
+        // Inlining a multiply referenced downstream CTE must propagate its
+        // demand to an automatic upstream producer instead of rescanning it.
+        var backend: TestBackend = .{ .row_count = 3 };
+        var compiled = try compiler.compile(std.testing.allocator, "WITH q AS (SELECT _id AS k FROM things), r AS NOT MATERIALIZED (SELECT k FROM q) SELECT a.k FROM r AS a JOIN r AS b ON a.k = b.k ORDER BY a.k", .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{ .page_rows = 1 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 3), result.output.rows.len);
+        try std.testing.expectEqual(@as(usize, 1), backend.statement_scan_count);
+        try std.testing.expectEqual(@as(usize, 1), backend.statement_opens);
+    }
 }
 
 test "SQL self joins preserve duplicate matches and evaluate complete ON residuals" {

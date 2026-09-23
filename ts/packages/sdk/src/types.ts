@@ -155,6 +155,9 @@ export interface WriteOptions {
 
 // SQL types. Integer result values are exact decimal strings.
 export type SQLRequest = components["schemas"]["SQLRequest"];
+export type SQLPrepareRequest = components["schemas"]["SQLPrepareRequest"];
+export type SQLPreparedExecutionRequest = components["schemas"]["SQLPreparedExecutionRequest"];
+export type SQLPreparedResponse = components["schemas"]["SQLPreparedResponse"];
 export type SQLResponse = components["schemas"]["SQLResponse"];
 export type SQLColumn = components["schemas"]["SQLColumn"];
 export type SQLColumnType = components["schemas"]["SQLColumnType"];

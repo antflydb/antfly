@@ -167,14 +167,19 @@ pub fn bind(alloc: Allocator, table: ?catalog.Table, statement: ast.Statement, p
 fn bindInsert(alloc: Allocator, table: catalog.Table, statement: ast.Insert, parameters: []?ast.ColumnType) !Bound {
     if (statement.expressions.len == 0) return .{};
     if (statement.expressions.len != statement.rows.len) return error.InvalidSqlParameters;
+    if (statement.defaults.len != 0) {
+        if (statement.defaults.len != statement.rows.len) return error.InvalidSqlParameters;
+        for (statement.defaults) |mask| if (mask.len != statement.columns.len) return error.InvalidSqlParameters;
+    }
     var builder: Builder = .{ .alloc = alloc, .table = null, .columns = &.{}, .parameters = parameters };
     var pass: usize = 0;
     while (true) : (pass += 1) {
         if (pass > parameters.len + 1) return error.ConflictingSqlParameterTypes;
         var changed = false;
-        for (statement.rows, statement.expressions) |row, expressions| {
+        for (statement.rows, statement.expressions, 0..) |row, expressions, row_index| {
             if (row.len != statement.columns.len or expressions.len != row.len) return error.InvalidSqlParameters;
-            for (row, expressions, statement.columns) |literal, expression, name| {
+            for (row, expressions, statement.columns, 0..) |literal, expression, name, cell_index| {
+                if (statement.isDefault(row_index, cell_index)) continue;
                 const column = try table.column(name);
                 const node = expression orelse try builder.node(.{ .literal = literal });
                 changed = try scalar.inferParameters(alloc, node, &.{}, parameters, column.type, .{}) or changed;

@@ -1292,6 +1292,31 @@ pub const UserManager = struct {
         return try self.effectiveApiKeyPermissionsUnlocked(key_id);
     }
 
+    /// Recheck the restrictions attached to an already authenticated durable
+    /// credential. No bearer secret is retained by background generation jobs.
+    pub fn durableCredentialRowFilters(self: *const UserManager, principal: []const u8) ![]RowFilterEntry {
+        var receiver = try self.io_borrow.receive();
+        const io = receiver.io();
+        const mutable: *UserManager = @constCast(self);
+        mutable.mutation_mutex.lockUncancelable(io);
+        defer mutable.mutation_mutex.unlock(io);
+        if (std.mem.startsWith(u8, principal, "basic:")) return self.getRowFilters(principal["basic:".len..]);
+        if (!std.mem.startsWith(u8, principal, "api-key:")) return error.ApiKeyInvalid;
+        const key = principal["api-key:".len..];
+        const permissions = try self.effectiveApiKeyPermissionsUnlocked(key);
+        defer {
+            for (permissions) |*permission| permission.deinit(self.alloc);
+            self.alloc.free(permissions);
+        }
+        const record = self.api_keys.get(key) orelse return error.ApiKeyNotFound;
+        const owner = try self.getRowFilters(record.key.username);
+        defer {
+            for (owner) |*entry| entry.deinit(self.alloc);
+            self.alloc.free(owner);
+        }
+        return combineLayeredRowFilters(self.alloc, owner, record.key.row_filter);
+    }
+
     fn effectiveApiKeyPermissionsUnlocked(self: *const UserManager, key_id: []const u8) ![]Permission {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();

@@ -32,6 +32,9 @@ pub const Request = struct {
     parameter_types: []const Type = &.{},
     database: ?[]const u8 = null,
     namespace: ?[]const u8 = null,
+    /// Immutable owner scope of an already active transaction; namespace above
+    /// is the mutable lookup scope. Never supplied by a remote session id.
+    session_namespace: ?[]const u8 = null,
     session_id: ?[]const u8 = null,
     limit: u32,
     io: std.Io,
@@ -112,6 +115,7 @@ pub const Backend = struct {
         authenticate: *const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8) anyerror!Identity,
         describe: *const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!Description,
         execute: *const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!Result,
+        validate_namespace: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!void = null,
         /// Evaluate SQL EXECUTE arguments as scalar expressions without any
         /// catalog/table access. Values are owned by the supplied allocator.
         evaluate_parameters: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request, []const []const u8) anyerror![]const std.json.Value = null,
@@ -133,5 +137,11 @@ pub const ReadStream = struct {
     columns: []const Column,
     next: *const fn (*anyopaque, std.mem.Allocator, Request, u32) anyerror!StreamPage,
     close: *const fn (*anyopaque) void,
+    /// Release capture, execution admission and plan after bounded spooling,
+    /// retaining only the authorization capsule until close.
+    detach: ?*const fn (*anyopaque) void = null,
+    /// Reauthenticate buffered rows against the original aliases/filter and
+    /// namespace, without opening readers or reexecuting the statement.
+    validate: ?*const fn (*anyopaque, std.mem.Allocator, Request) anyerror!void = null,
 };
 pub const StreamPage = struct { result: Result, exhausted: bool };

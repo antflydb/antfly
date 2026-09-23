@@ -15,7 +15,9 @@ pub fn lower(alloc: std.mem.Allocator, schema: Json, expression: *const ast.Scal
     return (try lowerTyped(alloc, schema, expression, expected)).expression;
 }
 
-pub fn lowerTyped(alloc: std.mem.Allocator, schema: Json, expression: *const ast.Scalar, expected: ?ast.ColumnType) !struct { expression: Json, type: ast.ColumnType } {
+const Lowered = struct { expression: Json, type: ast.ColumnType };
+
+pub fn lowerTyped(alloc: std.mem.Allocator, schema: Json, expression: *const ast.Scalar, expected: ?ast.ColumnType) !Lowered {
     const default_type = schema.object.get("default_type") orelse return error.InvalidSqlBackendResponse;
     const row = schema.object.get("document_schemas").?.object.get(default_type.string).?.object.get("schema").?;
     const properties = row.object.get("properties").?;
@@ -25,7 +27,11 @@ pub fn lowerTyped(alloc: std.mem.Allocator, schema: Json, expression: *const ast
         const kind: ast.ColumnType = if (std.mem.eql(u8, wire_type, "keyword")) .string else std.meta.stringToEnum(ast.ColumnType, wire_type) orelse return error.UnsupportedSqlShape;
         try columns.append(alloc, .{ .name = name, .type = kind });
     }
-    var program = try scalar.bindExpected(alloc, expression, columns.items, &.{}, expected, .{});
+    return lowerColumns(alloc, columns.items, expression, expected);
+}
+
+pub fn lowerColumns(alloc: std.mem.Allocator, columns: []const scalar.Column, expression: *const ast.Scalar, expected: ?ast.ColumnType) !Lowered {
+    var program = try scalar.bindExpected(alloc, expression, columns, &.{}, expected, .{});
     defer program.deinit();
     if (program.parameter_types.len != 0) return error.InvalidSqlParameters;
     const values = try alloc.alloc(Json, program.instructions.len);
@@ -33,7 +39,7 @@ pub fn lowerTyped(alloc: std.mem.Allocator, schema: Json, expression: *const ast
         const kind = instruction.type.kind orelse return error.SqlTypeMismatch;
         out.* = switch (instruction.operation) {
             .literal => |literal| try json(alloc, .{ .op = "literal", .type = @tagName(kind), .value = literal }),
-            .column => |ordinal| try json(alloc, .{ .op = "column", .column = columns.items[ordinal].name }),
+            .column => |ordinal| try json(alloc, .{ .op = "column", .column = columns[ordinal].name }),
             .parameter => return error.InvalidSqlParameters,
             .unary => |part| blk: {
                 if (part.op == .positive) break :blk values[part.operand];

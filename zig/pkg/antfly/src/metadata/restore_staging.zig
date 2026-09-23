@@ -115,7 +115,11 @@ pub const ProvisioningSnapshot = struct {
 pub const State = enum { importing, validating, cutover, published, canceling, canceled, preparing_sources };
 pub const SourceArtifact = @import("restore_provisioning_contract.zig").SourceArtifact;
 pub const Target = struct {
+    pub fn nativeJsonSkipField(self: @This(), comptime name: []const u8) bool {
+        return std.mem.eql(u8, name, "empty_generation") and !self.empty_generation;
+    }
     source_table_id: u64,
+    empty_generation: bool = false,
     table: records.TableRecord,
     /// Logical publication is part of the same transaction as the new owner
     /// generation. The namespace ID is pinned, not reinterpreted by name.
@@ -181,6 +185,18 @@ pub const Plan = struct {
         };
         for (self.targets, 0..) |target, index| {
             const table = target.table;
+            if (target.empty_generation) {
+                const old = target.replace orelse return error.InvalidRestoreStaging;
+                if (self.preparing_sources or target.rewrite != null or target.rewrite_sources.len != 0 or target.source_artifacts.len != 0 or old.table.table_id != target.source_table_id or old.fences.len != old.ranges.len or old.ranges.len != target.ranges.len) return error.InvalidRestoreStaging;
+                if (!std.mem.eql(u8, old.table.schema_json, table.schema_json) or !std.mem.eql(u8, old.table.read_schema_json, table.read_schema_json) or !std.mem.eql(u8, old.table.indexes_json, table.indexes_json)) return error.InvalidRestoreStaging;
+                for (old.ranges, target.ranges) |source, destination| {
+                    if (!std.mem.eql(u8, source.start_key, destination.start_key) or !std.mem.eql(u8, source.end_key orelse "", destination.end_key orelse "")) return error.InvalidRestoreStaging;
+                    const fence = for (old.fences) |item| {
+                        if (item.owner_group_id == source.group_id) break item;
+                    } else return error.InvalidRestoreStaging;
+                    if (fence.role != .rewrite_source or fence.peer_group_id != destination.group_id or fence.transition_id != std.mem.readInt(u64, self.id[0..8], .little) or fence.attempt != std.mem.readInt(u64, self.id[8..16], .little)) return error.InvalidRestoreStaging;
+                }
+            }
             if (target.catalog_binding) |binding| {
                 if (binding.kind != .table or binding.id != table.table_id or binding.parent_id == 0 or
                     !std.mem.eql(u8, binding.storage_name, table.name)) return error.InvalidRestoreStaging;
@@ -363,9 +379,6 @@ pub const Job = struct {
 /// coordinator. Hash the encoded runtime schema, not the public JSON spelling.
 pub fn ownerScope(alloc: std.mem.Allocator, plan: Plan, plan_digest: Digest, target: Target, range: records.RangeRecord) !@import("../storage/db/restore_staging_contract.zig").Scope {
     if (range.table_id != target.table.table_id) return error.InvalidRestoreStaging;
-    const artifact = for (target.source_artifacts) |source| {
-        if (source.target_group_id == range.group_id) break source;
-    } else return error.RestoreSourceProofMissing;
     const api_tables = @import("../api/tables.zig");
     const runtime_schema = @import("../storage/schema.zig");
     var schema = try api_tables.parseValidatedTableSchema(alloc, target.table.schema_json);
@@ -374,6 +387,24 @@ pub fn ownerScope(alloc: std.mem.Allocator, plan: Plan, plan_digest: Digest, tar
     defer runtime_schema.freeSchema(alloc, typed);
     const encoded = try runtime_schema.serializeSchema(alloc, typed);
     defer alloc.free(encoded);
+    if (target.empty_generation) {
+        const old = target.replace orelse return error.InvalidRestoreStaging;
+        const source = for (old.ranges) |item| {
+            if (std.mem.eql(u8, item.start_key, range.start_key) and std.mem.eql(u8, item.end_key orelse "", range.end_key orelse "")) break item;
+        } else return error.InvalidRestoreStaging;
+        return .{
+            .plan_id = plan.id,
+            .plan_digest = plan_digest,
+            .source_artifact_digest = @splat(0),
+            .source_namespace = .{ .table_id = old.table.table_id, .shard_id = tables.rangeDocIdentityShardId(source), .range_id = tables.rangeDocIdentityRangeId(source) },
+            .target_namespace = .{ .table_id = target.table.table_id, .shard_id = tables.rangeDocIdentityShardId(range), .range_id = tables.rangeDocIdentityRangeId(range) },
+            .target_schema_digest = @import("../storage/db/restore_staging_contract.zig").digest(encoded),
+            .empty_generation = true,
+        };
+    }
+    const artifact = for (target.source_artifacts) |source| {
+        if (source.target_group_id == range.group_id) break source;
+    } else return error.RestoreSourceProofMissing;
     return .{
         .plan_id = plan.id,
         .plan_digest = plan_digest,
@@ -564,6 +595,28 @@ pub fn sourceArtifactKey(buf: []u8, metadata_group_id: u64, id: Id, target_group
 /// This shares the plan's snapshot/tombstone lifetime, not a separate ledger.
 pub fn authorityNodeKey(buf: []u8, metadata_group_id: u64, id: Id, node_id: u64) ![]const u8 {
     return std.fmt.bufPrint(buf, "\x00\x00__metadata__:restore_staging:{d}:authority:{s}:{d}", .{ metadata_group_id, std.fmt.bytesToHex(id, .lower), node_id });
+}
+
+test "relational integrity restore staging empty generation binds old fences without source artifacts" {
+    const alloc = std.testing.allocator;
+    const id = try idForAttempt(7, 1);
+    const old: records.TableRecord = .{ .table_id = 9, .name = "docs", .schema_json = "{}" };
+    const old_range: records.RangeRecord = .{ .table_id = 9, .group_id = 301, .start_key = "" };
+    const fence: @import("../storage/db/relational_integrity_topology_contract.zig").Fence = .{ .role = .rewrite_source, .transition_id = 7, .attempt = 1, .owner_group_id = 301, .peer_group_id = 401, .namespace = .{ .table_id = 9, .shard_id = 301, .range_id = 301 }, .catalog_digest = @splat(4) };
+    var targets = [_]Target{.{ .source_table_id = 9, .empty_generation = true, .table = .{ .table_id = 10, .name = "docs", .schema_json = "{}" }, .ranges = &.{.{ .table_id = 10, .group_id = 401, .range_id = 401, .doc_identity_shard_id = 401, .doc_identity_range_id = 401, .start_key = "" }}, .replace = .{ .table = old, .ranges = &.{old_range}, .fences = &.{fence} } }};
+    const plan: Plan = .{ .id = id, .cohort_digest = @splat(3), .targets = &targets };
+    try plan.validate(alloc);
+    const scope = try ownerScope(alloc, plan, try plan.digest(alloc), targets[0], targets[0].ranges[0]);
+    try scope.validate();
+    try std.testing.expect(scope.empty_generation);
+    try std.testing.expect(!scope.preserve_artifacts);
+    try std.testing.expect(std.mem.allEqual(u8, &scope.source_artifact_digest, 0));
+    try std.testing.expectEqual(@as(u64, 9), scope.source_namespace.table_id);
+    targets[0].replace.?.fences = &.{};
+    try std.testing.expectError(error.InvalidRestoreStaging, plan.validate(alloc));
+    targets[0].replace.?.fences = &.{fence};
+    targets[0].table.schema_json = "{\"version\":2}";
+    try std.testing.expectError(error.InvalidRestoreStaging, plan.validate(alloc));
 }
 
 test "relational integrity restore staging shares one plan across document and typed tables" {

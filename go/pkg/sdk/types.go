@@ -28,12 +28,15 @@ import (
 
 // Re-export commonly used types from oapi package
 type (
-	SQLRequest         = oapi.SQLRequest
-	SQLResponse        = oapi.SQLResponse
-	SQLColumn          = oapi.SQLColumn
-	SQLColumnType      = oapi.SQLColumnType
-	SQLDiagnostic      = oapi.SQLDiagnostic
-	SQLMutationOutcome = oapi.SQLMutationOutcome
+	SQLRequest                  = oapi.SQLRequest
+	SQLPrepareRequest           = oapi.SQLPrepareRequest
+	SQLPreparedExecutionRequest = oapi.SQLPreparedExecutionRequest
+	SQLPreparedResponse         = oapi.SQLPreparedResponse
+	SQLResponse                 = oapi.SQLResponse
+	SQLColumn                   = oapi.SQLColumn
+	SQLColumnType               = oapi.SQLColumnType
+	SQLDiagnostic               = oapi.SQLDiagnostic
+	SQLMutationOutcome          = oapi.SQLMutationOutcome
 	// Table and Index types
 	CreateTableRequest                    = oapi.CreateTableRequest
 	TableStatus                           = oapi.TableStatus

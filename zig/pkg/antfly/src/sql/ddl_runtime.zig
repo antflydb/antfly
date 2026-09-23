@@ -5,7 +5,7 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const catalog = @import("catalog.zig");
 
-pub const Output = struct { command_tag: []const u8, mutation_outcome: catalog.MutationOutcome, receipt: ?catalog.DdlReceipt = null };
+pub const Output = struct { command_tag: []const u8, mutation_outcome: ?catalog.MutationOutcome, receipt: ?catalog.DdlReceipt = null };
 
 pub fn accepts(statement: ast.Statement) bool {
     return switch (statement) {
@@ -28,6 +28,7 @@ pub fn execute(alloc: std.mem.Allocator, backend: catalog.Backend, statement: as
         .create_table => "CREATE TABLE",
         .drop_table => "DROP TABLE",
         .catalog_ddl => |ddl| switch (ddl.action) {
+            .truncate => "TRUNCATE TABLE",
             .alter_schema => switch (ddl.schema_change orelse return error.InvalidSqlSyntax) {
                 .create_index => "CREATE INDEX",
                 .drop_index => "DROP INDEX",
@@ -113,6 +114,29 @@ pub fn createSchemaAlloc(alloc: std.mem.Allocator, create: ast.CreateTable) anye
     return std.json.Stringify.valueAlloc(alloc, schema, .{});
 }
 
+test "SQL TRUNCATE lowers complete table set and honest durable admission receipt" {
+    const Fake = struct {
+        fn ddl(_: *anyopaque, _: std.mem.Allocator, request: catalog.Ddl) !catalog.DdlOutcome {
+            const input = request.catalog_ddl;
+            try std.testing.expectEqual(@as(usize, 2), input.truncate_tables.len);
+            try std.testing.expect(input.cascade and input.restart_identity);
+            try std.testing.expectEqualStrings("first", input.truncate_tables[0].table);
+            return .{ .mutation_outcome = null, .receipt = .{ .database = "default", .namespace = "public", .table = "first", .table_id = "1", .schema_version = 1, .state = .admission_unknown, .restore_job_id = "42" } };
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+    };
+    var sentinel: u8 = 0;
+    var compiled = try @import("compiler.zig").compile(std.testing.allocator, "TRUNCATE TABLE first, second RESTART IDENTITY CASCADE", .{});
+    defer compiled.deinit();
+    const result = try execute(std.testing.allocator, .{ .ptr = &sentinel, .vtable = &.{ .resolve = undefined, .scan = undefined, .mutate = undefined, .ddl = Fake.ddl, .checkpoint = Fake.checkpoint } }, compiled.statement);
+    try std.testing.expectEqualStrings("DDL PENDING", result.command_tag);
+    try std.testing.expect(result.mutation_outcome == null);
+    try std.testing.expectEqualStrings("42", result.receipt.?.restore_job_id.?);
+    var continued = try @import("compiler.zig").compile(std.testing.allocator, "TRUNCATE first CONTINUE IDENTITY RESTRICT", .{});
+    defer continued.deinit();
+    try std.testing.expect(!continued.statement.catalog_ddl.restart_identity and !continued.statement.catalog_ddl.cascade);
+}
+
 test "SQL DDL lowers exact defaults nullability and native relational types" {
     var compiled = try @import("compiler.zig").compile(std.testing.allocator, "CREATE TABLE items (id BIGINT NOT NULL, name TEXT, amount BIGINT DEFAULT 9007199254740993)", .{});
     defer compiled.deinit();
@@ -140,6 +164,8 @@ test "SQL schema DDL preserves index ownership defaults and unrelated metadata" 
         "ALTER TABLE items ALTER COLUMN title DROP DEFAULT",
         "ALTER TABLE items DROP COLUMN enabled",
         "DROP INDEX items_id ON items",
+        "CREATE UNIQUE INDEX items_lower_title ON items ((lower(title))) WHERE title IS NOT NULL",
+        "DROP INDEX items_lower_title ON items",
     };
     for (commands, 0..) |command, i| {
         var compiled = try @import("compiler.zig").compile(alloc, command, .{});
@@ -148,6 +174,12 @@ test "SQL schema DDL preserves index ownership defaults and unrelated metadata" 
         if (i == 0) {
             try std.testing.expectEqual(@as(usize, 1), schema.object.get("relational_indexes").?.array.items.len);
             try std.testing.expectEqual(@as(usize, 1), schema.object.get("unique_constraints").?.array.items.len);
+        }
+        if (i == 6) {
+            const constraint = schema.object.get("unique_constraints").?.array.items[0];
+            try std.testing.expect(constraint.object.get("columns") == null);
+            try std.testing.expectEqual(@as(usize, 1), constraint.object.get("keys").?.array.items.len);
+            try std.testing.expectEqual(@as(usize, 1), constraint.object.get("where").?.array.items.len);
         }
     }
     try std.testing.expectEqual(@as(usize, 0), schema.object.get("relational_indexes").?.array.items.len);

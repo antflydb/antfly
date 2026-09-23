@@ -95,3 +95,69 @@ func TestExecuteSQLKeepsCommittedRepairReceipt(t *testing.T) {
 		t.Fatalf("lost committed repair receipt: %#v, %v", result, err)
 	}
 }
+
+func TestPreparedSQLLifecycleAndTransportPolicy(t *testing.T) {
+	const id = "0123456789abcdef0123456789abcdef"
+	calls := 0
+	status := http.StatusOK
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if status != http.StatusOK {
+			w.Header().Set("Location", "/replayed")
+			w.WriteHeader(status)
+			_, _ = io.WriteString(w, `{"code":"40003","message":"do not replay","retryable":false,"transaction_id":"`+id+`"}`)
+			return
+		}
+		switch r.URL.Path {
+		case "/db/v1/sql/prepared":
+			_, _ = io.WriteString(w, `{"prepared_id":"`+id+`","owner_node_id":"9007199254740993","expires_at_ms":123,"columns":[],"parameter_types":[]}`)
+		case "/db/v1/sql/prepared/" + id + "/execute":
+			_, _ = io.WriteString(w, `{"columns":[{"name":"v","type":"integer"}],"rows":[["9007199254740993"]],"rows_affected":0,"command_tag":"SELECT 1"}`)
+		case "/db/v1/sql/prepared/" + id:
+			if r.Method != http.MethodDelete {
+				t.Errorf("close method: %s", r.Method)
+			}
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	client, err := NewAntflyClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := client.PrepareSQL(context.Background(), SQLPrepareRequest{Statement: "SELECT $1::BIGINT"})
+	if err != nil || prepared.OwnerNodeId != "9007199254740993" {
+		t.Fatalf("prepare: %#v %v", prepared, err)
+	}
+	result, err := client.ExecutePreparedSQL(context.Background(), id, SQLPreparedExecutionRequest{Parameters: []json.RawMessage{json.RawMessage(`9007199254740993`)}})
+	if err != nil || string(result.Rows[0][0]) != `"9007199254740993"` {
+		t.Fatalf("execute: %#v %v", result, err)
+	}
+	if err := client.ClosePreparedSQL(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	operations := []func() error{
+		func() error {
+			_, err := client.PrepareSQL(context.Background(), SQLPrepareRequest{Statement: "SELECT 1"})
+			return err
+		},
+		func() error {
+			_, err := client.ExecutePreparedSQL(context.Background(), id, SQLPreparedExecutionRequest{})
+			return err
+		},
+		func() error { return client.ClosePreparedSQL(context.Background(), id) },
+	}
+	for _, code := range []int{307, 503} {
+		status = code
+		for _, operation := range operations {
+			before := calls
+			err := operation()
+			var diagnostic *SQLExecutionError
+			if !errors.As(err, &diagnostic) || calls != before+1 {
+				t.Fatalf("SQL policy: %v, calls %d", err, calls-before)
+			}
+		}
+	}
+}

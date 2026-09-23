@@ -5,8 +5,9 @@ metadata, and data runtimes. `api/sql_pgwire.zig` provides the native
 runtime adapter with non-executing Describe, password authentication, live
 credential/policy checks, existing row policies, native admission, and deadline
 propagation. It starts after the API reaches its stable owner address and joins
-all connections before API and backend teardown. Transactions/sessions are rejected until native ownership is
-implemented. HTTP SQL support does not implicitly enable pgwire or make
+all connections before API and backend teardown. Explicit transactions use the
+native durable session owner, including savepoint rollback and constraint timing.
+HTTP SQL support does not implicitly enable pgwire or make
 unsupported SQL shapes executable.
 
 SQL-language `PREPARE name [(types...)] AS statement`, `EXECUTE name
@@ -18,6 +19,45 @@ interpolation, and uses pull streaming for eligible reads. EXECUTE arguments
 are bounded scalar expressions; column references, parameters, and subqueries
 are not an argument-evaluation escape hatch into table reads. These commands
 do not create durable HTTP prepared-statement resources.
+
+SQL `DECLARE [NO SCROLL|SCROLL] CURSOR [WITH|WITHOUT HOLD]`, `FETCH`, `MOVE`,
+and `CLOSE` retain one eligible native pull snapshot. SCROLL supports forward,
+backward, absolute, relative, first/last and current-row positioning. Scroll and
+hold rows are copied as typed cells into a connection-owned spool: at most
+65,536 rows per cursor and 8 MiB shared by all cursor spools, also charged to the
+16 MiB connection limit. Quota exhaustion fails explicitly; there is no hidden
+unbounded materialization or query replay. These limits are protocol defaults.
+
+WITH HOLD materializes the remaining original snapshot before COMMIT and is
+published only after a confirmed COMMIT result. Unknown/failed outcomes never
+publish it. Snapshot/admission/plan resources are released on exhaustion, while
+buffered rows retain a small authorization capsule. Every fetch rechecks current
+credentials, scoped table identities, read grants and row filters. Held rows
+survive later transaction boundaries, not disconnect or node restart. Rollback
+to a savepoint closes cursors created after that savepoint without rewinding
+earlier cursor positions. Blocking plans without a native pull stream remain
+unsupported for SQL DECLARE.
+
+`SET [SESSION|LOCAL] statement_timeout`, `SHOW statement_timeout`, and
+`RESET statement_timeout` work with both simple and extended queries. Values
+accept integer milliseconds or quoted `ms`, `s`, and `min` units. Session changes
+inside a transaction commit/roll back with it; local changes expire at the
+transaction boundary; savepoint rollback restores both values. Zero disables
+the client-requested timeout but never the operator's hard statement deadline.
+`SET [SESSION|LOCAL] application_name`, `SHOW application_name`, and
+`RESET application_name` accept at most 128 bytes of UTF-8 text without
+control characters. Startup `application_name` obeys the same bound. Local and
+session changes follow the transaction and savepoint rules above.
+`SET [SESSION|LOCAL] search_path`, `SHOW search_path`, and `RESET search_path`
+support one existing namespace (at most 128 bytes), using the same transaction
+and savepoint restoration rules. SET rechecks namespace-read permission before
+the native existence lookup. Table operations still authorize their own scoped
+resources. Lookup scope is separate from the immutable durable transaction-owner
+scope. Existing SQL prepared statements, Parse/Bind portals and cursors retain
+their original namespace. Lists and `$user` expansion fail explicitly until
+multi-namespace resolution is implemented. Other session settings are not
+acknowledged as no-ops. `SET CONSTRAINTS` is a native durable transaction command,
+not a connection setting.
 
 Enable it in the node configuration with authentication configured:
 
@@ -42,8 +82,8 @@ process's port separately when running multiple nodes on one host.
 - Pull-based read portals for eligible scan/filter/projection and relational
   plans, including nonblocking nested queries. Each bounded page is released
   before the next pull; network flush supplies backpressure to storage reads.
-  Blocking final sorts/aggregations and transaction-session reads retain the
-  bounded materialized path. Execute suspends/resumes the same snapshot/result
+  Blocking final sorts/aggregations retain the bounded materialized path.
+  Execute suspends/resumes the same snapshot/result
   without replaying a statement or mutation. A statement can be closed
   independently of its portals. Opaque backend continuation tokens are rejected.
 - Prepared native statements retain a catalog revision and every physical table

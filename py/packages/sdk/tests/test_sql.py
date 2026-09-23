@@ -19,7 +19,92 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-from antfly import AntflyClient, AntflyException, SQLExecutionError, SQLRequest
+from antfly import (
+    AntflyClient,
+    AntflyException,
+    SQLExecutionError,
+    SQLPreparedExecutionRequest,
+    SQLPrepareRequest,
+    SQLRequest,
+)
+
+
+def test_prepared_sql_lifecycle_preserves_owner_and_execution_shape():
+    client = AntflyClient(base_url="http://localhost:8080")
+    prepared = {
+        "prepared_id": "a" * 32,
+        "owner_node_id": "9007199254740993",
+        "expires_at_ms": 123,
+        "columns": [],
+        "parameter_types": [],
+    }
+    with patch.object(client, "_request", return_value=prepared) as request:
+        assert client.prepare_sql(SQLPrepareRequest(statement="SELECT 1")).owner_node_id == "9007199254740993"
+        assert request.call_args.kwargs["follow_redirects"] is False
+    with patch.object(client, "_request", return_value={"columns": [], "rows": [[1]]}):
+        with pytest.raises(AntflyException, match="row width"):
+            client.execute_prepared_sql("a" * 32, SQLPreparedExecutionRequest())
+    with patch.object(client, "_request", return_value={}) as request:
+        client.close_prepared_sql("a/b")
+        assert request.call_args.args == ("DELETE", "/db/v1/sql/prepared/a%2Fb")
+        assert request.call_args.kwargs["_max_response_bytes"] == 16 << 20
+
+
+@pytest.mark.parametrize("operation", ["prepare", "execute", "close"])
+@pytest.mark.parametrize("status", [307, 503])
+def test_prepared_sql_never_redirects_or_retries(operation, status):
+    calls = []
+
+    def respond(request):
+        calls.append(request)
+        return httpx.Response(
+            status,
+            headers={"Location": "/replayed"},
+            json={"code": "40003", "message": "do not replay", "retryable": False},
+        )
+
+    client = AntflyClient(base_url="http://sql.test")
+    with httpx.Client(base_url=client.base_url, transport=httpx.MockTransport(respond), follow_redirects=True) as http:
+        client._client.set_httpx_client(http)
+        with pytest.raises(SQLExecutionError):
+            if operation == "prepare":
+                client.prepare_sql(SQLPrepareRequest(statement="SELECT 1"))
+            elif operation == "execute":
+                client.execute_prepared_sql("a" * 32, SQLPreparedExecutionRequest())
+            else:
+                client.close_prepared_sql("a" * 32)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("operation", ["prepare_sql", "execute_prepared_sql", "close_prepared_sql"])
+def test_generated_prepared_operations_preserve_transport_policy(operation):
+    import importlib
+
+    from antfly.client_generated.client import AuthenticatedClient
+
+    module = importlib.import_module(f"antfly.client_generated.api.data_operations.{operation}")
+    calls = []
+
+    def respond(request):
+        calls.append(request)
+        return httpx.Response(
+            307, headers={"Location": "/replayed"}, json={"code": "40003", "message": "do not replay"}
+        )
+
+    generated = AuthenticatedClient(base_url="http://sql.test", token="token")
+    kwargs = {"client": generated}
+    if operation == "prepare_sql":
+        kwargs["body"] = SQLPrepareRequest(statement="SELECT 1")
+    else:
+        kwargs["prepared_id"] = "a" * 32
+        if operation == "execute_prepared_sql":
+            kwargs["body"] = SQLPreparedExecutionRequest()
+    with httpx.Client(
+        base_url="http://sql.test", transport=httpx.MockTransport(respond), follow_redirects=True
+    ) as http:
+        generated.set_httpx_client(http)
+        assert module.sync_detailed(**kwargs).status_code == 307
+    assert len(calls) == 1
 
 
 def test_sql_bound_parameters_and_exact_integer_results():

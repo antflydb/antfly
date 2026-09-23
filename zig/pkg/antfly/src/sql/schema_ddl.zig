@@ -61,7 +61,7 @@ pub fn apply(alloc: std.mem.Allocator, schema: *Value, ddl: ast.CatalogDdl) !boo
             if (constraintExists(schema.*, constraint.name)) return error.SqlConstraintAlreadyExists;
             const constraints = try list(schema, alloc, "unique_constraints");
             if (named(constraints.items, constraint.name, "name") != null) return error.SqlConstraintAlreadyExists;
-            try constraints.append(try value(alloc, .{ .name = constraint.name, .columns = constraint.columns }));
+            try constraints.append(try value(alloc, .{ .name = constraint.name, .columns = constraint.columns, .deferrable = constraint.deferrable, .timing = constraint.timing }));
         },
         .add_check => |constraint| {
             if (constraintExists(schema.*, constraint.name)) return error.SqlConstraintAlreadyExists;
@@ -77,7 +77,6 @@ pub fn apply(alloc: std.mem.Allocator, schema: *Value, ddl: ast.CatalogDdl) !boo
             try constraints.append(try value(alloc, .{ .name = constraint.name, .child_columns = constraint.columns, .parent_table = constraint.parent, .parent_columns = constraint.parent_columns, .on_delete = constraint.on_delete, .on_update = constraint.on_update, .match = constraint.match, .timing = constraint.timing, .deferrable = constraint.deferrable }));
         },
         .create_index => |index| {
-            if (index.unique and index.predicate != null) return error.UnsupportedSqlShape;
             var indexes = try list(schema, alloc, "relational_indexes");
             if (named(indexes.items, index.name, "name") != null) {
                 if (ddl.conditional) return false;
@@ -89,7 +88,6 @@ pub fn apply(alloc: std.mem.Allocator, schema: *Value, ddl: ast.CatalogDdl) !boo
             for (index.keys) |key| {
                 const nulls: []const u8 = if (key.nulls_first orelse key.descending) "first" else "last";
                 if (key.expression) |expression| {
-                    if (index.unique) return error.UnsupportedSqlShape;
                     const lowered = try @import("schema_expression.zig").lowerTyped(alloc, schema.*, expression, null);
                     try keys.append(alloc, try value(alloc, .{ .expression = lowered.expression, .result_type = @tagName(lowered.type), .direction = if (key.descending) "desc" else "asc", .nulls = nulls }));
                 } else try keys.append(alloc, try value(alloc, .{ .column = key.field, .direction = if (key.descending) "desc" else "asc", .nulls = nulls }));
@@ -102,7 +100,13 @@ pub fn apply(alloc: std.mem.Allocator, schema: *Value, ddl: ast.CatalogDdl) !boo
             if (index.unique) {
                 const constraints = try list(schema, alloc, "unique_constraints");
                 if (named(constraints.items, index.name, "name") != null) return error.SqlConstraintAlreadyExists;
-                try constraints.append(try value(alloc, .{ .name = index.name, .columns = columns.items }));
+                const has_expression = for (index.keys) |key| {
+                    if (key.expression != null) break true;
+                } else false;
+                try constraints.append(if (has_expression)
+                    try value(alloc, .{ .name = index.name, .keys = keys.items, .where = predicates })
+                else
+                    try value(alloc, .{ .name = index.name, .columns = columns.items, .where = predicates }));
             }
         },
         .drop_index => |index_name| {

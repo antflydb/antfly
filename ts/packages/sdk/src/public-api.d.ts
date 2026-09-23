@@ -646,6 +646,67 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/sql/prepared": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create a durable prepared SQL resource
+         * @description Binds SELECT, INSERT, UPDATE or DELETE without executing it. The immutable resource belongs to the authenticated principal and API node, expires after one hour, and survives transaction COMMIT and owner restart with the same durable store and node identity. Owner failover is not automatic; execute and close must reach owner_node_id. Each durable store admits at most 128 resources and 4 MiB of serialized prepared state. Expired resources are reclaimed atomically during subsequent creation or close. Execution authenticates and authorizes again and rejects changed catalog identities or schemas. A native durable session store is required.
+         */
+        post: operations["prepareSQL"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/sql/prepared/{prepared_id}/execute": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                prepared_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Execute a durable prepared SQL resource
+         * @description Uses the stored statement, namespace and immutable binding identities. Resource admission linearizes when its durable record is loaded; a later close or expiry does not cancel that already admitted execution. Mutation outcomes must be reconciled rather than replayed after ambiguous errors.
+         */
+        post: operations["executePreparedSQL"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/sql/prepared/{prepared_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                prepared_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Release a durable prepared SQL resource */
+        delete: operations["closePreparedSQL"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/sql": {
         parameters: {
             query?: never;
@@ -4103,6 +4164,27 @@ export interface components {
             name: string;
             type: components["schemas"]["SQLColumnType"];
         };
+        SQLPrepareRequest: {
+            statement: string;
+            database?: string;
+            namespace?: string;
+        };
+        SQLPreparedExecutionRequest: {
+            parameters?: unknown[];
+            /** @default 128 */
+            limit?: number;
+            /** @description Optional durable transaction session, independent of the prepared resource lifetime. */
+            session_id?: string;
+        };
+        SQLPreparedResponse: {
+            prepared_id: string;
+            /** Format: int64 */
+            expires_at_ms: number;
+            /** @description Exact decimal API owner identifier, preserved by JavaScript clients. */
+            owner_node_id: string;
+            parameter_types: components["schemas"]["SQLColumnType"][];
+            columns: components["schemas"]["SQLColumn"][];
+        };
         /**
          * @description Execute one SQL statement. Parameters are positional (`$1`, `$2`, ...),
          *     never interpolated into SQL text. To preserve integer precision in
@@ -4173,9 +4255,11 @@ export interface components {
             transaction_status?: components["schemas"]["SQLTransactionStatus"];
         };
         /** @enum {string} */
-        SQLDDLReceiptState: "ready" | "pending" | "invalid";
+        SQLDDLReceiptState: "ready" | "pending" | "invalid" | "admission_unknown";
         /**
-         * @description Durable DDL declaration receipt. Pending or invalid means the declaration
+         * @description Durable DDL declaration receipt. admission_unknown means admission has
+         *     not been confirmed; reconcile restore_job_id without replaying DDL.
+         *     Pending or invalid means the declaration
          *     committed but validation has not established an active constraint. Do not
          *     replay it. Inspect table constraint status using this immutable table
          *     identity and schema generation; a later generation supersedes this receipt.
@@ -4189,7 +4273,7 @@ export interface components {
             schema_version: number;
             state: components["schemas"]["SQLDDLReceiptState"];
             diagnostic?: string;
-            /** @description Native restore job for an atomic schema rewrite. Until publication table_id identifies the source generation. Poll the restore job; do not replay this DDL. */
+            /** @description Native staging job for an atomic schema rewrite or TRUNCATE generation barrier. table_id identifies the source generation. Poll the job; pending or admission_unknown is not completed DDL and must not be replayed. */
             restore_job_id?: string;
         };
         SQLDiagnostic: {
@@ -12644,22 +12728,6 @@ export interface components {
             expression?: components["schemas"]["RelationalScalarExpression"];
         };
         /**
-         * @description A named, ordered composite unique key. Validation status is maintained
-         *     by the server. TTL expiry uses the distributed integrity coordinator.
-         *     Referenced unique keys are nondeferrable.
-         */
-        RelationalUniqueConstraint: {
-            name: string;
-            columns: string[];
-            /** @description When true, NULL components compare equal for uniqueness. */
-            nulls_not_distinct?: boolean;
-        };
-        /**
-         * @description Action on referencing rows when a referenced row is changed or removed.
-         * @enum {string}
-         */
-        ForeignKeyAction: "restrict" | "set_null" | "cascade" | "no_action";
-        /**
          * @description Enforcement timing for atomic mutations and transaction sessions. Deferred
          *     requires deferrable=true and validates the final transaction state.
          *     NO ACTION permits a valid final-state parent replacement; RESTRICT
@@ -12669,6 +12737,29 @@ export interface components {
          * @enum {string}
          */
         ForeignKeyTiming: "immediate" | "deferred";
+        /**
+         * @description A named, ordered composite unique key. Validation status is maintained
+         *     by the server. TTL expiry uses the distributed integrity coordinator.
+         *     Referenced unique keys are nondeferrable.
+         */
+        RelationalUniqueConstraint: {
+            name: string;
+            columns?: string[];
+            /** @description Typed native unique keys. Specify either columns or keys. */
+            keys?: components["schemas"]["RelationalIndexKey"][];
+            /** @description Conjunction restricting uniqueness to matching rows. */
+            where?: components["schemas"]["RelationalIndexPredicate"][];
+            /** @description When true, NULL components compare equal for uniqueness. */
+            nulls_not_distinct?: boolean;
+            /** @description Permit uniqueness checks at transaction commit. Never eligible as an ON CONFLICT arbiter or a referenced foreign key target. */
+            deferrable?: boolean;
+            timing?: components["schemas"]["ForeignKeyTiming"];
+        };
+        /**
+         * @description Action on referencing rows when a referenced row is changed or removed.
+         * @enum {string}
+         */
+        ForeignKeyAction: "restrict" | "set_null" | "cascade" | "no_action";
         /**
          * @description Null matching semantics of a composite foreign key. Partial requires
          *     at least one parent matching every non-null child component; all-null
@@ -20600,6 +20691,105 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             500: components["responses"]["InternalServerError"];
+        };
+    };
+    prepareSQL: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SQLPrepareRequest"];
+            };
+        };
+        responses: {
+            /** @description Durable prepared resource */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLPreparedResponse"];
+                };
+            };
+            /** @description Preparation rejected */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"];
+                };
+            };
+        };
+    };
+    executePreparedSQL: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                prepared_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SQLPreparedExecutionRequest"];
+            };
+        };
+        responses: {
+            /** @description SQL result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLResponse"];
+                };
+            };
+            /** @description Execution rejected or durable mutation outcome */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"];
+                };
+            };
+        };
+    };
+    closePreparedSQL: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                prepared_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Resource released; already admitted executions may finish */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description Close rejected */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"];
+                };
+            };
         };
     };
     executeSQL: {

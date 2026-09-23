@@ -64,12 +64,34 @@ pub const TableSchema = struct {
     pub fn relationalUniqueDefinitions(self: TableSchema, alloc: std.mem.Allocator) ![]const relational_native.UniqueConstraint {
         const declarations = self.unique_constraints orelse return &.{};
         const definitions = try alloc.alloc(relational_native.UniqueConstraint, declarations.value.len);
-        for (declarations.value, definitions) |declaration, *definition| definition.* = .{
-            .name = declaration.name,
-            .columns = declaration.columns,
-            .nulls_not_distinct = declaration.nulls_not_distinct orelse false,
-            .validation_state = .unvalidated,
-        };
+        for (declarations.value, definitions) |declaration, *definition| {
+            const wire_keys: []const relational_wire.RelationalIndexKey = declaration.keys orelse &.{};
+            const keys = try alloc.alloc(relational_native.RelationalIndexKey, wire_keys.len);
+            for (wire_keys, keys) |wire, *key| key.* = .{
+                .column = wire.column orelse "",
+                .expression_json = if (wire.expression) |expression| try std.json.Stringify.valueAlloc(alloc, expression, .{ .emit_null_optional_fields = false }) else null,
+                .result_type = if (wire.result_type) |kind| nativeEnum(storage_schema.RelationalColumnType, kind) else null,
+                .collation = wire.collation,
+            };
+            const conditions: []const relational_wire.RelationalIndexPredicate = declaration.where orelse &.{};
+            const where = try alloc.alloc(relational_native.UniquePredicate, conditions.len);
+            for (conditions, where) |condition, *target| target.* = .{
+                .field = condition.column,
+                .op = nativeEnum(relational_native.RelationalCheckOp, condition.op),
+                .value_json = if (condition.value) |value| try std.json.Stringify.valueAlloc(alloc, value, .{}) else null,
+                .collation = condition.collation,
+            };
+            definition.* = .{
+                .name = declaration.name,
+                .columns = declaration.columns orelse &.{},
+                .keys = keys,
+                .where = where,
+                .nulls_not_distinct = declaration.nulls_not_distinct orelse false,
+                .deferrable = declaration.deferrable orelse false,
+                .timing = nativeEnum(relational_native.ForeignKeyTiming, declaration.timing orelse .immediate),
+                .validation_state = .unvalidated,
+            };
+        }
         return definitions;
     }
 
@@ -2466,8 +2488,14 @@ fn parseRelationalDeclarations(comptime T: type, alloc: std.mem.Allocator, value
     for (parsed.value, 0..) |item, i| {
         if (item.name.len == 0 or item.name.len > 256 or !std.unicode.utf8ValidateSlice(item.name)) return error.InvalidSchemaUpdateRequest;
         for (parsed.value[0..i]) |prior| if (std.mem.eql(u8, prior.name, item.name)) return error.InvalidSchemaUpdateRequest;
-        const columns = if (T == relational_wire.RelationalUniqueConstraint) item.columns else item.child_columns;
-        try validateConstraintColumns(columns);
+        const columns = if (T == relational_wire.RelationalUniqueConstraint) item.columns orelse &.{} else item.child_columns;
+        if (T == relational_wire.RelationalUniqueConstraint) {
+            if (item.timing == .deferred and !(item.deferrable orelse false)) return error.InvalidSchemaUpdateRequest;
+            if ((item.columns != null) == (item.keys != null)) return error.InvalidSchemaUpdateRequest;
+            if (item.keys) |keys| {
+                if (keys.len == 0 or keys.len > 32) return error.InvalidSchemaUpdateRequest;
+            } else try validateConstraintColumns(columns);
+        } else try validateConstraintColumns(columns);
         if (T == relational_wire.RelationalForeignKeyConstraint) {
             if (item.parent_table.len == 0 or !std.unicode.utf8ValidateSlice(item.parent_table) or item.parent_columns.len != columns.len)
                 return error.InvalidSchemaUpdateRequest;
@@ -2580,7 +2608,8 @@ fn validateParsedRelationalSchema(schema: TableSchema) !void {
 
     const document_schema = schema.document_schemas[0];
     if (schema.unique_constraints) |constraints| for (constraints.value) |constraint| {
-        for (constraint.columns) |column| if (findDocumentProperty(document_schema.properties, column) == null) return error.InvalidSchemaUpdateRequest;
+        if ((constraint.columns != null) == (constraint.keys != null)) return error.InvalidSchemaUpdateRequest;
+        for (constraint.columns orelse &.{}) |column| if (findDocumentProperty(document_schema.properties, column) == null) return error.InvalidSchemaUpdateRequest;
         if (schema.checks) |checks| for (checks.value) |check| if (std.mem.eql(u8, check.name, constraint.name)) return error.InvalidSchemaUpdateRequest;
     };
     if (schema.foreign_keys) |constraints| for (constraints.value) |constraint| {

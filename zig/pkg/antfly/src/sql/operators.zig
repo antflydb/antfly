@@ -33,15 +33,20 @@ const OwnedRow = struct {
     arena: std.heap.ArenaAllocator,
     row: Row,
 
-    fn init(alloc: Allocator, row: Row) !OwnedRow {
-        var arena = std.heap.ArenaAllocator.init(alloc);
-        errdefer arena.deinit();
+    fn cloneInto(arena: *std.heap.ArenaAllocator, row: Row) !Row {
         const owned = arena.allocator();
         const values = try owned.alloc(Datum, row.values.len);
         const keys = try owned.alloc(Datum, row.keys.len);
         for (row.values, values) |value, *out| out.* = try cloneDatum(owned, value);
         for (row.keys, keys) |value, *out| out.* = try cloneDatum(owned, value);
-        return .{ .arena = arena, .row = .{ .values = values, .keys = keys, .ordinal = row.ordinal } };
+        return .{ .values = values, .keys = keys, .ordinal = row.ordinal };
+    }
+
+    fn init(alloc: Allocator, row: Row) !OwnedRow {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        errdefer arena.deinit();
+        const cloned = try cloneInto(&arena, row);
+        return .{ .arena = arena, .row = cloned };
     }
 
     fn deinit(self: *OwnedRow) void {
@@ -49,14 +54,18 @@ const OwnedRow = struct {
     }
 
     fn allocatedBytes(self: OwnedRow) usize {
-        var bytes = self.arena.queryCapacity();
-        inline for (.{ self.arena.state.used_list, self.arena.state.free_list }) |head| {
-            var next = head;
-            while (next) |node| : (next = node.next) bytes += @sizeOf(@TypeOf(node.*));
-        }
-        return bytes;
+        return arenaBytes(&self.arena);
     }
 };
+
+fn arenaBytes(arena: *const std.heap.ArenaAllocator) usize {
+    var bytes = arena.queryCapacity();
+    inline for (.{ arena.state.used_list, arena.state.free_list }) |head| {
+        var next = head;
+        while (next) |node| : (next = node.next) bytes += @sizeOf(@TypeOf(node.*));
+    }
+    return bytes;
+}
 
 /// Retains at most k rows. The heap root is the worst admitted row, so a
 /// noncompetitive input performs comparisons only, with no allocation/copy.
@@ -70,6 +79,9 @@ pub const TopK = struct {
     comparisons: usize = 0,
     copied_rows: usize = 0,
     finished: bool = false,
+    // Replacement exchanges a candidate with the displaced root. Retaining
+    // that root's arena avoids one allocator round-trip per competitive row.
+    scratch: ?std.heap.ArenaAllocator = null,
 
     pub fn init(alloc: Allocator, k: usize, orders: []const Order, max_bytes: usize) !TopK {
         const bytes = std.math.add(usize, std.math.mul(usize, k, @sizeOf(OwnedRow)) catch return error.SqlProgramLimitExceeded, std.math.mul(usize, orders.len, @sizeOf(Order)) catch return error.SqlProgramLimitExceeded) catch return error.SqlProgramLimitExceeded;
@@ -82,6 +94,7 @@ pub const TopK = struct {
 
     pub fn deinit(self: *TopK) void {
         for (self.entries[0..self.count]) |*entry| entry.deinit();
+        if (self.scratch) |*scratch| scratch.deinit();
         self.alloc.free(self.entries);
         self.alloc.free(self.orders);
         self.* = undefined;
@@ -106,8 +119,16 @@ pub const TopK = struct {
         for (row.values) |value| estimate = std.math.add(usize, estimate, try datumBytes(value)) catch return error.SqlProgramLimitExceeded;
         for (row.keys) |value| estimate = std.math.add(usize, estimate, try datumBytes(value)) catch return error.SqlProgramLimitExceeded;
         if (estimate > self.max_bytes -| self.retained_bytes) return error.SqlProgramLimitExceeded;
-        var owned = try OwnedRow.init(self.alloc, row);
-        errdefer owned.deinit();
+        var candidate_arena = self.scratch orelse std.heap.ArenaAllocator.init(self.alloc);
+        self.scratch = null;
+        errdefer {
+            _ = candidate_arena.reset(.retain_capacity);
+            if (self.retained_bytes +| arenaBytes(&candidate_arena) <= self.max_bytes) {
+                self.scratch = candidate_arena;
+            } else candidate_arena.deinit();
+        }
+        const cloned = try OwnedRow.cloneInto(&candidate_arena, row);
+        const owned: OwnedRow = .{ .arena = candidate_arena, .row = cloned };
         const bytes = owned.allocatedBytes();
         if (bytes > self.max_bytes -| self.retained_bytes) return error.SqlProgramLimitExceeded;
         self.copied_rows += 1;
@@ -144,7 +165,7 @@ pub const TopK = struct {
                 index = child;
             }
             self.retained_bytes -= self.entries[0].allocatedBytes();
-            self.entries[0].deinit();
+            var displaced = self.entries[0].arena;
             index = 0;
             for (path[0..path_count]) |child| {
                 self.entries[index] = self.entries[child];
@@ -152,6 +173,10 @@ pub const TopK = struct {
             }
             self.entries[index] = owned;
             self.retained_bytes += bytes;
+            _ = displaced.reset(.retain_capacity);
+            if (self.retained_bytes +| arenaBytes(&displaced) <= self.max_bytes) {
+                self.scratch = displaced;
+            } else displaced.deinit();
         }
     }
 
@@ -181,7 +206,7 @@ pub const TopK = struct {
 };
 
 pub const Aggregate = struct {
-    pub const Kind = enum { count, sum, avg, min, max, bool_and, bool_or };
+    pub const Kind = enum { count, sum, avg, min, max, bool_and, bool_or, pattern_set };
     alloc: Allocator,
     kind: Kind,
     input_type: ?ast.ColumnType,
@@ -192,18 +217,35 @@ pub const Aggregate = struct {
     mean: f64 = 0,
     boolean: bool = false,
     selected: ?OwnedRow = null,
+    patterns: ?*PatternState = null,
     distinct: bool = false,
     distinct_heads: std.AutoHashMapUnmanaged(u64, usize) = .empty,
     distinct_values: std.ArrayList(struct { row: OwnedRow, next: ?usize }) = .empty,
+    const PatternState = struct { values: std.json.Array, has_null: bool = false };
 
-    pub fn init(alloc: Allocator, kind: Kind, input_type: ?ast.ColumnType) !Aggregate {
+    pub fn validate(kind: Kind, input_type: ?ast.ColumnType) !void {
         if ((kind == .sum or kind == .avg) and input_type != null and input_type != .integer and input_type != .number) return error.SqlTypeMismatch;
         if ((kind == .bool_and or kind == .bool_or) and input_type != null and input_type != .boolean) return error.SqlTypeMismatch;
-        return .{ .alloc = alloc, .kind = kind, .input_type = input_type, .boolean = kind == .bool_and };
+        if (kind == .pattern_set and input_type != null and input_type != .string) return error.SqlTypeMismatch;
+    }
+
+    pub fn init(alloc: Allocator, kind: Kind, input_type: ?ast.ColumnType) !Aggregate {
+        try validate(kind, input_type);
+        var result: Aggregate = .{ .alloc = alloc, .kind = kind, .input_type = input_type, .boolean = kind == .bool_and };
+        if (kind == .pattern_set) {
+            const state = try alloc.create(PatternState);
+            state.* = .{ .values = .init(alloc) };
+            result.patterns = state;
+        }
+        return result;
     }
 
     pub fn deinit(self: *Aggregate) void {
         if (self.selected) |*value| value.deinit();
+        if (self.patterns) |state| {
+            state.values.deinit();
+            self.alloc.destroy(state);
+        }
         for (self.distinct_values.items) |*entry| entry.row.deinit();
         self.distinct_values.deinit(self.alloc);
         self.distinct_heads.deinit(self.alloc);
@@ -211,7 +253,16 @@ pub const Aggregate = struct {
     }
 
     pub fn update(self: *Aggregate, value: Datum) !void {
-        if (value.sql_null) return;
+        if (value.sql_null) {
+            if (self.patterns) |state| {
+                if (!state.has_null) {
+                    try state.values.append(.null);
+                    state.has_null = true;
+                }
+            }
+            return;
+        }
+        if (self.kind == .pattern_set and value.value != .string) return error.SqlTypeMismatch;
         if (self.distinct) {
             const hash = try scalar.semanticHash(value.value);
             var slot = self.distinct_heads.get(hash);
@@ -270,12 +321,19 @@ pub const Aggregate = struct {
                 if (self.selected) |*old| old.deinit();
                 self.selected = selected;
             },
+            .pattern_set => {
+                // DISTINCT owns the string; the JSON array borrows that stable
+                // copy until the grouped operator releases both together.
+                if (!self.distinct) return error.InvalidSqlBackendResponse;
+                try self.patterns.?.values.append(self.distinct_values.items[self.distinct_values.items.len - 1].row.row.values[0].value);
+            },
         }
         self.count += 1;
     }
 
     pub fn finish(self: *const Aggregate) !Datum {
         if (self.kind == .count) return Datum.json(.{ .integer = @intCast(self.count) });
+        if (self.kind == .pattern_set) return Datum.json(.{ .array = self.patterns.?.values });
         if (self.count == 0) return .{};
         return switch (self.kind) {
             .count => unreachable,
@@ -283,6 +341,7 @@ pub const Aggregate = struct {
             .avg => Datum.json(.{ .float = self.mean }),
             .bool_and, .bool_or => Datum.json(.{ .bool = self.boolean }),
             .min, .max => self.selected.?.row.values[0],
+            .pattern_set => unreachable,
         };
     }
 };
@@ -437,11 +496,9 @@ pub const Grouped = struct {
 
     pub fn ensureGlobalGroup(self: *Grouped) !void {
         if (self.rows_seen != 0 or self.groups.items.len != 0) return;
-        const inputs = try self.backing.alloc(Datum, self.specs.len);
-        defer self.backing.free(inputs);
-        @memset(inputs, .{});
-        try self.add(&.{}, inputs);
-        self.rows_seen = 0;
+        self.key_count = 0;
+        var hasher = std.hash.Wyhash.init(0);
+        _ = try self.appendGroup(&.{}, hasher.final());
     }
 
     pub fn groupCount(self: *const Grouped) usize {
@@ -483,27 +540,31 @@ pub const Grouped = struct {
             if (equal) break;
             slot = group.next;
         }
-        if (slot == null) {
-            if (self.groups.items.len >= self.limits.groups) return error.SqlProgramLimitExceeded;
-            const alloc = self.budget.allocator();
-            try self.groups.ensureUnusedCapacity(alloc, 1);
-            try self.heads.ensureUnusedCapacity(alloc, 1);
-            var owned = try OwnedRow.init(alloc, .{ .values = keys, .keys = &.{}, .ordinal = self.groups.items.len });
-            errdefer owned.deinit();
-            const states = try alloc.alloc(Aggregate, self.specs.len);
-            errdefer alloc.free(states);
-            // Aggregate.init owns no allocations, so a failed type validation
-            // cannot leave a partially initialized state array behind.
-            for (states, self.specs) |*state, spec| {
-                state.* = try Aggregate.init(alloc, spec.kind, spec.input_type);
-                state.distinct = spec.distinct;
-            }
-            slot = self.groups.items.len;
-            self.groups.appendAssumeCapacity(.{ .keys = owned, .states = states, .next = self.heads.get(hash) });
-            self.heads.putAssumeCapacity(hash, slot.?);
-        }
+        if (slot == null) slot = try self.appendGroup(keys, hash);
         for (self.groups.items[slot.?].states, inputs) |*state, value| try state.update(value);
         self.rows_seen = std.math.add(u64, self.rows_seen, 1) catch return error.SqlNumericOutOfRange;
+    }
+
+    fn appendGroup(self: *Grouped, keys: []const Datum, hash: u64) !usize {
+        if (self.groups.items.len >= self.limits.groups) return error.SqlProgramLimitExceeded;
+        const alloc = self.budget.allocator();
+        try self.groups.ensureUnusedCapacity(alloc, 1);
+        try self.heads.ensureUnusedCapacity(alloc, 1);
+        var owned = try OwnedRow.init(alloc, .{ .values = keys, .keys = &.{}, .ordinal = self.groups.items.len });
+        errdefer owned.deinit();
+        const states = try alloc.alloc(Aggregate, self.specs.len);
+        errdefer alloc.free(states);
+        var initialized: usize = 0;
+        errdefer for (states[0..initialized]) |*state| state.deinit();
+        for (states, self.specs) |*state, spec| {
+            state.* = try Aggregate.init(alloc, spec.kind, spec.input_type);
+            state.distinct = spec.distinct;
+            initialized += 1;
+        }
+        const index = self.groups.items.len;
+        self.groups.appendAssumeCapacity(.{ .keys = owned, .states = states, .next = self.heads.get(hash) });
+        self.heads.putAssumeCapacity(hash, index);
+        return index;
     }
 
     /// Returned arrays belong to alloc; nested values remain borrowed from this
@@ -677,6 +738,44 @@ test "SQL grouped aggregation quota and allocation failures retain no state" {
     try std.testing.expectError(error.SqlProgramLimitExceeded, grouped.add(&.{Datum.json(.{ .integer = 2 })}, &.{Datum.json(.{ .integer = 1 })}));
 }
 
+test "SQL pattern aggregate retains distinct nullable patterns within quota" {
+    const Harness = struct {
+        fn run(alloc: Allocator) !void {
+            const empty_grouped = try Grouped.create(alloc, &.{.{ .kind = .pattern_set, .input_type = .string, .distinct = true }}, .{ .groups = 1, .bytes = 8192 });
+            defer empty_grouped.deinit();
+            try empty_grouped.ensureGlobalGroup();
+            const empty = try empty_grouped.resultAt(alloc, 0);
+            defer alloc.free(empty.aggregates);
+            try std.testing.expectEqual(@as(usize, 0), empty.aggregates[0].value.array.items.len);
+            const grouped = try Grouped.create(alloc, &.{.{ .kind = .pattern_set, .input_type = .string, .distinct = true }}, .{ .groups = 1, .bytes = 8192 });
+            defer grouped.deinit();
+            try grouped.add(&.{}, &.{Datum.json(.{ .string = "op%" })});
+            try grouped.add(&.{}, &.{Datum.json(.{ .string = "op%" })});
+            try grouped.add(&.{}, &.{.{}});
+            const result = try grouped.finish(alloc);
+            defer {
+                for (result) |group| alloc.free(group.aggregates);
+                alloc.free(result);
+            }
+            try std.testing.expectEqual(@as(usize, 2), result[0].aggregates[0].value.array.items.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+    const grouped = try Grouped.create(std.testing.allocator, &.{.{ .kind = .pattern_set, .input_type = .string, .distinct = true }}, .{ .groups = 1, .bytes = 2048 });
+    defer grouped.deinit();
+    var exhausted = false;
+    for (0..1000) |index| {
+        var buffer: [32]u8 = undefined;
+        const pattern = try std.fmt.bufPrint(&buffer, "pattern-{d}%", .{index});
+        grouped.add(&.{}, &.{Datum.json(.{ .string = pattern })}) catch |err| {
+            try std.testing.expectEqual(error.SqlProgramLimitExceeded, err);
+            exhausted = true;
+            break;
+        };
+    }
+    try std.testing.expect(exhausted);
+}
+
 test "SQL top K replacement churn stays bounded by actual allocation quota" {
     var quota: MemoryBudget = .{ .backing = std.testing.allocator, .limit = 8192 };
     var top = try TopK.init(quota.allocator(), 5, &.{.{}}, 8192);
@@ -691,7 +790,7 @@ test "SQL top K replacement churn stays bounded by actual allocation quota" {
     const elapsed = std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start;
     try std.testing.expectEqual(@as(usize, 10000), top.copied_rows);
     for (result, 0..) |row, i| try std.testing.expectEqual(@as(i64, @intCast(i + 1)), row.values[0].value.integer);
-    try std.testing.expectEqual(quota.live, top.retained_bytes);
+    try std.testing.expectEqual(quota.live, top.retained_bytes + if (top.scratch) |*scratch| arenaBytes(scratch) else @as(usize, 0));
     try std.testing.expect(quota.peak <= quota.limit);
     std.debug.print("SQL topK churn: input=10000 k=5 copied={} retained_bytes={} peak_bytes={} comparisons={} elapsed_ns={}\n", .{ top.copied_rows, top.retained_bytes, quota.peak, top.comparisons, elapsed });
 }

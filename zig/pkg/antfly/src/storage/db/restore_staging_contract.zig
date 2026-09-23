@@ -110,6 +110,9 @@ pub const Control = union(enum) {
 };
 
 pub const Scope = struct {
+    pub fn nativeJsonSkipField(self: @This(), comptime name: []const u8) bool {
+        return std.mem.eql(u8, name, "empty_generation") and !self.empty_generation;
+    }
     plan_id: [16]u8,
     plan_digest: Digest,
     source_artifact_digest: Digest,
@@ -118,9 +121,12 @@ pub const Scope = struct {
     target_namespace: identity.Namespace,
     target_schema_digest: Digest,
     preserve_artifacts: bool = false,
+    /// A fresh, proven-pristine owner; never accepts source rows or artifacts.
+    empty_generation: bool = false,
     rewrite: ?@import("relational_rewrite_contract.zig").Binding = null,
 
     pub fn validateReservation(self: Scope) !void {
+        if (self.empty_generation and (self.preserve_artifacts or self.rewrite != null)) return error.InvalidRestoreStagingCommand;
         if (self.rewrite) |rewrite| {
             try rewrite.validate();
             if (rewrite.source_scope) |source| if (!source.receiver_namespace.eql(self.target_namespace) or
@@ -132,13 +138,14 @@ pub const Scope = struct {
     }
 
     pub fn validate(self: Scope) !void {
+        if (self.empty_generation and (self.preserve_artifacts or self.rewrite != null or !std.mem.allEqual(u8, &self.source_artifact_digest, 0) or !std.mem.allEqual(u8, &self.source_descriptor_digest, 0))) return error.InvalidRestoreStagingCommand;
         if (self.preserve_artifacts and self.rewrite != null) return error.InvalidRestoreStagingCommand;
         if (self.rewrite) |rewrite| {
             try rewrite.validate();
             if (rewrite.source_scope) |source| if (!source.fence.namespace.eql(self.source_namespace) or !source.receiver_namespace.eql(self.target_namespace)) return error.InvalidRestoreStagingCommand;
         }
         if (std.mem.allEqual(u8, &self.plan_id, 0) or std.mem.allEqual(u8, &self.plan_digest, 0) or
-            std.mem.allEqual(u8, &self.source_artifact_digest, 0) or self.target_namespace.table_id == 0 or
+            (!self.empty_generation and std.mem.allEqual(u8, &self.source_artifact_digest, 0)) or self.target_namespace.table_id == 0 or
             self.target_namespace.shard_id == 0 or self.target_namespace.range_id == 0 or
             self.source_namespace.table_id == 0 or self.source_namespace.table_id == self.target_namespace.table_id)
             return error.InvalidRestoreStagingCommand;
@@ -159,6 +166,7 @@ pub const Scope = struct {
         }
         hash.update(&self.target_schema_digest);
         if (self.preserve_artifacts) hash.update("native-artifact-preservation-v1");
+        if (self.empty_generation) hash.update("empty-generation-v1");
         if (self.rewrite) |rewrite| {
             hash.update("relational-rewrite-v1");
             hash.update(&rewrite.program_digest);
@@ -175,6 +183,24 @@ pub const Scope = struct {
         return result;
     }
 };
+
+test "restore empty generation scope cannot carry source authority or nonempty progress" {
+    const alloc = std.testing.allocator;
+    var scope: Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(0), .source_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .target_namespace = .{ .table_id = 3, .shard_id = 4, .range_id = 4 }, .target_schema_digest = @splat(5), .empty_generation = true };
+    try scope.validate();
+    const bytes = try (Progress{ .scope = scope, .phase = .imported }).encode(alloc);
+    defer alloc.free(bytes);
+    var decoded = try Progress.decode(alloc, bytes);
+    defer decoded.deinit();
+    try std.testing.expect(decoded.value.scope.empty_generation);
+    try std.testing.expectError(error.InvalidRestoreStagingCommand, (Progress{ .scope = scope, .phase = .imported, .rows = 1 }).encode(alloc));
+    try std.testing.expectError(error.InvalidRestoreStagingCommand, (Progress{ .scope = scope }).encode(alloc));
+    scope.preserve_artifacts = true;
+    try std.testing.expectError(error.InvalidRestoreStagingCommand, scope.validate());
+    scope.preserve_artifacts = false;
+    scope.source_artifact_digest = @splat(9);
+    try std.testing.expectError(error.InvalidRestoreStagingCommand, scope.validate());
+}
 
 pub const Progress = struct {
     scope: Scope,
@@ -215,6 +241,7 @@ pub const Progress = struct {
         return parsed;
     }
     fn validateRewrite(self: Progress) !void {
+        if (self.scope.empty_generation and (self.phase == .importing or self.rows != 0 or self.cursor.len != 0 or self.artifact_cursor.len != 0 or self.projection_cursor.len != 0 or self.rewrite != null or !std.mem.allEqual(u8, &self.logical_digest, 0))) return error.InvalidRestoreStagingCommand;
         if (self.scope.rewrite) |binding| {
             // Reservations and terminal cancellation may precede initialization.
             if (self.phase == .reserved or (self.phase == .canceled and self.rewrite == null)) return;

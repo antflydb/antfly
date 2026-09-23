@@ -2292,6 +2292,41 @@ pub const Client = struct {
         return ApiResponse(types.SQLResponse).fromResponse(self.allocator, &resp);
     }
 
+    /// Create a durable prepared SQL resource
+    /// POST /db/v1/sql/prepared
+    pub fn prepareSQL(self: *@This(), body: types.SQLPrepareRequest) !ApiResponse(types.SQLPreparedResponse) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/sql/prepared", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders(), .max_retries = 0, .follow_redirects = false, .cookies_enabled = false, .max_response_size = 16777216 });
+        return ApiResponse(types.SQLPreparedResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Release a durable prepared SQL resource
+    /// DELETE /db/v1/sql/prepared/{prepared_id}
+    pub fn closePreparedSQL(self: *@This(), prepared_id: []const u8) !ApiResponse(std.json.ArrayHashMap(std.json.Value)) {
+        const encoded_prepared_id = try httpx.PercentEncoding.encode(self.allocator, prepared_id);
+        defer self.allocator.free(encoded_prepared_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/sql/prepared/{s}", .{ self.base_url, encoded_prepared_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.delete(url, .{ .headers = self.authHeaders(), .max_retries = 0, .follow_redirects = false, .cookies_enabled = false, .max_response_size = 16777216 });
+        return ApiResponse(std.json.ArrayHashMap(std.json.Value)).fromResponse(self.allocator, &resp);
+    }
+
+    /// Execute a durable prepared SQL resource
+    /// POST /db/v1/sql/prepared/{prepared_id}/execute
+    pub fn executePreparedSQL(self: *@This(), prepared_id: []const u8, body: types.SQLPreparedExecutionRequest) !ApiResponse(types.SQLResponse) {
+        const encoded_prepared_id = try httpx.PercentEncoding.encode(self.allocator, prepared_id);
+        defer self.allocator.free(encoded_prepared_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/sql/prepared/{s}/execute", .{ self.base_url, encoded_prepared_id });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders(), .max_retries = 0, .follow_redirects = false, .cookies_enabled = false, .max_response_size = 16777216 });
+        return ApiResponse(types.SQLResponse).fromResponse(self.allocator, &resp);
+    }
+
     /// Get cluster status
     /// GET /db/v1/status
     pub fn getStatus(self: *@This()) !ApiResponse(types.ClusterStatus) {

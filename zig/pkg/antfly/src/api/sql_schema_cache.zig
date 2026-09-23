@@ -16,6 +16,7 @@ const Entry = struct {
     version: u32 = 0,
     storage_mode: @FieldType(catalog.Table, "storage_mode") = .relational,
     columns: []const catalog.Column = &.{},
+    indexes: []const catalog.Index = &.{},
     refs: usize = 0,
     used: u64 = 0,
 };
@@ -63,7 +64,13 @@ pub const Cache = struct {
             out.name = try alloc.dupe(u8, column.name);
             out.path = try alloc.dupe(u8, column.path);
         }
-        return .{ .id = id, .physical_name = physical_name, .schema_version = entry.version, .storage_mode = entry.storage_mode, .columns = columns };
+        const indexes = try alloc.alloc(catalog.Index, entry.indexes.len);
+        for (entry.indexes, indexes) |index, *out| {
+            const names = try alloc.alloc([]const u8, index.columns.len);
+            for (index.columns, names) |name, *copy| copy.* = try alloc.dupe(u8, name);
+            out.* = .{ .name = try alloc.dupe(u8, index.name), .columns = names };
+        }
+        return .{ .id = id, .physical_name = physical_name, .schema_version = entry.version, .storage_mode = entry.storage_mode, .columns = columns, .indexes = indexes };
     }
     fn acquire(self: *Cache, io: std.Io, json: []const u8) !*Entry {
         var digest: [32]u8 = undefined;
@@ -176,6 +183,22 @@ fn derive(entry: *Entry, json: []const u8) !void {
         },
     };
     entry.columns = columns;
+    var indexes: std.ArrayList(catalog.Index) = .empty;
+    if (parsed.relational_indexes) |declarations| for (declarations.value) |index| {
+        if (index.where != null or index.keys.len == 0 or index.keys.len > 32) continue;
+        const names = try owned.alloc([]const u8, index.keys.len);
+        var direct = true;
+        for (index.keys, names) |key, *name| {
+            const column = key.column orelse {
+                direct = false;
+                break;
+            };
+            name.* = try owned.dupe(u8, column);
+        }
+        if (!direct) continue;
+        try indexes.append(owned, .{ .name = try owned.dupe(u8, index.name), .columns = names });
+    };
+    entry.indexes = try indexes.toOwnedSlice(owned);
     entry.version = native.version;
 }
 
@@ -217,6 +240,23 @@ test "SQL schema cache reuses immutable layouts without caching table identity" 
     try std.testing.expectEqual(@as(usize, 0), schemaless.columns.len);
     try std.testing.expectEqualStrings("_id", (try schemaless.column("_id")).name);
     try std.testing.expectEqual(@as(usize, 0), cache.builds);
+}
+
+test "SQL schema cache pins direct total index candidates with the layout" {
+    var cache = Cache.init(std.testing.allocator);
+    defer cache.deinit();
+    const json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","relational_indexes":[{"name":"label_idx","keys":[{"column":"label"}]},{"name":"label_tenant_idx","keys":[{"column":"label"},{"column":"tenant"}]},{"name":"partial_idx","keys":[{"column":"label"}],"where":[{"column":"label","op":"eq","value":"ready"}]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"label":{"type":"keyword"},"tenant":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const table = try cache.resolve(std.testing.io, arena.allocator(), json, 1, "physical");
+    try std.testing.expectEqual(@as(usize, 2), table.indexes.len);
+    try std.testing.expectEqualStrings("label_idx", table.indexes[0].name);
+    try std.testing.expectEqualStrings("label", table.indexes[0].columns[0]);
+    try std.testing.expectEqualStrings("label_tenant_idx", table.indexes[1].name);
+    try std.testing.expectEqualStrings("label", table.indexes[1].columns[0]);
+    try std.testing.expectEqualStrings("tenant", table.indexes[1].columns[1]);
 }
 
 test "SQL schema cache document shapes are declared stable unions" {

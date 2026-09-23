@@ -26,10 +26,20 @@ pub const Node = struct {
     columns: []const Column,
     operation: union(enum) {
         singleton,
+        recursive_ref: usize,
+        recursive: struct { id: usize, seed: *const Node, step: *const Node, all: bool },
+        materialized_ref: *const Node,
         scan: struct { index: usize, source_columns: []const []const u8 },
         join: struct { kind: ast.JoinKind, left: *const Node, right: *const Node, condition: ?scalar.Program, left_keys: []const scalar.Program, right_keys: []const scalar.Program },
         query: struct { source: *const Node, statement: ast.Select, binding: describe.BoundStatement },
         set: struct { kind: ast.SetKind, all: bool, left: *const Node, right: *const Node },
+        /// Compiler-generated INSERT VALUES arms in input order. Each arm
+        /// retains its own captured source dependencies, but execution opens
+        /// only one arm iterator at a time after statement capture.
+        values: []const *const Node,
+        /// Adjacent compiler-owned literal rows share one small operator rather
+        /// than each allocating a SELECT program and iterator.
+        literal_rows: []const []const scalar.Datum,
     },
 };
 pub const Bound = struct { root: *const Node, scans: []const catalog.StatementScan, table: catalog.Table, statement: ast.Select };
@@ -73,7 +83,7 @@ fn qualifiedPredicate(node: *const ast.Predicate) bool {
     };
 }
 pub fn accepts(statement: ast.Select) bool {
-    if (statement.source != null or statement.ctes.len != 0 or statement.set_operation != null) return true;
+    if (statement.source != null or statement.ctes.len != 0 or statement.set_operation != null or statement.values_arms.len != 0) return true;
     for (statement.columns) |projection| {
         if (std.mem.indexOfScalar(u8, projection.field, 0) != null) return true;
         if (projection.expression) |node| if (qualified(node)) return true;
@@ -111,6 +121,50 @@ pub const ResolveAdapter = struct {
     }
 };
 
+/// Joined mutations pin the read/write-authorized target once, then bind all
+/// source relations against that same catalog identity. Non-target relations
+/// still resolve through the backend with their requested read authority.
+pub const TargetResolveAdapter = struct {
+    backend: catalog.Backend,
+    table: catalog.Table,
+    name: ast.Name,
+    /// A mutation statement must bind every occurrence of a source against
+    /// the same authorized catalog identity, including an optimized rebind.
+    cache_sources: bool = false,
+    source_tables: std.StringHashMapUnmanaged(catalog.Table) = .empty,
+    pub fn iface(self: *@This()) catalog.Backend {
+        return .{ .ptr = self, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint } };
+    }
+    fn resolve(ptr: *anyopaque, alloc: Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
+        // This adapter is only used while binding the read side of a mutation.
+        // Never let a future caller turn the pinned target into an implicit
+        // authorization for a second write or an administrative operation.
+        if (action != .read) return error.UnsupportedSqlExecution;
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (std.mem.eql(u8, name.table, self.name.table) and std.mem.eql(u8, name.database orelse "", self.name.database orelse "") and std.mem.eql(u8, name.namespace orelse "", self.name.namespace orelse "")) return self.table;
+        if (!self.cache_sources) return self.backend.vtable.resolve(self.backend.ptr, alloc, name, action);
+        const key = try std.fmt.allocPrint(alloc, "{s}\x00{s}\x00{s}", .{ name.database orelse "", name.namespace orelse "", name.table });
+        if (self.source_tables.get(key)) |cached| {
+            alloc.free(key);
+            return cached;
+        }
+        errdefer alloc.free(key);
+        const resolved = try self.backend.vtable.resolve(self.backend.ptr, alloc, name, action);
+        try self.source_tables.put(alloc, key, resolved);
+        return resolved;
+    }
+    fn scan(_: *anyopaque, _: Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
+        return error.InvalidSqlBackendResponse;
+    }
+    fn mutate(_: *anyopaque, _: Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+        return error.InvalidSqlBackendResponse;
+    }
+    fn checkpoint(ptr: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        try self.backend.vtable.checkpoint(self.backend.ptr);
+    }
+};
+
 const Builder = struct {
     alloc: Allocator,
     backend: catalog.Backend,
@@ -119,12 +173,19 @@ const Builder = struct {
     identities: std.StringHashMapUnmanaged(catalog.Table) = .empty,
     next_column: usize = 0,
     nodes: usize = 0,
+    node_limit: usize = 256,
     prepared: std.AutoHashMapUnmanaged(*const ast.Select, Prepared) = .empty,
     inferred_sets: std.AutoHashMapUnmanaged(*const ast.Select, void) = .empty,
     shape_only: bool = false,
     shape_expression_nodes: usize = 0,
     shape_columns: std.ArrayList(scalar.Column) = .empty,
     constraints: std.ArrayList(Constraint) = .empty,
+    recursive_nodes: std.AutoHashMapUnmanaged(*const ast.Select, *const Node) = .empty,
+    materialized_nodes: std.AutoHashMapUnmanaged(*const ast.Select, *const Node) = .empty,
+    auto_materialized: std.AutoHashMapUnmanaged(*const ast.Select, void) = .empty,
+    recursive_active: ?*const RecursiveFrame = null,
+    recursive_next: usize = 0,
+    const RecursiveFrame = struct { id: usize, query: *const ast.Select, columns: []const Column, parent: ?*const RecursiveFrame };
     const Constraint = struct { expression: *const ast.Scalar, expected: ?ast.ColumnType = null };
 
     const Prepared = struct { source: *const Node, lowered: ast.Select, expressions: []const *const ast.Scalar, types: []?ast.ColumnType };
@@ -179,6 +240,7 @@ const Builder = struct {
                     break :blk switch (kind) {
                         .avg => .{ .cast = .{ .operand = argument, .type = .number } },
                         .bool_and, .bool_or => .{ .cast = .{ .operand = argument, .type = .boolean } },
+                        .pattern_set => .{ .cast = .{ .operand = try self.scalarNode(.{ .cast = .{ .operand = argument, .type = .string } }), .type = .json } },
                         else => argument.*,
                     };
                 }
@@ -306,9 +368,70 @@ const Builder = struct {
         }
     }
 
+    fn mergeInferredType(current: *?ast.ColumnType, inferred: ?ast.ColumnType) !void {
+        const kind = inferred orelse return;
+        if (current.* == null) {
+            current.* = kind;
+        } else if (current.* != kind) {
+            if ((current.* == .integer or current.* == .number) and (kind == .integer or kind == .number)) current.* = .number else return error.SqlTypeMismatch;
+        }
+    }
+
+    fn literalType(value: ast.Value) ?ast.ColumnType {
+        return switch (value) {
+            .integer => .integer,
+            .number => .number,
+            .boolean => .boolean,
+            .string => .string,
+            .null, .parameter => null,
+        };
+    }
+
+    fn inferValues(self: *Builder, statement: ast.Select, scope: []const ast.Cte, depth: usize) anyerror![]const ?ast.ColumnType {
+        const width = statement.values_arms[0].columns.len;
+        var leaves: std.ArrayList(*const ast.Select) = .empty;
+        for (statement.values_arms, 0..) |arm, index| {
+            if (index % 64 == 0) try self.backend.vtable.checkpoint(self.backend.ptr);
+            if (arm.columns.len != width) return error.SqlTypeMismatch;
+            if (!literalValuesArm(arm)) try self.collectSet(arm, scope, &leaves, depth + 1);
+        }
+        const common = try self.alloc.alloc(?ast.ColumnType, width);
+        for (0..self.parameters.len + 2) |_| {
+            @memset(common, null);
+            for (statement.values_arms, 0..) |arm, index| {
+                if (index % 64 == 0) try self.backend.vtable.checkpoint(self.backend.ptr);
+                if (literalValuesArm(arm)) {
+                    for (arm.columns, common) |projection, *kind| {
+                        const expression_ = projection.expression orelse return error.InvalidSqlBackendResponse;
+                        try mergeInferredType(kind, literalType(expression_.literal));
+                    }
+                } else {
+                    const prepared = self.prepared.get(arm) orelse return error.InvalidSqlBackendResponse;
+                    const columns = try self.scalarColumns(prepared.source.columns);
+                    for (prepared.expressions, common) |expression_, *kind| try mergeInferredType(kind, (try scalar.inferOutput(self.alloc, expression_, columns, self.parameters)).kind);
+                }
+            }
+            var changed = false;
+            for (leaves.items) |leaf| {
+                const prepared = self.prepared.getPtr(leaf) orelse return error.InvalidSqlBackendResponse;
+                const columns = try self.scalarColumns(prepared.source.columns);
+                if (prepared.lowered.predicate) |predicate_| {
+                    const expression_ = try @import("bound_scalars.zig").predicateScalar(self.alloc, try self.virtualTable(prepared.source.columns), predicate_);
+                    changed = try scalar.inferParameters(self.alloc, expression_, columns, self.parameters, .boolean, .{}) or changed;
+                }
+                for (prepared.expressions, common, prepared.types) |expression_, kind, *output| {
+                    changed = try scalar.inferParameters(self.alloc, expression_, columns, self.parameters, kind, .{}) or changed;
+                    output.* = kind;
+                }
+            }
+            if (!changed) break;
+        }
+        return common;
+    }
+
     fn node(self: *Builder, columns: []const Column, operation: @FieldType(Node, "operation")) !*const Node {
         self.nodes += 1;
-        if (self.nodes > 256) return error.SqlProgramLimitExceeded;
+        if (self.nodes > self.node_limit) return error.SqlProgramLimitExceeded;
         const result = try self.alloc.create(Node);
         result.* = .{ .columns = columns, .operation = operation };
         return result;
@@ -425,6 +548,7 @@ const Builder = struct {
         result.source = null;
         result.ctes = &.{};
         result.set_operation = null;
+        result.values_arms = &.{};
         result.table = .{ .table = "$sql_relation" };
         var projections: std.ArrayList(ast.Projection) = .empty;
         if (statement.columns.len == 0 and !statement.count_all) {
@@ -473,12 +597,123 @@ const Builder = struct {
         return result;
     }
 
+    fn valuesOrigin(self: *Builder, arms: []const *const Node, index: usize) anyerror!*const ast.Scalar {
+        if (arms.len == 1) return arms[0].columns[index].origin orelse error.InvalidSqlBackendResponse;
+        const middle = arms.len / 2;
+        const arguments = try self.alloc.dupe(*const ast.Scalar, &.{ try self.valuesOrigin(arms[0..middle], index), try self.valuesOrigin(arms[middle..], index) });
+        return self.scalarNode(.{ .call = .{ .name = "coalesce", .args = arguments } });
+    }
+
+    fn literalValuesArm(query: *const ast.Select) bool {
+        if (!query.generated_values or query.table != null or query.source != null or query.set_operation != null or query.values_arms.len != 0 or query.ctes.len != 0 or query.predicate != null or query.group_by.len != 0 or query.having != null or query.order_by.len != 0 or query.limit != null or query.offset != null) return false;
+        for (query.columns) |projection| {
+            const expression_ = projection.expression orelse return false;
+            if (expression_.* != .literal or expression_.literal == .parameter) return false;
+        }
+        return true;
+    }
+
+    fn literalDatum(expression_: *const ast.Scalar) !scalar.Datum {
+        if (expression_.* != .literal) return error.InvalidSqlBackendResponse;
+        const value = expression_.literal;
+        return .{ .value = switch (value) {
+            .integer => |number| .{ .integer = number },
+            .number => |number| .{ .float = number },
+            .boolean => |boolean| .{ .bool = boolean },
+            .string => |string| .{ .string = string },
+            .null => .null,
+            .parameter => return error.InvalidSqlBackendResponse,
+        }, .sql_null = value == .null };
+    }
+
     fn querySource(self: *Builder, statement: ast.Select, scope: []const ast.Cte, depth: usize) anyerror!*const Node {
         if (depth > 32) return error.SqlProgramLimitExceeded;
+        // Work backward through the WITH dependency DAG. An inlined later CTE
+        // can multiply demand on its producer, while a materialized later CTE
+        // evaluates its producer once. Two is enough to choose sharing, so
+        // neither reference counts nor planning work grow with execution size.
+        const demand = try self.alloc.alloc(u8, statement.ctes.len);
+        var body = statement;
+        body.ctes = &.{};
+        var remaining = statement.ctes.len;
+        while (remaining != 0) {
+            remaining -= 1;
+            const cte = statement.ctes[remaining];
+            var count: usize = @min(2, try @import("recursive_shape.zig").references(body, cte.name, 0));
+            for (statement.ctes[remaining + 1 ..], demand[remaining + 1 ..]) |later, later_demand| {
+                if (later_demand == 0 or count == 2) continue;
+                const direct = @min(2, try @import("recursive_shape.zig").references(later.query.*, cte.name, 0));
+                const evaluations: usize = if (later.recursive) 2 else if (later.materialization == .materialized or (later.materialization == .automatic and self.auto_materialized.contains(later.query))) 1 else later_demand;
+                count = @min(2, count + direct * evaluations);
+            }
+            demand[remaining] = @intCast(count);
+            if (!cte.recursive and cte.materialization == .automatic and count > 1) try self.auto_materialized.put(self.alloc, cte.query, {});
+        }
+        for (statement.ctes, 0..) |cte, i| if (cte.recursive) {
+            for (statement.ctes[i + 1 ..]) |later| if (try @import("recursive_shape.zig").references(cte.query.*, later.name, 0) != 0) return error.UnsupportedSqlShape;
+        };
         const ctes = try self.alloc.alloc(ast.Cte, scope.len + statement.ctes.len);
         @memcpy(ctes[0..scope.len], scope);
         @memcpy(ctes[scope.len..], statement.ctes);
         for (statement.ctes, 0..) |cte, index| for (statement.ctes[0..index]) |prior| if (std.mem.eql(u8, cte.name, prior.name)) return error.DuplicateSqlColumn;
+        if (statement.values_arms.len != 0) {
+            if (!statement.generated_values or statement.set_operation != null or statement.values_arms.len > 1000) return error.InvalidSqlBackendResponse;
+            const common = if (self.shape_only) &.{} else try self.inferValues(statement, scope, depth + 1);
+            var grouped: std.ArrayList(*const Node) = .empty;
+            var arm_index: usize = 0;
+            while (arm_index < statement.values_arms.len) {
+                if (arm_index % 64 == 0) try self.backend.vtable.checkpoint(self.backend.ptr);
+                const leaf = statement.values_arms[arm_index];
+                if (!self.shape_only and literalValuesArm(leaf)) {
+                    const first = arm_index;
+                    while (arm_index < statement.values_arms.len and literalValuesArm(statement.values_arms[arm_index])) : (arm_index += 1) {
+                        if (arm_index % 64 == 0) try self.backend.vtable.checkpoint(self.backend.ptr);
+                    }
+                    const columns = try self.alloc.alloc(Column, leaf.columns.len);
+                    for (leaf.columns, columns, common) |projection, *column, kind| column.* = .{
+                        .name = projection.alias orelse return error.InvalidSqlBackendResponse,
+                        .internal = try self.internal(),
+                        .qualifier = "",
+                        .type = kind orelse .string,
+                        .nullable = true,
+                        .untyped_null = kind == null,
+                    };
+                    const rows = try self.alloc.alloc([]const scalar.Datum, arm_index - first);
+                    for (statement.values_arms[first..arm_index], rows, 0..) |row_query, *row, index| {
+                        if (index % 64 == 0) try self.backend.vtable.checkpoint(self.backend.ptr);
+                        const values = try self.alloc.alloc(scalar.Datum, row_query.columns.len);
+                        for (row_query.columns, values) |projection, *value| value.* = try literalDatum(projection.expression orelse return error.InvalidSqlBackendResponse);
+                        row.* = values;
+                    }
+                    try grouped.append(self.alloc, try self.node(columns, .{ .literal_rows = rows }));
+                } else {
+                    try grouped.append(self.alloc, try self.derived(leaf, "", &.{}, ctes, depth + 1));
+                    arm_index += 1;
+                }
+            }
+            const arms = grouped.items;
+            const columns = try self.alloc.dupe(Column, arms[0].columns);
+            for (arms[1..]) |arm| {
+                if (arm.columns.len != columns.len) return error.SqlTypeMismatch;
+                for (columns, arm.columns) |*column, other| {
+                    if (self.shape_only) {
+                        column.type = .string;
+                    } else if (column.untyped_null) column.type = other.type else if (!other.untyped_null and column.type != other.type) {
+                        if ((column.type == .integer and other.type == .number) or (column.type == .number and other.type == .integer)) column.type = .number else return error.SqlTypeMismatch;
+                    }
+                    column.nullable = column.nullable or other.nullable;
+                    column.untyped_null = column.untyped_null and other.untyped_null;
+                }
+            }
+            for (columns, 0..) |*column, index| {
+                column.internal = try self.internal();
+                if (self.shape_only) {
+                    column.origin = try self.valuesOrigin(arms, index);
+                    try self.constraints.append(self.alloc, .{ .expression = column.origin.? });
+                }
+            }
+            return self.node(columns, .{ .values = arms });
+        }
         if (statement.set_operation) |set| {
             if (!self.shape_only) try self.inferSet(statement, scope, depth + 1);
             defer _ = self.inferred_sets.remove(set.left);
@@ -559,24 +794,92 @@ const Builder = struct {
         }
         return self.node(columns, .{ .query = .{ .source = child, .statement = lowered, .binding = bound } });
     }
+    fn recursiveAlias(self: *Builder, source: *const Node, alias: []const u8) !*const Node {
+        const columns = try self.alloc.dupe(Column, source.columns);
+        for (columns) |*column| {
+            column.internal = try self.internal();
+            column.qualifier = alias;
+            column.nullable = true;
+        }
+        return self.node(columns, source.operation);
+    }
+
+    fn recursiveCte(self: *Builder, cte: ast.Cte, alias: []const u8, scope: []const ast.Cte, depth: usize) anyerror!*const Node {
+        var active = self.recursive_active;
+        while (active) |frame| : (active = frame.parent) if (frame.query == cte.query) {
+            return self.recursiveAlias(try self.node(frame.columns, .{ .recursive_ref = frame.id }), alias);
+        };
+        if (self.recursive_nodes.get(cte.query)) |prior| return self.recursiveAlias(prior, alias);
+        try @import("recursive_shape.zig").validate(cte);
+        if (self.recursive_next >= 32) return error.SqlProgramLimitExceeded;
+        const id = self.recursive_next;
+        self.recursive_next += 1;
+        const set = cte.query.set_operation.?;
+        const seed_scope = try self.alloc.alloc(ast.Cte, scope.len + cte.query.ctes.len);
+        @memcpy(seed_scope[0..scope.len], scope);
+        @memcpy(seed_scope[scope.len..], cte.query.ctes);
+        const seed = try self.derived(set.left, cte.name, cte.columns, seed_scope, depth + 1);
+        if (seed.columns.len == 0) return error.InvalidSqlParameters;
+        const frame: RecursiveFrame = .{ .id = id, .query = cte.query, .columns = seed.columns, .parent = self.recursive_active };
+        self.recursive_active = &frame;
+        defer self.recursive_active = frame.parent;
+        const step_scope = try self.alloc.alloc(ast.Cte, scope.len + 1 + cte.query.ctes.len);
+        @memcpy(step_scope[0..scope.len], scope);
+        step_scope[scope.len] = cte;
+        @memcpy(step_scope[scope.len + 1 ..], cte.query.ctes);
+        const step = try self.derived(set.right, cte.name, cte.columns, step_scope, depth + 1);
+        if (seed.columns.len != step.columns.len) return error.SqlTypeMismatch;
+        const columns = try self.alloc.dupe(Column, seed.columns);
+        for (columns, step.columns) |*column, other| {
+            column.nullable = true;
+            if (self.shape_only) {
+                const args = try self.alloc.dupe(*const ast.Scalar, &.{ column.origin.?, other.origin.? });
+                column.origin = try self.scalarNode(.{ .call = .{ .name = "coalesce", .args = args } });
+                try self.constraints.append(self.alloc, .{ .expression = column.origin.? });
+            } else if (!other.untyped_null and column.type != other.type and !(column.type == .number and other.type == .integer)) return error.SqlTypeMismatch;
+        }
+        const result = try self.node(columns, if (self.shape_only) .singleton else .{ .recursive = .{ .id = id, .seed = seed, .step = step, .all = set.all } });
+        try self.recursive_nodes.put(self.alloc, cte.query, result);
+        return self.recursiveAlias(result, alias);
+    }
+
     fn relation(self: *Builder, input: *const ast.Relation, scope: []const ast.Cte, depth: usize) anyerror!*const Node {
         if (depth > 32) return error.SqlProgramLimitExceeded;
         try self.backend.vtable.checkpoint(self.backend.ptr);
         return switch (input.*) {
             .table => |reference| blk: {
-                if (reference.name.database == null and reference.name.namespace == null) {
+                if (!reference.mutation_target and reference.name.database == null and reference.name.namespace == null) {
                     var i = scope.len;
                     while (i != 0) {
                         i -= 1;
                         const cte = scope[i];
-                        if (std.mem.eql(u8, cte.name, reference.name.table)) break :blk try self.derived(cte.query, reference.alias orelse cte.name, cte.columns, scope[0..i], depth + 1);
+                        if (std.mem.eql(u8, cte.name, reference.name.table)) {
+                            if (cte.recursive and try @import("recursive_shape.zig").references(cte.query.*, cte.name, 0) != 0)
+                                break :blk try self.recursiveCte(cte, reference.alias orelse cte.name, scope[0..i], depth + 1);
+                            if (cte.materialization == .materialized or (cte.materialization == .automatic and self.auto_materialized.contains(cte.query))) {
+                                const materialized = self.materialized_nodes.get(cte.query) orelse source: {
+                                    const source = try self.derived(cte.query, cte.name, cte.columns, scope[0..i], depth + 1);
+                                    try self.materialized_nodes.put(self.alloc, cte.query, source);
+                                    break :source source;
+                                };
+                                const columns = try self.alloc.dupe(Column, materialized.columns);
+                                for (columns) |*column| {
+                                    column.internal = try self.internal();
+                                    column.qualifier = reference.alias orelse cte.name;
+                                }
+                                break :blk try self.node(columns, .{ .materialized_ref = materialized });
+                            }
+                            break :blk try self.derived(cte.query, reference.alias orelse cte.name, cte.columns, scope[0..i], depth + 1);
+                        }
                     }
                 }
                 const identity = try std.fmt.allocPrint(self.alloc, "{s}\x00{s}\x00{s}", .{ reference.name.database orelse "", reference.name.namespace orelse "", reference.name.table });
                 const entry = try self.identities.getOrPut(self.alloc, identity);
                 if (!entry.found_existing) entry.value_ptr.* = try self.backend.vtable.resolve(self.backend.ptr, self.alloc, reference.name, .read);
                 const table = entry.value_ptr.*;
-                const columns = try self.alloc.alloc(Column, table.columns.len + 1);
+                if (reference.mutation_presence and !reference.mutation_target) return error.InvalidSqlBackendResponse;
+                const metadata_count: usize = if (!reference.mutation_target) 0 else if (reference.mutation_presence) 4 else 3;
+                const columns = try self.alloc.alloc(Column, table.columns.len + 1 + metadata_count);
                 const source_columns = try self.alloc.alloc([]const u8, columns.len);
                 const fields = try self.alloc.alloc([]const u8, table.columns.len);
                 for (table.columns, columns[0..table.columns.len], source_columns[0..table.columns.len], fields) |column, *out, *source_name, *field_name| {
@@ -585,15 +888,19 @@ const Builder = struct {
                     field_name.* = column.path;
                 }
                 columns[table.columns.len] = .{ .name = "_id", .internal = try self.internal(), .qualifier = reference.alias orelse reference.name.table, .type = .string, .nullable = false, .visible = false };
+                for (@import("joined_mutation.zig").metadata_fields[0..metadata_count], 0..) |name, i| {
+                    columns[table.columns.len + 1 + i] = .{ .name = name, .internal = try self.internal(), .qualifier = reference.alias orelse reference.name.table, .type = if (i == 2) .json else .string, .nullable = i == 2, .visible = false };
+                    source_columns[table.columns.len + 1 + i] = name;
+                }
                 if (self.shape_only) for (columns) |column| try self.shape_columns.append(self.alloc, .{ .name = column.internal, .type = column.type, .nullable = column.nullable });
                 source_columns[table.columns.len] = "_id";
                 const index = self.scans.items.len;
                 if (index >= 64) return error.SqlProgramLimitExceeded;
-                try self.scans.append(self.alloc, .{ .table = table, .request = .{ .fields = fields, .limit = 256 } });
+                try self.scans.append(self.alloc, .{ .table = table, .request = .{ .fields = fields, .limit = 256, .include_primary_digest = reference.mutation_target, .include_document = reference.mutation_document and table.storage_mode == .document } });
                 break :blk try self.node(columns, .{ .scan = .{ .index = index, .source_columns = source_columns } });
             },
             .derived => |query| blk: {
-                const result = try self.derived(query.query, query.alias, &.{}, scope, depth + 1);
+                const result = try self.derived(query.query, query.alias, query.columns, scope, depth + 1);
                 if (query.hidden) for (@constCast(result.columns)) |*column| {
                     column.visible = false;
                 };
@@ -699,6 +1006,9 @@ fn markExpression(alloc: Allocator, needed: *std.StringHashMapUnmanaged(void), i
         },
         .cast => |part| try markExpression(alloc, needed, part.operand),
         .call => |part| {
+            // Binding already validated the discarded EXISTS expression.
+            // It has no runtime dependencies and must not fetch cold payloads.
+            if (std.mem.eql(u8, part.name, "$validate")) return;
             for (part.args) |arg| try markExpression(alloc, needed, arg);
             if (part.filter) |filter| try markExpression(alloc, needed, filter);
             if (part.window) |spec| {
@@ -748,12 +1058,25 @@ fn markSelect(alloc: Allocator, needed: *std.StringHashMapUnmanaged(void), state
 }
 fn projectScans(builder: *Builder, node: *const Node, needed: *std.StringHashMapUnmanaged(void)) anyerror!void {
     switch (node.operation) {
-        .singleton => {},
+        .singleton, .recursive_ref, .literal_rows => {},
+        .materialized_ref => |source| {
+            // A materialized CTE stores its complete declared output once;
+            // references can project different columns without changing its
+            // producer's physical scan contract.
+            for (source.columns) |column| try needed.put(builder.alloc, column.internal, {});
+            try projectScans(builder, source, needed);
+        },
+        .recursive => |recursive| {
+            // The working row is positional. Every recursive output is needed
+            // to seed the next iteration even when the outer SELECT projects less.
+            try projectScans(builder, recursive.seed, needed);
+            try projectScans(builder, recursive.step, needed);
+        },
         .scan => |scan| {
             var fields: std.ArrayList([]const u8) = .empty;
             const request = &builder.scans.items[scan.index];
             for (node.columns, scan.source_columns) |column, name| {
-                if (!needed.contains(column.internal) or std.mem.eql(u8, name, "_id")) continue;
+                if (!needed.contains(column.internal) or std.mem.eql(u8, name, "_id") or @import("joined_mutation.zig").isMetadata(name)) continue;
                 try fields.append(builder.alloc, (try request.table.column(name)).path);
             }
             request.request.fields = try fields.toOwnedSlice(builder.alloc);
@@ -771,13 +1094,14 @@ fn projectScans(builder: *Builder, node: *const Node, needed: *std.StringHashMap
             try projectScans(builder, set.left, needed);
             try projectScans(builder, set.right, needed);
         },
+        .values => |arms| for (arms) |arm| try projectScans(builder, arm, needed),
     }
 }
 
 pub fn bind(alloc: Allocator, backend: catalog.Backend, statement: ast.Select, parameters: []?ast.ColumnType) anyerror!Bound {
-    var builder: Builder = .{ .alloc = alloc, .backend = backend, .parameters = parameters };
+    var builder: Builder = .{ .alloc = alloc, .backend = backend, .parameters = parameters, .node_limit = if (statement.generated_values) 8192 else 256 };
     if (std.mem.indexOfScalar(?ast.ColumnType, parameters, null) != null) {
-        var shape: Builder = .{ .alloc = alloc, .backend = backend, .parameters = parameters, .shape_only = true };
+        var shape: Builder = .{ .alloc = alloc, .backend = backend, .parameters = parameters, .shape_only = true, .node_limit = if (statement.generated_values) 8192 else 256 };
         try shape.inferShape(statement, &.{});
         builder.identities = shape.identities;
     }
@@ -793,8 +1117,16 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, statement: ast.Select, p
 /// source programs. This is a catalog-only pass; it never opens a row reader.
 pub fn inferExpected(alloc: Allocator, backend: catalog.Backend, statement: ast.Select, parameters: []?ast.ColumnType, expected: []const ast.ColumnType) !void {
     if (std.mem.indexOfScalar(?ast.ColumnType, parameters, null) == null) return;
-    var shape: Builder = .{ .alloc = alloc, .backend = backend, .parameters = parameters, .shape_only = true };
+    var shape: Builder = .{ .alloc = alloc, .backend = backend, .parameters = parameters, .shape_only = true, .node_limit = if (statement.generated_values) 8192 else 256 };
     try shape.inferShape(statement, expected);
+}
+
+/// Normalize one expression against an already-bound relation. Mutation arms
+/// use the same qualified-name and ambiguity rules as SELECT, then bind typed
+/// programs against the projected internal column ordinals.
+pub fn lowerBoundExpression(alloc: Allocator, columns: []const Column, expression_: *const ast.Scalar) !*const ast.Scalar {
+    var builder: Builder = .{ .alloc = alloc, .backend = undefined, .parameters = &.{} };
+    return builder.expression(columns, expression_, &.{});
 }
 
 /// RETURNING has one authorized target, not a separate relational read. Reuse

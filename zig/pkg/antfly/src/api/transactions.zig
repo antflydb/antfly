@@ -178,6 +178,8 @@ pub const TableCommitRequest = struct {
 pub const CatalogBinding = struct { logical: []const u8, physical: []const u8 };
 
 pub const OwnedTransactionCommitRequest = struct {
+    constraint_timing: std.ArrayListUnmanaged(@import("../storage/relational_index.zig").ConstraintTiming) = .empty,
+
     // Server-authored identity bindings are persisted with staged operations.
     // Public JSON cannot supply them. Labels remain stable across renames.
     catalog_bindings: std.ArrayListUnmanaged(CatalogBinding) = .empty,
@@ -185,6 +187,16 @@ pub const OwnedTransactionCommitRequest = struct {
     read_set: []TransactionReadItem = &.{},
     tables: []TableCommitRequest = &.{},
     sync_level: db_mod.types.SyncLevel = .propose,
+
+    pub fn setConstraintTiming(self: *@This(), alloc: std.mem.Allocator, mode: @import("../storage/relational_index.zig").ConstraintTiming) !void {
+        if (mode.generation == null) self.constraint_timing.clearRetainingCapacity();
+        for (self.constraint_timing.items) |*previous| if (std.meta.eql(previous.generation, mode.generation)) {
+            previous.* = mode;
+            return;
+        };
+        if (self.constraint_timing.items.len >= 4096) return error.TransactionTooLarge;
+        try self.constraint_timing.append(alloc, mode);
+    }
 
     pub fn bind(self: *OwnedTransactionCommitRequest, alloc: std.mem.Allocator, logical: []const u8, physical: []const u8) !void {
         for (self.catalog_bindings.items) |binding| if (std.mem.eql(u8, binding.logical, logical)) {
@@ -219,6 +231,7 @@ pub const OwnedTransactionCommitRequest = struct {
     }
 
     pub fn deinit(self: *OwnedTransactionCommitRequest, alloc: std.mem.Allocator) void {
+        self.constraint_timing.deinit(alloc);
         for (self.catalog_bindings.items) |binding| {
             alloc.free(binding.logical);
             alloc.free(binding.physical);
@@ -236,6 +249,7 @@ pub const OwnedTransactionCommitRequest = struct {
             .sync_level = self.sync_level,
         };
         errdefer out.deinit(alloc);
+        try out.constraint_timing.appendSlice(alloc, self.constraint_timing.items);
         for (self.catalog_bindings.items) |binding| try out.bind(alloc, binding.logical, binding.physical);
 
         out.read_set = try alloc.alloc(TransactionReadItem, self.read_set.len);
@@ -265,6 +279,7 @@ pub const OwnedTransactionCommitRequest = struct {
     }
 
     pub fn mergeFrom(self: *OwnedTransactionCommitRequest, alloc: std.mem.Allocator, other: *const OwnedTransactionCommitRequest) !void {
+        for (other.constraint_timing.items) |mode| try self.setConstraintTiming(alloc, mode);
         for (other.catalog_bindings.items) |binding| try self.bind(alloc, binding.logical, binding.physical);
         try appendReadSet(alloc, self, other.read_set);
         for (other.tables) |table| {
@@ -3390,6 +3405,12 @@ fn encodeCommitRequestMode(alloc: std.mem.Allocator, req: OwnedTransactionCommit
     try out.append(alloc, '}');
     try out.appendSlice(alloc, ",\"sync_level\":");
     try appendJsonString(alloc, &out, syncLevelText(req.sync_level));
+    if (trusted and req.constraint_timing.items.len != 0) {
+        try out.appendSlice(alloc, ",\"constraint_timing\":");
+        const timing = try std.json.Stringify.valueAlloc(alloc, req.constraint_timing.items, .{});
+        defer alloc.free(timing);
+        try out.appendSlice(alloc, timing);
+    }
     if (trusted and req.catalog_bindings.items.len != 0) {
         try out.appendSlice(alloc, ",\"catalog_bindings\":");
         const bindings = try std.json.Stringify.valueAlloc(alloc, req.catalog_bindings.items, .{});
@@ -3648,6 +3669,12 @@ fn parseReadSet(alloc: std.mem.Allocator, value: std.json.Value) ![]TransactionR
 fn parseStoredCommitValue(alloc: std.mem.Allocator, value: std.json.Value) !OwnedTransactionCommitRequest {
     var request = try parseCommitValue(alloc, value);
     errdefer request.deinit(alloc);
+    if (value.object.get("constraint_timing")) |timing| {
+        if (timing != .array or timing.array.items.len > 4096) return error.InvalidTransactionSessionRecord;
+        var parsed = try std.json.parseFromValue([]const @import("../storage/relational_index.zig").ConstraintTiming, alloc, timing, .{});
+        defer parsed.deinit();
+        for (parsed.value) |mode| try request.setConstraintTiming(alloc, mode);
+    }
     if (value.object.get("json_null_fields")) |tables| {
         if (tables != .object) return error.InvalidTransactionSessionRecord;
         var entries = tables.object.iterator();
@@ -5985,6 +6012,52 @@ test "transaction session registry reports status and cleans expired durable ses
     try std.testing.expect((try durable.load(session.txn_id)) == null);
 }
 
+test "distributed txn constraint timing stage rollback and durable reload are atomic" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/timing", .{tmp.sub_path}, 0);
+    defer alloc.free(path);
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+    var durable = DurableSessionStore.init(alloc, &store);
+    var writer = SessionRegistry.init(&durable);
+    defer writer.deinit(alloc);
+    const session = try writer.begin(alloc, .{}, 21);
+    var deferred: OwnedTransactionCommitRequest = .{};
+    defer deferred.deinit(alloc);
+    try deferred.setConstraintTiming(alloc, .{ .deferred = true });
+    _ = try writer.stage(alloc, session.txn_id, &deferred);
+    const point = (try writer.createNamedSavepoint(alloc, session.txn_id, "deferred")).?;
+    var immediate: OwnedTransactionCommitRequest = .{};
+    defer immediate.deinit(alloc);
+    try immediate.setConstraintTiming(alloc, .{ .generation = @splat(4), .deferred = false });
+    const Reject = struct {
+        fn validate(_: *anyopaque, _: std.mem.Allocator, _: ?*const OwnedTransactionCommitRequest, _: *OwnedTransactionCommitRequest, _: *const OwnedTransactionCommitRequest) !void {
+            return error.UniqueConstraintViolation;
+        }
+    };
+    var context: u8 = 0;
+    try std.testing.expectError(error.UniqueConstraintViolation, writer.stageValidated(alloc, session.txn_id, &immediate, .{ .ptr = &context, .validate = Reject.validate }));
+    {
+        var pending = try writer.sessions.get(session.txn_id).?.staged.?.clone(alloc);
+        defer pending.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), pending.constraint_timing.items.len);
+        try std.testing.expect(pending.constraint_timing.items[0].deferred);
+    }
+    _ = try writer.stage(alloc, session.txn_id, &immediate);
+    _ = try writer.rollbackToSavepoint(alloc, session.txn_id, point.savepoint_id);
+    var recovered = (try durable.load(session.txn_id)).?;
+    defer recovered.deinit(alloc);
+    var pending = try recovered.staged.?.clone(alloc);
+    defer pending.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), pending.constraint_timing.items.len);
+    try std.testing.expect(pending.constraint_timing.items[0].deferred);
+    var public = try parseCommitRequest(alloc, "{\"read_set\":[],\"tables\":{},\"constraint_timing\":[{\"deferred\":true}]}");
+    defer public.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), public.constraint_timing.items.len);
+}
+
 test "transaction session named savepoints shadow release and roll back nested state" {
     const alloc = std.testing.allocator;
     var registry = SessionRegistry.init(null);
@@ -6041,23 +6114,30 @@ test "distributed txn SQL range guards survive durability and savepoint rollback
         fn run(alloc: std.mem.Allocator) !void {
             const ranges = @import("range_read_guards.zig");
             const observation = ranges.OwnerRangeProof{ .fence = .{ .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .catalog_revision = 2, .table_id = 3, .topology_epoch = 4, .route = .{ .group_id = 5, .range_id = 6, .identity_namespace = .{ .table_id = 3, .shard_id = 5, .range_id = 6 } } }, .proofs = &.{.{ .bucket = 98, .generation = std.math.maxInt(u64) }} };
+            const source_observation = ranges.OwnerRangeProof{ .fence = .{ .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .catalog_revision = 2, .table_id = 4, .topology_epoch = 4, .route = .{ .group_id = 7, .range_id = 8, .identity_namespace = .{ .table_id = 4, .shard_id = 7, .range_id = 8 } } }, .proofs = &.{.{ .bucket = 99, .generation = 43 }} };
             var registry = SessionRegistry.init(null);
             defer registry.deinit(alloc);
             const session = try registry.begin(alloc, .{ .sql = .{ .database = "default", .namespace = "public", .isolation = .serializable, .mode = .read_write } }, 1);
             _ = try registry.createNamedSavepoint(alloc, session.txn_id, "before");
-            var request = try parseCommitRequest(alloc, "{\"read_set\":[],\"tables\":{\"docs\":{\"inserts\":{\"a\":{\"v\":1}}}}}");
+            var request = try parseCommitRequest(alloc, "{\"read_set\":[],\"tables\":{\"docs\":{\"inserts\":{\"a\":{\"v\":1}}},\"source\":{}}}");
             defer request.deinit(alloc);
             try request.bind(alloc, "docs", "physical:3");
+            try request.bind(alloc, "source", "physical:4");
             request.tables[0].schema_version = 7;
+            request.tables[1].schema_version = 8;
             try request.tables[0].mergeRangeGuards(alloc, &.{observation});
+            try request.tables[1].mergeRangeGuards(alloc, &.{source_observation});
             _ = try registry.stage(alloc, session.txn_id, &request);
             _ = try registry.rollbackToNamedSavepoint(alloc, session.txn_id, "before");
             var restored = try registry.cloneSqlStaged(alloc, session.txn_id);
             defer restored.deinit(alloc);
-            try std.testing.expectEqual(@as(usize, 1), restored.tables.len);
+            try std.testing.expectEqual(@as(usize, 2), restored.tables.len);
             try std.testing.expectEqual(@as(usize, 0), restored.tables[0].batch.writes.len);
+            try std.testing.expectEqual(@as(usize, 0), restored.tables[1].batch.writes.len);
             try std.testing.expectEqualStrings("physical:3", restored.physicalName("docs"));
+            try std.testing.expectEqualStrings("physical:4", restored.physicalName("source"));
             try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), restored.tables[0].range_guards.?.value[0].proofs[0].generation);
+            try std.testing.expectEqual(@as(?u64, 43), restored.tables[1].range_guards.?.value[0].proofs[0].generation);
             const encoded = try encodeCommitRequestMode(alloc, restored, true);
             defer alloc.free(encoded);
             var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{ .parse_numbers = false });
@@ -6068,6 +6148,10 @@ test "distributed txn SQL range guards survive durability and savepoint rollback
             defer alloc.free(routed);
             try std.testing.expectEqual(@as(u64, 5), routed[0].range_guards[0].fence.route.group_id);
             try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), routed[0].range_guards[0].proofs[0].generation);
+            try std.testing.expectEqual(@as(u64, 7), routed[1].range_guards[0].fence.route.group_id);
+            try std.testing.expectEqual(@as(u64, 8), routed[1].range_guards[0].fence.route.range_id);
+            try std.testing.expectEqual(@as(u64, 4), routed[1].range_guards[0].fence.route.identity_namespace.table_id);
+            try std.testing.expectEqual(@as(?u64, 43), routed[1].range_guards[0].proofs[0].generation);
             const public = try encodeCommitRequestMode(alloc, durable, false);
             defer alloc.free(public);
             try std.testing.expect(std.mem.indexOf(u8, public, "range_guards") == null);
@@ -6404,6 +6488,8 @@ test "distributed txn session preserves numeric tokens across staging savepoints
     const commit = "{\"read_set\":[],\"tables\":{\"docs\":{\"inserts\":{\"a\":" ++ row ++ "}}}}";
     var staged = try parseCommitRequest(alloc, commit);
     defer staged.deinit(alloc);
+    try staged.setConstraintTiming(alloc, .{ .deferred = true });
+    try session.staged.?.setConstraintTiming(alloc, .{ .generation = @splat(7), .deferred = false });
     try std.testing.expectEqualStrings(row, staged.tables[0].batch.writes[0].value);
     try upsertReadSnapshot(alloc, &session.read_snapshots, .{ .table_name = "docs", .key = "a", .version = 44, .document_json = row });
     try session.savepoints.put(alloc, 1, .{ .id = 1, .name = try alloc.dupe(u8, "before_update"), .snapshot = try staged.clone(alloc), .read_snapshots = try cloneReadSnapshotMap(alloc, session.read_snapshots) });
@@ -6417,6 +6503,9 @@ test "distributed txn session preserves numeric tokens across staging savepoints
     try std.testing.expectEqualStrings(row, restored.savepoints.get(1).?.snapshot.tables[0].batch.writes[0].value);
     try std.testing.expectEqualStrings(row, restored.savepoints.get(1).?.read_snapshots.values()[0].document_json.?);
     try std.testing.expectEqualStrings("before_update", restored.savepoints.get(1).?.name.?);
+    try std.testing.expect(restored.savepoints.get(1).?.snapshot.constraint_timing.items[0].deferred);
+    try std.testing.expectEqualDeep(@as(?[16]u8, @splat(7)), restored.staged.?.constraint_timing.items[0].generation);
+    try std.testing.expect(!restored.staged.?.constraint_timing.items[0].deferred);
 }
 
 test "transaction catalog bindings persist privately and cannot be injected publicly" {

@@ -164,9 +164,11 @@ pub const Client = struct {
         var parsed = try std.json.parseFromSlice(rpc.Response, self.alloc, response.body, .{});
         defer parsed.deinit();
         const proofs = parsed.value.range_proofs;
-        if (proofs.len == 0 or proofs.len > 257) return error.InvalidRetainedReadResponse;
+        if (proofs.len == 0 or proofs.len > @import("range_read_guards.zig").max_proofs) return error.InvalidRetainedReadResponse;
         for (proofs, 0..) |proof, i| {
-            if (proof.bucket >= 257 or (i != 0 and proofs[i - 1].bucket >= proof.bucket)) return error.InvalidRetainedReadResponse;
+            const tracking = @import("../storage/range_protection.zig");
+            tracking.validateProof(proof) catch return error.InvalidRetainedReadResponse;
+            if (i != 0 and !tracking.proofLess(proofs[i - 1], proof)) return error.InvalidRetainedReadResponse;
         }
         return alloc.dupe(@import("../storage/range_protection.zig").Proof, proofs);
     }

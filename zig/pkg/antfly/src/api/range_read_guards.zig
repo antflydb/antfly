@@ -9,6 +9,11 @@ pub const Proof = @import("../storage/range_protection.zig").Proof;
 pub const OwnerRangeProof = struct { fence: metadata.CatalogRouteFence, proofs: []const Proof };
 pub const max_owners = 4096;
 pub const max_proofs = 16384;
+const tracking = @import("../storage/range_protection.zig");
+const ProofKey = struct {
+    bucket: u16,
+    index: ?tracking.IndexSpan,
+};
 
 pub const Owned = struct {
     arena: std.heap.ArenaAllocator,
@@ -30,10 +35,10 @@ pub fn validate(input: []const OwnerRangeProof) !void {
     var count: usize = 0;
     for (input) |owner| {
         try owner.fence.validate();
-        if (owner.fence.metadata_incarnation == null or owner.proofs.len == 0 or owner.proofs.len > 257) return error.InvalidTransactionSessionRecord;
+        if (owner.fence.metadata_incarnation == null or owner.proofs.len == 0 or owner.proofs.len > max_proofs) return error.InvalidTransactionSessionRecord;
         count += owner.proofs.len;
         if (count > max_proofs) return error.TransactionTooLarge;
-        for (owner.proofs) |proof| if (proof.bucket > 256) return error.InvalidTransactionSessionRecord;
+        for (owner.proofs) |proof| tracking.validateProof(proof) catch return error.InvalidTransactionSessionRecord;
     }
 }
 
@@ -46,7 +51,7 @@ pub fn merge(alloc: std.mem.Allocator, previous: []const OwnerRangeProof, incomi
     var arena = std.heap.ArenaAllocator.init(alloc);
     errdefer arena.deinit();
     const owned = arena.allocator();
-    const Entry = struct { fence: metadata.CatalogRouteFence, proofs: std.AutoHashMapUnmanaged(u16, ?u64) = .empty };
+    const Entry = struct { fence: metadata.CatalogRouteFence, proofs: std.AutoHashMapUnmanaged(ProofKey, ?u64) = .empty };
     var entries: std.ArrayList(Entry) = .empty;
     var owners: std.AutoHashMapUnmanaged(u64, usize) = .empty;
     var count: usize = 0;
@@ -65,7 +70,7 @@ pub fn merge(alloc: std.mem.Allocator, previous: []const OwnerRangeProof, incomi
         if (!sameOwner(entry.fence, owner.fence)) return error.CatalogGenerationChanged;
         entry.fence.catalog_revision = @max(entry.fence.catalog_revision, owner.fence.catalog_revision);
         for (owner.proofs) |proof| {
-            const observed = try entry.proofs.getOrPut(owned, proof.bucket);
+            const observed = try entry.proofs.getOrPut(owned, .{ .bucket = proof.bucket, .index = proof.index });
             if (observed.found_existing) {
                 if (observed.value_ptr.* != proof.generation) return error.SqlWriteConflict;
             } else {
@@ -81,11 +86,11 @@ pub fn merge(alloc: std.mem.Allocator, previous: []const OwnerRangeProof, incomi
         var iterator = entry.proofs.iterator();
         for (proofs) |*proof| {
             const value = iterator.next().?;
-            proof.* = .{ .bucket = value.key_ptr.*, .generation = value.value_ptr.* };
+            proof.* = .{ .bucket = value.key_ptr.bucket, .generation = value.value_ptr.*, .index = value.key_ptr.index };
         }
         std.mem.sort(Proof, proofs, {}, struct {
             fn less(_: void, a: Proof, b: Proof) bool {
-                return a.bucket < b.bucket;
+                return tracking.proofLess(a, b);
             }
         }.less);
         out.* = .{ .fence = entry.fence, .proofs = proofs };
@@ -146,10 +151,52 @@ test "distributed txn SQL range observations retain first snapshot and reject ow
             }
             const bytes = try std.json.Stringify.valueAlloc(alloc, again.value, .{});
             defer alloc.free(bytes);
+            try std.testing.expect(std.mem.indexOf(u8, bytes, "\"index\"") == null);
             var decoded = try std.json.parseFromSlice([]const OwnerRangeProof, alloc, bytes, .{});
             defer decoded.deinit();
             try validate(decoded.value);
             try std.testing.expectEqual(null, decoded.value[0].proofs[1].generation);
+            var index_id: [tracking.index_id_bytes]u8 = @splat(0);
+            index_id[7] = 1;
+            const span: tracking.IndexSpan = .{ .id = index_id, .digest = @splat(3) };
+            const indexed = OwnerRangeProof{ .fence = fence, .proofs = &.{.{ .bucket = tracking.index_bucket_sentinel, .generation = 11, .index = span }} };
+            var combined = try merge(alloc, initial.value, &.{indexed});
+            defer combined.deinit();
+            try std.testing.expectEqual(@as(usize, 3), combined.value[0].proofs.len);
+            try std.testing.expectEqual(span, combined.value[0].proofs[2].index.?);
+            const indexed_bytes = try std.json.Stringify.valueAlloc(alloc, combined.value, .{});
+            defer alloc.free(indexed_bytes);
+            var indexed_decoded = try std.json.parseFromSlice([]const OwnerRangeProof, alloc, indexed_bytes, .{});
+            defer indexed_decoded.deinit();
+            try validate(indexed_decoded.value);
+            try std.testing.expectEqual(span, indexed_decoded.value[0].proofs[2].index.?);
+            var stale = indexed;
+            stale.proofs = &.{.{ .bucket = tracking.index_bucket_sentinel, .generation = 12, .index = span }};
+            if (merge(alloc, combined.value, &.{stale})) |unexpected| {
+                var value = unexpected;
+                value.deinit();
+                return error.TestExpectedError;
+            } else |err| if (err != error.SqlWriteConflict) return err;
+            var another = span;
+            another.digest = @splat(4);
+            stale.proofs = &.{.{ .bucket = tracking.index_bucket_sentinel, .generation = 12, .index = another }};
+            var independent = try merge(alloc, combined.value, &.{stale});
+            defer independent.deinit();
+            try std.testing.expectEqual(@as(usize, 4), independent.value[0].proofs.len);
+            var moved = indexed;
+            moved.fence.topology_epoch += 1;
+            if (merge(alloc, combined.value, &.{moved})) |unexpected| {
+                var value = unexpected;
+                value.deinit();
+                return error.TestExpectedError;
+            } else |err| if (err != error.CatalogGenerationChanged) return err;
+            var other_owner = indexed;
+            other_owner.fence.route.group_id += 1;
+            other_owner.fence.route.identity_namespace.shard_id = other_owner.fence.route.group_id;
+            var routed = try merge(alloc, combined.value, &.{other_owner});
+            defer routed.deinit();
+            try std.testing.expectEqual(@as(usize, 2), routed.value.len);
+            try std.testing.expectEqual(span, routed.value[1].proofs[0].index.?);
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});

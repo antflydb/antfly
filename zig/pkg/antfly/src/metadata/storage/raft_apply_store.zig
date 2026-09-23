@@ -10422,7 +10422,7 @@ pub const RaftApplyStore = struct {
         };
         defer header.deinit();
         if (header.value.job_id == 0 or header.value.attempt_id != 1 or header.value.staging_attempt_id != 1 or header.value.cancel_requested or
-            !std.mem.eql(u8, header.value.source_kind, "schema_rewrite") or !std.mem.eql(u8, header.value.phase, "queued")) return;
+            (!std.mem.eql(u8, header.value.source_kind, "schema_rewrite") and !std.mem.eql(u8, header.value.source_kind, "empty_generation")) or !std.mem.eql(u8, header.value.phase, "queued")) return;
         var expected_key_buf: [128]u8 = undefined;
         const expected_key = try std.fmt.bufPrint(&expected_key_buf, "{s}{x:0>16}", .{ restore_job_logical_prefix, header.value.job_id });
         if (!std.mem.eql(u8, record.key, expected_key)) return;
@@ -10432,7 +10432,9 @@ pub const RaftApplyStore = struct {
         };
         defer plan.deinit();
         const expected_id = try restore_staging.idForAttempt(header.value.job_id, 1);
-        if (!std.mem.eql(u8, &plan.value.id, &expected_id) or !plan.value.preparing_sources) return;
+        const empty_generation = std.mem.eql(u8, header.value.source_kind, "empty_generation");
+        if (!std.mem.eql(u8, &plan.value.id, &expected_id) or plan.value.preparing_sources == empty_generation) return;
+        for (plan.value.targets) |target| if (target.empty_generation != empty_generation) return;
         const reserve: restore_staging.Command = .{ .id = expected_id, .action = .reserve, .plan = plan.value };
         reserve.validate(self.alloc) catch |err| {
             if (err == error.OutOfMemory) return err;

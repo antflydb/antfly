@@ -27,6 +27,13 @@ pub const Column = struct {
     generated: bool = false,
 };
 
+pub const Index = struct {
+    name: []const u8,
+    /// Only direct ordered-tuple keys are exposed to SQL access planning.
+    /// Expression and partial indexes require a separate implication proof.
+    columns: []const []const u8,
+};
+
 pub const Table = struct {
     pub const Scope = struct {
         database: []const u8,
@@ -39,6 +46,7 @@ pub const Table = struct {
     schema_version: u32,
     storage_mode: enum { relational, document } = .relational,
     columns: []const Column,
+    indexes: []const Index = &.{},
     /// Request-owned logical authority. Never use a mutable adapter's last
     /// resolved name to validate an earlier table in a join or subquery.
     scope: ?Scope = null,
@@ -52,13 +60,18 @@ pub const Table = struct {
 
 pub const Action = enum { read, write, read_write, admin };
 pub const Condition = struct {
+    pub const Op = enum { eq, neq, lt, lte, gt, gte, is_null, is_not_null };
     /// Native relational three-valued comparison; only TRUE rows match.
     /// Equality with NULL is UNKNOWN, distinct from the explicit null tests.
     column: []const u8,
-    op: enum { eq, neq, lt, lte, gt, gte, is_null, is_not_null },
+    op: Op,
     value: std.json.Value = .null,
 };
 pub const Scan = struct {
+    pub const IndexEquality = struct {
+        name: []const u8,
+        values: []const std.json.Value,
+    };
     fields: []const []const u8,
     /// Mutation-only full document preimage; ordinary reads remain projected.
     include_document: bool = false,
@@ -68,6 +81,9 @@ pub const Scan = struct {
     /// Exact physical identity, not a schema predicate. Point pages exhaust
     /// after their matching row (or absence), without a continuation probe.
     primary_key: ?[]const u8 = null,
+    /// Require a READY schema-bound index. Unlike auto_index this must fail
+    /// closed; the coordinated owner read returns one exact-span proof.
+    index_equality: ?IndexEquality = null,
     conditions: []const Condition = &.{},
     after: ?[]const u8 = null,
     limit: u32,
@@ -146,6 +162,8 @@ pub const Mutation = struct {
     /// predicate makes it authoritative only after a successful commit.
     previous: ?*const Row = null,
 };
+pub const ConflictExpression = struct { json: []const u8, result_type: ast.ColumnType };
+
 pub const ConflictOwner = struct {
     key: ?[]const u8,
     identity: ?[]const u8,
@@ -173,11 +191,11 @@ pub const DdlReceipt = struct {
     table: []const u8,
     table_id: []const u8,
     schema_version: u32,
-    state: enum { ready, pending, invalid },
+    state: enum { ready, pending, invalid, admission_unknown },
     diagnostic: ?[]const u8 = null,
     restore_job_id: ?[]const u8 = null,
 };
-pub const DdlOutcome = struct { mutation_outcome: MutationOutcome = .committed, receipt: ?DdlReceipt = null };
+pub const DdlOutcome = struct { mutation_outcome: ?MutationOutcome = .committed, receipt: ?DdlReceipt = null };
 
 pub const Backend = struct {
     ptr: *anyopaque,
@@ -187,12 +205,22 @@ pub const Backend = struct {
     pinned_statement_snapshot: bool = false,
     /// mutate retains predicate-only entries in the same atomic commit.
     predicate_only_mutations: bool = false,
+    /// Statement capture range proofs are retained with the subsequent
+    /// mutation in one durable transaction. MERGE absence decisions may not
+    /// execute through a plain autocommit batch endpoint.
+    atomic_statement_read_set: bool = false,
+    /// Multiple bounded statement captures share one transaction read set;
+    /// each point absence proof is validated with the eventual mutation.
+    coordinated_point_reads: bool = false,
+    /// Exact secondary-index probes also share that read set, and cannot be
+    /// selected while a staged-session overlay requires primary ordering.
+    coordinated_index_reads: bool = false,
 
     pub const VTable = struct {
         /// Native opaque identity, generated once before mutation admission.
         /// Providers without this capability require an explicit _id.
         generate_row_id: ?*const fn (*anyopaque, std.mem.Allocator) anyerror![]const u8 = null,
-        resolve_conflict_owners: ?*const fn (*anyopaque, std.mem.Allocator, Table, []const []const u8, []const Mutation) anyerror![]const ConflictOwner = null,
+        resolve_conflict_owners: ?*const fn (*anyopaque, std.mem.Allocator, Table, []const []const u8, []const ConflictExpression, []const Condition, []const Mutation) anyerror![]const ConflictOwner = null,
         // All returned data belongs to the supplied allocator. Scans receive
         // a short-lived page arena, not the retained statement result arena.
         resolve: *const fn (*anyopaque, std.mem.Allocator, ast.Name, Action) anyerror!Table,
@@ -204,6 +232,10 @@ pub const Backend = struct {
         // Exactly one atomic commit, retaining all schema/row-version fences.
         // An ambiguous outcome is propagated, never replayed by SQL.
         mutate: *const fn (*anyopaque, std.mem.Allocator, Table, []const Mutation) anyerror!MutationOutcome,
+        /// Commit the exact images returned by prepare_mutations without
+        /// applying defaults/generated values a second time. Required when
+        /// SQL exposes a prepared postimage through RETURNING.
+        mutate_prepared: ?*const fn (*anyopaque, std.mem.Allocator, Table, []const Mutation) anyerror!MutationOutcome = null,
         /// Native deterministic defaults/generated/check preparation under the
         /// bound schema epoch. No writes occur. Mutation consumes these exact
         /// normalized values; SQL must never guess postimages or read them back

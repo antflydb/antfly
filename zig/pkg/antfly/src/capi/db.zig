@@ -13006,7 +13006,7 @@ test "capi SQL local integrity coordinator enforces unique arbitration and self 
     const table = try backend.vtable.resolve(backend.ptr, arena.allocator(), .{ .table = "rows" }, .read_write);
     const row = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"id\":4,\"parent\":null}", .{});
     var mutation: antfly.capi_dependencies.sql_catalog.Mutation = .{ .key = "racer", .row = row, .expected_version = 0 };
-    const owners = try backend.vtable.resolve_conflict_owners.?(backend.ptr, arena.allocator(), table, &.{"id"}, &.{mutation});
+    const owners = try backend.vtable.resolve_conflict_owners.?(backend.ptr, arena.allocator(), table, &.{"id"}, &.{}, &.{}, &.{mutation});
     try std.testing.expect(owners[0].key == null);
     mutation.conflict_guard = owners[0].guard;
     var winner = try sql.compiler.compile(alloc, "INSERT INTO rows (_id,id,parent) VALUES ('winner',4,NULL)", .{});
@@ -13015,6 +13015,50 @@ test "capi SQL local integrity coordinator enforces unique arbitration and self 
     defer won.deinit();
     try std.testing.expectError(error.PreparedReadSetChanged, backend.vtable.mutate(backend.ptr, arena.allocator(), table, &.{mutation}));
     try std.testing.expect(try database.lookup(alloc, "racer", .{}) == null);
+}
+
+test "capi SQL native expression partial unique claims reject collisions and arbitrate targetless inserts" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-sql-expression-unique");
+    defer directory.cleanup();
+    var database = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 601, .shard_id = 602 } });
+    defer database.close();
+    try database.setSchemaJson(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"email_key","keys":[{"expression":{"op":"lower_ascii","args":[{"op":"column","column":"email"}]},"result_type":"string"}],"where":[{"column":"active","op":"eq","value":true}]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"email":{"type":"keyword"},"active":{"type":"boolean"}},"additionalProperties":false}}}}
+    );
+    var adapter = @import("sql.zig").Adapter(antfly){ .db = &database, .table_name = "rows" };
+    const sql = @import("sql.zig");
+    for ([_]struct { statement: []const u8, count: u64 }{
+        .{ .statement = "INSERT INTO rows (_id,email,active) VALUES ('a','Alice',TRUE)", .count = 1 },
+        .{ .statement = "INSERT INTO rows (_id,email,active) VALUES ('skip','ALICE',TRUE) ON CONFLICT DO NOTHING", .count = 0 },
+        .{ .statement = "INSERT INTO rows (_id,email,active) VALUES ('b','ALICE',FALSE) ON CONFLICT DO NOTHING", .count = 1 },
+        .{ .statement = "UPDATE rows SET active=FALSE WHERE _id='a'", .count = 1 },
+        .{ .statement = "UPDATE rows SET active=TRUE WHERE _id='b'", .count = 1 },
+        .{ .statement = "INSERT INTO rows (_id,email,active) VALUES ('skip2','alice',TRUE),('c','Carol',TRUE),('skip3','CAROL',TRUE) ON CONFLICT DO NOTHING", .count = 1 },
+        .{ .statement = "INSERT INTO rows (_id,email,active) VALUES ('skip4','ALICE',TRUE) ON CONFLICT (lower(email)) WHERE active=TRUE DO NOTHING", .count = 0 },
+        .{ .statement = "INSERT INTO rows (_id,email,active) VALUES ('replace','ALICE',TRUE) ON CONFLICT ((lower(email))) WHERE active=TRUE DO UPDATE SET email='Bob'", .count = 1 },
+        .{ .statement = "INSERT INTO rows (_id,email,active) VALUES ('d','Alice',TRUE) ON CONFLICT (lower(email)) WHERE active=TRUE DO NOTHING", .count = 1 },
+    }) |case| {
+        var compiled = try sql.compiler.compile(alloc, case.statement, .{});
+        defer compiled.deinit();
+        var result = try sql.runtime.execute(alloc, adapter.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(case.count, result.output.rows_affected);
+    }
+    var collision = try sql.compiler.compile(alloc, "INSERT INTO rows (_id,email,active) VALUES ('collision','alice',TRUE)", .{});
+    defer collision.deinit();
+    try std.testing.expectError(error.UniqueConstraintViolation, sql.runtime.execute(alloc, adapter.backend(), &collision, &.{}, .{}));
+    try std.testing.expect(try database.lookup(alloc, "collision", .{}) == null);
+    try std.testing.expect(try database.lookup(alloc, "skip3", .{}) == null);
+    for ([_][]const u8{
+        "INSERT INTO rows (_id,email,active) VALUES ('wrong','ALICE',TRUE) ON CONFLICT (upper(email)) WHERE active=TRUE DO NOTHING",
+        "INSERT INTO rows (_id,email,active) VALUES ('wrong','ALICE',TRUE) ON CONFLICT (lower(email)) DO NOTHING",
+        "INSERT INTO rows (_id,email,active) VALUES ('wrong','ALICE',TRUE) ON CONFLICT (lower(email)) WHERE active=FALSE DO NOTHING",
+    }) |statement| {
+        var wrong = try sql.compiler.compile(alloc, statement, .{});
+        defer wrong.deinit();
+        try std.testing.expectError(error.ConflictArbiterNotFound, sql.runtime.execute(alloc, adapter.backend(), &wrong, &.{}, .{}));
+    }
 }
 
 test "capi SQL local integrity refuses partial ownership instead of inventing coverage" {

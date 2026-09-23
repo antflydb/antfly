@@ -519,7 +519,7 @@ fn parseBatchRequestWithOptions(
         break :guards @as(?std.json.Parsed([]const @import("../storage/range_protection.zig").Proof), try std.json.parseFromValue([]const @import("../storage/range_protection.zig").Proof, alloc, value, .{ .allocate = .alloc_always }));
     } else null;
     errdefer if (range_guards) |*guards| guards.deinit();
-    if (range_guards) |guards| if (guards.value.len > 257) return error.InvalidBatchRequest;
+    if (range_guards) |guards| if (guards.value.len > @import("range_read_guards.zig").max_proofs) return error.InvalidBatchRequest;
     var relational_activation = if (root.get("_relational_activation")) |value| activation: {
         if (!allow_internal) return error.InvalidBatchRequest;
         break :activation @as(?std.json.Parsed(@import("../storage/db/relational_integrity_activation_contract.zig").Command), try std.json.parseFromValue(@import("../storage/db/relational_integrity_activation_contract.zig").Command, alloc, value, .{ .allocate = .alloc_always }));
@@ -1201,7 +1201,7 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
 }
 
 fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequest) ![]u8 {
-    if (req.range_guards.len != 0 and (req.range_guards.len > 257 or req.transaction == null or req.transaction.? != .prepare)) return error.InvalidBatchRequest;
+    if (req.range_guards.len != 0 and (req.range_guards.len > @import("range_read_guards.zig").max_proofs or req.transaction == null or req.transaction.? != .prepare)) return error.InvalidBatchRequest;
     try @import("../storage/range_protection.zig").validateRequest(req);
     try @import("../storage/db/online_source_contract.zig").validateRequest(req);
     try merge_pages.validateRequest(req);

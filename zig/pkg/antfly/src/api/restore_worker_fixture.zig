@@ -52,6 +52,7 @@ const Fixture = struct {
     sequence: u8 = 0,
     private_catalog: ?*catalog_mod.Catalog = null,
     imports: usize = 0,
+    source_operations: usize = 0,
     validations: usize = 0,
     publications: usize = 0,
     target_paths: [3][]const u8 = undefined,
@@ -73,6 +74,7 @@ const Fixture = struct {
 
     fn sourceIo(ptr: *anyopaque, alloc: std.mem.Allocator, group: u64, name: []const u8, request: @import("online_merge_io.zig").contract.Request, context: operation.RequestContext) ![]u8 {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.source_operations += 1;
         const i = try index(name);
         const original = self.donors[i];
         try std.testing.expectEqual(@as(u64, 20) + i, group);
@@ -226,7 +228,7 @@ const Fixture = struct {
         // Fault the durable admission transition, whether it came from an
         // explicit begin or the first idempotent snapshot import. Binding the
         // fault to the RPC spelling silently misses implicit admissions.
-        const fault_bit: u8 = if (reserved and result.phase == .importing) 1 else switch (request.action) {
+        const fault_bit: u8 = if (reserved and (result.phase == .importing or (request.scope.empty_generation and result.phase == .imported))) 1 else switch (request.action) {
             .begin => 0,
             .import_page => if (result.rows != 0 or result.phase == .imported) 2 else 0,
             .validate => if (result.phase == .validated) 4 else 0,
@@ -359,12 +361,13 @@ const RewritePersistence = struct {
 /// reopen targets; acknowledged writes after the source cut must still appear.
 pub fn runRewrite(comptime Driver: type) !void {
     for ([_]bool{ false, true }) |non_raft| {
-        try runRewriteWithFailure(Driver, false, non_raft);
-        try runRewriteWithFailure(Driver, true, non_raft);
+        try runRewriteWithFailure(Driver, false, non_raft, false);
+        try runRewriteWithFailure(Driver, true, non_raft, false);
+        try runRewriteWithFailure(Driver, false, non_raft, true);
     }
 }
 
-fn runRewriteWithFailure(comptime Driver: type, invalid_tail: bool, non_raft: bool) !void {
+fn runRewriteWithFailure(comptime Driver: type, invalid_tail: bool, non_raft: bool, empty_generation: bool) !void {
     const alloc = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -443,8 +446,26 @@ fn runRewriteWithFailure(comptime Driver: type, invalid_tail: bool, non_raft: bo
         fixture.cache_paths[i] = try std.fmt.allocPrint(a, "{s}/decoder-{d}", .{ root, i });
     }
     try svc.runRound();
-    const plan = try @import("relational_rewrite_admission.zig").build(a, plan_id, &records, &ranges, "parent", proposed, &fixture);
-    _ = try server.restore_job_store.start(a, .{ .scope = .cluster, .source_kind = .schema_rewrite, .backup_id = "rewrite", .location = "metadata://rewrite", .connection = "internal", .restore_mode = "overwrite", .idempotency_namespace = "rewrite-worker", .idempotency_key = "one", .table_names = &.{ "parent", "child", "docs" }, .destination_authorization_principal = @import("stored_destination_authorization.zig").auth_disabled_principal, .rewrite_plan_json = try std.json.Stringify.valueAlloc(a, plan, .{}) });
+    var plan = try @import("relational_rewrite_admission.zig").build(a, plan_id, &records, &ranges, "parent", proposed, &fixture);
+    if (empty_generation) {
+        const targets = try a.dupe(stages.Target, plan.targets);
+        for (targets) |*target| {
+            target.empty_generation = true;
+            target.rewrite = null;
+            target.rewrite_sources = &.{};
+            target.source_artifacts = &.{};
+            target.table.schema_json = target.replace.?.table.schema_json;
+            target.table.read_schema_json = target.replace.?.table.read_schema_json;
+            target.table.indexes_json = target.replace.?.table.indexes_json;
+        }
+        plan.targets = targets;
+        plan.preparing_sources = false;
+        plan.cohort_digest = @splat(7);
+        try plan.validate(a);
+    }
+    const plan_json = try std.json.Stringify.valueAlloc(a, plan, .{});
+    const source_operations_before_execution = fixture.source_operations;
+    _ = try server.restore_job_store.start(a, .{ .scope = .cluster, .source_kind = if (empty_generation) .empty_generation else .schema_rewrite, .backup_id = "rewrite", .location = "metadata://rewrite", .connection = "internal", .restore_mode = "overwrite", .idempotency_namespace = "rewrite-worker", .idempotency_key = "one", .table_names = &.{ "parent", "child", "docs" }, .destination_authorization_principal = @import("stored_destination_authorization.zig").auth_disabled_principal, .rewrite_plan_json = if (empty_generation) null else plan_json, .generation_plan_json = if (empty_generation) plan_json else null });
     for (0..600) |_| {
         try Driver.work(&server, job_id);
         const bytes = (try server.restore_job_store.load(a, job_id)).?;
@@ -470,7 +491,7 @@ fn runRewriteWithFailure(comptime Driver: type, invalid_tail: bool, non_raft: bo
         std.debug.print("rewrite worker stalled: {s}\n", .{(try server.restore_job_store.load(a, job_id)).?});
         return error.RewriteWorkerDidNotComplete;
     }
-    try std.testing.expect(fixture.tail_injected);
+    try std.testing.expectEqual(!empty_generation, fixture.tail_injected);
     if (non_raft) {
         for (fixture.donors) |donor| try std.testing.expect((try donor.raftAppliedEntry()) == null);
         for (fixture.dbs, fixture.target_open) |target, opened| if (opened) try std.testing.expect((try target.raftAppliedEntry()) == null);
@@ -494,6 +515,18 @@ fn runRewriteWithFailure(comptime Driver: type, invalid_tail: bool, non_raft: bo
         return;
     }
     for (published.tables) |record| try std.testing.expect(record.table_id >= 13);
+    if (empty_generation) {
+        try std.testing.expectEqual(@as(usize, 0), fixture.imports);
+        try std.testing.expectEqual(source_operations_before_execution, fixture.source_operations);
+        for (fixture.dbs, fixture.donors, 0..) |target, original, i| {
+            try std.testing.expect((try target.lookup(alloc, "row", .{})) == null);
+            try std.testing.expectEqual(@as(u64, 0), target.core.table_catalog.row_count);
+            const retained = (try original.lookup(alloc, "row", .{})).?;
+            alloc.free(retained.json);
+            try std.testing.expect(fixture.faults_seen[i] & 13 == 13);
+        }
+        return;
+    }
     for (fixture.dbs, 0..) |target, i| {
         const row = (try target.lookup(alloc, "row", .{})).?;
         defer alloc.free(row.json);

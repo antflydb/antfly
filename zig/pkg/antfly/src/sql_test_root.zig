@@ -3,4 +3,6 @@
 
 test {
     _ = @import("sql/test_root.zig");
+    _ = @import("sql/subquery_shape_test.zig");
+    _ = @import("sql/joined_mutation_test.zig");
 }

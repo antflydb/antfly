@@ -75,11 +75,11 @@ pub fn Adapter(comptime native: type) type {
             return error.UnsupportedSqlExecution;
         }
 
-        fn resolveConflictOwners(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, columns: []const []const u8, mutations: []const catalog.Mutation) ![]const catalog.ConflictOwner {
+        fn resolveConflictOwners(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, columns: []const []const u8, expressions: []const catalog.ConflictExpression, conditions: []const catalog.Condition, mutations: []const catalog.Mutation) ![]const catalog.ConflictOwner {
             const self: *Self = @ptrCast(@alignCast(ptr));
             if (self.read_only) return error.SqlReadOnlyTransaction;
             if (!std.mem.eql(u8, table.physical_name, self.table_name)) return error.UndefinedTable;
-            if (columns.len == 0) {
+            if (columns.len == 0 and expressions.len == 0) {
                 const json = (try self.db.getSchemaJson(alloc)) orelse return error.IntegrityCatalogUnavailable;
                 const parsed = try native.public_api.tables.parseValidatedTableSchema(alloc, json);
                 if (parsed.version != table.schema_version) return error.PreparedGenerationChanged;
@@ -91,7 +91,9 @@ pub fn Adapter(comptime native: type) type {
             }
             const metadata = try self.localCatalog(alloc, table.schema_version);
             const writes = try dependencies.sql_mutation_images.writes(types.BatchWrite, alloc, mutations);
-            const owners = try integrity.resolveConflictOwners(alloc, self.localSource(), &metadata.table, &metadata.range, self.table_name, table.schema_version, columns, writes, &.{}, .{});
+            const target_predicates = try dependencies.sql_conflict_predicate.toNative(alloc, conditions);
+            const keys = try dependencies.sql_conflict_predicate.expressionsToNative(alloc, expressions);
+            const owners = try integrity.resolveConflictOwners(alloc, self.localSource(), &metadata.table, &metadata.range, self.table_name, table.schema_version, columns, keys, target_predicates, writes, &.{}, .{});
             const output = try alloc.alloc(catalog.ConflictOwner, owners.len);
             for (owners, output) |*owner, *out| out.* = .{ .key = owner.key, .identity = owner.identity, .identities = owner.identities, .guard = owner };
             return output;

@@ -18,9 +18,12 @@ const Fixture = struct {
     committed_n: i64 = 0,
     deny_after_commit: ?*std.testing.FailingAllocator = null,
     fn backend(self: *Fixture, preparation: bool) catalog.Backend {
-        const full: catalog.Backend.VTable = .{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint, .prepare_mutations = prepare };
-        const bare: catalog.Backend.VTable = .{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint };
+        const full: catalog.Backend.VTable = .{ .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .mutate = mutate, .mutate_prepared = mutate, .checkpoint = checkpoint, .prepare_mutations = prepare };
+        const bare: catalog.Backend.VTable = .{ .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint };
         return .{ .ptr = self, .vtable = if (preparation) &full else &bare };
+    }
+    fn generateRowId(_: *anyopaque, alloc: Allocator) ![]const u8 {
+        return alloc.dupe(u8, "generated");
     }
     fn resolve(_: *anyopaque, _: Allocator, _: ast.Name, action: catalog.Action) !catalog.Table {
         if (action != .read_write) return error.UnexpectedAuthorization;
@@ -55,6 +58,7 @@ const Fixture = struct {
             var object: std.json.ObjectMap = .empty;
             const original = mutation.row.?.object;
             for (original.keys(), original.values()) |key, value| try object.put(alloc, key, value);
+            if (!object.contains("n")) try object.put(alloc, "n", .{ .integer = 4 });
             if (!object.contains("label")) try object.put(alloc, "label", .{ .string = "native" });
             if (!object.contains("s")) try object.put(alloc, "s", .null);
             try object.put(alloc, "g", .{ .integer = object.get("n").?.integer * 2 });
@@ -101,6 +105,66 @@ test "SQL RETURNING INSERT and SELECT expose exactly prepared defaults generated
         try std.testing.expectEqualStrings("native", result.output.rows[0][3].string);
         try std.testing.expectEqualSlices(bool, &.{ false, false, false, false, false, true }, result.output.sql_nulls.?[0]);
     }
+}
+
+test "SQL INSERT DEFAULT cells and DEFAULT VALUES use native row preparation" {
+    for ([_][]const u8{
+        "INSERT INTO items (_id,n,label) VALUES ('a',4,DEFAULT),('b',5,'set'),('c',6,NULL) RETURNING _id,n,label,g",
+        "INSERT INTO items (_id,n,label) VALUES ('a',(SELECT 4),DEFAULT),('b',5,'set'),('c',6,NULL) RETURNING _id,n,label,g",
+    }) |sql| {
+        var fixture: Fixture = .{};
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(true), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u64, 3), result.output.rows_affected);
+        try std.testing.expectEqual(@as(usize, 1), fixture.prepares);
+        try std.testing.expectEqual(@as(usize, 1), fixture.writes);
+        try std.testing.expectEqualStrings("a", result.output.rows[0][0].string);
+        try std.testing.expectEqualStrings("native", result.output.rows[0][2].string);
+        try std.testing.expectEqualStrings("8", result.output.rows[0][3].string);
+        try std.testing.expectEqualStrings("b", result.output.rows[1][0].string);
+        try std.testing.expectEqualStrings("set", result.output.rows[1][2].string);
+        try std.testing.expectEqualStrings("10", result.output.rows[1][3].string);
+        try std.testing.expectEqualStrings("c", result.output.rows[2][0].string);
+        try std.testing.expect(result.output.rows[2][2] == .null);
+        try std.testing.expect(result.output.sql_nulls.?[2][2]);
+        try std.testing.expectEqualStrings("12", result.output.rows[2][3].string);
+    }
+    var fixture: Fixture = .{};
+    var compiled = try compiler.compile(std.testing.allocator, "INSERT INTO items DEFAULT VALUES RETURNING _id,n,label,g", .{});
+    defer compiled.deinit();
+    var result = try runtime.execute(std.testing.allocator, fixture.backend(true), &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u64, 1), result.output.rows_affected);
+    try std.testing.expectEqualStrings("generated", result.output.rows[0][0].string);
+    try std.testing.expectEqualStrings("4", result.output.rows[0][1].string);
+    try std.testing.expectEqualStrings("native", result.output.rows[0][2].string);
+    try std.testing.expectEqualStrings("8", result.output.rows[0][3].string);
+    for ([_][]const u8{
+        "INSERT INTO items (_id,n,g) VALUES (DEFAULT,4,DEFAULT) RETURNING _id,g",
+        "INSERT INTO items (_id,n) VALUES (DEFAULT,4) RETURNING _id,g",
+    }) |sql| {
+        var generated_fixture: Fixture = .{};
+        var generated_sql = try compiler.compile(std.testing.allocator, sql, .{});
+        defer generated_sql.deinit();
+        var generated_result = try runtime.execute(std.testing.allocator, generated_fixture.backend(true), &generated_sql, &.{}, .{});
+        defer generated_result.deinit();
+        try std.testing.expectEqualStrings("generated", generated_result.output.rows[0][0].string);
+        try std.testing.expectEqualStrings("8", generated_result.output.rows[0][1].string);
+    }
+    var rejected_fixture: Fixture = .{};
+    var explicit_generated = try compiler.compile(std.testing.allocator, "INSERT INTO items (_id,n,g) VALUES ('a',4,8) RETURNING g", .{});
+    defer explicit_generated.deinit();
+    try std.testing.expectError(error.SqlGeneratedColumnWrite, runtime.execute(std.testing.allocator, rejected_fixture.backend(true), &explicit_generated, &.{}, .{}));
+    try std.testing.expectEqual(@as(usize, 0), rejected_fixture.writes);
+    var no_identity_fixture: Fixture = .{};
+    var no_identity_backend = no_identity_fixture.backend(true);
+    var no_identity_vtable = no_identity_backend.vtable.*;
+    no_identity_vtable.generate_row_id = null;
+    no_identity_backend.vtable = &no_identity_vtable;
+    try std.testing.expectError(error.SqlRowIdentityRequired, runtime.execute(std.testing.allocator, no_identity_backend, &compiled, &.{}, .{}));
+    try std.testing.expectEqual(@as(usize, 0), no_identity_fixture.writes);
 }
 
 test "SQL RETURNING UPDATE uses normalized postimage and DELETE uses versioned preimage" {

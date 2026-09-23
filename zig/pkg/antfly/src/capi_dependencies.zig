@@ -55,6 +55,7 @@ pub const storage_restore_owner = @import("storage/restore_owner.zig");
 pub const api_operation = @import("api/operation.zig");
 pub const api_batch = @import("api/batch.zig");
 pub const api_relational_integrity_commit = @import("api/relational_integrity_commit.zig");
+pub const sql_conflict_predicate = @import("sql/conflict_predicate.zig");
 pub const api_table_read_source = @import("api/table_read_source.zig");
 pub const api_query_response = @import("api/query_response.zig");
 pub const api_local_query_contract = @import("api/local_query_contract.zig");

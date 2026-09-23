@@ -168,8 +168,10 @@ pub fn beginControlled(alloc: Allocator, reader: reads.TableReadSource, tables: 
                 const retiring = for (selected.items) |generation| {
                     if (std.mem.eql(u8, &generation, &binding.generation)) break true;
                 } else false;
-                if (!retiring or definition.columns.len != fk.parent_columns.len) continue;
-                const matches = for (definition.columns, fk.parent_columns) |left, right| {
+                const columns = definition.columns orelse continue;
+                if (!retiring or columns.len != fk.parent_columns.len) continue;
+                if (definition.where) |conditions| if (conditions.len != 0) continue;
+                const matches = for (columns, fk.parent_columns) |left, right| {
                     if (!std.mem.eql(u8, left, right)) break false;
                 } else true;
                 if (matches) return error.ForeignKeyReferenced;

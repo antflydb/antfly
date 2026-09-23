@@ -1415,6 +1415,61 @@ components:
           description: Display label. Labels need not be unique; rows use matching ordinal positions.
         type:
           $ref: "#/components/schemas/SQLColumnType"
+    SQLPrepareRequest:
+      type: object
+      additionalProperties: false
+      required: [statement]
+      properties:
+        statement:
+          type: string
+          minLength: 1
+          maxLength: 65536
+        database:
+          type: string
+        namespace:
+          type: string
+    SQLPreparedExecutionRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        parameters:
+          type: array
+          maxItems: 1024
+          items:
+            x-go-type: json.RawMessage
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 4096
+          default: 128
+        session_id:
+          type: string
+          pattern: '^[0-9a-fA-F]{32}$'
+          description: Optional durable transaction session, independent of the prepared resource lifetime.
+    SQLPreparedResponse:
+      type: object
+      additionalProperties: false
+      required: [prepared_id, expires_at_ms, owner_node_id, parameter_types, columns]
+      properties:
+        prepared_id:
+          type: string
+          pattern: '^[0-9a-f]{32}$'
+        expires_at_ms:
+          type: integer
+          format: int64
+        owner_node_id:
+          type: string
+          pattern: '^[0-9]{1,20}$'
+          maxLength: 20
+          description: Exact decimal API owner identifier, preserved by JavaScript clients.
+        parameter_types:
+          type: array
+          items:
+            $ref: '#/components/schemas/SQLColumnType'
+        columns:
+          type: array
+          items:
+            $ref: '#/components/schemas/SQLColumn'
     SQLRequest:
       type: object
       additionalProperties: false
@@ -1523,13 +1578,15 @@ components:
           $ref: "#/components/schemas/SQLTransactionStatus"
     SQLDDLReceiptState:
       type: string
-      enum: [ready, pending, invalid]
+      enum: [ready, pending, invalid, admission_unknown]
     SQLDDLReceipt:
       type: object
       additionalProperties: false
       required: [database, namespace, table, table_id, schema_version, state]
       description: |
-        Durable DDL declaration receipt. Pending or invalid means the declaration
+        Durable DDL declaration receipt. admission_unknown means admission has
+        not been confirmed; reconcile restore_job_id without replaying DDL.
+        Pending or invalid means the declaration
         committed but validation has not established an active constraint. Do not
         replay it. Inspect table constraint status using this immutable table
         identity and schema generation; a later generation supersedes this receipt.
@@ -1552,7 +1609,7 @@ components:
           type: string
         restore_job_id:
           type: string
-          description: Native restore job for an atomic schema rewrite. Until publication table_id identifies the source generation. Poll the restore job; do not replay this DDL.
+          description: Native staging job for an atomic schema rewrite or TRUNCATE generation barrier. table_id identifies the source generation. Poll the job; pending or admission_unknown is not completed DDL and must not be replayed.
     SQLDiagnostic:
       type: object
       additionalProperties: false
@@ -11729,6 +11786,116 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "500":
           $ref: "#/components/responses/InternalServerError"
+  /sql/prepared:
+    post:
+      operationId: prepareSQL
+      summary: Create a durable prepared SQL resource
+      tags: [data_operations]
+      description: >
+        Binds SELECT, INSERT, UPDATE or DELETE without executing it. The immutable
+        resource belongs to the authenticated principal and API node, expires
+        after one hour, and survives transaction COMMIT and owner restart with
+        the same durable store and node identity. Owner failover is not automatic;
+        execute and close must reach owner_node_id. Each durable store admits
+        at most 128 resources and 4 MiB of serialized prepared state. Expired
+        resources are reclaimed atomically during subsequent creation or close.
+        Execution authenticates and authorizes again and rejects changed catalog
+        identities or schemas. A native durable session store is required.
+      x-antfly-client-request-policy:
+        max_retries: 0
+        follow_redirects: false
+        cookies_enabled: false
+        max_response_size: 16777216
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SQLPrepareRequest'
+      responses:
+        '200':
+          description: Durable prepared resource
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SQLPreparedResponse'
+        default:
+          description: Preparation rejected
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SQLDiagnostic'
+  /sql/prepared/{prepared_id}/execute:
+    parameters:
+      - name: prepared_id
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: '^[0-9a-f]{32}$'
+    post:
+      operationId: executePreparedSQL
+      summary: Execute a durable prepared SQL resource
+      tags: [data_operations]
+      description: >
+        Uses the stored statement, namespace and immutable binding identities.
+        Resource admission linearizes when its durable record is loaded; a later
+        close or expiry does not cancel that already admitted execution. Mutation
+        outcomes must be reconciled rather than replayed after ambiguous errors.
+      x-antfly-client-request-policy:
+        max_retries: 0
+        follow_redirects: false
+        cookies_enabled: false
+        max_response_size: 16777216
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SQLPreparedExecutionRequest'
+      responses:
+        '200':
+          description: SQL result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SQLResponse'
+        default:
+          description: Execution rejected or durable mutation outcome
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SQLDiagnostic'
+  /sql/prepared/{prepared_id}:
+    parameters:
+      - name: prepared_id
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: '^[0-9a-f]{32}$'
+    delete:
+      operationId: closePreparedSQL
+      summary: Release a durable prepared SQL resource
+      tags: [data_operations]
+      x-antfly-client-request-policy:
+        max_retries: 0
+        follow_redirects: false
+        cookies_enabled: false
+        max_response_size: 16777216
+      responses:
+        '200':
+          description: Resource released; already admitted executions may finish
+          content:
+            application/json:
+              schema:
+                type: object
+        default:
+          description: Close rejected
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SQLDiagnostic'
   /sql:
     post:
       summary: Execute a SQL statement

@@ -13,7 +13,9 @@ T = TypeVar("T", bound="SQLDDLReceipt")
 
 @_attrs_define
 class SQLDDLReceipt:
-    """Durable DDL declaration receipt. Pending or invalid means the declaration
+    """Durable DDL declaration receipt. admission_unknown means admission has
+    not been confirmed; reconcile restore_job_id without replaying DDL.
+    Pending or invalid means the declaration
     committed but validation has not established an active constraint. Do not
     replay it. Inspect table constraint status using this immutable table
     identity and schema generation; a later generation supersedes this receipt.
@@ -26,8 +28,9 @@ class SQLDDLReceipt:
             schema_version (int):
             state (SQLDDLReceiptState):
             diagnostic (str | Unset):
-            restore_job_id (str | Unset): Native restore job for an atomic schema rewrite. Until publication table_id
-                identifies the source generation. Poll the restore job; do not replay this DDL.
+            restore_job_id (str | Unset): Native staging job for an atomic schema rewrite or TRUNCATE generation barrier.
+                table_id identifies the source generation. Poll the job; pending or admission_unknown is not completed DDL and
+                must not be replayed.
     """
 
     database: str

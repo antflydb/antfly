@@ -3202,6 +3202,7 @@ test "docstore range tracking native LSM common prefix batch benchmark" {
 
 test "docstore range tracking survives native LSM reopen and rejects generation overflow atomically" {
     const range_protection = @import("range_protection.zig");
+    const index_records = @import("db/relational_index_records.zig");
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3210,6 +3211,19 @@ test "docstore range tracking survives native LSM reopen and rejects generation 
     const key = try internal_keys.documentKeyAlloc(alloc, "doc:one");
     defer alloc.free(key);
     const id = range_protection.bucket("doc:one");
+    var component: std.ArrayList(u8) = .empty;
+    defer component.deinit(alloc);
+    try internal_keys.appendDocumentPrefix(&component, alloc, "doc:one");
+    var forward: std.ArrayList(u8) = .empty;
+    defer forward.deinit(alloc);
+    const forward_prefix = try index_records.forwardPrefix(.{ .generation = 7, .slot = 2 });
+    try forward.appendSlice(alloc, &forward_prefix);
+    try forward.appendSlice(alloc, &.{ 0x80, 'x', 0, 0 });
+    try forward.appendSlice(alloc, component.items[1..]);
+    var footer: [4]u8 = undefined;
+    std.mem.writeInt(u32, &footer, @intCast(component.items.len - 1), .big);
+    try forward.appendSlice(alloc, &footer);
+    const span = (try range_protection.indexSpanDigest(forward.items)).?;
     {
         var backend = try lsm_backend.Backend.open(alloc, path, .{ .flush_threshold_bytes = 4096 });
         defer backend.close();
@@ -3217,6 +3231,7 @@ test "docstore range tracking survives native LSM reopen and rejects generation 
         defer store.close();
         try store.put(range_protection.activation_key, range_protection.activation_value);
         try store.put(key, "before restart");
+        try store.put(forward.items, "");
     }
     {
         var backend = try lsm_backend.Backend.open(alloc, path, .{ .flush_threshold_bytes = 4096 });
@@ -3227,15 +3242,21 @@ test "docstore range tracking survives native LSM reopen and rejects generation 
         var read = try store.beginReadTxn();
         defer read.abort();
         try std.testing.expectEqual(@as(?u64, 2), try range_protection.generation(&read, id));
+        try std.testing.expectEqual(@as(?u64, 1), try range_protection.indexGeneration(&read, span));
         const counter_key = range_protection.counterKey(id);
+        const index_counter_key = range_protection.indexCounterKey(span);
         var exhausted: [8]u8 = undefined;
         std.mem.writeInt(u64, &exhausted, std.math.maxInt(u64), .little);
         try store.put(&counter_key, &exhausted);
+        try store.put(&index_counter_key, &exhausted);
         try std.testing.expectError(error.RangeTrackingGenerationExhausted, store.put(key, "must never publish"));
+        try std.testing.expectError(error.RangeTrackingGenerationExhausted, store.put(forward.items, "must never publish"));
         var current = try store.beginReadTxn();
         defer current.abort();
         try std.testing.expectEqualStrings("after restart", try current.get(key));
+        try std.testing.expectEqualStrings("", try current.get(forward.items));
         try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), try range_protection.generation(&current, id));
+        try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), try range_protection.indexGeneration(&current, span));
     }
 }
 

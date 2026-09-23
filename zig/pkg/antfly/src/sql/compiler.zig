@@ -126,6 +126,108 @@ pub fn compileDiagnostic(allocator: std.mem.Allocator, sql: []const u8, limits: 
     return .{ .arena = arena, .statement = statement, .parameter_count = parser.parameter_count };
 }
 
+test "SQL MERGE compiles ordered matched and unmatched mutation arms" {
+    // sql-0579, sql-0581, sql-0583, sql-0589: syntax/AST coverage only;
+    // these cases remain unresolved until native atomic execution is wired.
+    const sql = "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id " ++
+        "WHEN MATCHED AND target.status = 'locked' THEN DO NOTHING " ++
+        "WHEN MATCHED AND lower(source.status) != lower(target.status) THEN UPDATE SET status = lower(source.status) " ++
+        "WHEN MATCHED AND source.status = 'deleted' THEN DELETE " ++
+        "WHEN NOT MATCHED AND source.status = 'ready' THEN INSERT (id, status) VALUES (source.id, source.status) " ++
+        "WHEN NOT MATCHED THEN DO NOTHING RETURNING target.id, target.status";
+    var compiled = try compile(std.testing.allocator, sql, .{});
+    defer compiled.deinit();
+    try std.testing.expect(compiled.statement == .merge);
+    const merge_statement = compiled.statement.merge;
+    try std.testing.expectEqualStrings("usage_records", merge_statement.table.table);
+    try std.testing.expectEqualStrings("target", merge_statement.alias.?);
+    try std.testing.expect(merge_statement.source.* == .table);
+    try std.testing.expectEqualStrings("source", merge_statement.source.table.alias.?);
+    try std.testing.expectEqual(@as(usize, 5), merge_statement.arms.len);
+    try std.testing.expect(merge_statement.arms[0].matched and merge_statement.arms[0].action == .nothing);
+    try std.testing.expectEqualStrings("status", merge_statement.arms[1].action.update[0].field);
+    try std.testing.expect(merge_statement.arms[2].action == .delete);
+    try std.testing.expect(!merge_statement.arms[3].matched);
+    try std.testing.expectEqual(@as(usize, 2), merge_statement.arms[3].action.insert.columns.len);
+    try std.testing.expect(merge_statement.arms[4].action == .nothing);
+    try std.testing.expectEqual(@as(usize, 2), merge_statement.returning.?.len);
+}
+
+test "SQL MERGE rejects invalid arm/action and insert shapes before execution" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{
+        "MERGE INTO t USING s ON t.id = s.id",
+        "MERGE INTO t USING s ON t.id = s.id WHEN NOT MATCHED THEN DELETE",
+        "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN INSERT (id) VALUES (s.id)",
+        "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET id = s.id, id = 3",
+        "MERGE INTO t USING s ON t.id = s.id WHEN NOT MATCHED THEN INSERT (id, name) VALUES (s.id)",
+        "MERGE INTO t USING s ON t.id = s.id WHEN NOT MATCHED THEN INSERT (id) VALUES (s.id, s.id)",
+    }) |sql| {
+        if (compile(alloc, sql, .{})) |result| {
+            var compiled = result;
+            compiled.deinit();
+            return error.TestUnexpectedResult;
+        } else |err| try std.testing.expect(err == error.InvalidSqlSyntax or err == error.DuplicateSqlColumn or err == error.UnsupportedSqlShape);
+    }
+}
+
+test "SQL MERGE preserves explicit DEFAULT cells for native preparation" {
+    var compiled = try compile(std.testing.allocator, "MERGE INTO t USING s ON t.id=s.id WHEN MATCHED THEN UPDATE SET status=DEFAULT WHEN NOT MATCHED THEN INSERT (id,status) VALUES (s.id,DEFAULT)", .{});
+    defer compiled.deinit();
+    try std.testing.expect(compiled.statement.merge.arms[0].action.update[0].use_default);
+    try std.testing.expect(compiled.statement.merge.arms[1].action.insert.values[1] == null);
+}
+
+test "SQL MERGE preserves recursive CTE and derived source structure" {
+    // sql-0014: syntax/ownership only; mutation execution is still guarded.
+    const sql = "WITH RECURSIVE source_rows AS (SELECT id, status FROM usage_records " ++
+        "UNION ALL SELECT child.id, child.status FROM usage_records AS child " ++
+        "JOIN source_rows AS parent ON child.organization_id = parent.id) " ++
+        "MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id " ++
+        "WHEN MATCHED THEN UPDATE SET status = source_rows.status";
+    var compiled = try compile(std.testing.allocator, sql, .{});
+    defer compiled.deinit();
+    try std.testing.expect(compiled.statement == .merge);
+    try std.testing.expectEqual(@as(usize, 1), compiled.statement.merge.ctes.len);
+    try std.testing.expect(compiled.statement.merge.ctes[0].recursive);
+    try std.testing.expect(compiled.statement.merge.source.* == .table);
+    try std.testing.expectEqualStrings("source_rows", compiled.statement.merge.source.table.name.table);
+
+    var derived = try compile(std.testing.allocator, "MERGE INTO t USING (SELECT id FROM s) AS source ON t.id = source.id WHEN MATCHED THEN DELETE", .{});
+    defer derived.deinit();
+    try std.testing.expect(derived.statement.merge.source.* == .derived);
+}
+
+test "SQL INSERT VALUES subquery source is flat at row budget" {
+    const alloc = std.testing.allocator;
+    var sql: std.ArrayList(u8) = .empty;
+    defer sql.deinit(alloc);
+    try sql.appendSlice(alloc, "INSERT INTO things (_id,n) VALUES ");
+    for (0..1000) |index| {
+        const row = try std.fmt.allocPrint(alloc, "{s}('r{d}',{s})", .{ if (index == 0) "" else ",", index, if (index == 0) "(SELECT 7)" else "1" });
+        defer alloc.free(row);
+        try sql.appendSlice(alloc, row);
+    }
+    var compiled = try compile(alloc, sql.items, .{});
+    defer compiled.deinit();
+    try std.testing.expect(compiled.statement == .insert);
+    const source = compiled.statement.insert.source orelse return error.TestUnexpectedResult;
+    try std.testing.expect(source.generated_values);
+    try std.testing.expect(source.set_operation == null);
+    try std.testing.expectEqual(@as(usize, 1000), source.values_arms.len);
+    for (source.values_arms) |arm| try std.testing.expectEqual(@as(usize, 2), arm.columns.len);
+}
+
+test "compiler treats TIMESTAMPTZ quoted literals as typed datetime casts" {
+    var compiled = try compile(std.testing.allocator, "INSERT INTO usage_records (id, created_at_ns) VALUES ('u_typed_time', TIMESTAMPTZ '2025-01-01T01:30:00+01:30') RETURNING created_at_ns", .{});
+    defer compiled.deinit();
+    try std.testing.expect(compiled.statement == .insert);
+    const expression = compiled.statement.insert.expressions[0][1] orelse return error.TestUnexpectedResult;
+    try std.testing.expect(expression.* == .cast);
+    try std.testing.expectEqual(ast.ColumnType.datetime, expression.cast.type);
+    try std.testing.expectEqualStrings("2025-01-01T01:30:00+01:30", expression.cast.operand.literal.string);
+}
+
 const Parser = struct {
     alloc: std.mem.Allocator,
     tokens: []const token.Token,
@@ -200,6 +302,14 @@ const Parser = struct {
         return .{ .database = first, .namespace = second, .table = try self.identifier() };
     }
 
+    fn tableReferenceName(self: *Parser) Error!ast.Name {
+        // Inheritance is not a catalog capability: every table reference is
+        // already limited to its exact table. Accept ONLY at that boundary,
+        // not in generic object names such as a new table declaration.
+        _ = self.keyword(.only);
+        return self.name();
+    }
+
     fn field(self: *Parser) Error![]const u8 {
         const result = try self.identifier();
         // Internal separator preserves the distinction between t.column and
@@ -253,6 +363,19 @@ const Parser = struct {
         return node_value;
     }
 
+    fn singleColumnSubquery(self: *Parser, query: ast.Select) Error!void {
+        // Explicit projection arity is known before catalog binding. Reject
+        // invalid scalar/IN/quantified subqueries even inside mutations, whose
+        // source relation must not be opened just to discover this error.
+        // SELECT * remains a binder check because its width is schema-bound.
+        if (query.set_operation) |set| {
+            try self.singleColumnSubquery(set.left.*);
+            try self.singleColumnSubquery(set.right.*);
+            return;
+        }
+        if (query.columns.len > 1) return self.fail(error.InvalidSqlSyntax, "subquery must return one column in this expression");
+    }
+
     fn scalar(self: *Parser, depth: usize, minimum: u8) Error!*const ast.Scalar {
         if (depth >= self.limits.max_depth) return self.fail(error.SqlLimitExceeded, "SQL scalar nesting budget exceeded");
         var left: *const ast.Scalar = undefined;
@@ -263,19 +386,22 @@ const Parser = struct {
             defer self.relation_depth -= 1;
             if (self.relation_depth >= self.limits.max_depth) return self.fail(error.SqlLimitExceeded, "SQL subquery nesting limit exceeded");
             try self.expect(.lparen);
-            try self.expectKeyword(.select);
             const query = try self.alloc.create(ast.Select);
-            query.* = try self.select();
+            const nested = try self.statement();
+            if (nested != .select) return self.fail(error.InvalidSqlSyntax, "subquery requires SELECT");
+            query.* = nested.select;
             try self.expect(.rparen);
             left = try self.scalarNode(.{ .call = .{ .name = "$exists", .args = &.{}, .subquery = query } });
         } else if (self.take(.lparen)) {
-            if (self.pos < self.tokens.len and self.tokens[self.pos].isKeyword(.select)) {
+            if (self.pos < self.tokens.len and (self.tokens[self.pos].isKeyword(.select) or self.tokens[self.pos].isKeyword(.with))) {
                 self.relation_depth += 1;
                 defer self.relation_depth -= 1;
                 if (self.relation_depth >= self.limits.max_depth) return self.fail(error.SqlLimitExceeded, "SQL subquery nesting limit exceeded");
-                self.pos += 1;
                 const query = try self.alloc.create(ast.Select);
-                query.* = try self.select();
+                const nested = try self.statement();
+                if (nested != .select) return self.fail(error.InvalidSqlSyntax, "subquery requires SELECT");
+                query.* = nested.select;
+                try self.singleColumnSubquery(query.*);
                 left = try self.scalarNode(.{ .call = .{ .name = "$scalar", .args = &.{}, .subquery = query } });
             } else left = try self.scalar(depth + 1, 0);
             try self.expect(.rparen);
@@ -286,6 +412,12 @@ const Parser = struct {
             const kind = try self.columnType();
             try self.expect(.rparen);
             left = try self.scalarNode(.{ .cast = .{ .operand = operand, .type = kind } });
+        } else if (self.peek(.identifier) and !self.tokens[self.pos].owned and std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "timestamptz") and self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .string) {
+            // Typed literals use the same validating/canonicalizing cast as
+            // CAST(text AS timestamptz), including offset normalization.
+            self.pos += 1;
+            const literal = try self.scalarNode(.{ .literal = try self.value() });
+            left = try self.scalarNode(.{ .cast = .{ .operand = literal, .type = .datetime } });
         } else if (self.keyword(.case)) {
             const base = if (self.pos < self.tokens.len and self.tokens[self.pos].isKeyword(.when)) null else try self.scalar(depth + 1, 0);
             var branches: std.ArrayList(ast.Scalar.Branch) = .empty;
@@ -348,11 +480,14 @@ const Parser = struct {
                 }
                 if (self.keyword(.in)) {
                     try self.expect(.lparen);
-                    if (self.keyword(.select)) {
+                    if (self.pos < self.tokens.len and (self.tokens[self.pos].isKeyword(.select) or self.tokens[self.pos].isKeyword(.with))) {
                         if (self.relation_depth >= self.limits.max_depth) return self.fail(error.SqlLimitExceeded, "SQL subquery nesting limit exceeded");
                         self.relation_depth += 1;
                         const query = try self.alloc.create(ast.Select);
-                        query.* = try self.select();
+                        const nested = try self.statement();
+                        if (nested != .select) return self.fail(error.InvalidSqlSyntax, "subquery requires SELECT");
+                        query.* = nested.select;
+                        try self.singleColumnSubquery(query.*);
                         self.relation_depth -= 1;
                         try self.expect(.rparen);
                         left = try self.scalarNode(.{ .call = .{ .name = "$in_subquery", .args = try self.alloc.dupe(*const ast.Scalar, &.{left}), .subquery = query } });
@@ -371,6 +506,25 @@ const Parser = struct {
                 if (negated) {
                     const insensitive = self.keyword(.ilike);
                     if (!insensitive) try self.expectKeyword(.like);
+                    const every = self.keyword(.all);
+                    if (every or self.keyword(.any) or self.keyword(.some)) {
+                        try self.expect(.lparen);
+                        if (self.relation_depth >= self.limits.max_depth) return self.fail(error.SqlLimitExceeded, "SQL subquery nesting limit exceeded");
+                        self.relation_depth += 1;
+                        const query = try self.alloc.create(ast.Select);
+                        const nested = try self.statement();
+                        if (nested != .select) return self.fail(error.InvalidSqlSyntax, "subquery requires SELECT");
+                        query.* = nested.select;
+                        try self.singleColumnSubquery(query.*);
+                        self.relation_depth -= 1;
+                        try self.expect(.rparen);
+                        left = try self.scalarNode(.{ .call = .{
+                            .name = if (every) (if (insensitive) "$all_not_ilike" else "$all_not_like") else (if (insensitive) "$any_not_ilike" else "$any_not_like"),
+                            .args = try self.alloc.dupe(*const ast.Scalar, &.{left}),
+                            .subquery = query,
+                        } });
+                        continue;
+                    }
                     left = try self.scalarNode(.{ .unary = .{ .op = .not, .operand = try self.scalarNode(.{ .binary = .{ .op = if (insensitive) .ilike else .like, .left = left, .right = try self.scalar(depth + 1, 4) } }) } });
                     continue;
                 }
@@ -421,6 +575,27 @@ const Parser = struct {
             };
             if (precedence < minimum) break;
             self.pos += 1;
+            if (op == .eq or op == .neq or op == .lt or op == .lte or op == .gt or op == .gte or op == .like or op == .ilike) {
+                const every = self.keyword(.all);
+                if (every or self.keyword(.any) or self.keyword(.some)) {
+                    try self.expect(.lparen);
+                    if (self.relation_depth >= self.limits.max_depth) return self.fail(error.SqlLimitExceeded, "SQL subquery nesting limit exceeded");
+                    self.relation_depth += 1;
+                    const query = try self.alloc.create(ast.Select);
+                    const nested = try self.statement();
+                    if (nested != .select) return self.fail(error.InvalidSqlSyntax, "subquery requires SELECT");
+                    query.* = nested.select;
+                    try self.singleColumnSubquery(query.*);
+                    self.relation_depth -= 1;
+                    try self.expect(.rparen);
+                    left = try self.scalarNode(.{ .call = .{
+                        .name = try std.fmt.allocPrint(self.alloc, "${s}_{s}", .{ if (every) "all" else "any", @tagName(op) }),
+                        .args = try self.alloc.dupe(*const ast.Scalar, &.{left}),
+                        .subquery = query,
+                    } });
+                    continue;
+                }
+            }
             left = try self.scalarNode(.{ .binary = .{ .op = op, .left = left, .right = try self.scalar(depth + 1, precedence + 1) } });
         }
         return left;
@@ -763,16 +938,29 @@ const Parser = struct {
             if (statement_value != .select) return self.fail(error.InvalidSqlSyntax, "derived relation requires SELECT");
             try self.expect(.rparen);
             const alias = try self.sourceAlias() orelse return self.fail(error.InvalidSqlSyntax, "derived relation requires an alias");
+            var names: std.ArrayList([]const u8) = .empty;
+            if (self.take(.lparen)) {
+                while (true) {
+                    try self.node();
+                    try names.append(self.alloc, try self.identifier());
+                    if (!self.take(.comma)) break;
+                }
+                try self.expect(.rparen);
+            }
             const query = try self.alloc.create(ast.Select);
             query.* = statement_value.select;
-            return self.relationNode(.{ .derived = .{ .query = query, .alias = alias } });
+            return self.relationNode(.{ .derived = .{ .query = query, .alias = alias, .columns = try names.toOwnedSlice(self.alloc) } });
         }
-        const name_value = try self.name();
+        const name_value = try self.tableReferenceName();
         return self.relationNode(.{ .table = .{ .name = name_value, .alias = try self.sourceAlias() } });
     }
 
     fn relation(self: *Parser) Error!*const ast.Relation {
-        var left = try self.relationAtom();
+        return self.relationTail(try self.relationAtom());
+    }
+
+    fn relationTail(self: *Parser, first: *const ast.Relation) Error!*const ast.Relation {
+        var left = first;
         var depth: usize = 1;
         while (true) {
             var kind: ast.JoinKind = .inner;
@@ -805,7 +993,13 @@ const Parser = struct {
 
     fn insert(self: *Parser) Error!ast.Insert {
         try self.expectKeyword(.into);
-        const table = try self.name();
+        const table = try self.tableReferenceName();
+        if (self.keyword(.default)) {
+            try self.expectKeyword(.values);
+            const rows = try self.alloc.alloc([]const ast.Value, 1);
+            rows[0] = &.{};
+            return .{ .table = table, .columns = &.{}, .rows = rows, .conflict = try self.conflict(), .returning = try self.returning() };
+        }
         try self.expect(.lparen);
         var columns = std.ArrayList([]const u8).empty;
         var seen: std.StringHashMapUnmanaged(void) = .empty;
@@ -828,42 +1022,89 @@ const Parser = struct {
         try self.expectKeyword(.values);
         var rows = std.ArrayList([]const ast.Value).empty;
         var expressions = std.ArrayList([]const ?*const ast.Scalar).empty;
+        var defaults = std.ArrayList([]const bool).empty;
         while (true) {
             if (rows.items.len >= self.limits.max_insert_rows) return self.fail(error.SqlLimitExceeded, "INSERT row budget exceeded");
             try self.expect(.lparen);
             var row = std.ArrayList(ast.Value).empty;
             var row_expressions = std.ArrayList(?*const ast.Scalar).empty;
+            var row_defaults = std.ArrayList(bool).empty;
             while (true) {
-                const expression = try self.scalar(0, 0);
-                try self.checkScalarDepth(expression, 0);
-                try row.append(self.alloc, if (expression.* == .literal) expression.literal else .null);
-                try row_expressions.append(self.alloc, if (expression.* == .literal) null else expression);
+                if (self.keyword(.default)) {
+                    try row.append(self.alloc, .null);
+                    try row_expressions.append(self.alloc, null);
+                    try row_defaults.append(self.alloc, true);
+                } else {
+                    const expression = try self.scalar(0, 0);
+                    try self.checkScalarDepth(expression, 0);
+                    try row.append(self.alloc, if (expression.* == .literal) expression.literal else .null);
+                    try row_expressions.append(self.alloc, if (expression.* == .literal) null else expression);
+                    try row_defaults.append(self.alloc, false);
+                }
                 if (!self.take(.comma)) break;
             }
             try self.expect(.rparen);
             if (row.items.len != columns.items.len) return self.fail(error.InvalidSqlSyntax, "INSERT values count does not match columns");
             try rows.append(self.alloc, try row.toOwnedSlice(self.alloc));
             try expressions.append(self.alloc, try row_expressions.toOwnedSlice(self.alloc));
+            try defaults.append(self.alloc, try row_defaults.toOwnedSlice(self.alloc));
             if (!self.take(.comma)) break;
         }
-        return .{ .table = table, .columns = try columns.toOwnedSlice(self.alloc), .rows = try rows.toOwnedSlice(self.alloc), .expressions = try expressions.toOwnedSlice(self.alloc), .conflict = try self.conflict(), .returning = try self.returning() };
+        const names = try columns.toOwnedSlice(self.alloc);
+        const values = try rows.toOwnedSlice(self.alloc);
+        const cells = try expressions.toOwnedSlice(self.alloc);
+        const default_cells = try defaults.toOwnedSlice(self.alloc);
+        const conflict_clause = try self.conflict();
+        const returning_columns = try self.returning();
+        var contains_subquery = false;
+        for (cells) |row| for (row) |cell| if (cell) |expression| {
+            contains_subquery = contains_subquery or @import("subquery_lowering.zig").has(expression);
+        };
+        if (!contains_subquery) return .{ .table = table, .columns = names, .rows = values, .expressions = cells, .defaults = default_cells, .conflict = conflict_clause, .returning = returning_columns };
+
+        // VALUES with scalar subqueries is one source relation, not a collection
+        // of independent expression evaluations. Keep source arms flat and in
+        // input order; binding infers their shared output types as one unit.
+        // INSERT ... SELECT then captures every source before preparing any
+        // target image, including when the source reads the target itself.
+        var arms: std.ArrayList(*const ast.Select) = .empty;
+        for (values, cells) |row, row_cells| {
+            const projections = try self.alloc.alloc(ast.Projection, names.len);
+            for (names, row, row_cells, projections) |column_name, literal_value, expression, *projection| {
+                const scalar_value = expression orelse blk: {
+                    const literal = try self.scalarNode(.{ .literal = literal_value });
+                    break :blk literal;
+                };
+                projection.* = .{ .alias = column_name, .expression = scalar_value };
+            }
+            const leaf = try self.alloc.create(ast.Select);
+            leaf.* = .{ .columns = projections, .generated_values = true };
+            try arms.append(self.alloc, leaf);
+        }
+        const source = try self.alloc.create(ast.Select);
+        source.* = .{ .values_arms = try arms.toOwnedSlice(self.alloc), .generated_values = true };
+        return .{ .table = table, .columns = names, .source = source, .values_source_rows = values, .defaults = default_cells, .conflict = conflict_clause, .returning = returning_columns };
     }
 
     fn conflict(self: *Parser) Error!?ast.Conflict {
         if (!self.keyword(.on)) return null;
         try self.expectKeyword(.conflict);
         var columns: std.ArrayList([]const u8) = .empty;
+        var expressions: std.ArrayList(*const ast.Scalar) = .empty;
         if (self.take(.lparen)) {
             while (true) {
                 try self.node();
-                try columns.append(self.alloc, try self.identifier());
+                const expression = try self.scalar(0, 0);
+                if (expression.* == .column) try columns.append(self.alloc, expression.column) else try expressions.append(self.alloc, expression);
                 if (!self.take(.comma)) break;
             }
             try self.expect(.rparen);
         }
+        const arbiter_predicate = if (self.keyword(.where)) try self.scalar(0, 0) else null;
+        if (arbiter_predicate != null and columns.items.len + expressions.items.len == 0) return self.fail(error.UnsupportedSqlShape, "partial conflict inference requires an explicit target");
         try self.expectKeyword(.do);
-        if (self.keyword(.nothing)) return .{ .columns = try columns.toOwnedSlice(self.alloc) };
-        if (columns.items.len == 0) return self.fail(error.UnsupportedSqlShape, "ON CONFLICT DO UPDATE requires an explicit conflict target");
+        if (self.keyword(.nothing)) return .{ .columns = try columns.toOwnedSlice(self.alloc), .expressions = try expressions.toOwnedSlice(self.alloc), .arbiter_predicate = arbiter_predicate };
+        if (columns.items.len + expressions.items.len == 0) return self.fail(error.UnsupportedSqlShape, "ON CONFLICT DO UPDATE requires an explicit conflict target");
         try self.expectKeyword(.update);
         try self.expectKeyword(.set);
         var assignments: std.ArrayList(ast.Assignment) = .empty;
@@ -879,26 +1120,162 @@ const Parser = struct {
         }
         const filter = if (self.keyword(.where)) try self.scalar(0, 0) else null;
         if (filter) |expression| try self.checkScalarDepth(expression, 0);
-        return .{ .columns = try columns.toOwnedSlice(self.alloc), .assignments = try assignments.toOwnedSlice(self.alloc), .predicate = filter };
+        return .{ .columns = try columns.toOwnedSlice(self.alloc), .expressions = try expressions.toOwnedSlice(self.alloc), .arbiter_predicate = arbiter_predicate, .assignments = try assignments.toOwnedSlice(self.alloc), .predicate = filter };
     }
 
     fn update(self: *Parser) Error!ast.Update {
-        const table = try self.name();
+        const table = try self.tableReferenceName();
+        const alias = try self.sourceAlias();
+        const target = try self.relationNode(.{ .table = .{ .name = table, .alias = alias, .mutation_target = true, .mutation_document = true, .mutation_presence = true } });
+        var source = try self.relationTail(target);
         try self.expectKeyword(.set);
         var assignments = std.ArrayList(ast.Assignment).empty;
         var seen: std.StringHashMapUnmanaged(void) = .empty;
         while (true) {
-            try self.node();
-            const column = try self.field();
-            const entry = try seen.getOrPut(self.alloc, column);
-            if (entry.found_existing) return self.fail(error.DuplicateSqlColumn, "duplicate UPDATE assignment");
+            const tuple = self.take(.lparen);
+            var targets: std.ArrayList([]const u8) = .empty;
+            while (true) {
+                try self.node();
+                const field_name = try self.field();
+                const column = if (std.mem.indexOfScalar(u8, field_name, 0)) |separator| blk: {
+                    if (!std.mem.eql(u8, field_name[0..separator], alias orelse table.table)) return self.fail(error.InvalidSqlSyntax, "assignment must name the mutation target");
+                    break :blk field_name[separator + 1 ..];
+                } else field_name;
+                const entry = try seen.getOrPut(self.alloc, column);
+                if (entry.found_existing) return self.fail(error.DuplicateSqlColumn, "duplicate UPDATE assignment");
+                try targets.append(self.alloc, column);
+                if (!tuple or !self.take(.comma)) break;
+            }
+            if (tuple) try self.expect(.rparen);
             try self.expect(.eq);
-            const expression = try self.scalar(0, 0);
-            try self.checkScalarDepth(expression, 0);
-            try assignments.append(self.alloc, if (expression.* == .literal) .{ .field = column, .value = expression.literal } else .{ .field = column, .expression = expression });
+            if (tuple) {
+                _ = self.keyword(.row);
+                try self.expect(.lparen);
+                for (targets.items, 0..) |column, i| {
+                    if (i != 0) try self.expect(.comma);
+                    if (self.keyword(.default)) {
+                        try assignments.append(self.alloc, .{ .field = column, .use_default = true });
+                        continue;
+                    }
+                    const expression = try self.scalar(0, 0);
+                    try self.checkScalarDepth(expression, 0);
+                    try assignments.append(self.alloc, if (expression.* == .literal) .{ .field = column, .value = expression.literal } else .{ .field = column, .expression = expression });
+                }
+                if (!self.take(.rparen)) return self.fail(error.InvalidSqlSyntax, "row assignment value count does not match targets");
+            } else {
+                if (self.keyword(.default)) {
+                    try assignments.append(self.alloc, .{ .field = targets.items[0], .use_default = true });
+                } else {
+                    const expression = try self.scalar(0, 0);
+                    try self.checkScalarDepth(expression, 0);
+                    try assignments.append(self.alloc, if (expression.* == .literal) .{ .field = targets.items[0], .value = expression.literal } else .{ .field = targets.items[0], .expression = expression });
+                }
+            }
             if (!self.take(.comma)) break;
         }
-        return .{ .table = table, .assignments = try assignments.toOwnedSlice(self.alloc), .predicate = try self.where(), .returning = try self.returning() };
+        if (self.keyword(.from)) {
+            if (source != target) return self.fail(error.InvalidSqlSyntax, "use either joined UPDATE or UPDATE FROM");
+            source = try self.relationNode(.{ .join = .{ .kind = .cross, .left = target, .right = try self.relation() } });
+        }
+        return .{ .table = table, .alias = alias, .source = if (alias != null or source != target) source else null, .assignments = try assignments.toOwnedSlice(self.alloc), .predicate = try self.where(), .returning = try self.returning() };
+    }
+
+    fn delete(self: *Parser) Error!ast.Delete {
+        try self.expectKeyword(.from);
+        const table = try self.tableReferenceName();
+        const alias = try self.sourceAlias();
+        const target = try self.relationNode(.{ .table = .{ .name = table, .alias = alias, .mutation_target = true, .mutation_presence = true } });
+        var source = try self.relationTail(target);
+        if (self.keyword(.using)) {
+            if (source != target) return self.fail(error.InvalidSqlSyntax, "use either joined DELETE or DELETE USING");
+            source = try self.relationNode(.{ .join = .{ .kind = .cross, .left = target, .right = try self.relation() } });
+        }
+        return .{ .table = table, .alias = alias, .source = if (alias != null or source != target) source else null, .predicate = try self.where(), .returning = try self.returning() };
+    }
+
+    fn merge(self: *Parser) Error!ast.Merge {
+        try self.expectKeyword(.into);
+        const table = try self.tableReferenceName();
+        const alias = try self.sourceAlias();
+        try self.expectKeyword(.using);
+        const source = try self.relation();
+        try self.expectKeyword(.on);
+        const condition = try self.scalar(0, 0);
+        try self.checkScalarDepth(condition, 0);
+        var arms: std.ArrayList(ast.Merge.Arm) = .empty;
+        while (self.keyword(.when)) {
+            if (arms.items.len >= 128) return self.fail(error.SqlLimitExceeded, "MERGE arm limit exceeded");
+            const matched = !self.keyword(.not);
+            try self.expectKeyword(.matched);
+            const arm_filter = if (self.keyword(.@"and")) try self.scalar(0, 0) else null;
+            if (arm_filter) |filter_expr| try self.checkScalarDepth(filter_expr, 0);
+            try self.expectKeyword(.then);
+            var action: ast.Merge.Arm.Action = undefined;
+            if (self.keyword(.update)) {
+                if (!matched) return self.fail(error.InvalidSqlSyntax, "NOT MATCHED cannot UPDATE");
+                try self.expectKeyword(.set);
+                var assignments: std.ArrayList(ast.Assignment) = .empty;
+                var seen: std.StringHashMapUnmanaged(void) = .empty;
+                while (true) {
+                    if (assignments.items.len >= 256) return self.fail(error.SqlLimitExceeded, "MERGE assignment limit exceeded");
+                    try self.node();
+                    const field_name = try self.field();
+                    const column = if (std.mem.indexOfScalar(u8, field_name, 0)) |separator| blk: {
+                        if (!std.mem.eql(u8, field_name[0..separator], alias orelse table.table)) return self.fail(error.InvalidSqlSyntax, "assignment must name MERGE target");
+                        break :blk field_name[separator + 1 ..];
+                    } else field_name;
+                    const entry = try seen.getOrPut(self.alloc, column);
+                    if (entry.found_existing) return self.fail(error.DuplicateSqlColumn, "duplicate MERGE assignment");
+                    try self.expect(.eq);
+                    if (self.keyword(.default)) {
+                        try assignments.append(self.alloc, .{ .field = column, .use_default = true });
+                        if (!self.take(.comma)) break;
+                        continue;
+                    }
+                    const expression = try self.scalar(0, 0);
+                    try self.checkScalarDepth(expression, 0);
+                    try assignments.append(self.alloc, if (expression.* == .literal) .{ .field = column, .value = expression.literal } else .{ .field = column, .expression = expression });
+                    if (!self.take(.comma)) break;
+                }
+                action = .{ .update = try assignments.toOwnedSlice(self.alloc) };
+            } else if (self.keyword(.delete)) {
+                if (!matched) return self.fail(error.InvalidSqlSyntax, "NOT MATCHED cannot DELETE");
+                action = .delete;
+            } else if (self.keyword(.insert)) {
+                if (matched) return self.fail(error.InvalidSqlSyntax, "MATCHED cannot INSERT");
+                try self.expect(.lparen);
+                var columns: std.ArrayList([]const u8) = .empty;
+                var seen: std.StringHashMapUnmanaged(void) = .empty;
+                while (true) {
+                    if (columns.items.len >= 256) return self.fail(error.SqlLimitExceeded, "MERGE insert column limit exceeded");
+                    const column_name = try self.identifier();
+                    const entry = try seen.getOrPut(self.alloc, column_name);
+                    if (entry.found_existing) return self.fail(error.DuplicateSqlColumn, "duplicate MERGE insert column");
+                    try columns.append(self.alloc, column_name);
+                    if (!self.take(.comma)) break;
+                }
+                try self.expect(.rparen);
+                try self.expectKeyword(.values);
+                try self.expect(.lparen);
+                var values: std.ArrayList(?*const ast.Scalar) = .empty;
+                while (true) {
+                    if (values.items.len >= columns.items.len) return self.fail(error.InvalidSqlSyntax, "MERGE insert value count exceeds columns");
+                    const expression = if (self.keyword(.default)) null else try self.scalar(0, 0);
+                    if (expression) |expr| try self.checkScalarDepth(expr, 0);
+                    try values.append(self.alloc, expression);
+                    if (!self.take(.comma)) break;
+                }
+                try self.expect(.rparen);
+                if (values.items.len != columns.items.len) return self.fail(error.InvalidSqlSyntax, "MERGE insert value count differs from columns");
+                action = .{ .insert = .{ .columns = try columns.toOwnedSlice(self.alloc), .values = try values.toOwnedSlice(self.alloc) } };
+            } else if (self.keyword(.do)) {
+                try self.expectKeyword(.nothing);
+                action = .nothing;
+            } else return self.fail(error.InvalidSqlSyntax, "expected MERGE action");
+            try arms.append(self.alloc, .{ .matched = matched, .predicate = arm_filter, .action = action });
+        }
+        if (arms.items.len == 0) return self.fail(error.InvalidSqlSyntax, "MERGE requires a WHEN arm");
+        return .{ .table = table, .alias = alias, .source = source, .condition = condition, .arms = try arms.toOwnedSlice(self.alloc), .returning = try self.returning() };
     }
 
     fn returning(self: *Parser) Error!?[]const ast.Projection {
@@ -989,9 +1366,9 @@ const Parser = struct {
                 } else if (self.keyword(.primary)) {
                     try self.expectKeyword(.key);
                     definition.nullable = false;
-                    try constraints.append(self.alloc, .{ .add_unique = .{ .name = try std.fmt.allocPrint(self.alloc, "sql_primary_{d}", .{constraints.items.len}), .columns = try self.alloc.dupe([]const u8, &.{column}), .primary = true } });
+                    try constraints.append(self.alloc, try self.uniqueTiming(.{ .add_unique = .{ .name = try std.fmt.allocPrint(self.alloc, "sql_primary_{d}", .{constraints.items.len}), .columns = try self.alloc.dupe([]const u8, &.{column}), .primary = true } }));
                 } else if (self.keyword(.unique)) {
-                    try constraints.append(self.alloc, .{ .add_unique = .{ .name = try std.fmt.allocPrint(self.alloc, "sql_unique_{d}", .{constraints.items.len}), .columns = try self.alloc.dupe([]const u8, &.{column}) } });
+                    try constraints.append(self.alloc, try self.uniqueTiming(.{ .add_unique = .{ .name = try std.fmt.allocPrint(self.alloc, "sql_unique_{d}", .{constraints.items.len}), .columns = try self.alloc.dupe([]const u8, &.{column}) } }));
                 } else if (self.keyword(.constraint)) {
                     const constraint_name = try self.identifier();
                     try constraints.append(self.alloc, try self.inlineConstraint(constraint_name, column));
@@ -1031,7 +1408,7 @@ const Parser = struct {
                 try self.expectKeyword(.exists);
             }
         }
-        var target_name: ast.Name = if (kind == .table) try self.name() else .{ .table = try self.identifier() };
+        var target_name: ast.Name = if (kind == .table) (if (action == .rename) try self.tableReferenceName() else try self.name()) else .{ .table = try self.identifier() };
         if (kind == .namespace and self.take(.dot)) {
             target_name.database = target_name.table;
             target_name.table = try self.identifier();
@@ -1105,7 +1482,7 @@ const Parser = struct {
         }
         const index_name = try self.identifier();
         try self.expectKeyword(.on);
-        const table_name = try self.name();
+        const table_name = try self.tableReferenceName();
         if (!create) return .{ .kind = .table, .action = .alter_schema, .name = table_name, .conditional = conditional, .schema_change = .{ .drop_index = index_name } };
         try self.expect(.lparen);
         var keys = std.ArrayList(ast.Order).empty;
@@ -1170,13 +1547,36 @@ const Parser = struct {
         return self.constraintDefinition(constraint_name);
     }
 
+    fn uniqueTiming(self: *Parser, change: ast.SchemaChange) Error!ast.SchemaChange {
+        var result = change;
+        var timing_seen = false;
+        var deferrable_seen = false;
+        while (true) {
+            if (self.keyword(.deferrable)) {
+                if (deferrable_seen) return self.fail(error.InvalidSqlSyntax, "duplicate DEFERRABLE clause");
+                deferrable_seen = true;
+                result.add_unique.deferrable = true;
+            } else if (self.pos + 1 < self.tokens.len and self.tokens[self.pos].isKeyword(.not) and self.tokens[self.pos + 1].isKeyword(.deferrable)) {
+                if (deferrable_seen) return self.fail(error.InvalidSqlSyntax, "duplicate DEFERRABLE clause");
+                deferrable_seen = true;
+                self.pos += 2;
+            } else if (self.ddlWord("INITIALLY")) {
+                if (timing_seen) return self.fail(error.InvalidSqlSyntax, "duplicate INITIALLY clause");
+                timing_seen = true;
+                result.add_unique.timing = if (self.keyword(.deferred)) "deferred" else if (self.keyword(.immediate)) "immediate" else return self.fail(error.InvalidSqlSyntax, "invalid constraint timing");
+            } else break;
+        }
+        if (std.mem.eql(u8, result.add_unique.timing, "deferred") and !result.add_unique.deferrable) return self.fail(error.InvalidSqlSyntax, "INITIALLY DEFERRED requires DEFERRABLE");
+        return result;
+    }
+
     fn inlineConstraint(self: *Parser, constraint_name: []const u8, column: []const u8) Error!ast.SchemaChange {
         const columns = try self.alloc.dupe([]const u8, &.{column});
         if (self.keyword(.primary)) {
             try self.expectKeyword(.key);
-            return .{ .add_unique = .{ .name = constraint_name, .columns = columns, .primary = true } };
+            return self.uniqueTiming(.{ .add_unique = .{ .name = constraint_name, .columns = columns, .primary = true } });
         }
-        if (self.keyword(.unique)) return .{ .add_unique = .{ .name = constraint_name, .columns = columns } };
+        if (self.keyword(.unique)) return self.uniqueTiming(.{ .add_unique = .{ .name = constraint_name, .columns = columns } });
         if (self.tokens[self.pos].isKeyword(.check)) return self.constraintDefinition(constraint_name);
         return self.foreignKeyDefinition(constraint_name, columns);
     }
@@ -1184,9 +1584,9 @@ const Parser = struct {
     fn constraintDefinition(self: *Parser, constraint_name: []const u8) Error!ast.SchemaChange {
         if (self.keyword(.primary)) {
             try self.expectKeyword(.key);
-            return .{ .add_unique = .{ .name = constraint_name, .columns = try self.ddlColumnList(), .primary = true } };
+            return self.uniqueTiming(.{ .add_unique = .{ .name = constraint_name, .columns = try self.ddlColumnList(), .primary = true } });
         }
-        if (self.keyword(.unique)) return .{ .add_unique = .{ .name = constraint_name, .columns = try self.ddlColumnList() } };
+        if (self.keyword(.unique)) return self.uniqueTiming(.{ .add_unique = .{ .name = constraint_name, .columns = try self.ddlColumnList() } });
         if (self.keyword(.check)) {
             try self.expect(.lparen);
             const expression = try self.scalar(0, 0);
@@ -1241,8 +1641,53 @@ const Parser = struct {
 
     fn statement(self: *Parser) Error!ast.Statement {
         try self.node();
+        if (self.keyword(.explain)) {
+            var format: @FieldType(@FieldType(ast.Statement, "explain"), "format") = .text;
+            var verbose = false;
+            if (self.take(.lparen)) {
+                while (true) {
+                    if (self.keyword(.format)) {
+                        if (!self.keyword(.json)) return self.fail(error.UnsupportedSqlShape, "EXPLAIN supports FORMAT JSON or the default text format");
+                        format = .json;
+                    } else if (self.keyword(.verbose)) {
+                        if (self.keyword(.off)) return self.fail(error.UnsupportedSqlShape, "EXPLAIN VERBOSE OFF is not supported");
+                        _ = self.keyword(.on);
+                        verbose = true;
+                    } else if (self.keyword(.costs)) {
+                        if (!self.keyword(.off)) return self.fail(error.UnsupportedSqlShape, "EXPLAIN has no cost model; use COSTS OFF");
+                    } else return self.fail(error.UnsupportedSqlShape, "unsupported EXPLAIN option");
+                    if (!self.take(.comma)) break;
+                }
+                try self.expect(.rparen);
+            }
+            if (self.keyword(.analyze)) return self.fail(error.UnsupportedSqlShape, "EXPLAIN ANALYZE requires instrumented execution");
+            const inner = try self.alloc.create(ast.Statement);
+            inner.* = try self.statement();
+            switch (inner.*) {
+                .select, .insert, .update, .delete, .merge => {},
+                else => return self.fail(error.UnsupportedSqlShape, "EXPLAIN requires a supported query or mutation"),
+            }
+            return .{ .explain = .{ .statement = inner, .format = format, .verbose = verbose } };
+        }
+        if (self.keyword(.truncate)) {
+            _ = self.keyword(.table);
+            var tables: std.ArrayList(ast.Name) = .empty;
+            while (true) {
+                try tables.append(self.alloc, try self.tableReferenceName());
+                if (tables.items.len > 128) return self.fail(error.SqlLimitExceeded, "TRUNCATE table limit exceeded");
+                if (!self.take(.comma)) break;
+            }
+            var restart = false;
+            if (self.keyword(.restart)) {
+                try self.expectKeyword(.identity);
+                restart = true;
+            } else if (self.keyword(.@"continue")) try self.expectKeyword(.identity);
+            const cascade = self.keyword(.cascade);
+            if (!cascade) _ = self.keyword(.restrict);
+            return .{ .catalog_ddl = .{ .kind = .table, .action = .truncate, .name = tables.items[0], .truncate_tables = try tables.toOwnedSlice(self.alloc), .restart_identity = restart, .cascade = cascade } };
+        }
         if (self.keyword(.with)) {
-            if (self.keyword(.recursive)) return self.fail(error.UnsupportedSqlShape, "recursive CTE execution is not available");
+            const recursive = self.keyword(.recursive);
             self.relation_depth += 1;
             defer self.relation_depth -= 1;
             if (self.relation_depth >= self.limits.max_depth) return self.fail(error.SqlLimitExceeded, "SQL CTE nesting limit exceeded");
@@ -1258,19 +1703,51 @@ const Parser = struct {
                     try self.expect(.rparen);
                 }
                 try self.expectKeyword(.as);
+                const materialization: ast.Cte.Materialization = if (self.keyword(.materialized)) .materialized else if (self.keyword(.not)) blk: {
+                    try self.expectKeyword(.materialized);
+                    break :blk .not_materialized;
+                } else .automatic;
                 try self.expect(.lparen);
                 const cte_statement = try self.statement();
                 if (cte_statement != .select) return self.fail(error.UnsupportedSqlShape, "CTEs require SELECT queries");
                 try self.expect(.rparen);
                 const query = try self.alloc.create(ast.Select);
                 query.* = cte_statement.select;
-                try ctes.append(self.alloc, .{ .name = cte_name, .columns = try column_names.toOwnedSlice(self.alloc), .query = query });
+                try ctes.append(self.alloc, .{ .name = cte_name, .columns = try column_names.toOwnedSlice(self.alloc), .query = query, .recursive = recursive, .materialization = materialization });
                 if (!self.take(.comma)) break;
             }
-            try self.expectKeyword(.select);
-            var result = try self.select();
-            result.ctes = try ctes.toOwnedSlice(self.alloc);
-            return .{ .select = result };
+            var result = try self.statement();
+            switch (result) {
+                .update => |*mutation| {
+                    mutation.ctes = try ctes.toOwnedSlice(self.alloc);
+                    if (mutation.source == null) mutation.source = try self.relationNode(.{ .table = .{ .name = mutation.table, .alias = mutation.alias, .mutation_target = true, .mutation_document = true, .mutation_presence = true } });
+                    return result;
+                },
+                .delete => |*mutation| {
+                    mutation.ctes = try ctes.toOwnedSlice(self.alloc);
+                    if (mutation.source == null) mutation.source = try self.relationNode(.{ .table = .{ .name = mutation.table, .alias = mutation.alias, .mutation_target = true, .mutation_presence = true } });
+                    return result;
+                },
+                .merge => |*mutation| {
+                    mutation.ctes = try ctes.toOwnedSlice(self.alloc);
+                    return result;
+                },
+                else => {},
+            }
+            const source: *ast.Select = switch (result) {
+                .select => &result.select,
+                .insert => blk: {
+                    const original = result.insert.source orelse return self.fail(error.UnsupportedSqlShape, "WITH INSERT requires a SELECT source");
+                    const copy = try self.alloc.create(ast.Select);
+                    copy.* = original.*;
+                    result.insert.source = copy;
+                    break :blk copy;
+                },
+                else => return self.fail(error.UnsupportedSqlShape, "WITH requires a query or mutation"),
+            };
+            try ctes.appendSlice(self.alloc, source.ctes);
+            source.ctes = try ctes.toOwnedSlice(self.alloc);
+            return result;
         }
         if (self.take(.lparen)) {
             self.relation_depth += 1;
@@ -1295,9 +1772,9 @@ const Parser = struct {
         if (self.keyword(.insert)) return .{ .insert = try self.insert() };
         if (self.keyword(.update)) return .{ .update = try self.update() };
         if (self.keyword(.delete)) {
-            try self.expectKeyword(.from);
-            return .{ .delete = .{ .table = try self.name(), .predicate = try self.where(), .returning = try self.returning() } };
+            return .{ .delete = try self.delete() };
         }
+        if (self.keyword(.merge)) return .{ .merge = try self.merge() };
         if (self.keyword(.create)) {
             if (self.keyword(.table)) return .{ .create_table = try self.createTable() };
             const unique = self.keyword(.unique);
@@ -1313,6 +1790,18 @@ const Parser = struct {
             return .{ .drop_table = .{ .table = try self.name(), .if_exists = if_exists } };
         }
         if (self.keyword(.alter)) return .{ .catalog_ddl = try self.catalogDdl(.rename) };
+        if (self.keyword(.set)) {
+            if (!self.ddlWord("CONSTRAINTS")) return self.fail(error.UnsupportedSqlShape, "SET requires CONSTRAINTS");
+            var names: std.ArrayList([]const u8) = .empty;
+            if (!self.keyword(.all)) while (true) {
+                if (names.items.len >= 256) return error.SqlLimitExceeded;
+                try names.append(self.alloc, try self.identifier());
+                if (!self.take(.comma)) break;
+            };
+            const deferred = self.ddlWord("DEFERRED");
+            if (!deferred and !self.ddlWord("IMMEDIATE")) return self.fail(error.InvalidSqlSyntax, "SET CONSTRAINTS requires DEFERRED or IMMEDIATE");
+            return .{ .set_constraints = .{ .names = try names.toOwnedSlice(self.alloc), .deferred = deferred } };
+        }
         if (self.keyword(.begin)) {
             _ = self.keyword(.transaction) or self.keyword(.work);
             return .{ .begin = try self.transactionOptions() };
@@ -1372,6 +1861,89 @@ const Parser = struct {
     }
 };
 
+test "compiler deferred uniqueness and constraint timing are explicit" {
+    var declaration = try compile(std.testing.allocator, "ALTER TABLE rows ADD CONSTRAINT u UNIQUE (id) DEFERRABLE INITIALLY DEFERRED", .{});
+    defer declaration.deinit();
+    try std.testing.expect(declaration.statement.catalog_ddl.schema_change.?.add_unique.deferrable);
+    try std.testing.expectEqualStrings("deferred", declaration.statement.catalog_ddl.schema_change.?.add_unique.timing);
+    var immediate = try compile(std.testing.allocator, "ALTER TABLE rows ADD CONSTRAINT u UNIQUE (id) NOT DEFERRABLE", .{});
+    defer immediate.deinit();
+    try std.testing.expect(!immediate.statement.catalog_ddl.schema_change.?.add_unique.deferrable);
+    try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "ALTER TABLE rows ADD CONSTRAINT u UNIQUE (id) INITIALLY DEFERRED", .{}));
+    var all = try compile(std.testing.allocator, "SET CONSTRAINTS ALL DEFERRED", .{});
+    defer all.deinit();
+    try std.testing.expect(all.statement.set_constraints.deferred);
+    try std.testing.expectEqual(@as(usize, 0), all.statement.set_constraints.names.len);
+    var named = try compile(std.testing.allocator, "SET CONSTRAINTS u, \"Other\" IMMEDIATE", .{});
+    defer named.deinit();
+    try std.testing.expect(!named.statement.set_constraints.deferred);
+    try std.testing.expectEqualStrings("Other", named.statement.set_constraints.names[1]);
+}
+
+test "compiler ONLY scopes exact table references across read and write statements" {
+    for ([_][]const u8{
+        "SELECT id FROM ONLY public.rows",
+        "INSERT INTO ONLY public.rows (id) VALUES ('a') RETURNING id",
+        "UPDATE ONLY public.rows SET id='a' FROM ONLY public.source AS s WHERE rows.id=s.id",
+        "DELETE FROM ONLY public.rows USING ONLY public.source AS s WHERE rows.id=s.id",
+        "MERGE INTO ONLY public.rows AS r USING ONLY public.source AS s ON r.id=s.id WHEN MATCHED THEN DELETE",
+        "TRUNCATE ONLY public.rows",
+        "ALTER TABLE ONLY public.rows VALIDATE CONSTRAINT c",
+        "CREATE INDEX idx ON ONLY public.rows (id)",
+    }) |sql| {
+        var compiled = try compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+    }
+    var inserted = try compile(std.testing.allocator, "INSERT INTO ONLY public.rows (id) VALUES ('a')", .{});
+    defer inserted.deinit();
+    try std.testing.expectEqualStrings("public", inserted.statement.insert.table.namespace.?);
+    try std.testing.expectEqualStrings("rows", inserted.statement.insert.table.table);
+    var quoted = try compile(std.testing.allocator, "SELECT id FROM \"only\"", .{});
+    defer quoted.deinit();
+    try std.testing.expectEqualStrings("only", quoted.statement.select.table.?.table);
+}
+
+test "compiler UPDATE row assignments flatten simultaneous typed expressions" {
+    var compiled = try compile(std.testing.allocator, "UPDATE rows SET (quantity, status) = ROW((SELECT quantity FROM rows WHERE id = 'source'), 'copied') WHERE id = 'target' RETURNING id", .{});
+    defer compiled.deinit();
+    const assignments = compiled.statement.update.assignments;
+    try std.testing.expectEqual(@as(usize, 2), assignments.len);
+    try std.testing.expectEqualStrings("quantity", assignments[0].field);
+    try std.testing.expect(assignments[0].expression != null);
+    try std.testing.expectEqualStrings("status", assignments[1].field);
+    try std.testing.expectEqualStrings("copied", assignments[1].value.string);
+    var bare = try compile(std.testing.allocator, "UPDATE rows SET (quantity, status) = (7, 'ready')", .{});
+    defer bare.deinit();
+    try std.testing.expectEqual(@as(i64, 7), bare.statement.update.assignments[0].value.integer);
+    var defaults = try compile(std.testing.allocator, "UPDATE rows SET (quantity, status) = ROW(DEFAULT, 'ready'), other=DEFAULT", .{});
+    defer defaults.deinit();
+    try std.testing.expect(defaults.statement.update.assignments[0].use_default);
+    try std.testing.expect(!defaults.statement.update.assignments[1].use_default);
+    try std.testing.expect(defaults.statement.update.assignments[2].use_default);
+    try std.testing.expectError(error.DuplicateSqlColumn, compile(std.testing.allocator, "UPDATE rows SET (quantity, quantity) = ROW(1, 2)", .{}));
+    try std.testing.expectError(error.DuplicateSqlColumn, compile(std.testing.allocator, "UPDATE rows SET (quantity, status) = ROW(1, 'x'), status='y'", .{}));
+    try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "UPDATE rows SET (quantity, status) = ROW(1)", .{}));
+    try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "UPDATE rows SET (quantity, status) = ROW(1, 'x', 3)", .{}));
+}
+
+test "compiler INSERT defaults retain per-row omission beside scalar sources" {
+    var values = try compile(std.testing.allocator, "INSERT INTO rows (id,status,n) VALUES ('a',DEFAULT,1),('b','set',DEFAULT)", .{});
+    defer values.deinit();
+    try std.testing.expectEqual(@as(usize, 2), values.statement.insert.rows.len);
+    try std.testing.expect(values.statement.insert.isDefault(0, 1));
+    try std.testing.expect(values.statement.insert.isDefault(1, 2));
+    try std.testing.expect(!values.statement.insert.isDefault(0, 2));
+    var sourced = try compile(std.testing.allocator, "INSERT INTO rows (id,status,n) VALUES ('a',DEFAULT,(SELECT 1)),('b',(SELECT 'set'),DEFAULT)", .{});
+    defer sourced.deinit();
+    try std.testing.expect(sourced.statement.insert.source != null);
+    try std.testing.expect(sourced.statement.insert.isDefault(0, 1));
+    try std.testing.expect(sourced.statement.insert.isDefault(1, 2));
+    var all_default = try compile(std.testing.allocator, "INSERT INTO rows DEFAULT VALUES", .{});
+    defer all_default.deinit();
+    try std.testing.expectEqual(@as(usize, 1), all_default.statement.insert.rows.len);
+    try std.testing.expectEqual(@as(usize, 0), all_default.statement.insert.columns.len);
+}
+
 test "compiler transaction modes and quoted savepoints are explicit" {
     var begin = try compile(std.testing.allocator, "START TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY", .{});
     defer begin.deinit();
@@ -1398,6 +1970,17 @@ test "compiler owns folded and quoted identifiers and exact literals" {
     try std.testing.expectEqual(std.math.minInt(i64), insert.rows[0][2].integer);
     try std.testing.expectEqual(std.math.maxInt(i64), insert.rows[1][2].integer);
     try std.testing.expectEqual(@as(u32, 1), compiled.parameter_count);
+}
+
+test "compiler keeps ON CONFLICT arbiter predicate separate from update predicate" {
+    var compiled = try compile(std.testing.allocator, "INSERT INTO users (email, active) VALUES ('a', true) ON CONFLICT (email) WHERE active = true DO UPDATE SET active = false WHERE users.active = true", .{});
+    defer compiled.deinit();
+    const conflict = compiled.statement.insert.conflict.?;
+    try std.testing.expect(conflict.arbiter_predicate != null);
+    try std.testing.expect(conflict.predicate != null);
+    try std.testing.expect(conflict.arbiter_predicate.?.* == .binary);
+    try std.testing.expectEqual(ast.Scalar.Binary.eq, conflict.arbiter_predicate.?.binary.op);
+    try std.testing.expectEqual(ast.Scalar.Binary.eq, conflict.predicate.?.binary.op);
 }
 
 test "compiler keeps typed parameters and boolean precedence" {
@@ -1490,6 +2073,48 @@ test "compiler diagnostic identifies rejected trailing syntax without retained s
     try std.testing.expectEqual(@as(usize, 16), diagnostic.start);
     try std.testing.expectEqual(@as(usize, 19), diagnostic.end);
     try std.testing.expectEqualStrings("unexpected trailing SQL; only one supported statement is allowed", diagnostic.message);
+}
+
+test "SQL original row-lock clauses on non-locking SQL surfaces reject before backend access" {
+    // sql-0437, sql-0577, sql-0578, sql-0618: the original corpus marks
+    // these row-lock forms invalid. This compiler has no row-lock syntax, so
+    // reject the complete statement instead of executing its unlocked prefix.
+    for ([_][]const u8{
+        "SELECT u.id FROM usage_records AS u WHERE u.status = 'queued' FOR UPDATE OF archived_records",
+        "UPDATE usage_records SET status = 'processing' WHERE status = 'queued' FOR SHARE RETURNING id",
+        "UPDATE usage_records AS u SET status = 'processing' WHERE u.status = 'queued' FOR UPDATE OF archived_records RETURNING u.id",
+        "UPDATE usage_records AS target SET status = source.status FROM source_records AS source WHERE target.id = source.id FOR UPDATE OF source RETURNING target.id",
+    }) |sql| {
+        try std.testing.expectError(error.UnsupportedSqlShape, compile(std.testing.allocator, sql, .{}));
+    }
+}
+
+test "SQL original duplicate point update target rejects before backend access" {
+    // sql-0576
+    try std.testing.expectError(error.DuplicateSqlColumn, compile(std.testing.allocator, "UPDATE usage_records SET status = 'active', status = lower(status) WHERE id = 'u1'", .{}));
+}
+
+test "SQL original named conflict target rejects before backend access" {
+    // sql-1487: named constraints are not an admitted ON CONFLICT arbiter.
+    try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "INSERT INTO usage_records (id, status) VALUES ('u_bad_named', 'pending') ON CONFLICT ON CONSTRAINT usage_records_id_key DO NOTHING", .{}));
+}
+
+test "SQL original multi-output mutation selector rejects before backend access" {
+    // sql-0616, sql-0617: IN requires one projected value even when the
+    // enclosing mutation would otherwise need a target table binding.
+    for ([_][]const u8{
+        "UPDATE usage_records SET status = 'archived' WHERE id IN (SELECT organization_id, status FROM archived_records)",
+        "DELETE FROM usage_records WHERE id IN (SELECT organization_id, status FROM archived_records)",
+    }) |sql| {
+        try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, sql, .{}));
+    }
+    for ([_][]const u8{
+        "SELECT (SELECT 1, 2)",
+        "SELECT 1 = ANY (SELECT 1, 2)",
+        "SELECT 1 IN (SELECT 1 UNION ALL SELECT 2, 3)",
+    }) |sql| {
+        try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, sql, .{}));
+    }
 }
 
 test "compiler preserves keyword-named columns and quoted SQL-looking values" {

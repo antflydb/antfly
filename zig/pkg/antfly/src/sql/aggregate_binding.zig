@@ -25,6 +25,7 @@ pub const Bound = struct {
 };
 
 pub fn aggregateKind(name: []const u8) ?operators.Aggregate.Kind {
+    if (std.mem.eql(u8, name, "$pattern_set")) return .pattern_set;
     inline for (std.meta.fields(operators.Aggregate.Kind)) |field| if (std.mem.eql(u8, name, field.name)) return @enumFromInt(field.value);
     return null;
 }
@@ -94,6 +95,10 @@ pub fn same(a: *const ast.Scalar, b: *const ast.Scalar) bool {
 const Builder = struct {
     alloc: Allocator,
     groups: []const *const ast.Scalar,
+    table: ?catalog.Table = null,
+    output_columns: []const ast.Projection = &.{},
+    output_nodes: []const *const ast.Scalar = &.{},
+    aliases_enabled: bool = false,
     arguments: std.ArrayList(ast.Projection) = .empty,
     aggregates: std.ArrayList(*const ast.Scalar) = .empty,
     inputs: std.ArrayList(?usize) = .empty,
@@ -110,6 +115,27 @@ const Builder = struct {
     }
     fn rewrite(self: *Builder, input: *const ast.Scalar) anyerror!*const ast.Scalar {
         if (!self.inference) for (self.groups, 0..) |group, index| if (same(input, group)) return self.slot(index);
+        if (self.aliases_enabled and input.* == .column) {
+            const source_exists = if (self.table) |definition| blk: {
+                _ = definition.column(input.column) catch break :blk false;
+                break :blk true;
+            } else false;
+            if (!source_exists) {
+                var match: ?usize = null;
+                for (self.output_columns, 0..) |projection, index| if (projection.alias) |alias| {
+                    if (!std.mem.eql(u8, alias, input.column)) continue;
+                    if (match != null) return error.AmbiguousSqlColumn;
+                    match = index;
+                };
+                if (match) |index| {
+                    // Output aliases are visible to HAVING/ORDER BY, but the
+                    // projection itself cannot recursively reference aliases.
+                    self.aliases_enabled = false;
+                    defer self.aliases_enabled = true;
+                    return self.rewrite(self.output_nodes[index]);
+                }
+            }
+        }
         if (input.* == .call and aggregateKind(input.call.name) != null) {
             const call = input.call;
             if (call.star and call.distinct) return error.InvalidSqlParameters;
@@ -120,6 +146,7 @@ const Builder = struct {
                 .count => self.node(.{ .literal = .{ .integer = 0 } }),
                 .avg => self.node(.{ .cast = .{ .operand = call.args[0], .type = .number } }),
                 .bool_and, .bool_or => self.node(.{ .cast = .{ .operand = call.args[0], .type = .boolean } }),
+                .pattern_set => self.node(.{ .cast = .{ .operand = try self.node(.{ .cast = .{ .operand = call.args[0], .type = .string } }), .type = .json } }),
                 else => call.args[0],
             };
             for (self.aggregates.items, 0..) |aggregate, index| if (same(input, aggregate)) return self.slot(self.groups.len + index);
@@ -127,7 +154,7 @@ const Builder = struct {
             const index = self.aggregates.items.len;
             try self.aggregates.append(self.alloc, input);
             try self.inputs.append(self.alloc, if (call.star) null else self.arguments.items.len);
-            if (!call.star) try self.arguments.append(self.alloc, .{ .expression = call.args[0] });
+            if (!call.star) try self.arguments.append(self.alloc, .{ .expression = if (aggregateKind(call.name).? == .pattern_set) try self.node(.{ .cast = .{ .operand = call.args[0], .type = .string } }) else call.args[0] });
             try self.filters.append(self.alloc, if (call.filter != null) self.arguments.items.len else null);
             if (call.filter) |filter| try self.arguments.append(self.alloc, .{ .expression = filter });
             return self.slot(self.groups.len + index);
@@ -159,9 +186,10 @@ const Builder = struct {
 
 pub fn bind(alloc: Allocator, table: ?catalog.Table, statement: ast.Select, parameters: []?ast.ColumnType) !Bound {
     if (statement.columns.len == 0) return error.SqlGroupingError;
-    var builder: Builder = .{ .alloc = alloc, .groups = statement.group_by };
+    var builder: Builder = .{ .alloc = alloc, .groups = statement.group_by, .table = table, .output_columns = statement.columns };
     const projection_nodes = try alloc.alloc(*const ast.Scalar, statement.columns.len);
     for (statement.columns, projection_nodes) |projection, *node| node.* = projection.expression orelse try builder.node(.{ .column = projection.field });
+    builder.output_nodes = projection_nodes;
     const groups = try alloc.alloc(*const ast.Scalar, statement.group_by.len);
     for (statement.group_by, groups) |group, *out| {
         out.* = group;
@@ -185,6 +213,7 @@ pub fn bind(alloc: Allocator, table: ?catalog.Table, statement: ast.Select, para
     builder.groups = groups;
     const outputs = try alloc.alloc(*const ast.Scalar, projection_nodes.len);
     for (projection_nodes, outputs) |node, *out| out.* = try builder.rewrite(node);
+    builder.aliases_enabled = true;
     const having = if (statement.having) |node| try builder.rewrite(node) else null;
     const order_nodes = try alloc.alloc(*const ast.Scalar, statement.order_by.len);
     for (statement.order_by, order_nodes) |order, *out| {
@@ -213,7 +242,9 @@ pub fn bind(alloc: Allocator, table: ?catalog.Table, statement: ast.Select, para
         break :blk result;
     } else &.{};
     const inference_nodes = try alloc.alloc(*const ast.Scalar, projection_nodes.len);
+    builder.aliases_enabled = false;
     for (projection_nodes, inference_nodes) |node, *out| out.* = try builder.rewrite(node);
+    builder.aliases_enabled = true;
     const inference_having = if (statement.having) |node| try builder.rewrite(node) else null;
     var inference_pass: usize = 0;
     while (true) : (inference_pass += 1) {
@@ -236,12 +267,13 @@ pub fn bind(alloc: Allocator, table: ?catalog.Table, statement: ast.Select, para
     for (builder.aggregates.items, builder.inputs.items, specs, columns[groups.len..]) |node, index, *spec, *column| {
         const kind = aggregateKind(node.call.name).?;
         const input_type = if (index) |slot| input.projections[slot].?.output_type.kind else null;
-        _ = try operators.Aggregate.init(alloc, kind, input_type);
+        try operators.Aggregate.validate(kind, input_type);
         spec.* = .{ .kind = kind, .input_type = input_type, .distinct = node.call.distinct };
         column.type = switch (kind) {
             .count => .integer,
             .avg => .number,
             .bool_and, .bool_or => .boolean,
+            .pattern_set => .json,
             else => input_type orelse .string,
         };
     }
@@ -293,4 +325,27 @@ test "aggregate binding rejects nested aggregate and ungrouped row references" {
         defer arena.deinit();
         if (std.mem.eql(u8, sql, "SELECT count()")) try std.testing.expectError(error.InvalidSqlParameters, bind(arena.allocator(), null, compiled.statement.select, &.{})) else try std.testing.expectError(error.SqlGroupingError, bind(arena.allocator(), null, compiled.statement.select, &.{}));
     }
+}
+
+test "aggregate HAVING resolves grouped and aggregate output aliases" {
+    for ([_][]const u8{
+        "SELECT lower('OPEN') AS status_key, count(*) AS row_count GROUP BY lower('OPEN') HAVING status_key = 'open' ORDER BY status_key",
+        "SELECT 1 AS k, count(*) AS row_count GROUP BY k HAVING row_count > 0 ORDER BY k",
+    }) |sql| {
+        var compiled = try @import("compiler.zig").compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const bound = try bind(arena.allocator(), null, compiled.statement.select, &.{});
+        try std.testing.expect(bound.having != null);
+        try std.testing.expectEqual(@as(usize, 1), bound.orders.len);
+    }
+}
+
+test "aggregate HAVING rejects ambiguous output aliases" {
+    var compiled = try @import("compiler.zig").compile(std.testing.allocator, "SELECT 1 AS k, 2 AS k, count(*) AS n GROUP BY 1, 2 HAVING k = 1", .{});
+    defer compiled.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.AmbiguousSqlColumn, bind(arena.allocator(), null, compiled.statement.select, &.{}));
 }

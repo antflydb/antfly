@@ -63,6 +63,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_mod = options.antfly_test_mod;
     const run_lib_usermgr_tests = options.run_lib_usermgr_tests;
     const public_api_parity_default_filters = [_][]const u8{
+        "SQL API cross-table MERGE retains both source and target range proofs",
         "api http server authenticates bounded online merge owner routes",
         "online merge private port fences owners cancellation and deadlines before dispatch",
         "online merge private port preserves source recovery errors through foreign runtime dispatch",
@@ -241,7 +242,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "api.sql_execution",
         "api.sql_pgwire",
         "api.sql_session",
+        "api.sql_prepared",
         "api.sql_catalog",
+        "api.sql_truncate",
         "api.sql_schema_cache",
         "SQL typed mutation boundary",
         "SQL JSON null metadata",
@@ -1082,6 +1085,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "retained read RPC",
             "retained read client",
             "relational row query response budget",
+            "relational row query full-key index proof requires every routed owner",
             "relational row query executes typed projection",
             "relational row query retained owner holds admission and releases failed opens",
             "table reads translate request deadlines into the routing clock",

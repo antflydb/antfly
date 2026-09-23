@@ -206,8 +206,10 @@ pub const Page = struct {
         var selected: std.StringHashMapUnmanaged(void) = .empty;
         defer selected.deinit(alloc);
         switch (phase) {
-            .unique => if (public.unique_constraints) |constraints| {
-                for (constraints.value) |constraint| for (constraint.columns) |column| {
+            .unique => {
+                var scratch = std.heap.ArenaAllocator.init(alloc);
+                defer scratch.deinit();
+                for (try public.relationalUniqueDefinitions(scratch.allocator())) |constraint| for (try @import("../../schema/relational_declarations.zig").uniqueFields(scratch.allocator(), reader.active.tableSchema().*, reader.active.physicalLayout(), constraint)) |column| {
                     if (!(try selected.getOrPut(alloc, column)).found_existing) try selected_fields.append(alloc, column);
                 };
             },

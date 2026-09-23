@@ -77,7 +77,7 @@ pub const Adapter = struct {
     server: *http.ApiHttpServer,
 
     pub fn backend(self: *Adapter) wire.Backend {
-        return .{ .context = self, .vtable = &.{ .authenticate = authenticate, .describe = describe, .execute = execute, .evaluate_parameters = evaluateParameters, .fail_transaction = failTransaction, .open_stream = openStream, .disconnect = disconnect } };
+        return .{ .context = self, .vtable = &.{ .authenticate = authenticate, .describe = describe, .execute = execute, .validate_namespace = validateNamespace, .evaluate_parameters = evaluateParameters, .fail_transaction = failTransaction, .open_stream = openStream, .disconnect = disconnect } };
     }
 
     fn failTransaction(raw: *anyopaque, identity: wire.Identity, request: wire.Request) !void {
@@ -85,10 +85,10 @@ pub const Adapter = struct {
         const credential: *Credential = @ptrCast(@alignCast(identity.context));
         const encoded = request.session_id orelse return error.SqlTransactionNotActive;
         const id = try @import("distributed_txn.zig").parseTxnIdHex(encoded);
-        if (try self.server.txn_sessions.principalAccess(self.server.alloc, id, credential.principal) != .allowed) return error.SqlTransactionNotActive;
+        if (try self.server.txn_sessions.principalAccess(self.server.alloc, id, credential.sessionPrincipal()) != .allowed) return error.SqlTransactionNotActive;
         var state = (try self.server.txn_sessions.getSqlState(self.server.alloc, id)) orelse return error.SqlTransactionNotActive;
         defer state.deinit(self.server.alloc);
-        if (state.terminal != null or !std.mem.eql(u8, state.metadata.database, request.database orelse "default") or !std.mem.eql(u8, state.metadata.namespace, request.namespace orelse "public")) return error.SqlTransactionNotActive;
+        if (state.terminal != null or !std.mem.eql(u8, state.metadata.database, request.database orelse "default") or !std.mem.eql(u8, state.metadata.namespace, request.session_namespace orelse request.namespace orelse "public")) return error.SqlTransactionNotActive;
         try self.server.txn_sessions.setSqlFailed(self.server.alloc, id, true);
     }
 
@@ -130,6 +130,12 @@ pub const Adapter = struct {
         var job = StreamJob{ .adapter = self, .alloc = alloc, .credential = @ptrCast(@alignCast(identity.context)), .request = request };
         try job.dispatch();
         return job.opened;
+    }
+
+    fn validateNamespace(raw: *anyopaque, alloc: std.mem.Allocator, identity: wire.Identity, request: wire.Request) !void {
+        const self: *Adapter = @ptrCast(@alignCast(raw));
+        var job = StreamJob{ .adapter = self, .alloc = alloc, .credential = @ptrCast(@alignCast(identity.context)), .request = request, .namespace_only = true };
+        try job.dispatch();
     }
 
     fn authenticate(raw: *anyopaque, alloc: std.mem.Allocator, username: []const u8, password: []const u8) !wire.Identity {
@@ -179,7 +185,7 @@ pub const Adapter = struct {
                 _ = job.server.txn_sessions.removeBeforeExecution(job.server.alloc, job.id);
             }
         };
-        var job = Cleanup{ .server = self.server, .principal = if (std.mem.startsWith(u8, credential.principal, "basic:")) credential.username else credential.principal, .id = id, .completion_io = network_io };
+        var job = Cleanup{ .server = self.server, .principal = credential.sessionPrincipal(), .id = id, .completion_io = network_io };
         var future = io.concurrent(Cleanup.run, .{&job}) catch return;
         job.done.waitUncancelable(network_io);
         _ = future.await(io);
@@ -220,7 +226,8 @@ const OwnedRead = struct {
     stream: *Pull.Stream,
     columns: []const wire.Column,
     policies: []const Policy,
-    const Policy = struct { table: []const u8, filter: ?[]const u8 };
+    detached: bool = false,
+    const Policy = struct { table: []const u8, filter: ?[]const u8, name: ?ast.Name = null, id: u64 = 0, schema_version: u32 = 0 };
 
     fn open(adapter: *Adapter, alloc: std.mem.Allocator, credential: *Credential, request: wire.Request) !?wire.ReadStream {
         const server = adapter.server;
@@ -236,6 +243,10 @@ const OwnedRead = struct {
         const self = try alloc.create(OwnedRead);
         errdefer alloc.destroy(self);
         self.alloc = alloc;
+        self.session_id = null;
+        self.staged = .{};
+        self.range_guards = .{};
+        self.detached = false;
         self.adapter = adapter;
         self.arena = std.heap.ArenaAllocator.init(alloc);
         errdefer self.arena.deinit();
@@ -251,23 +262,29 @@ const OwnedRead = struct {
         // Statement, parameter and binding-guard data are portal-owned. Keep a
         // private request capsule so I/O borrows point to a stable address.
         self.authority = .{ .credential = credential, .identity = &self.identity, .request = request };
+        self.authority.request.statement = try arena.dupe(u8, request.statement);
+        self.authority.request.database = try arena.dupe(u8, request.database orelse "default");
+        self.authority.request.namespace = try arena.dupe(u8, request.namespace orelse "public");
+        self.authority.request.session_namespace = if (request.session_namespace) |scope| try arena.dupe(u8, scope) else null;
+        self.authority.request.binding_guard = if (request.binding_guard) |guard| try arena.dupe(u8, guard) else null;
         self.authority.request.session_id = self.session_id;
-        self.native_adapter = .{ .server = server, .identity = &self.identity, .context = try self.authority.context(), .database = request.database orelse "default", .namespace = request.namespace orelse "public", .session_id = self.session_id };
+        self.native_adapter = .{ .server = server, .identity = &self.identity, .context = try self.authority.context(), .database = self.authority.request.database.?, .namespace = self.authority.request.namespace.?, .session_id = self.session_id };
         var transaction_lease: ?@import("transactions.zig").SessionRegistry.CommitExecution = null;
         defer if (transaction_lease) |lease| lease.release();
         if (self.session_id) |id_hex| {
             const id = @import("distributed_txn.zig").parseTxnIdHex(id_hex) catch return error.SqlTransactionNotActive;
-            if (try server.txn_sessions.principalAccess(server.alloc, id, credential.principal) != .allowed) return error.SqlTransactionNotActive;
+            if (try server.txn_sessions.principalAccess(server.alloc, id, credential.sessionPrincipal()) != .allowed) return error.SqlTransactionNotActive;
             transaction_lease = server.txn_sessions.tryAcquireCommitExecution(id) orelse return error.SqlWriteCapacityUnavailable;
             var state = (try server.txn_sessions.getSqlState(server.alloc, id)) orelse return error.SqlTransactionNotActive;
             defer state.deinit(server.alloc);
             if (state.metadata.failed or state.terminal != null) return error.SqlTransactionAborted;
+            if (!std.mem.eql(u8, state.metadata.database, request.database orelse "default") or !std.mem.eql(u8, state.metadata.namespace, request.session_namespace orelse request.namespace orelse "public")) return error.SqlTransactionNotActive;
             self.staged = try server.txn_sessions.cloneSqlStaged(alloc, id);
             self.native_adapter.active_transaction = id;
             self.native_adapter.staged = &self.staged;
             if (state.metadata.isolation != .read_committed) self.native_adapter.range_reads = &self.range_guards;
         }
-        self.guarded = .{ .native = self.native_adapter.backend(), .authority = &self.authority, .revision = &self.native_adapter.revision, .expected_guard = request.binding_guard };
+        self.guarded = .{ .native = self.native_adapter.backend(), .authority = &self.authority, .revision = &self.native_adapter.revision, .expected_guard = self.authority.request.binding_guard };
         const parameters = try normalizeParameters(arena, request.parameters, request.parameter_types);
         const opened = try Pull.Stream.open(alloc, self.guarded.backend(), plan.compiled(), parameters, .{ .result_rows = request.limit, .page_rows = 256 });
         if (opened == null) {
@@ -290,19 +307,53 @@ const OwnedRead = struct {
             transaction_lease = null;
         }
         const binding = self.stream.context.binding;
-        const policies = try arena.alloc(Policy, if (binding.relation) |relation| relation.scans.len else 1);
+        const policies = try arena.alloc(Policy, if (binding.relation) |relation| relation.scans.len else if (binding.table != null) 1 else 0);
         for (policies, 0..) |*policy, i| {
             const table = if (binding.relation) |relation| relation.scans[i].table else binding.table.?;
-            policy.* = .{ .table = table.physical_name, .filter = try http.resolveEffectiveRowFilterJson(arena, self.identity, table.physical_name) };
+            policy.* = .{ .table = try arena.dupe(u8, table.physical_name), .filter = try http.resolveEffectiveRowFilterJson(arena, self.identity, table.physical_name) };
+            if (table.scope) |scope| {
+                policy.name = .{ .database = try arena.dupe(u8, scope.database), .namespace = try arena.dupe(u8, scope.namespace), .table = try arena.dupe(u8, scope.name) };
+                policy.id = table.id;
+                policy.schema_version = table.schema_version;
+            }
         }
         self.policies = policies;
         const columns = try arena.alloc(wire.Column, self.stream.context.binding.columns.len);
-        for (columns, self.stream.context.binding.columns) |*out, column| out.* = .{ .name = column.name, .type = wireType(column.type) };
+        for (columns, self.stream.context.binding.columns) |*out, column| out.* = .{ .name = try arena.dupe(u8, column.name), .type = wireType(column.type) };
         self.columns = columns;
         self.plan = plan;
         self.admission = admission;
         moved = true;
-        return .{ .context = self, .columns = columns, .next = next, .close = close };
+        return .{ .context = self, .columns = columns, .next = next, .close = close, .detach = detach, .validate = validate };
+    }
+
+    fn validate(raw: *anyopaque, alloc: std.mem.Allocator, request: wire.Request) !void {
+        const self: *OwnedRead = @ptrCast(@alignCast(raw));
+        var job = StreamJob{ .adapter = self.adapter, .alloc = alloc, .credential = self.authority.credential, .request = request, .owner = self, .validate_only = true };
+        try job.dispatch();
+    }
+
+    fn validateCursor(self: *OwnedRead, alloc: std.mem.Allocator, request: wire.Request) !void {
+        try request.check();
+        try self.authority.credential.validate();
+        var admission: ?http.RequestAdmission.Lease = if (self.detached) try self.adapter.server.acquireSqlExecution(false) else null;
+        defer if (admission) |*lease| lease.release();
+        const original = self.authority.request;
+        if (!std.mem.eql(u8, original.database.?, request.database orelse "default") or !std.mem.eql(u8, original.namespace.?, request.namespace orelse "public") or
+            !std.mem.eql(u8, original.binding_guard orelse "", request.binding_guard orelse "")) return error.CatalogGenerationChanged;
+        // Detached rows retain immutable source identity, not permission to
+        // follow a renamed/replaced logical resource into a different table.
+        // Resolve definitions only: never reacquire or rerun the row snapshot.
+        var current: ?http.AuthenticatedIdentity = try self.authority.credential.identity(self.adapter.server.alloc);
+        defer current.?.deinit(self.adapter.server.alloc);
+        try validatePolicies(self.adapter.server.alloc, &current.?, self.identity.?, self.policies);
+        var authority: Authority = .{ .credential = self.authority.credential, .identity = &current, .request = request };
+        var adapter: execution.Adapter = .{ .server = self.adapter.server, .identity = &current, .context = try authority.context(), .database = original.database.?, .namespace = original.namespace.? };
+        const catalog_backend = adapter.backend();
+        for (self.policies) |policy| if (policy.name) |name| {
+            const table = try catalog_backend.vtable.resolve(catalog_backend.ptr, alloc, name, .read);
+            if (table.id != policy.id or table.schema_version != policy.schema_version or !std.mem.eql(u8, table.physical_name, policy.table)) return error.CatalogGenerationChanged;
+        };
     }
 
     fn next(raw: *anyopaque, alloc: std.mem.Allocator, request: wire.Request, limit: u32) !wire.StreamPage {
@@ -313,6 +364,7 @@ const OwnedRead = struct {
     }
 
     fn pull(self: *OwnedRead, alloc: std.mem.Allocator, request: wire.Request, limit: u32) !wire.StreamPage {
+        if (self.detached) return error.InvalidSqlBackendResponse;
         try request.check();
         // Retained snapshots have a hard initial statement deadline, even if
         // later Execute messages carry a newer per-request deadline.
@@ -320,7 +372,7 @@ const OwnedRead = struct {
         try self.authority.credential.validate();
         if (self.session_id) |id_hex| {
             const id = try @import("distributed_txn.zig").parseTxnIdHex(id_hex);
-            if (try self.adapter.server.txn_sessions.principalAccess(self.adapter.server.alloc, id, self.authority.credential.principal) != .allowed) return error.SqlTransactionNotActive;
+            if (try self.adapter.server.txn_sessions.principalAccess(self.adapter.server.alloc, id, self.authority.credential.sessionPrincipal()) != .allowed) return error.SqlTransactionNotActive;
             var state = (try self.adapter.server.txn_sessions.getSqlState(self.adapter.server.alloc, id)) orelse return error.SqlTransactionNotActive;
             defer state.deinit(self.adapter.server.alloc);
             if (state.metadata.failed or state.terminal != null) return error.SqlTransactionNotActive;
@@ -368,14 +420,21 @@ const OwnedRead = struct {
 
     const PageOwner = struct { alloc: std.mem.Allocator, page: Pull.Page };
 
-    fn close(raw: *anyopaque) void {
+    fn detach(raw: *anyopaque) void {
         const self: *OwnedRead = @ptrCast(@alignCast(raw));
+        if (self.detached) return;
+        self.detached = true;
         self.stream.close();
         self.plan.release(self.adapter.server.sqlPlanCacheIo());
         self.admission.release();
-        self.identity.?.deinit(self.adapter.server.alloc);
         self.staged.deinit(self.alloc);
         self.range_guards.deinit(self.adapter.server.alloc);
+    }
+
+    fn close(raw: *anyopaque) void {
+        const self: *OwnedRead = @ptrCast(@alignCast(raw));
+        detach(raw);
+        self.identity.?.deinit(self.adapter.server.alloc);
         if (self.session_id) |id| self.adapter.server.alloc.free(id);
         self.arena.deinit();
         self.alloc.destroy(self);
@@ -389,6 +448,8 @@ const StreamJob = struct {
     request: wire.Request,
     owner: ?*OwnedRead = null,
     limit: u32 = 0,
+    validate_only: bool = false,
+    namespace_only: bool = false,
     opened: ?wire.ReadStream = null,
     page: ?wire.StreamPage = null,
     failure: ?anyerror = null,
@@ -416,6 +477,27 @@ const StreamJob = struct {
         };
     }
     fn runInner(self: *StreamJob) !void {
+        if (self.namespace_only) {
+            const server = self.adapter.server;
+            const domain = @import("../system_catalog/domain.zig");
+            const database = self.request.database orelse "default";
+            const namespace = self.request.namespace orelse "public";
+            try domain.validateName(database);
+            try domain.validateName(namespace);
+            var identity: ?http.AuthenticatedIdentity = try self.credential.identity(server.alloc);
+            defer identity.?.deinit(server.alloc);
+            const resource = try @import("../system_catalog/routes.zig").resourceNameAlloc(self.alloc, .{ .kind = .namespace, .database = database, .name = namespace });
+            defer self.alloc.free(resource);
+            if (!http.permissionsAllow(identity.?.permissions, .namespace, resource, .read)) return error.Forbidden;
+            var admission = try server.acquireSqlExecution(false);
+            defer admission.release();
+            var authority: Authority = .{ .credential = self.credential, .identity = &identity, .request = self.request };
+            const call = server.source.vtable.system_catalog orelse return error.UnsupportedSqlExecution;
+            const response = try call(server.source.ptr, self.alloc, try authority.context(), .{ .read = .{ .kind = .namespace, .database = database, .name = namespace } });
+            self.alloc.free(response);
+            return;
+        }
+        if (self.validate_only) return self.owner.?.validateCursor(self.alloc, self.request);
         if (self.owner) |owner| self.page = try owner.pull(self.alloc, self.request, self.limit) else self.opened = try OwnedRead.open(self.adapter, self.alloc, self.credential, self.request);
     }
 };
@@ -425,6 +507,12 @@ const Credential = struct {
     username: []u8,
     principal: []u8,
     verifier_mac: [Mac.mac_length]u8,
+
+    fn sessionPrincipal(self: *const Credential) []const u8 {
+        // Durable Basic SQL sessions use the username across mixed-version
+        // rollouts. Credential-scoped caches and grants still use `principal`.
+        return self.username;
+    }
 
     fn authenticate(alloc: std.mem.Allocator, manager: *usermgr.UserManager, username: []const u8, password: []const u8) !*Credential {
         // Snapshot only while locked; bcrypt must not serialize policy reads
@@ -558,8 +646,8 @@ const Job = struct {
         defer lease.release(self.adapter.server.sqlPlanCacheIo());
         const compiled = lease.compiled();
         const write = self.kind == .execute and switch (compiled.statement) {
-            .select => false,
-            .insert, .update, .delete, .create_table, .drop_table, .catalog_ddl, .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint => true,
+            .select, .explain => false,
+            .insert, .update, .delete, .merge, .create_table, .drop_table, .catalog_ddl, .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints => true,
         };
         const server = self.adapter.server;
         var admission = try server.acquireSqlExecution(write);
@@ -576,6 +664,7 @@ const Job = struct {
             .database = self.request.database orelse "default",
             .namespace = self.request.namespace orelse "public",
             .session_id = self.request.session_id,
+            .session_namespace = self.request.session_namespace,
         };
         var guarded = GuardedCatalog{
             .native = native_adapter.backend(),
@@ -585,7 +674,7 @@ const Job = struct {
         };
         if (self.kind == .describe) {
             switch (compiled.statement) {
-                .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint => {
+                .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints => {
                     if (self.request.parameter_types.len != 0) return error.InvalidSqlParameters;
                     self.description = .{ .columns = &.{} };
                     return;
@@ -607,7 +696,7 @@ const Job = struct {
             self.description = .{
                 .columns = columns,
                 .parameter_types = parameter_types,
-                .binding_guard = if (description.binding.relation) |relation| if (relation.scans.len != 0) try bindingGuards(self.alloc, native_adapter.revision orelse return error.InvalidSqlBackendResponse, relation.scans) else null else if (description.binding.table) |table| try bindingGuard(self.alloc, native_adapter.revision orelse return error.InvalidSqlBackendResponse, table) else null,
+                .binding_guard = try statementBindingGuard(self.alloc, native_adapter.revision, description.binding),
             };
             return;
         }
@@ -713,7 +802,7 @@ fn commandTag(alloc: std.mem.Allocator, command: []const u8, rows: usize, affect
     if (std.mem.eql(u8, command, "INSERT")) return std.fmt.allocPrint(alloc, "INSERT 0 {d}", .{affected});
     if (std.mem.eql(u8, command, "UPDATE") or std.mem.eql(u8, command, "DELETE")) return std.fmt.allocPrint(alloc, "{s} {d}", .{ command, affected });
     if (std.mem.startsWith(u8, command, "CREATE ") or std.mem.startsWith(u8, command, "DROP ") or std.mem.startsWith(u8, command, "ALTER ")) return alloc.dupe(u8, command);
-    inline for (.{ "BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE" }) |tag| if (std.mem.eql(u8, command, tag)) return alloc.dupe(u8, command);
+    inline for (.{ "BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE", "SET CONSTRAINTS", "TRUNCATE TABLE" }) |tag| if (std.mem.eql(u8, command, tag)) return alloc.dupe(u8, command);
     return error.UnsupportedSqlExecution;
 }
 
@@ -760,7 +849,7 @@ const GuardedCatalog = struct {
     fn backend(self: *GuardedCatalog) catalog.Backend {
         var result = self.native;
         result.ptr = self;
-        result.vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = openScan, .open_statement = openStatement, .mutate = mutate, .prepare_mutations = prepareMutations, .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .checkpoint = checkpoint, .ddl = ddl };
+        result.vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = openScan, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .checkpoint = checkpoint, .ddl = ddl };
         return result;
     }
     fn generateRowId(raw: *anyopaque, alloc: std.mem.Allocator) ![]const u8 {
@@ -769,12 +858,12 @@ const GuardedCatalog = struct {
         const generate = self.native.vtable.generate_row_id orelse return error.UnsupportedSqlExecution;
         return generate(self.native.ptr, alloc);
     }
-    fn resolveConflictOwners(raw: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, columns: []const []const u8, mutations: []const catalog.Mutation) ![]const catalog.ConflictOwner {
+    fn resolveConflictOwners(raw: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, columns: []const []const u8, expressions: []const catalog.ConflictExpression, arbiter_conditions: []const catalog.Condition, mutations: []const catalog.Mutation) ![]const catalog.ConflictOwner {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
         try self.checkRead(table.physical_name);
         if (!Authority.allowsWrite(self.authority, table.physical_name)) return error.Forbidden;
         const resolve_owners = self.native.vtable.resolve_conflict_owners orelse return error.UnsupportedSqlShape;
-        return resolve_owners(self.native.ptr, alloc, table, columns, mutations);
+        return resolve_owners(self.native.ptr, alloc, table, columns, expressions, arbiter_conditions, mutations);
     }
     fn checkpoint(raw: *anyopaque) !void {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
@@ -836,6 +925,14 @@ const GuardedCatalog = struct {
         try checkpoint(raw);
         if (!Authority.allowsWrite(self.authority, table.physical_name)) return error.Forbidden;
         return self.native.vtable.mutate(self.native.ptr, alloc, table, input);
+    }
+
+    fn mutatePrepared(raw: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation) !catalog.MutationOutcome {
+        const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
+        try checkpoint(raw);
+        if (!Authority.allowsWrite(self.authority, table.physical_name)) return error.Forbidden;
+        const commit = self.native.vtable.mutate_prepared orelse return error.UnsupportedSqlExecution;
+        return commit(self.native.ptr, alloc, table, input);
     }
 
     fn prepareMutations(raw: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation) ![]const catalog.Mutation {
@@ -900,6 +997,34 @@ const GuardedCatalog = struct {
         return dispatch_ddl(self.native.ptr, alloc, input);
     }
 };
+
+fn statementBindingGuard(alloc: std.mem.Allocator, revision: ?u64, binding: describe_sql.BoundStatement) !?[]const u8 {
+    var scans: [64]catalog.StatementScan = undefined;
+    var count: usize = 0;
+    try collectBindingTables(binding, &scans, &count, 0);
+    if (count == 0) return null;
+    return try bindingGuards(alloc, revision orelse return error.InvalidSqlBackendResponse, scans[0..count]);
+}
+
+fn collectBindingTable(table: catalog.Table, scans: *[64]catalog.StatementScan, count: *usize) !void {
+    for (scans[0..count.*]) |scan| {
+        if (scan.table.id == table.id and scan.table.schema_version == table.schema_version and std.mem.eql(u8, scan.table.physical_name, table.physical_name)) return;
+    }
+    if (count.* == scans.len) return error.SqlProgramLimitExceeded;
+    scans[count.*] = .{ .table = table, .request = .{ .fields = &.{}, .limit = 1 } };
+    count.* += 1;
+}
+
+fn collectBindingTables(binding: describe_sql.BoundStatement, scans: *[64]catalog.StatementScan, count: *usize, depth: usize) anyerror!void {
+    if (depth >= 64) return error.SqlProgramLimitExceeded;
+    if (binding.table) |table| try collectBindingTable(table, scans, count);
+    if (binding.relation) |relation| for (relation.scans) |scan| {
+        try collectBindingTable(scan.table, scans, count);
+    };
+    if (binding.insert_source) |source| try collectBindingTables(source.*, scans, count, depth + 1);
+    if (binding.joined_mutation) |joined| try collectBindingTables(joined.input.*, scans, count, depth + 1);
+    if (binding.returning) |returning| try collectBindingTables(returning.*, scans, count, depth + 1);
+}
 
 fn bindingGuard(alloc: std.mem.Allocator, revision: u64, table: catalog.Table) ![]const u8 {
     return bindingGuards(alloc, revision, &.{.{ .table = table, .request = .{ .fields = &.{}, .limit = 1 } }});
@@ -966,6 +1091,29 @@ test "SQL pgwire prepared identity rejects same shaped table replacement before 
     try verifyBindingGuard(many, 7, other);
     try verifyBindingGuard(many, 7, table);
     for (0..many.len) |length| try std.testing.expectError(error.CatalogGenerationChanged, verifyBindingGuard(many[0..length], 7, other));
+}
+
+test "SQL pgwire binding manifest includes recursive mutation sources and deduplicates targets" {
+    const target: catalog.Table = .{ .id = 1, .physical_name = "target", .schema_version = 1, .columns = &.{} };
+    const source: catalog.Table = .{ .id = 2, .physical_name = "source", .schema_version = 1, .columns = &.{} };
+    const source_binding: describe_sql.BoundStatement = .{ .table = source, .action = .read, .columns = &.{}, .parameter_types = &.{}, .json_literals = .empty };
+    var binding: describe_sql.BoundStatement = .{ .table = target, .action = .read, .columns = &.{}, .parameter_types = &.{}, .json_literals = .empty, .insert_source = &source_binding, .returning = &source_binding };
+    const inserted = (try statementBindingGuard(std.testing.allocator, 9, binding)).?;
+    defer std.testing.allocator.free(inserted);
+    try std.testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, inserted[8..10], .little));
+    try verifyBindingGuard(inserted, 9, target);
+    try verifyBindingGuard(inserted, 9, source);
+    var replaced = source;
+    replaced.id = 3;
+    try std.testing.expectError(error.CatalogGenerationChanged, verifyBindingGuard(inserted, 9, replaced));
+    var joined: @import("../sql/joined_mutation.zig").Bound = undefined;
+    joined.input = &source_binding;
+    binding.insert_source = null;
+    binding.returning = null;
+    binding.joined_mutation = &joined;
+    const updated = (try statementBindingGuard(std.testing.allocator, 9, binding)).?;
+    defer std.testing.allocator.free(updated);
+    try std.testing.expectEqualSlices(u8, inserted, updated);
 }
 
 test "SQL pgwire credential snapshot observes policy revocation and password rotation" {
@@ -1094,6 +1242,8 @@ test "SQL pgwire command tags carry exact PostgreSQL counts" {
         .{ .command = "INSERT", .expected = "INSERT 0 7" },
         .{ .command = "UPDATE", .expected = "UPDATE 7" },
         .{ .command = "DELETE", .expected = "DELETE 7" },
+        .{ .command = "SET CONSTRAINTS", .expected = "SET CONSTRAINTS" },
+        .{ .command = "TRUNCATE TABLE", .expected = "TRUNCATE TABLE" },
     };
     for (cases) |case| {
         const tag = try commandTag(std.testing.allocator, case.command, 3, 7);

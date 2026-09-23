@@ -272,7 +272,32 @@ pub const AntflyClient = struct {
             request.database = request.database orelse scope.database;
             request.namespace = request.namespace orelse scope.namespace;
         }
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/sql", .{self.inner.base_url});
+        return validateSqlResponse(try self.sqlPost(openapi.types.SQLResponse, "/db/v1/sql", request));
+    }
+
+    pub fn prepareSQL(self: *AntflyClient, body: openapi.types.SQLPrepareRequest) !openapi.ApiResponse(openapi.types.SQLPreparedResponse) {
+        var request = body;
+        if (self.catalog_scope) |scope| {
+            request.database = request.database orelse scope.database;
+            request.namespace = request.namespace orelse scope.namespace;
+        }
+        return self.sqlPost(openapi.types.SQLPreparedResponse, "/db/v1/sql/prepared", request);
+    }
+
+    pub fn executePreparedSQL(self: *AntflyClient, prepared_id: []const u8, body: openapi.types.SQLPreparedExecutionRequest) !openapi.ApiResponse(openapi.types.SQLResponse) {
+        const encoded_id = try httpx.PercentEncoding.encode(self.allocator, prepared_id);
+        defer self.allocator.free(encoded_id);
+        const path = try std.fmt.allocPrint(self.allocator, "/db/v1/sql/prepared/{s}/execute", .{encoded_id});
+        defer self.allocator.free(path);
+        return validateSqlResponse(try self.sqlPost(openapi.types.SQLResponse, path, body));
+    }
+
+    pub fn closePreparedSQL(self: *AntflyClient, prepared_id: []const u8) !openapi.ApiResponse(std.json.ArrayHashMap(std.json.Value)) {
+        return self.inner.closePreparedSQL(prepared_id);
+    }
+
+    fn sqlPost(self: *AntflyClient, comptime T: type, path: []const u8, request: anytype) !openapi.ApiResponse(T) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ self.inner.base_url, path });
         defer self.allocator.free(url);
         const encoded = try httpx.json.Json.stringifyRequest(self.allocator, request);
         defer self.allocator.free(encoded);
@@ -286,9 +311,14 @@ pub const AntflyClient = struct {
             .follow_redirects = false,
             .cookies_enabled = false,
         });
-        var result = try openapi.ApiResponse(openapi.types.SQLResponse).fromResponse(self.allocator, &response);
+        return openapi.ApiResponse(T).fromResponse(self.allocator, &response);
+    }
+
+    fn validateSqlResponse(response: openapi.ApiResponse(openapi.types.SQLResponse)) !openapi.ApiResponse(openapi.types.SQLResponse) {
+        var result = response;
         errdefer result.deinit();
         if (result.data) |data| {
+            if (data.value.rows.len > 4096) return error.InvalidApiResponse;
             for (data.value.rows) |row| if (row.len != data.value.columns.len) return error.InvalidApiResponse;
         }
         return result;

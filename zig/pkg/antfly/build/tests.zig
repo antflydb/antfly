@@ -864,6 +864,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "get index response timeout bounds the complete HTTP request",
             "list indexes response timeout bounds readiness preflight",
             "SQL client preserves typed parameters receipts and forbids replay",
+            "SQL prepared client forbids replay and preserves exact owner identity",
         },
     });
     const run_antfly_client_pkg_tests = addFilteredTestRunArtifact(b, antfly_client_pkg_tests);

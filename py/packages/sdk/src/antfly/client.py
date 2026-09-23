@@ -48,6 +48,9 @@ from antfly.client_generated.models import (
     OpenAIEmbedderConfig,
     QueryResponses,
     SQLDiagnostic,
+    SQLPreparedExecutionRequest,
+    SQLPreparedResponse,
+    SQLPrepareRequest,
     SQLRequest,
     SQLResponse,
 )
@@ -756,7 +759,7 @@ class AntflyClient:
                     if not msg:
                         msg = response.reason_phrase or f"HTTP {response.status_code}"
                     if (
-                        path == "/db/v1/sql"
+                        (path == "/db/v1/sql" or path.startswith("/db/v1/sql/prepared"))
                         and error_body is not None
                         and isinstance(error_body.get("code"), str)
                         and len(error_body["code"]) == 5
@@ -1006,21 +1009,41 @@ class AntflyClient:
         Integer-typed result cells are decimal strings. Other JSON numbers retain
         Python's native integer precision. The response body is bounded to 16 MiB.
         """
+        return self._sql_result(self._sql_request("POST", "/db/v1/sql", request.to_dict()))
+
+    def prepare_sql(self, request: SQLPrepareRequest) -> SQLPreparedResponse:
+        """Create an owner-bound durable resource independent of transactions."""
+        return SQLPreparedResponse.from_dict(self._sql_request("POST", "/db/v1/sql/prepared", request.to_dict()))
+
+    def execute_prepared_sql(self, prepared_id: str, request: SQLPreparedExecutionRequest) -> SQLResponse:
+        """Execute with fresh authorization, without replaying ambiguous mutations."""
+        return self._sql_result(
+            self._sql_request("POST", f"/db/v1/sql/prepared/{quote(prepared_id, safe='')}/execute", request.to_dict())
+        )
+
+    def close_prepared_sql(self, prepared_id: str) -> None:
+        """Close a resource; already admitted executions may finish."""
+        self._sql_request("DELETE", f"/db/v1/sql/prepared/{quote(prepared_id, safe='')}", None)
+
+    def _sql_request(self, method: str, path: str, value: dict[str, Any] | None) -> dict[str, Any]:
         from .sql_transport import encode_sql_request
 
         try:
-            encoded = encode_sql_request(request.to_dict())
+            encoded = encode_sql_request(value) if value is not None else b""
         except (TypeError, ValueError) as error:
             raise AntflyException(f"Invalid SQL request: {error}") from error
-        body = self._request(
-            "POST",
-            "/db/v1/sql",
+        return self._request(
+            method,
+            path,
             content=encoded,
             headers={"Content-Type": "application/json"},
             follow_redirects=False,
             _expected_status=200,
             _max_response_bytes=16 << 20,
         )
+
+    @staticmethod
+    def _sql_result(body: dict[str, Any]) -> SQLResponse:
         if (
             not isinstance(body, dict)
             or not isinstance(body.get("rows"), list)

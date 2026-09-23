@@ -18,6 +18,9 @@
 const std = @import("std");
 pub const backend = @import("backend.zig");
 const values = @import("values.zig");
+const commands = @import("session_commands.zig");
+const Spool = @import("cursor_spool.zig").Store;
+const Budget = @import("budget.zig").Budget;
 
 pub const Limits = struct {
     frame_bytes: u32 = 1024 * 1024,
@@ -27,6 +30,8 @@ pub const Limits = struct {
     parameters: u16 = 256,
     columns: u16 = 1024,
     result_rows: u32 = 4096,
+    cursor_rows: u32 = 65536,
+    cursor_bytes: usize = 8 << 20,
     startup_timeout_ms: u32 = 5000,
     idle_timeout_ms: u32 = 60000,
     statement_timeout_ms: u32 = 30000,
@@ -44,6 +49,7 @@ const Prepared = struct {
     statement: []const u8,
     parameter_oids: []const u32,
     description: backend.Description,
+    namespace: []const u8,
 };
 
 const Portal = struct {
@@ -53,6 +59,7 @@ const Portal = struct {
     types: []const backend.Type,
     formats: []const u16,
     description: backend.Description,
+    namespace: ?[]const u8 = null,
     result: ?backend.Result = null,
     stream: ?backend.ReadStream = null,
     stream_opened: bool = false,
@@ -69,6 +76,13 @@ const SqlCursor = struct {
     session_id: []const u8,
     fetched: u64 = 0,
     exhausted: bool = false,
+    spool: ?Spool = null,
+    scroll: bool = false,
+    hold: bool = false,
+    committed: bool = false,
+    database: ?[]const u8 = null,
+    namespace: ?[]const u8 = null,
+    creation_epoch: u64 = 0,
 };
 
 pub const Session = struct {
@@ -87,6 +101,15 @@ pub const Session = struct {
     prepared: std.StringHashMapUnmanaged(Prepared) = .empty,
     portals: std.StringHashMapUnmanaged(Portal) = .empty,
     sql_cursors: std.StringHashMapUnmanaged(SqlCursor) = .empty,
+    cursor_budget: ?*Budget = null,
+    cursor_epoch: u64 = 0,
+    statement_timeout: ?u32 = null,
+    application_name: commands.ApplicationName = .{},
+    namespace_setting: ?commands.Namespace = null,
+    request_namespace: ?[]const u8 = null,
+    transaction_namespace: ?commands.Namespace = null,
+    timeout_transaction: ?struct { before: ?u32, committed: ?u32, namespace_before: ?commands.Namespace, namespace_committed: ?commands.Namespace, application_before: commands.ApplicationName, application_committed: commands.ApplicationName } = null,
+    savepoints: std.ArrayList(struct { name: []const u8, epoch: u64, timeout: ?u32, committed_timeout: ?u32, namespace: ?commands.Namespace, committed_namespace: ?commands.Namespace, application: commands.ApplicationName, committed_application: commands.ApplicationName }) = .empty,
     skip_until_sync: bool = false,
     backend_pid: i32 = 0,
     cancel_key: i32 = 0,
@@ -97,6 +120,7 @@ pub const Session = struct {
     deadline_changed: std.Io.Event = .unset,
     diagnostic: backend.Diagnostic = .{},
     mutation_ack_pending: bool = false,
+    discard_after_reply: bool = false,
 
     pub fn deinit(self: *Session) void {
         if (self.hooks) |hooks| hooks.unregister(hooks.context, self);
@@ -104,17 +128,16 @@ pub const Session = struct {
         // Close them before disconnecting/releasing that credential.
         self.clearPortals();
         self.clearSqlCursors();
+        self.clearCursorSavepoints();
+        self.savepoints.deinit(self.alloc);
+        if (self.cursor_budget) |budget| self.alloc.destroy(budget);
         if (self.identity) |identity| {
             self.source.vtable.disconnect(self.source.context, identity, self.session_id);
             identity.release(identity.context, self.alloc);
         }
         self.portals.deinit(self.alloc);
         self.sql_cursors.deinit(self.alloc);
-        var it = self.prepared.iterator();
-        while (it.next()) |entry| {
-            self.alloc.free(entry.key_ptr.*);
-            entry.value_ptr.arena.deinit();
-        }
+        self.clearPrepared();
         self.prepared.deinit(self.alloc);
         if (self.database) |value| self.alloc.free(value);
         if (self.namespace) |value| self.alloc.free(value);
@@ -149,7 +172,8 @@ pub const Session = struct {
                 return;
             }
             if (self.skip_until_sync and tag != 'S') continue;
-            self.setDeadline(self.limits.statement_timeout_ms);
+            const timeout = self.statement_timeout orelse self.limits.statement_timeout_ms;
+            self.setDeadline(if (timeout == 0) self.limits.statement_timeout_ms else @min(timeout, self.limits.statement_timeout_ms));
             self.diagnostic = .{};
             self.mutation_ack_pending = false;
             self.dispatch(tag, payload) catch |err| {
@@ -160,9 +184,20 @@ pub const Session = struct {
                     if (status == .idle) {
                         if (self.session_id) |id| self.alloc.free(id);
                         self.session_id = null;
+                        if (self.timeout_transaction) |settings| {
+                            self.statement_timeout = settings.before;
+                            self.namespace_setting = settings.namespace_before;
+                            self.application_name = settings.application_before;
+                        }
+                        self.timeout_transaction = null;
+                        self.transaction_namespace = null;
+                        self.clearCursorSavepoints();
                     }
-                } else if (self.status == .in_transaction) self.status = .failed;
-                if (self.status != .in_transaction) self.clearSqlCursors();
+                } else if (self.status == .in_transaction) {
+                    self.markTransactionFailed("");
+                    self.status = .failed;
+                }
+                if (self.status == .idle) self.finishSqlCursors(false);
                 if (self.mutation_ack_pending) self.diagnostic.set("40003", "mutation committed but its acknowledgement failed; do not replay this statement", self.diagnostic.transaction_id, false);
                 if (self.diagnostic.code != null) try self.sendDiagnostic('E', self.diagnostic, null) else try self.sendError(sqlstate(err), @errorName(err));
                 if (tag == 'Q') try self.ready();
@@ -208,7 +243,9 @@ pub const Session = struct {
                             database = value;
                         } else if (std.mem.eql(u8, key, "client_encoding")) {
                             if (!std.ascii.eqlIgnoreCase(value, "UTF8") and !std.ascii.eqlIgnoreCase(value, "UTF-8")) return error.UnsupportedEncoding;
-                        } else if (!std.mem.eql(u8, key, "application_name")) {
+                        } else if (std.mem.eql(u8, key, "application_name")) {
+                            self.application_name = try commands.ApplicationName.init(value);
+                        } else {
                             // Never accept unchecked search_path/options that
                             // could silently change resolution or permissions.
                             return error.UnsupportedStartupOption;
@@ -264,13 +301,18 @@ pub const Session = struct {
         return self.reader.readAlloc(self.alloc, len - 4);
     }
 
+    fn effectiveNamespace(self: *const Session) []const u8 {
+        return if (self.namespace_setting) |*value| value.slice() else self.namespace orelse "public";
+    }
+
     fn request(self: *Session, statement: []const u8, parameters: []const std.json.Value, types: []const backend.Type) backend.Request {
         return .{
             .statement = statement,
             .parameters = parameters,
             .parameter_types = types,
             .database = self.database,
-            .namespace = self.namespace,
+            .namespace = self.request_namespace orelse self.effectiveNamespace(),
+            .session_namespace = if (self.transaction_namespace) |*value| value.slice() else null,
             .session_id = self.session_id,
             .limit = self.limits.result_rows,
             .io = self.io,
@@ -281,6 +323,17 @@ pub const Session = struct {
     }
 
     fn describe(self: *Session, alloc: std.mem.Allocator, statement: []const u8, types: []const backend.Type) !backend.Description {
+        if (try commands.settingCommand(alloc, statement)) |setting| {
+            if (types.len != 0) return error.InvalidParameter;
+            return .{ .columns = switch (setting) {
+                .search_path => |value| if (value == .show) &.{.{ .name = "search_path", .type = .string }} else &.{},
+                .statement_timeout => |value| if (value == .show) &.{.{ .name = "statement_timeout", .type = .string }} else &.{},
+                .application_name => |value| if (value == .show) &.{.{ .name = "application_name", .type = .string }} else &.{},
+                .client_encoding => |value| if (value == .show) &.{.{ .name = "client_encoding", .type = .string }} else &.{},
+                .reset_all => &.{},
+                .discard_all => &.{},
+            } };
+        }
         self.cancel_requested.store(false, .release);
         self.executing.store(true, .release);
         defer self.executing.store(false, .release);
@@ -292,12 +345,33 @@ pub const Session = struct {
     }
 
     fn execute(self: *Session, alloc: std.mem.Allocator, statement: []const u8, parameters: []const std.json.Value, types: []const backend.Type, binding_guard: ?[]const u8) !backend.Result {
+        if (try commands.settingCommand(alloc, statement)) |setting| {
+            if (parameters.len != 0 or types.len != 0) return error.InvalidParameter;
+            return switch (setting) {
+                .search_path => |value| self.executeSearchPathSetting(alloc, statement, value),
+                .statement_timeout => |value| self.executeTimeoutSetting(alloc, value),
+                .application_name => |value| self.executeApplicationNameSetting(alloc, value),
+                .client_encoding => |value| self.executeEncodingSetting(alloc, value),
+                .reset_all => self.executeResetAll(),
+                .discard_all => self.executeDiscardAll(),
+            };
+        }
         self.cancel_requested.store(false, .release);
         self.executing.store(true, .release);
         defer self.executing.store(false, .release);
         var req = self.request(statement, parameters, types);
         req.binding_guard = binding_guard;
         try req.check();
+        const control = try commands.control(alloc, statement);
+        var savepoint_name: ?[]const u8 = null;
+        defer if (savepoint_name) |name| self.alloc.free(name);
+        if (control) |value| if (value == .savepoint) {
+            if (self.savepoints.items.len >= 64) return error.ProgramLimitExceeded;
+            savepoint_name = try self.alloc.dupe(u8, value.savepoint);
+            try self.savepoints.ensureUnusedCapacity(self.alloc, 1);
+        };
+        if (commands.isCommit(statement)) try self.materializeHeldCursors();
+        const previous_status = self.status;
         var result = try self.source.vtable.execute(self.source.context, alloc, self.identity orelse return error.AuthenticationFailed, req);
         errdefer result.deinit();
         if (result.mutation_outcome != null) {
@@ -313,8 +387,170 @@ pub const Session = struct {
         if (self.session_id) |old| self.alloc.free(old);
         self.session_id = session;
         self.status = result.transaction_status;
-        if (self.status == .idle) self.clearSqlCursors();
+        if (previous_status == .idle and self.status == .in_transaction) {
+            self.timeout_transaction = .{ .before = self.statement_timeout, .committed = self.statement_timeout, .namespace_before = self.namespace_setting, .namespace_committed = self.namespace_setting, .application_before = self.application_name, .application_committed = self.application_name };
+            self.transaction_namespace = try commands.Namespace.init(req.namespace orelse "public");
+        }
+        if (control) |value| switch (value) {
+            .savepoint => {
+                self.savepoints.appendAssumeCapacity(.{ .name = savepoint_name.?, .epoch = self.cursor_epoch, .timeout = self.statement_timeout, .committed_timeout = if (self.timeout_transaction) |settings| settings.committed else self.statement_timeout, .namespace = self.namespace_setting, .committed_namespace = if (self.timeout_transaction) |settings| settings.namespace_committed else self.namespace_setting, .application = self.application_name, .committed_application = if (self.timeout_transaction) |settings| settings.application_committed else self.application_name });
+                savepoint_name = null;
+            },
+            .release, .rollback_to => |name| {
+                var index = self.savepoints.items.len;
+                while (index != 0) {
+                    index -= 1;
+                    if (std.mem.eql(u8, name, self.savepoints.items[index].name)) {
+                        if (value == .rollback_to) {
+                            self.discardCursorsAfter(self.savepoints.items[index].epoch);
+                            self.statement_timeout = self.savepoints.items[index].timeout;
+                            self.namespace_setting = self.savepoints.items[index].namespace;
+                            self.application_name = self.savepoints.items[index].application;
+                            if (self.timeout_transaction) |*settings| {
+                                settings.committed = self.savepoints.items[index].committed_timeout;
+                                settings.namespace_committed = self.savepoints.items[index].committed_namespace;
+                                settings.application_committed = self.savepoints.items[index].committed_application;
+                            }
+                        }
+                        const keep = index + @as(usize, if (value == .rollback_to) 1 else 0);
+                        for (self.savepoints.items[keep..]) |point| self.alloc.free(point.name);
+                        self.savepoints.shrinkRetainingCapacity(keep);
+                        break;
+                    }
+                }
+            },
+        };
+        if (self.status == .idle) self.clearCursorSavepoints();
+        if (self.status == .idle) if (self.timeout_transaction) |settings| {
+            self.statement_timeout = if (std.ascii.eqlIgnoreCase(result.command_tag, "COMMIT")) settings.committed else settings.before;
+            self.namespace_setting = if (std.ascii.eqlIgnoreCase(result.command_tag, "COMMIT")) settings.namespace_committed else settings.namespace_before;
+            self.application_name = if (std.ascii.eqlIgnoreCase(result.command_tag, "COMMIT")) settings.application_committed else settings.application_before;
+            self.timeout_transaction = null;
+            self.transaction_namespace = null;
+        };
+        if (self.status == .idle) self.finishSqlCursors(std.ascii.eqlIgnoreCase(result.command_tag, "COMMIT"));
         return result;
+    }
+
+    fn executeSearchPathSetting(self: *Session, alloc: std.mem.Allocator, statement: []const u8, setting: commands.SearchPathSetting) !backend.Result {
+        if (self.status == .failed) return error.InFailedSqlTransaction;
+        var result: backend.Result = .{ .command_tag = if (setting == .show) "SHOW" else if (setting == .reset) "RESET" else "SET", .transaction_status = self.status, .session_id = self.session_id };
+        if (setting == .show) {
+            result.columns = &.{.{ .name = "search_path", .type = .string }};
+            const row = try alloc.alloc(std.json.Value, 1);
+            row[0] = .{ .string = try alloc.dupe(u8, self.effectiveNamespace()) };
+            const rows = try alloc.alloc([]const std.json.Value, 1);
+            rows[0] = row;
+            result.rows = rows;
+            return result;
+        }
+        const update = if (setting == .reset) (commands.SearchPathSetting{ .set = .{ .local = false, .namespace = null } }).set else setting.set;
+        if (update.local and self.status != .in_transaction) return error.NoActiveSqlTransaction;
+        const validate = self.source.vtable.validate_namespace orelse return error.UnsupportedSqlExecution;
+        var request_value = self.request(statement, &.{}, &.{});
+        request_value.namespace = if (update.namespace) |*value| value.slice() else self.namespace orelse "public";
+        self.cancel_requested.store(false, .release);
+        self.executing.store(true, .release);
+        defer self.executing.store(false, .release);
+        try request_value.check();
+        try validate(self.source.context, alloc, self.identity orelse return error.AuthenticationFailed, request_value);
+        self.namespace_setting = update.namespace;
+        if (!update.local) if (self.timeout_transaction) |*settings| {
+            settings.namespace_committed = update.namespace;
+        };
+        return result;
+    }
+
+    fn executeTimeoutSetting(self: *Session, alloc: std.mem.Allocator, setting: commands.TimeoutSetting) !backend.Result {
+        if (self.status == .failed) return error.InFailedSqlTransaction;
+        var result: backend.Result = .{ .command_tag = if (setting == .show) "SHOW" else if (setting == .reset) "RESET" else "SET", .transaction_status = self.status, .session_id = self.session_id };
+        if (setting == .show) {
+            result.columns = &.{.{ .name = "statement_timeout", .type = .string }};
+            const row = try alloc.alloc(std.json.Value, 1);
+            row[0] = .{ .string = try std.fmt.allocPrint(alloc, "{d}ms", .{self.statement_timeout orelse self.limits.statement_timeout_ms}) };
+            const rows = try alloc.alloc([]const std.json.Value, 1);
+            rows[0] = row;
+            result.rows = rows;
+            return result;
+        }
+        const update = if (setting == .reset) (commands.TimeoutSetting{ .set = .{ .local = false, .milliseconds = null } }).set else setting.set;
+        if (update.local and self.status != .in_transaction) return error.NoActiveSqlTransaction;
+        // A client may shorten its deadline or request zero, but cannot remove
+        // the operator-configured hard statement timeout.
+        self.statement_timeout = update.milliseconds;
+        if (!update.local) if (self.timeout_transaction) |*settings| {
+            settings.committed = update.milliseconds;
+        };
+        return result;
+    }
+
+    fn executeApplicationNameSetting(self: *Session, alloc: std.mem.Allocator, setting: commands.ApplicationNameSetting) !backend.Result {
+        if (self.status == .failed) return error.InFailedSqlTransaction;
+        var result: backend.Result = .{ .command_tag = if (setting == .show) "SHOW" else if (setting == .reset) "RESET" else "SET", .transaction_status = self.status, .session_id = self.session_id };
+        if (setting == .show) {
+            result.columns = &.{.{ .name = "application_name", .type = .string }};
+            const row = try alloc.alloc(std.json.Value, 1);
+            row[0] = .{ .string = try alloc.dupe(u8, self.application_name.slice()) };
+            const rows = try alloc.alloc([]const std.json.Value, 1);
+            rows[0] = row;
+            result.rows = rows;
+            return result;
+        }
+        const update = if (setting == .reset) (commands.ApplicationNameSetting{ .set = .{ .local = false, .value = .{} } }).set else setting.set;
+        if (update.local and self.status != .in_transaction) return error.NoActiveSqlTransaction;
+        self.application_name = update.value;
+        if (!update.local) if (self.timeout_transaction) |*settings| {
+            settings.application_committed = update.value;
+        };
+        return result;
+    }
+
+    fn executeEncodingSetting(self: *Session, alloc: std.mem.Allocator, setting: commands.EncodingSetting) !backend.Result {
+        if (self.status == .failed) return error.InFailedSqlTransaction;
+        var result: backend.Result = .{ .command_tag = if (setting == .show) "SHOW" else if (setting == .reset) "RESET" else "SET", .transaction_status = self.status, .session_id = self.session_id };
+        if (setting == .show) {
+            result.columns = &.{.{ .name = "client_encoding", .type = .string }};
+            const row = try alloc.alloc(std.json.Value, 1);
+            row[0] = .{ .string = "UTF8" };
+            const rows = try alloc.alloc([]const std.json.Value, 1);
+            rows[0] = row;
+            result.rows = rows;
+        } else if (setting == .set and setting.set.local and self.status != .in_transaction) return error.NoActiveSqlTransaction;
+        return result;
+    }
+
+    fn executeResetAll(self: *Session) !backend.Result {
+        if (self.status == .failed) return error.InFailedSqlTransaction;
+        self.statement_timeout = null;
+        self.namespace_setting = null;
+        self.application_name = .{};
+        // RESET ALL is a session-level change even inside a transaction.
+        // Savepoint snapshots can still roll it back locally; a committed
+        // transaction publishes the reset values.
+        if (self.timeout_transaction) |*settings| {
+            settings.committed = null;
+            settings.namespace_committed = null;
+            settings.application_committed = .{};
+        }
+        return .{ .command_tag = "RESET", .transaction_status = self.status, .session_id = self.session_id };
+    }
+
+    fn executeDiscardAll(self: *Session) !backend.Result {
+        if (self.status == .failed) return error.InFailedSqlTransaction;
+        if (self.status != .idle) return error.ActiveSqlTransaction;
+        _ = try self.executeResetAll();
+        // The current extended-protocol portal may own the statement and
+        // result being serialized. Release resources only after CommandComplete.
+        self.discard_after_reply = true;
+        return .{ .command_tag = "DISCARD ALL", .transaction_status = .idle, .session_id = self.session_id };
+    }
+
+    fn finishDiscardAll(self: *Session) void {
+        if (!self.discard_after_reply) return;
+        self.discard_after_reply = false;
+        self.clearPortals();
+        self.clearSqlCursors();
+        self.clearPrepared();
     }
 
     fn dispatch(self: *Session, tag: u8, payload: []const u8) !void {
@@ -333,7 +569,7 @@ pub const Session = struct {
                     if (try self.sessionCommand(arena.allocator(), statement)) {
                         if (self.status == .idle) {
                             self.clearPortals();
-                            self.clearSqlCursors();
+                            self.finishSqlCursors(false);
                         }
                         try self.ready();
                         return;
@@ -349,10 +585,11 @@ pub const Session = struct {
                     if (result.sql_nulls) |flags| if (flags.len != result.rows.len) return error.InvalidResult;
                     for (result.rows, 0..) |row, index| try self.dataRow(result.columns, &.{}, row, if (result.sql_nulls) |flags| flags[index] else null);
                     try self.complete(result);
+                    self.finishDiscardAll();
                 }
                 if (self.status == .idle) {
                     self.clearPortals();
-                    self.clearSqlCursors();
+                    self.finishSqlCursors(false);
                 }
                 try self.ready();
             },
@@ -385,7 +622,8 @@ pub const Session = struct {
                 errdefer if (!transferred) self.alloc.free(owned_name);
                 self.removePrepared(name);
                 if (name.len == 0) self.removePortal("");
-                try self.prepared.put(self.alloc, owned_name, .{ .arena = arena, .statement = owned_statement, .parameter_oids = oids, .description = description });
+                const namespace = try a.dupe(u8, self.request_namespace orelse self.effectiveNamespace());
+                try self.prepared.put(self.alloc, owned_name, .{ .arena = arena, .statement = owned_statement, .parameter_oids = oids, .description = description, .namespace = namespace });
                 transferred = true;
                 try self.message('1', "");
             },
@@ -437,7 +675,8 @@ pub const Session = struct {
                 const owned_name = try self.alloc.dupe(u8, name);
                 errdefer if (!transferred) self.alloc.free(owned_name);
                 self.removePortal(name);
-                try self.portals.put(self.alloc, owned_name, .{ .arena = arena, .statement = text, .parameters = parameters, .types = types, .formats = result_formats, .description = description });
+                const namespace = try a.dupe(u8, statement.namespace);
+                try self.portals.put(self.alloc, owned_name, .{ .arena = arena, .statement = text, .parameters = parameters, .types = types, .formats = result_formats, .description = description, .namespace = namespace });
                 transferred = true;
                 try self.message('2', "");
             },
@@ -468,6 +707,9 @@ pub const Session = struct {
                 if (requested < 0) return error.ProtocolViolation;
                 try cursor.finish();
                 const portal = self.portals.getPtr(name) orelse return error.InvalidPortalName;
+                const previous_namespace = self.request_namespace;
+                self.request_namespace = portal.namespace;
+                defer self.request_namespace = previous_namespace;
                 if (portal.failed) return error.PortalExecutionFailed;
                 portal.failed = true;
                 errdefer if (portal.stream) |stream| {
@@ -476,14 +718,14 @@ pub const Session = struct {
                 };
                 if (!portal.stream_opened) {
                     portal.stream_opened = true;
-                    if (self.source.vtable.open_stream) |open| {
+                    if (self.source.vtable.open_stream) |open| if (try commands.settingCommand(portal.arena.allocator(), portal.statement) == null) {
                         self.cancel_requested.store(false, .release);
                         self.executing.store(true, .release);
                         defer self.executing.store(false, .release);
                         var req = self.request(portal.statement, portal.parameters, portal.types);
                         req.binding_guard = portal.description.binding_guard;
                         portal.stream = try open(self.source.context, self.alloc, self.identity orelse return error.AuthenticationFailed, req);
-                    }
+                    };
                 }
                 if (portal.stream != null or portal.stream_complete) {
                     try self.executeStream(portal, requested);
@@ -505,7 +747,12 @@ pub const Session = struct {
                 for (result.rows[portal.offset..][0..count], portal.offset..) |row, index| try self.dataRow(result.columns, portal.formats, row, if (result.sql_nulls) |flags| flags[index] else null);
                 portal.offset += count;
                 if (portal.offset < result.rows.len) try self.message('s', "") else try self.complete(result);
+                if (result.ddl_receipt_json != null and std.mem.eql(u8, result.command_tag, "DDL PENDING")) {
+                    self.skip_until_sync = true;
+                    return;
+                }
                 portal.failed = false;
+                self.finishDiscardAll();
             },
             'C' => {
                 const target = try cursor.int(u8);
@@ -549,7 +796,8 @@ pub const Session = struct {
                 const sql = try a.dupe(u8, prepare.statement);
                 const name = try self.alloc.dupe(u8, prepare.name);
                 errdefer self.alloc.free(name);
-                try self.prepared.put(self.alloc, name, .{ .arena = arena, .statement = sql, .parameter_oids = oids, .description = description });
+                const namespace = try a.dupe(u8, self.request_namespace orelse self.effectiveNamespace());
+                try self.prepared.put(self.alloc, name, .{ .arena = arena, .statement = sql, .parameter_oids = oids, .description = description, .namespace = namespace });
                 // Map ownership has transferred before writing an acknowledgement.
                 // A failed socket is handled by connection cleanup, never replay.
             },
@@ -568,6 +816,9 @@ pub const Session = struct {
             },
             .execute => |execute_command| {
                 const prepared = self.prepared.get(execute_command.name) orelse return error.InvalidStatementName;
+                const previous_namespace = self.request_namespace;
+                self.request_namespace = prepared.namespace;
+                defer self.request_namespace = previous_namespace;
                 if (execute_command.expressions.len != prepared.description.parameter_types.len) return error.InvalidParameter;
                 const evaluator = self.source.vtable.evaluate_parameters orelse return error.UnsupportedSqlExecution;
                 self.cancel_requested.store(false, .release);
@@ -587,15 +838,12 @@ pub const Session = struct {
                 return true;
             },
             .declare_cursor => |declaration| {
-                self.declareCursor(declaration.name, declaration.statement) catch |err| {
-                    self.markTransactionFailed(declaration.statement);
-                    return err;
-                };
+                try self.declareCursor(declaration.name, declaration.statement, declaration.scroll, declaration.hold);
                 return true;
             },
             .fetch_cursor => |fetch| {
-                self.fetchCursor(fetch.name, fetch.count) catch |err| {
-                    self.markTransactionFailed("");
+                self.fetchCursor(fetch) catch |err| {
+                    self.removeSqlCursor(fetch.name);
                     return err;
                 };
                 return true;
@@ -617,11 +865,11 @@ pub const Session = struct {
         return true;
     }
 
-    fn declareCursor(self: *Session, name: []const u8, statement: []const u8) !void {
-        if (self.status != .in_transaction or self.session_id == null) return error.CursorMustBeInTransaction;
+    fn declareCursor(self: *Session, name: []const u8, statement: []const u8, scroll: bool, hold: bool) !void {
+        if (self.status == .failed) return error.SqlTransactionAborted;
+        if (!hold and (self.status != .in_transaction or self.session_id == null)) return error.CursorMustBeInTransaction;
         if (self.sql_cursors.contains(name)) return error.DuplicateCursorName;
         if (self.sql_cursors.count() >= self.limits.portals) return error.ProgramLimitExceeded;
-        const open = self.source.vtable.open_stream orelse return error.UnsupportedSqlExecution;
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         var arena_moved = false;
         defer if (!arena_moved) arena.deinit();
@@ -633,36 +881,78 @@ pub const Session = struct {
         var req = self.request(statement, &.{}, &.{});
         req.binding_guard = description.binding_guard;
         try req.check();
-        const stream = open(self.source.context, self.alloc, self.identity orelse return error.AuthenticationFailed, req) catch |err| {
-            return err;
-        } orelse {
-            return error.UnsupportedSqlExecution;
-        };
+        const identity = self.identity orelse return error.AuthenticationFailed;
+        const stream = if (self.source.vtable.open_stream) |open| try open(self.source.context, self.alloc, identity, req) else null;
         var stream_moved = false;
-        defer if (!stream_moved) stream.close(stream.context);
-        if (!columnsEqual(description.columns, stream.columns)) return error.InvalidResult;
+        defer if (!stream_moved) if (stream) |opened| opened.close(opened.context);
+        var spool: ?Spool = null;
+        var spool_moved = false;
+        defer if (!spool_moved) if (spool) |*owned| owned.deinit();
+        if (stream) |opened| {
+            if (!columnsEqual(description.columns, opened.columns)) return error.InvalidResult;
+            if (scroll or hold) if (opened.validate == null or opened.detach == null) return error.UnsupportedSqlExecution;
+        }
+        if (stream == null or scroll or hold) {
+            if (self.cursor_budget == null) {
+                const budget = try self.alloc.create(Budget);
+                budget.* = .{ .child = self.alloc, .limit = @min(self.limits.cursor_bytes, self.limits.connection_bytes) };
+                self.cursor_budget = budget;
+            }
+            spool = Spool.init(self.cursor_budget.?);
+        }
+        if (stream == null) {
+            // Blocking sorts/aggregates decline pull execution. Materialize
+            // once under the statement row cap, then copy into the shared
+            // cursor byte/row budget before exposing a cursor name.
+            var result = try self.source.vtable.execute(self.source.context, arena.allocator(), identity, req);
+            defer result.deinit();
+            const same_session = if (self.session_id) |id|
+                if (result.session_id) |observed| std.mem.eql(u8, id, observed) else false
+            else
+                result.session_id == null;
+            if (!columnsEqual(description.columns, result.columns) or !std.mem.startsWith(u8, result.command_tag, "SELECT") or
+                result.mutation_outcome != null or result.ddl_receipt_json != null or result.continuation != null or
+                result.transaction_status != self.status or !same_session or result.rows.len > self.limits.result_rows) return error.InvalidResult;
+            spool.?.append(result, self.limits.cursor_rows) catch |err| return if (err == error.OutOfMemory) error.ProgramLimitExceeded else err;
+        }
         const owned_statement = try arena.allocator().dupe(u8, statement);
-        const session_id = try arena.allocator().dupe(u8, self.session_id.?);
+        const session_id = try arena.allocator().dupe(u8, self.session_id orelse "");
         const key = try self.alloc.dupe(u8, name);
         var key_moved = false;
         defer if (!key_moved) self.alloc.free(key);
-        try self.sql_cursors.put(self.alloc, key, .{ .arena = arena, .statement = owned_statement, .description = description, .stream = stream, .session_id = session_id });
+        const database = if (self.database) |value| try arena.allocator().dupe(u8, value) else null;
+        const namespace = try arena.allocator().dupe(u8, self.request_namespace orelse self.effectiveNamespace());
+        self.cursor_epoch = std.math.add(u64, self.cursor_epoch, 1) catch return error.ProgramLimitExceeded;
+        try self.sql_cursors.put(self.alloc, key, .{ .arena = arena, .statement = owned_statement, .description = description, .stream = stream, .session_id = session_id, .scroll = scroll, .hold = hold, .committed = hold and self.status == .idle, .spool = spool, .exhausted = stream == null, .database = database, .namespace = namespace, .creation_epoch = self.cursor_epoch });
         key_moved = true;
         arena_moved = true;
         stream_moved = true;
+        spool_moved = true;
+        errdefer self.removeSqlCursor(name);
+        if (hold and self.status == .idle) try self.fillCursor(self.sql_cursors.getPtr(name).?, std.math.maxInt(usize));
         try self.command("DECLARE CURSOR");
     }
 
-    fn fetchCursor(self: *Session, name: []const u8, count: u32) !void {
-        if (self.status != .in_transaction or self.session_id == null) return error.CursorMustBeInTransaction;
-        const cursor = self.sql_cursors.getPtr(name) orelse return error.InvalidCursorName;
-        if (!std.mem.eql(u8, cursor.session_id, self.session_id.?)) return error.InvalidCursorName;
+    fn fetchCursor(self: *Session, fetch: commands.Fetch) !void {
+        if (self.status == .failed) return error.SqlTransactionAborted;
+        const cursor = self.sql_cursors.getPtr(fetch.name) orelse return error.InvalidCursorName;
+        if (!cursor.committed and (self.status != .in_transaction or self.session_id == null or !std.mem.eql(u8, cursor.session_id, self.session_id.?))) return error.CursorMustBeInTransaction;
         self.cancel_requested.store(false, .release);
         self.executing.store(true, .release);
         defer self.executing.store(false, .release);
         var req = self.request(cursor.statement, &.{}, &.{});
         req.binding_guard = cursor.description.binding_guard;
+        req.database = cursor.database;
+        req.namespace = cursor.namespace;
         try req.check();
+        if (cursor.spool != null) {
+            self.fetchSpooled(cursor, fetch, req) catch |err| {
+                self.removeSqlCursor(fetch.name);
+                return err;
+            };
+            return;
+        }
+        if (fetch.direction != .forward) return error.CursorNotScrollable;
         var completed = false;
         const fetched_before = cursor.fetched;
         errdefer if (!completed) {
@@ -671,8 +961,8 @@ pub const Session = struct {
                 stream.close(stream.context);
             }
         };
-        try self.rowDescription(cursor.description.columns, &.{});
-        var remaining: usize = if (count == std.math.maxInt(u32)) std.math.maxInt(usize) else count;
+        if (!fetch.move) try self.rowDescription(cursor.description.columns, &.{});
+        var remaining: usize = if (fetch.count == std.math.maxInt(u32)) std.math.maxInt(usize) else fetch.count;
         while (!cursor.exhausted and remaining != 0) {
             try req.check();
             const stream = cursor.stream orelse {
@@ -691,7 +981,7 @@ pub const Session = struct {
             if (page.result.mutation_outcome != null or page.result.continuation != null or page.result.session_id != null or page.result.rows.len > wanted or !columnsEqual(cursor.description.columns, page.result.columns)) return error.InvalidResult;
             if (page.result.rows.len == 0 and !page.exhausted) return error.InvalidResult;
             if (page.result.sql_nulls) |flags| if (flags.len != page.result.rows.len) return error.InvalidResult;
-            for (page.result.rows, 0..) |row, index| try self.dataRow(page.result.columns, &.{}, row, if (page.result.sql_nulls) |flags| flags[index] else null);
+            if (!fetch.move) for (page.result.rows, 0..) |row, index| try self.dataRow(page.result.columns, &.{}, row, if (page.result.sql_nulls) |flags| flags[index] else null);
             cursor.fetched += page.result.rows.len;
             remaining -= page.result.rows.len;
             cursor.exhausted = page.exhausted;
@@ -702,7 +992,7 @@ pub const Session = struct {
             try self.writer.flush();
         }
         var tag: [64]u8 = undefined;
-        try self.command(try std.fmt.bufPrint(&tag, "FETCH {d}", .{cursor.fetched - fetched_before}));
+        try self.command(try std.fmt.bufPrint(&tag, "{s} {d}", .{ if (fetch.move) "MOVE" else "FETCH", cursor.fetched - fetched_before }));
         completed = true;
     }
 
@@ -712,11 +1002,127 @@ pub const Session = struct {
         fail(self.source.context, identity, self.request(statement, &.{}, &.{})) catch {};
     }
 
+    fn cursorRequest(self: *Session, cursor: *SqlCursor) backend.Request {
+        var req = self.request(cursor.statement, &.{}, &.{});
+        req.database = cursor.database;
+        req.namespace = cursor.namespace;
+        req.session_id = if (cursor.committed or cursor.session_id.len == 0) null else cursor.session_id;
+        req.binding_guard = cursor.description.binding_guard;
+        return req;
+    }
+
+    fn fillCursor(self: *Session, cursor: *SqlCursor, through: usize) !void {
+        const spool = &cursor.spool.?;
+        const req = self.cursorRequest(cursor);
+        while (!cursor.exhausted and spool.rows.items.len < through) {
+            try req.check();
+            const stream = cursor.stream orelse return error.InvalidResult;
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+            const wanted: u32 = @intCast(@min(through - spool.rows.items.len, @min(self.limits.result_rows, 256)));
+            var page = try stream.next(stream.context, arena.allocator(), req, wanted);
+            defer page.result.deinit();
+            if (page.result.mutation_outcome != null or page.result.continuation != null or page.result.session_id != null or page.result.rows.len > wanted or !columnsEqual(cursor.description.columns, page.result.columns)) return error.InvalidResult;
+            if (page.result.rows.len == 0 and !page.exhausted) return error.InvalidResult;
+            spool.append(page.result, self.limits.cursor_rows) catch |err| return if (err == error.OutOfMemory) error.ProgramLimitExceeded else err;
+            cursor.exhausted = page.exhausted;
+            if (cursor.exhausted) stream.detach.?(stream.context);
+        }
+    }
+
+    fn materializeHeldCursors(self: *Session) !void {
+        if (self.status != .in_transaction) return;
+        var iterator = self.sql_cursors.valueIterator();
+        while (iterator.next()) |cursor| if (cursor.hold and !cursor.committed) try self.fillCursor(cursor, std.math.maxInt(usize));
+    }
+
+    fn fetchSpooled(self: *Session, cursor: *SqlCursor, fetch: commands.Fetch, req: backend.Request) !void {
+        if (!cursor.scroll and fetch.direction != .forward) return error.CursorNotScrollable;
+        var validation = std.heap.ArenaAllocator.init(self.alloc);
+        defer validation.deinit();
+        try self.validateSpooledCursor(cursor, validation.allocator(), req);
+        const spool = &cursor.spool.?;
+        if (fetch.direction == .absolute and fetch.offset < 0) try self.fillCursor(cursor, std.math.maxInt(usize));
+        var target: i64 = switch (fetch.direction) {
+            .forward => spool.position +| @as(i64, if (fetch.count == 0) 0 else 1),
+            .backward => spool.position -| @as(i64, if (fetch.count == 0) 0 else 1),
+            .absolute => if (fetch.offset < 0) @as(i64, @intCast(spool.rows.items.len)) + 1 +| fetch.offset else fetch.offset,
+            .relative => spool.position +| fetch.offset,
+        };
+        const single = fetch.direction == .absolute or fetch.direction == .relative or fetch.count == 0;
+        var remaining: u64 = if (single) 1 else fetch.count;
+        if (!fetch.move) try self.rowDescription(cursor.description.columns, &.{});
+        var emitted: u64 = 0;
+        while (remaining != 0) : (remaining -= 1) {
+            try req.check();
+            if (target > 0 and @as(u64, @intCast(target)) > spool.rows.items.len and !cursor.exhausted) {
+                const wanted: usize = @intCast(@min(@as(u64, @intCast(target)) +| @min(remaining - 1, 255), std.math.maxInt(usize)));
+                try self.fillCursor(cursor, wanted);
+            }
+            const end: i64 = @intCast(spool.rows.items.len + 1);
+            spool.position = std.math.clamp(target, 0, end);
+            if (target <= 0 or target >= end) break;
+            if (emitted != 0 and emitted % 256 == 0) {
+                _ = validation.reset(.retain_capacity);
+                try self.validateSpooledCursor(cursor, validation.allocator(), req);
+            }
+            const row = spool.rows.items[@intCast(target - 1)];
+            if (!fetch.move) try self.dataRow(cursor.description.columns, &.{}, row.values, row.nulls);
+            emitted += 1;
+            if (emitted % 256 == 0) try self.writer.flush();
+            if (single) break;
+            target += if (fetch.direction == .backward) @as(i64, -1) else 1;
+        }
+        var tag: [64]u8 = undefined;
+        try self.command(try std.fmt.bufPrint(&tag, "{s} {d}", .{ if (fetch.move) "MOVE" else "FETCH", emitted }));
+    }
+
+    fn validateSpooledCursor(self: *Session, cursor: *SqlCursor, alloc: std.mem.Allocator, req: backend.Request) !void {
+        if (cursor.stream) |stream| return stream.validate.?(stream.context, alloc, req);
+        if (!cursor.exhausted) return error.InvalidCursorName;
+        const identity = self.identity orelse return error.AuthenticationFailed;
+        const current = try self.source.vtable.describe(self.source.context, alloc, identity, req);
+        if (!columnsEqual(cursor.description.columns, current.columns) or
+            !std.mem.eql(u8, cursor.description.binding_guard orelse "", current.binding_guard orelse "")) return error.CatalogGenerationChanged;
+    }
+
+    fn finishSqlCursors(self: *Session, committed: bool) void {
+        if (committed) {
+            var values_it = self.sql_cursors.valueIterator();
+            while (values_it.next()) |cursor| if (cursor.hold and cursor.exhausted) {
+                cursor.committed = true;
+            };
+        }
+        while (true) {
+            var iterator = self.sql_cursors.iterator();
+            const remove = while (iterator.next()) |entry| {
+                if (!entry.value_ptr.committed) break entry.key_ptr.*;
+            } else break;
+            self.removeSqlCursor(remove);
+        }
+    }
+
+    fn clearCursorSavepoints(self: *Session) void {
+        for (self.savepoints.items) |point| self.alloc.free(point.name);
+        self.savepoints.clearRetainingCapacity();
+    }
+
+    fn discardCursorsAfter(self: *Session, epoch: u64) void {
+        while (true) {
+            var iterator = self.sql_cursors.iterator();
+            const remove = while (iterator.next()) |entry| {
+                if (!entry.value_ptr.committed and entry.value_ptr.creation_epoch > epoch) break entry.key_ptr.*;
+            } else break;
+            self.removeSqlCursor(remove);
+        }
+    }
+
     fn removeSqlCursor(self: *Session, name: []const u8) void {
         if (self.sql_cursors.fetchRemove(name)) |entry| {
             self.alloc.free(entry.key);
             var cursor = entry.value;
             if (cursor.stream) |stream| stream.close(stream.context);
+            if (cursor.spool) |*spool| spool.deinit();
             cursor.arena.deinit();
         }
     }
@@ -726,6 +1132,7 @@ pub const Session = struct {
         while (iterator.next()) |entry| {
             self.alloc.free(entry.key_ptr.*);
             if (entry.value_ptr.stream) |stream| stream.close(stream.context);
+            if (entry.value_ptr.spool) |*spool| spool.deinit();
             entry.value_ptr.arena.deinit();
         }
         self.sql_cursors.clearRetainingCapacity();
@@ -737,6 +1144,15 @@ pub const Session = struct {
             var value = entry.value;
             value.arena.deinit();
         }
+    }
+
+    fn clearPrepared(self: *Session) void {
+        var it = self.prepared.iterator();
+        while (it.next()) |entry| {
+            self.alloc.free(entry.key_ptr.*);
+            entry.value_ptr.arena.deinit();
+        }
+        self.prepared.clearRetainingCapacity();
     }
 
     fn removePortal(self: *Session, name: []const u8) void {
@@ -802,6 +1218,9 @@ pub const Session = struct {
     }
 
     fn simpleStreamParameters(self: *Session, statement: []const u8, parameters: []const std.json.Value, types: []const backend.Type, binding_guard: ?[]const u8) !bool {
+        var settings_arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer settings_arena.deinit();
+        if (try commands.settingCommand(settings_arena.allocator(), statement) != null) return false;
         const open = self.source.vtable.open_stream orelse return false;
         self.cancel_requested.store(false, .release);
         self.executing.store(true, .release);
@@ -868,7 +1287,8 @@ pub const Session = struct {
             var bytes = std.Io.Writer.Allocating.init(self.alloc);
             defer bytes.deinit();
             const pending = std.mem.eql(u8, result.command_tag, "DDL PENDING");
-            try bytes.writer.writeAll(if (pending) "SERROR\x00C55000\x00MDDL declaration committed but constraint is not ready; do not replay; inspect receipt\x00D" else "SNOTICE\x00C01000\x00MDDL declaration committed; inspect receipt for validation readiness\x00D");
+            const unknown = pending and result.mutation_outcome == null;
+            try bytes.writer.writeAll(if (unknown) "SERROR\x00C40003\x00MDDL admission outcome is unknown; do not replay; inspect receipt\x00D" else if (pending) "SERROR\x00C55000\x00MDDL declaration committed but is not ready; do not replay; inspect receipt\x00D" else "SNOTICE\x00C01000\x00MDDL declaration committed; inspect receipt for validation readiness\x00D");
             try bytes.writer.writeAll(receipt);
             try bytes.writer.writeAll("\x00\x00");
             try self.message(if (pending) 'E' else 'N', bytes.written());
@@ -995,7 +1415,8 @@ fn sqlstate(err: anyerror) []const u8 {
         error.SyntaxError => "42601",
         error.InvalidSqlSyntax => "42601",
         error.InFailedSqlTransaction => "25P02",
-        error.CursorMustBeInTransaction => "25P01",
+        error.CursorMustBeInTransaction, error.NoActiveSqlTransaction => "25P01",
+        error.CursorNotScrollable => "55000",
         error.InvalidSqlParameters, error.InvalidSqlParameter, error.InvalidSqlNumber, error.SqlTypeMismatch, error.InvalidSqlLimit => "22023",
         error.SqlNotNullViolation => "23502",
         error.SqlProgramLimitExceeded, error.SqlResultTooLarge, error.SqlLimitExceeded => "54000",

@@ -24,7 +24,13 @@ export default function SQLWorkbenchPage() {
   const [busy, setBusy] = useState(false);
   const [uncertain, setUncertain] = useState(false);
   const request = useRef<AbortController | null>(null);
-  useEffect(() => () => request.current?.abort(), []);
+  useEffect(
+    () => () => {
+      request.current?.abort();
+      request.current = null;
+    },
+    []
+  );
   // A session belongs to its authenticated connection, never a new endpoint.
   // biome-ignore lint/correctness/useExhaustiveDependencies: changing the authenticated client must clear its session.
   useEffect(() => {
@@ -33,14 +39,15 @@ export default function SQLWorkbenchPage() {
     setBusy(false);
     setSession(undefined);
     setResult(undefined);
+    setDiagnostic("");
     setUncertain(false);
   }, [client]);
 
-  async function execute(sql: string) {
+  async function execute(sql: string, editorParameters = false) {
     if (request.current || uncertain) return;
     let values: unknown[];
     try {
-      values = sql === statement ? sqlParameters(parameters) : [];
+      values = editorParameters ? sqlParameters(parameters) : [];
     } catch (error) {
       setDiagnostic(String(error));
       return;
@@ -137,7 +144,7 @@ export default function SQLWorkbenchPage() {
       <div className="flex gap-2">
         <Button
           disabled={busy || uncertain || !statement.trim()}
-          onClick={() => void execute(statement)}
+          onClick={() => void execute(statement, true)}
         >
           Run statement
         </Button>

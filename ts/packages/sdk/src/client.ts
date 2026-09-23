@@ -68,6 +68,9 @@ import type {
   RetrievalAgentStreamCallbacks,
   ScanKeysRequest,
   SQLDiagnostic,
+  SQLPreparedExecutionRequest,
+  SQLPreparedResponse,
+  SQLPrepareRequest,
   SQLRequest,
   SQLResponse,
   Table,
@@ -584,22 +587,27 @@ export class AntflyClient {
     marshalErrorPrefix: string,
     relational = false,
     errorFactory?: (status: number, body: unknown) => Error | undefined,
-    redirect?: RequestRedirect
+    redirect?: RequestRedirect,
+    method: "POST" | "DELETE" = "POST",
+    credentials?: RequestCredentials
   ): Promise<{ data?: T; text: string; status: number }> {
     const opts = normalizedWriteOptions(options);
-    let encodedBody: string;
-    try {
-      encodedBody = encodeBoundedJSON(body, opts.maxRequestBytes, relational);
-    } catch (error) {
-      throw new Error(`${marshalErrorPrefix}: ${(error as Error).message}`);
+    let encodedBody: string | undefined;
+    if (method === "POST") {
+      try {
+        encodedBody = encodeBoundedJSON(body, opts.maxRequestBytes, relational);
+      } catch (error) {
+        throw new Error(`${marshalErrorPrefix}: ${(error as Error).message}`);
+      }
     }
 
     const response = await fetch(this.url(path), {
-      method: "POST",
+      method,
       headers: this.requestHeaders(),
       body: encodedBody,
       signal: opts.signal,
       ...(redirect ? { redirect } : {}),
+      ...(credentials ? { credentials } : {}),
     });
 
     if (!response.ok) {
@@ -768,10 +776,14 @@ export class AntflyClient {
     }
   }
 
-  /** Execute one statement with bounded transport and no automatic mutation retries. */
-  async executeSQL(request: SQLRequest, options?: WriteOptions): Promise<SQLResponse> {
-    const { data } = await this.postBoundedJSON<SQLResponse>(
-      "/db/v1/sql",
+  private async sqlRequest<T>(
+    path: string,
+    request: unknown,
+    options?: WriteOptions,
+    method: "POST" | "DELETE" = "POST"
+  ): Promise<T | undefined> {
+    const { data } = await this.postBoundedJSON<T>(
+      path,
       request,
       {
         ...options,
@@ -797,8 +809,14 @@ export class AntflyClient {
           return undefined;
         return new SQLExecutionError(status, diagnostic);
       },
-      "error"
+      "error",
+      method,
+      "omit"
     );
+    return data;
+  }
+
+  private sqlResponse(data: SQLResponse | undefined): SQLResponse {
     if (!data || !Array.isArray(data.columns) || !Array.isArray(data.rows)) {
       throw new Error("Invalid SQL response");
     }
@@ -809,6 +827,74 @@ export class AntflyClient {
       }
     }
     return data;
+  }
+
+  /** Execute one statement with bounded transport and no automatic mutation retries. */
+  async executeSQL(request: SQLRequest, options?: WriteOptions): Promise<SQLResponse> {
+    return this.sqlResponse(await this.sqlRequest<SQLResponse>("/db/v1/sql", request, options));
+  }
+
+  /**
+   * Bind a durable, owner-bound statement without executing it. The resource survives
+   * transaction commit; keep its owner_node_id and expires_at_ms for routing and cleanup.
+   * Creation is never retried or redirected automatically.
+   */
+  async prepareSQL(
+    request: SQLPrepareRequest,
+    options?: WriteOptions
+  ): Promise<SQLPreparedResponse> {
+    const data = await this.sqlRequest<SQLPreparedResponse>(
+      "/db/v1/sql/prepared",
+      request,
+      options
+    );
+    if (
+      !data ||
+      typeof data.prepared_id !== "string" ||
+      !data.prepared_id ||
+      !Number.isSafeInteger(data.expires_at_ms) ||
+      typeof data.owner_node_id !== "string" ||
+      !/^[0-9]{1,20}$/.test(data.owner_node_id) ||
+      !Array.isArray(data.parameter_types) ||
+      !Array.isArray(data.columns)
+    )
+      throw new Error("Invalid prepared SQL response");
+    return data;
+  }
+
+  /** Execute on the resource owner; reconcile ambiguous outcomes instead of replaying. */
+  async executePreparedSQL(
+    preparedId: string,
+    request: SQLPreparedExecutionRequest = {},
+    options?: WriteOptions
+  ): Promise<SQLResponse> {
+    if (!preparedId) throw new Error("Prepared SQL resource ID is required");
+    return this.sqlResponse(
+      await this.sqlRequest<SQLResponse>(
+        `/db/v1/sql/prepared/${encodeURIComponent(preparedId)}/execute`,
+        request,
+        options
+      )
+    );
+  }
+
+  /** Release an owner-bound resource; already admitted executions may still finish. */
+  async closePreparedSQL(preparedId: string, options?: WriteOptions): Promise<void> {
+    if (!preparedId) throw new Error("Prepared SQL resource ID is required");
+    const data = await this.sqlRequest<Record<string, never>>(
+      `/db/v1/sql/prepared/${encodeURIComponent(preparedId)}`,
+      undefined,
+      options,
+      "DELETE"
+    );
+    if (
+      !data ||
+      Array.isArray(data) ||
+      typeof data !== "object" ||
+      Object.keys(data).length !== 0
+    ) {
+      throw new Error("Invalid prepared SQL close response");
+    }
   }
 
   /**

@@ -1183,15 +1183,26 @@ pub const RelationalScalarExpression = struct {
 /// A named, ordered composite unique key. Validation status is maintained by the server. TTL expiry uses the distributed integrity coordinator. Referenced unique keys are nondeferrable.
 pub const RelationalUniqueConstraint = struct {
     name: []const u8,
-    columns: []const []const u8,
+    columns: ?[]const []const u8 = null,
+    /// Typed native unique keys. Specify either columns or keys.
+    keys: ?[]const RelationalIndexKey = null,
+    /// Conjunction restricting uniqueness to matching rows.
+    where: ?[]const RelationalIndexPredicate = null,
     /// When true, NULL components compare equal for uniqueness.
     nulls_not_distinct: ?bool = null,
+    /// Permit uniqueness checks at transaction commit. Never eligible as an ON CONFLICT arbiter or a referenced foreign key target.
+    deferrable: ?bool = null,
+    timing: ?ForeignKeyTiming = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "name", "name", false },
-        .{ "columns", "columns", false },
+        .{ "columns", "columns", true },
+        .{ "keys", "keys", true },
+        .{ "where", "where", true },
         .{ "nulls_not_distinct", "nulls_not_distinct", true },
+        .{ "deferrable", "deferrable", true },
+        .{ "timing", "timing", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -1206,10 +1217,28 @@ pub const RelationalUniqueConstraint = struct {
         try jw.beginObject();
         try jw.objectField("name");
         try jw.write(self.name);
-        try jw.objectField("columns");
-        try jw.write(self.columns);
+        if (self.columns) |value| {
+            try jw.objectField("columns");
+            try jw.write(value);
+        }
+        if (self.keys) |value| {
+            try jw.objectField("keys");
+            try jw.write(value);
+        }
+        if (self.where) |value| {
+            try jw.objectField("where");
+            try jw.write(value);
+        }
         if (self.nulls_not_distinct) |value| {
             try jw.objectField("nulls_not_distinct");
+            try jw.write(value);
+        }
+        if (self.deferrable) |value| {
+            try jw.objectField("deferrable");
+            try jw.write(value);
+        }
+        if (self.timing) |value| {
+            try jw.objectField("timing");
             try jw.write(value);
         }
         try jw.endObject();

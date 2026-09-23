@@ -30,7 +30,8 @@ def encode_sql_request(value: Any) -> bytes:
 
 def _kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
     result = dict(kwargs)
-    result["content"] = encode_sql_request(result.pop("json"))
+    if "json" in result:
+        result["content"] = encode_sql_request(result.pop("json"))
     result["follow_redirects"] = False
     return result
 

@@ -99,6 +99,7 @@ from .chunker_config_full_text_index import ChunkerConfigFullTextIndex
 from .chunker_provider import ChunkerProvider
 from .classification_step_config import ClassificationStepConfig
 from .classification_transformation_result import ClassificationTransformationResult
+from .close_prepared_sql_response_200 import ClosePreparedSQLResponse200
 from .cluster_backup_request import ClusterBackupRequest
 from .cluster_backup_request_format import ClusterBackupRequestFormat
 from .cluster_backup_response import ClusterBackupResponse
@@ -1137,6 +1138,9 @@ from .sql_column import SQLColumn
 from .sql_column_type import SQLColumnType
 from .sql_diagnostic import SQLDiagnostic
 from .sql_mutation_outcome import SQLMutationOutcome
+from .sql_prepare_request import SQLPrepareRequest
+from .sql_prepared_execution_request import SQLPreparedExecutionRequest
+from .sql_prepared_response import SQLPreparedResponse
 from .sql_request import SQLRequest
 from .sql_response import SQLResponse
 from .sql_transaction_status import SQLTransactionStatus
@@ -1393,6 +1397,7 @@ __all__ = (
     "ChunkOptions",
     "ClassificationStepConfig",
     "ClassificationTransformationResult",
+    "ClosePreparedSQLResponse200",
     "ClusterBackupRequest",
     "ClusterBackupRequestFormat",
     "ClusterBackupResponse",
@@ -2421,6 +2426,9 @@ __all__ = (
     "SQLDDLReceiptState",
     "SQLDiagnostic",
     "SQLMutationOutcome",
+    "SQLPreparedExecutionRequest",
+    "SQLPreparedResponse",
+    "SQLPrepareRequest",
     "SQLRequest",
     "SQLResponse",
     "SQLTransactionStatus",

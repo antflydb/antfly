@@ -778,6 +778,53 @@ test "relational integrity shared parent guards and fenced bounded action recove
     }
 }
 
+test "distributed txn deferred unique swaps fence concurrent claims and survive prepared restart" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const a = try Address.init(@splat(9), "one");
+    const b = try Address.init(@splat(9), "two");
+    const first: Claim = .{ .tuple = "one", .parent_table = "rows", .parent_key = "a", .schema_version = 1 };
+    const second: Claim = .{ .tuple = "two", .parent_table = "rows", .parent_key = "b", .schema_version = 1 };
+    var swapped_first = first;
+    swapped_first.parent_key = "b";
+    var swapped_second = second;
+    swapped_second.parent_key = "a";
+    const commands = [_]Command{
+        .{ .address = a, .operation = .{ .establish = swapped_first } },
+        .{ .address = b, .operation = .{ .establish = swapped_second } },
+        .{ .address = a, .operation = .{ .release = .{ .parent_table = "rows", .parent_key = "a" } } },
+        .{ .address = b, .operation = .{ .release = .{ .parent_table = "rows", .parent_key = "b" } } },
+    };
+    {
+        var backend = try @import("../lsm_backend.zig").Backend.open(alloc, path, .{});
+        defer backend.close();
+        var store = try @import("../docstore.zig").DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        var manager = try transactions.TxnManager.init(alloc, &store);
+        defer manager.deinit();
+        try testCommands(&store, &manager, @splat(1), &.{ .{ .address = a, .operation = .{ .establish = first } }, .{ .address = b, .operation = .{ .establish = second } } }, true);
+        try testCommands(&store, &manager, @splat(2), &commands, false);
+        try std.testing.expectError(error.IntentConflict, testCommands(&store, &manager, @splat(3), &commands, false));
+    }
+    {
+        var backend = try @import("../lsm_backend.zig").Backend.open(alloc, path, .{});
+        defer backend.close();
+        var store = try @import("../docstore.zig").DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        var manager = try transactions.TxnManager.init(alloc, &store);
+        defer manager.deinit();
+        try manager.resolveIntents(@splat(2), .committed, 3);
+        var read = try CurrentView.init(&store);
+        defer read.deinit();
+        try std.testing.expectEqualStrings("b", (try Claim.decode(&a.claimKey(), try read.get(&a.claimKey()))).parent_key);
+        try std.testing.expectEqualStrings("a", (try Claim.decode(&b.claimKey(), try read.get(&b.claimKey()))).parent_key);
+        try std.testing.expectError(error.UniqueConstraintViolation, prepare(alloc, &read, &.{.{ .address = a, .operation = .{ .establish = first } }}));
+    }
+}
+
 test "distributed txn deferred reference handoff commits atomically and rejects unseen children" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

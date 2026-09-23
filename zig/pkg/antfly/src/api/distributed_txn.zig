@@ -48,7 +48,14 @@ pub const TxnBeginRequest = struct {
 test "distributed txn range guard wire preserves absent and exact counters" {
     const Harness = struct {
         fn run(alloc: std.mem.Allocator) !void {
-            const proofs = [_]@import("../storage/range_protection.zig").Proof{ .{ .bucket = 0, .generation = null }, .{ .bucket = 256, .generation = 9007199254740993 } };
+            const tracking = @import("../storage/range_protection.zig");
+            var index_id: [tracking.index_id_bytes]u8 = @splat(0);
+            index_id[7] = 9;
+            const proofs = [_]tracking.Proof{
+                .{ .bucket = 0, .generation = null },
+                .{ .bucket = 256, .generation = 9007199254740993 },
+                .{ .bucket = tracking.index_bucket_sentinel, .generation = 7, .index = .{ .id = index_id, .digest = @splat(0xa5) } },
+            };
             const request: TxnPrepareRequest = .{ .txn_id = @splat(1), .topology_epoch = 3, .route_fence = .{ .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .catalog_revision = 2, .table_id = 7, .topology_epoch = 3, .route = .{ .group_id = 9, .range_id = 10, .identity_namespace = .{ .table_id = 7, .shard_id = 9, .range_id = 10 } } }, .req = .{ .range_guards = &proofs } };
             const bytes = try encodeTxnPrepareRequest(alloc, request);
             defer alloc.free(bytes);
@@ -1216,7 +1223,7 @@ fn executeMultiTableCommitOnce(
                 fence.route.identity_namespace.range_id != manager.rangeDocIdentityRangeId(range.*)) return error.TopologyChanged;
             const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, fence.route.group_id, topology_epoch);
             participant.route_fence = fence;
-            for (owner.proofs) |proof| try participant.range_guards.append(alloc, .{ .bucket = proof.bucket, .generation = proof.generation });
+            for (owner.proofs) |proof| try participant.range_guards.append(alloc, proof);
         }
 
         for (table.writes) |write| {
@@ -2582,7 +2589,7 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
     errdefer if (integrity_commands_owner) |*owner| owner.deinit();
     var range_guards_owner = if (obj.get("range_guards")) |value| try std.json.parseFromValue([]const @import("../storage/range_protection.zig").Proof, alloc, value, .{ .allocate = .alloc_always }) else null;
     errdefer if (range_guards_owner) |*owner| owner.deinit();
-    if (range_guards_owner) |owner| if (owner.value.len > 257) return error.InvalidTxnRequest;
+    if (range_guards_owner) |owner| if (owner.value.len > @import("range_read_guards.zig").max_proofs) return error.InvalidTxnRequest;
     var relational_activation_owner = if (obj.get("relational_activation")) |value| try std.json.parseFromValue(integrity_activation.Command, alloc, value, .{ .allocate = .alloc_always }) else null;
     errdefer if (relational_activation_owner) |*owner| owner.deinit();
     var relational_retirement_owner = if (obj.get("relational_retirement")) |value| try std.json.parseFromValue(integrity_retirement.Command, alloc, value, .{ .allocate = .alloc_always }) else null;
