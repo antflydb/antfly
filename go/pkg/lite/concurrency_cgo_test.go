@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"fmt"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -232,4 +233,32 @@ func TestBusyTimeoutWaitsForWriterLock(t *testing.T) {
 		t.Fatalf("second writer after first closed: %v", err)
 	}
 	second.Close()
+}
+
+// Handle values are opaque ids that the Go binding keeps in an
+// unsafe.Pointer. Reopening reuses the same registry slot under a new
+// generation each time; forcing GC between iterations makes the collector
+// inspect every generation's value, which must never look like a bad Go
+// heap pointer.
+func TestHandleValuesSurviveGCAcrossSlotReuse(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gc-handles.aflite")
+	db, err := CreateWithOptions(path, OpenOptions{NoSync: true})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	db.Close()
+	var stale []*DB
+	for i := range 300 {
+		db, err := OpenWithOptions(path, OpenOptions{NoSync: true})
+		if err != nil {
+			t.Fatalf("open %d: %v", i, err)
+		}
+		if _, err := db.StatsJSON(); err != nil {
+			t.Fatalf("stats %d: %v", i, err)
+		}
+		db.Close()
+		stale = append(stale, db)
+		runtime.GC()
+	}
+	runtime.KeepAlive(stale)
 }

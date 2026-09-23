@@ -92,12 +92,29 @@ its final attempt briefly holds off writers so it always completes. A read
 with a caller-pinned `identity_read_generation` that has gone stale is
 rejected with `ANTFLY_INVALID_ARGUMENT` rather than retried.
 
-`antfly_db_close` rejects new calls with `ANTFLY_INVALID_ARGUMENT`, waits for
-every call that has already entered (including calls still waiting for a
-lock), and then frees the handle. Concurrent `antfly_db_close` calls on one
-handle are safe. As with `sqlite3_close`, using a handle after
-`antfly_db_close` has returned is undefined; bindings should guard their own
-handle field (the Go binding holds a read/write mutex around every call).
+A handle value is an opaque id for a slot in a process-wide registry, not a
+pointer to the database. Registry slots are never freed and each carries a
+generation, so every handle value a caller passes is safe to use at any time:
+
+- `antfly_db_close` claims the slot, rejects new calls, waits for every call
+  that has already entered (including calls still waiting for a lock), then
+  frees the database and advances the slot's generation.
+- A call racing close, or made after it, returns `ANTFLY_INVALID_ARGUMENT`
+  instead of touching freed memory. This holds even for a thread paused
+  before its call reached the handle.
+- Concurrent and repeated `antfly_db_close` calls are no-ops after the first.
+- A slot reused by a later open gets a new generation, so an old handle value
+  can never reach the new database.
+
+On 64-bit POSIX targets a handle value is also a genuine address inside an
+inaccessible region the library reserves (no memory is committed), so it is
+at least 4096, aligned, and never inside any allocator's heap. Bindings can
+therefore keep it in pointer-typed fields that a garbage collector inspects,
+such as Go's `unsafe.Pointer`.
+
+This is stronger than `sqlite3_close`, where using a closed connection is
+undefined. Bindings may still track their own handle state to report a
+closed handle before crossing the ABI.
 
 Across handles and processes the Lite model matches SQLite in WAL mode: one
 writer and any number of readers per file. The writer lock is taken when a
