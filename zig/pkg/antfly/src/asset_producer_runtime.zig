@@ -5317,7 +5317,7 @@ test "asset producer runtime accepts an unrequested boundary-model schema_versio
 // `extractionResultJsonAlloc` path, whenever more than one document changes
 // in the same replay pass -- exactly what
 // TestLiteNativeGraphEdgesFromExtractionArtifactBoundaryV2
-// (go/pkg/antflylite/lite_cgo_test.go) exercises with its two documents.
+// (go/pkg/lite/lite_cgo_test.go) exercises with its two documents.
 test "asset producer runtime batch path accepts an unrequested boundary-model schema_version upgrade" {
     const a = std.testing.allocator;
     const item_shape =

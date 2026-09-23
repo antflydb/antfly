@@ -637,7 +637,10 @@ Antfly Lite should match the familiar embedded database model:
 - Cross-process locking for the database path.
 - Read-only opens for tooling and inspection.
 - Clear `ANTFLY_BUSY` errors when another process or in-process write handle
-  owns the writer lock.
+  owns the writer lock, or an optional `busy_timeout_ms` wait for it.
+- Serialized threading within a process: one handle may be shared by any
+  number of threads, with reads running in parallel and alongside writes. See
+  `CAPI.md` "Thread Safety" for the per-call access classes.
 
 The CLI should expose this plainly:
 
@@ -812,7 +815,7 @@ Adding an `embeddings` index whose `embedder` (or chunker/extractor producer)
 uses `"provider": "antfly"` with no `api_url` runs against that embedded
 provider instead of failing or requiring a remote URL -- `antfly lite
 run-until-idle app.aflite` drains the resulting enrichment work locally, with
-no network calls. Application embedding (see `go/pkg/antflylite/README.md`
+no network calls. Application embedding (see `go/pkg/lite/README.md`
 for the Go binding) gets the same embedded behavior automatically by linking
 the standard `libantfly` -- no separate library or extra link flags.
 
@@ -1071,7 +1074,7 @@ query-visible results should match within documented index rebuild semantics.
 - Expose stable error-code names and descriptions for language bindings.
 - Provide a buffer free-and-zero helper for generated bindings while retaining
   the raw pointer/length free function.
-- Add Go as the first post-Zig/C binding in `go/pkg/antflylite`, backed by the
+- Add Go as the first post-Zig/C binding in `go/pkg/lite`, backed by the
   stable C ABI and gated C-library smoke tests.
 - Freeze the Lite open options and capabilities response.
 

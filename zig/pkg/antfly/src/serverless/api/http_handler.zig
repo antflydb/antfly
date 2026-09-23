@@ -3062,6 +3062,21 @@ pub const HttpHandler = struct {
 
         var metric_requests = try query_api.parseGraphMetricRequestsAlloc(self.alloc, body);
         defer metric_requests.deinit(self.alloc);
+        // Serverless serves immutable published metric segments and cannot
+        // compute query-seeded personalized PageRank from a live edge
+        // snapshot. Fail closed rather than silently returning global scores.
+        for (metric_requests.queries) |named| {
+            if (named.query.seed_nodes.len != 0) {
+                graph_query_diagnostic.record("$request", "graph_metric", .request_control_not_supported);
+                return error.UnsupportedQueryRequest;
+            }
+        }
+        if (metric_requests.rerank) |rerank| {
+            if (rerank.seed_nodes.len != 0) {
+                graph_query_diagnostic.record("$request", "graph_metric_rerank", .request_control_not_supported);
+                return error.UnsupportedQueryRequest;
+            }
+        }
 
         var req: db_types.SearchRequest = .{
             .count_only = request.count == true,

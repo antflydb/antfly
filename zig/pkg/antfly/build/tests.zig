@@ -470,6 +470,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "restore staging cohort proof binds every source identity and durable seal",
             "restore staging partial selection is dependency closed across both schema generations",
             "retryable restore contention durably requeues progress and honors cancellation",
+            "restore retry diagnostics",
             "restore cooperative continuation",
             "restore ownership loss requeues only the exact running attempt",
             "replicated restore mutations are rejected after leadership term changes",
@@ -1436,11 +1437,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db graph shortest path searches through admitted alternatives",
         "db graph artifact external node targets return ids without document hydration",
         "db graph hydration rejects table-qualified entity nodes in local snapshots",
+        "db complete-snapshot scope expands graph traversal through tagged entity nodes",
         "db index repair streams graph artifact rebuild in batches",
         "api distributed graph cross-table hydrate enforces target authorization",
         "public table query handler maps exact graph execution failures",
         "unsupported graph diagnostics identify the rejected operation feature",
         "authenticated single-group graph queries require distributed coordination",
+        "single-group graph requests carry the complete-snapshot execution scope",
         "graph table queries have one fresh-topology retry",
         "generic shard query wire preserves admitted canonical graph operations without reparsing",
         "generic shard query wire fails closed without an admitted graph fragment",
@@ -1526,6 +1529,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "table contract preserves typed artifact-backed graph configuration",
         "created index configs normalize single-source input forms",
         "merged index metadata validates artifact consumer references",
+        "index metadata closes neighbor context graph index references at admission",
         "graph config accepts canonical single-source mappings without a discriminator",
         "created graph index response projects closed nested schemas",
         "index encoders expose graph sources once in normalized config",
@@ -1685,8 +1689,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     secret_backend_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const secret_backend_tests = b.addTest(.{
         .root_module = secret_backend_test_mod,
-        // ReleaseSafe on macOS peaks above the aggregate 10 GiB estimate.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 13 else 7) * 1024 * 1024 * 1024,
+        // ReleaseSafe peaks above the aggregate estimates on both platforms:
+        // 12.88 GB measured on x86_64-linux in the VOPR qualification lane,
+        // above 10 GiB on macOS. Debug keeps the conservative default so the
+        // unit lanes retain their tighter scheduler claim.
+        .max_rss = @as(usize, switch (target.result.os.tag) {
+            .macos => 13,
+            else => if (optimize == .Debug) 7 else 14,
+        }) * 1024 * 1024 * 1024,
         .filters = &.{"secret backend"},
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
@@ -1802,7 +1812,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const recall_test_step = b.step("antfly-storage-vectorindex-recall-test", "Run HBC vector recall quality tests");
 
-    const raft_unit_default_filters = [_][]const u8{"raft."};
+    const raft_unit_default_filters = [_][]const u8{ "raft.", "trace files preserve overlapping producers" };
     const raft_unit_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = selectTestFilters(b, &raft_unit_default_filters),
@@ -4701,6 +4711,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     index_manager_test_mod.addImport("antfly_resolver", resolver_mod);
     index_manager_test_mod.addImport("antfly_chunking", chunking_mod);
     index_manager_test_mod.addImport("antfly-json", json_mod);
+    index_manager_test_mod.addImport("antfly_schema_openapi", antfly_imports.schema_openapi);
     index_manager_test_mod.addImport("antfly_scraping", scraping_mod);
     index_manager_test_mod.addImport("antfly_image", image_mod);
     index_manager_test_mod.addImport("antfly_pdf", pdf_mod);
@@ -4951,6 +4962,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "query parser accepts direct graph metric reads",
         "query parser accepts graph metric rerank",
         "api query contract bounds graph metric top k",
+        "api query contract admits personalized graph metric seed fields",
+        "api query contract rejects malformed personalized graph metric shapes",
         "api query contract uses portable graph metric filter operators",
         "api query contract rejects oversized and duplicate graph metric clauses",
         "query encoder emits graph metric results",

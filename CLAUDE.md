@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Antfly is a distributed key-value store and vector search engine with a Zig server runtime. It provides hybrid search capabilities combining full-text search (BM25) with vector similarity search, supporting multimodal data (images, audio, video) and various embedding models.
 
-The Go tree contains client SDKs, bindings, the operator, proxies, and supporting libraries. Multiple independent Go modules exist under `go/pkg/` (`sdk`, `operator`, `docsaf`, `evalaf`, `genkit`, `memoryaf`, `proxy`, `antflylite`), and each must be built from within its own directory with `GOWORK=off` (the Makefiles set this). The Antfly and inference servers live under `zig/`.
+The Go tree contains client SDKs, bindings, the operator, proxies, and supporting libraries. Multiple independent Go modules exist under `go/pkg/` (`sdk`, `operator`, `docsaf`, `evalaf`, `genkit`, `memoryaf`, `proxy`, `lite`), and each must be built from within its own directory with `GOWORK=off` (the Makefiles set this). The Antfly and inference servers live under `zig/`.
 
 ## Go Version
 

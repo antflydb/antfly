@@ -243,9 +243,14 @@ pub fn recordFromDerivedBatch(alloc: Allocator, batch: derived_types.DerivedBatc
             // The resolution stage journals its output; wake the graph
             // materializer for doc->entity provenance edges and the promoter so
             // it upserts the canonical entity documents for the resolved
-            // mentions.
+            // mentions. The resolution stage itself also re-consumes the key:
+            // compositional event identity composes sibling canonical keys, so
+            // a committed resolution re-drives the OTHER resolvers over the
+            // same source artifact (byte-stable recomputes publish no new
+            // resolution record, so the fan-back terminates).
             try appendUniqueHintAlloc(alloc, &target_hints, .graph);
             try appendUniqueHintAlloc(alloc, &target_hints, .promotion);
+            try appendUniqueHintAlloc(alloc, &target_hints, .resolution);
         } else if (internal_keys.isEmbeddingArtifactKey(key) or internal_keys.isDerivedEmbeddingArtifactKey(key)) {
             try appendUniqueHintAlloc(alloc, &target_hints, .dense_vector);
             try appendUniqueHintAlloc(alloc, &target_hints, .sparse_vector);

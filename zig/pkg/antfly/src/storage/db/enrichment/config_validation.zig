@@ -8,6 +8,7 @@ const types = @import("../types.zig");
 const asset_producer = @import("asset_producer.zig");
 const document_extraction = @import("document_extraction.zig");
 const json_helpers = @import("../../../api/json_helpers.zig");
+const neighbor_context = @import("neighbor_context.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -30,7 +31,9 @@ pub fn producerJsonValuesEqual(alloc: Allocator, lhs: []const u8, rhs: []const u
 /// Dependency edges are validated by the catalog-aware caller, while this
 /// function is intentionally shared by API admission and local provisioning.
 pub fn validatePublicConfig(alloc: Allocator, cfg: types.EnrichmentConfig) !void {
-    if (cfg.name.len == 0 or (cfg.field.len == 0 and cfg.template.len == 0))
+    if (cfg.name.len == 0) return error.InvalidEnrichmentConfig;
+    const consumes_asset_artifact = cfg.kind == .asset and cfg.source_artifact_name.len > 0;
+    if (cfg.field.len == 0 and cfg.template.len == 0 and !consumes_asset_artifact)
         return error.InvalidEnrichmentConfig;
     if (cfg.execution) |execution| {
         if (execution.batch_items) |items| if (items == 0)
@@ -44,12 +47,74 @@ pub fn validatePublicConfig(alloc: Allocator, cfg: types.EnrichmentConfig) !void
         return error.InvalidEnrichmentConfig;
     if (cfg.vector_space.len > 0 and cfg.kind != .embedding)
         return error.InvalidEnrichmentConfig;
+    if (cfg.neighbor_context != null and cfg.kind != .asset)
+        return error.InvalidEnrichmentConfig;
     switch (cfg.kind) {
         .chunk => if (cfg.chunk_size == 0 and cfg.chunker_json.len == 0)
             return error.InvalidEnrichmentConfig,
         .embedding => {},
-        .asset => try validateAssetProducerConfig(alloc, cfg.producer_json),
+        .asset => {
+            try validateAssetProducerConfig(alloc, cfg.producer_json);
+            if (cfg.neighbor_context) |context| try validateNeighborContextConfig(alloc, context, cfg.producer_json);
+            if (cfg.source_artifact_name.len > 0) {
+                if (cfg.field.len > 0 or cfg.template.len > 0) return error.InvalidEnrichmentConfig;
+                try validateUpstreamAssetProducer(alloc, cfg.producer_json);
+            }
+        },
     }
+}
+
+/// An asset that names `source_artifact_name` consumes another asset's
+/// produced bytes instead of a document field. Media-locator producers
+/// (`document_extraction`, `reader`, `transcriber`) treat the source as a
+/// URL and would dereference artifact bytes as a location, so the option is
+/// closed to them at admission. Shared by the API config walk and the
+/// catalog validator.
+pub fn validateUpstreamAssetProducer(alloc: Allocator, producer_json: []const u8) !void {
+    var producer = asset_producer.parseProducerConfig(alloc, producer_json) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidAssetProducerConfig,
+    };
+    defer producer.deinit(alloc);
+    switch (producer.type) {
+        .copy, .generator, .extractor => {},
+        .document_extraction, .reader, .transcriber => return error.InvalidEnrichmentConfig,
+    }
+}
+
+/// Neighbor context is a producer-input option: only producers whose source
+/// text is a rendered prompt can carry it. `copy` republishes the source
+/// verbatim, while `document_extraction`, `reader`, and `transcriber` treat
+/// the source as a media locator, so they reject the option at admission
+/// rather than corrupting a URL at runtime. The runtime samples same-shard
+/// graph state only; the graph-index reference itself is validated against
+/// the table's index catalog by API admission.
+fn validateNeighborContextConfig(
+    alloc: Allocator,
+    context: types.EnrichmentNeighborContextConfig,
+    producer_json: []const u8,
+) !void {
+    if (context.graph_index.len == 0) return error.InvalidEnrichmentConfig;
+    if (context.limit < 1 or context.limit > neighbor_context.max_limit)
+        return error.InvalidEnrichmentConfig;
+    for (context.edge_types) |edge_type| {
+        if (edge_type.len == 0) return error.InvalidEnrichmentConfig;
+    }
+    var producer = asset_producer.parseProducerConfig(alloc, producer_json) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidAssetProducerConfig,
+    };
+    defer producer.deinit(alloc);
+    if (!producerConsumesPromptText(producer.type)) return error.InvalidEnrichmentConfig;
+}
+
+/// Producers whose `source_text` is a rendered prompt rather than a media
+/// locator. Shared by admission and the runtime injection guard.
+pub fn producerConsumesPromptText(producer_type: asset_producer.ProducerType) bool {
+    return switch (producer_type) {
+        .generator, .extractor => true,
+        .copy, .document_extraction, .reader, .transcriber => false,
+    };
 }
 
 /// Parses every producer at admission time and applies the same deep
@@ -131,6 +196,73 @@ test "public enrichment validation rejects invalid execution and producer config
         .chunk_size = 256,
         .vector_space = "dense-v1",
     }));
+}
+
+test "public enrichment validation bounds neighbor context to text-consuming asset producers" {
+    const generator_producer = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\"}}";
+    // A well-formed neighbor context on a generator producer is admitted.
+    try validatePublicConfig(std.testing.allocator, .{
+        .name = "conceptualize_v1",
+        .kind = .asset,
+        .field = "name",
+        .producer_json = generator_producer,
+        .neighbor_context = .{ .graph_index = "taxonomy", .direction = .out, .limit = 8 },
+    });
+    // Only asset enrichments can sample adjacency.
+    try std.testing.expectError(error.InvalidEnrichmentConfig, validatePublicConfig(std.testing.allocator, .{
+        .name = "chunks",
+        .kind = .chunk,
+        .field = "body",
+        .chunk_size = 256,
+        .neighbor_context = .{ .graph_index = "taxonomy" },
+    }));
+    // Bounds: the graph index is required and the limit is 1..64.
+    try std.testing.expectError(error.InvalidEnrichmentConfig, validatePublicConfig(std.testing.allocator, .{
+        .name = "conceptualize_v1",
+        .kind = .asset,
+        .field = "name",
+        .producer_json = generator_producer,
+        .neighbor_context = .{ .graph_index = "" },
+    }));
+    try std.testing.expectError(error.InvalidEnrichmentConfig, validatePublicConfig(std.testing.allocator, .{
+        .name = "conceptualize_v1",
+        .kind = .asset,
+        .field = "name",
+        .producer_json = generator_producer,
+        .neighbor_context = .{ .graph_index = "taxonomy", .limit = 0 },
+    }));
+    try std.testing.expectError(error.InvalidEnrichmentConfig, validatePublicConfig(std.testing.allocator, .{
+        .name = "conceptualize_v1",
+        .kind = .asset,
+        .field = "name",
+        .producer_json = generator_producer,
+        .neighbor_context = .{ .graph_index = "taxonomy", .limit = 65 },
+    }));
+    // Producers whose source text is a media locator, not a prompt, reject
+    // the option instead of corrupting the URL at runtime.
+    try std.testing.expectError(error.InvalidEnrichmentConfig, validatePublicConfig(std.testing.allocator, .{
+        .name = "copied",
+        .kind = .asset,
+        .field = "body",
+        .neighbor_context = .{ .graph_index = "taxonomy" },
+    }));
+    inline for (.{ "reader", "transcriber" }) |producer_type| {
+        try std.testing.expectError(error.InvalidEnrichmentConfig, validatePublicConfig(std.testing.allocator, .{
+            .name = "media",
+            .kind = .asset,
+            .field = "url",
+            .producer_json = "{\"type\":\"" ++ producer_type ++ "\",\"config\":{\"provider\":\"antfly\"}}",
+            .neighbor_context = .{ .graph_index = "taxonomy" },
+        }));
+    }
+    // Extractors consume rendered content text and are admitted.
+    try validatePublicConfig(std.testing.allocator, .{
+        .name = "relations_v1",
+        .kind = .asset,
+        .field = "body",
+        .producer_json = "{\"type\":\"extractor\",\"config\":{\"provider\":\"antfly\"}}",
+        .neighbor_context = .{ .graph_index = "taxonomy", .edge_types = &.{"mentions"} },
+    });
 }
 
 test "producer JSON equality ignores object key order" {

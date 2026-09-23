@@ -136,6 +136,7 @@ comptime {
     _ = @import("db/enrichment/enrichment_state.zig");
     _ = @import("db/enrichment/enrichment_types.zig");
     _ = @import("db/enrichment/enrichment_worker.zig");
+    _ = @import("db/enrichment/neighbor_context.zig");
     _ = @import("db/enrichment/utf8_text.zig");
     _ = @import("db/generation_lifecycle.zig");
     _ = @import("db/graph_runtime.zig");

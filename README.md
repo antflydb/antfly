@@ -44,7 +44,7 @@ See the [quickstart guide](https://antfly.io/docs/guides/quickstart) for a full 
 - **CPU, Metal, and CUDA** — native kernels for [inference](zig/pkg/inference) and vector search: SIMD on x86 and ARM, Metal on Apple silicon, and [CUDA](zig/pkg/inference/CUDA.md) with a kernel JIT
 - **Distributed** — multi-Raft consensus, automatic sharding and replication, online shard splits, cross-shard transactions, horizontal scaling
 - **Runs anywhere** — [Antfly Lite](docs/guides/lite.mdx) as a single `.aflite` file, a single node with a [hot standby](zig/pkg/antfly/src/storage/hot_standby), a Raft cluster, or [serverless](zig/pkg/antfly/src/serverless) over object storage
-- **Embeddable** — a [C API](zig/pkg/antfly/src/capi) (`libantfly`), a [Go binding](go/pkg/antflylite), and an in-browser [WASM build](zig/pkg/antfly-embedded/WASM.md) so the engine runs in-process, in unit tests, or on the edge
+- **Embeddable** — a [C API](zig/pkg/antfly/src/capi) (`libantfly`), [Lite bindings](docs/sdks.mdx#embedded-lite-binding) for [Go](go/pkg/lite), [Python](py/packages/lite), [Rust](rs/crates/lite), and [TypeScript](ts/packages/lite), and an in-browser [WASM build](zig/pkg/antfly-embedded/WASM.md) so the engine runs in-process, in unit tests, or on the edge
 - **Extensions** — run your own code inside the engine with the [Wasmtime extension runtime](zig/pkg/antfly/src/extensions)
 - **Enrichment pipelines** — [configurable pipelines](zig/pkg/antfly/src/storage/db/enrichment) per index for embeddings, summaries, graph edges, and custom computed fields
 - **Bring your own models** — Ollama, OpenAI, Bedrock, Google, or run models locally with Antfly inference (GGUF, safetensors, and ONNX)
@@ -109,7 +109,7 @@ Antfly inference handles the ML side: embeddings, chunking, reranking, classific
 | evalaf | LLM/RAG/agent evaluation ("promptfoo for Go") | [`go/pkg/evalaf`](go/pkg/evalaf) |
 | Genkit plugin | Firebase Genkit integration for retrieval and docstore | [`go/pkg/genkit/antfly`](go/pkg/genkit/antfly) |
 | memoryaf | Shared long-term memory for AI agents over MCP and HTTP | [`go/pkg/memoryaf`](go/pkg/memoryaf) |
-| antflylite | Go binding for embedded `.aflite` databases over the C ABI | [`go/pkg/antflylite`](go/pkg/antflylite) |
+| lite | Go, Python, Rust, and TypeScript bindings for embedded `.aflite` databases over the C ABI | [`go/pkg/lite`](go/pkg/lite), [`py/packages/lite`](py/packages/lite), [`rs/crates/lite`](rs/crates/lite), [`ts/packages/lite`](ts/packages/lite) |
 
 ## Architecture
 
@@ -139,4 +139,4 @@ Interested in contributing? See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-The core server is [Elastic License 2.0 (ELv2)](LICENSE). That means you can use it, modify it, self-host it, and build products on top of it — you just can't offer Antfly itself as a managed service. The in-process bindings that link the core — [`antfly-embedded`](zig/pkg/antfly-embedded) and the [Go Lite binding](go/pkg/antflylite) — are ELv2 as well. Everything else — the [SDKs](go/pkg/sdk) for Go, TypeScript, Python, and Rust, [React components](ts/packages/components), the [inference runtime](zig/pkg/inference), [pgaf](rs/crates/pgaf), [docsaf](go/pkg/docsaf), [evalaf](go/pkg/evalaf) — is Apache 2.0. We tried to keep as much as possible under a permissive license.
+The core server is [Elastic License 2.0 (ELv2)](LICENSE). That means you can use it, modify it, self-host it, and build products on top of it — you just can't offer Antfly itself as a managed service. The in-process Zig embedding package, [`antfly-embedded`](zig/pkg/antfly-embedded), is ELv2 as well. Everything else — the [SDKs](go/pkg/sdk) for Go, TypeScript, Python, and Rust, the public C ABI header [`antfly.h`](zig/pkg/antfly/include/antfly.h), the Antfly Lite bindings for [Go](go/pkg/lite), [Python](py/packages/lite), [Rust](rs/crates/lite), and [TypeScript](ts/packages/lite), [React components](ts/packages/components), the [inference runtime](zig/pkg/inference), [pgaf](rs/crates/pgaf), [docsaf](go/pkg/docsaf), [evalaf](go/pkg/evalaf), and the runnable [examples](examples) — is Apache 2.0. We tried to keep as much as possible under a permissive license.

@@ -1507,8 +1507,14 @@ fn collectGraphEdgeArtifact(
         alloc.free(parsed.index_name);
         alloc.free(parsed.edge_type);
         alloc.free(parsed.target_doc_key);
+        if (parsed.source_node) |source| alloc.free(source);
     }
 
+    // The portable edge-batch wire format carries owner-sourced pairs only.
+    // An entity-sourced row (explicit source_node) restores as its legacy
+    // owner-sourced collapse here; the backed-up extraction and resolution
+    // artifacts re-materialize the canonical entity-sourced row on the first
+    // managed replay after import, and replacement retires this collapse.
     try appendEdgeBatchEntry(alloc, batches, parsed.index_name, parsed.doc_key, parsed.target_doc_key, parsed.edge_type, value);
 }
 

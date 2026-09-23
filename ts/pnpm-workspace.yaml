@@ -6,6 +6,7 @@ allowBuilds:
   '@parcel/watcher': true
   core-js: true
   esbuild: true
+  koffi: true
   msw: true
   sharp: true
 
@@ -14,6 +15,7 @@ onlyBuiltDependencies:
   - canvas
   - core-js
   - esbuild
+  - koffi
   - msw
   - protobufjs
   - sharp

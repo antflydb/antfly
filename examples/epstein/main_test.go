@@ -1,3 +1,17 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package main
 
 import (
@@ -130,8 +144,8 @@ func TestCreateEmbeddingIndexUsesAntflyClipClap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AsAntflyEmbedderConfig failed: %v", err)
 	}
-	if cfg.Embedder.Provider != antfly.EmbedderProviderAntfly {
-		t.Fatalf("embedder provider = %q, want %q", cfg.Embedder.Provider, antfly.EmbedderProviderAntfly)
+	if string(embedder.Provider) != string(antfly.EmbedderProviderAntfly) {
+		t.Fatalf("embedder provider = %q, want %q", embedder.Provider, antfly.EmbedderProviderAntfly)
 	}
 	if cfg.Dimension != DefaultEmbeddingDims {
 		t.Fatalf("embedding dimension = %d, want %d", cfg.Dimension, DefaultEmbeddingDims)
@@ -444,6 +458,22 @@ func TestParseSyncLevelFlag(t *testing.T) {
 	}
 }
 
+func TestAutoschemaRequiresCreateTable(t *testing.T) {
+	commands := []struct {
+		name string
+		run  func([]string) error
+	}{
+		{name: "load", run: loadCmd},
+		{name: "sync", run: syncCmd},
+	}
+	for _, cmd := range commands {
+		err := cmd.run([]string{"--autoschema"})
+		if err == nil || !strings.Contains(err.Error(), "--autoschema requires --create-table") {
+			t.Fatalf("%s with --autoschema but without --create-table: err = %v, want the --create-table requirement", cmd.name, err)
+		}
+	}
+}
+
 func TestCreateSearchTableIndexesUsesServerDefaultFullText(t *testing.T) {
 	embeddingIndex, err := createEmbeddingIndex(DefaultEmbeddingModel, DefaultInferenceURL, DefaultChunkerModel, 512, 50)
 	if err != nil {
@@ -475,7 +505,7 @@ func TestStreamJSONPagesNormalizesReservedTypeField(t *testing.T) {
   }
 }`
 
-	var batches []map[string]any
+	var batches []antfly.LinearMergeRecords
 	for batch := range streamJSONPages(strings.NewReader(input), 1) {
 		batches = append(batches, batch)
 	}
@@ -483,9 +513,9 @@ func TestStreamJSONPagesNormalizesReservedTypeField(t *testing.T) {
 		t.Fatalf("batch count = %d, want 2", len(batches))
 	}
 
-	first, ok := batches[0]["doc_001"].(map[string]any)
+	first, ok := batches[0]["doc_001"]
 	if !ok {
-		t.Fatalf("doc_001 has type %T, want map[string]any", batches[0]["doc_001"])
+		t.Fatalf("doc_001 missing from first batch: %#v", batches[0])
 	}
 	if _, ok := first["_type"]; ok {
 		t.Fatalf("doc_001 still has reserved _type field")
@@ -497,9 +527,9 @@ func TestStreamJSONPagesNormalizesReservedTypeField(t *testing.T) {
 		t.Fatalf("doc_001 content = %v, want one", got)
 	}
 
-	second, ok := batches[1]["doc_002"].(map[string]any)
+	second, ok := batches[1]["doc_002"]
 	if !ok {
-		t.Fatalf("doc_002 has type %T, want map[string]any", batches[1]["doc_002"])
+		t.Fatalf("doc_002 missing from second batch: %#v", batches[1])
 	}
 	if _, ok := second["_type"]; ok {
 		t.Fatalf("doc_002 still has reserved _type field")
@@ -516,7 +546,7 @@ func TestStreamJSONPagesWithLimit(t *testing.T) {
   "doc_003": {"content": "three"}
 }`
 
-	var batches []map[string]any
+	var batches []antfly.LinearMergeRecords
 	for batch := range streamJSONPagesWithLimit(strings.NewReader(input), 2, 1) {
 		batches = append(batches, batch)
 	}

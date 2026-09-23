@@ -275,6 +275,20 @@ pub fn addOpenApiSourceSteps(
             }),
             .destination = antfly_generated_root ++ "/exa_api",
         },
+        .{
+            .directory = openapi_build.addGeneratedDirectory(b, .{
+                .compiler = openapi_codegen,
+                .scripts_root = b.path("../scripts"),
+                .spec = b.path("specs/tavily-openapi.json"),
+                .package_name = "tavily_api",
+                .generate = "types",
+                .schema_aliases = &.{
+                    .{ "SearchRequest", "/paths/~1search/post/requestBody/content/application~1json/schema" },
+                    .{ "SearchResult", "/paths/~1search/post/responses/200/content/application~1json/schema/properties/results/items" },
+                },
+            }),
+            .destination = antfly_generated_root ++ "/tavily_api",
+        },
     };
 
     // Assemble complete owner trees so removing a module from this inventory
@@ -336,6 +350,7 @@ pub const CommittedModules = struct {
     extraction: *std.Build.Module,
     openai_api: *std.Build.Module,
     exa_api: *std.Build.Module,
+    tavily_api: *std.Build.Module,
 };
 
 fn committedModule(b: *std.Build, options: CommittedOptions, name: []const u8, httpx: bool) *std.Build.Module {
@@ -444,6 +459,7 @@ pub fn createCommittedModules(b: *std.Build, options: CommittedOptions) Committe
 
     const openai_api_mod = committedModule(b, options, "openai_api", true);
     const exa_api_mod = committedModule(b, options, "exa_api", true);
+    const tavily_api_mod = committedModule(b, options, "tavily_api", true);
     public_openapi_mod.addImport("antfly-json", options.json);
     client_openapi_mod.addImport("antfly-json", options.json);
     metadata_openapi_mod.addImport("antfly-json", options.json);
@@ -478,5 +494,6 @@ pub fn createCommittedModules(b: *std.Build, options: CommittedOptions) Committe
         .extraction = extraction_openapi_mod,
         .openai_api = openai_api_mod,
         .exa_api = exa_api_mod,
+        .tavily_api = tavily_api_mod,
     };
 }

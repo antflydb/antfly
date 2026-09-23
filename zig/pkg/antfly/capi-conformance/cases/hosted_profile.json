@@ -1,0 +1,16 @@
+{
+  "name": "hosted_profile",
+  "description": "Hosted/manual-maintenance handles do no background work; the caller drains with run_until_idle.",
+  "open": {"create": true, "profile": "hosted", "no_sync": true},
+  "steps": [
+    {"op": "capabilities", "expect": {"json_subset": {"hosted_profile": true, "manual_maintenance": true, "threading": "serialized"}}},
+    {"op": "batch", "timestamp": 1, "writes": [
+      {"key": "doc:hosted", "value": {"title": "hosted", "body": "manual maintenance drain"}}
+    ]},
+    {"op": "run_until_idle"},
+    {"op": "search", "request": {"full_text_search": {"match": {"field": "body", "text": "manual maintenance"}}, "limit": 5},
+      "expect": {"contains": ["doc:hosted"]}},
+    {"op": "reopen", "profile": "hosted", "no_sync": true},
+    {"op": "lookup", "key": "doc:hosted", "expect": {"json_subset": {"title": "hosted"}}}
+  ]
+}

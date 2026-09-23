@@ -44,7 +44,8 @@ class RestoreJob:
             `failure_details_truncated` indicates that additional failures or part of a long failure detail were omitted.
             Any failed or durability-pending table makes the job phase `failed`; inspect this result for partial progress
             and use a new idempotency key when retrying a changed request.
-        error (str | Unset):
+        error (str | Unset): Most recent retry or terminal failure reason. Retained while queued or running, including
+            across progress checkpoints and recovery; omitted after successful completion.
         expires_at_ms (int | Unset): Unix epoch milliseconds after which this terminal job record and its idempotency
             key may be removed. Omitted while the job is nonterminal.
     """

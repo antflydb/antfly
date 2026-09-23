@@ -45,6 +45,7 @@ pub const ResolverConfig = resolver_catalog.ResolverConfig;
 const enrichment_types = @import("../enrichment/enrichment_types.zig");
 const enrichment_artifact_codec = @import("../enrichment/artifact_codec.zig");
 const enrichment_config_validation = @import("../enrichment/config_validation.zig");
+const enrichment_neighbor_context = @import("../enrichment/neighbor_context.zig");
 const asset_producer_mod = @import("../enrichment/asset_producer.zig");
 const backfill_state_mod = @import("../backfill_state.zig");
 const db_config = @import("../config.zig");
@@ -2092,6 +2093,17 @@ pub const IndexManager = struct {
     pub const DenseIndex = struct {
         apply_mutex: *std.atomic.Mutex,
         capture_incarnation: u64 = 0,
+        /// A certificate is checked against the resident HBC generation once.
+        /// Later live writes may change active_count before the next checkpoint;
+        /// they must not revoke an already validated serving snapshot.
+        serving_certificate_mutex: std.atomic.Mutex = .unlocked,
+        verified_serving_certificate: ?struct {
+            capture_incarnation: u64,
+            applied_sequence: u64,
+            generation: u64,
+            config_hash: u64,
+            published_count: u64,
+        } = null,
         config: types.IndexConfig,
         field_name: []u8,
         dims: u32,
@@ -2123,6 +2135,41 @@ pub const IndexManager = struct {
         vector_loader_context: ?*DenseVectorLoadContext = null,
         ordinal_vector_ids: std.AutoHashMapUnmanaged(doc_identity.DocOrdinal, u64) = .empty,
         vector_ordinals: std.AutoHashMapUnmanaged(u64, doc_identity.DocOrdinal) = .empty,
+
+        fn matchesVerifiedServingCertificate(self: *const DenseIndex, checkpoint: apply_state.ProjectionCheckpoint, certified_count: u64) bool {
+            const verified = self.verified_serving_certificate orelse return false;
+            return verified.capture_incarnation == self.capture_incarnation and
+                verified.applied_sequence == checkpoint.applied_sequence and
+                verified.generation == checkpoint.generation and
+                verified.config_hash == checkpoint.config_hash and
+                verified.published_count == certified_count;
+        }
+
+        /// Only an open or publication boundary may establish this proof.
+        pub fn validateServingCertificate(self: *DenseIndex, checkpoint: apply_state.ProjectionCheckpoint) bool {
+            const certified_count = checkpoint.published_count orelse return false;
+            while (!self.serving_certificate_mutex.tryLock()) std.atomic.spinLoopHint();
+            defer self.serving_certificate_mutex.unlock();
+            if (self.matchesVerifiedServingCertificate(checkpoint, certified_count)) return true;
+            if (self.index.stats().active_count != certified_count) return false;
+            self.verified_serving_certificate = .{
+                .capture_incarnation = self.capture_incarnation,
+                .applied_sequence = checkpoint.applied_sequence,
+                .generation = checkpoint.generation,
+                .config_hash = checkpoint.config_hash,
+                .published_count = certified_count,
+            };
+            return true;
+        }
+
+        /// Status reads must never turn a previously failed certificate into
+        /// a valid one just because later live writes reach the same count.
+        pub fn hasValidatedServingCertificate(self: *DenseIndex, checkpoint: apply_state.ProjectionCheckpoint) bool {
+            const certified_count = checkpoint.published_count orelse return false;
+            while (!self.serving_certificate_mutex.tryLock()) std.atomic.spinLoopHint();
+            defer self.serving_certificate_mutex.unlock();
+            return self.matchesVerifiedServingCertificate(checkpoint, certified_count);
+        }
     };
 
     const DenseVectorLoadContext = struct {
@@ -3046,6 +3093,29 @@ pub const IndexManager = struct {
             .manager = self,
             .mutex = mutex,
         };
+    }
+
+    // Keep publication, cleanup, and pointer validation on the same adapter
+    // as backend open. Resolve at use time so option setters stay consistent;
+    // text main and WAL adapters may intentionally be different.
+    fn effectiveTextMainStorage(self: *const IndexManager) ?lsm_backend_mod.Storage {
+        return self.text_lsm_storage orelse self.text_main_lsm_options.storage;
+    }
+
+    fn effectiveDenseStorage(self: *const IndexManager) ?lsm_backend_mod.Storage {
+        return self.dense_lsm_storage orelse self.dense_lsm_options.storage;
+    }
+
+    fn effectiveSparseStorage(self: *const IndexManager) ?lsm_backend_mod.Storage {
+        return self.sparse_lsm_storage orelse self.sparse_lsm_options.storage;
+    }
+
+    fn effectiveGraphStorage(self: *const IndexManager) ?lsm_backend_mod.Storage {
+        return self.graph_lsm_storage orelse self.graph_reverse_lsm_options.storage;
+    }
+
+    fn effectiveTextWalStorage(self: *const IndexManager) ?lsm_backend_mod.Storage {
+        return self.text_lsm_storage orelse self.text_wal_lsm_options.storage;
     }
 
     pub fn setTextMainBackend(self: *IndexManager, backend: persistent_mod.MainBackend) void {
@@ -4996,7 +5066,7 @@ pub const IndexManager = struct {
     ) bool {
         if (native_physical_v2) return true;
         if (!self.configuredDenseNativePostingStoreSupported()) return false;
-        if (!nativeBackupStoragePublicationCompatible(self.dense_lsm_storage)) return false;
+        if (!nativeBackupStoragePublicationCompatible(self.effectiveDenseStorage())) return false;
         if (self.dense_native_migration_policy_source) |source| {
             if (!source.authorityPermitted()) return false;
         }
@@ -5028,7 +5098,7 @@ pub const IndexManager = struct {
         // authority until their adapter exposes an equivalent staged
         // generation/promote contract; repeatedly scheduling an impossible
         // migration only creates permanent repair debt.
-        if (!nativeBackupStoragePublicationCompatible(self.dense_lsm_storage)) return false;
+        if (!nativeBackupStoragePublicationCompatible(self.effectiveDenseStorage())) return false;
         if (self.dense_native_migration_policy_source) |source| {
             if (!source.authorityPermitted()) return false;
         }
@@ -6214,7 +6284,7 @@ pub const IndexManager = struct {
             .no_meta_sync = self.relaxed_split_durability,
         }, .{
             .backend_options = self.dense_lsm_options,
-            .storage = self.dense_lsm_storage,
+            .storage = self.effectiveDenseStorage(),
             .cache = self.lsm_cache,
             .root_generation = self.lsm_root_generation,
         });
@@ -6307,7 +6377,7 @@ pub const IndexManager = struct {
             .no_sync = self.relaxed_split_durability,
             .no_meta_sync = self.relaxed_split_durability,
             .backend = self.sparse_backend,
-            .lsm_storage = self.sparse_lsm_storage,
+            .lsm_storage = self.effectiveSparseStorage(),
             .lsm_cache = self.lsm_cache,
             .lsm_options = self.sparse_lsm_options,
             .lsm_root_generation = self.lsm_root_generation,
@@ -6339,7 +6409,7 @@ pub const IndexManager = struct {
             .no_sync = self.relaxed_split_durability,
             .no_meta_sync = self.relaxed_split_durability,
             .reverse_backend = self.graph_reverse_backend,
-            .reverse_lsm_storage = self.graph_lsm_storage,
+            .reverse_lsm_storage = self.effectiveGraphStorage(),
             .reverse_lsm_cache = self.lsm_cache,
             .reverse_lsm_options = self.graph_reverse_lsm_options,
             .reverse_lsm_root_generation = self.lsm_root_generation,
@@ -8034,19 +8104,19 @@ pub const IndexManager = struct {
     /// immutable files that remain stable after capture admission reopens.
     pub fn nativeBackupSupportsImmutableCheckpoint(self: *IndexManager, name: []const u8, kind: types.IndexKind) bool {
         return switch (kind) {
-            .full_text => self.text_main_backend == .lsm and nativeBackupStoragePublicationCompatible(self.text_lsm_storage),
+            .full_text => self.text_main_backend == .lsm and nativeBackupStoragePublicationCompatible(self.effectiveTextMainStorage()),
             .dense_vector => if (self.denseIndex(name)) |entry|
                 if (entry.index.experimentalPostingWalAuthoritative())
                     // Native postings are the projection authority. Shared
                     // vector blocks are optional acceleration and therefore
                     // must not make an otherwise complete backup unsupported.
-                    nativeBackupStoragePublicationCompatible(self.dense_lsm_storage)
+                    nativeBackupStoragePublicationCompatible(self.effectiveDenseStorage())
                 else
-                    self.dense_storage_backend == .lsm and nativeBackupStoragePublicationCompatible(self.dense_lsm_storage)
+                    self.dense_storage_backend == .lsm and nativeBackupStoragePublicationCompatible(self.effectiveDenseStorage())
             else
                 false,
-            .sparse_vector => self.sparse_backend == .lsm and nativeBackupStoragePublicationCompatible(self.sparse_lsm_storage),
-            .graph => self.graph_reverse_backend == .lsm and nativeBackupStoragePublicationCompatible(self.graph_lsm_storage),
+            .sparse_vector => self.sparse_backend == .lsm and nativeBackupStoragePublicationCompatible(self.effectiveSparseStorage()),
+            .graph => self.graph_reverse_backend == .lsm and nativeBackupStoragePublicationCompatible(self.effectiveGraphStorage()),
             .algebraic => true,
         };
     }
@@ -8783,6 +8853,9 @@ pub const IndexManager = struct {
             .generation = checkpoint.generation,
             .config_hash = checkpoint.config_hash,
         });
+        // Verify at publication time. A status request may arrive only after
+        // the next live mutation has already advanced the resident count.
+        _ = entry.validateServingCertificate(checkpoint);
     }
 
     pub fn denseProjectionCheckpointMetadata(
@@ -11206,10 +11279,10 @@ pub const IndexManager = struct {
         cfg: types.IndexConfig,
     ) backfill_state_mod.RebuildState {
         const storage = switch (kind) {
-            .full_text => self.text_lsm_storage,
-            .dense_vector => self.dense_lsm_storage,
-            .sparse_vector => self.sparse_lsm_storage,
-            .graph => self.graph_lsm_storage,
+            .full_text => self.effectiveTextMainStorage(),
+            .dense_vector => self.effectiveDenseStorage(),
+            .sparse_vector => self.effectiveSparseStorage(),
+            .graph => self.effectiveGraphStorage(),
             .algebraic => null,
         };
         return backfill_state_mod.RebuildState.initOwned(
@@ -11576,9 +11649,38 @@ pub const IndexManager = struct {
         return existing.eql(cfg);
     }
 
+    fn resolverLabelSetsEqual(a: []const []const u8, b: []const []const u8) bool {
+        if (a.len != b.len) return false;
+        for (a, b) |as, bs| if (!std.mem.eql(u8, as, bs)) return false;
+        return true;
+    }
+
+    /// Label-routing admission: labeled resolvers sharing a source artifact
+    /// must claim disjoint label sets, otherwise the mention partition is
+    /// ambiguous. Catch-alls (empty `labels`) are unrestricted — multiple
+    /// catch-alls per artifact remain admitted for compatibility with
+    /// intentional double-resolution setups, and each catch-all skips the
+    /// labels claimed by labeled siblings at runtime. Caller holds the
+    /// catalog mutex.
+    fn resolverLabelRoutingConflicts(self: *const IndexManager, cfg: resolver_catalog.ResolverConfig) bool {
+        if (cfg.labels.len == 0) return false;
+        for (self.resolvers.items) |entry| {
+            if (std.mem.eql(u8, entry.name, cfg.name)) continue;
+            if (entry.labels.len == 0) continue;
+            if (!std.mem.eql(u8, entry.source_artifact, cfg.source_artifact)) continue;
+            if (!entry.source_artifact_kind.matches(cfg.source_artifact_kind) and
+                !cfg.source_artifact_kind.matches(entry.source_artifact_kind)) continue;
+            for (entry.labels) |claimed| {
+                if (cfg.resolvesLabel(claimed)) return true;
+            }
+        }
+        return false;
+    }
+
     fn resolverMaterialConfigChanged(existing: resolver_catalog.ResolverConfig, next: resolver_catalog.ResolverConfig) bool {
         return !std.mem.eql(u8, existing.table, next.table) or
             !std.mem.eql(u8, existing.key_template, next.key_template) or
+            !resolverLabelSetsEqual(existing.labels, next.labels) or
             existing.type_must_match != next.type_must_match or
             !std.mem.eql(u8, existing.scorer_json, next.scorer_json) or
             !std.mem.eql(u8, existing.candidate_search, next.candidate_search) or
@@ -11590,6 +11692,10 @@ pub const IndexManager = struct {
             existing.fusion_trust != next.fusion_trust or
             existing.fusion_prior != next.fusion_prior or
             existing.fusion_prior_weight != next.fusion_prior_weight or
+            // A changed admission floor re-resolves the corpus: raising it
+            // must retire existing low-confidence resolutions and their
+            // edges, not leave them in place until an unrelated change.
+            existing.min_confidence != next.min_confidence or
             existing.config_generation != next.config_generation;
     }
 
@@ -11598,6 +11704,7 @@ pub const IndexManager = struct {
         defer self.catalog_mutex.unlockExclusive();
         if (self.getResolver(cfg.name) != null) return error.ResolverAlreadyExists;
         if (self.resolverResolutionArtifactInUse(cfg.resolution_artifact, null)) return error.ResolverArtifactAlreadyExists;
+        if (self.resolverLabelRoutingConflicts(cfg)) return error.ResolverLabelRoutingConflict;
 
         const checkpoint = self.resolvers.items.len;
         errdefer self.truncateResolvers(checkpoint);
@@ -11619,6 +11726,7 @@ pub const IndexManager = struct {
             if (entry.source_artifact_kind != cfg.source_artifact_kind) return error.ResolverSourceArtifactImmutable;
             if (!std.mem.eql(u8, entry.resolution_artifact, cfg.resolution_artifact)) return error.ResolverArtifactImmutable;
             if (self.resolverResolutionArtifactInUse(cfg.resolution_artifact, cfg.name)) return error.ResolverArtifactAlreadyExists;
+            if (self.resolverLabelRoutingConflicts(cfg)) return error.ResolverLabelRoutingConflict;
             const material_changed = resolverMaterialConfigChanged(entry.*, cfg);
             var previous = entry.*;
             entry.* = try resolver_catalog.ResolverConfig.clone(self.alloc, cfg);
@@ -11631,6 +11739,7 @@ pub const IndexManager = struct {
             return if (material_changed) .updated_backfill_required else .updated_no_backfill;
         }
         if (self.resolverResolutionArtifactInUse(cfg.resolution_artifact, null)) return error.ResolverArtifactAlreadyExists;
+        if (self.resolverLabelRoutingConflicts(cfg)) return error.ResolverLabelRoutingConflict;
         const checkpoint = self.resolvers.items.len;
         errdefer self.truncateResolvers(checkpoint);
         try self.resolvers.append(self.alloc, try resolver_catalog.ResolverConfig.clone(self.alloc, cfg));
@@ -13197,6 +13306,59 @@ pub const IndexManager = struct {
         return self.cached_has_generated_enrichment_targets.load(.acquire);
     }
 
+    /// Which adjacency orientations asset enrichments sample from one graph
+    /// index via `neighbor_context`. `out` means some enrichment samples a
+    /// document's outgoing edges (direction `out` or `both`), `in` means some
+    /// enrichment samples reverse edges (direction `in` or `both`).
+    pub const NeighborContextDirections = struct {
+        out: bool = false,
+        in: bool = false,
+
+        pub fn any(self: @This()) bool {
+            return self.out or self.in;
+        }
+    };
+
+    /// Read-only scheduling lookup for graph-edge mutations: does any
+    /// admitted asset enrichment sample `neighbor_context` adjacency from the
+    /// named graph index, and in which orientations? An edge write or delete
+    /// on a referenced index must wake the enrichment worker for the affected
+    /// documents, because the sampled adjacency participates in the producer
+    /// skip-state hash. Catalogs hold few enrichments and the stored
+    /// neighbor-context JSON is small and admission-validated, so this parses
+    /// on demand instead of maintaining another invalidated cache; callers on
+    /// the batch-apply path memoize per index name. A stored config that no
+    /// longer parses contributes nothing (fail open-empty, matching the
+    /// runtime's empty-neighbors fallback).
+    pub fn assetNeighborContextDirectionsForGraphIndex(
+        self: *const IndexManager,
+        alloc: Allocator,
+        graph_index_name: []const u8,
+    ) !NeighborContextDirections {
+        var directions: NeighborContextDirections = .{};
+        if (graph_index_name.len == 0) return directions;
+        for (self.enrichments.items) |entry| {
+            if (entry.kind != .asset) continue;
+            if (entry.neighbor_context_json.len == 0) continue;
+            var context = enrichment_neighbor_context.parseConfigJson(alloc, entry.neighbor_context_json) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => continue,
+            };
+            defer context.deinit(alloc);
+            if (!std.mem.eql(u8, context.graph_index, graph_index_name)) continue;
+            switch (context.direction) {
+                .out => directions.out = true,
+                .in => directions.in = true,
+                .both => {
+                    directions.out = true;
+                    directions.in = true;
+                },
+            }
+            if (directions.out and directions.in) break;
+        }
+        return directions;
+    }
+
     pub fn has(self: *const IndexManager, name: []const u8) bool {
         return self.get(name) != null;
     }
@@ -13503,20 +13665,49 @@ pub const IndexManager = struct {
             requests.deinit(alloc);
         }
 
-        for (self.enrichments.items) |entry| {
-            if (entry.kind != .asset) continue;
-            try requests.append(alloc, .{
-                .kind = .asset,
-                .index_name = try alloc.dupe(u8, entry.name),
-                .artifact_name = try alloc.dupe(u8, entry.name),
-                .doc_key = try alloc.dupe(u8, doc_key),
-                .source_field = try alloc.dupe(u8, entry.source_field),
-                .source_template = if (entry.source_template.len > 0) try alloc.dupe(u8, entry.source_template) else "",
-                .full_text_index = entry.full_text_index,
-                .content_type = if (entry.content_type.len > 0) try alloc.dupe(u8, entry.content_type) else "",
-                .producer_json = if (entry.producer_json.len > 0) try alloc.dupe(u8, entry.producer_json) else "",
-                .execution_json = if (entry.execution_json.len > 0) try alloc.dupe(u8, entry.execution_json) else "",
-            });
+        // Assets are emitted upstream-first so a consumer that names another
+        // asset via `source_artifact_name` runs after its producer in the
+        // same quantum. Entries whose upstream cannot be scheduled first
+        // (defensive: admission rejects cycles) fall out in catalog order.
+        const asset_emitted = try alloc.alloc(bool, self.enrichments.items.len);
+        defer alloc.free(asset_emitted);
+        @memset(asset_emitted, false);
+        var emit_final_pass = false;
+        emit_loop: while (true) {
+            var emit_progress = false;
+            for (self.enrichments.items, 0..) |entry, entry_index| {
+                if (entry.kind != .asset or asset_emitted[entry_index]) continue;
+                if (!emit_final_pass and entry.source_artifact_name.len > 0) {
+                    var upstream_pending = false;
+                    for (self.enrichments.items, 0..) |candidate, candidate_index| {
+                        if (candidate.kind != .asset or asset_emitted[candidate_index]) continue;
+                        if (candidate_index == entry_index) continue;
+                        if (std.mem.eql(u8, candidate.name, entry.source_artifact_name)) {
+                            upstream_pending = true;
+                            break;
+                        }
+                    }
+                    if (upstream_pending) continue;
+                }
+                asset_emitted[entry_index] = true;
+                emit_progress = true;
+                try requests.append(alloc, .{
+                    .kind = .asset,
+                    .index_name = try alloc.dupe(u8, entry.name),
+                    .artifact_name = try alloc.dupe(u8, entry.name),
+                    .doc_key = try alloc.dupe(u8, doc_key),
+                    .source_field = try alloc.dupe(u8, entry.source_field),
+                    .source_template = if (entry.source_template.len > 0) try alloc.dupe(u8, entry.source_template) else "",
+                    .upstream_artifact_name = if (entry.source_artifact_name.len > 0) try alloc.dupe(u8, entry.source_artifact_name) else "",
+                    .full_text_index = entry.full_text_index,
+                    .content_type = if (entry.content_type.len > 0) try alloc.dupe(u8, entry.content_type) else "",
+                    .producer_json = if (entry.producer_json.len > 0) try alloc.dupe(u8, entry.producer_json) else "",
+                    .neighbor_context_json = if (entry.neighbor_context_json.len > 0) try alloc.dupe(u8, entry.neighbor_context_json) else "",
+                    .execution_json = if (entry.execution_json.len > 0) try alloc.dupe(u8, entry.execution_json) else "",
+                });
+            }
+            if (emit_final_pass) break :emit_loop;
+            if (!emit_progress) emit_final_pass = true;
         }
 
         for (self.text_indexes.items) |entry| {
@@ -18987,10 +19178,10 @@ pub const IndexManager = struct {
 
     fn provisionConfiguredIndexDirDurable(self: *IndexManager, cfg: types.IndexConfig) !void {
         const storage = switch (cfg.kind) {
-            .full_text => self.text_lsm_storage,
-            .dense_vector => self.dense_lsm_storage,
-            .sparse_vector => self.sparse_lsm_storage,
-            .graph => self.graph_lsm_storage,
+            .full_text => self.effectiveTextMainStorage(),
+            .dense_vector => self.effectiveDenseStorage(),
+            .sparse_vector => self.effectiveSparseStorage(),
+            .graph => self.effectiveGraphStorage(),
             .algebraic => return,
         };
         const path = try self.indexPath(cfg.name);
@@ -19024,7 +19215,7 @@ pub const IndexManager = struct {
         // (Lite, object storage, modeled devices) may use the native posting
         // format, but cannot safely share that locator unless it explicitly
         // proves its logical paths are the host paths being published.
-        if (!nativeBackupStoragePublicationCompatible(self.dense_lsm_storage)) return false;
+        if (!nativeBackupStoragePublicationCompatible(self.effectiveDenseStorage())) return false;
         if (self.dense_native_migration_policy_source) |source| return source.authorityPermitted();
         return true;
     }
@@ -19426,7 +19617,7 @@ pub const IndexManager = struct {
             &.{ index_path, "posting-segments", posting_segment_store_mod.authority_name },
         );
         defer self.alloc.free(marker_path);
-        const authority = if (self.dense_lsm_storage) |storage|
+        const authority = if (self.effectiveDenseStorage()) |storage|
             storage.readFileAlloc(
                 self.alloc,
                 marker_path,
@@ -19968,22 +20159,22 @@ pub const IndexManager = struct {
 
         switch (cfg.kind) {
             .full_text => {
-                if (self.text_lsm_storage == null) {
+                if (self.effectiveTextMainStorage() == null) {
                     try ensureIndexDir(self.alloc, self.base_path, path);
                 }
             },
             .dense_vector => {
-                if (self.dense_lsm_storage == null) {
+                if (self.effectiveDenseStorage() == null) {
                     try ensureIndexDir(self.alloc, self.base_path, path);
                 }
             },
             .sparse_vector => {
-                if (self.sparse_lsm_storage == null) {
+                if (self.effectiveSparseStorage() == null) {
                     try ensureIndexDir(self.alloc, self.base_path, path);
                 }
             },
             .graph => {
-                if (self.graph_lsm_storage == null) {
+                if (self.effectiveGraphStorage() == null) {
                     try ensureIndexDir(self.alloc, self.base_path, path);
                 }
             },
@@ -20058,8 +20249,8 @@ pub const IndexManager = struct {
                     .path = zpath,
                     .io = self.io,
                     .main_backend = self.text_main_backend,
-                    .main_lsm_storage = self.text_lsm_storage,
-                    .wal_storage = self.text_lsm_storage,
+                    .main_lsm_storage = self.effectiveTextMainStorage(),
+                    .wal_storage = self.effectiveTextWalStorage(),
                     .main_lsm_options = self.text_main_lsm_options,
                     .wal_lsm_options = self.text_wal_lsm_options,
                     .lsm_cache = self.lsm_cache,
@@ -20310,7 +20501,7 @@ pub const IndexManager = struct {
                     .no_meta_sync = self.relaxed_split_durability,
                 }, .{
                     .backend_options = self.dense_lsm_options,
-                    .storage = self.dense_lsm_storage,
+                    .storage = self.effectiveDenseStorage(),
                     .cache = self.lsm_cache,
                     .root_generation = self.lsm_root_generation,
                 });
@@ -20552,7 +20743,7 @@ pub const IndexManager = struct {
                     .no_sync = self.relaxed_split_durability,
                     .no_meta_sync = self.relaxed_split_durability,
                     .backend = self.sparse_backend,
-                    .lsm_storage = self.sparse_lsm_storage,
+                    .lsm_storage = self.effectiveSparseStorage(),
                     .lsm_cache = self.lsm_cache,
                     .lsm_options = self.sparse_lsm_options,
                     .lsm_root_generation = self.lsm_root_generation,
@@ -20650,7 +20841,7 @@ pub const IndexManager = struct {
                 defer self.alloc.free(forward_path);
                 const reverse_path = try std.fmt.allocPrint(self.alloc, "{s}/reverse", .{path});
                 defer self.alloc.free(reverse_path);
-                const reverse_store_missing = if (self.graph_lsm_storage != null) false else if (comptime builtin.os.tag == .freestanding) true else blk: {
+                const reverse_store_missing = if (self.effectiveGraphStorage() != null) false else if (comptime builtin.os.tag == .freestanding) true else blk: {
                     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
                     defer io_impl.deinit();
                     var reverse_dir = std.Io.Dir.cwd().openDir(io_impl.io(), reverse_path, .{}) catch |err| switch (err) {
@@ -20674,7 +20865,7 @@ pub const IndexManager = struct {
                     .no_sync = self.relaxed_split_durability,
                     .no_meta_sync = self.relaxed_split_durability,
                     .reverse_backend = self.graph_reverse_backend,
-                    .reverse_lsm_storage = self.graph_lsm_storage,
+                    .reverse_lsm_storage = self.effectiveGraphStorage(),
                     .reverse_lsm_cache = self.lsm_cache,
                     .reverse_lsm_options = self.graph_reverse_lsm_options,
                     .reverse_lsm_root_generation = self.lsm_root_generation,
@@ -21116,8 +21307,10 @@ pub const IndexManager = struct {
         if (self.getEnrichment(.asset, cfg.name)) |existing| {
             if (!std.mem.eql(u8, existing.source_field, cfg.source_field) or
                 !std.mem.eql(u8, existing.source_template, cfg.source_template) or
+                !std.mem.eql(u8, existing.source_artifact_name, cfg.source_artifact_name) or
                 !std.mem.eql(u8, existing.content_type, cfg.content_type) or
                 !try enrichment_config_validation.producerJsonValuesEqual(self.alloc, existing.producer_json, cfg.producer_json) or
+                !std.mem.eql(u8, existing.neighbor_context_json, cfg.neighbor_context_json) or
                 !std.mem.eql(u8, existing.execution_json, cfg.execution_json))
             {
                 return error.ConflictingEnrichmentConfig;
@@ -21130,7 +21323,9 @@ pub const IndexManager = struct {
     }
 
     fn validateEnrichmentConfig(self: *const IndexManager, cfg: enrichment_catalog.EnrichmentConfig) !void {
-        if (cfg.name.len == 0 or (cfg.source_field.len == 0 and cfg.source_template.len == 0)) return error.InvalidEnrichmentConfig;
+        if (cfg.name.len == 0) return error.InvalidEnrichmentConfig;
+        const consumes_asset_artifact = cfg.kind == .asset and cfg.source_artifact_name.len > 0;
+        if (cfg.source_field.len == 0 and cfg.source_template.len == 0 and !consumes_asset_artifact) return error.InvalidEnrichmentConfig;
         if (cfg.execution_json.len > 0) _ = try enrichment_types.parseExecutionPolicyJson(self.alloc, cfg.execution_json);
         if (cfg.full_text_index and cfg.kind == .embedding) return error.InvalidEnrichmentConfig;
         switch (cfg.kind) {
@@ -21152,6 +21347,27 @@ pub const IndexManager = struct {
             },
             .asset => {
                 try enrichment_config_validation.validateAssetProducerConfig(self.alloc, cfg.producer_json);
+                if (cfg.neighbor_context_json.len > 0) {
+                    var context = try enrichment_neighbor_context.parseConfigJson(self.alloc, cfg.neighbor_context_json);
+                    context.deinit(self.alloc);
+                }
+                if (cfg.source_artifact_name.len > 0) {
+                    // Asset-consumes-asset: the upstream chain must resolve
+                    // to admitted assets and terminate without revisiting
+                    // this config. Cycles that exclude `cfg` are caught when
+                    // their own members are validated.
+                    if (cfg.source_field.len > 0 or cfg.source_template.len > 0) return error.InvalidEnrichmentConfig;
+                    try enrichment_config_validation.validateUpstreamAssetProducer(self.alloc, cfg.producer_json);
+                    var hops: usize = 0;
+                    var current: []const u8 = cfg.source_artifact_name;
+                    while (current.len > 0) {
+                        if (std.mem.eql(u8, current, cfg.name)) return error.InvalidEnrichmentConfig;
+                        const upstream = self.getEnrichment(.asset, current) orelse return error.InvalidEnrichmentConfig;
+                        current = upstream.source_artifact_name;
+                        hops += 1;
+                        if (hops > self.enrichments.items.len) return error.InvalidEnrichmentConfig;
+                    }
+                }
             },
         }
     }
@@ -24475,7 +24691,13 @@ pub const IndexManager = struct {
         defer batch_deletes.deinit(self.alloc);
 
         for (writes) |write| {
-            if (!self.keyInRange(write.source)) continue;
+            // Range admission follows the OWNING document, exactly like the
+            // artifact key: an entity-sourced edge's canonical source key
+            // (write.owner non-empty) can hash into a different shard range
+            // than the producing document, and filtering by it would make
+            // the owner's shard silently drop the mutation.
+            const range_key = if (write.owner.len > 0) write.owner else write.source;
+            if (!self.keyInRange(range_key)) continue;
             if (!std.mem.eql(u8, write.index_name, entry.config.name)) continue;
             try batch_writes.append(self.alloc, .{
                 .source = write.source,
@@ -24485,16 +24707,19 @@ pub const IndexManager = struct {
                 .created_at = write.created_at,
                 .updated_at = write.updated_at,
                 .metadata_json = write.metadata_json,
+                .owner = write.owner,
             });
         }
 
         for (deletes) |delete| {
-            if (!self.keyInRange(delete.source)) continue;
+            const range_key = if (delete.owner.len > 0) delete.owner else delete.source;
+            if (!self.keyInRange(range_key)) continue;
             if (!std.mem.eql(u8, delete.index_name, entry.config.name)) continue;
             try batch_deletes.append(self.alloc, .{
                 .source = delete.source,
                 .target = delete.target,
                 .edge_type = delete.edge_type,
+                .owner = delete.owner,
             });
         }
 
@@ -29846,6 +30071,14 @@ fn enrichmentFromPublic(alloc: Allocator, cfg: types.EnrichmentConfig) !enrichme
         break :blk json;
     } else "";
     errdefer if (execution_json.len > 0) alloc.free(execution_json);
+    const neighbor_context_json = if (cfg.neighbor_context) |context| blk: {
+        const json = try std.json.Stringify.valueAlloc(alloc, context, .{});
+        errdefer alloc.free(json);
+        var parsed = try enrichment_neighbor_context.parseConfigJson(alloc, json);
+        parsed.deinit(alloc);
+        break :blk json;
+    } else "";
+    errdefer if (neighbor_context_json.len > 0) alloc.free(neighbor_context_json);
     return .{
         .name = try alloc.dupe(u8, cfg.name),
         .kind = publicEnrichmentKindToInternal(cfg.kind),
@@ -29861,6 +30094,7 @@ fn enrichmentFromPublic(alloc: Allocator, cfg: types.EnrichmentConfig) !enrichme
         .full_text_index = cfg.full_text_index,
         .content_type = if (cfg.content_type.len > 0) try alloc.dupe(u8, cfg.content_type) else "",
         .producer_json = if (cfg.producer_json.len > 0) try alloc.dupe(u8, cfg.producer_json) else "",
+        .neighbor_context_json = neighbor_context_json,
         .execution_json = execution_json,
     };
 }
@@ -29880,6 +30114,7 @@ fn internalEnrichmentConfigsEqual(alloc: Allocator, a: enrichment_catalog.Enrich
         a.full_text_index == b.full_text_index and
         std.mem.eql(u8, a.content_type, b.content_type) and
         try enrichment_config_validation.producerJsonValuesEqual(alloc, a.producer_json, b.producer_json) and
+        std.mem.eql(u8, a.neighbor_context_json, b.neighbor_context_json) and
         std.mem.eql(u8, a.execution_json, b.execution_json);
 }
 
@@ -29896,6 +30131,15 @@ fn enrichmentToPublic(alloc: Allocator, cfg: enrichment_catalog.EnrichmentConfig
         try parsePublicExecutionConfig(alloc, cfg.execution_json)
     else
         null;
+    const neighbor_context: ?types.EnrichmentNeighborContextConfig = if (cfg.neighbor_context_json.len > 0) blk: {
+        const parsed = try enrichment_neighbor_context.parseConfigJson(alloc, cfg.neighbor_context_json);
+        break :blk .{
+            .graph_index = parsed.graph_index,
+            .edge_types = parsed.edge_types,
+            .direction = parsed.direction,
+            .limit = parsed.limit,
+        };
+    } else null;
     const out = types.EnrichmentConfig{
         .name = try alloc.dupe(u8, cfg.name),
         .kind = internalEnrichmentKindToPublic(cfg.kind),
@@ -29911,6 +30155,7 @@ fn enrichmentToPublic(alloc: Allocator, cfg: enrichment_catalog.EnrichmentConfig
         .full_text_index = cfg.full_text_index,
         .content_type = if (cfg.content_type.len > 0) try alloc.dupe(u8, cfg.content_type) else "",
         .producer_json = if (cfg.producer_json.len > 0) try alloc.dupe(u8, cfg.producer_json) else "",
+        .neighbor_context = neighbor_context,
         .execution = execution,
     };
     return out;
@@ -32300,39 +32545,48 @@ test "native pointer validation reads authority through configured storage" {
     const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     var dense_storage = lsm_backend_mod.MemoryStorage.init(alloc);
     defer dense_storage.deinit();
-    var manager = try IndexManager.initWithOptions(alloc, path, .{
-        .dense_lsm_storage = dense_storage.storage(),
-    });
-    defer manager.deinit();
+    // The explicit adapter wins when both forms are provided. Otherwise the
+    // nested LSM adapter must also govern publication and pointer validation.
+    var unused_storage = lsm_backend_mod.MemoryStorage.init(alloc);
+    defer unused_storage.deinit();
+    const Configuration = enum { nested, explicit_override, reconfigured };
+    for (std.enums.values(Configuration)) |configuration| {
+        var manager = try IndexManager.initWithOptions(alloc, path, .{
+            .dense_lsm_storage = if (configuration == .explicit_override) dense_storage.storage() else null,
+            .dense_lsm_options = .{ .storage = if (configuration == .nested) dense_storage.storage() else unused_storage.storage() },
+        });
+        defer manager.deinit();
+        if (configuration == .reconfigured) manager.setDenseLsmOptions(.{ .storage = dense_storage.storage() });
 
-    const index_name = "dv_v2";
-    const relative = ".repair-shadow-configured/indexes/dv_v2";
-    const active_path = try std.fs.path.join(alloc, &.{ path, relative });
-    defer alloc.free(active_path);
-    try std.Io.Dir.cwd().createDirPath(std.testing.io, active_path);
-    try index_generation_manifest.writeReadyForPhysicalFormat(
-        alloc,
-        active_path,
-        17,
-        index_name,
-        23,
-        29,
-        .dense_native_v2,
-    );
-    const posting_path = try std.fs.path.join(alloc, &.{ active_path, "posting-segments" });
-    defer alloc.free(posting_path);
-    try dense_storage.storage().createDirPath(posting_path);
-    const authority_path = try std.fs.path.join(alloc, &.{ posting_path, posting_segment_store_mod.authority_name });
-    defer alloc.free(authority_path);
-    try dense_storage.storage().writeFileAbsolute(authority_path, posting_segment_store_mod.authority_value);
+        const index_name = "dv_v2";
+        const relative = ".repair-shadow-configured/indexes/dv_v2";
+        const active_path = try std.fs.path.join(alloc, &.{ path, relative });
+        defer alloc.free(active_path);
+        try std.Io.Dir.cwd().createDirPath(std.testing.io, active_path);
+        try index_generation_manifest.writeReadyForPhysicalFormat(
+            alloc,
+            active_path,
+            17,
+            index_name,
+            23,
+            29,
+            .dense_native_v2,
+        );
+        const posting_path = try std.fs.path.join(alloc, &.{ active_path, "posting-segments" });
+        defer alloc.free(posting_path);
+        try dense_storage.storage().createDirPath(posting_path);
+        const authority_path = try std.fs.path.join(alloc, &.{ posting_path, posting_segment_store_mod.authority_name });
+        defer alloc.free(authority_path);
+        try dense_storage.storage().writeFileAbsolute(authority_path, posting_segment_store_mod.authority_value);
 
-    const canonical_path = try manager.indexPath(index_name);
-    defer alloc.free(canonical_path);
-    try manager.writeActiveIndexRootPointer(canonical_path, relative);
-    const selected = (try manager.readActiveIndexRootPointer(canonical_path, index_name)) orelse
-        return error.TestUnexpectedResult;
-    defer alloc.free(selected);
-    try std.testing.expectEqualStrings(relative, selected);
+        const canonical_path = try manager.indexPath(index_name);
+        defer alloc.free(canonical_path);
+        try manager.writeActiveIndexRootPointer(canonical_path, relative);
+        const selected = (try manager.readActiveIndexRootPointer(canonical_path, index_name)) orelse
+            return error.TestUnexpectedResult;
+        defer alloc.free(selected);
+        try std.testing.expectEqualStrings(relative, selected);
+    }
 }
 
 test "fresh dense admission remains legacy before the native capability floor" {

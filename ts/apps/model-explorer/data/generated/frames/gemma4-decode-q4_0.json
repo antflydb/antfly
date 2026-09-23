@@ -1,0 +1,119 @@
+{
+ "schemaVersion": 1,
+ "id": "decode-q4_0",
+ "modelId": "gemma4-e4b",
+ "title": "Recorded Q4_0 frame counts · schematic operations",
+ "description": "Historical E-series Q4_0 counters from the performance plan: 1 serial compute encoder, 143 planned scopes, zero explicit planned barriers under suppression. This E4B teaching diagram draws representative operations; it is not a captured frame or a current benchmark. Bar widths are illustrative, not measured durations.",
+ "source": {
+  "path": "work-log/completed/inference/gemma4/metal-perf-plan.md",
+  "anchor": "3. **Barrier work reframed by measurement**:",
+  "line": 22
+ },
+ "mode": "planned",
+ "stats": {
+  "encoders": 1,
+  "plannedScopes": 143,
+  "plannedBarriers": 0
+ },
+ "encoderScopes": [
+  {
+   "id": "attn-setup",
+   "kind": "compute",
+   "label": "attention setup (per layer)",
+   "ops": [
+    {
+     "label": "pre-attn rms_norm",
+     "family": "norm_rope"
+    },
+    {
+     "label": "QKV project",
+     "kernel": "termite_q4_0_linear_1x_reduce",
+     "family": "matvec"
+    },
+    {
+     "label": "Q/K head norm + RoPE (separate calls)",
+     "kernel": "termite_apply_head_rms_rope",
+     "family": "fusion"
+    },
+    {
+     "label": "KV append",
+     "kernel": "termite_paged_f16_kv_seed",
+     "family": "kv"
+    }
+   ]
+  },
+  {
+   "id": "attn",
+   "kind": "compute",
+   "label": "attention",
+   "ops": [
+    {
+     "label": "split-GQA stage",
+     "kernel": "termite_paged_attention_kv_decode_gqa_split_stage",
+     "family": "attention"
+    },
+    {
+     "label": "split-GQA reduce",
+     "kernel": "termite_paged_attention_kv_decode_gqa_split_reduce",
+     "family": "attention"
+    },
+    {
+     "label": "output project",
+     "kernel": "termite_q4_0_linear_1x_reduce",
+     "family": "matvec"
+    }
+   ]
+  },
+  {
+   "id": "ffn",
+   "kind": "compute",
+   "label": "gated FFN (per layer)",
+   "ops": [
+    {
+     "label": "post-attn norm+add",
+     "family": "norm_rope"
+    },
+    {
+     "label": "gate+up pair-fused",
+     "kernel": "termite_q4_0_pair_activation_1x_reduce",
+     "family": "fusion"
+    },
+    {
+     "label": "down project",
+     "kernel": "termite_q4_0_linear_1x_reduce",
+     "family": "matvec"
+    },
+    {
+     "label": "post-FFN norm+add+PLE",
+     "family": "norm_rope"
+    }
+   ]
+  },
+  {
+   "id": "tail",
+   "kind": "compute",
+   "label": "tail: LM head + sample",
+   "ops": [
+    {
+     "label": "final norm",
+     "family": "norm_rope"
+    },
+    {
+     "label": "Q6_K LM head (full vocabulary)",
+     "kernel": "termite_q6_k_linear_1x_reduce",
+     "family": "matvec"
+    },
+    {
+     "label": "greedy argmax (sampled route differs)",
+     "kernel": "termite_argmax_logits_reduce",
+     "family": "sampling"
+    }
+   ]
+  }
+ ],
+ "barriers": [],
+ "pipelining": {
+  "overlapsPrevFrame": true,
+  "tokenHandoff": "device"
+ }
+}
