@@ -534,6 +534,40 @@ pub fn glinerBoundaryResidentLoadAmounts(mf: manifest_mod.ModelManifest, source_
     return .{ .peak = peak, .resident = resident };
 }
 
+/// Laya keeps native projection storage plus F32 embedding/norm constants.
+/// Two encoded copies bound even an all-F16 artifact; staging and host cache
+/// coexist only during preparation. No request workspace is retained here.
+pub fn layaResidentLoadAmounts(mf: manifest_mod.ModelManifest, source_bytes: usize) !?GlinerBoundaryResidentLoadAmounts {
+    if (comptime !build_options.enable_metal) return null;
+    if (!@import("../ops/laya_metal.zig").enabled() or !mf.hasCapability("typed_decisions")) return null;
+    if (!modern_bert_arch.isModernBertModel(mf.config_model_arch)) return error.UnsupportedLayaArtifact;
+    const metadata: usize = 8 * 1024 * 1024;
+    const resident = runtime.tier.memory.AdmissionAmounts{
+        .host_weight_bytes = try std.math.add(usize, source_bytes, metadata),
+        .backend_weight_bytes = try std.math.add(usize, try std.math.mul(usize, source_bytes, 2), metadata),
+    };
+    var peak = resident;
+    peak.host_weight_bytes = try std.math.add(usize, peak.host_weight_bytes, source_bytes);
+    peak.host_scratch_bytes = 4 * 1024 * 1024;
+    return .{ .peak = peak, .resident = resident };
+}
+
+pub fn prepareLayaResident(session: Session, control: ?InferenceExecutionControl) !void {
+    if (comptime !build_options.enable_metal) return;
+    if (session.vtable != &arch_vtable or !@import("../ops/laya_metal.zig").enabled()) return;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (self.backend_type != .metal or self.arch_config != .modern_bert or self.arch_config.modern_bert.laya == null) return;
+    const active = control orelse InferenceExecutionControl{};
+    try active.check();
+    var protection = if (control) |c| try c.enterUninterruptible(session.interruption()) else null;
+    defer if (protection) |*p| p.deinit();
+    var cb = try makeComputeBackend(self, self.allocator, null);
+    defer cb.deinit();
+    cb.execution_control = control;
+    const compute: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+    _ = try @import("../ops/laya_metal.zig").Owner.prepare(compute, self.arch_config.modern_bert, control);
+}
+
 pub const UnsupportedTensorTypeCount = struct {
     tensor_type: gguf_mod.tensor_types.TensorType,
     count: usize,
@@ -6696,6 +6730,8 @@ fn gpuBackendData(self: *ArchSession) *GpuHostedData {
 }
 
 const arch_vtable = Session.VTable{
+    .hasLayaDecisions = archHasLayaDecisions,
+    .runLayaDecisions = archRunLayaDecisions,
     .run = &archRun,
     .runWithControl = &archRunWithControl,
     .runResident = &archRunResident,
@@ -8169,6 +8205,38 @@ fn isQwen3GenerativeRerankerFamily(family: gpt_arch.ModelFamily) bool {
     return family == .qwen3 or family == .qwen3_vl;
 }
 
+fn archHasLayaDecisions(ptr: *anyopaque) bool {
+    if (comptime !build_options.enable_metal) return false;
+    const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    return self.backend_type == .metal and self.arch_config == .modern_bert and self.arch_config.modern_bert.laya != null and @import("../ops/laya_metal.zig").enabled();
+}
+
+fn archRunLayaDecisions(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !?[]Tensor {
+    if (comptime !build_options.enable_metal) return null;
+    const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    if (self.backend_type != .metal or self.arch_config != .modern_bert or self.arch_config.modern_bert.laya == null or !@import("../ops/laya_metal.zig").enabled()) return null;
+    if (inputs.len != 4) return error.InvalidLayaInputs;
+    const bi = try parseBertRunInputs(inputs[0..2]);
+    const kinds = try validateI64Matrix(inputs[2], .{ bi.batch, 1 });
+    const markers = try validateI64Matrix(inputs[3], null);
+    if (markers.shape[0] != bi.batch) return error.InvalidLayaInputs;
+    var cb = try makeComputeBackend(self, allocator, null);
+    cb.execution_control = control;
+    defer cb.deinit();
+    const compute: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+    return try @import("../ops/laya_metal.zig").run(compute, allocator, self.arch_config.modern_bert, bi.input_ids, bi.attention_mask, kinds.values, markers.values, bi.batch, bi.seq_len, markers.shape[1], control, true);
+}
+
+/// Snapshot only while holding the session lifetime and exclusive execution access.
+pub fn layaResidentStats(session: Session) ?@import("../ops/laya_metal.zig").Stats {
+    if (comptime !build_options.enable_metal) return null;
+    if (session.vtable != &arch_vtable) return null;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (self.backend_type != .metal) return null;
+    const owner = gpuBackendData(self).laya_resident orelse return null;
+    return owner.snapshot();
+}
+
 fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) ![]Tensor {
     return archRunImpl(ptr, inputs, allocator, null);
 }
@@ -8259,6 +8327,12 @@ fn archRunImpl(
                 const kinds = try validateI64Matrix(inputs[2], .{ bi.batch, 1 });
                 const markers = try validateI64Matrix(inputs[3], null);
                 if (markers.shape[0] != bi.batch) return error.InvalidLayaInputs;
+                if (comptime build_options.enable_metal) {
+                    if (self.backend_type == .metal and @import("../ops/laya_metal.zig").enabled()) {
+                        const compute: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+                        return @import("../ops/laya_metal.zig").run(compute, allocator, cfg, bi.input_ids, bi.attention_mask, kinds.values, markers.values, bi.batch, bi.seq_len, markers.shape[1], control, false);
+                    }
+                }
                 const hidden = try modern_bert_arch.forwardCT(&cb, allocator, cfg, bi.input_ids, bi.attention_mask, bi.batch, bi.seq_len);
                 defer cb.free(hidden);
                 return @import("laya_head.zig").forward(&cb, allocator, laya, hidden, bi.attention_mask, kinds.values, markers.values, bi.batch, bi.seq_len, markers.shape[1], cfg.hidden_size);
@@ -9263,7 +9337,10 @@ fn archRunGeometry(ptr: *anyopaque, inputs: @import("../backends/session.zig").S
                     try layaCudaWorkspace(batch, input_seq, count, cfg.hidden_size, cfg.intermediate_size)
                 else
                     try std.math.mul(usize, 2, try whisperStageWorkspace(batch, input_seq, input_seq, cfg.hidden_size, @max(cfg.num_attention_heads, cfg.hidden_size / 64), cfg.hidden_size * 4));
-                break :blk count + laya.n_act;
+                if (comptime build_options.enable_metal) if (self.backend_type == .metal and @import("../ops/laya_metal.zig").enabled()) {
+                    workspace_bytes = try @import("../ops/laya_metal.zig").workspaceBound(cfg, batch, input_seq, count);
+                };
+                break :blk count + @max(laya.n_act, 6);
             }
             break :blk cfg.hidden_size;
         },

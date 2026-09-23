@@ -24,24 +24,13 @@ import (
 	"strings"
 )
 
-// BackupToFile writes a portable Antfly backup archive for this Lite database.
+// BackupToFile writes a portable Antfly backup archive (.afb) of this
+// database.
 func (db *DB) BackupToFile(path string) error {
 	if !strings.HasSuffix(path, ".afb") {
 		return InvalidArgument
 	}
 	backup, err := db.Backup()
-	if err != nil {
-		return err
-	}
-	return writeFileAtomically(path, backup, 0o600)
-}
-
-// ExportToFile writes a portable Antfly backup archive for this Lite database.
-func (db *DB) ExportToFile(path string) error {
-	if !strings.HasSuffix(path, ".afb") {
-		return InvalidArgument
-	}
-	backup, err := db.Export()
 	if err != nil {
 		return err
 	}
@@ -65,54 +54,29 @@ func CopyStableSnapshotFile(srcPath, destPath string, replace bool) (*StableSnap
 	return &report, nil
 }
 
-// RestoreBackupFile creates or replaces a Lite database by streaming a
-// portable Antfly backup archive with bounded memory use. Busy means the source
+// Restore creates a database at path from a portable Antfly backup archive,
+// of the storage kind opts.Storage selects. A backup of either kind restores
+// into either kind. OutcomeUnknown means the destination was published but
+// crash durability could not be confirmed; inspect it and do not retry
+// automatically.
+func Restore(path string, backup []byte, opts RestoreOptions) error {
+	if len(backup) == 0 || (opts.Storage == StorageLite && !strings.HasSuffix(path, ".aflite")) {
+		return InvalidArgument
+	}
+	return restoreBackupBytes(path, backup, opts)
+}
+
+// RestoreFile is Restore reading the archive from backupPath. For .aflite
+// destinations it streams with bounded memory use. Busy means the source
 // changed during streaming or the source/destination is concurrently locked;
-// retry after the files are stable and no writer is active. Unsupported means
-// the source filesystem lacks required advisory locking; copy the archive to a
-// supported local filesystem. OutcomeUnknown means the destination was
-// published but crash durability could not be confirmed; inspect it and do not
-// retry automatically.
-func RestoreBackupFile(path, backupPath string, replace bool) error {
-	if !strings.HasSuffix(path, ".aflite") || !strings.HasSuffix(backupPath, ".afb") {
+// retry after the files are stable and no writer is active. Unsupported
+// means the source filesystem lacks required advisory locking; copy the
+// archive to a supported local filesystem.
+func RestoreFile(path, backupPath string, opts RestoreOptions) error {
+	if !strings.HasSuffix(backupPath, ".afb") || (opts.Storage == StorageLite && !strings.HasSuffix(path, ".aflite")) {
 		return InvalidArgument
 	}
-	return restoreBackupFileToFile(path, backupPath, replace)
-}
-
-// RestoreBackup creates or replaces a Lite database from a portable Antfly
-// backup archive. OutcomeUnknown means the destination was published but crash
-// durability could not be confirmed; inspect it and do not retry automatically.
-func RestoreBackup(path string, backup []byte, replace bool) error {
-	if !strings.HasSuffix(path, ".aflite") || len(backup) == 0 {
-		return InvalidArgument
-	}
-	return restoreBackupToFile(path, backup, replace)
-}
-
-// RestoreFile creates or replaces a Lite database by streaming a portable
-// Antfly backup archive with bounded memory use. Busy means the source changed
-// during streaming or the source/destination is concurrently locked; retry
-// after the files are stable and no writer is active. Unsupported means the
-// source filesystem lacks required advisory locking; copy the archive to a
-// supported local filesystem. OutcomeUnknown means the destination was
-// published but crash durability could not be confirmed; inspect it and do not
-// retry automatically.
-func RestoreFile(path, backupPath string, replace bool) error {
-	if !strings.HasSuffix(path, ".aflite") || !strings.HasSuffix(backupPath, ".afb") {
-		return InvalidArgument
-	}
-	return restoreBackupFileToFile(path, backupPath, replace)
-}
-
-// Restore creates or replaces a Lite database from a portable Antfly backup
-// archive. OutcomeUnknown means the destination was published but crash
-// durability could not be confirmed; inspect it and do not retry automatically.
-func Restore(path string, backup []byte, replace bool) error {
-	if !strings.HasSuffix(path, ".aflite") || len(backup) == 0 {
-		return InvalidArgument
-	}
-	return restoreToFile(path, backup, replace)
+	return restoreBackupFile(path, backupPath, opts)
 }
 
 func writeFileAtomically(path string, data []byte, perm fs.FileMode) error {

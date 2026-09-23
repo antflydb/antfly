@@ -56,8 +56,8 @@ def test_abi_version_matches_supported_version() -> None:
     assert antfly_lite.abi_version() == _ffi.SUPPORTED_ABI_VERSION
 
 
-def test_lite_open_options_struct_size_matches_c_abi() -> None:
+def test_open_options_struct_size_matches_c_abi() -> None:
     lib = _ffi.get_lib()
-    got = lib.antfly_lite_open_options_size()
-    want = ctypes.sizeof(_ffi.LiteOpenOptions)
+    got = lib.antfly_open_options_size()
+    want = ctypes.sizeof(_ffi.AntflyOpenOptions)
     assert got == want, f"C ABI open options size {got}, compiled struct size {want}"

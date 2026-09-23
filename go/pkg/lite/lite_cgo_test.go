@@ -878,7 +878,7 @@ func TestLiteCAPI(t *testing.T) {
 		t.Fatalf("backup with open transaction: %v", err)
 	}
 	openTxnRestoredPath := filepath.Join(t.TempDir(), "go-open-txn-restored.aflite")
-	if err := RestoreBackupFile(openTxnRestoredPath, openTxnBackupPath, false); err != nil {
+	if err := RestoreFile(openTxnRestoredPath, openTxnBackupPath, RestoreOptions{}); err != nil {
 		t.Fatalf("restore backup with open transaction: %v", err)
 	}
 	openTxnRestored, err := OpenReadonly(openTxnRestoredPath)
@@ -919,18 +919,8 @@ func TestLiteCAPI(t *testing.T) {
 		t.Fatalf("backup file is empty: %s", backupPath)
 	}
 
-	exportPath := filepath.Join(t.TempDir(), "go-export.afb")
-	if err := db.ExportToFile(exportPath); err != nil {
-		t.Fatalf("export to file: %v", err)
-	}
-	if info, err := os.Stat(exportPath); err != nil {
-		t.Fatalf("export file: %v", err)
-	} else if info.Size() == 0 {
-		t.Fatalf("export file is empty: %s", exportPath)
-	}
-
 	restoredPath := filepath.Join(t.TempDir(), "go-restored.aflite")
-	if err := RestoreBackupFile(restoredPath, backupPath, false); err != nil {
+	if err := RestoreFile(restoredPath, backupPath, RestoreOptions{}); err != nil {
 		t.Fatalf("restore backup file: %v", err)
 	}
 	restored, err := OpenReadonly(restoredPath)
@@ -958,24 +948,35 @@ func TestLiteCAPI(t *testing.T) {
 		t.Fatalf("read backup file: %v", err)
 	}
 	restoredFromBytesPath := filepath.Join(t.TempDir(), "go-restored-bytes.aflite")
-	if err := RestoreBackup(restoredFromBytesPath, backupBytes, false); err != nil {
+	if err := Restore(restoredFromBytesPath, backupBytes, RestoreOptions{}); err != nil {
 		t.Fatalf("restore backup bytes: %v", err)
 	}
-	if err := RestoreBackup(restoredFromBytesPath, backupBytes, false); err == nil {
+	if err := Restore(restoredFromBytesPath, backupBytes, RestoreOptions{}); err == nil {
 		t.Fatalf("restore without replace unexpectedly overwrote target")
 	}
-
-	restoredAliasPath := filepath.Join(t.TempDir(), "go-restored-alias.aflite")
-	if err := Restore(restoredAliasPath, backupBytes, false); err != nil {
-		t.Fatalf("restore alias bytes: %v", err)
-	}
-	if err := Restore(restoredAliasPath, backupBytes, false); err == nil {
-		t.Fatalf("restore alias without replace unexpectedly overwrote target")
+	if err := Restore(restoredFromBytesPath, backupBytes, RestoreOptions{Replace: true}); err != nil {
+		t.Fatalf("restore with replace: %v", err)
 	}
 
-	restoredAliasFilePath := filepath.Join(t.TempDir(), "go-restored-alias-file.aflite")
-	if err := RestoreFile(restoredAliasFilePath, exportPath, false); err != nil {
-		t.Fatalf("restore alias file: %v", err)
+	// The same .aflite backup restores into directory storage.
+	restoredDirPath := filepath.Join(t.TempDir(), "go-restored-dir")
+	if err := Restore(restoredDirPath, backupBytes, RestoreOptions{Storage: StorageDirectory}); err != nil {
+		t.Fatalf("restore backup bytes into a directory: %v", err)
+	}
+	if err := Restore(restoredDirPath, backupBytes, RestoreOptions{Storage: StorageDirectory}); err == nil {
+		t.Fatalf("directory restore without replace unexpectedly overwrote target")
+	}
+	restoredDirFilePath := filepath.Join(t.TempDir(), "go-restored-dir-file")
+	if err := RestoreFile(restoredDirFilePath, backupPath, RestoreOptions{Storage: StorageDirectory}); err != nil {
+		t.Fatalf("restore backup file into a directory: %v", err)
+	}
+	restoredDir, err := OpenWithOptions(restoredDirFilePath, OpenOptions{Storage: StorageDirectory, Mode: OpenModeReadonly})
+	if err != nil {
+		t.Fatalf("open restored directory database: %v", err)
+	}
+	assertSearchContains(restoredDir, "restored directory full-text", fullTextQuery, "go binding full text search")
+	if err := restoredDir.Close(); err != nil {
+		t.Fatalf("close restored directory database: %v", err)
 	}
 
 	lockedRestorePath := filepath.Join(t.TempDir(), "go-locked-restore.aflite")
@@ -989,7 +990,7 @@ func TestLiteCAPI(t *testing.T) {
 	}}, 7); err != nil {
 		t.Fatalf("write locked restore target: %v", err)
 	}
-	if err := RestoreBackup(lockedRestorePath, backupBytes, true); err != Busy {
+	if err := Restore(lockedRestorePath, backupBytes, RestoreOptions{Replace: true}); err != Busy {
 		t.Fatalf("restore into active writer = %v, want %v", err, Busy)
 	}
 	lockedLookup, err := lockedRestore.LookupJSON("doc:locked-restore-target")
@@ -1011,14 +1012,14 @@ func TestLiteCAPI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open imported Lite database: %v", err)
 	}
-	exportBytes, err := db.Export()
+	exportBytes, err := db.Backup()
 	if err != nil {
-		t.Fatalf("export bytes: %v", err)
+		t.Fatalf("backup bytes: %v", err)
 	}
 	if len(exportBytes) == 0 {
-		t.Fatalf("export bytes are empty")
+		t.Fatalf("backup bytes are empty")
 	}
-	if err := imported.Import(exportBytes); err != nil {
+	if err := imported.ImportBackup(exportBytes); err != nil {
 		t.Fatalf("import bytes: %v", err)
 	}
 	assertSearchContains(imported, "imported full-text", fullTextQuery, "go binding full text search")
@@ -1031,7 +1032,7 @@ func TestLiteCAPI(t *testing.T) {
 	}
 
 	malformedRestorePath := filepath.Join(t.TempDir(), "go-malformed-restore.aflite")
-	if err := RestoreBackup(malformedRestorePath, []byte("not an afb"), false); err == nil {
+	if err := Restore(malformedRestorePath, []byte("not an afb"), RestoreOptions{}); err == nil {
 		t.Fatalf("malformed restore unexpectedly succeeded")
 	}
 	if _, err := os.Stat(malformedRestorePath); !os.IsNotExist(err) {
@@ -1370,7 +1371,7 @@ func TestLiteCAPILocalEmbeddedInferenceVariant(t *testing.T) {
 // TestLiteOpenOptionsResourceBudgetPlumbing confirms the OpenOptions
 // resource-budget fields (HostBudgetMB, BackendBudgetMB, CombinedBudgetMB,
 // KVBudgetMB, ScratchBudgetMB, ProcessMemoryBudgetMB) round-trip through the
-// C ABI (antfly_lite_open_options) to the embedded node and back out through
+// C ABI (antfly_open_options) to the embedded node and back out through
 // Status().Inference, and that a handle opened with LocalRuntimeConfigured
 // but no override does not fall back to the previous zero-bytes/automatic
 // generation-budget policy that could not admit even one

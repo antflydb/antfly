@@ -110,6 +110,6 @@ fn threading_mode_is_serialized() {
 #[test]
 fn open_options_struct_sizes_match_library() {
     let want = antfly_lite::open_options_size() as usize;
-    let got = std::mem::size_of::<sys::antfly_lite_open_options>();
+    let got = std::mem::size_of::<sys::antfly_open_options>();
     assert_eq!(got, want);
 }

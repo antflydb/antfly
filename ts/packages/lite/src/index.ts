@@ -80,8 +80,6 @@ export {
   decodeArtifactId,
   decodeArtifactIdRaw,
   restore,
-  restoreBackup,
-  restoreBackupFile,
   restoreFile,
 } from "./files.js";
 export type { JsonInput, Uint64Like } from "./marshal.js";
@@ -95,6 +93,7 @@ export type {
   OpenOptions,
   PendingWorkStatus,
   ReplayGeneratedEnrichmentsResult,
+  RestoreOptions,
   StableSnapshotReport,
   Status,
   StorageStatus,
@@ -107,6 +106,7 @@ export {
   InferenceMode,
   OpenMode,
   Profile,
+  Storage,
   SUPPORTED_ABI_VERSION,
   THREADING_SERIALIZED,
   TxnStatus,

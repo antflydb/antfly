@@ -50,12 +50,10 @@ pub use db::{
     decode_artifact_id_json, open_options_size, threading_mode, validate_abi,
 };
 pub use error::{Error, Result};
-pub use files::{
-    check_file_json, copy_stable_snapshot_file_json, restore, restore_backup, restore_backup_file,
-    restore_file,
-};
+pub use files::{check_file_json, copy_stable_snapshot_file_json, restore, restore_file};
 pub use options::{
-    GraphDirection, OpenMode, OpenOptions, Profile, TtlCleanupOptions, WriteIntent, inference_mode,
+    GraphDirection, OpenMode, OpenOptions, Profile, RestoreOptions, Storage, TtlCleanupOptions,
+    WriteIntent, inference_mode,
 };
 pub use transactions::{TxnId, TxnStatus};
 

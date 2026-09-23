@@ -1080,7 +1080,7 @@ fn runBench(alloc: std.mem.Allocator, path: []const u8, cfg: Config, queries: []
                 0,
                 &packed_result,
             ));
-            capi_db.antfly_db_packed_dense_search_result_free(&packed_result);
+            capi_db.antfly_packed_dense_search_result_free(&packed_result);
         }
 
         var total_ns: u64 = 0;
@@ -1101,7 +1101,7 @@ fn runBench(alloc: std.mem.Allocator, path: []const u8, cfg: Config, queries: []
                 ));
                 total_ns += elapsedSince(start_ns);
                 std.mem.doNotOptimizeAway(packed_result.hit_count);
-                capi_db.antfly_db_packed_dense_search_result_free(&packed_result);
+                capi_db.antfly_packed_dense_search_result_free(&packed_result);
             }
         }
         break :blk @divTrunc(total_ns, query_total);
@@ -1127,7 +1127,7 @@ fn runBench(alloc: std.mem.Allocator, path: []const u8, cfg: Config, queries: []
         for (requests) |req| {
             var buf: capi.Buffer = .{};
             try expectOk(capi_db.antfly_db_search_dense_wire(handle_ptr, sliceBytes(req), &buf));
-            capi_db.antfly_db_buffer_free(buf.ptr, buf.len);
+            capi_db.antfly_buffer_free(&buf);
         }
 
         var total_ns: u64 = 0;
@@ -1138,7 +1138,7 @@ fn runBench(alloc: std.mem.Allocator, path: []const u8, cfg: Config, queries: []
                 try expectOk(capi_db.antfly_db_search_dense_wire(handle_ptr, sliceBytes(req), &buf));
                 total_ns += elapsedSince(start_ns);
                 std.mem.doNotOptimizeAway(buf.len);
-                capi_db.antfly_db_buffer_free(buf.ptr, buf.len);
+                capi_db.antfly_buffer_free(&buf);
             }
         }
         break :blk @divTrunc(total_ns, query_total);

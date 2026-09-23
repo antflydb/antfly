@@ -19,7 +19,7 @@
 # ///
 """Prepare an upstream Laya checkpoint for Antfly's native extractor.
 
-uv run scripts/prepare_laya.py convaiinnovations/laya --revision <commit> \
+uv run scripts/laya/prepare_laya.py convaiinnovations/laya --revision <commit> \
     --output ./models/extractors/laya
 
 Weights are copied unchanged; encoder and decision metadata are combined in
