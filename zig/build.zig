@@ -281,13 +281,15 @@ pub fn create(b: *std.Build) ?Artifacts {
     // is independent of the executor's per-statement memory admission tests.
     run_sql_tests.step.max_rss = 192 * 1024 * 1024;
     b.step("sql-test", "Run SQL compilation, catalog binding, and native execution contract tests").dependOn(&run_sql_tests.step);
+    const pgwire_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/pgwire_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = link_libc,
+    });
+    pgwire_test_mod.addImport("sql_parser", sql_parser_mod);
     const pgwire_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("pkg/antfly/src/pgwire/mod.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = link_libc,
-        }),
+        .root_module = pgwire_test_mod,
         .filters = b.args orelse &.{},
     });
     const run_pgwire_tests = b.addRunArtifact(pgwire_tests);

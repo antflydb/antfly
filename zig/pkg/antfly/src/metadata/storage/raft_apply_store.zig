@@ -2629,6 +2629,17 @@ test "relational integrity restore staging reserves external parent and rejects 
     try std.testing.expectError(error.NotFound, txn.get(try restore_staging.identityKey(&buf, group_id, .group, parent_range.group_id)));
     try txn.commit();
     txn_open = false;
+    try std.testing.expect(!try store.restoreStagingAuthorityAllowed(alloc, group_id, id, 7, 501));
+    try store.applyStandaloneCommand(group_id, .{ .register_node = .{ .node_id = 7, .role = "data", .lifecycle = metadata_table_manager.node_lifecycle_active } });
+    try store.applyStandaloneCommand(group_id, .{ .upsert_replica_intent = .{
+        .expected_metadata_version = null,
+        .expected_version_fence = 0,
+        .expected_target_drain_requested = false,
+        .replacement = .{ .record = .{ .group_id = 501, .replica_id = 1, .local_node_id = 7 }, .store_id = 0, .peer_node_ids = &.{7} },
+    } });
+    try std.testing.expect(try store.restoreStagingAuthorityAllowed(alloc, group_id, id, 7, 501));
+    try std.testing.expect(!try store.restoreStagingAuthorityAllowed(alloc, group_id, id, 7, null));
+    try std.testing.expect(!try store.restoreStagingAuthorityAllowed(alloc, group_id, id, 7, 301));
     txn = try store.store.beginWriteTxn();
     txn_open = true;
     try std.testing.expect(try restoreStagingLocksTableTxn(&txn, group_id, parent_table.table_id));
@@ -2648,6 +2659,30 @@ test "relational integrity restore staging reserves external parent and rejects 
     try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .parent_fenced, .expected_revision = 3, .receipt = parent_receipt });
     try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .parent_fenced, .expected_revision = 3, .receipt = parent_receipt });
     try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .old_fenced, .expected_revision = 3, .receipt = old_receipt });
+    try txn.commit();
+    txn_open = false;
+    txn = try store.store.beginWriteTxn();
+    txn_open = true;
+    // The metadata decision is irreversible: once a parent may have made old
+    // inverse references invisible, cancellation cannot revive the child.
+    // The owner activation proof is not connected yet, so publication still
+    // fails closed even when a service submits a fabricated acknowledgement.
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .begin_activation, .expected_revision = 3 });
+    const activating_bytes = try txn.get(try restore_staging.progressKey(&buf, group_id, id));
+    var activating = try std.json.parseFromSlice(restore_staging.Progress, alloc, activating_bytes, .{});
+    defer activating.deinit();
+    try std.testing.expectEqual(restore_staging.State.activating, activating.value.state);
+    try std.testing.expectEqual(@as(u64, 4), activating.value.revision);
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .begin_cancel, .expected_revision = 4 });
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .parent_activated, .expected_revision = 4, .receipt = parent_receipt });
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .publish, .expected_revision = 4 });
+    try std.testing.expectError(error.NotFound, txn.get(try tableKeyForGroup(&buf, group_id, target.table.table_id)));
+    txn.abort();
+    txn_open = false;
+    try store.applyStandaloneCommand(group_id, .{ .remove_replica_intent = .{ .group_id = 501, .local_node_id = 7, .expected_metadata_version = 1 } });
+    try std.testing.expect(!try store.restoreStagingAuthorityAllowed(alloc, group_id, id, 7, 501));
+    txn = try store.store.beginWriteTxn();
+    txn_open = true;
     // Publication is still impossible without activation proof.
     try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .publish, .expected_revision = 3 });
     try std.testing.expectError(error.NotFound, txn.get(try tableKeyForGroup(&buf, group_id, target.table.table_id)));
@@ -10358,7 +10393,7 @@ pub const RaftApplyStore = struct {
             // not create target owners until immutable source cuts are bound.
             if (job.value.plan.preparing_sources) continue;
             switch (job.value.state) {
-                .importing, .validating, .cutover, .canceling => {},
+                .importing, .validating, .cutover, .activating, .canceling => {},
                 .published, .canceled, .preparing_sources => return error.InvalidRestoreStaging,
             }
             // The plan remains immutable. Only this snapshot's small progress
@@ -10464,21 +10499,36 @@ pub const RaftApplyStore = struct {
     /// retained-history scan is needed for each owner progress poll.
     /// Replacement old owners deliberately receive no grant: the metadata
     /// driver reads their receipts locally and fences them through the normal
-    /// topology batch route. Only new staged owners consume this capability.
+    /// topology batch route. An unchanged external FK parent may request its
+    /// exact owner group while it still has a live placement. That scope is
+    /// intentionally not kept after placement removal, unlike a new target's
+    /// historical placement grant needed for terminal status reads.
     pub fn restoreStagingAuthorityAllowed(self: *RaftApplyStore, alloc: std.mem.Allocator, metadata_group_id: u64, id: restore_staging.Id, node_id: u64, owner_group: ?u64) !bool {
         _ = alloc;
         if (node_id == 0) return false;
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
         var key_buf: [256]u8 = undefined;
-        const witness = (try stagingGet(&txn, try restore_staging.authorityNodeKey(&key_buf, metadata_group_id, id, node_id))) orelse return false;
-        if (witness.len != 8) return error.InvalidRestoreStaging;
-        const witness_group = std.mem.readInt(u64, witness[0..8], .little);
-        const reservation = (try stagingGet(&txn, try restore_staging.identityKey(&key_buf, metadata_group_id, .group, witness_group))) orelse return false;
-        if (!std.mem.eql(u8, reservation, &id) or try self.loadPlacementVersionFenceTxn(&txn, metadata_group_id, witness_group, node_id) == 0) return false;
+        const witness = try stagingGet(&txn, try restore_staging.authorityNodeKey(&key_buf, metadata_group_id, id, node_id));
+        if (witness) |bytes| {
+            if (bytes.len != 8) return error.InvalidRestoreStaging;
+            const witness_group = std.mem.readInt(u64, bytes[0..8], .little);
+            const reservation = (try stagingGet(&txn, try restore_staging.identityKey(&key_buf, metadata_group_id, .group, witness_group))) orelse return false;
+            if (!std.mem.eql(u8, reservation, &id) or try self.loadPlacementVersionFenceTxn(&txn, metadata_group_id, witness_group, node_id) == 0) return false;
+        } else if (owner_group == null) return false;
         if (owner_group) |requested_group| {
-            const requested = (try stagingGet(&txn, try restore_staging.identityKey(&key_buf, metadata_group_id, .group, requested_group))) orelse return false;
-            if (!std.mem.eql(u8, requested, &id) or try self.loadPlacementVersionFenceTxn(&txn, metadata_group_id, requested_group, node_id) == 0) return false;
+            const target_reservation = try stagingGet(&txn, try restore_staging.identityKey(&key_buf, metadata_group_id, .group, requested_group));
+            if (target_reservation) |requested| {
+                if (witness == null or !std.mem.eql(u8, requested, &id) or try self.loadPlacementVersionFenceTxn(&txn, metadata_group_id, requested_group, node_id) == 0) return false;
+            } else {
+                const parent_reservation = (try stagingGet(&txn, try restore_staging.identityKey(&key_buf, metadata_group_id, .parent_group, requested_group))) orelse return false;
+                if (!std.mem.eql(u8, parent_reservation, &id)) return false;
+                // The permanent placement-version fence alone also covers
+                // former nodes. Parent activation requires a current hosted
+                // replica; final leader authority is checked again at apply.
+                if (try stagingGet(&txn, try placementKeyForGroup(&key_buf, metadata_group_id, requested_group, node_id)) == null or
+                    try self.loadPlacementVersionFenceTxn(&txn, metadata_group_id, requested_group, node_id) == 0) return false;
+            }
         }
         return true;
     }
@@ -10804,11 +10854,12 @@ pub const RaftApplyStore = struct {
                     next.completed_owners = 0;
                     next.revision += 1;
                 },
-                .imported, .validated, .old_fenced, .canceled, .parent_fenced => {
+                .imported, .validated, .old_fenced, .canceled, .parent_fenced, .parent_activated => {
                     const expected_state: restore_staging.State = switch (command.action) {
                         .imported => .importing,
                         .validated => .validating,
                         .old_fenced, .parent_fenced => .cutover,
+                        .parent_activated => .activating,
                         .canceled => .canceling,
                         else => unreachable,
                     };
@@ -10819,6 +10870,7 @@ pub const RaftApplyStore = struct {
                     // owner receipt in this monotone counter.
                     if (command.action == .old_fenced and next.completed_owners < parent_total) return;
                     if (command.action == .parent_fenced and next.completed_owners >= parent_total) return;
+                    if (command.action == .parent_activated and next.completed_owners >= parent_total) return;
                     const receipt = command.receipt.?;
                     if (!std.mem.eql(u8, &receipt.plan_digest, &job.value.plan_digest)) return;
                     const owner_matches = outer: for (job.value.plan.targets) |target| {
@@ -10829,7 +10881,7 @@ pub const RaftApplyStore = struct {
                             for (old.ranges) |range| if (range.group_id == receipt.group_id and (if (range.range_id == 0) range.group_id else range.range_id) == receipt.range_id) break :outer true;
                         };
                     } else blk: {
-                        if (command.action == .parent_fenced or command.action == .canceled) for (job.value.plan.external_fk_parents) |parent| {
+                        if (command.action == .parent_fenced or command.action == .parent_activated or command.action == .canceled) for (job.value.plan.external_fk_parents) |parent| {
                             for (parent.ranges) |range| if (range.group_id == receipt.group_id and (if (range.range_id == 0) range.group_id else range.range_id) == receipt.range_id) break :blk true;
                         };
                         break :blk false;
@@ -10852,20 +10904,42 @@ pub const RaftApplyStore = struct {
                     next.completed_owners = 0;
                     next.revision += 1;
                 },
+                .begin_activation => {
+                    if (parent_total == 0 or next.state != .cutover or next.completed_owners != old_total + parent_total) return;
+                    // This transition is the irrevocable metadata decision.
+                    // Recheck the full topology and dependency closure in the
+                    // same transaction; external owners may only activate
+                    // after observing this decision with a leader read-index.
+                    for (job.value.plan.targets) |target| if (!try self.restoreReplacementMatchesTxn(txn, group_id, target)) return;
+                    for (job.value.plan.external_fk_parents) |parent| if (!try self.restoreExternalParentMatchesTxn(txn, group_id, parent)) return;
+                    if (!try self.restoreIncomingDependenciesClosedTxn(txn, group_id, job.value.plan)) return;
+                    next.state = .activating;
+                    next.completed_owners = 0;
+                    next.revision += 1;
+                },
                 .begin_cancel => {
-                    if (next.state == .canceling) return;
+                    if (next.state == .canceling or next.state == .activating) return;
                     next.state = .canceling;
                     next.completed_owners = 0;
                     next.revision += 1;
                 },
                 .publish, .finish_cancel => {
-                    // Parent owner activation is not yet ordered with this
-                    // publication. A plan may reserve exact parents for
-                    // preflight, but cannot expose the new child generation.
+                    // The activation decision and all parent-owner receipts
+                    // must precede target publication. The native owner proof
+                    // path is not connected yet, so external plans remain
+                    // additionally guarded below rather than accepting a
+                    // coordinator-supplied receipt as activation evidence.
                     if (command.action == .publish and job.value.plan.external_fk_parents.len != 0) return;
-                    const required = if (command.action == .finish_cancel) (if (job.value.plan.preparing_sources) old_total else total + old_total + parent_total) else if (old_total != 0) old_total + parent_total else total + parent_total;
+                    const required = if (command.action == .finish_cancel)
+                        (if (job.value.plan.preparing_sources) old_total else total + old_total + parent_total)
+                    else if (parent_total != 0)
+                        parent_total
+                    else if (old_total != 0)
+                        old_total
+                    else
+                        total;
                     if (next.completed_owners != required or
-                        (command.action == .publish and next.state != (if (old_total != 0) restore_staging.State.cutover else .validating)) or
+                        (command.action == .publish and next.state != (if (parent_total != 0) restore_staging.State.activating else if (old_total != 0) restore_staging.State.cutover else .validating)) or
                         (command.action == .finish_cancel and next.state != .canceling)) return;
                     // Verify reservations before publication; stale/corrupt
                     // ownership must never partially expose the target set.

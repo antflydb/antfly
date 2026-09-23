@@ -84,10 +84,13 @@ same INSERT source capture, then combine those outputs with the observed old
 row and `excluded` image before one guarded commit. This covers direct and
 mixed eager scalar expressions, including the original `sql-1411` and
 `sql-1440` cases. Multi-row captures retain each proposed row's result, and
-NULL/cardinality failures abort before mutation. Lazy CASE/COALESCE branches
-with subqueries still reject: eager source lowering could evaluate an untaken
-branch and change its error semantics. They require a masked conditional Apply
-operator in the relation binder and pull runtime.
+NULL/cardinality failures abort before mutation. A guaranteed-demand first
+CASE condition or COALESCE argument can share that guarded capture; later
+lazy branches, including nested short-circuit sites, still reject before any
+read or write. Eager source lowering could evaluate an untaken branch and
+change its error semantics. Full masked Apply and owner-dependent correlation
+need a transaction-scoped snapshot/read-set handle that allows scans opened
+after owner binding and atomically commits their point/range/absence proofs.
 Existing conflict-owner point reads now use reclaimed cursor and page scratch
 per owner, resetting page scratch after empty progress pages. A 32-owner batch
 with three 64 KiB native continuation pages per owner fits a 512 KiB SQL
@@ -207,9 +210,11 @@ UTF-8 `application_name`, a single existing `search_path` namespace, and the
 immutable negotiated UTF-8 `client_encoding`.
 `SET NAMES` uses the same UTF-8-only connection-owned path.
 `RESET ALL` resets those connection-owned settings with transaction/savepoint
-semantics in simple and extended protocol; custom `app.*` setting definitions
-now have a durable catalog owner, but pgwire SET/overlay semantics for them
-are not implemented, so original case `sql-0045` remains unresolved.
+semantics in simple and extended protocol. Writable dotted `app.*` definitions
+now have typed pgwire overlays from the durable catalog, while policy-sensitive
+definitions cannot be set by the client. Original case `sql-0045` remains
+unresolved until exact mounted parity evidence covers the complete catalog
+setting/session behavior.
 Outside a transaction, `DISCARD ALL` additionally closes connection-owned
 prepared plans, portals and held cursors after the command reply; original
 case `sql-0047` also remains unresolved pending full catalog-setting parity.
@@ -339,10 +344,28 @@ generations, dynamic names, and client overlays on policy-sensitive values fail
 closed. Metadata Raft now owns durable setting records, revision-fenced
 publication, snapshot/import state, and an administrator-only public mutation
 route. The production SQL adapter obtains authenticated scoped snapshots; it
-does not grant SQL SET authority to mutate the durable registry. Native row
-policies, remote propagation, transaction/savepoint setting overlays, the
-complete RESET/DISCARD surface, and failover/security workload gates remain
-open. A durable setting registry alone is not policy parity.
+does not grant SQL SET authority to mutate the durable registry. Pgwire now
+holds typed, identity-fenced dotted-name overlays with SET/SET LOCAL/SHOW/RESET,
+transaction/savepoint rollback, RESET ALL/DISCARD ALL, and prepared-plan epoch
+checks. Those overlays belong to one connection; they are not restart-durable
+or available to HTTP durable sessions. Native row policies, remote propagation,
+durable-session overlays, and failover/security workload gates remain open. A
+durable setting registry alone is not policy parity.
+
+The native policy boundary must be catalog-versioned authority, not a SQL
+projection filter. A policy record needs the bound table ID/schema epoch,
+command and role scope, USING/WITH CHECK expressions, setting dependency
+identities, and a publication generation. Every protected read owner must
+receive an authenticated principal and immutable policy/setting view, apply
+USING before pagination, and return an owner proof tied to the same read cut.
+Mutation preparation must check the old image for UPDATE/DELETE visibility and
+the normalized new image for INSERT/UPDATE WITH CHECK inside the guarded commit;
+API, pgwire, Lite, remote reads, and non-SQL mutation routes must not be able to
+select an unprotected backend. A missing/stale policy view or unsupported owner
+must deny the operation. Policy DDL must publish durably before it can authorize
+new traffic, and prepared statements must revalidate policy and setting
+generations. Until those paths and revocation/failover tests are complete,
+CREATE/ALTER/DROP POLICY and RLS-enabled tables remain unsupported.
 
 ### MERGE mutation lowering: partial
 
@@ -577,9 +600,13 @@ fence receipts before child cutover. A private replicated control command stages
 pending retirement idempotently across restart; changed replays fail,
 cancellation removes it, and fence release and portable backup reject a
 retained pending record. Pending state has no read-side effect. Final-owner
-activation still needs an authenticated linearizable metadata publication
-proof; generation-aware native reference handling and resumable GC are also
-missing, so both SQL admission and metadata publication remain guarded.
+activation now has an irreversible metadata decision after old/parent fencing
+and topology/dependency recheck. A direct leader-linearizable authority response
+can be validated against the exact parent fence and child FK generations, but
+the final data-group leader does not yet fetch it or persist an activated
+generation registry. Generation-aware native reference handling and resumable
+GC are also missing, so both SQL admission and metadata publication remain
+guarded; no coordinator-supplied receipt is trusted as activation evidence.
 
 Acceptance needs crash/lost-ack tests at each fence, publication and activation
 boundary, cancellation on both sides of publication, parent mutations and new

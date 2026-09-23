@@ -21,6 +21,10 @@ pub const Pending = struct {
     /// Borrowed from the encoded record after decode.
     entries: []const u8,
 
+    pub fn entryCount(self: Pending) usize {
+        return self.entries.len / entry_len;
+    }
+
     pub fn contains(self: Pending, child_table_id: u64, generation: integrity.Generation) bool {
         var offset: usize = 0;
         while (offset < self.entries.len) : (offset += entry_len) {

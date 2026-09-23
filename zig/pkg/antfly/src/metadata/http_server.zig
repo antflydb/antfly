@@ -765,7 +765,7 @@ pub const AdminSource = struct {
             // The host's existing internal-service middleware authenticates a
             // cluster service claim. node_id is scoped against durable actual
             // placement grants, not treated as cryptographic per-node proof.
-            if (!try store.restoreStagingAuthorityAllowed(alloc, svc.metadata_group_id, input.plan_id, input.node_id, if (input.receipt) |receipt| receipt.owner_group else null)) return error.RestoreStagingScopeChanged;
+            if (!try store.restoreStagingAuthorityAllowed(alloc, svc.metadata_group_id, input.plan_id, input.node_id, input.owner_group orelse if (input.receipt) |receipt| receipt.owner_group else null)) return error.RestoreStagingScopeChanged;
             var result: @import("restore_staging.zig").AuthorityResponse = .{
                 .node_id = input.node_id,
                 .plan_id = input.plan_id,

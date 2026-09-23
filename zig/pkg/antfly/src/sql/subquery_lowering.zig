@@ -28,6 +28,37 @@ pub fn has(node: *const ast.Scalar) bool {
         else => false,
     };
 }
+
+/// A read in one of these positions is not demanded on every row. Moving it
+/// into a grouped/hoisted child could expose cardinality, type, or permission
+/// errors from a branch SQL would never evaluate. This is the admission
+/// boundary until a masked Apply operator owns branch-row and snapshot state.
+pub fn hasConditional(node: *const ast.Scalar) bool {
+    return switch (node.*) {
+        .literal, .column => false,
+        .unary => |part| hasConditional(part.operand),
+        .cast => |part| hasConditional(part.operand),
+        .binary => |part| hasConditional(part.left) or (if (part.op == .@"and" or part.op == .@"or") has(part.right) else hasConditional(part.right)),
+        .in_list => |part| blk: {
+            if (hasConditional(part.operand)) break :blk true;
+            for (part.values) |value| if (has(value)) break :blk true;
+            break :blk false;
+        },
+        .case_when => |part| blk: {
+            for (part.branches, 0..) |branch, index| {
+                if ((if (index == 0) hasConditional(branch.condition) else has(branch.condition)) or has(branch.value)) break :blk true;
+            }
+            break :blk if (part.otherwise) |otherwise| has(otherwise) else false;
+        },
+        .call => |part| blk: {
+            if (part.subquery != null) break :blk false;
+            if (std.mem.eql(u8, part.name, "coalesce")) {
+                for (part.args, 0..) |arg, index| if (if (index == 0) hasConditional(arg) else has(arg)) break :blk true;
+            } else for (part.args) |arg| if (hasConditional(arg)) break :blk true;
+            break :blk if (part.filter) |filter| has(filter) else false;
+        },
+    };
+}
 pub fn predicateHas(predicate: *const ast.Predicate) bool {
     return switch (predicate.*) {
         .scalar => |value| has(value),
@@ -681,10 +712,7 @@ const Builder = struct {
     fn rewrite(self: *Builder, input: *const ast.Scalar) anyerror!*const ast.Scalar {
         if (!has(input)) return input;
         if (input.* == .call and input.call.subquery != null) return self.subquery(input);
-        // Hoisting a subquery out of a lazy branch would evaluate its data
-        // expressions even when SQL never demands that branch. A future
-        // conditional Apply node must own those evaluation masks explicitly.
-        if (input.* == .case_when or (input.* == .call and std.mem.eql(u8, input.call.name, "coalesce"))) return error.UnsupportedSqlShape;
+        if (hasConditional(input)) return error.UnsupportedSqlShape;
         return self.scalar(switch (input.*) {
             .call => |part| blk: {
                 var copy = part;

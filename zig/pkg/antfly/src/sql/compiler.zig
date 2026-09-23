@@ -1126,6 +1126,7 @@ const Parser = struct {
         for (assignments) |*assignment| {
             const expression = assignment.expression orelse continue;
             if (!hasScalarSubquery(expression)) continue;
+            if (@import("subquery_lowering.zig").hasConditional(expression)) return self.fail(error.UnsupportedSqlShape, "lazy conflict expression requires conditional subquery Apply");
             // A conflict-row reference outside the subquery must be evaluated
             // after owner arbitration. It cannot be moved into the INSERT
             // source without changing which row the reference denotes.
@@ -1152,7 +1153,6 @@ const Parser = struct {
             hole.* = .{ .column = try std.fmt.allocPrint(self.alloc, "$conflict_capture_{d}", .{ordinal}) };
             return hole;
         }
-        if (expression.* == .case_when or (expression.* == .call and std.mem.eql(u8, expression.call.name, "coalesce"))) return self.fail(error.UnsupportedSqlShape, "lazy conflict expression requires conditional subquery Apply");
         const rewritten = try self.alloc.create(ast.Scalar);
         rewritten.* = switch (expression.*) {
             .literal, .column => expression.*,
@@ -1172,7 +1172,11 @@ const Parser = struct {
                 copy.filter = if (part.filter) |filter| try self.rewriteConflictHoles(filter, captures) else null;
                 break :blk .{ .call = copy };
             },
-            .case_when => unreachable,
+            .case_when => |part| blk: {
+                const branches = try self.alloc.alloc(ast.Scalar.Branch, part.branches.len);
+                for (part.branches, branches) |branch, *out| out.* = .{ .condition = try self.rewriteConflictHoles(branch.condition, captures), .value = try self.rewriteConflictHoles(branch.value, captures) };
+                break :blk .{ .case_when = .{ .branches = branches, .otherwise = if (part.otherwise) |otherwise| try self.rewriteConflictHoles(otherwise, captures) else null } };
+            },
         };
         return rewritten;
     }

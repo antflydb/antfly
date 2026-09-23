@@ -66,11 +66,13 @@ pub const ApplicationName = struct {
 };
 pub const ApplicationNameSetting = union(enum) { show, set: struct { local: bool, value: ApplicationName }, reset };
 pub const EncodingSetting = union(enum) { show, set: struct { local: bool }, reset };
+pub const CatalogSetting = union(enum) { show: []const u8, set: struct { name: []const u8, value: []const u8, local: bool }, reset: []const u8 };
 pub const Setting = union(enum) {
     search_path: SearchPathSetting,
     statement_timeout: TimeoutSetting,
     application_name: ApplicationNameSetting,
     client_encoding: EncodingSetting,
+    catalog: CatalogSetting,
     reset_all,
     discard_all,
 };
@@ -96,7 +98,64 @@ pub fn settingCommand(alloc: std.mem.Allocator, input: []const u8) !?Setting {
             return .discard_all;
         }
     }
+    if (try catalogSetting(alloc, input)) |value| return .{ .catalog = value };
     return null;
+}
+
+/// Only dotted catalog-owned names enter the typed overlay. Built-in pgwire
+/// compatibility settings retain their existing dedicated grammar and scope.
+pub fn catalogSetting(alloc: std.mem.Allocator, input: []const u8) !?CatalogSetting {
+    var p: Parser = .{ .alloc = alloc, .input = input };
+    const verb = p.word() catch return null;
+    const set = std.ascii.eqlIgnoreCase(verb, "set");
+    const show = std.ascii.eqlIgnoreCase(verb, "show");
+    const reset = std.ascii.eqlIgnoreCase(verb, "reset");
+    if (!set and !show and !reset) return null;
+    var local = false;
+    if (set) {
+        const saved = p.pos;
+        const modifier = p.word() catch "";
+        if (std.ascii.eqlIgnoreCase(modifier, "local")) local = true else if (!std.ascii.eqlIgnoreCase(modifier, "session")) p.pos = saved;
+    }
+    const name = p.settingName() catch return null;
+    if (std.mem.indexOfScalar(u8, name, '.') == null) {
+        alloc.free(name);
+        return null;
+    }
+    if (show or reset) {
+        try p.finish();
+        return if (show) .{ .show = name } else .{ .reset = name };
+    }
+    if (!try p.take('=')) {
+        const to = try p.word();
+        if (!std.ascii.eqlIgnoreCase(to, "to")) return error.InvalidSqlSyntax;
+    }
+    try p.space();
+    const quoted = p.pos < input.len and input[p.pos] == '\'';
+    const value = if (quoted)
+        try p.quoted('\'')
+    else blk: {
+        const start = p.pos;
+        while (p.pos < input.len and !std.ascii.isWhitespace(input[p.pos]) and input[p.pos] != ';') p.pos += 1;
+        if (p.pos == start) return error.InvalidSqlSyntax;
+        break :blk input[start..p.pos];
+    };
+    try p.finish();
+    if (!quoted and std.ascii.eqlIgnoreCase(value, "default")) return .{ .reset = name };
+    return .{ .set = .{ .name = name, .value = value, .local = local } };
+}
+
+test "pgwire dotted catalog settings preserve quoted default and reject trailing SQL" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const literal = (try settingCommand(alloc, "SET app.mode = 'default'")).?.catalog.set;
+    try std.testing.expectEqualStrings("app.mode", literal.name);
+    try std.testing.expectEqualStrings("default", literal.value);
+    try std.testing.expect(!literal.local);
+    try std.testing.expect((try settingCommand(alloc, "SET LOCAL app.limit TO 4")).?.catalog.set.local);
+    try std.testing.expect((try settingCommand(alloc, "SET app.limit = DEFAULT")).?.catalog == .reset);
+    try std.testing.expectError(error.InvalidSqlSyntax, settingCommand(alloc, "SHOW app.limit; SELECT 1"));
 }
 
 pub fn encodingSetting(alloc: std.mem.Allocator, input: []const u8) !?EncodingSetting {
@@ -407,6 +466,14 @@ const Parser = struct {
             return result;
         }
         const result = try self.alloc.dupe(u8, try self.word());
+        for (result) |*ch| ch.* = std.ascii.toLower(ch.*);
+        return result;
+    }
+    fn settingName(self: *Parser) ![]const u8 {
+        const start = self.pos;
+        _ = try self.word();
+        while (try self.take('.')) _ = try self.word();
+        const result = try self.alloc.dupe(u8, std.mem.trim(u8, self.input[start..self.pos], " \t\r\n"));
         for (result) |*ch| ch.* = std.ascii.toLower(ch.*);
         return result;
     }

@@ -16470,6 +16470,7 @@ pub const ApiHttpServer = struct {
                 switch (phase) {
                     .preparing_sources => return error.RestoreValidationPending,
                     .importing => return error.RestoreValidationPending,
+                    .activating => return error.RestoreValidationPending,
                     .validating => {
                         const has_old = for (job.value.plan.targets) |target| {
                             if (target.replace != null) break true;

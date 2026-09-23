@@ -77,7 +77,21 @@ pub const Adapter = struct {
     server: *http.ApiHttpServer,
 
     pub fn backend(self: *Adapter) wire.Backend {
-        return .{ .context = self, .vtable = &.{ .authenticate = authenticate, .describe = describe, .execute = execute, .validate_namespace = validateNamespace, .evaluate_parameters = evaluateParameters, .fail_transaction = failTransaction, .open_stream = openStream, .disconnect = disconnect } };
+        return .{ .context = self, .vtable = &.{ .authenticate = authenticate, .describe = describe, .execute = execute, .load_settings = loadSettings, .validate_namespace = validateNamespace, .evaluate_parameters = evaluateParameters, .fail_transaction = failTransaction, .open_stream = openStream, .disconnect = disconnect } };
+    }
+
+    fn loadSettings(raw: *anyopaque, alloc: std.mem.Allocator, identity: wire.Identity, request: wire.Request) !@import("../sql/setting_catalog.zig").RawSnapshot {
+        const self: *Adapter = @ptrCast(@alignCast(raw));
+        const credential: *Credential = @ptrCast(@alignCast(identity.context));
+        var authenticated: ?http.AuthenticatedIdentity = try credential.identity(self.server.alloc);
+        defer authenticated.?.deinit(self.server.alloc);
+        var authority: Authority = .{ .credential = credential, .identity = &authenticated, .request = request };
+        var context = try authority.context();
+        context.setting_read_principal = credential.sessionPrincipal();
+        const scope: @import("../sql/setting_catalog.zig").Scope = .{ .principal = credential.sessionPrincipal(), .database = request.database orelse "default" };
+        const bytes = try self.server.source.systemCatalog(alloc, context, .{ .setting_snapshot = scope });
+        defer alloc.free(bytes);
+        return std.json.parseFromSliceLeaky(@import("../sql/setting_catalog.zig").RawSnapshot, alloc, bytes, .{ .allocate = .alloc_always });
     }
 
     fn failTransaction(raw: *anyopaque, identity: wire.Identity, request: wire.Request) !void {
@@ -208,6 +222,15 @@ pub const Adapter = struct {
 
 const Pull = @import("../sql/read_stream.zig");
 
+fn cloneSettingOverlay(alloc: std.mem.Allocator, entries: []const @import("../sql/setting_catalog.zig").OverlayEntry) ![]const @import("../sql/setting_catalog.zig").OverlayEntry {
+    const result = try alloc.alloc(@import("../sql/setting_catalog.zig").OverlayEntry, entries.len);
+    for (entries, result) |entry, *out| {
+        out.* = entry;
+        if (entry.value == .string) out.value = .{ .string = try alloc.dupe(u8, entry.value.string) };
+    }
+    return result;
+}
+
 /// The portal owns this entire capsule. No cursor retains Job.runInner's stack
 /// identity, authority, schema binding or temporary request context.
 const OwnedRead = struct {
@@ -267,8 +290,9 @@ const OwnedRead = struct {
         self.authority.request.namespace = try arena.dupe(u8, request.namespace orelse "public");
         self.authority.request.session_namespace = if (request.session_namespace) |scope| try arena.dupe(u8, scope) else null;
         self.authority.request.binding_guard = if (request.binding_guard) |guard| try arena.dupe(u8, guard) else null;
+        self.authority.request.setting_overlay = try cloneSettingOverlay(arena, request.setting_overlay);
         self.authority.request.session_id = self.session_id;
-        self.native_adapter = .{ .server = server, .identity = &self.identity, .context = try self.authority.context(), .database = self.authority.request.database.?, .namespace = self.authority.request.namespace.?, .session_id = self.session_id };
+        self.native_adapter = .{ .server = server, .identity = &self.identity, .context = try self.authority.context(), .database = self.authority.request.database.?, .namespace = self.authority.request.namespace.?, .session_id = self.session_id, .setting_overlay = self.authority.request.setting_overlay, .expected_setting_epoch = self.authority.request.setting_epoch };
         var transaction_lease: ?@import("transactions.zig").SessionRegistry.CommitExecution = null;
         defer if (transaction_lease) |lease| lease.release();
         if (self.session_id) |id_hex| {
@@ -288,6 +312,8 @@ const OwnedRead = struct {
         const parameters = try normalizeParameters(arena, request.parameters, request.parameter_types);
         var stream_backend = self.guarded.backend();
         if (plan.compiled().uses_current_setting) stream_backend.setting_capture = self.native_adapter.settingCapture();
+        // Stream.open captures the owner view once; loadSettings validates the
+        // prepared epoch on that same snapshot before binding or reading rows.
         const opened = try Pull.Stream.open(alloc, stream_backend, plan.compiled(), parameters, .{ .result_rows = request.limit, .page_rows = 256 });
         if (opened == null) {
             self.identity.?.deinit(server.alloc);
@@ -667,7 +693,11 @@ const Job = struct {
             .namespace = self.request.namespace orelse "public",
             .session_id = self.request.session_id,
             .session_namespace = self.request.session_namespace,
+            .setting_overlay = self.request.setting_overlay,
+            .expected_setting_epoch = self.request.setting_epoch,
         };
+        // describe/execute capture a single settings view. The adapter's
+        // loader checks expected_setting_epoch on that exact captured epoch.
         var guarded = GuardedCatalog{
             .native = native_adapter.backend(),
             .authority = &authority,
@@ -701,6 +731,7 @@ const Job = struct {
                 .columns = columns,
                 .parameter_types = parameter_types,
                 .binding_guard = try statementBindingGuard(self.alloc, native_adapter.revision, description.binding),
+                .setting_epoch = if (description.settings) |view| view.epoch else null,
             };
             return;
         }

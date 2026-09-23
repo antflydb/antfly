@@ -324,6 +324,18 @@ test "SQL original sql-1411 conflict scalar source captures before one guarded c
     } else return error.TestMissingCorpusCase;
     var compiled = try compiler.compile(std.testing.allocator, exact_sql, .{});
     defer compiled.deinit();
+    // Capability flags alone do not authorize a collection of independently
+    // refreshed pages as one statement snapshot. The native provider must
+    // supply the coordinated capture entry point before any mutation work.
+    var missing_capture_fixture: Original = .{};
+    var missing_capture_backend = missing_capture_fixture.backend();
+    var missing_capture_vtable = missing_capture_backend.vtable.*;
+    missing_capture_vtable.open_statement = null;
+    missing_capture_backend.vtable = &missing_capture_vtable;
+    missing_capture_backend.pinned_statement_snapshot = true;
+    try std.testing.expectError(error.SqlRangeTrackingRequired, runtime.execute(std.testing.allocator, missing_capture_backend, &compiled, &.{}, .{}));
+    try std.testing.expectEqual(@as(usize, 0), missing_capture_fixture.point_reads);
+    try std.testing.expectEqual(@as(usize, 0), missing_capture_fixture.commits);
     var fixture: Original = .{};
     var result = try runtime.execute(std.testing.allocator, fixture.backend(), &compiled, &.{}, .{});
     defer result.deinit();
@@ -371,9 +383,34 @@ test "SQL original sql-1411 conflict scalar source captures before one guarded c
     var lazy_case = try compiler.compile(std.testing.allocator, "INSERT INTO usage_records (id,status,quantity) VALUES ('u1','new',2) ON CONFLICT (id) DO UPDATE SET quantity=CASE WHEN (SELECT quantity FROM usage_records WHERE id='u1') > 7 THEN 11 ELSE 0 END", .{});
     defer lazy_case.deinit();
     var lazy_fixture: Original = .{};
-    try std.testing.expectError(error.UnsupportedSqlShape, runtime.execute(std.testing.allocator, lazy_fixture.backend(), &lazy_case, &.{}, .{}));
-    try std.testing.expectEqual(@as(usize, 0), lazy_fixture.captures);
-    try std.testing.expectEqual(@as(usize, 0), lazy_fixture.commits);
+    var lazy_result = try runtime.execute(std.testing.allocator, lazy_fixture.backend(), &lazy_case, &.{}, .{});
+    defer lazy_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), lazy_fixture.captures);
+    try std.testing.expectEqual(@as(usize, 1), lazy_fixture.commits);
+    try std.testing.expectEqual(@as(i64, 11), lazy_fixture.assigned);
+    for ([_]struct { sql: []const u8, expected: i64 }{
+        .{ .sql = "INSERT INTO usage_records (id,status,quantity) VALUES ('u1','new',2) ON CONFLICT (id) DO UPDATE SET quantity=CASE WHEN (SELECT quantity FROM usage_records WHERE id='u1') > 7 THEN quantity+1 ELSE 0 END", .expected = 5 },
+        .{ .sql = "INSERT INTO usage_records (id,status,quantity) VALUES ('u1','new',2) ON CONFLICT (id) DO UPDATE SET quantity=COALESCE((SELECT quantity FROM usage_records WHERE id='u1'),quantity)", .expected = 8 },
+    }) |case| {
+        var unconditional = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer unconditional.deinit();
+        var unconditional_fixture: Original = .{};
+        var unconditional_result = try runtime.execute(std.testing.allocator, unconditional_fixture.backend(), &unconditional, &.{}, .{});
+        defer unconditional_result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), unconditional_fixture.captures);
+        try std.testing.expectEqual(@as(usize, 1), unconditional_fixture.commits);
+        try std.testing.expectEqual(case.expected, unconditional_fixture.assigned);
+    }
+    var cardinality_fixture: Original = .{ .source_rows = 2 };
+    try std.testing.expectError(error.SqlCardinalityViolation, runtime.execute(std.testing.allocator, cardinality_fixture.backend(), &lazy_case, &.{}, .{}));
+    try std.testing.expectEqual(@as(usize, 0), cardinality_fixture.commits);
+    try std.testing.expectError(error.UnsupportedSqlShape, compiler.compile(std.testing.allocator, "INSERT INTO usage_records (id,status,quantity) VALUES ('u1','new',2) ON CONFLICT (id) DO UPDATE SET quantity=CASE WHEN FALSE THEN (SELECT quantity FROM usage_records WHERE id='u1') ELSE quantity END", .{}));
+    for ([_][]const u8{
+        "INSERT INTO usage_records (id,status,quantity) VALUES ('u1','new',2) ON CONFLICT (id) DO UPDATE SET quantity=CASE WHEN FALSE AND (SELECT quantity FROM usage_records WHERE id='u1')>0 THEN 1 ELSE quantity END",
+        "INSERT INTO usage_records (id,status,quantity) VALUES ('u1','new',2) ON CONFLICT (id) DO UPDATE SET quantity=CASE WHEN 1 IN (1,(SELECT quantity FROM usage_records WHERE id='u1')) THEN 1 ELSE quantity END",
+    }) |sql| {
+        try std.testing.expectError(error.UnsupportedSqlShape, compiler.compile(std.testing.allocator, sql, .{}));
+    }
     for ([_]struct { sql: []const u8, assigned: i64 }{
         .{ .sql = "INSERT INTO usage_records (id,status,quantity) VALUES ('u1','new',2) ON CONFLICT (id) DO UPDATE SET quantity=quantity+(SELECT quantity FROM usage_records WHERE id='u1')", .assigned = 12 },
         .{ .sql = "INSERT INTO usage_records (id,status,quantity) VALUES ('u1','new',2) ON CONFLICT (id) DO UPDATE SET quantity=excluded.quantity+(SELECT quantity FROM usage_records WHERE id='u1')", .assigned = 10 },
@@ -405,12 +442,7 @@ test "SQL original sql-1411 conflict scalar source captures before one guarded c
     try std.testing.expectEqual(@as(i64, 8), per_row_fixture.assigned);
     try std.testing.expectEqual(@as(i64, 9), per_row_fixture.assigned_second);
     try std.testing.expectEqual(@as(usize, 2), per_row_result.output.rows.len);
-    var lazy_coalesce = try compiler.compile(std.testing.allocator, "INSERT INTO usage_records (id,status,quantity) VALUES ('u1','new',2) ON CONFLICT (id) DO UPDATE SET quantity=COALESCE(NULL,(SELECT quantity FROM usage_records WHERE id='u1'))", .{});
-    defer lazy_coalesce.deinit();
-    var coalesce_fixture: Original = .{};
-    try std.testing.expectError(error.UnsupportedSqlShape, runtime.execute(std.testing.allocator, coalesce_fixture.backend(), &lazy_coalesce, &.{}, .{}));
-    try std.testing.expectEqual(@as(usize, 0), coalesce_fixture.captures);
-    try std.testing.expectEqual(@as(usize, 0), coalesce_fixture.commits);
+    try std.testing.expectError(error.UnsupportedSqlShape, compiler.compile(std.testing.allocator, "INSERT INTO usage_records (id,status,quantity) VALUES ('u1','new',2) ON CONFLICT (id) DO UPDATE SET quantity=COALESCE(NULL,(SELECT quantity FROM usage_records WHERE id='u1'))", .{}));
     var mixed_rejection = try compiler.compile(std.testing.allocator, "INSERT INTO usage_records (id,status,quantity) VALUES ('u1','new',2) ON CONFLICT (id) DO UPDATE SET quantity=quantity+(SELECT quantity FROM usage_records WHERE id='u1')", .{});
     defer mixed_rejection.deinit();
     for ([_]usize{ 0, 2 }) |count| {

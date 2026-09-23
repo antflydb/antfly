@@ -43,6 +43,10 @@ pub const Request = struct {
     diagnostics: ?*Diagnostic = null,
     /// Backend-owned opaque Parse-time identity fence, copied into each portal.
     binding_guard: ?[]const u8 = null,
+    /// Parse-time setting catalog epoch for prepared current_setting plans.
+    setting_epoch: ?u64 = null,
+    /// Connection-owned, identity-fenced setting values for this statement.
+    setting_overlay: []const @import("../sql/setting_catalog.zig").OverlayEntry = &.{},
 
     pub fn check(self: Request) !void {
         try self.io.checkCancel();
@@ -80,6 +84,7 @@ pub const Description = struct {
     columns: []const Column = &.{},
     parameter_types: []const Type = &.{},
     binding_guard: ?[]const u8 = null,
+    setting_epoch: ?u64 = null,
 };
 
 pub const Result = struct {
@@ -115,6 +120,8 @@ pub const Backend = struct {
         authenticate: *const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8) anyerror!Identity,
         describe: *const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!Description,
         execute: *const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!Result,
+        /// Authenticated catalog snapshot for typed dotted-name SET/SHOW/RESET.
+        load_settings: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!@import("../sql/setting_catalog.zig").RawSnapshot = null,
         validate_namespace: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!void = null,
         /// Evaluate SQL EXECUTE arguments as scalar expressions without any
         /// catalog/table access. Values are owned by the supplied allocator.

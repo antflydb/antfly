@@ -112,7 +112,11 @@ pub const ProvisioningSnapshot = struct {
         try stream.endObject();
     }
 };
-pub const State = enum { importing, validating, cutover, published, canceling, canceled, preparing_sources };
+/// `activating` is a durable, irreversible publication decision. The old
+/// child owners are fenced and the new child owners remain hidden while each
+/// external parent activates its generation tombstone. Cancellation after
+/// this point would revive old children without their inverse references.
+pub const State = enum { importing, validating, cutover, activating, published, canceling, canceled, preparing_sources };
 pub const SourceArtifact = @import("restore_provisioning_contract.zig").SourceArtifact;
 pub const Target = struct {
     pub fn nativeJsonSkipField(self: @This(), comptime name: []const u8) bool {
@@ -507,6 +511,9 @@ pub const AuthorityRequest = struct {
     node_id: u64,
     plan_id: Id,
     include_plan: bool = false,
+    /// Required for an unchanged external parent owner: unlike a staged
+    /// target it has no hidden-placement authority row.
+    owner_group: ?u64 = null,
     receipt: ?struct { state: State, owner_group: u64 } = null,
 
     pub fn jsonStringify(self: AuthorityRequest, stream: anytype) @TypeOf(stream.*).Error!void {
@@ -515,10 +522,11 @@ pub const AuthorityRequest = struct {
 
     pub fn validate(self: AuthorityRequest) !void {
         if (self.node_id == 0 or std.mem.allEqual(u8, &self.plan_id, 0)) return error.InvalidArgument;
+        if (self.owner_group) |group| if (group == 0 or (self.receipt != null and self.receipt.?.owner_group != group)) return error.InvalidArgument;
         if (self.receipt) |receipt| {
             if (receipt.owner_group == 0) return error.InvalidArgument;
             switch (receipt.state) {
-                .importing, .validating, .cutover, .canceling => {},
+                .importing, .validating, .cutover, .activating, .canceling => {},
                 .published, .canceled, .preparing_sources => return error.InvalidArgument,
             }
         }
@@ -553,6 +561,69 @@ pub const AuthorityResponse = struct {
         if ((!request.include_plan and self.job_json != null) or (request.receipt == null and self.receipt != null)) return error.InvalidRestoreStaging;
         if (self.job_json) |json| if (json.len == 0 or json.len > max_encoded_bytes) return error.InvalidRestoreStaging;
     }
+
+    /// Validate a parent activation decision from a *direct*, authenticated
+    /// leader read-index response. These fields are not a signed bearer token:
+    /// passing a coordinator-provided copy to the storage apply path would be
+    /// forgeable. The final owner leader must perform this read itself before
+    /// proposing its local activation transaction.
+    pub fn parentActivationDecision(
+        self: AuthorityResponse,
+        alloc: std.mem.Allocator,
+        request: AuthorityRequest,
+        fence: @import("../storage/db/relational_integrity_topology_contract.zig").Fence,
+        pending: @import("../storage/db/relational_integrity_generation_retirement.zig").Pending,
+    ) !ParentActivationDecision {
+        try self.validate(request);
+        if (!request.include_plan or request.owner_group != fence.owner_group_id or request.receipt != null or
+            self.progress == null or self.progress.?.state != .activating or
+            self.job_json == null or !pending.fence.eql(fence) or fence.role != .truncate_parent)
+            return error.RestoreActivationDecisionMissing;
+        var job = try std.json.parseFromSlice(Job, alloc, self.job_json.?, .{});
+        defer job.deinit();
+        if (job.value.state != .activating or job.value.revision != self.progress.?.revision or
+            job.value.completed_owners != self.progress.?.completed_owners or
+            !std.mem.eql(u8, &job.value.plan.id, &self.plan_id) or
+            !std.mem.eql(u8, &job.value.plan_digest, &pending.plan_digest) or
+            !std.mem.eql(u8, &job.value.plan_digest, &try job.value.plan.digest(alloc)))
+            return error.RestoreActivationDecisionMissing;
+        try job.value.plan.validate(alloc);
+        const parent = for (job.value.plan.external_fk_parents) |candidate| {
+            if (candidate.table.table_id == fence.namespace.table_id) break candidate;
+        } else return error.RestoreActivationDecisionMissing;
+        const planned_fence = for (parent.fences) |candidate| {
+            if (candidate.owner_group_id == fence.owner_group_id) break candidate;
+        } else return error.RestoreActivationDecisionMissing;
+        if (!planned_fence.eql(fence) or parent.foreign_keys.len != pending.entryCount())
+            return error.RestoreActivationDecisionMissing;
+        for (parent.foreign_keys) |fk| {
+            if (!pending.contains(fk.child_table_id, fk.generation)) return error.RestoreActivationDecisionMissing;
+            const reference: @import("../storage/db/relational_integrity_contract.zig").Reference = .{
+                .child_table = fk.child_table_name,
+                .child_key = "not used for generation match",
+                .constraint_name = fk.constraint_name,
+                .constraint_generation = fk.generation,
+            };
+            if (!pending.matchesReference(reference)) return error.RestoreActivationDecisionMissing;
+        }
+        return .{
+            .metadata_group_id = self.metadata_group_id,
+            .metadata_incarnation = self.metadata_incarnation,
+            .metadata_epoch = self.metadata_epoch,
+            .revision = self.progress.?.revision,
+            .plan_digest = pending.plan_digest,
+            .owner_group_id = fence.owner_group_id,
+        };
+    }
+};
+
+pub const ParentActivationDecision = struct {
+    metadata_group_id: u64,
+    metadata_incarnation: @import("incarnation.zig").MetadataClusterIncarnation,
+    metadata_epoch: u64,
+    revision: u64,
+    plan_digest: Digest,
+    owner_group_id: u64,
 };
 
 fn writeAuthority(value: anytype, stream: anytype) @TypeOf(stream.*).Error!void {
@@ -582,7 +653,7 @@ pub const OwnerReceipt = struct {
 pub const Command = struct {
     id: Id,
     expected_revision: u64 = 0,
-    action: enum { reserve, cancel_reservation, imported, validated, begin_cutover, old_fenced, publish, begin_cancel, canceled, finish_cancel, freeze_rewrite, rewrite_source_ready, parent_fenced },
+    action: enum { reserve, cancel_reservation, imported, validated, begin_cutover, old_fenced, begin_activation, parent_activated, publish, begin_cancel, canceled, finish_cancel, freeze_rewrite, rewrite_source_ready, parent_fenced },
     plan: ?Plan = null,
     receipt: ?OwnerReceipt = null,
     source_artifact: ?SourceArtifact = null,
@@ -616,7 +687,7 @@ pub const Command = struct {
                 !artifact.source_namespace.eql(scope.fence.namespace) or artifact.target_group_id != scope.fence.peer_group_id or
                 scope.fence.transition_id != std.mem.readInt(u64, self.id[0..8], .little) or scope.fence.attempt != std.mem.readInt(u64, self.id[8..16], .little)) return error.InvalidRestoreStaging;
         }
-        const needs_receipt = self.action == .imported or self.action == .validated or self.action == .old_fenced or self.action == .canceled or self.action == .parent_fenced;
+        const needs_receipt = self.action == .imported or self.action == .validated or self.action == .old_fenced or self.action == .canceled or self.action == .parent_fenced or self.action == .parent_activated;
         if (needs_receipt != (self.receipt != null)) return error.InvalidRestoreStaging;
         if (self.receipt) |receipt| {
             if (receipt.group_id == 0 or receipt.range_id == 0 or std.mem.allEqual(u8, &receipt.plan_digest, 0) or
@@ -715,6 +786,36 @@ test "relational integrity restore staging pins an untouched FK parent and exact
     const parent: ExternalFkParent = .{ .table = .{ .table_id = 11, .name = "parents", .schema_json = parent_schema }, .ranges = &.{parent_range}, .fences = &.{parent_fence}, .foreign_keys = &.{.{ .child_table_id = 9, .child_table_name = "children", .constraint_name = "fk", .generation = @splat(5) }} };
     const plan: Plan = .{ .id = id, .cohort_digest = @splat(3), .targets = &.{target}, .external_fk_parents = &.{parent} };
     try plan.validate(alloc);
+    const digest = try plan.digest(alloc);
+    const pending_bytes = try @import("../storage/db/relational_integrity_generation_retirement.zig").encodePending(alloc, parent_fence, digest, &.{.{ .child_table_id = 9, .child_table_name = "children", .constraint_name = "fk", .generation = @splat(5) }});
+    defer alloc.free(pending_bytes);
+    const pending = try @import("../storage/db/relational_integrity_generation_retirement.zig").Pending.decode(pending_bytes);
+    const request: AuthorityRequest = .{ .node_id = 7, .plan_id = id, .include_plan = true, .owner_group = 501 };
+    var conflicting_request = request;
+    conflicting_request.receipt = .{ .state = .cutover, .owner_group = 502 };
+    try std.testing.expectError(error.InvalidArgument, conflicting_request.validate());
+    const job_json = try std.json.Stringify.valueAlloc(alloc, Job{ .plan = plan, .plan_digest = digest, .state = .activating, .revision = 4 }, .{});
+    defer alloc.free(job_json);
+    var response: AuthorityResponse = .{ .node_id = 7, .plan_id = id, .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .metadata_epoch = 9, .progress = .{ .state = .activating, .revision = 4 }, .job_json = job_json };
+    const decision = try response.parentActivationDecision(alloc, request, parent_fence, pending);
+    try std.testing.expectEqual(@as(u64, 501), decision.owner_group_id);
+    response.progress.?.state = .cutover;
+    try std.testing.expectError(error.RestoreActivationDecisionMissing, response.parentActivationDecision(alloc, request, parent_fence, pending));
+    response.progress.?.state = .activating;
+    response.progress.?.revision = 5;
+    try std.testing.expectError(error.RestoreActivationDecisionMissing, response.parentActivationDecision(alloc, request, parent_fence, pending));
+    response.progress.?.revision = 4;
+    var wrong_parent_fence = parent_fence;
+    wrong_parent_fence.owner_group_id = 502;
+    try std.testing.expectError(error.RestoreActivationDecisionMissing, response.parentActivationDecision(alloc, request, wrong_parent_fence, pending));
+    const wrong_pending_bytes = try @import("../storage/db/relational_integrity_generation_retirement.zig").encodePending(alloc, parent_fence, @splat(8), &.{.{ .child_table_id = 9, .child_table_name = "children", .constraint_name = "fk", .generation = @splat(5) }});
+    defer alloc.free(wrong_pending_bytes);
+    const wrong_pending = try @import("../storage/db/relational_integrity_generation_retirement.zig").Pending.decode(wrong_pending_bytes);
+    try std.testing.expectError(error.RestoreActivationDecisionMissing, response.parentActivationDecision(alloc, request, parent_fence, wrong_pending));
+    const wrong_fk_bytes = try @import("../storage/db/relational_integrity_generation_retirement.zig").encodePending(alloc, parent_fence, digest, &.{.{ .child_table_id = 9, .child_table_name = "children", .constraint_name = "other", .generation = @splat(5) }});
+    defer alloc.free(wrong_fk_bytes);
+    const wrong_fk = try @import("../storage/db/relational_integrity_generation_retirement.zig").Pending.decode(wrong_fk_bytes);
+    try std.testing.expectError(error.RestoreActivationDecisionMissing, response.parentActivationDecision(alloc, request, parent_fence, wrong_fk));
     var missing = plan;
     missing.external_fk_parents = &.{};
     try std.testing.expectError(error.RestoreDependencyMissing, missing.validate(alloc));

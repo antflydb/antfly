@@ -28,6 +28,152 @@ pub const Owner = struct {
 
 pub const OverlayEntry = struct { identity: Identity, value: Value };
 
+const Entries = struct {
+    items: std.ArrayList(OverlayEntry) = .empty,
+
+    fn deinit(self: *Entries, alloc: std.mem.Allocator) void {
+        for (self.items.items) |entry| if (entry.value == .string) alloc.free(entry.value.string);
+        self.items.deinit(alloc);
+        self.* = .{};
+    }
+
+    fn clone(self: Entries, alloc: std.mem.Allocator) !Entries {
+        var result: Entries = .{};
+        errdefer result.deinit(alloc);
+        for (self.items.items) |entry| try result.put(alloc, entry);
+        return result;
+    }
+
+    fn put(self: *Entries, alloc: std.mem.Allocator, entry: OverlayEntry) !void {
+        for (self.items.items) |*old| if (old.identity.id == entry.identity.id) {
+            const value = try copyValue(alloc, entry.value);
+            if (old.value == .string) alloc.free(old.value.string);
+            old.* = .{ .identity = entry.identity, .value = value };
+            return;
+        };
+        if (self.items.items.len >= 1024) return error.SettingLimitExceeded;
+        const value = try copyValue(alloc, entry.value);
+        errdefer if (value == .string) alloc.free(value.string);
+        try self.items.append(alloc, .{ .identity = entry.identity, .value = value });
+    }
+
+    fn remove(self: *Entries, alloc: std.mem.Allocator, id: u64) void {
+        for (self.items.items, 0..) |entry, i| if (entry.identity.id == id) {
+            if (entry.value == .string) alloc.free(entry.value.string);
+            _ = self.items.swapRemove(i);
+            return;
+        };
+    }
+};
+
+/// Connection-owned overlay. The catalog remains authoritative: every write
+/// reloads and validates the current definition identity and writable policy.
+/// Savepoint snapshots are deep-owned and can be restored without retaining
+/// a statement allocator or an old catalog view.
+pub const OverlayState = struct {
+    alloc: std.mem.Allocator,
+    session: Entries = .{},
+    active: Entries = .{},
+    committed: Entries = .{},
+    before: Entries = .{},
+    in_transaction: bool = false,
+
+    pub const Savepoint = struct {
+        active: Entries,
+        committed: Entries,
+        pub fn deinit(self: *Savepoint, alloc: std.mem.Allocator) void {
+            self.active.deinit(alloc);
+            self.committed.deinit(alloc);
+        }
+    };
+
+    pub fn init(alloc: std.mem.Allocator) OverlayState {
+        return .{ .alloc = alloc };
+    }
+    pub fn deinit(self: *OverlayState) void {
+        self.session.deinit(self.alloc);
+        self.active.deinit(self.alloc);
+        self.committed.deinit(self.alloc);
+        self.before.deinit(self.alloc);
+    }
+    pub fn values(self: *const OverlayState) []const OverlayEntry {
+        return if (self.in_transaction) self.active.items.items else self.session.items.items;
+    }
+    pub fn begin(self: *OverlayState) !void {
+        if (self.in_transaction) return error.ActiveSqlTransaction;
+        self.before = try self.session.clone(self.alloc);
+        errdefer self.before.deinit(self.alloc);
+        self.active = try self.session.clone(self.alloc);
+        errdefer self.active.deinit(self.alloc);
+        self.committed = try self.session.clone(self.alloc);
+        self.in_transaction = true;
+    }
+    pub fn finish(self: *OverlayState, commit: bool) void {
+        if (!self.in_transaction) return;
+        self.session.deinit(self.alloc);
+        self.session = if (commit) self.committed else self.before;
+        if (commit) self.before.deinit(self.alloc) else self.committed.deinit(self.alloc);
+        self.active.deinit(self.alloc);
+        self.before = .{};
+        self.committed = .{};
+        self.in_transaction = false;
+    }
+    pub fn savepoint(self: *const OverlayState) !Savepoint {
+        if (!self.in_transaction) return error.NoActiveSqlTransaction;
+        var active = try self.active.clone(self.alloc);
+        errdefer active.deinit(self.alloc);
+        return .{ .active = active, .committed = try self.committed.clone(self.alloc) };
+    }
+    pub fn rollbackTo(self: *OverlayState, point: Savepoint) !void {
+        if (!self.in_transaction) return error.NoActiveSqlTransaction;
+        var active = try point.active.clone(self.alloc);
+        errdefer active.deinit(self.alloc);
+        const committed = try point.committed.clone(self.alloc);
+        self.active.deinit(self.alloc);
+        self.committed.deinit(self.alloc);
+        self.active = active;
+        self.committed = committed;
+    }
+    pub fn resetAll(self: *OverlayState) void {
+        if (self.in_transaction) {
+            self.active.deinit(self.alloc);
+            self.committed.deinit(self.alloc);
+        } else self.session.deinit(self.alloc);
+    }
+    pub fn set(self: *OverlayState, owner: Owner, scope: Scope, name: []const u8, raw: []const u8, local: bool) !void {
+        if (local and !self.in_transaction) return error.NoActiveSqlTransaction;
+        var view = try View.capture(self.alloc, owner, scope, self.values());
+        defer view.deinit();
+        const definition = try view.writable(name);
+        const value = try parseValue(definition.kind, raw);
+        const entry: OverlayEntry = .{ .identity = definition.identity, .value = value };
+        if (self.in_transaction) {
+            try self.active.put(self.alloc, entry);
+            if (!local) try self.committed.put(self.alloc, entry);
+        } else try self.session.put(self.alloc, entry);
+    }
+    pub fn reset(self: *OverlayState, owner: Owner, scope: Scope, name: []const u8) !void {
+        var view = try View.capture(self.alloc, owner, scope, self.values());
+        defer view.deinit();
+        const definition = try view.writable(name);
+        if (self.in_transaction) {
+            self.active.remove(self.alloc, definition.identity.id);
+            self.committed.remove(self.alloc, definition.identity.id);
+        } else self.session.remove(self.alloc, definition.identity.id);
+    }
+};
+
+fn parseValue(kind: Kind, raw: []const u8) !Value {
+    return switch (kind) {
+        .boolean => .{ .boolean = if (std.ascii.eqlIgnoreCase(raw, "true") or std.mem.eql(u8, raw, "1") or std.ascii.eqlIgnoreCase(raw, "on")) true else if (std.ascii.eqlIgnoreCase(raw, "false") or std.mem.eql(u8, raw, "0") or std.ascii.eqlIgnoreCase(raw, "off")) false else return error.InvalidSettingValue },
+        .integer => .{ .integer = std.fmt.parseInt(i64, raw, 10) catch return error.InvalidSettingValue },
+        .string => blk: {
+            if (raw.len > 4096 or !std.unicode.utf8ValidateSlice(raw)) return error.InvalidSettingValue;
+            break :blk .{ .string = raw };
+        },
+    };
+}
+
 /// Deep-owned immutable input to binding and evaluation. Keep one View alive
 /// through all bound programs and remote read requests for the statement.
 pub const View = struct {
@@ -87,6 +233,14 @@ pub const View = struct {
         for (self.definitions, self.values) |definition, value| {
             if (std.ascii.eqlIgnoreCase(definition.name, name)) return .{ .identity = definition.identity, .value = value };
         }
+        return error.UnknownSetting;
+    }
+
+    pub fn writable(self: View, name: []const u8) !Definition {
+        for (self.definitions) |definition| if (std.ascii.eqlIgnoreCase(definition.name, name)) {
+            if (!definition.session_writable or definition.policy_sensitive) return error.SettingWriteForbidden;
+            return definition;
+        };
         return error.UnknownSetting;
     }
 
@@ -199,6 +353,57 @@ test "setting view rejects malformed owner snapshots and duplicate overlays" {
     fake.raw.scope = scope;
     fake.raw.definitions = &.{ definition, definition };
     try std.testing.expectError(error.InvalidSettingCatalogSnapshot, View.capture(std.testing.allocator, fake.owner(), scope, &.{}));
+}
+
+test "typed setting overlays roll back local and savepoint changes and fence generations" {
+    const Fixture = struct {
+        generation: u64 = 1,
+        fn load(ptr: *anyopaque, alloc: std.mem.Allocator, scope: Scope) !RawSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const definitions = try alloc.alloc(Definition, 3);
+            definitions[0] = .{ .identity = .{ .id = 1, .generation = self.generation }, .name = "app.limit", .kind = .integer, .session_writable = true, .default = .{ .integer = 3 } };
+            definitions[1] = .{ .identity = .{ .id = 2, .generation = 1 }, .name = "app.enabled", .kind = .boolean, .session_writable = true, .default = .{ .boolean = false } };
+            definitions[2] = .{ .identity = .{ .id = 3, .generation = 1 }, .name = "app.tenant", .kind = .string, .policy_sensitive = true, .default = .{ .string = "owner" } };
+            return .{ .scope = scope, .epoch = self.generation, .definitions = definitions };
+        }
+    };
+    var fixture: Fixture = .{};
+    const scope: Scope = .{ .principal = "alice", .database = "main" };
+    const owner: Owner = .{ .ptr = &fixture, .load = Fixture.load };
+    var state = OverlayState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.set(owner, scope, "app.limit", "5", false);
+    try std.testing.expectEqual(@as(i64, 5), state.values()[0].value.integer);
+    try state.begin();
+    try state.set(owner, scope, "app.limit", "7", true);
+    var point = try state.savepoint();
+    defer point.deinit(std.testing.allocator);
+    try state.set(owner, scope, "app.limit", "9", false);
+    try state.rollbackTo(point);
+    try std.testing.expectEqual(@as(i64, 7), state.values()[0].value.integer);
+    state.finish(true);
+    try std.testing.expectEqual(@as(i64, 5), state.values()[0].value.integer);
+    try state.begin();
+    try state.set(owner, scope, "app.enabled", "on", false);
+    state.finish(false);
+    try std.testing.expectEqual(@as(usize, 1), state.values().len);
+    try std.testing.expectError(error.SettingWriteForbidden, state.set(owner, scope, "app.tenant", "other", false));
+    try std.testing.expectError(error.InvalidSettingValue, state.set(owner, scope, "app.limit", "invalid", false));
+    fixture.generation = 2;
+    try std.testing.expectError(error.SettingCatalogChanged, state.set(owner, scope, "app.limit", "6", false));
+    state.resetAll();
+    var view = try View.capture(std.testing.allocator, owner, scope, state.values());
+    defer view.deinit();
+    try std.testing.expectEqual(@as(i64, 3), (try view.resolve("app.limit")).value.integer);
+    try state.set(owner, scope, "app.limit", "8", false);
+    // A new pgwire connection starts with the durable catalog defaults, not
+    // another connection's process-local overlay. It cannot resume SET LOCAL.
+    var reconnected = OverlayState.init(std.testing.allocator);
+    defer reconnected.deinit();
+    var after_reconnect = try View.capture(std.testing.allocator, owner, scope, reconnected.values());
+    defer after_reconnect.deinit();
+    try std.testing.expectEqual(@as(i64, 3), (try after_reconnect.resolve("app.limit")).value.integer);
+    try std.testing.expectEqual(@as(i64, 8), state.values()[0].value.integer);
 }
 
 test "SQL current_setting evaluates from one authorized pinned view" {

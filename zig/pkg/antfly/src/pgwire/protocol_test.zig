@@ -58,9 +58,22 @@ const Mock = struct {
     namespace_checks: usize = 0,
     saw_distinct_owner_namespace: bool = false,
     expected_cursor_namespace: ?[]const u8 = null,
+    setting_generation: u64 = 1,
+    setting_snapshots: usize = 0,
+    observed_setting: ?i64 = null,
+    describe_setting_epoch: ?u64 = null,
+    observed_setting_epoch: ?u64 = null,
 
     fn source(self: *Mock) backend.Backend {
-        return .{ .context = self, .vtable = &.{ .authenticate = authenticate, .describe = describe, .execute = Mock.execute, .validate_namespace = validateNamespace, .evaluate_parameters = evaluateParameters, .fail_transaction = failTransaction, .open_stream = openStream, .disconnect = disconnect } };
+        return .{ .context = self, .vtable = &.{ .authenticate = authenticate, .describe = describe, .execute = Mock.execute, .load_settings = loadSettings, .validate_namespace = validateNamespace, .evaluate_parameters = evaluateParameters, .fail_transaction = failTransaction, .open_stream = openStream, .disconnect = disconnect } };
+    }
+    fn loadSettings(raw: *anyopaque, alloc: std.mem.Allocator, _: backend.Identity, request: backend.Request) !@import("../sql/setting_catalog.zig").RawSnapshot {
+        const self: *Mock = @ptrCast(@alignCast(raw));
+        self.setting_snapshots += 1;
+        const definitions = try alloc.alloc(@import("../sql/setting_catalog.zig").Definition, 2);
+        definitions[0] = .{ .identity = .{ .id = 1, .generation = self.setting_generation }, .name = "app.limit", .kind = .integer, .session_writable = true, .default = .{ .integer = 3 } };
+        definitions[1] = .{ .identity = .{ .id = 2, .generation = 1 }, .name = "app.tenant", .kind = .string, .policy_sensitive = true, .default = .{ .string = "owner" } };
+        return .{ .scope = .{ .principal = "tester", .database = request.database orelse "db" }, .epoch = self.setting_generation, .definitions = definitions };
     }
     fn validateNamespace(raw: *anyopaque, _: std.mem.Allocator, _: backend.Identity, request: backend.Request) !void {
         const self: *Mock = @ptrCast(@alignCast(raw));
@@ -134,10 +147,12 @@ const Mock = struct {
         if (self.cursor_revoked) return error.Forbidden;
         if (self.ddl_pending or self.ddl_unknown) return .{ .columns = &.{} };
         if (self.json_null_results) return .{ .columns = &.{.{ .name = "j", .type = .json }} };
-        return .{ .columns = &.{.{ .name = "n", .type = .integer }}, .parameter_types = if (std.mem.indexOf(u8, request.statement, "$1") != null) (if (std.mem.indexOf(u8, request.statement, "usage_records") != null) &.{.string} else &.{.integer}) else &.{}, .binding_guard = "immutable-catalog-binding" };
+        return .{ .columns = &.{.{ .name = "n", .type = .integer }}, .parameter_types = if (std.mem.indexOf(u8, request.statement, "$1") != null) (if (std.mem.indexOf(u8, request.statement, "usage_records") != null) &.{.string} else &.{.integer}) else &.{}, .binding_guard = "immutable-catalog-binding", .setting_epoch = self.describe_setting_epoch };
     }
     fn execute(raw: *anyopaque, alloc: std.mem.Allocator, _: backend.Identity, request: backend.Request) !backend.Result {
         const self: *Mock = @ptrCast(@alignCast(raw));
+        self.observed_setting = if (request.setting_overlay.len == 0) null else request.setting_overlay[0].value.integer;
+        self.observed_setting_epoch = request.setting_epoch;
         if (self.expected_execute_statement) |expected| if (std.mem.startsWith(u8, request.statement, "SELECT")) try std.testing.expectEqualStrings(expected, request.statement);
         self.executions += 1;
         if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, request.statement, " \t\r\n;"), "begin")) return .{ .command_tag = "BEGIN", .transaction_status = .in_transaction, .session_id = "0123456789abcdef0123456789abcdef" };
@@ -849,6 +864,88 @@ test "pgwire DISCARD ALL releases active portal after extended reply" {
     }
     try std.testing.expect(saw_encoding);
     try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
+}
+
+test "pgwire typed catalog settings honor local savepoint reset and discard overlays" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    for ([_][]const u8{
+        "SET app.limit = 5\x00",
+        "SHOW app.limit\x00",
+        "BEGIN\x00",
+        "SET LOCAL app.limit = 7\x00",
+        "SHOW app.limit\x00",
+        "SAVEPOINT saved\x00",
+        "SET app.limit = 9\x00",
+        "ROLLBACK TO saved\x00",
+        "SHOW app.limit\x00",
+        "COMMIT\x00",
+        "SHOW app.limit\x00",
+        "RESET ALL\x00",
+        "SHOW app.limit\x00",
+        "SET app.limit = 6\x00",
+        "DISCARD ALL\x00",
+        "SHOW app.limit\x00",
+        "SELECT 1\x00",
+    }) |statement| try frame(&input.writer, 'Q', statement);
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{};
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    const expected = [_][]const u8{ "5", "7", "7", "5", "3", "3", "9007199254740993", "2" };
+    var index: usize = 0;
+    var cursor: protocol.Cursor = .{ .bytes = output.written() };
+    while (cursor.offset < cursor.bytes.len) {
+        const tag = try cursor.int(u8);
+        const length = try cursor.int(u32);
+        var payload: protocol.Cursor = .{ .bytes = try cursor.take(length - 4) };
+        try std.testing.expect(tag != 'E');
+        if (tag == 'D') {
+            try std.testing.expectEqual(@as(u16, 1), try payload.int(u16));
+            const n = try payload.int(u32);
+            try std.testing.expect(index < expected.len);
+            try std.testing.expectEqualStrings(expected[index], try payload.take(n));
+            index += 1;
+        }
+    }
+    try std.testing.expectEqual(expected.len, index);
+    try std.testing.expect(mock.setting_snapshots >= 9);
+    try std.testing.expectEqual(@as(?i64, null), mock.observed_setting);
+}
+
+test "pgwire typed catalog setting writes fail closed for policy type and local scope" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    for ([_][]const u8{
+        "SET app.tenant = 'other'\x00",
+        "SET app.limit = nope\x00",
+        "SET app.unknown = 1\x00",
+        "SET LOCAL app.limit = 8\x00",
+        "SHOW app.limit\x00",
+    }) |statement| try frame(&input.writer, 'Q', statement);
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{};
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    for ([_][]const u8{ "42501", "22023", "42704", "25P01" }) |state| try std.testing.expect(std.mem.indexOf(u8, output.written(), state) != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "3") != null);
+    try std.testing.expectEqual(@as(usize, 0), mock.executions);
+}
+
+test "pgwire prepared statement carries setting catalog epoch to execution" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    try parse(&input.writer, "setting_plan", "SELECT 1", false);
+    try bind(&input.writer, "setting_portal", "setting_plan", null);
+    try execute(&input.writer, "setting_portal", 0);
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .describe_setting_epoch = 17 };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    try std.testing.expectEqual(@as(?u64, 17), mock.observed_setting_epoch);
 }
 
 test "pgwire DISCARD ALL inside a transaction leaves prepared plans intact" {

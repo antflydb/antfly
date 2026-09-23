@@ -12172,8 +12172,10 @@ test "relational topology admission rejects lifecycle proposals before encoding 
 
 test "relational topology admission requires metadata decoder capability beyond framed status" {
     try std.testing.expectEqual(@as(u16, 11), metadata_topology_protocol.source_scope_version);
-    try std.testing.expectEqual(metadata_topology_protocol.current_version, metadata_topology_protocol.coordinated_lifecycle_version);
-    try std.testing.expectEqual(metadata_topology_protocol.current_version, metadata_topology_protocol.relational_integrity_topology_version);
+    // The latest metadata protocol can advance independently of the minimum
+    // decoder version required by coordinated relational lifecycle entries.
+    try std.testing.expect(metadata_topology_protocol.current_version >= metadata_topology_protocol.coordinated_lifecycle_version);
+    try std.testing.expectEqual(metadata_topology_protocol.coordinated_lifecycle_version, metadata_topology_protocol.relational_integrity_topology_version);
     const incarnation: metadata_mod.MetadataClusterIncarnation = "0123456789abcdef0123456789abcdef".*;
     var status: MetadataStatus = .{ .metadata_group_id = 42, .metadata_incarnation = incarnation, .metadata_raft_local_node_id = 7, .metrics = .{}, .table_topology_protocol_version = 6, .runtime_status_record_version = metadata_runtime_status_protocol.current_record_version };
     try std.testing.expect(runtimeStatusProtocolCompatible(status, 42, 7, incarnation, metadata_runtime_status_protocol.current_record_version));
