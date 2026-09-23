@@ -759,6 +759,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "aggregation full-result capture survives a later primary write",
             "aggregation selection and rerun share a read lease without repeating the raft barrier",
             "local query provider returns complete aggregations and preserves the requested hit page",
+            "aggregation domain",
+            "aggregation full-result rerun counts text matches and each vector window without changing ranked page",
             "provisioned single-group queries retain coordinator-owned finalization",
             "provisioned query delegates single-group physical execution to local read source",
             "aggregation full-result rerun can reuse snapped result identity generation",
@@ -1080,6 +1082,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "aggregation full-result capture survives a later primary write",
             "aggregation selection and rerun share a read lease without repeating the raft barrier",
             "local query provider returns complete aggregations and preserves the requested hit page",
+            "aggregation domain",
+            "aggregation full-result rerun counts text matches and each vector window without changing ranked page",
             "provisioned single-group queries retain coordinator-owned finalization",
             "provisioned query delegates single-group physical execution to local read source",
             "aggregation text analysis selects the named full text index",
@@ -1530,7 +1534,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const api_aggregation_tests = @import("linked_tests.zig").addPair(b, .{
         .name = "api-aggregation-tests",
         .root_module = api_table_reads_docid_test_mod,
-        .filters = &.{ "aggregation-only collection", "aggregation completeness", "aggregation context", "aggregation full-result rerun" },
+        .filters = &.{ "aggregation-only collection", "aggregation completeness", "aggregation context", "aggregation full-result rerun", "aggregation domain" },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     }, write_implementation_tests);
     b.step("antfly-api-aggregation-test", "Run captured aggregation collection, completeness and generation regressions").dependOn(&api_aggregation_tests.run(b).step);
