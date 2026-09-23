@@ -7,7 +7,11 @@ providers, shard DB access, and DB runtime ownership.
 
 - A node should own one `BackendRuntime` and share it across metadata, data,
   and all DB/store opens on that node.
-- A standalone node always owns embedded Antfly inference. It exposes Antfly inference as both the
+- A standalone node owns embedded Antfly inference unless `inference.api_url`
+  is set, which turns off the embedded provider, preloads, and `/ai/v1` routes
+  (`standalone/runtime.zig`). In builds with Metal, CUDA, ONNX, or PJRT, the
+  embedded runtime delegates all execution, CPU models included, to a
+  supervised `antfly inference _worker` child. It exposes Antfly inference as both the
   direct local inference provider for Antfly enrichment/query code and as the
   public `/ai/v1` compatibility API on the unified server. Local managed
   embeddings must not loop back through the node's public HTTP `/ai/v1` server
@@ -58,12 +62,10 @@ and batching are controlled. Enrichment can then batch documents and chunking
 requests without creating a fresh HTTP client per sub-batch or competing with
 user traffic for the same listener.
 
-This applies to Antfly inference chunking as well as embeddings. Today the enrichment
-chunker routes `.antfly` configs through `chunking.antfly.chunkText(...)`,
-which posts to `{api_url}/chunk`. That is correct for remote Antfly inference, but local
-embedded standalone should resolve the same config to an in-process chunker instead.
-The existing `.antfly` / `.mock` fixed chunkers are already local and do not
-need this migration.
+This applies to Antfly inference chunking as well as embeddings. Embedded
+standalone resolves `.antfly` chunker configs to the linked direct chunker
+(`chunking/inference.zig`); `{api_url}/chunk` is used only when a remote
+inference endpoint is configured.
 
 ## Request Admission Ownership
 
@@ -184,7 +186,8 @@ Current classification:
 - [x] Add direct local Antfly inference dense/sparse embedder, reranker, and chunker
       implementations and route embedded standalone `provider=antfly` /
       `provider=antfly` configs to them.
-- [x] Always expose the Antfly inference-compatible public `/ai/v1` API from standalone while
+- [x] Always expose the Antfly inference-compatible public `/ai/v1` API from standalone (when
+      `inference.api_url` is unset) while
       keeping Antfly-managed local enrichment/query paths on the direct provider
       instead of loopback HTTP.
 - [x] Add direct local Antfly inference generator implementations for Antfly managed

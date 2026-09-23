@@ -2,7 +2,8 @@
 
 Investigated 2026-09-19 against Antfly `origin/main` at
 `8b87fb96d2ac67b45888f0c6d1831d445963730a`, in branch
-`codex/investigate-laya`. This is a proposal; no runtime support is implemented.
+`codex/investigate-laya`. This began as a proposal; runtime support has since been implemented (see
+Implementation follow-up).
 Upstream source revision: `6a5819129eb220570792e417e49723d697efd76f`.
 
 ## Recommended placement
@@ -209,7 +210,8 @@ extraction. The released English checkpoint also matches all 192 sampled upstrea
 decisions on CPU and Metal, with maximum probability errors below `1e-5`, and
 passes batch scaling through 128 tasks. See the
 [accuracy, parity, and performance report](laya-qualification.md) for results,
-regression fixes, and reproducible commands. CUDA, multilingual checkpoints,
+regression fixes, and reproducible commands. CUDA is qualified on NVIDIA L4 (see
+[Laya](../guides/laya.md)). Multilingual checkpoints,
 fine-tuned checkpoints, and application-specific tool-routing accuracy remain
 unqualified. Tool selection is available through classification results; agent
 tool execution is outside this change.

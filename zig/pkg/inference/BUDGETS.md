@@ -5,7 +5,8 @@
 Make memory budgeting a first-class runtime subsystem instead of a set of
 per-path heuristics.
 
-The immediate problems are:
+This plan is largely implemented; see "Current State". The original problems
+were:
 
 - request-time `RunBudget` decisions do not coordinate globally
 - model loading has no comparable admission control
@@ -35,18 +36,34 @@ The intended end state is still Hypura-like:
   - `src/ops/native_compute.zig`
 - model cache and cold-load path in `src/server/model_manager.zig`
 
-### What is missing
+### Implemented since this plan
 
-- no load-time budget or load admission control
-- no in-flight load dedup at the model-manager layer
-- no single coordinator that sees:
-  - resident model footprint
-  - in-flight model loads
-  - active request budgets
-- no clear separation between:
-  - temporary load-time memory
-  - persistent model residency
-  - request-scoped run memory
+- Load admission: `ModelManager` reserves the construction peak through
+  `AdmissionController`/`AdmissionLease` (`src/runtime/tier/memory.zig`) before
+  import, then shrinks the lease to retained residency with `retain()`.
+- In-flight load dedup: `in_flight_loads` single-flights concurrent loads of the
+  same model (`src/server/model_manager.zig`).
+- Global coordinator: one process-level `AdmissionController` covers resident
+  models, in-flight loads, and request KV/scratch. In standalone it is mirrored
+  into the node `ResourceManager` (see `zig/MANAGERS.md`).
+- Evict-before-deny: `evictOneIdleForAdmission` evicts idle models, then cold
+  cache entries, before admission denies a request.
+- Bounded working set: lazy weight caches take incremental leases, and
+  `residency_mode` is `auto`, `resident`, or `streamed`.
+- Live process-envelope checks against `--process-memory-budget-mb`.
+- Retryable `MODEL_RESOURCE_BUSY` versus permanent `MODEL_RESOURCE_LIMIT`.
+
+### Still missing or different from this plan
+
+- No separate `LoadBudget` or `BudgetCoordinator` types exist; those roles are
+  merged into `AdmissionController` plus `ModelManager`.
+- Runs are rejected, never delayed or queued (`src/server/inference_admission.zig`).
+- Cold loads are not explicitly serialized or rate-limited under pressure.
+- Node-owned per-device (GPU) capacity domains remain future work
+  (`zig/MANAGERS.md`).
+
+The rest of this document is the original plan, kept for its rationale. Phases
+1 through 4 are implemented under the names above; phases 5 and 6 are partial.
 
 ## Budget Model
 

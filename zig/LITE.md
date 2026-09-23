@@ -831,7 +831,11 @@ _worker`), not in the host process -- see
 an implementation accident: an unabortable driver call or a model load that
 corrupts GPU state can only be recovered by killing and respawning the
 process that made it, and that must never be the process embedding
-`libantfly`. Native-only backends (CPU) never need this and run in-process.
+`libantfly`. Worker placement is decided per build, not per model: when any
+process-isolated backend is compiled in (Metal is on by default on macOS), the
+worker starts when a local-runtime handle opens and all local inference runs
+there, CPU models included. Only builds without those backends run inference
+in-process.
 
 The `antfly` CLI resolves the worker by re-executing itself (`argv[0]` names
 the `antfly` binary the user launched, which understands `inference

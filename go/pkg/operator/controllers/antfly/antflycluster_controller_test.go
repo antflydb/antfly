@@ -12533,7 +12533,157 @@ func TestApplyDefaults_StandaloneDefaults(t *testing.T) {
 	g.Expect(cluster.Spec.Standalone.Health.Port).To(Equal(int32(4200)))
 	g.Expect(cluster.Spec.Standalone.Inference).ToNot(BeNil())
 	g.Expect(cluster.Spec.Standalone.Inference.Enabled).To(BeTrue())
-	g.Expect(cluster.Spec.Standalone.Inference.APIURL).To(Equal("http://0.0.0.0:11433"))
+	g.Expect(cluster.Spec.Standalone.Inference.APIURL).To(Equal(""))
+}
+
+// TestGenerateStandaloneConfig_EmbeddedInferenceOmitsAPIURL guards against
+// the operator ever reintroducing a forced inference.api_url default for
+// standalone mode. A set api_url is a hard isolation contract in the Zig
+// runtime (it disables the embedded, in-process inference provider, preloads,
+// and /ai/v1 routes), so with embedded inference enabled and no user-supplied
+// URL, the generated config must not set api_url at all.
+func TestGenerateStandaloneConfig_EmbeddedInferenceOmitsAPIURL(t *testing.T) {
+	g := NewWithT(t)
+	reconciler := &AntflyClusterReconciler{ClusterDomain: "cluster.local"}
+	cluster := baseStandaloneControllerCluster()
+	cluster.Spec.Standalone.Inference = &antflyv1.StandaloneInferenceSpec{Enabled: true}
+	cluster.Spec.Config = "{}"
+
+	configJSON, err := reconciler.generateStandaloneConfig(cluster)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	var config map[string]any
+	g.Expect(json.Unmarshal([]byte(configJSON), &config)).To(Succeed())
+	if inferenceConfig, ok := config["inference"].(map[string]any); ok {
+		_, hasAPIURL := inferenceConfig["api_url"]
+		g.Expect(hasAPIURL).To(BeFalse(), "embedded inference must not get a synthesized api_url")
+	}
+}
+
+// TestGenerateStandaloneConfig_ExplicitAPIURLWins verifies that an explicit
+// spec.standalone.inference.apiURL (pointing standalone at an external/shared
+// inference endpoint) is always honored.
+func TestGenerateStandaloneConfig_ExplicitAPIURLWins(t *testing.T) {
+	g := NewWithT(t)
+	reconciler := &AntflyClusterReconciler{ClusterDomain: "cluster.local"}
+	cluster := baseStandaloneControllerCluster()
+	cluster.Spec.Standalone.Inference = &antflyv1.StandaloneInferenceSpec{
+		Enabled: true,
+		APIURL:  "http://external-inference.example:11433",
+	}
+	cluster.Spec.Config = "{}"
+
+	configJSON, err := reconciler.generateStandaloneConfig(cluster)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	var config map[string]any
+	g.Expect(json.Unmarshal([]byte(configJSON), &config)).To(Succeed())
+	inferenceConfig, ok := config["inference"].(map[string]any)
+	g.Expect(ok).To(BeTrue())
+	g.Expect(inferenceConfig["api_url"]).To(Equal("http://external-inference.example:11433"))
+}
+
+// TestGenerateStandaloneConfig_PreservesUserProvidedAPIURL verifies the
+// operator never overwrites an api_url the user already set directly in
+// spec.config when spec.standalone.inference.apiURL is left unset.
+func TestGenerateStandaloneConfig_PreservesUserProvidedAPIURL(t *testing.T) {
+	g := NewWithT(t)
+	reconciler := &AntflyClusterReconciler{ClusterDomain: "cluster.local"}
+	cluster := baseStandaloneControllerCluster()
+	cluster.Spec.Standalone.Inference = &antflyv1.StandaloneInferenceSpec{Enabled: true}
+	cluster.Spec.Config = `{"inference":{"api_url":"http://user-provided.example:9999"}}`
+
+	configJSON, err := reconciler.generateStandaloneConfig(cluster)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	var config map[string]any
+	g.Expect(json.Unmarshal([]byte(configJSON), &config)).To(Succeed())
+	inferenceConfig, ok := config["inference"].(map[string]any)
+	g.Expect(ok).To(BeTrue())
+	g.Expect(inferenceConfig["api_url"]).To(Equal("http://user-provided.example:9999"))
+}
+
+// TestProcessMemoryBudgetMB covers the ANTFLY_PROCESS_MEMORY_BUDGET_MB
+// derivation: 90% of an explicit memory limit, in MiB, and no budget when no
+// limit is set (an unbounded/"max" cgroup gives nothing safe to derive from).
+func TestProcessMemoryBudgetMB(t *testing.T) {
+	g := NewWithT(t)
+
+	budget, ok := processMemoryBudgetMB(corev1.ResourceList{
+		corev1.ResourceMemory: resource.MustParse("2Gi"),
+	})
+	g.Expect(ok).To(BeTrue())
+	g.Expect(budget).To(Equal(int64(1843)))
+
+	_, ok = processMemoryBudgetMB(nil)
+	g.Expect(ok).To(BeFalse())
+
+	_, ok = processMemoryBudgetMB(corev1.ResourceList{
+		corev1.ResourceCPU: resource.MustParse("2"),
+	})
+	g.Expect(ok).To(BeFalse())
+}
+
+// TestReconcileStandaloneStatefulSet_SetsProcessMemoryBudgetWhenLimitPresent
+// verifies the standalone pod gets ANTFLY_PROCESS_MEMORY_BUDGET_MB set below
+// its container memory limit, so a Burstable standalone pod (request < limit)
+// throttles itself before the kernel OOM-kills the container. See
+// zig/MANAGERS.md "Budget derivation".
+func TestReconcileStandaloneStatefulSet_SetsProcessMemoryBudgetWhenLimitPresent(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := baseStandaloneControllerCluster()
+	cluster.Spec.Standalone.Resources = antflyv1.ResourceSpec{
+		Memory: "1Gi",
+		Limits: antflyv1.ResourceLimits{Memory: "2Gi"},
+	}
+	client := fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build()
+	reconciler := &AntflyClusterReconciler{Client: client, Scheme: s}
+
+	g.Expect(reconciler.reconcileStandaloneStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+
+	observed := &appsv1.StatefulSet{}
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: standaloneStatefulSetName(cluster), Namespace: cluster.Namespace}, observed)).To(Succeed())
+	container := observed.Spec.Template.Spec.Containers[0]
+	var budgetValue string
+	var found bool
+	for _, env := range container.Env {
+		if env.Name == antflyProcessMemoryBudgetEnvVar {
+			found = true
+			budgetValue = env.Value
+		}
+	}
+	g.Expect(found).To(BeTrue(), "expected %s to be set", antflyProcessMemoryBudgetEnvVar)
+	g.Expect(budgetValue).To(Equal("1843"))
+}
+
+// TestReconcileStandaloneStatefulSet_NoProcessMemoryBudgetWithoutLimit
+// verifies the operator does not invent a memory budget when the user has
+// not set a memory limit for standalone.
+func TestReconcileStandaloneStatefulSet_NoProcessMemoryBudgetWithoutLimit(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := baseStandaloneControllerCluster()
+	cluster.Spec.Standalone.Resources = antflyv1.ResourceSpec{Memory: "1Gi"}
+	client := fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build()
+	reconciler := &AntflyClusterReconciler{Client: client, Scheme: s}
+
+	g.Expect(reconciler.reconcileStandaloneStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+
+	observed := &appsv1.StatefulSet{}
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: standaloneStatefulSetName(cluster), Namespace: cluster.Namespace}, observed)).To(Succeed())
+	container := observed.Spec.Template.Spec.Containers[0]
+	for _, env := range container.Env {
+		g.Expect(env.Name).NotTo(Equal(antflyProcessMemoryBudgetEnvVar))
+	}
 }
 
 func TestReconcilePVCExpansionReportsInProgress(t *testing.T) {

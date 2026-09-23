@@ -1791,8 +1791,8 @@ func TestDefault_StandaloneDefaults(t *testing.T) {
 	if !cluster.Spec.Standalone.Inference.Enabled {
 		t.Fatal("expected inference to default enabled for standalone mode")
 	}
-	if cluster.Spec.Standalone.Inference.APIURL != "http://0.0.0.0:11433" {
-		t.Fatalf("expected default inference API URL, got %q", cluster.Spec.Standalone.Inference.APIURL)
+	if cluster.Spec.Standalone.Inference.APIURL != "" {
+		t.Fatalf("expected no default inference API URL (embedded inference runs in-process), got %q", cluster.Spec.Standalone.Inference.APIURL)
 	}
 }
 

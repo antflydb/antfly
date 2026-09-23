@@ -39,6 +39,7 @@ antfly lite status app.aflite
     "available_modes": [
       "caller_supplied_artifacts",
       "remote_provider",
+      "local_embedded",
       "disabled_deferred"
     ],
     "configured": false,
@@ -338,7 +339,7 @@ From the `zig` directory, `zig build lite` installs the Lite-only CLI as `zig-ou
 zig build antfly capi
 ```
 
-When you embed a local inference runtime, pass `-Dlite-local-inference-runtime=true` so Lite status and the bindings advertise it; the flag declares the capability and does not package a separate runtime. `zig build wasm` builds and installs the embedded database and inference WASM bundle, and `zig build wasm-test` runs its Node smoke test. `zig build lite-test` runs the Lite backend, CLI, C ABI, Go binding, embedded example, and packaging checks in one pass.
+Lite builds embed the local inference runtime, and status advertises it by default (`-Dlite-local-inference-runtime=false` hides it). Builds with Metal (the macOS default), CUDA, ONNX, or PJRT run all local inference, CPU models included, in an `antfly inference _worker` child process that starts when a local-runtime handle opens. A host process other than the `antfly` binary must set `ANTFLY_INFERENCE_WORKER` or ship `antfly` next to `libantfly` or on `PATH`. `zig build wasm` builds and installs the embedded database and inference WASM bundle, and `zig build wasm-test` runs its Node smoke test. `zig build lite-test` runs the Lite backend, CLI, C ABI, Go binding, embedded example, and packaging checks in one pass.
 
 ## Maintenance
 

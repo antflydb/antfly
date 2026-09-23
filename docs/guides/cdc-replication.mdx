@@ -224,6 +224,8 @@ Several PostgreSQL tables can feed one Antfly table. Give each source its own `o
 ]
 ```
 
+To fan one PostgreSQL table out to several Antfly tables, use `routes` instead. Each route has its own `where` filter, `target_table`, `key_template`, and `on_update`/`on_delete` transforms. Every route whose filter matches a row receives it, and when routes are present the top-level `on_update`/`on_delete` are ignored.
+
 ### Managed PostgreSQL Setup
 
 Every provider needs the same two things, `wal_level = logical` and a user allowed to replicate, and each exposes them differently. Pre-create the publication as the table owner whenever the replication user does not own the table, then pass `publication_name`. Antfly still checks for the named publication on every poll and creates it if it is missing, so the name has to exist before the replication user connects:
@@ -248,7 +250,7 @@ Two things are yours to decide: what happens to the replication slot when Antfly
 
 Replication runs one way. Antfly never writes back, so your application keeps its transactions, constraints, and backups exactly where they are, and Antfly holds a searchable copy that is as current as the stream.
 
-The cost of that arrangement is the replication slot. A slot makes PostgreSQL retain WAL until the subscriber has consumed it. While Antfly is up, that is a few seconds of WAL. While Antfly is down for a long stretch, PostgreSQL keeps every change since the last checkpoint, and disk usage grows until the stream resumes. Monitor slot lag the way you would for any logical subscriber, and if you decommission an Antfly table, drop its slot in PostgreSQL rather than leaving it to hold WAL forever.
+The cost of that arrangement is the replication slot. A slot makes PostgreSQL retain WAL until the subscriber has consumed it. While Antfly is up, that is a few seconds of WAL. While Antfly is down for a long stretch, PostgreSQL keeps every change since the last checkpoint, and disk usage grows until the stream resumes. Monitor slot lag the way you would for any logical subscriber (Antfly also reports `status.lag_records` and `status.lag_millis` in the table detail), and if you decommission an Antfly table, drop its slot in PostgreSQL rather than leaving it to hold WAL forever.
 
 That one-way flow is also why the delete decision is yours. PostgreSQL knows a row is gone; only you know whether the document should vanish from search or stay, marked inactive, so that history remains retrievable. `$delete_document` is right for data that should not be found once removed. A soft delete is right when the document is evidence, such as a resolved ticket that still teaches a classifier.
 

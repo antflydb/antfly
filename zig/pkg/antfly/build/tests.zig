@@ -645,6 +645,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "inference runtime preload parser preserves registry variants and explicit backends",
             "inference run config",
             "inference list accepts models directory before or after flags",
+            "kernel JIT mode precedence is CLI then environment then config then default",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -1476,7 +1477,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // Keep retrieval's unit/contract gate independent of the HTTP-linked
     // serving harness pulled in by root-test. Reuse the same root module and
     // runner, with only retrieval tests selected for code generation.
-    const retrieval_filters = &[_][]const u8{ "api.retrieval_agent.", "api.web_search." };
+    const retrieval_filters = &[_][]const u8{ "api.retrieval_agent.", "api.document_renderer.", "api.web_search." };
     const retrieval_selected_filters = selectTestFilters(b, retrieval_filters);
     const retrieval_tests = b.addTest(.{
         .root_module = antfly_test_mod,
