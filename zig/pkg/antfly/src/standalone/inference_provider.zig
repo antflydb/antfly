@@ -11,7 +11,7 @@ const platform_time = platform.time;
 const process_memory_budget = @import("../common/process_memory_budget.zig");
 pub const inference_bridge = @import("inference_bridge.zig");
 const inference_connection_abi = @import("../inference_connection_abi.zig");
-const runtime_http_abi = @import("../runtime_http_abi.zig");
+pub const runtime_http_abi = @import("../runtime_http_abi.zig");
 const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 const inline_inference_codegen = builtin.is_test and !@import("standalone_runtime_options").linked_inference;
 const inference_host = if (inline_inference_codegen) @import("inference_host.zig") else struct {};
@@ -902,6 +902,8 @@ pub fn invokeEmbeddedInferenceRoute(
     body: []const u8,
     deadline_ns: u64,
     cancellation: runtime_http_abi.CancellationView,
+    /// Receives a streaming response instead of `body`; empty for buffered.
+    stream: runtime_http_abi.StreamSink,
 ) !EmbeddedInferenceRouteResponse {
     var guard = try lifetime.acquire();
     defer guard.deinit();
@@ -917,6 +919,7 @@ pub fn invokeEmbeddedInferenceRoute(
         .body = .init(body),
         .deadline_ns = deadline_ns,
         .cancellation = cancellation,
+        .stream = stream,
         .out_response = &response,
     }, method);
     if (!response.valid()) return error.RuntimeBoundaryFailure;

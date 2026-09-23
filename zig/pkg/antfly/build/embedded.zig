@@ -518,6 +518,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi inference generates text with a local model and rejects streaming",
         "capi inference pull rejects invalid requests with a JSON error",
         "capi inference pulls a model with progress into the handle's models directory",
+        "capi inference streaming reports request errors without a model",
         "capi get edges json does not double free a non-empty edge slice",
         "run until idle no-progress error maps to a dedicated stalled ABI code, not internal",
         "capi lite merged indexes JSON discovers a standalone asset extractor and chunk enrichment with no owning index",

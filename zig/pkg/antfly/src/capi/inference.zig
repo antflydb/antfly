@@ -32,6 +32,12 @@ const InferenceHandle = struct {
     models_dir: ?[]u8,
     call_timeout_ms: u64,
 
+    /// Absolute monotonic deadline for a call starting now; 0 means none.
+    fn deadline(self: *const InferenceHandle) u64 {
+        if (self.call_timeout_ms == 0) return 0;
+        return db.monotonicNowNs() +| self.call_timeout_ms *| std.time.ns_per_ms;
+    }
+
     fn destroy(self: *InferenceHandle) void {
         self.lifetime.quiesce();
         inference_provider.destroyEmbeddedInferenceNode(self.lifetime.handle, self.lifetime.resource_owner);
@@ -169,10 +175,7 @@ fn invoke(
     const out = db.resetOutBuffer(out_buf) orelse return .invalid_argument;
     const handle, const slot = registry.enter(handle_ptr) orelse return .invalid_argument;
     defer @TypeOf(registry).leave(slot);
-    const deadline_ns: u64 = if (handle.call_timeout_ms == 0)
-        0
-    else
-        db.monotonicNowNs() +| handle.call_timeout_ms *| std.time.ns_per_ms;
+    const deadline_ns = handle.deadline();
     const response = inference_provider.invokeEmbeddedInferenceRoute(
         &handle.lifetime,
         alloc,
@@ -183,6 +186,7 @@ fn invoke(
         operation,
         request,
         deadline_ns,
+        .{},
         .{},
     ) catch |err| return mapCallError(err);
     out.* = .{ .ptr = response.body.ptr, .len = response.body.len };
@@ -206,7 +210,7 @@ pub export fn antfly_inference_generate_json(h: ?*anyopaque, request_json: capi.
     // runtime fails a streaming request with an opaque internal error.
     if (requestsStreaming(request_json.bytes())) {
         const buffer = db.resetOutBuffer(out) orelse return .invalid_argument;
-        const body = "{\"error\":\"STREAMING_UNSUPPORTED\",\"message\":\"the C API returns complete responses; set stream to false\"}";
+        const body = "{\"error\":\"STREAMING_UNSUPPORTED\",\"message\":\"use antfly_inference_generate_stream_json to stream\"}";
         const owned = alloc.dupe(u8, body) catch return .internal;
         buffer.* = .{ .ptr = owned.ptr, .len = owned.len };
         return .invalid_argument;
@@ -250,26 +254,104 @@ pub export fn antfly_inference_list_models_json(h: ?*anyopaque, out: ?*capi.Buff
     return invoke(h, .get, "models", "", out);
 }
 
-/// The HTTP client streams downloads on its own tasks, so progress arrives on
-/// runtime threads. Callers are promised reports on their own thread (koffi,
-/// for one, deadlocks on a foreign-thread callback during a synchronous call),
-/// so the download runs on a helper thread while the calling thread waits
-/// here and delivers queued reports.
-const PullCall = struct {
-    const Report = struct {
-        model: []u8,
-        file: []u8,
-        progress: capi.InferencePullProgress,
-    };
+/// Runs work on a runtime thread while the calling thread delivers its
+/// callbacks. Runtime work reports from its own threads (the HTTP client
+/// streams on separate tasks, and generation writes from executor tasks), but
+/// callers are promised callbacks on their own thread: koffi, for one,
+/// deadlocks on a foreign-thread callback during a synchronous call.
+fn CallerThreadRelay(comptime Item: type) type {
+    return struct {
+        const Self = @This();
 
-    mutex: std.Io.Mutex = .init,
-    changed: std.Io.Condition = .init,
-    reports: std.ArrayListUnmanaged(Report) = .empty,
-    done: bool = false,
+        mutex: std.Io.Mutex = .init,
+        changed: std.Io.Condition = .init,
+        items: std.ArrayListUnmanaged(Item) = .empty,
+        done: bool = false,
+        /// Set once the caller's callback asks to stop; later items are
+        /// dropped rather than queued.
+        cancelled: std.atomic.Value(bool) = .init(false),
+
+        /// Queues an item from a runtime thread; takes ownership.
+        fn push(self: *Self, item: Item) void {
+            if (self.cancelled.load(.acquire)) {
+                var dropped = item;
+                dropped.deinit();
+                return;
+            }
+            const io = db.handleLockIo();
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            self.items.append(alloc, item) catch {
+                var dropped = item;
+                dropped.deinit();
+                return;
+            };
+            self.changed.signal(io);
+        }
+
+        fn finish(self: *Self) void {
+            const io = db.handleLockIo();
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            self.done = true;
+            self.changed.signal(io);
+        }
+
+        /// Delivers items on the calling thread until `finish`. `deliver_one`
+        /// returns false to cancel: `on_cancel` then runs once, and the rest
+        /// is drained without delivery.
+        fn run(
+            self: *Self,
+            context: anytype,
+            comptime deliver_one: fn (@TypeOf(context), *Item) bool,
+            comptime on_cancel: fn (@TypeOf(context)) void,
+        ) void {
+            const io = db.handleLockIo();
+            while (true) {
+                self.mutex.lockUncancelable(io);
+                while (self.items.items.len == 0 and !self.done) self.changed.waitUncancelable(io, &self.mutex);
+                var batch = self.items;
+                self.items = .empty;
+                const finished = self.done;
+                self.mutex.unlock(io);
+                defer batch.deinit(alloc);
+                for (batch.items) |*item| {
+                    defer item.deinit();
+                    if (self.cancelled.load(.acquire)) continue;
+                    if (!deliver_one(context, item)) {
+                        self.cancelled.store(true, .release);
+                        on_cancel(context);
+                    }
+                }
+                if (finished) return;
+            }
+        }
+    };
+}
+
+const PullReport = struct {
+    model: []u8,
+    file: []u8,
+    progress: capi.InferencePullProgress,
+
+    fn deinit(self: *PullReport) void {
+        alloc.free(self.model);
+        alloc.free(self.file);
+    }
+};
+
+/// A model pull. The download runs as a task on the handle's Io so that a
+/// cancel from the caller's callback interrupts it (the registry keeps the
+/// partial download staged, so a later pull resumes it).
+const PullCall = struct {
+    relay: CallerThreadRelay(PullReport) = .{},
     result: ?[]u8 = null,
     outcome: anyerror!void = {},
-    /// Whether the caller wants progress at all.
     wants_progress: bool,
+    callback: ?capi.InferencePullProgressFn,
+    callback_context: ?*anyopaque,
+    io: std.Io,
+    future: ?std.Io.Future(void) = null,
 
     fn onProgress(raw: ?*anyopaque, progress: *const inference_provider.inference_bridge.PullProgress) callconv(.c) void {
         const self: *PullCall = @ptrCast(@alignCast(raw.?));
@@ -279,10 +361,7 @@ const PullCall = struct {
             alloc.free(model);
             return;
         };
-        const io = db.handleLockIo();
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-        self.reports.append(alloc, .{
+        self.relay.push(.{
             .model = model,
             .file = file,
             .progress = .{
@@ -292,12 +371,7 @@ const PullCall = struct {
                 .files_total = progress.files_total,
                 .cached = progress.cached != 0,
             },
-        }) catch {
-            alloc.free(model);
-            alloc.free(file);
-            return;
-        };
-        self.changed.signal(io);
+        });
     }
 
     fn onResult(raw: ?*anyopaque, result: inference_provider.inference_bridge.String) callconv(.c) void {
@@ -305,38 +379,22 @@ const PullCall = struct {
         self.result = alloc.dupe(u8, result.slice()) catch null;
     }
 
-    fn run(self: *PullCall, io: std.Io, models_dir: ?[]const u8, request: []const u8) void {
-        const outcome = inference_provider.pullEmbeddedInferenceModels(io, models_dir, request, self, onProgress, self, onResult);
-        const lock_io = db.handleLockIo();
-        self.mutex.lockUncancelable(lock_io);
-        defer self.mutex.unlock(lock_io);
-        self.outcome = outcome;
-        self.done = true;
-        self.changed.signal(lock_io);
+    fn download(self: *PullCall, models_dir: ?[]const u8, request: []const u8) void {
+        self.outcome = inference_provider.pullEmbeddedInferenceModels(self.io, models_dir, request, self, onProgress, self, onResult);
+        self.relay.finish();
     }
 
-    /// Delivers reports on the calling thread until the download finishes.
-    fn deliver(self: *PullCall, callback: ?capi.InferencePullProgressFn, context: ?*anyopaque) void {
-        const io = db.handleLockIo();
-        while (true) {
-            self.mutex.lockUncancelable(io);
-            while (self.reports.items.len == 0 and !self.done) self.changed.waitUncancelable(io, &self.mutex);
-            var batch = self.reports;
-            self.reports = .empty;
-            const finished = self.done;
-            self.mutex.unlock(io);
-            defer batch.deinit(alloc);
-            for (batch.items) |*report| {
-                defer {
-                    alloc.free(report.model);
-                    alloc.free(report.file);
-                }
-                report.progress.model = sliceOf(report.model);
-                report.progress.file = sliceOf(report.file);
-                if (callback) |call| call(context, &report.progress);
-            }
-            if (finished) return;
-        }
+    fn deliver(self: *PullCall, report: *PullReport) bool {
+        report.progress.model = sliceOf(report.model);
+        report.progress.file = sliceOf(report.file);
+        return self.callback.?(self.callback_context, &report.progress);
+    }
+
+    fn cancel(self: *PullCall) void {
+        // Interrupts blocked downloads; returns once the task has finished,
+        // which also ends the relay.
+        if (self.future) |*future| future.cancel(self.io);
+        self.future = null;
     }
 };
 
@@ -361,6 +419,8 @@ fn pullErrorCode(name: []const u8) capi.ErrorCode {
         .{ "UnexpectedEndOfInput", .invalid_argument },
         .{ "DownloadSizeLimitExceeded", .invalid_argument },
         .{ "ModelSizeLimitExceeded", .invalid_argument },
+        .{ "Canceled", .cancelled },
+        .{ "Cancelled", .cancelled },
         // Transient network and hub failures; retrying may succeed.
         .{ "HubApiError", .busy },
         .{ "DownloadFailed", .busy },
@@ -377,7 +437,7 @@ fn pullErrorCode(name: []const u8) capi.ErrorCode {
 }
 
 /// Downloads models into this handle's models directory, calling `progress`
-/// (if set) on the calling thread as files download. See `PullCall`.
+/// (if set) on the calling thread as files download; see `PullCall`.
 pub export fn antfly_inference_pull_json(
     handle_ptr: ?*anyopaque,
     request_json: capi.Slice,
@@ -388,17 +448,19 @@ pub export fn antfly_inference_pull_json(
     const out = db.resetOutBuffer(out_buf) orelse return .invalid_argument;
     const handle, const slot = registry.enter(handle_ptr) orelse return .invalid_argument;
     defer @TypeOf(registry).leave(slot);
-    var call = PullCall{ .wants_progress = progress != null };
-    // Downloads need a stack as deep as any other libantfly call.
-    const thread = std.Thread.spawn(
-        .{ .stack_size = 8 * 1024 * 1024 },
-        PullCall.run,
-        .{ &call, handle.io.io(), handle.models_dir, request_json.bytes() },
-    ) catch |err| return capi.mapError(err);
-    call.deliver(progress, progress_context);
-    thread.join();
+    const io = handle.io.io();
+    var call = PullCall{
+        .wants_progress = progress != null,
+        .callback = progress,
+        .callback_context = progress_context,
+        .io = io,
+    };
+    call.future = io.concurrent(PullCall.download, .{ &call, handle.models_dir, request_json.bytes() }) catch |err|
+        return capi.mapError(err);
+    call.relay.run(&call, PullCall.deliver, PullCall.cancel);
+    if (call.future) |*future| future.await(io);
     const pulled = call.outcome;
-    const result = call.result orelse return if (pulled) |_| .internal else |err| capi.mapError(err);
+    const result = call.result orelse return if (pulled) |_| .internal else |err| mapCallError(err);
     out.* = .{ .ptr = result.ptr, .len = result.len };
     _ = pulled catch {
         const parsed = std.json.parseFromSlice(struct { @"error": []const u8 }, alloc, result, .{ .ignore_unknown_fields = true }) catch return .internal;
@@ -406,6 +468,167 @@ pub export fn antfly_inference_pull_json(
         return pullErrorCode(parsed.value.@"error");
     };
     return .ok;
+}
+
+const StreamEvent = struct {
+    data: []u8,
+
+    fn deinit(self: *StreamEvent) void {
+        alloc.free(self.data);
+    }
+};
+
+/// A streaming generate call. The route runs on a helper thread and writes
+/// server-sent events into `onWrite`; complete `data:` payloads are relayed to
+/// the caller's thread. Cancelling sets a flag the handler polls between
+/// tokens and fails further writes.
+const StreamCall = struct {
+    relay: CallerThreadRelay(StreamEvent) = .{},
+    callback: capi.InferenceStreamFn,
+    callback_context: ?*anyopaque,
+    /// SSE bytes not yet split into events. Written only by the route.
+    pending: std.ArrayListUnmanaged(u8) = .empty,
+    status: u16 = 0,
+    /// The first `event: error` payload, reported as the call's failure.
+    stream_error: ?[]u8 = null,
+    response: ?inference_provider.EmbeddedInferenceRouteResponse = null,
+    outcome: anyerror!void = {},
+
+    fn isCancelled(raw: ?*const anyopaque) callconv(.c) u8 {
+        const self: *const StreamCall = @ptrCast(@alignCast(raw.?));
+        return @intFromBool(self.relay.cancelled.load(.acquire));
+    }
+
+    fn onStart(raw: ?*anyopaque, status: u16, _: inference_provider.runtime_http_abi.Bytes, _: inference_provider.runtime_http_abi.HeaderList) callconv(.c) inference_provider.runtime_http_abi.CallbackStatus {
+        const self: *StreamCall = @ptrCast(@alignCast(raw.?));
+        self.status = status;
+        return .ok;
+    }
+
+    fn onWrite(raw: ?*anyopaque, bytes: inference_provider.runtime_http_abi.Bytes) callconv(.c) inference_provider.runtime_http_abi.CallbackStatus {
+        const self: *StreamCall = @ptrCast(@alignCast(raw.?));
+        if (self.relay.cancelled.load(.acquire)) return .canceled;
+        self.pending.appendSlice(alloc, bytes.slice()) catch return .failed;
+        self.splitEvents() catch return .failed;
+        return .ok;
+    }
+
+    fn onClose(raw: ?*anyopaque) callconv(.c) inference_provider.runtime_http_abi.CallbackStatus {
+        const self: *StreamCall = @ptrCast(@alignCast(raw.?));
+        self.splitEvents() catch return .failed;
+        return .ok;
+    }
+
+    /// Splits complete `\n\n`-terminated events out of `pending`.
+    fn splitEvents(self: *StreamCall) !void {
+        while (std.mem.indexOf(u8, self.pending.items, "\n\n")) |end| {
+            const event = self.pending.items[0..end];
+            var name: []const u8 = "";
+            var data: std.ArrayListUnmanaged(u8) = .empty;
+            defer data.deinit(alloc);
+            var lines = std.mem.splitScalar(u8, event, '\n');
+            while (lines.next()) |line| {
+                if (std.mem.startsWith(u8, line, "event:")) {
+                    name = std.mem.trim(u8, line["event:".len..], " ");
+                } else if (std.mem.startsWith(u8, line, "data:")) {
+                    var value = line["data:".len..];
+                    if (value.len > 0 and value[0] == ' ') value = value[1..];
+                    if (data.items.len > 0) try data.append(alloc, '\n');
+                    try data.appendSlice(alloc, value);
+                }
+            }
+            if (std.mem.eql(u8, name, "error")) {
+                if (self.stream_error == null) self.stream_error = try alloc.dupe(u8, data.items);
+            } else if (data.items.len > 0 and !std.mem.eql(u8, data.items, "[DONE]")) {
+                self.relay.push(.{ .data = try data.toOwnedSlice(alloc) });
+            }
+            const rest = self.pending.items.len - (end + 2);
+            std.mem.copyForwards(u8, self.pending.items[0..rest], self.pending.items[end + 2 ..]);
+            self.pending.shrinkRetainingCapacity(rest);
+        }
+    }
+
+    fn generate(self: *StreamCall, handle: *InferenceHandle, request: []const u8) void {
+        defer self.relay.finish();
+        self.response = inference_provider.invokeEmbeddedInferenceRoute(
+            &handle.lifetime,
+            alloc,
+            .post,
+            "generate",
+            request,
+            handle.deadline(),
+            .{ .context = self, .is_cancelled = isCancelled },
+            .{ .context = self, .start = onStart, .write = onWrite, .close = onClose },
+        ) catch |err| {
+            self.outcome = err;
+            return;
+        };
+    }
+
+    fn deliver(self: *StreamCall, event: *StreamEvent) bool {
+        return self.callback(self.callback_context, sliceOf(event.data));
+    }
+
+    fn cancel(_: *StreamCall) void {}
+
+    fn deinit(self: *StreamCall) void {
+        self.pending.deinit(alloc);
+        if (self.stream_error) |message| alloc.free(message);
+        if (self.response) |response| alloc.free(response.body);
+    }
+};
+
+/// Returns `request` as a JSON object with `"stream": true`.
+fn streamingRequest(request: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, request, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidArgument;
+    try parsed.value.object.put(parsed.arena.allocator(), "stream", .{ .bool = true });
+    return std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(parsed.value, .{})});
+}
+
+/// Streams a generate call: `on_chunk` receives each chunk's JSON on the
+/// calling thread and returns false to stop generation.
+pub export fn antfly_inference_generate_stream_json(
+    handle_ptr: ?*anyopaque,
+    request_json: capi.Slice,
+    on_chunk: ?capi.InferenceStreamFn,
+    chunk_context: ?*anyopaque,
+    out_buf: ?*capi.Buffer,
+) capi.ErrorCode {
+    const out = db.resetOutBuffer(out_buf) orelse return .invalid_argument;
+    const callback = on_chunk orelse return .invalid_argument;
+    const request = streamingRequest(request_json.bytes()) catch |err| switch (err) {
+        error.OutOfMemory => return .internal,
+        else => return .invalid_argument,
+    };
+    defer alloc.free(request);
+    const handle, const slot = registry.enter(handle_ptr) orelse return .invalid_argument;
+    defer @TypeOf(registry).leave(slot);
+
+    var call = StreamCall{ .callback = callback, .callback_context = chunk_context };
+    defer call.deinit();
+    // Generation needs a stack as deep as any other libantfly call.
+    const thread = std.Thread.spawn(.{ .stack_size = 8 * 1024 * 1024 }, StreamCall.generate, .{ &call, handle, request }) catch |err|
+        return capi.mapError(err);
+    call.relay.run(&call, StreamCall.deliver, StreamCall.cancel);
+    thread.join();
+
+    if (call.relay.cancelled.load(.acquire)) return .cancelled;
+    _ = call.outcome catch |err| return mapCallError(err);
+    if (call.stream_error) |message| {
+        const body = std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(.{ .@"error" = "STREAM_FAILED", .message = message }, .{})}) catch return .internal;
+        out.* = .{ .ptr = body.ptr, .len = body.len };
+        return .internal;
+    }
+    // A request rejected before streaming started gets an ordinary response.
+    if (call.status == 0) {
+        const response = call.response orelse return .internal;
+        call.response = null;
+        out.* = .{ .ptr = response.body.ptr, .len = response.body.len };
+        return errorForStatus(response.status);
+    }
+    return errorForStatus(call.status);
 }
 
 fn testSlice(bytes: []const u8) capi.Slice {
@@ -617,6 +840,38 @@ test "capi inference generates text with a local model and rejects streaming" {
         \\ {"custom_id":"a","body":{"model":"ggml-org/gemma-4-e2b-it-gguf:gguf:Q4_0","messages":[{"role":"user","content":"Say one"}],"max_tokens":4}},
         \\ {"custom_id":"b","body":{"model":"ggml-org/gemma-4-e2b-it-gguf:gguf:Q4_0","messages":[{"role":"user","content":"Say two"}],"max_tokens":4}}]}
     ;
+    // Streaming delivers chunks on the calling thread, and returning false
+    // stops generation.
+    const Chunks = struct {
+        caller: std.Thread.Id,
+        count: usize = 0,
+        off_thread: bool = false,
+        well_formed: bool = true,
+        stop_after: ?usize = null,
+        fn onChunk(raw: ?*anyopaque, chunk: capi.Slice) callconv(.c) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.count += 1;
+            if (std.Thread.getCurrentId() != self.caller) self.off_thread = true;
+            if (std.mem.indexOf(u8, chunk.bytes(), "chat.completion.chunk") == null) self.well_formed = false;
+            return if (self.stop_after) |limit| self.count < limit else true;
+        }
+    };
+    const counting_request = "{\"model\":\"ggml-org/gemma-4-e2b-it-gguf:gguf:Q4_0\",\"messages\":[{\"role\":\"user\",\"content\":\"Count from one to twenty in words.\"}],\"max_tokens\":48}";
+    var chunks = Chunks{ .caller = std.Thread.getCurrentId() };
+    var streamed_out: capi.Buffer = .{};
+    const stream_code = antfly_inference_generate_stream_json(handle, testSlice(counting_request), Chunks.onChunk, &chunks, &streamed_out);
+    defer db.antfly_buffer_free(&streamed_out);
+    if (stream_code != .ok) std.debug.print("stream failed: {s}\n", .{testBuffer(streamed_out)});
+    try std.testing.expectEqual(capi.ErrorCode.ok, stream_code);
+    try std.testing.expect(chunks.count > 2);
+    try std.testing.expect(chunks.well_formed and !chunks.off_thread);
+
+    var stopped = Chunks{ .caller = std.Thread.getCurrentId(), .stop_after = 2 };
+    var stopped_out: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.cancelled, antfly_inference_generate_stream_json(handle, testSlice(counting_request), Chunks.onChunk, &stopped, &stopped_out));
+    db.antfly_buffer_free(&stopped_out);
+    try std.testing.expectEqual(@as(usize, 2), stopped.count);
+
     const batch_code = antfly_inference_generate_batch_json(handle, testSlice(batch_request), &batch);
     defer db.antfly_buffer_free(&batch);
     if (batch_code != .ok) std.debug.print("generate batch failed: {s}\n", .{testBuffer(batch)});
@@ -664,16 +919,30 @@ test "capi inference pulls a model with progress into the handle's models direct
         reports: usize = 0,
         saw_model: bool = false,
         off_thread: bool = false,
-        fn report(raw: ?*anyopaque, progress: *const capi.InferencePullProgress) callconv(.c) void {
+        cancel_at: ?usize = null,
+        fn report(raw: ?*anyopaque, progress: *const capi.InferencePullProgress) callconv(.c) bool {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             self.reports += 1;
             if (progress.model.len > 0 and progress.file.len > 0) self.saw_model = true;
             if (std.Thread.getCurrentId() != self.caller) self.off_thread = true;
+            return if (self.cancel_at) |at| self.reports < at else true;
         }
     };
-    var progress = Progress{ .caller = std.Thread.getCurrentId() };
     const request = try std.fmt.allocPrint(std.testing.allocator, "{{\"model\":\"{s}\"}}", .{model});
     defer std.testing.allocator.free(request);
+
+    // Returning false from the callback cancels; nothing is installed.
+    var cancelled = Progress{ .caller = std.Thread.getCurrentId(), .cancel_at = 1 };
+    var cancelled_out: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.cancelled, antfly_inference_pull_json(handle, testSlice(request), Progress.report, &cancelled, &cancelled_out));
+    db.antfly_buffer_free(&cancelled_out);
+    try std.testing.expectEqual(@as(usize, 1), cancelled.reports);
+    var before: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_inference_list_models_json(handle, &before));
+    try std.testing.expect(std.mem.indexOf(u8, testBuffer(before), model) == null);
+    db.antfly_buffer_free(&before);
+
+    var progress = Progress{ .caller = std.Thread.getCurrentId() };
     var out: capi.Buffer = .{};
     const code = antfly_inference_pull_json(handle, testSlice(request), Progress.report, &progress, &out);
     defer db.antfly_buffer_free(&out);
@@ -688,4 +957,23 @@ test "capi inference pulls a model with progress into the handle's models direct
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_inference_list_models_json(handle, &models));
     defer db.antfly_buffer_free(&models);
     try std.testing.expect(std.mem.indexOf(u8, testBuffer(models), model) != null);
+}
+
+test "capi inference streaming reports request errors without a model" {
+    if (!db.localInferenceRuntimeAvailable()) return error.SkipZigTest;
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_inference_open(null, &handle));
+    defer antfly_inference_close(handle);
+    const Ignore = struct {
+        fn onChunk(_: ?*anyopaque, _: capi.Slice) callconv(.c) bool {
+            return true;
+        }
+    };
+    var out: capi.Buffer = .{};
+    const missing = "{\"model\":\"nobody/no-such-model\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}";
+    try std.testing.expectEqual(capi.ErrorCode.not_found, antfly_inference_generate_stream_json(handle, testSlice(missing), Ignore.onChunk, null, &out));
+    try std.testing.expect(std.mem.indexOf(u8, testBuffer(out), "MODEL_NOT_FOUND") != null);
+    db.antfly_buffer_free(&out);
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_inference_generate_stream_json(handle, testSlice("[1]"), Ignore.onChunk, null, &out));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_inference_generate_stream_json(handle, testSlice(missing), null, null, &out));
 }

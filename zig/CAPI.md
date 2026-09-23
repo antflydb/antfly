@@ -115,8 +115,10 @@ handlers:
 | `antfly_inference_list_models_json` | `GET /models` |
 
 - Images and audio go inline in the JSON, as base64 or `data:` URIs.
-- Responses are complete; a generate request with `"stream": true` fails
-  with `ANTFLY_INVALID_ARGUMENT`.
+- The `_json` calls return complete responses. To stream,
+  `antfly_inference_generate_stream_json` calls a callback with each
+  `chat.completion.chunk` as tokens are produced; the callback returns false
+  to stop generation, and the call then returns `ANTFLY_CANCELLED`.
 - The output buffer holds the response body even when a call fails, so a
   failure carries the runtime's JSON error. Free it either way. HTTP 404
   (for example a model that is not installed) maps to `ANTFLY_NOT_FOUND`,
@@ -125,8 +127,16 @@ handlers:
   `ANTFLY_UNSUPPORTED`.
 - Models are not downloaded on demand. `antfly_inference_pull_json`
   downloads one into the handle's models directory, like
-  `antfly inference pull`, with an optional progress callback called on the
-  calling thread. It cannot be cancelled, and close waits for it.
+  `antfly inference pull`, with an optional progress callback. Returning
+  false from the callback cancels the download (`ANTFLY_CANCELLED`);
+  completed files stay staged, so pulling again resumes. Close waits for a
+  pull in progress.
+- Callbacks always run on the thread that made the call. The runtime works
+  on its own threads and hands results to the caller's thread, so bindings
+  whose runtimes require that (koffi for Node, for example) are safe.
+  Cancellation takes effect at the next callback: between generated tokens,
+  or at the next pull report (each file's start, every 16 MiB, and its
+  end).
 - Models run in the calling process on every backend; see Inference In
   Process below. If the runtime cannot start, open returns
   `ANTFLY_UNSUPPORTED`.

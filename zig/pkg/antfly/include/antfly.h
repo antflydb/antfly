@@ -40,6 +40,9 @@ typedef enum antfly_error_code {
     /* A bounded drain such as run-until-idle found a managed index making no
      * forward progress for its stall window and gave up. */
     ANTFLY_STALLED = 9,
+    /* The caller cancelled the call by returning false from its progress or
+     * stream callback. */
+    ANTFLY_CANCELLED = 10,
     ANTFLY_INTERNAL = 255,
 } antfly_error_code;
 
@@ -536,8 +539,9 @@ antfly_error_code antfly_db_match_pattern_json(antfly_db *db, antfly_slice reque
  * Antfly inference HTTP API (see specs/openapi/inference/api.yaml): embed,
  * rerank, chunk, generate, generate/batch, rewrite, extract, read (OCR),
  * transcribe, and models. Binary inputs such as images and audio are passed inline, as base64
- * or data: URIs. Responses are always complete: a generate request with
- * "stream": true fails with ANTFLY_INVALID_ARGUMENT.
+ * or data: URIs. The _json calls return complete responses: a generate
+ * request with "stream": true fails with ANTFLY_INVALID_ARGUMENT; use
+ * antfly_inference_generate_stream_json to stream.
  *
  * Every call resets *out, then fills it with the response body whether or
  * not the call succeeds, so a failure carries the runtime's JSON error
@@ -597,6 +601,27 @@ antfly_error_code antfly_inference_embed_json(antfly_inference *inference, antfl
 antfly_error_code antfly_inference_rerank_json(antfly_inference *inference, antfly_slice request_json, antfly_buffer *out);
 antfly_error_code antfly_inference_chunk_json(antfly_inference *inference, antfly_slice request_json, antfly_buffer *out);
 antfly_error_code antfly_inference_generate_json(antfly_inference *inference, antfly_slice request_json, antfly_buffer *out);
+/* Receives one streamed chunk: the JSON of a "chat.completion.chunk", valid
+ * only during the call. Return true to continue, false to stop generating. */
+typedef bool (*antfly_inference_stream_fn)(void *context, antfly_slice chunk_json);
+
+/*
+ * Streams a generate request (the same body as antfly_inference_generate_json;
+ * "stream" is set for you). on_chunk is called on the calling thread for each
+ * chunk, as the model produces tokens. Returns ANTFLY_OK once generation
+ * finishes, or ANTFLY_CANCELLED when on_chunk returned false. A request
+ * rejected before generation starts (such as a missing model) fails as
+ * antfly_inference_generate_json does, with the JSON error in *out; a failure
+ * mid-stream returns ANTFLY_INTERNAL with {"error": "STREAM_FAILED", ...}.
+ */
+antfly_error_code antfly_inference_generate_stream_json(
+    antfly_inference *inference,
+    antfly_slice request_json,
+    antfly_inference_stream_fn on_chunk,
+    void *chunk_context,
+    antfly_buffer *out
+);
+
 /* Up to 128 non-streaming generate requests in one call; per-item failures
  * are reported in the response. */
 antfly_error_code antfly_inference_generate_batch_json(antfly_inference *inference, antfly_slice request_json, antfly_buffer *out);
@@ -625,7 +650,8 @@ typedef struct antfly_inference_pull_progress {
     bool cached;
 } antfly_inference_pull_progress;
 
-typedef void (*antfly_inference_pull_progress_fn)(
+/* Return true to continue, false to cancel the pull. */
+typedef bool (*antfly_inference_pull_progress_fn)(
     void *context,
     const antfly_inference_pull_progress *progress
 );
@@ -641,12 +667,16 @@ typedef void (*antfly_inference_pull_progress_fn)(
  *    "projector": "auto" | "none" | "match",
  *    "max_artifact_bytes": N, "max_model_bytes": N}
  *
- * progress (may be NULL) is called on the calling thread as files download.
+ * progress (may be NULL) is called on the calling thread as each file
+ * starts, every 16 MiB, and as it completes. Returning false cancels: the
+ * download stops and the call returns ANTFLY_CANCELLED. Completed files stay
+ * staged, so pulling the same model again resumes rather than restarts.
+ *
  * On success *out is {"models": [...], "models_dir": "..."}; on failure it is
  * {"error": ..., "message": ...}. A model missing from the hub returns
  * ANTFLY_NOT_FOUND, a bad request or a model over the size limits
- * ANTFLY_INVALID_ARGUMENT, and a network or hub failure ANTFLY_BUSY. The call
- * cannot be cancelled, and antfly_inference_close waits for it.
+ * ANTFLY_INVALID_ARGUMENT, and a network or hub failure ANTFLY_BUSY.
+ * antfly_inference_close waits for a pull in progress.
  */
 antfly_error_code antfly_inference_pull_json(
     antfly_inference *inference,

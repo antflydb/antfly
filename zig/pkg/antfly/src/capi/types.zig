@@ -128,7 +128,11 @@ pub const InferencePullProgress = extern struct {
     cached: bool = false,
 };
 
-pub const InferencePullProgressFn = *const fn (?*anyopaque, *const InferencePullProgress) callconv(.c) void;
+/// Returns false to cancel the pull.
+pub const InferencePullProgressFn = *const fn (?*anyopaque, *const InferencePullProgress) callconv(.c) bool;
+
+/// Receives one streamed chunk's JSON; returns false to stop generating.
+pub const InferenceStreamFn = *const fn (?*anyopaque, Slice) callconv(.c) bool;
 
 pub const DenseSearchHit = extern struct {
     id_ptr: ?[*]u8 = null,
@@ -240,6 +244,9 @@ pub const ErrorCode = enum(c_int) {
     /// succeed. See `antfly_db_run_until_idle_json`
     /// for the stuck index name and indexed/expected counters.
     stalled = 9,
+    /// The caller cancelled the call, by returning false from its progress
+    /// or stream callback.
+    cancelled = 10,
     internal = 255,
 };
 
@@ -255,6 +262,7 @@ pub fn errorCodeName(code: c_int) [*:0]const u8 {
         @intFromEnum(ErrorCode.outcome_unknown) => "ANTFLY_OUTCOME_UNKNOWN",
         @intFromEnum(ErrorCode.unsupported) => "ANTFLY_UNSUPPORTED",
         @intFromEnum(ErrorCode.stalled) => "ANTFLY_STALLED",
+        @intFromEnum(ErrorCode.cancelled) => "ANTFLY_CANCELLED",
         @intFromEnum(ErrorCode.internal) => "ANTFLY_INTERNAL",
         else => "ANTFLY_UNKNOWN_ERROR",
     };
@@ -272,6 +280,7 @@ pub fn errorCodeDescription(code: c_int) [*:0]const u8 {
         @intFromEnum(ErrorCode.outcome_unknown) => "the operation was published, but crash durability could not be confirmed; inspect the destination and do not retry automatically",
         @intFromEnum(ErrorCode.unsupported) => "the operation requires a capability that is not supported by this platform or filesystem",
         @intFromEnum(ErrorCode.stalled) => "a bounded drain made no forward progress for its configured stall window and gave up",
+        @intFromEnum(ErrorCode.cancelled) => "the caller cancelled the operation",
         @intFromEnum(ErrorCode.internal) => "an internal error occurred",
         else => "unknown Antfly error code",
     };

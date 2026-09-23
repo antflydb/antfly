@@ -1791,6 +1791,7 @@ const ReadableLeaseHook = struct {
             .outcome_unknown => return error.DurabilityOutcomeUnknown,
             .unsupported => return error.UnsupportedOperation,
             .stalled => return error.Stalled,
+            .cancelled => return error.Canceled,
             .internal => return error.Internal,
         }
     }
