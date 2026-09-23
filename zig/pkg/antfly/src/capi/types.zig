@@ -344,7 +344,7 @@ pub fn mapError(err: anyerror) ErrorCode {
         error.PortableRuntimeActivationPending,
         error.GenerationTransitionActive,
         => .busy,
-        error.FileLocksUnsupported => .unsupported,
+        error.FileLocksUnsupported, error.GenerationFileLocksUnsupported => .unsupported,
         error.DurabilityOutcomeUnknown => .outcome_unknown,
         error.RunUntilIdleNoProgress => .stalled,
         // A dimension probe against a live embedder hit an operational

@@ -9338,6 +9338,9 @@ fn restorePortableBackupToDirectory(
         _ = try db.rebuildSparseIndexesForTargetCoverage(alloc);
         try db.rebuildGraphIndexesForTargetCoverage(alloc);
         _ = try db.replayGeneratedEnrichmentsFromStoredDocs(alloc);
+        // Drain any derived or replayed generated work before publication,
+        // as the Lite restore does, so a read-only reopen sees final results.
+        try db.runUntilIdle();
         try db.sync(true);
         try db.syncIndexes(true);
     }
@@ -14393,6 +14396,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expectEqual(capi.ErrorCode.busy, capi.mapError(error.SourceFileChanged));
     try std.testing.expectEqual(capi.ErrorCode.busy, capi.mapError(error.PortableRuntimeActivationPending));
     try std.testing.expectEqual(capi.ErrorCode.unsupported, capi.mapError(error.FileLocksUnsupported));
+    try std.testing.expectEqual(capi.ErrorCode.unsupported, capi.mapError(error.GenerationFileLocksUnsupported));
     try std.testing.expectEqual(capi.ErrorCode.not_found, capi.mapError(error.NotFound));
     try std.testing.expectEqual(capi.ErrorCode.txn_not_found, capi.mapError(error.TxnNotFound));
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, capi.mapError(error.TruncatedNativeHeader));
@@ -15341,6 +15345,52 @@ test "capi directory restore coordinates with open handles and publishes atomica
             std.debug.print("unexpected restore sibling left behind: {s}\n", .{entry.name});
             return error.TestUnexpectedResult;
         }
+    }
+}
+
+test "capi directory restore publishes with derived work drained" {
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const src_path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-dir-restore-drain-src");
+    defer alloc.free(src_path);
+    const dest_path = try tempTestPath(alloc, test_tmp.path(), "capi-dir-restore-drain-dest");
+    defer alloc.free(dest_path);
+    cleanupTestFile(src_path);
+    defer cleanupTestFile(src_path);
+    cleanupTestDir(dest_path);
+    defer cleanupTestDir(dest_path);
+
+    var src: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(src_path, &src));
+    const writes = [_]capi.WriteIntent{.{ .key = .{ .ptr = "doc:fox", .len = 7 }, .value = .{ .ptr = "{\"body\":\"the quick brown fox\"}", .len = 30 } }};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch(src, &writes, 1, null, 0, 1, 0));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(src));
+    var backup: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_backup(src, &backup));
+    defer antfly_buffer_free(&backup);
+    antfly_db_close(src);
+
+    const directory = capi.OpenOptions{ .storage_kind = capi.storage_kind_directory };
+    var report: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_restore_backup_json(dest_path, &directory, .{ .ptr = backup.ptr, .len = backup.len }, false, &report));
+    antfly_buffer_free(&report);
+
+    // A read-only handle runs no derived work of its own, so the published
+    // directory must already carry complete index results.
+    var readonly = directory;
+    readonly.open_mode = capi.open_mode_readonly;
+    var restored: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open_with_options(dest_path, &readonly, &restored));
+    defer antfly_db_close(restored);
+    const request = "{\"full_text_search\":{\"match\":{\"field\":\"body\",\"text\":\"quick fox\"}},\"limit\":5}";
+    var result: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_json(restored, .{ .ptr = request.ptr, .len = request.len }, &result));
+    defer antfly_buffer_free(&result);
+    const hits = result.ptr.?[0..result.len];
+    if (std.mem.indexOf(u8, hits, "doc:fox") == null) {
+        std.debug.print("restored directory search missed doc:fox: {s}\n", .{hits});
+        return error.TestUnexpectedResult;
     }
 }
 
