@@ -1,5 +1,36 @@
 # Zig runtime flakes
 
+## 2026-09-23: older Raft owner descriptor regressed a migrated schema
+
+[CI job 107389740209](https://github.com/antflydb/antfly/actions/runs/35916384702/job/107389740209)
+failed `test_concurrent_tenant_schema_migrations_preserve_documents`. During
+startup catch-up, an older committed entry (index 3) carried its original
+storage-owner descriptor. The physical DB had already durably installed a
+newer schema. Opening the owner tried to commit the older schema and returned
+`SchemaVersionRegression`; the C ABI mapped it to an internal storage failure,
+which stopped data nodes 102 and 103 and left the migration poll to time out.
+
+The owner open and configuration paths now retain a newer durable schema and
+its index definitions when an older descriptor is replayed. A committed Raft
+batch no longer revalidates against the replica's current metadata schema:
+admission happened before the entry was committed, and the native applied
+marker still performs idempotent replay. This keeps metadata arrival order
+from changing the outcome of an older committed entry. The exact descriptor
+transition has a deterministic compiled-owner test; a DB reopen test checks
+that the newer public and runtime schema remain persisted. Both pass. One
+unchanged-binary focused E2E invocation passed, so the timing-sensitive CI
+failure was not reproduced by that single local run. The rebuilt server passed
+four focused E2E invocations across two concurrent regression-loop workers;
+those passes validate recovery under local load but do not prove the CI race
+cannot recur.
+
+```sh
+SKIP_BUILD=1 ANTFLY_BIN=/absolute/path/to/antfly \
+  ANTFLY_E2E_REGRESSION_WORKERS=2 ANTFLY_E2E_REGRESSION_REPEATS=2 \
+  scripts/ci/zig-e2e-regression-loop.sh \
+  e2e/antfly/test_catalog_resilience.py::test_concurrent_tenant_schema_migrations_preserve_documents
+```
+
 ## 2026-09-23: restore staging contention and partial vector publication after restart
 
 [CI job 107069241819](https://github.com/antflydb/antfly/actions/runs/35823581381/job/107069241819)

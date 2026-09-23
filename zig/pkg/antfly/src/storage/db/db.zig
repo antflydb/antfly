@@ -6377,7 +6377,15 @@ pub const DB = struct {
                 // provisioner. Persist directly through the core before index
                 // open; no index runtime exists yet and the metadata record is
                 // already the durable authority for this replica projection.
-                if (prepared_schema.public_schema_json) |public_json| {
+                // Raft catch-up can reopen an older entry's pinned descriptor
+                // after this physical DB has durably installed a newer schema.
+                // Keep that newer epoch; the older entry's native applied
+                // marker decides whether it still needs its data mutation.
+                if (db.core.schema != null and db.core.schema.?.version > prepared_schema.runtime_schema.version) {
+                    std.log.debug("owner open retains newer durable schema path={s} durable_version={d} descriptor_version={d}", .{
+                        path, db.core.schema.?.version, prepared_schema.runtime_schema.version,
+                    });
+                } else if (prepared_schema.public_schema_json) |public_json| {
                     const versioned_public_key = try public_table_schema.versionedSchemaKeyAlloc(alloc, prepared_schema.runtime_schema.version);
                     defer alloc.free(versioned_public_key);
                     _ = try db.core.commitSchemaMetadata(prepared_schema.runtime_schema, &.{
@@ -126138,6 +126146,34 @@ test "db provisioning reopen preserves an older encoding of the same schema epoc
         }
         try db.batch(.{ .writes = &.{.{ .key = "doc:1", .value = "{\"text\":\"still writable\"}" }} });
     }
+}
+
+test "db owner open does not downgrade a newer durable schema for Raft catch-up" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db-owner-schema-catch-up");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    const older_json = "{\"version\":0}";
+    const newer_json = "{\"version\":1}";
+    var parsed = try public_table_schema.parseValidatedTableSchema(alloc, older_json);
+    defer parsed.deinit(alloc);
+    const older_schema = try public_table_schema.deriveRuntimeTableSchema(alloc, parsed);
+    defer schema_mod.freeSchema(alloc, older_schema);
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
+        defer db.close();
+        try db.setSchemaJson(alloc, newer_json);
+    }
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .start_optional_runtimes = false,
+        .schema_before_index_load = .{ .runtime_schema = older_schema, .public_schema_json = older_json },
+    });
+    defer reopened.close();
+    try std.testing.expectEqual(@as(u32, 1), reopened.core.schema.?.version);
+    const public_json = try reopened.core.store.get(alloc, public_schema_json_key);
+    defer alloc.free(public_json);
+    try std.testing.expectEqualStrings(newer_json, public_json);
 }
 
 test "db provisioning schema is persisted before configured full text indexes open" {

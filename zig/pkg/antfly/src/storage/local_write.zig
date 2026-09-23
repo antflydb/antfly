@@ -316,7 +316,11 @@ pub fn applyStorageKernelReplicatedBatchAtRaftEntry(
     req: db_mod.types.BatchRequest,
     raft_entry: db_mod.RaftAppliedEntryIdentity,
 ) !void {
-    try validateTableBatchAgainstLocalSchema(alloc, db, req.writes, req.deletes, req.transforms);
+    // The leader admitted this immutable command under the descriptor pinned
+    // in its Raft entry. A follower may already have a newer durable schema
+    // when it catches up; validating against that schema would make apply
+    // order depend on metadata delivery and can even reject an already
+    // applied entry before the native marker gets a chance to short-circuit.
     runTestBeforeBatchExecutionHook();
     if (req.transaction != null)
         try applyReplicatedTransactionMutationAtRaftEntry(alloc, db, table_name, group_id, req, raft_entry)
@@ -1745,6 +1749,18 @@ pub fn configureStorageKernelOwnerDb(
     remote_content: ?*const scraping.RemoteContentConfig,
     installed: ?*OwnerManagedConfig,
 ) !void {
+    // Catch-up may request an owner using an older Raft entry's pinned
+    // descriptor after this physical generation has a newer durable schema.
+    // Never roll back its schema, managed runtimes, or index definitions.
+    if (db.core.schema) |durable_schema| {
+        var descriptor_schema = if (schema_json.len > 0)
+            try tables_api.parseValidatedTableSchema(alloc, schema_json)
+        else
+            null;
+        defer if (descriptor_schema) |*parsed| parsed.deinit(alloc);
+        const descriptor_version: u32 = if (descriptor_schema) |parsed| parsed.version else 0;
+        if (descriptor_version < durable_schema.version) return;
+    }
     if (schema_json.len > 0) try applyLocalTableSchemaJson(alloc, db, schema_json);
     if (indexes_json.len > 0) {
         const replace = backend_runtime != null and !(if (installed) |state| state.matches(indexes_json) else false);

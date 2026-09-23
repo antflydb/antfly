@@ -5210,6 +5210,57 @@ test "committed owner apply yields admission conflicts and retries the exact ent
     }
 }
 
+test "committed catch-up retains newer durable schema across an older pinned descriptor" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(root);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-1/table-db", .{root});
+    defer alloc.free(path);
+    var source = ProvisionedKernelOwnerSource.init(alloc, root, table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+    defer source.deinit();
+    const old: descriptor_contract.Descriptor = .{
+        .lsm_root_generation = table_reads.backend_current_root_generation,
+        .identity = .{ .table_id = 1, .shard_id = 1, .range_id = 1 },
+        .schema_json = "{\"version\":0}",
+    };
+    const current: descriptor_contract.Descriptor = .{
+        .lsm_root_generation = old.lsm_root_generation,
+        .identity = old.identity,
+        .schema_json = "{\"version\":1}",
+    };
+    try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", old, .{
+        .writes = &.{.{ .key = "doc:first", .value = "{\"title\":\"first\"}" }},
+    }, 1, 1);
+    {
+        var lease = try source.acquireDescriptor(1, "docs", path, current);
+        lease.deinit();
+    }
+    // An old Raft entry can be retried after the metadata schema advances.
+    // Its already-applied marker must win without reopening a downgraded DB.
+    for (0..4) |_| {
+        source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", old, .{
+            .writes = &.{.{ .key = "doc:first", .value = "{\"title\":\"duplicate\"}" }},
+        }, 1, 1) catch |err| switch (err) {
+            error.StorageBusy => continue,
+            else => return err,
+        };
+        break;
+    } else return error.TestOwnerAdmissionDidNotRecover;
+    try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", old, .{
+        .writes = &.{.{ .key = "doc:second", .value = "{\"title\":\"second\"}" }},
+    }, 1, 2);
+    var lease = try source.acquireDescriptor(1, "docs", path, current);
+    defer lease.deinit();
+    var first = try lease.owner().lookupJson("docs", "{\"key\":\"doc:first\"}");
+    defer first.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, first.bytes(), "duplicate") == null);
+    var second = try lease.owner().lookupJson("docs", "{\"key\":\"doc:second\"}");
+    defer second.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, second.bytes(), "second") != null);
+}
+
 test "pending exclusive storage owner lease blocks new readers until drain" {
     var entry: ProvisionedKernelOwnerSource.Entry = undefined;
     entry.active_users = 1;
