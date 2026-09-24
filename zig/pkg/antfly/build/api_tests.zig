@@ -1133,6 +1133,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "typed routed batch preserves forwarding cancellation and identity conflicts",
             "typed internal query workers preserve identity generation validation",
             "remote shard query phases propagate deadline and request cancellation",
+            "parallel preflight joins canceled wave without dispatching later groups",
             "provisioned table read cache has a finite worker ceiling",
             "provisioned read cache invalidates repeated ownership moves with pinned leases",
             "provisioned read cache exclusive access drains active read leases",

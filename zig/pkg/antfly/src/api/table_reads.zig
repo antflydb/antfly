@@ -8228,12 +8228,15 @@ fn preflightProvisionedGroupsParallel(
 
     var start: usize = 0;
     while (start < group_ids.len) : (start += width) {
+        try checkQueryDeadline(req);
         const end = @min(start + width, group_ids.len);
         var group: std.Io.Group = .init;
         for (group_ids[start..end], start..end) |group_id, i| {
             group.async(io, Fiber.run, .{ self, &slots[i], group_id, table_name, &req, consistency, max_work });
         }
-        group.await(io) catch {};
+        // await joins every worker before a canceled request can release its slots.
+        try group.await(io);
+        try checkQueryDeadline(req);
     }
 
     for (slots) |slot| {
@@ -8245,6 +8248,7 @@ fn preflightProvisionedGroupsParallel(
     for (slots[1..]) |slot| {
         try mergeRuntimePreflightSummaryNoFree(alloc, &merged, slot.summary.?);
     }
+    try checkQueryDeadline(req);
     recordParallelFanout(.preflight, @intCast(platform_time.monotonicNs() - start_ns));
     return merged;
 }
@@ -8310,12 +8314,15 @@ fn preflightHostedGroupsParallel(
 
     var start: usize = 0;
     while (start < group_ids.len) : (start += width) {
+        try checkQueryDeadline(req);
         const end = @min(start + width, group_ids.len);
         var group: std.Io.Group = .init;
         for (group_ids[start..end], start..end) |group_id, i| {
             group.async(io, Fiber.run, .{ self, &slots[i], routes[i], group_id, table_name, &req, consistency, max_work });
         }
-        group.await(io) catch {};
+        // await joins every worker before a canceled request can release its slots.
+        try group.await(io);
+        try checkQueryDeadline(req);
     }
 
     for (slots) |slot| {
@@ -8327,6 +8334,7 @@ fn preflightHostedGroupsParallel(
     for (slots[1..]) |slot| {
         try mergeRuntimePreflightSummaryNoFree(alloc, &merged, slot.summary.?);
     }
+    try checkQueryDeadline(req);
     recordParallelFanout(.preflight, @intCast(platform_time.monotonicNs() - start_ns));
     return merged;
 }
@@ -20874,6 +20882,109 @@ fn consumerTests() type {
             fake = .{ .failures = std.math.maxInt(usize) };
             try std.testing.expectError(error.DeadlineExceeded, retry.run(Fake.lookup, .{&fake}));
             try std.testing.expectEqual(default_deadline, catalog.budget(null).nowNs());
+        }
+
+        test "parallel preflight joins canceled wave without dispatching later groups" {
+            const Fake = struct {
+                cancelled: *std.atomic.Value(bool),
+                calls: std.atomic.Value(usize) = .init(0),
+                cancel_on_group: ?u64 = 1,
+
+                fn lookup(
+                    _: *anyopaque,
+                    _: std.mem.Allocator,
+                    _: []const u8,
+                    _: []const u8,
+                    _: db_mod.types.LookupOptions,
+                    _: raft_mod.ReadConsistency,
+                ) !?LookupResponse {
+                    return error.TestUnexpectedCall;
+                }
+
+                fn scan(
+                    _: *anyopaque,
+                    _: std.mem.Allocator,
+                    _: []const u8,
+                    _: []const u8,
+                    _: []const u8,
+                    _: db_mod.types.ScanOptions,
+                    _: raft_mod.ReadConsistency,
+                ) !?ScanResponse {
+                    return error.TestUnexpectedCall;
+                }
+
+                fn query(
+                    _: *anyopaque,
+                    _: std.mem.Allocator,
+                    _: []const u8,
+                    _: db_mod.types.SearchRequest,
+                    _: raft_mod.ReadConsistency,
+                ) !?query_api.QueryResponse {
+                    return error.TestUnexpectedCall;
+                }
+
+                fn preflight(
+                    ptr: *anyopaque,
+                    _: std.mem.Allocator,
+                    group_id: u64,
+                    _: []const u8,
+                    _: db_mod.types.SearchRequest,
+                    _: raft_mod.ReadConsistency,
+                    _: u32,
+                ) !?db_mod.RuntimePreflightSummary {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    _ = self.calls.fetchAdd(1, .acq_rel);
+                    if (self.cancel_on_group) |target| {
+                        if (target == group_id) self.cancelled.store(true, .release);
+                    }
+                    return .{};
+                }
+            };
+
+            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{ .async_limit = .limited(2) });
+            defer io_impl.deinit();
+            var cancelled = std.atomic.Value(bool).init(false);
+            var fake: Fake = .{ .cancelled = &cancelled };
+            var source = ProvisionedTableReadSource.init("", undefined, raft_mod.read_gate.alreadyReadSafeBarrier());
+            source.local_read_source = .{ .ptr = &fake, .vtable = &.{
+                .lookup = Fake.lookup,
+                .scan = Fake.scan,
+                .query = Fake.query,
+                .preflight_query_group_local = Fake.preflight,
+            } };
+            const req: db_mod.types.SearchRequest = .{
+                .cancellation = db_mod.types.CancellationToken.fromAtomic(&cancelled),
+            };
+            const group_ids = [_]u64{ 1, 2, 3, 4, 5 };
+            try std.testing.expectError(error.Cancelled, preflightProvisionedGroupsParallel(
+                &source,
+                std.testing.allocator,
+                io_impl.io(),
+                2,
+                &group_ids,
+                "docs",
+                req,
+                .stale,
+                0,
+            ));
+            try std.testing.expectEqual(@as(usize, 2), fake.calls.load(.acquire));
+
+            cancelled.store(false, .release);
+            fake.cancel_on_group = null;
+            fake.calls.store(0, .release);
+            var summary = (try preflightProvisionedGroupsParallel(
+                &source,
+                std.testing.allocator,
+                io_impl.io(),
+                2,
+                &group_ids,
+                "docs",
+                req,
+                .stale,
+                0,
+            )).?;
+            defer summary.deinit(std.testing.allocator);
+            try std.testing.expectEqual(group_ids.len, fake.calls.load(.acquire));
         }
 
         test "fanout planner uses io cap and request shape" {
