@@ -95,6 +95,9 @@ pub const TransitionStepResult = struct {
 };
 
 pub const TransitionService = struct {
+    /// Deliberately uninstalled in production until the whole source snapshot
+    /// and authenticated transfer capability bundle is available.
+    online_driver: ?@import("../metadata/online_merge.zig").Driver = null,
     alloc: std.mem.Allocator,
     retry_clock: RetryClock,
     retry_jitter_salt: u64,
@@ -251,12 +254,19 @@ pub const TransitionService = struct {
     }
 
     pub fn submitMerge(self: *TransitionService, record: metadata.MergeTransitionRecord) !void {
+        if (record.online) |online| try online.validateRecord(record);
         // Merge transition IDs are immutable operation identities. Once an ID
         // is terminal, replayed metadata for that ID is a no-op.
         if (findCompletedMergeIndex(self.completed_merge_observations.items, record.transition_id) != null)
             return;
         if (findMergeIndex(self.pending_merge.items, record.transition_id)) |index| {
             const previous = self.pending_merge.items[index];
+            if (previous.online != null and record.online == null) return error.InvalidOnlineMergeState;
+            if (previous.online == null and record.online != null and
+                (previous.phase != .prepare or previous.rollback_reason != null)) return error.InvalidOnlineMergeState;
+            if (previous.online) |online| {
+                if (!@import("../metadata/online_merge.zig").updateAllowed(online, record.online.?)) return;
+            }
             var effective_record = record;
             const observation_context_changed =
                 previous.donor_group_id != record.donor_group_id or
@@ -492,6 +502,7 @@ pub const TransitionService = struct {
         const merge_records = try self.snapshotPendingRecords(metadata.MergeTransitionRecord);
         defer self.freePendingSnapshot(merge_records);
         for (merge_records) |record| {
+            if (record.online != null) continue;
             if (mergeObservationFresh(&self.cached_merge_observations, record.transition_id, now_ms)) continue;
             if (retryPending(&self.merge_observation_retries, record.transition_id, now_ms)) continue;
             if (!self.pendingRecordMatches(record)) continue;
@@ -602,6 +613,51 @@ pub const TransitionService = struct {
             if (record.phase == .finalized or record.phase == .rolled_back) continue;
             if (retryPending(&self.merge_retries, record.transition_id, now_ms)) continue;
             if (!self.pendingRecordMatches(expected)) continue;
+            if (record.online == null and record.phase == .prepare and record.rollback_reason == null) {
+                if (self.online_driver) |driver| if (driver.admit) |admit| {
+                    const admitted = admit(driver.ptr, record.*) catch |err| {
+                        if (!self.pendingRecordMatches(expected)) continue;
+                        try recordRetry(self.alloc, &self.merge_retries, record.transition_id, now_ms, self.retry_jitter_salt);
+                        std.log.warn("online merge admission pending transition_id={d} err={s}", .{ record.transition_id, @errorName(err) });
+                        continue;
+                    };
+                    if (admitted) |initial| {
+                        if (self.pendingRecordMatches(expected)) self.pendingRecord(expected).?.online = initial;
+                        _ = self.merge_retries.remove(record.transition_id);
+                        result.stepped_merge += 1;
+                        continue;
+                    }
+                    if (!self.pendingRecordMatches(expected)) continue;
+                };
+            }
+            if (record.online) |online| {
+                const driver = self.online_driver orelse {
+                    try recordRetry(self.alloc, &self.merge_retries, record.transition_id, now_ms, self.retry_jitter_salt);
+                    continue;
+                };
+                const next = driver.step(online, record.rollback_reason != null) catch |err| {
+                    if (!self.pendingRecordMatches(expected)) continue;
+                    if (err == error.OnlineMergePublicationPending or err == error.OnlineMergeArtifactPending) {
+                        const jitter_ms = if (self.retry_jitter_salt == 0) 0 else mixRetryJitter(self.retry_jitter_salt ^ record.transition_id ^ now_ms) % 101;
+                        try self.merge_retries.put(self.alloc, record.transition_id, .{ .failures = 0, .retry_at_ms = now_ms +| 250 +| jitter_ms });
+                        continue;
+                    }
+                    try recordRetry(self.alloc, &self.merge_retries, record.transition_id, now_ms, self.retry_jitter_salt);
+                    std.log.warn("online merge step failed transition_id={d} phase={s} err={s}", .{ record.transition_id, @tagName(online.phase), @errorName(err) });
+                    continue;
+                };
+                // Reentrant committed metadata notification may already have
+                // installed the successor. Never overwrite a different record.
+                if (self.pendingRecordMatches(expected)) {
+                    const live = self.pendingRecord(expected).?;
+                    live.online = next;
+                    if (next.phase == .complete) live.phase = .finalized;
+                    if (next.phase == .cancelled) live.phase = .rolled_back;
+                }
+                _ = self.merge_retries.remove(record.transition_id);
+                result.stepped_merge += 1;
+                continue;
+            }
             const observation = runtime.observeMerge(record.*) catch |err| {
                 if (!self.pendingRecordMatches(expected)) continue;
                 try recordRetry(self.alloc, &self.merge_retries, record.transition_id, now_ms, self.retry_jitter_salt);
@@ -701,6 +757,7 @@ pub const TransitionService = struct {
     }
 
     fn observeMergeMeta(ptr: *anyopaque, record: metadata.MergeTransitionRecord) !metadata.MergeObservation {
+        if (record.online != null) return error.OnlineMergeUnavailable;
         const self: *TransitionService = @ptrCast(@alignCast(ptr));
         return switch (self.ops) {
             .runtime => |*runtime| try runtime.metadataRuntime().observeMerge(record),
@@ -767,6 +824,7 @@ pub const TransitionService = struct {
         const merge_records = try self.snapshotPendingRecords(metadata.MergeTransitionRecord);
         defer self.freePendingSnapshot(merge_records);
         for (merge_records) |record| {
+            if (record.online != null) continue;
             if (!self.pendingRecordMatches(record)) continue;
             if (record.phase != .finalized and record.phase != .rolled_back) continue;
             if (self.cached_merge_observations.get(record.transition_id)) |cached| {
@@ -1175,6 +1233,173 @@ fn deinitMergeRecord(alloc: std.mem.Allocator, record: *metadata.MergeTransition
     record.* = undefined;
 }
 
+test "metadata transition driver online service never invokes ordinary merge fallback" {
+    const Stub = struct {
+        const Parent = @This();
+        ordinary_calls: usize = 0,
+        admission_calls: usize = 0,
+        publication_calls: usize = 0,
+        artifact_pending: bool = false,
+        recovery_published: bool = false,
+        recovered_durable: ?@import("../metadata/online_merge.zig").State = null,
+        admission_mode: enum { transient, eligible, ineligible } = .transient,
+        initial: @import("../metadata/online_merge.zig").State = undefined,
+        fn admit(ptr: *anyopaque, _: metadata.MergeTransitionRecord) !?@import("../metadata/online_merge.zig").State {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.admission_calls += 1;
+            return switch (self.admission_mode) {
+                .transient => error.GroupLeaderUnavailable,
+                .eligible => self.initial,
+                .ineligible => null,
+            };
+        }
+        fn now(ptr: ?*anyopaque) u64 {
+            return @as(*u64, @ptrCast(@alignCast(ptr.?))).*;
+        }
+        fn observe(ptr: *anyopaque, state: @import("../metadata/online_merge.zig").State) !@import("../metadata/online_merge.zig").Observation {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (state.phase != .publish) return error.UnexpectedOnlineStep;
+            if (self.recovery_published) {
+                const certificate: @import("../storage/source_snapshot.zig").Certificate = .{ .cut = .{ .namespace = state.scope.fence.namespace, .applied_index = 19, .retained_start = 11 }, .objects = 1, .content_bytes = 100, .schema_manifest_digest = @splat(2), .ordered_content_digest = @splat(3) };
+                return .{ .scope = state.scope, .certificate = certificate, .source_progress = .{ .namespace = state.scope.namespace(), .consumer_epoch = state.scope.consumer_epoch, .pin = state.scope.pin(), .start = 11, .acknowledged = 11, .admitted_applied_index = 19, .snapshot_phase = .published, .snapshot_certificate = try certificate.digest() } };
+            }
+            return .{ .scope = state.scope, .source_progress = .{ .namespace = state.scope.namespace(), .consumer_epoch = state.scope.consumer_epoch, .pin = state.scope.pin(), .start = 11, .acknowledged = 11, .admitted_applied_index = 19, .snapshot_phase = .pinned } };
+        }
+        fn execute(ptr: *anyopaque, _: @import("../metadata/online_merge.zig").State, action: @import("../metadata/online_merge.zig").Action, _: *const @import("../metadata/online_merge.zig").Observation) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (action != .prepare_certificate) return error.UnexpectedOnlineStep;
+            self.publication_calls += 1;
+            if (self.artifact_pending) return error.OnlineMergeArtifactPending;
+            return error.OnlineMergePublicationPending;
+        }
+        fn cas(ptr: *anyopaque, previous: @import("../metadata/online_merge.zig").State, next: @import("../metadata/online_merge.zig").State, cancel: bool) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!self.recovery_published) return error.UnexpectedOnlineStep;
+            try std.testing.expect(!cancel);
+            try std.testing.expectEqual(.publish, previous.phase);
+            try std.testing.expectEqual(.snapshot, next.phase);
+            try std.testing.expect(@import("../metadata/online_merge.zig").updateAllowed(previous, next));
+            self.recovered_durable = next;
+            return true;
+        }
+        const vtable: shard_ops.ShardOperationAdapter.VTable = blk: {
+            var value: shard_ops.ShardOperationAdapter.VTable = undefined;
+            for (std.meta.fields(@TypeOf(value))) |field| {
+                if (@typeInfo(field.type) == .optional) {
+                    @field(value, field.name) = null;
+                    continue;
+                }
+                @field(value, field.name) = struct {
+                    fn call(ptr: *anyopaque, _: u64, _: @typeInfo(@typeInfo(field.type).pointer.child).@"fn".params[2].type.?) @typeInfo(@typeInfo(field.type).pointer.child).@"fn".return_type.? {
+                        const self: *Parent = @ptrCast(@alignCast(ptr));
+                        self.ordinary_calls += 1;
+                        return error.UnexpectedOrdinaryMergeFallback;
+                    }
+                }.call;
+            }
+            break :blk value;
+        };
+    };
+    var stub = Stub{};
+    var service = try TransitionService.init(std.testing.allocator, shard_ops.ShardOperationAdapter{ .ptr = &stub, .vtable = &Stub.vtable });
+    defer service.deinit();
+    const record: metadata.MergeTransitionRecord = .{
+        .transition_id = 1,
+        .donor_group_id = 2,
+        .receiver_group_id = 3,
+        .table_contract = .{ .table_id = 1, .table_name = "docs", .schema_json = "{}", .indexes_json = "{}", .source_identity = .{ .shard_id = 2, .range_id = 4 }, .target_identity = .{ .shard_id = 3, .range_id = 5 } },
+        .online = .{ .scope = .{ .fence = .{ .transition_id = 1, .attempt = 1, .owner_group_id = 2, .peer_group_id = 3, .role = .merge_source, .namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 4 }, .catalog_digest = @splat(1) }, .receiver_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 5 }, .consumer_epoch = 1, .copy_attempt = .{ .donor_term = 1, .sequence = 1 } } },
+    };
+    try service.submitMerge(record);
+    try service.refreshPendingObservations();
+    const result = try service.stepPending();
+    try std.testing.expectEqual(@as(usize, 0), result.stepped_merge);
+    try std.testing.expectEqual(@as(usize, 1), service.pending_merge.items.len);
+    try std.testing.expect(service.pending_merge.items[0].online.?.eql(record.online.?));
+    var direct = record;
+    try std.testing.expectError(error.OnlineMergeUnavailable, metadata.TransitionDriver.stepMerge(service.metadataRuntime(), &direct));
+    try std.testing.expectEqual(@as(usize, 0), stub.ordinary_calls);
+    try std.testing.expect(service.removeMerge(record.transition_id));
+    var ordinary = record;
+    ordinary.online = null;
+    try service.submitMerge(ordinary);
+    stub.initial = record.online.?;
+    var capabilities: @import("../metadata/online_merge.zig").Capabilities = .{};
+    inline for (std.meta.fields(@TypeOf(capabilities))) |field| @field(capabilities, field.name) = true;
+    service.online_driver = .{ .ptr = &stub, .capabilities = capabilities, .observe = Stub.observe, .execute = Stub.execute, .compare_and_set = Stub.cas, .admit = Stub.admit };
+    _ = try service.stepPending();
+    try std.testing.expectEqual(@as(usize, 1), stub.admission_calls);
+    try std.testing.expectEqual(@as(usize, 0), stub.ordinary_calls);
+    try std.testing.expect(service.pending_merge.items[0].online == null);
+    service.merge_retries.clearRetainingCapacity();
+    stub.admission_mode = .eligible;
+    _ = try service.stepPending();
+    try std.testing.expectEqual(@as(usize, 2), stub.admission_calls);
+    try std.testing.expectEqual(@as(usize, 0), stub.ordinary_calls);
+    try std.testing.expect(service.pending_merge.items[0].online.?.eql(stub.initial));
+    try std.testing.expect(service.removeMerge(record.transition_id));
+    try service.submitMerge(ordinary);
+    stub.admission_mode = .ineligible;
+    _ = try service.stepPending();
+    try std.testing.expectEqual(@as(usize, 3), stub.admission_calls);
+    try std.testing.expect(stub.ordinary_calls != 0);
+    try std.testing.expect(service.removeMerge(record.transition_id));
+    var publishing = record;
+    publishing.online.?.phase = .publish;
+    try service.submitMerge(publishing);
+    var clock_ms: u64 = 1000;
+    service.retry_clock = .{ .ptr = &clock_ms, .now_ms_fn = Stub.now };
+    service.retry_jitter_salt = 0;
+    _ = try service.stepPending();
+    try std.testing.expectEqual(@as(usize, 1), stub.publication_calls);
+    const pending = service.merge_retries.get(record.transition_id).?;
+    try std.testing.expectEqual(@as(u8, 0), pending.failures);
+    try std.testing.expectEqual(@as(u64, 1250), pending.retry_at_ms);
+    clock_ms = 1249;
+    _ = try service.stepPending();
+    try std.testing.expectEqual(@as(usize, 1), stub.publication_calls);
+    clock_ms = 1250;
+    _ = try service.stepPending();
+    try std.testing.expectEqual(@as(usize, 2), stub.publication_calls);
+    try std.testing.expectEqual(@as(u64, 1500), service.merge_retries.get(record.transition_id).?.retry_at_ms);
+    // The same bounded progress policy applies to artifact transfer/verifier
+    // slices, without treating successful work as an exponential failure.
+    stub.artifact_pending = true;
+    clock_ms = 1500;
+    _ = try service.stepPending();
+    try std.testing.expectEqual(@as(usize, 3), stub.publication_calls);
+    try std.testing.expectEqual(@as(u8, 0), service.merge_retries.get(record.transition_id).?.failures);
+    try std.testing.expectEqual(@as(u64, 1750), service.merge_retries.get(record.transition_id).?.retry_at_ms);
+    clock_ms = 1749;
+    _ = try service.stepPending();
+    try std.testing.expectEqual(@as(usize, 3), stub.publication_calls);
+    clock_ms = 1750;
+    _ = try service.stepPending();
+    try std.testing.expectEqual(@as(usize, 4), stub.publication_calls);
+    try std.testing.expectEqual(@as(u8, 0), service.merge_retries.get(record.transition_id).?.failures);
+    try std.testing.expectEqual(@as(u64, 2000), service.merge_retries.get(record.transition_id).?.retry_at_ms);
+    // Explicit disable changes admission policy, not recovery authority.
+    // Exercise the actual scheduler with the recovery-only installed shape.
+    try std.testing.expect(service.removeMerge(record.transition_id));
+    service.online_driver.?.admit = null;
+    const admissions_before = stub.admission_calls;
+    const ordinary_before = stub.ordinary_calls;
+    try service.submitMerge(ordinary);
+    _ = try service.stepPending();
+    try std.testing.expectEqual(admissions_before, stub.admission_calls);
+    try std.testing.expect(stub.ordinary_calls > ordinary_before);
+    try std.testing.expect(service.pending_merge.items[0].online == null);
+    try std.testing.expect(service.removeMerge(record.transition_id));
+    const ordinary_before_recovery = stub.ordinary_calls;
+    stub.recovery_published = true;
+    try service.submitMerge(publishing);
+    _ = try service.stepPending();
+    try std.testing.expectEqual(admissions_before, stub.admission_calls);
+    try std.testing.expectEqual(ordinary_before_recovery, stub.ordinary_calls);
+    try std.testing.expectEqual(.snapshot, service.pending_merge.items[0].online.?.phase);
+    try std.testing.expect(stub.recovered_durable.?.eql(service.pending_merge.items[0].online.?));
+}
+
 test "transition service owns records and fences reentrant observations" {
     const Pass = enum { step, background, terminal };
     const Stub = struct {
@@ -1190,6 +1415,8 @@ test "transition service owns records and fences reentrant observations" {
                     @field(value, field.name) = observeSplit;
                 } else if (std.mem.eql(u8, field.name, "observe_merge")) {
                     @field(value, field.name) = observeMerge;
+                } else if (@typeInfo(field.type) == .optional) {
+                    @field(value, field.name) = null;
                 } else {
                     @field(value, field.name) = struct {
                         fn call(_: *anyopaque, _: u64, _: @typeInfo(@typeInfo(field.type).pointer.child).@"fn".params[2].type.?) !void {

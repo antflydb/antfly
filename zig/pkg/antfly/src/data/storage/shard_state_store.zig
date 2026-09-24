@@ -40,21 +40,8 @@ pub const AppliedSplitState = struct {
     original_range_end: []const u8,
 };
 
-pub const MergeSourcePhase = enum(u8) {
-    accepting = 1,
-    finalized = 2,
-    rolled_back = 3,
-};
-
-/// Durable donor-side range-merge fence. `applied_index` is the exact Raft
-/// index of the lifecycle command, and therefore the receiver watermark that
-/// must be covered before metadata can retire a finalized donor.
-pub const AppliedMergeSourceState = struct {
-    transition_id: u64,
-    receiver_group_id: u64,
-    phase: MergeSourcePhase,
-    applied_index: u64,
-};
+pub const MergeSourcePhase = @import("../../storage/data_raft_projection_wire.zig").MergeSourcePhase;
+pub const AppliedMergeSourceState = @import("../../storage/data_raft_projection_wire.zig").AppliedMergeSourceState;
 
 pub const SplitHandoff = struct {
     byte_range: AppliedDataRange,
@@ -98,8 +85,14 @@ pub const DataOperation = union(enum) {
     merge_receiver_checkpoint: MergeReceiverCheckpoint,
     /// Scope the following document effects to one merge copy envelope.
     merge_copy_fence: ?db_types.MergeReplicationContext,
+    /// Owned bounded native batch JSON, including its page effect digest.
+    merge_page_fence: []const u8,
     /// Irreversibly activates a Raft batch log format for this group.
     set_raft_batch_protocol: u16,
+    /// Source effects execute only in the native delegate, after this guard.
+    require_source_pin_protocol: void,
+    topology_guard: @import("online_topology_arbitration.zig").Guard,
+    topology_end: void,
     /// Internal apply boundary. Split deltas use the committed Raft index as
     /// their stable cursor, independent of each replica's apply batching.
     flush_split_delta: u64,
@@ -244,6 +237,19 @@ pub fn currentRaftBatchProtocolVersion(
     if (version == 0 or version > data_raft_protocol.batch_protocol_version)
         return error.InvalidRaftBatchProtocolVersion;
     return version;
+}
+
+pub fn snapshotRequiresNativePrimary(txn: *docstore.DocStore.Txn, alloc: std.mem.Allocator, group_id: u64) !bool {
+    const key = try groupRaftBatchProtocolKeyAlloc(alloc, group_id);
+    defer alloc.free(key);
+    const raw = txn.get(key) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    if (raw.len != 2) return error.InvalidRaftBatchProtocolVersion;
+    const version = std.mem.readInt(u16, raw[0..2], .little);
+    if (version == 0 or version > data_raft_protocol.batch_protocol_version) return error.InvalidRaftBatchProtocolVersion;
+    return version >= data_raft_protocol.batch_native_snapshot_protocol_version;
 }
 
 fn dupeRangeAlloc(alloc: std.mem.Allocator, byte_range: AppliedDataRange) !AppliedDataRange {
@@ -697,18 +703,57 @@ pub fn writeSnapshotTxn(
     writer: *std.Io.Writer,
     cancelled: ?*const std.atomic.Value(bool),
 ) !void {
+    if (cancelled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
+    if (try snapshotRequiresNativePrimary(txn, alloc, group_id)) return error.NativeSnapshotRequired;
     const byte_range = try currentRangeTxn(txn, alloc, group_id);
     defer range_state.freeRange(alloc, byte_range);
-    const controls = try groupControlStateTxn(txn, alloc, group_id);
-    defer freeGroupStateEntries(alloc, controls);
-
     try writer.writeAll(group_snapshot_magic);
     try writer.writeByte(group_snapshot_version);
     try writeSnapshotBytes(writer, byte_range.start);
     try writeSnapshotBytes(writer, byte_range.end);
     try writeGroupDocumentsTxn(txn, alloc, group_id, writer, cancelled);
-    try writeSnapshotTerminatedEntries(writer, controls);
+    var controls = SnapshotControlWriter{ .writer = writer };
+    try visitGroupControlsTxn(txn, alloc, group_id, cancelled, &controls);
+    try writer.writeByte(0);
 }
+
+/// Native-authoritative snapshots retain the same ordered control stream, but
+/// transport the primary checkpoint once instead of also copying API rows.
+/// The caller streams exactly native_size bytes immediately after this prefix.
+pub fn writeNativeSnapshotPrefixTxn(
+    txn: *docstore.DocStore.Txn,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    writer: *std.Io.Writer,
+    native_size: u64,
+    cancelled: ?*const std.atomic.Value(bool),
+) !void {
+    if (native_size == 0) return error.InvalidGroupStateSnapshot;
+    if (cancelled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
+    const byte_range = try currentRangeTxn(txn, alloc, group_id);
+    defer range_state.freeRange(alloc, byte_range);
+    try writer.writeAll(group_snapshot_magic);
+    try writer.writeByte(group_native_snapshot_version);
+    try writeSnapshotBytes(writer, byte_range.start);
+    try writeSnapshotBytes(writer, byte_range.end);
+    try writer.writeByte(0); // No duplicate logical document corpus.
+    var controls = SnapshotControlWriter{ .writer = writer };
+    try visitGroupControlsTxn(txn, alloc, group_id, cancelled, &controls);
+    try writer.writeByte(0);
+    var size: [8]u8 = undefined;
+    std.mem.writeInt(u64, &size, native_size, .little);
+    try writer.writeAll(&size);
+}
+
+const SnapshotControlWriter = struct {
+    writer: *std.Io.Writer,
+
+    fn append(self: *@This(), entry: AppliedDataKV) !void {
+        try self.writer.writeByte(1);
+        try writeSnapshotBytes(self.writer, entry.key);
+        try writeSnapshotBytes(self.writer, entry.value);
+    }
+};
 
 fn writeGroupDocumentsTxn(
     txn: *docstore.DocStore.Txn,
@@ -740,15 +785,6 @@ fn writeGroupDocumentsTxn(
         try writer.writeByte(1);
         try writeSnapshotBytes(writer, logical_key[logical_prefix.len..]);
         try writeSnapshotBytes(writer, kv.value);
-    }
-    try writer.writeByte(0);
-}
-
-fn writeSnapshotTerminatedEntries(writer: *std.Io.Writer, entries: []const AppliedDataKV) !void {
-    for (entries) |entry| {
-        try writer.writeByte(1);
-        try writeSnapshotBytes(writer, entry.key);
-        try writeSnapshotBytes(writer, entry.value);
     }
     try writer.writeByte(0);
 }
@@ -796,6 +832,7 @@ pub const GroupStateSnapshotStream = struct {
     controls_pos: usize,
     first_entry_key: ?[]const u8,
     last_entry_key: ?[]const u8,
+    native_primary: ?[]const u8 = null,
 
     pub const Iterator = struct {
         encoded: []const u8,
@@ -822,7 +859,8 @@ pub const GroupStateSnapshotStream = struct {
     pub fn init(encoded: []const u8) !GroupStateSnapshotStream {
         if (encoded.len < group_snapshot_magic.len + 1 or
             !std.mem.eql(u8, encoded[0..group_snapshot_magic.len], group_snapshot_magic) or
-            encoded[group_snapshot_magic.len] != group_snapshot_version)
+            (encoded[group_snapshot_magic.len] != group_snapshot_version and
+                encoded[group_snapshot_magic.len] != group_native_snapshot_version))
         {
             return error.InvalidGroupStateSnapshot;
         }
@@ -844,6 +882,15 @@ pub const GroupStateSnapshotStream = struct {
         pos = entry_iterator.pos;
         const controls_pos = pos;
         try skipSnapshotTerminatedEntries(encoded, &pos);
+        const native_primary: ?[]const u8 = if (encoded[group_snapshot_magic.len] == group_native_snapshot_version) blk: {
+            if (first_entry_key != null or encoded.len - pos < 8) return error.InvalidGroupStateSnapshot;
+            const len = std.mem.readInt(u64, encoded[pos..][0..8], .little);
+            pos += 8;
+            if (len == 0 or len != encoded.len - pos) return error.InvalidGroupStateSnapshot;
+            const value = encoded[pos..];
+            pos = encoded.len;
+            break :blk value;
+        } else null;
         if (pos != encoded.len) return error.InvalidGroupStateSnapshot;
         return .{
             .encoded = encoded,
@@ -852,6 +899,7 @@ pub const GroupStateSnapshotStream = struct {
             .controls_pos = controls_pos,
             .first_entry_key = first_entry_key,
             .last_entry_key = last_entry_key,
+            .native_primary = native_primary,
         };
     }
 
@@ -931,6 +979,14 @@ pub fn validateGroupStateSnapshotStream(alloc: std.mem.Allocator, group_id: u64,
         snapshot.last_entry_key,
         snapshot.controls(),
     );
+    var controls = snapshot.controls();
+    var native_required = false;
+    while (try controls.next()) |entry| {
+        if (groupControlKind(group_id, entry.key)) |kind| if (kind == .raft_batch_protocol) {
+            native_required = std.mem.readInt(u16, entry.value[0..2], .little) >= data_raft_protocol.batch_native_snapshot_protocol_version;
+        };
+    }
+    if (native_required != (snapshot.native_primary != null)) return error.InvalidGroupStateSnapshot;
 }
 
 pub fn installSnapshot(store: *docstore.DocStore, alloc: std.mem.Allocator, group_id: u64, encoded: []const u8) !void {
@@ -947,8 +1003,35 @@ pub fn installSnapshotStreamIntoEmptyStore(
     snapshot: GroupStateSnapshotStream,
     external_metadata_writes: []const docstore.KVPair,
 ) !void {
+    if (snapshot.native_primary != null) return error.NativeSnapshotRequired;
     try validateGroupStateSnapshotStream(alloc, group_id, snapshot);
 
+    try installSnapshotProjectionIntoEmptyStore(store, alloc, group_id, snapshot, external_metadata_writes);
+}
+
+/// The source is the verified, unpublished native generation owned by the
+/// caller. Both projections are prepared from that one checkpoint extraction.
+pub fn installNativeSnapshotStreamIntoEmptyStore(
+    store: *docstore.DocStore,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    snapshot: GroupStateSnapshotStream,
+    native_source: *docstore.DocStore,
+    external_metadata_writes: []const docstore.KVPair,
+) !void {
+    if (snapshot.native_primary == null) return error.InvalidGroupStateSnapshot;
+    try validateGroupStateSnapshotStream(alloc, group_id, snapshot);
+    try installSnapshotProjectionIntoEmptyStore(store, alloc, group_id, snapshot, &.{});
+    try reconcileAuthoritativeGroupDocumentsPaged(store, native_source, alloc, group_id, snapshot.byte_range, external_metadata_writes, 512, 4 * 1024 * 1024);
+}
+
+fn installSnapshotProjectionIntoEmptyStore(
+    store: *docstore.DocStore,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    snapshot: GroupStateSnapshotStream,
+    external_metadata_writes: []const docstore.KVPair,
+) !void {
     const max_chunk_entries = 512;
     var writes: [max_chunk_entries]docstore.KVPair = undefined;
     var owned_keys: [max_chunk_entries][]u8 = undefined;
@@ -1070,6 +1153,11 @@ fn validateGroupStateSnapshotEntryBounds(
     var max_delta_sequence: u64 = 0;
     var previous_control_order: ?u8 = null;
     var previous_delta_sequence: u64 = 0;
+    var spool_count: u32 = 0;
+    var spool_manifest: ?u32 = null;
+    var spool_seen_manifest = false;
+    var spool_assembly: ?@import("../../storage/db/merge_page_contract.zig").Assembly = null;
+    var protocol_version: u16 = 0;
     var controls = controls_iterator;
     while (try controls.next()) |control| {
         try validateGroupControlEntry(alloc, group_id, control);
@@ -1082,21 +1170,41 @@ fn validateGroupStateSnapshotEntryBounds(
             .terminal => 4,
             .merge_source => 5,
             .merge_receiver => 6,
-            .delta => 7,
+            .merge_page => 7,
+            .online_topology => 8,
+            .delta => 9,
+            .merge_spool_slot, .merge_spool_manifest => 10,
         };
         if (previous_control_order) |previous| {
-            if (control_order < previous or (control_order == previous and control_order != 7))
+            if (control_order < previous or (control_order == previous and control_order != 9 and control_order != 10))
                 return error.InvalidGroupStateSnapshot;
         }
         previous_control_order = control_order;
         switch (kind) {
-            .raft_batch_protocol => {},
+            .raft_batch_protocol => protocol_version = std.mem.readInt(u16, control.value[0..2], .little),
             .split_state => state_entry = control,
             .delta_sequence => sequence = std.mem.readInt(u64, control.value[0..8], .little),
             .acknowledgement => acknowledgement_entry = control,
             .terminal => terminal_entry = control,
             .merge_source => {},
             .merge_receiver => {},
+            .online_topology => if (protocol_version < data_raft_protocol.batch_native_snapshot_protocol_version) return error.InvalidGroupStateSnapshot,
+            .merge_page => {
+                var decoded = try @import("../../storage/db/merge_page_contract.zig").decode(alloc, control.value);
+                defer decoded.deinit();
+                spool_assembly = decoded.value.assembly;
+            },
+            .merge_spool_slot => |slot| {
+                if (spool_seen_manifest or slot != spool_count) return error.InvalidGroupStateSnapshot;
+                if (spool_assembly) |assembly| if (slot < assembly.next_offset / @import("../../storage/db/merge_page_contract.zig").chunk_bytes and
+                    !std.mem.eql(u8, control.value[0..32], &assembly.transfer_digest)) return error.InvalidGroupStateSnapshot;
+                spool_count += 1;
+            },
+            .merge_spool_manifest => {
+                if (spool_seen_manifest) return error.InvalidGroupStateSnapshot;
+                spool_seen_manifest = true;
+                spool_manifest = std.mem.readInt(u32, control.value[0..4], .little);
+            },
             .delta => |delta_sequence| {
                 if (delta_sequence == 0 or delta_sequence <= previous_delta_sequence)
                     return error.InvalidGroupStateSnapshot;
@@ -1108,6 +1216,9 @@ fn validateGroupStateSnapshotEntryBounds(
     }
 
     const source_sequence = sequence orelse 0;
+    if (spool_count != (spool_manifest orelse 0)) return error.InvalidGroupStateSnapshot;
+    if ((spool_count != 0 or spool_assembly != null) and protocol_version < data_raft_protocol.batch_merge_chunk_protocol_version) return error.InvalidGroupStateSnapshot;
+    if (spool_assembly) |assembly| if (assembly.next_offset / @import("../../storage/db/merge_page_contract.zig").chunk_bytes > spool_count) return error.InvalidGroupStateSnapshot;
     if ((delta_count > 0 and sequence == null) or
         max_delta_sequence > source_sequence or
         (delta_count > 0 and max_delta_sequence != source_sequence))
@@ -1198,6 +1309,10 @@ const GroupControlKind = union(enum) {
     terminal,
     merge_source,
     merge_receiver,
+    merge_page,
+    online_topology,
+    merge_spool_slot: u32,
+    merge_spool_manifest,
     delta: u64,
 };
 
@@ -1217,12 +1332,35 @@ fn groupControlKind(group_id: u64, key: []const u8) ?GroupControlKind {
     if (std.mem.eql(u8, merge_source_key, key)) return .merge_source;
     const merge_receiver_key = std.fmt.bufPrint(&buf, "\x00\x00__metadata__:data_group_merge_receiver:{d}", .{group_id}) catch return null;
     if (std.mem.eql(u8, merge_receiver_key, key)) return .merge_receiver;
+    const merge_page_key = std.fmt.bufPrint(&buf, "\x00\x00__metadata__:data_group_merge_page:{d}", .{group_id}) catch return null;
+    if (std.mem.eql(u8, merge_page_key, key)) return .merge_page;
+    const online_key = @import("online_topology_arbitration.zig").reservationKey(&buf, group_id) catch return null;
+    if (std.mem.eql(u8, online_key, key)) return .online_topology;
+    const spool_prefix = std.fmt.bufPrint(&buf, "\x00\x00__metadata__:data_group_merge_spool:{d}:", .{group_id}) catch return null;
+    if (std.mem.startsWith(u8, key, spool_prefix)) {
+        const chunks = @import("../../storage/db/merge_page_chunks.zig");
+        const suffix = key[spool_prefix.len..];
+        if (std.mem.eql(u8, suffix, chunks.manifest_key)) return .merge_spool_manifest;
+        if (suffix.len == chunks.slot_prefix.len + 4 and std.mem.startsWith(u8, suffix, chunks.slot_prefix)) return .{ .merge_spool_slot = std.mem.readInt(u32, suffix[chunks.slot_prefix.len..][0..4], .big) };
+        return null;
+    }
     return if (parseSplitDeltaSeq(group_id, key)) |sequence| .{ .delta = sequence } else null;
 }
 
 fn validateGroupControlEntry(alloc: std.mem.Allocator, group_id: u64, entry: AppliedDataKV) !void {
     const kind = groupControlKind(group_id, entry.key) orelse return error.InvalidGroupStateSnapshot;
     switch (kind) {
+        .online_topology => {
+            const reservation = @import("online_topology_arbitration.zig").Reservation.decode(entry.value) catch return error.InvalidGroupStateSnapshot;
+            if (reservation.scope.fence.owner_group_id != group_id) return error.InvalidGroupStateSnapshot;
+        },
+        .merge_spool_slot => |slot| {
+            if (slot >= 4096) return error.InvalidGroupStateSnapshot;
+            @import("../../storage/db/merge_page_chunks.zig").validateSlot(entry.value) catch return error.InvalidGroupStateSnapshot;
+        },
+        .merge_spool_manifest => {
+            if (entry.value.len != 4 or std.mem.readInt(u32, entry.value[0..4], .little) > 4096) return error.InvalidGroupStateSnapshot;
+        },
         .raft_batch_protocol => {
             if (entry.value.len != @sizeOf(u16)) return error.InvalidGroupStateSnapshot;
             const version = std.mem.readInt(u16, entry.value[0..2], .little);
@@ -1256,6 +1394,11 @@ fn validateGroupControlEntry(alloc: std.mem.Allocator, group_id: u64, entry: App
             var state = merge_state.decodeAlloc(alloc, entry.value) catch
                 return error.InvalidGroupStateSnapshot;
             state.deinit(alloc);
+        },
+        .merge_page => {
+            var progress = @import("../../storage/db/merge_page_contract.zig").decode(alloc, entry.value) catch return error.InvalidGroupStateSnapshot;
+            defer progress.deinit();
+            if (progress.value.receiver_group_id != group_id) return error.InvalidGroupStateSnapshot;
         },
         .delta => |sequence| {
             var delta = shard_mod.decodeSplitDeltaAlloc(alloc, sequence, entry.value) catch return error.InvalidGroupStateSnapshot;
@@ -1351,16 +1494,42 @@ fn groupControlState(store: *docstore.DocStore, alloc: std.mem.Allocator, group_
 }
 
 fn groupControlStateTxn(txn: *docstore.DocStore.Txn, alloc: std.mem.Allocator, group_id: u64) ![]AppliedDataKV {
-    var out = std.ArrayListUnmanaged(AppliedDataKV).empty;
+    const Collector = struct {
+        alloc: std.mem.Allocator,
+        out: std.ArrayListUnmanaged(AppliedDataKV) = .empty,
+
+        fn append(self: *@This(), entry: AppliedDataKV) !void {
+            const key = try self.alloc.dupe(u8, entry.key);
+            errdefer self.alloc.free(key);
+            const value = try self.alloc.dupe(u8, entry.value);
+            errdefer self.alloc.free(value);
+            try self.out.append(self.alloc, .{ .key = key, .value = value });
+        }
+    };
+    var collector = Collector{ .alloc = alloc };
     errdefer {
-        for (out.items) |entry| {
+        for (collector.out.items) |entry| {
             alloc.free(@constCast(entry.key));
             alloc.free(@constCast(entry.value));
         }
-        out.deinit(alloc);
+        collector.out.deinit(alloc);
     }
+    try visitGroupControlsTxn(txn, alloc, group_id, null, &collector);
+    return try collector.out.toOwnedSlice(alloc);
+}
 
-    var point_keys: [7][]u8 = undefined;
+/// Visit controls in wire order using values borrowed from the pinned read
+/// transaction. In particular, do not collect the split journal or merge row
+/// spool: either can be much larger than the snapshot writer's memory budget.
+fn visitGroupControlsTxn(
+    txn: *docstore.DocStore.Txn,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    cancelled: ?*const std.atomic.Value(bool),
+    sink: anytype,
+) !void {
+    if (cancelled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
+    var point_keys: [9][]u8 = undefined;
     var initialized: usize = 0;
     defer for (point_keys[0..initialized]) |key| alloc.free(key);
     point_keys[initialized] = try groupRaftBatchProtocolKeyAlloc(alloc, group_id);
@@ -1377,30 +1546,54 @@ fn groupControlStateTxn(txn: *docstore.DocStore.Txn, alloc: std.mem.Allocator, g
     initialized += 1;
     point_keys[initialized] = try groupMergeReceiverStateKeyAlloc(alloc, group_id);
     initialized += 1;
+    point_keys[initialized] = try groupMergePageKeyAlloc(alloc, group_id);
+    initialized += 1;
+    var online_key_buf: [160]u8 = undefined;
+    point_keys[initialized] = try alloc.dupe(u8, try @import("online_topology_arbitration.zig").reservationKey(&online_key_buf, group_id));
+    initialized += 1;
     for (point_keys) |key| {
+        if (cancelled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
         const borrowed = txn.get(key) catch |err| switch (err) {
             error.NotFound => continue,
             else => return err,
         };
-        const owned_key = try alloc.dupe(u8, key);
-        errdefer alloc.free(owned_key);
-        const value = try alloc.dupe(u8, borrowed);
-        errdefer alloc.free(value);
-        try out.append(alloc, .{ .key = owned_key, .value = value });
+        try sink.append(.{ .key = key, .value = borrowed });
     }
 
     const delta_prefix = try groupSplitDeltaPrefixAlloc(alloc, group_id);
     defer alloc.free(delta_prefix);
-    const deltas = try docstore.DocStore.scanPrefixTxn(alloc, txn, delta_prefix);
-    defer alloc.free(deltas);
-    for (deltas) |delta| {
-        errdefer {
-            alloc.free(delta.key);
-            alloc.free(delta.value);
-        }
-        try out.append(alloc, .{ .key = delta.key, .value = delta.value });
+    try visitGroupControlPrefixTxn(txn, delta_prefix, cancelled, sink);
+    const spool_prefix = try groupMergeChunkKey(alloc, group_id, "");
+    defer alloc.free(spool_prefix);
+    try visitGroupControlPrefixTxn(txn, spool_prefix, cancelled, sink);
+}
+
+fn visitGroupControlPrefixTxn(
+    txn: *docstore.DocStore.Txn,
+    prefix: []const u8,
+    cancelled: ?*const std.atomic.Value(bool),
+    sink: anytype,
+) !void {
+    if (cancelled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    // Both control families end in ':' and have a fixed, bounded metadata
+    // prefix. Bound the cursor so it never decodes an adjacent family's value.
+    var upper_buf: [128]u8 = undefined;
+    std.debug.assert(prefix.len > 0 and prefix.len <= upper_buf.len and prefix[prefix.len - 1] == ':');
+    @memcpy(upper_buf[0..prefix.len], prefix);
+    upper_buf[prefix.len - 1] += 1;
+    cursor.setUpperBound(upper_buf[0..prefix.len]);
+    var entry = try cursor.seekAtOrAfter(prefix);
+    while (entry) |kv| {
+        if (cancelled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
+        if (!std.mem.startsWith(u8, kv.key, prefix)) break;
+        try sink.append(.{ .key = kv.key, .value = kv.value });
+        // Cancellation is checked before fetching the next potentially large
+        // spool slot, not just after the cursor has materialized its value.
+        if (cancelled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
+        entry = try cursor.next();
     }
-    return try out.toOwnedSlice(alloc);
 }
 
 fn groupStateInRange(
@@ -1426,6 +1619,33 @@ pub fn groupStatePageInRange(
     max_entries: usize,
     max_bytes: usize,
 ) !GroupStatePage {
+    return groupStatePageProjected(true, store, alloc, group_id, byte_range, after_key, max_entries, max_bytes);
+}
+
+/// Cleanup needs only logical keys. Do not materialize a wide projected row
+/// merely to discard its value when constructing the ordinary delete batch.
+pub fn groupStateKeysPageInRange(
+    store: *docstore.DocStore,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    byte_range: AppliedDataRange,
+    after_key: ?[]const u8,
+    max_entries: usize,
+    max_bytes: usize,
+) !GroupStatePage {
+    return groupStatePageProjected(false, store, alloc, group_id, byte_range, after_key, max_entries, max_bytes);
+}
+
+fn groupStatePageProjected(
+    comptime include_values: bool,
+    store: *docstore.DocStore,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    byte_range: AppliedDataRange,
+    after_key: ?[]const u8,
+    max_entries: usize,
+    max_bytes: usize,
+) !GroupStatePage {
     if (max_entries == 0 or max_bytes == 0)
         return .{ .entries = try alloc.alloc(AppliedDataKV, 0), .exhausted = false };
 
@@ -1439,7 +1659,7 @@ pub fn groupStatePageInRange(
 
     var txn = try store.beginReadTxn();
     defer txn.abort();
-    var cursor = try txn.openCursor();
+    var cursor = if (include_values) try txn.openCursor() else try txn.openPhysicalCursorAdapter();
     defer cursor.close();
     cursor.setUpperBound(upper);
 
@@ -1468,7 +1688,7 @@ pub fn groupStatePageInRange(
                 continue;
             }
         }
-        const entry_bytes = std.math.add(usize, raw_key.len, kv.value.len) catch return error.OutOfMemory;
+        const entry_bytes = std.math.add(usize, raw_key.len, if (include_values) kv.value.len else 0) catch return error.OutOfMemory;
         if (entries.items.len > 0 and
             (entries.items.len >= max_entries or entry_bytes > max_bytes -| used_bytes))
         {
@@ -1476,7 +1696,7 @@ pub fn groupStatePageInRange(
             exhausted = false;
             break;
         }
-        const value = try alloc.dupe(u8, kv.value);
+        const value = try alloc.dupe(u8, if (include_values) kv.value else "");
         errdefer alloc.free(value);
         try entries.append(alloc, .{ .key = raw_key, .value = value });
         used_bytes +|= entry_bytes;
@@ -1489,6 +1709,44 @@ pub fn groupStatePageInRange(
         .entries = try entries.toOwnedSlice(alloc),
         .exhausted = exhausted,
     };
+}
+
+test "group state range scan keys-only cleanup pages do not materialize wide values" {
+    const alloc = std.testing.allocator;
+    const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
+    var directory = try TestDirectory.init("group-state-key-pages");
+    defer directory.cleanup();
+    var store = try docstore.DocStore.open(alloc, directory.path().ptr, .{});
+    defer store.close();
+    const wide = try alloc.alloc(u8, 256 * 1024);
+    defer alloc.free(wide);
+    @memset(wide, 'x');
+    for ([_][]const u8{ "a", "m\x00", "n", "z" }) |key| {
+        const physical = try groupDocumentStoreKeyAlloc(alloc, 7, key);
+        defer alloc.free(physical);
+        try store.put(physical, wide);
+    }
+    // The value-returning scan requires at least 256 KiB for its first row;
+    // the deletion projection remains bounded by key count/bytes alone.
+    var scratch: [8 * 1024]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&scratch);
+    const page_alloc = bounded.allocator();
+    var first = try groupStateKeysPageInRange(&store, page_alloc, 7, .{ .start = "m", .end = "z" }, null, 1, 16);
+    defer first.deinit(page_alloc);
+    try std.testing.expectEqual(@as(usize, 1), first.entries.len);
+    try std.testing.expectEqualStrings("m\x00", first.entries[0].key);
+    try std.testing.expectEqualStrings("", first.entries[0].value);
+    try std.testing.expect(!first.exhausted);
+    var second = try groupStateKeysPageInRange(&store, page_alloc, 7, .{ .start = "m", .end = "z" }, first.entries[0].key, 128, 512 * 1024);
+    defer second.deinit(page_alloc);
+    try std.testing.expectEqual(@as(usize, 1), second.entries.len);
+    try std.testing.expectEqualStrings("n", second.entries[0].key);
+    try std.testing.expectEqualStrings("", second.entries[0].value);
+    try std.testing.expect(second.exhausted);
+    var empty = try groupStateKeysPageInRange(&store, page_alloc, 7, .{ .start = "m", .end = "z" }, second.entries[0].key, 128, 512 * 1024);
+    defer empty.deinit(page_alloc);
+    try std.testing.expectEqual(@as(usize, 0), empty.entries.len);
+    try std.testing.expect(empty.exhausted);
 }
 
 fn nextPrimaryRawKeyAlloc(
@@ -1505,11 +1763,13 @@ fn nextPrimaryRawKeyAlloc(
                 return null;
             }
         }
-        if (!internal_keys.isPrimaryDocumentKey(kv.key)) {
+        if (!internal_keys.isPrimaryDocumentKey(kv.key) and
+            !(group_id == null and internal_keys.isRelationalRowKey(kv.key)))
+        {
             entry.* = try cursor.next();
             continue;
         }
-        const logical_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, kv.key)) orelse {
+        const logical_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(alloc, kv.key)) orelse {
             entry.* = try cursor.next();
             continue;
         };
@@ -1828,6 +2088,16 @@ pub fn reconcileAuthoritativeGroupDocumentsPaged(
 
     var source_txn = try source.beginReadTxn();
     defer source_txn.abort();
+    // The Raft projection stores API values, never schema-bound AROW bytes.
+    // Cache one immutable layout for this streaming snapshot; this is bounded
+    // by one schema rather than the number of rows or historical epochs.
+    var layout_arena = std.heap.ArenaAllocator.init(alloc);
+    defer layout_arena.deinit();
+    const storage_schema = @import("../../storage/schema.zig");
+    const row_codec = @import("../../storage/db/algebraic/relational_row_codec.zig");
+    const relational_store = @import("../../storage/db/relational_store.zig");
+    var schema: ?storage_schema.TableSchema = null;
+    var layout: ?row_codec.PhysicalLayout = null;
     var source_cursor = try source_txn.openCursor();
     defer source_cursor.close();
     source_cursor.setUpperBound(source_upper);
@@ -1842,24 +2112,44 @@ pub fn reconcileAuthoritativeGroupDocumentsPaged(
                 entry = null;
                 break;
             };
-            if (!internal_keys.isPrimaryDocumentKey(kv.key)) {
+            if (!internal_keys.isPrimaryDocumentKey(kv.key) and !internal_keys.isRelationalRowKey(kv.key)) {
                 entry = try source_cursor.next();
                 continue;
             }
-            const raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, kv.key)) orelse {
+            const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(alloc, kv.key)) orelse {
                 entry = try source_cursor.next();
                 continue;
             };
             defer alloc.free(raw_key);
             const projected_key = try groupDocumentStoreKeyAlloc(alloc, group_id, raw_key);
             defer alloc.free(projected_key);
-            const entry_bytes = std.math.add(usize, projected_key.len, kv.value.len) catch return error.OutOfMemory;
+            const logical_value = if (internal_keys.isRelationalRowKey(kv.key)) logical: {
+                const version = try relational_store.rowSchemaVersion(kv.value);
+                if (schema == null or schema.?.version != version) {
+                    schema = null;
+                    layout = null;
+                    _ = layout_arena.reset(.retain_capacity);
+                    const owned = layout_arena.allocator();
+                    const schema_key = try storage_schema.schemaVersionKeyAlloc(owned, version);
+                    const encoded = source_txn.get(schema_key) catch |err| switch (err) {
+                        error.NotFound => return error.UnknownSchemaVersion,
+                        else => return err,
+                    };
+                    schema = try storage_schema.deserializeSchema(owned, encoded);
+                    if (schema.?.version != version) return error.InvalidSchema;
+                    layout = try row_codec.PhysicalLayout.init(owned, schema.?);
+                }
+                break :logical try relational_store.decodeValueForSchemaAndLayoutAlloc(alloc, kv.value, schema.?, &layout.?);
+            } else null;
+            defer if (logical_value) |value| alloc.free(value);
+            const value = logical_value orelse kv.value;
+            const entry_bytes = std.math.add(usize, projected_key.len, value.len) catch return error.OutOfMemory;
             if (page_entries > 0 and
                 (page_entries >= max_page_entries or entry_bytes > max_page_bytes -| page_bytes))
             {
                 break;
             }
-            try write_txn.put(projected_key, kv.value);
+            try write_txn.put(projected_key, value);
             page_entries += 1;
             page_bytes +|= entry_bytes;
             entry = try source_cursor.next();
@@ -2109,6 +2399,43 @@ test "paged authoritative reconciliation removes stale out-of-range documents be
     const marker = try projected.get(alloc, marker_key);
     defer alloc.free(marker);
     try std.testing.expectEqualStrings("complete", marker);
+}
+
+test "paged authoritative reconciliation projects schema-bound relational rows across epochs" {
+    const alloc = std.testing.allocator;
+    const schema_mod = @import("../../storage/schema.zig");
+    const relational = @import("../../storage/db/relational_store.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source_path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/relational-projection-source", .{tmp.sub_path}, 0);
+    defer alloc.free(source_path);
+    var source = try docstore.DocStore.open(alloc, source_path.ptr, .{});
+    defer source.close();
+    const projected_path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/relational-projection-target", .{tmp.sub_path}, 0);
+    defer alloc.free(projected_path);
+    var projected = try docstore.DocStore.open(alloc, projected_path.ptr, .{});
+    defer projected.close();
+    for ([_]u32{ 1, 2, 1 }, [_][]const u8{ "doc:a", "doc:b", "doc:c" }) |version, key| {
+        const schema: schema_mod.TableSchema = .{ .version = version, .storage_mode = .relational, .relational_columns = &.{.{ .name = "id", .path = "id", .column_type = .string, .required = true }} };
+        const schema_key = try schema_mod.schemaVersionKeyAlloc(alloc, version);
+        defer alloc.free(schema_key);
+        const schema_bytes = try schema_mod.serializeSchema(alloc, schema);
+        defer alloc.free(schema_bytes);
+        try source.put(schema_key, schema_bytes);
+        const row_key = try relational.keyAlloc(alloc, key);
+        defer alloc.free(row_key);
+        const encoded = try relational.encodeValueForSchemaAlloc(alloc, "{\"id\":\"kept\"}", schema);
+        defer alloc.free(encoded);
+        try source.put(row_key, encoded);
+    }
+    for (0..2) |_| try reconcileAuthoritativeGroupDocumentsPaged(&projected, &source, alloc, 61, .{ .start = "doc:a", .end = "doc:z" }, &.{}, 1, 1);
+    const rows = try groupState(&projected, alloc, 61);
+    defer freeGroupStateEntries(alloc, rows);
+    try std.testing.expectEqual(@as(usize, 3), rows.len);
+    for (rows, [_][]const u8{ "doc:a", "doc:b", "doc:c" }) |row, key| {
+        try std.testing.expectEqualStrings(key, row.key);
+        try std.testing.expectEqualStrings("{\"id\":\"kept\"}", row.value);
+    }
 }
 
 test "paged authoritative reconciliation is allocation-failure safe" {
@@ -2451,17 +2778,42 @@ pub fn appendOperationEffects(
     var split_terminal = try currentSplitTerminal(store, alloc, group_id);
     defer if (split_terminal) |terminal| freeSplitTerminal(alloc, terminal);
     var merge_source_state = try currentMergeSourceState(store, alloc, group_id);
+    const arbitration = @import("online_topology_arbitration.zig");
+    var online_reservation: ?arbitration.Reservation = null;
+    for (operations) |op| if (op == .topology_guard) {
+        var online_key_buf: [160]u8 = undefined;
+        const raw = store.get(alloc, try arbitration.reservationKey(&online_key_buf, group_id)) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        defer if (raw) |value| alloc.free(value);
+        if (raw) |value| online_reservation = try arbitration.Reservation.decode(value);
+        break;
+    };
     var merge_receiver_state = try currentMergeReceiverState(store, alloc, group_id);
     defer if (merge_receiver_state) |*state| state.deinit(alloc);
     var needs_raft_batch_protocol = false;
     for (operations) |op| switch (op) {
-        .set_raft_batch_protocol, .merge_source_transition, .merge_receiver_checkpoint, .merge_copy_fence => needs_raft_batch_protocol = true,
+        .set_raft_batch_protocol, .require_source_pin_protocol, .merge_source_transition, .merge_receiver_checkpoint, .merge_copy_fence, .merge_page_fence => needs_raft_batch_protocol = true,
         else => {},
     };
     var raft_batch_protocol_version: u16 = if (needs_raft_batch_protocol)
         try currentRaftBatchProtocolVersion(store, alloc, group_id)
     else
         0;
+    const pages = @import("../../storage/db/merge_page_contract.zig");
+    var page_progress: ?std.json.Parsed(pages.Progress) = null;
+    defer if (page_progress) |*value| value.deinit();
+    if (needs_raft_batch_protocol) {
+        const page_key = try groupMergePageKeyAlloc(alloc, group_id);
+        defer alloc.free(page_key);
+        const raw = store.get(alloc, page_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        defer if (raw) |value| alloc.free(value);
+        if (raw) |value| page_progress = try pages.decode(alloc, value);
+    }
     var delta_writes = std.ArrayListUnmanaged(docstore.OwnedKVPair).empty;
     defer {
         for (delta_writes.items) |write| {
@@ -2477,478 +2829,582 @@ pub fn appendOperationEffects(
     }
 
     var merge_copy_allowed = true;
-    for (operations) |op| switch (op) {
-        .merge_copy_fence => |replication| {
-            if (replication) |context| {
-                if (context.copy_attempt.donor_term != 0 and
-                    raft_batch_protocol_version < data_raft_protocol.batch_merge_copy_attempt_protocol_version)
-                    return error.RaftBatchMergeProtocolNotActivated;
-            }
-            merge_copy_allowed = if (replication) |context| merge_state.copyAllowed(merge_receiver_state, context) else true;
-        },
-        .set_raft_batch_protocol => |version| {
-            if (version < raft_batch_protocol_version)
-                return error.RaftBatchProtocolVersionRegression;
-            try appendRaftBatchProtocolEffect(
-                store,
-                alloc,
-                group_id,
-                version,
-                writes,
-                deletes,
-            );
-            raft_batch_protocol_version = version;
-        },
-        .put => |put| {
-            if (!merge_copy_allowed) continue;
-            if (merge_source_state != null and merge_source_state.?.phase == .finalized)
-                return error.MergeSourceFenced;
-            const shard_split_state: ?shard_mod.SplitState = if (split_state) |state| .{
-                .phase = state.phase,
-                .split_key = state.split_key,
-                .new_shard_id = state.new_shard_id,
-                .started_at = 0,
-                .original_range_end = state.original_range_end,
-            } else null;
-            try shard_mod.validateSplitAwareOwnership(byte_range, shard_split_state, put.key);
-            const state_key = try groupDocumentStoreKeyAlloc(alloc, group_id, put.key);
-            errdefer alloc.free(state_key);
-            removeOwnedWriteByKey(alloc, writes, state_key);
-            removeDeleteByKey(alloc, deletes, state_key);
-            const state_value = try alloc.dupe(u8, put.value);
-            errdefer alloc.free(state_value);
-            try writes.append(alloc, .{ .key = state_key, .value = state_value });
-            if (split_state != null and split_state.?.phase == .splitting) {
-                removeOwnedWriteByKey(alloc, &delta_writes, state_key);
-                removeDeleteByKey(alloc, &delta_deletes, state_key);
-                try delta_writes.append(alloc, .{
-                    .key = try alloc.dupe(u8, state_key),
-                    .value = try alloc.dupe(u8, put.value),
-                });
-            }
-        },
-        .delete => |key_to_delete| {
-            if (!merge_copy_allowed) continue;
-            if (merge_source_state != null and merge_source_state.?.phase == .finalized)
-                return error.MergeSourceFenced;
-            const shard_split_state: ?shard_mod.SplitState = if (split_state) |state| .{
-                .phase = state.phase,
-                .split_key = state.split_key,
-                .new_shard_id = state.new_shard_id,
-                .started_at = 0,
-                .original_range_end = state.original_range_end,
-            } else null;
-            try shard_mod.validateSplitAwareOwnership(byte_range, shard_split_state, key_to_delete);
-            const state_key = try groupDocumentStoreKeyAlloc(alloc, group_id, key_to_delete);
-            errdefer alloc.free(state_key);
-            removeOwnedWriteByKey(alloc, writes, state_key);
-            removeDeleteByKey(alloc, deletes, state_key);
-            try deletes.append(alloc, state_key);
-            if (split_state != null and split_state.?.phase == .splitting) {
-                removeOwnedWriteByKey(alloc, &delta_writes, state_key);
-                removeDeleteByKey(alloc, &delta_deletes, state_key);
-                try delta_deletes.append(alloc, try alloc.dupe(u8, state_key));
-            }
-        },
-        .set_range => |range| {
-            range_state.freeRange(alloc, byte_range);
-            byte_range = .{
-                .start = try alloc.dupe(u8, range.start),
-                .end = try alloc.dupe(u8, range.end),
-            };
-            const range_key = try groupRangeKeyAlloc(alloc, group_id);
-            errdefer alloc.free(range_key);
-            removeOwnedWriteByKey(alloc, writes, range_key);
-            removeDeleteByKey(alloc, deletes, range_key);
-            const range_value = try range_state.encodeRangeAlloc(alloc, byte_range);
-            errdefer alloc.free(range_value);
-            try writes.append(alloc, .{ .key = range_key, .value = range_value });
-        },
-        .prepare_split => |prepare| {
-            if (prepare.attempt_epoch == 0) return error.InvalidSplitAttemptEpoch;
-            if (split_terminal) |terminal| {
-                if (prepare.attempt_epoch < terminal.attempt_epoch) continue;
-                if (prepare.attempt_epoch == terminal.attempt_epoch) {
-                    try validateSplitTerminalIdentity(terminal, prepare.transition_id, prepare.attempt_epoch, prepare.new_shard_id, prepare.split_key);
-                    continue;
+    var topology_rejected = false;
+    for (operations) |op| {
+        if (topology_rejected and op != .topology_guard and op != .topology_end) continue;
+        switch (op) {
+            .topology_end => topology_rejected = false,
+            .topology_guard => |guard| {
+                topology_rejected = false;
+                const ordinary_active = split_state != null or
+                    (merge_source_state != null and merge_source_state.?.phase != .rolled_back) or
+                    (merge_receiver_state != null and merge_receiver_state.?.phase != .finalized and merge_receiver_state.?.phase != .rolled_back);
+                const before = online_reservation;
+                if (try arbitration.decide(&online_reservation, guard, ordinary_active)) |rejection| {
+                    topology_rejected = true;
+                    var rejection_buf: [176]u8 = undefined;
+                    const owned_key = try alloc.dupe(u8, try arbitration.rejectionKey(&rejection_buf, group_id, guard.index));
+                    errdefer alloc.free(owned_key);
+                    const owned_value = try alloc.dupe(u8, &.{@intFromEnum(rejection)});
+                    errdefer alloc.free(owned_value);
+                    try writes.append(alloc, .{ .key = owned_key, .value = owned_value });
+                } else if (!std.meta.eql(before, online_reservation)) {
+                    var online_key_buf: [160]u8 = undefined;
+                    const key = try arbitration.reservationKey(&online_key_buf, group_id);
+                    removeOwnedWriteByKey(alloc, writes, key);
+                    removeDeleteByKey(alloc, deletes, key);
+                    const owned_key = try alloc.dupe(u8, key);
+                    errdefer alloc.free(owned_key);
+                    const value = try alloc.dupe(u8, &try online_reservation.?.encode());
+                    errdefer alloc.free(value);
+                    try writes.append(alloc, .{ .key = owned_key, .value = value });
                 }
-            }
-            if (split_state) |state| {
-                const already_prepared = switch (state.phase) {
-                    .prepare, .splitting, .finalizing => state.transition_id == prepare.transition_id and
-                        state.attempt_epoch == prepare.attempt_epoch and
-                        state.new_shard_id == prepare.new_shard_id and
-                        std.mem.eql(u8, state.split_key, prepare.split_key),
-                    .none, .rolling_back => false,
-                };
-                if (already_prepared) continue;
-                if (state.phase == .prepare or state.phase == .splitting or state.phase == .finalizing)
-                    return error.ConflictingSplitTransition;
-            }
-            const shard_split_state: ?shard_mod.SplitState = if (split_state) |state| .{
-                .phase = state.phase,
-                .split_key = state.split_key,
-                .new_shard_id = state.new_shard_id,
-                .started_at = 0,
-                .original_range_end = state.original_range_end,
-            } else null;
-            try shard_mod.validatePrepareSplit(byte_range, shard_split_state, prepare.split_key);
-
-            if (split_state) |state| {
-                freeSplitState(alloc, state);
-                split_state = null;
-            }
-
-            split_state = try allocPreparedSplitState(alloc, byte_range.end, prepare);
-            try appendSplitStateWrite(alloc, group_id, split_state.?, writes, deletes);
-
-            try appendSplitAcknowledgementClear(alloc, group_id, writes, deletes);
-            split_acknowledgement = null;
-        },
-        .start_split => |start| {
-            if (start.attempt_epoch == 0) return error.InvalidSplitAttemptEpoch;
-            if (split_terminal) |terminal| {
-                if (start.attempt_epoch < terminal.attempt_epoch) continue;
-                if (start.attempt_epoch == terminal.attempt_epoch) {
-                    try validateSplitTerminalIdentity(terminal, start.transition_id, start.attempt_epoch, start.new_shard_id, start.split_key);
-                    continue;
-                }
-            }
-            if (split_state) |state| {
-                const already_started = switch (state.phase) {
-                    .splitting, .finalizing => state.transition_id == start.transition_id and
-                        state.attempt_epoch == start.attempt_epoch and
-                        state.new_shard_id == start.new_shard_id and
-                        std.mem.eql(u8, state.split_key, start.split_key),
-                    .none, .prepare, .rolling_back => false,
-                };
-                if (already_started) continue;
-                if (state.phase == .splitting or state.phase == .finalizing)
-                    return error.ConflictingSplitTransition;
-            }
-            if (split_state == null) {
-                // A replacement generation can inherit a Raft applied index
-                // just ahead of its projected state. Start carries the full
-                // transition identity, so recover the missing prepare only
-                // while the unsplit range still validates it. Conflicting or
-                // already-narrowed generations remain rejected below.
-                try shard_mod.validatePrepareSplit(byte_range, null, start.split_key);
-                split_state = try allocPreparedSplitState(alloc, byte_range.end, start);
-                try appendSplitAcknowledgementClear(alloc, group_id, writes, deletes);
-                split_acknowledgement = null;
-            }
-            const shard_split_state: ?shard_mod.SplitState = if (split_state) |state| .{
-                .phase = state.phase,
-                .split_key = state.split_key,
-                .new_shard_id = state.new_shard_id,
-                .started_at = 0,
-                .original_range_end = state.original_range_end,
-            } else null;
-            try shard_mod.validateStartSplit(shard_split_state, start.split_key);
-            try validateSplitIdentity(split_state.?, start.transition_id, start.attempt_epoch, start.new_shard_id, start.split_key);
-
-            split_state.?.phase = .splitting;
-
-            const original_start = try alloc.dupe(u8, byte_range.start);
-            errdefer alloc.free(original_start);
-            range_state.freeRange(alloc, byte_range);
-            byte_range = .{
-                .start = original_start,
-                .end = try alloc.dupe(u8, start.split_key),
-            };
-
-            const range_key = try groupRangeKeyAlloc(alloc, group_id);
-            errdefer alloc.free(range_key);
-            removeOwnedWriteByKey(alloc, writes, range_key);
-            removeDeleteByKey(alloc, deletes, range_key);
-            const range_value = try range_state.encodeRangeAlloc(alloc, byte_range);
-            errdefer alloc.free(range_value);
-            try writes.append(alloc, .{ .key = range_key, .value = range_value });
-
-            try appendSplitStateWrite(alloc, group_id, split_state.?, writes, deletes);
-
-            const split_delta_seq_key = try groupSplitDeltaSeqKeyAlloc(alloc, group_id);
-            errdefer alloc.free(split_delta_seq_key);
-            removeOwnedWriteByKey(alloc, writes, split_delta_seq_key);
-            removeDeleteByKey(alloc, deletes, split_delta_seq_key);
-            var zero_seq: [8]u8 = undefined;
-            std.mem.writeInt(u64, &zero_seq, 0, .little);
-            const zero_seq_value = try alloc.dupe(u8, &zero_seq);
-            errdefer alloc.free(zero_seq_value);
-            try writes.append(alloc, .{ .key = split_delta_seq_key, .value = zero_seq_value });
-        },
-        .acknowledge_split => |acknowledgement| {
-            const state = split_state orelse return error.SplitInProgress;
-            try validateSplitIdentity(state, acknowledgement.transition_id, acknowledgement.attempt_epoch, acknowledgement.destination_group_id, null);
-            if (state.phase != .splitting and state.phase != .finalizing) return error.SplitInProgress;
-            if (split_acknowledgement) |current| {
-                if (current.transition_id != acknowledgement.transition_id or
-                    current.attempt_epoch != acknowledgement.attempt_epoch or
-                    current.destination_group_id != acknowledgement.destination_group_id)
-                    return error.ConflictingSplitTransition;
-                if (acknowledgement.delta_sequence <= current.delta_sequence) continue;
-            }
-            if (acknowledgement.delta_sequence > source_delta_sequence)
-                return error.SplitAcknowledgementAheadOfSource;
-            const acknowledgement_key = try groupSplitAcknowledgementKeyAlloc(alloc, group_id);
-            errdefer alloc.free(acknowledgement_key);
-            removeOwnedWriteByKey(alloc, writes, acknowledgement_key);
-            removeDeleteByKey(alloc, deletes, acknowledgement_key);
-            const value = try alloc.alloc(u8, 32);
-            errdefer alloc.free(value);
-            std.mem.writeInt(u64, value[0..8], acknowledgement.transition_id, .little);
-            std.mem.writeInt(u64, value[8..16], acknowledgement.attempt_epoch, .little);
-            std.mem.writeInt(u64, value[16..24], acknowledgement.destination_group_id, .little);
-            std.mem.writeInt(u64, value[24..32], acknowledgement.delta_sequence, .little);
-            try writes.append(alloc, .{ .key = acknowledgement_key, .value = value });
-            split_acknowledgement = acknowledgement;
-        },
-        .finalize_split => |finalize| {
-            if (finalize.attempt_epoch == 0) return error.InvalidSplitAttemptEpoch;
-            if (split_terminal) |terminal| {
-                if (finalize.attempt_epoch < terminal.attempt_epoch) continue;
-                if (finalize.attempt_epoch == terminal.attempt_epoch) {
-                    try validateSplitTerminalIdentity(terminal, finalize.transition_id, finalize.attempt_epoch, finalize.new_shard_id, finalize.split_key);
-                    if (terminal.outcome != .finalized) return error.ConflictingSplitTransition;
-                    continue;
-                }
-            }
-            if (split_state) |state| try validateSplitIdentity(state, finalize.transition_id, finalize.attempt_epoch, finalize.new_shard_id, finalize.split_key);
-            const shard_split_state: ?shard_mod.SplitState = if (split_state) |state| .{
-                .phase = state.phase,
-                .split_key = state.split_key,
-                .new_shard_id = state.new_shard_id,
-                .started_at = 0,
-                .original_range_end = state.original_range_end,
-            } else null;
-            try shard_mod.validateFinalizeSplit(shard_split_state);
-            try appendFinalizeSplitDeletes(store, alloc, group_id, split_state.?, deletes);
-            try appendSplitDeltaClears(store, alloc, group_id, deletes);
-            const split_state_key = try groupSplitStateKeyAlloc(alloc, group_id);
-            defer alloc.free(split_state_key);
-            removeOwnedWriteByKey(alloc, writes, split_state_key);
-            removeDeleteByKey(alloc, deletes, split_state_key);
-            try deletes.append(alloc, try alloc.dupe(u8, split_state_key));
-            removeOwnedWritesWithPrefix(alloc, writes, "\x00\x00__metadata__:data_group_split_delta:");
-            const split_delta_seq_key = try groupSplitDeltaSeqKeyAlloc(alloc, group_id);
-            defer alloc.free(split_delta_seq_key);
-            removeOwnedWriteByKey(alloc, writes, split_delta_seq_key);
-            try appendSplitTerminal(
-                alloc,
-                group_id,
-                .{
-                    .transition_id = finalize.transition_id,
-                    .attempt_epoch = finalize.attempt_epoch,
-                    .destination_group_id = finalize.new_shard_id,
-                    .split_key = finalize.split_key,
-                    .outcome = .finalized,
-                },
-                &split_terminal,
-                writes,
-                deletes,
-            );
-            freeSplitState(alloc, split_state.?);
-            split_state = null;
-        },
-        .rollback_split => |rollback| {
-            if (rollback.attempt_epoch == 0) return error.InvalidSplitAttemptEpoch;
-            if (split_terminal) |terminal| {
-                if (rollback.attempt_epoch < terminal.attempt_epoch) continue;
-                if (rollback.attempt_epoch == terminal.attempt_epoch) {
-                    try validateSplitTerminalIdentity(terminal, rollback.transition_id, rollback.attempt_epoch, rollback.new_shard_id, rollback.split_key);
-                    if (terminal.outcome != .rolled_back) return error.ConflictingSplitTransition;
-                    continue;
-                }
-            }
-            if (split_state) |state| try validateSplitIdentity(state, rollback.transition_id, rollback.attempt_epoch, rollback.new_shard_id, rollback.split_key);
-            const shard_split_state: ?shard_mod.SplitState = if (split_state) |state| .{
-                .phase = state.phase,
-                .split_key = state.split_key,
-                .new_shard_id = state.new_shard_id,
-                .started_at = 0,
-                .original_range_end = state.original_range_end,
-            } else null;
-            try shard_mod.validateRollbackSplit(shard_split_state);
-            const original_start = try alloc.dupe(u8, byte_range.start);
-            errdefer alloc.free(original_start);
-            range_state.freeRange(alloc, byte_range);
-            byte_range = .{
-                .start = original_start,
-                .end = try alloc.dupe(u8, split_state.?.original_range_end),
-            };
-            const range_key = try groupRangeKeyAlloc(alloc, group_id);
-            errdefer alloc.free(range_key);
-            removeOwnedWriteByKey(alloc, writes, range_key);
-            removeDeleteByKey(alloc, deletes, range_key);
-            const range_value = try range_state.encodeRangeAlloc(alloc, byte_range);
-            errdefer alloc.free(range_value);
-            try writes.append(alloc, .{ .key = range_key, .value = range_value });
-
-            try appendSplitDeltaClears(store, alloc, group_id, deletes);
-            const split_state_key = try groupSplitStateKeyAlloc(alloc, group_id);
-            defer alloc.free(split_state_key);
-            removeOwnedWriteByKey(alloc, writes, split_state_key);
-            removeDeleteByKey(alloc, deletes, split_state_key);
-            try deletes.append(alloc, try alloc.dupe(u8, split_state_key));
-            removeOwnedWritesWithPrefix(alloc, writes, "\x00\x00__metadata__:data_group_split_delta:");
-            const split_delta_seq_key = try groupSplitDeltaSeqKeyAlloc(alloc, group_id);
-            defer alloc.free(split_delta_seq_key);
-            removeOwnedWriteByKey(alloc, writes, split_delta_seq_key);
-            const acknowledgement_key = try groupSplitAcknowledgementKeyAlloc(alloc, group_id);
-            defer alloc.free(acknowledgement_key);
-            removeOwnedWriteByKey(alloc, writes, acknowledgement_key);
-            removeDeleteByKey(alloc, deletes, acknowledgement_key);
-            try deletes.append(alloc, try alloc.dupe(u8, acknowledgement_key));
-            split_acknowledgement = null;
-            try appendSplitTerminal(
-                alloc,
-                group_id,
-                .{
-                    .transition_id = rollback.transition_id,
-                    .attempt_epoch = rollback.attempt_epoch,
-                    .destination_group_id = rollback.new_shard_id,
-                    .split_key = rollback.split_key,
-                    .outcome = .rolled_back,
-                },
-                &split_terminal,
-                writes,
-                deletes,
-            );
-            freeSplitState(alloc, split_state.?);
-            split_state = null;
-        },
-        .merge_source_transition => |transition| {
-            if (raft_batch_protocol_version < data_raft_protocol.batch_merge_transition_protocol_version)
-                return error.RaftBatchMergeProtocolNotActivated;
-            if (transition.transition_id == 0 or transition.receiver_group_id == 0 or
-                transition.receiver_group_id == group_id or transition.raft_index == 0)
-                return error.InvalidMergeSourceTransition;
-            if (merge_source_state) |current| {
-                if (current.transition_id == transition.transition_id and
-                    (current.phase == .finalized or current.phase == .rolled_back))
-                {
-                    try validateMergeSourceIdentity(current, transition);
-                    continue;
-                }
-            }
-            switch (transition.kind) {
-                .prepare => if (merge_source_state) |current| switch (current.phase) {
-                    .accepting => {
-                        try validateMergeSourceIdentity(current, transition);
-                        continue;
-                    },
-                    .finalized => return error.ConflictingMergeTransition,
-                    .rolled_back => {
-                        if (current.transition_id == transition.transition_id) {
-                            try validateMergeSourceIdentity(current, transition);
-                            continue;
+            },
+            .require_source_pin_protocol => if (raft_batch_protocol_version < data_raft_protocol.batch_source_pin_protocol_version) return error.UnsupportedBatchProtocolVersion,
+            .merge_page_fence => |encoded| {
+                var parsed = try std.json.parseFromSlice(db_types.BatchRequest, alloc, encoded, .{});
+                defer parsed.deinit();
+                const request = parsed.value;
+                try pages.validateRequest(request);
+                const context = request.merge_replication orelse return error.InvalidMergePage;
+                merge_copy_allowed = merge_state.copyAllowed(merge_receiver_state, context);
+                if (!merge_copy_allowed) continue;
+                const required_page_protocol = if (request.merge_page.?.source.retention != null) data_raft_protocol.batch_source_scope_protocol_version else if (request.merge_page.?.source.integrity != null) data_raft_protocol.batch_relational_transfer_protocol_version else if (request.merge_page.?.next_snapshot_position != null) data_raft_protocol.batch_native_snapshot_protocol_version else if (request.merge_page.?.chunk != null) data_raft_protocol.batch_merge_chunk_protocol_version else data_raft_protocol.batch_merge_page_protocol_version;
+                if (raft_batch_protocol_version < required_page_protocol) return error.RaftBatchMergeProtocolNotActivated;
+                if (page_progress == null) return error.MergePageSourceMissing;
+                try pages.validateRange(alloc, merge_receiver_state.?, request);
+                switch (try pages.plan(page_progress.?.value, request)) {
+                    .replay => merge_copy_allowed = false,
+                    .apply => |next| {
+                        if (request.merge_page.?.phase == .cleanup)
+                            try validateMergeCleanupOverlay(store, alloc, group_id, merge_receiver_state.?, request, writes.items, deletes.items);
+                        if (request.merge_page.?.chunk) |chunk| {
+                            if (chunk.complete()) {
+                                if (merge_source_state != null and merge_source_state.?.phase == .finalized) return error.MergeSourceFenced;
+                                const split: ?shard_mod.SplitState = if (split_state) |state| .{ .phase = state.phase, .split_key = state.split_key, .new_shard_id = state.new_shard_id, .started_at = 0, .original_range_end = state.original_range_end } else null;
+                                try shard_mod.validateSplitAwareOwnership(byte_range, split, chunk.row_key);
+                            }
+                            try appendMergeChunkEffects(store, alloc, group_id, page_progress.?.value, request, writes, deletes);
+                            if (chunk.complete() and split_state != null and split_state.?.phase == .splitting) {
+                                const final_row = writes.items[writes.items.len - 1];
+                                const owned_key = try alloc.dupe(u8, final_row.key);
+                                errdefer alloc.free(owned_key);
+                                const owned_value = try alloc.dupe(u8, final_row.value);
+                                errdefer alloc.free(owned_value);
+                                removeOwnedWriteByKey(alloc, &delta_writes, owned_key);
+                                removeDeleteByKey(alloc, &delta_deletes, owned_key);
+                                try delta_writes.append(alloc, .{ .key = owned_key, .value = owned_value });
+                            }
                         }
+                        const encoded_progress = try appendMergePageWrite(alloc, group_id, next, writes, deletes);
+                        page_progress.?.deinit();
+                        page_progress = null;
+                        page_progress = try pages.decode(alloc, encoded_progress);
                     },
-                },
-                .finalize => {
-                    const current = merge_source_state orelse return error.MergeTransitionNotReady;
-                    try validateMergeSourceIdentity(current, transition);
-                    switch (current.phase) {
-                        .accepting => {},
-                        .finalized => continue,
-                        .rolled_back => return error.ConflictingMergeTransition,
-                    }
-                },
-                .rollback => if (merge_source_state) |current| switch (current.phase) {
-                    .accepting => try validateMergeSourceIdentity(current, transition),
-                    .finalized => return error.ConflictingMergeTransition,
-                    .rolled_back => {
-                        if (current.transition_id == transition.transition_id) {
-                            try validateMergeSourceIdentity(current, transition);
-                            continue;
-                        }
-                    },
-                },
-            }
-            merge_source_state = .{
-                .transition_id = transition.transition_id,
-                .receiver_group_id = transition.receiver_group_id,
-                .phase = switch (transition.kind) {
-                    .prepare => .accepting,
-                    .finalize => .finalized,
-                    .rollback => .rolled_back,
-                },
-                .applied_index = transition.raft_index,
-            };
-            try appendMergeSourceStateWrite(
-                alloc,
-                group_id,
-                merge_source_state.?,
-                writes,
-                deletes,
-            );
-        },
-        .merge_receiver_checkpoint => |owned_checkpoint| {
-            if (owned_checkpoint.checkpoint.copy_attempt.donor_term != 0 and
-                raft_batch_protocol_version < data_raft_protocol.batch_merge_copy_attempt_protocol_version)
-                return error.RaftBatchMergeProtocolNotActivated;
-            if (raft_batch_protocol_version < data_raft_protocol.batch_merge_transition_protocol_version)
-                return error.RaftBatchMergeProtocolNotActivated;
-            // Every replica owns an independent durable apply projection. A
-            // donor coordinator can reconcile only its local copy before it
-            // proposes the receiver checkpoint, so a freshly placed receiver
-            // replica has no range record yet. The first replicated accept is
-            // the authoritative initialization boundary for that pristine
-            // projection. Once any range has been published, exact base-range
-            // validation remains fail closed.
-            const checkpoint_range: AppliedDataRange = .{
-                .start = owned_checkpoint.checkpoint.receiver_base_start,
-                .end = owned_checkpoint.checkpoint.receiver_base_end,
-            };
-            const plan = try merge_state.planCheckpointApply(
-                alloc,
-                if (merge_receiver_state) |*state| state else null,
-                if (!range_initialized and merge_receiver_state == null and
-                    owned_checkpoint.checkpoint.kind == .accept)
-                    checkpoint_range
-                else
-                    byte_range,
-                owned_checkpoint.checkpoint,
-            );
-            defer plan.deinit(alloc);
-
-            const next_start = try alloc.dupe(u8, plan.range.start);
-            const next_end = alloc.dupe(u8, plan.range.end) catch |err| {
-                alloc.free(next_start);
-                return err;
-            };
-            range_state.freeRange(alloc, byte_range);
-            byte_range = .{ .start = next_start, .end = next_end };
-            try appendGroupRangeWrite(alloc, group_id, byte_range, writes, deletes);
-
-            const encoded_state = try appendMergeReceiverStateWrite(
-                alloc,
-                group_id,
-                plan.state,
-                writes,
-                deletes,
-            );
-            if (merge_receiver_state) |*state| state.deinit(alloc);
-            merge_receiver_state = try merge_state.decodeAlloc(alloc, encoded_state);
-        },
-        .flush_split_delta => |raft_index| {
-            if (split_state != null and split_state.?.phase == .splitting and
-                (delta_writes.items.len > 0 or delta_deletes.items.len > 0))
-            {
-                if (raft_index <= source_delta_sequence) return error.InvalidSplitDeltaSequence;
-                try appendPendingSplitDelta(
+                }
+            },
+            .merge_copy_fence => |replication| {
+                if (replication) |context| {
+                    if (context.copy_attempt.donor_term != 0 and
+                        raft_batch_protocol_version < data_raft_protocol.batch_merge_copy_attempt_protocol_version)
+                        return error.RaftBatchMergeProtocolNotActivated;
+                }
+                merge_copy_allowed = if (replication) |context| merge_state.copyAllowed(merge_receiver_state, context) else true;
+                if (merge_copy_allowed) if (replication) |context| if (page_progress) |progress| if (progress.value.matches(context)) return error.MergePageRequired;
+            },
+            .set_raft_batch_protocol => |version| {
+                if (version < raft_batch_protocol_version)
+                    return error.RaftBatchProtocolVersionRegression;
+                try appendRaftBatchProtocolEffect(
+                    store,
                     alloc,
                     group_id,
-                    raft_index,
-                    &delta_writes,
-                    &delta_deletes,
+                    version,
                     writes,
                     deletes,
                 );
-                source_delta_sequence = raft_index;
-            }
-        },
-    };
+                raft_batch_protocol_version = version;
+            },
+            .put => |put| {
+                if (!merge_copy_allowed) continue;
+                if (merge_source_state != null and merge_source_state.?.phase == .finalized)
+                    return error.MergeSourceFenced;
+                const shard_split_state: ?shard_mod.SplitState = if (split_state) |state| .{
+                    .phase = state.phase,
+                    .split_key = state.split_key,
+                    .new_shard_id = state.new_shard_id,
+                    .started_at = 0,
+                    .original_range_end = state.original_range_end,
+                } else null;
+                try shard_mod.validateSplitAwareOwnership(byte_range, shard_split_state, put.key);
+                const state_key = try groupDocumentStoreKeyAlloc(alloc, group_id, put.key);
+                errdefer alloc.free(state_key);
+                removeOwnedWriteByKey(alloc, writes, state_key);
+                removeDeleteByKey(alloc, deletes, state_key);
+                const state_value = try alloc.dupe(u8, put.value);
+                errdefer alloc.free(state_value);
+                try writes.append(alloc, .{ .key = state_key, .value = state_value });
+                if (split_state != null and split_state.?.phase == .splitting) {
+                    removeOwnedWriteByKey(alloc, &delta_writes, state_key);
+                    removeDeleteByKey(alloc, &delta_deletes, state_key);
+                    try delta_writes.append(alloc, .{
+                        .key = try alloc.dupe(u8, state_key),
+                        .value = try alloc.dupe(u8, put.value),
+                    });
+                }
+            },
+            .delete => |key_to_delete| {
+                if (!merge_copy_allowed) continue;
+                if (merge_source_state != null and merge_source_state.?.phase == .finalized)
+                    return error.MergeSourceFenced;
+                const shard_split_state: ?shard_mod.SplitState = if (split_state) |state| .{
+                    .phase = state.phase,
+                    .split_key = state.split_key,
+                    .new_shard_id = state.new_shard_id,
+                    .started_at = 0,
+                    .original_range_end = state.original_range_end,
+                } else null;
+                try shard_mod.validateSplitAwareOwnership(byte_range, shard_split_state, key_to_delete);
+                const state_key = try groupDocumentStoreKeyAlloc(alloc, group_id, key_to_delete);
+                errdefer alloc.free(state_key);
+                removeOwnedWriteByKey(alloc, writes, state_key);
+                removeDeleteByKey(alloc, deletes, state_key);
+                try deletes.append(alloc, state_key);
+                if (split_state != null and split_state.?.phase == .splitting) {
+                    removeOwnedWriteByKey(alloc, &delta_writes, state_key);
+                    removeDeleteByKey(alloc, &delta_deletes, state_key);
+                    try delta_deletes.append(alloc, try alloc.dupe(u8, state_key));
+                }
+            },
+            .set_range => |range| {
+                range_state.freeRange(alloc, byte_range);
+                byte_range = .{
+                    .start = try alloc.dupe(u8, range.start),
+                    .end = try alloc.dupe(u8, range.end),
+                };
+                const range_key = try groupRangeKeyAlloc(alloc, group_id);
+                errdefer alloc.free(range_key);
+                removeOwnedWriteByKey(alloc, writes, range_key);
+                removeDeleteByKey(alloc, deletes, range_key);
+                const range_value = try range_state.encodeRangeAlloc(alloc, byte_range);
+                errdefer alloc.free(range_value);
+                try writes.append(alloc, .{ .key = range_key, .value = range_value });
+            },
+            .prepare_split => |prepare| {
+                if (prepare.attempt_epoch == 0) return error.InvalidSplitAttemptEpoch;
+                if (split_terminal) |terminal| {
+                    if (prepare.attempt_epoch < terminal.attempt_epoch) continue;
+                    if (prepare.attempt_epoch == terminal.attempt_epoch) {
+                        try validateSplitTerminalIdentity(terminal, prepare.transition_id, prepare.attempt_epoch, prepare.new_shard_id, prepare.split_key);
+                        continue;
+                    }
+                }
+                if (split_state) |state| {
+                    const already_prepared = switch (state.phase) {
+                        .prepare, .splitting, .finalizing => state.transition_id == prepare.transition_id and
+                            state.attempt_epoch == prepare.attempt_epoch and
+                            state.new_shard_id == prepare.new_shard_id and
+                            std.mem.eql(u8, state.split_key, prepare.split_key),
+                        .none, .rolling_back => false,
+                    };
+                    if (already_prepared) continue;
+                    if (state.phase == .prepare or state.phase == .splitting or state.phase == .finalizing)
+                        return error.ConflictingSplitTransition;
+                }
+                const shard_split_state: ?shard_mod.SplitState = if (split_state) |state| .{
+                    .phase = state.phase,
+                    .split_key = state.split_key,
+                    .new_shard_id = state.new_shard_id,
+                    .started_at = 0,
+                    .original_range_end = state.original_range_end,
+                } else null;
+                try shard_mod.validatePrepareSplit(byte_range, shard_split_state, prepare.split_key);
+
+                if (split_state) |state| {
+                    freeSplitState(alloc, state);
+                    split_state = null;
+                }
+
+                split_state = try allocPreparedSplitState(alloc, byte_range.end, prepare);
+                try appendSplitStateWrite(alloc, group_id, split_state.?, writes, deletes);
+
+                try appendSplitAcknowledgementClear(alloc, group_id, writes, deletes);
+                split_acknowledgement = null;
+            },
+            .start_split => |start| {
+                if (start.attempt_epoch == 0) return error.InvalidSplitAttemptEpoch;
+                if (split_terminal) |terminal| {
+                    if (start.attempt_epoch < terminal.attempt_epoch) continue;
+                    if (start.attempt_epoch == terminal.attempt_epoch) {
+                        try validateSplitTerminalIdentity(terminal, start.transition_id, start.attempt_epoch, start.new_shard_id, start.split_key);
+                        continue;
+                    }
+                }
+                if (split_state) |state| {
+                    const already_started = switch (state.phase) {
+                        .splitting, .finalizing => state.transition_id == start.transition_id and
+                            state.attempt_epoch == start.attempt_epoch and
+                            state.new_shard_id == start.new_shard_id and
+                            std.mem.eql(u8, state.split_key, start.split_key),
+                        .none, .prepare, .rolling_back => false,
+                    };
+                    if (already_started) continue;
+                    if (state.phase == .splitting or state.phase == .finalizing)
+                        return error.ConflictingSplitTransition;
+                }
+                if (split_state == null) {
+                    // A replacement generation can inherit a Raft applied index
+                    // just ahead of its projected state. Start carries the full
+                    // transition identity, so recover the missing prepare only
+                    // while the unsplit range still validates it. Conflicting or
+                    // already-narrowed generations remain rejected below.
+                    try shard_mod.validatePrepareSplit(byte_range, null, start.split_key);
+                    split_state = try allocPreparedSplitState(alloc, byte_range.end, start);
+                    try appendSplitAcknowledgementClear(alloc, group_id, writes, deletes);
+                    split_acknowledgement = null;
+                }
+                const shard_split_state: ?shard_mod.SplitState = if (split_state) |state| .{
+                    .phase = state.phase,
+                    .split_key = state.split_key,
+                    .new_shard_id = state.new_shard_id,
+                    .started_at = 0,
+                    .original_range_end = state.original_range_end,
+                } else null;
+                try shard_mod.validateStartSplit(shard_split_state, start.split_key);
+                try validateSplitIdentity(split_state.?, start.transition_id, start.attempt_epoch, start.new_shard_id, start.split_key);
+
+                split_state.?.phase = .splitting;
+
+                const original_start = try alloc.dupe(u8, byte_range.start);
+                errdefer alloc.free(original_start);
+                range_state.freeRange(alloc, byte_range);
+                byte_range = .{
+                    .start = original_start,
+                    .end = try alloc.dupe(u8, start.split_key),
+                };
+
+                const range_key = try groupRangeKeyAlloc(alloc, group_id);
+                errdefer alloc.free(range_key);
+                removeOwnedWriteByKey(alloc, writes, range_key);
+                removeDeleteByKey(alloc, deletes, range_key);
+                const range_value = try range_state.encodeRangeAlloc(alloc, byte_range);
+                errdefer alloc.free(range_value);
+                try writes.append(alloc, .{ .key = range_key, .value = range_value });
+
+                try appendSplitStateWrite(alloc, group_id, split_state.?, writes, deletes);
+
+                const split_delta_seq_key = try groupSplitDeltaSeqKeyAlloc(alloc, group_id);
+                errdefer alloc.free(split_delta_seq_key);
+                removeOwnedWriteByKey(alloc, writes, split_delta_seq_key);
+                removeDeleteByKey(alloc, deletes, split_delta_seq_key);
+                var zero_seq: [8]u8 = undefined;
+                std.mem.writeInt(u64, &zero_seq, 0, .little);
+                const zero_seq_value = try alloc.dupe(u8, &zero_seq);
+                errdefer alloc.free(zero_seq_value);
+                try writes.append(alloc, .{ .key = split_delta_seq_key, .value = zero_seq_value });
+            },
+            .acknowledge_split => |acknowledgement| {
+                const state = split_state orelse return error.SplitInProgress;
+                try validateSplitIdentity(state, acknowledgement.transition_id, acknowledgement.attempt_epoch, acknowledgement.destination_group_id, null);
+                if (state.phase != .splitting and state.phase != .finalizing) return error.SplitInProgress;
+                if (split_acknowledgement) |current| {
+                    if (current.transition_id != acknowledgement.transition_id or
+                        current.attempt_epoch != acknowledgement.attempt_epoch or
+                        current.destination_group_id != acknowledgement.destination_group_id)
+                        return error.ConflictingSplitTransition;
+                    if (acknowledgement.delta_sequence <= current.delta_sequence) continue;
+                }
+                if (acknowledgement.delta_sequence > source_delta_sequence)
+                    return error.SplitAcknowledgementAheadOfSource;
+                const acknowledgement_key = try groupSplitAcknowledgementKeyAlloc(alloc, group_id);
+                errdefer alloc.free(acknowledgement_key);
+                removeOwnedWriteByKey(alloc, writes, acknowledgement_key);
+                removeDeleteByKey(alloc, deletes, acknowledgement_key);
+                const value = try alloc.alloc(u8, 32);
+                errdefer alloc.free(value);
+                std.mem.writeInt(u64, value[0..8], acknowledgement.transition_id, .little);
+                std.mem.writeInt(u64, value[8..16], acknowledgement.attempt_epoch, .little);
+                std.mem.writeInt(u64, value[16..24], acknowledgement.destination_group_id, .little);
+                std.mem.writeInt(u64, value[24..32], acknowledgement.delta_sequence, .little);
+                try writes.append(alloc, .{ .key = acknowledgement_key, .value = value });
+                split_acknowledgement = acknowledgement;
+            },
+            .finalize_split => |finalize| {
+                if (finalize.attempt_epoch == 0) return error.InvalidSplitAttemptEpoch;
+                if (split_terminal) |terminal| {
+                    if (finalize.attempt_epoch < terminal.attempt_epoch) continue;
+                    if (finalize.attempt_epoch == terminal.attempt_epoch) {
+                        try validateSplitTerminalIdentity(terminal, finalize.transition_id, finalize.attempt_epoch, finalize.new_shard_id, finalize.split_key);
+                        if (terminal.outcome != .finalized) return error.ConflictingSplitTransition;
+                        continue;
+                    }
+                }
+                if (split_state) |state| try validateSplitIdentity(state, finalize.transition_id, finalize.attempt_epoch, finalize.new_shard_id, finalize.split_key);
+                const shard_split_state: ?shard_mod.SplitState = if (split_state) |state| .{
+                    .phase = state.phase,
+                    .split_key = state.split_key,
+                    .new_shard_id = state.new_shard_id,
+                    .started_at = 0,
+                    .original_range_end = state.original_range_end,
+                } else null;
+                try shard_mod.validateFinalizeSplit(shard_split_state);
+                try appendFinalizeSplitDeletes(store, alloc, group_id, split_state.?, deletes);
+                try appendSplitDeltaClears(store, alloc, group_id, deletes);
+                const split_state_key = try groupSplitStateKeyAlloc(alloc, group_id);
+                defer alloc.free(split_state_key);
+                removeOwnedWriteByKey(alloc, writes, split_state_key);
+                removeDeleteByKey(alloc, deletes, split_state_key);
+                try deletes.append(alloc, try alloc.dupe(u8, split_state_key));
+                removeOwnedWritesWithPrefix(alloc, writes, "\x00\x00__metadata__:data_group_split_delta:");
+                const split_delta_seq_key = try groupSplitDeltaSeqKeyAlloc(alloc, group_id);
+                defer alloc.free(split_delta_seq_key);
+                removeOwnedWriteByKey(alloc, writes, split_delta_seq_key);
+                try appendSplitTerminal(
+                    alloc,
+                    group_id,
+                    .{
+                        .transition_id = finalize.transition_id,
+                        .attempt_epoch = finalize.attempt_epoch,
+                        .destination_group_id = finalize.new_shard_id,
+                        .split_key = finalize.split_key,
+                        .outcome = .finalized,
+                    },
+                    &split_terminal,
+                    writes,
+                    deletes,
+                );
+                freeSplitState(alloc, split_state.?);
+                split_state = null;
+            },
+            .rollback_split => |rollback| {
+                if (rollback.attempt_epoch == 0) return error.InvalidSplitAttemptEpoch;
+                if (split_terminal) |terminal| {
+                    if (rollback.attempt_epoch < terminal.attempt_epoch) continue;
+                    if (rollback.attempt_epoch == terminal.attempt_epoch) {
+                        try validateSplitTerminalIdentity(terminal, rollback.transition_id, rollback.attempt_epoch, rollback.new_shard_id, rollback.split_key);
+                        if (terminal.outcome != .rolled_back) return error.ConflictingSplitTransition;
+                        continue;
+                    }
+                }
+                if (split_state) |state| try validateSplitIdentity(state, rollback.transition_id, rollback.attempt_epoch, rollback.new_shard_id, rollback.split_key);
+                const shard_split_state: ?shard_mod.SplitState = if (split_state) |state| .{
+                    .phase = state.phase,
+                    .split_key = state.split_key,
+                    .new_shard_id = state.new_shard_id,
+                    .started_at = 0,
+                    .original_range_end = state.original_range_end,
+                } else null;
+                try shard_mod.validateRollbackSplit(shard_split_state);
+                const original_start = try alloc.dupe(u8, byte_range.start);
+                errdefer alloc.free(original_start);
+                range_state.freeRange(alloc, byte_range);
+                byte_range = .{
+                    .start = original_start,
+                    .end = try alloc.dupe(u8, split_state.?.original_range_end),
+                };
+                const range_key = try groupRangeKeyAlloc(alloc, group_id);
+                errdefer alloc.free(range_key);
+                removeOwnedWriteByKey(alloc, writes, range_key);
+                removeDeleteByKey(alloc, deletes, range_key);
+                const range_value = try range_state.encodeRangeAlloc(alloc, byte_range);
+                errdefer alloc.free(range_value);
+                try writes.append(alloc, .{ .key = range_key, .value = range_value });
+
+                try appendSplitDeltaClears(store, alloc, group_id, deletes);
+                const split_state_key = try groupSplitStateKeyAlloc(alloc, group_id);
+                defer alloc.free(split_state_key);
+                removeOwnedWriteByKey(alloc, writes, split_state_key);
+                removeDeleteByKey(alloc, deletes, split_state_key);
+                try deletes.append(alloc, try alloc.dupe(u8, split_state_key));
+                removeOwnedWritesWithPrefix(alloc, writes, "\x00\x00__metadata__:data_group_split_delta:");
+                const split_delta_seq_key = try groupSplitDeltaSeqKeyAlloc(alloc, group_id);
+                defer alloc.free(split_delta_seq_key);
+                removeOwnedWriteByKey(alloc, writes, split_delta_seq_key);
+                const acknowledgement_key = try groupSplitAcknowledgementKeyAlloc(alloc, group_id);
+                defer alloc.free(acknowledgement_key);
+                removeOwnedWriteByKey(alloc, writes, acknowledgement_key);
+                removeDeleteByKey(alloc, deletes, acknowledgement_key);
+                try deletes.append(alloc, try alloc.dupe(u8, acknowledgement_key));
+                split_acknowledgement = null;
+                try appendSplitTerminal(
+                    alloc,
+                    group_id,
+                    .{
+                        .transition_id = rollback.transition_id,
+                        .attempt_epoch = rollback.attempt_epoch,
+                        .destination_group_id = rollback.new_shard_id,
+                        .split_key = rollback.split_key,
+                        .outcome = .rolled_back,
+                    },
+                    &split_terminal,
+                    writes,
+                    deletes,
+                );
+                freeSplitState(alloc, split_state.?);
+                split_state = null;
+            },
+            .merge_source_transition => |transition| {
+                if (raft_batch_protocol_version < data_raft_protocol.batch_merge_transition_protocol_version)
+                    return error.RaftBatchMergeProtocolNotActivated;
+                if (transition.transition_id == 0 or transition.receiver_group_id == 0 or
+                    transition.receiver_group_id == group_id or transition.raft_index == 0)
+                    return error.InvalidMergeSourceTransition;
+                if (merge_source_state) |current| {
+                    if (current.transition_id == transition.transition_id and
+                        (current.phase == .finalized or current.phase == .rolled_back))
+                    {
+                        try validateMergeSourceIdentity(current, transition);
+                        continue;
+                    }
+                }
+                switch (transition.kind) {
+                    .prepare => if (merge_source_state) |current| switch (current.phase) {
+                        .accepting => {
+                            try validateMergeSourceIdentity(current, transition);
+                            continue;
+                        },
+                        .finalized => return error.ConflictingMergeTransition,
+                        .rolled_back => {
+                            if (current.transition_id == transition.transition_id) {
+                                try validateMergeSourceIdentity(current, transition);
+                                continue;
+                            }
+                        },
+                    },
+                    .finalize => {
+                        const current = merge_source_state orelse return error.MergeTransitionNotReady;
+                        try validateMergeSourceIdentity(current, transition);
+                        switch (current.phase) {
+                            .accepting => {},
+                            .finalized => continue,
+                            .rolled_back => return error.ConflictingMergeTransition,
+                        }
+                    },
+                    .rollback => if (merge_source_state) |current| switch (current.phase) {
+                        .accepting => try validateMergeSourceIdentity(current, transition),
+                        .finalized => return error.ConflictingMergeTransition,
+                        .rolled_back => {
+                            if (current.transition_id == transition.transition_id) {
+                                try validateMergeSourceIdentity(current, transition);
+                                continue;
+                            }
+                        },
+                    },
+                }
+                merge_source_state = .{
+                    .transition_id = transition.transition_id,
+                    .receiver_group_id = transition.receiver_group_id,
+                    .phase = switch (transition.kind) {
+                        .prepare => .accepting,
+                        .finalize => .finalized,
+                        .rollback => .rolled_back,
+                    },
+                    .applied_index = transition.raft_index,
+                };
+                try appendMergeSourceStateWrite(
+                    alloc,
+                    group_id,
+                    merge_source_state.?,
+                    writes,
+                    deletes,
+                );
+            },
+            .merge_receiver_checkpoint => |owned_checkpoint| {
+                if (owned_checkpoint.checkpoint.page_source) |source| if (source.retention != null and
+                    raft_batch_protocol_version < data_raft_protocol.batch_source_scope_protocol_version)
+                    return error.RaftBatchMergeProtocolNotActivated;
+                if (owned_checkpoint.checkpoint.page_source) |source| if (source.integrity != null and
+                    raft_batch_protocol_version < data_raft_protocol.batch_relational_transfer_protocol_version)
+                    return error.RaftBatchMergeProtocolNotActivated;
+                if (owned_checkpoint.checkpoint.copy_attempt.donor_term != 0 and
+                    raft_batch_protocol_version < data_raft_protocol.batch_merge_copy_attempt_protocol_version)
+                    return error.RaftBatchMergeProtocolNotActivated;
+                if (raft_batch_protocol_version < data_raft_protocol.batch_merge_transition_protocol_version)
+                    return error.RaftBatchMergeProtocolNotActivated;
+                // Every replica owns an independent durable apply projection. A
+                // donor coordinator can reconcile only its local copy before it
+                // proposes the receiver checkpoint, so a freshly placed receiver
+                // replica has no range record yet. The first replicated accept is
+                // the authoritative initialization boundary for that pristine
+                // projection. Once any range has been published, exact base-range
+                // validation remains fail closed.
+                const checkpoint_range: AppliedDataRange = .{
+                    .start = owned_checkpoint.checkpoint.receiver_base_start,
+                    .end = owned_checkpoint.checkpoint.receiver_base_end,
+                };
+                const plan = try merge_state.planCheckpointApply(
+                    alloc,
+                    if (merge_receiver_state) |*state| state else null,
+                    if (!range_initialized and merge_receiver_state == null and
+                        owned_checkpoint.checkpoint.kind == .accept)
+                        checkpoint_range
+                    else
+                        byte_range,
+                    owned_checkpoint.checkpoint,
+                );
+                defer plan.deinit(alloc);
+
+                const page_plan = try pages.checkpointPlan(merge_receiver_state, plan.state, owned_checkpoint.checkpoint, if (page_progress) |value| value.value else null);
+                switch (page_plan) {
+                    .unchanged => {},
+                    .clear => {
+                        const page_key = try groupMergePageKeyAlloc(alloc, group_id);
+                        errdefer alloc.free(page_key);
+                        removeOwnedWriteByKey(alloc, writes, page_key);
+                        removeDeleteByKey(alloc, deletes, page_key);
+                        try deletes.append(alloc, page_key);
+                        if (page_progress) |*value| value.deinit();
+                        page_progress = null;
+                    },
+                    .bind => |progress| {
+                        const required_page_protocol = if (progress.source.retention != null) data_raft_protocol.batch_source_scope_protocol_version else if (progress.source.integrity != null) data_raft_protocol.batch_relational_transfer_protocol_version else data_raft_protocol.batch_merge_page_protocol_version;
+                        if (raft_batch_protocol_version < required_page_protocol) return error.RaftBatchMergeProtocolNotActivated;
+                        const encoded_progress = try appendMergePageWrite(alloc, group_id, progress, writes, deletes);
+                        if (page_progress) |*value| value.deinit();
+                        page_progress = null;
+                        page_progress = try pages.decode(alloc, encoded_progress);
+                    },
+                }
+                if (page_plan != .unchanged) try clearMergeChunkEffects(store, alloc, group_id, writes, deletes);
+
+                const next_start = try alloc.dupe(u8, plan.range.start);
+                const next_end = alloc.dupe(u8, plan.range.end) catch |err| {
+                    alloc.free(next_start);
+                    return err;
+                };
+                range_state.freeRange(alloc, byte_range);
+                byte_range = .{ .start = next_start, .end = next_end };
+                try appendGroupRangeWrite(alloc, group_id, byte_range, writes, deletes);
+
+                const encoded_state = try appendMergeReceiverStateWrite(
+                    alloc,
+                    group_id,
+                    plan.state,
+                    writes,
+                    deletes,
+                );
+                if (merge_receiver_state) |*state| state.deinit(alloc);
+                merge_receiver_state = try merge_state.decodeAlloc(alloc, encoded_state);
+            },
+            .flush_split_delta => |raft_index| {
+                if (split_state != null and split_state.?.phase == .splitting and
+                    (delta_writes.items.len > 0 or delta_deletes.items.len > 0))
+                {
+                    if (raft_index <= source_delta_sequence) return error.InvalidSplitDeltaSequence;
+                    try appendPendingSplitDelta(
+                        alloc,
+                        group_id,
+                        raft_index,
+                        &delta_writes,
+                        &delta_deletes,
+                        writes,
+                        deletes,
+                    );
+                    source_delta_sequence = raft_index;
+                }
+            },
+        }
+    }
 
     if (split_state != null and split_state.?.phase == .splitting and (delta_writes.items.len > 0 or delta_deletes.items.len > 0)) {
         try appendPendingSplitDelta(
@@ -3118,6 +3574,179 @@ fn groupMergeReceiverStateKeyAlloc(alloc: std.mem.Allocator, group_id: u64) ![]u
     return try std.fmt.allocPrint(alloc, "\x00\x00__metadata__:data_group_merge_receiver:{d}", .{group_id});
 }
 
+fn groupMergePageKeyAlloc(alloc: std.mem.Allocator, group_id: u64) ![]u8 {
+    return std.fmt.allocPrint(alloc, "\x00\x00__metadata__:data_group_merge_page:{d}", .{group_id});
+}
+
+fn groupMergeChunkKey(alloc: std.mem.Allocator, group_id: u64, key: []const u8) ![]u8 {
+    return std.fmt.allocPrint(alloc, "\x00\x00__metadata__:data_group_merge_spool:{d}:{s}", .{ group_id, key });
+}
+
+fn clearMergeChunkEffects(store: *docstore.DocStore, alloc: std.mem.Allocator, group_id: u64, writes: *std.ArrayListUnmanaged(docstore.OwnedKVPair), deletes: *std.ArrayListUnmanaged([]u8)) !void {
+    const chunks = @import("../../storage/db/merge_page_chunks.zig");
+    const manifest_key = try groupMergeChunkKey(alloc, group_id, chunks.manifest_key);
+    defer alloc.free(manifest_key);
+    for (deletes.items) |key| if (std.mem.eql(u8, key, manifest_key)) return;
+    var owned_manifest: ?[]u8 = null;
+    defer if (owned_manifest) |value| alloc.free(value);
+    const manifest = blk: {
+        for (writes.items) |write| if (std.mem.eql(u8, write.key, manifest_key)) break :blk write.value;
+        owned_manifest = store.get(alloc, manifest_key) catch |err| switch (err) {
+            error.NotFound => return,
+            else => return err,
+        };
+        break :blk owned_manifest.?;
+    };
+    const count = try chunks.slotCount(manifest);
+    for (0..@as(usize, count) + 1) |i| {
+        const native_key = if (i == count) try alloc.dupe(u8, chunks.manifest_key) else try chunks.slotKey(alloc, @intCast(i));
+        defer alloc.free(native_key);
+        const mapped = try groupMergeChunkKey(alloc, group_id, native_key);
+        errdefer alloc.free(mapped);
+        removeOwnedWriteByKey(alloc, writes, mapped);
+        removeDeleteByKey(alloc, deletes, mapped);
+        try deletes.append(alloc, mapped);
+    }
+}
+
+fn appendMergeChunkEffects(store: *docstore.DocStore, alloc: std.mem.Allocator, group_id: u64, progress: @import("../../storage/db/merge_page_contract.zig").Progress, request: db_types.BatchRequest, writes: *std.ArrayListUnmanaged(docstore.OwnedKVPair), deletes: *std.ArrayListUnmanaged([]u8)) !void {
+    const chunks = @import("../../storage/db/merge_page_chunks.zig");
+    const pages = @import("../../storage/db/merge_page_contract.zig");
+    const Reader = struct {
+        store: *docstore.DocStore,
+        alloc: std.mem.Allocator,
+        group: u64,
+        progress: []const u8,
+        writes: []const docstore.OwnedKVPair,
+        deletes: []const []const u8,
+        manifest: ?[]u8 = null,
+        pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+            if (std.mem.eql(u8, key, pages.key)) return self.progress;
+            const mapped = try groupMergeChunkKey(self.alloc, self.group, key);
+            defer self.alloc.free(mapped);
+            for (self.deletes) |deleted| if (std.mem.eql(u8, deleted, mapped)) return error.NotFound;
+            for (self.writes) |write| if (std.mem.eql(u8, write.key, mapped)) return write.value;
+            if (self.manifest) |value| self.alloc.free(value);
+            self.manifest = null;
+            self.manifest = try self.store.get(self.alloc, mapped);
+            return self.manifest.?;
+        }
+        pub fn copyChunk(self: *@This(), key: []const u8, transfer: pages.Digest, destination: []u8) !void {
+            const mapped = try groupMergeChunkKey(self.alloc, self.group, key);
+            defer self.alloc.free(mapped);
+            for (self.deletes) |deleted| if (std.mem.eql(u8, deleted, mapped)) return error.NotFound;
+            for (self.writes) |write| if (std.mem.eql(u8, write.key, mapped)) return chunks.copyChecked(write.value, transfer, destination);
+            const stored = try self.store.get(self.alloc, mapped);
+            defer self.alloc.free(stored);
+            try chunks.copyChecked(stored, transfer, destination);
+        }
+    };
+    const encoded_progress = try pages.encode(alloc, progress);
+    defer alloc.free(encoded_progress);
+    var reader: Reader = .{ .store = store, .alloc = alloc, .group = group_id, .progress = encoded_progress, .writes = writes.items, .deletes = deletes.items };
+    defer if (reader.manifest) |value| alloc.free(value);
+    var prepared = try chunks.prepare(alloc, &reader, request, .none);
+    defer prepared.deinit();
+    for (prepared.writes) |write| {
+        const mapped = try groupMergeChunkKey(alloc, group_id, write.key);
+        errdefer alloc.free(mapped);
+        const value = try alloc.dupe(u8, write.value);
+        errdefer alloc.free(value);
+        removeOwnedWriteByKey(alloc, writes, mapped);
+        removeDeleteByKey(alloc, deletes, mapped);
+        try writes.append(alloc, .{ .key = mapped, .value = value });
+    }
+    for (prepared.deletes) |key| {
+        const mapped = try groupMergeChunkKey(alloc, group_id, key);
+        errdefer alloc.free(mapped);
+        removeOwnedWriteByKey(alloc, writes, mapped);
+        removeDeleteByKey(alloc, deletes, mapped);
+        try deletes.append(alloc, mapped);
+    }
+    for (prepared.request.writes) |write| {
+        const mapped = try groupDocumentStoreKeyAlloc(alloc, group_id, write.key);
+        errdefer alloc.free(mapped);
+        const value = try alloc.dupe(u8, write.value);
+        errdefer alloc.free(value);
+        removeOwnedWriteByKey(alloc, writes, mapped);
+        removeDeleteByKey(alloc, deletes, mapped);
+        try writes.append(alloc, .{ .key = mapped, .value = value });
+    }
+}
+
+/// Merge persisted keys with effects already staged by earlier entries in the
+/// same apply batch. Do not hydrate values, copy the corpus, or certify EOF
+/// against a store snapshot that omits those pending puts/deletes.
+fn validateMergeCleanupOverlay(store: *docstore.DocStore, alloc: std.mem.Allocator, group_id: u64, state: merge_state.State, request: db_types.BatchRequest, writes: []const docstore.OwnedKVPair, deletes: []const []const u8) !void {
+    const page = request.merge_page.?;
+    const merged = state.merged_range.?;
+    const donor: AppliedDataRange = if (!std.mem.eql(u8, merged.start, state.receiver_base_range.start))
+        .{ .start = merged.start, .end = state.receiver_base_range.start }
+    else
+        .{ .start = state.receiver_base_range.end, .end = merged.end };
+    const lower = if (page.after.len != 0) try groupDocumentStoreKeyAlloc(alloc, group_id, page.after) else try groupDocumentLowerBoundAlloc(alloc, group_id, donor.start);
+    defer alloc.free(lower);
+    const upper = if (donor.end.len != 0) (try groupDocumentUpperBoundAlloc(alloc, group_id, donor.end)).? else blk: {
+        const prefix = try groupDocumentPrefixAlloc(alloc, group_id);
+        defer alloc.free(prefix);
+        break :blk (try internal_keys.documentRangeUpperAlloc(alloc, prefix)) orelse return error.InvalidMergePage;
+    };
+    defer alloc.free(upper);
+    var txn = try store.beginReadTxn();
+    defer txn.abort();
+    var cursor = try txn.openPhysicalCursorAdapter();
+    defer cursor.close();
+    cursor.setUpperBound(upper);
+    var current = try cursor.seekAtOrAfter(lower);
+    var after: ?[]u8 = if (page.after.len != 0) try alloc.dupe(u8, lower) else null;
+    defer if (after) |value| alloc.free(value);
+    var index: usize = 0;
+    while (true) {
+        while (current) |row| {
+            if (std.mem.order(u8, row.key, upper) != .lt) {
+                current = null;
+                break;
+            }
+            if (internal_keys.isPrimaryDocumentKey(row.key) and
+                (after == null or std.mem.order(u8, row.key, after.?) == .gt) and !mergeOverlayDeleted(deletes, row.key)) break;
+            current = try cursor.next();
+        }
+        var candidate: ?[]const u8 = if (current) |row| row.key else null;
+        for (writes) |write| {
+            if (!internal_keys.isPrimaryDocumentKey(write.key) or std.mem.order(u8, write.key, lower) == .lt or
+                std.mem.order(u8, write.key, upper) != .lt or (after != null and std.mem.order(u8, write.key, after.?) != .gt) or
+                mergeOverlayDeleted(deletes, write.key)) continue;
+            if (candidate == null or std.mem.order(u8, write.key, candidate.?) == .lt) candidate = write.key;
+        }
+        const actual = candidate orelse break;
+        if (index == request.deletes.len) return error.InvalidMergePage;
+        const expected = try groupDocumentStoreKeyAlloc(alloc, group_id, request.deletes[index]);
+        errdefer alloc.free(expected);
+        if (!std.mem.eql(u8, expected, actual)) return error.InvalidMergePage;
+        if (after) |value| alloc.free(value);
+        after = expected;
+        index += 1;
+        if (index == request.deletes.len and !page.exhausted) return;
+    }
+    if (index != request.deletes.len) return error.InvalidMergePage;
+}
+
+fn mergeOverlayDeleted(deletes: []const []const u8, key: []const u8) bool {
+    for (deletes) |deleted| if (std.mem.eql(u8, deleted, key)) return true;
+    return false;
+}
+
+fn appendMergePageWrite(alloc: std.mem.Allocator, group_id: u64, progress: @import("../../storage/db/merge_page_contract.zig").Progress, writes: *std.ArrayListUnmanaged(docstore.OwnedKVPair), deletes: *std.ArrayListUnmanaged([]u8)) ![]const u8 {
+    const page_key = try groupMergePageKeyAlloc(alloc, group_id);
+    errdefer alloc.free(page_key);
+    const encoded = try @import("../../storage/db/merge_page_contract.zig").encode(alloc, progress);
+    errdefer alloc.free(encoded);
+    removeOwnedWriteByKey(alloc, writes, page_key);
+    removeDeleteByKey(alloc, deletes, page_key);
+    try writes.append(alloc, .{ .key = page_key, .value = encoded });
+    return encoded;
+}
+
 const merge_source_state_format_version: u8 = 1;
 const merge_source_state_encoded_len = 1 + 1 + 8 + 8 + 8;
 
@@ -3198,8 +3827,9 @@ fn stripAnyGroupDocumentPrefixAlloc(alloc: std.mem.Allocator, logical_key: []con
     return try alloc.dupe(u8, logical_key[sep + 1 ..]);
 }
 
-const group_snapshot_magic = "AFDS";
+const group_snapshot_magic = @import("../../raft/native_snapshot_delegate.zig").snapshot_magic;
 const group_snapshot_version: u8 = 3;
+const group_native_snapshot_version = @import("../../raft/native_snapshot_delegate.zig").native_version;
 
 pub fn encodeGroupStateSnapshot(
     alloc: std.mem.Allocator,
@@ -3721,6 +4351,135 @@ test "shard state store decodes legacy split acknowledgement layouts" {
     try std.testing.expectEqual(@as(u64, 72), decoded_v2.destination_group_id);
 }
 
+test "shard state snapshot v4 requires native authority and projects only verified native rows" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source_path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/v4-controls", .{tmp.sub_path}, 0);
+    defer alloc.free(source_path);
+    var source = try docstore.DocStore.open(alloc, source_path.ptr, .{});
+    defer source.close();
+    const target_path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/v4-target", .{tmp.sub_path}, 0);
+    defer alloc.free(target_path);
+    var target = try docstore.DocStore.open(alloc, target_path.ptr, .{});
+    defer target.close();
+    const native_path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/v4-native", .{tmp.sub_path}, 0);
+    defer alloc.free(native_path);
+    var primary = try docstore.DocStore.open(alloc, native_path.ptr, .{});
+    defer primary.close();
+    try replaceGroupSnapshot(&source, alloc, 91, .{ .start = "a", .end = "z" }, &.{.{ .key = "b", .value = "obsolete projection" }});
+    const protocol_key = try groupRaftBatchProtocolKeyAlloc(alloc, 91);
+    defer alloc.free(protocol_key);
+    var protocol: [2]u8 = undefined;
+    std.mem.writeInt(u16, &protocol, data_raft_protocol.batch_native_snapshot_protocol_version, .little);
+    try source.put(protocol_key, &protocol);
+    var txn = try source.beginReadTxn();
+    defer txn.abort();
+    try std.testing.expect(try snapshotRequiresNativePrimary(&txn, alloc, 91));
+    try std.testing.expectError(error.NativeSnapshotRequired, buildSnapshotTxn(&txn, alloc, 91));
+    var output: std.Io.Writer.Allocating = .init(alloc);
+    defer output.deinit();
+    const native_bytes = "native checkpoint is owned and validated by the install boundary";
+    try writeNativeSnapshotPrefixTxn(&txn, alloc, 91, &output.writer, native_bytes.len, null);
+    const prefix_length = output.written().len;
+    try output.writer.writeAll(native_bytes);
+    const encoded = output.written();
+    const decoded = try GroupStateSnapshotStream.init(encoded);
+    try validateGroupStateSnapshotStream(alloc, 91, decoded);
+    try std.testing.expectEqualStrings(native_bytes, decoded.native_primary.?);
+    var entries = decoded.entries();
+    try std.testing.expect((try entries.next()) == null);
+    try std.testing.expectError(error.NativeSnapshotRequired, installSnapshotStreamIntoEmptyStore(&target, alloc, 91, decoded, &.{}));
+    // Merely changing the version and dropping the native body cannot install
+    // a protocol-10 source's control ledger without its primary checkpoint.
+    const downgraded = try alloc.dupe(u8, encoded[0 .. prefix_length - 8]);
+    defer alloc.free(downgraded);
+    downgraded[group_snapshot_magic.len] = group_snapshot_version;
+    const old = try GroupStateSnapshotStream.init(downgraded);
+    try std.testing.expectError(error.InvalidGroupStateSnapshot, validateGroupStateSnapshotStream(alloc, 91, old));
+    try std.testing.expectError(error.InvalidGroupStateSnapshot, installSnapshotStreamIntoEmptyStore(&target, alloc, 91, old, &.{}));
+    try std.testing.expectError(error.InvalidGroupStateSnapshot, GroupStateSnapshotStream.init(encoded[0 .. encoded.len - 1]));
+    const malformed = try alloc.dupe(u8, encoded);
+    defer alloc.free(malformed);
+    std.mem.writeInt(u64, malformed[prefix_length - 8 ..][0..8], std.math.maxInt(u64), .little);
+    try std.testing.expectError(error.InvalidGroupStateSnapshot, GroupStateSnapshotStream.init(malformed));
+    std.mem.writeInt(u64, malformed[prefix_length - 8 ..][0..8], 0, .little);
+    try std.testing.expectError(error.InvalidGroupStateSnapshot, GroupStateSnapshotStream.init(malformed));
+    const primary_key = try internal_keys.documentKeyAlloc(alloc, "b");
+    defer alloc.free(primary_key);
+    try primary.put(primary_key, "authoritative checkpoint row");
+    try installNativeSnapshotStreamIntoEmptyStore(&target, alloc, 91, decoded, &primary, &.{});
+    const rows = try groupState(&target, alloc, 91);
+    defer freeGroupStateEntries(alloc, rows);
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqualStrings("b", rows[0].key);
+    try std.testing.expectEqualStrings("authoritative checkpoint row", rows[0].value);
+    try std.testing.expectEqual(data_raft_protocol.batch_native_snapshot_protocol_version, try currentRaftBatchProtocolVersion(&target, alloc, 91));
+}
+
+test "shard state snapshot streams control spools within a fixed allocation budget" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/snapshot-stream-budget", .{tmp.sub_path}, 0);
+    defer alloc.free(path);
+    var store = try docstore.DocStore.open(alloc, path.ptr, .{});
+    defer store.close();
+    try replaceGroupSnapshot(&store, alloc, 91, .{ .start = "a", .end = "z" }, &.{});
+
+    const payload = try alloc.alloc(u8, 1024 * 1024);
+    defer alloc.free(payload);
+    @memset(payload, 'x');
+    // Only the transport framing is exercised here; slot semantic validation
+    // has its own receiver/snapshot regressions. Keep all values large enough
+    // that copying even one into the writer's allocator would fail the budget.
+    for (0..16) |i| {
+        var suffix: [5]u8 = undefined;
+        suffix[0] = 'c';
+        std.mem.writeInt(u32, suffix[1..5], @intCast(i), .big);
+        const key = try groupMergeChunkKey(alloc, 91, &suffix);
+        defer alloc.free(key);
+        try store.put(key, payload);
+    }
+    var txn = try store.beginReadTxn();
+    defer txn.abort();
+    var scratch: [16 * 1024]u8 = undefined;
+    var budget = std.heap.FixedBufferAllocator.init(&scratch);
+    var output_buffer: [4096]u8 = undefined;
+    var output = std.Io.Writer.Discarding.init(&output_buffer);
+    try writeSnapshotTxn(&txn, budget.allocator(), 91, &output.writer, null);
+    try std.testing.expect(output.fullCount() > 16 * 1024 * 1024);
+    const encoded = try buildSnapshotTxn(&txn, alloc, 91);
+    defer alloc.free(encoded);
+    try std.testing.expectEqual(encoded.len, output.fullCount());
+    const decoded = try GroupStateSnapshotStream.init(encoded);
+    var controls = decoded.controls();
+    var count: usize = 0;
+    while (try controls.next()) |entry| {
+        try std.testing.expectEqualStrings(payload, entry.value);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 16), count);
+
+    // Cancel between borrowed slots, before another large value is read.
+    const CancellingSink = struct {
+        cancelled: *std.atomic.Value(bool),
+        count: usize = 0,
+
+        fn append(self: *@This(), _: AppliedDataKV) !void {
+            self.count += 1;
+            if (self.count == 3) self.cancelled.store(true, .release);
+        }
+    };
+    var cancelled = std.atomic.Value(bool).init(false);
+    var sink = CancellingSink{ .cancelled = &cancelled };
+    try std.testing.expectError(error.SnapshotBuildCancelled, visitGroupControlsTxn(&txn, alloc, 91, &cancelled, &sink));
+    try std.testing.expectEqual(@as(usize, 3), sink.count);
+    var cancelled_output = std.Io.Writer.Discarding.init(&output_buffer);
+    try std.testing.expectError(error.SnapshotBuildCancelled, writeSnapshotTxn(&txn, budget.allocator(), 91, &cancelled_output.writer, &cancelled));
+    try std.testing.expectEqual(@as(u64, 0), cancelled_output.fullCount());
+}
+
 test "shard state snapshot round trips split control state" {
     var source_tmp = std.testing.tmpDir(.{});
     defer source_tmp.cleanup();
@@ -3768,6 +4527,9 @@ test "shard state snapshot round trips split control state" {
     defer decoded.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("doc:m", decoded.byte_range.end);
     try std.testing.expect(decoded.controls.len >= 3);
+    const canonical = try encodeGroupStateSnapshot(std.testing.allocator, decoded.byte_range, decoded.entries, decoded.controls);
+    defer std.testing.allocator.free(canonical);
+    try std.testing.expectEqualSlices(u8, canonical, active_snapshot);
 
     var target_tmp = std.testing.tmpDir(.{});
     defer target_tmp.cleanup();

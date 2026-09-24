@@ -1,3 +1,17 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use antfly_sdk::types::{QueryHit, QueryResponses};
 use reqwest::blocking::Client;
 use serde_json::Value;
@@ -6,7 +20,7 @@ use url::Url;
 /// HTTP client for communicating with an Antfly server.
 ///
 /// The base URL should include the API version prefix with a trailing slash,
-/// e.g. `http://localhost:8080/api/v1/`.
+/// e.g. `http://localhost:8080/db/v1/`.
 pub struct AntflyClient {
     base_url: Url,
     http: Client,

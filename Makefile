@@ -8,7 +8,7 @@ SCRIPTS_PY ?= uv run --project scripts --locked python
 # Use Go 1.26 with SIMD experiment enabled for hardware SIMD acceleration
 GO := GOWORK=off GOEXPERIMENT=simd go
 GO_MODULES := \
-	./go/pkg/antflylite \
+	./go/pkg/lite \
 	./go/pkg/sdk \
 	./go/pkg/proxy \
 	./go/pkg/operator \
@@ -138,9 +138,11 @@ zig-checksums-check:
 	python3 scripts/ci/check_zig_checksum_usage.py
 
 zig-generated-check: graph-identifier-check
+	$(SCRIPTS_PY) -m unittest scripts/test_openapi_build_paths.py
 	$(ZIG_MAKE) generated-check
 
 zig-openapi-check:
+	$(SCRIPTS_PY) -m unittest scripts/test_openapi_build_paths.py
 	$(ZIG_MAKE) openapi-check
 
 zig-snowball-check:

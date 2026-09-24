@@ -34,6 +34,10 @@ pub fn build(b: *std.Build) void {
     var steps = std.AutoHashMap(*std.Build.Step, void).init(b.allocator);
     var modules = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
     for (b.top_level_steps.values()) |top| collectSteps(&top.step, &steps, &modules);
+    // Individual commands are intentionally absent from the consolidated gate.
+    // Inspect the owner's registry without making every CLI a gate dependency.
+    for (artifacts.inference_steps.finetune_commands) |command| collectSteps(&command.executable.step, &steps, &modules);
+    for (artifacts.inference_steps.finetune_workflows) |command| collectSteps(&command.executable.step, &steps, &modules);
     const host_tools = b.step("cache-host-tools", "Compile the actual host generators");
     const openapi = b.step("cache-openapi", "Exercise the actual schema joins and their discovered inputs");
     const unit_tests = b.step("cache-unit-tests", "Exercise actual test imports with stable metadata");
@@ -80,8 +84,13 @@ pub fn build(b: *std.Build) void {
                     b.step("cache-lmdb-tests", "Exercise actual LMDB consumer imports and options").dependOn(&b.addRunArtifact(artifact).step);
                     lmdb_test_found = true;
                 }
-                if (artifact.kind.isTest() and std.mem.endsWith(u8, path.sub_path, "/api_http_runtime_test_root.zig")) {
-                    // Keep the actual API test's imports, flags, and runner.
+                if (artifact.kind.isTest() and std.mem.eql(u8, artifact.name, "test") and
+                    artifact.test_runner != null and artifact.test_runner.?.mode == .simple and
+                    std.mem.endsWith(u8, path.sub_path, "/api_http_runtime_test_root.zig"))
+                {
+                    // Several artifacts share this root module. Select the owning
+                    // API suite before mutating it; pointer-hash iteration must
+                    // not choose a different runner or compiler profile per build.
                     artifact.root_module.root_source_file = sources.add("vopr_test.zig",
                         \\test "VOPR cache probe" {
                         \\    const revision = @import("vopr").cache_test_revision;
@@ -197,10 +206,12 @@ pub fn build(b: *std.Build) void {
         \\extern fn probe_serverless() u64;
         \\extern fn probe_inference() u64;
         \\extern fn probe_api_kernel() u64;
+        \\extern fn probe_storage_kernel() u64;
+        \\extern fn probe_enrichment_compute() u64;
         \\pub fn main() void {
-        \\    std.debug.print("CACHE_PROBE {s} {x} {x} {x} {x} {x}\n", .{
+        \\    std.debug.print("CACHE_PROBE {s} {x} {x} {x} {x} {x} {x} {x}\n", .{
         \\        @import("build_info").version(), probe_cli(), probe_distributed(),
-        \\        probe_serverless(), probe_inference(), probe_api_kernel(),
+        \\        probe_serverless(), probe_inference(), probe_api_kernel(), probe_storage_kernel(), probe_enrichment_compute(),
         \\    });
         \\}
     );
@@ -282,7 +293,7 @@ fn inspect(module: *std.Build.Module, unit: runtime.RuntimeLibraryUnit, metadata
             std.debug.panic("{s} archive depends on simulation test support", .{@tagName(unit)});
         if (std.mem.eql(u8, name, "lmdb_engine"))
             std.debug.panic("{s} archive depends on disabled LMDB", .{@tagName(unit)});
-        if (unit != .distributed and std.mem.eql(u8, name, "antfly_lite_options"))
+        if (unit != .distributed and unit != .storage_kernel and std.mem.eql(u8, name, "antfly_lite_options"))
             std.debug.panic("{s} archive depends on Lite capability settings", .{@tagName(unit)});
         if (unit != .api_kernel and (std.mem.eql(u8, name, "antfly_mcp") or std.mem.eql(u8, name, "antfly_a2a")))
             std.debug.panic("{s} archive depends on API protocol adapters", .{@tagName(unit)});

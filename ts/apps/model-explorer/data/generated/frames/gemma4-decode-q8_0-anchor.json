@@ -1,0 +1,158 @@
+{
+ "schemaVersion": 1,
+ "id": "decode-q8_0-anchor",
+ "modelId": "gemma4-e2b",
+ "title": "Historical E2B Q8_0 anchor · schematic operations",
+ "description": "METAL.md records a 35-layer Q8_0/f32-KV greedy anchor with 41 compute encoders, 422 planned barriers and 36 planned scopes. The scopes and hazard ticks here are representative, not a capture. This differs in model/precision/route from the Q4_0 illustration and is not a matched before/after experiment.",
+ "source": {
+  "path": "work-log/completed/inference/metal/status-history.md",
+  "anchor": "`10979 236888 2088 740`, reports `planned_scopes=36`,",
+  "line": 164
+ },
+ "mode": "planned",
+ "stats": {
+  "encoders": 41,
+  "plannedScopes": 36,
+  "plannedBarriers": 422
+ },
+ "encoderScopes": [
+  {
+   "id": "attn-setup",
+   "kind": "compute",
+   "label": "attention setup",
+   "ops": [
+    {
+     "label": "rms_norm",
+     "family": "norm_rope"
+    },
+    {
+     "label": "QKV project",
+     "kernel": "termite_q8_0_linear",
+     "family": "matvec"
+    },
+    {
+     "label": "rope",
+     "family": "norm_rope"
+    }
+   ]
+  },
+  {
+   "id": "attn",
+   "kind": "compute",
+   "label": "attention",
+   "ops": [
+    {
+     "label": "paged attention",
+     "kernel": "termite_paged_attention_kv_1x",
+     "family": "attention"
+    },
+    {
+     "label": "output project",
+     "kernel": "termite_q8_0_linear",
+     "family": "matvec"
+    }
+   ]
+  },
+  {
+   "id": "ffn",
+   "kind": "compute",
+   "label": "FFN",
+   "ops": [
+    {
+     "label": "gate",
+     "kernel": "termite_q8_0_linear",
+     "family": "matvec"
+    },
+    {
+     "label": "up",
+     "kernel": "termite_q8_0_linear",
+     "family": "matvec"
+    },
+    {
+     "label": "GELU(tanh)·up",
+     "family": "norm_rope"
+    },
+    {
+     "label": "down",
+     "kernel": "termite_q8_0_linear",
+     "family": "matvec"
+    }
+   ]
+  },
+  {
+   "id": "tail",
+   "kind": "compute",
+   "label": "LM head + device greedy selection",
+   "ops": [
+    {
+     "label": "Q8_0 LM head",
+     "kernel": "termite_q8_0_linear",
+     "family": "matvec"
+    },
+    {
+     "label": "parallel greedy argmax",
+     "kernel": "termite_argmax_logits_reduce",
+     "family": "sampling"
+    }
+   ]
+  }
+ ],
+ "barriers": [
+  {
+   "afterScope": "attn-setup",
+   "afterOpIndex": 0,
+   "hazard": "raw",
+   "tensors": [
+    "normed_x"
+   ]
+  },
+  {
+   "afterScope": "attn-setup",
+   "afterOpIndex": 1,
+   "hazard": "raw",
+   "tensors": [
+    "qkv"
+   ]
+  },
+  {
+   "afterScope": "attn",
+   "afterOpIndex": 0,
+   "hazard": "raw",
+   "tensors": [
+    "attn_out"
+   ]
+  },
+  {
+   "afterScope": "ffn",
+   "afterOpIndex": 0,
+   "hazard": "waw",
+   "tensors": [
+    "gate_out"
+   ]
+  },
+  {
+   "afterScope": "ffn",
+   "afterOpIndex": 1,
+   "hazard": "raw",
+   "tensors": [
+    "up_out"
+   ]
+  },
+  {
+   "afterScope": "ffn",
+   "afterOpIndex": 2,
+   "hazard": "raw",
+   "tensors": [
+    "act"
+   ]
+  },
+  {
+   "afterScope": "tail",
+   "afterOpIndex": 0,
+   "hazard": "raw",
+   "tensors": [
+    "logits"
+   ]
+  }
+ ]
+}

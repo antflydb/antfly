@@ -158,6 +158,32 @@ export type Table = components["schemas"]["Table"];
 export type CommittedMutationOutcome = components["schemas"]["CommittedMutationOutcome"];
 export type CreateTableRequest = components["schemas"]["CreateTableRequest"];
 export type TableSchema = components["schemas"]["TableSchema"];
+export type RelationalUniqueConstraint = components["schemas"]["RelationalUniqueConstraint"];
+export type RelationalForeignKeyConstraint =
+  components["schemas"]["RelationalForeignKeyConstraint"];
+export type RelationalRow = components["schemas"]["RelationalRow"];
+export type RelationalIndexPredicate = components["schemas"]["RelationalIndexPredicate"];
+export type RelationalScalarExpression = components["schemas"]["RelationalScalarExpression"];
+export type RelationalColumnExpression = components["schemas"]["RelationalColumnExpression"];
+export type RelationalExpressionOp = components["schemas"]["RelationalExpressionOp"];
+export type RelationalExpressionType = components["schemas"]["RelationalExpressionType"];
+export type RelationalRowCondition = components["schemas"]["RelationalRowCondition"];
+export type RelationalRowQueryRequest = components["schemas"]["RelationalRowQueryRequest"];
+export type RelationalRowMutation = components["schemas"]["RelationalRowMutation"];
+export type RelationalRowMutationRequest = components["schemas"]["RelationalRowMutationRequest"];
+export type RelationalConstraintStatus = components["schemas"]["RelationalConstraintStatus"];
+export type RelationalConstraintRetryRequest =
+  components["schemas"]["RelationalConstraintRetryRequest"];
+export type RelationalConstraintRetirementRequest =
+  components["schemas"]["RelationalConstraintRetirementRequest"];
+export type RelationalConstraintRetirementStatus =
+  components["schemas"]["RelationalConstraintRetirementStatus"];
+export type RelationalConstraintRetryResponse =
+  components["schemas"]["RelationalConstraintRetryResponse"];
+export type RelationalConstraintRangeStatus =
+  components["schemas"]["RelationalConstraintRangeStatus"];
+export type RelationalConstraintConflictReason =
+  components["schemas"]["RelationalConstraintConflictReason"];
 export type TableMigration = components["schemas"]["TableMigration"];
 export type TableStatus = components["schemas"]["TableStatus"];
 
@@ -191,6 +217,18 @@ export type CreateFullTextIndexRequest = components["schemas"]["CreateFullTextIn
 export type CreateEmbeddingsIndexRequest = components["schemas"]["CreateEmbeddingsIndexRequest"];
 export type CreateGraphIndexRequest = components["schemas"]["CreateGraphIndexRequest"];
 export type CreateAlgebraicIndexRequest = components["schemas"]["CreateAlgebraicIndexRequest"];
+export type CreateRelationalIndexRequest = components["schemas"]["CreateRelationalIndexRequest"];
+export type CreatedRelationalIndex = components["schemas"]["CreatedRelationalIndex"];
+export type RelationalIndexConfig = components["schemas"]["RelationalIndexConfig"];
+export type RelationalIndexStats = components["schemas"]["RelationalIndexStats"];
+export type RelationalIndexStatus = components["schemas"]["RelationalIndexStatus"];
+export type RelationalIndexRangeStatus = components["schemas"]["RelationalIndexRangeStatus"];
+export type RelationalIndexBuildState = components["schemas"]["RelationalIndexBuildState"];
+export type RelationalIndexBuildFailure = components["schemas"]["RelationalIndexBuildFailure"];
+export type IndexMaintenanceRequest = components["schemas"]["IndexMaintenanceRequest"];
+export type IndexMaintenanceResponse = components["schemas"]["IndexMaintenanceResponse"];
+export type IndexMaintenanceOwnerProof = components["schemas"]["IndexMaintenanceOwnerProof"];
+export type RelationalRowIndexBound = components["schemas"]["RelationalRowIndexBound"];
 export type CreatedIndex = components["schemas"]["CreatedIndex"];
 export type IndexType = components["schemas"]["IndexType"];
 export type IndexStatus = components["schemas"]["IndexStatus"];
@@ -199,6 +237,25 @@ export type ClusterStatus = components["schemas"]["ClusterStatus"];
 
 // Graph index types
 export type GraphIndexConfig = components["schemas"]["GraphIndexConfig"];
+export type GraphIndexStats = components["schemas"]["GraphIndexStats"];
+export type GraphMetricActionResponse = components["schemas"]["GraphMetricActionResponse"];
+export type GraphMetricBuildPageStatus = components["schemas"]["GraphMetricBuildPageStatus"];
+export type GraphMetricEdgeFilterStatus = components["schemas"]["GraphMetricEdgeFilterStatus"];
+export type GraphMetricEvent = components["schemas"]["GraphMetricEvent"];
+export type GraphMetricFilter = components["schemas"]["GraphMetricFilter"];
+export type GraphMetricOrder = components["schemas"]["GraphMetricOrder"];
+export type GraphMetricProfile = components["schemas"]["GraphMetricProfile"];
+export type GraphMetricQuery = components["schemas"]["GraphMetricQuery"];
+export type GraphMetricRerank = components["schemas"]["GraphMetricRerank"];
+export type GraphMetricRerankScoreDetails = components["schemas"]["GraphMetricRerankScoreDetails"];
+export type GraphMetricResult = components["schemas"]["GraphMetricResult"];
+export type GraphMetricRuntimeStats = components["schemas"]["GraphMetricRuntimeStats"];
+export type GraphMetricScore = components["schemas"]["GraphMetricScore"];
+export type GraphMetricStatus = components["schemas"]["GraphMetricStatus"];
+export type GraphMetricFreshness = NonNullable<
+  components["schemas"]["GraphTraversal"]["metric_freshness"]
+>;
+export type QueryScoreDetails = components["schemas"]["QueryScoreDetails"];
 export type EdgeTypeConfig = components["schemas"]["EdgeTypeConfig"];
 export type EdgeTopology = NonNullable<EdgeTypeConfig["topology"]>;
 
@@ -347,7 +404,7 @@ export const embedderProviderCapabilities = {
   gemini: { index: false },
   ollama: { index: true },
   openai: { index: true },
-  openrouter: { index: false },
+  openrouter: { index: true },
   vertex: { index: false },
 } as const satisfies Record<EmbedderProvider, { index: boolean }>;
 export const embedderProviders = Object.keys(embedderProviderCapabilities) as EmbedderProvider[];
@@ -360,6 +417,7 @@ export const generatorProviderCapabilities = {
   gemini: {},
   ollama: {},
   openai: {},
+  openrouter: {},
   vertex: {},
 } as const satisfies Record<GeneratorProvider, object>;
 export const generatorProviders = Object.keys(generatorProviderCapabilities) as GeneratorProvider[];
@@ -398,6 +456,8 @@ export type AgentStep = components["schemas"]["AgentStep"];
 export type AgentStepKind = components["schemas"]["AgentStepKind"];
 export type AgentStepStatus = components["schemas"]["AgentStepStatus"];
 export type WebSearchConfig = components["schemas"]["WebSearchConfig"];
+export type WebSearchProviderConfig = components["schemas"]["WebSearchProviderConfig"];
+export type ExaSearchConfig = components["schemas"]["ExaSearchConfig"];
 export type FetchConfig = components["schemas"]["FetchConfig"];
 
 // Eval types
@@ -452,6 +512,7 @@ export interface AntflyConfig {
 }
 
 // Retrieval Agent types
+export type RetrievalNavigationConfig = components["schemas"]["RetrievalNavigationConfig"];
 export type RetrievalAgentRequest = components["schemas"]["RetrievalAgentRequest"];
 export type RetrievalAgentResult = components["schemas"]["RetrievalAgentResult"];
 export type RetrievalAgentSteps = components["schemas"]["RetrievalAgentSteps"];
@@ -535,3 +596,12 @@ export interface QueryOptions {
   orderBy?: Record<string, boolean>;
   aggregations?: Record<string, AggregationRequest>;
 }
+
+// System catalog resources and lifecycle requests.
+export type DatabaseCatalogRecord = components["schemas"]["DatabaseCatalogRecord"];
+export type NamespaceCatalogRecord = components["schemas"]["NamespaceCatalogRecord"];
+export type TablespaceCatalogRecord = components["schemas"]["TablespaceCatalogRecord"];
+export type CreateTablespaceRequest = components["schemas"]["CreateTablespaceRequest"];
+export type CatalogTablespaceBindingRequest =
+  components["schemas"]["CatalogTablespaceBindingRequest"];
+export type RenameCatalogResourceRequest = components["schemas"]["RenameCatalogResourceRequest"];

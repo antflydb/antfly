@@ -26,6 +26,8 @@ const shard_mod = @import("../shard.zig");
 const transactions_mod = @import("../transactions.zig");
 const reranking_mod = @import("antfly_reranking");
 const doc_identity_mod = @import("doc_identity.zig");
+const enrichment_neighbor_context = @import("enrichment/neighbor_context.zig");
+const graph_edge_types = @import("graph_edge_types.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
 const index_repair_status = @import("../../common/index_repair_status.zig");
 const dense_native_storage_phase = @import("../../common/dense_native_storage_phase.zig");
@@ -106,6 +108,27 @@ pub const TransformOpType = enum {
     current_date,
     rename,
 };
+
+/// Canonical public wire spelling for document transform operations. Keep the
+/// representation beside the value contract so routing/serialization code
+/// does not need to import the physical transform executor.
+pub fn transformOpText(op: TransformOpType) []const u8 {
+    return switch (op) {
+        .set => "$set",
+        .set_on_insert => "$setOnInsert",
+        .unset => "$unset",
+        .inc => "$inc",
+        .push => "$push",
+        .pull => "$pull",
+        .add_to_set => "$addToSet",
+        .pop => "$pop",
+        .mul => "$mul",
+        .min => "$min",
+        .max => "$max",
+        .current_date => "$currentDate",
+        .rename => "$rename",
+    };
+}
 
 pub const TransformOp = struct {
     op: TransformOpType,
@@ -196,15 +219,7 @@ pub const MergeSourceTransitionMutation = struct {
 
 /// Receiver-persisted fencing identity for one copy, ordered by the donor's
 /// elected Raft term and then its per-process attempt sequence.
-pub const MergeCopyAttempt = struct {
-    donor_term: u64 = 0,
-    sequence: u64 = 0,
-
-    pub fn order(a: MergeCopyAttempt, b: MergeCopyAttempt) std.math.Order {
-        const term_order = std.math.order(a.donor_term, b.donor_term);
-        return if (term_order == .eq) std.math.order(a.sequence, b.sequence) else term_order;
-    }
-};
+pub const MergeCopyAttempt = @import("relational_integrity_handoff_contract.zig").MergeCopyAttempt;
 
 /// Replay identity for receiver-side merge copy batches. Unlike an ordinary
 /// write, these entries must reopen the already-provisioned receiver from its
@@ -244,6 +259,10 @@ pub const MergeReplicationCheckpoint = struct {
     copy_attempt: MergeCopyAttempt = .{},
     allow_doc_identity_reassignment: bool = false,
     receiver_identity_reassignment_namespace: ?doc_identity_mod.Namespace = null,
+    /// Opt-in immutable source binding for atomic, resumable receiver pages.
+    /// Only begin_copy may install it; ordinary checkpoint payloads stay empty.
+    page_source: ?@import("merge_page_contract.zig").Source = null,
+    page_receiver_namespace: ?doc_identity_mod.Namespace = null,
 };
 
 /// Private data-Raft command used by the distributed transaction protocol.
@@ -287,12 +306,32 @@ pub const TransactionMutation = union(enum) {
 };
 
 pub const BatchRequest = struct {
+    /// Private, replicated source-retention lifecycle. Never accepted by public JSON.
+    online_source: ?@import("online_source_contract.zig").Command = null,
+    /// Private replicated hidden-owner lifecycle; public JSON cannot set it.
+    restore_staging: ?@import("restore_staging_contract.zig").Control = null,
+    restore_staging_scope: ?[32]u8 = null,
+    /// Private metadata lookup identity, authenticated together with the scope.
+    restore_staging_plan_id: ?[16]u8 = null,
+    /// Authenticated owner lifecycle control; never populated by public JSON.
+    relational_topology: ?@import("relational_integrity_topology_contract.zig").Command = null,
+    relational_schema_version: ?u32 = null,
+    /// Internal coordinator evidence; never populated from public request JSON.
+    relational_integrity_generation_set: ?[32]u8 = null,
+    /// Authenticated administrative repair, still subject to integrity checks.
+    relational_repair: bool = false,
     writes: []const BatchWrite = &.{},
     deletes: []const []const u8 = &.{},
     transforms: []const DocumentTransform = &.{},
     graph_writes: []const GraphEdgeWrite = &.{},
     graph_deletes: []const GraphEdgeDelete = &.{},
     predicates: []const TransactionVersionPredicate = &.{},
+    /// Internal transaction-only effects; never accepted from public batch JSON.
+    integrity: []const TransactionIntegrityOperation = &.{},
+    integrity_commands: []const @import("relational_integrity_contract.zig").Command = &.{},
+    relational_activation: ?@import("relational_integrity_activation_contract.zig").Command = null,
+    relational_retirement: ?@import("relational_integrity_retirement_contract.zig").Command = null,
+    relational_index_maintenance: ?@import("relational_index_maintenance_contract.zig").Command = null,
     timestamp_ns: u64 = 0,
     sync_level: SyncLevel = .write,
     /// Internal single-participant transaction contract. Transform expansion
@@ -314,11 +353,53 @@ pub const BatchRequest = struct {
     /// Internal identity context for receiver-side merge copy and rollback
     /// batches. Public batch parsing never sets it.
     merge_replication: ?MergeReplicationContext = null,
+    /// Separate effect-bearing command; never combined with a checkpoint.
+    merge_page: ?@import("merge_page_contract.zig").Command = null,
     /// Authoritative document-scoped store rows, not original write inputs.
     /// Ordered after primary copy and before the receiver completion checkpoint.
     merge_artifacts: []const BatchWrite = &.{},
     /// Internal 2PC phase. Public batch parsing never accepts this field.
     transaction: ?TransactionMutation = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        inline for (std.meta.fields(@This())) |field| {
+            try jw.objectField(field.name);
+            if (comptime std.mem.eql(u8, field.name, "relational_integrity_generation_set") or std.mem.eql(u8, field.name, "restore_staging_scope") or std.mem.eql(u8, field.name, "restore_staging_plan_id")) {
+                if (@field(self, field.name)) |digest| {
+                    try jw.beginArray();
+                    for (digest) |byte| try jw.write(byte);
+                    try jw.endArray();
+                } else try jw.write(null);
+            } else if (comptime std.mem.eql(u8, field.name, "merge_page")) {
+                // The same bounded chunk encoding crosses HTTP, native replay
+                // and projection storage; never expand payload bytes to nodes.
+                try jw.write(self.merge_page);
+            } else if (comptime std.mem.eql(u8, field.name, "split_checkpoint") or
+                std.mem.eql(u8, field.name, "split_transition") or
+                std.mem.eql(u8, field.name, "merge_checkpoint") or
+                std.mem.eql(u8, field.name, "merge_artifacts"))
+            {
+                // Lifecycle ranges and physical artifacts are opaque bytes,
+                // including when replayed through the native HA envelope.
+                try @import("relational_integrity_json.zig").write(@field(self, field.name), jw);
+            } else if (comptime std.mem.eql(u8, field.name, "writes") or std.mem.eql(u8, field.name, "deletes")) {
+                // Final transaction effects can contain binary private keys
+                // and values in live HA as well as staged restore. Preserve
+                // those bytes without expanding ordinary JSON primary rows.
+                try jw.beginArray();
+                for (@field(self, field.name)) |item| {
+                    const key = if (comptime std.mem.eql(u8, field.name, "writes")) item.key else item;
+                    if (std.mem.startsWith(u8, key, "\x00\x00__metadata__:"))
+                        try @import("relational_integrity_json.zig").write(item, jw)
+                    else
+                        try jw.write(item);
+                }
+                try jw.endArray();
+            } else try jw.write(@field(self, field.name));
+        }
+        try jw.endObject();
+    }
 };
 
 pub fn validateMergeArtifacts(req: BatchRequest) !void {
@@ -337,23 +418,8 @@ pub fn validateMergeArtifacts(req: BatchRequest) !void {
     }
 }
 
-pub const GraphEdgeWrite = struct {
-    index_name: []const u8,
-    source: []const u8,
-    target: []const u8,
-    edge_type: []const u8,
-    weight: f64 = 1.0,
-    created_at: u64 = 0,
-    updated_at: u64 = 0,
-    metadata_json: []const u8 = "",
-};
-
-pub const GraphEdgeDelete = struct {
-    index_name: []const u8,
-    source: []const u8,
-    target: []const u8,
-    edge_type: []const u8,
-};
+pub const GraphEdgeWrite = graph_edge_types.GraphEdgeWrite;
+pub const GraphEdgeDelete = graph_edge_types.GraphEdgeDelete;
 
 pub const IndexKind = enum {
     full_text,
@@ -536,6 +602,7 @@ pub const EnrichmentConfig = struct {
     full_text_index: bool = false,
     content_type: []const u8 = "",
     producer_json: []const u8 = "",
+    neighbor_context: ?EnrichmentNeighborContextConfig = null,
     execution: ?EnrichmentExecutionConfig = null,
 
     pub fn clone(alloc: Allocator, cfg: EnrichmentConfig) !EnrichmentConfig {
@@ -554,6 +621,7 @@ pub const EnrichmentConfig = struct {
             .full_text_index = cfg.full_text_index,
             .content_type = if (cfg.content_type.len > 0) try alloc.dupe(u8, cfg.content_type) else "",
             .producer_json = if (cfg.producer_json.len > 0) try alloc.dupe(u8, cfg.producer_json) else "",
+            .neighbor_context = if (cfg.neighbor_context) |context| try EnrichmentNeighborContextConfig.clone(alloc, context) else null,
             .execution = cfg.execution,
         };
     }
@@ -567,6 +635,46 @@ pub const EnrichmentConfig = struct {
         if (self.chunker_json.len > 0) alloc.free(self.chunker_json);
         if (self.content_type.len > 0) alloc.free(self.content_type);
         if (self.producer_json.len > 0) alloc.free(self.producer_json);
+        if (self.neighbor_context) |*context| context.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+/// Bounded same-shard graph adjacency sampled into an asset producer's
+/// rendered input. Only valid on asset enrichments whose producer consumes
+/// rendered text; bounds and the graph index reference are enforced at
+/// admission while a missing runtime state fails open with empty neighbors.
+pub const EnrichmentNeighborContextConfig = struct {
+    graph_index: []const u8 = "",
+    edge_types: []const []const u8 = &.{},
+    direction: enrichment_neighbor_context.Direction = .both,
+    limit: u32 = enrichment_neighbor_context.default_limit,
+
+    pub fn clone(alloc: Allocator, cfg: EnrichmentNeighborContextConfig) !EnrichmentNeighborContextConfig {
+        const graph_index = if (cfg.graph_index.len > 0) try alloc.dupe(u8, cfg.graph_index) else "";
+        errdefer if (graph_index.len > 0) alloc.free(graph_index);
+        const edge_types = try alloc.alloc([]const u8, cfg.edge_types.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (edge_types[0..initialized]) |edge_type| alloc.free(edge_type);
+            alloc.free(edge_types);
+        }
+        for (cfg.edge_types, 0..) |edge_type, i| {
+            edge_types[i] = try alloc.dupe(u8, edge_type);
+            initialized += 1;
+        }
+        return .{
+            .graph_index = graph_index,
+            .edge_types = edge_types,
+            .direction = cfg.direction,
+            .limit = cfg.limit,
+        };
+    }
+
+    pub fn deinit(self: *EnrichmentNeighborContextConfig, alloc: Allocator) void {
+        if (self.graph_index.len > 0) alloc.free(self.graph_index);
+        for (self.edge_types) |edge_type| alloc.free(edge_type);
+        if (self.edge_types.len > 0) alloc.free(self.edge_types);
         self.* = undefined;
     }
 };
@@ -592,6 +700,12 @@ pub fn enrichmentConfigHash(cfg: EnrichmentConfig) u64 {
     hashBool(&hasher, cfg.full_text_index);
     hashLengthPrefixedBytes(&hasher, cfg.content_type);
     hashLengthPrefixedBytes(&hasher, cfg.producer_json);
+    if (cfg.neighbor_context) |context| {
+        hashLengthPrefixedBytes(&hasher, context.graph_index);
+        for (context.edge_types) |edge_type| hashLengthPrefixedBytes(&hasher, edge_type);
+        hashLengthPrefixedBytes(&hasher, @tagName(context.direction));
+        hashU32(&hasher, context.limit);
+    }
     return hasher.final();
 }
 
@@ -681,6 +795,7 @@ pub const ExtractEnrichmentsResult = struct {
             alloc.free(@constCast(write.target));
             alloc.free(@constCast(write.edge_type));
             if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
+            if (write.owner.len > 0) alloc.free(@constCast(write.owner));
         }
         if (self.graph_writes.len > 0) alloc.free(self.graph_writes);
 
@@ -1204,6 +1319,18 @@ pub const Query = union(enum) {
 };
 
 pub const LookupOptions = struct {
+    /// Private optimistic observation: captures version and SHA256 of the
+    /// exact primary bytes from one snapshot, regardless of JSON projection.
+    include_primary_digest: bool = false,
+    restore_staging_scope: ?[32]u8 = null,
+    restore_staging_plan_id: ?[16]u8 = null,
+    /// Authenticated group-local control read; never accepted by public lookup parsing.
+    relational_integrity_catalog: bool = false,
+    relational_integrity_action: bool = false,
+    relational_integrity_jobs_json: []const u8 = "",
+    relational_activation_json: []const u8 = "",
+    relational_index_status_json: []const u8 = "",
+    relational_topology_json: []const u8 = "",
     fields: []const []const u8 = &.{},
     include_all_fields: bool = true,
     /// Internal, absolute monotonic deadline used by routed lookups. It is not
@@ -1223,6 +1350,8 @@ pub const LookupOptions = struct {
 
 pub const LookupResult = struct {
     json: []u8,
+    version: ?u64 = null,
+    expected_content_digest: ?[32]u8 = null,
 
     pub fn deinit(self: *LookupResult, alloc: Allocator) void {
         alloc.free(self.json);
@@ -1271,6 +1400,9 @@ pub const ColumnarScanStats = struct {
 };
 
 pub const ScanOptions = struct {
+    /// Schema-bound typed row query carried by the routed scan transport. It
+    /// is never interpreted as a search DSL or permitted to replace RLS filters.
+    relational_query_json: []const u8 = "",
     /// Internal differential-testing and benchmark baseline; never serialized.
     disable_columnar_scan: bool = false,
     /// Internal request-local decoded payload reuse budget. Includes retained
@@ -1312,9 +1444,12 @@ pub const ScanHash = struct {
     id: []u8,
     hash: u64,
     content_hash: ?DocumentContentHash = null,
+    relational_schema_version: ?u32 = null,
+    relational_cursor: ?[]u8 = null,
 
     pub fn deinit(self: *ScanHash, alloc: Allocator) void {
         alloc.free(self.id);
+        if (self.relational_cursor) |cursor| alloc.free(cursor);
         self.* = undefined;
     }
 };
@@ -1325,6 +1460,8 @@ pub const ScanVisitEntry = struct {
     id: []const u8,
     hash: u64,
     content_hash: ?DocumentContentHash = null,
+    relational_schema_version: ?u32 = null,
+    relational_cursor: ?[]const u8 = null,
     document_json: ?[]const u8 = null,
 };
 
@@ -1408,7 +1545,7 @@ pub const DocumentArtifactTableReprocessResult = struct {
 pub const TxnId = transactions_mod.TxnId;
 pub const TxnStatus = transactions_mod.TxnStatus;
 pub const TxnRecoveryStats = transactions_mod.RecoveryStats;
-pub const ByteRange = docstore_mod.ByteRange;
+pub const ByteRange = @import("../byte_range.zig").ByteRange;
 pub const SplitPhase = shard_mod.SplitPhase;
 pub const GraphEdge = graph_mod.Edge;
 pub const GraphEdgeDirection = graph_mod.EdgeDirection;
@@ -1425,13 +1562,32 @@ pub const TransactionWrite = struct {
 pub const TransactionVersionPredicate = struct {
     key: []const u8,
     expected_version: u64,
+    /// Internal observation guard. TTL timestamps need not change on updates.
+    /// SHA-256 binds the exact primary row read before planning FK actions.
+    expected_content_digest: ?[32]u8 = null,
 };
 
+/// Server-compiled integrity effects. The logical routing key is separate from
+/// the protected physical key: routing a metadata prefix would concentrate all
+/// claims on the first shard. Public mutation parsers must never populate this
+/// envelope directly. Participants validate its namespace before admission.
+pub const TransactionIntegrityOperation = @import("relational_integrity_contract.zig").Operation;
+
 pub const TransactionIntentRequest = struct {
+    relational_index_maintenance: ?@import("relational_index_maintenance_contract.zig").Command = null,
+    restore_staging_scope: ?[32]u8 = null,
+    restore_staging_plan_id: ?[16]u8 = null,
+    relational_activation: ?@import("relational_integrity_activation_contract.zig").Command = null,
+    relational_retirement: ?@import("relational_integrity_retirement_contract.zig").Command = null,
+    relational_schema_version: ?u32 = null,
+    relational_integrity_generation_set: ?[32]u8 = null,
+    relational_repair: bool = false,
     writes: []const TransactionWrite = &.{},
     deletes: []const []const u8 = &.{},
     transforms: []const DocumentTransform = &.{},
     predicates: []const TransactionVersionPredicate = &.{},
+    integrity: []const TransactionIntegrityOperation = &.{},
+    integrity_commands: []const @import("relational_integrity_contract.zig").Command = &.{},
 };
 
 pub const SplitState = struct {
@@ -1516,6 +1672,27 @@ pub const GraphQueryTransport = struct {
 };
 
 pub const SearchRequest = struct {
+    /// Set only after catalog schema/index preparation; never populated by public JSON.
+    prepared_read_table_id: u64 = 0,
+    /// Request-owned routing map parallel to filter_doc_ids; never serialized.
+    document_lookup_groups: []const u64 = &.{},
+    /// Borrowed coordinator label; routing and storage continue using immutable identities.
+    response_table_name: ?[]const u8 = null,
+    /// Borrowed physical name of the queried table, set by the API read
+    /// source together with `graph_index_complete_snapshot`. Graph executors
+    /// canonicalize a `target_table` tag naming this table to the local
+    /// (null) identity, mirroring the distributed coordinator's
+    /// canonicalGraphNodeTable, so a self-table tag never stops expansion or
+    /// splits node identity. Never populated by public JSON.
+    graph_owning_table: []const u8 = "",
+    /// True when the executing snapshot holds the graph index's COMPLETE
+    /// row set: the table has exactly one group and the query was admitted
+    /// for local (non-coordinated) graph execution. Local graph executors
+    /// may then expand THROUGH cross-table tagged nodes — entity-sourced
+    /// edges are document-owned rows in this same index, so the walk is a
+    /// same-snapshot single-index read (the embedded DBCore entry points'
+    /// justification). Never populated by public JSON.
+    graph_index_complete_snapshot: bool = false,
     query: Query = .{ .match_all = {} },
     index_name: ?[]const u8 = null,
     primary_text_index_name: ?[]const u8 = null,
@@ -1546,6 +1723,8 @@ pub const SearchRequest = struct {
     dense_queries: []const NamedDenseQuery = &.{},
     sparse_queries: []const NamedSparseQuery = &.{},
     graph_queries: []const NamedGraphQuery = &.{},
+    graph_metric_queries: []const NamedGraphMetricQuery = &.{},
+    graph_metric_rerank: ?GraphMetricRerank = null,
     /// Trusted operator-owned graph admission ceilings. Public request parsing
     /// never reads these from JSON, and shard transport must not serialize them.
     graph_execution_limits: @import("../../graph/work_budget.zig").Limits = .{},
@@ -1646,6 +1825,9 @@ const hierarchy_children_validated_fields = [_][]const u8{
 };
 
 const hierarchy_children_supported_internal_fields = [_][]const u8{
+    "response_table_name",
+    "prepared_read_table_id",
+    "document_lookup_groups",
     "filter_query_json",
     "exclusion_query_json",
     "authorization_filter_query_json",
@@ -1661,6 +1843,8 @@ const hierarchy_children_supported_internal_fields = [_][]const u8{
     "execution_deadline_ns",
     "cancellation",
     "graph_execution_limits",
+    "graph_owning_table",
+    "graph_index_complete_snapshot",
 };
 
 const hierarchy_children_rejected_fields = [_][]const u8{
@@ -1680,6 +1864,8 @@ const hierarchy_children_rejected_fields = [_][]const u8{
     "dense_queries",
     "sparse_queries",
     "graph_queries",
+    "graph_metric_queries",
+    "graph_metric_rerank",
     "graph_query_transport",
     "merge_config",
     "reranker",
@@ -1844,10 +2030,15 @@ pub fn canonicalGroupedMatchDescendantRequest(
 
 pub const GraphTableReadAuthorization = struct {
     allowed: bool,
+    /// Binding alone does not require a document-existence or predicate read.
+    requires_document_admission: bool = true,
+    /// Owned physical routing name; authorization remains against the logical target.
+    physical_table_name: ?[]u8 = null,
     /// Owned by this value when non-null.
     filter_query_json: ?[]u8 = null,
 
     pub fn deinit(self: *GraphTableReadAuthorization, alloc: std.mem.Allocator) void {
+        if (self.physical_table_name) |value| alloc.free(value);
         if (self.filter_query_json) |value| alloc.free(value);
         self.* = undefined;
     }
@@ -1919,6 +2110,66 @@ pub const NamedGraphQuery = struct {
     name: []const u8,
     query: graph_query_mod.GraphQuery,
 };
+
+pub const GraphMetricFreshness = enum {
+    published,
+    fresh,
+};
+
+pub const GraphMetricQuery = struct {
+    index_name: []const u8,
+    metric_name: []const u8,
+    top_k: u32 = 10,
+    freshness: GraphMetricFreshness = .published,
+    /// Query-seeded personalized PageRank: teleport mass restricted to these
+    /// node keys. The ranking is computed at query time from the current edge
+    /// snapshot, so seeds require freshness=fresh; published generations are
+    /// global-only. Seed keys absent from the graph are skipped, not errors.
+    seed_nodes: []const []const u8 = &.{},
+    /// Damping override for personalized reads. Null keeps the metric's
+    /// configured damping. Only valid together with seed_nodes.
+    damping: ?f64 = null,
+};
+
+pub const NamedGraphMetricQuery = struct {
+    name: []const u8,
+    query: GraphMetricQuery,
+};
+
+pub const GraphMetricRerank = struct {
+    index_name: []const u8,
+    metric_name: []const u8,
+    freshness: GraphMetricFreshness = .published,
+    candidate_count: ?u32 = null,
+    base_weight: f64 = 1.0,
+    weight: f64 = 1.0,
+    missing_score: f64 = 0.0,
+    /// Query-seeded personalized PageRank blend: metric feature scores are
+    /// computed at query time with teleport mass restricted to these node
+    /// keys. Requires freshness=fresh; published generations are global-only.
+    seed_nodes: []const []const u8 = &.{},
+    /// Damping override for personalized blends. Only valid with seed_nodes.
+    damping: ?f64 = null,
+};
+
+pub const graph_metric_rerank_max_candidates: u32 = 10_000;
+pub const graph_metric_rerank_default_oversample: u32 = 4;
+
+pub fn graphMetricRerankCandidateCount(rerank: GraphMetricRerank, offset: u32, limit: u32) u32 {
+    if (rerank.candidate_count) |count| return count;
+    const page_boundary = offset +| limit;
+    const adaptive = offset +| (limit *| graph_metric_rerank_default_oversample);
+    return @min(graph_metric_rerank_max_candidates, @max(page_boundary, adaptive));
+}
+
+pub fn validateGraphMetricRerankWindow(rerank: GraphMetricRerank, offset: u32, limit: u32) !void {
+    const page_boundary = offset +| limit;
+    if (page_boundary > graph_metric_rerank_max_candidates) return error.QueryCandidateBudgetExceeded;
+    if (rerank.candidate_count) |count| {
+        if (count == 0 or count > graph_metric_rerank_max_candidates or count < page_boundary)
+            return error.InvalidQueryRequest;
+    }
+}
 
 pub const NamedFullTextQuery = struct {
     name: []const u8,
@@ -2022,6 +2273,44 @@ pub fn cloneHighlights(alloc: Allocator, items: []const HighlightedField) ![]Hig
     return cloned;
 }
 
+pub const GraphMetricRerankScoreDetails = struct {
+    index_name: []u8,
+    metric_name: []u8,
+    base_score: f64 = 0.0,
+    base_weight: f64 = 1.0,
+    metric_score: ?f64 = null,
+    metric_score_used: f64 = 0.0,
+    metric_weight: f64 = 1.0,
+    missing_score_used: bool = false,
+    final_score: f64 = 0.0,
+    published_generation: u64 = 0,
+
+    pub fn clone(self: GraphMetricRerankScoreDetails, alloc: Allocator) !GraphMetricRerankScoreDetails {
+        const index_name = try alloc.dupe(u8, self.index_name);
+        errdefer alloc.free(index_name);
+        const metric_name = try alloc.dupe(u8, self.metric_name);
+        errdefer alloc.free(metric_name);
+        return .{
+            .index_name = index_name,
+            .metric_name = metric_name,
+            .base_score = self.base_score,
+            .base_weight = self.base_weight,
+            .metric_score = self.metric_score,
+            .metric_score_used = self.metric_score_used,
+            .metric_weight = self.metric_weight,
+            .missing_score_used = self.missing_score_used,
+            .final_score = self.final_score,
+            .published_generation = self.published_generation,
+        };
+    }
+
+    pub fn deinit(self: *GraphMetricRerankScoreDetails, alloc: Allocator) void {
+        alloc.free(self.index_name);
+        alloc.free(self.metric_name);
+        self.* = undefined;
+    }
+};
+
 pub const SearchHit = struct {
     id: []u8,
     /// Internal graph-hydration namespace. Null means the query's source
@@ -2031,6 +2320,7 @@ pub const SearchHit = struct {
     native_text_doc_id: ?u32 = null,
     /// Higher-is-better relevance score used by every public query path.
     score: ?f32 = null,
+    score_details: ?GraphMetricRerankScoreDetails = null,
     /// Metric-native dense-vector distance. Lower values are better. This is
     /// retained separately so score ordering never depends on the metric.
     distance: ?f32 = null,
@@ -2050,6 +2340,7 @@ pub const SearchHit = struct {
         errdefer {
             alloc.free(cloned.id);
             if (cloned.source_table) |table| alloc.free(table);
+            if (cloned.score_details) |*details| details.deinit(alloc);
             freeIndexScores(alloc, cloned.index_scores);
             freeJsonValues(alloc, cloned.sort_values);
             if (cloned.stored_data) |data| alloc.free(data);
@@ -2062,6 +2353,7 @@ pub const SearchHit = struct {
         cloned.doc_ordinal = self.doc_ordinal;
         cloned.native_text_doc_id = self.native_text_doc_id;
         cloned.score = self.score;
+        cloned.score_details = if (self.score_details) |details| try details.clone(alloc) else null;
         cloned.distance = self.distance;
         cloned.index_scores = try cloneIndexScores(alloc, self.index_scores);
         cloned.sort_values = try cloneJsonValues(alloc, self.sort_values);
@@ -2090,6 +2382,7 @@ pub const SearchHit = struct {
     pub fn deinit(self: *SearchHit, alloc: Allocator) void {
         alloc.free(self.id);
         if (self.source_table) |table| alloc.free(table);
+        if (self.score_details) |*details| details.deinit(alloc);
         freeIndexScores(alloc, self.index_scores);
         freeJsonValues(alloc, self.sort_values);
         if (self.stored_data) |data| alloc.free(data);
@@ -2353,14 +2646,74 @@ pub const SearchResult = struct {
     /// relying on `identity_read_generation` being globally common.
     shard_identity_read_generations: []ShardIdentityReadGeneration = &.{},
     sort_profile: ?SortProfile = null,
+    /// Decoded profiles own their strings here. Native profiles borrow static
+    /// labels; both representations follow the SearchResult's move lifetime.
+    sort_profile_storage: ?[]u8 = null,
     graph_results: []GraphSearchResult = &.{},
+    graph_metric_results: []GraphMetricResult = &.{},
+    graph_metric_rerank_status: ?GraphMetricStatus = null,
+
+    /// Clone all profile strings in one allocation. Reflection keeps future
+    /// string fields in the ownership contract without a second field list.
+    pub fn setOwnedSortProfile(self: *SearchResult, profile: SortProfile) !void {
+        var length: usize = 0;
+        inline for (@typeInfo(SortProfile).@"struct".fields) |field| {
+            if (field.type == []const u8) length = try std.math.add(usize, length, @field(profile, field.name).len);
+        }
+        const storage = try self.alloc.alloc(u8, length);
+        var owned = profile;
+        var offset: usize = 0;
+        inline for (@typeInfo(SortProfile).@"struct".fields) |field| {
+            if (field.type == []const u8) {
+                const value = @field(profile, field.name);
+                @memcpy(storage[offset..][0..value.len], value);
+                @field(owned, field.name) = storage[offset..][0..value.len];
+                offset += value.len;
+            }
+        }
+        if (self.sort_profile_storage) |previous| self.alloc.free(previous);
+        self.sort_profile_storage = storage;
+        self.sort_profile = owned;
+    }
 
     pub fn deinit(self: *SearchResult) void {
+        if (self.sort_profile_storage) |storage| self.alloc.free(storage);
         for (self.hits) |*hit| hit.deinit(self.alloc);
         if (self.hits.len > 0) self.alloc.free(self.hits);
         for (self.graph_results) |*graph_result| graph_result.deinit(self.alloc);
         if (self.graph_results.len > 0) self.alloc.free(self.graph_results);
+        for (self.graph_metric_results) |*metric_result| metric_result.deinit(self.alloc);
+        if (self.graph_metric_results.len > 0) self.alloc.free(self.graph_metric_results);
+        if (self.graph_metric_rerank_status) |*status| status.deinit(self.alloc);
         if (self.shard_identity_read_generations.len > 0) self.alloc.free(self.shard_identity_read_generations);
+        self.* = undefined;
+    }
+};
+
+pub const GraphMetricScore = struct {
+    node: []u8,
+    score: f64,
+
+    pub fn deinit(self: *GraphMetricScore, alloc: Allocator) void {
+        alloc.free(self.node);
+        self.* = undefined;
+    }
+};
+
+pub const GraphMetricResult = struct {
+    name: []u8,
+    index_name: []u8,
+    metric_name: []u8,
+    scores: []GraphMetricScore,
+    status: GraphMetricStatus,
+
+    pub fn deinit(self: *GraphMetricResult, alloc: Allocator) void {
+        alloc.free(self.name);
+        alloc.free(self.index_name);
+        alloc.free(self.metric_name);
+        for (self.scores) |*score| score.deinit(alloc);
+        if (self.scores.len > 0) alloc.free(self.scores);
+        self.status.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -2368,11 +2721,14 @@ pub const SearchResult = struct {
 pub const GraphSearchResult = struct {
     name: []u8,
     nodes: []graph_query_mod.GraphResultNode = &.{},
+    metric_values_slab: []graph_query_mod.GraphMetricValue = &.{},
+    metric_value_names: [][]u8 = &.{},
     paths: []GraphPath = &.{},
     matches: []GraphPatternMatch = &.{},
     aggregates: []GraphAggregateResult = &.{},
     hits: []SearchHit,
     total_hits: u32,
+    metric_status: []GraphMetricStatus = &.{},
     truncated: bool = false,
 
     /// Detach request-scoped retained-state release hooks at the result
@@ -2386,6 +2742,9 @@ pub const GraphSearchResult = struct {
         alloc.free(self.name);
         for (self.nodes) |*node| node.deinit(alloc);
         if (self.nodes.len > 0) alloc.free(self.nodes);
+        if (self.metric_values_slab.len > 0) alloc.free(self.metric_values_slab);
+        for (self.metric_value_names) |name| alloc.free(name);
+        if (self.metric_value_names.len > 0) alloc.free(self.metric_value_names);
         for (self.paths) |path| paths_mod.freePath(alloc, path);
         if (self.paths.len > 0) alloc.free(self.paths);
         for (self.matches) |*match| match.deinit(alloc);
@@ -2394,10 +2753,136 @@ pub const GraphSearchResult = struct {
         if (self.aggregates.len > 0) alloc.free(self.aggregates);
         for (self.hits) |*hit| hit.deinit(alloc);
         if (self.hits.len > 0) alloc.free(self.hits);
+        freeGraphMetricStatuses(alloc, self.metric_status);
         self.* = undefined;
     }
 };
 
+pub const GraphMetricStatus = struct {
+    name: []u8,
+    state: graph_mod.GraphIndex.GraphMetricState = .not_ready,
+    phase: graph_mod.GraphIndex.GraphMetricBuildPhase = .idle,
+    edge_filter: graph_mod.GraphMetricEdgeFilter = .{},
+    metadata_version: u32 = 0,
+    config_fingerprint: u64 = 0,
+    maintenance_paused: bool = false,
+    build_queued: bool = false,
+    published_generation: u64 = 0,
+    edge_generation: u64 = 0,
+    target_edge_generation: u64 = 0,
+    queued_generation: u64 = 0,
+    building_generation: u64 = 0,
+    build_job_id: u64 = 0,
+    build_started_at_ms: u64 = 0,
+    build_iteration: u32 = 0,
+    build_lease_expires_at_ms: u64 = 0,
+    build_worker_id: []const u8 = "",
+    build_cursor: []const u8 = "",
+    build_completed_units: u64 = 0,
+    build_total_units: u64 = 0,
+    build_pages: []GraphMetricBuildPageStatus = &.{},
+    build_pages_truncated: bool = false,
+    retry_count: u64 = 0,
+    last_error: []const u8 = "",
+    progress: f64 = 0.0,
+    converged: bool = false,
+    iterations_completed: u32 = 0,
+    delta: f64 = 0.0,
+    computed_at_ms: u64 = 0,
+    last_event: ?graph_mod.GraphIndex.GraphMetricEvent = null,
+    recent_events: []graph_mod.GraphIndex.GraphMetricEvent = &.{},
+
+    pub fn cloneAlloc(self: GraphMetricStatus, alloc: Allocator) !GraphMetricStatus {
+        var out = self;
+        out.name = try alloc.dupe(u8, self.name);
+        out.edge_filter = .{};
+        out.build_worker_id = "";
+        out.build_cursor = "";
+        out.build_pages = &.{};
+        out.last_error = "";
+        out.recent_events = &.{};
+        errdefer out.deinit(alloc);
+        out.edge_filter = try self.edge_filter.cloneAlloc(alloc);
+        out.build_worker_id = try alloc.dupe(u8, self.build_worker_id);
+        out.build_cursor = try alloc.dupe(u8, self.build_cursor);
+        out.last_error = try alloc.dupe(u8, self.last_error);
+        out.recent_events = try alloc.dupe(graph_mod.GraphIndex.GraphMetricEvent, self.recent_events);
+        out.build_pages = try cloneGraphMetricBuildPageStatuses(alloc, self.build_pages);
+        return out;
+    }
+
+    pub fn deinit(self: *GraphMetricStatus, alloc: Allocator) void {
+        alloc.free(self.name);
+        self.edge_filter.deinit(alloc);
+        if (self.build_worker_id.len > 0) alloc.free(self.build_worker_id);
+        if (self.build_cursor.len > 0) alloc.free(self.build_cursor);
+        for (self.build_pages) |*page| page.deinit(alloc);
+        if (self.build_pages.len > 0) alloc.free(self.build_pages);
+        if (self.last_error.len > 0) alloc.free(self.last_error);
+        if (self.recent_events.len > 0) alloc.free(self.recent_events);
+        self.* = undefined;
+    }
+};
+
+pub const GraphMetricBuildPageStatus = struct {
+    phase: graph_mod.GraphIndex.GraphMetricBuildPhase = .idle,
+    iteration: u32 = 0,
+    page_id: u64 = 0,
+    state: graph_mod.GraphIndex.GraphMetricBuildPageState = .pending,
+    range_kind: graph_mod.GraphIndex.GraphMetricBuildPageRangeKind = .full,
+    worker_id: []const u8 = "",
+    lease_expires_at_ms: u64 = 0,
+    attempt: u64 = 0,
+    cursor: []const u8 = "",
+    completed_units: u64 = 0,
+    total_units: u64 = 0,
+    last_error: []const u8 = "",
+
+    pub fn deinit(self: *GraphMetricBuildPageStatus, alloc: Allocator) void {
+        if (self.worker_id.len > 0) alloc.free(self.worker_id);
+        if (self.cursor.len > 0) alloc.free(self.cursor);
+        if (self.last_error.len > 0) alloc.free(self.last_error);
+        self.* = undefined;
+    }
+};
+
+pub fn freeGraphMetricStatuses(alloc: Allocator, statuses: []GraphMetricStatus) void {
+    for (statuses) |*status| status.deinit(alloc);
+    if (statuses.len > 0) alloc.free(statuses);
+}
+
+pub fn cloneGraphMetricStatuses(alloc: Allocator, statuses: []const GraphMetricStatus) ![]GraphMetricStatus {
+    const out = try alloc.alloc(GraphMetricStatus, statuses.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*status| status.deinit(alloc);
+        alloc.free(out);
+    }
+    for (statuses, 0..) |status, i| {
+        out[i] = try status.cloneAlloc(alloc);
+        initialized += 1;
+    }
+    return out;
+}
+
+pub fn cloneGraphMetricBuildPageStatuses(alloc: Allocator, source: []const GraphMetricBuildPageStatus) ![]GraphMetricBuildPageStatus {
+    const out = try alloc.alloc(GraphMetricBuildPageStatus, source.len);
+    for (out) |*page| page.* = .{};
+    errdefer {
+        for (out) |*page| page.deinit(alloc);
+        alloc.free(out);
+    }
+    for (source, out) |original, *page| {
+        page.* = original;
+        page.worker_id = "";
+        page.cursor = "";
+        page.last_error = "";
+        page.worker_id = try alloc.dupe(u8, original.worker_id);
+        page.cursor = try alloc.dupe(u8, original.cursor);
+        page.last_error = try alloc.dupe(u8, original.last_error);
+    }
+    return out;
+}
 pub const GraphAggregateResult = struct {
     name: []u8,
     value: u128,
@@ -2489,6 +2974,12 @@ pub fn InlineStatusText(comptime capacity: usize) type {
         pub fn jsonStringify(self: @This(), jw: anytype) !void {
             try jw.write(self.slice());
         }
+
+        pub fn jsonParse(alloc: Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+            const value = try std.json.innerParse([]const u8, alloc, source, options);
+            if (value.len > capacity) return error.Overflow;
+            return init(value);
+        }
     };
 }
 
@@ -2514,6 +3005,12 @@ pub const EnrichmentStats = struct {
     processed_requests: u64 = 0,
     error_count: u64 = 0,
     retryable_error_count: u64 = 0,
+    /// Durable count of requests parked with a terminal (non-retryable)
+    /// disposition plus fatal worker failures — despite the name, this is
+    /// NOT only worker deaths. A terminally parked request never returns to
+    /// pending; per-document terminal state lives in the derived-coverage
+    /// counters (DBIndexStats.coverage_terminal_failed_count) and the
+    /// artifact repair ledger.
     fatal_error_count: u64 = 0,
     consecutive_retry_count: u32 = 0,
     next_retry_at_ms: u64 = 0,
@@ -2654,6 +3151,11 @@ pub const TransactionRecoveryStats = struct {
     error_count: u64 = 0,
 };
 
+// Error identifiers cross the storage ABI and survive allocation-free cache merges.
+// Keep their bytes in the value, as for enrichment model/backend diagnostics.
+// JSON decoding rejects identifiers exceeding the wire bound.
+pub const RuntimeErrorName = InlineStatusText(256);
+
 pub const TextMergeStats = struct {
     enabled: bool = false,
     active_indexes: u64 = 0,
@@ -2683,7 +3185,7 @@ pub const TextMergeStats = struct {
     last_merge_peak_task_alloc_bytes: u64 = 0,
     quarantined_merges: u64 = 0,
     quarantined_segments: u64 = 0,
-    last_merge_error: []const u8 = "",
+    last_merge_error: RuntimeErrorName = .{},
     retry_after_ns: u64 = 0,
     deferred_for_pressure: u64 = 0,
     backpressure_events: u64 = 0,
@@ -2692,6 +3194,117 @@ pub const TextMergeStats = struct {
     backpressure_failures: u64 = 0,
     max_pending_segments: u64 = 0,
     max_pending_bytes: u64 = 0,
+};
+
+pub const GraphMetricRuntimeRole = enum {
+    combined,
+    coordinator,
+    worker,
+    worker_pool,
+};
+
+pub const GraphMetricRuntimeStats = struct {
+    enabled: bool = false,
+    role: ?GraphMetricRuntimeRole = null,
+    runtime_id_hash: u64 = 0,
+    owner_id_hash: u64 = 0,
+    lease_key_hash: u64 = 0,
+    worker_id_hash: u64 = 0,
+    worker_count: u64 = 0,
+    lease_owned: bool = false,
+    has_lease: bool = false,
+    acquisition_count: u64 = 0,
+    takeover_count: u64 = 0,
+    lease_acquire_failures: u64 = 0,
+    lost_leases: u64 = 0,
+    last_acquired_ms: u64 = 0,
+    lease_expires_at_ms: u64 = 0,
+    lease_renew_after_ms: u64 = 0,
+    renewal_count: u64 = 0,
+    started: bool = false,
+    shutdown: bool = false,
+    notified: bool = false,
+    ticks_started: u64 = 0,
+    ticks_completed: u64 = 0,
+    durable_progress_ticks: u64 = 0,
+    idle_ticks: u64 = 0,
+    error_ticks: u64 = 0,
+    last_error_name: ?RuntimeErrorName = null,
+    total_metrics_scanned: u64 = 0,
+    total_active_builds: u64 = 0,
+    total_builds_started: u64 = 0,
+    total_worker_steps: u64 = 0,
+    total_coordinator_steps: u64 = 0,
+    total_retired_input_records: u64 = 0,
+    total_pages_claimed: u64 = 0,
+    total_pages_completed: u64 = 0,
+    total_phases_advanced: u64 = 0,
+    total_published: u64 = 0,
+    total_failed_builds: u64 = 0,
+    last_metrics_scanned: u64 = 0,
+    last_active_builds: u64 = 0,
+    last_builds_started: u64 = 0,
+    last_worker_steps: u64 = 0,
+    last_coordinator_steps: u64 = 0,
+    last_retired_input_records: u64 = 0,
+    last_pages_claimed: u64 = 0,
+    last_pages_completed: u64 = 0,
+    last_phases_advanced: u64 = 0,
+    last_published: u64 = 0,
+    last_failed_builds: u64 = 0,
+    last_budget_exhausted: bool = false,
+
+    pub fn hasRuntimeFacts(self: @This()) bool {
+        return self.enabled or
+            self.role != null or
+            self.runtime_id_hash != 0 or
+            self.owner_id_hash != 0 or
+            self.lease_key_hash != 0 or
+            self.worker_id_hash != 0 or
+            self.worker_count != 0 or
+            self.lease_owned or
+            self.has_lease or
+            self.acquisition_count != 0 or
+            self.takeover_count != 0 or
+            self.lease_acquire_failures != 0 or
+            self.lost_leases != 0 or
+            self.last_acquired_ms != 0 or
+            self.lease_expires_at_ms != 0 or
+            self.lease_renew_after_ms != 0 or
+            self.renewal_count != 0 or
+            self.started or
+            self.shutdown or
+            self.notified or
+            self.ticks_started != 0 or
+            self.ticks_completed != 0 or
+            self.durable_progress_ticks != 0 or
+            self.idle_ticks != 0 or
+            self.error_ticks != 0 or
+            self.last_error_name != null or
+            self.total_metrics_scanned != 0 or
+            self.total_active_builds != 0 or
+            self.total_builds_started != 0 or
+            self.total_worker_steps != 0 or
+            self.total_coordinator_steps != 0 or
+            self.total_retired_input_records != 0 or
+            self.total_pages_claimed != 0 or
+            self.total_pages_completed != 0 or
+            self.total_phases_advanced != 0 or
+            self.total_published != 0 or
+            self.total_failed_builds != 0 or
+            self.last_metrics_scanned != 0 or
+            self.last_active_builds != 0 or
+            self.last_builds_started != 0 or
+            self.last_worker_steps != 0 or
+            self.last_coordinator_steps != 0 or
+            self.last_retired_input_records != 0 or
+            self.last_pages_claimed != 0 or
+            self.last_pages_completed != 0 or
+            self.last_phases_advanced != 0 or
+            self.last_published != 0 or
+            self.last_failed_builds != 0 or
+            self.last_budget_exhausted;
+    }
 };
 
 pub fn accumulateTextMergeStats(dst: *TextMergeStats, src: TextMergeStats) void {
@@ -2856,6 +3469,7 @@ pub const DBStats = struct {
     ttl_cleanup: TTLCleanupStats = .{},
     transaction_recovery: TransactionRecoveryStats = .{},
     text_merge: TextMergeStats = .{},
+    graph_metric_runtime: GraphMetricRuntimeStats = .{},
     term_doc_freq_cache_hits: u64 = 0,
     term_doc_freq_cache_misses: u64 = 0,
     async_indexing: AsyncIndexingStats = .{},
@@ -3171,6 +3785,12 @@ pub const RepairCapacityCheck = struct {
 };
 
 pub const ArtifactRepairRunOptions = struct {
+    /// Absolute local catalog-admission deadline in the source routing clock.
+    /// Background admission must not consume the quantum waiting for metadata.
+    admission_deadline_ns: ?u64 = null,
+    /// Restrict a local schema-migration quantum to its exact index. Unrelated
+    /// durable repairs retain their existing scheduler and ownership policy.
+    target_index_name: ?[]const u8 = null,
     cancel_check: ?RepairCancelCheck = null,
     /// Internal BackendRuntime scheduling policy. This is deliberately not an
     /// API/index setting and is observed only after a bounded candidate batch
@@ -3211,6 +3831,29 @@ pub const ArtifactRepairRunOptions = struct {
         if (self.cancel_check) |check| return check.requested();
         return false;
     }
+};
+
+/// Authoritative owner wake decision. A tagged state prevents `0` from
+/// ambiguously meaning both "run now" and "nothing runnable" at scheduler
+/// boundaries while remaining available to the control-only compiler unit.
+pub const IndexRepairWake = union(enum) {
+    immediate,
+    at_realtime_ms: u64,
+    parked,
+    empty,
+
+    pub fn retryAtMs(self: @This()) u64 {
+        return switch (self) {
+            .at_realtime_ms => |deadline| deadline,
+            .immediate, .parked, .empty => 0,
+        };
+    }
+};
+
+/// Exact data-Raft entry persisted atomically with one document mutation.
+pub const RaftAppliedEntryIdentity = struct {
+    term: u64,
+    index: u64,
 };
 
 pub const ArtifactRepairResult = struct {
@@ -3436,6 +4079,7 @@ pub const DBIndexStats = struct {
     term_count: u64 = 0,
     edge_count: u64 = 0,
     node_count: u64 = 0,
+    graph_counts_pending: bool = false,
     root_node: u64 = 0,
     // Exact physical artifact cardinality owned by this index incarnation.
     // Unlike source coverage, this remains correct for chunked projections
@@ -3519,6 +4163,9 @@ pub const DBIndexStats = struct {
     projection_checkpoint_applied_sequence: u64 = 0,
     projection_checkpoint_generation: u64 = 0,
     projection_checkpoint_config_hash: u64 = 0,
+    // Internal physical publication certificate. A reopened index must not
+    // report a serving snapshot when its loaded cardinality differs.
+    projection_checkpoint_published_count: ?u64 = null,
     replay_applied_sequence: u64 = 0,
     replay_target_sequence: u64 = 0,
     source_replay: []IndexSourceReplayStatus = &.{},
@@ -3573,6 +4220,7 @@ pub const DBIndexStats = struct {
     algebraic_graph_traversal_rejected_count: u64 = 0,
     algebraic_graph_traversal_fallback_count: u64 = 0,
     algebraic_graph_traversal_result_node_count: u64 = 0,
+    graph_metric_status: []GraphMetricStatus = &.{},
     algebraic_observed_query_shape_count: u64 = 0,
     algebraic_recommendation_count: u64 = 0,
     algebraic_adaptive_candidate_count: u64 = 0,
@@ -3774,6 +4422,9 @@ pub fn freeAlgebraicAdaptiveProgress(alloc: Allocator, progress: []AlgebraicAdap
 }
 
 pub const HbcPostingStats = struct {
+    /// False only after a clean bounded sweep at the current mutation epoch.
+    /// Defaults conservatively when a runtime observation is unavailable.
+    refresh_pending: bool = true,
     scanned_nodes: u64 = 0,
     scanned_postings: u64 = 0,
     dirty_postings: u64 = 0,
@@ -4129,6 +4780,7 @@ pub fn freeResolverReplayDiagnostics(alloc: Allocator, stats: ResolverReplayDiag
 }
 
 pub fn freeDBIndexStatsItem(alloc: Allocator, item: DBIndexStats) void {
+    freeGraphMetricStatuses(alloc, item.graph_metric_status);
     alloc.free(item.name);
     for (item.source_replay) |source| alloc.free(source.artifact_name);
     if (item.source_replay.len > 0) alloc.free(item.source_replay);
@@ -4182,3 +4834,50 @@ pub fn freeDBStats(alloc: Allocator, stats: DBStats) void {
     for (stats.indexes) |item| freeDBIndexStatsItem(alloc, item);
     if (stats.indexes.len > 0) alloc.free(stats.indexes);
 }
+
+pub const NativePublicationResult = struct {
+    published: usize = 0,
+    /// No attempt was made because another owner holds an admission lane.
+    /// This is neither completed work nor evidence of zero progress.
+    busy: bool = false,
+    deferred: bool = false,
+};
+test "graph metric index stats cleanup owns nested status payloads" {
+    const alloc = std.testing.allocator;
+    var item: DBIndexStats = .{ .name = try alloc.dupe(u8, "graph_idx"), .kind = .graph };
+    defer freeDBIndexStatsItem(alloc, item);
+    const statuses = blk: {
+        const owned = try alloc.alloc(GraphMetricStatus, 1);
+        errdefer alloc.free(owned);
+        owned[0] = .{ .name = try alloc.dupe(u8, "pagerank") };
+        break :blk owned;
+    };
+    item.graph_metric_status = statuses;
+    statuses[0].build_worker_id = try alloc.dupe(u8, "worker");
+    statuses[0].build_cursor = try alloc.dupe(u8, "cursor");
+    statuses[0].last_error = try alloc.dupe(u8, "diagnostic");
+    statuses[0].build_pages = try alloc.alloc(GraphMetricBuildPageStatus, 1);
+    statuses[0].build_pages[0] = .{};
+    statuses[0].build_pages[0].cursor = try alloc.dupe(u8, "page-cursor");
+}
+
+/// Exact durable identity affected by a source-target advance. Names are
+/// borrowed for the synchronous callback. An empty slice with
+/// `target_scope_known = false` means the producer could not prove scope and
+/// consumers must conservatively fence the whole group.
+pub const IndexTargetVisibility = struct {
+    pub const ServingSetEffect = enum {
+        /// This commit may add or replace members, but cannot remove a
+        /// previously searchable member from this exact incarnation.
+        additive_only,
+        /// This commit contains a delete, overwrite, or another mutation
+        /// whose authoritative projection may have lower cardinality.
+        may_reduce,
+    };
+
+    index_name: []const u8,
+    kind: IndexKind,
+    incarnation: u64,
+    config_hash: u64,
+    serving_set_effect: ServingSetEffect = .may_reduce,
+};

@@ -1,0 +1,19 @@
+{
+  "name": "full_text_search",
+  "description": "A new database provisions the default full-text index, so public full-text queries work without explicit index setup.",
+  "open": {"create": true, "no_sync": true},
+  "steps": [
+    {"op": "list_indexes", "expect": {"contains": ["full_text_index_v0"]}},
+    {"op": "batch", "timestamp": 1, "writes": [
+      {"key": "doc:fox", "value": {"title": "Fox", "body": "the quick brown fox jumps"}},
+      {"key": "doc:dog", "value": {"title": "Dog", "body": "a lazy dog sleeps all day"}}
+    ]},
+    {"op": "run_until_idle"},
+    {"op": "search", "request": {"full_text_search": {"match": {"field": "body", "text": "quick fox"}}, "limit": 5},
+      "expect": {"contains": ["doc:fox"], "not_contains": ["doc:dog"]}},
+    {"op": "search", "request": {"full_text_search": {"match": {"field": "body", "text": "lazy"}}, "limit": 5},
+      "expect": {"contains": ["doc:dog"], "not_contains": ["doc:fox"]}},
+    {"op": "search", "request": {"full_text_search": {"match": {"field": "body", "text": "zebra"}}, "limit": 5},
+      "expect": {"not_contains": ["doc:fox", "doc:dog"]}}
+  ]
+}

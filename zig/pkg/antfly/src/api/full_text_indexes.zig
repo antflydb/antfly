@@ -26,8 +26,12 @@ const template_remote = if (builtin.os.tag == .freestanding)
     @import("../storage/db/template_remote_stub.zig")
 else
     @import("../template_remote.zig");
+const full_text_index_defaults = @import("../common/full_text_index_defaults.zig");
 
-pub const default_full_text_index_name = "full_text_index_v0";
+/// Re-exported from the dependency-free `common` module so `capi`, `embedded`,
+/// and Antfly Lite's connection layer can reference the same name without
+/// pulling in this file's chunker/template dependency chain.
+pub const default_full_text_index_name = full_text_index_defaults.default_full_text_index_name;
 
 pub const FullTextSourceMode = enum {
     document,
@@ -89,7 +93,8 @@ pub fn listFullTextIndexNamesAlloc(
     var it = root.iterator();
     while (it.next()) |entry| {
         if (!isFullTextIndexConfig(entry.value_ptr.*)) continue;
-        try names.append(alloc, try alloc.dupe(u8, entry.key_ptr.*));
+        try names.ensureUnusedCapacity(alloc, 1);
+        names.appendAssumeCapacity(try alloc.dupe(u8, entry.key_ptr.*));
     }
 
     std.mem.sort([]u8, names.items, {}, lessString);

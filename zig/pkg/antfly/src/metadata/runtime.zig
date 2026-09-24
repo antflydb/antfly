@@ -14,6 +14,9 @@
 
 const std = @import("std");
 const antfly = @import("runtime_root.zig");
+const storage_source_options = @import("storage_source_options");
+const kernel_owner_client = @import("../storage/kernel_owner_client.zig");
+const metadata_replica_root_client = @import("../storage/metadata_replica_root_client.zig");
 const internal_service_auth = @import("../api/internal_service_auth.zig");
 const fs_paths = @import("../common/fs_paths.zig");
 const group_ids = @import("../common/group_ids.zig");
@@ -26,7 +29,51 @@ const metadata_http_client = @import("http_client.zig");
 const platform_time = @import("antfly_platform").time;
 const thread_config = @import("../runtime_thread_config.zig");
 
-const setup_io_thread_stack_size = thread_config.minimum_partitioned_stack_size;
+const linked_storage = storage_source_options.control_only;
+const StorageKernelContext = if (linked_storage)
+    kernel_owner_client.Context
+else
+    struct {
+        fn deinit(self: *@This()) void {
+            self.* = .{};
+        }
+    };
+
+fn storageKernelContextHandle(context: ?StorageKernelContext) ?*anyopaque {
+    if (comptime linked_storage) {
+        return if (context) |value| value.handle else null;
+    }
+    return null;
+}
+
+const LegacyAuthBackend = if (linked_storage) struct {} else antfly.lsm_backend.BackendHandle;
+const KernelReplicaRootReconciler = if (linked_storage) struct {
+    alloc: std.mem.Allocator,
+    context: ?*anyopaque,
+    replica_root_dir: []const u8,
+
+    fn hook(self: *@This()) antfly.metadata_service.LocalReplicaRootReconcileHook {
+        return .{ .ptr = self, .vtable = &.{ .run = reconcile } };
+    }
+
+    fn reconcile(
+        ptr: *anyopaque,
+        request: antfly.metadata_service.LocalReplicaRootReconcileHook.Request,
+    ) !metadata_replica_root_client.ProvisionSummary {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try metadata_replica_root_client.reconcile(
+            self.alloc,
+            self.context,
+            self.replica_root_dir,
+            request.metadata_group_id,
+            request.group_ids,
+            request.tables,
+            request.ranges,
+        );
+    }
+} else struct {};
+
+const setup_io_thread_stack_size = 1 * 1024 * 1024;
 const metadata_raft_retained_entries = 1024;
 const metadata_raft_compaction_min_interval_entries = 512;
 const metadata_raft_election_max_ticks = 60;
@@ -85,6 +132,7 @@ fn metadataWalReplicaStateConfig() antfly.raft.storage.WalReplicaStateConfig {
 
 const CliConfig = struct {
     config_path: ?[]const u8 = null,
+    online_merge_enabled: bool = true,
     experimental: bool = false,
     raft_host: ?[]const u8 = null,
     raft_port: ?u16 = null,
@@ -128,8 +176,14 @@ const Factory = struct {
             .vtable = &.{
                 .build_descriptor = buildDescriptor,
                 .free_descriptor = freeDescriptor,
+                .accepts_record = acceptsRecord,
             },
         };
+    }
+
+    fn acceptsRecord(ptr: *anyopaque, record: antfly.raft.catalog.ReplicaRecord) bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return record.group_id == self.metadata_group_id;
     }
 
     fn buildDescriptor(ptr: *anyopaque, record: antfly.raft.catalog.ReplicaRecord) !raft_engine.runtime.ReplicaDescriptor {
@@ -309,6 +363,8 @@ pub const HealthSource = struct {
         try append(writer, "antfly_raft_async_send_queue_full_total", "counter", "Total async raft HTTP global queue-full events", host_metrics.async_send_queue_full);
         try append(writer, "antfly_raft_async_send_peer_queue_full_total", "counter", "Total async raft HTTP per-peer queue-full events", host_metrics.async_send_peer_queue_full);
         try append(writer, "antfly_raft_async_send_pending", "gauge", "Pending async raft HTTP frames", @intCast(host_metrics.async_send_pending));
+        try append(writer, "antfly_raft_async_send_retained_bytes", "gauge", "Retained async raft HTTP bytes including in-flight and failed frames", @intCast(host_metrics.async_send_retained_bytes));
+        try append(writer, "antfly_raft_async_send_retained_frames", "gauge", "Retained async raft HTTP frames including in-flight and failed frames", @intCast(host_metrics.async_send_retained_frames));
         try append(writer, "antfly_raft_async_snapshot_send_enqueued_total", "counter", "Total raft snapshots admitted to the bounded async HTTP send lane", host_metrics.async_snapshot_send_enqueued);
         try append(writer, "antfly_raft_async_snapshot_send_failed_total", "counter", "Total async raft snapshot HTTP send failures", host_metrics.async_snapshot_send_failed);
         try append(writer, "antfly_raft_async_snapshot_send_retried_total", "counter", "Total async raft snapshot sends requeued for retry", host_metrics.async_snapshot_send_retried);
@@ -414,6 +470,10 @@ pub const MetadataClusterPeer = struct {
 };
 
 pub const ServerConfig = struct {
+    /// Prefer online copying where the authenticated native protocol bundle
+    /// and each new candidate are eligible. False disables new admission while
+    /// still recovering already-admitted online transitions.
+    online_merge_enabled: bool = true,
     local_node_id: u64 = 1,
     metadata_group_id: u64 = group_ids.main_metadata_group_id,
     metadata_cluster_peers: []const MetadataClusterPeer = &.{},
@@ -430,7 +490,44 @@ pub const ServerConfig = struct {
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     secret_store: ?*antfly.common.secrets.FileStore = null,
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig = .{},
+    storage_context: ?*anyopaque = null,
 };
+
+test "metadata server online merge default preserves unsupported startup and explicit disable" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/online-install", .{tmp.sub_path});
+    defer alloc.free(root);
+    const catalog = try std.fmt.allocPrint(alloc, "{s}/catalog", .{root});
+    defer alloc.free(catalog);
+    const snapshots = try std.fmt.allocPrint(alloc, "{s}/snapshots", .{root});
+    defer alloc.free(snapshots);
+    var cfg: ServerConfig = .{ .replica_root_dir = root, .replica_catalog_path = catalog, .snapshot_root_dir = snapshots };
+    try std.testing.expect(cfg.online_merge_enabled);
+    // Missing authentication disables only the online driver, not deployment
+    // startup. The ordinary merge path remains available.
+    {
+        var server = try Server.init(alloc, cfg);
+        defer server.deinit();
+        try std.testing.expect(server.server.svc.online_merge_runtime == null);
+    }
+    cfg.online_merge_enabled = false;
+    cfg.api_server_cfg.internal_service_secret = "online-config-test-secret";
+    {
+        var server = try Server.init(alloc, cfg);
+        defer server.deinit();
+        try std.testing.expectEqual(linked_storage, server.server.svc.online_merge_runtime != null);
+        if (server.server.svc.online_merge_runtime) |runtime| try std.testing.expect(runtime.driver.admit == null);
+    }
+    cfg.online_merge_enabled = true;
+    {
+        var server = try Server.init(alloc, cfg);
+        defer server.deinit();
+        try std.testing.expectEqual(linked_storage, server.server.svc.online_merge_runtime != null);
+        if (server.server.svc.online_merge_runtime) |runtime| try std.testing.expect(runtime.driver.admit != null);
+    }
+}
 
 const MetadataRaftStorageDiagnostics = struct {
     groups: usize = 0,
@@ -496,6 +593,7 @@ pub const Server = struct {
     snapshot_root_dir: []u8,
     bind_host: []u8,
     admin_bind_host: []u8,
+    kernel_replica_root_reconciler: ?*KernelReplicaRootReconciler = null,
     reallocation_protocol_peers: []antfly.metadata_service.ReallocationProtocolPeer,
     raft_storage_diagnostics: MetadataRaftStorageDiagnosticsCache = .{},
 
@@ -526,15 +624,29 @@ pub const Server = struct {
         errdefer alloc.free(result.bind_host);
         result.admin_bind_host = try alloc.dupe(u8, cfg.admin_bind_host);
         errdefer alloc.free(result.admin_bind_host);
+        result.kernel_replica_root_reconciler = null;
+        if (comptime linked_storage) {
+            const reconciler = try alloc.create(KernelReplicaRootReconciler);
+            reconciler.* = .{
+                .alloc = alloc,
+                .context = cfg.storage_context,
+                .replica_root_dir = result.replica_root_dir,
+            };
+            result.kernel_replica_root_reconciler = reconciler;
+        }
+        errdefer if (comptime linked_storage) if (result.kernel_replica_root_reconciler) |reconciler|
+            alloc.destroy(reconciler);
         result.reallocation_protocol_peers = try reallocationProtocolPeersFromClusterPeers(alloc, cfg.metadata_cluster_peers);
         errdefer freeReallocationProtocolPeers(alloc, result.reallocation_protocol_peers);
         const service_cfg = antfly.metadata_service.MetadataServiceConfig{
             .observe_local_replica_root = cfg.observe_local_replica_root,
+            .local_data_owner = false,
             .backend_runtime = cfg.backend_runtime,
             .secret_store = cfg.secret_store,
             .reallocation_protocol_peers = result.reallocation_protocol_peers,
         };
         result.server = try antfly.metadata_server.MetadataServer.init(alloc, .{
+            .online_merge_enabled = cfg.online_merge_enabled,
             .http = .{
                 .http = .{
                     .host = .{
@@ -568,6 +680,7 @@ pub const Server = struct {
         }, .{
             .http = .{
                 .http = .{
+                    .data_apply_storage_context = cfg.storage_context,
                     .http = .{
                         .host = .{
                             .descriptor_factory = result.factory.iface(),
@@ -577,6 +690,9 @@ pub const Server = struct {
             },
         });
         errdefer result.server.deinit();
+        if (comptime linked_storage) {
+            result.server.setLocalReplicaRootReconcileHook(result.kernel_replica_root_reconciler.?.hook());
+        }
         return result;
     }
 
@@ -590,6 +706,8 @@ pub const Server = struct {
     ) void {
         self.server.deinitWithDeadline(deadline);
         freeReallocationProtocolPeers(self.alloc, self.reallocation_protocol_peers);
+        if (comptime linked_storage) if (self.kernel_replica_root_reconciler) |reconciler|
+            self.alloc.destroy(reconciler);
         self.alloc.free(self.admin_bind_host);
         self.alloc.free(self.bind_host);
         self.alloc.free(self.snapshot_root_dir);
@@ -898,8 +1016,8 @@ pub fn runFromIterator(
     var secret_store_initialized = false;
     defer if (secret_store_initialized) secret_store.deinit();
 
-    if (cli.secret_store_paths.items.len > 0) {
-        secret_store = try initLayeredSecretStore(alloc, setup_io.io(), cli.secret_store_paths.items);
+    if (try antfly.common.secrets.initFromConfigPathWithIo(alloc, setup_io.io(), cli.config_path, cli.secret_store_paths.items)) |configured_store| {
+        secret_store = configured_store;
         secret_store_initialized = true;
     }
 
@@ -1028,18 +1146,49 @@ pub fn runFromIterator(
     );
     defer active_audio_runtime.deinit();
 
-    var auth_backend: ?antfly.lsm_backend.BackendHandle = null;
+    var storage_kernel_context: ?StorageKernelContext = null;
+    defer if (storage_kernel_context) |*context| context.deinit();
+    if (comptime linked_storage) {
+        var context = kernel_owner_client.Context{};
+        try context.ensureWith(.{
+            .auth_storage_path = .fromSlice(if (auth_enabled) resolved.auth_store_root_dir else ""),
+        });
+        storage_kernel_context = context;
+        const security_json = try antfly.common.config.remoteContentSecurityJsonAlloc(alloc, remote_content);
+        defer alloc.free(security_json);
+        try storage_kernel_context.?.configureRemoteContentSecurity(security_json);
+        try storage_kernel_context.?.configureSecrets(if (secret_store_initialized) &secret_store else null);
+    }
+
+    var auth_backend: ?LegacyAuthBackend = null;
     var auth_runtime: ?antfly.storage_backend_erased.NamespaceStore = null;
+    var kernel_auth_users_store: ?antfly.storage_backend_erased.Store = null;
+    var kernel_auth_casbin_store: ?antfly.storage_backend_erased.Store = null;
+    var kernel_auth_users_runtime: ?antfly.storage_backend_erased.NamespaceStore = null;
+    var kernel_auth_casbin_runtime: ?antfly.storage_backend_erased.NamespaceStore = null;
     var auth_user_store: ?antfly.usermgr.StorageUserStore = null;
     var auth_casbin_store: ?antfly.usermgr.StorageCasbinAdapter = null;
     var user_manager: ?antfly.usermgr.UserManager = null;
     if (auth_enabled) {
-        auth_backend = try antfly.lsm_backend.BackendHandle.open(alloc, resolved.auth_store_root_dir, .{});
-        errdefer if (auth_backend) |*backend| backend.close();
-        auth_runtime = try auth_backend.?.backend.runtimeNamespaceStore(alloc);
-        errdefer if (auth_runtime) |*runtime| runtime.deinit();
-        auth_user_store = antfly.usermgr.StorageUserStore.init(alloc, auth_runtime.?);
-        auth_casbin_store = antfly.usermgr.StorageCasbinAdapter.init(alloc, auth_runtime.?);
+        if (comptime linked_storage) {
+            kernel_auth_users_store = try storage_kernel_context.?.systemStore(alloc, "system/auth-users");
+            errdefer kernel_auth_users_store.?.deinit();
+            kernel_auth_casbin_store = try storage_kernel_context.?.systemStore(alloc, "system/auth-casbin");
+            errdefer kernel_auth_casbin_store.?.deinit();
+            kernel_auth_users_runtime = try kernel_owner_client.singleNamespaceStore(alloc, &kernel_auth_users_store.?, "usermgr_users");
+            errdefer kernel_auth_users_runtime.?.deinit();
+            kernel_auth_casbin_runtime = try kernel_owner_client.singleNamespaceStore(alloc, &kernel_auth_casbin_store.?, "usermgr_casbin");
+            errdefer kernel_auth_casbin_runtime.?.deinit();
+            auth_user_store = antfly.usermgr.StorageUserStore.init(alloc, kernel_auth_users_runtime.?);
+            auth_casbin_store = antfly.usermgr.StorageCasbinAdapter.init(alloc, kernel_auth_casbin_runtime.?);
+        } else {
+            auth_backend = try antfly.lsm_backend.BackendHandle.open(alloc, resolved.auth_store_root_dir, .{});
+            errdefer if (auth_backend) |*backend| backend.close();
+            auth_runtime = try auth_backend.?.backend.runtimeNamespaceStore(alloc);
+            errdefer if (auth_runtime) |*runtime| runtime.deinit();
+            auth_user_store = antfly.usermgr.StorageUserStore.init(alloc, auth_runtime.?);
+            auth_casbin_store = antfly.usermgr.StorageCasbinAdapter.init(alloc, auth_runtime.?);
+        }
         user_manager = try antfly.usermgr.UserManager.initWithIo(
             alloc,
             setup_io.io(),
@@ -1049,9 +1198,13 @@ pub fn runFromIterator(
         errdefer if (user_manager) |*manager| manager.deinit();
         try antfly.usermgr.ensureDefaultAdminUser(&user_manager.?);
     }
-    defer if (user_manager) |*manager| manager.deinit();
+    defer if (comptime !linked_storage) if (auth_backend) |*backend| backend.close();
     defer if (auth_runtime) |*runtime| runtime.deinit();
-    defer if (auth_backend) |*backend| backend.close();
+    defer if (kernel_auth_users_store) |*store| store.deinit();
+    defer if (kernel_auth_casbin_store) |*store| store.deinit();
+    defer if (kernel_auth_users_runtime) |*runtime| runtime.deinit();
+    defer if (kernel_auth_casbin_runtime) |*runtime| runtime.deinit();
+    defer if (user_manager) |*manager| manager.deinit();
 
     const trusted_principal_issuer = try resolveTrustedPrincipalIssuer(
         alloc,
@@ -1066,7 +1219,19 @@ pub fn runFromIterator(
     const listener = resolveRaftListener(cli, if (loaded_config) |*cfg| cfg else null);
     const admin_listener = resolveAdminListener(cli, if (loaded_config) |*cfg| cfg else null, local_node_id, listener.bind_host);
 
+    var native_keys: @import("../common/secret_keyring.zig").Keyring = undefined;
+    var native_secrets: ?@import("secret_store.zig").Store = null;
+    defer if (native_secrets) |*store| store.deinit();
+    if (secret_store_initialized) {
+        if (secret_store.native_config) |native| {
+            if (native.value.backend != .distributed or native.value.reader != null) return error.InvalidConfig;
+            native_keys = .{ .alloc = alloc, .io = setup_io.io(), .path = native.value.keyring_path.? };
+            try native_keys.validate();
+        }
+    }
+
     var server = try Server.init(alloc, .{
+        .online_merge_enabled = cli.online_merge_enabled,
         .local_node_id = local_node_id,
         .metadata_group_id = metadata_group_id,
         .metadata_cluster_peers = cluster_peers,
@@ -1105,8 +1270,16 @@ pub fn runFromIterator(
             .backup_operation_timeout_ms = if (loaded_config) |*cfg| cfg.backup.operation_timeout_ms else antfly.common.config.default_backup_operation_timeout_ms,
             .node_config = if (loaded_config) |*cfg| cfg else null,
         },
+        .storage_context = storageKernelContextHandle(storage_kernel_context),
     });
     defer server.deinitWithDeadline(supervisor.deadline());
+    if (secret_store_initialized) {
+        if (secret_store.native_config) |native| {
+            native_secrets = try @import("secret_store.zig").Store.init(alloc, setup_io.io(), native.value.scope, native_keys.provider(), .{ .service = server.server.svc });
+            const handle = native_secrets.?.nativeStore();
+            secret_store.attachNative(handle.source, handle.writer);
+        }
+    }
     try server.start();
     try server.bootstrapCluster(metadata_group_id, local_node_id, cluster_peers);
     const synced_extension_packages = try server.server.svc.syncExtensionPackageStore(setup_io.io(), resolved.extension_package_store_dir);
@@ -1263,6 +1436,14 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             cfg.control_tick_ms = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
+        if (std.mem.eql(u8, arg, "--online-merge-enabled")) {
+            cfg.online_merge_enabled = parseBoolFlag(args.next() orelse return error.InvalidArguments) orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--online-merge-enabled=")) {
+            cfg.online_merge_enabled = parseBoolFlag(arg["--online-merge-enabled=".len..]) orelse return error.InvalidArguments;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--data-dir")) {
             cfg.data_dir = args.next() orelse return error.InvalidArguments;
             continue;
@@ -1300,22 +1481,18 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
     return cfg;
 }
 
+test "metadata runtime secret store follows projected symlink rotation" {
+    try @import("../common/secret_projection_test_support.zig").expectRuntimeRotation(initLayeredSecretStore);
+}
+
 fn initLayeredSecretStore(
     alloc: std.mem.Allocator,
     io: std.Io,
     raw_paths: []const []const u8,
 ) !antfly.common.secrets.FileStore {
-    var normalized_paths: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer {
-        for (normalized_paths.items) |path| alloc.free(path);
-        normalized_paths.deinit(alloc);
-    }
-    for (raw_paths) |raw_path| {
-        const normalized_path = try normalizeResolvedPathAlloc(alloc, raw_path);
-        errdefer alloc.free(normalized_path);
-        try normalized_paths.append(alloc, normalized_path);
-    }
-    return try antfly.common.secrets.FileStore.initLayeredWithIo(alloc, io, normalized_paths.items);
+    // FileStore owns these paths and must follow their current symlink targets
+    // on reload, including Kubernetes projected-volume generation switches.
+    return try antfly.common.secrets.FileStore.initLayeredWithIo(alloc, io, raw_paths);
 }
 
 fn resolveLocalBaseDir(
@@ -1708,6 +1885,8 @@ fn printUsage(argv0: []const u8) void {
         \\  --experimental                 Enable experimental A2A protocol surfaces
         \\  --raft-tick-ms <ms>            Consensus progress interval, 1-1000 (default: 100)
         \\  --control-tick-ms <ms>         Control scheduling interval, 1-60000 (default: 100)
+        \\  --online-merge-enabled <bool>  Prefer online copying for eligible new merges (default: true; requires authenticated native storage)
+        \\                                 False stops new admission, but completes in-flight online merges
         \\  --data-dir <path>              Local storage root for metadata data
         \\  --replica-root-dir <path>      Replica root directory
         \\  --replica-catalog-path <path>  Replica catalog file path
@@ -1803,6 +1982,23 @@ test "metadata runtime cli accepts secret and extension package store paths" {
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("/run/antfly/secrets/secrets.json", cfg.secret_store_paths.items[0]);
     try std.testing.expectEqualStrings("/opt/antfly/extensions", cfg.extension_package_store_dir.?);
+}
+
+test "metadata runtime cli online merge defaults on and accepts explicit disable" {
+    try std.testing.expect((CliConfig{}).online_merge_enabled);
+    var argv = [_][*:0]const u8{ "--online-merge-enabled", "true" };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var cfg = try parseCli(std.testing.allocator, &iter);
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expect(cfg.online_merge_enabled);
+    var off = [_][*:0]const u8{"--online-merge-enabled=false"};
+    var off_iter = std.process.Args.Iterator.init(.{ .vector = off[0..] });
+    var off_cfg = try parseCli(std.testing.allocator, &off_iter);
+    defer off_cfg.deinit(std.testing.allocator);
+    try std.testing.expect(!off_cfg.online_merge_enabled);
+    var invalid = [_][*:0]const u8{"--online-merge-enabled=maybe"};
+    var invalid_iter = std.process.Args.Iterator.init(.{ .vector = invalid[0..] });
+    try std.testing.expectError(error.InvalidArguments, parseCli(std.testing.allocator, &invalid_iter));
 }
 
 test "metadata runtime cli accepts layered secret store paths" {
@@ -2574,9 +2770,331 @@ test "metadata runtime bootstrapLocal skips local replica-root reconcile on the 
     try server.bootstrapLocal(group_ids.main_metadata_group_id, 1);
     try std.testing.expectEqual(@as(usize, 0), hook_ctx.runs);
 
-    var rounds: usize = 0;
-    while (hook_ctx.runs == 0 and rounds < 8) : (rounds += 1) {
-        try server.runRound();
+    for (0..8) |_| try server.runRound();
+    try std.testing.expectEqual(@as(usize, 0), hook_ctx.runs);
+}
+
+test "metadata ownership rejects direct data replica admission" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try MetadataOwnershipTestPaths.init(alloc, &tmp.sub_path);
+    defer paths.deinit(alloc);
+    var server = try Server.init(alloc, paths.config());
+    defer server.deinit();
+    try server.start();
+    try server.bootstrapLocal(group_ids.main_metadata_group_id, 3);
+    const host = server.metadataHttpService().raft.host.http_host.host;
+    const foreign: antfly.raft.catalog.ReplicaRecord = .{
+        .group_id = 1951,
+        .replica_id = 1,
+        .local_node_id = 3,
+        .bootstrap_mode = .empty,
+    };
+    std.debug.print("OWNERSHIP_RED direct_admission expects ReplicaAdmissionRejected\n", .{});
+    try std.testing.expectError(error.ReplicaAdmissionRejected, host.ensureReplica(foreign));
+    try std.testing.expectEqual(.absent, host.status(foreign.group_id));
+    try std.testing.expect(!host.replicaCatalogContains(foreign.group_id).?);
+}
+
+test "metadata ownership ignores retained foreign catalog before serving" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try MetadataOwnershipTestPaths.init(alloc, &tmp.sub_path);
+    defer paths.deinit(alloc);
+    const cfg = paths.config();
+    {
+        var server = try Server.init(alloc, cfg);
+        defer server.deinit();
+        try server.start();
+        try server.bootstrapLocal(cfg.metadata_group_id, cfg.local_node_id);
     }
-    try std.testing.expect(hook_ctx.runs > 0);
+    const foreign: antfly.raft.catalog.ReplicaRecord = .{
+        .group_id = 1951,
+        .replica_id = 1,
+        .local_node_id = cfg.local_node_id,
+        .bootstrap_mode = .empty,
+    };
+    {
+        var catalog = try antfly.raft.storage.FileReplicaCatalog.init(alloc, paths.catalog);
+        defer catalog.deinit();
+        try catalog.catalog().upsertReplica(foreign);
+    }
+    var restarted = try Server.init(alloc, cfg);
+    defer restarted.deinit();
+    const svc = restarted.metadataHttpService();
+    std.debug.print("OWNERSHIP_RED retained_catalog expects absent foreign group\n", .{});
+    try std.testing.expectEqual(.absent, svc.raft.host.status(foreign.group_id));
+    try std.testing.expectEqual(.active, svc.raft.host.status(cfg.metadata_group_id));
+    try std.testing.expectEqual(@as(usize, 1), svc.raft.host.http_host.transport_stack.transport_host.served_groups.count());
+    try std.testing.expect(svc.raft.host.http_host.host.replicaCatalogContains(foreign.group_id).?);
+    try restarted.start();
+    try restarted.bootstrapLocal(cfg.metadata_group_id, cfg.local_node_id);
+    for (0..8) |_| try restarted.runRound();
+    try std.testing.expectEqual(.absent, svc.raft.host.status(foreign.group_id));
+}
+
+test "metadata ownership excludes colliding data placements across control rounds and restart" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try MetadataOwnershipTestPaths.init(alloc, &tmp.sub_path);
+    defer paths.deinit(alloc);
+    for (0..2) |boot| {
+        var server = try Server.init(alloc, paths.config());
+        defer server.deinit();
+        try server.start();
+        // start() runs the restore supervisor. Drive Raft through the service
+        // owner so Ready processing shares its lock with supervisor ReadIndex.
+        const svc = server.metadataHttpService();
+        try server.bootstrapLocal(svc.metadata_group_id, 3);
+        if (boot == 0) {
+            try svc.upsertNode(.{ .node_id = 3 });
+            try svc.runRaftRoundOnly();
+            try svc.upsertStore(.{
+                .store_id = 3,
+                .node_id = 3,
+                .api_url = "http://data-3.invalid:8080",
+                .capacity_bytes = 1024,
+                .available_bytes = 900,
+            });
+            try svc.upsertTable(.{ .table_id = 77, .name = "seeded", .desired_replica_count = 1 });
+            try svc.upsertRange(.{ .group_id = 1951, .table_id = 77, .start_key = "" });
+            try svc.upsertReplicaIntent(.{
+                .record = .{ .group_id = 1951, .replica_id = 1, .local_node_id = 3, .bootstrap_mode = .empty },
+                .store_id = 3,
+                .peer_node_ids = &.{},
+            }, null, 0, false);
+            for (0..8) |_| try svc.runRaftRoundOnly();
+        }
+        for (0..8) |_| try server.runRound();
+        std.debug.print("OWNERSHIP_RED placements boot={d} expects absent foreign group\n", .{boot});
+        std.debug.print("OWNERSHIP_ASSERT placements boot={d} foreign_status\n", .{boot});
+        try std.testing.expectEqual(.absent, svc.raft.host.status(1951));
+        std.debug.print("OWNERSHIP_ASSERT placements boot={d} served_group_count\n", .{boot});
+        try std.testing.expectEqual(@as(usize, 1), svc.raft.host.http_host.transport_stack.transport_host.served_groups.count());
+        const intents = try svc.listProjectedPlacementIntents(alloc);
+        defer svc.freeProjectedPlacementIntents(alloc, intents);
+        std.debug.print("OWNERSHIP_ASSERT placements boot={d} intent_count\n", .{boot});
+        try std.testing.expectEqual(@as(usize, 1), intents.len);
+        std.debug.print("OWNERSHIP_ASSERT placements boot={d} intent_group_id\n", .{boot});
+        try std.testing.expectEqual(@as(u64, 1951), intents[0].record.group_id);
+        std.debug.print("OWNERSHIP_ASSERT placements boot={d} lease_held\n", .{boot});
+        try std.testing.expect(svc.reconcileLeaseStats().held_by_local);
+        std.debug.print("OWNERSHIP_ASSERT placements boot={d} placement_epoch\n", .{boot});
+        try std.testing.expectEqual(svc.placement_epoch.load(.monotonic), svc.local_placement_epoch.?);
+        try svc.upsertTable(.{ .table_id = 77, .name = if (boot == 0) "first" else "restarted" });
+        for (0..8) |_| try server.runRound();
+        const tables = try svc.listProjectedTables(alloc);
+        defer svc.freeProjectedTables(alloc, tables);
+        std.debug.print("OWNERSHIP_ASSERT placements boot={d} table_count\n", .{boot});
+        try std.testing.expectEqual(@as(usize, 1), tables.len);
+        std.debug.print("OWNERSHIP_ASSERT placements boot={d} table_name\n", .{boot});
+        try std.testing.expectEqualStrings(if (boot == 0) "first" else "restarted", tables[0].name);
+    }
+}
+
+test "metadata ownership never provisions data roots on repeated control rounds" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try MetadataOwnershipTestPaths.init(alloc, &tmp.sub_path);
+    defer paths.deinit(alloc);
+    const Hook = struct {
+        calls: usize = 0,
+        fn run(ptr: *anyopaque, _: antfly.metadata_service.LocalReplicaRootReconcileHook.Request) !antfly.metadata.table_provisioner.ProvisionSummary {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return .{};
+        }
+    };
+    var server = try Server.init(alloc, paths.config());
+    defer server.deinit();
+    try server.start();
+    var hook = Hook{};
+    server.setLocalReplicaRootReconcileHook(.{ .ptr = &hook, .vtable = &.{ .run = Hook.run } });
+    try server.bootstrapLocal(group_ids.main_metadata_group_id, 3);
+    try std.testing.expectEqual(@as(usize, 0), hook.calls);
+    for (0..8) |_| try server.runRound();
+    std.debug.print("OWNERSHIP_RED provisioning expects zero calls; actual={d}\n", .{hook.calls});
+    try std.testing.expectEqual(@as(usize, 0), hook.calls);
+    const svc = server.metadataHttpService();
+    try std.testing.expect(svc.observe_local_replica_root);
+    try std.testing.expect(svc.reconcileLeaseStats().held_by_local);
+    try std.testing.expectEqual(svc.placement_epoch.load(.monotonic), svc.local_placement_epoch.?);
+}
+
+test "metadata ownership preserves same-id remote progress across rounds and restart" {
+    try exerciseMetadataOwnershipProjection(.progress);
+}
+
+test "metadata ownership scalar routing keeps same-id data node remote" {
+    try exerciseMetadataOwnershipProjection(.scalar_route);
+}
+
+test "metadata ownership batch routing keeps same-id data node remote" {
+    try exerciseMetadataOwnershipProjection(.batch_route);
+}
+
+test "metadata ownership preserves same-id remote backfill observations" {
+    try exerciseMetadataOwnershipProjection(.backfill);
+}
+
+const MetadataOwnershipTestPaths = struct {
+    replicas: []u8,
+    catalog: []u8,
+    snapshots: []u8,
+
+    fn init(alloc: std.mem.Allocator, sub_path: []const u8) !@This() {
+        const replicas = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-ownership/replicas", .{sub_path});
+        errdefer alloc.free(replicas);
+        const catalog = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-ownership/catalog.txt", .{sub_path});
+        errdefer alloc.free(catalog);
+        return .{
+            .replicas = replicas,
+            .catalog = catalog,
+            .snapshots = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-ownership/snapshots", .{sub_path}),
+        };
+    }
+
+    fn config(self: @This()) ServerConfig {
+        return .{ .local_node_id = 3, .replica_root_dir = self.replicas, .replica_catalog_path = self.catalog, .snapshot_root_dir = self.snapshots };
+    }
+
+    fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.replicas);
+        alloc.free(self.catalog);
+        alloc.free(self.snapshots);
+    }
+};
+
+const MetadataOwnershipProjectionCase = enum { progress, scalar_route, batch_route, backfill };
+
+fn exerciseMetadataOwnershipProjection(case: MetadataOwnershipProjectionCase) !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try MetadataOwnershipTestPaths.init(alloc, &tmp.sub_path);
+    defer paths.deinit(alloc);
+    const data_group_id = 1951;
+    const api_url = "http://data-3.invalid:8080";
+    for (0..2) |boot| {
+        var cfg = paths.config();
+        cfg.observe_local_replica_root = false;
+        var server = try Server.init(alloc, cfg);
+        defer server.deinit();
+        try server.start();
+        // start() runs the restore supervisor. Drive Raft through the service
+        // owner so Ready processing shares its lock with supervisor ReadIndex.
+        const svc = server.metadataHttpService();
+        try server.bootstrapLocal(svc.metadata_group_id, 3);
+        if (boot == 0) {
+            try svc.upsertNode(.{ .node_id = 3 });
+            try svc.runRaftRoundOnly();
+            var groups = [_]antfly.metadata.table_manager.GroupStatusReport{.{
+                .group_id = data_group_id,
+                .doc_count = 1,
+                .empty = false,
+                .local_leader = true,
+                .local_voter = true,
+                .voter_count = 1,
+            }};
+            try svc.upsertStore(.{
+                .store_id = 3,
+                .node_id = 3,
+                .api_url = api_url,
+                .group_statuses = &groups,
+                .active_backfills = 7,
+                .backfill_progress_millis = 250,
+            });
+            try svc.upsertTable(.{ .table_id = 77, .name = "docs", .desired_replica_count = 1 });
+            try svc.upsertRange(.{
+                .group_id = data_group_id,
+                .table_id = 77,
+                .start_key = "",
+                .restore_backup_id = if (case == .progress) "remote-backup" else "",
+                .restore_location = if (case == .progress) "file:///remote-backups" else "",
+            });
+            if (case == .scalar_route or case == .batch_route) {
+                try svc.upsertReplicaIntent(.{
+                    .record = .{ .group_id = data_group_id, .replica_id = 1, .local_node_id = 3, .bootstrap_mode = .empty },
+                    .store_id = 3,
+                    .peer_node_ids = &.{},
+                }, null, 0, false);
+            }
+            if (case == .progress) {
+                try svc.upsertSchemaProgress(.{ .table_id = 77, .node_id = 3, .schema_version = 0 });
+                try svc.upsertRestoreProgress(.{
+                    .table_id = 77,
+                    .node_id = 3,
+                    .group_id = data_group_id,
+                    .backup_id = "remote-backup",
+                    .location = "file:///remote-backups",
+                    .primary_restored = true,
+                });
+            }
+        }
+        for (0..8) |_| try svc.runRaftRoundOnly();
+        switch (case) {
+            .progress => {
+                try expectMetadataOwnershipRemoteProgress(svc, boot, "before_control");
+                svc.setLifecycleReconcileHook(null);
+                svc.observe_local_replica_root = true;
+                for (0..8) |_| try server.runRound();
+                std.debug.print("OWNERSHIP_RED progress expects retained schema and restore reports\n", .{});
+                try expectMetadataOwnershipRemoteProgress(svc, boot, "after_control");
+            },
+            .scalar_route, .batch_route => {
+                const source = server.server.owned_public_read_source.?;
+                for ([_]antfly.public_api.table_router.RoutePolicy{ .any_active, .prefer_leader }) |policy| {
+                    if (case == .scalar_route) {
+                        std.debug.print("OWNERSHIP_RED scalar_route expects remote node 3\n", .{});
+                        var route = (try antfly.public_api.table_router.resolveGroupRoute(alloc, source.catalog, source.router, data_group_id, policy)) orelse return error.MissingRemoteDataRoute;
+                        defer route.deinit(alloc);
+                        try std.testing.expect(route == .remote);
+                        try std.testing.expectEqual(@as(u64, 3), route.remote.node_id);
+                        try std.testing.expectEqualStrings(api_url, route.remote.base_uri);
+                    } else {
+                        std.debug.print("OWNERSHIP_RED batch_route expects remote node 3\n", .{});
+                        const routes = (try antfly.public_api.table_router.resolveGroupRoutes(alloc, source.catalog, source.router, &.{data_group_id}, policy)) orelse return error.MissingRemoteDataRoutes;
+                        defer antfly.public_api.table_router.freeGroupRoutes(alloc, routes);
+                        try std.testing.expectEqual(@as(usize, 1), routes.len);
+                        try std.testing.expect(routes[0] == .remote);
+                        try std.testing.expectEqual(@as(u64, 3), routes[0].remote.node_id);
+                        try std.testing.expectEqualStrings(api_url, routes[0].remote.base_uri);
+                    }
+                }
+            },
+            .backfill => {
+                svc.observe_local_replica_root = true;
+                svc.store_status_ticks = 39;
+                for (0..8) |_| try server.runRound();
+                const stores = try svc.listProjectedStores(alloc);
+                defer svc.freeProjectedStores(alloc, stores);
+                std.debug.print("OWNERSHIP_RED backfill expects retained 7 and 250\n", .{});
+                try std.testing.expectEqual(@as(usize, 1), stores.len);
+                try std.testing.expectEqual(@as(u32, 7), stores[0].active_backfills);
+                try std.testing.expectEqual(@as(u16, 250), stores[0].backfill_progress_millis);
+            },
+        }
+    }
+}
+
+fn expectMetadataOwnershipRemoteProgress(svc: *antfly.metadata_service.MetadataHttpService, boot: usize, phase: []const u8) !void {
+    const alloc = std.testing.allocator;
+    const schema = try svc.listProjectedSchemaProgress(alloc);
+    defer svc.freeProjectedSchemaProgress(alloc, schema);
+    const restore = try svc.listProjectedRestoreProgress(alloc);
+    defer svc.freeProjectedRestoreProgress(alloc, restore);
+    std.debug.print("OWNERSHIP_ASSERT progress boot={d} phase={s} schema_count\n", .{ boot, phase });
+    try std.testing.expectEqual(@as(usize, 1), schema.len);
+    std.debug.print("OWNERSHIP_ASSERT progress boot={d} phase={s} schema_node_id\n", .{ boot, phase });
+    try std.testing.expectEqual(@as(u64, 3), schema[0].node_id);
+    std.debug.print("OWNERSHIP_ASSERT progress boot={d} phase={s} restore_count\n", .{ boot, phase });
+    try std.testing.expectEqual(@as(usize, 1), restore.len);
+    std.debug.print("OWNERSHIP_ASSERT progress boot={d} phase={s} restore_node_id\n", .{ boot, phase });
+    try std.testing.expectEqual(@as(u64, 3), restore[0].node_id);
+    std.debug.print("OWNERSHIP_ASSERT progress boot={d} phase={s} restore_backup_id\n", .{ boot, phase });
+    try std.testing.expectEqualStrings("remote-backup", restore[0].backup_id);
 }

@@ -1,7 +1,7 @@
 # Antfly Python SDK
 
-[![PyPI version](https://badge.fury.io/py/antfly.svg)](https://badge.fury.io/py/antfly)
-[![Python](https://img.shields.io/pypi/pyversions/antfly.svg)](https://pypi.org/project/antfly/)
+[![PyPI version](https://badge.fury.io/py/antfly-sdk.svg)](https://badge.fury.io/py/antfly-sdk)
+[![Python](https://img.shields.io/pypi/pyversions/antfly.svg)](https://pypi.org/project/antfly-sdk/)
 
 Python SDK for [Antfly](https://github.com/antflydb/antfly) - a distributed key-value store and search engine.
 
@@ -121,7 +121,6 @@ make build
 
 `make docs` will generate the documentation in the `docs/` folder.
 
-Full documentation is available at [https://antfly-sdk-python.readthedocs.io](https://antfly-sdk-python.readthedocs.io)
 
 ## License
 

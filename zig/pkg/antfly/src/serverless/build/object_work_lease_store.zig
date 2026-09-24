@@ -1,5 +1,16 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 //! Durable serverless work leases backed by conditional object-store writes.
 //! The record is retained after release so fencing tokens never move backwards.
@@ -86,10 +97,9 @@ pub const ObjectWorkLeaseStore = struct {
 
         var current = try self.readCurrentAlloc(key);
         defer if (current) |*value| value.deinit(self.alloc);
-        if (current == null) return error.WorkLeaseRequiresPublishedHead;
 
         var took_over = false;
-        var fencing_token: u64 = 0;
+        var fencing_token: u64 = if (current == null) try self.reserveFencingToken(namespace, 0) else 0;
         if (current) |value| {
             // Acquisition denotes a new worker incarnation. Even a matching
             // configured owner must not inherit an active token: only renew()
@@ -173,129 +183,15 @@ pub const ObjectWorkLeaseStore = struct {
         now_unix_ns: u64,
         ttl_ns: u64,
     ) !?work_lease.Acquisition {
-        const expires_at = std.math.add(u64, now_unix_ns, ttl_ns) catch
-            return error.LeaseExpiryOverflow;
-        const key = try bootstrapKeyAlloc(self.alloc, self.prefix, namespace);
-        defer self.alloc.free(key);
-
-        var current = try self.readCurrentAlloc(key);
-        defer if (current) |*value| value.deinit(self.alloc);
-        if (current) |value| {
-            if (!value.released and value.expires_at_unix_ns > now_unix_ns) return null;
-        }
-        const minimum = if (current) |value| value.fencing_token else 0;
-        const fencing_token = try self.reserveFencingToken(namespace, minimum);
-        const proposed = head_coordination.Record{
-            .owner_id = owner_id,
-            .fencing_token = fencing_token,
-            .expires_at_unix_ns = expires_at,
-            .released = false,
-        };
-        const payload = try std.json.Stringify.valueAlloc(self.alloc, proposed, .{});
-        defer self.alloc.free(payload);
-        var result = self.client.putObject(self.bucket, key, payload, .{
-            .content_type = "application/json",
-            .if_none_match = current == null,
-            .if_match_etag = if (current) |value| value.etag else null,
-        }) catch |err| switch (err) {
-            error.PreconditionFailed => return null,
-            else => {
-                if (try self.recordMatches(key, proposed)) {
-                    return .{
-                        .fencing_token = fencing_token,
-                        .expires_at_unix_ns = expires_at,
-                        .took_over = if (current) |value| !value.released else false,
-                    };
-                }
-                return err;
-            },
-        };
-        defer result.deinit(self.alloc);
-        return .{
-            .fencing_token = fencing_token,
-            .expires_at_unix_ns = expires_at,
-            .took_over = if (current) |value| !value.released else false,
-        };
+        return self.acquire(namespace, owner_id, now_unix_ns, ttl_ns);
     }
 
-    pub fn releaseBootstrap(
-        self: *ObjectWorkLeaseStore,
-        namespace: []const u8,
-        owner_id: []const u8,
-        fencing_token: u64,
-    ) !bool {
-        const key = try bootstrapKeyAlloc(self.alloc, self.prefix, namespace);
-        defer self.alloc.free(key);
-        var current = (try self.readCurrentAlloc(key)) orelse return false;
-        defer current.deinit(self.alloc);
-        if (current.owner_id == null or
-            !std.mem.eql(u8, current.owner_id.?, owner_id) or
-            current.fencing_token != fencing_token)
-        {
-            return false;
-        }
-        const released_record = head_coordination.Record{
-            .owner_id = owner_id,
-            .fencing_token = fencing_token,
-            .released = true,
-        };
-        const payload = try std.json.Stringify.valueAlloc(self.alloc, released_record, .{});
-        defer self.alloc.free(payload);
-        var result = self.client.putObject(self.bucket, key, payload, .{
-            .content_type = "application/json",
-            .if_match_etag = current.etag,
-        }) catch |err| switch (err) {
-            error.PreconditionFailed => return false,
-            else => {
-                if (try self.recordMatches(key, released_record)) return true;
-                return err;
-            },
-        };
-        defer result.deinit(self.alloc);
-        return true;
+    pub fn releaseBootstrap(self: *ObjectWorkLeaseStore, namespace: []const u8, owner_id: []const u8, fencing_token: u64) !bool {
+        return self.release(namespace, owner_id, fencing_token);
     }
 
-    pub fn renewBootstrap(
-        self: *ObjectWorkLeaseStore,
-        namespace: []const u8,
-        owner_id: []const u8,
-        fencing_token: u64,
-        now_unix_ns: u64,
-        ttl_ns: u64,
-    ) !u64 {
-        const expires_at = std.math.add(u64, now_unix_ns, ttl_ns) catch
-            return error.LeaseExpiryOverflow;
-        const key = try bootstrapKeyAlloc(self.alloc, self.prefix, namespace);
-        defer self.alloc.free(key);
-        var current = (try self.readCurrentAlloc(key)) orelse return error.WorkLeaseLost;
-        defer current.deinit(self.alloc);
-        if (current.owner_id == null or
-            !std.mem.eql(u8, current.owner_id.?, owner_id) or
-            current.fencing_token != fencing_token or
-            current.released)
-        {
-            return error.WorkLeaseLost;
-        }
-        const proposed = head_coordination.Record{
-            .owner_id = owner_id,
-            .fencing_token = fencing_token,
-            .expires_at_unix_ns = expires_at,
-            .released = false,
-        };
-        const payload = try std.json.Stringify.valueAlloc(self.alloc, proposed, .{});
-        defer self.alloc.free(payload);
-        var result = self.client.putObject(self.bucket, key, payload, .{
-            .content_type = "application/json",
-            .if_match_etag = current.etag,
-        }) catch |err| switch (err) {
-            error.PreconditionFailed => return error.WorkLeaseLost,
-            else => {
-                if (try self.recordMatches(key, proposed)) return expires_at;
-                return err;
-            },
-        };
-        defer result.deinit(self.alloc);
-        return expires_at;
+    pub fn renewBootstrap(self: *ObjectWorkLeaseStore, namespace: []const u8, owner_id: []const u8, fencing_token: u64, now_unix_ns: u64, ttl_ns: u64) !u64 {
+        return self.renew(namespace, owner_id, fencing_token, now_unix_ns, ttl_ns);
     }
 
     pub fn renew(
@@ -646,13 +542,6 @@ fn fenceFloorKeyAlloc(alloc: Allocator, prefix: []const u8, namespace: []const u
     return try std.fmt.allocPrint(alloc, "{s}/{s}/HEAD_FENCE", .{ prefix, namespace });
 }
 
-fn bootstrapKeyAlloc(alloc: Allocator, prefix: []const u8, namespace: []const u8) ![]u8 {
-    if (prefix.len == 0) {
-        return try std.fmt.allocPrint(alloc, "{s}/HEAD_BOOTSTRAP", .{namespace});
-    }
-    return try std.fmt.allocPrint(alloc, "{s}/{s}/HEAD_BOOTSTRAP", .{ prefix, namespace });
-}
-
 test "serverless object work lease fences stale owners and reconciles ambiguous acquisition" {
     const alloc = std.testing.allocator;
     var memory = objectstore.MemoryClient.init(alloc);
@@ -756,7 +645,7 @@ test "serverless head publication atomically rejects a stale fencing token" {
     );
 }
 
-test "serverless work lease preserves first publication for rolling rollback" {
+test "serverless bootstrap and first publication share one fenced ownership record" {
     const alloc = std.testing.allocator;
     var memory = objectstore.MemoryClient.init(alloc);
     defer memory.deinit();
@@ -768,28 +657,23 @@ test "serverless work lease preserves first publication for rolling rollback" {
     );
     defer store.deinit();
 
-    try std.testing.expectError(
-        error.WorkLeaseRequiresPublishedHead,
-        store.provider().acquire("docs", "new-worker", 100, 10),
-    );
     const bootstrap = (try store.provider().acquireBootstrap("docs", "new-worker", 100, 10)).?;
     try std.testing.expect(
         (try store.provider().acquireBootstrap("docs", "contender", 100, 10)) == null,
     );
-    var legacy_client = memory.client();
-    try std.testing.expectError(
-        error.FileNotFound,
-        legacy_client.getObject("coordination", "tenant/docs/HEAD", .{}),
-    );
-    var first_head = try legacy_client.putObject("coordination", "tenant/docs/HEAD", "1", .{
-        .content_type = "text/plain",
-        .if_none_match = true,
-    });
-    first_head.deinit(alloc);
+    var progress_impl = try @import("../catalog/object_progress_store.zig").ObjectProgressStore.initWithClient(alloc, memory.client(), "coordination", "tenant");
+    defer progress_impl.deinit();
+    var progress = progress_impl.progressStore();
+    try std.testing.expectError(error.FileNotFound, progress.getHead("docs"));
+    const replacement = (try store.provider().acquire("docs", "contender", 111, 10)).?;
+    try std.testing.expect(replacement.fencing_token > bootstrap.fencing_token);
+    try std.testing.expectError(error.WorkLeaseLost, progress.compareAndSwapHeadFenced("docs", null, 1, .{ .owner_id = "new-worker", .fencing_token = bootstrap.fencing_token }));
+    try std.testing.expect(try progress.compareAndSwapHeadFenced("docs", null, 1, .{ .owner_id = "contender", .fencing_token = replacement.fencing_token }));
+    try std.testing.expectEqual(@as(u64, 1), try progress.getHead("docs"));
     try std.testing.expect(try store.provider().releaseBootstrap(
         "docs",
-        "new-worker",
-        bootstrap.fencing_token,
+        "contender",
+        replacement.fencing_token,
     ));
 }
 

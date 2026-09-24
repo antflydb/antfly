@@ -19,6 +19,7 @@ const google_auth = @import("antfly_google").auth;
 const remote_uri = @import("remote_uri.zig");
 
 const Allocator = std.mem.Allocator;
+const AwsCredentialContext = @import("aws_credential_context.zig").AwsCredentialContext;
 
 pub const S3Options = struct {
     endpoint: ?[]const u8 = null,
@@ -129,6 +130,8 @@ pub const OpenedObjectStore = struct {
     gcs_client: ?*object_storage.Gcs.JsonApiClient = null,
     s3_client: ?*object_storage.S3.Client = null,
     owns_client: bool = true,
+    credential_context: ?*AwsCredentialContext = null,
+    credential_io: ?*std.Io.Threaded = null,
     bucket: []u8,
     prefix: []u8,
 
@@ -331,17 +334,53 @@ pub const OpenedObjectStore = struct {
     ) !OpenedObjectStore {
         const s3 = try alloc.create(object_storage.S3.Client);
         errdefer alloc.destroy(s3);
-        const cfg = try s3ConfigAlloc(alloc, s3_options);
+        const options = s3_options orelse S3Options{};
+        if ((options.access_key_id == null) != (options.secret_access_key == null)) return error.IncompleteStaticCredentials;
+        const dynamic = options.access_key_id == null;
+        var config_options = options;
+        if (dynamic) {
+            config_options.access_key_id = "dynamic-provider";
+            config_options.secret_access_key = "dynamic-provider";
+        }
+        var cfg = try s3ConfigAlloc(alloc, config_options);
+        var cfg_owned = true;
+        errdefer if (cfg_owned) cfg.deinit(alloc);
+        var credential_io: ?*std.Io.Threaded = null;
+        errdefer if (credential_io) |io| {
+            io.deinit();
+            alloc.destroy(io);
+        };
+        var credential_context: ?*AwsCredentialContext = null;
+        errdefer if (credential_context) |context| {
+            context.deinit();
+            alloc.destroy(context);
+        };
+        if (dynamic) {
+            const io = try alloc.create(std.Io.Threaded);
+            io.* = @import("../common/threaded_io_limits.zig").initServerlessObjectStore(alloc);
+            credential_io = io;
+            const context = try alloc.create(AwsCredentialContext);
+            errdefer alloc.destroy(context);
+            context.* = try AwsCredentialContext.init(alloc, cfg.credentials.region, options.credential_source, io.io());
+            credential_context = context;
+            cfg.io = io.io();
+            cfg.credential_provider = context.provider();
+        }
         s3.* = try object_storage.S3.Client.init(alloc, cfg);
-
+        cfg_owned = false;
         var owned_client = s3.client();
+        errdefer owned_client.deinit();
         if (open_options.ensure_bucket and !(try owned_client.bucketExists(bucket))) try owned_client.makeBucket(bucket);
+        const owned_bucket = try alloc.dupe(u8, bucket);
+        errdefer alloc.free(owned_bucket);
         return .{
             .alloc = alloc,
             .client = owned_client,
             .s3_client = s3,
-            .bucket = try alloc.dupe(u8, bucket),
+            .bucket = owned_bucket,
             .prefix = try alloc.dupe(u8, prefix),
+            .credential_context = credential_context,
+            .credential_io = credential_io,
         };
     }
 
@@ -381,6 +420,14 @@ pub const OpenedObjectStore = struct {
 
     pub fn deinit(self: *OpenedObjectStore) void {
         if (self.owns_client) self.client.deinit();
+        if (self.credential_context) |context| {
+            context.deinit();
+            self.alloc.destroy(context);
+        }
+        if (self.credential_io) |io| {
+            io.deinit();
+            self.alloc.destroy(io);
+        }
         if (self.fs_client) |fs| self.alloc.destroy(fs);
         if (self.gcs_client) |gcs| self.alloc.destroy(gcs);
         if (self.s3_client) |s3| self.alloc.destroy(s3);
@@ -390,7 +437,7 @@ pub const OpenedObjectStore = struct {
     }
 };
 
-test "storage.ha cleanup object store does not create a missing bucket while opening deletion authority" {
+test "storage.hot_standby cleanup object store does not create a missing bucket while opening deletion authority" {
     const alloc = std.testing.allocator;
     var memory = object_storage.MemoryObjectStorage.init(alloc);
     defer memory.deinit();

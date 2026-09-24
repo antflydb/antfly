@@ -24,61 +24,110 @@ pub const BaseBackupStartRequest = openapi.BaseBackupStartRequest;
 pub const BaseBackupManifestPathRequest = openapi.BaseBackupManifestPathRequest;
 pub const SeedArtifactCaptureRequest = openapi.SeedArtifactCaptureRequest;
 pub const StandbyBootstrapRequest = openapi.StandbyBootstrapRequest;
+pub const StandbyUpstreamRequest = openapi.StandbyUpstreamRequest;
 pub const SeededSlotActivateRequest = openapi.SeededSlotActivateRequest;
-pub const HASyncPolicy = openapi.HASyncPolicy;
+pub const HASyncPolicy = openapi.StandbySyncPolicy;
+pub const StandbySyncPolicy = openapi.StandbySyncPolicy;
 pub const CommitCheckRequest = openapi.CommitCheckRequest;
 pub const CommitAppendRequest = openapi.CommitAppendRequest;
 pub const ReadCheckRequest = openapi.ReadCheckRequest;
 pub const WriteCheckRequest = openapi.WriteCheckRequest;
 pub const OwnerJobCheckRequest = openapi.OwnerJobCheckRequest;
-pub const HAIdentity = openapi.HAIdentity;
-pub const HALeaseWatchdogProof = openapi.HALeaseWatchdogProof;
+pub const HAIdentity = openapi.StandbyIdentity;
+pub const StandbyIdentity = openapi.StandbyIdentity;
+pub const HALeaseWatchdogProof = openapi.StandbyLeaseWatchdogProof;
+pub const StandbyLeaseWatchdogProof = openapi.StandbyLeaseWatchdogProof;
 pub const FenceAcquireRequest = openapi.FenceAcquireRequest;
-pub const HAFenceReceipt = openapi.HAFenceReceipt;
+pub const HAFenceReceipt = openapi.StandbyFenceReceipt;
+pub const StandbyFenceReceipt = openapi.StandbyFenceReceipt;
 pub const PromotionAssessRequest = openapi.PromotionAssessRequest;
 pub const RejoinAssessRequest = openapi.RejoinAssessRequest;
 
-pub const HAPrimaryStatusResponse = openapi.HAPrimaryStatusResponse;
-pub const HAWatchdogProofResponse = openapi.HAWatchdogProofResponse;
-pub const HAStandbyStatusResponse = openapi.HAStandbyStatusResponse;
-pub const HACommitCheckResponse = openapi.HACommitCheckResponse;
-pub const HACommitAppendResponse = openapi.HACommitAppendResponse;
-pub const HAReadCheckResponse = openapi.HAReadCheckResponse;
-pub const HAWriteCheckResponse = openapi.HAWriteCheckResponse;
-pub const HAOwnerJobCheckResponse = openapi.HAOwnerJobCheckResponse;
-pub const HAReplicationSlotActionResponse = openapi.HAReplicationSlotActionResponse;
-pub const HAReplicationSlotListResponse = openapi.HAReplicationSlotListResponse;
-pub const HABaseBackupBeginResponse = openapi.HABaseBackupBeginResponse;
-pub const HABaseBackupFinishResponse = openapi.HABaseBackupFinishResponse;
-pub const HASeedArtifactCaptureResponse = openapi.HASeedArtifactCaptureResponse;
-pub const HASeedLifecycleReceiptEvent = openapi.HASeedLifecycleReceiptEvent;
-pub const HASeedLifecycleReceiptInventoryResponse = openapi.HASeedLifecycleReceiptInventoryResponse;
-pub const HARuntimeLifecycleObservation = openapi.HARuntimeLifecycleObservation;
-pub const HAStandbyBootstrapResponse = openapi.HAStandbyBootstrapResponse;
-pub const HASeededSlotActivateResponse = openapi.HASeededSlotActivateResponse;
-pub const HAFenceResponse = openapi.HAFenceResponse;
-pub const HACurrentFenceResponse = openapi.HACurrentFenceResponse;
-pub const HAPromotionAssessResponse = openapi.HAPromotionAssessResponse;
-pub const HAPromotionResponse = openapi.HAPromotionResponse;
-pub const HARejoinAssessResponse = openapi.HARejoinAssessResponse;
-pub const HARejoinRewindResult = openapi.HARejoinRewindResult;
-pub const HARejoinReseedResult = openapi.HARejoinReseedResult;
+pub const HAPrimaryStatusResponse = openapi.StandbyPrimaryStatusResponse;
+pub const StandbyPrimaryStatusResponse = openapi.StandbyPrimaryStatusResponse;
+pub const HAWatchdogProofResponse = openapi.StandbyWatchdogProofResponse;
+pub const StandbyWatchdogProofResponse = openapi.StandbyWatchdogProofResponse;
+pub const HAStandbyStatusResponse = openapi.StandbyStatusResponse;
+pub const StandbyStatusResponse = openapi.StandbyStatusResponse;
+pub const HACommitCheckResponse = openapi.StandbyCommitCheckResponse;
+pub const StandbyCommitCheckResponse = openapi.StandbyCommitCheckResponse;
+pub const HACommitAppendResponse = openapi.StandbyCommitAppendResponse;
+pub const StandbyCommitAppendResponse = openapi.StandbyCommitAppendResponse;
+pub const HAReadCheckResponse = openapi.StandbyReadCheckResponse;
+pub const StandbyReadCheckResponse = openapi.StandbyReadCheckResponse;
+pub const HAWriteCheckResponse = openapi.StandbyWriteCheckResponse;
+pub const StandbyWriteCheckResponse = openapi.StandbyWriteCheckResponse;
+pub const HAOwnerJobCheckResponse = openapi.StandbyOwnerJobCheckResponse;
+pub const StandbyOwnerJobCheckResponse = openapi.StandbyOwnerJobCheckResponse;
+pub const HAReplicationSlotActionResponse = openapi.StandbyReplicationSlotActionResponse;
+pub const StandbyReplicationSlotActionResponse = openapi.StandbyReplicationSlotActionResponse;
+pub const HAReplicationSlotListResponse = openapi.StandbyReplicationSlotListResponse;
+pub const StandbyReplicationSlotListResponse = openapi.StandbyReplicationSlotListResponse;
+pub const HABaseBackupBeginResponse = openapi.StandbyBaseBackupBeginResponse;
+pub const StandbyBaseBackupBeginResponse = openapi.StandbyBaseBackupBeginResponse;
+pub const HABaseBackupFinishResponse = openapi.StandbyBaseBackupFinishResponse;
+pub const StandbyBaseBackupFinishResponse = openapi.StandbyBaseBackupFinishResponse;
+pub const HASeedArtifactCaptureResponse = openapi.StandbySeedArtifactCaptureResponse;
+pub const StandbySeedArtifactCaptureResponse = openapi.StandbySeedArtifactCaptureResponse;
+pub const HASeedLifecycleReceiptEvent = openapi.StandbySeedLifecycleReceiptEvent;
+pub const StandbySeedLifecycleReceiptEvent = openapi.StandbySeedLifecycleReceiptEvent;
+pub const HASeedLifecycleReceiptInventoryResponse = openapi.StandbySeedLifecycleReceiptInventoryResponse;
+pub const StandbySeedLifecycleReceiptInventoryResponse = openapi.StandbySeedLifecycleReceiptInventoryResponse;
+pub const HARuntimeLifecycleObservation = openapi.StandbyRuntimeLifecycleObservation;
+pub const StandbyRuntimeLifecycleObservation = openapi.StandbyRuntimeLifecycleObservation;
+pub const HAStandbyBootstrapResponse = openapi.StandbyBootstrapResponse;
+pub const StandbyBootstrapResponse = openapi.StandbyBootstrapResponse;
+pub const HAStandbyUpstream = openapi.StandbyUpstream;
+pub const StandbyUpstream = openapi.StandbyUpstream;
+pub const HAStandbyUpstreamResponse = openapi.StandbyUpstreamResponse;
+pub const StandbyUpstreamResponse = openapi.StandbyUpstreamResponse;
+pub const HASeededSlotActivateResponse = openapi.StandbySeededSlotActivateResponse;
+pub const StandbySeededSlotActivateResponse = openapi.StandbySeededSlotActivateResponse;
+pub const HAFenceResponse = openapi.StandbyFenceResponse;
+pub const StandbyFenceResponse = openapi.StandbyFenceResponse;
+pub const HACurrentFenceResponse = openapi.StandbyCurrentFenceResponse;
+pub const StandbyCurrentFenceResponse = openapi.StandbyCurrentFenceResponse;
+pub const HAPromotionAssessResponse = openapi.StandbyPromotionAssessResponse;
+pub const StandbyPromotionAssessResponse = openapi.StandbyPromotionAssessResponse;
+pub const HAPromotionResponse = openapi.StandbyPromotionResponse;
+pub const StandbyPromotionResponse = openapi.StandbyPromotionResponse;
+pub const HARejoinAssessResponse = openapi.StandbyRejoinAssessResponse;
+pub const StandbyRejoinAssessResponse = openapi.StandbyRejoinAssessResponse;
+pub const HARejoinRewindResult = openapi.StandbyRejoinRewindResult;
+pub const StandbyRejoinRewindResult = openapi.StandbyRejoinRewindResult;
+pub const HARejoinReseedResult = openapi.StandbyRejoinReseedResult;
+pub const StandbyRejoinReseedResult = openapi.StandbyRejoinReseedResult;
 
-pub const HAPromotionAssessment = openapi.HAPromotionAssessment;
-pub const HAPromotionResult = openapi.HAPromotionResult;
-pub const HARejoinAssessment = openapi.HARejoinAssessment;
-pub const HAPrimarySnapshot = openapi.HAPrimarySnapshot;
-pub const HAStandbySnapshot = openapi.HAStandbySnapshot;
-pub const HASlotSnapshot = openapi.HASlotSnapshot;
-pub const HARetentionSnapshot = openapi.HARetentionSnapshot;
-pub const HADurabilityDecision = openapi.HADurabilityDecision;
-pub const HAReadDecision = openapi.HAReadDecision;
-pub const HAPromotionHandoff = openapi.HAPromotionHandoff;
-pub const HAWriteDecision = openapi.HAWriteDecision;
-pub const HAOwnerJobDecision = openapi.HAOwnerJobDecision;
-pub const HACommitGate = openapi.HACommitGate;
-pub const HAReplicationSlot = openapi.HAReplicationSlot;
-pub const HAActionReceipt = openapi.HAActionReceipt;
+pub const HAPromotionAssessment = openapi.StandbyPromotionAssessment;
+pub const StandbyPromotionAssessment = openapi.StandbyPromotionAssessment;
+pub const HAPromotionResult = openapi.StandbyPromotionResult;
+pub const StandbyPromotionResult = openapi.StandbyPromotionResult;
+pub const HARejoinAssessment = openapi.StandbyRejoinAssessment;
+pub const StandbyRejoinAssessment = openapi.StandbyRejoinAssessment;
+pub const HAPrimarySnapshot = openapi.StandbyPrimarySnapshot;
+pub const StandbyPrimarySnapshot = openapi.StandbyPrimarySnapshot;
+pub const HAStandbySnapshot = openapi.StandbySnapshot;
+pub const StandbySnapshot = openapi.StandbySnapshot;
+pub const HASlotSnapshot = openapi.StandbySlotSnapshot;
+pub const StandbySlotSnapshot = openapi.StandbySlotSnapshot;
+pub const HARetentionSnapshot = openapi.StandbyRetentionSnapshot;
+pub const StandbyRetentionSnapshot = openapi.StandbyRetentionSnapshot;
+pub const HADurabilityDecision = openapi.StandbyDurabilityDecision;
+pub const StandbyDurabilityDecision = openapi.StandbyDurabilityDecision;
+pub const HAReadDecision = openapi.StandbyReadDecision;
+pub const StandbyReadDecision = openapi.StandbyReadDecision;
+pub const HAPromotionHandoff = openapi.StandbyPromotionHandoff;
+pub const StandbyPromotionHandoff = openapi.StandbyPromotionHandoff;
+pub const HAWriteDecision = openapi.StandbyWriteDecision;
+pub const StandbyWriteDecision = openapi.StandbyWriteDecision;
+pub const HAOwnerJobDecision = openapi.StandbyOwnerJobDecision;
+pub const StandbyOwnerJobDecision = openapi.StandbyOwnerJobDecision;
+pub const HACommitGate = openapi.StandbyCommitGate;
+pub const StandbyCommitGate = openapi.StandbyCommitGate;
+pub const HAReplicationSlot = openapi.StandbyReplicationSlot;
+pub const StandbyReplicationSlot = openapi.StandbyReplicationSlot;
+pub const HAActionReceipt = openapi.StandbyActionReceipt;
+pub const StandbyActionReceipt = openapi.StandbyActionReceipt;
 
 const std = @import("std");
 
@@ -99,6 +148,16 @@ test {
 test "admin facade mirrors generated HA OpenAPI contract types" {
     inline for (ha_contract_type_names) |name| {
         try expectFacadeTypeAlias(name);
+    }
+}
+
+test "admin facade exposes deprecated HA aliases and canonical Standby names as the same type" {
+    inline for (ha_to_standby_alias_pairs) |pair| {
+        try std.testing.expect(@hasDecl(@This(), pair.ha));
+        try std.testing.expect(@hasDecl(@This(), pair.standby));
+        try std.testing.expect(@hasDecl(openapi, pair.standby));
+        try std.testing.expect(@field(@This(), pair.ha) == @field(@This(), pair.standby));
+        try std.testing.expect(@field(@This(), pair.standby) == @field(openapi, pair.standby));
     }
 }
 
@@ -222,6 +281,12 @@ test "admin facade preserves HA slot seed and fence schema fields" {
     inline for (ha_standby_bootstrap_response_fields) |name| {
         try expectFacadeStructField(HAStandbyBootstrapResponse, name);
     }
+    inline for (ha_standby_upstream_fields) |name| {
+        try expectFacadeStructField(HAStandbyUpstream, name);
+    }
+    inline for (ha_standby_upstream_response_fields) |name| {
+        try expectFacadeStructField(HAStandbyUpstreamResponse, name);
+    }
     inline for (ha_fence_receipt_fields) |name| {
         try expectFacadeStructField(HAFenceReceipt, name);
     }
@@ -238,6 +303,7 @@ const ha_contract_type_names = [_][]const u8{
     "BaseBackupStartRequest",
     "BaseBackupManifestPathRequest",
     "StandbyBootstrapRequest",
+    "StandbyUpstreamRequest",
     "SeededSlotActivateRequest",
     "HASyncPolicy",
     "CommitCheckRequest",
@@ -263,6 +329,8 @@ const ha_contract_type_names = [_][]const u8{
     "HABaseBackupBeginResponse",
     "HABaseBackupFinishResponse",
     "HAStandbyBootstrapResponse",
+    "HAStandbyUpstream",
+    "HAStandbyUpstreamResponse",
     "HASeededSlotActivateResponse",
     "HAFenceResponse",
     "HACurrentFenceResponse",
@@ -286,6 +354,59 @@ const ha_contract_type_names = [_][]const u8{
     "HACommitGate",
     "HAReplicationSlot",
     "HAActionReceipt",
+};
+
+const HaToStandbyAliasPair = struct { ha: []const u8, standby: []const u8 };
+
+// Deprecated aliases, remove after 0.4: every `HA*` facade name above that has
+// a same-shape `Standby*` counterpart, paired for the alias-equivalence test.
+const ha_to_standby_alias_pairs = [_]HaToStandbyAliasPair{
+    .{ .ha = "HASyncPolicy", .standby = "StandbySyncPolicy" },
+    .{ .ha = "HAIdentity", .standby = "StandbyIdentity" },
+    .{ .ha = "HALeaseWatchdogProof", .standby = "StandbyLeaseWatchdogProof" },
+    .{ .ha = "HAFenceReceipt", .standby = "StandbyFenceReceipt" },
+    .{ .ha = "HAPrimaryStatusResponse", .standby = "StandbyPrimaryStatusResponse" },
+    .{ .ha = "HAWatchdogProofResponse", .standby = "StandbyWatchdogProofResponse" },
+    .{ .ha = "HAStandbyStatusResponse", .standby = "StandbyStatusResponse" },
+    .{ .ha = "HACommitCheckResponse", .standby = "StandbyCommitCheckResponse" },
+    .{ .ha = "HACommitAppendResponse", .standby = "StandbyCommitAppendResponse" },
+    .{ .ha = "HAReadCheckResponse", .standby = "StandbyReadCheckResponse" },
+    .{ .ha = "HAWriteCheckResponse", .standby = "StandbyWriteCheckResponse" },
+    .{ .ha = "HAOwnerJobCheckResponse", .standby = "StandbyOwnerJobCheckResponse" },
+    .{ .ha = "HAReplicationSlotActionResponse", .standby = "StandbyReplicationSlotActionResponse" },
+    .{ .ha = "HAReplicationSlotListResponse", .standby = "StandbyReplicationSlotListResponse" },
+    .{ .ha = "HABaseBackupBeginResponse", .standby = "StandbyBaseBackupBeginResponse" },
+    .{ .ha = "HABaseBackupFinishResponse", .standby = "StandbyBaseBackupFinishResponse" },
+    .{ .ha = "HASeedArtifactCaptureResponse", .standby = "StandbySeedArtifactCaptureResponse" },
+    .{ .ha = "HASeedLifecycleReceiptEvent", .standby = "StandbySeedLifecycleReceiptEvent" },
+    .{ .ha = "HASeedLifecycleReceiptInventoryResponse", .standby = "StandbySeedLifecycleReceiptInventoryResponse" },
+    .{ .ha = "HARuntimeLifecycleObservation", .standby = "StandbyRuntimeLifecycleObservation" },
+    .{ .ha = "HAStandbyBootstrapResponse", .standby = "StandbyBootstrapResponse" },
+    .{ .ha = "HAStandbyUpstream", .standby = "StandbyUpstream" },
+    .{ .ha = "HAStandbyUpstreamResponse", .standby = "StandbyUpstreamResponse" },
+    .{ .ha = "HASeededSlotActivateResponse", .standby = "StandbySeededSlotActivateResponse" },
+    .{ .ha = "HAFenceResponse", .standby = "StandbyFenceResponse" },
+    .{ .ha = "HACurrentFenceResponse", .standby = "StandbyCurrentFenceResponse" },
+    .{ .ha = "HAPromotionAssessResponse", .standby = "StandbyPromotionAssessResponse" },
+    .{ .ha = "HAPromotionResponse", .standby = "StandbyPromotionResponse" },
+    .{ .ha = "HARejoinAssessResponse", .standby = "StandbyRejoinAssessResponse" },
+    .{ .ha = "HARejoinRewindResult", .standby = "StandbyRejoinRewindResult" },
+    .{ .ha = "HARejoinReseedResult", .standby = "StandbyRejoinReseedResult" },
+    .{ .ha = "HAPromotionAssessment", .standby = "StandbyPromotionAssessment" },
+    .{ .ha = "HAPromotionResult", .standby = "StandbyPromotionResult" },
+    .{ .ha = "HARejoinAssessment", .standby = "StandbyRejoinAssessment" },
+    .{ .ha = "HAPrimarySnapshot", .standby = "StandbyPrimarySnapshot" },
+    .{ .ha = "HAStandbySnapshot", .standby = "StandbySnapshot" },
+    .{ .ha = "HASlotSnapshot", .standby = "StandbySlotSnapshot" },
+    .{ .ha = "HARetentionSnapshot", .standby = "StandbyRetentionSnapshot" },
+    .{ .ha = "HADurabilityDecision", .standby = "StandbyDurabilityDecision" },
+    .{ .ha = "HAReadDecision", .standby = "StandbyReadDecision" },
+    .{ .ha = "HAPromotionHandoff", .standby = "StandbyPromotionHandoff" },
+    .{ .ha = "HAWriteDecision", .standby = "StandbyWriteDecision" },
+    .{ .ha = "HAOwnerJobDecision", .standby = "StandbyOwnerJobDecision" },
+    .{ .ha = "HACommitGate", .standby = "StandbyCommitGate" },
+    .{ .ha = "HAReplicationSlot", .standby = "StandbyReplicationSlot" },
+    .{ .ha = "HAActionReceipt", .standby = "StandbyActionReceipt" },
 };
 
 const ha_action_receipt_fields = [_][]const u8{
@@ -575,6 +696,20 @@ const ha_standby_bootstrap_response_fields = [_][]const u8{
     "manifest_id",
     "backup_lsn",
     "checkpoint_lsn",
+};
+
+const ha_standby_upstream_fields = [_][]const u8{
+    "upstream_url",
+    "slot_name",
+};
+
+const ha_standby_upstream_response_fields = [_][]const u8{
+    "schema_version",
+    "action",
+    "identity",
+    "upstream",
+    "previous",
+    "changed",
 };
 
 const ha_fence_receipt_fields = [_][]const u8{

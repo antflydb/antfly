@@ -28,6 +28,7 @@ const AntflyRootImports = @import("imports.zig").AntflyRootImports;
 const LmdbBackend = @import("storage.zig").LmdbBackend;
 
 pub const AddBenchmarksOptions = struct {
+    vopr: *std.Build.Module,
     lmdb_engine: *std.Build.Module,
     api_bench_standalone: bool,
     optimize: std.builtin.OptimizeMode,
@@ -60,14 +61,41 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const structlog_mod = options.antfly_imports.structlog;
     const hash_mod = options.antfly_imports.hash;
     const vectorindex_mod = options.antfly_imports.vectorindex;
-    const vellum_mod = options.antfly_imports.vellum;
+    const fst_mod = options.antfly_imports.fst;
     const antfly_imports = options.antfly_imports;
     const antfly_mod = options.antfly_mod;
     const antfly_test_mod = options.antfly_test_mod;
     const run_lib_ha_compat_tests = options.run_lib_ha_compat_tests;
     const compiled_recall_tests = options.compiled_recall_tests;
+    const system_catalog_bench = b.addExecutable(.{
+        .name = "antfly-system-catalog-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/benchmarks/system_catalog.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    system_catalog_bench.root_module.addImport("system_catalog", b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/system_catalog/domain.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    }));
+    b.step("antfly-system-catalog-bench", "Benchmark indexed catalog lookups and mutation planning").dependOn(&b.addRunArtifact(system_catalog_bench).step);
+    // Benchmarks sharing the product graph use its selected optimization mode.
+    // Pass -Doptimize=ReleaseFast for performance measurements.
+    const system_catalog_routing_bench = b.addExecutable(.{
+        .name = "antfly-system-catalog-routing-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/src/system_catalog_routing_bench.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const catalog_bench_imports = @import("test_support.zig").Imports{ .runtime = antfly_imports, .vopr = options.vopr, .lmdb_engine = options.lmdb_engine };
+    catalog_bench_imports.configure(b, system_catalog_routing_bench.root_module, true, true);
+    b.step("antfly-system-catalog-routing-bench", "Benchmark rebuilt and retained indexed routing generations").dependOn(&b.addRunArtifact(system_catalog_routing_bench).step);
     const lmdb_bench_engine_options_c = makeLmdbBuildOptions(b, .c, false, false);
-    const lmdb_bench_build_options_c = makeRootBuildOptions(b, .c, false, false, false, true, false, true);
+    const lmdb_bench_build_options_c = makeRootBuildOptions(b, .c, false, false, false, true, false, true, false);
     const lmdb_bench_engine_mod_c = makeLmdbEngineModule(b, target, optimize, true, lmdb_bench_engine_options_c);
     const lmdb_bench_wrapper_mod_c = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, optimize, lmdb_bench_build_options_c, lmdb_bench_engine_mod_c, platform_mod, hash_mod);
     const lmstorage_bench_mod_c = b.createModule(.{
@@ -84,7 +112,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     });
 
     const lmdb_bench_engine_options_zig = makeLmdbBuildOptions(b, .zig, lmdb_evented_async_io, false);
-    const lmdb_bench_build_options_zig = makeRootBuildOptions(b, .zig, lmdb_evented_async_io, false, false, true, false, true);
+    const lmdb_bench_build_options_zig = makeRootBuildOptions(b, .zig, lmdb_evented_async_io, false, false, true, false, true, false);
     const lmdb_bench_engine_mod_zig = makeLmdbEngineModule(b, target, optimize, true, lmdb_bench_engine_options_zig);
     const lmdb_bench_wrapper_mod_zig = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, optimize, lmdb_bench_build_options_zig, lmdb_bench_engine_mod_zig, platform_mod, hash_mod);
     const lmstorage_bench_mod_zig = b.createModule(.{
@@ -105,7 +133,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     lmstorage_bench_step.dependOn(&b.addInstallArtifact(lmdb_bench_zig, .{}).step);
 
     const split_bench_engine_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
-    const split_bench_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, false, true, false, true);
+    const split_bench_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, false, true, false, true, false);
     const split_bench_engine_mod = makeLmdbEngineModule(b, target, optimize, true, split_bench_engine_options);
     const split_bench_root_mod = makeLmdbModule(b, split_bench_root, target, optimize, split_bench_build_options, split_bench_engine_mod, platform_mod, hash_mod);
     const split_bench_mod = b.createModule(.{
@@ -154,19 +182,14 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const backend_bench_step = b.step("backend-bench", "Build and install backend_bench");
     backend_bench_step.dependOn(&b.addInstallArtifact(backend_bench, .{}).step);
 
-    const graph_pattern_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/graph/pattern_query_bench.zig"),
+    const graph_bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/graph/main.zig"),
         .target = target,
         .optimize = optimize,
     });
-    graph_pattern_bench_mod.addImport("antfly_zig", antfly_mod);
-    const graph_pattern_bench = b.addExecutable(.{
-        .name = "graph_pattern_query_bench",
-        .root_module = graph_pattern_bench_mod,
-    });
-
-    const graph_pattern_bench_step = b.step("graph-pattern-bench", "Build and install graph_pattern_query_bench");
-    graph_pattern_bench_step.dependOn(&b.addInstallArtifact(graph_pattern_bench, .{}).step);
+    graph_bench_mod.addImport("antfly_zig", antfly_mod);
+    const graph_bench = b.addExecutable(.{ .name = "antfly-graph-bench", .root_module = graph_bench_mod });
+    b.step("antfly-graph-bench", "Build and install graph preparation and query benchmarks").dependOn(&b.addInstallArtifact(graph_bench, .{}).step);
 
     const lsm_backend_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/lsm_backend_bench.zig"),
@@ -242,7 +265,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
         .optimize = optimize,
     });
     text_segment_bench_root_mod.addImport("bloom", bloom_mod);
-    text_segment_bench_root_mod.addImport("antfly_vellum", vellum_mod);
+    text_segment_bench_root_mod.addImport("antfly_fst", fst_mod);
     text_segment_bench_root_mod.addImport("antfly_platform", platform_mod);
     text_segment_bench_root_mod.addImport("antfly_hash", hash_mod);
     text_segment_write_bench_mod.addImport("antfly_text_bench", text_segment_bench_root_mod);
@@ -268,7 +291,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     lsm_backend_bench_compare_step.dependOn(&b.addInstallArtifact(lsm_backend_bench_compare, .{}).step);
 
     const wal_bench_engine_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
-    const wal_bench_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, false, true, false, true);
+    const wal_bench_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, false, true, false, true, false);
     const wal_bench_engine_mod = makeLmdbEngineModule(b, target, optimize, true, wal_bench_engine_options);
     const wal_bench_wal_mod = makeLmdbModule(b, wal_bench_root, target, optimize, wal_bench_build_options, wal_bench_engine_mod, platform_mod, hash_mod);
     const wal_bench_mod = b.createModule(.{
@@ -295,7 +318,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     wal_bench_step.dependOn(&b.addInstallArtifact(wal_bench, .{}).step);
 
     const derived_log_bench_engine_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
-    const derived_log_bench_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, false, true, false, true);
+    const derived_log_bench_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, false, true, false, true, false);
     const derived_log_bench_engine_mod = makeLmdbEngineModule(b, target, optimize, true, derived_log_bench_engine_options);
     const derived_log_bench_root_mod = b.createModule(.{
         .root_source_file = b.path(derived_log_bench_root),
@@ -355,7 +378,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
         .target = target,
         .optimize = optimize,
     });
-    quickstart_bench_root_mod.addImport("antfly_vellum", vellum_mod);
+    quickstart_bench_root_mod.addImport("antfly_fst", fst_mod);
     quickstart_bench_root_mod.addImport("bloom", bloom_mod);
     quickstart_bench_root_mod.addImport("antfly_platform", platform_mod);
     quickstart_bench_root_mod.addImport("antfly_hash", hash_mod);
@@ -486,9 +509,12 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
             "v25 norm table uses one byte per document and reads legacy packed norms",
             "v22 term dictionary block values compact one-hit terms and delta postings offsets",
             "v23 term dictionary stores front-coded blocks indexed by block ceiling",
+            "top-k limits results",
+            "scorer executes into external top-k collector",
             "WAND pivot bound remains conservative across later high-impact blocks",
             "single-term block scan preserves a later higher-impact chunk",
             "single-term equality pruning retains earliest cutoff ties",
+            "block-max scorer proves sparse matches complete below top-k",
             "pure conjunction block pruning retains earliest cutoff ties",
             "pure conjunction metadata scan preserves later competitive block",
             "multi-segment filter execution",
@@ -665,6 +691,16 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
 
     const hbc_isolate_step = b.step("hbc-isolate", "Build and install hbc_isolate");
     hbc_isolate_step.dependOn(&b.addInstallArtifact(hbc_isolate, .{}).step);
+
+    const build_quality_mod = b.createModule(.{
+        .root_source_file = b.path("tools/bench_build_quality.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    build_quality_mod.addImport("antfly_hbc_isolate_root", hbc_isolate_root_mod);
+    const build_quality = b.addExecutable(.{ .name = "bench_build_quality", .root_module = build_quality_mod });
+    const build_quality_step = b.step("bench-build-quality", "Build bounded-bootstrap held-out recall benchmark");
+    build_quality_step.dependOn(&b.addInstallArtifact(build_quality, .{}).step);
 
     const dense_stack_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/vectors/dense_stack_bench.zig"),

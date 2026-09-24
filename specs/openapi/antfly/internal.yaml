@@ -13,13 +13,13 @@ servers:
   - url: /internal/v1
     description: Node-local internal API
 tags:
-  - name: ha-replication
-    x-displayName: HA Replication
+  - name: standby-replication
+    x-displayName: Hot Standby Replication
     description: Runtime-to-runtime hot-standby replication protocol.
 paths:
-  /ha/replication/identify:
+  /standby/replication/identify:
     get:
-      tags: [ha-replication]
+      tags: [standby-replication]
       operationId: identifyHAReplicationSystem
       summary: Identify this primary replication system
       responses:
@@ -28,12 +28,12 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HAIdentifySystemResponse"
+                $ref: "#/components/schemas/StandbyIdentifySystemResponse"
         "409":
           $ref: "#/components/responses/Conflict"
-  /ha/replication/slots:
+  /standby/replication/slots:
     post:
-      tags: [ha-replication]
+      tags: [standby-replication]
       operationId: createHAReplicationStreamingSlot
       summary: Create or reserve a runtime replication slot
       requestBody:
@@ -41,45 +41,45 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/HACreateReplicationSlotRequest"
+              $ref: "#/components/schemas/StandbyCreateReplicationSlotRequest"
       responses:
         "200":
           description: Created replication slot.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HAReplicationSlotResponse"
+                $ref: "#/components/schemas/StandbyReplicationSlotResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "409":
           $ref: "#/components/responses/Conflict"
-  /ha/replication/start:
+  /standby/replication/start:
     post:
-      tags: [ha-replication]
+      tags: [standby-replication]
       operationId: startHAReplication
-      summary: Pull ordered HA replication records from a slot
+      summary: Pull ordered hot-standby replication records from a slot
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/HAStartReplicationRequest"
+              $ref: "#/components/schemas/StandbyStartReplicationRequest"
       responses:
         "200":
           description: Ordered replication records starting at the requested LSN.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HAStartReplicationResponse"
+                $ref: "#/components/schemas/StandbyStartReplicationResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
-  /ha/replication/status:
+  /standby/replication/status:
     post:
-      tags: [ha-replication]
+      tags: [standby-replication]
       operationId: updateHAStandbyStatus
       summary: Report durable receive and apply progress for a standby slot
       requestBody:
@@ -87,14 +87,14 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/HAStandbyStatusUpdateRequest"
+              $ref: "#/components/schemas/StandbyStatusUpdateRequest"
       responses:
         "200":
           description: Persisted standby slot progress.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HAStandbyStatusUpdateResponse"
+                $ref: "#/components/schemas/StandbyStatusUpdateResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "404":
@@ -122,19 +122,19 @@ components:
           schema:
             type: string
   schemas:
-    HAIdentifier:
+    StandbyIdentifier:
       type: string
-      description: Stable HA node or slot identifier. Identifiers are 1-128 ASCII bytes and may contain letters, digits, `_`, `-`, `.`, and `:`.
+      description: Stable hot-standby node or slot identifier. Identifiers are 1-128 ASCII bytes and may contain letters, digits, `_`, `-`, `.`, and `:`.
       minLength: 1
       maxLength: 128
       pattern: "^[A-Za-z0-9_.:-]+$"
-    HASlotName:
+    StandbySlotName:
       description: Stable standby replication slot name.
       type: string
       minLength: 1
       maxLength: 128
       pattern: "^[A-Za-z0-9_.:-]+$"
-    HAIdentity:
+    StandbyIdentity:
       type: object
       required: [cluster_id, shard_id, table_id, timeline_id, epoch]
       properties:
@@ -158,12 +158,12 @@ components:
           type: integer
           format: uint64
           minimum: 1
-    HAIdentifySystemResponse:
+    StandbyIdentifySystemResponse:
       type: object
       required: [identity, current_lsn, next_lsn, record_format_version]
       properties:
         identity:
-          $ref: "#/components/schemas/HAIdentity"
+          $ref: "#/components/schemas/StandbyIdentity"
         current_lsn:
           type: integer
           format: uint64
@@ -176,18 +176,18 @@ components:
           type: integer
           format: uint32
           minimum: 1
-    HACreateReplicationSlotRequest:
+    StandbyCreateReplicationSlotRequest:
       type: object
       required: [slot_name]
       properties:
         slot_name:
-          $ref: "#/components/schemas/HASlotName"
+          $ref: "#/components/schemas/StandbySlotName"
         initial_lsn:
           type: integer
           format: uint64
           minimum: 0
           description: Optional LSN to initialize the slot at. Defaults to the current primary LSN.
-    HAReplicationSlotResponse:
+    StandbyReplicationSlotResponse:
       type: object
       required:
         - slot_name
@@ -201,7 +201,7 @@ components:
         - current_lsn
       properties:
         slot_name:
-          $ref: "#/components/schemas/HASlotName"
+          $ref: "#/components/schemas/StandbySlotName"
         timeline_id:
           type: integer
           format: uint64
@@ -233,12 +233,12 @@ components:
           type: integer
           format: uint64
           minimum: 0
-    HAStartReplicationRequest:
+    StandbyStartReplicationRequest:
       type: object
       required: [slot_name, from_lsn]
       properties:
         slot_name:
-          $ref: "#/components/schemas/HASlotName"
+          $ref: "#/components/schemas/StandbySlotName"
         from_lsn:
           type: integer
           format: uint64
@@ -253,7 +253,7 @@ components:
           format: uint64
           minimum: 0
           description: Optional encoded byte budget. Zero means no byte limit.
-    HARecordKind:
+    StandbyRecordKind:
       type: string
       enum:
         - batch-mutation
@@ -265,10 +265,10 @@ components:
         - manifest
         - truncate
         - timeline-switch
-    HAPayloadCodec:
+    StandbyPayloadCodec:
       type: string
       enum: [raw, json, binary]
-    HAReplicationFrame:
+    StandbyReplicationFrame:
       type: object
       required: [lsn, kind, payload_codec, encoded]
       properties:
@@ -277,14 +277,14 @@ components:
           format: uint64
           minimum: 1
         kind:
-          $ref: "#/components/schemas/HARecordKind"
+          $ref: "#/components/schemas/StandbyRecordKind"
         payload_codec:
-          $ref: "#/components/schemas/HAPayloadCodec"
+          $ref: "#/components/schemas/StandbyPayloadCodec"
         encoded:
           type: string
           format: byte
           description: Base64-encoded complete replication record envelope.
-    HAStartReplicationResponse:
+    StandbyStartReplicationResponse:
       type: object
       required:
         - slot_name
@@ -300,9 +300,9 @@ components:
         - records
       properties:
         slot_name:
-          $ref: "#/components/schemas/HASlotName"
+          $ref: "#/components/schemas/StandbySlotName"
         identity:
-          $ref: "#/components/schemas/HAIdentity"
+          $ref: "#/components/schemas/StandbyIdentity"
         record_format_version:
           type: integer
           format: uint32
@@ -336,13 +336,13 @@ components:
         records:
           type: array
           items:
-            $ref: "#/components/schemas/HAReplicationFrame"
-    HAStandbyStatusUpdateRequest:
+            $ref: "#/components/schemas/StandbyReplicationFrame"
+    StandbyStatusUpdateRequest:
       type: object
       required: [slot_name, timeline_id, received_lsn, applied_lsn]
       properties:
         slot_name:
-          $ref: "#/components/schemas/HASlotName"
+          $ref: "#/components/schemas/StandbySlotName"
         timeline_id:
           type: integer
           format: uint64
@@ -360,6 +360,6 @@ components:
           format: uint64
           minimum: 0
           description: Optional safe-read boundary. Defaults to applied_lsn.
-    HAStandbyStatusUpdateResponse:
+    StandbyStatusUpdateResponse:
       allOf:
-        - $ref: "#/components/schemas/HAReplicationSlotResponse"
+        - $ref: "#/components/schemas/StandbyReplicationSlotResponse"

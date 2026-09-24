@@ -43,7 +43,9 @@ from conftest import (
 )
 from port_reservations import LoopbackPortReservations
 
-HA_ADMIN_ROOT = "/admin/v1/ha"
+HA_ADMIN_ROOT = "/admin/v1/standby"
+# Served as an alias for one minor release; see zig/HOT_STANDBY.md "Naming".
+HA_LEGACY_ADMIN_ROOT = "/admin/v1/ha"
 DB_API_ROOT = "/db/v1"
 HA_BACKUP_MAGIC = b"AFHABKP\n"
 HA_BACKUP_HEADER_SIZE = 96
@@ -53,12 +55,25 @@ HA_BACKUP_FILE_KIND_METADATA = 3
 HA_TRANSITION_BUSY_BODY = b"HAStateTransitionBusy"
 HA_TRANSITION_RETRY_TIMEOUT_S = 20.0
 HA_TRANSITION_RETRY_INTERVAL_S = 0.1
+# Exercise identities outside the signed range on every capture and replication run.
+HA_TEST_CLUSTER_ID = (1 << 63) + 100
 
 pytestmark = pytest.mark.ha_standby
 
 
 def _is_ha_transition_busy(response: requests.Response) -> bool:
     return response.status_code == 503 and response.content == HA_TRANSITION_BUSY_BODY
+
+
+def _is_ha_post_not_admitted(path: str, response: requests.Response) -> bool:
+    # These exact errors precede route dispatch or capture's backup_start.
+    # A capture can otherwise have committed even when its reply is lost: never
+    # infer replay safety from HTTP 503 alone or retry transport exceptions.
+    return _is_ha_transition_busy(response) or (
+        path == "/base-backups/capture"
+        and response.status_code == 503
+        and response.content == b"HASeedSnapshotRuntimeBusy"
+    )
 
 
 class HAStandaloneNode:
@@ -79,11 +94,17 @@ class HAStandaloneNode:
         sync_standby_name: str | None = None,
         admin_token_env: str | None = None,
         admin_token: str | None = None,
+        layout: str = "standby",
     ):
         self.binary = binary
         self.root = root
         self.role = role
         self.node_id = node_id
+        # "standby" (default) exercises the canonical 0.3 on-disk layout;
+        # "ha" exercises the pre-0.3 legacy layout the server migrates on
+        # startup. See zig/HOT_STANDBY.md "Naming" (Data directory row) and
+        # "Layout migration".
+        self.layout = layout
         self.host = "127.0.0.1"
         with ExitStack() as setup:
             self.port_reservations = LoopbackPortReservations(self.host)
@@ -104,6 +125,7 @@ class HAStandaloneNode:
         self.admin_token_env = admin_token_env
         self.admin_token = admin_token
         self.proc: subprocess.Popen[str] | None = None
+        self.extra_runtime_args: list[str] = []
 
     @property
     def node_root(self) -> Path:
@@ -111,59 +133,102 @@ class HAStandaloneNode:
 
     @property
     def ha_root(self) -> Path:
-        return self.node_root / "ha"
+        # See zig/HOT_STANDBY.md "Naming" (Data directory row): the on-disk
+        # tree moved from <node>/ha/ to <node>/standby/.
+        return self.node_root / self.layout
 
     @property
     def catalog_path(self) -> Path:
         return self.node_root / "metadata" / "local-metadata.json"
 
+    def capture_catalog(self) -> dict[str, Any]:
+        generation = f"catalog-{time.time_ns()}"
+        # The server allows 30 seconds just for seed snapshot preflight.
+        # Capture can commit before its reply, so a short transport timeout
+        # cannot be recovered by issuing the POST again.
+        captured = self.admin_post(
+            "/base-backups/capture",
+            {
+                "slot_name": "catalog-inspection",
+                "generation": generation,
+                "topology_id": "e2e",
+                "topology_generation": 1,
+                "node_id": "standby-a",
+                "target_pvc_name": "e2e-data",
+                "target_pvc_uid": "e2e-data-uid",
+            },
+            timeout_s=60.0,
+            request_timeout_s=60.0,
+        )
+        topology = json.loads(
+            (Path(captured["content_root"]) / "TOPOLOGY.json").read_text()
+        )
+        # Inspection does not create a standby. Release its retention slot so
+        # later lag/reseed assertions observe only the test's actual replicas.
+        self._check(
+            self._request(
+                "DELETE",
+                f"{self.url}{HA_ADMIN_ROOT}/replication-slots/catalog-inspection",
+                headers=self.admin_headers(),
+                timeout=10,
+            )
+        )
+        return topology["catalog"]
+
     def start(self, *, enable_replication: bool = True) -> None:
         self.node_root.mkdir(parents=True, exist_ok=True)
+        extension_root = self.node_root / "extensions"
+        extension_root.mkdir(exist_ok=True)
         command = _standalone_stateful_command(
             self.binary, host=self.host, port=self.port, root=self.node_root
         )
         command.extend(["--health", "true", "--health-port", str(self.health_port)])
+        command.extend(["--extension-package-store", str(extension_root)])
+        command.extend(["--ha-seed-capture-root", str(self.ha_root / "captures")])
         if self.role == "primary":
             command.extend(
                 [
-                    "--ha-primary-log",
-                    str(self.ha_root / "primary.log"),
-                    "--ha-primary-slots",
-                    str(self.ha_root / "primary-slots.wal"),
-                    "--ha-primary-node-id",
+                    "--hot-standby-primary-log",
+                    str(self.ha_root / "primary.wal"),
+                    "--hot-standby-primary-slots",
+                    str(self.ha_root / "slots"),
+                    "--hot-standby-primary-node-id",
                     self.node_id,
                 ]
             )
         elif self.role == "standby":
             command.extend(
                 [
-                    "--ha-standby-log",
-                    str(self.ha_root / "standby.log"),
-                    "--ha-standby-progress",
-                    str(self.ha_root / "standby-progress.wal"),
-                    "--ha-standby-node-id",
+                    "--hot-standby-log",
+                    str(self.ha_root / "log.wal"),
+                    "--hot-standby-progress",
+                    str(self.ha_root / "progress.wal"),
+                    "--hot-standby-node-id",
                     self.node_id,
                 ]
             )
             if enable_replication and self.upstream_url is not None:
-                command.extend(["--ha-standby-upstream-url", self.upstream_url])
+                command.extend(["--hot-standby-upstream-url", self.upstream_url])
             if enable_replication and self.slot_name is not None:
-                command.extend(["--ha-standby-slot", self.slot_name])
+                command.extend(["--hot-standby-slot", self.slot_name])
         else:
             raise ValueError(f"unsupported HA role {self.role!r}")
 
         command.extend(
             [
+                # Intentionally kept as the deprecated --ha-* spelling so the
+                # e2e suite exercises the alias flagMatches() keeps working;
+                # see zig/HOT_STANDBY.md "Naming" (Server flags row).
                 "--ha-fence-wal",
                 str(self.ha_root / "fence.wal"),
-                "--ha-cluster-id",
+                "--hot-standby-cluster-id",
                 str(self.cluster_id),
             ]
         )
         if self.shard_id is not None:
-            command.extend(["--ha-shard-id", str(self.shard_id)])
+            command.extend(["--hot-standby-shard-id", str(self.shard_id)])
         if self.table_id is not None:
-            command.extend(["--ha-table-id", str(self.table_id)])
+            command.extend(["--hot-standby-table-id", str(self.table_id)])
         if (
             self.role == "primary"
             and self.sync_standby_name is not None
@@ -171,26 +236,27 @@ class HAStandaloneNode:
         ):
             command.extend(
                 [
-                    "--ha-sync-mode",
+                    "--hot-standby-sync-mode",
                     "remote_apply",
-                    "--ha-sync-selection",
+                    "--hot-standby-sync-selection",
                     "first",
-                    "--ha-sync-required",
+                    "--hot-standby-sync-required",
                     "1",
-                    "--ha-sync-standby",
+                    "--hot-standby-sync-standby",
                     self.sync_standby_name,
-                    "--ha-sync-failure",
+                    "--hot-standby-sync-failure",
                     "block",
                 ]
             )
         command.extend(
             [
-                "--ha-timeline-id",
+                "--hot-standby-timeline-id",
                 str(self.timeline_id),
-                "--ha-epoch",
+                "--hot-standby-epoch",
                 str(self.epoch),
             ]
         )
+        command.extend(self.extra_runtime_args)
         env = os.environ.copy()
         if self.admin_token_env is not None:
             command.extend(["--admin-token-env", self.admin_token_env])
@@ -276,14 +342,18 @@ class HAStandaloneNode:
         )
 
     def admin_post_response(
-        self, path: str, payload: dict[str, Any]
+        self,
+        path: str,
+        payload: dict[str, Any],
+        *,
+        request_timeout_s: float = 10.0,
     ) -> requests.Response:
         return self._request(
             "POST",
             f"{self.url}{HA_ADMIN_ROOT}{path}",
             json=payload,
             headers=self.admin_headers(),
-            timeout=10,
+            timeout=request_timeout_s,
         )
 
     def admin_get(self, path: str, **params: Any) -> dict[str, Any]:
@@ -299,18 +369,31 @@ class HAStandaloneNode:
             # transient response without weakening any other failure signal.
             time.sleep(HA_TRANSITION_RETRY_INTERVAL_S)
 
-    def admin_post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        deadline = time.monotonic() + HA_TRANSITION_RETRY_TIMEOUT_S
+    def admin_post(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        *,
+        timeout_s: float = HA_TRANSITION_RETRY_TIMEOUT_S,
+        request_timeout_s: float = 10.0,
+    ) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout_s
         while True:
-            response = self.admin_post_response(path, payload)
-            if not _is_ha_transition_busy(response):
+            response = self.admin_post_response(
+                path,
+                payload,
+                request_timeout_s=max(
+                    0.001, min(request_timeout_s, deadline - time.monotonic())
+                ),
+            )
+            if not _is_ha_post_not_admitted(path, response):
                 return self._check(response)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return self._check(response)
+            time.sleep(min(HA_TRANSITION_RETRY_INTERVAL_S, remaining))
             if time.monotonic() >= deadline:
                 return self._check(response)
-            # This exact response is emitted before route dispatch when the HA
-            # state mutex is owned, so no mutation has occurred and retrying is
-            # safe. Do not retry arbitrary 503 responses from route handlers.
-            time.sleep(HA_TRANSITION_RETRY_INTERVAL_S)
 
     def create_table(self, table_name: str) -> dict[str, Any]:
         response = self._request(
@@ -382,7 +465,9 @@ def test_admin_post_retries_exact_pre_dispatch_transition_busy(
     )
     attempts = 0
 
-    def next_response(_path: str, _payload: dict[str, Any]) -> requests.Response:
+    def next_response(
+        _path: str, _payload: dict[str, Any], **_kwargs: Any
+    ) -> requests.Response:
         nonlocal attempts
         attempts += 1
         return next(responses)
@@ -398,7 +483,9 @@ def test_admin_post_does_not_retry_ambiguous_service_unavailable():
     node = object.__new__(HAStandaloneNode)
     attempts = 0
 
-    def unavailable(_path: str, _payload: dict[str, Any]) -> requests.Response:
+    def unavailable(
+        _path: str, _payload: dict[str, Any], **_kwargs: Any
+    ) -> requests.Response:
         nonlocal attempts
         attempts += 1
         return _test_response(503, b"upstream unavailable")
@@ -409,6 +496,119 @@ def test_admin_post_does_not_retry_ambiguous_service_unavailable():
     with pytest.raises(requests.HTTPError, match="upstream unavailable"):
         node.admin_post("/test", {})
     assert attempts == 1
+
+
+def test_admin_capture_retries_only_pre_admission_busy_with_same_identity(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    node = object.__new__(HAStandaloneNode)
+    payload = {"slot_name": "standby-a", "generation": "same-generation"}
+    requests_seen = []
+    responses = iter(
+        [
+            _test_response(503, b"HASeedSnapshotRuntimeBusy"),
+            _test_response(503, HA_TRANSITION_BUSY_BODY),
+            _test_response(200, b'{"already_captured":false}'),
+        ]
+    )
+
+    def next_response(path, body, *, request_timeout_s):
+        assert 0 < request_timeout_s <= 10
+        requests_seen.append((path, body))
+        return next(responses)
+
+    node.admin_post_response = next_response
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+    assert node.admin_post("/base-backups/capture", payload) == {
+        "already_captured": False
+    }
+    assert requests_seen == [("/base-backups/capture", payload)] * 3
+    assert all(body is payload for _, body in requests_seen)
+
+
+@pytest.mark.parametrize(
+    ("path", "status", "body"),
+    [
+        ("/standby/bootstrap", 503, b"HASeedSnapshotRuntimeBusy"),
+        ("/base-backups/capture", 500, b"HASeedSnapshotRuntimeBusy"),
+        ("/base-backups/capture", 503, b"HASeedSnapshotRuntimeBusy\n"),
+        ("/base-backups/capture", 503, b"capture outcome unknown"),
+    ],
+)
+def test_admin_capture_never_replays_unclassified_errors(path, status, body):
+    node = object.__new__(HAStandaloneNode)
+    attempts = []
+
+    def next_response(*args, **kwargs):
+        attempts.append(args)
+        return _test_response(status, body)
+
+    node.admin_post_response = next_response
+    node.debug_logs = lambda: "test logs"
+    with pytest.raises(requests.HTTPError):
+        node.admin_post(path, {})
+    assert len(attempts) == 1
+
+
+@pytest.mark.parametrize("error", [requests.Timeout, requests.ConnectionError])
+def test_admin_capture_does_not_replay_unknown_transport_outcome(error):
+    node = object.__new__(HAStandaloneNode)
+    attempts = []
+
+    def next_response(*args, **kwargs):
+        attempts.append(args)
+        raise error("reply lost")
+
+    node.admin_post_response = next_response
+    with pytest.raises(error, match="reply lost"):
+        node.admin_post("/base-backups/capture", {})
+    assert len(attempts) == 1
+
+
+def test_admin_capture_admission_budget_includes_request_and_sleep(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    node = object.__new__(HAStandaloneNode)
+    now = [0.0]
+    timeouts = []
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(time, "sleep", lambda delay: now.__setitem__(0, now[0] + delay))
+
+    def busy(_path, _payload, *, request_timeout_s):
+        timeouts.append(request_timeout_s)
+        now[0] += request_timeout_s
+        return _test_response(503, b"HASeedSnapshotRuntimeBusy")
+
+    node.admin_post_response = busy
+    node.debug_logs = lambda: "test logs"
+    with pytest.raises(requests.HTTPError, match="HASeedSnapshotRuntimeBusy"):
+        node.admin_post("/base-backups/capture", {})
+    assert timeouts == pytest.approx([10.0, 9.9])
+    assert now[0] == pytest.approx(HA_TRANSITION_RETRY_TIMEOUT_S)
+
+
+def test_admin_capture_can_outlive_server_preflight_without_replay(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    node = object.__new__(HAStandaloneNode)
+    now = [0.0]
+    timeouts = []
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+
+    def captured(_path, _payload, *, request_timeout_s):
+        timeouts.append(request_timeout_s)
+        now[0] += 31.0
+        return _test_response(200, b"{}")
+
+    node.admin_post_response = captured
+    node._check = lambda response: response.json()
+    assert (
+        node.admin_post(
+            "/base-backups/capture", {}, timeout_s=60.0, request_timeout_s=60.0
+        )
+        == {}
+    )
+    assert timeouts == [60.0]
 
 
 class HACluster:
@@ -424,7 +624,7 @@ class HACluster:
                 root=self.root,
                 role="primary",
                 node_id="primary-a",
-                cluster_id=100,
+                cluster_id=HA_TEST_CLUSTER_ID,
                 timeline_id=1,
                 epoch=1,
                 sync_standby_name="standby-a",
@@ -437,7 +637,7 @@ class HACluster:
                 root=self.root,
                 role="standby",
                 node_id="standby-a",
-                cluster_id=100,
+                cluster_id=HA_TEST_CLUSTER_ID,
                 timeline_id=1,
                 epoch=1,
                 upstream_url=self.primary.url,
@@ -460,12 +660,12 @@ class HACluster:
         catalog_rel = Path("metadata") / "local-metadata.json"
         catalog_backup_path = backup_root / catalog_rel
         catalog_backup_path.parent.mkdir(parents=True, exist_ok=True)
-        catalog_bytes = self.primary.catalog_path.read_bytes()
+        catalog_bytes = json.dumps(self.primary.capture_catalog()).encode()
         catalog_backup_path.write_bytes(catalog_bytes)
 
         self.standby.node_root.mkdir(parents=True, exist_ok=True)
         self.standby.catalog_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(self.primary.catalog_path, self.standby.catalog_path)
+        self.standby.catalog_path.write_bytes(catalog_bytes)
 
         manifest_id = "base-standby-a"
         begun = self.primary.admin_post(
@@ -603,7 +803,7 @@ def _wait_for_standby_applied(
             )
         try:
             response = cluster.standby.admin_get_response(
-                "/standby/status",
+                "/status",
                 upstream_lsn=lsn,
                 request_timeout_s=max(0.001, min(10.0, deadline - time.monotonic())),
             )
@@ -783,10 +983,42 @@ def _wait_for_primary_slot_applied(
     )
 
 
+def _write_and_wait_for_standby_durability(cluster, table_name, inserts):
+    """Send once, then require both replay and the primary's durable ACK."""
+    response = cluster.primary.batch_write_response(table_name, inserts)
+    pending = response.status_code == 503 and response.text == (
+        "write committed locally; standby durability acknowledgment pending"
+    )
+    if not pending:
+        cluster.primary._check(response)
+    # A prior successful replication round cannot guarantee that the next
+    # write's ACK arrives inside its two-second response budget. Replaying
+    # this post-commit outcome would issue another mutation. Reconcile the
+    # original write through actual progress; all document assertions follow.
+    deadline = time.monotonic() + 20.0
+    lsn = _primary_lsn(cluster)
+    snapshot = _wait_for_standby_applied(
+        cluster, lsn, timeout_s=max(0.0, deadline - time.monotonic())
+    )
+    _wait_for_primary_slot_applied(
+        cluster,
+        "standby-a",
+        lsn,
+        timeout_s=max(0.0, deadline - time.monotonic()),
+    )
+    return lsn, snapshot
+
+
 def _table_identity_from_catalog(
     node: HAStandaloneNode, table_name: str
 ) -> tuple[int, int]:
-    catalog = json.loads(node.catalog_path.read_text())
+    catalog = node.capture_catalog()
+    resource = next(
+        resource
+        for resource in catalog["system_catalog"]["resources"]
+        if resource["kind"] == "table" and resource["name"] == table_name
+    )
+    table_name = resource["storage_name"]
     table = next(table for table in catalog["tables"] if table["name"] == table_name)
     table_id = int(table["table_id"])
     table_range = next(
@@ -914,22 +1146,40 @@ def _binary_supports_ha_standalone(binary: str) -> bool:
         timeout=10,
         check=False,
     )
-    return "--ha-primary-log" in result.stdout and "--ha-standby-log" in result.stdout
+    return (
+        "--hot-standby-primary-log" in result.stdout
+        and "--hot-standby-log" in result.stdout
+    )
 
 
 def _assert_admin_requires_bearer(node: HAStandaloneNode, path: str) -> None:
-    missing = requests.get(f"{node.url}{HA_ADMIN_ROOT}{path}", timeout=10)
-    assert missing.status_code == 401
-    wrong = requests.get(
-        f"{node.url}{HA_ADMIN_ROOT}{path}",
-        headers={"Authorization": "Bearer wrong-token"},
+    for root in (HA_ADMIN_ROOT, HA_LEGACY_ADMIN_ROOT):
+        missing = requests.get(f"{node.url}{root}{path}", timeout=10)
+        assert missing.status_code == 401, root
+        wrong = requests.get(
+            f"{node.url}{root}{path}",
+            headers={"Authorization": "Bearer wrong-token"},
+            timeout=10,
+        )
+        assert wrong.status_code == 401, root
+
+
+def _assert_legacy_admin_alias(node: HAStandaloneNode, path: str) -> None:
+    """The deprecated /admin/v1/ha prefix must answer exactly like the canonical one."""
+    canonical = node.admin_get(path)
+    legacy = requests.get(
+        f"{node.url}{HA_LEGACY_ADMIN_ROOT}{path}",
+        headers=node.admin_headers(),
         timeout=10,
     )
-    assert wrong.status_code == 401
+    assert legacy.status_code == 200, legacy.text
+    body = legacy.json()
+    assert body["schema_version"] == canonical["schema_version"]
+    assert body["snapshot"]["identity"] == canonical["snapshot"]["identity"]
 
 
 def _assert_internal_replication_requires_bearer(node: HAStandaloneNode) -> None:
-    url = f"{node.url}/internal/v1/ha/replication/identify"
+    url = f"{node.url}/internal/v1/standby/replication/identify"
     missing = requests.get(url, timeout=10)
     assert missing.status_code == 401
     wrong = requests.get(
@@ -963,6 +1213,79 @@ def _slot_by_name(status: dict[str, Any], slot_name: str) -> dict[str, Any]:
     )
 
 
+def test_primary_migrates_legacy_ha_layout_to_canonical_standby_on_restart():
+    """The server moves an existing pre-0.3 `ha/` tree to `standby/` itself,
+    once, at startup (zig/HOT_STANDBY.md "Layout migration"). A node created
+    under the legacy layout must come back up unchanged, under the canonical
+    layout, when next started with canonical flags -- as the Kubernetes
+    operator will do once it adopts the 0.3 path spellings.
+    """
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    if not Path(binary).exists():
+        pytest.skip(f"Antfly binary not found: {binary}")
+    if Path(binary).name != "antfly":
+        pytest.skip("HA standby e2e requires the supported Zig antfly binary")
+    if not _binary_supports_ha_standalone(binary):
+        pytest.skip(
+            f"Antfly binary does not expose HA standalone flags; rebuild current Zig binary: {binary}"
+        )
+
+    with tempfile.TemporaryDirectory(
+        prefix="antfly-ha-layout-migration-e2e-"
+    ) as tempdir:
+        root = Path(tempdir).resolve()
+        table_name = "ha_layout_migration_docs"
+
+        legacy_node = HAStandaloneNode(
+            binary=binary,
+            root=root,
+            role="primary",
+            node_id="primary-a",
+            cluster_id=100,
+            timeline_id=1,
+            epoch=1,
+            layout="ha",
+            admin_token_env="ANTFLY_HA_E2E_ADMIN_TOKEN",
+            admin_token="layout-migration-token",
+        )
+        try:
+            legacy_node.start()
+            legacy_node.create_table(table_name)
+            before = legacy_node.admin_get("/primary/status")
+            before_identity = before["snapshot"]["identity"]
+            before_lsn = int(before["snapshot"]["current_lsn"])
+            legacy_ha_root = legacy_node.ha_root
+            assert legacy_ha_root.is_dir()
+            assert (legacy_ha_root / "primary.wal").exists()
+            assert (legacy_ha_root / "slots").exists()
+        finally:
+            legacy_node.close()
+
+        canonical_node = HAStandaloneNode(
+            binary=binary,
+            root=root,
+            role="primary",
+            node_id="primary-a",
+            cluster_id=100,
+            timeline_id=1,
+            epoch=1,
+            layout="standby",
+            admin_token_env="ANTFLY_HA_E2E_ADMIN_TOKEN",
+            admin_token="layout-migration-token",
+        )
+        try:
+            canonical_node.start()
+            assert not legacy_ha_root.exists()
+            assert (canonical_node.ha_root / "primary.wal").exists()
+            assert (canonical_node.ha_root / "slots").exists()
+
+            after = canonical_node.admin_get("/primary/status")
+            assert after["snapshot"]["identity"] == before_identity
+            assert int(after["snapshot"]["current_lsn"]) == before_lsn
+        finally:
+            canonical_node.close()
+
+
 def test_standby_streams_public_writes_restarts_and_rejects_writes(
     ha_cluster: HACluster,
 ):
@@ -975,15 +1298,16 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(
     ha_cluster.configure_table_identity(shard_id=shard_id, table_id=table_id)
     ha_cluster.primary.start()
     _assert_admin_requires_bearer(ha_cluster.primary, "/primary/status")
+    _assert_legacy_admin_alias(ha_cluster.primary, "/primary/status")
     _assert_internal_replication_requires_bearer(ha_cluster.primary)
 
     seed = ha_cluster.seed_standby_catalog_from_primary()
     assert seed["backup_lsn"] >= 1
 
     ha_cluster.standby.start(enable_replication=False)
-    _assert_admin_requires_bearer(ha_cluster.standby, "/standby/status")
+    _assert_admin_requires_bearer(ha_cluster.standby, "/status")
     bootstrapped = ha_cluster.standby.admin_post(
-        "/standby/bootstrap",
+        "/bootstrap",
         {
             "manifest_path": str(seed["manifest_path"]),
             "content_root": str(seed["content_root"]),
@@ -1006,7 +1330,7 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(
     )
     assert seeding_slot["active"] is False
     blocked_stream = requests.post(
-        f"{ha_cluster.primary.url}/internal/v1/ha/replication/start",
+        f"{ha_cluster.primary.url}/internal/v1/standby/replication/start",
         headers=ha_cluster.primary.admin_headers(),
         json={
             "slot_name": "standby-a",
@@ -1051,10 +1375,10 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(
         ha_cluster, seed["backup_lsn"], require_live_replication=True
     )
 
-    ha_cluster.primary.batch_write(table_name, {"doc:first": {"title": "first"}})
-    first_lsn = _primary_lsn(ha_cluster)
+    first_lsn, first_snapshot = _write_and_wait_for_standby_durability(
+        ha_cluster, table_name, {"doc:first": {"title": "first"}}
+    )
     assert first_lsn >= 1
-    first_snapshot = _wait_for_standby_applied(ha_cluster, first_lsn)
     assert first_snapshot["role"] == "standby"
     assert first_snapshot["received_lsn"] >= first_lsn
     assert first_snapshot["applied_lsn"] >= first_lsn
@@ -1099,10 +1423,10 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(
     restarted_doc = _wait_for_standby_lookup(ha_cluster, table_name, "doc:first")
     assert restarted_doc["title"] == "first"
 
-    ha_cluster.primary.batch_write(table_name, {"doc:second": {"title": "second"}})
-    second_lsn = _primary_lsn(ha_cluster)
+    second_lsn, second_snapshot = _write_and_wait_for_standby_durability(
+        ha_cluster, table_name, {"doc:second": {"title": "second"}}
+    )
     assert second_lsn > first_lsn
-    second_snapshot = _wait_for_standby_applied(ha_cluster, second_lsn)
     assert second_snapshot["received_lsn"] >= second_lsn
     assert second_snapshot["applied_lsn"] >= second_lsn
     second_read_check = ha_cluster.standby.admin_post(
@@ -1403,7 +1727,7 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(
 
 def test_forced_promotion_receipt_records_lossy_runtime_evidence(ha_cluster: HACluster):
     ha_cluster.standby.start(enable_replication=False)
-    _assert_admin_requires_bearer(ha_cluster.standby, "/standby/status")
+    _assert_admin_requires_bearer(ha_cluster.standby, "/status")
 
     required_lsn = 1
     forced_request = {

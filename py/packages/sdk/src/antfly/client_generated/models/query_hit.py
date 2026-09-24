@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from ..models.query_hit_highlights import QueryHitHighlights
     from ..models.query_hit_index_scores import QueryHitIndexScores
     from ..models.query_hit_source import QueryHitSource
+    from ..models.query_score_details import QueryScoreDetails
 
 
 T = TypeVar("T", bound="QueryHit")
@@ -30,6 +31,8 @@ class QueryHit:
             the best matching descendant that supplied the group score. Omitted for
             non-dense and fused results.
         field_index_scores (QueryHitIndexScores | Unset): Scores partitioned by index when using RRF search.
+        field_score_details (QueryScoreDetails | Unset): Optional score provenance for ranking features that changed the
+            final hit score.
         field_source (QueryHitSource | Unset):
         hierarchy (QueryHitHierarchy | Unset):
         field_sort (list[Any] | Unset): Sort key values for this hit. Pass as search_after or search_before
@@ -38,15 +41,18 @@ class QueryHit:
             requests whose effective order is `_id` ascending.
         field_highlights (QueryHitHighlights | Unset): Highlighted fragments keyed by source field, present when the
             request
-            set `highlight` and the hit carried the field. Each fragment is a
-            window of the stored field value with byte-offset spans marking the
-            text the full-text query matched.
+            set `highlight` and the stored document has the field. Highlights are
+            computed from the unprojected document, so a `fields` projection that
+            omits a highlighted field does not suppress its highlights. Each
+            fragment is a window of the stored field value with byte-offset spans
+            marking the text the full-text query matched.
     """
 
     field_id: str
     field_score: float
     field_distance: float | Unset = UNSET
     field_index_scores: QueryHitIndexScores | Unset = UNSET
+    field_score_details: QueryScoreDetails | Unset = UNSET
     field_source: QueryHitSource | Unset = UNSET
     hierarchy: QueryHitHierarchy | Unset = UNSET
     field_sort: list[Any] | Unset = UNSET
@@ -63,6 +69,10 @@ class QueryHit:
         field_index_scores: dict[str, Any] | Unset = UNSET
         if not isinstance(self.field_index_scores, Unset):
             field_index_scores = self.field_index_scores.to_dict()
+
+        field_score_details: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.field_score_details, Unset):
+            field_score_details = self.field_score_details.to_dict()
 
         field_source: dict[str, Any] | Unset = UNSET
         if not isinstance(self.field_source, Unset):
@@ -92,6 +102,8 @@ class QueryHit:
             field_dict["_distance"] = field_distance
         if field_index_scores is not UNSET:
             field_dict["_index_scores"] = field_index_scores
+        if field_score_details is not UNSET:
+            field_dict["_score_details"] = field_score_details
         if field_source is not UNSET:
             field_dict["_source"] = field_source
         if hierarchy is not UNSET:
@@ -109,6 +121,7 @@ class QueryHit:
         from ..models.query_hit_highlights import QueryHitHighlights
         from ..models.query_hit_index_scores import QueryHitIndexScores
         from ..models.query_hit_source import QueryHitSource
+        from ..models.query_score_details import QueryScoreDetails
 
         d = dict(src_dict)
         field_id = d.pop("_id")
@@ -123,6 +136,13 @@ class QueryHit:
             field_index_scores = UNSET
         else:
             field_index_scores = QueryHitIndexScores.from_dict(_field_index_scores)
+
+        _field_score_details = d.pop("_score_details", UNSET)
+        field_score_details: QueryScoreDetails | Unset
+        if isinstance(_field_score_details, Unset):
+            field_score_details = UNSET
+        else:
+            field_score_details = QueryScoreDetails.from_dict(_field_score_details)
 
         _field_source = d.pop("_source", UNSET)
         field_source: QueryHitSource | Unset
@@ -152,6 +172,7 @@ class QueryHit:
             field_score=field_score,
             field_distance=field_distance,
             field_index_scores=field_index_scores,
+            field_score_details=field_score_details,
             field_source=field_source,
             hierarchy=hierarchy,
             field_sort=field_sort,

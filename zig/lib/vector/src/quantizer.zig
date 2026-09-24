@@ -55,6 +55,17 @@ const query_quantization_simd_width = 8;
 const QueryQuantizationSimdF32 = @Vector(query_quantization_simd_width, f32);
 const QueryQuantizationSimdU32 = @Vector(query_quantization_simd_width, u32);
 
+pub const QueryPacking = enum { lanes, reduce, mask };
+
+fn packedQueryByte(values: QueryQuantizationSimdU32, comptime bit: u5, mode: QueryPacking) u8 {
+    const bits = (values >> @as(@Vector(8, u5), @splat(bit))) & @as(QueryQuantizationSimdU32, @splat(1));
+    return switch (mode) {
+        .reduce => @intCast(@reduce(.Or, bits << @as(@Vector(8, u5), .{ 7, 6, 5, 4, 3, 2, 1, 0 }))),
+        .mask => @bitReverse(@as(u8, @bitCast(@as(@Vector(8, u1), @truncate(bits))))),
+        .lanes => unreachable,
+    };
+}
+
 fn quantizeQueryPlanes(
     query_diff: []const f32,
     unbias: []const f32,
@@ -65,6 +76,7 @@ fn quantizeQueryPlanes(
     q3: []u64,
     q4: []u64,
     cancellation: ?CancellationToken,
+    packing: QueryPacking,
 ) !u64 {
     std.debug.assert(query_diff.len == unbias.len);
     const width = rabitq.codeWidth(query_diff.len);
@@ -96,13 +108,23 @@ fn quantizeQueryPlanes(
                 const quantized_float = @min(@floor((diff_vec - min_vec) / delta_vec + unbias_vec), max_vec);
                 const quantized: QueryQuantizationSimdU32 = @intFromFloat(quantized_float);
 
-                inline for (0..query_quantization_simd_width) |lane| {
-                    const q_val: u64 = quantized[lane];
-                    quantized_sum += q_val;
-                    quantized1 = (quantized1 << 1) | (q_val & 1);
-                    quantized2 = (quantized2 << 1) | ((q_val & 2) >> 1);
-                    quantized3 = (quantized3 << 1) | ((q_val & 4) >> 2);
-                    quantized4 = (quantized4 << 1) | ((q_val & 8) >> 3);
+                if (packing == .lanes) {
+                    inline for (0..query_quantization_simd_width) |lane| {
+                        const q_val: u64 = quantized[lane];
+                        quantized_sum += q_val;
+                        quantized1 = (quantized1 << 1) | (q_val & 1);
+                        quantized2 = (quantized2 << 1) | ((q_val & 2) >> 1);
+                        quantized3 = (quantized3 << 1) | ((q_val & 4) >> 2);
+                        quantized4 = (quantized4 << 1) | ((q_val & 8) >> 3);
+                    }
+                } else {
+                    // Preserve the exact float arithmetic above and MSB-first
+                    // representation. Pack eight lanes without scalar extracts.
+                    quantized_sum += @reduce(.Add, quantized);
+                    quantized1 = (quantized1 << 8) | packedQueryByte(quantized, 0, packing);
+                    quantized2 = (quantized2 << 8) | packedQueryByte(quantized, 1, packing);
+                    quantized3 = (quantized3 << 8) | packedQueryByte(quantized, 2, packing);
+                    quantized4 = (quantized4 << 8) | packedQueryByte(quantized, 3, packing);
                 }
             }
 
@@ -139,6 +161,7 @@ fn quantizeQueryPlanes(
 /// Thread-safe: can be cached and reused across threads.
 pub const RaBitQuantizer = struct {
     dims: usize,
+    query_packing: QueryPacking = .lanes,
     sqrt_dims: f32,
     sqrt_dims_inv: f32,
     /// Random offsets in [0, 1) to remove bias when quantizing query vectors.
@@ -637,6 +660,7 @@ pub const RaBitQuantizer = struct {
             temp_q3,
             temp_q4,
             cancellation,
+            self.query_packing,
         );
 
         const delta_scale = delta * self.sqrt_dims_inv;
@@ -1027,7 +1051,7 @@ test "RaBitQuantizer SIMD query packing is bit-identical to scalar packing" {
     const alloc = std.testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x5241_4249_5451);
     const random = prng.random();
-    const dimensions = [_]usize{ 1, 7, 8, 9, 63, 64, 65, 127, 768 };
+    const dimensions = [_]usize{ 1, 7, 8, 9, 15, 16, 17, 63, 64, 65, 127, 128, 768, 1536, 3073 };
 
     for (dimensions) |dims| {
         const query_diff = try alloc.alloc(f32, dims);
@@ -1055,19 +1079,22 @@ test "RaBitQuantizer SIMD query packing is bit-identical to scalar packing" {
             expected[2 * width .. 3 * width],
             expected[3 * width .. 4 * width],
         );
-        const actual_sum = try quantizeQueryPlanes(
-            query_diff,
-            unbias,
-            mm.min,
-            delta,
-            actual[0 * width .. 1 * width],
-            actual[1 * width .. 2 * width],
-            actual[2 * width .. 3 * width],
-            actual[3 * width .. 4 * width],
-            null,
-        );
-        try std.testing.expectEqual(expected_sum, actual_sum);
-        try std.testing.expectEqualSlices(u64, expected, actual);
+        for (std.enums.values(QueryPacking)) |packing| {
+            const actual_sum = try quantizeQueryPlanes(
+                query_diff,
+                unbias,
+                mm.min,
+                delta,
+                actual[0 * width .. 1 * width],
+                actual[1 * width .. 2 * width],
+                actual[2 * width .. 3 * width],
+                actual[3 * width .. 4 * width],
+                null,
+                packing,
+            );
+            try std.testing.expectEqual(expected_sum, actual_sum);
+            try std.testing.expectEqualSlices(u64, expected, actual);
+        }
     }
 
     var zero_q1: [1]u64 = undefined;
@@ -1084,6 +1111,7 @@ test "RaBitQuantizer SIMD query packing is bit-identical to scalar packing" {
         &zero_q3,
         &zero_q4,
         null,
+        .reduce,
     );
     try std.testing.expectEqual(@as(u64, 0), zero_sum);
     try std.testing.expectEqual(@as(u64, 0), zero_q1[0]);
@@ -1241,4 +1269,20 @@ test "RaBitQuantizer centroid query matches cosine centroid distances" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), error_bounds[0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), error_bounds[1], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), error_bounds[2], 1e-6);
+}
+
+test "SIMD packing exhausts every eight-lane bit mask" {
+    for (0..256) |mask| {
+        inline for (0..4) |bit| {
+            var values: @Vector(8, u32) = undefined;
+            var expected: u8 = 0;
+            inline for (0..8) |lane| {
+                const selected: u32 = @intCast((mask >> @as(u3, @intCast(lane))) & 1);
+                values[lane] = (selected << bit) | (@as(u32, 15) & ~(@as(u32, 1) << bit));
+                expected = (expected << 1) | @as(u8, @intCast(selected));
+            }
+            try std.testing.expectEqual(expected, packedQueryByte(values, bit, .reduce));
+            try std.testing.expectEqual(expected, packedQueryByte(values, bit, .mask));
+        }
+    }
 }

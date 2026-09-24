@@ -88,6 +88,7 @@ pub const Routes = struct {
     pub const merge_suffix = "/merge";
     pub const backup_suffix = "/backup";
     pub const backup_shard_suffix = "/backup-shard";
+    pub const restore_owner_suffix = "/restore-owner";
     pub const restore_suffix = "/restore";
     pub const destination_authorization_suffix = "/destination-authorization";
     pub const query_suffix = "/query";
@@ -102,11 +103,13 @@ pub const Routes = struct {
     pub const graph_expand_suffix = "/graph-expand";
     pub const graph_hydrate_suffix = "/graph-hydrate";
     pub const graph_edges_suffix = "/graph-edges";
+    pub const graph_metric_maintenance_suffix = "/graph-metric-maintenance";
     pub const vector_worker_suffix = "/vector-worker";
     pub const txn_begin_suffix = "/txn-begin";
     pub const txn_prepare_suffix = "/txn-prepare";
     pub const txn_resolve_suffix = "/txn-resolve";
     pub const txn_status_suffix = "/txn-status";
+    pub const online_merge_io_suffix = "/online-merge-io";
     pub const txn_acknowledge_suffix = "/txn-acknowledge";
     pub const corrupt_embedding_artifact_suffix = "/corrupt-embedding-artifact";
     pub const group_db_median_key_suffix = "/db/median-key";
@@ -117,6 +120,7 @@ pub const Routes = struct {
     pub const schema_suffix = "/schema";
     pub const indexes_suffix = "/indexes";
     pub const indexes_marker = "/indexes/";
+    pub const graph_metrics_marker = "/graph-metrics/";
     pub const documents_suffix = "/documents";
     pub const artifacts_suffix = "/artifacts";
     pub const artifact_repair_suffix = "/repair/issues";
@@ -193,6 +197,13 @@ pub const Routes = struct {
     pub const TableIndex = struct {
         table_name: []const u8,
         index_name: []const u8,
+    };
+
+    pub const TableGraphMetricAction = struct {
+        table_name: []const u8,
+        index_name: []const u8,
+        metric_name: []const u8,
+        action: []const u8,
     };
 
     pub const TableArtifact = struct {
@@ -483,6 +494,29 @@ pub const Routes = struct {
         return .{ .table_name = table_name };
     }
 
+    pub fn matchRelationalRowsQuery(path: []const u8) ?TableScan {
+        return matchRelationalRowsPath(path, "/rows/query");
+    }
+
+    pub fn matchRelationalRowsMutation(path: []const u8) ?TableScan {
+        return matchRelationalRowsPath(path, "/rows/mutate");
+    }
+
+    pub fn matchRelationalConstraintStatus(path: []const u8) ?TableScan {
+        return matchRelationalRowsPath(path, "/constraints/status");
+    }
+
+    pub fn matchRelationalConstraintRecovery(path: []const u8) ?TableScan {
+        return matchRelationalRowsPath(path, "/constraints/repair") orelse matchRelationalRowsPath(path, "/constraints/retry") orelse matchRelationalRowsPath(path, "/constraints/retire");
+    }
+
+    fn matchRelationalRowsPath(path: []const u8, suffix: []const u8) ?TableScan {
+        if (!std.mem.startsWith(u8, path, tables_prefix) or !std.mem.endsWith(u8, path, suffix)) return null;
+        const name = path[tables_prefix.len .. path.len - suffix.len];
+        if (name.len == 0 or std.mem.indexOfScalar(u8, name, '/') != null) return null;
+        return .{ .table_name = name };
+    }
+
     pub fn matchTableQuery(path: []const u8) ?TableQuery {
         if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, path, query_suffix)) return null;
@@ -542,8 +576,28 @@ pub const Routes = struct {
         return matchTableArtifactRepairWithSuffix(path, artifact_repair_suffix);
     }
 
+    pub fn matchTableStorageMigration(path: []const u8) ?TableArtifactRepair {
+        return matchTableArtifactRepairWithSuffix(path, "/storage/migrations");
+    }
+
+    pub const TableStorageMigrationJob = struct { table_name: []const u8, job_id: []const u8 };
+    pub fn matchTableStorageMigrationJob(path: []const u8) ?TableStorageMigrationJob {
+        if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
+        const tail = path[tables_prefix.len..];
+        const separator = std.mem.indexOfScalar(u8, tail, '/') orelse return null;
+        const suffix = "/storage/migrations/";
+        if (separator == 0 or !std.mem.startsWith(u8, tail[separator..], suffix)) return null;
+        const job_id = tail[separator + suffix.len ..];
+        if (job_id.len == 0 or std.mem.indexOfScalar(u8, job_id, '/') != null) return null;
+        return .{ .table_name = tail[0..separator], .job_id = job_id };
+    }
+
     pub fn matchTableArtifactRepairRun(path: []const u8) ?TableArtifactRepair {
         return matchTableArtifactRepairWithSuffix(path, artifact_repair_run_suffix);
+    }
+
+    pub fn matchTableRepairControlJobs(path: []const u8) ?TableArtifactRepair {
+        return matchTableArtifactRepairWithSuffix(path, "/repair/control-jobs");
     }
 
     pub fn matchTableRepairJobs(path: []const u8) ?TableArtifactRepair {
@@ -623,6 +677,39 @@ pub const Routes = struct {
         return .{
             .table_name = table_name,
             .index_name = index_name,
+        };
+    }
+
+    pub fn matchTableIndexMaintenance(path: []const u8) ?TableIndex {
+        const suffix: []const u8 = if (std.mem.endsWith(u8, path, "/retry")) "/retry" else if (std.mem.endsWith(u8, path, "/repair")) "/repair" else return null;
+        const index = matchTableIndex(path[0 .. path.len - suffix.len]) orelse return null;
+        if (std.mem.indexOfScalar(u8, index.table_name, '/') != null) return null;
+        return index;
+    }
+
+    pub fn matchTableGraphMetricAction(path: []const u8) ?TableGraphMetricAction {
+        if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
+        const rest = path[tables_prefix.len..];
+        const indexes_index = std.mem.indexOf(u8, rest, indexes_marker) orelse return null;
+        if (indexes_index == 0) return null;
+        const table_name = rest[0..indexes_index];
+        if (std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+
+        const index_and_action = rest[indexes_index + indexes_marker.len ..];
+        const graph_metrics_index = std.mem.indexOf(u8, index_and_action, graph_metrics_marker) orelse return null;
+        if (graph_metrics_index == 0) return null;
+        const index_name = index_and_action[0..graph_metrics_index];
+        if (std.mem.indexOfScalar(u8, index_name, '/') != null) return null;
+
+        const metric_and_action = index_and_action[graph_metrics_index + graph_metrics_marker.len ..];
+        if (std.mem.indexOfScalar(u8, metric_and_action, '/') != null) return null;
+        const action_separator = std.mem.lastIndexOfScalar(u8, metric_and_action, ':') orelse return null;
+        if (action_separator == 0 or action_separator + 1 == metric_and_action.len) return null;
+        return .{
+            .table_name = table_name,
+            .index_name = index_name,
+            .metric_name = metric_and_action[0..action_separator],
+            .action = metric_and_action[action_separator + 1 ..],
         };
     }
 
@@ -1453,6 +1540,15 @@ test "public api routes compile" {
     try std.testing.expectEqualStrings("docs", index.table_name);
     try std.testing.expectEqualStrings("search_idx", index.index_name);
     try std.testing.expect(Routes.matchTableIndex("/tables/docs/indexes/search_idx/algebraic") == null);
+    const graph_metric_action = Routes.matchTableGraphMetricAction("/tables/docs/indexes/graph_idx/graph-metrics/pagerank:rebuild").?;
+    try std.testing.expectEqualStrings("docs", graph_metric_action.table_name);
+    try std.testing.expectEqualStrings("graph_idx", graph_metric_action.index_name);
+    try std.testing.expectEqualStrings("pagerank", graph_metric_action.metric_name);
+    try std.testing.expectEqualStrings("rebuild", graph_metric_action.action);
+    try std.testing.expect(Routes.matchTableGraphMetricAction("/tables/docs/indexes/graph_idx/graph-metrics/pagerank") == null);
+    try std.testing.expect(Routes.matchTableGraphMetricAction("/tables/docs/indexes/graph_idx/graph-metrics/:rebuild") == null);
+    try std.testing.expect(Routes.matchTableGraphMetricAction("/tables/docs/indexes/graph_idx/graph-metrics/pagerank:") == null);
+    try std.testing.expect(Routes.matchTableGraphMetricAction("/tables/docs/indexes/graph_idx/graph-metrics/pagerank:rebuild/extra") == null);
     const artifact = Routes.matchTableDocumentArtifact("/tables/docs/documents/doc%2Fa/artifacts/document_units_v1").?;
     try std.testing.expectEqualStrings("docs", artifact.table_name);
     try std.testing.expectEqualStrings("doc%2Fa", artifact.key);

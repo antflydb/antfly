@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const platform_time = @import("antfly_platform").time;
 const httpx = @import("httpx");
 const lib = @import("antfly_reranking");
@@ -31,6 +32,44 @@ const common_cancellation = @import("../common/cancellation.zig");
 const provider_limits = @import("../common/provider_limits.zig");
 const credential_identity = @import("../common/credential_source_identity.zig");
 const google_auth = @import("antfly_google").auth;
+const template_mod = if (builtin.os.tag == .freestanding or builtin.is_test)
+    @import("../storage/db/template_stub.zig")
+else
+    @import("../template.zig");
+
+pub const ContentPart = template_mod.ContentPart;
+
+/// Rendered rerank candidates. `texts[i]` is document i as text and is what
+/// text-only providers score. `parts`, parallel to `texts`, holds each
+/// document's ordered content parts; callers set it only when a rendered
+/// template produced media.
+pub const Documents = struct {
+    texts: []const []const u8,
+    parts: ?[]const []const ContentPart = null,
+
+    pub fn hasMedia(self: Documents) bool {
+        return antfly_provider.rerankDocumentsHaveMedia(self.parts);
+    }
+
+    fn mediaShape(self: Documents) struct { encoded_bytes: usize, max_parts_per_document: usize } {
+        var encoded_bytes: usize = 0;
+        var max_parts: usize = 0;
+        const documents = self.parts orelse return .{ .encoded_bytes = 0, .max_parts_per_document = 0 };
+        for (documents) |document| {
+            var count: usize = 0;
+            for (document) |part| switch (part) {
+                .text => {},
+                .media_url => count += 1,
+                .binary => |binary| {
+                    count += 1;
+                    encoded_bytes +|= binary.data.len;
+                },
+            };
+            max_parts = @max(max_parts, count);
+        }
+        return .{ .encoded_bytes = encoded_bytes, .max_parts_per_document = max_parts };
+    }
+};
 
 pub const Config = lib.Config;
 pub const Provider = lib.Provider;
@@ -115,6 +154,21 @@ pub const Runtime = struct {
         );
     }
 
+    /// Like `rerankAdmitted`, for documents that may carry media parts.
+    pub fn rerankContentAdmitted(
+        self: *Runtime,
+        alloc: std.mem.Allocator,
+        cfg: Config,
+        dependencies: Options,
+        query: []const u8,
+        documents: Documents,
+    ) ![]f32 {
+        if (dependencies.execution_context) |context| try context.check();
+        var options = dependencies;
+        options.runtime = self;
+        return try rerankContentWithOptions(alloc, &self.http, cfg, options, query, documents);
+    }
+
     pub fn deinit(self: *Runtime) void {
         self.credentials.deinit();
         self.http.deinit();
@@ -131,6 +185,7 @@ pub fn normalizeOperationalError(err: anyerror) anyerror {
         error.RerankRateLimited,
         error.RerankTransientFailure,
         error.RerankUpstreamFailure,
+        error.RerankerMediaUnsupported,
         error.Timeout,
         => err,
         // httpx spells transport cancellation `Canceled`; collapse both
@@ -152,18 +207,15 @@ pub fn normalizeOperationalError(err: anyerror) anyerror {
         error.HostUnreachable,
         error.TemporaryNameServerFailure,
         error.NameServerFailure,
+        error.ResourceTemporarilyUnavailable,
+        error.ConcurrencyUnavailable,
         => error.RerankTransientFailure,
         else => err,
     };
 }
 
 pub fn statusError(status: u16) anyerror {
-    return switch (status) {
-        408, 504 => error.Timeout,
-        429 => error.RerankRateLimited,
-        500...503, 505...599 => error.RerankTransientFailure,
-        else => error.RerankRequestFailed,
-    };
+    return @import("../inference/types.zig").rerankStatusError(status);
 }
 
 test "reranking runtime failures use stable query dependency classes" {
@@ -174,6 +226,12 @@ test "reranking runtime failures use stable query dependency classes" {
     try std.testing.expectEqual(error.RerankRequestFailed, statusError(401));
     try std.testing.expectEqual(error.RerankUpstreamFailure, normalizeOperationalError(error.InvalidRerankerResponse));
     try std.testing.expectEqual(error.RerankTransientFailure, normalizeOperationalError(error.ConnectionRefused));
+    try std.testing.expectEqual(error.RerankTransientFailure, normalizeOperationalError(error.ResourceTemporarilyUnavailable));
+    try std.testing.expectEqual(error.RerankTransientFailure, normalizeOperationalError(error.ConcurrencyUnavailable));
+    // Embedded execution crosses the stable ABI before query classification.
+    try std.testing.expectEqual(error.RerankTransientFailure, normalizeOperationalError(
+        runtime_error_abi.errorFromStatus(runtime_error_abi.statusFromError(error.ResourceTemporarilyUnavailable)),
+    ));
     try std.testing.expectEqual(error.Timeout, normalizeOperationalError(error.ConnectionTimedOut));
     try std.testing.expectEqual(error.Cancelled, normalizeOperationalError(error.Canceled));
     try std.testing.expectEqual(error.Cancelled, normalizeOperationalError(error.Cancelled));
@@ -288,7 +346,26 @@ pub fn rerankDocumentsWithOptions(
     query: []const u8,
     documents: []const []const u8,
 ) ![]f32 {
+    return rerankContentWithOptions(alloc, http, cfg, options, query, .{ .texts = documents });
+}
+
+/// Reranks documents that may carry media. Only the Antfly provider scores
+/// images, and only through a model that accepts them; everything else fails
+/// with `error.RerankerMediaUnsupported` before any provider call.
+pub fn rerankContentWithOptions(
+    alloc: std.mem.Allocator,
+    http: *httpx.Client,
+    cfg: Config,
+    options: Options,
+    query: []const u8,
+    content: Documents,
+) ![]f32 {
+    const documents = content.texts;
+    if (content.parts) |parts| if (parts.len != documents.len) return error.InvalidArguments;
+    const has_media = content.hasMedia();
+    const media_shape = content.mediaShape();
     try cfg.validate();
+    if (has_media and cfg.provider != .antfly) return error.RerankerMediaUnsupported;
     const request_context = options.execution_context orelse inference_request_context.RequestContext{
         .io = options.execution.io orelse http.io,
         .deadline_ns = options.execution.deadline_ns,
@@ -313,6 +390,34 @@ pub fn rerankDocumentsWithOptions(
                 if (policy.enabled()) return error.UnsupportedLocalRateLimit;
                 const local = options.antfly_provider.?;
                 try request_context.check();
+                if (has_media) {
+                    const rerank_parts = local.rerank_documents_with_context orelse return error.RerankerMediaUnsupported;
+                    if (local.model_capabilities) |resolve| {
+                        const capabilities = try managed_embedder.AntflyProviderBoundary.call(
+                            "model_capabilities",
+                            local.boundary_dispatch,
+                            resolve,
+                            .{ local.ptr, alloc, cfg.model, .rerank },
+                        );
+                        if (!capabilities.input_modalities.image) return error.RerankerMediaUnsupported;
+                    }
+                    const scores = managed_embedder.AntflyProviderBoundary.call(
+                        "rerank_documents_with_context",
+                        local.boundary_dispatch,
+                        rerank_parts,
+                        .{ local.ptr, alloc, cfg.model, query, content.parts.?, request_context },
+                    ) catch |err| return switch (err) {
+                        // The linked host reports the rerank core's 400/413 as
+                        // InvalidArguments: this model cannot score these
+                        // documents, a query error like the remote path's 400.
+                        error.InvalidArguments => error.RerankerMediaUnsupported,
+                        else => err,
+                    };
+                    errdefer alloc.free(scores);
+                    try validateScores(scores, documents.len);
+                    try request_context.check();
+                    return scores;
+                }
                 const scores = if (linked_context_reranker) |rerank|
                     try managed_embedder.AntflyProviderBoundary.call(
                         "rerank_texts_with_context",
@@ -382,13 +487,20 @@ pub fn rerankDocumentsWithOptions(
                     },
                 );
                 if (capability_lease.capabilities) |discovered| {
-                    try discovered.validateInvocation(.rerank, .{
+                    discovered.validateInvocation(.rerank, .{
                         .item_count = 1,
-                        .modalities = .{ .text = true },
+                        .modalities = .{ .text = true, .image = has_media },
                         .text_bytes = query.len +| documentBytes(documents),
                         .max_text_bytes_per_item = query.len +| maximumDocumentBytes(documents),
                         .max_candidates_per_request = documents.len,
-                    });
+                        .encoded_media_bytes = media_shape.encoded_bytes,
+                        .max_media_parts_per_item = media_shape.max_parts_per_document,
+                    }) catch |err| return if (has_media and err == error.UnsupportedInferenceModality)
+                        error.RerankerMediaUnsupported
+                    else
+                        err;
+                    provider.setRerankDocuments(discovered.rerank_documents_v1);
+                    provider.setFramedAttachments(discovered.framed_attachments);
                 }
                 if (capability_lease.routing_token) |token|
                     try provider.setCapabilityToken(token.slice());
@@ -403,7 +515,7 @@ pub fn rerankDocumentsWithOptions(
                 @min(timeout_ms, remote_rerank_max_timeout_ms)
             else
                 null);
-            var result = provider.reranker().rerank(alloc, cfg.model, query, documents) catch |err| {
+            var result = provider.rerankDocuments(alloc, cfg.model, query, documents, content.parts) catch |err| {
                 if (err == error.InferenceCapabilitiesStale and cfg.model.len > 0)
                     try capability_cache.?.invalidate(endpoint, cfg.model, .rerank, headers);
                 return err;
@@ -688,6 +800,129 @@ test "reranking runtime delegates to antfly provider" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.9), scores.?[0], 0.0001);
 }
 
+test "reranking runtime preserves antfly HTTP failure classes" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const Case = struct { status: u16, body: []const u8 = "{}", expected: anyerror };
+    const cases = [_]Case{
+        .{ .status = 503, .body = "{\"error\":\"MODEL_RESOURCE_BUSY\",\"reason\":\"inference_capacity\",\"retryable\":true,\"retry_after_ms\":1000}", .expected = error.RerankTransientFailure },
+        .{ .status = 429, .expected = error.RerankRateLimited },
+        .{ .status = 500, .expected = error.RerankTransientFailure },
+        .{ .status = 502, .expected = error.RerankTransientFailure },
+        .{ .status = 408, .expected = error.Timeout },
+        .{ .status = 504, .expected = error.Timeout },
+        .{ .status = 401, .expected = error.RerankUpstreamFailure },
+        .{ .status = 422, .body = "{\"error\":\"MODEL_RESOURCE_LIMIT\",\"retryable\":false}", .expected = error.RerankUpstreamFailure },
+    };
+    for (cases) |tc| {
+        var server = try httpx.TestServer.start(alloc, io, &.{
+            .{ .method = .POST, .path = "/rerank", .respond = .{ .status = tc.status, .body = tc.body } },
+        });
+        defer server.deinit();
+        var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+        defer client.deinit();
+        var run_err: ?anyerror = null;
+        var group = std.Io.Group.init;
+        defer group.cancel(io);
+        const Fiber = struct {
+            fn run(a: std.mem.Allocator, http: *httpx.Client, url: []const u8, err_out: *?anyerror) std.Io.Cancelable!void {
+                // Use the endpoint's default model to exercise execution without discovery.
+                const scores = rerankDocumentsWithOptions(a, http, .{
+                    .provider = .antfly,
+                    .url = url,
+                    .field = "body",
+                }, .{}, "query", &.{"document"}) catch |err| {
+                    err_out.* = normalizeOperationalError(err);
+                    return;
+                };
+                a.free(scores);
+            }
+        };
+        try group.concurrent(io, Fiber.run, .{ alloc, &client, server.baseUrl(), &run_err });
+        try server.handleOne();
+        try group.await(io);
+        try std.testing.expectEqual(@as(?anyerror, tc.expected), run_err);
+    }
+}
+
+test "reranking runtime cancels active antfly HTTP work and releases admission" {
+    if (@import("builtin").os.tag == .windows or @import("builtin").os.tag == .freestanding) return;
+    const State = struct {
+        var started = std.atomic.Value(bool).init(false);
+        var canceled = std.atomic.Value(bool).init(false);
+        var release = std.atomic.Value(bool).init(false);
+        fn handler(ctx: *httpx.Context) anyerror!httpx.Response {
+            if (started.swap(true, .acq_rel)) return ctx.json(.{ .scores = [_]f32{0.5} });
+            while (!release.load(.acquire)) {
+                if (ctx.isCancellationRequested()) {
+                    canceled.store(true, .release);
+                    return error.Canceled;
+                }
+                try ctx.io.sleep(.fromMilliseconds(1), .awake);
+            }
+            return ctx.json(.{ .scores = [_]f32{0.5} });
+        }
+    };
+    State.started.store(false, .release);
+    State.canceled.store(false, .release);
+    State.release.store(false, .release);
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var server = httpx.Server.initWithConfig(alloc, io, .{ .host = "127.0.0.1", .port = 0 });
+    defer server.deinit();
+    try server.post("/rerank", State.handler);
+    try server.bind();
+    var listener = try std.testing.io.concurrent(struct {
+        fn run(s: *httpx.Server) void {
+            s.listen() catch {};
+        }
+    }.run, .{&server});
+    defer {
+        State.release.store(true, .release);
+        server.stop();
+        listener.await(std.testing.io);
+    }
+    while (!server.listen_started.load(.acquire)) try io.sleep(.fromMilliseconds(1), .awake);
+    const url = try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}", .{server.boundAddress().?.getPort()});
+    defer alloc.free(url);
+    var runtime = Runtime.init(alloc, io);
+    defer runtime.deinit();
+    runtime.admission = .init(1);
+    var cancellation = std.atomic.Value(bool).init(false);
+    const cfg = Config{ .provider = .antfly, .url = url, .field = "body" };
+    var request = try io.concurrent(struct {
+        fn run(a: std.mem.Allocator, r: *Runtime, config: Config, signal: *std.atomic.Value(bool)) anyerror!void {
+            const scores = try r.rerank(a, config, .{ .execution_context = .{
+                .io = r.io,
+                .deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s,
+                .cancellation = common_cancellation.CancellationToken.fromAtomic(signal),
+            } }, "query", &.{"document"});
+            a.free(scores);
+        }
+    }.run, .{ alloc, &runtime, cfg, &cancellation });
+    defer request.cancel(io) catch {};
+    for (0..5000) |_| {
+        if (State.started.load(.acquire)) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(State.started.load(.acquire));
+    cancellation.store(true, .release);
+    try std.testing.expectError(error.Cancelled, request.await(io));
+    for (0..2000) |_| {
+        if (State.canceled.load(.acquire)) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(State.canceled.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), runtime.admission.stats().in_flight);
+    const scores = try runtime.rerank(alloc, cfg, .{}, "next query", &.{"document"});
+    defer alloc.free(scores);
+    try std.testing.expectEqual(@as(f32, 0.5), scores[0]);
+}
+
 test "reranking runtime routes antfly provider to local antfly" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -698,6 +933,7 @@ test "reranking runtime routes antfly provider to local antfly" {
     const State = struct {
         legacy_called: bool = false,
         context_calls: usize = 0,
+        failure: ?anyerror = null,
 
         fn dense(_: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![][]f32 {
             return try a.alloc([]f32, 0);
@@ -722,6 +958,7 @@ test "reranking runtime routes antfly provider to local antfly" {
             try context.check();
             try std.testing.expect(context.deadline_ns != null);
             state.context_calls += 1;
+            if (state.failure) |err| return err;
             try std.testing.expectEqualStrings("local-reranker", model);
             try std.testing.expectEqualStrings("query", query);
             try std.testing.expectEqual(@as(usize, 2), documents.len);
@@ -787,6 +1024,14 @@ test "reranking runtime routes antfly provider to local antfly" {
         .execution = .{ .cancellation = .fromAtomic(&canceled) },
     }, "query", &.{ "doc1", "doc2" }));
     try std.testing.expectEqual(@as(usize, 1), state.context_calls);
+
+    for ([_]anyerror{ error.ResourceTemporarilyUnavailable, error.ConcurrencyUnavailable }) |err| {
+        state.failure = err;
+        try std.testing.expectError(err, rerankDocumentsWithOptions(alloc, &client, cfg, .{
+            .antfly_provider = local,
+            .execution = .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s },
+        }, "query", &.{ "doc1", "doc2" }));
+    }
 }
 
 test "reranking runtime authentication owns wire credentials and stable quota sources" {
@@ -953,4 +1198,187 @@ test "reranking runtime remote Antfly defaults match anonymous or environment au
     if (failure) |err| return err;
     try std.testing.expect(held.limiter().requests < 1);
     try std.testing.expectEqual(@as(u32, 0), held.limiter().in_flight);
+}
+
+fn testRerankCatalog(comptime documents_flag: []const u8) []const u8 {
+    return "{\"rerankers\":{\"owner/colqwen\":{\"inputs\":[\"text\",\"image\"],\"inference_capabilities\":{\"version\":4,\"task\":\"rerank\",\"input_modalities\":[\"text\",\"image\"],\"accepted_mime_types\":[\"text/plain\",\"image/png\"],\"input_granularity\":\"item\",\"output\":\"ranked_items\",\"result_cardinality\":\"one_per_request\",\"prompt_policy\":\"explicit\",\"borrowed_attachments\":false,\"framed_attachments\":false,\"numeric_responses_v1\":false" ++ documents_flag ++ ",\"task_limits\":{\"max_text_bytes_per_item\":null,\"max_input_tokens_per_item\":null,\"max_output_tokens_per_item\":null,\"max_candidates_per_request\":null,\"max_schema_bytes\":null},\"batch\":{\"mode\":\"native\",\"preferred_items\":8,\"max_items\":64,\"max_encoded_media_bytes\":1048576,\"max_decoded_pixels\":16777216,\"max_media_parts_per_item\":4,\"per_item_failures\":false}}}}}";
+}
+
+const test_rerank_scores_body = "{\"object\":\"list\",\"data\":[{\"object\":\"rerank.score\",\"index\":0,\"score\":0.7},{\"object\":\"rerank.score\",\"index\":1,\"score\":0.1}],\"model\":\"owner/colqwen\",\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":0,\"total_tokens\":2}}";
+
+fn runRemoteContentRerank(
+    catalog: []const u8,
+    check: *const fn (httpx.testing_mod.RequestInfo) anyerror!void,
+    content: Documents,
+    expect_rerank_request: bool,
+) !?[]f32 {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var ts = try httpx.TestServer.start(alloc, io, &.{
+        .{ .method = .GET, .path = "/ai/v1/models", .respond = .{ .body = catalog } },
+        .{ .method = .POST, .path = "/rerank", .assert_request = check, .respond = .{ .body = test_rerank_scores_body } },
+    });
+    defer ts.deinit();
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+    defer client.deinit();
+    var scores: ?[]f32 = null;
+    var run_err: ?anyerror = null;
+    var group = std.Io.Group.init;
+    const Fiber = struct {
+        fn run(a: std.mem.Allocator, test_client: *httpx.Client, url: []const u8, docs: Documents, out: *?[]f32, err_out: *?anyerror) std.Io.Cancelable!void {
+            const cfg = Config{ .provider = .antfly, .model = "owner/colqwen", .url = url, .field = "body" };
+            out.* = rerankContentWithOptions(a, test_client, cfg, .{}, "invoice total", docs) catch |err| {
+                err_out.* = err;
+                return;
+            };
+        }
+    };
+    group.concurrent(io, Fiber.run, .{ alloc, &client, ts.baseUrl(), content, &scores, &run_err }) catch return error.SkipZigTest;
+    try ts.handleOne();
+    if (expect_rerank_request) try ts.handleOne();
+    group.await(io) catch {};
+    if (run_err) |err| {
+        if (scores) |value| alloc.free(value);
+        return err;
+    }
+    return scores;
+}
+
+test "reranking runtime sends image documents to servers that accept documents" {
+    const Check = struct {
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expect(std.mem.indexOf(u8, req.body, "\"prompts\"") == null);
+            // The image document is an array of parts with inline base64 media;
+            // the text-only document stays a plain string.
+            try std.testing.expect(std.mem.indexOf(u8, req.body, "\"documents\":[[{\"type\":\"text\",\"text\":\"page one\"},{\"type\":\"media\",\"mime_type\":\"image/png\",\"data\":\"iVBORw==\"}],\"plain page\"]") != null);
+        }
+    };
+    const png = [_]u8{ 0x89, 'P', 'N', 'G' };
+    const with_image = [_]ContentPart{ .{ .text = "page one" }, .{ .binary = .{ .mime_type = "image/png", .data = &png } } };
+    const text_only = [_]ContentPart{.{ .text = "plain page" }};
+    const parts = [_][]const ContentPart{ &with_image, &text_only };
+    const scores = (try runRemoteContentRerank(testRerankCatalog(",\"rerank_documents_v1\":true"), Check.request, .{
+        .texts = &.{ "page one", "plain page" },
+        .parts = &parts,
+    }, true)).?;
+    defer std.testing.allocator.free(scores);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.7), scores[0], 0.0001);
+}
+
+test "reranking runtime keeps prompts for servers without rerank documents" {
+    const Check = struct {
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expect(std.mem.indexOf(u8, req.body, "\"prompts\":[\"page one\",\"plain page\"]") != null);
+            try std.testing.expect(std.mem.indexOf(u8, req.body, "\"documents\"") == null);
+        }
+    };
+    const scores = (try runRemoteContentRerank(testRerankCatalog(""), Check.request, .{
+        .texts = &.{ "page one", "plain page" },
+    }, true)).?;
+    defer std.testing.allocator.free(scores);
+
+    // The same server cannot receive images, so they fail before `/rerank`.
+    const png = [_]u8{ 0x89, 'P', 'N', 'G' };
+    const with_image = [_]ContentPart{.{ .binary = .{ .mime_type = "image/png", .data = &png } }};
+    const text_only = [_]ContentPart{.{ .text = "plain page" }};
+    const parts = [_][]const ContentPart{ &with_image, &text_only };
+    try std.testing.expectError(error.RerankerMediaUnsupported, runRemoteContentRerank(testRerankCatalog(""), Check.request, .{
+        .texts = &.{ "", "plain page" },
+        .parts = &parts,
+    }, false));
+}
+
+test "reranking runtime rejects image documents for text-only providers before dispatch" {
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var client = httpx.Client.initWithConfig(std.testing.allocator, io_impl.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const with_image = [_]ContentPart{.{ .media_url = "https://example.invalid/page.png" }};
+    const parts = [_][]const ContentPart{&with_image};
+    for ([_]Provider{ .cohere, .vertex }) |provider| {
+        const cfg = Config{ .provider = provider, .model = "rerank", .api_key = "key", .field = "body", .url = "http://127.0.0.1:1" };
+        try std.testing.expectError(error.RerankerMediaUnsupported, rerankContentWithOptions(
+            std.testing.allocator,
+            &client,
+            cfg,
+            .{},
+            "query",
+            .{ .texts = &.{""}, .parts = &parts },
+        ));
+    }
+}
+
+test "reranking runtime sends image documents to linked rerankers that accept images" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
+    defer client.deinit();
+
+    const State = struct {
+        accepts_images: bool,
+        reject: bool = false,
+        document_calls: usize = 0,
+
+        fn dense(_: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![][]f32 {
+            return try a.alloc([]f32, 0);
+        }
+        fn sparse(_: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![]db_embedder.SparseEmbedding {
+            return try a.alloc(db_embedder.SparseEmbedding, 0);
+        }
+        fn rerankTexts(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const []const u8, _: inference_request_context.RequestContext) anyerror![]f32 {
+            return error.TestUnexpectedResult;
+        }
+        fn rerankDocuments(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const u8, documents: []const []const ContentPart, _: inference_request_context.RequestContext) anyerror![]f32 {
+            const state: *@This() = @ptrCast(@alignCast(ptr));
+            if (state.reject) return error.InvalidArguments;
+            state.document_calls += 1;
+            try std.testing.expectEqual(@as(usize, 2), documents.len);
+            try std.testing.expect(documents[0][1] == .binary);
+            try std.testing.expectEqualStrings("plain page", documents[1][0].text);
+            const scores = try a.alloc(f32, 2);
+            scores[0] = 0.9;
+            scores[1] = 0.3;
+            return scores;
+        }
+        fn capabilities(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, task: @import("../inference/work.zig").Task) anyerror!@import("../inference/work.zig").InferenceCapabilities {
+            const state: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .task = task, .input_modalities = .{ .text = true, .image = state.accepts_images }, .input_granularity = .item, .output = .ranked_items, .result_cardinality = .one_per_request };
+        }
+    };
+    const png = [_]u8{ 0x89, 'P', 'N', 'G' };
+    const with_image = [_]ContentPart{ .{ .text = "page one" }, .{ .binary = .{ .mime_type = "image/png", .data = &png } } };
+    const text_only = [_]ContentPart{.{ .text = "plain page" }};
+    const parts = [_][]const ContentPart{ &with_image, &text_only };
+    const content = Documents{ .texts = &.{ "page one", "plain page" }, .parts = &parts };
+    const cfg = Config{ .provider = .antfly, .model = "local-colqwen", .field = "body" };
+
+    var state = State{ .accepts_images = true };
+    var local = managed_embedder.AntflyProvider{
+        .ptr = &state,
+        .embed_dense_texts = State.dense,
+        .embed_sparse_texts = State.sparse,
+        .rerank_texts_with_context = State.rerankTexts,
+        .rerank_documents_with_context = State.rerankDocuments,
+        .model_capabilities = State.capabilities,
+    };
+    const scores = try rerankContentWithOptions(alloc, &client, cfg, .{ .antfly_provider = local }, "invoice total", content);
+    defer alloc.free(scores);
+    try std.testing.expectEqual(@as(usize, 1), state.document_calls);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9), scores[0], 0.0001);
+
+    state.accepts_images = false;
+    try std.testing.expectError(error.RerankerMediaUnsupported, rerankContentWithOptions(alloc, &client, cfg, .{ .antfly_provider = local }, "invoice total", content));
+    try std.testing.expectEqual(@as(usize, 1), state.document_calls);
+
+    // A document the linked core rejects is a query error, not an outage.
+    state.accepts_images = true;
+    state.reject = true;
+    try std.testing.expectError(error.RerankerMediaUnsupported, rerankContentWithOptions(alloc, &client, cfg, .{ .antfly_provider = local }, "invoice total", content));
+    state.reject = false;
+
+    local.rerank_documents_with_context = null;
+    try std.testing.expectError(error.RerankerMediaUnsupported, rerankContentWithOptions(alloc, &client, cfg, .{ .antfly_provider = local }, "invoice total", content));
 }

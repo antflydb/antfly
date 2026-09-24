@@ -57,7 +57,7 @@ const RunConfig = struct {
     };
 
     const PromptCacheConfig = struct {
-        enabled: bool = false,
+        enabled: bool = true,
         mode: inference.runtime.kv.prompt_cache.Mode = .block_hash,
         max_bytes_mb: usize = 512,
         min_tokens: usize = 64,
@@ -453,7 +453,9 @@ fn consumeParsedMaxLoadedModelsOption(args: []const []const u8, index: *usize) b
     return true;
 }
 
-fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
+/// Also used by the focused resident-server benchmark executable, so its
+/// argument parsing, resource ownership and HTTP routes remain production code.
+pub fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     structlog.init(.{ .formatter = .json, .level = .info });
 
     var host: []const u8 = "127.0.0.1";
@@ -683,9 +685,9 @@ fn listModels(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8
 fn pullModel(allocator: std.mem.Allocator, io: std.Io, usage_name: []const u8, args: []const []const u8) !void {
     if (args.len == 0) {
         print("usage: {s} pull <owner/name|hf:owner/name>[:gguf|:gguf:Q4_K_M|:mmproj] [--token <hf-token>] [--models-dir <dir>] [--tasks <task1,task2>] [--capabilities <cap1,cap2>] [--projector <auto|none|Q8_0|filename>] [--max-artifact-bytes <n>] [--max-model-bytes <n>]\n", .{usage_name});
-        print("       {s} pull hf:<owner>/<repo> --type predictor [--name <predictor-name>] [--ml-dir <dir>] [--file <repo-path>] [--framework auto|onnx|xgboost|lightgbm]\n", .{usage_name});
+        print("       {s} pull hf:<owner>/<repo>[@revision] --type predictor [--name <predictor-name>] [--ml-dir <dir>] [--file <repo-path>] [--framework auto|onnx|xgboost|lightgbm]\n", .{usage_name});
         print("       {s} pull <https-url-to-tabular-artifact> --name <predictor-name> [--ml-dir <dir>] [--token <bearer-token>]\n", .{usage_name});
-        print("variants: <model-ref>:gguf, <model-ref>:gguf:Q4_K, <model-ref>:onnx, <model-ref>:hybrid, <model-ref>:safetensors[@<40-hex-commit>]\n", .{});
+        print("variants: <model-ref>:gguf, <model-ref>:gguf:Q4_K, <model-ref>:onnx, <model-ref>:hybrid, <model-ref>:safetensors; append @<branch|tag|commit> to any format\n", .{});
         print("CLIP/CLAP v0.2 example: {s} pull antflydb/clipclap:gguf:Q4_K\n", .{usage_name});
         return;
     }
@@ -837,7 +839,8 @@ fn printUsage(usage_name: []const u8) void {
         \\  --max-model-bytes <n> Maximum aggregate bytes accepted for one pull (default: 137438953472)
         \\  --models-dir <dir>    AI models directory (default: ~/.antfly/inference/models)
         \\  --ml-dir <dir>        Traditional ML directory for URL pulls (default: ~/.antfly/inference/ml)
-        \\  variants          <model-ref>:gguf, <model-ref>:gguf:Q4_K, <model-ref>:onnx, <model-ref>:hybrid, <model-ref>:safetensors[@<40-hex-commit>]
+        \\  variants          <model-ref>:gguf, <model-ref>:gguf:Q4_K, <model-ref>:onnx, <model-ref>:hybrid, <model-ref>:safetensors; append @<branch|tag|commit> to any format
+        \\                    :native is a compatibility alias for :auto; it does not force a backend
         \\                    default :gguf now prefers smaller GGUF quants; use :gguf:Q... for larger files
         \\  CLIP/CLAP v0.2    {s} pull antflydb/clipclap:gguf:Q4_K
         \\

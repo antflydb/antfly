@@ -13,10 +13,11 @@
 // limitations.
 
 const std = @import("std");
+const system_catalog = @import("../../system_catalog/domain.zig");
 const fs_paths = @import("../../common/fs_paths.zig");
 const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
 const backups_api = @import("../../api/backups.zig");
-const db_mod = @import("../../storage/db/mod.zig");
+const db_mod = @import("../../storage/db/selected_root.zig").db;
 const doc_identity = @import("../../storage/db/doc_identity.zig");
 const portable_backup = @import("../../storage/portable_backup.zig");
 const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
@@ -168,6 +169,15 @@ pub const PreparedRestore = struct {
 
     pub fn seal(self: *@This()) !void {
         try self._generation.seal();
+    }
+
+    /// Transfer the prepared generation into a publication handle after all
+    /// restore-only repair opens are complete. The native plan is immutable
+    /// admission evidence and has no owned resources after this point.
+    pub fn takeStagedGeneration(self: *@This()) db_mod.generation_lifecycle.StagedGeneration {
+        const generation = self._generation;
+        self._generation = undefined;
+        return generation;
     }
 };
 
@@ -537,7 +547,14 @@ pub fn applyBackupRestoreFromRecordWithOptions(
         .open_options = open_options,
     };
     if (try publishedRestoreAlreadyApplied(alloc, path, group_id, source)) return;
-    try applyRestoreSnapshotToPathWithOptions(alloc, path, group_id, source, .{});
+    try applyRestoreSnapshotToPathWithOptions(alloc, path, group_id, source, .{
+        .expected_table_name = if (restore.destination_table_name.len > 0) restore.destination_table_name else null,
+        .expected_identity_namespace = if (restore.destination_table_id != 0) .{
+            .table_id = restore.destination_table_id,
+            .shard_id = restore.destination_shard_id,
+            .range_id = restore.destination_range_id,
+        } else null,
+    });
 }
 
 fn prepareRestoreSnapshotIfNeeded(
@@ -573,7 +590,24 @@ fn prepareRestoreSnapshotIfNeeded(
         }
     }
 
-    return try prepareRestoreSnapshot(transition, alloc, io, path, group_id, restore, options);
+    var prepared = try prepareRestoreSnapshot(transition, alloc, io, path, group_id, restore, options);
+    errdefer prepared.deinit();
+    // A qualified restore publishes a new table incarnation. Reassign only
+    // the isolated, integrity-validated candidate; serving generations and
+    // ordinary repair opens retain their exact namespace checks.
+    if (options.expected_table_name) |name| {
+        if (try system_catalog.isRestoreTarget(name)) {
+            if (options.expected_identity_namespace) |namespace| {
+                try restore.cancellation.check();
+                const open_options = try preparedRestoreOpenOptionsForRepair(&prepared, restore, options);
+                var db = try db_mod.DB.open(alloc, prepared.path(), open_options);
+                defer db.close();
+                if (!db.core.identity_namespace.eql(namespace))
+                    try db.reassignIdentityNamespaceForInternalTransition(namespace);
+            }
+        }
+    }
+    return prepared;
 }
 
 fn prepareRestoreSnapshot(
@@ -600,7 +634,9 @@ fn prepareRestoreSnapshot(
     };
     try backups_api.validateRestoreManifest(alloc, manifest, restore.backup_id);
     if (options.expected_table_name) |table_name| {
-        if (!std.mem.eql(u8, manifest.table_name, table_name)) {
+        if (!std.mem.eql(u8, manifest.table_name, table_name) and
+            !(system_catalog.isRestoreTarget(table_name) catch false))
+        {
             std.log.err("restore manifest validation failed phase=table_identity class=mismatch", .{});
             return error.InvalidBackupRequest;
         }
@@ -657,6 +693,9 @@ fn prepareRestoreSnapshot(
         path,
         .{
             .identity_namespace = options.expected_identity_namespace,
+            // The isolated candidate is rebound after integrity validation.
+            // Ordinary restore/repair opens keep exact namespace validation.
+            .prefer_existing_identity_namespace = if (options.expected_table_name) |name| try system_catalog.isRestoreTarget(name) else false,
             .backend_runtime = restore.backend_runtime,
         },
     );
@@ -737,6 +776,9 @@ fn applyManifestNativeRestore(
         staged_generation.livePath(),
         .{
             .identity_namespace = options.expected_identity_namespace,
+            // The isolated candidate is rebound after integrity validation.
+            // Ordinary restore/repair opens keep exact namespace validation.
+            .prefer_existing_identity_namespace = if (options.expected_table_name) |name| try system_catalog.isRestoreTarget(name) else false,
             .backend_runtime = restore.backend_runtime,
         },
     );
@@ -1052,7 +1094,7 @@ fn stageRestoreFile(
     return staging_path;
 }
 
-fn cleanupSnapshotsForPublishedRestore(alloc: std.mem.Allocator, io: std.Io, path: []const u8) void {
+pub fn cleanupSnapshotsForPublishedRestore(alloc: std.mem.Allocator, io: std.Io, path: []const u8) void {
     const snapshot_dir = std.fmt.allocPrint(alloc, "{s}.snapshots", .{path}) catch return;
     defer alloc.free(snapshot_dir);
     destroyPathIfExistsWithIo(io, snapshot_dir);

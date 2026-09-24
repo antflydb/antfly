@@ -1,0 +1,318 @@
+{
+  "binary": "/Users/ajroetker/antfly/.worktrees/feature-catalog-core/zig/zig-out/bin/antfly",
+  "binary_sha256": "faf2b3e51f5a41f4b56c073295874f35c20e54c8cee3871f9e622ee2691ae5bd",
+  "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+  "settings": {
+    "binary": "zig-out/bin/antfly",
+    "scenario": "catalog",
+    "deployment": "cluster",
+    "restart_after_ddl": false,
+    "listing_distinct_schemas": false,
+    "listing_page_size": 0,
+    "listing_concurrent": false,
+    "listing_reader_rate": 0,
+    "table_counts": [
+      10
+    ],
+    "catalog_shards": 8,
+    "catalog_ingress": "first",
+    "mixed_seconds": 0,
+    "resolution_workload": "exact",
+    "schema_fields": 32,
+    "tenant_counts": [
+      10,
+      100
+    ],
+    "storage_mode": "document",
+    "entity_shards": 1,
+    "entity_key_layout": "clustered",
+    "mentions": [
+      10,
+      100
+    ],
+    "documents": 5,
+    "concurrency": 8,
+    "samples": 20,
+    "lookup_seconds": 0,
+    "warmup": 2,
+    "ndjson_lines": 20,
+    "poll_ms": 20,
+    "readiness_timeout": 115,
+    "output": "pkg/antfly/benchmarks/system_catalog_join_planning_candidate_2026_09_15.json",
+    "diagnostics_dir": "/private/tmp/catalog-join-planning-candidate-run"
+  },
+  "scenarios": {
+    "catalog": {
+      "deployment": "cluster",
+      "startup_ms": 5657.022875268012,
+      "checkpoints": [
+        {
+          "table_count": 10,
+          "ingress": {
+            "coordinator_node_id": 101,
+            "join_group_owners": {
+              "8552283641146362273": [
+                101
+              ],
+              "2876514064958371014": [
+                103
+              ],
+              "1243160089816389641": [
+                101
+              ],
+              "4097175694605292815": [
+                101
+              ],
+              "1977798391395396050": [
+                102
+              ],
+              "8067010701055833871": [
+                103
+              ],
+              "8656939159193738105": [
+                102
+              ],
+              "7952062172281669788": [
+                102
+              ]
+            },
+            "remote_join_group_ids": [
+              1977798391395396050,
+              2876514064958371014,
+              7952062172281669788,
+              8067010701055833871,
+              8656939159193738105
+            ]
+          },
+          "table_create": {
+            "samples": 10,
+            "p50_ms": 212.7219375,
+            "p95_ms": 277.437,
+            "max_ms": 277.437
+          },
+          "shard_readiness": {
+            "samples": 10,
+            "p50_ms": 899.7104372829199,
+            "p95_ms": 1236.6931247524917,
+            "max_ms": 1236.6931247524917
+          },
+          "operations": {
+            "qualified_batch_validation": {
+              "samples": 20,
+              "p50_ms": 224.00381249999998,
+              "p95_ms": 307.1905,
+              "max_ms": 330.748417
+            },
+            "qualified_lookup": {
+              "samples": 20,
+              "p50_ms": 26.480937,
+              "p95_ms": 52.438625,
+              "max_ms": 57.091875
+            },
+            "qualified_query": {
+              "samples": 20,
+              "p50_ms": 80.806229,
+              "p95_ms": 107.687625,
+              "max_ms": 163.261209
+            },
+            "qualified_join": {
+              "samples": 20,
+              "p50_ms": 287.08433349999996,
+              "p95_ms": 338.61,
+              "max_ms": 395.992834
+            },
+            "ndjson_repeated_target": {
+              "samples": 20,
+              "p50_ms": 1348.3552915,
+              "p95_ms": 1479.668167,
+              "max_ms": 1537.865416
+            },
+            "scoped_listing": {
+              "samples": 20,
+              "p50_ms": 54.164229,
+              "p95_ms": 140.25825,
+              "max_ms": 161.237084
+            },
+            "concurrent_qualified_lookup": {
+              "samples": 160,
+              "p50_ms": 52.366979,
+              "p95_ms": 81.798791,
+              "max_ms": 102.392125,
+              "concurrency": 8,
+              "elapsed_seconds": 1.101796917,
+              "requests_per_second": 145.21732411055567,
+              "requests": [
+                {"client": 0, "sequence": 0, "start_ms": 0.216084, "duration_ms": 71.922875},
+                {"client": 0, "sequence": 1, "start_ms": 72.141, "duration_ms": 60.865709},
+                {"client": 0, "sequence": 2, "start_ms": 133.007417, "duration_ms": 18.670208},
+                {"client": 0, "sequence": 3, "start_ms": 151.678125, "duration_ms": 85.552709},
+                {"client": 0, "sequence": 4, "start_ms": 237.23175, "duration_ms": 46.282125},
+                {"client": 0, "sequence": 5, "start_ms": 283.515084, "duration_ms": 29.065625},
+                {"client": 0, "sequence": 6, "start_ms": 312.581334, "duration_ms": 56.180458},
+                {"client": 0, "sequence": 7, "start_ms": 368.76225, "duration_ms": 44.362584},
+                {"client": 0, "sequence": 8, "start_ms": 413.125959, "duration_ms": 29.749041},
+                {"client": 0, "sequence": 9, "start_ms": 442.875667, "duration_ms": 56.254458},
+                {"client": 0, "sequence": 10, "start_ms": 499.130625, "duration_ms": 43.993834},
+                {"client": 0, "sequence": 11, "start_ms": 543.12525, "duration_ms": 56.338834},
+                {"client": 0, "sequence": 12, "start_ms": 599.465084, "duration_ms": 48.979791},
+                {"client": 0, "sequence": 13, "start_ms": 648.446292, "duration_ms": 61.844625},
+                {"client": 0, "sequence": 14, "start_ms": 710.29175, "duration_ms": 41.933125},
+                {"client": 0, "sequence": 15, "start_ms": 752.225875, "duration_ms": 55.599},
+                {"client": 0, "sequence": 16, "start_ms": 807.825417, "duration_ms": 54.13575},
+                {"client": 0, "sequence": 17, "start_ms": 861.962, "duration_ms": 81.96525},
+                {"client": 0, "sequence": 18, "start_ms": 943.927959, "duration_ms": 54.947958},
+                {"client": 0, "sequence": 19, "start_ms": 998.877, "duration_ms": 21.616},
+                {"client": 1, "sequence": 0, "start_ms": 0.144834, "duration_ms": 52.065958},
+                {"client": 1, "sequence": 1, "start_ms": 52.212709, "duration_ms": 48.504291},
+                {"client": 1, "sequence": 2, "start_ms": 100.71825, "duration_ms": 50.443125},
+                {"client": 1, "sequence": 3, "start_ms": 151.162584, "duration_ms": 96.26075},
+                {"client": 1, "sequence": 4, "start_ms": 247.424459, "duration_ms": 35.147708},
+                {"client": 1, "sequence": 5, "start_ms": 282.573209, "duration_ms": 57.11125},
+                {"client": 1, "sequence": 6, "start_ms": 339.685209, "duration_ms": 69.199833},
+                {"client": 1, "sequence": 7, "start_ms": 408.886292, "duration_ms": 31.459458},
+                {"client": 1, "sequence": 8, "start_ms": 440.346584, "duration_ms": 59.61425},
+                {"client": 1, "sequence": 9, "start_ms": 499.961459, "duration_ms": 46.0475},
+                {"client": 1, "sequence": 10, "start_ms": 546.00975, "duration_ms": 56.291375},
+                {"client": 1, "sequence": 11, "start_ms": 602.301709, "duration_ms": 46.463125},
+                {"client": 1, "sequence": 12, "start_ms": 648.765875, "duration_ms": 52.750375},
+                {"client": 1, "sequence": 13, "start_ms": 701.517417, "duration_ms": 55.021292},
+                {"client": 1, "sequence": 14, "start_ms": 756.539834, "duration_ms": 49.168083},
+                {"client": 1, "sequence": 15, "start_ms": 805.708792, "duration_ms": 49.184167},
+                {"client": 1, "sequence": 16, "start_ms": 854.894417, "duration_ms": 88.16025},
+                {"client": 1, "sequence": 17, "start_ms": 943.055334, "duration_ms": 52.031708},
+                {"client": 1, "sequence": 18, "start_ms": 995.087875, "duration_ms": 56.223042},
+                {"client": 1, "sequence": 19, "start_ms": 1051.311667, "duration_ms": 46.392625},
+                {"client": 2, "sequence": 0, "start_ms": 0.451084, "duration_ms": 46.222875},
+                {"client": 2, "sequence": 1, "start_ms": 46.676959, "duration_ms": 51.956875},
+                {"client": 2, "sequence": 2, "start_ms": 98.635042, "duration_ms": 52.732792},
+                {"client": 2, "sequence": 3, "start_ms": 151.369167, "duration_ms": 79.690708},
+                {"client": 2, "sequence": 4, "start_ms": 231.061709, "duration_ms": 52.821375},
+                {"client": 2, "sequence": 5, "start_ms": 283.883875, "duration_ms": 60.585209},
+                {"client": 2, "sequence": 6, "start_ms": 344.469709, "duration_ms": 49.394333},
+                {"client": 2, "sequence": 7, "start_ms": 393.864625, "duration_ms": 49.234042},
+                {"client": 2, "sequence": 8, "start_ms": 443.099542, "duration_ms": 27.727833},
+                {"client": 2, "sequence": 9, "start_ms": 470.828084, "duration_ms": 48.392708},
+                {"client": 2, "sequence": 10, "start_ms": 519.22175, "duration_ms": 54.786875},
+                {"client": 2, "sequence": 11, "start_ms": 574.009375, "duration_ms": 54.573},
+                {"client": 2, "sequence": 12, "start_ms": 628.582917, "duration_ms": 53.26675},
+                {"client": 2, "sequence": 13, "start_ms": 681.85125, "duration_ms": 45.02125},
+                {"client": 2, "sequence": 14, "start_ms": 726.873375, "duration_ms": 58.885542},
+                {"client": 2, "sequence": 15, "start_ms": 785.76025, "duration_ms": 44.417917},
+                {"client": 2, "sequence": 16, "start_ms": 830.178917, "duration_ms": 59.026042},
+                {"client": 2, "sequence": 17, "start_ms": 889.205584, "duration_ms": 53.57975},
+                {"client": 2, "sequence": 18, "start_ms": 942.786084, "duration_ms": 22.537041},
+                {"client": 2, "sequence": 19, "start_ms": 965.323792, "duration_ms": 25.537958},
+                {"client": 3, "sequence": 0, "start_ms": 0.029417, "duration_ms": 78.678542},
+                {"client": 3, "sequence": 1, "start_ms": 78.708917, "duration_ms": 48.096},
+                {"client": 3, "sequence": 2, "start_ms": 126.805917, "duration_ms": 24.710958},
+                {"client": 3, "sequence": 3, "start_ms": 151.517917, "duration_ms": 84.518292},
+                {"client": 3, "sequence": 4, "start_ms": 236.03725, "duration_ms": 20.42625},
+                {"client": 3, "sequence": 5, "start_ms": 256.464459, "duration_ms": 52.782583},
+                {"client": 3, "sequence": 6, "start_ms": 309.247667, "duration_ms": 28.266458},
+                {"client": 3, "sequence": 7, "start_ms": 337.514709, "duration_ms": 57.046333},
+                {"client": 3, "sequence": 8, "start_ms": 394.561709, "duration_ms": 47.764291},
+                {"client": 3, "sequence": 9, "start_ms": 442.326875, "duration_ms": 52.921042},
+                {"client": 3, "sequence": 10, "start_ms": 495.24875, "duration_ms": 50.422625},
+                {"client": 3, "sequence": 11, "start_ms": 545.67225, "duration_ms": 56.78925},
+                {"client": 3, "sequence": 12, "start_ms": 602.462084, "duration_ms": 46.571583},
+                {"client": 3, "sequence": 13, "start_ms": 649.0345, "duration_ms": 61.057959},
+                {"client": 3, "sequence": 14, "start_ms": 710.093625, "duration_ms": 76.050834},
+                {"client": 3, "sequence": 15, "start_ms": 786.145334, "duration_ms": 43.825875},
+                {"client": 3, "sequence": 16, "start_ms": 829.972834, "duration_ms": 52.220208},
+                {"client": 3, "sequence": 17, "start_ms": 882.194084, "duration_ms": 57.655958},
+                {"client": 3, "sequence": 18, "start_ms": 939.851167, "duration_ms": 22.985042},
+                {"client": 3, "sequence": 19, "start_ms": 962.837042, "duration_ms": 28.16225},
+                {"client": 4, "sequence": 0, "start_ms": 0.540334, "duration_ms": 72.941416},
+                {"client": 4, "sequence": 1, "start_ms": 73.482459, "duration_ms": 52.111041},
+                {"client": 4, "sequence": 2, "start_ms": 125.595667, "duration_ms": 29.762875},
+                {"client": 4, "sequence": 3, "start_ms": 155.359, "duration_ms": 80.251584},
+                {"client": 4, "sequence": 4, "start_ms": 235.611334, "duration_ms": 21.029166},
+                {"client": 4, "sequence": 5, "start_ms": 256.641209, "duration_ms": 33.786166},
+                {"client": 4, "sequence": 6, "start_ms": 290.427959, "duration_ms": 46.915625},
+                {"client": 4, "sequence": 7, "start_ms": 337.34425, "duration_ms": 56.819417},
+                {"client": 4, "sequence": 8, "start_ms": 394.16425, "duration_ms": 52.857625},
+                {"client": 4, "sequence": 9, "start_ms": 447.022584, "duration_ms": 76.095958},
+                {"client": 4, "sequence": 10, "start_ms": 523.119417, "duration_ms": 51.060375},
+                {"client": 4, "sequence": 11, "start_ms": 574.180667, "duration_ms": 31.141208},
+                {"client": 4, "sequence": 12, "start_ms": 605.322625, "duration_ms": 71.112292},
+                {"client": 4, "sequence": 13, "start_ms": 676.435959, "duration_ms": 51.356375},
+                {"client": 4, "sequence": 14, "start_ms": 727.793209, "duration_ms": 58.661833},
+                {"client": 4, "sequence": 15, "start_ms": 786.455875, "duration_ms": 75.817417},
+                {"client": 4, "sequence": 16, "start_ms": 862.274042, "duration_ms": 84.7385},
+                {"client": 4, "sequence": 17, "start_ms": 947.013209, "duration_ms": 44.081875},
+                {"client": 4, "sequence": 18, "start_ms": 991.095542, "duration_ms": 32.905208},
+                {"client": 4, "sequence": 19, "start_ms": 1024.001584, "duration_ms": 27.602375},
+                {"client": 5, "sequence": 0, "start_ms": 0.000959, "duration_ms": 72.944458},
+                {"client": 5, "sequence": 1, "start_ms": 72.946459, "duration_ms": 59.888375},
+                {"client": 5, "sequence": 2, "start_ms": 132.835959, "duration_ms": 26.606791},
+                {"client": 5, "sequence": 3, "start_ms": 159.443375, "duration_ms": 76.362209},
+                {"client": 5, "sequence": 4, "start_ms": 235.806584, "duration_ms": 21.797833},
+                {"client": 5, "sequence": 5, "start_ms": 257.605125, "duration_ms": 26.537709},
+                {"client": 5, "sequence": 6, "start_ms": 284.143375, "duration_ms": 59.895},
+                {"client": 5, "sequence": 7, "start_ms": 344.039417, "duration_ms": 46.367542},
+                {"client": 5, "sequence": 8, "start_ms": 390.40775, "duration_ms": 55.699625},
+                {"client": 5, "sequence": 9, "start_ms": 446.10825, "duration_ms": 75.4455},
+                {"client": 5, "sequence": 10, "start_ms": 521.554417, "duration_ms": 48.504083},
+                {"client": 5, "sequence": 11, "start_ms": 570.059167, "duration_ms": 55.5405},
+                {"client": 5, "sequence": 12, "start_ms": 625.600375, "duration_ms": 51.508625},
+                {"client": 5, "sequence": 13, "start_ms": 677.109625, "duration_ms": 52.703417},
+                {"client": 5, "sequence": 14, "start_ms": 729.813917, "duration_ms": 52.926375},
+                {"client": 5, "sequence": 15, "start_ms": 782.741667, "duration_ms": 53.307958},
+                {"client": 5, "sequence": 16, "start_ms": 836.050334, "duration_ms": 53.825625},
+                {"client": 5, "sequence": 17, "start_ms": 889.876792, "duration_ms": 53.351042},
+                {"client": 5, "sequence": 18, "start_ms": 943.228417, "duration_ms": 52.022792},
+                {"client": 5, "sequence": 19, "start_ms": 995.251959, "duration_ms": 47.952458},
+                {"client": 6, "sequence": 0, "start_ms": 0.168292, "duration_ms": 52.295042},
+                {"client": 6, "sequence": 1, "start_ms": 52.464542, "duration_ms": 48.055958},
+                {"client": 6, "sequence": 2, "start_ms": 100.5215, "duration_ms": 53.895667},
+                {"client": 6, "sequence": 3, "start_ms": 154.418334, "duration_ms": 81.798791},
+                {"client": 6, "sequence": 4, "start_ms": 236.218, "duration_ms": 47.4745},
+                {"client": 6, "sequence": 5, "start_ms": 283.693209, "duration_ms": 24.413541},
+                {"client": 6, "sequence": 6, "start_ms": 308.107709, "duration_ms": 56.230375},
+                {"client": 6, "sequence": 7, "start_ms": 364.338625, "duration_ms": 54.153917},
+                {"client": 6, "sequence": 8, "start_ms": 418.4935, "duration_ms": 55.097459},
+                {"client": 6, "sequence": 9, "start_ms": 473.591709, "duration_ms": 48.602083},
+                {"client": 6, "sequence": 10, "start_ms": 522.19425, "duration_ms": 52.639834},
+                {"client": 6, "sequence": 11, "start_ms": 574.834875, "duration_ms": 27.302334},
+                {"client": 6, "sequence": 12, "start_ms": 602.137834, "duration_ms": 63.839458},
+                {"client": 6, "sequence": 13, "start_ms": 665.97825, "duration_ms": 36.4565},
+                {"client": 6, "sequence": 14, "start_ms": 702.435375, "duration_ms": 54.344459},
+                {"client": 6, "sequence": 15, "start_ms": 756.7805, "duration_ms": 51.212459},
+                {"client": 6, "sequence": 16, "start_ms": 807.993709, "duration_ms": 50.251833},
+                {"client": 6, "sequence": 17, "start_ms": 858.246292, "duration_ms": 84.718333},
+                {"client": 6, "sequence": 18, "start_ms": 942.96525, "duration_ms": 47.131834},
+                {"client": 6, "sequence": 19, "start_ms": 990.097959, "duration_ms": 26.911583},
+                {"client": 7, "sequence": 0, "start_ms": 0.190459, "duration_ms": 102.392125},
+                {"client": 7, "sequence": 1, "start_ms": 102.583959, "duration_ms": 52.438916},
+                {"client": 7, "sequence": 2, "start_ms": 155.023584, "duration_ms": 81.595},
+                {"client": 7, "sequence": 3, "start_ms": 236.62, "duration_ms": 47.638417},
+                {"client": 7, "sequence": 4, "start_ms": 284.259042, "duration_ms": 54.200167},
+                {"client": 7, "sequence": 5, "start_ms": 338.460125, "duration_ms": 25.725},
+                {"client": 7, "sequence": 6, "start_ms": 364.18575, "duration_ms": 50.688084},
+                {"client": 7, "sequence": 7, "start_ms": 414.8745, "duration_ms": 62.019209},
+                {"client": 7, "sequence": 8, "start_ms": 476.8945, "duration_ms": 71.996292},
+                {"client": 7, "sequence": 9, "start_ms": 548.891792, "duration_ms": 54.431667},
+                {"client": 7, "sequence": 10, "start_ms": 603.324167, "duration_ms": 74.596167},
+                {"client": 7, "sequence": 11, "start_ms": 677.920875, "duration_ms": 54.785459},
+                {"client": 7, "sequence": 12, "start_ms": 732.707, "duration_ms": 48.399584},
+                {"client": 7, "sequence": 13, "start_ms": 781.107792, "duration_ms": 54.254333},
+                {"client": 7, "sequence": 14, "start_ms": 835.363042, "duration_ms": 47.28575},
+                {"client": 7, "sequence": 15, "start_ms": 882.649709, "duration_ms": 60.904083},
+                {"client": 7, "sequence": 16, "start_ms": 943.554209, "duration_ms": 47.041583},
+                {"client": 7, "sequence": 17, "start_ms": 990.596709, "duration_ms": 26.528},
+                {"client": 7, "sequence": 18, "start_ms": 1017.12525, "duration_ms": 33.600792},
+                {"client": 7, "sequence": 19, "start_ms": 1050.727209, "duration_ms": 51.068791}
+              ]
+            },
+            "table_rename": {
+              "samples": 20,
+              "p50_ms": 31.242021,
+              "p95_ms": 115.360542,
+              "max_ms": 136.984292
+            }
+          }
+        }
+      ]
+    }
+  }
+}

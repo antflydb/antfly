@@ -4,18 +4,24 @@
 name: Antfly Operator Tests
 
 on:
+  workflow_call:
+    inputs:
+      pr_number:
+        type: string
+        default: ''
+      head_sha:
+        type: string
+        default: ''
+      base_sha:
+        type: string
+        default: ''
+      check_id:
+        type: string
+        default: ''
+      comment_id:
+        type: string
+        default: ''
   push:
-    branches: ["main"]
-    paths:
-      - 'go/pkg/operator/**'
-      - 'go/pkg/sdk/admin/**'
-      - 'go/pkg/sdk/go.mod'
-      - 'go/pkg/sdk/go.sum'
-      - 'specs/openapi/**'
-      - 'scripts/ci/toolchain-policy.json'
-      - '.github/actions/load-toolchain-policy/action.yml'
-      - '.github/workflows/antfly-operator-go.yml'
-  pull_request:
     branches: ["main"]
     paths:
       - 'go/pkg/operator/**'
@@ -30,16 +36,35 @@ on:
 
 permissions:
   contents: read
+  checks: read
+  pull-requests: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  group: operator-${{ inputs.pr_number || github.ref }}
   cancel-in-progress: true
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  admission:
+    uses: ./.github/workflows/pr-ci-admission.yml
+    with:
+      pr_number: ${{ inputs.pr_number }}
+      head_sha: ${{ inputs.head_sha }}
+      base_sha: ${{ inputs.base_sha }}
+      check_id: ${{ inputs.check_id }}
+      comment_id: ${{ inputs.comment_id }}
+      suite: operator
+
   test:
+    if: >-
+      ${{ !cancelled() &&
+      success() &&
+      needs.admission.result == 'success' &&
+      (inputs.pr_number == '' ||
+      github.run_attempt == 1) }}
+    needs: admission
     runs-on: arc-antfly-standard
     timeout-minutes: 30
     defaults:
@@ -47,6 +72,9 @@ jobs:
         working-directory: go/pkg/operator
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
 
       - name: Load pinned toolchain policy
         id: toolchain

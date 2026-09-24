@@ -1,0 +1,55 @@
+{
+  "suites": [
+    {
+      "id": "policy",
+      "workflow": "pr-ci-policy.yml"
+    },
+    {
+      "id": "zig",
+      "workflow": "zig-tests.yml"
+    },
+    {
+      "id": "sdks",
+      "workflow": "sdks-ci.yml"
+    },
+    {
+      "id": "proxy",
+      "workflow": "antfly-proxy-go.yml",
+      "paths": [
+        "^(?!.*\\.mdx?$)(?:go/pkg/proxy/.*)$",
+        "^(?!.*\\.mdx?$)(?:scripts/ci/toolchain\\-policy\\.json)$",
+        "^(?!.*\\.mdx?$)(?:\\.github/actions/load\\-toolchain\\-policy/action\\.yml)$",
+        "^(?!.*\\.mdx?$)(?:\\.github/workflows/antfly\\-proxy\\-go\\.yml)$"
+      ]
+    },
+    {
+      "id": "operator",
+      "workflow": "antfly-operator-go.yml",
+      "paths": [
+        "^(?!.*\\.mdx?$)(?:go/pkg/operator/.*)$",
+        "^(?!.*\\.mdx?$)(?:go/pkg/sdk/admin/.*)$",
+        "^(?!.*\\.mdx?$)(?:go/pkg/sdk/go\\.mod)$",
+        "^(?!.*\\.mdx?$)(?:go/pkg/sdk/go\\.sum)$",
+        "^(?!.*\\.mdx?$)(?:specs/openapi/.*)$",
+        "^(?!.*\\.mdx?$)(?:scripts/ci/toolchain\\-policy\\.json)$",
+        "^(?!.*\\.mdx?$)(?:\\.github/actions/load\\-toolchain\\-policy/action\\.yml)$",
+        "^(?!.*\\.mdx?$)(?:\\.github/workflows/antfly\\-operator\\-go\\.yml)$"
+      ]
+    },
+    {
+      "id": "scale",
+      "workflow": "zig-scale-tests.yml",
+      "label": "ci:scale-tests"
+    },
+    {
+      "id": "gpu",
+      "workflow": "zig-inference-l4-spot.yml",
+      "label": "ci:gpu"
+    },
+    {
+      "id": "darwin",
+      "workflow": "diagnose-zig-arm64-bad-alloc.yml",
+      "label": "ci:darwin-release"
+    }
+  ]
+}

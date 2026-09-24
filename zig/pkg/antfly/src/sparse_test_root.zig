@@ -14,4 +14,8 @@
 
 test {
     _ = @import("sparse/sparse.zig");
+    // Explicit reachability for dependency fixtures formerly pulled in only
+    // through imported integration tests.
+    _ = @import("storage/sim_runtime.zig");
+    _ = @import("common/test_directory.zig");
 }

@@ -38,6 +38,7 @@ pub fn createdIndexType(config: antfly_client.types.CreatedIndex) antfly_client.
         .created_embeddings_index => .embeddings,
         .created_graph_index => .graph,
         .created_algebraic_index => .algebraic,
+        .created_relational_index => .relational,
     };
 }
 

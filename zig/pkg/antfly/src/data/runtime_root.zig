@@ -17,9 +17,9 @@
 pub const admin = @import("../admin/mod.zig");
 pub const common = @import("../common/mod.zig");
 pub const data = @import("domain.zig");
-pub const db = @import("../storage/db/mod.zig");
+pub const db = @import("../storage/db/selected_root.zig").db;
 pub const extensions = @import("../extensions/mod.zig");
-pub const ha = @import("../storage/ha/mod.zig");
+pub const hot_standby = @import("../storage/hot_standby/mod.zig");
 pub const inference = @import("../inference/mod.zig");
 pub const internal = @import("../internal/mod.zig");
 pub const internal_keys = @import("../storage/internal_keys.zig");

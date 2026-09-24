@@ -2,11 +2,14 @@
 
 ## Scope
 
-This document has two jobs:
+This document has three jobs:
 
 - Track GGUF/GGML tensor format compatibility.
 - Record the ggml/llama.cpp execution shape Antfly inference should follow where it is
   useful.
+- Document the graph-execution partitioning and backend-executor design that
+  implements that shape (the implementation history is in
+  [ggml-graph-execution-history.md](../../../work-log/completed/inference/ggml-graph-execution-history.md)).
 
 It fits with:
 
@@ -59,17 +62,17 @@ dimension order:
 
 That makes the expert axis the third dimension and the quantized input axis the
 first dimension. This is normal GGUF/ggml layout, not an unsupported variant.
-Antfly inference should therefore treat packed experts as first-class 3D weights plus
-expert IDs, not as a bundle of independently contiguous 2D tensors.
+Antfly inference treats packed experts as first-class 3D weights plus expert
+IDs, not as a bundle of independently contiguous 2D tensors.
 
 Implementation implications:
 
 - `expert_axis == 2` is valid for ggml-compatible Gemma4/Unsloth GGUF files.
-- Native, MLX, and Metal paths must not compute selected expert bytes as
+- Native and Metal paths must not compute selected expert bytes as
   `total_bytes / expert_count` unless the layout proves that slice is
   contiguous.
-- Fused gate/up tensors should project once over the packed expert tensor, then
-  split gate and up rows, or use an equivalent backend implementation.
+- Fused gate/up tensors project once over the packed expert tensor, then split
+  gate and up rows (or use an equivalent backend implementation).
 - Backend kernels route through Antfly inference's `mulMatId` contract: full packed 3D
   weight tensor, selected expert IDs, logical `in_dim/out_dim`, and
   backend-owned layout handling. `moeLinearNoBias` remains as a compatibility
@@ -78,18 +81,46 @@ Implementation implications:
   quantized GGUF weights it keeps storage packed and performs selected-row block
   dot products directly against the quantized bytes.
 
-## Antfly inference Graph Alignment Plan
+### Implementation Status
 
-Antfly inference should align with ggml at the execution-contract level, not by copying
-ggml's graph structs or backend file layout. The intended shape is:
+Packed MoE routing uses this `mul_mat_id`-style contract end to end: the
+generic `ComputeBackend` API, the native reference path, Metal native-quant
+providers, and Metal grouped kernels all dispatch through it.
+
+- Weight loading adds shared GGUF packed-expert layout metadata for both
+  row-major legacy views and ggml expert-last views.
+- Native packed quantized linear accepts `expert_axis == 2` when the input
+  axis is the first GGUF dimension; dense packed-expert materialization
+  supports the same layout, including fused gate/up row offsets.
+- Metal packed-weight slicing uses the shared offset calculation, and Metal
+  grouped dispatch can index full packed storage directly for
+  `expert_axis == 2` instead of staging selected expert slabs.
+- Gemma4 packed GGUF MoE registers one lazy weight per layer/projection
+  (`packed.w1`, `packed.w2`, `packed.w3`) instead of one per expert/projection;
+  grouped MoE lookup prefers the packed projection weights and keeps legacy
+  per-expert names as fallback, and GGUF inspection treats the synthetic
+  packed projection names as required weights so packed models report
+  complete required-tensor coverage.
+- `ComputeBackend` exposes `mulMatId` generically; Metal native-quant
+  providers expose `mulMatId` and route grouped kernels through it. Native CPU
+  has a `mulMatId` path covering legacy 2D packed expert weights and ggml
+  expert-last 3D weights.
+- Tests cover both existing row-major packed views and ggml expert-last Q8_0
+  views.
+
+## Graph Alignment Design
+
+Antfly inference aligns with ggml at the execution-contract level, not by copying
+ggml's graph structs or backend file layout. The shape is:
 
 ```text
 Antfly inference frontend/tracing
   -> ml.graph.Graph
   -> canonical lowered op set
-  -> partition + memory plan
-  -> backend executor
-  -> backend kernel picker
+  -> capability + profitability partitioning
+  -> liveness/buffer plan
+  -> backend partition executor
+  -> backend kernel picker and command encoder
 ```
 
 The rough concept map is:
@@ -165,6 +196,151 @@ partition. Antfly inference's capability model should therefore expose both:
 This capability matrix should drive graph partitioning and diagnostics. A
 coverage report should answer: which nodes stayed on the target backend, which
 nodes fell back, and which op/type/shape rule caused the fallback.
+
+## Graph Execution: Partitioning And Backend Executors
+
+Antfly inference's graph runtime implements the alignment model above: a
+capability-based partitioner, tensor/storage descriptors, a liveness-driven
+buffer plan, and backend-owned partition executors for native/cblas, Metal,
+and WebGPU.
+
+### Capability Decisions
+
+Graph partitioning asks two questions per node instead of a single
+`supports(OpCode)` check:
+
+```text
+Can this backend execute this graph node correctly?
+Should this backend execute it for this shape/storage state?
+Why was it accepted or rejected?
+```
+
+`CapabilityQuery` and `CapabilityDecision` carry that split. Assignment
+requires both `can_execute` and `should_execute`, with diagnostic reason
+buckets (`unsupported_op`, `unprofitable_shape`, `wrong_storage`,
+`missing_quant_kernel`, `backend_disabled`) recorded for partition reports.
+Native, cblas/Accelerate-style, and Metal each have eager graph decision
+helpers; the legacy `supports(OpCode)` callback remains as a compatibility
+adapter. This lets cblas accept a matmul it can run but reject it as too
+small to beat call/thread-pool overhead, and lets Metal/WebGPU reject
+supported ops when the transfer would be unprofitable.
+
+### Tensor And Storage Descriptors
+
+A graph-runtime tensor descriptor (`TensorStorageClass`, `TensorStrides`,
+`TensorDesc`) tracks dtype, shape, stride/view metadata, storage class, quant
+format, view source, and residency for every node. Storage classes
+distinguish host f32, host packed quant, Metal buffer, WebGPU buffer, runtime
+input, constant, and metadata view. Descriptor inference covers parameters,
+constants, and reshape/transpose/slice/broadcast/range/shape-of nodes, and
+seeded external residency/quant metadata expands into the full table before
+partitioning, so every `CapabilityQuery` can inspect it.
+
+### Profitability-Aware Partitioning
+
+Native accepts all supported graph ops as the correctness fallback. cblas is
+modeled as a host kernel provider and claims only profitable dense f32 GEMMs.
+Metal/WebGPU claim device partitions only when the region is large enough to
+amortize upload/dispatch cost, and keep parameters/metadata-view ops with
+their resident storage owner where possible. Metal accepts tiny
+already-resident device chains but rejects small host-input islands that
+would not amortize transfer overhead.
+
+### Native Partition Executor
+
+`src/graph/native_partition_executor.zig` is the first real graph
+`PartitionExecutor`: native/cblas partitions without a compiled executor run
+through it, reusing interpreter node dispatch, backend vtable ops, runtime
+input transfer, donation-aware liveness freeing, attention layer state, and
+pair outputs. cblas/Accelerate stays inside native execution rather than
+becoming a separate device runtime.
+
+### Graph Buffer Plan
+
+`src/graph/buffer_plan.zig` turns a graph, partition plan, tensor
+descriptors, and output nodes into logical buffer slots, liveness intervals,
+storage classes, and cross-partition transfer edges. Backends map logical
+slots to concrete allocations: native/cblas to host buffers, Metal to
+`MTLBuffer` ranges or scratch-pool slots, WebGPU to GPU buffers, and quant
+weights to prepared packed storage. The plan reuses physical allocations
+across non-overlapping lifetimes, keeps view slots attached to their source
+allocation, and is threaded through `PartitionExecutor.ExecutionContext` and
+validated in `MultiExecutor` before partition executors run.
+
+### Metal Partition Executor
+
+`src/graph/metal_partition_executor.zig` implements resident Metal execution
+for profitable partitions: it validates the buffer plan, materializes
+partition runtime inputs onto Metal, dispatches supported commands (dense
+linear, layer/RMS norm, softmax, elementwise ops, RoPE, attention-block
+composition) through the backend op surface, and synchronizes only at
+partition/output boundaries. It uses the backend frame hooks
+`decoderRuntimeBeginFrame`/`decoderRuntimeSubmitAndWaitFrame` when available,
+with cancellation on errors, and evaluates only partition boundary outputs
+after submission rather than synchronizing per node. `MetalCompute` can still
+opportunistically route eager interpreter ops through resident Metal runtime
+slots as a correctness/performance bridge (used by CLIPCLAP-style paths); new
+operations should be added as backend primitives the partition executor can
+call rather than as model-specific eager helpers.
+
+The resident-execution policy is: Metal partition boundary outputs stay
+device-resident until the final caller readback, and shared cross-device
+transfers into Metal explicitly upload into private Metal buffers rather than
+materializing to host in between. `TERMITE_GRAPH_EXECUTOR_STATS=1` prints
+per-run counters (command dispatches, interpreter fallbacks,
+runtime/cross-device transfers, device-resident outputs, host materialized
+outputs, and boundary output materializations) from the shared `MultiExecutor`
+path, so a real graph/model execution can be checked for whether it stayed
+resident or silently fell back/materialized. See History below for the
+detailed implementation log.
+
+### Quant Matmul Routing
+
+`src/graph/quant_matmul.zig` is the shared shape/format planner: it chooses
+`mul_mv` for decode rows, `mul_mv_ext` for small prompt rows, `mul_mm` for
+larger prompt rows, and fallback for unsupported/unprofitable shapes.
+`CapabilityDecision` can carry the selected `OperatorPlan`, and
+`PartitionPlan` persists a per-node `OperatorPlan` for later command
+dispatch. `ComputeBackend` exposes `linearPlanned`/`linearNoBiasPlanned` so
+graph executors can pass the selected plan into backend dispatch without
+changing ordinary model code. Metal's Q8_0 path is the most complete consumer
+today (`mul_mv`/`mul_mv_ext`/`mul_mm` dispatch, fused gate/up activation MM,
+paired QKV projections); Q4_0, Q4_1, and Q5_K packed buckets are promoted
+beyond decode into `mul_mv_ext`/`mul_mm`. Packed quant metadata survives graph
+metadata views (reshape/slice/etc.) so it cannot be silently dequantized into
+a generic dense primitive. The Q8_0 `mul_mm` kernel uses a conservative
+16-output by 8-row Metal reduction tile; the fused Q8_0 gate/up activation MM
+kernel uses the same reduction tile and is enabled by default. See History
+below for the detailed implementation log.
+
+### WebGPU Partition Executor
+
+`src/graph/webgpu_partition_executor.zig` mirrors the Metal graph executor
+shape for browser execution: the same capability model, storage descriptors,
+and buffer planning, with WebGPU-specific command encoding and shader
+dispatch. WebGPU is selectable as a compiled partition backend in Wasm/WebGPU
+builds — `compiled` means graph compilation/planning/fusion/partitioning runs
+and attaches `WebGpuPartitionExecutor`, mirroring Metal's compiled partition
+path rather than emitting an offline WebGPU artifact. See History below for
+the detailed implementation log.
+
+### Validation
+
+Each phase of graph-execution work keeps native/cblas as the oracle. Minimum
+checks: partition tests for capability/profitability decisions, graph
+execution parity against the interpreter, per-backend rejection-reason
+reports, buffer-plan liveness tests, Metal/WebGPU output parity for each
+newly claimed op family, and real model smoke tests once matmul, norm,
+softmax, and quant linear are routed through the graph executor.
+
+### Debug And Bisection Controls
+
+| Variable | Effect |
+|---|---|
+| `TERMITE_GRAPH_EXECUTOR_STATS=1` | Prints `MultiExecutor` per-run counters: command dispatches, interpreter fallbacks, runtime/cross-device transfers, device-resident outputs, host materialized outputs, boundary output materializations, and Metal graph-plan slot/byte reservations. Real direct CLI paths that bypass `MultiExecutor` (`termite.generate`, `termite.embed`) report an explicit bypass line instead of zero stats. |
+| `TERMITE_GRAPH_MODE=1` | Routes ordinary single-device traced graph replay through `MultiExecutor` instead of the interpreter replay path; combine with `TERMITE_GRAPH_EXECUTOR_STATS=1` to see real graph executor stats for the full traced graph. |
+| `TERMITE_METAL_DISABLE_Q8_MM=1` | Forces Q8_0 rows >= 9 back onto the verified small-batch/MMV paths for bisection; the default path enables tiled Q8_0 `mul_mm`. |
+| `TERMITE_METAL_DISABLE_Q8_PAIR_ACTIVATION_MM=1` | Forces the split gate/up path instead of the default-on fused Q8_0 gate/up activation MM kernel, for bisection. |
 
 ## Native Direct Quant Kernel Coverage
 
@@ -355,7 +531,7 @@ Antfly inference already recognizes the `Q4_1` tensor type and block sizing in
 
 - GGUF codec materialization and row dequantization.
 - Native CPU direct quantized matmul.
-- MLX and pure-Metal device kernels, including grouped packed-expert MoE
+- Pure-Metal device kernels, including grouped packed-expert MoE
   kernels where the backend supports them.
 - WASM/WebGPU quantized matmul if browser inference needs the same model.
 
@@ -372,12 +548,12 @@ concerns:
 1. File compatibility: GGUF can parse the tensor type and compute byte length.
 2. Correctness fallback: codec and native CPU paths can produce correct f32
    results without full model-specific fast kernels.
-3. Fast execution: MLX, pure Metal, and WebGPU can execute common linear and
+3. Fast execution: pure Metal and WebGPU can execute common linear and
    MoE paths without materializing whole tensors.
 
 Current practical priority:
 
-- Complete `Q4_1` across codec, native, MLX, pure Metal, and WebGPU.
+- Complete `Q4_1` across codec, native, pure Metal, and WebGPU.
 - Add the sibling legacy formats `Q5_1` and `Q8_1` next, because the parser
   already recognizes them and their layouts are close to existing `Q5_0` and
   `Q8_0` support.
@@ -385,7 +561,7 @@ Current practical priority:
   shapes permit 256-value blocks.
 
 Validation should include synthetic block tests, row dequant tests, native
-matmul-vs-dense tests, MLX and pure-Metal kernel tests, and at least one real
+matmul-vs-dense tests, pure-Metal kernel tests, and at least one real
 GGUF smoke test that verifies quantized execution counters are hit.
 
 ## Quantization Task List
@@ -393,22 +569,19 @@ GGUF smoke test that verifies quantized execution counters are hit.
 Antfly inference should prioritize formats by how much real GGUF compatibility they
 unlock and how close they are to already-covered paths.
 
-- [x] Finish `Q4_1` across GGUF codec, native CPU, MLX/Metal, Antfly inference WebGPU,
+- [x] Finish `Q4_1` across GGUF codec, native CPU, Metal, Antfly inference WebGPU,
   and the embedded WebGPU mirror.
 - [x] Add WebGPU `Q4_K` support in Antfly inference and the embedded mirror. `Q4_K` is a
-  common K-quant format and already has codec/native/MLX coverage.
+  common K-quant format and already has codec/native coverage.
 - [x] Add fast-path parity for legacy `Q5_0`, `Q5_1`, and `Q8_1`, starting with
-  WebGPU where missing and then filling any MLX grouped-path gaps.
+  WebGPU where missing.
   - [x] Antfly inference WebGPU `Q5_0` direct linear shader and WASM dispatch.
   - [x] Antfly inference WebGPU `Q5_1` direct linear shader and WASM dispatch.
   - [x] Antfly inference WebGPU `Q8_1` direct linear shader and WASM dispatch.
   - [x] Embedded WebGPU mirror and install packaging for `Q5_0`, `Q5_1`, and
     `Q8_1`.
-  - [x] MLX grouped coverage checked: `Q5_0` already has direct and grouped
-    kernels.
-  - [x] Add MLX direct and grouped kernels for `Q5_1` and `Q8_1`.
 - [x] Add WebGPU parity for `Q2_K`, `Q3_K`, and `Q8_K` so browser execution
-  covers the same K-quant family as codec/native/MLX paths.
+  covers the same K-quant family as codec/native paths.
   - [x] Antfly inference WebGPU `Q2_K` direct linear shader and WASM dispatch.
   - [x] Antfly inference WebGPU `Q3_K` direct linear shader and WASM dispatch.
   - [x] Antfly inference WebGPU `Q8_K` direct linear shader and WASM dispatch.
@@ -418,7 +591,6 @@ unlock and how close they are to already-covered paths.
   `IQ4_XS`.
 - [x] Add fast kernels for the `IQ4_*` formats that show up in real target
   GGUFs.
-  - [x] MLX direct and grouped kernels for `IQ4_NL` and `IQ4_XS`.
   - [x] Antfly inference WebGPU direct linear shaders and WASM dispatch for `IQ4_NL` and
     `IQ4_XS`.
   - [x] Embedded WebGPU mirror and install packaging for `IQ4_NL` and
@@ -459,3 +631,36 @@ unlock and how close they are to already-covered paths.
     tensor metadata.
   - [x] Add native runtime dtypes and GGUF materialization for `I8`, `I16`,
     `I32`, `I64`, and `F64`.
+
+
+> **Relocated:** The bullet-by-bullet implementation history for the Metal,
+> quant-matmul, and WebGPU partition executors that previously lived here
+> (320 lines) is preserved verbatim in
+> [work-log/completed/inference/ggml-graph-execution-history.md](../../../work-log/completed/inference/ggml-graph-execution-history.md).
+> Durable decisions from it are in Metal Partition Executor, Quant Matmul
+> Routing, WebGPU Partition Executor, and Debug And Bisection Controls above.
+
+## Open work
+
+- Make graph execution the default hot path where it is at least as reliable
+  and fast as the direct runtime path. Generation keeps the eager/direct
+  runtime default unless `TERMITE_GRAPH_MODE`, an explicit compiled partition
+  backend, or a graph-runtime option selects the graph path; embedding
+  similarly reports a direct-runtime bypass when no graph runtime strategy is
+  requested.
+- Broaden real-model graph-mode smokes for Metal and WebGPU. Focused graph
+  executor and browser smokes cover the promoted command families, but full
+  model layouts should be exercised under `TERMITE_GRAPH_EXECUTOR_STATS=1` so
+  regressions show up as unexpected interpreter fallbacks, boundary
+  materializations, or direct-runtime bypasses.
+- Continue the Metal FFN precision migration: command plans distinguish f32
+  scratch from f16 FFN intermediates, and Q8_0 pair-activation dispatch
+  prefers the fused pair kernel over the split simdgroup fallback. The first
+  executable kernel slice adds a Q8_0 FFN gated activation MM kernel that
+  writes f16 and a matching f16-input Q8_0 down projection MM kernel that
+  writes f32 for the existing residual/RMS epilogue. The planner selects this
+  route automatically for supported descriptors; runtime descriptor/pipeline
+  checks fail closed when a specific shape, quant family, or kernel variant is
+  unsupported.
+- Tune profitability thresholds from benchmark data. The current native/cblas,
+  Metal, and WebGPU thresholds are conservative constants; existing bench

@@ -108,7 +108,6 @@ def _semantic_embedding_producer(*, model: str, endpoint: str) -> dict:
         "region": "",
         "request_format": "",
         "sparse": False,
-        "multimodal": False,
         "input_type": "",
         "truncate": "",
     }
@@ -1555,79 +1554,62 @@ def test_embedding_producer_registry_rejects_orphans_and_owner_mismatches(
         sync_level="full_index",
     )
     assert written["inserted"] == 1
-    runtime = wait_until(
-        lambda: (
-            current
-            if (
-                (current := stateful_api.get_index(owner_table, "document_vectors"))
-                .get("status", {})
-                .get("total_indexed")
-                == 1
-                and current.get("status", {}).get("query_visible_doc_count") == 1
-                and current.get("status", {})
-                .get("enrichment_runtime", {})
-                .get("embed_batches_completed", 0)
-                > 0
+
+    def assert_published_and_queryable():
+        for index_name in ("document_vectors", "document_artifact_vectors"):
+
+            def published():
+                detail = stateful_api.get_index(owner_table, index_name)
+                status = detail.get("status", {})
+                readiness = status.get("readiness", {})
+                sources = readiness.get("sources", [])
+                if (
+                    status.get("total_indexed") == 1
+                    and status.get("query_visible_doc_count") == 1
+                    and readiness.get("complete") is True
+                    and len(sources) == 1
+                    and sources[0].get("artifact") == "document_dense_v1"
+                    and sources[0].get("complete") is True
+                ):
+                    return detail
+                return None
+
+            detail = wait_until(published, timeout_s=60.0, interval_s=0.5)
+            assert detail is not None, json.dumps(
+                stateful_api.get_index(owner_table, index_name), sort_keys=True
             )
-            else None
-        ),
-        timeout_s=60.0,
-        interval_s=0.5,
-    )
-    assert runtime is not None, json.dumps(
-        stateful_api.get_index(owner_table, "document_vectors"), sort_keys=True
-    )
-    consumer_runtime = wait_until(
-        lambda: (
-            current
-            if (
-                (
-                    current := stateful_api.get_index(
-                        owner_table, "document_artifact_vectors"
-                    )
+            for status in (detail["status"], *detail["shard_status"].values()):
+                enrichment = status["enrichment_runtime"]
+                for label in (
+                    "active_phase",
+                    "stall_reason",
+                    "projection_checkpoint_status",
+                ):
+                    assert isinstance(enrichment[label], str), enrichment
+            # The per-group and aggregate projections must retain the same
+            # source publication proof through owner and cache snapshot copies.
+            for shard in detail["shard_status"].values():
+                shard_readiness = shard["readiness"]
+                assert shard_readiness["complete"] is True, shard
+                assert (
+                    shard_readiness["sources"]
+                    == detail["status"]["readiness"]["sources"]
                 )
-                .get("status", {})
-                .get("total_indexed")
-                == 1
-                and current.get("status", {}).get("query_visible_doc_count") == 1
+            response = stateful_api.query_table(
+                owner_table,
+                {
+                    "semantic_search": "durable artifact producer",
+                    "indexes": [index_name],
+                    "limit": 5,
+                },
             )
-            else None
-        ),
-        timeout_s=60.0,
-        interval_s=0.5,
-    )
-    assert consumer_runtime is not None, json.dumps(
-        stateful_api.get_index(owner_table, "document_artifact_vectors"), sort_keys=True
-    )
-    semantic = wait_until(
-        lambda: (
-            response
-            if doc_key
-            in _query_hit_ids(
-                response := stateful_api.query_table(
-                    owner_table,
-                    {
-                        "semantic_search": "durable artifact producer",
-                        "indexes": ["document_vectors"],
-                        "limit": 5,
-                    },
-                )
-            )
-            else None
-        ),
-        timeout_s=60.0,
-        interval_s=0.5,
-    )
-    assert semantic is not None
-    artifact_semantic = stateful_api.query_table(
-        owner_table,
-        {
-            "semantic_search": "durable artifact producer",
-            "indexes": ["document_artifact_vectors"],
-            "limit": 5,
-        },
-    )
-    assert doc_key in _query_hit_ids(artifact_semantic)
+            assert doc_key in _query_hit_ids(response)
+
+    # Runtime batch counters reset when the owner is reopened. Prove the
+    # durable producer output and both consumers' publication instead.
+    assert_published_and_queryable()
+    stateful_api.restart_server()
+    assert_published_and_queryable()
 
 
 @pytest.mark.parametrize("dense_embeddings", ["primary_lsm", "vector_store"])

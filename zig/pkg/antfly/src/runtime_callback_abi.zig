@@ -90,6 +90,7 @@ fn BoundaryImpl(comptime VTable: type) type {
             args: *const anyopaque,
             output: ?*anyopaque,
         ) callconv(.c) error_abi.Status {
+            @setEvalBranchQuota(64 * std.meta.fields(VTable).len);
             if (contract.version != native_abi.abi_version)
                 return error_abi.statusFromError(error.UnsupportedVersion);
             inline for (std.meta.fields(VTable)) |field| {
@@ -225,6 +226,34 @@ test "boundary dispatcher preserves local calls and maps cross-unit calls" {
             return error.ProposalDropped;
         }
 
+        fn readIndexTimeout(_: *u32) anyerror!void {
+            return error.ReadIndexTimeout;
+        }
+
+        fn storageBusy(_: *u32) anyerror!void {
+            return error.StorageBusy;
+        }
+
+        fn distributedQueryUnavailable(_: *u32) anyerror!void {
+            return error.DistributedQueryUnavailable;
+        }
+
+        fn storageReadUnavailable(_: *u32) anyerror!void {
+            return error.StorageReadTemporarilyUnavailable;
+        }
+
+        fn concurrencyUnavailable(_: *u32) anyerror!void {
+            return error.ConcurrencyUnavailable;
+        }
+
+        fn topologyUpgradeRequired(_: *u32) anyerror!void {
+            return error.TableTopologyProtocolUpgradeRequired;
+        }
+
+        fn indexGenerationMismatch(_: *u32) anyerror!void {
+            return error.IndexGenerationMismatch;
+        }
+
         fn ambiguousFail(_: *u32) anyerror!void {
             return error.MetadataMutationOutcomeUnknown;
         }
@@ -275,6 +304,34 @@ test "boundary dispatcher preserves local calls and maps cross-unit calls" {
     try std.testing.expectError(
         error.ProposalDropped,
         TestBoundary.call("retryable_fail", &callbacks.foreignDispatch, &callbacks.retryableFail, .{&base}),
+    );
+    try std.testing.expectError(
+        error.ReadIndexTimeout,
+        TestBoundary.call("fail", &callbacks.foreignDispatch, &callbacks.readIndexTimeout, .{&base}),
+    );
+    try std.testing.expectError(
+        error.StorageBusy,
+        TestBoundary.call("retryable_fail", &callbacks.foreignDispatch, &callbacks.storageBusy, .{&base}),
+    );
+    try std.testing.expectError(
+        error.DistributedQueryUnavailable,
+        TestBoundary.call("retryable_fail", &callbacks.foreignDispatch, &callbacks.distributedQueryUnavailable, .{&base}),
+    );
+    try std.testing.expectError(
+        error.StorageReadTemporarilyUnavailable,
+        TestBoundary.call("retryable_fail", &callbacks.foreignDispatch, &callbacks.storageReadUnavailable, .{&base}),
+    );
+    try std.testing.expectError(
+        error.ConcurrencyUnavailable,
+        TestBoundary.call("retryable_fail", &callbacks.foreignDispatch, &callbacks.concurrencyUnavailable, .{&base}),
+    );
+    try std.testing.expectError(
+        error.TableTopologyProtocolUpgradeRequired,
+        TestBoundary.call("retryable_fail", &callbacks.foreignDispatch, &callbacks.topologyUpgradeRequired, .{&base}),
+    );
+    try std.testing.expectError(
+        error.IndexGenerationMismatch,
+        TestBoundary.call("retryable_fail", &callbacks.foreignDispatch, &callbacks.indexGenerationMismatch, .{&base}),
     );
     try std.testing.expectError(
         error.MetadataMutationOutcomeUnknown,

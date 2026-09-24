@@ -26,6 +26,10 @@ const snapshot_payload_store = @import("raft/storage/snapshot_payload_store.zig"
 const persistent_replica_state = @import("raft/storage/replica_state.zig");
 const wal_replica_state = @import("raft/storage/wal_replica_state.zig");
 
+test {
+    _ = @import("data/storage/merge_page_projection_test.zig");
+}
+
 test "data storage module tests are reachable" {
     std.testing.refAllDecls(storage.shard_state_store);
     std.testing.refAllDecls(storage.raft_apply_store);
@@ -119,3 +123,6 @@ test "db merge coordinator reapplies target namespace for persisted reassignment
     try std.testing.expectEqual(target_namespace.shard_id, after.doc_identity.namespace_shard_id);
     try std.testing.expectEqual(target_namespace.range_id, after.doc_identity.namespace_range_id);
 }
+
+/// Implementation source choices for this compilation root.
+pub const antfly_sources = @import("source_owner_physical.zig");

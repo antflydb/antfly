@@ -1547,8 +1547,11 @@ pub const MetalPartitionExecutor = struct {
         }
 
         const chunk_ops = frameChunkOpsForExecution(exec_ctx.options);
+        const planned_primitives = if (exec_ctx.options) |opts| opts.planned_device_execution else false;
         const graph_plan_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
-        if (reservePartitionGraphPlanForExecution(chunk_ops)) {
+        if (reservePartitionGraphPlanForExecution(chunk_ops) or
+            (planned_primitives and !platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_PARTITION_GRAPH_PLAN", false)))
+        {
             var metal_graph_plan = try buildMetalGraphPlan(allocator, buffer_plan, partition_view);
             defer metal_graph_plan.deinit(allocator);
             if (trace_nodes) printMetalGraphPlanTrace(partition_index, metal_graph_plan);
@@ -1701,7 +1704,7 @@ pub const MetalPartitionExecutor = struct {
         if (trace_nodes) std.debug.print("graph_executor_node_trace: begin_frame_begin partition={d}\n", .{partition_index});
         if (trace_progress) std.debug.print("metal_partition_progress: phase=begin_frame_begin partition={d}\n", .{partition_index});
         const begin_frame_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
-        var frame_active = if (metalPartitionFrameDisabled() or runtime_region_plan.region_count == 0) false else try cb.decoderRuntimeBeginFrame();
+        var frame_active = if (metalPartitionFrameDisabled() or (!planned_primitives and runtime_region_plan.region_count == 0)) false else try cb.decoderRuntimeBeginFrame();
         errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
         if (collect_loop_profile) loop_profile.begin_frame_ns += metalPartitionElapsedNs(begin_frame_start_ns, metalPartitionNowNs());
         if (trace_progress) std.debug.print("metal_partition_progress: phase=begin_frame_end partition={d} active={}\n", .{ partition_index, frame_active });
@@ -15027,6 +15030,7 @@ fn executeRuntimeConvGeneral(
     const weight = valueFor(values, inputs[1]) orelse return null;
     const input_shape = graph.node(inputs[0]).output_shape;
     const weight_shape = graph.node(inputs[1]).output_shape;
+    if (attrs.hasDilation()) return null;
     if (attrs.num_spatial == 1 and attrs.groups == 1 and input_shape.rank() == 3 and weight_shape.rank() == 3 and attrs.padding[0][0] == attrs.padding[0][1]) {
         const out_channels = shapeDimUsize(weight_shape, 0) orelse return null;
         const bias_data = try std.heap.page_allocator.alloc(f32, out_channels);

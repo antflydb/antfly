@@ -957,11 +957,11 @@ fn plePostNormSlot(configured_layer_count: usize, layer: usize) usize {
     return gemma4_runtime.plePostNormSlot(configured_layer_count, layer);
 }
 
-fn qHeadNormSlot(configured_layer_count: usize, layer: usize) usize {
+pub fn qHeadNormSlot(configured_layer_count: usize, layer: usize) usize {
     return gemma4_runtime.qHeadNormSlot(configured_layer_count, layer);
 }
 
-fn kHeadNormSlot(configured_layer_count: usize, layer: usize) usize {
+pub fn kHeadNormSlot(configured_layer_count: usize, layer: usize) usize {
     return gemma4_runtime.kHeadNormSlot(configured_layer_count, layer);
 }
 
@@ -5055,6 +5055,31 @@ pub fn prepareDecodeRuntime(
     kv_tokens: usize,
     configured_layer_count: usize,
 ) !bool {
+    return prepareRuntime(cb, allocator, gpt_config, kv_tokens, configured_layer_count, true);
+}
+
+/// Dense text prefill consumes final hidden states, not vocabulary logits.
+/// Keep the generation entry point's head preparation unchanged.
+pub fn prepareTextPrefillRuntime(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    kv_tokens: usize,
+    configured_layer_count: usize,
+) !bool {
+    if (!gpt_arch.denseQwen3PrefillEligible(gpt_config)) return false;
+    return prepareRuntime(cb, allocator, gpt_config, kv_tokens, configured_layer_count, false);
+}
+
+fn prepareRuntime(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    kv_tokens: usize,
+    configured_layer_count: usize,
+    include_lm_head: bool,
+) !bool {
+    try cb.checkExecutionControl();
     if (!supportsPreparedDecodeConfig(gpt_config)) return false;
     timing_stats.prepare_calls += 1;
     var started_at = monotonicNowNs();
@@ -5076,6 +5101,7 @@ pub fn prepareDecodeRuntime(
 
     const prepared_layer_count = preparedLayers(@min(configured_layer_count, gpt_config.num_hidden_layers));
     for (0..prepared_layer_count) |layer| {
+        try cb.checkExecutionControl();
         var name_buf: [256]u8 = undefined;
         const layer_head_dim = gpt_config.effectiveHeadDimForLayer(layer);
         const layer_kv_heads = gpt_config.effectiveKVHeadsForLayer(layer);
@@ -5492,6 +5518,8 @@ pub fn prepareDecodeRuntime(
     }
     finished_at = monotonicNowNs();
     if (finished_at > started_at) timing_stats.final_prep_nanos += finished_at - started_at;
+
+    if (!include_lm_head) return true;
 
     started_at = monotonicNowNs();
     const lm_head_w = try decoder_tail_runtime.getLmHeadWeight(cb, gpt_config);
@@ -6171,6 +6199,9 @@ pub fn forwardPrefillLastPreparedTail(
     };
     finished_at = monotonicNowNs();
     if (finished_at > started_at) timing_stats.prefill_block_nanos += finished_at - started_at;
+    // The embedded rows were borrowed by the block stack (the direct paths
+    // copy them into their own hidden buffers); release them here.
+    if (final_hidden != hidden) cb.free(hidden);
     var owns_final_hidden = true;
     errdefer if (owns_final_hidden) cb.free(final_hidden);
     if (direct_hidden_result != null and compare_hidden_input != null) {
@@ -6281,9 +6312,9 @@ fn forwardFinalHiddenRowsInternal(
     if (decode_context.attention_mode != .paged_prefill and decode_context.attention_mode != .paged_decode) return null;
 
     const phase: BlockTimingPhase = if (decode_context.attention_mode == .paged_decode) .greedy else .prefill;
-    var started_at = monotonicNowNs();
+    const started_at = monotonicNowNs();
     const hidden = try decoder_rms_runtime.embedTokens(cb, allocator, gpt_config, input_ids);
-    var finished_at = monotonicNowNs();
+    const finished_at = monotonicNowNs();
     if (finished_at > started_at) {
         if (phase == .greedy) {
             timing_stats.greedy_embed_nanos += finished_at - started_at;
@@ -6291,21 +6322,83 @@ fn forwardFinalHiddenRowsInternal(
             timing_stats.prefill_embed_nanos += finished_at - started_at;
         }
     }
+    return forwardFinalHiddenRowsFromHidden(
+        cb,
+        allocator,
+        gpt_config,
+        configured_layer_count,
+        hidden,
+        true,
+        input_ids,
+        seq_len,
+        decode_context,
+        prepared_tail_suppress_token_ids,
+        phase,
+    );
+}
 
-    started_at = monotonicNowNs();
+/// The framed prefill for prompt embeddings assembled outside the runtime
+/// (image and audio prompts): the same planned Gemma frame the token-id
+/// prefill takes, with `ple_ids` standing in for the per-layer embedding
+/// lookup. `hidden` must be device-resident `[seq_len, hidden]` scaled
+/// embeddings. It is borrowed: the direct paths copy the rows into their
+/// own hidden buffers, so the caller frees it after either outcome.
+pub fn forwardFinalHiddenRowsFromEmbeddings(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    hidden: ops.CT,
+    ple_ids: []const i64,
+    seq_len: usize,
+    decode_context: *const gpt_arch.DecodeContext,
+) !?FinalHiddenRows {
+    if (!supportsConfig(gpt_config)) return null;
+    if (ple_ids.len == 0 or decode_context.query_sequence_len != ple_ids.len) return null;
+    if (decode_context.attention_mode != .paged_prefill) return null;
+    return forwardFinalHiddenRowsFromHidden(
+        cb,
+        allocator,
+        gpt_config,
+        configured_layer_count,
+        hidden,
+        false,
+        ple_ids,
+        seq_len,
+        decode_context,
+        null,
+        .prefill,
+    );
+}
+
+fn forwardFinalHiddenRowsFromHidden(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    hidden: ops.CT,
+    owns_hidden: bool,
+    ple_ids: []const i64,
+    seq_len: usize,
+    decode_context: *const gpt_arch.DecodeContext,
+    prepared_tail_suppress_token_ids: ?[]const i32,
+    phase: BlockTimingPhase,
+) !?FinalHiddenRows {
+    var started_at = monotonicNowNs();
+    var finished_at = started_at;
     const direct_ple_vectors = try computePleVectorsDirect(
         cb,
         gpt_config,
         configured_layer_count,
-        input_ids,
+        ple_ids,
         hidden,
-        input_ids.len,
+        ple_ids.len,
     );
     const ple_vectors = if (direct_ple_vectors) |direct_ple|
         direct_ple
     else blk: {
         const fallback_started_at = monotonicNowNs();
-        const fallback_ple = try gpt_arch.computePleVectors(cb, allocator, gpt_config, input_ids, hidden, input_ids.len);
+        const fallback_ple = try gpt_arch.computePleVectors(cb, allocator, gpt_config, ple_ids, hidden, ple_ids.len);
         const fallback_finished_at = monotonicNowNs();
         if (fallback_finished_at > fallback_started_at) {
             timing_stats.prefill_ple_fallback_nanos += fallback_finished_at - fallback_started_at;
@@ -6329,10 +6422,13 @@ fn forwardFinalHiddenRowsInternal(
         ple_vectors,
     );
     if (direct_hidden_result == null) {
-        cb.free(hidden);
+        if (owns_hidden) cb.free(hidden);
         return null;
     }
     const hidden_result = direct_hidden_result.?;
+    // The direct paths copy the input rows into their own hidden buffers, so
+    // an owned input is done once they return.
+    if (owns_hidden and hidden_result.hidden != hidden) cb.free(hidden);
     var decoder_frame_active = hidden_result.decoder_frame_active;
     defer finishDecoderRuntimeFrame(cb, &decoder_frame_active);
     finished_at = monotonicNowNs();

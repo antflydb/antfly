@@ -127,12 +127,14 @@ pub const TransportResponse = struct {
     status: u16,
     body: []u8,
     etag: ?[]u8 = null,
+    generation: ?[]u8 = null,
     content_type: ?[]u8 = null,
     location: ?[]u8 = null,
 
     pub fn deinit(self: *TransportResponse, alloc: Allocator) void {
         alloc.free(self.body);
         if (self.etag) |value| alloc.free(value);
+        if (self.generation) |value| alloc.free(value);
         if (self.content_type) |value| alloc.free(value);
         if (self.location) |value| alloc.free(value);
         self.* = undefined;
@@ -211,7 +213,7 @@ const HttpxTransport = struct {
         }) catch |err| return if (err == error.Cancelled) error.Canceled else err;
         defer response.deinit();
 
-        return try transportResponseAlloc(
+        var result = try transportResponseAlloc(
             alloc,
             response.status.code,
             response.body orelse "",
@@ -219,6 +221,9 @@ const HttpxTransport = struct {
             response.headers.get("Content-Type"),
             response.headers.get("Location"),
         );
+        errdefer result.deinit(alloc);
+        if (response.headers.get("x-goog-generation")) |generation| result.generation = try alloc.dupe(u8, generation);
+        return result;
     }
 };
 
@@ -343,6 +348,27 @@ pub const JsonApiClient = struct {
         }
     }
 
+    /// Atomic JSON API publication against a generation obtained with the
+    /// payload. Generation "0" creates only when no live object exists.
+    /// ETag If-Match is a read precondition in GCS, not an upload CAS.
+    pub fn putObjectAtGeneration(self: *JsonApiClient, alloc: Allocator, bucket: []const u8, key: []const u8, body: []const u8, generation: []const u8, content_type: []const u8) !void {
+        if (generation.len == 0 or generation.len > 20) return error.InvalidArgument;
+        for (generation) |digit| if (!std.ascii.isDigit(digit)) return error.InvalidArgument;
+        _ = std.fmt.parseInt(u64, generation, 10) catch return error.InvalidArgument;
+        const base = try uploadMediaUrlAlloc(alloc, self.cfg, bucket, key, .{});
+        defer alloc.free(base);
+        const url = try std.fmt.allocPrint(alloc, "{s}&ifGenerationMatch={s}", .{ base, generation });
+        defer alloc.free(url);
+        var response = try self.performWithResponseLimit(.POST, url, &.{}, body, content_type, 64 * 1024);
+        defer response.deinit(self.alloc);
+        return switch (response.status) {
+            200, 201 => {},
+            304, 412 => error.PreconditionFailed,
+            404 => error.FileNotFound,
+            else => mapUnexpectedStatus(response.status),
+        };
+    }
+
     fn putObject(
         self: *JsonApiClient,
         alloc: Allocator,
@@ -352,6 +378,9 @@ pub const JsonApiClient = struct {
         opts: types.PutOptions,
     ) !types.PutResult {
         if (opts.cancellation) |token| try token.check();
+        if (opts.checksum_sha256_hex) |checksum| {
+            if (body.len != 0) return try self.putObjectWithSha256Metadata(alloc, bucket, key, body, opts, checksum);
+        }
         const url = try uploadMediaUrlAlloc(alloc, self.cfg, bucket, key, opts);
         defer alloc.free(url);
 
@@ -384,6 +413,75 @@ pub const JsonApiClient = struct {
         };
     }
 
+    fn putObjectWithSha256Metadata(
+        self: *JsonApiClient,
+        alloc: Allocator,
+        bucket: []const u8,
+        key: []const u8,
+        body: []const u8,
+        opts: types.PutOptions,
+        checksum: []const u8,
+    ) !types.PutResult {
+        try validateSha256Hex(checksum);
+        const initiate_url = try uploadResumableUrlAlloc(alloc, self.cfg, bucket, key, opts);
+        defer alloc.free(initiate_url);
+        const size_text = try std.fmt.allocPrint(alloc, "{d}", .{body.len});
+        defer alloc.free(size_text);
+        const content_type = opts.content_type orelse "application/octet-stream";
+        const initiate_headers = [_]HeaderPair{
+            .{ "X-Upload-Content-Length", size_text },
+            .{ "X-Upload-Content-Type", content_type },
+        };
+        const metadata_payload = try uploadMetadataPayloadAlloc(alloc, content_type, checksum);
+        defer alloc.free(metadata_payload);
+        var initiated = try self.performWithResponseLimitAndCancellation(
+            .POST,
+            initiate_url,
+            &initiate_headers,
+            metadata_payload,
+            "application/json",
+            null,
+            opts.cancellation,
+        );
+        defer initiated.deinit(alloc);
+        switch (initiated.status) {
+            200, 201 => {},
+            304, 412 => return error.PreconditionFailed,
+            404 => return error.FileNotFound,
+            else => return mapUnexpectedStatus(initiated.status),
+        }
+        const session_url = initiated.location orelse return error.MissingResumableUploadLocation;
+        var completed = false;
+        defer if (!completed) {
+            var cleanup_deadline: ?transfer.CleanupDeadline = if (self.operationIo()) |cleanup_io|
+                transfer.CleanupDeadline.init(cleanup_io)
+            else
+                null;
+            self.cancelResumableUpload(
+                session_url,
+                if (cleanup_deadline) |*deadline| deadline.token() else null,
+            ) catch {};
+        };
+        const content_range = try std.fmt.allocPrint(alloc, "bytes 0-{d}/{d}", .{ body.len - 1, body.len });
+        defer alloc.free(content_range);
+        const upload_headers = [_]HeaderPair{.{ "Content-Range", content_range }};
+        var response = try self.performWithResponseLimitAndCancellation(
+            .PUT,
+            session_url,
+            &upload_headers,
+            body,
+            content_type,
+            null,
+            opts.cancellation,
+        );
+        defer response.deinit(alloc);
+        if (response.status != 200 and response.status != 201) return mapUnexpectedStatus(response.status);
+        var metadata = try parseObjectMetadataResponse(alloc, bucket, response.body);
+        defer metadata.deinit(alloc);
+        completed = true;
+        return .{ .etag = if (metadata.etag) |value| try alloc.dupe(u8, value) else null };
+    }
+
     fn putFile(
         self: *JsonApiClient,
         alloc: Allocator,
@@ -413,7 +511,7 @@ pub const JsonApiClient = struct {
         if (stat.size <= resumable_threshold) {
             const body = try alloc.alloc(u8, @intCast(stat.size));
             defer alloc.free(body);
-            if (try source.readPositionalAll(io, body, 0) != body.len) return error.SourceFileChanged;
+            try client_mod.readPositionalAllWithCancellation(source, io, body, opts.cancellation);
             var extra: [1]u8 = undefined;
             if (try source.readPositionalAll(io, &extra, stat.size) != 0) return error.SourceFileChanged;
             const current_stat = try source.stat(io);
@@ -436,11 +534,14 @@ pub const JsonApiClient = struct {
             .{ "X-Upload-Content-Length", size_text },
             .{ "X-Upload-Content-Type", upload_type },
         };
+        if (opts.checksum_sha256_hex) |checksum| try validateSha256Hex(checksum);
+        const metadata_payload = try uploadMetadataPayloadAlloc(alloc, upload_type, opts.checksum_sha256_hex);
+        defer alloc.free(metadata_payload);
         var initiated = try self.performWithResponseLimitAndCancellation(
             .POST,
             initiate_url,
             &initiate_headers,
-            "{}",
+            metadata_payload,
             "application/json",
             null,
             opts.cancellation,
@@ -599,6 +700,7 @@ pub const JsonApiClient = struct {
         meta.content_length = @intCast(response.body.len);
         if (opts.skip_metadata_probe) {
             if (response.etag) |value| meta.etag = try alloc.dupe(u8, value);
+            if (response.generation) |value| meta.version_id = try alloc.dupe(u8, value);
         }
         if (response.content_type) |value| {
             if (meta.content_type) |current| alloc.free(current);
@@ -1169,6 +1271,21 @@ fn uploadResumableUrlAlloc(
     return url;
 }
 
+fn validateSha256Hex(checksum: []const u8) !void {
+    var decoded: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&decoded, checksum) catch return error.InvalidChecksum;
+}
+
+fn uploadMetadataPayloadAlloc(alloc: Allocator, content_type: []const u8, checksum: ?[]const u8) ![]u8 {
+    if (checksum) |value| {
+        return try httpx.json.Json.stringify(alloc, .{
+            .contentType = content_type,
+            .metadata = .{ .antfly_sha256 = value },
+        });
+    }
+    return try httpx.json.Json.stringify(alloc, .{ .contentType = content_type });
+}
+
 fn openFilePath(io: std.Io, path: []const u8) !std.Io.File {
     return if (std.fs.path.isAbsolute(path))
         try std.Io.Dir.openFileAbsolute(io, path, .{})
@@ -1226,6 +1343,9 @@ fn parseObjectMetadataResponse(alloc: Allocator, bucket: []const u8, body: []con
         contentType: ?[]const u8 = null,
         md5Hash: ?[]const u8 = null,
         crc32c: ?[]const u8 = null,
+        metadata: ?struct {
+            antfly_sha256: ?[]const u8 = null,
+        } = null,
     };
 
     var parsed = try std.json.parseFromSlice(Parsed, alloc, body, .{ .ignore_unknown_fields = true });
@@ -1242,6 +1362,9 @@ fn parseObjectMetadataResponse(alloc: Allocator, bucket: []const u8, body: []con
     errdefer if (version_id) |value| alloc.free(value);
     const content_type = if (parsed.value.contentType) |value| try alloc.dupe(u8, value) else null;
     errdefer if (content_type) |value| alloc.free(value);
+    // Custom metadata is caller-controlled and is therefore not an
+    // authenticated checksum of the stored object. Only expose digests that
+    // GCS computes from the object bytes.
     var checksum: ?types.ObjectChecksum = if (parsed.value.md5Hash) |value| .{
         .algorithm = .md5_base64,
         .value = try alloc.dupe(u8, value),
@@ -1644,6 +1767,29 @@ test "json api metadata falls back to the always-available crc32c checksum" {
     try std.testing.expectEqual(types.ObjectChecksumType.full_object, meta.checksum.?.checksum_type);
 }
 
+test "json api metadata never promotes caller-owned SHA-256 over provider checksum" {
+    const alloc = std.testing.allocator;
+    var meta = try parseObjectMetadataResponse(
+        alloc,
+        "bucket",
+        "{\"name\":\"metric\",\"generation\":\"9\",\"size\":\"4\",\"crc32c\":\"crc-body\",\"metadata\":{\"antfly_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}",
+    );
+    defer meta.deinit(alloc);
+    try std.testing.expectEqual(types.ObjectChecksumAlgorithm.crc32c_base64, meta.checksum.?.algorithm);
+    try std.testing.expectEqualStrings("crc-body", meta.checksum.?.value);
+}
+
+test "json api metadata does not expose caller-owned SHA-256 as a checksum" {
+    const alloc = std.testing.allocator;
+    var meta = try parseObjectMetadataResponse(
+        alloc,
+        "bucket",
+        "{\"name\":\"metric\",\"generation\":\"9\",\"size\":\"4\",\"metadata\":{\"antfly_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}",
+    );
+    defer meta.deinit(alloc);
+    try std.testing.expect(meta.checksum == null);
+}
+
 test "gcs cancellation reaches active read and write requests" {
     const alloc = std.testing.allocator;
     const State = struct {
@@ -1789,6 +1935,62 @@ test "json api client put object encodes upload url and returns etag" {
     defer put.deinit(alloc);
 
     try std.testing.expectEqualStrings("etag-2", put.etag.?);
+}
+
+test "json api client persists informational caller SHA-256 metadata" {
+    const alloc = std.testing.allocator;
+    const checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const State = struct {
+        calls: usize = 0,
+
+        fn request(
+            ptr: ?*anyopaque,
+            request_alloc: Allocator,
+            method: HttpMethod,
+            url: []const u8,
+            headers: []const HeaderPair,
+            body: ?[]const u8,
+            content_type: ?[]const u8,
+            _: ?usize,
+            _: ?types.CancellationToken,
+        ) !TransportResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.calls += 1;
+            if (self.calls == 1) {
+                try std.testing.expectEqual(HttpMethod.POST, method);
+                try std.testing.expect(std.mem.indexOf(u8, url, "uploadType=resumable") != null);
+                try std.testing.expect(std.mem.indexOf(u8, body.?, "\"antfly_sha256\":\"" ++ checksum ++ "\"") != null);
+                try std.testing.expectEqualStrings("application/json", content_type.?);
+                return try transportResponseAlloc(request_alloc, 200, "", null, null, "https://upload.example/session");
+            }
+            try std.testing.expectEqual(@as(usize, 2), self.calls);
+            try std.testing.expectEqual(HttpMethod.PUT, method);
+            try std.testing.expectEqualStrings("https://upload.example/session", url);
+            try expectHeader(headers, "Content-Range", "bytes 0-4/5");
+            try std.testing.expectEqualStrings("hello", body.?);
+            return try transportResponseAlloc(
+                request_alloc,
+                200,
+                "{\"bucket\":\"bucket\",\"name\":\"metric\",\"etag\":\"etag-sha\",\"size\":\"5\",\"metadata\":{\"antfly_sha256\":\"" ++ checksum ++ "\"}}",
+                null,
+                null,
+                null,
+            );
+        }
+    };
+
+    var state = State{};
+    const cfg = try jsonApiClientConfigAlloc(alloc);
+    var json_client = JsonApiClient.initWithRequestFn(alloc, cfg, &state, State.request);
+    var client = json_client.client();
+    defer client.deinit();
+    var put = try client.putObject("bucket", "metric", "hello", .{
+        .content_type = "application/octet-stream",
+        .checksum_sha256_hex = checksum,
+    });
+    defer put.deinit(alloc);
+    try std.testing.expectEqualStrings("etag-sha", put.etag.?);
+    try std.testing.expectEqual(@as(usize, 2), state.calls);
 }
 
 test "json api client lists objects and prefixes" {

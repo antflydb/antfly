@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const platform = @import("antfly_platform");
-const gliner2_data = @import("inference_finetune_data").gliner2_data;
+const gliner2_data = @import("inference_internal").finetune.gliner2_data;
 
 test {
     std.testing.refAllDecls(gliner2_data);

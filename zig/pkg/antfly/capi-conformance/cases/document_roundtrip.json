@@ -1,0 +1,24 @@
+{
+  "name": "document_roundtrip",
+  "description": "Typed batch writes, point lookups, deletes, missing keys, key-range scans (which return base64 ids), and stats.",
+  "open": {"create": true, "no_sync": true},
+  "steps": [
+    {"op": "batch", "timestamp": 1, "writes": [
+      {"key": "doc:alpha", "value": {"title": "Alpha", "body": "first document", "rank": 1}},
+      {"key": "doc:beta", "value": {"title": "Beta", "body": "second document", "rank": 2}},
+      {"key": "doc:gamma", "value": {"title": "Gamma", "body": "third document", "tags": ["x", "y"]}}
+    ]},
+    {"op": "lookup", "key": "doc:alpha", "expect": {"json_subset": {"title": "Alpha", "rank": 1}}},
+    {"op": "lookup", "key": "doc:gamma", "expect": {"json_subset": {"tags": ["x", "y"]}}},
+    {"op": "lookup", "key": "doc:missing", "expect": {"error": "ANTFLY_NOT_FOUND"}},
+    {"op": "batch", "timestamp": 2, "writes": [
+      {"key": "doc:beta", "delete": true},
+      {"key": "doc:alpha", "value": {"title": "Alpha v2", "body": "updated", "rank": 10}}
+    ]},
+    {"op": "lookup", "key": "doc:beta", "expect": {"error": "ANTFLY_NOT_FOUND"}},
+    {"op": "lookup", "key": "doc:alpha", "expect": {"json_subset": {"title": "Alpha v2", "rank": 10}}},
+    {"op": "scan", "request": {"from": "doc:", "to": "doc;", "include_documents": true, "limit": 10},
+      "expect": {"contains": ["ZG9jOmFscGhh", "ZG9jOmdhbW1h", "Alpha v2"], "not_contains": ["ZG9jOmJldGE=", "second document"]}},
+    {"op": "stats"}
+  ]
+}

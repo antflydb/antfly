@@ -80,618 +80,6 @@ func (e CommitAppendRequestPayloadCodec) Valid() bool {
 	}
 }
 
-// Defines values for HAActionReceiptActionKind.
-const (
-	HAActionReceiptActionKindBaseBackupBegin       HAActionReceiptActionKind = "base_backup_begin"
-	HAActionReceiptActionKindBaseBackupFinish      HAActionReceiptActionKind = "base_backup_finish"
-	HAActionReceiptActionKindFenceAcquire          HAActionReceiptActionKind = "fence_acquire"
-	HAActionReceiptActionKindPromotion             HAActionReceiptActionKind = "promotion"
-	HAActionReceiptActionKindPromotionAssess       HAActionReceiptActionKind = "promotion_assess"
-	HAActionReceiptActionKindRejoinAssess          HAActionReceiptActionKind = "rejoin_assess"
-	HAActionReceiptActionKindRejoinReseed          HAActionReceiptActionKind = "rejoin_reseed"
-	HAActionReceiptActionKindRejoinRewind          HAActionReceiptActionKind = "rejoin_rewind"
-	HAActionReceiptActionKindReplicationSlotCreate HAActionReceiptActionKind = "replication_slot_create"
-	HAActionReceiptActionKindReplicationSlotDrop   HAActionReceiptActionKind = "replication_slot_drop"
-	HAActionReceiptActionKindReplicationSlotPause  HAActionReceiptActionKind = "replication_slot_pause"
-	HAActionReceiptActionKindReplicationSlotResume HAActionReceiptActionKind = "replication_slot_resume"
-	HAActionReceiptActionKindSeedCapture           HAActionReceiptActionKind = "seed_capture"
-	HAActionReceiptActionKindSeededSlotActivate    HAActionReceiptActionKind = "seeded_slot_activate"
-	HAActionReceiptActionKindStandbyBootstrap      HAActionReceiptActionKind = "standby_bootstrap"
-)
-
-// Valid indicates whether the value is a known member of the HAActionReceiptActionKind enum.
-func (e HAActionReceiptActionKind) Valid() bool {
-	switch e {
-	case HAActionReceiptActionKindBaseBackupBegin:
-		return true
-	case HAActionReceiptActionKindBaseBackupFinish:
-		return true
-	case HAActionReceiptActionKindFenceAcquire:
-		return true
-	case HAActionReceiptActionKindPromotion:
-		return true
-	case HAActionReceiptActionKindPromotionAssess:
-		return true
-	case HAActionReceiptActionKindRejoinAssess:
-		return true
-	case HAActionReceiptActionKindRejoinReseed:
-		return true
-	case HAActionReceiptActionKindRejoinRewind:
-		return true
-	case HAActionReceiptActionKindReplicationSlotCreate:
-		return true
-	case HAActionReceiptActionKindReplicationSlotDrop:
-		return true
-	case HAActionReceiptActionKindReplicationSlotPause:
-		return true
-	case HAActionReceiptActionKindReplicationSlotResume:
-		return true
-	case HAActionReceiptActionKindSeedCapture:
-		return true
-	case HAActionReceiptActionKindSeededSlotActivate:
-		return true
-	case HAActionReceiptActionKindStandbyBootstrap:
-		return true
-	default:
-		return false
-	}
-}
-
-// Defines values for HAActionReceiptState.
-const (
-	HAActionReceiptStateAlreadyApplied HAActionReceiptState = "already_applied"
-	HAActionReceiptStateApplied        HAActionReceiptState = "applied"
-	HAActionReceiptStateAssessed       HAActionReceiptState = "assessed"
-)
-
-// Valid indicates whether the value is a known member of the HAActionReceiptState enum.
-func (e HAActionReceiptState) Valid() bool {
-	switch e {
-	case HAActionReceiptStateAlreadyApplied:
-		return true
-	case HAActionReceiptStateApplied:
-		return true
-	case HAActionReceiptStateAssessed:
-		return true
-	default:
-		return false
-	}
-}
-
-// Defines values for HACommitGateAction.
-const (
-	HACommitGateActionAcknowledge         HACommitGateAction = "acknowledge"
-	HACommitGateActionAcknowledgeDegraded HACommitGateAction = "acknowledge_degraded"
-	HACommitGateActionReject              HACommitGateAction = "reject"
-	HACommitGateActionWaitForStandby      HACommitGateAction = "wait_for_standby"
-)
-
-// Valid indicates whether the value is a known member of the HACommitGateAction enum.
-func (e HACommitGateAction) Valid() bool {
-	switch e {
-	case HACommitGateActionAcknowledge:
-		return true
-	case HACommitGateActionAcknowledgeDegraded:
-		return true
-	case HACommitGateActionReject:
-		return true
-	case HACommitGateActionWaitForStandby:
-		return true
-	default:
-		return false
-	}
-}
-
-// Defines values for HADurabilityDecisionMode.
-const (
-	HADurabilityDecisionModeAsync       HADurabilityDecisionMode = "async"
-	HADurabilityDecisionModeRemoteApply HADurabilityDecisionMode = "remote_apply"
-	HADurabilityDecisionModeRemoteWrite HADurabilityDecisionMode = "remote_write"
-)
-
-// Valid indicates whether the value is a known member of the HADurabilityDecisionMode enum.
-func (e HADurabilityDecisionMode) Valid() bool {
-	switch e {
-	case HADurabilityDecisionModeAsync:
-		return true
-	case HADurabilityDecisionModeRemoteApply:
-		return true
-	case HADurabilityDecisionModeRemoteWrite:
-		return true
-	default:
-		return false
-	}
-}
-
-// Defines values for HADurabilityDecisionSelection.
-const (
-	HADurabilityDecisionSelectionAll   HADurabilityDecisionSelection = "all"
-	HADurabilityDecisionSelectionAny   HADurabilityDecisionSelection = "any"
-	HADurabilityDecisionSelectionFirst HADurabilityDecisionSelection = "first"
-)
-
-// Valid indicates whether the value is a known member of the HADurabilityDecisionSelection enum.
-func (e HADurabilityDecisionSelection) Valid() bool {
-	switch e {
-	case HADurabilityDecisionSelectionAll:
-		return true
-	case HADurabilityDecisionSelectionAny:
-		return true
-	case HADurabilityDecisionSelectionFirst:
-		return true
-	default:
-		return false
-	}
-}
-
-// Defines values for HADurabilityDecisionStatus.
-const (
-	HADurabilityDecisionStatusDegradedToAsync HADurabilityDecisionStatus = "degraded_to_async"
-	HADurabilityDecisionStatusFailClosed      HADurabilityDecisionStatus = "fail_closed"
-	HADurabilityDecisionStatusSatisfied       HADurabilityDecisionStatus = "satisfied"
-	HADurabilityDecisionStatusWouldBlock      HADurabilityDecisionStatus = "would_block"
-)
-
-// Valid indicates whether the value is a known member of the HADurabilityDecisionStatus enum.
-func (e HADurabilityDecisionStatus) Valid() bool {
-	switch e {
-	case HADurabilityDecisionStatusDegradedToAsync:
-		return true
-	case HADurabilityDecisionStatusFailClosed:
-		return true
-	case HADurabilityDecisionStatusSatisfied:
-		return true
-	case HADurabilityDecisionStatusWouldBlock:
-		return true
-	default:
-		return false
-	}
-}
-
-// Defines values for HAOwnerJobDecisionAction.
-const (
-	HAOwnerJobDecisionActionDisableOnStandby    HAOwnerJobDecisionAction = "disable_on_standby"
-	HAOwnerJobDecisionActionOpenPromotedPrimary HAOwnerJobDecisionAction = "open_promoted_primary"
-	HAOwnerJobDecisionActionRun                 HAOwnerJobDecisionAction = "run"
-)
-
-// Valid indicates whether the value is a known member of the HAOwnerJobDecisionAction enum.
-func (e HAOwnerJobDecisionAction) Valid() bool {
-	switch e {
-	case HAOwnerJobDecisionActionDisableOnStandby:
-		return true
-	case HAOwnerJobDecisionActionOpenPromotedPrimary:
-		return true
-	case HAOwnerJobDecisionActionRun:
-		return true
-	default:
-		return false
-	}
-}
-
-// Defines values for HAOwnerJobDecisionKind.
-const (
-	HAOwnerJobDecisionKindCompactionPublish   HAOwnerJobDecisionKind = "compaction_publish"
-	HAOwnerJobDecisionKindDerivedEffectWriter HAOwnerJobDecisionKind = "derived_effect_writer"
-	HAOwnerJobDecisionKindEnrichmentWriter    HAOwnerJobDecisionKind = "enrichment_writer"
-	HAOwnerJobDecisionKindRetentionAdvance    HAOwnerJobDecisionKind = "retention_advance"
-)
-
-// Valid indicates whether the value is a known member of the HAOwnerJobDecisionKind enum.
-func (e HAOwnerJobDecisionKind) Valid() bool {
-	switch e {
-	case HAOwnerJobDecisionKindCompactionPublish:
-		return true
-	case HAOwnerJobDecisionKindDerivedEffectWriter:
-		return true
-	case HAOwnerJobDecisionKindEnrichmentWriter:
-		return true
-	case HAOwnerJobDecisionKindRetentionAdvance:
-		return true
-	default:
-		return false
-	}
-}
-
-// Defines values for HAOwnerJobDecisionRole.
-const (
-	HAOwnerJobDecisionRolePrimary         HAOwnerJobDecisionRole = "primary"
-	HAOwnerJobDecisionRolePromotedStandby HAOwnerJobDecisionRole = "promoted_standby"
-	HAOwnerJobDecisionRoleStandby         HAOwnerJobDecisionRole = "standby"
-)
-
-// Valid indicates whether the value is a known member of the HAOwnerJobDecisionRole enum.
-func (e HAOwnerJobDecisionRole) Valid() bool {
-	switch e {
-	case HAOwnerJobDecisionRolePrimary:
-		return true
-	case HAOwnerJobDecisionRolePromotedStandby:
-		return true
-	case HAOwnerJobDecisionRoleStandby:
-		return true
-	default:
-		return false
-	}
-}
-
-// Defines values for HAPrimarySnapshotRole.
-const (
-	HAPrimarySnapshotRolePrimary HAPrimarySnapshotRole = "primary"
-)
-
-// Valid indicates whether the value is a known member of the HAPrimarySnapshotRole enum.
-func (e HAPrimarySnapshotRole) Valid() bool {
-	switch e {
-	case HAPrimarySnapshotRolePrimary:
-		return true
-	default:
-		return false
-	}
-}
-
-// Defines values for HAPromotionAssessmentMode.
-const (
-	HAPromotionAssessmentModeBlocked HAPromotionAssessmentMode = "blocked"
-	HAPromotionAssessmentModeForced  HAPromotionAssessmentMode = "forced"
-	HAPromotionAssessmentModeLossy   HAPromotionAssessmentMode = "lossy"
-	HAPromotionAssessmentModeSafe    HAPromotionAssessmentMode = "safe"
-)
-
-// Valid indicates whether the value is a known member of the HAPromotionAssessmentMode enum.
-func (e HAPromotionAssessmentMode) Valid() bool {
-	switch e {
-	case HAPromotionAssessmentModeBlocked:
-		return true
-	case HAPromotionAssessmentModeForced:
-		return true
-	case HAPromotionAssessmentModeLossy:
-		return true
-	case HAPromotionAssessmentModeSafe:
-		return true
-	default:
-		return false
-	}
-}
-
-// Defines values for HAReadDecisionAction.
-const (
-	HAReadDecisionActionRouteToPrimary  HAReadDecisionAction = "route_to_primary"
-	HAReadDecisionActionServeStandby    HAReadDecisionAction = "serve_standby"
-	HAReadDecisionActionWaitForApply    HAReadDecisionAction = "wait_for_apply"
-	HAReadDecisionActionWaitForMetadata HAReadDecisionAction = "wait_for_metadata"
-)
-
-// Valid indicates whether the value is a known member of the HAReadDecisionAction enum.
-func (e HAReadDecisionAction) Valid() bool {
-	switch e {
-	case HAReadDecisionActionRouteToPrimary:
-		return true
-	case HAReadDecisionActionServeStandby:
-		return true
-	case HAReadDecisionActionWaitForApply:
-		return true
-	case HAReadDecisionActionWaitForMetadata:
-		return true
-	default:
-		return false
-	}
-}
-
-// Defines values for HAReadDecisionConsistency.
-const (
-	HAReadDecisionConsistencyAtLeastLsn HAReadDecisionConsistency = "at_least_lsn"
-	HAReadDecisionConsistencyPrimary    HAReadDecisionConsistency = "primary"
-	HAReadDecisionConsistencyStaleOk    HAReadDecisionConsistency = "stale_ok"
-)
-
-// Valid indicates whether the value is a known member of the HAReadDecisionConsistency enum.
-func (e HAReadDecisionConsistency) Valid() bool {
-	switch e {
-	case HAReadDecisionConsistencyAtLeastLsn:
-		return true
-	case HAReadDecisionConsistencyPrimary:
-		return true
-	case HAReadDecisionConsistencyStaleOk:
-		return true
-	default:
-		return false
-	}
-}
-
-// Defines values for HARejoinAssessmentAction.
-const (
-	HARejoinAssessmentActionAlreadyCurrent HARejoinAssessmentAction = "already_current"
-	HARejoinAssessmentActionRejectUnfenced HARejoinAssessmentAction = "reject_unfenced"
-	HARejoinAssessmentActionReseed         HARejoinAssessmentAction = "reseed"
-	HARejoinAssessmentActionRewind         HARejoinAssessmentAction = "rewind"
-)
-
-// Valid indicates whether the value is a known member of the HARejoinAssessmentAction enum.
-func (e HARejoinAssessmentAction) Valid() bool {
-	switch e {
-	case HARejoinAssessmentActionAlreadyCurrent:
-		return true
-	case HARejoinAssessmentActionRejectUnfenced:
-		return true
-	case HARejoinAssessmentActionReseed:
-		return true
-	case HARejoinAssessmentActionRewind:
-		return true
-	default:
-		return false
-	}
-}
-
-// Defines values for HARejoinAssessmentReason.
-const (
-	HARejoinAssessmentReasonCurrentTimeline          HARejoinAssessmentReason = "current_timeline"
-	HARejoinAssessmentReasonIncompatibleTimeline     HARejoinAssessmentReason = "incompatible_timeline"
-	HARejoinAssessmentReasonLocalLsnBeforeFork       HARejoinAssessmentReason = "local_lsn_before_fork"
-	HARejoinAssessmentReasonNoFence                  HARejoinAssessmentReason = "no_fence"
-	HARejoinAssessmentReasonParentTimelineRetained   HARejoinAssessmentReason = "parent_timeline_retained"
-	HARejoinAssessmentReasonParentTimelineWalExpired HARejoinAssessmentReason = "parent_timeline_wal_expired"
-	HARejoinAssessmentReasonWrongCluster             HARejoinAssessmentReason = "wrong_cluster"
-	HARejoinAssessmentReasonWrongOldPrimary          HARejoinAssessmentReason = "wrong_old_primary"
-	HARejoinAssessmentReasonWrongShard               HARejoinAssessmentReason = "wrong_shard"
-	HARejoinAssessmentReasonWrongTable               HARejoinAssessmentReason = "wrong_table"
-)
-
-// Valid indicates whether the value is a known member of the HARejoinAssessmentReason enum.
-func (e HARejoinAssessmentReason) Valid() bool {
-	switch e {
-	case HARejoinAssessmentReasonCurrentTimeline:
-		return true
-	case HARejoinAssessmentReasonIncompatibleTimeline:
-		return true
-	case HARejoinAssessmentReasonLocalLsnBeforeFork:
-		return true
-	case HARejoinAssessmentReasonNoFence:
-		return true
-	case HARejoinAssessmentReasonParentTimelineRetained:
-		return true
-	case HARejoinAssessmentReasonParentTimelineWalExpired:
-		return true
-	case HARejoinAssessmentReasonWrongCluster:
-		return true
-	case HARejoinAssessmentReasonWrongOldPrimary:
-		return true
-	case HARejoinAssessmentReasonWrongShard:
-		return true
-	case HARejoinAssessmentReasonWrongTable:
-		return true
-	default:
-		return false
-	}
-}
-
-// Defines values for HAReplicationSlotActionResponseSlotAction.
-const (
-	HAReplicationSlotActionResponseSlotActionCreate HAReplicationSlotActionResponseSlotAction = "create"
-	HAReplicationSlotActionResponseSlotActionDrop   HAReplicationSlotActionResponseSlotAction = "drop"
-	HAReplicationSlotActionResponseSlotActionPause  HAReplicationSlotActionResponseSlotAction = "pause"
-	HAReplicationSlotActionResponseSlotActionResume HAReplicationSlotActionResponseSlotAction = "resume"
-)
-
-// Valid indicates whether the value is a known member of the HAReplicationSlotActionResponseSlotAction enum.
-func (e HAReplicationSlotActionResponseSlotAction) Valid() bool {
-	switch e {
-	case HAReplicationSlotActionResponseSlotActionCreate:
-		return true
-	case HAReplicationSlotActionResponseSlotActionDrop:
-		return true
-	case HAReplicationSlotActionResponseSlotActionPause:
-		return true
-	case HAReplicationSlotActionResponseSlotActionResume:
-		return true
-	default:
-		return false
-	}
-}
-
-// Defines values for HARuntimeLifecycleObservationRole.
-const (
-	HARuntimeLifecycleObservationRolePrimary HARuntimeLifecycleObservationRole = "primary"
-	HARuntimeLifecycleObservationRoleStandby HARuntimeLifecycleObservationRole = "standby"
-	HARuntimeLifecycleObservationRoleUnknown HARuntimeLifecycleObservationRole = "unknown"
-)
-
-// Valid indicates whether the value is a known member of the HARuntimeLifecycleObservationRole enum.
-func (e HARuntimeLifecycleObservationRole) Valid() bool {
-	switch e {
-	case HARuntimeLifecycleObservationRolePrimary:
-		return true
-	case HARuntimeLifecycleObservationRoleStandby:
-		return true
-	case HARuntimeLifecycleObservationRoleUnknown:
-		return true
-	default:
-		return false
-	}
-}
-
-// Defines values for HASeedLifecycleReceiptEventAuthoritativeState.
-const (
-	HASeedLifecycleReceiptEventAuthoritativeStateMissing  HASeedLifecycleReceiptEventAuthoritativeState = "missing"
-	HASeedLifecycleReceiptEventAuthoritativeStateRetained HASeedLifecycleReceiptEventAuthoritativeState = "retained"
-)
-
-// Valid indicates whether the value is a known member of the HASeedLifecycleReceiptEventAuthoritativeState enum.
-func (e HASeedLifecycleReceiptEventAuthoritativeState) Valid() bool {
-	switch e {
-	case HASeedLifecycleReceiptEventAuthoritativeStateMissing:
-		return true
-	case HASeedLifecycleReceiptEventAuthoritativeStateRetained:
-		return true
-	default:
-		return false
-	}
-}
-
-// Defines values for HASeedLifecycleReceiptEventKind.
-const (
-	HASeedLifecycleReceiptEventKindActivation HASeedLifecycleReceiptEventKind = "activation"
-	HASeedLifecycleReceiptEventKindCapture    HASeedLifecycleReceiptEventKind = "capture"
-)
-
-// Valid indicates whether the value is a known member of the HASeedLifecycleReceiptEventKind enum.
-func (e HASeedLifecycleReceiptEventKind) Valid() bool {
-	switch e {
-	case HASeedLifecycleReceiptEventKindActivation:
-		return true
-	case HASeedLifecycleReceiptEventKindCapture:
-		return true
-	default:
-		return false
-	}
-}
-
-// Defines values for HASlotSnapshotStatus.
-const (
-	HASlotSnapshotStatusHealthy        HASlotSnapshotStatus = "healthy"
-	HASlotSnapshotStatusLagging        HASlotSnapshotStatus = "lagging"
-	HASlotSnapshotStatusReseedRequired HASlotSnapshotStatus = "reseed_required"
-)
-
-// Valid indicates whether the value is a known member of the HASlotSnapshotStatus enum.
-func (e HASlotSnapshotStatus) Valid() bool {
-	switch e {
-	case HASlotSnapshotStatusHealthy:
-		return true
-	case HASlotSnapshotStatusLagging:
-		return true
-	case HASlotSnapshotStatusReseedRequired:
-		return true
-	default:
-		return false
-	}
-}
-
-// Defines values for HAStandbySnapshotRole.
-const (
-	HAStandbySnapshotRoleStandby HAStandbySnapshotRole = "standby"
-)
-
-// Valid indicates whether the value is a known member of the HAStandbySnapshotRole enum.
-func (e HAStandbySnapshotRole) Valid() bool {
-	switch e {
-	case HAStandbySnapshotRoleStandby:
-		return true
-	default:
-		return false
-	}
-}
-
-// Defines values for HASyncPolicyFailurePolicy.
-const (
-	HASyncPolicyFailurePolicyBlock          HASyncPolicyFailurePolicy = "block"
-	HASyncPolicyFailurePolicyDegradeToAsync HASyncPolicyFailurePolicy = "degrade_to_async"
-	HASyncPolicyFailurePolicyFailClosed     HASyncPolicyFailurePolicy = "fail_closed"
-)
-
-// Valid indicates whether the value is a known member of the HASyncPolicyFailurePolicy enum.
-func (e HASyncPolicyFailurePolicy) Valid() bool {
-	switch e {
-	case HASyncPolicyFailurePolicyBlock:
-		return true
-	case HASyncPolicyFailurePolicyDegradeToAsync:
-		return true
-	case HASyncPolicyFailurePolicyFailClosed:
-		return true
-	default:
-		return false
-	}
-}
-
-// Defines values for HASyncPolicyMode.
-const (
-	HASyncPolicyModeAsync       HASyncPolicyMode = "async"
-	HASyncPolicyModeRemoteApply HASyncPolicyMode = "remote_apply"
-	HASyncPolicyModeRemoteWrite HASyncPolicyMode = "remote_write"
-)
-
-// Valid indicates whether the value is a known member of the HASyncPolicyMode enum.
-func (e HASyncPolicyMode) Valid() bool {
-	switch e {
-	case HASyncPolicyModeAsync:
-		return true
-	case HASyncPolicyModeRemoteApply:
-		return true
-	case HASyncPolicyModeRemoteWrite:
-		return true
-	default:
-		return false
-	}
-}
-
-// Defines values for HASyncPolicySelection.
-const (
-	HASyncPolicySelectionAll   HASyncPolicySelection = "all"
-	HASyncPolicySelectionAny   HASyncPolicySelection = "any"
-	HASyncPolicySelectionFirst HASyncPolicySelection = "first"
-)
-
-// Valid indicates whether the value is a known member of the HASyncPolicySelection enum.
-func (e HASyncPolicySelection) Valid() bool {
-	switch e {
-	case HASyncPolicySelectionAll:
-		return true
-	case HASyncPolicySelectionAny:
-		return true
-	case HASyncPolicySelectionFirst:
-		return true
-	default:
-		return false
-	}
-}
-
-// Defines values for HAWriteDecisionAction.
-const (
-	HAWriteDecisionActionAllowWrite            HAWriteDecisionAction = "allow_write"
-	HAWriteDecisionActionOpenPromotedPrimary   HAWriteDecisionAction = "open_promoted_primary"
-	HAWriteDecisionActionRejectFencedPrimary   HAWriteDecisionAction = "reject_fenced_primary"
-	HAWriteDecisionActionRejectReadOnlyStandby HAWriteDecisionAction = "reject_read_only_standby"
-)
-
-// Valid indicates whether the value is a known member of the HAWriteDecisionAction enum.
-func (e HAWriteDecisionAction) Valid() bool {
-	switch e {
-	case HAWriteDecisionActionAllowWrite:
-		return true
-	case HAWriteDecisionActionOpenPromotedPrimary:
-		return true
-	case HAWriteDecisionActionRejectFencedPrimary:
-		return true
-	case HAWriteDecisionActionRejectReadOnlyStandby:
-		return true
-	default:
-		return false
-	}
-}
-
-// Defines values for HAWriteDecisionRole.
-const (
-	HAWriteDecisionRoleFencedPrimary   HAWriteDecisionRole = "fenced_primary"
-	HAWriteDecisionRolePrimary         HAWriteDecisionRole = "primary"
-	HAWriteDecisionRolePromotedStandby HAWriteDecisionRole = "promoted_standby"
-	HAWriteDecisionRoleStandby         HAWriteDecisionRole = "standby"
-)
-
-// Valid indicates whether the value is a known member of the HAWriteDecisionRole enum.
-func (e HAWriteDecisionRole) Valid() bool {
-	switch e {
-	case HAWriteDecisionRoleFencedPrimary:
-		return true
-	case HAWriteDecisionRolePrimary:
-		return true
-	case HAWriteDecisionRolePromotedStandby:
-		return true
-	case HAWriteDecisionRoleStandby:
-		return true
-	default:
-		return false
-	}
-}
-
 // Defines values for OwnerJobCheckRequestKind.
 const (
 	OwnerJobCheckRequestKindCompactionPublish   OwnerJobCheckRequestKind = "compaction_publish"
@@ -749,6 +137,621 @@ func (e ReadCheckRequestConsistency) Valid() bool {
 	case ReadCheckRequestConsistencyPrimary:
 		return true
 	case ReadCheckRequestConsistencyStaleOk:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for StandbyActionReceiptActionKind.
+const (
+	StandbyActionReceiptActionKindBaseBackupBegin       StandbyActionReceiptActionKind = "base_backup_begin"
+	StandbyActionReceiptActionKindBaseBackupFinish      StandbyActionReceiptActionKind = "base_backup_finish"
+	StandbyActionReceiptActionKindFenceAcquire          StandbyActionReceiptActionKind = "fence_acquire"
+	StandbyActionReceiptActionKindPromotion             StandbyActionReceiptActionKind = "promotion"
+	StandbyActionReceiptActionKindPromotionAssess       StandbyActionReceiptActionKind = "promotion_assess"
+	StandbyActionReceiptActionKindRejoinAssess          StandbyActionReceiptActionKind = "rejoin_assess"
+	StandbyActionReceiptActionKindRejoinReseed          StandbyActionReceiptActionKind = "rejoin_reseed"
+	StandbyActionReceiptActionKindRejoinRewind          StandbyActionReceiptActionKind = "rejoin_rewind"
+	StandbyActionReceiptActionKindReplicationSlotCreate StandbyActionReceiptActionKind = "replication_slot_create"
+	StandbyActionReceiptActionKindReplicationSlotDrop   StandbyActionReceiptActionKind = "replication_slot_drop"
+	StandbyActionReceiptActionKindReplicationSlotPause  StandbyActionReceiptActionKind = "replication_slot_pause"
+	StandbyActionReceiptActionKindReplicationSlotResume StandbyActionReceiptActionKind = "replication_slot_resume"
+	StandbyActionReceiptActionKindSeedCapture           StandbyActionReceiptActionKind = "seed_capture"
+	StandbyActionReceiptActionKindSeededSlotActivate    StandbyActionReceiptActionKind = "seeded_slot_activate"
+	StandbyActionReceiptActionKindStandbyBootstrap      StandbyActionReceiptActionKind = "standby_bootstrap"
+	StandbyActionReceiptActionKindStandbyUpstream       StandbyActionReceiptActionKind = "standby_upstream"
+)
+
+// Valid indicates whether the value is a known member of the StandbyActionReceiptActionKind enum.
+func (e StandbyActionReceiptActionKind) Valid() bool {
+	switch e {
+	case StandbyActionReceiptActionKindBaseBackupBegin:
+		return true
+	case StandbyActionReceiptActionKindBaseBackupFinish:
+		return true
+	case StandbyActionReceiptActionKindFenceAcquire:
+		return true
+	case StandbyActionReceiptActionKindPromotion:
+		return true
+	case StandbyActionReceiptActionKindPromotionAssess:
+		return true
+	case StandbyActionReceiptActionKindRejoinAssess:
+		return true
+	case StandbyActionReceiptActionKindRejoinReseed:
+		return true
+	case StandbyActionReceiptActionKindRejoinRewind:
+		return true
+	case StandbyActionReceiptActionKindReplicationSlotCreate:
+		return true
+	case StandbyActionReceiptActionKindReplicationSlotDrop:
+		return true
+	case StandbyActionReceiptActionKindReplicationSlotPause:
+		return true
+	case StandbyActionReceiptActionKindReplicationSlotResume:
+		return true
+	case StandbyActionReceiptActionKindSeedCapture:
+		return true
+	case StandbyActionReceiptActionKindSeededSlotActivate:
+		return true
+	case StandbyActionReceiptActionKindStandbyBootstrap:
+		return true
+	case StandbyActionReceiptActionKindStandbyUpstream:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for StandbyActionReceiptState.
+const (
+	StandbyActionReceiptStateAlreadyApplied StandbyActionReceiptState = "already_applied"
+	StandbyActionReceiptStateApplied        StandbyActionReceiptState = "applied"
+	StandbyActionReceiptStateAssessed       StandbyActionReceiptState = "assessed"
+)
+
+// Valid indicates whether the value is a known member of the StandbyActionReceiptState enum.
+func (e StandbyActionReceiptState) Valid() bool {
+	switch e {
+	case StandbyActionReceiptStateAlreadyApplied:
+		return true
+	case StandbyActionReceiptStateApplied:
+		return true
+	case StandbyActionReceiptStateAssessed:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for StandbyCommitGateAction.
+const (
+	StandbyCommitGateActionAcknowledge         StandbyCommitGateAction = "acknowledge"
+	StandbyCommitGateActionAcknowledgeDegraded StandbyCommitGateAction = "acknowledge_degraded"
+	StandbyCommitGateActionReject              StandbyCommitGateAction = "reject"
+	StandbyCommitGateActionWaitForStandby      StandbyCommitGateAction = "wait_for_standby"
+)
+
+// Valid indicates whether the value is a known member of the StandbyCommitGateAction enum.
+func (e StandbyCommitGateAction) Valid() bool {
+	switch e {
+	case StandbyCommitGateActionAcknowledge:
+		return true
+	case StandbyCommitGateActionAcknowledgeDegraded:
+		return true
+	case StandbyCommitGateActionReject:
+		return true
+	case StandbyCommitGateActionWaitForStandby:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for StandbyDurabilityDecisionMode.
+const (
+	StandbyDurabilityDecisionModeAsync       StandbyDurabilityDecisionMode = "async"
+	StandbyDurabilityDecisionModeRemoteApply StandbyDurabilityDecisionMode = "remote_apply"
+	StandbyDurabilityDecisionModeRemoteWrite StandbyDurabilityDecisionMode = "remote_write"
+)
+
+// Valid indicates whether the value is a known member of the StandbyDurabilityDecisionMode enum.
+func (e StandbyDurabilityDecisionMode) Valid() bool {
+	switch e {
+	case StandbyDurabilityDecisionModeAsync:
+		return true
+	case StandbyDurabilityDecisionModeRemoteApply:
+		return true
+	case StandbyDurabilityDecisionModeRemoteWrite:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for StandbyDurabilityDecisionSelection.
+const (
+	StandbyDurabilityDecisionSelectionAll   StandbyDurabilityDecisionSelection = "all"
+	StandbyDurabilityDecisionSelectionAny   StandbyDurabilityDecisionSelection = "any"
+	StandbyDurabilityDecisionSelectionFirst StandbyDurabilityDecisionSelection = "first"
+)
+
+// Valid indicates whether the value is a known member of the StandbyDurabilityDecisionSelection enum.
+func (e StandbyDurabilityDecisionSelection) Valid() bool {
+	switch e {
+	case StandbyDurabilityDecisionSelectionAll:
+		return true
+	case StandbyDurabilityDecisionSelectionAny:
+		return true
+	case StandbyDurabilityDecisionSelectionFirst:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for StandbyDurabilityDecisionStatus.
+const (
+	StandbyDurabilityDecisionStatusDegradedToAsync StandbyDurabilityDecisionStatus = "degraded_to_async"
+	StandbyDurabilityDecisionStatusFailClosed      StandbyDurabilityDecisionStatus = "fail_closed"
+	StandbyDurabilityDecisionStatusSatisfied       StandbyDurabilityDecisionStatus = "satisfied"
+	StandbyDurabilityDecisionStatusWouldBlock      StandbyDurabilityDecisionStatus = "would_block"
+)
+
+// Valid indicates whether the value is a known member of the StandbyDurabilityDecisionStatus enum.
+func (e StandbyDurabilityDecisionStatus) Valid() bool {
+	switch e {
+	case StandbyDurabilityDecisionStatusDegradedToAsync:
+		return true
+	case StandbyDurabilityDecisionStatusFailClosed:
+		return true
+	case StandbyDurabilityDecisionStatusSatisfied:
+		return true
+	case StandbyDurabilityDecisionStatusWouldBlock:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for StandbyOwnerJobDecisionAction.
+const (
+	StandbyOwnerJobDecisionActionDisableOnStandby    StandbyOwnerJobDecisionAction = "disable_on_standby"
+	StandbyOwnerJobDecisionActionOpenPromotedPrimary StandbyOwnerJobDecisionAction = "open_promoted_primary"
+	StandbyOwnerJobDecisionActionRun                 StandbyOwnerJobDecisionAction = "run"
+)
+
+// Valid indicates whether the value is a known member of the StandbyOwnerJobDecisionAction enum.
+func (e StandbyOwnerJobDecisionAction) Valid() bool {
+	switch e {
+	case StandbyOwnerJobDecisionActionDisableOnStandby:
+		return true
+	case StandbyOwnerJobDecisionActionOpenPromotedPrimary:
+		return true
+	case StandbyOwnerJobDecisionActionRun:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for StandbyOwnerJobDecisionKind.
+const (
+	StandbyOwnerJobDecisionKindCompactionPublish   StandbyOwnerJobDecisionKind = "compaction_publish"
+	StandbyOwnerJobDecisionKindDerivedEffectWriter StandbyOwnerJobDecisionKind = "derived_effect_writer"
+	StandbyOwnerJobDecisionKindEnrichmentWriter    StandbyOwnerJobDecisionKind = "enrichment_writer"
+	StandbyOwnerJobDecisionKindRetentionAdvance    StandbyOwnerJobDecisionKind = "retention_advance"
+)
+
+// Valid indicates whether the value is a known member of the StandbyOwnerJobDecisionKind enum.
+func (e StandbyOwnerJobDecisionKind) Valid() bool {
+	switch e {
+	case StandbyOwnerJobDecisionKindCompactionPublish:
+		return true
+	case StandbyOwnerJobDecisionKindDerivedEffectWriter:
+		return true
+	case StandbyOwnerJobDecisionKindEnrichmentWriter:
+		return true
+	case StandbyOwnerJobDecisionKindRetentionAdvance:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for StandbyOwnerJobDecisionRole.
+const (
+	StandbyOwnerJobDecisionRolePrimary         StandbyOwnerJobDecisionRole = "primary"
+	StandbyOwnerJobDecisionRolePromotedStandby StandbyOwnerJobDecisionRole = "promoted_standby"
+	StandbyOwnerJobDecisionRoleStandby         StandbyOwnerJobDecisionRole = "standby"
+)
+
+// Valid indicates whether the value is a known member of the StandbyOwnerJobDecisionRole enum.
+func (e StandbyOwnerJobDecisionRole) Valid() bool {
+	switch e {
+	case StandbyOwnerJobDecisionRolePrimary:
+		return true
+	case StandbyOwnerJobDecisionRolePromotedStandby:
+		return true
+	case StandbyOwnerJobDecisionRoleStandby:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for StandbyPrimarySnapshotRole.
+const (
+	StandbyPrimarySnapshotRolePrimary StandbyPrimarySnapshotRole = "primary"
+)
+
+// Valid indicates whether the value is a known member of the StandbyPrimarySnapshotRole enum.
+func (e StandbyPrimarySnapshotRole) Valid() bool {
+	switch e {
+	case StandbyPrimarySnapshotRolePrimary:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for StandbyPromotionAssessmentMode.
+const (
+	StandbyPromotionAssessmentModeBlocked StandbyPromotionAssessmentMode = "blocked"
+	StandbyPromotionAssessmentModeForced  StandbyPromotionAssessmentMode = "forced"
+	StandbyPromotionAssessmentModeLossy   StandbyPromotionAssessmentMode = "lossy"
+	StandbyPromotionAssessmentModeSafe    StandbyPromotionAssessmentMode = "safe"
+)
+
+// Valid indicates whether the value is a known member of the StandbyPromotionAssessmentMode enum.
+func (e StandbyPromotionAssessmentMode) Valid() bool {
+	switch e {
+	case StandbyPromotionAssessmentModeBlocked:
+		return true
+	case StandbyPromotionAssessmentModeForced:
+		return true
+	case StandbyPromotionAssessmentModeLossy:
+		return true
+	case StandbyPromotionAssessmentModeSafe:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for StandbyReadDecisionAction.
+const (
+	StandbyReadDecisionActionRouteToPrimary  StandbyReadDecisionAction = "route_to_primary"
+	StandbyReadDecisionActionServeStandby    StandbyReadDecisionAction = "serve_standby"
+	StandbyReadDecisionActionWaitForApply    StandbyReadDecisionAction = "wait_for_apply"
+	StandbyReadDecisionActionWaitForMetadata StandbyReadDecisionAction = "wait_for_metadata"
+)
+
+// Valid indicates whether the value is a known member of the StandbyReadDecisionAction enum.
+func (e StandbyReadDecisionAction) Valid() bool {
+	switch e {
+	case StandbyReadDecisionActionRouteToPrimary:
+		return true
+	case StandbyReadDecisionActionServeStandby:
+		return true
+	case StandbyReadDecisionActionWaitForApply:
+		return true
+	case StandbyReadDecisionActionWaitForMetadata:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for StandbyReadDecisionConsistency.
+const (
+	StandbyReadDecisionConsistencyAtLeastLsn StandbyReadDecisionConsistency = "at_least_lsn"
+	StandbyReadDecisionConsistencyPrimary    StandbyReadDecisionConsistency = "primary"
+	StandbyReadDecisionConsistencyStaleOk    StandbyReadDecisionConsistency = "stale_ok"
+)
+
+// Valid indicates whether the value is a known member of the StandbyReadDecisionConsistency enum.
+func (e StandbyReadDecisionConsistency) Valid() bool {
+	switch e {
+	case StandbyReadDecisionConsistencyAtLeastLsn:
+		return true
+	case StandbyReadDecisionConsistencyPrimary:
+		return true
+	case StandbyReadDecisionConsistencyStaleOk:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for StandbyRejoinAssessmentAction.
+const (
+	StandbyRejoinAssessmentActionAlreadyCurrent StandbyRejoinAssessmentAction = "already_current"
+	StandbyRejoinAssessmentActionRejectUnfenced StandbyRejoinAssessmentAction = "reject_unfenced"
+	StandbyRejoinAssessmentActionReseed         StandbyRejoinAssessmentAction = "reseed"
+	StandbyRejoinAssessmentActionRewind         StandbyRejoinAssessmentAction = "rewind"
+)
+
+// Valid indicates whether the value is a known member of the StandbyRejoinAssessmentAction enum.
+func (e StandbyRejoinAssessmentAction) Valid() bool {
+	switch e {
+	case StandbyRejoinAssessmentActionAlreadyCurrent:
+		return true
+	case StandbyRejoinAssessmentActionRejectUnfenced:
+		return true
+	case StandbyRejoinAssessmentActionReseed:
+		return true
+	case StandbyRejoinAssessmentActionRewind:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for StandbyRejoinAssessmentReason.
+const (
+	StandbyRejoinAssessmentReasonCurrentTimeline          StandbyRejoinAssessmentReason = "current_timeline"
+	StandbyRejoinAssessmentReasonIncompatibleTimeline     StandbyRejoinAssessmentReason = "incompatible_timeline"
+	StandbyRejoinAssessmentReasonLocalLsnBeforeFork       StandbyRejoinAssessmentReason = "local_lsn_before_fork"
+	StandbyRejoinAssessmentReasonNoFence                  StandbyRejoinAssessmentReason = "no_fence"
+	StandbyRejoinAssessmentReasonParentTimelineRetained   StandbyRejoinAssessmentReason = "parent_timeline_retained"
+	StandbyRejoinAssessmentReasonParentTimelineWalExpired StandbyRejoinAssessmentReason = "parent_timeline_wal_expired"
+	StandbyRejoinAssessmentReasonWrongCluster             StandbyRejoinAssessmentReason = "wrong_cluster"
+	StandbyRejoinAssessmentReasonWrongOldPrimary          StandbyRejoinAssessmentReason = "wrong_old_primary"
+	StandbyRejoinAssessmentReasonWrongShard               StandbyRejoinAssessmentReason = "wrong_shard"
+	StandbyRejoinAssessmentReasonWrongTable               StandbyRejoinAssessmentReason = "wrong_table"
+)
+
+// Valid indicates whether the value is a known member of the StandbyRejoinAssessmentReason enum.
+func (e StandbyRejoinAssessmentReason) Valid() bool {
+	switch e {
+	case StandbyRejoinAssessmentReasonCurrentTimeline:
+		return true
+	case StandbyRejoinAssessmentReasonIncompatibleTimeline:
+		return true
+	case StandbyRejoinAssessmentReasonLocalLsnBeforeFork:
+		return true
+	case StandbyRejoinAssessmentReasonNoFence:
+		return true
+	case StandbyRejoinAssessmentReasonParentTimelineRetained:
+		return true
+	case StandbyRejoinAssessmentReasonParentTimelineWalExpired:
+		return true
+	case StandbyRejoinAssessmentReasonWrongCluster:
+		return true
+	case StandbyRejoinAssessmentReasonWrongOldPrimary:
+		return true
+	case StandbyRejoinAssessmentReasonWrongShard:
+		return true
+	case StandbyRejoinAssessmentReasonWrongTable:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for StandbyReplicationSlotActionResponseSlotAction.
+const (
+	StandbyReplicationSlotActionResponseSlotActionCreate StandbyReplicationSlotActionResponseSlotAction = "create"
+	StandbyReplicationSlotActionResponseSlotActionDrop   StandbyReplicationSlotActionResponseSlotAction = "drop"
+	StandbyReplicationSlotActionResponseSlotActionPause  StandbyReplicationSlotActionResponseSlotAction = "pause"
+	StandbyReplicationSlotActionResponseSlotActionResume StandbyReplicationSlotActionResponseSlotAction = "resume"
+)
+
+// Valid indicates whether the value is a known member of the StandbyReplicationSlotActionResponseSlotAction enum.
+func (e StandbyReplicationSlotActionResponseSlotAction) Valid() bool {
+	switch e {
+	case StandbyReplicationSlotActionResponseSlotActionCreate:
+		return true
+	case StandbyReplicationSlotActionResponseSlotActionDrop:
+		return true
+	case StandbyReplicationSlotActionResponseSlotActionPause:
+		return true
+	case StandbyReplicationSlotActionResponseSlotActionResume:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for StandbyRuntimeLifecycleObservationRole.
+const (
+	StandbyRuntimeLifecycleObservationRolePrimary StandbyRuntimeLifecycleObservationRole = "primary"
+	StandbyRuntimeLifecycleObservationRoleStandby StandbyRuntimeLifecycleObservationRole = "standby"
+	StandbyRuntimeLifecycleObservationRoleUnknown StandbyRuntimeLifecycleObservationRole = "unknown"
+)
+
+// Valid indicates whether the value is a known member of the StandbyRuntimeLifecycleObservationRole enum.
+func (e StandbyRuntimeLifecycleObservationRole) Valid() bool {
+	switch e {
+	case StandbyRuntimeLifecycleObservationRolePrimary:
+		return true
+	case StandbyRuntimeLifecycleObservationRoleStandby:
+		return true
+	case StandbyRuntimeLifecycleObservationRoleUnknown:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for StandbySeedLifecycleReceiptEventAuthoritativeState.
+const (
+	StandbySeedLifecycleReceiptEventAuthoritativeStateMissing  StandbySeedLifecycleReceiptEventAuthoritativeState = "missing"
+	StandbySeedLifecycleReceiptEventAuthoritativeStateRetained StandbySeedLifecycleReceiptEventAuthoritativeState = "retained"
+)
+
+// Valid indicates whether the value is a known member of the StandbySeedLifecycleReceiptEventAuthoritativeState enum.
+func (e StandbySeedLifecycleReceiptEventAuthoritativeState) Valid() bool {
+	switch e {
+	case StandbySeedLifecycleReceiptEventAuthoritativeStateMissing:
+		return true
+	case StandbySeedLifecycleReceiptEventAuthoritativeStateRetained:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for StandbySeedLifecycleReceiptEventKind.
+const (
+	StandbySeedLifecycleReceiptEventKindActivation StandbySeedLifecycleReceiptEventKind = "activation"
+	StandbySeedLifecycleReceiptEventKindCapture    StandbySeedLifecycleReceiptEventKind = "capture"
+)
+
+// Valid indicates whether the value is a known member of the StandbySeedLifecycleReceiptEventKind enum.
+func (e StandbySeedLifecycleReceiptEventKind) Valid() bool {
+	switch e {
+	case StandbySeedLifecycleReceiptEventKindActivation:
+		return true
+	case StandbySeedLifecycleReceiptEventKindCapture:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for StandbySlotSnapshotStatus.
+const (
+	StandbySlotSnapshotStatusHealthy        StandbySlotSnapshotStatus = "healthy"
+	StandbySlotSnapshotStatusLagging        StandbySlotSnapshotStatus = "lagging"
+	StandbySlotSnapshotStatusReseedRequired StandbySlotSnapshotStatus = "reseed_required"
+)
+
+// Valid indicates whether the value is a known member of the StandbySlotSnapshotStatus enum.
+func (e StandbySlotSnapshotStatus) Valid() bool {
+	switch e {
+	case StandbySlotSnapshotStatusHealthy:
+		return true
+	case StandbySlotSnapshotStatusLagging:
+		return true
+	case StandbySlotSnapshotStatusReseedRequired:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for StandbySnapshotRole.
+const (
+	StandbySnapshotRoleStandby StandbySnapshotRole = "standby"
+)
+
+// Valid indicates whether the value is a known member of the StandbySnapshotRole enum.
+func (e StandbySnapshotRole) Valid() bool {
+	switch e {
+	case StandbySnapshotRoleStandby:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for StandbySyncPolicyFailurePolicy.
+const (
+	StandbySyncPolicyFailurePolicyBlock          StandbySyncPolicyFailurePolicy = "block"
+	StandbySyncPolicyFailurePolicyDegradeToAsync StandbySyncPolicyFailurePolicy = "degrade_to_async"
+	StandbySyncPolicyFailurePolicyFailClosed     StandbySyncPolicyFailurePolicy = "fail_closed"
+)
+
+// Valid indicates whether the value is a known member of the StandbySyncPolicyFailurePolicy enum.
+func (e StandbySyncPolicyFailurePolicy) Valid() bool {
+	switch e {
+	case StandbySyncPolicyFailurePolicyBlock:
+		return true
+	case StandbySyncPolicyFailurePolicyDegradeToAsync:
+		return true
+	case StandbySyncPolicyFailurePolicyFailClosed:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for StandbySyncPolicyMode.
+const (
+	StandbySyncPolicyModeAsync       StandbySyncPolicyMode = "async"
+	StandbySyncPolicyModeRemoteApply StandbySyncPolicyMode = "remote_apply"
+	StandbySyncPolicyModeRemoteWrite StandbySyncPolicyMode = "remote_write"
+)
+
+// Valid indicates whether the value is a known member of the StandbySyncPolicyMode enum.
+func (e StandbySyncPolicyMode) Valid() bool {
+	switch e {
+	case StandbySyncPolicyModeAsync:
+		return true
+	case StandbySyncPolicyModeRemoteApply:
+		return true
+	case StandbySyncPolicyModeRemoteWrite:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for StandbySyncPolicySelection.
+const (
+	StandbySyncPolicySelectionAll   StandbySyncPolicySelection = "all"
+	StandbySyncPolicySelectionAny   StandbySyncPolicySelection = "any"
+	StandbySyncPolicySelectionFirst StandbySyncPolicySelection = "first"
+)
+
+// Valid indicates whether the value is a known member of the StandbySyncPolicySelection enum.
+func (e StandbySyncPolicySelection) Valid() bool {
+	switch e {
+	case StandbySyncPolicySelectionAll:
+		return true
+	case StandbySyncPolicySelectionAny:
+		return true
+	case StandbySyncPolicySelectionFirst:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for StandbyWriteDecisionAction.
+const (
+	StandbyWriteDecisionActionAllowWrite            StandbyWriteDecisionAction = "allow_write"
+	StandbyWriteDecisionActionOpenPromotedPrimary   StandbyWriteDecisionAction = "open_promoted_primary"
+	StandbyWriteDecisionActionRejectFencedPrimary   StandbyWriteDecisionAction = "reject_fenced_primary"
+	StandbyWriteDecisionActionRejectReadOnlyStandby StandbyWriteDecisionAction = "reject_read_only_standby"
+)
+
+// Valid indicates whether the value is a known member of the StandbyWriteDecisionAction enum.
+func (e StandbyWriteDecisionAction) Valid() bool {
+	switch e {
+	case StandbyWriteDecisionActionAllowWrite:
+		return true
+	case StandbyWriteDecisionActionOpenPromotedPrimary:
+		return true
+	case StandbyWriteDecisionActionRejectFencedPrimary:
+		return true
+	case StandbyWriteDecisionActionRejectReadOnlyStandby:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for StandbyWriteDecisionRole.
+const (
+	StandbyWriteDecisionRoleFencedPrimary   StandbyWriteDecisionRole = "fenced_primary"
+	StandbyWriteDecisionRolePrimary         StandbyWriteDecisionRole = "primary"
+	StandbyWriteDecisionRolePromotedStandby StandbyWriteDecisionRole = "promoted_standby"
+	StandbyWriteDecisionRoleStandby         StandbyWriteDecisionRole = "standby"
+)
+
+// Valid indicates whether the value is a known member of the StandbyWriteDecisionRole enum.
+func (e StandbyWriteDecisionRole) Valid() bool {
+	switch e {
+	case StandbyWriteDecisionRoleFencedPrimary:
+		return true
+	case StandbyWriteDecisionRolePrimary:
+		return true
+	case StandbyWriteDecisionRolePromotedStandby:
+		return true
+	case StandbyWriteDecisionRoleStandby:
 		return true
 	default:
 		return false
@@ -904,7 +907,7 @@ func (e GetHASeedLifecycleReceiptsParamsKind) Valid() bool {
 
 // BaseBackupManifestPathRequest defines model for BaseBackupManifestPathRequest.
 type BaseBackupManifestPathRequest struct {
-	// ManifestPath Absolute normalized pod-local path to the HA base-backup manifest.
+	// ManifestPath Absolute normalized pod-local path to the hot-standby base-backup manifest.
 	ManifestPath string `json:"manifest_path"`
 }
 
@@ -914,7 +917,7 @@ type BaseBackupStartRequest struct {
 	ManifestId string `json:"manifest_id"`
 
 	// SlotName Stable standby replication slot name.
-	SlotName HASlotName `json:"slot_name"`
+	SlotName StandbySlotName `json:"slot_name"`
 }
 
 // CommitAppendRequest defines model for CommitAppendRequest.
@@ -926,7 +929,7 @@ type CommitAppendRequest struct {
 	Payload      string                          `json:"payload"`
 	PayloadCodec CommitAppendRequestPayloadCodec `json:"payload_codec,omitempty,omitzero"`
 	ShardId      uint64                          `json:"shard_id,omitempty,omitzero"`
-	SyncPolicy   HASyncPolicy                    `json:"sync_policy"`
+	SyncPolicy   StandbySyncPolicy               `json:"sync_policy"`
 	TableId      uint64                          `json:"table_id,omitempty,omitzero"`
 }
 
@@ -938,711 +941,39 @@ type CommitAppendRequestPayloadCodec string
 
 // CommitCheckRequest defines model for CommitCheckRequest.
 type CommitCheckRequest struct {
-	SyncPolicy HASyncPolicy `json:"sync_policy"`
-	TargetLsn  uint64       `json:"target_lsn"`
+	SyncPolicy StandbySyncPolicy `json:"sync_policy"`
+	TargetLsn  uint64            `json:"target_lsn"`
 }
 
 // FenceAcquireRequest defines model for FenceAcquireRequest.
 type FenceAcquireRequest struct {
 	Force bool `json:"force"`
 
-	// Generation Exact Kubernetes Lease transition generation authorizing this fence.
-	Generation    uint64     `json:"generation"`
-	Identity      HAIdentity `json:"identity"`
-	NewEpoch      uint64     `json:"new_epoch"`
-	NewTimelineId uint64     `json:"new_timeline_id"`
-	ObservedLsn   uint64     `json:"observed_lsn"`
+	// Generation Fence generation authorizing this fence. When the fencing authority is
+	// a Kubernetes Lease this is the exact Lease transition generation and
+	// must be supplied. When omitted, the node allocates the next
+	// generation itself: the current durable fence generation plus one, or
+	// 1 when no fence exists. Allocation is only permitted when the node
+	// is not configured with an external fencing authority, so a
+	// Lease-managed cluster cannot be fenced by an unauthorized caller.
+	Generation    uint64          `json:"generation,omitempty,omitzero"`
+	Identity      StandbyIdentity `json:"identity"`
+	NewEpoch      uint64          `json:"new_epoch"`
+	NewTimelineId uint64          `json:"new_timeline_id"`
+	ObservedLsn   uint64          `json:"observed_lsn"`
 
-	// OldPrimaryId Stable HA node id.
-	OldPrimaryId HANodeID `json:"old_primary_id"`
+	// OldPrimaryId Stable hot-standby node id.
+	OldPrimaryId StandbyNodeID `json:"old_primary_id"`
 
-	// PromotedNodeId Stable HA node id.
-	PromotedNodeId HANodeID `json:"promoted_node_id"`
-	Reason         string   `json:"reason,omitempty,omitzero"`
-	RequiredLsn    uint64   `json:"required_lsn"`
+	// PromotedNodeId Stable hot-standby node id.
+	PromotedNodeId StandbyNodeID `json:"promoted_node_id"`
+	Reason         string        `json:"reason,omitempty,omitzero"`
+	RequiredLsn    uint64        `json:"required_lsn"`
 }
-
-// HAActionReceipt defines model for HAActionReceipt.
-type HAActionReceipt struct {
-	// ActionId Stable action correlation id derived from the acted-on HA resource and boundary values.
-	ActionId string `json:"action_id"`
-
-	// ActionKind Typed HA action that produced this response.
-	ActionKind HAActionReceiptActionKind `json:"action_kind"`
-
-	// NodeId Stable HA node id.
-	NodeId HANodeID `json:"node_id"`
-
-	// State Idempotency state for this action response.
-	State HAActionReceiptState `json:"state"`
-
-	// Target Node id, slot name, manifest id, or promotion boundary acted on by this node-local endpoint.
-	Target string `json:"target"`
-}
-
-// HAActionReceiptActionKind Typed HA action that produced this response.
-type HAActionReceiptActionKind string
-
-// HAActionReceiptState Idempotency state for this action response.
-type HAActionReceiptState string
-
-// HABaseBackupBeginResponse defines model for HABaseBackupBeginResponse.
-type HABaseBackupBeginResponse struct {
-	Action HAActionReceipt `json:"action"`
-
-	// BackupLsn LSN reserved as the base-backup start boundary.
-	BackupLsn uint64 `json:"backup_lsn"`
-
-	// ManifestId Stable base-backup manifest id for retry and action correlation.
-	ManifestId    string `json:"manifest_id"`
-	SchemaVersion uint32 `json:"schema_version"`
-
-	// SlotName Stable standby replication slot name.
-	SlotName HASlotName `json:"slot_name"`
-
-	// StartRecordLsn Durable `backup_start` record LSN.
-	StartRecordLsn uint64 `json:"start_record_lsn"`
-}
-
-// HABaseBackupFinishResponse defines model for HABaseBackupFinishResponse.
-type HABaseBackupFinishResponse struct {
-	Action    HAActionReceipt `json:"action"`
-	BackupLsn uint64          `json:"backup_lsn"`
-
-	// EndRecordLsn Durable `backup_end` record LSN.
-	EndRecordLsn  uint64 `json:"end_record_lsn"`
-	ManifestId    string `json:"manifest_id"`
-	SchemaVersion uint32 `json:"schema_version"`
-}
-
-// HACommitAppendResponse defines model for HACommitAppendResponse.
-type HACommitAppendResponse struct {
-	Gate          HACommitGate `json:"gate"`
-	Lsn           uint64       `json:"lsn"`
-	SchemaVersion uint32       `json:"schema_version"`
-}
-
-// HACommitCheckResponse defines model for HACommitCheckResponse.
-type HACommitCheckResponse struct {
-	Gate          HACommitGate `json:"gate"`
-	SchemaVersion uint32       `json:"schema_version"`
-}
-
-// HACommitGate defines model for HACommitGate.
-type HACommitGate struct {
-	Action     HACommitGateAction   `json:"action"`
-	Durability HADurabilityDecision `json:"durability"`
-	TargetLsn  uint64               `json:"target_lsn"`
-}
-
-// HACommitGateAction defines model for HACommitGate.Action.
-type HACommitGateAction string
-
-// HACurrentFenceResponse defines model for HACurrentFenceResponse.
-type HACurrentFenceResponse struct {
-	Held          bool           `json:"held"`
-	Receipt       HAFenceReceipt `json:"receipt,omitempty,omitzero"`
-	SchemaVersion uint32         `json:"schema_version"`
-}
-
-// HADurabilityDecision defines model for HADurabilityDecision.
-type HADurabilityDecision struct {
-	CandidateCount  uint64                        `json:"candidate_count"`
-	MissingLsnCount uint64                        `json:"missing_lsn_count"`
-	Mode            HADurabilityDecisionMode      `json:"mode"`
-	ProgressLsn     uint64                        `json:"progress_lsn"`
-	RequiredCount   uint64                        `json:"required_count"`
-	SatisfiedCount  uint64                        `json:"satisfied_count"`
-	Selection       HADurabilityDecisionSelection `json:"selection"`
-	Status          HADurabilityDecisionStatus    `json:"status"`
-	TargetLsn       uint64                        `json:"target_lsn"`
-}
-
-// HADurabilityDecisionMode defines model for HADurabilityDecision.Mode.
-type HADurabilityDecisionMode string
-
-// HADurabilityDecisionSelection defines model for HADurabilityDecision.Selection.
-type HADurabilityDecisionSelection string
-
-// HADurabilityDecisionStatus defines model for HADurabilityDecision.Status.
-type HADurabilityDecisionStatus string
-
-// HAFenceReceipt defines model for HAFenceReceipt.
-type HAFenceReceipt struct {
-	Forced        bool       `json:"forced"`
-	Generation    uint64     `json:"generation"`
-	Identity      HAIdentity `json:"identity"`
-	NewEpoch      uint64     `json:"new_epoch"`
-	NewTimelineId uint64     `json:"new_timeline_id"`
-	ObservedLsn   uint64     `json:"observed_lsn"`
-
-	// OldPrimaryId Stable HA node id.
-	OldPrimaryId     HANodeID `json:"old_primary_id"`
-	ParentEpoch      uint64   `json:"parent_epoch"`
-	ParentTimelineId uint64   `json:"parent_timeline_id"`
-
-	// PromotedNodeId Stable HA node id.
-	PromotedNodeId HANodeID `json:"promoted_node_id"`
-	Reason         string   `json:"reason"`
-	RequiredLsn    uint64   `json:"required_lsn"`
-	Token          string   `json:"token"`
-}
-
-// HAFenceResponse defines model for HAFenceResponse.
-type HAFenceResponse struct {
-	Action        HAActionReceipt `json:"action"`
-	Receipt       HAFenceReceipt  `json:"receipt"`
-	SchemaVersion uint32          `json:"schema_version"`
-}
-
-// HAIdentifier Stable HA node or slot identifier. Identifiers are 1-128 ASCII bytes and may contain letters, digits, `_`, `-`, `.`, and `:`.
-type HAIdentifier = string
-
-// HAIdentity defines model for HAIdentity.
-type HAIdentity struct {
-	ClusterId uint64 `json:"cluster_id"`
-	Epoch     uint64 `json:"epoch"`
-
-	// ShardId Shard identity. Use 0 for whole-instance HA scope.
-	ShardId uint64 `json:"shard_id"`
-
-	// TableId Table identity. Use 0 for whole-instance HA scope.
-	TableId    uint64 `json:"table_id"`
-	TimelineId uint64 `json:"timeline_id"`
-}
-
-// HALeaseWatchdogProof defines model for HALeaseWatchdogProof.
-type HALeaseWatchdogProof struct {
-	// Active Watchdog capability is running and has validated this exact shared Lease.
-	Active bool `json:"active"`
-
-	// AuthorityGranted This process is the current holder and its suspend-inclusive local deadline has not elapsed.
-	AuthorityGranted bool `json:"authority_granted"`
-
-	// AuthorityRemainingMs Suspend-inclusive local authority remaining when this proof snapshot was created; zero when authority is not granted.
-	AuthorityRemainingMs uint64 `json:"authority_remaining_ms"`
-	CapabilityVersion    uint32 `json:"capability_version"`
-	LeaseName            string `json:"lease_name"`
-	LeaseNamespace       string `json:"lease_namespace"`
-
-	// LocalNodeId Stable HA node id.
-	LocalNodeId       HANodeID `json:"local_node_id"`
-	MaxFenceLatencyMs uint64   `json:"max_fence_latency_ms"`
-
-	// ObservedHolderNodeId Stable HA node id.
-	ObservedHolderNodeId     HANodeID `json:"observed_holder_node_id"`
-	ObservedLeaseTransitions uint64   `json:"observed_lease_transitions"`
-	PodUid                   string   `json:"pod_uid"`
-	ProcessBootId            string   `json:"process_boot_id"`
-	StableTopologyId         string   `json:"stable_topology_id"`
-}
-
-// HANodeID Stable HA node id.
-type HANodeID = string
-
-// HAOwnerJobCheckResponse defines model for HAOwnerJobCheckResponse.
-type HAOwnerJobCheckResponse struct {
-	Decision      HAOwnerJobDecision `json:"decision"`
-	SchemaVersion uint32             `json:"schema_version"`
-}
-
-// HAOwnerJobDecision defines model for HAOwnerJobDecision.
-type HAOwnerJobDecision struct {
-	Action           HAOwnerJobDecisionAction `json:"action"`
-	DurableLsn       uint64                   `json:"durable_lsn"`
-	Identity         HAIdentity               `json:"identity"`
-	Kind             HAOwnerJobDecisionKind   `json:"kind"`
-	NextLsn          uint64                   `json:"next_lsn"`
-	PromotionHandoff HAPromotionHandoff       `json:"promotion_handoff,omitempty,omitzero"`
-	Role             HAOwnerJobDecisionRole   `json:"role"`
-}
-
-// HAOwnerJobDecisionAction defines model for HAOwnerJobDecision.Action.
-type HAOwnerJobDecisionAction string
-
-// HAOwnerJobDecisionKind defines model for HAOwnerJobDecision.Kind.
-type HAOwnerJobDecisionKind string
-
-// HAOwnerJobDecisionRole defines model for HAOwnerJobDecision.Role.
-type HAOwnerJobDecisionRole string
-
-// HAPrimarySnapshot defines model for HAPrimarySnapshot.
-type HAPrimarySnapshot struct {
-	CurrentLsn    uint64               `json:"current_lsn"`
-	Durability    HADurabilityDecision `json:"durability,omitempty,omitzero"`
-	Identity      HAIdentity           `json:"identity"`
-	LeaseWatchdog HALeaseWatchdogProof `json:"lease_watchdog,omitempty,omitzero"`
-
-	// NodeId Stable HA node id.
-	NodeId    HANodeID              `json:"node_id"`
-	Retention HARetentionSnapshot   `json:"retention"`
-	Role      HAPrimarySnapshotRole `json:"role"`
-	Slots     []HASlotSnapshot      `json:"slots"`
-}
-
-// HAPrimarySnapshotRole defines model for HAPrimarySnapshot.Role.
-type HAPrimarySnapshotRole string
-
-// HAPrimaryStatusResponse defines model for HAPrimaryStatusResponse.
-type HAPrimaryStatusResponse struct {
-	SchemaVersion uint32            `json:"schema_version"`
-	Snapshot      HAPrimarySnapshot `json:"snapshot"`
-}
-
-// HAPromotionAssessResponse defines model for HAPromotionAssessResponse.
-type HAPromotionAssessResponse struct {
-	Action        HAActionReceipt       `json:"action"`
-	Assessment    HAPromotionAssessment `json:"assessment"`
-	SchemaVersion uint32                `json:"schema_version"`
-}
-
-// HAPromotionAssessment defines model for HAPromotionAssessment.
-type HAPromotionAssessment struct {
-	AppliedLsn         uint64 `json:"applied_lsn"`
-	CanPromote         bool   `json:"can_promote"`
-	CaughtUpToReceived bool   `json:"caught_up_to_received"`
-	DataLossPossible   bool   `json:"data_loss_possible"`
-	FencingConfirmed   bool   `json:"fencing_confirmed"`
-	Force              bool   `json:"force"`
-	HasRequiredLsn     bool   `json:"has_required_lsn"`
-
-	// Mode Explicit promotion mode for automation. `blocked` means the
-	// assessment is not promotable. `safe` means fencing is confirmed and
-	// all required/applied LSN evidence is present without forcing.
-	// `forced` means force was requested but no data loss is indicated.
-	// `lossy` means force was requested and data loss is possible.
-	Mode            HAPromotionAssessmentMode `json:"mode"`
-	ReceivedLsn     uint64                    `json:"received_lsn"`
-	RequiredLsn     uint64                    `json:"required_lsn"`
-	RequiresFencing bool                      `json:"requires_fencing"`
-	RequiresForce   bool                      `json:"requires_force"`
-	Safe            bool                      `json:"safe"`
-}
-
-// HAPromotionAssessmentMode Explicit promotion mode for automation. `blocked` means the
-// assessment is not promotable. `safe` means fencing is confirmed and
-// all required/applied LSN evidence is present without forcing.
-// `forced` means force was requested but no data loss is indicated.
-// `lossy` means force was requested and data loss is possible.
-type HAPromotionAssessmentMode string
-
-// HAPromotionHandoff defines model for HAPromotionHandoff.
-type HAPromotionHandoff struct {
-	Identity  HAIdentity `json:"identity"`
-	NextLsn   uint64     `json:"next_lsn"`
-	SwitchLsn uint64     `json:"switch_lsn"`
-}
-
-// HAPromotionResponse defines model for HAPromotionResponse.
-type HAPromotionResponse struct {
-	Action          HAActionReceipt       `json:"action"`
-	Assessment      HAPromotionAssessment `json:"assessment"`
-	FenceGeneration uint64                `json:"fence_generation"`
-	FenceToken      string                `json:"fence_token"`
-	Forced          bool                  `json:"forced"`
-	Promotion       HAPromotionResult     `json:"promotion"`
-	SchemaVersion   uint32                `json:"schema_version"`
-}
-
-// HAPromotionResult defines model for HAPromotionResult.
-type HAPromotionResult struct {
-	DataLossPossible bool       `json:"data_loss_possible"`
-	Forced           bool       `json:"forced"`
-	NewIdentity      HAIdentity `json:"new_identity"`
-
-	// NodeId Stable HA node id.
-	NodeId      HANodeID   `json:"node_id"`
-	OldIdentity HAIdentity `json:"old_identity"`
-	SwitchLsn   uint64     `json:"switch_lsn"`
-}
-
-// HAReadCheckResponse defines model for HAReadCheckResponse.
-type HAReadCheckResponse struct {
-	Decision      HAReadDecision `json:"decision"`
-	SchemaVersion uint32         `json:"schema_version"`
-}
-
-// HAReadDecision defines model for HAReadDecision.
-type HAReadDecision struct {
-	Action                  HAReadDecisionAction      `json:"action"`
-	AppliedLsn              uint64                    `json:"applied_lsn"`
-	Consistency             HAReadDecisionConsistency `json:"consistency"`
-	MetadataAppliedLsn      uint64                    `json:"metadata_applied_lsn,omitempty,omitzero"`
-	MetadataMissingLsnCount uint64                    `json:"metadata_missing_lsn_count"`
-	MissingLsnCount         uint64                    `json:"missing_lsn_count"`
-	ReceivedLsn             uint64                    `json:"received_lsn"`
-	RequiredLsn             uint64                    `json:"required_lsn,omitempty,omitzero"`
-	RequiredMetadataLsn     uint64                    `json:"required_metadata_lsn,omitempty,omitzero"`
-	SafeReadLsn             uint64                    `json:"safe_read_lsn"`
-	ServeLsn                uint64                    `json:"serve_lsn,omitempty,omitzero"`
-}
-
-// HAReadDecisionAction defines model for HAReadDecision.Action.
-type HAReadDecisionAction string
-
-// HAReadDecisionConsistency defines model for HAReadDecision.Consistency.
-type HAReadDecisionConsistency string
-
-// HARejoinAssessResponse defines model for HARejoinAssessResponse.
-type HARejoinAssessResponse struct {
-	Action        HAActionReceipt      `json:"action"`
-	Assessment    HARejoinAssessment   `json:"assessment"`
-	Reseed        HARejoinReseedResult `json:"reseed,omitempty,omitzero"`
-	Rewind        HARejoinRewindResult `json:"rewind,omitempty,omitzero"`
-	SchemaVersion uint32               `json:"schema_version"`
-}
-
-// HARejoinAssessment defines model for HARejoinAssessment.
-type HARejoinAssessment struct {
-	Action            HARejoinAssessmentAction `json:"action"`
-	DataLossDiscarded bool                     `json:"data_loss_discarded"`
-	ForkLsn           uint64                   `json:"fork_lsn"`
-	FormerLastLsn     uint64                   `json:"former_last_lsn"`
-
-	// FormerNodeId Stable HA node id.
-	FormerNodeId HANodeID `json:"former_node_id"`
-
-	// ParentClusterId Cluster identity of the retained parent-timeline fork record.
-	ParentClusterId uint64 `json:"parent_cluster_id"`
-
-	// ParentEpoch Parent epoch that must contain the fork record before rewind.
-	ParentEpoch uint64 `json:"parent_epoch"`
-
-	// ParentShardId Shard identity of the retained parent-timeline fork record.
-	ParentShardId uint64 `json:"parent_shard_id"`
-
-	// ParentTableId Table identity of the retained parent-timeline fork record.
-	ParentTableId uint64 `json:"parent_table_id"`
-
-	// ParentTimelineId Parent timeline that must contain the fork record before rewind.
-	ParentTimelineId uint64                   `json:"parent_timeline_id"`
-	Reason           HARejoinAssessmentReason `json:"reason"`
-	RetainedFromLsn  uint64                   `json:"retained_from_lsn"`
-	TargetEpoch      uint64                   `json:"target_epoch"`
-	TargetTimelineId uint64                   `json:"target_timeline_id"`
-}
-
-// HARejoinAssessmentAction defines model for HARejoinAssessment.Action.
-type HARejoinAssessmentAction string
-
-// HARejoinAssessmentReason defines model for HARejoinAssessment.Reason.
-type HARejoinAssessmentReason string
-
-// HARejoinReseedResult defines model for HARejoinReseedResult.
-type HARejoinReseedResult struct {
-	BaseBackupRequired bool   `json:"base_backup_required"`
-	ForkLsn            uint64 `json:"fork_lsn"`
-	FormerLastLsn      uint64 `json:"former_last_lsn"`
-
-	// NodeId Stable HA node id.
-	NodeId         HANodeID `json:"node_id"`
-	ReseedRequired bool     `json:"reseed_required"`
-
-	// SlotName Stable standby replication slot name.
-	SlotName         HASlotName `json:"slot_name"`
-	TargetEpoch      uint64     `json:"target_epoch"`
-	TargetTimelineId uint64     `json:"target_timeline_id"`
-}
-
-// HARejoinRewindResult defines model for HARejoinRewindResult.
-type HARejoinRewindResult struct {
-	CurrentLastLsn    uint64 `json:"current_last_lsn"`
-	DataLossDiscarded bool   `json:"data_loss_discarded"`
-	DiscardedLsnCount uint64 `json:"discarded_lsn_count"`
-	ForkLsn           uint64 `json:"fork_lsn"`
-	NextLsn           uint64 `json:"next_lsn"`
-
-	// NodeId Stable HA node id.
-	NodeId           HANodeID `json:"node_id"`
-	PreviousLastLsn  uint64   `json:"previous_last_lsn"`
-	TargetEpoch      uint64   `json:"target_epoch"`
-	TargetTimelineId uint64   `json:"target_timeline_id"`
-}
-
-// HAReplicationSlot defines model for HAReplicationSlot.
-type HAReplicationSlot struct {
-	Active         bool   `json:"active"`
-	AppliedLsn     uint64 `json:"applied_lsn"`
-	CurrentLsn     uint64 `json:"current_lsn"`
-	Dropped        bool   `json:"dropped,omitempty,omitzero"`
-	LastError      string `json:"last_error,omitempty,omitzero"`
-	ReceivedLsn    uint64 `json:"received_lsn"`
-	ReseedRequired bool   `json:"reseed_required"`
-	RestartLsn     uint64 `json:"restart_lsn"`
-	SafeReadLsn    uint64 `json:"safe_read_lsn"`
-
-	// SlotName Stable standby replication slot name.
-	SlotName   HASlotName `json:"slot_name"`
-	TimelineId uint64     `json:"timeline_id"`
-}
-
-// HAReplicationSlotActionResponse defines model for HAReplicationSlotActionResponse.
-type HAReplicationSlotActionResponse struct {
-	Action        HAActionReceipt                           `json:"action"`
-	SchemaVersion uint32                                    `json:"schema_version"`
-	Slot          HAReplicationSlot                         `json:"slot"`
-	SlotAction    HAReplicationSlotActionResponseSlotAction `json:"slot_action"`
-}
-
-// HAReplicationSlotActionResponseSlotAction defines model for HAReplicationSlotActionResponse.SlotAction.
-type HAReplicationSlotActionResponseSlotAction string
-
-// HAReplicationSlotListResponse defines model for HAReplicationSlotListResponse.
-type HAReplicationSlotListResponse struct {
-	SchemaVersion uint32              `json:"schema_version"`
-	Slots         []HAReplicationSlot `json:"slots"`
-}
-
-// HARetentionSnapshot defines model for HARetentionSnapshot.
-type HARetentionSnapshot struct {
-	ActiveSlots       uint64 `json:"active_slots"`
-	OldestRestartLsn  uint64 `json:"oldest_restart_lsn"`
-	PrimaryLsn        uint64 `json:"primary_lsn"`
-	ReseedRecommended uint64 `json:"reseed_recommended"`
-	RetainedAgeNs     uint64 `json:"retained_age_ns"`
-	RetainedByteCount uint64 `json:"retained_byte_count"`
-	RetainedLsnCount  uint64 `json:"retained_lsn_count"`
-}
-
-// HARuntimeLifecycleObservation defines model for HARuntimeLifecycleObservation.
-type HARuntimeLifecycleObservation struct {
-	Fenced           bool                              `json:"fenced"`
-	NodeId           string                            `json:"node_id,omitempty,omitzero"`
-	ObservedAtUnixNs uint64                            `json:"observed_at_unix_ns"`
-	PodUid           string                            `json:"pod_uid,omitempty,omitzero"`
-	Role             HARuntimeLifecycleObservationRole `json:"role"`
-}
-
-// HARuntimeLifecycleObservationRole defines model for HARuntimeLifecycleObservation.Role.
-type HARuntimeLifecycleObservationRole string
-
-// HASeedArtifactCaptureResponse defines model for HASeedArtifactCaptureResponse.
-type HASeedArtifactCaptureResponse struct {
-	Action          HAActionReceipt `json:"action"`
-	AlreadyCaptured bool            `json:"already_captured"`
-	BackupLsn       uint64          `json:"backup_lsn"`
-
-	// CaptureReceiptSha256 SHA-256 of the exact immutable runtime capture COMPLETE response bytes.
-	CaptureReceiptSha256 string `json:"capture_receipt_sha256"`
-	CheckpointLsn        uint64 `json:"checkpoint_lsn"`
-	ClusterId            uint64 `json:"cluster_id"`
-	ContentRoot          string `json:"content_root"`
-	EndRecordLsn         uint64 `json:"end_record_lsn"`
-	Epoch                uint64 `json:"epoch"`
-	FileCount            uint64 `json:"file_count"`
-	Generation           string `json:"generation"`
-	GenerationRoot       string `json:"generation_root"`
-	ManifestId           string `json:"manifest_id"`
-	ManifestPath         string `json:"manifest_path"`
-	ManifestSha256       string `json:"manifest_sha256"`
-	NodeId               string `json:"node_id"`
-	SchemaVersion        uint32 `json:"schema_version"`
-	ShardId              uint64 `json:"shard_id"`
-
-	// SlotName Stable standby replication slot name.
-	SlotName           HASlotName `json:"slot_name"`
-	SourcePlanSha256   string     `json:"source_plan_sha256"`
-	TableId            uint64     `json:"table_id"`
-	TargetPvcName      string     `json:"target_pvc_name"`
-	TargetPvcUid       string     `json:"target_pvc_uid"`
-	TimelineId         uint64     `json:"timeline_id"`
-	TopologyGeneration uint64     `json:"topology_generation"`
-	TopologyId         string     `json:"topology_id"`
-	TotalBytes         uint64     `json:"total_bytes"`
-}
-
-// HASeedLifecycleReceiptEvent defines model for HASeedLifecycleReceiptEvent.
-type HASeedLifecycleReceiptEvent struct {
-	AuthoritativeState HASeedLifecycleReceiptEventAuthoritativeState `json:"authoritative_state"`
-	Cursor             uint64                                        `json:"cursor"`
-	Generation         string                                        `json:"generation"`
-	Kind               HASeedLifecycleReceiptEventKind               `json:"kind"`
-	NodeId             string                                        `json:"node_id"`
-	PodUid             string                                        `json:"pod_uid,omitempty,omitzero"`
-	ReceiptJson        string                                        `json:"receipt_json"`
-	ReceiptSha256      string                                        `json:"receipt_sha256"`
-	RecordedAtUnixNs   uint64                                        `json:"recorded_at_unix_ns"`
-
-	// SlotName Stable standby replication slot name.
-	SlotName           HASlotName `json:"slot_name"`
-	TargetPvcName      string     `json:"target_pvc_name"`
-	TargetPvcUid       string     `json:"target_pvc_uid"`
-	TopologyGeneration uint64     `json:"topology_generation"`
-	TopologyId         string     `json:"topology_id"`
-}
-
-// HASeedLifecycleReceiptEventAuthoritativeState defines model for HASeedLifecycleReceiptEvent.AuthoritativeState.
-type HASeedLifecycleReceiptEventAuthoritativeState string
-
-// HASeedLifecycleReceiptEventKind defines model for HASeedLifecycleReceiptEvent.Kind.
-type HASeedLifecycleReceiptEventKind string
-
-// HASeedLifecycleReceiptInventoryResponse defines model for HASeedLifecycleReceiptInventoryResponse.
-type HASeedLifecycleReceiptInventoryResponse struct {
-	EndCursor        uint64                        `json:"end_cursor"`
-	Entries          []HASeedLifecycleReceiptEvent `json:"entries"`
-	FirstCursor      uint64                        `json:"first_cursor"`
-	Gap              bool                          `json:"gap"`
-	HasMore          bool                          `json:"has_more"`
-	HistoryTruncated bool                          `json:"history_truncated"`
-	NextCursor       uint64                        `json:"next_cursor"`
-	Runtime          HARuntimeLifecycleObservation `json:"runtime"`
-	SchemaVersion    uint32                        `json:"schema_version"`
-}
-
-// HASeededSlotActivateResponse defines model for HASeededSlotActivateResponse.
-type HASeededSlotActivateResponse struct {
-	Action          HAActionReceipt `json:"action"`
-	AggregateSha256 string          `json:"aggregate_sha256"`
-
-	// CaptureReceiptSha256 SHA-256 of the exact runtime-owned capture COMPLETE receipt bytes that authorized publication.
-	CaptureReceiptSha256 string `json:"capture_receipt_sha256"`
-	CheckpointLsn        uint64 `json:"checkpoint_lsn"`
-	Generation           string `json:"generation"`
-	ManifestId           string `json:"manifest_id"`
-	ManifestSha256       string `json:"manifest_sha256"`
-	SchemaVersion        uint32 `json:"schema_version"`
-	SeedReceiptSha256    string `json:"seed_receipt_sha256"`
-
-	// SlotName Stable standby replication slot name.
-	SlotName   HASlotName `json:"slot_name"`
-	TimelineId uint64     `json:"timeline_id"`
-}
-
-// HASlotName Stable standby replication slot name.
-type HASlotName = string
-
-// HASlotSnapshot defines model for HASlotSnapshot.
-type HASlotSnapshot struct {
-	Active          bool                 `json:"active"`
-	AppliedLsn      uint64               `json:"applied_lsn"`
-	ApplyLagLsn     uint64               `json:"apply_lag_lsn"`
-	LastError       string               `json:"last_error,omitempty,omitzero"`
-	Name            string               `json:"name"`
-	ReceivedLsn     uint64               `json:"received_lsn"`
-	ReseedRequired  bool                 `json:"reseed_required"`
-	RestartLsn      uint64               `json:"restart_lsn"`
-	RetentionLagLsn uint64               `json:"retention_lag_lsn"`
-	SafeReadLagLsn  uint64               `json:"safe_read_lag_lsn"`
-	SafeReadLsn     uint64               `json:"safe_read_lsn"`
-	Status          HASlotSnapshotStatus `json:"status"`
-	TimelineId      uint64               `json:"timeline_id"`
-	WriteLagLsn     uint64               `json:"write_lag_lsn"`
-}
-
-// HASlotSnapshotStatus defines model for HASlotSnapshot.Status.
-type HASlotSnapshotStatus string
-
-// HAStandbyBootstrapResponse defines model for HAStandbyBootstrapResponse.
-type HAStandbyBootstrapResponse struct {
-	Action    HAActionReceipt `json:"action"`
-	BackupLsn uint64          `json:"backup_lsn"`
-
-	// CheckpointLsn Standby checkpoint LSN after manifest validation.
-	CheckpointLsn uint64 `json:"checkpoint_lsn"`
-	ManifestId    string `json:"manifest_id"`
-	SchemaVersion uint32 `json:"schema_version"`
-}
-
-// HAStandbySnapshot defines model for HAStandbySnapshot.
-type HAStandbySnapshot struct {
-	AppliedLsn         uint64     `json:"applied_lsn"`
-	ApplyLagLsn        uint64     `json:"apply_lag_lsn,omitempty,omitzero"`
-	CanServeSafeReads  bool       `json:"can_serve_safe_reads"`
-	CaughtUpToReceived bool       `json:"caught_up_to_received"`
-	Identity           HAIdentity `json:"identity"`
-
-	// LastAttemptNs Monotonic nanosecond timestamp for the most recent local standby replication attempt.
-	LastAttemptNs uint64 `json:"last_attempt_ns,omitempty,omitzero"`
-
-	// LastError Last local standby replication pull or apply error observed by the node-local runtime.
-	LastError string `json:"last_error,omitempty,omitzero"`
-
-	// LastSuccessNs Monotonic nanosecond timestamp for the most recent successful local standby replication round.
-	LastSuccessNs uint64               `json:"last_success_ns,omitempty,omitzero"`
-	LeaseWatchdog HALeaseWatchdogProof `json:"lease_watchdog,omitempty,omitzero"`
-
-	// NodeId Stable HA node id.
-	NodeId        HANodeID `json:"node_id"`
-	ReceiveLagLsn uint64   `json:"receive_lag_lsn,omitempty,omitzero"`
-	ReceivedLsn   uint64   `json:"received_lsn"`
-
-	// ReplicationFailuresTotal Local standby replication rounds that exited early with an error.
-	ReplicationFailuresTotal uint64                `json:"replication_failures_total,omitempty,omitzero"`
-	Role                     HAStandbySnapshotRole `json:"role"`
-	SafeReadLsn              uint64                `json:"safe_read_lsn"`
-	UnappliedLsnCount        uint64                `json:"unapplied_lsn_count"`
-	UpstreamLsn              uint64                `json:"upstream_lsn,omitempty,omitzero"`
-	WriteLagLsn              uint64                `json:"write_lag_lsn,omitempty,omitzero"`
-}
-
-// HAStandbySnapshotRole defines model for HAStandbySnapshot.Role.
-type HAStandbySnapshotRole string
-
-// HAStandbyStatusResponse defines model for HAStandbyStatusResponse.
-type HAStandbyStatusResponse struct {
-	SchemaVersion uint32            `json:"schema_version"`
-	Snapshot      HAStandbySnapshot `json:"snapshot"`
-}
-
-// HASyncPolicy defines model for HASyncPolicy.
-type HASyncPolicy struct {
-	// FailurePolicy Caller-visible action when synchronous durability is not currently satisfied.
-	FailurePolicy HASyncPolicyFailurePolicy `json:"failure_policy,omitempty,omitzero"`
-
-	// Mode Durability mode to require before acknowledging the commit.
-	Mode HASyncPolicyMode `json:"mode"`
-
-	// Required Number of eligible standbys required for `any` selection.
-	Required uint64 `json:"required,omitempty,omitzero"`
-
-	// Selection How named standbys are selected to satisfy the policy.
-	Selection HASyncPolicySelection `json:"selection,omitempty,omitzero"`
-
-	// StandbyNames Ordered candidate standby names for synchronous commit.
-	StandbyNames []HASlotName `json:"standby_names,omitempty,omitzero"`
-}
-
-// HASyncPolicyFailurePolicy Caller-visible action when synchronous durability is not currently satisfied.
-type HASyncPolicyFailurePolicy string
-
-// HASyncPolicyMode Durability mode to require before acknowledging the commit.
-type HASyncPolicyMode string
-
-// HASyncPolicySelection How named standbys are selected to satisfy the policy.
-type HASyncPolicySelection string
-
-// HAWatchdogProofResponse defines model for HAWatchdogProofResponse.
-type HAWatchdogProofResponse struct {
-	Proof         HALeaseWatchdogProof `json:"proof"`
-	SchemaVersion uint32               `json:"schema_version"`
-}
-
-// HAWriteCheckResponse defines model for HAWriteCheckResponse.
-type HAWriteCheckResponse struct {
-	Decision      HAWriteDecision `json:"decision"`
-	SchemaVersion uint32          `json:"schema_version"`
-}
-
-// HAWriteDecision defines model for HAWriteDecision.
-type HAWriteDecision struct {
-	Action           HAWriteDecisionAction `json:"action"`
-	DurableLsn       uint64                `json:"durable_lsn"`
-	Identity         HAIdentity            `json:"identity"`
-	NextLsn          uint64                `json:"next_lsn"`
-	PromotionHandoff HAPromotionHandoff    `json:"promotion_handoff,omitempty,omitzero"`
-	Role             HAWriteDecisionRole   `json:"role"`
-}
-
-// HAWriteDecisionAction defines model for HAWriteDecision.Action.
-type HAWriteDecisionAction string
-
-// HAWriteDecisionRole defines model for HAWriteDecision.Role.
-type HAWriteDecisionRole string
 
 // OwnerJobCheckRequest defines model for OwnerJobCheckRequest.
 type OwnerJobCheckRequest struct {
-	ExpectedIdentity HAIdentity               `json:"expected_identity,omitempty,omitzero"`
+	ExpectedIdentity StandbyIdentity          `json:"expected_identity,omitempty,omitzero"`
 	Kind             OwnerJobCheckRequestKind `json:"kind"`
 	Role             OwnerJobCheckRequestRole `json:"role"`
 }
@@ -1674,15 +1005,15 @@ type ReadCheckRequestConsistency string
 
 // RejoinAssessRequest defines model for RejoinAssessRequest.
 type RejoinAssessRequest struct {
-	AllowRewindAfterForcedPromotion bool       `json:"allow_rewind_after_forced_promotion"`
-	Identity                        HAIdentity `json:"identity"`
+	AllowRewindAfterForcedPromotion bool            `json:"allow_rewind_after_forced_promotion"`
+	Identity                        StandbyIdentity `json:"identity"`
 
 	// LastLsn Last local LSN durably present on the former primary.
 	LastLsn uint64 `json:"last_lsn"`
 
-	// NodeId Stable HA node id.
-	NodeId  HANodeID       `json:"node_id"`
-	Receipt HAFenceReceipt `json:"receipt,omitempty,omitzero"`
+	// NodeId Stable hot-standby node id.
+	NodeId  StandbyNodeID       `json:"node_id"`
+	Receipt StandbyFenceReceipt `json:"receipt,omitempty,omitzero"`
 
 	// RetainedFromLsn Earliest parent-timeline WAL LSN still retained for rewind.
 	RetainedFromLsn uint64 `json:"retained_from_lsn"`
@@ -1694,7 +1025,7 @@ type ReplicationSlotCreateRequest struct {
 	InitialLsn uint64 `json:"initial_lsn,omitempty,omitzero"`
 
 	// SlotName Stable standby replication slot name.
-	SlotName HASlotName `json:"slot_name"`
+	SlotName StandbySlotName `json:"slot_name"`
 }
 
 // SeedArtifactCaptureRequest defines model for SeedArtifactCaptureRequest.
@@ -1703,11 +1034,11 @@ type SeedArtifactCaptureRequest struct {
 	NodeId     string `json:"node_id"`
 
 	// SlotName Stable standby replication slot name.
-	SlotName           HASlotName `json:"slot_name"`
-	TargetPvcName      string     `json:"target_pvc_name"`
-	TargetPvcUid       string     `json:"target_pvc_uid"`
-	TopologyGeneration uint64     `json:"topology_generation"`
-	TopologyId         string     `json:"topology_id"`
+	SlotName           StandbySlotName `json:"slot_name"`
+	TargetPvcName      string          `json:"target_pvc_name"`
+	TargetPvcUid       string          `json:"target_pvc_uid"`
+	TopologyGeneration uint64          `json:"topology_generation"`
+	TopologyId         string          `json:"topology_id"`
 }
 
 // SeededSlotActivateRequest defines model for SeededSlotActivateRequest.
@@ -1723,8 +1054,61 @@ type SeededSlotActivateRequest struct {
 	SeedReceiptSha256    string `json:"seed_receipt_sha256"`
 
 	// SlotName Stable standby replication slot name.
-	SlotName   HASlotName `json:"slot_name"`
-	TimelineId uint64     `json:"timeline_id"`
+	SlotName   StandbySlotName `json:"slot_name"`
+	TimelineId uint64          `json:"timeline_id"`
+}
+
+// StandbyActionReceipt defines model for StandbyActionReceipt.
+type StandbyActionReceipt struct {
+	// ActionId Stable action correlation id derived from the acted-on hot-standby resource and boundary values.
+	ActionId string `json:"action_id"`
+
+	// ActionKind Typed hot-standby action that produced this response.
+	ActionKind StandbyActionReceiptActionKind `json:"action_kind"`
+
+	// NodeId Stable hot-standby node id.
+	NodeId StandbyNodeID `json:"node_id"`
+
+	// State Idempotency state for this action response.
+	State StandbyActionReceiptState `json:"state"`
+
+	// Target Node id, slot name, manifest id, or promotion boundary acted on by this node-local endpoint.
+	Target string `json:"target"`
+}
+
+// StandbyActionReceiptActionKind Typed hot-standby action that produced this response.
+type StandbyActionReceiptActionKind string
+
+// StandbyActionReceiptState Idempotency state for this action response.
+type StandbyActionReceiptState string
+
+// StandbyBaseBackupBeginResponse defines model for StandbyBaseBackupBeginResponse.
+type StandbyBaseBackupBeginResponse struct {
+	Action StandbyActionReceipt `json:"action"`
+
+	// BackupLsn LSN reserved as the base-backup start boundary.
+	BackupLsn uint64 `json:"backup_lsn"`
+
+	// ManifestId Stable base-backup manifest id for retry and action correlation.
+	ManifestId    string `json:"manifest_id"`
+	SchemaVersion uint32 `json:"schema_version"`
+
+	// SlotName Stable standby replication slot name.
+	SlotName StandbySlotName `json:"slot_name"`
+
+	// StartRecordLsn Durable `backup_start` record LSN.
+	StartRecordLsn uint64 `json:"start_record_lsn"`
+}
+
+// StandbyBaseBackupFinishResponse defines model for StandbyBaseBackupFinishResponse.
+type StandbyBaseBackupFinishResponse struct {
+	Action    StandbyActionReceipt `json:"action"`
+	BackupLsn uint64               `json:"backup_lsn"`
+
+	// EndRecordLsn Durable `backup_end` record LSN.
+	EndRecordLsn  uint64 `json:"end_record_lsn"`
+	ManifestId    string `json:"manifest_id"`
+	SchemaVersion uint32 `json:"schema_version"`
 }
 
 // StandbyBootstrapRequest defines model for StandbyBootstrapRequest.
@@ -1732,9 +1116,668 @@ type StandbyBootstrapRequest struct {
 	// ContentRoot Optional absolute normalized pod-local directory containing files referenced by the manifest.
 	ContentRoot string `json:"content_root,omitempty,omitzero"`
 
-	// ManifestPath Absolute normalized pod-local path to the HA base-backup manifest.
+	// ManifestPath Absolute normalized pod-local path to the hot-standby base-backup manifest.
 	ManifestPath string `json:"manifest_path"`
 }
+
+// StandbyBootstrapResponse defines model for StandbyBootstrapResponse.
+type StandbyBootstrapResponse struct {
+	Action    StandbyActionReceipt `json:"action"`
+	BackupLsn uint64               `json:"backup_lsn"`
+
+	// CheckpointLsn Standby checkpoint LSN after manifest validation.
+	CheckpointLsn uint64 `json:"checkpoint_lsn"`
+	ManifestId    string `json:"manifest_id"`
+	SchemaVersion uint32 `json:"schema_version"`
+}
+
+// StandbyCommitAppendResponse defines model for StandbyCommitAppendResponse.
+type StandbyCommitAppendResponse struct {
+	Gate          StandbyCommitGate `json:"gate"`
+	Lsn           uint64            `json:"lsn"`
+	SchemaVersion uint32            `json:"schema_version"`
+}
+
+// StandbyCommitCheckResponse defines model for StandbyCommitCheckResponse.
+type StandbyCommitCheckResponse struct {
+	Gate          StandbyCommitGate `json:"gate"`
+	SchemaVersion uint32            `json:"schema_version"`
+}
+
+// StandbyCommitGate defines model for StandbyCommitGate.
+type StandbyCommitGate struct {
+	Action     StandbyCommitGateAction   `json:"action"`
+	Durability StandbyDurabilityDecision `json:"durability"`
+	TargetLsn  uint64                    `json:"target_lsn"`
+}
+
+// StandbyCommitGateAction defines model for StandbyCommitGate.Action.
+type StandbyCommitGateAction string
+
+// StandbyCurrentFenceResponse defines model for StandbyCurrentFenceResponse.
+type StandbyCurrentFenceResponse struct {
+	Held          bool                `json:"held"`
+	Receipt       StandbyFenceReceipt `json:"receipt,omitempty,omitzero"`
+	SchemaVersion uint32              `json:"schema_version"`
+}
+
+// StandbyDurabilityDecision defines model for StandbyDurabilityDecision.
+type StandbyDurabilityDecision struct {
+	CandidateCount  uint64                             `json:"candidate_count"`
+	MissingLsnCount uint64                             `json:"missing_lsn_count"`
+	Mode            StandbyDurabilityDecisionMode      `json:"mode"`
+	ProgressLsn     uint64                             `json:"progress_lsn"`
+	RequiredCount   uint64                             `json:"required_count"`
+	SatisfiedCount  uint64                             `json:"satisfied_count"`
+	Selection       StandbyDurabilityDecisionSelection `json:"selection"`
+	Status          StandbyDurabilityDecisionStatus    `json:"status"`
+	TargetLsn       uint64                             `json:"target_lsn"`
+}
+
+// StandbyDurabilityDecisionMode defines model for StandbyDurabilityDecision.Mode.
+type StandbyDurabilityDecisionMode string
+
+// StandbyDurabilityDecisionSelection defines model for StandbyDurabilityDecision.Selection.
+type StandbyDurabilityDecisionSelection string
+
+// StandbyDurabilityDecisionStatus defines model for StandbyDurabilityDecision.Status.
+type StandbyDurabilityDecisionStatus string
+
+// StandbyFenceReceipt defines model for StandbyFenceReceipt.
+type StandbyFenceReceipt struct {
+	Forced        bool            `json:"forced"`
+	Generation    uint64          `json:"generation"`
+	Identity      StandbyIdentity `json:"identity"`
+	NewEpoch      uint64          `json:"new_epoch"`
+	NewTimelineId uint64          `json:"new_timeline_id"`
+	ObservedLsn   uint64          `json:"observed_lsn"`
+
+	// OldPrimaryId Stable hot-standby node id.
+	OldPrimaryId     StandbyNodeID `json:"old_primary_id"`
+	ParentEpoch      uint64        `json:"parent_epoch"`
+	ParentTimelineId uint64        `json:"parent_timeline_id"`
+
+	// PromotedNodeId Stable hot-standby node id.
+	PromotedNodeId StandbyNodeID `json:"promoted_node_id"`
+	Reason         string        `json:"reason"`
+	RequiredLsn    uint64        `json:"required_lsn"`
+	Token          string        `json:"token"`
+}
+
+// StandbyFenceResponse defines model for StandbyFenceResponse.
+type StandbyFenceResponse struct {
+	Action        StandbyActionReceipt `json:"action"`
+	Receipt       StandbyFenceReceipt  `json:"receipt"`
+	SchemaVersion uint32               `json:"schema_version"`
+}
+
+// StandbyIdentifier Stable hot-standby node or slot identifier. Identifiers are 1-128 ASCII bytes and may contain letters, digits, `_`, `-`, `.`, and `:`.
+type StandbyIdentifier = string
+
+// StandbyIdentity defines model for StandbyIdentity.
+type StandbyIdentity struct {
+	ClusterId uint64 `json:"cluster_id"`
+	Epoch     uint64 `json:"epoch"`
+
+	// ShardId Shard identity. Use 0 for whole-instance hot-standby scope.
+	ShardId uint64 `json:"shard_id"`
+
+	// TableId Table identity. Use 0 for whole-instance hot-standby scope.
+	TableId    uint64 `json:"table_id"`
+	TimelineId uint64 `json:"timeline_id"`
+}
+
+// StandbyLeaseWatchdogProof defines model for StandbyLeaseWatchdogProof.
+type StandbyLeaseWatchdogProof struct {
+	// Active Watchdog capability is running and has validated this exact shared Lease.
+	Active bool `json:"active"`
+
+	// AuthorityGranted This process is the current holder and its suspend-inclusive local deadline has not elapsed.
+	AuthorityGranted bool `json:"authority_granted"`
+
+	// AuthorityRemainingMs Suspend-inclusive local authority remaining when this proof snapshot was created; zero when authority is not granted.
+	AuthorityRemainingMs uint64 `json:"authority_remaining_ms"`
+	CapabilityVersion    uint32 `json:"capability_version"`
+	LeaseName            string `json:"lease_name"`
+	LeaseNamespace       string `json:"lease_namespace"`
+
+	// LocalNodeId Stable hot-standby node id.
+	LocalNodeId       StandbyNodeID `json:"local_node_id"`
+	MaxFenceLatencyMs uint64        `json:"max_fence_latency_ms"`
+
+	// ObservedHolderNodeId Stable hot-standby node id.
+	ObservedHolderNodeId     StandbyNodeID `json:"observed_holder_node_id"`
+	ObservedLeaseTransitions uint64        `json:"observed_lease_transitions"`
+	PodUid                   string        `json:"pod_uid"`
+	ProcessBootId            string        `json:"process_boot_id"`
+	StableTopologyId         string        `json:"stable_topology_id"`
+}
+
+// StandbyNodeID Stable hot-standby node id.
+type StandbyNodeID = string
+
+// StandbyOwnerJobCheckResponse defines model for StandbyOwnerJobCheckResponse.
+type StandbyOwnerJobCheckResponse struct {
+	Decision      StandbyOwnerJobDecision `json:"decision"`
+	SchemaVersion uint32                  `json:"schema_version"`
+}
+
+// StandbyOwnerJobDecision defines model for StandbyOwnerJobDecision.
+type StandbyOwnerJobDecision struct {
+	Action           StandbyOwnerJobDecisionAction `json:"action"`
+	DurableLsn       uint64                        `json:"durable_lsn"`
+	Identity         StandbyIdentity               `json:"identity"`
+	Kind             StandbyOwnerJobDecisionKind   `json:"kind"`
+	NextLsn          uint64                        `json:"next_lsn"`
+	PromotionHandoff StandbyPromotionHandoff       `json:"promotion_handoff,omitempty,omitzero"`
+	Role             StandbyOwnerJobDecisionRole   `json:"role"`
+}
+
+// StandbyOwnerJobDecisionAction defines model for StandbyOwnerJobDecision.Action.
+type StandbyOwnerJobDecisionAction string
+
+// StandbyOwnerJobDecisionKind defines model for StandbyOwnerJobDecision.Kind.
+type StandbyOwnerJobDecisionKind string
+
+// StandbyOwnerJobDecisionRole defines model for StandbyOwnerJobDecision.Role.
+type StandbyOwnerJobDecisionRole string
+
+// StandbyPrimarySnapshot defines model for StandbyPrimarySnapshot.
+type StandbyPrimarySnapshot struct {
+	CurrentLsn    uint64                    `json:"current_lsn"`
+	Durability    StandbyDurabilityDecision `json:"durability,omitempty,omitzero"`
+	Identity      StandbyIdentity           `json:"identity"`
+	LeaseWatchdog StandbyLeaseWatchdogProof `json:"lease_watchdog,omitempty,omitzero"`
+
+	// NodeId Stable hot-standby node id.
+	NodeId    StandbyNodeID              `json:"node_id"`
+	Retention StandbyRetentionSnapshot   `json:"retention"`
+	Role      StandbyPrimarySnapshotRole `json:"role"`
+	Slots     []StandbySlotSnapshot      `json:"slots"`
+
+	// WaitingForTables The runtime catalog has no tables. Controllers may defer initial standby seeding, but must not dismantle HA that has already started. Omitted by older runtimes.
+	WaitingForTables *bool `json:"waiting_for_tables,omitempty"`
+}
+
+// StandbyPrimarySnapshotRole defines model for StandbyPrimarySnapshot.Role.
+type StandbyPrimarySnapshotRole string
+
+// StandbyPrimaryStatusResponse defines model for StandbyPrimaryStatusResponse.
+type StandbyPrimaryStatusResponse struct {
+	SchemaVersion uint32                 `json:"schema_version"`
+	Snapshot      StandbyPrimarySnapshot `json:"snapshot"`
+}
+
+// StandbyPromotionAssessResponse defines model for StandbyPromotionAssessResponse.
+type StandbyPromotionAssessResponse struct {
+	Action        StandbyActionReceipt       `json:"action"`
+	Assessment    StandbyPromotionAssessment `json:"assessment"`
+	SchemaVersion uint32                     `json:"schema_version"`
+}
+
+// StandbyPromotionAssessment defines model for StandbyPromotionAssessment.
+type StandbyPromotionAssessment struct {
+	AppliedLsn         uint64 `json:"applied_lsn"`
+	CanPromote         bool   `json:"can_promote"`
+	CaughtUpToReceived bool   `json:"caught_up_to_received"`
+	DataLossPossible   bool   `json:"data_loss_possible"`
+	FencingConfirmed   bool   `json:"fencing_confirmed"`
+	Force              bool   `json:"force"`
+	HasRequiredLsn     bool   `json:"has_required_lsn"`
+
+	// Mode Explicit promotion mode for automation. `blocked` means the
+	// assessment is not promotable. `safe` means fencing is confirmed and
+	// all required/applied LSN evidence is present without forcing.
+	// `forced` means force was requested but no data loss is indicated.
+	// `lossy` means force was requested and data loss is possible.
+	Mode            StandbyPromotionAssessmentMode `json:"mode"`
+	ReceivedLsn     uint64                         `json:"received_lsn"`
+	RequiredLsn     uint64                         `json:"required_lsn"`
+	RequiresFencing bool                           `json:"requires_fencing"`
+	RequiresForce   bool                           `json:"requires_force"`
+	Safe            bool                           `json:"safe"`
+}
+
+// StandbyPromotionAssessmentMode Explicit promotion mode for automation. `blocked` means the
+// assessment is not promotable. `safe` means fencing is confirmed and
+// all required/applied LSN evidence is present without forcing.
+// `forced` means force was requested but no data loss is indicated.
+// `lossy` means force was requested and data loss is possible.
+type StandbyPromotionAssessmentMode string
+
+// StandbyPromotionHandoff defines model for StandbyPromotionHandoff.
+type StandbyPromotionHandoff struct {
+	Identity  StandbyIdentity `json:"identity"`
+	NextLsn   uint64          `json:"next_lsn"`
+	SwitchLsn uint64          `json:"switch_lsn"`
+}
+
+// StandbyPromotionResponse defines model for StandbyPromotionResponse.
+type StandbyPromotionResponse struct {
+	Action          StandbyActionReceipt       `json:"action"`
+	Assessment      StandbyPromotionAssessment `json:"assessment"`
+	FenceGeneration uint64                     `json:"fence_generation"`
+	FenceToken      string                     `json:"fence_token"`
+	Forced          bool                       `json:"forced"`
+	Promotion       StandbyPromotionResult     `json:"promotion"`
+	SchemaVersion   uint32                     `json:"schema_version"`
+}
+
+// StandbyPromotionResult defines model for StandbyPromotionResult.
+type StandbyPromotionResult struct {
+	DataLossPossible bool            `json:"data_loss_possible"`
+	Forced           bool            `json:"forced"`
+	NewIdentity      StandbyIdentity `json:"new_identity"`
+
+	// NodeId Stable hot-standby node id.
+	NodeId      StandbyNodeID   `json:"node_id"`
+	OldIdentity StandbyIdentity `json:"old_identity"`
+	SwitchLsn   uint64          `json:"switch_lsn"`
+}
+
+// StandbyReadCheckResponse defines model for StandbyReadCheckResponse.
+type StandbyReadCheckResponse struct {
+	Decision      StandbyReadDecision `json:"decision"`
+	SchemaVersion uint32              `json:"schema_version"`
+}
+
+// StandbyReadDecision defines model for StandbyReadDecision.
+type StandbyReadDecision struct {
+	Action                  StandbyReadDecisionAction      `json:"action"`
+	AppliedLsn              uint64                         `json:"applied_lsn"`
+	Consistency             StandbyReadDecisionConsistency `json:"consistency"`
+	MetadataAppliedLsn      uint64                         `json:"metadata_applied_lsn,omitempty,omitzero"`
+	MetadataMissingLsnCount uint64                         `json:"metadata_missing_lsn_count"`
+	MissingLsnCount         uint64                         `json:"missing_lsn_count"`
+	ReceivedLsn             uint64                         `json:"received_lsn"`
+	RequiredLsn             uint64                         `json:"required_lsn,omitempty,omitzero"`
+	RequiredMetadataLsn     uint64                         `json:"required_metadata_lsn,omitempty,omitzero"`
+	SafeReadLsn             uint64                         `json:"safe_read_lsn"`
+	ServeLsn                uint64                         `json:"serve_lsn,omitempty,omitzero"`
+}
+
+// StandbyReadDecisionAction defines model for StandbyReadDecision.Action.
+type StandbyReadDecisionAction string
+
+// StandbyReadDecisionConsistency defines model for StandbyReadDecision.Consistency.
+type StandbyReadDecisionConsistency string
+
+// StandbyRejoinAssessResponse defines model for StandbyRejoinAssessResponse.
+type StandbyRejoinAssessResponse struct {
+	Action        StandbyActionReceipt      `json:"action"`
+	Assessment    StandbyRejoinAssessment   `json:"assessment"`
+	Reseed        StandbyRejoinReseedResult `json:"reseed,omitempty,omitzero"`
+	Rewind        StandbyRejoinRewindResult `json:"rewind,omitempty,omitzero"`
+	SchemaVersion uint32                    `json:"schema_version"`
+}
+
+// StandbyRejoinAssessment defines model for StandbyRejoinAssessment.
+type StandbyRejoinAssessment struct {
+	Action            StandbyRejoinAssessmentAction `json:"action"`
+	DataLossDiscarded bool                          `json:"data_loss_discarded"`
+	ForkLsn           uint64                        `json:"fork_lsn"`
+	FormerLastLsn     uint64                        `json:"former_last_lsn"`
+
+	// FormerNodeId Stable hot-standby node id.
+	FormerNodeId StandbyNodeID `json:"former_node_id"`
+
+	// ParentClusterId Cluster identity of the retained parent-timeline fork record.
+	ParentClusterId uint64 `json:"parent_cluster_id"`
+
+	// ParentEpoch Parent epoch that must contain the fork record before rewind.
+	ParentEpoch uint64 `json:"parent_epoch"`
+
+	// ParentShardId Shard identity of the retained parent-timeline fork record.
+	ParentShardId uint64 `json:"parent_shard_id"`
+
+	// ParentTableId Table identity of the retained parent-timeline fork record.
+	ParentTableId uint64 `json:"parent_table_id"`
+
+	// ParentTimelineId Parent timeline that must contain the fork record before rewind.
+	ParentTimelineId uint64                        `json:"parent_timeline_id"`
+	Reason           StandbyRejoinAssessmentReason `json:"reason"`
+	RetainedFromLsn  uint64                        `json:"retained_from_lsn"`
+	TargetEpoch      uint64                        `json:"target_epoch"`
+	TargetTimelineId uint64                        `json:"target_timeline_id"`
+}
+
+// StandbyRejoinAssessmentAction defines model for StandbyRejoinAssessment.Action.
+type StandbyRejoinAssessmentAction string
+
+// StandbyRejoinAssessmentReason defines model for StandbyRejoinAssessment.Reason.
+type StandbyRejoinAssessmentReason string
+
+// StandbyRejoinReseedResult defines model for StandbyRejoinReseedResult.
+type StandbyRejoinReseedResult struct {
+	BaseBackupRequired bool   `json:"base_backup_required"`
+	ForkLsn            uint64 `json:"fork_lsn"`
+	FormerLastLsn      uint64 `json:"former_last_lsn"`
+
+	// NodeId Stable hot-standby node id.
+	NodeId         StandbyNodeID `json:"node_id"`
+	ReseedRequired bool          `json:"reseed_required"`
+
+	// SlotName Stable standby replication slot name.
+	SlotName         StandbySlotName `json:"slot_name"`
+	TargetEpoch      uint64          `json:"target_epoch"`
+	TargetTimelineId uint64          `json:"target_timeline_id"`
+}
+
+// StandbyRejoinRewindResult defines model for StandbyRejoinRewindResult.
+type StandbyRejoinRewindResult struct {
+	CurrentLastLsn    uint64 `json:"current_last_lsn"`
+	DataLossDiscarded bool   `json:"data_loss_discarded"`
+	DiscardedLsnCount uint64 `json:"discarded_lsn_count"`
+	ForkLsn           uint64 `json:"fork_lsn"`
+	NextLsn           uint64 `json:"next_lsn"`
+
+	// NodeId Stable hot-standby node id.
+	NodeId           StandbyNodeID `json:"node_id"`
+	PreviousLastLsn  uint64        `json:"previous_last_lsn"`
+	TargetEpoch      uint64        `json:"target_epoch"`
+	TargetTimelineId uint64        `json:"target_timeline_id"`
+}
+
+// StandbyReplicationSlot defines model for StandbyReplicationSlot.
+type StandbyReplicationSlot struct {
+	Active         bool   `json:"active"`
+	AppliedLsn     uint64 `json:"applied_lsn"`
+	CurrentLsn     uint64 `json:"current_lsn"`
+	Dropped        bool   `json:"dropped,omitempty,omitzero"`
+	LastError      string `json:"last_error,omitempty,omitzero"`
+	ReceivedLsn    uint64 `json:"received_lsn"`
+	ReseedRequired bool   `json:"reseed_required"`
+	RestartLsn     uint64 `json:"restart_lsn"`
+	SafeReadLsn    uint64 `json:"safe_read_lsn"`
+
+	// SlotName Stable standby replication slot name.
+	SlotName   StandbySlotName `json:"slot_name"`
+	TimelineId uint64          `json:"timeline_id"`
+}
+
+// StandbyReplicationSlotActionResponse defines model for StandbyReplicationSlotActionResponse.
+type StandbyReplicationSlotActionResponse struct {
+	Action        StandbyActionReceipt                           `json:"action"`
+	SchemaVersion uint32                                         `json:"schema_version"`
+	Slot          StandbyReplicationSlot                         `json:"slot"`
+	SlotAction    StandbyReplicationSlotActionResponseSlotAction `json:"slot_action"`
+}
+
+// StandbyReplicationSlotActionResponseSlotAction defines model for StandbyReplicationSlotActionResponse.SlotAction.
+type StandbyReplicationSlotActionResponseSlotAction string
+
+// StandbyReplicationSlotListResponse defines model for StandbyReplicationSlotListResponse.
+type StandbyReplicationSlotListResponse struct {
+	SchemaVersion uint32                   `json:"schema_version"`
+	Slots         []StandbyReplicationSlot `json:"slots"`
+}
+
+// StandbyRetentionSnapshot defines model for StandbyRetentionSnapshot.
+type StandbyRetentionSnapshot struct {
+	ActiveSlots       uint64 `json:"active_slots"`
+	OldestRestartLsn  uint64 `json:"oldest_restart_lsn"`
+	PrimaryLsn        uint64 `json:"primary_lsn"`
+	ReseedRecommended uint64 `json:"reseed_recommended"`
+	RetainedAgeNs     uint64 `json:"retained_age_ns"`
+	RetainedByteCount uint64 `json:"retained_byte_count"`
+	RetainedLsnCount  uint64 `json:"retained_lsn_count"`
+}
+
+// StandbyRuntimeLifecycleObservation defines model for StandbyRuntimeLifecycleObservation.
+type StandbyRuntimeLifecycleObservation struct {
+	Fenced           bool                                   `json:"fenced"`
+	NodeId           string                                 `json:"node_id,omitempty,omitzero"`
+	ObservedAtUnixNs uint64                                 `json:"observed_at_unix_ns"`
+	PodUid           string                                 `json:"pod_uid,omitempty,omitzero"`
+	Role             StandbyRuntimeLifecycleObservationRole `json:"role"`
+}
+
+// StandbyRuntimeLifecycleObservationRole defines model for StandbyRuntimeLifecycleObservation.Role.
+type StandbyRuntimeLifecycleObservationRole string
+
+// StandbySeedArtifactCaptureResponse defines model for StandbySeedArtifactCaptureResponse.
+type StandbySeedArtifactCaptureResponse struct {
+	Action          StandbyActionReceipt `json:"action"`
+	AlreadyCaptured bool                 `json:"already_captured"`
+	BackupLsn       uint64               `json:"backup_lsn"`
+
+	// CaptureReceiptSha256 SHA-256 of the exact immutable runtime capture COMPLETE response bytes.
+	CaptureReceiptSha256 string `json:"capture_receipt_sha256"`
+	CheckpointLsn        uint64 `json:"checkpoint_lsn"`
+	ClusterId            uint64 `json:"cluster_id"`
+	ContentRoot          string `json:"content_root"`
+	EndRecordLsn         uint64 `json:"end_record_lsn"`
+	Epoch                uint64 `json:"epoch"`
+	FileCount            uint64 `json:"file_count"`
+	Generation           string `json:"generation"`
+	GenerationRoot       string `json:"generation_root"`
+	ManifestId           string `json:"manifest_id"`
+	ManifestPath         string `json:"manifest_path"`
+	ManifestSha256       string `json:"manifest_sha256"`
+	NodeId               string `json:"node_id"`
+	SchemaVersion        uint32 `json:"schema_version"`
+	ShardId              uint64 `json:"shard_id"`
+
+	// SlotName Stable standby replication slot name.
+	SlotName           StandbySlotName `json:"slot_name"`
+	SourcePlanSha256   string          `json:"source_plan_sha256"`
+	TableId            uint64          `json:"table_id"`
+	TargetPvcName      string          `json:"target_pvc_name"`
+	TargetPvcUid       string          `json:"target_pvc_uid"`
+	TimelineId         uint64          `json:"timeline_id"`
+	TopologyGeneration uint64          `json:"topology_generation"`
+	TopologyId         string          `json:"topology_id"`
+	TotalBytes         uint64          `json:"total_bytes"`
+}
+
+// StandbySeedLifecycleReceiptEvent defines model for StandbySeedLifecycleReceiptEvent.
+type StandbySeedLifecycleReceiptEvent struct {
+	AuthoritativeState StandbySeedLifecycleReceiptEventAuthoritativeState `json:"authoritative_state"`
+	Cursor             uint64                                             `json:"cursor"`
+	Generation         string                                             `json:"generation"`
+	Kind               StandbySeedLifecycleReceiptEventKind               `json:"kind"`
+	NodeId             string                                             `json:"node_id"`
+	PodUid             string                                             `json:"pod_uid,omitempty,omitzero"`
+	ReceiptJson        string                                             `json:"receipt_json"`
+	ReceiptSha256      string                                             `json:"receipt_sha256"`
+	RecordedAtUnixNs   uint64                                             `json:"recorded_at_unix_ns"`
+
+	// SlotName Stable standby replication slot name.
+	SlotName           StandbySlotName `json:"slot_name"`
+	TargetPvcName      string          `json:"target_pvc_name"`
+	TargetPvcUid       string          `json:"target_pvc_uid"`
+	TopologyGeneration uint64          `json:"topology_generation"`
+	TopologyId         string          `json:"topology_id"`
+}
+
+// StandbySeedLifecycleReceiptEventAuthoritativeState defines model for StandbySeedLifecycleReceiptEvent.AuthoritativeState.
+type StandbySeedLifecycleReceiptEventAuthoritativeState string
+
+// StandbySeedLifecycleReceiptEventKind defines model for StandbySeedLifecycleReceiptEvent.Kind.
+type StandbySeedLifecycleReceiptEventKind string
+
+// StandbySeedLifecycleReceiptInventoryResponse defines model for StandbySeedLifecycleReceiptInventoryResponse.
+type StandbySeedLifecycleReceiptInventoryResponse struct {
+	EndCursor        uint64                             `json:"end_cursor"`
+	Entries          []StandbySeedLifecycleReceiptEvent `json:"entries"`
+	FirstCursor      uint64                             `json:"first_cursor"`
+	Gap              bool                               `json:"gap"`
+	HasMore          bool                               `json:"has_more"`
+	HistoryTruncated bool                               `json:"history_truncated"`
+	NextCursor       uint64                             `json:"next_cursor"`
+	Runtime          StandbyRuntimeLifecycleObservation `json:"runtime"`
+	SchemaVersion    uint32                             `json:"schema_version"`
+}
+
+// StandbySeededSlotActivateResponse defines model for StandbySeededSlotActivateResponse.
+type StandbySeededSlotActivateResponse struct {
+	Action          StandbyActionReceipt `json:"action"`
+	AggregateSha256 string               `json:"aggregate_sha256"`
+
+	// CaptureReceiptSha256 SHA-256 of the exact runtime-owned capture COMPLETE receipt bytes that authorized publication.
+	CaptureReceiptSha256 string `json:"capture_receipt_sha256"`
+	CheckpointLsn        uint64 `json:"checkpoint_lsn"`
+	Generation           string `json:"generation"`
+	ManifestId           string `json:"manifest_id"`
+	ManifestSha256       string `json:"manifest_sha256"`
+	SchemaVersion        uint32 `json:"schema_version"`
+	SeedReceiptSha256    string `json:"seed_receipt_sha256"`
+
+	// SlotName Stable standby replication slot name.
+	SlotName   StandbySlotName `json:"slot_name"`
+	TimelineId uint64          `json:"timeline_id"`
+}
+
+// StandbySlotName Stable standby replication slot name.
+type StandbySlotName = string
+
+// StandbySlotSnapshot defines model for StandbySlotSnapshot.
+type StandbySlotSnapshot struct {
+	Active          bool                      `json:"active"`
+	AppliedLsn      uint64                    `json:"applied_lsn"`
+	ApplyLagLsn     uint64                    `json:"apply_lag_lsn"`
+	LastError       string                    `json:"last_error,omitempty,omitzero"`
+	Name            string                    `json:"name"`
+	ReceivedLsn     uint64                    `json:"received_lsn"`
+	ReseedRequired  bool                      `json:"reseed_required"`
+	RestartLsn      uint64                    `json:"restart_lsn"`
+	RetentionLagLsn uint64                    `json:"retention_lag_lsn"`
+	SafeReadLagLsn  uint64                    `json:"safe_read_lag_lsn"`
+	SafeReadLsn     uint64                    `json:"safe_read_lsn"`
+	Status          StandbySlotSnapshotStatus `json:"status"`
+	TimelineId      uint64                    `json:"timeline_id"`
+	WriteLagLsn     uint64                    `json:"write_lag_lsn"`
+}
+
+// StandbySlotSnapshotStatus defines model for StandbySlotSnapshot.Status.
+type StandbySlotSnapshotStatus string
+
+// StandbySnapshot defines model for StandbySnapshot.
+type StandbySnapshot struct {
+	AppliedLsn         uint64          `json:"applied_lsn"`
+	ApplyLagLsn        uint64          `json:"apply_lag_lsn,omitempty,omitzero"`
+	CanServeSafeReads  bool            `json:"can_serve_safe_reads"`
+	CaughtUpToReceived bool            `json:"caught_up_to_received"`
+	Identity           StandbyIdentity `json:"identity"`
+
+	// LastAttemptNs Monotonic nanosecond timestamp for the most recent local standby replication attempt.
+	LastAttemptNs uint64 `json:"last_attempt_ns,omitempty,omitzero"`
+
+	// LastError Last local standby replication pull or apply error observed by the node-local runtime.
+	LastError string `json:"last_error,omitempty,omitzero"`
+
+	// LastSuccessNs Monotonic nanosecond timestamp for the most recent successful local standby replication round.
+	LastSuccessNs uint64                    `json:"last_success_ns,omitempty,omitzero"`
+	LeaseWatchdog StandbyLeaseWatchdogProof `json:"lease_watchdog,omitempty,omitzero"`
+
+	// NodeId Stable hot-standby node id.
+	NodeId        StandbyNodeID `json:"node_id"`
+	ReceiveLagLsn uint64        `json:"receive_lag_lsn,omitempty,omitzero"`
+	ReceivedLsn   uint64        `json:"received_lsn"`
+
+	// ReplicationFailuresTotal Local standby replication rounds that exited early with an error.
+	ReplicationFailuresTotal uint64              `json:"replication_failures_total,omitempty,omitzero"`
+	Role                     StandbySnapshotRole `json:"role"`
+	SafeReadLsn              uint64              `json:"safe_read_lsn"`
+	UnappliedLsnCount        uint64              `json:"unapplied_lsn_count"`
+	UpstreamLsn              uint64              `json:"upstream_lsn,omitempty,omitzero"`
+	WriteLagLsn              uint64              `json:"write_lag_lsn,omitempty,omitzero"`
+}
+
+// StandbySnapshotRole defines model for StandbySnapshot.Role.
+type StandbySnapshotRole string
+
+// StandbyStatusResponse defines model for StandbyStatusResponse.
+type StandbyStatusResponse struct {
+	SchemaVersion uint32          `json:"schema_version"`
+	Snapshot      StandbySnapshot `json:"snapshot"`
+}
+
+// StandbySyncPolicy defines model for StandbySyncPolicy.
+type StandbySyncPolicy struct {
+	// FailurePolicy Caller-visible action when synchronous durability is not currently satisfied.
+	FailurePolicy StandbySyncPolicyFailurePolicy `json:"failure_policy,omitempty,omitzero"`
+
+	// Mode Durability mode to require before acknowledging the commit.
+	Mode StandbySyncPolicyMode `json:"mode"`
+
+	// Required Number of eligible standbys required for `any` selection.
+	Required uint64 `json:"required,omitempty,omitzero"`
+
+	// Selection How named standbys are selected to satisfy the policy.
+	Selection StandbySyncPolicySelection `json:"selection,omitempty,omitzero"`
+
+	// StandbyNames Ordered candidate standby names for synchronous commit.
+	StandbyNames []StandbySlotName `json:"standby_names,omitempty,omitzero"`
+}
+
+// StandbySyncPolicyFailurePolicy Caller-visible action when synchronous durability is not currently satisfied.
+type StandbySyncPolicyFailurePolicy string
+
+// StandbySyncPolicyMode Durability mode to require before acknowledging the commit.
+type StandbySyncPolicyMode string
+
+// StandbySyncPolicySelection How named standbys are selected to satisfy the policy.
+type StandbySyncPolicySelection string
+
+// StandbyUpstream defines model for StandbyUpstream.
+type StandbyUpstream struct {
+	// SlotName Stable standby replication slot name.
+	SlotName    StandbySlotName `json:"slot_name"`
+	UpstreamUrl string          `json:"upstream_url"`
+}
+
+// StandbyUpstreamRequest defines model for StandbyUpstreamRequest.
+type StandbyUpstreamRequest struct {
+	Identity StandbyIdentity `json:"identity"`
+	Reason   string          `json:"reason,omitempty,omitzero"`
+
+	// SlotName Stable standby replication slot name.
+	SlotName StandbySlotName `json:"slot_name"`
+
+	// UpstreamUrl Base URL of the primary to pull from.
+	UpstreamUrl string `json:"upstream_url"`
+}
+
+// StandbyUpstreamResponse defines model for StandbyUpstreamResponse.
+type StandbyUpstreamResponse struct {
+	Action StandbyActionReceipt `json:"action"`
+
+	// Changed False when the requested upstream already matched, which makes retries idempotent.
+	Changed       bool            `json:"changed"`
+	Identity      StandbyIdentity `json:"identity"`
+	Previous      StandbyUpstream `json:"previous,omitempty,omitzero"`
+	SchemaVersion uint32          `json:"schema_version"`
+	Upstream      StandbyUpstream `json:"upstream"`
+}
+
+// StandbyWatchdogProofResponse defines model for StandbyWatchdogProofResponse.
+type StandbyWatchdogProofResponse struct {
+	Proof         StandbyLeaseWatchdogProof `json:"proof"`
+	SchemaVersion uint32                    `json:"schema_version"`
+}
+
+// StandbyWriteCheckResponse defines model for StandbyWriteCheckResponse.
+type StandbyWriteCheckResponse struct {
+	Decision      StandbyWriteDecision `json:"decision"`
+	SchemaVersion uint32               `json:"schema_version"`
+}
+
+// StandbyWriteDecision defines model for StandbyWriteDecision.
+type StandbyWriteDecision struct {
+	Action           StandbyWriteDecisionAction `json:"action"`
+	DurableLsn       uint64                     `json:"durable_lsn"`
+	Identity         StandbyIdentity            `json:"identity"`
+	NextLsn          uint64                     `json:"next_lsn"`
+	PromotionHandoff StandbyPromotionHandoff    `json:"promotion_handoff,omitempty,omitzero"`
+	Role             StandbyWriteDecisionRole   `json:"role"`
+}
+
+// StandbyWriteDecisionAction defines model for StandbyWriteDecision.Action.
+type StandbyWriteDecisionAction string
+
+// StandbyWriteDecisionRole defines model for StandbyWriteDecision.Role.
+type StandbyWriteDecisionRole string
 
 // StorageMaintenanceJob defines model for StorageMaintenanceJob.
 type StorageMaintenanceJob struct {
@@ -1772,7 +1815,7 @@ type StorageMaintenanceState string
 
 // WriteCheckRequest defines model for WriteCheckRequest.
 type WriteCheckRequest struct {
-	ExpectedIdentity HAIdentity            `json:"expected_identity,omitempty,omitzero"`
+	ExpectedIdentity StandbyIdentity       `json:"expected_identity,omitempty,omitzero"`
 	Role             WriteCheckRequestRole `json:"role"`
 }
 
@@ -1783,7 +1826,25 @@ type WriteCheckRequestRole string
 type IdempotencyKey = string
 
 // SlotName Stable standby replication slot name.
-type SlotName = HASlotName
+type SlotName = StandbySlotName
+
+// StartStorageCheckParams defines parameters for StartStorageCheck.
+type StartStorageCheckParams struct {
+	// IdempotencyKey Stable caller key used to return the original job on safe retries. Completed keys are retained for at least 24 hours within one server process. Job IDs are opaque 63-bit process-seeded values with retained history collision checks; callers must treat them as non-sequential.
+	IdempotencyKey IdempotencyKey `json:"Idempotency-Key,omitempty,omitzero"`
+}
+
+// StartStorageCompactParams defines parameters for StartStorageCompact.
+type StartStorageCompactParams struct {
+	// IdempotencyKey Stable caller key used to return the original job on safe retries. Completed keys are retained for at least 24 hours within one server process. Job IDs are opaque 63-bit process-seeded values with retained history collision checks; callers must treat them as non-sequential.
+	IdempotencyKey IdempotencyKey `json:"Idempotency-Key,omitempty,omitzero"`
+}
+
+// StartStorageVacuumParams defines parameters for StartStorageVacuum.
+type StartStorageVacuumParams struct {
+	// IdempotencyKey Stable caller key used to return the original job on safe retries. Completed keys are retained for at least 24 hours within one server process. Job IDs are opaque 63-bit process-seeded values with retained history collision checks; callers must treat them as non-sequential.
+	IdempotencyKey IdempotencyKey `json:"Idempotency-Key,omitempty,omitzero"`
+}
 
 // GetHAPrimaryStatusParams defines parameters for GetHAPrimaryStatus.
 type GetHAPrimaryStatusParams struct {
@@ -1806,7 +1867,7 @@ type GetHAPrimaryStatusParams struct {
 	SyncRequired uint64 `form:"sync_required,omitempty" json:"sync_required,omitempty,omitzero"`
 
 	// SyncStandby Repeatable synchronous standby name.
-	SyncStandby []HASlotName `form:"sync_standby,omitempty" json:"sync_standby,omitempty,omitzero"`
+	SyncStandby []StandbySlotName `form:"sync_standby,omitempty" json:"sync_standby,omitempty,omitzero"`
 
 	// SyncFailure Synchronous standby failure policy.
 	SyncFailure GetHAPrimaryStatusParamsSyncFailure `form:"sync_failure,omitempty" json:"sync_failure,omitempty,omitzero"`
@@ -1839,24 +1900,6 @@ type GetHAStandbyStatusParams struct {
 	UpstreamLsn uint64 `form:"upstream_lsn,omitempty" json:"upstream_lsn,omitempty,omitzero"`
 }
 
-// StartStorageCheckParams defines parameters for StartStorageCheck.
-type StartStorageCheckParams struct {
-	// IdempotencyKey Stable caller key used to return the original job on safe retries. Completed keys are retained for at least 24 hours within one server process. Job IDs are opaque 63-bit process-seeded values with retained history collision checks; callers must treat them as non-sequential.
-	IdempotencyKey IdempotencyKey `json:"Idempotency-Key,omitempty,omitzero"`
-}
-
-// StartStorageCompactParams defines parameters for StartStorageCompact.
-type StartStorageCompactParams struct {
-	// IdempotencyKey Stable caller key used to return the original job on safe retries. Completed keys are retained for at least 24 hours within one server process. Job IDs are opaque 63-bit process-seeded values with retained history collision checks; callers must treat them as non-sequential.
-	IdempotencyKey IdempotencyKey `json:"Idempotency-Key,omitempty,omitzero"`
-}
-
-// StartStorageVacuumParams defines parameters for StartStorageVacuum.
-type StartStorageVacuumParams struct {
-	// IdempotencyKey Stable caller key used to return the original job on safe retries. Completed keys are retained for at least 24 hours within one server process. Job IDs are opaque 63-bit process-seeded values with retained history collision checks; callers must treat them as non-sequential.
-	IdempotencyKey IdempotencyKey `json:"Idempotency-Key,omitempty,omitzero"`
-}
-
 // BeginHABaseBackupJSONRequestBody defines body for BeginHABaseBackup for application/json ContentType.
 type BeginHABaseBackupJSONRequestBody = BaseBackupStartRequest
 
@@ -1868,6 +1911,9 @@ type CaptureHASeedArtifactJSONRequestBody = SeedArtifactCaptureRequest
 
 // FinishHABaseBackupJSONRequestBody defines body for FinishHABaseBackup for application/json ContentType.
 type FinishHABaseBackupJSONRequestBody = BaseBackupManifestPathRequest
+
+// BootstrapHAStandbyJSONRequestBody defines body for BootstrapHAStandby for application/json ContentType.
+type BootstrapHAStandbyJSONRequestBody = StandbyBootstrapRequest
 
 // AppendHACommitJSONRequestBody defines body for AppendHACommit for application/json ContentType.
 type AppendHACommitJSONRequestBody = CommitAppendRequest
@@ -1902,8 +1948,8 @@ type RewindHARejoinJSONRequestBody = RejoinAssessRequest
 // CreateHAReplicationSlotJSONRequestBody defines body for CreateHAReplicationSlot for application/json ContentType.
 type CreateHAReplicationSlotJSONRequestBody = ReplicationSlotCreateRequest
 
-// BootstrapHAStandbyJSONRequestBody defines body for BootstrapHAStandby for application/json ContentType.
-type BootstrapHAStandbyJSONRequestBody = StandbyBootstrapRequest
+// SetHAStandbyUpstreamJSONRequestBody defines body for SetHAStandbyUpstream for application/json ContentType.
+type SetHAStandbyUpstreamJSONRequestBody = StandbyUpstreamRequest
 
 // CheckHAWriteJSONRequestBody defines body for CheckHAWrite for application/json ContentType.
 type CheckHAWriteJSONRequestBody = WriteCheckRequest
@@ -1982,301 +2028,6 @@ func WithRequestEditorFn(fn RequestEditorFn) ClientOption {
 // The interface specification for the client above.
 type ClientInterface interface {
 
-	// BeginHABaseBackupWithBody Begin an HA base backup and reserve its replication slot
-	//
-	// Takes any type of body and a specified content type.
-	//
-	// Corresponds with POST /ha/base-backups (the `BeginHABaseBackup` operationId).
-	BeginHABaseBackupWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// BeginHABaseBackup Begin an HA base backup and reserve its replication slot
-	//
-	// Takes a body of the `application/json` content type.
-	//
-	// Corresponds with POST /ha/base-backups (the `BeginHABaseBackup` operationId).
-	BeginHABaseBackup(ctx context.Context, body BeginHABaseBackupJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// ActivateHASeededSlotWithBody Activate a seeded slot after durable target-generation publication
-	//
-	// Takes any type of body and a specified content type.
-	//
-	// Corresponds with POST /ha/base-backups/activate (the `ActivateHASeededSlot` operationId).
-	ActivateHASeededSlotWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// ActivateHASeededSlot Activate a seeded slot after durable target-generation publication
-	//
-	// Takes a body of the `application/json` content type.
-	//
-	// Corresponds with POST /ha/base-backups/activate (the `ActivateHASeededSlot` operationId).
-	ActivateHASeededSlot(ctx context.Context, body ActivateHASeededSlotJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// CaptureHASeedArtifactWithBody Capture an immutable seed from runtime-owned primary storage
-	//
-	// Takes any type of body and a specified content type.
-	//
-	// Corresponds with POST /ha/base-backups/capture (the `CaptureHASeedArtifact` operationId).
-	CaptureHASeedArtifactWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// CaptureHASeedArtifact Capture an immutable seed from runtime-owned primary storage
-	//
-	// Takes a body of the `application/json` content type.
-	//
-	// Corresponds with POST /ha/base-backups/capture (the `CaptureHASeedArtifact` operationId).
-	CaptureHASeedArtifact(ctx context.Context, body CaptureHASeedArtifactJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// FinishHABaseBackupWithBody Finish an HA base backup from a local manifest path
-	//
-	// Takes any type of body and a specified content type.
-	//
-	// Corresponds with POST /ha/base-backups/finish (the `FinishHABaseBackup` operationId).
-	FinishHABaseBackupWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// FinishHABaseBackup Finish an HA base backup from a local manifest path
-	//
-	// Takes a body of the `application/json` content type.
-	//
-	// Corresponds with POST /ha/base-backups/finish (the `FinishHABaseBackup` operationId).
-	FinishHABaseBackup(ctx context.Context, body FinishHABaseBackupJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// AppendHACommitWithBody Append a primary WAL/effects record and evaluate synchronous commit durability
-	//
-	// Takes any type of body and a specified content type.
-	//
-	// Corresponds with POST /ha/commit/append (the `AppendHACommit` operationId).
-	AppendHACommitWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// AppendHACommit Append a primary WAL/effects record and evaluate synchronous commit durability
-	//
-	// Takes a body of the `application/json` content type.
-	//
-	// Corresponds with POST /ha/commit/append (the `AppendHACommit` operationId).
-	AppendHACommit(ctx context.Context, body AppendHACommitJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// CheckHACommitWithBody Evaluate synchronous commit durability for an existing LSN
-	//
-	// Takes any type of body and a specified content type.
-	//
-	// Corresponds with POST /ha/commit/check (the `CheckHACommit` operationId).
-	CheckHACommitWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// CheckHACommit Evaluate synchronous commit durability for an existing LSN
-	//
-	// Takes a body of the `application/json` content type.
-	//
-	// Corresponds with POST /ha/commit/check (the `CheckHACommit` operationId).
-	CheckHACommit(ctx context.Context, body CheckHACommitJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// AcquireHAFenceWithBody Acquire a durable HA promotion fence
-	//
-	// Takes any type of body and a specified content type.
-	//
-	// Corresponds with POST /ha/fence (the `AcquireHAFence` operationId).
-	AcquireHAFenceWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// AcquireHAFence Acquire a durable HA promotion fence
-	//
-	// Takes a body of the `application/json` content type.
-	//
-	// Corresponds with POST /ha/fence (the `AcquireHAFence` operationId).
-	AcquireHAFence(ctx context.Context, body AcquireHAFenceJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// GetHACurrentFence Get the current durable HA promotion fence
-	//
-	// Corresponds with GET /ha/fence/current (the `GetHACurrentFence` operationId).
-	GetHACurrentFence(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// CheckHAOwnerJobWithBody Evaluate whether an owner-only background job may run
-	//
-	// Takes any type of body and a specified content type.
-	//
-	// Corresponds with POST /ha/owner-jobs/check (the `CheckHAOwnerJob` operationId).
-	CheckHAOwnerJobWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// CheckHAOwnerJob Evaluate whether an owner-only background job may run
-	//
-	// Takes a body of the `application/json` content type.
-	//
-	// Corresponds with POST /ha/owner-jobs/check (the `CheckHAOwnerJob` operationId).
-	CheckHAOwnerJob(ctx context.Context, body CheckHAOwnerJobJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// GetHAPrimaryStatus Get primary HA status
-	//
-	// Corresponds with GET /ha/primary/status (the `GetHAPrimaryStatus` operationId).
-	GetHAPrimaryStatus(ctx context.Context, params *GetHAPrimaryStatusParams, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// PromoteHAWithBody Acquire a fence and promote this standby
-	//
-	// Takes any type of body and a specified content type.
-	//
-	// Corresponds with POST /ha/promotion (the `PromoteHA` operationId).
-	PromoteHAWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// PromoteHA Acquire a fence and promote this standby
-	//
-	// Takes a body of the `application/json` content type.
-	//
-	// Corresponds with POST /ha/promotion (the `PromoteHA` operationId).
-	PromoteHA(ctx context.Context, body PromoteHAJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// AssessHAPromotionWithBody Assess whether this standby can be promoted
-	//
-	// Takes any type of body and a specified content type.
-	//
-	// Corresponds with POST /ha/promotion/assess (the `AssessHAPromotion` operationId).
-	AssessHAPromotionWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// AssessHAPromotion Assess whether this standby can be promoted
-	//
-	// Takes a body of the `application/json` content type.
-	//
-	// Corresponds with POST /ha/promotion/assess (the `AssessHAPromotion` operationId).
-	AssessHAPromotion(ctx context.Context, body AssessHAPromotionJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// PromoteHAWithCurrentFence Promote this standby using the current durable fence receipt
-	//
-	// Corresponds with POST /ha/promotion/current-fence (the `PromoteHAWithCurrentFence` operationId).
-	PromoteHAWithCurrentFence(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// CheckHAReadWithBody Evaluate standby read freshness and routing
-	//
-	// Takes any type of body and a specified content type.
-	//
-	// Corresponds with POST /ha/read/check (the `CheckHARead` operationId).
-	CheckHAReadWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// CheckHARead Evaluate standby read freshness and routing
-	//
-	// Takes a body of the `application/json` content type.
-	//
-	// Corresponds with POST /ha/read/check (the `CheckHARead` operationId).
-	CheckHARead(ctx context.Context, body CheckHAReadJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// AssessHARejoinWithBody Assess whether a former primary can safely rejoin
-	//
-	// Takes any type of body and a specified content type.
-	//
-	// Corresponds with POST /ha/rejoin/assess (the `AssessHARejoin` operationId).
-	AssessHARejoinWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// AssessHARejoin Assess whether a former primary can safely rejoin
-	//
-	// Takes a body of the `application/json` content type.
-	//
-	// Corresponds with POST /ha/rejoin/assess (the `AssessHARejoin` operationId).
-	AssessHARejoin(ctx context.Context, body AssessHARejoinJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// ReseedHARejoinWithBody Reseed a fenced former primary when rewind is unsafe
-	//
-	// Takes any type of body and a specified content type.
-	//
-	// Corresponds with POST /ha/rejoin/reseed (the `ReseedHARejoin` operationId).
-	ReseedHARejoinWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// ReseedHARejoin Reseed a fenced former primary when rewind is unsafe
-	//
-	// Takes a body of the `application/json` content type.
-	//
-	// Corresponds with POST /ha/rejoin/reseed (the `ReseedHARejoin` operationId).
-	ReseedHARejoin(ctx context.Context, body ReseedHARejoinJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// RewindHARejoinWithBody Rewind a fenced former primary onto the promoted timeline
-	//
-	// Takes any type of body and a specified content type.
-	//
-	// Corresponds with POST /ha/rejoin/rewind (the `RewindHARejoin` operationId).
-	RewindHARejoinWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// RewindHARejoin Rewind a fenced former primary onto the promoted timeline
-	//
-	// Takes a body of the `application/json` content type.
-	//
-	// Corresponds with POST /ha/rejoin/rewind (the `RewindHARejoin` operationId).
-	RewindHARejoin(ctx context.Context, body RewindHARejoinJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// ListHAReplicationSlots List HA replication slots
-	//
-	// Corresponds with GET /ha/replication-slots (the `ListHAReplicationSlots` operationId).
-	ListHAReplicationSlots(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// CreateHAReplicationSlotWithBody Create an HA replication slot
-	//
-	// Takes any type of body and a specified content type.
-	//
-	// Corresponds with POST /ha/replication-slots (the `CreateHAReplicationSlot` operationId).
-	CreateHAReplicationSlotWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// CreateHAReplicationSlot Create an HA replication slot
-	//
-	// Takes a body of the `application/json` content type.
-	//
-	// Corresponds with POST /ha/replication-slots (the `CreateHAReplicationSlot` operationId).
-	CreateHAReplicationSlot(ctx context.Context, body CreateHAReplicationSlotJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// DropHAReplicationSlot Drop an HA replication slot
-	//
-	// Corresponds with DELETE /ha/replication-slots/{slot_name} (the `DropHAReplicationSlot` operationId).
-	DropHAReplicationSlot(ctx context.Context, slotName SlotName, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// PauseHAReplicationSlot Pause an HA replication slot
-	//
-	// Corresponds with PUT /ha/replication-slots/{slot_name}/pause (the `PauseHAReplicationSlot` operationId).
-	PauseHAReplicationSlot(ctx context.Context, slotName SlotName, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// ResumeHAReplicationSlot Resume an HA replication slot
-	//
-	// Corresponds with PUT /ha/replication-slots/{slot_name}/resume (the `ResumeHAReplicationSlot` operationId).
-	ResumeHAReplicationSlot(ctx context.Context, slotName SlotName, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// GetHASeedLifecycleReceipts Read durable runtime-owned HA seed lifecycle receipts
-	//
-	// Returns an authenticated, read-only cursor page from the runtime-owned
-	// append-only receipt ledger. `history_truncated` and `gap` make bounded
-	// retention explicit so observers can fail closed when their collection
-	// window is incomplete.
-	//
-	// Corresponds with GET /ha/seed-lifecycle/receipts (the `GetHASeedLifecycleReceipts` operationId).
-	GetHASeedLifecycleReceipts(ctx context.Context, params *GetHASeedLifecycleReceiptsParams, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// BootstrapHAStandbyWithBody Bootstrap this standby from a local base-backup manifest and copied files
-	//
-	// Takes any type of body and a specified content type.
-	//
-	// Corresponds with POST /ha/standby/bootstrap (the `BootstrapHAStandby` operationId).
-	BootstrapHAStandbyWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// BootstrapHAStandby Bootstrap this standby from a local base-backup manifest and copied files
-	//
-	// Takes a body of the `application/json` content type.
-	//
-	// Corresponds with POST /ha/standby/bootstrap (the `BootstrapHAStandby` operationId).
-	BootstrapHAStandby(ctx context.Context, body BootstrapHAStandbyJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// GetHAStandbyStatus Get standby HA status
-	//
-	// Corresponds with GET /ha/standby/status (the `GetHAStandbyStatus` operationId).
-	GetHAStandbyStatus(ctx context.Context, params *GetHAStandbyStatusParams, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// GetHAWatchdogProof Get the runtime Lease watchdog capability proof
-	//
-	// Returns only the authenticated, process-local Lease watchdog proof. This endpoint remains independent of storage mutation critical sections so a slow seed capture cannot prevent the operator from renewing an otherwise valid fencing Lease.
-	//
-	// Corresponds with GET /ha/watchdog-proof (the `GetHAWatchdogProof` operationId).
-	GetHAWatchdogProof(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// CheckHAWriteWithBody Evaluate whether this node can accept writes
-	//
-	// Takes any type of body and a specified content type.
-	//
-	// Corresponds with POST /ha/write/check (the `CheckHAWrite` operationId).
-	CheckHAWriteWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// CheckHAWrite Evaluate whether this node can accept writes
-	//
-	// Takes a body of the `application/json` content type.
-	//
-	// Corresponds with POST /ha/write/check (the `CheckHAWrite` operationId).
-	CheckHAWrite(ctx context.Context, body CheckHAWriteJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
-
 	// StartStorageCheck Start a coordinated storage integrity check
 	//
 	// Corresponds with POST /maintenance/check (the `StartStorageCheck` operationId).
@@ -2303,741 +2054,331 @@ type ClientInterface interface {
 	//
 	// Corresponds with POST /maintenance/vacuum (the `StartStorageVacuum` operationId).
 	StartStorageVacuum(ctx context.Context, params *StartStorageVacuumParams, reqEditors ...RequestEditorFn) (*http.Response, error)
-}
 
-// BeginHABaseBackupWithBody Begin an HA base backup and reserve its replication slot
-//
-// Takes any type of body and a specified content type.
-//
-// Corresponds with POST /ha/base-backups (the `BeginHABaseBackup` operationId).
-func (c *Client) BeginHABaseBackupWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewBeginHABaseBackupRequestWithBody(c.Server, contentType, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// BeginHABaseBackupWithBody Begin a hot-standby base backup and reserve its replication slot
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /standby/base-backups (the `BeginHABaseBackup` operationId).
+	BeginHABaseBackupWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// BeginHABaseBackup Begin an HA base backup and reserve its replication slot
-//
-// Takes a body of the `application/json` content type.
-//
-// Corresponds with POST /ha/base-backups (the `BeginHABaseBackup` operationId).
-func (c *Client) BeginHABaseBackup(ctx context.Context, body BeginHABaseBackupJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewBeginHABaseBackupRequest(c.Server, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// BeginHABaseBackup Begin a hot-standby base backup and reserve its replication slot
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /standby/base-backups (the `BeginHABaseBackup` operationId).
+	BeginHABaseBackup(ctx context.Context, body BeginHABaseBackupJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// ActivateHASeededSlotWithBody Activate a seeded slot after durable target-generation publication
-//
-// Takes any type of body and a specified content type.
-//
-// Corresponds with POST /ha/base-backups/activate (the `ActivateHASeededSlot` operationId).
-func (c *Client) ActivateHASeededSlotWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewActivateHASeededSlotRequestWithBody(c.Server, contentType, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// ActivateHASeededSlotWithBody Activate a seeded slot after durable target-generation publication
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /standby/base-backups/activate (the `ActivateHASeededSlot` operationId).
+	ActivateHASeededSlotWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// ActivateHASeededSlot Activate a seeded slot after durable target-generation publication
-//
-// Takes a body of the `application/json` content type.
-//
-// Corresponds with POST /ha/base-backups/activate (the `ActivateHASeededSlot` operationId).
-func (c *Client) ActivateHASeededSlot(ctx context.Context, body ActivateHASeededSlotJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewActivateHASeededSlotRequest(c.Server, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// ActivateHASeededSlot Activate a seeded slot after durable target-generation publication
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /standby/base-backups/activate (the `ActivateHASeededSlot` operationId).
+	ActivateHASeededSlot(ctx context.Context, body ActivateHASeededSlotJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// CaptureHASeedArtifactWithBody Capture an immutable seed from runtime-owned primary storage
-//
-// Takes any type of body and a specified content type.
-//
-// Corresponds with POST /ha/base-backups/capture (the `CaptureHASeedArtifact` operationId).
-func (c *Client) CaptureHASeedArtifactWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewCaptureHASeedArtifactRequestWithBody(c.Server, contentType, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// CaptureHASeedArtifactWithBody Capture an immutable seed from runtime-owned primary storage
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /standby/base-backups/capture (the `CaptureHASeedArtifact` operationId).
+	CaptureHASeedArtifactWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// CaptureHASeedArtifact Capture an immutable seed from runtime-owned primary storage
-//
-// Takes a body of the `application/json` content type.
-//
-// Corresponds with POST /ha/base-backups/capture (the `CaptureHASeedArtifact` operationId).
-func (c *Client) CaptureHASeedArtifact(ctx context.Context, body CaptureHASeedArtifactJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewCaptureHASeedArtifactRequest(c.Server, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// CaptureHASeedArtifact Capture an immutable seed from runtime-owned primary storage
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /standby/base-backups/capture (the `CaptureHASeedArtifact` operationId).
+	CaptureHASeedArtifact(ctx context.Context, body CaptureHASeedArtifactJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// FinishHABaseBackupWithBody Finish an HA base backup from a local manifest path
-//
-// Takes any type of body and a specified content type.
-//
-// Corresponds with POST /ha/base-backups/finish (the `FinishHABaseBackup` operationId).
-func (c *Client) FinishHABaseBackupWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewFinishHABaseBackupRequestWithBody(c.Server, contentType, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// FinishHABaseBackupWithBody Finish a hot-standby base backup from a local manifest path
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /standby/base-backups/finish (the `FinishHABaseBackup` operationId).
+	FinishHABaseBackupWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// FinishHABaseBackup Finish an HA base backup from a local manifest path
-//
-// Takes a body of the `application/json` content type.
-//
-// Corresponds with POST /ha/base-backups/finish (the `FinishHABaseBackup` operationId).
-func (c *Client) FinishHABaseBackup(ctx context.Context, body FinishHABaseBackupJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewFinishHABaseBackupRequest(c.Server, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// FinishHABaseBackup Finish a hot-standby base backup from a local manifest path
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /standby/base-backups/finish (the `FinishHABaseBackup` operationId).
+	FinishHABaseBackup(ctx context.Context, body FinishHABaseBackupJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// AppendHACommitWithBody Append a primary WAL/effects record and evaluate synchronous commit durability
-//
-// Takes any type of body and a specified content type.
-//
-// Corresponds with POST /ha/commit/append (the `AppendHACommit` operationId).
-func (c *Client) AppendHACommitWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewAppendHACommitRequestWithBody(c.Server, contentType, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// BootstrapHAStandbyWithBody Bootstrap this standby from a local base-backup manifest and copied files
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /standby/bootstrap (the `BootstrapHAStandby` operationId).
+	BootstrapHAStandbyWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// AppendHACommit Append a primary WAL/effects record and evaluate synchronous commit durability
-//
-// Takes a body of the `application/json` content type.
-//
-// Corresponds with POST /ha/commit/append (the `AppendHACommit` operationId).
-func (c *Client) AppendHACommit(ctx context.Context, body AppendHACommitJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewAppendHACommitRequest(c.Server, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// BootstrapHAStandby Bootstrap this standby from a local base-backup manifest and copied files
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /standby/bootstrap (the `BootstrapHAStandby` operationId).
+	BootstrapHAStandby(ctx context.Context, body BootstrapHAStandbyJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// CheckHACommitWithBody Evaluate synchronous commit durability for an existing LSN
-//
-// Takes any type of body and a specified content type.
-//
-// Corresponds with POST /ha/commit/check (the `CheckHACommit` operationId).
-func (c *Client) CheckHACommitWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewCheckHACommitRequestWithBody(c.Server, contentType, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// AppendHACommitWithBody Append a primary WAL/effects record and evaluate synchronous commit durability
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /standby/commit/append (the `AppendHACommit` operationId).
+	AppendHACommitWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// CheckHACommit Evaluate synchronous commit durability for an existing LSN
-//
-// Takes a body of the `application/json` content type.
-//
-// Corresponds with POST /ha/commit/check (the `CheckHACommit` operationId).
-func (c *Client) CheckHACommit(ctx context.Context, body CheckHACommitJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewCheckHACommitRequest(c.Server, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// AppendHACommit Append a primary WAL/effects record and evaluate synchronous commit durability
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /standby/commit/append (the `AppendHACommit` operationId).
+	AppendHACommit(ctx context.Context, body AppendHACommitJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// AcquireHAFenceWithBody Acquire a durable HA promotion fence
-//
-// Takes any type of body and a specified content type.
-//
-// Corresponds with POST /ha/fence (the `AcquireHAFence` operationId).
-func (c *Client) AcquireHAFenceWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewAcquireHAFenceRequestWithBody(c.Server, contentType, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// CheckHACommitWithBody Evaluate synchronous commit durability for an existing LSN
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /standby/commit/check (the `CheckHACommit` operationId).
+	CheckHACommitWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// AcquireHAFence Acquire a durable HA promotion fence
-//
-// Takes a body of the `application/json` content type.
-//
-// Corresponds with POST /ha/fence (the `AcquireHAFence` operationId).
-func (c *Client) AcquireHAFence(ctx context.Context, body AcquireHAFenceJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewAcquireHAFenceRequest(c.Server, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// CheckHACommit Evaluate synchronous commit durability for an existing LSN
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /standby/commit/check (the `CheckHACommit` operationId).
+	CheckHACommit(ctx context.Context, body CheckHACommitJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// GetHACurrentFence Get the current durable HA promotion fence
-//
-// Corresponds with GET /ha/fence/current (the `GetHACurrentFence` operationId).
-func (c *Client) GetHACurrentFence(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewGetHACurrentFenceRequest(c.Server)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// AcquireHAFenceWithBody Acquire a durable hot-standby promotion fence
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /standby/fence (the `AcquireHAFence` operationId).
+	AcquireHAFenceWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// CheckHAOwnerJobWithBody Evaluate whether an owner-only background job may run
-//
-// Takes any type of body and a specified content type.
-//
-// Corresponds with POST /ha/owner-jobs/check (the `CheckHAOwnerJob` operationId).
-func (c *Client) CheckHAOwnerJobWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewCheckHAOwnerJobRequestWithBody(c.Server, contentType, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// AcquireHAFence Acquire a durable hot-standby promotion fence
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /standby/fence (the `AcquireHAFence` operationId).
+	AcquireHAFence(ctx context.Context, body AcquireHAFenceJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// CheckHAOwnerJob Evaluate whether an owner-only background job may run
-//
-// Takes a body of the `application/json` content type.
-//
-// Corresponds with POST /ha/owner-jobs/check (the `CheckHAOwnerJob` operationId).
-func (c *Client) CheckHAOwnerJob(ctx context.Context, body CheckHAOwnerJobJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewCheckHAOwnerJobRequest(c.Server, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// GetHACurrentFence Get the current durable hot-standby promotion fence
+	//
+	// Corresponds with GET /standby/fence/current (the `GetHACurrentFence` operationId).
+	GetHACurrentFence(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// GetHAPrimaryStatus Get primary HA status
-//
-// Corresponds with GET /ha/primary/status (the `GetHAPrimaryStatus` operationId).
-func (c *Client) GetHAPrimaryStatus(ctx context.Context, params *GetHAPrimaryStatusParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewGetHAPrimaryStatusRequest(c.Server, params)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// CheckHAOwnerJobWithBody Evaluate whether an owner-only background job may run
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /standby/owner-jobs/check (the `CheckHAOwnerJob` operationId).
+	CheckHAOwnerJobWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// PromoteHAWithBody Acquire a fence and promote this standby
-//
-// Takes any type of body and a specified content type.
-//
-// Corresponds with POST /ha/promotion (the `PromoteHA` operationId).
-func (c *Client) PromoteHAWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewPromoteHARequestWithBody(c.Server, contentType, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// CheckHAOwnerJob Evaluate whether an owner-only background job may run
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /standby/owner-jobs/check (the `CheckHAOwnerJob` operationId).
+	CheckHAOwnerJob(ctx context.Context, body CheckHAOwnerJobJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// PromoteHA Acquire a fence and promote this standby
-//
-// Takes a body of the `application/json` content type.
-//
-// Corresponds with POST /ha/promotion (the `PromoteHA` operationId).
-func (c *Client) PromoteHA(ctx context.Context, body PromoteHAJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewPromoteHARequest(c.Server, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// GetHAPrimaryStatus Get primary hot-standby status
+	//
+	// Corresponds with GET /standby/primary/status (the `GetHAPrimaryStatus` operationId).
+	GetHAPrimaryStatus(ctx context.Context, params *GetHAPrimaryStatusParams, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// AssessHAPromotionWithBody Assess whether this standby can be promoted
-//
-// Takes any type of body and a specified content type.
-//
-// Corresponds with POST /ha/promotion/assess (the `AssessHAPromotion` operationId).
-func (c *Client) AssessHAPromotionWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewAssessHAPromotionRequestWithBody(c.Server, contentType, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// PromoteHAWithBody Acquire a fence and promote this standby
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /standby/promotion (the `PromoteHA` operationId).
+	PromoteHAWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// AssessHAPromotion Assess whether this standby can be promoted
-//
-// Takes a body of the `application/json` content type.
-//
-// Corresponds with POST /ha/promotion/assess (the `AssessHAPromotion` operationId).
-func (c *Client) AssessHAPromotion(ctx context.Context, body AssessHAPromotionJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewAssessHAPromotionRequest(c.Server, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// PromoteHA Acquire a fence and promote this standby
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /standby/promotion (the `PromoteHA` operationId).
+	PromoteHA(ctx context.Context, body PromoteHAJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// PromoteHAWithCurrentFence Promote this standby using the current durable fence receipt
-//
-// Corresponds with POST /ha/promotion/current-fence (the `PromoteHAWithCurrentFence` operationId).
-func (c *Client) PromoteHAWithCurrentFence(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewPromoteHAWithCurrentFenceRequest(c.Server)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// AssessHAPromotionWithBody Assess whether this standby can be promoted
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /standby/promotion/assess (the `AssessHAPromotion` operationId).
+	AssessHAPromotionWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// CheckHAReadWithBody Evaluate standby read freshness and routing
-//
-// Takes any type of body and a specified content type.
-//
-// Corresponds with POST /ha/read/check (the `CheckHARead` operationId).
-func (c *Client) CheckHAReadWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewCheckHAReadRequestWithBody(c.Server, contentType, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// AssessHAPromotion Assess whether this standby can be promoted
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /standby/promotion/assess (the `AssessHAPromotion` operationId).
+	AssessHAPromotion(ctx context.Context, body AssessHAPromotionJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// CheckHARead Evaluate standby read freshness and routing
-//
-// Takes a body of the `application/json` content type.
-//
-// Corresponds with POST /ha/read/check (the `CheckHARead` operationId).
-func (c *Client) CheckHARead(ctx context.Context, body CheckHAReadJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewCheckHAReadRequest(c.Server, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// PromoteHAWithCurrentFence Promote this standby using the current durable fence receipt
+	//
+	// Corresponds with POST /standby/promotion/current-fence (the `PromoteHAWithCurrentFence` operationId).
+	PromoteHAWithCurrentFence(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// AssessHARejoinWithBody Assess whether a former primary can safely rejoin
-//
-// Takes any type of body and a specified content type.
-//
-// Corresponds with POST /ha/rejoin/assess (the `AssessHARejoin` operationId).
-func (c *Client) AssessHARejoinWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewAssessHARejoinRequestWithBody(c.Server, contentType, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// CheckHAReadWithBody Evaluate standby read freshness and routing
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /standby/read/check (the `CheckHARead` operationId).
+	CheckHAReadWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// AssessHARejoin Assess whether a former primary can safely rejoin
-//
-// Takes a body of the `application/json` content type.
-//
-// Corresponds with POST /ha/rejoin/assess (the `AssessHARejoin` operationId).
-func (c *Client) AssessHARejoin(ctx context.Context, body AssessHARejoinJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewAssessHARejoinRequest(c.Server, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// CheckHARead Evaluate standby read freshness and routing
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /standby/read/check (the `CheckHARead` operationId).
+	CheckHARead(ctx context.Context, body CheckHAReadJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// ReseedHARejoinWithBody Reseed a fenced former primary when rewind is unsafe
-//
-// Takes any type of body and a specified content type.
-//
-// Corresponds with POST /ha/rejoin/reseed (the `ReseedHARejoin` operationId).
-func (c *Client) ReseedHARejoinWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewReseedHARejoinRequestWithBody(c.Server, contentType, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// AssessHARejoinWithBody Assess whether a former primary can safely rejoin
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /standby/rejoin/assess (the `AssessHARejoin` operationId).
+	AssessHARejoinWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// ReseedHARejoin Reseed a fenced former primary when rewind is unsafe
-//
-// Takes a body of the `application/json` content type.
-//
-// Corresponds with POST /ha/rejoin/reseed (the `ReseedHARejoin` operationId).
-func (c *Client) ReseedHARejoin(ctx context.Context, body ReseedHARejoinJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewReseedHARejoinRequest(c.Server, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// AssessHARejoin Assess whether a former primary can safely rejoin
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /standby/rejoin/assess (the `AssessHARejoin` operationId).
+	AssessHARejoin(ctx context.Context, body AssessHARejoinJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// RewindHARejoinWithBody Rewind a fenced former primary onto the promoted timeline
-//
-// Takes any type of body and a specified content type.
-//
-// Corresponds with POST /ha/rejoin/rewind (the `RewindHARejoin` operationId).
-func (c *Client) RewindHARejoinWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewRewindHARejoinRequestWithBody(c.Server, contentType, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// ReseedHARejoinWithBody Reseed a fenced former primary when rewind is unsafe
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /standby/rejoin/reseed (the `ReseedHARejoin` operationId).
+	ReseedHARejoinWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// RewindHARejoin Rewind a fenced former primary onto the promoted timeline
-//
-// Takes a body of the `application/json` content type.
-//
-// Corresponds with POST /ha/rejoin/rewind (the `RewindHARejoin` operationId).
-func (c *Client) RewindHARejoin(ctx context.Context, body RewindHARejoinJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewRewindHARejoinRequest(c.Server, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// ReseedHARejoin Reseed a fenced former primary when rewind is unsafe
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /standby/rejoin/reseed (the `ReseedHARejoin` operationId).
+	ReseedHARejoin(ctx context.Context, body ReseedHARejoinJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// ListHAReplicationSlots List HA replication slots
-//
-// Corresponds with GET /ha/replication-slots (the `ListHAReplicationSlots` operationId).
-func (c *Client) ListHAReplicationSlots(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewListHAReplicationSlotsRequest(c.Server)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// RewindHARejoinWithBody Rewind a fenced former primary onto the promoted timeline
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /standby/rejoin/rewind (the `RewindHARejoin` operationId).
+	RewindHARejoinWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// CreateHAReplicationSlotWithBody Create an HA replication slot
-//
-// Takes any type of body and a specified content type.
-//
-// Corresponds with POST /ha/replication-slots (the `CreateHAReplicationSlot` operationId).
-func (c *Client) CreateHAReplicationSlotWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewCreateHAReplicationSlotRequestWithBody(c.Server, contentType, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// RewindHARejoin Rewind a fenced former primary onto the promoted timeline
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /standby/rejoin/rewind (the `RewindHARejoin` operationId).
+	RewindHARejoin(ctx context.Context, body RewindHARejoinJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// CreateHAReplicationSlot Create an HA replication slot
-//
-// Takes a body of the `application/json` content type.
-//
-// Corresponds with POST /ha/replication-slots (the `CreateHAReplicationSlot` operationId).
-func (c *Client) CreateHAReplicationSlot(ctx context.Context, body CreateHAReplicationSlotJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewCreateHAReplicationSlotRequest(c.Server, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// ListHAReplicationSlots List hot-standby replication slots
+	//
+	// Corresponds with GET /standby/replication-slots (the `ListHAReplicationSlots` operationId).
+	ListHAReplicationSlots(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// DropHAReplicationSlot Drop an HA replication slot
-//
-// Corresponds with DELETE /ha/replication-slots/{slot_name} (the `DropHAReplicationSlot` operationId).
-func (c *Client) DropHAReplicationSlot(ctx context.Context, slotName SlotName, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewDropHAReplicationSlotRequest(c.Server, slotName)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// CreateHAReplicationSlotWithBody Create a hot-standby replication slot
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /standby/replication-slots (the `CreateHAReplicationSlot` operationId).
+	CreateHAReplicationSlotWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// PauseHAReplicationSlot Pause an HA replication slot
-//
-// Corresponds with PUT /ha/replication-slots/{slot_name}/pause (the `PauseHAReplicationSlot` operationId).
-func (c *Client) PauseHAReplicationSlot(ctx context.Context, slotName SlotName, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewPauseHAReplicationSlotRequest(c.Server, slotName)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// CreateHAReplicationSlot Create a hot-standby replication slot
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /standby/replication-slots (the `CreateHAReplicationSlot` operationId).
+	CreateHAReplicationSlot(ctx context.Context, body CreateHAReplicationSlotJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// ResumeHAReplicationSlot Resume an HA replication slot
-//
-// Corresponds with PUT /ha/replication-slots/{slot_name}/resume (the `ResumeHAReplicationSlot` operationId).
-func (c *Client) ResumeHAReplicationSlot(ctx context.Context, slotName SlotName, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewResumeHAReplicationSlotRequest(c.Server, slotName)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// DropHAReplicationSlot Drop a hot-standby replication slot
+	//
+	// Corresponds with DELETE /standby/replication-slots/{slot_name} (the `DropHAReplicationSlot` operationId).
+	DropHAReplicationSlot(ctx context.Context, slotName SlotName, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// GetHASeedLifecycleReceipts Read durable runtime-owned HA seed lifecycle receipts
-//
-// Returns an authenticated, read-only cursor page from the runtime-owned
-// append-only receipt ledger. `history_truncated` and `gap` make bounded
-// retention explicit so observers can fail closed when their collection
-// window is incomplete.
-//
-// Corresponds with GET /ha/seed-lifecycle/receipts (the `GetHASeedLifecycleReceipts` operationId).
-func (c *Client) GetHASeedLifecycleReceipts(ctx context.Context, params *GetHASeedLifecycleReceiptsParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewGetHASeedLifecycleReceiptsRequest(c.Server, params)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// PauseHAReplicationSlot Pause a hot-standby replication slot
+	//
+	// Corresponds with PUT /standby/replication-slots/{slot_name}/pause (the `PauseHAReplicationSlot` operationId).
+	PauseHAReplicationSlot(ctx context.Context, slotName SlotName, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// BootstrapHAStandbyWithBody Bootstrap this standby from a local base-backup manifest and copied files
-//
-// Takes any type of body and a specified content type.
-//
-// Corresponds with POST /ha/standby/bootstrap (the `BootstrapHAStandby` operationId).
-func (c *Client) BootstrapHAStandbyWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewBootstrapHAStandbyRequestWithBody(c.Server, contentType, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// ResumeHAReplicationSlot Resume a hot-standby replication slot
+	//
+	// Corresponds with PUT /standby/replication-slots/{slot_name}/resume (the `ResumeHAReplicationSlot` operationId).
+	ResumeHAReplicationSlot(ctx context.Context, slotName SlotName, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// BootstrapHAStandby Bootstrap this standby from a local base-backup manifest and copied files
-//
-// Takes a body of the `application/json` content type.
-//
-// Corresponds with POST /ha/standby/bootstrap (the `BootstrapHAStandby` operationId).
-func (c *Client) BootstrapHAStandby(ctx context.Context, body BootstrapHAStandbyJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewBootstrapHAStandbyRequest(c.Server, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// GetHASeedLifecycleReceipts Read durable runtime-owned hot-standby seed lifecycle receipts
+	//
+	// Returns an authenticated, read-only cursor page from the runtime-owned
+	// append-only receipt ledger. `history_truncated` and `gap` make bounded
+	// retention explicit so observers can fail closed when their collection
+	// window is incomplete.
+	//
+	// Corresponds with GET /standby/seed-lifecycle/receipts (the `GetHASeedLifecycleReceipts` operationId).
+	GetHASeedLifecycleReceipts(ctx context.Context, params *GetHASeedLifecycleReceiptsParams, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// GetHAStandbyStatus Get standby HA status
-//
-// Corresponds with GET /ha/standby/status (the `GetHAStandbyStatus` operationId).
-func (c *Client) GetHAStandbyStatus(ctx context.Context, params *GetHAStandbyStatusParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewGetHAStandbyStatusRequest(c.Server, params)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// GetHAStandbyStatus Get standby status
+	//
+	// Corresponds with GET /standby/status (the `GetHAStandbyStatus` operationId).
+	GetHAStandbyStatus(ctx context.Context, params *GetHAStandbyStatusParams, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// GetHAWatchdogProof Get the runtime Lease watchdog capability proof
-//
-// Returns only the authenticated, process-local Lease watchdog proof. This endpoint remains independent of storage mutation critical sections so a slow seed capture cannot prevent the operator from renewing an otherwise valid fencing Lease.
-//
-// Corresponds with GET /ha/watchdog-proof (the `GetHAWatchdogProof` operationId).
-func (c *Client) GetHAWatchdogProof(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewGetHAWatchdogProofRequest(c.Server)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// SetHAStandbyUpstreamWithBody Repoint a running standby at a different primary
+	//
+	// Atomically replaces the upstream URL and replication slot a running
+	// standby pulls from, without restarting the process. The request carries
+	// the identity the caller expects the standby to have; the swap is
+	// rejected with 409 when the standby's current identity differs, so a
+	// stale operator cannot repoint a node that has since been promoted or
+	// reseeded. The next replication round pulls from the new upstream. This
+	// is the `follow` step of a switchover.
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /standby/upstream (the `SetHAStandbyUpstream` operationId).
+	SetHAStandbyUpstreamWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// CheckHAWriteWithBody Evaluate whether this node can accept writes
-//
-// Takes any type of body and a specified content type.
-//
-// Corresponds with POST /ha/write/check (the `CheckHAWrite` operationId).
-func (c *Client) CheckHAWriteWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewCheckHAWriteRequestWithBody(c.Server, contentType, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
+	// SetHAStandbyUpstream Repoint a running standby at a different primary
+	//
+	// Atomically replaces the upstream URL and replication slot a running
+	// standby pulls from, without restarting the process. The request carries
+	// the identity the caller expects the standby to have; the swap is
+	// rejected with 409 when the standby's current identity differs, so a
+	// stale operator cannot repoint a node that has since been promoted or
+	// reseeded. The next replication round pulls from the new upstream. This
+	// is the `follow` step of a switchover.
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /standby/upstream (the `SetHAStandbyUpstream` operationId).
+	SetHAStandbyUpstream(ctx context.Context, body SetHAStandbyUpstreamJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-// CheckHAWrite Evaluate whether this node can accept writes
-//
-// Takes a body of the `application/json` content type.
-//
-// Corresponds with POST /ha/write/check (the `CheckHAWrite` operationId).
-func (c *Client) CheckHAWrite(ctx context.Context, body CheckHAWriteJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewCheckHAWriteRequest(c.Server, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
+	// GetHAWatchdogProof Get the runtime Lease watchdog capability proof
+	//
+	// Returns only the authenticated, process-local Lease watchdog proof. This endpoint remains independent of storage mutation critical sections so a slow seed capture cannot prevent the operator from renewing an otherwise valid fencing Lease.
+	//
+	// Corresponds with GET /standby/watchdog-proof (the `GetHAWatchdogProof` operationId).
+	GetHAWatchdogProof(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// CheckHAWriteWithBody Evaluate whether this node can accept writes
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /standby/write/check (the `CheckHAWrite` operationId).
+	CheckHAWriteWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// CheckHAWrite Evaluate whether this node can accept writes
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /standby/write/check (the `CheckHAWrite` operationId).
+	CheckHAWrite(ctx context.Context, body CheckHAWriteJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 }
 
 // StartStorageCheck Start a coordinated storage integrity check
@@ -3117,1120 +2458,789 @@ func (c *Client) StartStorageVacuum(ctx context.Context, params *StartStorageVac
 	return c.Client.Do(req)
 }
 
-// NewBeginHABaseBackupRequest calls the generic BeginHABaseBackup builder with application/json body
-func NewBeginHABaseBackupRequest(server string, body BeginHABaseBackupJSONRequestBody) (*http.Request, error) {
-	var bodyReader io.Reader
-	buf, err := json.Marshal(body)
+// BeginHABaseBackupWithBody Begin a hot-standby base backup and reserve its replication slot
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /standby/base-backups (the `BeginHABaseBackup` operationId).
+func (c *Client) BeginHABaseBackupWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewBeginHABaseBackupRequestWithBody(c.Server, contentType, body)
 	if err != nil {
 		return nil, err
 	}
-	bodyReader = bytes.NewReader(buf)
-	return NewBeginHABaseBackupRequestWithBody(server, "application/json", bodyReader)
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
 }
 
-// NewBeginHABaseBackupRequestWithBody constructs an http.Request for the BeginHABaseBackup method, with any body, and a specified content type
-func NewBeginHABaseBackupRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
-	var err error
-
-	serverURL, err := url.Parse(server)
+// BeginHABaseBackup Begin a hot-standby base backup and reserve its replication slot
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /standby/base-backups (the `BeginHABaseBackup` operationId).
+func (c *Client) BeginHABaseBackup(ctx context.Context, body BeginHABaseBackupJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewBeginHABaseBackupRequest(c.Server, body)
 	if err != nil {
 		return nil, err
 	}
-
-	operationPath := fmt.Sprintf("/ha/base-backups")
-	if operationPath[0] == '/' {
-		operationPath = "." + operationPath
-	}
-
-	queryURL, err := serverURL.Parse(operationPath)
-	if err != nil {
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-
-	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Add("Content-Type", contentType)
-
-	return req, nil
+	return c.Client.Do(req)
 }
 
-// NewActivateHASeededSlotRequest calls the generic ActivateHASeededSlot builder with application/json body
-func NewActivateHASeededSlotRequest(server string, body ActivateHASeededSlotJSONRequestBody) (*http.Request, error) {
-	var bodyReader io.Reader
-	buf, err := json.Marshal(body)
+// ActivateHASeededSlotWithBody Activate a seeded slot after durable target-generation publication
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /standby/base-backups/activate (the `ActivateHASeededSlot` operationId).
+func (c *Client) ActivateHASeededSlotWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewActivateHASeededSlotRequestWithBody(c.Server, contentType, body)
 	if err != nil {
 		return nil, err
 	}
-	bodyReader = bytes.NewReader(buf)
-	return NewActivateHASeededSlotRequestWithBody(server, "application/json", bodyReader)
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
 }
 
-// NewActivateHASeededSlotRequestWithBody constructs an http.Request for the ActivateHASeededSlot method, with any body, and a specified content type
-func NewActivateHASeededSlotRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
-	var err error
-
-	serverURL, err := url.Parse(server)
+// ActivateHASeededSlot Activate a seeded slot after durable target-generation publication
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /standby/base-backups/activate (the `ActivateHASeededSlot` operationId).
+func (c *Client) ActivateHASeededSlot(ctx context.Context, body ActivateHASeededSlotJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewActivateHASeededSlotRequest(c.Server, body)
 	if err != nil {
 		return nil, err
 	}
-
-	operationPath := fmt.Sprintf("/ha/base-backups/activate")
-	if operationPath[0] == '/' {
-		operationPath = "." + operationPath
-	}
-
-	queryURL, err := serverURL.Parse(operationPath)
-	if err != nil {
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-
-	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Add("Content-Type", contentType)
-
-	return req, nil
+	return c.Client.Do(req)
 }
 
-// NewCaptureHASeedArtifactRequest calls the generic CaptureHASeedArtifact builder with application/json body
-func NewCaptureHASeedArtifactRequest(server string, body CaptureHASeedArtifactJSONRequestBody) (*http.Request, error) {
-	var bodyReader io.Reader
-	buf, err := json.Marshal(body)
+// CaptureHASeedArtifactWithBody Capture an immutable seed from runtime-owned primary storage
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /standby/base-backups/capture (the `CaptureHASeedArtifact` operationId).
+func (c *Client) CaptureHASeedArtifactWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewCaptureHASeedArtifactRequestWithBody(c.Server, contentType, body)
 	if err != nil {
 		return nil, err
 	}
-	bodyReader = bytes.NewReader(buf)
-	return NewCaptureHASeedArtifactRequestWithBody(server, "application/json", bodyReader)
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
 }
 
-// NewCaptureHASeedArtifactRequestWithBody constructs an http.Request for the CaptureHASeedArtifact method, with any body, and a specified content type
-func NewCaptureHASeedArtifactRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
-	var err error
-
-	serverURL, err := url.Parse(server)
+// CaptureHASeedArtifact Capture an immutable seed from runtime-owned primary storage
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /standby/base-backups/capture (the `CaptureHASeedArtifact` operationId).
+func (c *Client) CaptureHASeedArtifact(ctx context.Context, body CaptureHASeedArtifactJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewCaptureHASeedArtifactRequest(c.Server, body)
 	if err != nil {
 		return nil, err
 	}
-
-	operationPath := fmt.Sprintf("/ha/base-backups/capture")
-	if operationPath[0] == '/' {
-		operationPath = "." + operationPath
-	}
-
-	queryURL, err := serverURL.Parse(operationPath)
-	if err != nil {
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-
-	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Add("Content-Type", contentType)
-
-	return req, nil
+	return c.Client.Do(req)
 }
 
-// NewFinishHABaseBackupRequest calls the generic FinishHABaseBackup builder with application/json body
-func NewFinishHABaseBackupRequest(server string, body FinishHABaseBackupJSONRequestBody) (*http.Request, error) {
-	var bodyReader io.Reader
-	buf, err := json.Marshal(body)
+// FinishHABaseBackupWithBody Finish a hot-standby base backup from a local manifest path
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /standby/base-backups/finish (the `FinishHABaseBackup` operationId).
+func (c *Client) FinishHABaseBackupWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewFinishHABaseBackupRequestWithBody(c.Server, contentType, body)
 	if err != nil {
 		return nil, err
 	}
-	bodyReader = bytes.NewReader(buf)
-	return NewFinishHABaseBackupRequestWithBody(server, "application/json", bodyReader)
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
 }
 
-// NewFinishHABaseBackupRequestWithBody constructs an http.Request for the FinishHABaseBackup method, with any body, and a specified content type
-func NewFinishHABaseBackupRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
-	var err error
-
-	serverURL, err := url.Parse(server)
+// FinishHABaseBackup Finish a hot-standby base backup from a local manifest path
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /standby/base-backups/finish (the `FinishHABaseBackup` operationId).
+func (c *Client) FinishHABaseBackup(ctx context.Context, body FinishHABaseBackupJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewFinishHABaseBackupRequest(c.Server, body)
 	if err != nil {
 		return nil, err
 	}
-
-	operationPath := fmt.Sprintf("/ha/base-backups/finish")
-	if operationPath[0] == '/' {
-		operationPath = "." + operationPath
-	}
-
-	queryURL, err := serverURL.Parse(operationPath)
-	if err != nil {
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-
-	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Add("Content-Type", contentType)
-
-	return req, nil
+	return c.Client.Do(req)
 }
 
-// NewAppendHACommitRequest calls the generic AppendHACommit builder with application/json body
-func NewAppendHACommitRequest(server string, body AppendHACommitJSONRequestBody) (*http.Request, error) {
-	var bodyReader io.Reader
-	buf, err := json.Marshal(body)
+// BootstrapHAStandbyWithBody Bootstrap this standby from a local base-backup manifest and copied files
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /standby/bootstrap (the `BootstrapHAStandby` operationId).
+func (c *Client) BootstrapHAStandbyWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewBootstrapHAStandbyRequestWithBody(c.Server, contentType, body)
 	if err != nil {
 		return nil, err
 	}
-	bodyReader = bytes.NewReader(buf)
-	return NewAppendHACommitRequestWithBody(server, "application/json", bodyReader)
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
 }
 
-// NewAppendHACommitRequestWithBody constructs an http.Request for the AppendHACommit method, with any body, and a specified content type
-func NewAppendHACommitRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
-	var err error
-
-	serverURL, err := url.Parse(server)
+// BootstrapHAStandby Bootstrap this standby from a local base-backup manifest and copied files
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /standby/bootstrap (the `BootstrapHAStandby` operationId).
+func (c *Client) BootstrapHAStandby(ctx context.Context, body BootstrapHAStandbyJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewBootstrapHAStandbyRequest(c.Server, body)
 	if err != nil {
 		return nil, err
 	}
-
-	operationPath := fmt.Sprintf("/ha/commit/append")
-	if operationPath[0] == '/' {
-		operationPath = "." + operationPath
-	}
-
-	queryURL, err := serverURL.Parse(operationPath)
-	if err != nil {
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-
-	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Add("Content-Type", contentType)
-
-	return req, nil
+	return c.Client.Do(req)
 }
 
-// NewCheckHACommitRequest calls the generic CheckHACommit builder with application/json body
-func NewCheckHACommitRequest(server string, body CheckHACommitJSONRequestBody) (*http.Request, error) {
-	var bodyReader io.Reader
-	buf, err := json.Marshal(body)
+// AppendHACommitWithBody Append a primary WAL/effects record and evaluate synchronous commit durability
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /standby/commit/append (the `AppendHACommit` operationId).
+func (c *Client) AppendHACommitWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewAppendHACommitRequestWithBody(c.Server, contentType, body)
 	if err != nil {
 		return nil, err
 	}
-	bodyReader = bytes.NewReader(buf)
-	return NewCheckHACommitRequestWithBody(server, "application/json", bodyReader)
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
 }
 
-// NewCheckHACommitRequestWithBody constructs an http.Request for the CheckHACommit method, with any body, and a specified content type
-func NewCheckHACommitRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
-	var err error
-
-	serverURL, err := url.Parse(server)
+// AppendHACommit Append a primary WAL/effects record and evaluate synchronous commit durability
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /standby/commit/append (the `AppendHACommit` operationId).
+func (c *Client) AppendHACommit(ctx context.Context, body AppendHACommitJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewAppendHACommitRequest(c.Server, body)
 	if err != nil {
 		return nil, err
 	}
-
-	operationPath := fmt.Sprintf("/ha/commit/check")
-	if operationPath[0] == '/' {
-		operationPath = "." + operationPath
-	}
-
-	queryURL, err := serverURL.Parse(operationPath)
-	if err != nil {
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-
-	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Add("Content-Type", contentType)
-
-	return req, nil
+	return c.Client.Do(req)
 }
 
-// NewAcquireHAFenceRequest calls the generic AcquireHAFence builder with application/json body
-func NewAcquireHAFenceRequest(server string, body AcquireHAFenceJSONRequestBody) (*http.Request, error) {
-	var bodyReader io.Reader
-	buf, err := json.Marshal(body)
+// CheckHACommitWithBody Evaluate synchronous commit durability for an existing LSN
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /standby/commit/check (the `CheckHACommit` operationId).
+func (c *Client) CheckHACommitWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewCheckHACommitRequestWithBody(c.Server, contentType, body)
 	if err != nil {
 		return nil, err
 	}
-	bodyReader = bytes.NewReader(buf)
-	return NewAcquireHAFenceRequestWithBody(server, "application/json", bodyReader)
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
 }
 
-// NewAcquireHAFenceRequestWithBody constructs an http.Request for the AcquireHAFence method, with any body, and a specified content type
-func NewAcquireHAFenceRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
-	var err error
-
-	serverURL, err := url.Parse(server)
+// CheckHACommit Evaluate synchronous commit durability for an existing LSN
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /standby/commit/check (the `CheckHACommit` operationId).
+func (c *Client) CheckHACommit(ctx context.Context, body CheckHACommitJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewCheckHACommitRequest(c.Server, body)
 	if err != nil {
 		return nil, err
 	}
-
-	operationPath := fmt.Sprintf("/ha/fence")
-	if operationPath[0] == '/' {
-		operationPath = "." + operationPath
-	}
-
-	queryURL, err := serverURL.Parse(operationPath)
-	if err != nil {
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-
-	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Add("Content-Type", contentType)
-
-	return req, nil
+	return c.Client.Do(req)
 }
 
-// NewGetHACurrentFenceRequest constructs an http.Request for the GetHACurrentFence method
-func NewGetHACurrentFenceRequest(server string) (*http.Request, error) {
-	var err error
-
-	serverURL, err := url.Parse(server)
+// AcquireHAFenceWithBody Acquire a durable hot-standby promotion fence
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /standby/fence (the `AcquireHAFence` operationId).
+func (c *Client) AcquireHAFenceWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewAcquireHAFenceRequestWithBody(c.Server, contentType, body)
 	if err != nil {
 		return nil, err
 	}
-
-	operationPath := fmt.Sprintf("/ha/fence/current")
-	if operationPath[0] == '/' {
-		operationPath = "." + operationPath
-	}
-
-	queryURL, err := serverURL.Parse(operationPath)
-	if err != nil {
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-
-	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
-	if err != nil {
-		return nil, err
-	}
-
-	return req, nil
+	return c.Client.Do(req)
 }
 
-// NewCheckHAOwnerJobRequest calls the generic CheckHAOwnerJob builder with application/json body
-func NewCheckHAOwnerJobRequest(server string, body CheckHAOwnerJobJSONRequestBody) (*http.Request, error) {
-	var bodyReader io.Reader
-	buf, err := json.Marshal(body)
+// AcquireHAFence Acquire a durable hot-standby promotion fence
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /standby/fence (the `AcquireHAFence` operationId).
+func (c *Client) AcquireHAFence(ctx context.Context, body AcquireHAFenceJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewAcquireHAFenceRequest(c.Server, body)
 	if err != nil {
 		return nil, err
 	}
-	bodyReader = bytes.NewReader(buf)
-	return NewCheckHAOwnerJobRequestWithBody(server, "application/json", bodyReader)
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
 }
 
-// NewCheckHAOwnerJobRequestWithBody constructs an http.Request for the CheckHAOwnerJob method, with any body, and a specified content type
-func NewCheckHAOwnerJobRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
-	var err error
-
-	serverURL, err := url.Parse(server)
+// GetHACurrentFence Get the current durable hot-standby promotion fence
+//
+// Corresponds with GET /standby/fence/current (the `GetHACurrentFence` operationId).
+func (c *Client) GetHACurrentFence(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewGetHACurrentFenceRequest(c.Server)
 	if err != nil {
 		return nil, err
 	}
-
-	operationPath := fmt.Sprintf("/ha/owner-jobs/check")
-	if operationPath[0] == '/' {
-		operationPath = "." + operationPath
-	}
-
-	queryURL, err := serverURL.Parse(operationPath)
-	if err != nil {
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-
-	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Add("Content-Type", contentType)
-
-	return req, nil
+	return c.Client.Do(req)
 }
 
-// NewGetHAPrimaryStatusRequest constructs an http.Request for the GetHAPrimaryStatus method
-func NewGetHAPrimaryStatusRequest(server string, params *GetHAPrimaryStatusParams) (*http.Request, error) {
-	var err error
-
-	serverURL, err := url.Parse(server)
+// CheckHAOwnerJobWithBody Evaluate whether an owner-only background job may run
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /standby/owner-jobs/check (the `CheckHAOwnerJob` operationId).
+func (c *Client) CheckHAOwnerJobWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewCheckHAOwnerJobRequestWithBody(c.Server, contentType, body)
 	if err != nil {
 		return nil, err
 	}
-
-	operationPath := fmt.Sprintf("/ha/primary/status")
-	if operationPath[0] == '/' {
-		operationPath = "." + operationPath
-	}
-
-	queryURL, err := serverURL.Parse(operationPath)
-	if err != nil {
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-
-	if params != nil {
-		// queryValues collects non-styled parameters (passthrough, JSON)
-		// that are safe to round-trip through url.Values.Encode().
-		queryValues := queryURL.Query()
-		// rawQueryFragments collects pre-encoded query fragments from
-		// styled parameters, preserving literal commas as delimiters
-		// per the OpenAPI spec (e.g. "color=blue,black,brown").
-		var rawQueryFragments []string
-
-		if queryFrag, err := runtime.StyleParamWithOptions("form", true, "max_lag_lsn", params.MaxLagLsn, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "integer", Format: "uint64"}); err != nil {
-			return nil, err
-		} else {
-			for _, qp := range strings.Split(queryFrag, "&") {
-				rawQueryFragments = append(rawQueryFragments, qp)
-			}
-		}
-
-		if queryFrag, err := runtime.StyleParamWithOptions("form", true, "max_retained_bytes", params.MaxRetainedBytes, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "integer", Format: "uint64"}); err != nil {
-			return nil, err
-		} else {
-			for _, qp := range strings.Split(queryFrag, "&") {
-				rawQueryFragments = append(rawQueryFragments, qp)
-			}
-		}
-
-		if queryFrag, err := runtime.StyleParamWithOptions("form", true, "max_retained_age_ns", params.MaxRetainedAgeNs, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "integer", Format: "uint64"}); err != nil {
-			return nil, err
-		} else {
-			for _, qp := range strings.Split(queryFrag, "&") {
-				rawQueryFragments = append(rawQueryFragments, qp)
-			}
-		}
-
-		if queryFrag, err := runtime.StyleParamWithOptions("form", true, "sync_mode", params.SyncMode, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
-			return nil, err
-		} else {
-			for _, qp := range strings.Split(queryFrag, "&") {
-				rawQueryFragments = append(rawQueryFragments, qp)
-			}
-		}
-
-		if queryFrag, err := runtime.StyleParamWithOptions("form", true, "sync_selection", params.SyncSelection, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
-			return nil, err
-		} else {
-			for _, qp := range strings.Split(queryFrag, "&") {
-				rawQueryFragments = append(rawQueryFragments, qp)
-			}
-		}
-
-		if queryFrag, err := runtime.StyleParamWithOptions("form", true, "sync_required", params.SyncRequired, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "integer", Format: "uint64"}); err != nil {
-			return nil, err
-		} else {
-			for _, qp := range strings.Split(queryFrag, "&") {
-				rawQueryFragments = append(rawQueryFragments, qp)
-			}
-		}
-
-		if params.SyncStandby != nil {
-
-			if queryFrag, err := runtime.StyleParamWithOptions("form", true, "sync_standby", params.SyncStandby, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "array", Format: ""}); err != nil {
-				return nil, err
-			} else {
-				for _, qp := range strings.Split(queryFrag, "&") {
-					rawQueryFragments = append(rawQueryFragments, qp)
-				}
-			}
-
-		}
-
-		if queryFrag, err := runtime.StyleParamWithOptions("form", true, "sync_failure", params.SyncFailure, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
-			return nil, err
-		} else {
-			for _, qp := range strings.Split(queryFrag, "&") {
-				rawQueryFragments = append(rawQueryFragments, qp)
-			}
-		}
-
-		if encoded := queryValues.Encode(); encoded != "" {
-			rawQueryFragments = append(rawQueryFragments, encoded)
-		}
-		queryURL.RawQuery = strings.Join(rawQueryFragments, "&")
-	}
-
-	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
-	if err != nil {
-		return nil, err
-	}
-
-	return req, nil
+	return c.Client.Do(req)
 }
 
-// NewPromoteHARequest calls the generic PromoteHA builder with application/json body
-func NewPromoteHARequest(server string, body PromoteHAJSONRequestBody) (*http.Request, error) {
-	var bodyReader io.Reader
-	buf, err := json.Marshal(body)
+// CheckHAOwnerJob Evaluate whether an owner-only background job may run
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /standby/owner-jobs/check (the `CheckHAOwnerJob` operationId).
+func (c *Client) CheckHAOwnerJob(ctx context.Context, body CheckHAOwnerJobJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewCheckHAOwnerJobRequest(c.Server, body)
 	if err != nil {
 		return nil, err
 	}
-	bodyReader = bytes.NewReader(buf)
-	return NewPromoteHARequestWithBody(server, "application/json", bodyReader)
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
 }
 
-// NewPromoteHARequestWithBody constructs an http.Request for the PromoteHA method, with any body, and a specified content type
-func NewPromoteHARequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
-	var err error
-
-	serverURL, err := url.Parse(server)
+// GetHAPrimaryStatus Get primary hot-standby status
+//
+// Corresponds with GET /standby/primary/status (the `GetHAPrimaryStatus` operationId).
+func (c *Client) GetHAPrimaryStatus(ctx context.Context, params *GetHAPrimaryStatusParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewGetHAPrimaryStatusRequest(c.Server, params)
 	if err != nil {
 		return nil, err
 	}
-
-	operationPath := fmt.Sprintf("/ha/promotion")
-	if operationPath[0] == '/' {
-		operationPath = "." + operationPath
-	}
-
-	queryURL, err := serverURL.Parse(operationPath)
-	if err != nil {
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-
-	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Add("Content-Type", contentType)
-
-	return req, nil
+	return c.Client.Do(req)
 }
 
-// NewAssessHAPromotionRequest calls the generic AssessHAPromotion builder with application/json body
-func NewAssessHAPromotionRequest(server string, body AssessHAPromotionJSONRequestBody) (*http.Request, error) {
-	var bodyReader io.Reader
-	buf, err := json.Marshal(body)
+// PromoteHAWithBody Acquire a fence and promote this standby
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /standby/promotion (the `PromoteHA` operationId).
+func (c *Client) PromoteHAWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewPromoteHARequestWithBody(c.Server, contentType, body)
 	if err != nil {
 		return nil, err
 	}
-	bodyReader = bytes.NewReader(buf)
-	return NewAssessHAPromotionRequestWithBody(server, "application/json", bodyReader)
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
 }
 
-// NewAssessHAPromotionRequestWithBody constructs an http.Request for the AssessHAPromotion method, with any body, and a specified content type
-func NewAssessHAPromotionRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
-	var err error
-
-	serverURL, err := url.Parse(server)
+// PromoteHA Acquire a fence and promote this standby
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /standby/promotion (the `PromoteHA` operationId).
+func (c *Client) PromoteHA(ctx context.Context, body PromoteHAJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewPromoteHARequest(c.Server, body)
 	if err != nil {
 		return nil, err
 	}
-
-	operationPath := fmt.Sprintf("/ha/promotion/assess")
-	if operationPath[0] == '/' {
-		operationPath = "." + operationPath
-	}
-
-	queryURL, err := serverURL.Parse(operationPath)
-	if err != nil {
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-
-	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Add("Content-Type", contentType)
-
-	return req, nil
+	return c.Client.Do(req)
 }
 
-// NewPromoteHAWithCurrentFenceRequest constructs an http.Request for the PromoteHAWithCurrentFence method
-func NewPromoteHAWithCurrentFenceRequest(server string) (*http.Request, error) {
-	var err error
-
-	serverURL, err := url.Parse(server)
+// AssessHAPromotionWithBody Assess whether this standby can be promoted
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /standby/promotion/assess (the `AssessHAPromotion` operationId).
+func (c *Client) AssessHAPromotionWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewAssessHAPromotionRequestWithBody(c.Server, contentType, body)
 	if err != nil {
 		return nil, err
 	}
-
-	operationPath := fmt.Sprintf("/ha/promotion/current-fence")
-	if operationPath[0] == '/' {
-		operationPath = "." + operationPath
-	}
-
-	queryURL, err := serverURL.Parse(operationPath)
-	if err != nil {
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-
-	req, err := http.NewRequest(http.MethodPost, queryURL.String(), nil)
-	if err != nil {
-		return nil, err
-	}
-
-	return req, nil
+	return c.Client.Do(req)
 }
 
-// NewCheckHAReadRequest calls the generic CheckHARead builder with application/json body
-func NewCheckHAReadRequest(server string, body CheckHAReadJSONRequestBody) (*http.Request, error) {
-	var bodyReader io.Reader
-	buf, err := json.Marshal(body)
+// AssessHAPromotion Assess whether this standby can be promoted
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /standby/promotion/assess (the `AssessHAPromotion` operationId).
+func (c *Client) AssessHAPromotion(ctx context.Context, body AssessHAPromotionJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewAssessHAPromotionRequest(c.Server, body)
 	if err != nil {
 		return nil, err
 	}
-	bodyReader = bytes.NewReader(buf)
-	return NewCheckHAReadRequestWithBody(server, "application/json", bodyReader)
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
 }
 
-// NewCheckHAReadRequestWithBody constructs an http.Request for the CheckHARead method, with any body, and a specified content type
-func NewCheckHAReadRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
-	var err error
-
-	serverURL, err := url.Parse(server)
+// PromoteHAWithCurrentFence Promote this standby using the current durable fence receipt
+//
+// Corresponds with POST /standby/promotion/current-fence (the `PromoteHAWithCurrentFence` operationId).
+func (c *Client) PromoteHAWithCurrentFence(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewPromoteHAWithCurrentFenceRequest(c.Server)
 	if err != nil {
 		return nil, err
 	}
-
-	operationPath := fmt.Sprintf("/ha/read/check")
-	if operationPath[0] == '/' {
-		operationPath = "." + operationPath
-	}
-
-	queryURL, err := serverURL.Parse(operationPath)
-	if err != nil {
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-
-	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Add("Content-Type", contentType)
-
-	return req, nil
+	return c.Client.Do(req)
 }
 
-// NewAssessHARejoinRequest calls the generic AssessHARejoin builder with application/json body
-func NewAssessHARejoinRequest(server string, body AssessHARejoinJSONRequestBody) (*http.Request, error) {
-	var bodyReader io.Reader
-	buf, err := json.Marshal(body)
+// CheckHAReadWithBody Evaluate standby read freshness and routing
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /standby/read/check (the `CheckHARead` operationId).
+func (c *Client) CheckHAReadWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewCheckHAReadRequestWithBody(c.Server, contentType, body)
 	if err != nil {
 		return nil, err
 	}
-	bodyReader = bytes.NewReader(buf)
-	return NewAssessHARejoinRequestWithBody(server, "application/json", bodyReader)
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
 }
 
-// NewAssessHARejoinRequestWithBody constructs an http.Request for the AssessHARejoin method, with any body, and a specified content type
-func NewAssessHARejoinRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
-	var err error
-
-	serverURL, err := url.Parse(server)
+// CheckHARead Evaluate standby read freshness and routing
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /standby/read/check (the `CheckHARead` operationId).
+func (c *Client) CheckHARead(ctx context.Context, body CheckHAReadJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewCheckHAReadRequest(c.Server, body)
 	if err != nil {
 		return nil, err
 	}
-
-	operationPath := fmt.Sprintf("/ha/rejoin/assess")
-	if operationPath[0] == '/' {
-		operationPath = "." + operationPath
-	}
-
-	queryURL, err := serverURL.Parse(operationPath)
-	if err != nil {
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-
-	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Add("Content-Type", contentType)
-
-	return req, nil
+	return c.Client.Do(req)
 }
 
-// NewReseedHARejoinRequest calls the generic ReseedHARejoin builder with application/json body
-func NewReseedHARejoinRequest(server string, body ReseedHARejoinJSONRequestBody) (*http.Request, error) {
-	var bodyReader io.Reader
-	buf, err := json.Marshal(body)
+// AssessHARejoinWithBody Assess whether a former primary can safely rejoin
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /standby/rejoin/assess (the `AssessHARejoin` operationId).
+func (c *Client) AssessHARejoinWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewAssessHARejoinRequestWithBody(c.Server, contentType, body)
 	if err != nil {
 		return nil, err
 	}
-	bodyReader = bytes.NewReader(buf)
-	return NewReseedHARejoinRequestWithBody(server, "application/json", bodyReader)
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
 }
 
-// NewReseedHARejoinRequestWithBody constructs an http.Request for the ReseedHARejoin method, with any body, and a specified content type
-func NewReseedHARejoinRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
-	var err error
-
-	serverURL, err := url.Parse(server)
+// AssessHARejoin Assess whether a former primary can safely rejoin
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /standby/rejoin/assess (the `AssessHARejoin` operationId).
+func (c *Client) AssessHARejoin(ctx context.Context, body AssessHARejoinJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewAssessHARejoinRequest(c.Server, body)
 	if err != nil {
 		return nil, err
 	}
-
-	operationPath := fmt.Sprintf("/ha/rejoin/reseed")
-	if operationPath[0] == '/' {
-		operationPath = "." + operationPath
-	}
-
-	queryURL, err := serverURL.Parse(operationPath)
-	if err != nil {
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-
-	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Add("Content-Type", contentType)
-
-	return req, nil
+	return c.Client.Do(req)
 }
 
-// NewRewindHARejoinRequest calls the generic RewindHARejoin builder with application/json body
-func NewRewindHARejoinRequest(server string, body RewindHARejoinJSONRequestBody) (*http.Request, error) {
-	var bodyReader io.Reader
-	buf, err := json.Marshal(body)
+// ReseedHARejoinWithBody Reseed a fenced former primary when rewind is unsafe
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /standby/rejoin/reseed (the `ReseedHARejoin` operationId).
+func (c *Client) ReseedHARejoinWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewReseedHARejoinRequestWithBody(c.Server, contentType, body)
 	if err != nil {
 		return nil, err
 	}
-	bodyReader = bytes.NewReader(buf)
-	return NewRewindHARejoinRequestWithBody(server, "application/json", bodyReader)
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
 }
 
-// NewRewindHARejoinRequestWithBody constructs an http.Request for the RewindHARejoin method, with any body, and a specified content type
-func NewRewindHARejoinRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
-	var err error
-
-	serverURL, err := url.Parse(server)
+// ReseedHARejoin Reseed a fenced former primary when rewind is unsafe
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /standby/rejoin/reseed (the `ReseedHARejoin` operationId).
+func (c *Client) ReseedHARejoin(ctx context.Context, body ReseedHARejoinJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewReseedHARejoinRequest(c.Server, body)
 	if err != nil {
 		return nil, err
 	}
-
-	operationPath := fmt.Sprintf("/ha/rejoin/rewind")
-	if operationPath[0] == '/' {
-		operationPath = "." + operationPath
-	}
-
-	queryURL, err := serverURL.Parse(operationPath)
-	if err != nil {
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-
-	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Add("Content-Type", contentType)
-
-	return req, nil
+	return c.Client.Do(req)
 }
 
-// NewListHAReplicationSlotsRequest constructs an http.Request for the ListHAReplicationSlots method
-func NewListHAReplicationSlotsRequest(server string) (*http.Request, error) {
-	var err error
-
-	serverURL, err := url.Parse(server)
+// RewindHARejoinWithBody Rewind a fenced former primary onto the promoted timeline
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /standby/rejoin/rewind (the `RewindHARejoin` operationId).
+func (c *Client) RewindHARejoinWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRewindHARejoinRequestWithBody(c.Server, contentType, body)
 	if err != nil {
 		return nil, err
 	}
-
-	operationPath := fmt.Sprintf("/ha/replication-slots")
-	if operationPath[0] == '/' {
-		operationPath = "." + operationPath
-	}
-
-	queryURL, err := serverURL.Parse(operationPath)
-	if err != nil {
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-
-	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
-	if err != nil {
-		return nil, err
-	}
-
-	return req, nil
+	return c.Client.Do(req)
 }
 
-// NewCreateHAReplicationSlotRequest calls the generic CreateHAReplicationSlot builder with application/json body
-func NewCreateHAReplicationSlotRequest(server string, body CreateHAReplicationSlotJSONRequestBody) (*http.Request, error) {
-	var bodyReader io.Reader
-	buf, err := json.Marshal(body)
+// RewindHARejoin Rewind a fenced former primary onto the promoted timeline
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /standby/rejoin/rewind (the `RewindHARejoin` operationId).
+func (c *Client) RewindHARejoin(ctx context.Context, body RewindHARejoinJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRewindHARejoinRequest(c.Server, body)
 	if err != nil {
 		return nil, err
 	}
-	bodyReader = bytes.NewReader(buf)
-	return NewCreateHAReplicationSlotRequestWithBody(server, "application/json", bodyReader)
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
 }
 
-// NewCreateHAReplicationSlotRequestWithBody constructs an http.Request for the CreateHAReplicationSlot method, with any body, and a specified content type
-func NewCreateHAReplicationSlotRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
-	var err error
-
-	serverURL, err := url.Parse(server)
+// ListHAReplicationSlots List hot-standby replication slots
+//
+// Corresponds with GET /standby/replication-slots (the `ListHAReplicationSlots` operationId).
+func (c *Client) ListHAReplicationSlots(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewListHAReplicationSlotsRequest(c.Server)
 	if err != nil {
 		return nil, err
 	}
-
-	operationPath := fmt.Sprintf("/ha/replication-slots")
-	if operationPath[0] == '/' {
-		operationPath = "." + operationPath
-	}
-
-	queryURL, err := serverURL.Parse(operationPath)
-	if err != nil {
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-
-	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Add("Content-Type", contentType)
-
-	return req, nil
+	return c.Client.Do(req)
 }
 
-// NewDropHAReplicationSlotRequest constructs an http.Request for the DropHAReplicationSlot method
-func NewDropHAReplicationSlotRequest(server string, slotName SlotName) (*http.Request, error) {
-	var err error
-
-	var pathParam0 string
-
-	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "slot_name", slotName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+// CreateHAReplicationSlotWithBody Create a hot-standby replication slot
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /standby/replication-slots (the `CreateHAReplicationSlot` operationId).
+func (c *Client) CreateHAReplicationSlotWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewCreateHAReplicationSlotRequestWithBody(c.Server, contentType, body)
 	if err != nil {
 		return nil, err
 	}
-
-	serverURL, err := url.Parse(server)
-	if err != nil {
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-
-	operationPath := fmt.Sprintf("/ha/replication-slots/%s", pathParam0)
-	if operationPath[0] == '/' {
-		operationPath = "." + operationPath
-	}
-
-	queryURL, err := serverURL.Parse(operationPath)
-	if err != nil {
-		return nil, err
-	}
-
-	req, err := http.NewRequest(http.MethodDelete, queryURL.String(), nil)
-	if err != nil {
-		return nil, err
-	}
-
-	return req, nil
+	return c.Client.Do(req)
 }
 
-// NewPauseHAReplicationSlotRequest constructs an http.Request for the PauseHAReplicationSlot method
-func NewPauseHAReplicationSlotRequest(server string, slotName SlotName) (*http.Request, error) {
-	var err error
-
-	var pathParam0 string
-
-	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "slot_name", slotName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+// CreateHAReplicationSlot Create a hot-standby replication slot
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /standby/replication-slots (the `CreateHAReplicationSlot` operationId).
+func (c *Client) CreateHAReplicationSlot(ctx context.Context, body CreateHAReplicationSlotJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewCreateHAReplicationSlotRequest(c.Server, body)
 	if err != nil {
 		return nil, err
 	}
-
-	serverURL, err := url.Parse(server)
-	if err != nil {
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-
-	operationPath := fmt.Sprintf("/ha/replication-slots/%s/pause", pathParam0)
-	if operationPath[0] == '/' {
-		operationPath = "." + operationPath
-	}
-
-	queryURL, err := serverURL.Parse(operationPath)
-	if err != nil {
-		return nil, err
-	}
-
-	req, err := http.NewRequest(http.MethodPut, queryURL.String(), nil)
-	if err != nil {
-		return nil, err
-	}
-
-	return req, nil
+	return c.Client.Do(req)
 }
 
-// NewResumeHAReplicationSlotRequest constructs an http.Request for the ResumeHAReplicationSlot method
-func NewResumeHAReplicationSlotRequest(server string, slotName SlotName) (*http.Request, error) {
-	var err error
-
-	var pathParam0 string
-
-	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "slot_name", slotName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+// DropHAReplicationSlot Drop a hot-standby replication slot
+//
+// Corresponds with DELETE /standby/replication-slots/{slot_name} (the `DropHAReplicationSlot` operationId).
+func (c *Client) DropHAReplicationSlot(ctx context.Context, slotName SlotName, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewDropHAReplicationSlotRequest(c.Server, slotName)
 	if err != nil {
 		return nil, err
 	}
-
-	serverURL, err := url.Parse(server)
-	if err != nil {
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-
-	operationPath := fmt.Sprintf("/ha/replication-slots/%s/resume", pathParam0)
-	if operationPath[0] == '/' {
-		operationPath = "." + operationPath
-	}
-
-	queryURL, err := serverURL.Parse(operationPath)
-	if err != nil {
-		return nil, err
-	}
-
-	req, err := http.NewRequest(http.MethodPut, queryURL.String(), nil)
-	if err != nil {
-		return nil, err
-	}
-
-	return req, nil
+	return c.Client.Do(req)
 }
 
-// NewGetHASeedLifecycleReceiptsRequest constructs an http.Request for the GetHASeedLifecycleReceipts method
-func NewGetHASeedLifecycleReceiptsRequest(server string, params *GetHASeedLifecycleReceiptsParams) (*http.Request, error) {
-	var err error
-
-	serverURL, err := url.Parse(server)
+// PauseHAReplicationSlot Pause a hot-standby replication slot
+//
+// Corresponds with PUT /standby/replication-slots/{slot_name}/pause (the `PauseHAReplicationSlot` operationId).
+func (c *Client) PauseHAReplicationSlot(ctx context.Context, slotName SlotName, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewPauseHAReplicationSlotRequest(c.Server, slotName)
 	if err != nil {
 		return nil, err
 	}
-
-	operationPath := fmt.Sprintf("/ha/seed-lifecycle/receipts")
-	if operationPath[0] == '/' {
-		operationPath = "." + operationPath
-	}
-
-	queryURL, err := serverURL.Parse(operationPath)
-	if err != nil {
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-
-	if params != nil {
-		// queryValues collects non-styled parameters (passthrough, JSON)
-		// that are safe to round-trip through url.Values.Encode().
-		queryValues := queryURL.Query()
-		// rawQueryFragments collects pre-encoded query fragments from
-		// styled parameters, preserving literal commas as delimiters
-		// per the OpenAPI spec (e.g. "color=blue,black,brown").
-		var rawQueryFragments []string
-
-		if queryFrag, err := runtime.StyleParamWithOptions("form", true, "kind", params.Kind, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
-			return nil, err
-		} else {
-			for _, qp := range strings.Split(queryFrag, "&") {
-				rawQueryFragments = append(rawQueryFragments, qp)
-			}
-		}
-
-		if queryFrag, err := runtime.StyleParamWithOptions("form", true, "after", params.After, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "integer", Format: "uint64"}); err != nil {
-			return nil, err
-		} else {
-			for _, qp := range strings.Split(queryFrag, "&") {
-				rawQueryFragments = append(rawQueryFragments, qp)
-			}
-		}
-
-		if queryFrag, err := runtime.StyleParamWithOptions("form", true, "limit", params.Limit, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "integer", Format: "uint32"}); err != nil {
-			return nil, err
-		} else {
-			for _, qp := range strings.Split(queryFrag, "&") {
-				rawQueryFragments = append(rawQueryFragments, qp)
-			}
-		}
-
-		if encoded := queryValues.Encode(); encoded != "" {
-			rawQueryFragments = append(rawQueryFragments, encoded)
-		}
-		queryURL.RawQuery = strings.Join(rawQueryFragments, "&")
-	}
-
-	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
-	if err != nil {
-		return nil, err
-	}
-
-	return req, nil
+	return c.Client.Do(req)
 }
 
-// NewBootstrapHAStandbyRequest calls the generic BootstrapHAStandby builder with application/json body
-func NewBootstrapHAStandbyRequest(server string, body BootstrapHAStandbyJSONRequestBody) (*http.Request, error) {
-	var bodyReader io.Reader
-	buf, err := json.Marshal(body)
+// ResumeHAReplicationSlot Resume a hot-standby replication slot
+//
+// Corresponds with PUT /standby/replication-slots/{slot_name}/resume (the `ResumeHAReplicationSlot` operationId).
+func (c *Client) ResumeHAReplicationSlot(ctx context.Context, slotName SlotName, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewResumeHAReplicationSlotRequest(c.Server, slotName)
 	if err != nil {
 		return nil, err
 	}
-	bodyReader = bytes.NewReader(buf)
-	return NewBootstrapHAStandbyRequestWithBody(server, "application/json", bodyReader)
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
 }
 
-// NewBootstrapHAStandbyRequestWithBody constructs an http.Request for the BootstrapHAStandby method, with any body, and a specified content type
-func NewBootstrapHAStandbyRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
-	var err error
-
-	serverURL, err := url.Parse(server)
+// GetHASeedLifecycleReceipts Read durable runtime-owned hot-standby seed lifecycle receipts
+//
+// Returns an authenticated, read-only cursor page from the runtime-owned
+// append-only receipt ledger. `history_truncated` and `gap` make bounded
+// retention explicit so observers can fail closed when their collection
+// window is incomplete.
+//
+// Corresponds with GET /standby/seed-lifecycle/receipts (the `GetHASeedLifecycleReceipts` operationId).
+func (c *Client) GetHASeedLifecycleReceipts(ctx context.Context, params *GetHASeedLifecycleReceiptsParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewGetHASeedLifecycleReceiptsRequest(c.Server, params)
 	if err != nil {
 		return nil, err
 	}
-
-	operationPath := fmt.Sprintf("/ha/standby/bootstrap")
-	if operationPath[0] == '/' {
-		operationPath = "." + operationPath
-	}
-
-	queryURL, err := serverURL.Parse(operationPath)
-	if err != nil {
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-
-	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Add("Content-Type", contentType)
-
-	return req, nil
+	return c.Client.Do(req)
 }
 
-// NewGetHAStandbyStatusRequest constructs an http.Request for the GetHAStandbyStatus method
-func NewGetHAStandbyStatusRequest(server string, params *GetHAStandbyStatusParams) (*http.Request, error) {
-	var err error
-
-	serverURL, err := url.Parse(server)
+// GetHAStandbyStatus Get standby status
+//
+// Corresponds with GET /standby/status (the `GetHAStandbyStatus` operationId).
+func (c *Client) GetHAStandbyStatus(ctx context.Context, params *GetHAStandbyStatusParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewGetHAStandbyStatusRequest(c.Server, params)
 	if err != nil {
 		return nil, err
 	}
-
-	operationPath := fmt.Sprintf("/ha/standby/status")
-	if operationPath[0] == '/' {
-		operationPath = "." + operationPath
-	}
-
-	queryURL, err := serverURL.Parse(operationPath)
-	if err != nil {
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-
-	if params != nil {
-		// queryValues collects non-styled parameters (passthrough, JSON)
-		// that are safe to round-trip through url.Values.Encode().
-		queryValues := queryURL.Query()
-		// rawQueryFragments collects pre-encoded query fragments from
-		// styled parameters, preserving literal commas as delimiters
-		// per the OpenAPI spec (e.g. "color=blue,black,brown").
-		var rawQueryFragments []string
-
-		if queryFrag, err := runtime.StyleParamWithOptions("form", true, "upstream_lsn", params.UpstreamLsn, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "integer", Format: "uint64"}); err != nil {
-			return nil, err
-		} else {
-			for _, qp := range strings.Split(queryFrag, "&") {
-				rawQueryFragments = append(rawQueryFragments, qp)
-			}
-		}
-
-		if encoded := queryValues.Encode(); encoded != "" {
-			rawQueryFragments = append(rawQueryFragments, encoded)
-		}
-		queryURL.RawQuery = strings.Join(rawQueryFragments, "&")
-	}
-
-	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
-	if err != nil {
-		return nil, err
-	}
-
-	return req, nil
+	return c.Client.Do(req)
 }
 
-// NewGetHAWatchdogProofRequest constructs an http.Request for the GetHAWatchdogProof method
-func NewGetHAWatchdogProofRequest(server string) (*http.Request, error) {
-	var err error
-
-	serverURL, err := url.Parse(server)
+// SetHAStandbyUpstreamWithBody Repoint a running standby at a different primary
+//
+// Atomically replaces the upstream URL and replication slot a running
+// standby pulls from, without restarting the process. The request carries
+// the identity the caller expects the standby to have; the swap is
+// rejected with 409 when the standby's current identity differs, so a
+// stale operator cannot repoint a node that has since been promoted or
+// reseeded. The next replication round pulls from the new upstream. This
+// is the `follow` step of a switchover.
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /standby/upstream (the `SetHAStandbyUpstream` operationId).
+func (c *Client) SetHAStandbyUpstreamWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewSetHAStandbyUpstreamRequestWithBody(c.Server, contentType, body)
 	if err != nil {
 		return nil, err
 	}
-
-	operationPath := fmt.Sprintf("/ha/watchdog-proof")
-	if operationPath[0] == '/' {
-		operationPath = "." + operationPath
-	}
-
-	queryURL, err := serverURL.Parse(operationPath)
-	if err != nil {
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-
-	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
-	if err != nil {
-		return nil, err
-	}
-
-	return req, nil
+	return c.Client.Do(req)
 }
 
-// NewCheckHAWriteRequest calls the generic CheckHAWrite builder with application/json body
-func NewCheckHAWriteRequest(server string, body CheckHAWriteJSONRequestBody) (*http.Request, error) {
-	var bodyReader io.Reader
-	buf, err := json.Marshal(body)
+// SetHAStandbyUpstream Repoint a running standby at a different primary
+//
+// Atomically replaces the upstream URL and replication slot a running
+// standby pulls from, without restarting the process. The request carries
+// the identity the caller expects the standby to have; the swap is
+// rejected with 409 when the standby's current identity differs, so a
+// stale operator cannot repoint a node that has since been promoted or
+// reseeded. The next replication round pulls from the new upstream. This
+// is the `follow` step of a switchover.
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /standby/upstream (the `SetHAStandbyUpstream` operationId).
+func (c *Client) SetHAStandbyUpstream(ctx context.Context, body SetHAStandbyUpstreamJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewSetHAStandbyUpstreamRequest(c.Server, body)
 	if err != nil {
 		return nil, err
 	}
-	bodyReader = bytes.NewReader(buf)
-	return NewCheckHAWriteRequestWithBody(server, "application/json", bodyReader)
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
 }
 
-// NewCheckHAWriteRequestWithBody constructs an http.Request for the CheckHAWrite method, with any body, and a specified content type
-func NewCheckHAWriteRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
-	var err error
-
-	serverURL, err := url.Parse(server)
+// GetHAWatchdogProof Get the runtime Lease watchdog capability proof
+//
+// Returns only the authenticated, process-local Lease watchdog proof. This endpoint remains independent of storage mutation critical sections so a slow seed capture cannot prevent the operator from renewing an otherwise valid fencing Lease.
+//
+// Corresponds with GET /standby/watchdog-proof (the `GetHAWatchdogProof` operationId).
+func (c *Client) GetHAWatchdogProof(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewGetHAWatchdogProofRequest(c.Server)
 	if err != nil {
 		return nil, err
 	}
-
-	operationPath := fmt.Sprintf("/ha/write/check")
-	if operationPath[0] == '/' {
-		operationPath = "." + operationPath
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
 	}
+	return c.Client.Do(req)
+}
 
-	queryURL, err := serverURL.Parse(operationPath)
+// CheckHAWriteWithBody Evaluate whether this node can accept writes
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /standby/write/check (the `CheckHAWrite` operationId).
+func (c *Client) CheckHAWriteWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewCheckHAWriteRequestWithBody(c.Server, contentType, body)
 	if err != nil {
 		return nil, err
 	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
 
-	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+// CheckHAWrite Evaluate whether this node can accept writes
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /standby/write/check (the `CheckHAWrite` operationId).
+func (c *Client) CheckHAWrite(ctx context.Context, body CheckHAWriteJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewCheckHAWriteRequest(c.Server, body)
 	if err != nil {
 		return nil, err
 	}
-
-	req.Header.Add("Content-Type", contentType)
-
-	return req, nil
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
 }
 
 // NewStartStorageCheckRequest constructs an http.Request for the StartStorageCheck method
@@ -4421,6 +3431,1162 @@ func NewStartStorageVacuumRequest(server string, params *StartStorageVacuumParam
 	return req, nil
 }
 
+// NewBeginHABaseBackupRequest calls the generic BeginHABaseBackup builder with application/json body
+func NewBeginHABaseBackupRequest(server string, body BeginHABaseBackupJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewBeginHABaseBackupRequestWithBody(server, "application/json", bodyReader)
+}
+
+// NewBeginHABaseBackupRequestWithBody constructs an http.Request for the BeginHABaseBackup method, with any body, and a specified content type
+func NewBeginHABaseBackupRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/standby/base-backups")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewActivateHASeededSlotRequest calls the generic ActivateHASeededSlot builder with application/json body
+func NewActivateHASeededSlotRequest(server string, body ActivateHASeededSlotJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewActivateHASeededSlotRequestWithBody(server, "application/json", bodyReader)
+}
+
+// NewActivateHASeededSlotRequestWithBody constructs an http.Request for the ActivateHASeededSlot method, with any body, and a specified content type
+func NewActivateHASeededSlotRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/standby/base-backups/activate")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewCaptureHASeedArtifactRequest calls the generic CaptureHASeedArtifact builder with application/json body
+func NewCaptureHASeedArtifactRequest(server string, body CaptureHASeedArtifactJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewCaptureHASeedArtifactRequestWithBody(server, "application/json", bodyReader)
+}
+
+// NewCaptureHASeedArtifactRequestWithBody constructs an http.Request for the CaptureHASeedArtifact method, with any body, and a specified content type
+func NewCaptureHASeedArtifactRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/standby/base-backups/capture")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewFinishHABaseBackupRequest calls the generic FinishHABaseBackup builder with application/json body
+func NewFinishHABaseBackupRequest(server string, body FinishHABaseBackupJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewFinishHABaseBackupRequestWithBody(server, "application/json", bodyReader)
+}
+
+// NewFinishHABaseBackupRequestWithBody constructs an http.Request for the FinishHABaseBackup method, with any body, and a specified content type
+func NewFinishHABaseBackupRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/standby/base-backups/finish")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewBootstrapHAStandbyRequest calls the generic BootstrapHAStandby builder with application/json body
+func NewBootstrapHAStandbyRequest(server string, body BootstrapHAStandbyJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewBootstrapHAStandbyRequestWithBody(server, "application/json", bodyReader)
+}
+
+// NewBootstrapHAStandbyRequestWithBody constructs an http.Request for the BootstrapHAStandby method, with any body, and a specified content type
+func NewBootstrapHAStandbyRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/standby/bootstrap")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewAppendHACommitRequest calls the generic AppendHACommit builder with application/json body
+func NewAppendHACommitRequest(server string, body AppendHACommitJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewAppendHACommitRequestWithBody(server, "application/json", bodyReader)
+}
+
+// NewAppendHACommitRequestWithBody constructs an http.Request for the AppendHACommit method, with any body, and a specified content type
+func NewAppendHACommitRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/standby/commit/append")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewCheckHACommitRequest calls the generic CheckHACommit builder with application/json body
+func NewCheckHACommitRequest(server string, body CheckHACommitJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewCheckHACommitRequestWithBody(server, "application/json", bodyReader)
+}
+
+// NewCheckHACommitRequestWithBody constructs an http.Request for the CheckHACommit method, with any body, and a specified content type
+func NewCheckHACommitRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/standby/commit/check")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewAcquireHAFenceRequest calls the generic AcquireHAFence builder with application/json body
+func NewAcquireHAFenceRequest(server string, body AcquireHAFenceJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewAcquireHAFenceRequestWithBody(server, "application/json", bodyReader)
+}
+
+// NewAcquireHAFenceRequestWithBody constructs an http.Request for the AcquireHAFence method, with any body, and a specified content type
+func NewAcquireHAFenceRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/standby/fence")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewGetHACurrentFenceRequest constructs an http.Request for the GetHACurrentFence method
+func NewGetHACurrentFenceRequest(server string) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/standby/fence/current")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewCheckHAOwnerJobRequest calls the generic CheckHAOwnerJob builder with application/json body
+func NewCheckHAOwnerJobRequest(server string, body CheckHAOwnerJobJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewCheckHAOwnerJobRequestWithBody(server, "application/json", bodyReader)
+}
+
+// NewCheckHAOwnerJobRequestWithBody constructs an http.Request for the CheckHAOwnerJob method, with any body, and a specified content type
+func NewCheckHAOwnerJobRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/standby/owner-jobs/check")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewGetHAPrimaryStatusRequest constructs an http.Request for the GetHAPrimaryStatus method
+func NewGetHAPrimaryStatusRequest(server string, params *GetHAPrimaryStatusParams) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/standby/primary/status")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	if params != nil {
+		// queryValues collects non-styled parameters (passthrough, JSON)
+		// that are safe to round-trip through url.Values.Encode().
+		queryValues := queryURL.Query()
+		// rawQueryFragments collects pre-encoded query fragments from
+		// styled parameters, preserving literal commas as delimiters
+		// per the OpenAPI spec (e.g. "color=blue,black,brown").
+		var rawQueryFragments []string
+
+		if queryFrag, err := runtime.StyleParamWithOptions("form", true, "max_lag_lsn", params.MaxLagLsn, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "integer", Format: "uint64"}); err != nil {
+			return nil, err
+		} else {
+			for _, qp := range strings.Split(queryFrag, "&") {
+				rawQueryFragments = append(rawQueryFragments, qp)
+			}
+		}
+
+		if queryFrag, err := runtime.StyleParamWithOptions("form", true, "max_retained_bytes", params.MaxRetainedBytes, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "integer", Format: "uint64"}); err != nil {
+			return nil, err
+		} else {
+			for _, qp := range strings.Split(queryFrag, "&") {
+				rawQueryFragments = append(rawQueryFragments, qp)
+			}
+		}
+
+		if queryFrag, err := runtime.StyleParamWithOptions("form", true, "max_retained_age_ns", params.MaxRetainedAgeNs, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "integer", Format: "uint64"}); err != nil {
+			return nil, err
+		} else {
+			for _, qp := range strings.Split(queryFrag, "&") {
+				rawQueryFragments = append(rawQueryFragments, qp)
+			}
+		}
+
+		if queryFrag, err := runtime.StyleParamWithOptions("form", true, "sync_mode", params.SyncMode, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
+			return nil, err
+		} else {
+			for _, qp := range strings.Split(queryFrag, "&") {
+				rawQueryFragments = append(rawQueryFragments, qp)
+			}
+		}
+
+		if queryFrag, err := runtime.StyleParamWithOptions("form", true, "sync_selection", params.SyncSelection, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
+			return nil, err
+		} else {
+			for _, qp := range strings.Split(queryFrag, "&") {
+				rawQueryFragments = append(rawQueryFragments, qp)
+			}
+		}
+
+		if queryFrag, err := runtime.StyleParamWithOptions("form", true, "sync_required", params.SyncRequired, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "integer", Format: "uint64"}); err != nil {
+			return nil, err
+		} else {
+			for _, qp := range strings.Split(queryFrag, "&") {
+				rawQueryFragments = append(rawQueryFragments, qp)
+			}
+		}
+
+		if params.SyncStandby != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", true, "sync_standby", params.SyncStandby, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "array", Format: ""}); err != nil {
+				return nil, err
+			} else {
+				for _, qp := range strings.Split(queryFrag, "&") {
+					rawQueryFragments = append(rawQueryFragments, qp)
+				}
+			}
+
+		}
+
+		if queryFrag, err := runtime.StyleParamWithOptions("form", true, "sync_failure", params.SyncFailure, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
+			return nil, err
+		} else {
+			for _, qp := range strings.Split(queryFrag, "&") {
+				rawQueryFragments = append(rawQueryFragments, qp)
+			}
+		}
+
+		if encoded := queryValues.Encode(); encoded != "" {
+			rawQueryFragments = append(rawQueryFragments, encoded)
+		}
+		queryURL.RawQuery = strings.Join(rawQueryFragments, "&")
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewPromoteHARequest calls the generic PromoteHA builder with application/json body
+func NewPromoteHARequest(server string, body PromoteHAJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewPromoteHARequestWithBody(server, "application/json", bodyReader)
+}
+
+// NewPromoteHARequestWithBody constructs an http.Request for the PromoteHA method, with any body, and a specified content type
+func NewPromoteHARequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/standby/promotion")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewAssessHAPromotionRequest calls the generic AssessHAPromotion builder with application/json body
+func NewAssessHAPromotionRequest(server string, body AssessHAPromotionJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewAssessHAPromotionRequestWithBody(server, "application/json", bodyReader)
+}
+
+// NewAssessHAPromotionRequestWithBody constructs an http.Request for the AssessHAPromotion method, with any body, and a specified content type
+func NewAssessHAPromotionRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/standby/promotion/assess")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewPromoteHAWithCurrentFenceRequest constructs an http.Request for the PromoteHAWithCurrentFence method
+func NewPromoteHAWithCurrentFenceRequest(server string) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/standby/promotion/current-fence")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewCheckHAReadRequest calls the generic CheckHARead builder with application/json body
+func NewCheckHAReadRequest(server string, body CheckHAReadJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewCheckHAReadRequestWithBody(server, "application/json", bodyReader)
+}
+
+// NewCheckHAReadRequestWithBody constructs an http.Request for the CheckHARead method, with any body, and a specified content type
+func NewCheckHAReadRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/standby/read/check")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewAssessHARejoinRequest calls the generic AssessHARejoin builder with application/json body
+func NewAssessHARejoinRequest(server string, body AssessHARejoinJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewAssessHARejoinRequestWithBody(server, "application/json", bodyReader)
+}
+
+// NewAssessHARejoinRequestWithBody constructs an http.Request for the AssessHARejoin method, with any body, and a specified content type
+func NewAssessHARejoinRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/standby/rejoin/assess")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewReseedHARejoinRequest calls the generic ReseedHARejoin builder with application/json body
+func NewReseedHARejoinRequest(server string, body ReseedHARejoinJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewReseedHARejoinRequestWithBody(server, "application/json", bodyReader)
+}
+
+// NewReseedHARejoinRequestWithBody constructs an http.Request for the ReseedHARejoin method, with any body, and a specified content type
+func NewReseedHARejoinRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/standby/rejoin/reseed")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewRewindHARejoinRequest calls the generic RewindHARejoin builder with application/json body
+func NewRewindHARejoinRequest(server string, body RewindHARejoinJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewRewindHARejoinRequestWithBody(server, "application/json", bodyReader)
+}
+
+// NewRewindHARejoinRequestWithBody constructs an http.Request for the RewindHARejoin method, with any body, and a specified content type
+func NewRewindHARejoinRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/standby/rejoin/rewind")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewListHAReplicationSlotsRequest constructs an http.Request for the ListHAReplicationSlots method
+func NewListHAReplicationSlotsRequest(server string) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/standby/replication-slots")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewCreateHAReplicationSlotRequest calls the generic CreateHAReplicationSlot builder with application/json body
+func NewCreateHAReplicationSlotRequest(server string, body CreateHAReplicationSlotJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewCreateHAReplicationSlotRequestWithBody(server, "application/json", bodyReader)
+}
+
+// NewCreateHAReplicationSlotRequestWithBody constructs an http.Request for the CreateHAReplicationSlot method, with any body, and a specified content type
+func NewCreateHAReplicationSlotRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/standby/replication-slots")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewDropHAReplicationSlotRequest constructs an http.Request for the DropHAReplicationSlot method
+func NewDropHAReplicationSlotRequest(server string, slotName SlotName) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "slot_name", slotName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/standby/replication-slots/%s", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodDelete, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewPauseHAReplicationSlotRequest constructs an http.Request for the PauseHAReplicationSlot method
+func NewPauseHAReplicationSlotRequest(server string, slotName SlotName) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "slot_name", slotName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/standby/replication-slots/%s/pause", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPut, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewResumeHAReplicationSlotRequest constructs an http.Request for the ResumeHAReplicationSlot method
+func NewResumeHAReplicationSlotRequest(server string, slotName SlotName) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "slot_name", slotName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/standby/replication-slots/%s/resume", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPut, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewGetHASeedLifecycleReceiptsRequest constructs an http.Request for the GetHASeedLifecycleReceipts method
+func NewGetHASeedLifecycleReceiptsRequest(server string, params *GetHASeedLifecycleReceiptsParams) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/standby/seed-lifecycle/receipts")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	if params != nil {
+		// queryValues collects non-styled parameters (passthrough, JSON)
+		// that are safe to round-trip through url.Values.Encode().
+		queryValues := queryURL.Query()
+		// rawQueryFragments collects pre-encoded query fragments from
+		// styled parameters, preserving literal commas as delimiters
+		// per the OpenAPI spec (e.g. "color=blue,black,brown").
+		var rawQueryFragments []string
+
+		if queryFrag, err := runtime.StyleParamWithOptions("form", true, "kind", params.Kind, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
+			return nil, err
+		} else {
+			for _, qp := range strings.Split(queryFrag, "&") {
+				rawQueryFragments = append(rawQueryFragments, qp)
+			}
+		}
+
+		if queryFrag, err := runtime.StyleParamWithOptions("form", true, "after", params.After, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "integer", Format: "uint64"}); err != nil {
+			return nil, err
+		} else {
+			for _, qp := range strings.Split(queryFrag, "&") {
+				rawQueryFragments = append(rawQueryFragments, qp)
+			}
+		}
+
+		if queryFrag, err := runtime.StyleParamWithOptions("form", true, "limit", params.Limit, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "integer", Format: "uint32"}); err != nil {
+			return nil, err
+		} else {
+			for _, qp := range strings.Split(queryFrag, "&") {
+				rawQueryFragments = append(rawQueryFragments, qp)
+			}
+		}
+
+		if encoded := queryValues.Encode(); encoded != "" {
+			rawQueryFragments = append(rawQueryFragments, encoded)
+		}
+		queryURL.RawQuery = strings.Join(rawQueryFragments, "&")
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewGetHAStandbyStatusRequest constructs an http.Request for the GetHAStandbyStatus method
+func NewGetHAStandbyStatusRequest(server string, params *GetHAStandbyStatusParams) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/standby/status")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	if params != nil {
+		// queryValues collects non-styled parameters (passthrough, JSON)
+		// that are safe to round-trip through url.Values.Encode().
+		queryValues := queryURL.Query()
+		// rawQueryFragments collects pre-encoded query fragments from
+		// styled parameters, preserving literal commas as delimiters
+		// per the OpenAPI spec (e.g. "color=blue,black,brown").
+		var rawQueryFragments []string
+
+		if queryFrag, err := runtime.StyleParamWithOptions("form", true, "upstream_lsn", params.UpstreamLsn, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "integer", Format: "uint64"}); err != nil {
+			return nil, err
+		} else {
+			for _, qp := range strings.Split(queryFrag, "&") {
+				rawQueryFragments = append(rawQueryFragments, qp)
+			}
+		}
+
+		if encoded := queryValues.Encode(); encoded != "" {
+			rawQueryFragments = append(rawQueryFragments, encoded)
+		}
+		queryURL.RawQuery = strings.Join(rawQueryFragments, "&")
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewSetHAStandbyUpstreamRequest calls the generic SetHAStandbyUpstream builder with application/json body
+func NewSetHAStandbyUpstreamRequest(server string, body SetHAStandbyUpstreamJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewSetHAStandbyUpstreamRequestWithBody(server, "application/json", bodyReader)
+}
+
+// NewSetHAStandbyUpstreamRequestWithBody constructs an http.Request for the SetHAStandbyUpstream method, with any body, and a specified content type
+func NewSetHAStandbyUpstreamRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/standby/upstream")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewGetHAWatchdogProofRequest constructs an http.Request for the GetHAWatchdogProof method
+func NewGetHAWatchdogProofRequest(server string) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/standby/watchdog-proof")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewCheckHAWriteRequest calls the generic CheckHAWrite builder with application/json body
+func NewCheckHAWriteRequest(server string, body CheckHAWriteJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewCheckHAWriteRequestWithBody(server, "application/json", bodyReader)
+}
+
+// NewCheckHAWriteRequestWithBody constructs an http.Request for the CheckHAWrite method, with any body, and a specified content type
+func NewCheckHAWriteRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/standby/write/check")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
 func (c *Client) applyEditors(ctx context.Context, req *http.Request, additionalEditors []RequestEditorFn) error {
 	for _, r := range c.RequestEditors {
 		if err := r(ctx, req); err != nil {
@@ -4465,321 +4631,6 @@ func WithBaseURL(baseURL string) ClientOption {
 // ClientWithResponsesInterface is the interface specification for the client with responses above.
 type ClientWithResponsesInterface interface {
 
-	// BeginHABaseBackupWithBodyWithResponse Begin an HA base backup and reserve its replication slot
-	//
-	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /ha/base-backups (the `BeginHABaseBackup` operationId).
-	BeginHABaseBackupWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*BeginHABaseBackupResponse, error)
-
-	// BeginHABaseBackupWithResponse Begin an HA base backup and reserve its replication slot
-	//
-	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /ha/base-backups (the `BeginHABaseBackup` operationId).
-	BeginHABaseBackupWithResponse(ctx context.Context, body BeginHABaseBackupJSONRequestBody, reqEditors ...RequestEditorFn) (*BeginHABaseBackupResponse, error)
-
-	// ActivateHASeededSlotWithBodyWithResponse Activate a seeded slot after durable target-generation publication
-	//
-	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /ha/base-backups/activate (the `ActivateHASeededSlot` operationId).
-	ActivateHASeededSlotWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*ActivateHASeededSlotResponse, error)
-
-	// ActivateHASeededSlotWithResponse Activate a seeded slot after durable target-generation publication
-	//
-	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /ha/base-backups/activate (the `ActivateHASeededSlot` operationId).
-	ActivateHASeededSlotWithResponse(ctx context.Context, body ActivateHASeededSlotJSONRequestBody, reqEditors ...RequestEditorFn) (*ActivateHASeededSlotResponse, error)
-
-	// CaptureHASeedArtifactWithBodyWithResponse Capture an immutable seed from runtime-owned primary storage
-	//
-	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /ha/base-backups/capture (the `CaptureHASeedArtifact` operationId).
-	CaptureHASeedArtifactWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CaptureHASeedArtifactResponse, error)
-
-	// CaptureHASeedArtifactWithResponse Capture an immutable seed from runtime-owned primary storage
-	//
-	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /ha/base-backups/capture (the `CaptureHASeedArtifact` operationId).
-	CaptureHASeedArtifactWithResponse(ctx context.Context, body CaptureHASeedArtifactJSONRequestBody, reqEditors ...RequestEditorFn) (*CaptureHASeedArtifactResponse, error)
-
-	// FinishHABaseBackupWithBodyWithResponse Finish an HA base backup from a local manifest path
-	//
-	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /ha/base-backups/finish (the `FinishHABaseBackup` operationId).
-	FinishHABaseBackupWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*FinishHABaseBackupResponse, error)
-
-	// FinishHABaseBackupWithResponse Finish an HA base backup from a local manifest path
-	//
-	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /ha/base-backups/finish (the `FinishHABaseBackup` operationId).
-	FinishHABaseBackupWithResponse(ctx context.Context, body FinishHABaseBackupJSONRequestBody, reqEditors ...RequestEditorFn) (*FinishHABaseBackupResponse, error)
-
-	// AppendHACommitWithBodyWithResponse Append a primary WAL/effects record and evaluate synchronous commit durability
-	//
-	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /ha/commit/append (the `AppendHACommit` operationId).
-	AppendHACommitWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*AppendHACommitResponse, error)
-
-	// AppendHACommitWithResponse Append a primary WAL/effects record and evaluate synchronous commit durability
-	//
-	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /ha/commit/append (the `AppendHACommit` operationId).
-	AppendHACommitWithResponse(ctx context.Context, body AppendHACommitJSONRequestBody, reqEditors ...RequestEditorFn) (*AppendHACommitResponse, error)
-
-	// CheckHACommitWithBodyWithResponse Evaluate synchronous commit durability for an existing LSN
-	//
-	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /ha/commit/check (the `CheckHACommit` operationId).
-	CheckHACommitWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CheckHACommitResponse, error)
-
-	// CheckHACommitWithResponse Evaluate synchronous commit durability for an existing LSN
-	//
-	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /ha/commit/check (the `CheckHACommit` operationId).
-	CheckHACommitWithResponse(ctx context.Context, body CheckHACommitJSONRequestBody, reqEditors ...RequestEditorFn) (*CheckHACommitResponse, error)
-
-	// AcquireHAFenceWithBodyWithResponse Acquire a durable HA promotion fence
-	//
-	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /ha/fence (the `AcquireHAFence` operationId).
-	AcquireHAFenceWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*AcquireHAFenceResponse, error)
-
-	// AcquireHAFenceWithResponse Acquire a durable HA promotion fence
-	//
-	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /ha/fence (the `AcquireHAFence` operationId).
-	AcquireHAFenceWithResponse(ctx context.Context, body AcquireHAFenceJSONRequestBody, reqEditors ...RequestEditorFn) (*AcquireHAFenceResponse, error)
-
-	// GetHACurrentFenceWithResponse Get the current durable HA promotion fence
-	//
-	// Returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with GET /ha/fence/current (the `GetHACurrentFence` operationId).
-	GetHACurrentFenceWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*GetHACurrentFenceResponse, error)
-
-	// CheckHAOwnerJobWithBodyWithResponse Evaluate whether an owner-only background job may run
-	//
-	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /ha/owner-jobs/check (the `CheckHAOwnerJob` operationId).
-	CheckHAOwnerJobWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CheckHAOwnerJobResponse, error)
-
-	// CheckHAOwnerJobWithResponse Evaluate whether an owner-only background job may run
-	//
-	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /ha/owner-jobs/check (the `CheckHAOwnerJob` operationId).
-	CheckHAOwnerJobWithResponse(ctx context.Context, body CheckHAOwnerJobJSONRequestBody, reqEditors ...RequestEditorFn) (*CheckHAOwnerJobResponse, error)
-
-	// GetHAPrimaryStatusWithResponse Get primary HA status
-	//
-	// Returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with GET /ha/primary/status (the `GetHAPrimaryStatus` operationId).
-	GetHAPrimaryStatusWithResponse(ctx context.Context, params *GetHAPrimaryStatusParams, reqEditors ...RequestEditorFn) (*GetHAPrimaryStatusResponse, error)
-
-	// PromoteHAWithBodyWithResponse Acquire a fence and promote this standby
-	//
-	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /ha/promotion (the `PromoteHA` operationId).
-	PromoteHAWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PromoteHAResponse, error)
-
-	// PromoteHAWithResponse Acquire a fence and promote this standby
-	//
-	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /ha/promotion (the `PromoteHA` operationId).
-	PromoteHAWithResponse(ctx context.Context, body PromoteHAJSONRequestBody, reqEditors ...RequestEditorFn) (*PromoteHAResponse, error)
-
-	// AssessHAPromotionWithBodyWithResponse Assess whether this standby can be promoted
-	//
-	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /ha/promotion/assess (the `AssessHAPromotion` operationId).
-	AssessHAPromotionWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*AssessHAPromotionResponse, error)
-
-	// AssessHAPromotionWithResponse Assess whether this standby can be promoted
-	//
-	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /ha/promotion/assess (the `AssessHAPromotion` operationId).
-	AssessHAPromotionWithResponse(ctx context.Context, body AssessHAPromotionJSONRequestBody, reqEditors ...RequestEditorFn) (*AssessHAPromotionResponse, error)
-
-	// PromoteHAWithCurrentFenceWithResponse Promote this standby using the current durable fence receipt
-	//
-	// Returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /ha/promotion/current-fence (the `PromoteHAWithCurrentFence` operationId).
-	PromoteHAWithCurrentFenceWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*PromoteHAWithCurrentFenceResponse, error)
-
-	// CheckHAReadWithBodyWithResponse Evaluate standby read freshness and routing
-	//
-	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /ha/read/check (the `CheckHARead` operationId).
-	CheckHAReadWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CheckHAReadResponse, error)
-
-	// CheckHAReadWithResponse Evaluate standby read freshness and routing
-	//
-	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /ha/read/check (the `CheckHARead` operationId).
-	CheckHAReadWithResponse(ctx context.Context, body CheckHAReadJSONRequestBody, reqEditors ...RequestEditorFn) (*CheckHAReadResponse, error)
-
-	// AssessHARejoinWithBodyWithResponse Assess whether a former primary can safely rejoin
-	//
-	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /ha/rejoin/assess (the `AssessHARejoin` operationId).
-	AssessHARejoinWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*AssessHARejoinResponse, error)
-
-	// AssessHARejoinWithResponse Assess whether a former primary can safely rejoin
-	//
-	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /ha/rejoin/assess (the `AssessHARejoin` operationId).
-	AssessHARejoinWithResponse(ctx context.Context, body AssessHARejoinJSONRequestBody, reqEditors ...RequestEditorFn) (*AssessHARejoinResponse, error)
-
-	// ReseedHARejoinWithBodyWithResponse Reseed a fenced former primary when rewind is unsafe
-	//
-	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /ha/rejoin/reseed (the `ReseedHARejoin` operationId).
-	ReseedHARejoinWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*ReseedHARejoinResponse, error)
-
-	// ReseedHARejoinWithResponse Reseed a fenced former primary when rewind is unsafe
-	//
-	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /ha/rejoin/reseed (the `ReseedHARejoin` operationId).
-	ReseedHARejoinWithResponse(ctx context.Context, body ReseedHARejoinJSONRequestBody, reqEditors ...RequestEditorFn) (*ReseedHARejoinResponse, error)
-
-	// RewindHARejoinWithBodyWithResponse Rewind a fenced former primary onto the promoted timeline
-	//
-	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /ha/rejoin/rewind (the `RewindHARejoin` operationId).
-	RewindHARejoinWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RewindHARejoinResponse, error)
-
-	// RewindHARejoinWithResponse Rewind a fenced former primary onto the promoted timeline
-	//
-	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /ha/rejoin/rewind (the `RewindHARejoin` operationId).
-	RewindHARejoinWithResponse(ctx context.Context, body RewindHARejoinJSONRequestBody, reqEditors ...RequestEditorFn) (*RewindHARejoinResponse, error)
-
-	// ListHAReplicationSlotsWithResponse List HA replication slots
-	//
-	// Returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with GET /ha/replication-slots (the `ListHAReplicationSlots` operationId).
-	ListHAReplicationSlotsWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*ListHAReplicationSlotsResponse, error)
-
-	// CreateHAReplicationSlotWithBodyWithResponse Create an HA replication slot
-	//
-	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /ha/replication-slots (the `CreateHAReplicationSlot` operationId).
-	CreateHAReplicationSlotWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CreateHAReplicationSlotResponse, error)
-
-	// CreateHAReplicationSlotWithResponse Create an HA replication slot
-	//
-	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /ha/replication-slots (the `CreateHAReplicationSlot` operationId).
-	CreateHAReplicationSlotWithResponse(ctx context.Context, body CreateHAReplicationSlotJSONRequestBody, reqEditors ...RequestEditorFn) (*CreateHAReplicationSlotResponse, error)
-
-	// DropHAReplicationSlotWithResponse Drop an HA replication slot
-	//
-	// Returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with DELETE /ha/replication-slots/{slot_name} (the `DropHAReplicationSlot` operationId).
-	DropHAReplicationSlotWithResponse(ctx context.Context, slotName SlotName, reqEditors ...RequestEditorFn) (*DropHAReplicationSlotResponse, error)
-
-	// PauseHAReplicationSlotWithResponse Pause an HA replication slot
-	//
-	// Returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with PUT /ha/replication-slots/{slot_name}/pause (the `PauseHAReplicationSlot` operationId).
-	PauseHAReplicationSlotWithResponse(ctx context.Context, slotName SlotName, reqEditors ...RequestEditorFn) (*PauseHAReplicationSlotResponse, error)
-
-	// ResumeHAReplicationSlotWithResponse Resume an HA replication slot
-	//
-	// Returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with PUT /ha/replication-slots/{slot_name}/resume (the `ResumeHAReplicationSlot` operationId).
-	ResumeHAReplicationSlotWithResponse(ctx context.Context, slotName SlotName, reqEditors ...RequestEditorFn) (*ResumeHAReplicationSlotResponse, error)
-
-	// GetHASeedLifecycleReceiptsWithResponse Read durable runtime-owned HA seed lifecycle receipts
-	//
-	// Returns an authenticated, read-only cursor page from the runtime-owned
-	// append-only receipt ledger. `history_truncated` and `gap` make bounded
-	// retention explicit so observers can fail closed when their collection
-	// window is incomplete.
-	//
-	// Returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with GET /ha/seed-lifecycle/receipts (the `GetHASeedLifecycleReceipts` operationId).
-	GetHASeedLifecycleReceiptsWithResponse(ctx context.Context, params *GetHASeedLifecycleReceiptsParams, reqEditors ...RequestEditorFn) (*GetHASeedLifecycleReceiptsResponse, error)
-
-	// BootstrapHAStandbyWithBodyWithResponse Bootstrap this standby from a local base-backup manifest and copied files
-	//
-	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /ha/standby/bootstrap (the `BootstrapHAStandby` operationId).
-	BootstrapHAStandbyWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*BootstrapHAStandbyResponse, error)
-
-	// BootstrapHAStandbyWithResponse Bootstrap this standby from a local base-backup manifest and copied files
-	//
-	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /ha/standby/bootstrap (the `BootstrapHAStandby` operationId).
-	BootstrapHAStandbyWithResponse(ctx context.Context, body BootstrapHAStandbyJSONRequestBody, reqEditors ...RequestEditorFn) (*BootstrapHAStandbyResponse, error)
-
-	// GetHAStandbyStatusWithResponse Get standby HA status
-	//
-	// Returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with GET /ha/standby/status (the `GetHAStandbyStatus` operationId).
-	GetHAStandbyStatusWithResponse(ctx context.Context, params *GetHAStandbyStatusParams, reqEditors ...RequestEditorFn) (*GetHAStandbyStatusResponse, error)
-
-	// GetHAWatchdogProofWithResponse Get the runtime Lease watchdog capability proof
-	//
-	// Returns only the authenticated, process-local Lease watchdog proof. This endpoint remains independent of storage mutation critical sections so a slow seed capture cannot prevent the operator from renewing an otherwise valid fencing Lease.
-	//
-	// Returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with GET /ha/watchdog-proof (the `GetHAWatchdogProof` operationId).
-	GetHAWatchdogProofWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*GetHAWatchdogProofResponse, error)
-
-	// CheckHAWriteWithBodyWithResponse Evaluate whether this node can accept writes
-	//
-	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /ha/write/check (the `CheckHAWrite` operationId).
-	CheckHAWriteWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CheckHAWriteResponse, error)
-
-	// CheckHAWriteWithResponse Evaluate whether this node can accept writes
-	//
-	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /ha/write/check (the `CheckHAWrite` operationId).
-	CheckHAWriteWithResponse(ctx context.Context, body CheckHAWriteJSONRequestBody, reqEditors ...RequestEditorFn) (*CheckHAWriteResponse, error)
-
 	// StartStorageCheckWithResponse Start a coordinated storage integrity check
 	//
 	// Returns a wrapper object for the known response body format(s).
@@ -4816,1113 +4667,351 @@ type ClientWithResponsesInterface interface {
 	//
 	// Corresponds with POST /maintenance/vacuum (the `StartStorageVacuum` operationId).
 	StartStorageVacuumWithResponse(ctx context.Context, params *StartStorageVacuumParams, reqEditors ...RequestEditorFn) (*StartStorageVacuumResponse, error)
-}
-
-type BeginHABaseBackupResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	// JSON200 the response for an HTTP 200 `application/json` response
-	JSON200 *HABaseBackupBeginResponse
-}
-
-// GetJSON200 returns the response for an HTTP 200 `application/json` response
-func (r BeginHABaseBackupResponse) GetJSON200() *HABaseBackupBeginResponse {
-	return r.JSON200
-}
-
-// GetBody returns the raw response body bytes
-func (r BeginHABaseBackupResponse) GetBody() []byte {
-	return r.Body
-}
-
-// Status returns HTTPResponse.Status
-func (r BeginHABaseBackupResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r BeginHABaseBackupResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
-func (r BeginHABaseBackupResponse) ContentType() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Header.Get("Content-Type")
-	}
-	return ""
-}
-
-type ActivateHASeededSlotResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	// JSON200 the response for an HTTP 200 `application/json` response
-	JSON200 *HASeededSlotActivateResponse
-}
-
-// GetJSON200 returns the response for an HTTP 200 `application/json` response
-func (r ActivateHASeededSlotResponse) GetJSON200() *HASeededSlotActivateResponse {
-	return r.JSON200
-}
-
-// GetBody returns the raw response body bytes
-func (r ActivateHASeededSlotResponse) GetBody() []byte {
-	return r.Body
-}
-
-// Status returns HTTPResponse.Status
-func (r ActivateHASeededSlotResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r ActivateHASeededSlotResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
-func (r ActivateHASeededSlotResponse) ContentType() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Header.Get("Content-Type")
-	}
-	return ""
-}
-
-type CaptureHASeedArtifactResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	// JSON200 the response for an HTTP 200 `application/json` response
-	JSON200 *HASeedArtifactCaptureResponse
-}
-
-// GetJSON200 returns the response for an HTTP 200 `application/json` response
-func (r CaptureHASeedArtifactResponse) GetJSON200() *HASeedArtifactCaptureResponse {
-	return r.JSON200
-}
-
-// GetBody returns the raw response body bytes
-func (r CaptureHASeedArtifactResponse) GetBody() []byte {
-	return r.Body
-}
-
-// Status returns HTTPResponse.Status
-func (r CaptureHASeedArtifactResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r CaptureHASeedArtifactResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
-func (r CaptureHASeedArtifactResponse) ContentType() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Header.Get("Content-Type")
-	}
-	return ""
-}
-
-type FinishHABaseBackupResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	// JSON200 the response for an HTTP 200 `application/json` response
-	JSON200 *HABaseBackupFinishResponse
-}
-
-// GetJSON200 returns the response for an HTTP 200 `application/json` response
-func (r FinishHABaseBackupResponse) GetJSON200() *HABaseBackupFinishResponse {
-	return r.JSON200
-}
-
-// GetBody returns the raw response body bytes
-func (r FinishHABaseBackupResponse) GetBody() []byte {
-	return r.Body
-}
-
-// Status returns HTTPResponse.Status
-func (r FinishHABaseBackupResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r FinishHABaseBackupResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
-func (r FinishHABaseBackupResponse) ContentType() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Header.Get("Content-Type")
-	}
-	return ""
-}
-
-type AppendHACommitResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	// JSON200 the response for an HTTP 200 `application/json` response
-	JSON200 *HACommitAppendResponse
-}
-
-// GetJSON200 returns the response for an HTTP 200 `application/json` response
-func (r AppendHACommitResponse) GetJSON200() *HACommitAppendResponse {
-	return r.JSON200
-}
-
-// GetBody returns the raw response body bytes
-func (r AppendHACommitResponse) GetBody() []byte {
-	return r.Body
-}
-
-// Status returns HTTPResponse.Status
-func (r AppendHACommitResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r AppendHACommitResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
-func (r AppendHACommitResponse) ContentType() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Header.Get("Content-Type")
-	}
-	return ""
-}
-
-type CheckHACommitResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	// JSON200 the response for an HTTP 200 `application/json` response
-	JSON200 *HACommitCheckResponse
-}
-
-// GetJSON200 returns the response for an HTTP 200 `application/json` response
-func (r CheckHACommitResponse) GetJSON200() *HACommitCheckResponse {
-	return r.JSON200
-}
-
-// GetBody returns the raw response body bytes
-func (r CheckHACommitResponse) GetBody() []byte {
-	return r.Body
-}
-
-// Status returns HTTPResponse.Status
-func (r CheckHACommitResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r CheckHACommitResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
-func (r CheckHACommitResponse) ContentType() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Header.Get("Content-Type")
-	}
-	return ""
-}
-
-type AcquireHAFenceResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	// JSON200 the response for an HTTP 200 `application/json` response
-	JSON200 *HAFenceResponse
-}
-
-// GetJSON200 returns the response for an HTTP 200 `application/json` response
-func (r AcquireHAFenceResponse) GetJSON200() *HAFenceResponse {
-	return r.JSON200
-}
-
-// GetBody returns the raw response body bytes
-func (r AcquireHAFenceResponse) GetBody() []byte {
-	return r.Body
-}
-
-// Status returns HTTPResponse.Status
-func (r AcquireHAFenceResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r AcquireHAFenceResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
-func (r AcquireHAFenceResponse) ContentType() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Header.Get("Content-Type")
-	}
-	return ""
-}
-
-type GetHACurrentFenceResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	// JSON200 the response for an HTTP 200 `application/json` response
-	JSON200 *HACurrentFenceResponse
-}
-
-// GetJSON200 returns the response for an HTTP 200 `application/json` response
-func (r GetHACurrentFenceResponse) GetJSON200() *HACurrentFenceResponse {
-	return r.JSON200
-}
-
-// GetBody returns the raw response body bytes
-func (r GetHACurrentFenceResponse) GetBody() []byte {
-	return r.Body
-}
-
-// Status returns HTTPResponse.Status
-func (r GetHACurrentFenceResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r GetHACurrentFenceResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
-func (r GetHACurrentFenceResponse) ContentType() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Header.Get("Content-Type")
-	}
-	return ""
-}
-
-type CheckHAOwnerJobResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	// JSON200 the response for an HTTP 200 `application/json` response
-	JSON200 *HAOwnerJobCheckResponse
-}
-
-// GetJSON200 returns the response for an HTTP 200 `application/json` response
-func (r CheckHAOwnerJobResponse) GetJSON200() *HAOwnerJobCheckResponse {
-	return r.JSON200
-}
-
-// GetBody returns the raw response body bytes
-func (r CheckHAOwnerJobResponse) GetBody() []byte {
-	return r.Body
-}
-
-// Status returns HTTPResponse.Status
-func (r CheckHAOwnerJobResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r CheckHAOwnerJobResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
-func (r CheckHAOwnerJobResponse) ContentType() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Header.Get("Content-Type")
-	}
-	return ""
-}
-
-type GetHAPrimaryStatusResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	// JSON200 the response for an HTTP 200 `application/json` response
-	JSON200 *HAPrimaryStatusResponse
-}
-
-// GetJSON200 returns the response for an HTTP 200 `application/json` response
-func (r GetHAPrimaryStatusResponse) GetJSON200() *HAPrimaryStatusResponse {
-	return r.JSON200
-}
-
-// GetBody returns the raw response body bytes
-func (r GetHAPrimaryStatusResponse) GetBody() []byte {
-	return r.Body
-}
-
-// Status returns HTTPResponse.Status
-func (r GetHAPrimaryStatusResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r GetHAPrimaryStatusResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
-func (r GetHAPrimaryStatusResponse) ContentType() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Header.Get("Content-Type")
-	}
-	return ""
-}
-
-type PromoteHAResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	// JSON200 the response for an HTTP 200 `application/json` response
-	JSON200 *HAPromotionResponse
-}
-
-// GetJSON200 returns the response for an HTTP 200 `application/json` response
-func (r PromoteHAResponse) GetJSON200() *HAPromotionResponse {
-	return r.JSON200
-}
-
-// GetBody returns the raw response body bytes
-func (r PromoteHAResponse) GetBody() []byte {
-	return r.Body
-}
-
-// Status returns HTTPResponse.Status
-func (r PromoteHAResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r PromoteHAResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
-func (r PromoteHAResponse) ContentType() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Header.Get("Content-Type")
-	}
-	return ""
-}
-
-type AssessHAPromotionResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	// JSON200 the response for an HTTP 200 `application/json` response
-	JSON200 *HAPromotionAssessResponse
-}
-
-// GetJSON200 returns the response for an HTTP 200 `application/json` response
-func (r AssessHAPromotionResponse) GetJSON200() *HAPromotionAssessResponse {
-	return r.JSON200
-}
-
-// GetBody returns the raw response body bytes
-func (r AssessHAPromotionResponse) GetBody() []byte {
-	return r.Body
-}
-
-// Status returns HTTPResponse.Status
-func (r AssessHAPromotionResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r AssessHAPromotionResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
-func (r AssessHAPromotionResponse) ContentType() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Header.Get("Content-Type")
-	}
-	return ""
-}
-
-type PromoteHAWithCurrentFenceResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	// JSON200 the response for an HTTP 200 `application/json` response
-	JSON200 *HAPromotionResponse
-}
-
-// GetJSON200 returns the response for an HTTP 200 `application/json` response
-func (r PromoteHAWithCurrentFenceResponse) GetJSON200() *HAPromotionResponse {
-	return r.JSON200
-}
-
-// GetBody returns the raw response body bytes
-func (r PromoteHAWithCurrentFenceResponse) GetBody() []byte {
-	return r.Body
-}
-
-// Status returns HTTPResponse.Status
-func (r PromoteHAWithCurrentFenceResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r PromoteHAWithCurrentFenceResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
-func (r PromoteHAWithCurrentFenceResponse) ContentType() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Header.Get("Content-Type")
-	}
-	return ""
-}
-
-type CheckHAReadResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	// JSON200 the response for an HTTP 200 `application/json` response
-	JSON200 *HAReadCheckResponse
-}
-
-// GetJSON200 returns the response for an HTTP 200 `application/json` response
-func (r CheckHAReadResponse) GetJSON200() *HAReadCheckResponse {
-	return r.JSON200
-}
-
-// GetBody returns the raw response body bytes
-func (r CheckHAReadResponse) GetBody() []byte {
-	return r.Body
-}
-
-// Status returns HTTPResponse.Status
-func (r CheckHAReadResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r CheckHAReadResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
-func (r CheckHAReadResponse) ContentType() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Header.Get("Content-Type")
-	}
-	return ""
-}
-
-type AssessHARejoinResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	// JSON200 the response for an HTTP 200 `application/json` response
-	JSON200 *HARejoinAssessResponse
-}
-
-// GetJSON200 returns the response for an HTTP 200 `application/json` response
-func (r AssessHARejoinResponse) GetJSON200() *HARejoinAssessResponse {
-	return r.JSON200
-}
-
-// GetBody returns the raw response body bytes
-func (r AssessHARejoinResponse) GetBody() []byte {
-	return r.Body
-}
-
-// Status returns HTTPResponse.Status
-func (r AssessHARejoinResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r AssessHARejoinResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
-func (r AssessHARejoinResponse) ContentType() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Header.Get("Content-Type")
-	}
-	return ""
-}
-
-type ReseedHARejoinResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	// JSON200 the response for an HTTP 200 `application/json` response
-	JSON200 *HARejoinAssessResponse
-}
-
-// GetJSON200 returns the response for an HTTP 200 `application/json` response
-func (r ReseedHARejoinResponse) GetJSON200() *HARejoinAssessResponse {
-	return r.JSON200
-}
-
-// GetBody returns the raw response body bytes
-func (r ReseedHARejoinResponse) GetBody() []byte {
-	return r.Body
-}
-
-// Status returns HTTPResponse.Status
-func (r ReseedHARejoinResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r ReseedHARejoinResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
-func (r ReseedHARejoinResponse) ContentType() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Header.Get("Content-Type")
-	}
-	return ""
-}
-
-type RewindHARejoinResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	// JSON200 the response for an HTTP 200 `application/json` response
-	JSON200 *HARejoinAssessResponse
-}
-
-// GetJSON200 returns the response for an HTTP 200 `application/json` response
-func (r RewindHARejoinResponse) GetJSON200() *HARejoinAssessResponse {
-	return r.JSON200
-}
-
-// GetBody returns the raw response body bytes
-func (r RewindHARejoinResponse) GetBody() []byte {
-	return r.Body
-}
-
-// Status returns HTTPResponse.Status
-func (r RewindHARejoinResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r RewindHARejoinResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
-func (r RewindHARejoinResponse) ContentType() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Header.Get("Content-Type")
-	}
-	return ""
-}
-
-type ListHAReplicationSlotsResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	// JSON200 the response for an HTTP 200 `application/json` response
-	JSON200 *HAReplicationSlotListResponse
-}
-
-// GetJSON200 returns the response for an HTTP 200 `application/json` response
-func (r ListHAReplicationSlotsResponse) GetJSON200() *HAReplicationSlotListResponse {
-	return r.JSON200
-}
-
-// GetBody returns the raw response body bytes
-func (r ListHAReplicationSlotsResponse) GetBody() []byte {
-	return r.Body
-}
-
-// Status returns HTTPResponse.Status
-func (r ListHAReplicationSlotsResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r ListHAReplicationSlotsResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
-func (r ListHAReplicationSlotsResponse) ContentType() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Header.Get("Content-Type")
-	}
-	return ""
-}
-
-type CreateHAReplicationSlotResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	// JSON200 the response for an HTTP 200 `application/json` response
-	JSON200 *HAReplicationSlotActionResponse
-}
-
-// GetJSON200 returns the response for an HTTP 200 `application/json` response
-func (r CreateHAReplicationSlotResponse) GetJSON200() *HAReplicationSlotActionResponse {
-	return r.JSON200
-}
-
-// GetBody returns the raw response body bytes
-func (r CreateHAReplicationSlotResponse) GetBody() []byte {
-	return r.Body
-}
-
-// Status returns HTTPResponse.Status
-func (r CreateHAReplicationSlotResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r CreateHAReplicationSlotResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
-func (r CreateHAReplicationSlotResponse) ContentType() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Header.Get("Content-Type")
-	}
-	return ""
-}
-
-type DropHAReplicationSlotResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	// JSON200 the response for an HTTP 200 `application/json` response
-	JSON200 *HAReplicationSlotActionResponse
-}
-
-// GetJSON200 returns the response for an HTTP 200 `application/json` response
-func (r DropHAReplicationSlotResponse) GetJSON200() *HAReplicationSlotActionResponse {
-	return r.JSON200
-}
-
-// GetBody returns the raw response body bytes
-func (r DropHAReplicationSlotResponse) GetBody() []byte {
-	return r.Body
-}
-
-// Status returns HTTPResponse.Status
-func (r DropHAReplicationSlotResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r DropHAReplicationSlotResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
-func (r DropHAReplicationSlotResponse) ContentType() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Header.Get("Content-Type")
-	}
-	return ""
-}
-
-type PauseHAReplicationSlotResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	// JSON200 the response for an HTTP 200 `application/json` response
-	JSON200 *HAReplicationSlotActionResponse
-}
-
-// GetJSON200 returns the response for an HTTP 200 `application/json` response
-func (r PauseHAReplicationSlotResponse) GetJSON200() *HAReplicationSlotActionResponse {
-	return r.JSON200
-}
-
-// GetBody returns the raw response body bytes
-func (r PauseHAReplicationSlotResponse) GetBody() []byte {
-	return r.Body
-}
-
-// Status returns HTTPResponse.Status
-func (r PauseHAReplicationSlotResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r PauseHAReplicationSlotResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
-func (r PauseHAReplicationSlotResponse) ContentType() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Header.Get("Content-Type")
-	}
-	return ""
-}
-
-type ResumeHAReplicationSlotResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	// JSON200 the response for an HTTP 200 `application/json` response
-	JSON200 *HAReplicationSlotActionResponse
-}
-
-// GetJSON200 returns the response for an HTTP 200 `application/json` response
-func (r ResumeHAReplicationSlotResponse) GetJSON200() *HAReplicationSlotActionResponse {
-	return r.JSON200
-}
-
-// GetBody returns the raw response body bytes
-func (r ResumeHAReplicationSlotResponse) GetBody() []byte {
-	return r.Body
-}
-
-// Status returns HTTPResponse.Status
-func (r ResumeHAReplicationSlotResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r ResumeHAReplicationSlotResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
-func (r ResumeHAReplicationSlotResponse) ContentType() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Header.Get("Content-Type")
-	}
-	return ""
-}
-
-type GetHASeedLifecycleReceiptsResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	// JSON200 the response for an HTTP 200 `application/json` response
-	JSON200 *HASeedLifecycleReceiptInventoryResponse
-}
-
-// GetJSON200 returns the response for an HTTP 200 `application/json` response
-func (r GetHASeedLifecycleReceiptsResponse) GetJSON200() *HASeedLifecycleReceiptInventoryResponse {
-	return r.JSON200
-}
-
-// GetBody returns the raw response body bytes
-func (r GetHASeedLifecycleReceiptsResponse) GetBody() []byte {
-	return r.Body
-}
-
-// Status returns HTTPResponse.Status
-func (r GetHASeedLifecycleReceiptsResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r GetHASeedLifecycleReceiptsResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
-func (r GetHASeedLifecycleReceiptsResponse) ContentType() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Header.Get("Content-Type")
-	}
-	return ""
-}
-
-type BootstrapHAStandbyResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	// JSON200 the response for an HTTP 200 `application/json` response
-	JSON200 *HAStandbyBootstrapResponse
-}
-
-// GetJSON200 returns the response for an HTTP 200 `application/json` response
-func (r BootstrapHAStandbyResponse) GetJSON200() *HAStandbyBootstrapResponse {
-	return r.JSON200
-}
-
-// GetBody returns the raw response body bytes
-func (r BootstrapHAStandbyResponse) GetBody() []byte {
-	return r.Body
-}
-
-// Status returns HTTPResponse.Status
-func (r BootstrapHAStandbyResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r BootstrapHAStandbyResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
-func (r BootstrapHAStandbyResponse) ContentType() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Header.Get("Content-Type")
-	}
-	return ""
-}
-
-type GetHAStandbyStatusResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	// JSON200 the response for an HTTP 200 `application/json` response
-	JSON200 *HAStandbyStatusResponse
-}
-
-// GetJSON200 returns the response for an HTTP 200 `application/json` response
-func (r GetHAStandbyStatusResponse) GetJSON200() *HAStandbyStatusResponse {
-	return r.JSON200
-}
-
-// GetBody returns the raw response body bytes
-func (r GetHAStandbyStatusResponse) GetBody() []byte {
-	return r.Body
-}
-
-// Status returns HTTPResponse.Status
-func (r GetHAStandbyStatusResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r GetHAStandbyStatusResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
-func (r GetHAStandbyStatusResponse) ContentType() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Header.Get("Content-Type")
-	}
-	return ""
-}
-
-type GetHAWatchdogProofResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	// JSON200 the response for an HTTP 200 `application/json` response
-	JSON200 *HAWatchdogProofResponse
-}
-
-// GetJSON200 returns the response for an HTTP 200 `application/json` response
-func (r GetHAWatchdogProofResponse) GetJSON200() *HAWatchdogProofResponse {
-	return r.JSON200
-}
-
-// GetBody returns the raw response body bytes
-func (r GetHAWatchdogProofResponse) GetBody() []byte {
-	return r.Body
-}
-
-// Status returns HTTPResponse.Status
-func (r GetHAWatchdogProofResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r GetHAWatchdogProofResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
-func (r GetHAWatchdogProofResponse) ContentType() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Header.Get("Content-Type")
-	}
-	return ""
-}
-
-type CheckHAWriteResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	// JSON200 the response for an HTTP 200 `application/json` response
-	JSON200 *HAWriteCheckResponse
-}
-
-// GetJSON200 returns the response for an HTTP 200 `application/json` response
-func (r CheckHAWriteResponse) GetJSON200() *HAWriteCheckResponse {
-	return r.JSON200
-}
-
-// GetBody returns the raw response body bytes
-func (r CheckHAWriteResponse) GetBody() []byte {
-	return r.Body
-}
-
-// Status returns HTTPResponse.Status
-func (r CheckHAWriteResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r CheckHAWriteResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
-func (r CheckHAWriteResponse) ContentType() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Header.Get("Content-Type")
-	}
-	return ""
+
+	// BeginHABaseBackupWithBodyWithResponse Begin a hot-standby base backup and reserve its replication slot
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /standby/base-backups (the `BeginHABaseBackup` operationId).
+	BeginHABaseBackupWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*BeginHABaseBackupResponse, error)
+
+	// BeginHABaseBackupWithResponse Begin a hot-standby base backup and reserve its replication slot
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /standby/base-backups (the `BeginHABaseBackup` operationId).
+	BeginHABaseBackupWithResponse(ctx context.Context, body BeginHABaseBackupJSONRequestBody, reqEditors ...RequestEditorFn) (*BeginHABaseBackupResponse, error)
+
+	// ActivateHASeededSlotWithBodyWithResponse Activate a seeded slot after durable target-generation publication
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /standby/base-backups/activate (the `ActivateHASeededSlot` operationId).
+	ActivateHASeededSlotWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*ActivateHASeededSlotResponse, error)
+
+	// ActivateHASeededSlotWithResponse Activate a seeded slot after durable target-generation publication
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /standby/base-backups/activate (the `ActivateHASeededSlot` operationId).
+	ActivateHASeededSlotWithResponse(ctx context.Context, body ActivateHASeededSlotJSONRequestBody, reqEditors ...RequestEditorFn) (*ActivateHASeededSlotResponse, error)
+
+	// CaptureHASeedArtifactWithBodyWithResponse Capture an immutable seed from runtime-owned primary storage
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /standby/base-backups/capture (the `CaptureHASeedArtifact` operationId).
+	CaptureHASeedArtifactWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CaptureHASeedArtifactResponse, error)
+
+	// CaptureHASeedArtifactWithResponse Capture an immutable seed from runtime-owned primary storage
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /standby/base-backups/capture (the `CaptureHASeedArtifact` operationId).
+	CaptureHASeedArtifactWithResponse(ctx context.Context, body CaptureHASeedArtifactJSONRequestBody, reqEditors ...RequestEditorFn) (*CaptureHASeedArtifactResponse, error)
+
+	// FinishHABaseBackupWithBodyWithResponse Finish a hot-standby base backup from a local manifest path
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /standby/base-backups/finish (the `FinishHABaseBackup` operationId).
+	FinishHABaseBackupWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*FinishHABaseBackupResponse, error)
+
+	// FinishHABaseBackupWithResponse Finish a hot-standby base backup from a local manifest path
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /standby/base-backups/finish (the `FinishHABaseBackup` operationId).
+	FinishHABaseBackupWithResponse(ctx context.Context, body FinishHABaseBackupJSONRequestBody, reqEditors ...RequestEditorFn) (*FinishHABaseBackupResponse, error)
+
+	// BootstrapHAStandbyWithBodyWithResponse Bootstrap this standby from a local base-backup manifest and copied files
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /standby/bootstrap (the `BootstrapHAStandby` operationId).
+	BootstrapHAStandbyWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*BootstrapHAStandbyResponse, error)
+
+	// BootstrapHAStandbyWithResponse Bootstrap this standby from a local base-backup manifest and copied files
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /standby/bootstrap (the `BootstrapHAStandby` operationId).
+	BootstrapHAStandbyWithResponse(ctx context.Context, body BootstrapHAStandbyJSONRequestBody, reqEditors ...RequestEditorFn) (*BootstrapHAStandbyResponse, error)
+
+	// AppendHACommitWithBodyWithResponse Append a primary WAL/effects record and evaluate synchronous commit durability
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /standby/commit/append (the `AppendHACommit` operationId).
+	AppendHACommitWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*AppendHACommitResponse, error)
+
+	// AppendHACommitWithResponse Append a primary WAL/effects record and evaluate synchronous commit durability
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /standby/commit/append (the `AppendHACommit` operationId).
+	AppendHACommitWithResponse(ctx context.Context, body AppendHACommitJSONRequestBody, reqEditors ...RequestEditorFn) (*AppendHACommitResponse, error)
+
+	// CheckHACommitWithBodyWithResponse Evaluate synchronous commit durability for an existing LSN
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /standby/commit/check (the `CheckHACommit` operationId).
+	CheckHACommitWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CheckHACommitResponse, error)
+
+	// CheckHACommitWithResponse Evaluate synchronous commit durability for an existing LSN
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /standby/commit/check (the `CheckHACommit` operationId).
+	CheckHACommitWithResponse(ctx context.Context, body CheckHACommitJSONRequestBody, reqEditors ...RequestEditorFn) (*CheckHACommitResponse, error)
+
+	// AcquireHAFenceWithBodyWithResponse Acquire a durable hot-standby promotion fence
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /standby/fence (the `AcquireHAFence` operationId).
+	AcquireHAFenceWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*AcquireHAFenceResponse, error)
+
+	// AcquireHAFenceWithResponse Acquire a durable hot-standby promotion fence
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /standby/fence (the `AcquireHAFence` operationId).
+	AcquireHAFenceWithResponse(ctx context.Context, body AcquireHAFenceJSONRequestBody, reqEditors ...RequestEditorFn) (*AcquireHAFenceResponse, error)
+
+	// GetHACurrentFenceWithResponse Get the current durable hot-standby promotion fence
+	//
+	// Returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with GET /standby/fence/current (the `GetHACurrentFence` operationId).
+	GetHACurrentFenceWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*GetHACurrentFenceResponse, error)
+
+	// CheckHAOwnerJobWithBodyWithResponse Evaluate whether an owner-only background job may run
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /standby/owner-jobs/check (the `CheckHAOwnerJob` operationId).
+	CheckHAOwnerJobWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CheckHAOwnerJobResponse, error)
+
+	// CheckHAOwnerJobWithResponse Evaluate whether an owner-only background job may run
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /standby/owner-jobs/check (the `CheckHAOwnerJob` operationId).
+	CheckHAOwnerJobWithResponse(ctx context.Context, body CheckHAOwnerJobJSONRequestBody, reqEditors ...RequestEditorFn) (*CheckHAOwnerJobResponse, error)
+
+	// GetHAPrimaryStatusWithResponse Get primary hot-standby status
+	//
+	// Returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with GET /standby/primary/status (the `GetHAPrimaryStatus` operationId).
+	GetHAPrimaryStatusWithResponse(ctx context.Context, params *GetHAPrimaryStatusParams, reqEditors ...RequestEditorFn) (*GetHAPrimaryStatusResponse, error)
+
+	// PromoteHAWithBodyWithResponse Acquire a fence and promote this standby
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /standby/promotion (the `PromoteHA` operationId).
+	PromoteHAWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PromoteHAResponse, error)
+
+	// PromoteHAWithResponse Acquire a fence and promote this standby
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /standby/promotion (the `PromoteHA` operationId).
+	PromoteHAWithResponse(ctx context.Context, body PromoteHAJSONRequestBody, reqEditors ...RequestEditorFn) (*PromoteHAResponse, error)
+
+	// AssessHAPromotionWithBodyWithResponse Assess whether this standby can be promoted
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /standby/promotion/assess (the `AssessHAPromotion` operationId).
+	AssessHAPromotionWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*AssessHAPromotionResponse, error)
+
+	// AssessHAPromotionWithResponse Assess whether this standby can be promoted
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /standby/promotion/assess (the `AssessHAPromotion` operationId).
+	AssessHAPromotionWithResponse(ctx context.Context, body AssessHAPromotionJSONRequestBody, reqEditors ...RequestEditorFn) (*AssessHAPromotionResponse, error)
+
+	// PromoteHAWithCurrentFenceWithResponse Promote this standby using the current durable fence receipt
+	//
+	// Returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /standby/promotion/current-fence (the `PromoteHAWithCurrentFence` operationId).
+	PromoteHAWithCurrentFenceWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*PromoteHAWithCurrentFenceResponse, error)
+
+	// CheckHAReadWithBodyWithResponse Evaluate standby read freshness and routing
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /standby/read/check (the `CheckHARead` operationId).
+	CheckHAReadWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CheckHAReadResponse, error)
+
+	// CheckHAReadWithResponse Evaluate standby read freshness and routing
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /standby/read/check (the `CheckHARead` operationId).
+	CheckHAReadWithResponse(ctx context.Context, body CheckHAReadJSONRequestBody, reqEditors ...RequestEditorFn) (*CheckHAReadResponse, error)
+
+	// AssessHARejoinWithBodyWithResponse Assess whether a former primary can safely rejoin
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /standby/rejoin/assess (the `AssessHARejoin` operationId).
+	AssessHARejoinWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*AssessHARejoinResponse, error)
+
+	// AssessHARejoinWithResponse Assess whether a former primary can safely rejoin
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /standby/rejoin/assess (the `AssessHARejoin` operationId).
+	AssessHARejoinWithResponse(ctx context.Context, body AssessHARejoinJSONRequestBody, reqEditors ...RequestEditorFn) (*AssessHARejoinResponse, error)
+
+	// ReseedHARejoinWithBodyWithResponse Reseed a fenced former primary when rewind is unsafe
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /standby/rejoin/reseed (the `ReseedHARejoin` operationId).
+	ReseedHARejoinWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*ReseedHARejoinResponse, error)
+
+	// ReseedHARejoinWithResponse Reseed a fenced former primary when rewind is unsafe
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /standby/rejoin/reseed (the `ReseedHARejoin` operationId).
+	ReseedHARejoinWithResponse(ctx context.Context, body ReseedHARejoinJSONRequestBody, reqEditors ...RequestEditorFn) (*ReseedHARejoinResponse, error)
+
+	// RewindHARejoinWithBodyWithResponse Rewind a fenced former primary onto the promoted timeline
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /standby/rejoin/rewind (the `RewindHARejoin` operationId).
+	RewindHARejoinWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RewindHARejoinResponse, error)
+
+	// RewindHARejoinWithResponse Rewind a fenced former primary onto the promoted timeline
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /standby/rejoin/rewind (the `RewindHARejoin` operationId).
+	RewindHARejoinWithResponse(ctx context.Context, body RewindHARejoinJSONRequestBody, reqEditors ...RequestEditorFn) (*RewindHARejoinResponse, error)
+
+	// ListHAReplicationSlotsWithResponse List hot-standby replication slots
+	//
+	// Returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with GET /standby/replication-slots (the `ListHAReplicationSlots` operationId).
+	ListHAReplicationSlotsWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*ListHAReplicationSlotsResponse, error)
+
+	// CreateHAReplicationSlotWithBodyWithResponse Create a hot-standby replication slot
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /standby/replication-slots (the `CreateHAReplicationSlot` operationId).
+	CreateHAReplicationSlotWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CreateHAReplicationSlotResponse, error)
+
+	// CreateHAReplicationSlotWithResponse Create a hot-standby replication slot
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /standby/replication-slots (the `CreateHAReplicationSlot` operationId).
+	CreateHAReplicationSlotWithResponse(ctx context.Context, body CreateHAReplicationSlotJSONRequestBody, reqEditors ...RequestEditorFn) (*CreateHAReplicationSlotResponse, error)
+
+	// DropHAReplicationSlotWithResponse Drop a hot-standby replication slot
+	//
+	// Returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with DELETE /standby/replication-slots/{slot_name} (the `DropHAReplicationSlot` operationId).
+	DropHAReplicationSlotWithResponse(ctx context.Context, slotName SlotName, reqEditors ...RequestEditorFn) (*DropHAReplicationSlotResponse, error)
+
+	// PauseHAReplicationSlotWithResponse Pause a hot-standby replication slot
+	//
+	// Returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with PUT /standby/replication-slots/{slot_name}/pause (the `PauseHAReplicationSlot` operationId).
+	PauseHAReplicationSlotWithResponse(ctx context.Context, slotName SlotName, reqEditors ...RequestEditorFn) (*PauseHAReplicationSlotResponse, error)
+
+	// ResumeHAReplicationSlotWithResponse Resume a hot-standby replication slot
+	//
+	// Returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with PUT /standby/replication-slots/{slot_name}/resume (the `ResumeHAReplicationSlot` operationId).
+	ResumeHAReplicationSlotWithResponse(ctx context.Context, slotName SlotName, reqEditors ...RequestEditorFn) (*ResumeHAReplicationSlotResponse, error)
+
+	// GetHASeedLifecycleReceiptsWithResponse Read durable runtime-owned hot-standby seed lifecycle receipts
+	//
+	// Returns an authenticated, read-only cursor page from the runtime-owned
+	// append-only receipt ledger. `history_truncated` and `gap` make bounded
+	// retention explicit so observers can fail closed when their collection
+	// window is incomplete.
+	//
+	// Returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with GET /standby/seed-lifecycle/receipts (the `GetHASeedLifecycleReceipts` operationId).
+	GetHASeedLifecycleReceiptsWithResponse(ctx context.Context, params *GetHASeedLifecycleReceiptsParams, reqEditors ...RequestEditorFn) (*GetHASeedLifecycleReceiptsResponse, error)
+
+	// GetHAStandbyStatusWithResponse Get standby status
+	//
+	// Returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with GET /standby/status (the `GetHAStandbyStatus` operationId).
+	GetHAStandbyStatusWithResponse(ctx context.Context, params *GetHAStandbyStatusParams, reqEditors ...RequestEditorFn) (*GetHAStandbyStatusResponse, error)
+
+	// SetHAStandbyUpstreamWithBodyWithResponse Repoint a running standby at a different primary
+	//
+	// Atomically replaces the upstream URL and replication slot a running
+	// standby pulls from, without restarting the process. The request carries
+	// the identity the caller expects the standby to have; the swap is
+	// rejected with 409 when the standby's current identity differs, so a
+	// stale operator cannot repoint a node that has since been promoted or
+	// reseeded. The next replication round pulls from the new upstream. This
+	// is the `follow` step of a switchover.
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /standby/upstream (the `SetHAStandbyUpstream` operationId).
+	SetHAStandbyUpstreamWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*SetHAStandbyUpstreamResponse, error)
+
+	// SetHAStandbyUpstreamWithResponse Repoint a running standby at a different primary
+	//
+	// Atomically replaces the upstream URL and replication slot a running
+	// standby pulls from, without restarting the process. The request carries
+	// the identity the caller expects the standby to have; the swap is
+	// rejected with 409 when the standby's current identity differs, so a
+	// stale operator cannot repoint a node that has since been promoted or
+	// reseeded. The next replication round pulls from the new upstream. This
+	// is the `follow` step of a switchover.
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /standby/upstream (the `SetHAStandbyUpstream` operationId).
+	SetHAStandbyUpstreamWithResponse(ctx context.Context, body SetHAStandbyUpstreamJSONRequestBody, reqEditors ...RequestEditorFn) (*SetHAStandbyUpstreamResponse, error)
+
+	// GetHAWatchdogProofWithResponse Get the runtime Lease watchdog capability proof
+	//
+	// Returns only the authenticated, process-local Lease watchdog proof. This endpoint remains independent of storage mutation critical sections so a slow seed capture cannot prevent the operator from renewing an otherwise valid fencing Lease.
+	//
+	// Returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with GET /standby/watchdog-proof (the `GetHAWatchdogProof` operationId).
+	GetHAWatchdogProofWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*GetHAWatchdogProofResponse, error)
+
+	// CheckHAWriteWithBodyWithResponse Evaluate whether this node can accept writes
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /standby/write/check (the `CheckHAWrite` operationId).
+	CheckHAWriteWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CheckHAWriteResponse, error)
+
+	// CheckHAWriteWithResponse Evaluate whether this node can accept writes
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /standby/write/check (the `CheckHAWrite` operationId).
+	CheckHAWriteWithResponse(ctx context.Context, body CheckHAWriteJSONRequestBody, reqEditors ...RequestEditorFn) (*CheckHAWriteResponse, error)
 }
 
 type StartStorageCheckResponse struct {
@@ -6130,583 +5219,1152 @@ func (r StartStorageVacuumResponse) ContentType() string {
 	return ""
 }
 
-// BeginHABaseBackupWithBodyWithResponse Begin an HA base backup and reserve its replication slot
-//
-// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /ha/base-backups (the `BeginHABaseBackup` operationId).
-func (c *ClientWithResponses) BeginHABaseBackupWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*BeginHABaseBackupResponse, error) {
-	rsp, err := c.BeginHABaseBackupWithBody(ctx, contentType, body, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParseBeginHABaseBackupResponse(rsp)
+type BeginHABaseBackupResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *StandbyBaseBackupBeginResponse
 }
 
-// BeginHABaseBackupWithResponse Begin an HA base backup and reserve its replication slot
-//
-// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /ha/base-backups (the `BeginHABaseBackup` operationId).
-func (c *ClientWithResponses) BeginHABaseBackupWithResponse(ctx context.Context, body BeginHABaseBackupJSONRequestBody, reqEditors ...RequestEditorFn) (*BeginHABaseBackupResponse, error) {
-	rsp, err := c.BeginHABaseBackup(ctx, body, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParseBeginHABaseBackupResponse(rsp)
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r BeginHABaseBackupResponse) GetJSON200() *StandbyBaseBackupBeginResponse {
+	return r.JSON200
 }
 
-// ActivateHASeededSlotWithBodyWithResponse Activate a seeded slot after durable target-generation publication
-//
-// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /ha/base-backups/activate (the `ActivateHASeededSlot` operationId).
-func (c *ClientWithResponses) ActivateHASeededSlotWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*ActivateHASeededSlotResponse, error) {
-	rsp, err := c.ActivateHASeededSlotWithBody(ctx, contentType, body, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParseActivateHASeededSlotResponse(rsp)
+// GetBody returns the raw response body bytes
+func (r BeginHABaseBackupResponse) GetBody() []byte {
+	return r.Body
 }
 
-// ActivateHASeededSlotWithResponse Activate a seeded slot after durable target-generation publication
-//
-// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /ha/base-backups/activate (the `ActivateHASeededSlot` operationId).
-func (c *ClientWithResponses) ActivateHASeededSlotWithResponse(ctx context.Context, body ActivateHASeededSlotJSONRequestBody, reqEditors ...RequestEditorFn) (*ActivateHASeededSlotResponse, error) {
-	rsp, err := c.ActivateHASeededSlot(ctx, body, reqEditors...)
-	if err != nil {
-		return nil, err
+// Status returns HTTPResponse.Status
+func (r BeginHABaseBackupResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
 	}
-	return ParseActivateHASeededSlotResponse(rsp)
+	return http.StatusText(0)
 }
 
-// CaptureHASeedArtifactWithBodyWithResponse Capture an immutable seed from runtime-owned primary storage
-//
-// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /ha/base-backups/capture (the `CaptureHASeedArtifact` operationId).
-func (c *ClientWithResponses) CaptureHASeedArtifactWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CaptureHASeedArtifactResponse, error) {
-	rsp, err := c.CaptureHASeedArtifactWithBody(ctx, contentType, body, reqEditors...)
-	if err != nil {
-		return nil, err
+// StatusCode returns HTTPResponse.StatusCode
+func (r BeginHABaseBackupResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
 	}
-	return ParseCaptureHASeedArtifactResponse(rsp)
+	return 0
 }
 
-// CaptureHASeedArtifactWithResponse Capture an immutable seed from runtime-owned primary storage
-//
-// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /ha/base-backups/capture (the `CaptureHASeedArtifact` operationId).
-func (c *ClientWithResponses) CaptureHASeedArtifactWithResponse(ctx context.Context, body CaptureHASeedArtifactJSONRequestBody, reqEditors ...RequestEditorFn) (*CaptureHASeedArtifactResponse, error) {
-	rsp, err := c.CaptureHASeedArtifact(ctx, body, reqEditors...)
-	if err != nil {
-		return nil, err
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r BeginHABaseBackupResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
 	}
-	return ParseCaptureHASeedArtifactResponse(rsp)
+	return ""
 }
 
-// FinishHABaseBackupWithBodyWithResponse Finish an HA base backup from a local manifest path
-//
-// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /ha/base-backups/finish (the `FinishHABaseBackup` operationId).
-func (c *ClientWithResponses) FinishHABaseBackupWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*FinishHABaseBackupResponse, error) {
-	rsp, err := c.FinishHABaseBackupWithBody(ctx, contentType, body, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParseFinishHABaseBackupResponse(rsp)
+type ActivateHASeededSlotResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *StandbySeededSlotActivateResponse
 }
 
-// FinishHABaseBackupWithResponse Finish an HA base backup from a local manifest path
-//
-// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /ha/base-backups/finish (the `FinishHABaseBackup` operationId).
-func (c *ClientWithResponses) FinishHABaseBackupWithResponse(ctx context.Context, body FinishHABaseBackupJSONRequestBody, reqEditors ...RequestEditorFn) (*FinishHABaseBackupResponse, error) {
-	rsp, err := c.FinishHABaseBackup(ctx, body, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParseFinishHABaseBackupResponse(rsp)
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r ActivateHASeededSlotResponse) GetJSON200() *StandbySeededSlotActivateResponse {
+	return r.JSON200
 }
 
-// AppendHACommitWithBodyWithResponse Append a primary WAL/effects record and evaluate synchronous commit durability
-//
-// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /ha/commit/append (the `AppendHACommit` operationId).
-func (c *ClientWithResponses) AppendHACommitWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*AppendHACommitResponse, error) {
-	rsp, err := c.AppendHACommitWithBody(ctx, contentType, body, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParseAppendHACommitResponse(rsp)
+// GetBody returns the raw response body bytes
+func (r ActivateHASeededSlotResponse) GetBody() []byte {
+	return r.Body
 }
 
-// AppendHACommitWithResponse Append a primary WAL/effects record and evaluate synchronous commit durability
-//
-// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /ha/commit/append (the `AppendHACommit` operationId).
-func (c *ClientWithResponses) AppendHACommitWithResponse(ctx context.Context, body AppendHACommitJSONRequestBody, reqEditors ...RequestEditorFn) (*AppendHACommitResponse, error) {
-	rsp, err := c.AppendHACommit(ctx, body, reqEditors...)
-	if err != nil {
-		return nil, err
+// Status returns HTTPResponse.Status
+func (r ActivateHASeededSlotResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
 	}
-	return ParseAppendHACommitResponse(rsp)
+	return http.StatusText(0)
 }
 
-// CheckHACommitWithBodyWithResponse Evaluate synchronous commit durability for an existing LSN
-//
-// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /ha/commit/check (the `CheckHACommit` operationId).
-func (c *ClientWithResponses) CheckHACommitWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CheckHACommitResponse, error) {
-	rsp, err := c.CheckHACommitWithBody(ctx, contentType, body, reqEditors...)
-	if err != nil {
-		return nil, err
+// StatusCode returns HTTPResponse.StatusCode
+func (r ActivateHASeededSlotResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
 	}
-	return ParseCheckHACommitResponse(rsp)
+	return 0
 }
 
-// CheckHACommitWithResponse Evaluate synchronous commit durability for an existing LSN
-//
-// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /ha/commit/check (the `CheckHACommit` operationId).
-func (c *ClientWithResponses) CheckHACommitWithResponse(ctx context.Context, body CheckHACommitJSONRequestBody, reqEditors ...RequestEditorFn) (*CheckHACommitResponse, error) {
-	rsp, err := c.CheckHACommit(ctx, body, reqEditors...)
-	if err != nil {
-		return nil, err
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r ActivateHASeededSlotResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
 	}
-	return ParseCheckHACommitResponse(rsp)
+	return ""
 }
 
-// AcquireHAFenceWithBodyWithResponse Acquire a durable HA promotion fence
-//
-// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /ha/fence (the `AcquireHAFence` operationId).
-func (c *ClientWithResponses) AcquireHAFenceWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*AcquireHAFenceResponse, error) {
-	rsp, err := c.AcquireHAFenceWithBody(ctx, contentType, body, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParseAcquireHAFenceResponse(rsp)
+type CaptureHASeedArtifactResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *StandbySeedArtifactCaptureResponse
 }
 
-// AcquireHAFenceWithResponse Acquire a durable HA promotion fence
-//
-// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /ha/fence (the `AcquireHAFence` operationId).
-func (c *ClientWithResponses) AcquireHAFenceWithResponse(ctx context.Context, body AcquireHAFenceJSONRequestBody, reqEditors ...RequestEditorFn) (*AcquireHAFenceResponse, error) {
-	rsp, err := c.AcquireHAFence(ctx, body, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParseAcquireHAFenceResponse(rsp)
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r CaptureHASeedArtifactResponse) GetJSON200() *StandbySeedArtifactCaptureResponse {
+	return r.JSON200
 }
 
-// GetHACurrentFenceWithResponse Get the current durable HA promotion fence
-//
-// Returns a wrapper object for the known response body format(s).
-//
-// Corresponds with GET /ha/fence/current (the `GetHACurrentFence` operationId).
-func (c *ClientWithResponses) GetHACurrentFenceWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*GetHACurrentFenceResponse, error) {
-	rsp, err := c.GetHACurrentFence(ctx, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParseGetHACurrentFenceResponse(rsp)
+// GetBody returns the raw response body bytes
+func (r CaptureHASeedArtifactResponse) GetBody() []byte {
+	return r.Body
 }
 
-// CheckHAOwnerJobWithBodyWithResponse Evaluate whether an owner-only background job may run
-//
-// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /ha/owner-jobs/check (the `CheckHAOwnerJob` operationId).
-func (c *ClientWithResponses) CheckHAOwnerJobWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CheckHAOwnerJobResponse, error) {
-	rsp, err := c.CheckHAOwnerJobWithBody(ctx, contentType, body, reqEditors...)
-	if err != nil {
-		return nil, err
+// Status returns HTTPResponse.Status
+func (r CaptureHASeedArtifactResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
 	}
-	return ParseCheckHAOwnerJobResponse(rsp)
+	return http.StatusText(0)
 }
 
-// CheckHAOwnerJobWithResponse Evaluate whether an owner-only background job may run
-//
-// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /ha/owner-jobs/check (the `CheckHAOwnerJob` operationId).
-func (c *ClientWithResponses) CheckHAOwnerJobWithResponse(ctx context.Context, body CheckHAOwnerJobJSONRequestBody, reqEditors ...RequestEditorFn) (*CheckHAOwnerJobResponse, error) {
-	rsp, err := c.CheckHAOwnerJob(ctx, body, reqEditors...)
-	if err != nil {
-		return nil, err
+// StatusCode returns HTTPResponse.StatusCode
+func (r CaptureHASeedArtifactResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
 	}
-	return ParseCheckHAOwnerJobResponse(rsp)
+	return 0
 }
 
-// GetHAPrimaryStatusWithResponse Get primary HA status
-//
-// Returns a wrapper object for the known response body format(s).
-//
-// Corresponds with GET /ha/primary/status (the `GetHAPrimaryStatus` operationId).
-func (c *ClientWithResponses) GetHAPrimaryStatusWithResponse(ctx context.Context, params *GetHAPrimaryStatusParams, reqEditors ...RequestEditorFn) (*GetHAPrimaryStatusResponse, error) {
-	rsp, err := c.GetHAPrimaryStatus(ctx, params, reqEditors...)
-	if err != nil {
-		return nil, err
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r CaptureHASeedArtifactResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
 	}
-	return ParseGetHAPrimaryStatusResponse(rsp)
+	return ""
 }
 
-// PromoteHAWithBodyWithResponse Acquire a fence and promote this standby
-//
-// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /ha/promotion (the `PromoteHA` operationId).
-func (c *ClientWithResponses) PromoteHAWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PromoteHAResponse, error) {
-	rsp, err := c.PromoteHAWithBody(ctx, contentType, body, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParsePromoteHAResponse(rsp)
+type FinishHABaseBackupResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *StandbyBaseBackupFinishResponse
 }
 
-// PromoteHAWithResponse Acquire a fence and promote this standby
-//
-// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /ha/promotion (the `PromoteHA` operationId).
-func (c *ClientWithResponses) PromoteHAWithResponse(ctx context.Context, body PromoteHAJSONRequestBody, reqEditors ...RequestEditorFn) (*PromoteHAResponse, error) {
-	rsp, err := c.PromoteHA(ctx, body, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParsePromoteHAResponse(rsp)
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r FinishHABaseBackupResponse) GetJSON200() *StandbyBaseBackupFinishResponse {
+	return r.JSON200
 }
 
-// AssessHAPromotionWithBodyWithResponse Assess whether this standby can be promoted
-//
-// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /ha/promotion/assess (the `AssessHAPromotion` operationId).
-func (c *ClientWithResponses) AssessHAPromotionWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*AssessHAPromotionResponse, error) {
-	rsp, err := c.AssessHAPromotionWithBody(ctx, contentType, body, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParseAssessHAPromotionResponse(rsp)
+// GetBody returns the raw response body bytes
+func (r FinishHABaseBackupResponse) GetBody() []byte {
+	return r.Body
 }
 
-// AssessHAPromotionWithResponse Assess whether this standby can be promoted
-//
-// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /ha/promotion/assess (the `AssessHAPromotion` operationId).
-func (c *ClientWithResponses) AssessHAPromotionWithResponse(ctx context.Context, body AssessHAPromotionJSONRequestBody, reqEditors ...RequestEditorFn) (*AssessHAPromotionResponse, error) {
-	rsp, err := c.AssessHAPromotion(ctx, body, reqEditors...)
-	if err != nil {
-		return nil, err
+// Status returns HTTPResponse.Status
+func (r FinishHABaseBackupResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
 	}
-	return ParseAssessHAPromotionResponse(rsp)
+	return http.StatusText(0)
 }
 
-// PromoteHAWithCurrentFenceWithResponse Promote this standby using the current durable fence receipt
-//
-// Returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /ha/promotion/current-fence (the `PromoteHAWithCurrentFence` operationId).
-func (c *ClientWithResponses) PromoteHAWithCurrentFenceWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*PromoteHAWithCurrentFenceResponse, error) {
-	rsp, err := c.PromoteHAWithCurrentFence(ctx, reqEditors...)
-	if err != nil {
-		return nil, err
+// StatusCode returns HTTPResponse.StatusCode
+func (r FinishHABaseBackupResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
 	}
-	return ParsePromoteHAWithCurrentFenceResponse(rsp)
+	return 0
 }
 
-// CheckHAReadWithBodyWithResponse Evaluate standby read freshness and routing
-//
-// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /ha/read/check (the `CheckHARead` operationId).
-func (c *ClientWithResponses) CheckHAReadWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CheckHAReadResponse, error) {
-	rsp, err := c.CheckHAReadWithBody(ctx, contentType, body, reqEditors...)
-	if err != nil {
-		return nil, err
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r FinishHABaseBackupResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
 	}
-	return ParseCheckHAReadResponse(rsp)
+	return ""
 }
 
-// CheckHAReadWithResponse Evaluate standby read freshness and routing
-//
-// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /ha/read/check (the `CheckHARead` operationId).
-func (c *ClientWithResponses) CheckHAReadWithResponse(ctx context.Context, body CheckHAReadJSONRequestBody, reqEditors ...RequestEditorFn) (*CheckHAReadResponse, error) {
-	rsp, err := c.CheckHARead(ctx, body, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParseCheckHAReadResponse(rsp)
+type BootstrapHAStandbyResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *StandbyBootstrapResponse
 }
 
-// AssessHARejoinWithBodyWithResponse Assess whether a former primary can safely rejoin
-//
-// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /ha/rejoin/assess (the `AssessHARejoin` operationId).
-func (c *ClientWithResponses) AssessHARejoinWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*AssessHARejoinResponse, error) {
-	rsp, err := c.AssessHARejoinWithBody(ctx, contentType, body, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParseAssessHARejoinResponse(rsp)
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r BootstrapHAStandbyResponse) GetJSON200() *StandbyBootstrapResponse {
+	return r.JSON200
 }
 
-// AssessHARejoinWithResponse Assess whether a former primary can safely rejoin
-//
-// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /ha/rejoin/assess (the `AssessHARejoin` operationId).
-func (c *ClientWithResponses) AssessHARejoinWithResponse(ctx context.Context, body AssessHARejoinJSONRequestBody, reqEditors ...RequestEditorFn) (*AssessHARejoinResponse, error) {
-	rsp, err := c.AssessHARejoin(ctx, body, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParseAssessHARejoinResponse(rsp)
+// GetBody returns the raw response body bytes
+func (r BootstrapHAStandbyResponse) GetBody() []byte {
+	return r.Body
 }
 
-// ReseedHARejoinWithBodyWithResponse Reseed a fenced former primary when rewind is unsafe
-//
-// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /ha/rejoin/reseed (the `ReseedHARejoin` operationId).
-func (c *ClientWithResponses) ReseedHARejoinWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*ReseedHARejoinResponse, error) {
-	rsp, err := c.ReseedHARejoinWithBody(ctx, contentType, body, reqEditors...)
-	if err != nil {
-		return nil, err
+// Status returns HTTPResponse.Status
+func (r BootstrapHAStandbyResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
 	}
-	return ParseReseedHARejoinResponse(rsp)
+	return http.StatusText(0)
 }
 
-// ReseedHARejoinWithResponse Reseed a fenced former primary when rewind is unsafe
-//
-// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /ha/rejoin/reseed (the `ReseedHARejoin` operationId).
-func (c *ClientWithResponses) ReseedHARejoinWithResponse(ctx context.Context, body ReseedHARejoinJSONRequestBody, reqEditors ...RequestEditorFn) (*ReseedHARejoinResponse, error) {
-	rsp, err := c.ReseedHARejoin(ctx, body, reqEditors...)
-	if err != nil {
-		return nil, err
+// StatusCode returns HTTPResponse.StatusCode
+func (r BootstrapHAStandbyResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
 	}
-	return ParseReseedHARejoinResponse(rsp)
+	return 0
 }
 
-// RewindHARejoinWithBodyWithResponse Rewind a fenced former primary onto the promoted timeline
-//
-// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /ha/rejoin/rewind (the `RewindHARejoin` operationId).
-func (c *ClientWithResponses) RewindHARejoinWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RewindHARejoinResponse, error) {
-	rsp, err := c.RewindHARejoinWithBody(ctx, contentType, body, reqEditors...)
-	if err != nil {
-		return nil, err
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r BootstrapHAStandbyResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
 	}
-	return ParseRewindHARejoinResponse(rsp)
+	return ""
 }
 
-// RewindHARejoinWithResponse Rewind a fenced former primary onto the promoted timeline
-//
-// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /ha/rejoin/rewind (the `RewindHARejoin` operationId).
-func (c *ClientWithResponses) RewindHARejoinWithResponse(ctx context.Context, body RewindHARejoinJSONRequestBody, reqEditors ...RequestEditorFn) (*RewindHARejoinResponse, error) {
-	rsp, err := c.RewindHARejoin(ctx, body, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParseRewindHARejoinResponse(rsp)
+type AppendHACommitResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *StandbyCommitAppendResponse
 }
 
-// ListHAReplicationSlotsWithResponse List HA replication slots
-//
-// Returns a wrapper object for the known response body format(s).
-//
-// Corresponds with GET /ha/replication-slots (the `ListHAReplicationSlots` operationId).
-func (c *ClientWithResponses) ListHAReplicationSlotsWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*ListHAReplicationSlotsResponse, error) {
-	rsp, err := c.ListHAReplicationSlots(ctx, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParseListHAReplicationSlotsResponse(rsp)
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r AppendHACommitResponse) GetJSON200() *StandbyCommitAppendResponse {
+	return r.JSON200
 }
 
-// CreateHAReplicationSlotWithBodyWithResponse Create an HA replication slot
-//
-// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /ha/replication-slots (the `CreateHAReplicationSlot` operationId).
-func (c *ClientWithResponses) CreateHAReplicationSlotWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CreateHAReplicationSlotResponse, error) {
-	rsp, err := c.CreateHAReplicationSlotWithBody(ctx, contentType, body, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParseCreateHAReplicationSlotResponse(rsp)
+// GetBody returns the raw response body bytes
+func (r AppendHACommitResponse) GetBody() []byte {
+	return r.Body
 }
 
-// CreateHAReplicationSlotWithResponse Create an HA replication slot
-//
-// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /ha/replication-slots (the `CreateHAReplicationSlot` operationId).
-func (c *ClientWithResponses) CreateHAReplicationSlotWithResponse(ctx context.Context, body CreateHAReplicationSlotJSONRequestBody, reqEditors ...RequestEditorFn) (*CreateHAReplicationSlotResponse, error) {
-	rsp, err := c.CreateHAReplicationSlot(ctx, body, reqEditors...)
-	if err != nil {
-		return nil, err
+// Status returns HTTPResponse.Status
+func (r AppendHACommitResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
 	}
-	return ParseCreateHAReplicationSlotResponse(rsp)
+	return http.StatusText(0)
 }
 
-// DropHAReplicationSlotWithResponse Drop an HA replication slot
-//
-// Returns a wrapper object for the known response body format(s).
-//
-// Corresponds with DELETE /ha/replication-slots/{slot_name} (the `DropHAReplicationSlot` operationId).
-func (c *ClientWithResponses) DropHAReplicationSlotWithResponse(ctx context.Context, slotName SlotName, reqEditors ...RequestEditorFn) (*DropHAReplicationSlotResponse, error) {
-	rsp, err := c.DropHAReplicationSlot(ctx, slotName, reqEditors...)
-	if err != nil {
-		return nil, err
+// StatusCode returns HTTPResponse.StatusCode
+func (r AppendHACommitResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
 	}
-	return ParseDropHAReplicationSlotResponse(rsp)
+	return 0
 }
 
-// PauseHAReplicationSlotWithResponse Pause an HA replication slot
-//
-// Returns a wrapper object for the known response body format(s).
-//
-// Corresponds with PUT /ha/replication-slots/{slot_name}/pause (the `PauseHAReplicationSlot` operationId).
-func (c *ClientWithResponses) PauseHAReplicationSlotWithResponse(ctx context.Context, slotName SlotName, reqEditors ...RequestEditorFn) (*PauseHAReplicationSlotResponse, error) {
-	rsp, err := c.PauseHAReplicationSlot(ctx, slotName, reqEditors...)
-	if err != nil {
-		return nil, err
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r AppendHACommitResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
 	}
-	return ParsePauseHAReplicationSlotResponse(rsp)
+	return ""
 }
 
-// ResumeHAReplicationSlotWithResponse Resume an HA replication slot
-//
-// Returns a wrapper object for the known response body format(s).
-//
-// Corresponds with PUT /ha/replication-slots/{slot_name}/resume (the `ResumeHAReplicationSlot` operationId).
-func (c *ClientWithResponses) ResumeHAReplicationSlotWithResponse(ctx context.Context, slotName SlotName, reqEditors ...RequestEditorFn) (*ResumeHAReplicationSlotResponse, error) {
-	rsp, err := c.ResumeHAReplicationSlot(ctx, slotName, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParseResumeHAReplicationSlotResponse(rsp)
+type CheckHACommitResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *StandbyCommitCheckResponse
 }
 
-// GetHASeedLifecycleReceiptsWithResponse Read durable runtime-owned HA seed lifecycle receipts
-//
-// Returns an authenticated, read-only cursor page from the runtime-owned
-// append-only receipt ledger. `history_truncated` and `gap` make bounded
-// retention explicit so observers can fail closed when their collection
-// window is incomplete.
-//
-// Returns a wrapper object for the known response body format(s).
-//
-// Corresponds with GET /ha/seed-lifecycle/receipts (the `GetHASeedLifecycleReceipts` operationId).
-func (c *ClientWithResponses) GetHASeedLifecycleReceiptsWithResponse(ctx context.Context, params *GetHASeedLifecycleReceiptsParams, reqEditors ...RequestEditorFn) (*GetHASeedLifecycleReceiptsResponse, error) {
-	rsp, err := c.GetHASeedLifecycleReceipts(ctx, params, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParseGetHASeedLifecycleReceiptsResponse(rsp)
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r CheckHACommitResponse) GetJSON200() *StandbyCommitCheckResponse {
+	return r.JSON200
 }
 
-// BootstrapHAStandbyWithBodyWithResponse Bootstrap this standby from a local base-backup manifest and copied files
-//
-// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /ha/standby/bootstrap (the `BootstrapHAStandby` operationId).
-func (c *ClientWithResponses) BootstrapHAStandbyWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*BootstrapHAStandbyResponse, error) {
-	rsp, err := c.BootstrapHAStandbyWithBody(ctx, contentType, body, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParseBootstrapHAStandbyResponse(rsp)
+// GetBody returns the raw response body bytes
+func (r CheckHACommitResponse) GetBody() []byte {
+	return r.Body
 }
 
-// BootstrapHAStandbyWithResponse Bootstrap this standby from a local base-backup manifest and copied files
-//
-// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /ha/standby/bootstrap (the `BootstrapHAStandby` operationId).
-func (c *ClientWithResponses) BootstrapHAStandbyWithResponse(ctx context.Context, body BootstrapHAStandbyJSONRequestBody, reqEditors ...RequestEditorFn) (*BootstrapHAStandbyResponse, error) {
-	rsp, err := c.BootstrapHAStandby(ctx, body, reqEditors...)
-	if err != nil {
-		return nil, err
+// Status returns HTTPResponse.Status
+func (r CheckHACommitResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
 	}
-	return ParseBootstrapHAStandbyResponse(rsp)
+	return http.StatusText(0)
 }
 
-// GetHAStandbyStatusWithResponse Get standby HA status
-//
-// Returns a wrapper object for the known response body format(s).
-//
-// Corresponds with GET /ha/standby/status (the `GetHAStandbyStatus` operationId).
-func (c *ClientWithResponses) GetHAStandbyStatusWithResponse(ctx context.Context, params *GetHAStandbyStatusParams, reqEditors ...RequestEditorFn) (*GetHAStandbyStatusResponse, error) {
-	rsp, err := c.GetHAStandbyStatus(ctx, params, reqEditors...)
-	if err != nil {
-		return nil, err
+// StatusCode returns HTTPResponse.StatusCode
+func (r CheckHACommitResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
 	}
-	return ParseGetHAStandbyStatusResponse(rsp)
+	return 0
 }
 
-// GetHAWatchdogProofWithResponse Get the runtime Lease watchdog capability proof
-//
-// Returns only the authenticated, process-local Lease watchdog proof. This endpoint remains independent of storage mutation critical sections so a slow seed capture cannot prevent the operator from renewing an otherwise valid fencing Lease.
-//
-// Returns a wrapper object for the known response body format(s).
-//
-// Corresponds with GET /ha/watchdog-proof (the `GetHAWatchdogProof` operationId).
-func (c *ClientWithResponses) GetHAWatchdogProofWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*GetHAWatchdogProofResponse, error) {
-	rsp, err := c.GetHAWatchdogProof(ctx, reqEditors...)
-	if err != nil {
-		return nil, err
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r CheckHACommitResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
 	}
-	return ParseGetHAWatchdogProofResponse(rsp)
+	return ""
 }
 
-// CheckHAWriteWithBodyWithResponse Evaluate whether this node can accept writes
-//
-// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /ha/write/check (the `CheckHAWrite` operationId).
-func (c *ClientWithResponses) CheckHAWriteWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CheckHAWriteResponse, error) {
-	rsp, err := c.CheckHAWriteWithBody(ctx, contentType, body, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParseCheckHAWriteResponse(rsp)
+type AcquireHAFenceResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *StandbyFenceResponse
 }
 
-// CheckHAWriteWithResponse Evaluate whether this node can accept writes
-//
-// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /ha/write/check (the `CheckHAWrite` operationId).
-func (c *ClientWithResponses) CheckHAWriteWithResponse(ctx context.Context, body CheckHAWriteJSONRequestBody, reqEditors ...RequestEditorFn) (*CheckHAWriteResponse, error) {
-	rsp, err := c.CheckHAWrite(ctx, body, reqEditors...)
-	if err != nil {
-		return nil, err
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r AcquireHAFenceResponse) GetJSON200() *StandbyFenceResponse {
+	return r.JSON200
+}
+
+// GetBody returns the raw response body bytes
+func (r AcquireHAFenceResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r AcquireHAFenceResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
 	}
-	return ParseCheckHAWriteResponse(rsp)
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r AcquireHAFenceResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r AcquireHAFenceResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type GetHACurrentFenceResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *StandbyCurrentFenceResponse
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r GetHACurrentFenceResponse) GetJSON200() *StandbyCurrentFenceResponse {
+	return r.JSON200
+}
+
+// GetBody returns the raw response body bytes
+func (r GetHACurrentFenceResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r GetHACurrentFenceResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r GetHACurrentFenceResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r GetHACurrentFenceResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type CheckHAOwnerJobResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *StandbyOwnerJobCheckResponse
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r CheckHAOwnerJobResponse) GetJSON200() *StandbyOwnerJobCheckResponse {
+	return r.JSON200
+}
+
+// GetBody returns the raw response body bytes
+func (r CheckHAOwnerJobResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r CheckHAOwnerJobResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r CheckHAOwnerJobResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r CheckHAOwnerJobResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type GetHAPrimaryStatusResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *StandbyPrimaryStatusResponse
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r GetHAPrimaryStatusResponse) GetJSON200() *StandbyPrimaryStatusResponse {
+	return r.JSON200
+}
+
+// GetBody returns the raw response body bytes
+func (r GetHAPrimaryStatusResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r GetHAPrimaryStatusResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r GetHAPrimaryStatusResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r GetHAPrimaryStatusResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type PromoteHAResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *StandbyPromotionResponse
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r PromoteHAResponse) GetJSON200() *StandbyPromotionResponse {
+	return r.JSON200
+}
+
+// GetBody returns the raw response body bytes
+func (r PromoteHAResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r PromoteHAResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r PromoteHAResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r PromoteHAResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type AssessHAPromotionResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *StandbyPromotionAssessResponse
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r AssessHAPromotionResponse) GetJSON200() *StandbyPromotionAssessResponse {
+	return r.JSON200
+}
+
+// GetBody returns the raw response body bytes
+func (r AssessHAPromotionResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r AssessHAPromotionResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r AssessHAPromotionResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r AssessHAPromotionResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type PromoteHAWithCurrentFenceResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *StandbyPromotionResponse
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r PromoteHAWithCurrentFenceResponse) GetJSON200() *StandbyPromotionResponse {
+	return r.JSON200
+}
+
+// GetBody returns the raw response body bytes
+func (r PromoteHAWithCurrentFenceResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r PromoteHAWithCurrentFenceResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r PromoteHAWithCurrentFenceResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r PromoteHAWithCurrentFenceResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type CheckHAReadResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *StandbyReadCheckResponse
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r CheckHAReadResponse) GetJSON200() *StandbyReadCheckResponse {
+	return r.JSON200
+}
+
+// GetBody returns the raw response body bytes
+func (r CheckHAReadResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r CheckHAReadResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r CheckHAReadResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r CheckHAReadResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type AssessHARejoinResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *StandbyRejoinAssessResponse
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r AssessHARejoinResponse) GetJSON200() *StandbyRejoinAssessResponse {
+	return r.JSON200
+}
+
+// GetBody returns the raw response body bytes
+func (r AssessHARejoinResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r AssessHARejoinResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r AssessHARejoinResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r AssessHARejoinResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type ReseedHARejoinResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *StandbyRejoinAssessResponse
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r ReseedHARejoinResponse) GetJSON200() *StandbyRejoinAssessResponse {
+	return r.JSON200
+}
+
+// GetBody returns the raw response body bytes
+func (r ReseedHARejoinResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r ReseedHARejoinResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r ReseedHARejoinResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r ReseedHARejoinResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type RewindHARejoinResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *StandbyRejoinAssessResponse
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r RewindHARejoinResponse) GetJSON200() *StandbyRejoinAssessResponse {
+	return r.JSON200
+}
+
+// GetBody returns the raw response body bytes
+func (r RewindHARejoinResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r RewindHARejoinResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r RewindHARejoinResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r RewindHARejoinResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type ListHAReplicationSlotsResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *StandbyReplicationSlotListResponse
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r ListHAReplicationSlotsResponse) GetJSON200() *StandbyReplicationSlotListResponse {
+	return r.JSON200
+}
+
+// GetBody returns the raw response body bytes
+func (r ListHAReplicationSlotsResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r ListHAReplicationSlotsResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r ListHAReplicationSlotsResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r ListHAReplicationSlotsResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type CreateHAReplicationSlotResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *StandbyReplicationSlotActionResponse
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r CreateHAReplicationSlotResponse) GetJSON200() *StandbyReplicationSlotActionResponse {
+	return r.JSON200
+}
+
+// GetBody returns the raw response body bytes
+func (r CreateHAReplicationSlotResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r CreateHAReplicationSlotResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r CreateHAReplicationSlotResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r CreateHAReplicationSlotResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type DropHAReplicationSlotResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *StandbyReplicationSlotActionResponse
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r DropHAReplicationSlotResponse) GetJSON200() *StandbyReplicationSlotActionResponse {
+	return r.JSON200
+}
+
+// GetBody returns the raw response body bytes
+func (r DropHAReplicationSlotResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r DropHAReplicationSlotResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r DropHAReplicationSlotResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r DropHAReplicationSlotResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type PauseHAReplicationSlotResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *StandbyReplicationSlotActionResponse
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r PauseHAReplicationSlotResponse) GetJSON200() *StandbyReplicationSlotActionResponse {
+	return r.JSON200
+}
+
+// GetBody returns the raw response body bytes
+func (r PauseHAReplicationSlotResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r PauseHAReplicationSlotResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r PauseHAReplicationSlotResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r PauseHAReplicationSlotResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type ResumeHAReplicationSlotResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *StandbyReplicationSlotActionResponse
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r ResumeHAReplicationSlotResponse) GetJSON200() *StandbyReplicationSlotActionResponse {
+	return r.JSON200
+}
+
+// GetBody returns the raw response body bytes
+func (r ResumeHAReplicationSlotResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r ResumeHAReplicationSlotResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r ResumeHAReplicationSlotResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r ResumeHAReplicationSlotResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type GetHASeedLifecycleReceiptsResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *StandbySeedLifecycleReceiptInventoryResponse
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r GetHASeedLifecycleReceiptsResponse) GetJSON200() *StandbySeedLifecycleReceiptInventoryResponse {
+	return r.JSON200
+}
+
+// GetBody returns the raw response body bytes
+func (r GetHASeedLifecycleReceiptsResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r GetHASeedLifecycleReceiptsResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r GetHASeedLifecycleReceiptsResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r GetHASeedLifecycleReceiptsResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type GetHAStandbyStatusResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *StandbyStatusResponse
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r GetHAStandbyStatusResponse) GetJSON200() *StandbyStatusResponse {
+	return r.JSON200
+}
+
+// GetBody returns the raw response body bytes
+func (r GetHAStandbyStatusResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r GetHAStandbyStatusResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r GetHAStandbyStatusResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r GetHAStandbyStatusResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type SetHAStandbyUpstreamResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *StandbyUpstreamResponse
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r SetHAStandbyUpstreamResponse) GetJSON200() *StandbyUpstreamResponse {
+	return r.JSON200
+}
+
+// GetBody returns the raw response body bytes
+func (r SetHAStandbyUpstreamResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r SetHAStandbyUpstreamResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r SetHAStandbyUpstreamResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r SetHAStandbyUpstreamResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type GetHAWatchdogProofResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *StandbyWatchdogProofResponse
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r GetHAWatchdogProofResponse) GetJSON200() *StandbyWatchdogProofResponse {
+	return r.JSON200
+}
+
+// GetBody returns the raw response body bytes
+func (r GetHAWatchdogProofResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r GetHAWatchdogProofResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r GetHAWatchdogProofResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r GetHAWatchdogProofResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type CheckHAWriteResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *StandbyWriteCheckResponse
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r CheckHAWriteResponse) GetJSON200() *StandbyWriteCheckResponse {
+	return r.JSON200
+}
+
+// GetBody returns the raw response body bytes
+func (r CheckHAWriteResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r CheckHAWriteResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r CheckHAWriteResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r CheckHAWriteResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
 }
 
 // StartStorageCheckWithResponse Start a coordinated storage integrity check
@@ -6776,709 +6434,625 @@ func (c *ClientWithResponses) StartStorageVacuumWithResponse(ctx context.Context
 	return ParseStartStorageVacuumResponse(rsp)
 }
 
-// ParseBeginHABaseBackupResponse parses an HTTP response from a BeginHABaseBackupWithResponse call
-func ParseBeginHABaseBackupResponse(rsp *http.Response) (*BeginHABaseBackupResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
-	defer func() { _ = rsp.Body.Close() }()
+// BeginHABaseBackupWithBodyWithResponse Begin a hot-standby base backup and reserve its replication slot
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /standby/base-backups (the `BeginHABaseBackup` operationId).
+func (c *ClientWithResponses) BeginHABaseBackupWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*BeginHABaseBackupResponse, error) {
+	rsp, err := c.BeginHABaseBackupWithBody(ctx, contentType, body, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
-
-	response := &BeginHABaseBackupResponse{
-		Body:         bodyBytes,
-		HTTPResponse: rsp,
-	}
-
-	switch {
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest HABaseBackupBeginResponse
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON200 = &dest
-
-	}
-
-	return response, nil
+	return ParseBeginHABaseBackupResponse(rsp)
 }
 
-// ParseActivateHASeededSlotResponse parses an HTTP response from a ActivateHASeededSlotWithResponse call
-func ParseActivateHASeededSlotResponse(rsp *http.Response) (*ActivateHASeededSlotResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
-	defer func() { _ = rsp.Body.Close() }()
+// BeginHABaseBackupWithResponse Begin a hot-standby base backup and reserve its replication slot
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /standby/base-backups (the `BeginHABaseBackup` operationId).
+func (c *ClientWithResponses) BeginHABaseBackupWithResponse(ctx context.Context, body BeginHABaseBackupJSONRequestBody, reqEditors ...RequestEditorFn) (*BeginHABaseBackupResponse, error) {
+	rsp, err := c.BeginHABaseBackup(ctx, body, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
-
-	response := &ActivateHASeededSlotResponse{
-		Body:         bodyBytes,
-		HTTPResponse: rsp,
-	}
-
-	switch {
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest HASeededSlotActivateResponse
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON200 = &dest
-
-	}
-
-	return response, nil
+	return ParseBeginHABaseBackupResponse(rsp)
 }
 
-// ParseCaptureHASeedArtifactResponse parses an HTTP response from a CaptureHASeedArtifactWithResponse call
-func ParseCaptureHASeedArtifactResponse(rsp *http.Response) (*CaptureHASeedArtifactResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
-	defer func() { _ = rsp.Body.Close() }()
+// ActivateHASeededSlotWithBodyWithResponse Activate a seeded slot after durable target-generation publication
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /standby/base-backups/activate (the `ActivateHASeededSlot` operationId).
+func (c *ClientWithResponses) ActivateHASeededSlotWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*ActivateHASeededSlotResponse, error) {
+	rsp, err := c.ActivateHASeededSlotWithBody(ctx, contentType, body, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
-
-	response := &CaptureHASeedArtifactResponse{
-		Body:         bodyBytes,
-		HTTPResponse: rsp,
-	}
-
-	switch {
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest HASeedArtifactCaptureResponse
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON200 = &dest
-
-	}
-
-	return response, nil
+	return ParseActivateHASeededSlotResponse(rsp)
 }
 
-// ParseFinishHABaseBackupResponse parses an HTTP response from a FinishHABaseBackupWithResponse call
-func ParseFinishHABaseBackupResponse(rsp *http.Response) (*FinishHABaseBackupResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
-	defer func() { _ = rsp.Body.Close() }()
+// ActivateHASeededSlotWithResponse Activate a seeded slot after durable target-generation publication
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /standby/base-backups/activate (the `ActivateHASeededSlot` operationId).
+func (c *ClientWithResponses) ActivateHASeededSlotWithResponse(ctx context.Context, body ActivateHASeededSlotJSONRequestBody, reqEditors ...RequestEditorFn) (*ActivateHASeededSlotResponse, error) {
+	rsp, err := c.ActivateHASeededSlot(ctx, body, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
-
-	response := &FinishHABaseBackupResponse{
-		Body:         bodyBytes,
-		HTTPResponse: rsp,
-	}
-
-	switch {
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest HABaseBackupFinishResponse
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON200 = &dest
-
-	}
-
-	return response, nil
+	return ParseActivateHASeededSlotResponse(rsp)
 }
 
-// ParseAppendHACommitResponse parses an HTTP response from a AppendHACommitWithResponse call
-func ParseAppendHACommitResponse(rsp *http.Response) (*AppendHACommitResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
-	defer func() { _ = rsp.Body.Close() }()
+// CaptureHASeedArtifactWithBodyWithResponse Capture an immutable seed from runtime-owned primary storage
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /standby/base-backups/capture (the `CaptureHASeedArtifact` operationId).
+func (c *ClientWithResponses) CaptureHASeedArtifactWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CaptureHASeedArtifactResponse, error) {
+	rsp, err := c.CaptureHASeedArtifactWithBody(ctx, contentType, body, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
-
-	response := &AppendHACommitResponse{
-		Body:         bodyBytes,
-		HTTPResponse: rsp,
-	}
-
-	switch {
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest HACommitAppendResponse
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON200 = &dest
-
-	}
-
-	return response, nil
+	return ParseCaptureHASeedArtifactResponse(rsp)
 }
 
-// ParseCheckHACommitResponse parses an HTTP response from a CheckHACommitWithResponse call
-func ParseCheckHACommitResponse(rsp *http.Response) (*CheckHACommitResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
-	defer func() { _ = rsp.Body.Close() }()
+// CaptureHASeedArtifactWithResponse Capture an immutable seed from runtime-owned primary storage
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /standby/base-backups/capture (the `CaptureHASeedArtifact` operationId).
+func (c *ClientWithResponses) CaptureHASeedArtifactWithResponse(ctx context.Context, body CaptureHASeedArtifactJSONRequestBody, reqEditors ...RequestEditorFn) (*CaptureHASeedArtifactResponse, error) {
+	rsp, err := c.CaptureHASeedArtifact(ctx, body, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
-
-	response := &CheckHACommitResponse{
-		Body:         bodyBytes,
-		HTTPResponse: rsp,
-	}
-
-	switch {
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest HACommitCheckResponse
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON200 = &dest
-
-	}
-
-	return response, nil
+	return ParseCaptureHASeedArtifactResponse(rsp)
 }
 
-// ParseAcquireHAFenceResponse parses an HTTP response from a AcquireHAFenceWithResponse call
-func ParseAcquireHAFenceResponse(rsp *http.Response) (*AcquireHAFenceResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
-	defer func() { _ = rsp.Body.Close() }()
+// FinishHABaseBackupWithBodyWithResponse Finish a hot-standby base backup from a local manifest path
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /standby/base-backups/finish (the `FinishHABaseBackup` operationId).
+func (c *ClientWithResponses) FinishHABaseBackupWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*FinishHABaseBackupResponse, error) {
+	rsp, err := c.FinishHABaseBackupWithBody(ctx, contentType, body, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
-
-	response := &AcquireHAFenceResponse{
-		Body:         bodyBytes,
-		HTTPResponse: rsp,
-	}
-
-	switch {
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest HAFenceResponse
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON200 = &dest
-
-	}
-
-	return response, nil
+	return ParseFinishHABaseBackupResponse(rsp)
 }
 
-// ParseGetHACurrentFenceResponse parses an HTTP response from a GetHACurrentFenceWithResponse call
-func ParseGetHACurrentFenceResponse(rsp *http.Response) (*GetHACurrentFenceResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
-	defer func() { _ = rsp.Body.Close() }()
+// FinishHABaseBackupWithResponse Finish a hot-standby base backup from a local manifest path
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /standby/base-backups/finish (the `FinishHABaseBackup` operationId).
+func (c *ClientWithResponses) FinishHABaseBackupWithResponse(ctx context.Context, body FinishHABaseBackupJSONRequestBody, reqEditors ...RequestEditorFn) (*FinishHABaseBackupResponse, error) {
+	rsp, err := c.FinishHABaseBackup(ctx, body, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
-
-	response := &GetHACurrentFenceResponse{
-		Body:         bodyBytes,
-		HTTPResponse: rsp,
-	}
-
-	switch {
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest HACurrentFenceResponse
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON200 = &dest
-
-	}
-
-	return response, nil
+	return ParseFinishHABaseBackupResponse(rsp)
 }
 
-// ParseCheckHAOwnerJobResponse parses an HTTP response from a CheckHAOwnerJobWithResponse call
-func ParseCheckHAOwnerJobResponse(rsp *http.Response) (*CheckHAOwnerJobResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
-	defer func() { _ = rsp.Body.Close() }()
+// BootstrapHAStandbyWithBodyWithResponse Bootstrap this standby from a local base-backup manifest and copied files
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /standby/bootstrap (the `BootstrapHAStandby` operationId).
+func (c *ClientWithResponses) BootstrapHAStandbyWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*BootstrapHAStandbyResponse, error) {
+	rsp, err := c.BootstrapHAStandbyWithBody(ctx, contentType, body, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
-
-	response := &CheckHAOwnerJobResponse{
-		Body:         bodyBytes,
-		HTTPResponse: rsp,
-	}
-
-	switch {
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest HAOwnerJobCheckResponse
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON200 = &dest
-
-	}
-
-	return response, nil
+	return ParseBootstrapHAStandbyResponse(rsp)
 }
 
-// ParseGetHAPrimaryStatusResponse parses an HTTP response from a GetHAPrimaryStatusWithResponse call
-func ParseGetHAPrimaryStatusResponse(rsp *http.Response) (*GetHAPrimaryStatusResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
-	defer func() { _ = rsp.Body.Close() }()
+// BootstrapHAStandbyWithResponse Bootstrap this standby from a local base-backup manifest and copied files
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /standby/bootstrap (the `BootstrapHAStandby` operationId).
+func (c *ClientWithResponses) BootstrapHAStandbyWithResponse(ctx context.Context, body BootstrapHAStandbyJSONRequestBody, reqEditors ...RequestEditorFn) (*BootstrapHAStandbyResponse, error) {
+	rsp, err := c.BootstrapHAStandby(ctx, body, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
-
-	response := &GetHAPrimaryStatusResponse{
-		Body:         bodyBytes,
-		HTTPResponse: rsp,
-	}
-
-	switch {
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest HAPrimaryStatusResponse
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON200 = &dest
-
-	}
-
-	return response, nil
+	return ParseBootstrapHAStandbyResponse(rsp)
 }
 
-// ParsePromoteHAResponse parses an HTTP response from a PromoteHAWithResponse call
-func ParsePromoteHAResponse(rsp *http.Response) (*PromoteHAResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
-	defer func() { _ = rsp.Body.Close() }()
+// AppendHACommitWithBodyWithResponse Append a primary WAL/effects record and evaluate synchronous commit durability
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /standby/commit/append (the `AppendHACommit` operationId).
+func (c *ClientWithResponses) AppendHACommitWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*AppendHACommitResponse, error) {
+	rsp, err := c.AppendHACommitWithBody(ctx, contentType, body, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
-
-	response := &PromoteHAResponse{
-		Body:         bodyBytes,
-		HTTPResponse: rsp,
-	}
-
-	switch {
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest HAPromotionResponse
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON200 = &dest
-
-	}
-
-	return response, nil
+	return ParseAppendHACommitResponse(rsp)
 }
 
-// ParseAssessHAPromotionResponse parses an HTTP response from a AssessHAPromotionWithResponse call
-func ParseAssessHAPromotionResponse(rsp *http.Response) (*AssessHAPromotionResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
-	defer func() { _ = rsp.Body.Close() }()
+// AppendHACommitWithResponse Append a primary WAL/effects record and evaluate synchronous commit durability
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /standby/commit/append (the `AppendHACommit` operationId).
+func (c *ClientWithResponses) AppendHACommitWithResponse(ctx context.Context, body AppendHACommitJSONRequestBody, reqEditors ...RequestEditorFn) (*AppendHACommitResponse, error) {
+	rsp, err := c.AppendHACommit(ctx, body, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
-
-	response := &AssessHAPromotionResponse{
-		Body:         bodyBytes,
-		HTTPResponse: rsp,
-	}
-
-	switch {
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest HAPromotionAssessResponse
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON200 = &dest
-
-	}
-
-	return response, nil
+	return ParseAppendHACommitResponse(rsp)
 }
 
-// ParsePromoteHAWithCurrentFenceResponse parses an HTTP response from a PromoteHAWithCurrentFenceWithResponse call
-func ParsePromoteHAWithCurrentFenceResponse(rsp *http.Response) (*PromoteHAWithCurrentFenceResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
-	defer func() { _ = rsp.Body.Close() }()
+// CheckHACommitWithBodyWithResponse Evaluate synchronous commit durability for an existing LSN
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /standby/commit/check (the `CheckHACommit` operationId).
+func (c *ClientWithResponses) CheckHACommitWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CheckHACommitResponse, error) {
+	rsp, err := c.CheckHACommitWithBody(ctx, contentType, body, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
-
-	response := &PromoteHAWithCurrentFenceResponse{
-		Body:         bodyBytes,
-		HTTPResponse: rsp,
-	}
-
-	switch {
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest HAPromotionResponse
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON200 = &dest
-
-	}
-
-	return response, nil
+	return ParseCheckHACommitResponse(rsp)
 }
 
-// ParseCheckHAReadResponse parses an HTTP response from a CheckHAReadWithResponse call
-func ParseCheckHAReadResponse(rsp *http.Response) (*CheckHAReadResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
-	defer func() { _ = rsp.Body.Close() }()
+// CheckHACommitWithResponse Evaluate synchronous commit durability for an existing LSN
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /standby/commit/check (the `CheckHACommit` operationId).
+func (c *ClientWithResponses) CheckHACommitWithResponse(ctx context.Context, body CheckHACommitJSONRequestBody, reqEditors ...RequestEditorFn) (*CheckHACommitResponse, error) {
+	rsp, err := c.CheckHACommit(ctx, body, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
-
-	response := &CheckHAReadResponse{
-		Body:         bodyBytes,
-		HTTPResponse: rsp,
-	}
-
-	switch {
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest HAReadCheckResponse
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON200 = &dest
-
-	}
-
-	return response, nil
+	return ParseCheckHACommitResponse(rsp)
 }
 
-// ParseAssessHARejoinResponse parses an HTTP response from a AssessHARejoinWithResponse call
-func ParseAssessHARejoinResponse(rsp *http.Response) (*AssessHARejoinResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
-	defer func() { _ = rsp.Body.Close() }()
+// AcquireHAFenceWithBodyWithResponse Acquire a durable hot-standby promotion fence
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /standby/fence (the `AcquireHAFence` operationId).
+func (c *ClientWithResponses) AcquireHAFenceWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*AcquireHAFenceResponse, error) {
+	rsp, err := c.AcquireHAFenceWithBody(ctx, contentType, body, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
-
-	response := &AssessHARejoinResponse{
-		Body:         bodyBytes,
-		HTTPResponse: rsp,
-	}
-
-	switch {
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest HARejoinAssessResponse
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON200 = &dest
-
-	}
-
-	return response, nil
+	return ParseAcquireHAFenceResponse(rsp)
 }
 
-// ParseReseedHARejoinResponse parses an HTTP response from a ReseedHARejoinWithResponse call
-func ParseReseedHARejoinResponse(rsp *http.Response) (*ReseedHARejoinResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
-	defer func() { _ = rsp.Body.Close() }()
+// AcquireHAFenceWithResponse Acquire a durable hot-standby promotion fence
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /standby/fence (the `AcquireHAFence` operationId).
+func (c *ClientWithResponses) AcquireHAFenceWithResponse(ctx context.Context, body AcquireHAFenceJSONRequestBody, reqEditors ...RequestEditorFn) (*AcquireHAFenceResponse, error) {
+	rsp, err := c.AcquireHAFence(ctx, body, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
-
-	response := &ReseedHARejoinResponse{
-		Body:         bodyBytes,
-		HTTPResponse: rsp,
-	}
-
-	switch {
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest HARejoinAssessResponse
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON200 = &dest
-
-	}
-
-	return response, nil
+	return ParseAcquireHAFenceResponse(rsp)
 }
 
-// ParseRewindHARejoinResponse parses an HTTP response from a RewindHARejoinWithResponse call
-func ParseRewindHARejoinResponse(rsp *http.Response) (*RewindHARejoinResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
-	defer func() { _ = rsp.Body.Close() }()
+// GetHACurrentFenceWithResponse Get the current durable hot-standby promotion fence
+//
+// Returns a wrapper object for the known response body format(s).
+//
+// Corresponds with GET /standby/fence/current (the `GetHACurrentFence` operationId).
+func (c *ClientWithResponses) GetHACurrentFenceWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*GetHACurrentFenceResponse, error) {
+	rsp, err := c.GetHACurrentFence(ctx, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
-
-	response := &RewindHARejoinResponse{
-		Body:         bodyBytes,
-		HTTPResponse: rsp,
-	}
-
-	switch {
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest HARejoinAssessResponse
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON200 = &dest
-
-	}
-
-	return response, nil
+	return ParseGetHACurrentFenceResponse(rsp)
 }
 
-// ParseListHAReplicationSlotsResponse parses an HTTP response from a ListHAReplicationSlotsWithResponse call
-func ParseListHAReplicationSlotsResponse(rsp *http.Response) (*ListHAReplicationSlotsResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
-	defer func() { _ = rsp.Body.Close() }()
+// CheckHAOwnerJobWithBodyWithResponse Evaluate whether an owner-only background job may run
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /standby/owner-jobs/check (the `CheckHAOwnerJob` operationId).
+func (c *ClientWithResponses) CheckHAOwnerJobWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CheckHAOwnerJobResponse, error) {
+	rsp, err := c.CheckHAOwnerJobWithBody(ctx, contentType, body, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
-
-	response := &ListHAReplicationSlotsResponse{
-		Body:         bodyBytes,
-		HTTPResponse: rsp,
-	}
-
-	switch {
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest HAReplicationSlotListResponse
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON200 = &dest
-
-	}
-
-	return response, nil
+	return ParseCheckHAOwnerJobResponse(rsp)
 }
 
-// ParseCreateHAReplicationSlotResponse parses an HTTP response from a CreateHAReplicationSlotWithResponse call
-func ParseCreateHAReplicationSlotResponse(rsp *http.Response) (*CreateHAReplicationSlotResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
-	defer func() { _ = rsp.Body.Close() }()
+// CheckHAOwnerJobWithResponse Evaluate whether an owner-only background job may run
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /standby/owner-jobs/check (the `CheckHAOwnerJob` operationId).
+func (c *ClientWithResponses) CheckHAOwnerJobWithResponse(ctx context.Context, body CheckHAOwnerJobJSONRequestBody, reqEditors ...RequestEditorFn) (*CheckHAOwnerJobResponse, error) {
+	rsp, err := c.CheckHAOwnerJob(ctx, body, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
-
-	response := &CreateHAReplicationSlotResponse{
-		Body:         bodyBytes,
-		HTTPResponse: rsp,
-	}
-
-	switch {
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest HAReplicationSlotActionResponse
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON200 = &dest
-
-	}
-
-	return response, nil
+	return ParseCheckHAOwnerJobResponse(rsp)
 }
 
-// ParseDropHAReplicationSlotResponse parses an HTTP response from a DropHAReplicationSlotWithResponse call
-func ParseDropHAReplicationSlotResponse(rsp *http.Response) (*DropHAReplicationSlotResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
-	defer func() { _ = rsp.Body.Close() }()
+// GetHAPrimaryStatusWithResponse Get primary hot-standby status
+//
+// Returns a wrapper object for the known response body format(s).
+//
+// Corresponds with GET /standby/primary/status (the `GetHAPrimaryStatus` operationId).
+func (c *ClientWithResponses) GetHAPrimaryStatusWithResponse(ctx context.Context, params *GetHAPrimaryStatusParams, reqEditors ...RequestEditorFn) (*GetHAPrimaryStatusResponse, error) {
+	rsp, err := c.GetHAPrimaryStatus(ctx, params, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
-
-	response := &DropHAReplicationSlotResponse{
-		Body:         bodyBytes,
-		HTTPResponse: rsp,
-	}
-
-	switch {
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest HAReplicationSlotActionResponse
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON200 = &dest
-
-	}
-
-	return response, nil
+	return ParseGetHAPrimaryStatusResponse(rsp)
 }
 
-// ParsePauseHAReplicationSlotResponse parses an HTTP response from a PauseHAReplicationSlotWithResponse call
-func ParsePauseHAReplicationSlotResponse(rsp *http.Response) (*PauseHAReplicationSlotResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
-	defer func() { _ = rsp.Body.Close() }()
+// PromoteHAWithBodyWithResponse Acquire a fence and promote this standby
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /standby/promotion (the `PromoteHA` operationId).
+func (c *ClientWithResponses) PromoteHAWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PromoteHAResponse, error) {
+	rsp, err := c.PromoteHAWithBody(ctx, contentType, body, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
-
-	response := &PauseHAReplicationSlotResponse{
-		Body:         bodyBytes,
-		HTTPResponse: rsp,
-	}
-
-	switch {
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest HAReplicationSlotActionResponse
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON200 = &dest
-
-	}
-
-	return response, nil
+	return ParsePromoteHAResponse(rsp)
 }
 
-// ParseResumeHAReplicationSlotResponse parses an HTTP response from a ResumeHAReplicationSlotWithResponse call
-func ParseResumeHAReplicationSlotResponse(rsp *http.Response) (*ResumeHAReplicationSlotResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
-	defer func() { _ = rsp.Body.Close() }()
+// PromoteHAWithResponse Acquire a fence and promote this standby
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /standby/promotion (the `PromoteHA` operationId).
+func (c *ClientWithResponses) PromoteHAWithResponse(ctx context.Context, body PromoteHAJSONRequestBody, reqEditors ...RequestEditorFn) (*PromoteHAResponse, error) {
+	rsp, err := c.PromoteHA(ctx, body, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
-
-	response := &ResumeHAReplicationSlotResponse{
-		Body:         bodyBytes,
-		HTTPResponse: rsp,
-	}
-
-	switch {
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest HAReplicationSlotActionResponse
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON200 = &dest
-
-	}
-
-	return response, nil
+	return ParsePromoteHAResponse(rsp)
 }
 
-// ParseGetHASeedLifecycleReceiptsResponse parses an HTTP response from a GetHASeedLifecycleReceiptsWithResponse call
-func ParseGetHASeedLifecycleReceiptsResponse(rsp *http.Response) (*GetHASeedLifecycleReceiptsResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
-	defer func() { _ = rsp.Body.Close() }()
+// AssessHAPromotionWithBodyWithResponse Assess whether this standby can be promoted
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /standby/promotion/assess (the `AssessHAPromotion` operationId).
+func (c *ClientWithResponses) AssessHAPromotionWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*AssessHAPromotionResponse, error) {
+	rsp, err := c.AssessHAPromotionWithBody(ctx, contentType, body, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
-
-	response := &GetHASeedLifecycleReceiptsResponse{
-		Body:         bodyBytes,
-		HTTPResponse: rsp,
-	}
-
-	switch {
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest HASeedLifecycleReceiptInventoryResponse
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON200 = &dest
-
-	case rsp.StatusCode == 500:
-		break // No content-type
-
-	}
-
-	return response, nil
+	return ParseAssessHAPromotionResponse(rsp)
 }
 
-// ParseBootstrapHAStandbyResponse parses an HTTP response from a BootstrapHAStandbyWithResponse call
-func ParseBootstrapHAStandbyResponse(rsp *http.Response) (*BootstrapHAStandbyResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
-	defer func() { _ = rsp.Body.Close() }()
+// AssessHAPromotionWithResponse Assess whether this standby can be promoted
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /standby/promotion/assess (the `AssessHAPromotion` operationId).
+func (c *ClientWithResponses) AssessHAPromotionWithResponse(ctx context.Context, body AssessHAPromotionJSONRequestBody, reqEditors ...RequestEditorFn) (*AssessHAPromotionResponse, error) {
+	rsp, err := c.AssessHAPromotion(ctx, body, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
-
-	response := &BootstrapHAStandbyResponse{
-		Body:         bodyBytes,
-		HTTPResponse: rsp,
-	}
-
-	switch {
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest HAStandbyBootstrapResponse
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON200 = &dest
-
-	}
-
-	return response, nil
+	return ParseAssessHAPromotionResponse(rsp)
 }
 
-// ParseGetHAStandbyStatusResponse parses an HTTP response from a GetHAStandbyStatusWithResponse call
-func ParseGetHAStandbyStatusResponse(rsp *http.Response) (*GetHAStandbyStatusResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
-	defer func() { _ = rsp.Body.Close() }()
+// PromoteHAWithCurrentFenceWithResponse Promote this standby using the current durable fence receipt
+//
+// Returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /standby/promotion/current-fence (the `PromoteHAWithCurrentFence` operationId).
+func (c *ClientWithResponses) PromoteHAWithCurrentFenceWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*PromoteHAWithCurrentFenceResponse, error) {
+	rsp, err := c.PromoteHAWithCurrentFence(ctx, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
-
-	response := &GetHAStandbyStatusResponse{
-		Body:         bodyBytes,
-		HTTPResponse: rsp,
-	}
-
-	switch {
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest HAStandbyStatusResponse
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON200 = &dest
-
-	}
-
-	return response, nil
+	return ParsePromoteHAWithCurrentFenceResponse(rsp)
 }
 
-// ParseGetHAWatchdogProofResponse parses an HTTP response from a GetHAWatchdogProofWithResponse call
-func ParseGetHAWatchdogProofResponse(rsp *http.Response) (*GetHAWatchdogProofResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
-	defer func() { _ = rsp.Body.Close() }()
+// CheckHAReadWithBodyWithResponse Evaluate standby read freshness and routing
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /standby/read/check (the `CheckHARead` operationId).
+func (c *ClientWithResponses) CheckHAReadWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CheckHAReadResponse, error) {
+	rsp, err := c.CheckHAReadWithBody(ctx, contentType, body, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
-
-	response := &GetHAWatchdogProofResponse{
-		Body:         bodyBytes,
-		HTTPResponse: rsp,
-	}
-
-	switch {
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest HAWatchdogProofResponse
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON200 = &dest
-
-	}
-
-	return response, nil
+	return ParseCheckHAReadResponse(rsp)
 }
 
-// ParseCheckHAWriteResponse parses an HTTP response from a CheckHAWriteWithResponse call
-func ParseCheckHAWriteResponse(rsp *http.Response) (*CheckHAWriteResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
-	defer func() { _ = rsp.Body.Close() }()
+// CheckHAReadWithResponse Evaluate standby read freshness and routing
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /standby/read/check (the `CheckHARead` operationId).
+func (c *ClientWithResponses) CheckHAReadWithResponse(ctx context.Context, body CheckHAReadJSONRequestBody, reqEditors ...RequestEditorFn) (*CheckHAReadResponse, error) {
+	rsp, err := c.CheckHARead(ctx, body, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
+	return ParseCheckHAReadResponse(rsp)
+}
 
-	response := &CheckHAWriteResponse{
-		Body:         bodyBytes,
-		HTTPResponse: rsp,
+// AssessHARejoinWithBodyWithResponse Assess whether a former primary can safely rejoin
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /standby/rejoin/assess (the `AssessHARejoin` operationId).
+func (c *ClientWithResponses) AssessHARejoinWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*AssessHARejoinResponse, error) {
+	rsp, err := c.AssessHARejoinWithBody(ctx, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
 	}
+	return ParseAssessHARejoinResponse(rsp)
+}
 
-	switch {
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest HAWriteCheckResponse
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON200 = &dest
-
+// AssessHARejoinWithResponse Assess whether a former primary can safely rejoin
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /standby/rejoin/assess (the `AssessHARejoin` operationId).
+func (c *ClientWithResponses) AssessHARejoinWithResponse(ctx context.Context, body AssessHARejoinJSONRequestBody, reqEditors ...RequestEditorFn) (*AssessHARejoinResponse, error) {
+	rsp, err := c.AssessHARejoin(ctx, body, reqEditors...)
+	if err != nil {
+		return nil, err
 	}
+	return ParseAssessHARejoinResponse(rsp)
+}
 
-	return response, nil
+// ReseedHARejoinWithBodyWithResponse Reseed a fenced former primary when rewind is unsafe
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /standby/rejoin/reseed (the `ReseedHARejoin` operationId).
+func (c *ClientWithResponses) ReseedHARejoinWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*ReseedHARejoinResponse, error) {
+	rsp, err := c.ReseedHARejoinWithBody(ctx, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseReseedHARejoinResponse(rsp)
+}
+
+// ReseedHARejoinWithResponse Reseed a fenced former primary when rewind is unsafe
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /standby/rejoin/reseed (the `ReseedHARejoin` operationId).
+func (c *ClientWithResponses) ReseedHARejoinWithResponse(ctx context.Context, body ReseedHARejoinJSONRequestBody, reqEditors ...RequestEditorFn) (*ReseedHARejoinResponse, error) {
+	rsp, err := c.ReseedHARejoin(ctx, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseReseedHARejoinResponse(rsp)
+}
+
+// RewindHARejoinWithBodyWithResponse Rewind a fenced former primary onto the promoted timeline
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /standby/rejoin/rewind (the `RewindHARejoin` operationId).
+func (c *ClientWithResponses) RewindHARejoinWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RewindHARejoinResponse, error) {
+	rsp, err := c.RewindHARejoinWithBody(ctx, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRewindHARejoinResponse(rsp)
+}
+
+// RewindHARejoinWithResponse Rewind a fenced former primary onto the promoted timeline
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /standby/rejoin/rewind (the `RewindHARejoin` operationId).
+func (c *ClientWithResponses) RewindHARejoinWithResponse(ctx context.Context, body RewindHARejoinJSONRequestBody, reqEditors ...RequestEditorFn) (*RewindHARejoinResponse, error) {
+	rsp, err := c.RewindHARejoin(ctx, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRewindHARejoinResponse(rsp)
+}
+
+// ListHAReplicationSlotsWithResponse List hot-standby replication slots
+//
+// Returns a wrapper object for the known response body format(s).
+//
+// Corresponds with GET /standby/replication-slots (the `ListHAReplicationSlots` operationId).
+func (c *ClientWithResponses) ListHAReplicationSlotsWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*ListHAReplicationSlotsResponse, error) {
+	rsp, err := c.ListHAReplicationSlots(ctx, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseListHAReplicationSlotsResponse(rsp)
+}
+
+// CreateHAReplicationSlotWithBodyWithResponse Create a hot-standby replication slot
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /standby/replication-slots (the `CreateHAReplicationSlot` operationId).
+func (c *ClientWithResponses) CreateHAReplicationSlotWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CreateHAReplicationSlotResponse, error) {
+	rsp, err := c.CreateHAReplicationSlotWithBody(ctx, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseCreateHAReplicationSlotResponse(rsp)
+}
+
+// CreateHAReplicationSlotWithResponse Create a hot-standby replication slot
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /standby/replication-slots (the `CreateHAReplicationSlot` operationId).
+func (c *ClientWithResponses) CreateHAReplicationSlotWithResponse(ctx context.Context, body CreateHAReplicationSlotJSONRequestBody, reqEditors ...RequestEditorFn) (*CreateHAReplicationSlotResponse, error) {
+	rsp, err := c.CreateHAReplicationSlot(ctx, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseCreateHAReplicationSlotResponse(rsp)
+}
+
+// DropHAReplicationSlotWithResponse Drop a hot-standby replication slot
+//
+// Returns a wrapper object for the known response body format(s).
+//
+// Corresponds with DELETE /standby/replication-slots/{slot_name} (the `DropHAReplicationSlot` operationId).
+func (c *ClientWithResponses) DropHAReplicationSlotWithResponse(ctx context.Context, slotName SlotName, reqEditors ...RequestEditorFn) (*DropHAReplicationSlotResponse, error) {
+	rsp, err := c.DropHAReplicationSlot(ctx, slotName, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseDropHAReplicationSlotResponse(rsp)
+}
+
+// PauseHAReplicationSlotWithResponse Pause a hot-standby replication slot
+//
+// Returns a wrapper object for the known response body format(s).
+//
+// Corresponds with PUT /standby/replication-slots/{slot_name}/pause (the `PauseHAReplicationSlot` operationId).
+func (c *ClientWithResponses) PauseHAReplicationSlotWithResponse(ctx context.Context, slotName SlotName, reqEditors ...RequestEditorFn) (*PauseHAReplicationSlotResponse, error) {
+	rsp, err := c.PauseHAReplicationSlot(ctx, slotName, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParsePauseHAReplicationSlotResponse(rsp)
+}
+
+// ResumeHAReplicationSlotWithResponse Resume a hot-standby replication slot
+//
+// Returns a wrapper object for the known response body format(s).
+//
+// Corresponds with PUT /standby/replication-slots/{slot_name}/resume (the `ResumeHAReplicationSlot` operationId).
+func (c *ClientWithResponses) ResumeHAReplicationSlotWithResponse(ctx context.Context, slotName SlotName, reqEditors ...RequestEditorFn) (*ResumeHAReplicationSlotResponse, error) {
+	rsp, err := c.ResumeHAReplicationSlot(ctx, slotName, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseResumeHAReplicationSlotResponse(rsp)
+}
+
+// GetHASeedLifecycleReceiptsWithResponse Read durable runtime-owned hot-standby seed lifecycle receipts
+//
+// Returns an authenticated, read-only cursor page from the runtime-owned
+// append-only receipt ledger. `history_truncated` and `gap` make bounded
+// retention explicit so observers can fail closed when their collection
+// window is incomplete.
+//
+// Returns a wrapper object for the known response body format(s).
+//
+// Corresponds with GET /standby/seed-lifecycle/receipts (the `GetHASeedLifecycleReceipts` operationId).
+func (c *ClientWithResponses) GetHASeedLifecycleReceiptsWithResponse(ctx context.Context, params *GetHASeedLifecycleReceiptsParams, reqEditors ...RequestEditorFn) (*GetHASeedLifecycleReceiptsResponse, error) {
+	rsp, err := c.GetHASeedLifecycleReceipts(ctx, params, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseGetHASeedLifecycleReceiptsResponse(rsp)
+}
+
+// GetHAStandbyStatusWithResponse Get standby status
+//
+// Returns a wrapper object for the known response body format(s).
+//
+// Corresponds with GET /standby/status (the `GetHAStandbyStatus` operationId).
+func (c *ClientWithResponses) GetHAStandbyStatusWithResponse(ctx context.Context, params *GetHAStandbyStatusParams, reqEditors ...RequestEditorFn) (*GetHAStandbyStatusResponse, error) {
+	rsp, err := c.GetHAStandbyStatus(ctx, params, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseGetHAStandbyStatusResponse(rsp)
+}
+
+// SetHAStandbyUpstreamWithBodyWithResponse Repoint a running standby at a different primary
+//
+// Atomically replaces the upstream URL and replication slot a running
+// standby pulls from, without restarting the process. The request carries
+// the identity the caller expects the standby to have; the swap is
+// rejected with 409 when the standby's current identity differs, so a
+// stale operator cannot repoint a node that has since been promoted or
+// reseeded. The next replication round pulls from the new upstream. This
+// is the `follow` step of a switchover.
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /standby/upstream (the `SetHAStandbyUpstream` operationId).
+func (c *ClientWithResponses) SetHAStandbyUpstreamWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*SetHAStandbyUpstreamResponse, error) {
+	rsp, err := c.SetHAStandbyUpstreamWithBody(ctx, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseSetHAStandbyUpstreamResponse(rsp)
+}
+
+// SetHAStandbyUpstreamWithResponse Repoint a running standby at a different primary
+//
+// Atomically replaces the upstream URL and replication slot a running
+// standby pulls from, without restarting the process. The request carries
+// the identity the caller expects the standby to have; the swap is
+// rejected with 409 when the standby's current identity differs, so a
+// stale operator cannot repoint a node that has since been promoted or
+// reseeded. The next replication round pulls from the new upstream. This
+// is the `follow` step of a switchover.
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /standby/upstream (the `SetHAStandbyUpstream` operationId).
+func (c *ClientWithResponses) SetHAStandbyUpstreamWithResponse(ctx context.Context, body SetHAStandbyUpstreamJSONRequestBody, reqEditors ...RequestEditorFn) (*SetHAStandbyUpstreamResponse, error) {
+	rsp, err := c.SetHAStandbyUpstream(ctx, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseSetHAStandbyUpstreamResponse(rsp)
+}
+
+// GetHAWatchdogProofWithResponse Get the runtime Lease watchdog capability proof
+//
+// Returns only the authenticated, process-local Lease watchdog proof. This endpoint remains independent of storage mutation critical sections so a slow seed capture cannot prevent the operator from renewing an otherwise valid fencing Lease.
+//
+// Returns a wrapper object for the known response body format(s).
+//
+// Corresponds with GET /standby/watchdog-proof (the `GetHAWatchdogProof` operationId).
+func (c *ClientWithResponses) GetHAWatchdogProofWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*GetHAWatchdogProofResponse, error) {
+	rsp, err := c.GetHAWatchdogProof(ctx, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseGetHAWatchdogProofResponse(rsp)
+}
+
+// CheckHAWriteWithBodyWithResponse Evaluate whether this node can accept writes
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /standby/write/check (the `CheckHAWrite` operationId).
+func (c *ClientWithResponses) CheckHAWriteWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CheckHAWriteResponse, error) {
+	rsp, err := c.CheckHAWriteWithBody(ctx, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseCheckHAWriteResponse(rsp)
+}
+
+// CheckHAWriteWithResponse Evaluate whether this node can accept writes
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /standby/write/check (the `CheckHAWrite` operationId).
+func (c *ClientWithResponses) CheckHAWriteWithResponse(ctx context.Context, body CheckHAWriteJSONRequestBody, reqEditors ...RequestEditorFn) (*CheckHAWriteResponse, error) {
+	rsp, err := c.CheckHAWrite(ctx, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseCheckHAWriteResponse(rsp)
 }
 
 // ParseStartStorageCheckResponse parses an HTTP response from a StartStorageCheckWithResponse call
@@ -7611,163 +7185,906 @@ func ParseStartStorageVacuumResponse(rsp *http.Response) (*StartStorageVacuumRes
 	return response, nil
 }
 
+// ParseBeginHABaseBackupResponse parses an HTTP response from a BeginHABaseBackupWithResponse call
+func ParseBeginHABaseBackupResponse(rsp *http.Response) (*BeginHABaseBackupResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &BeginHABaseBackupResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest StandbyBaseBackupBeginResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseActivateHASeededSlotResponse parses an HTTP response from a ActivateHASeededSlotWithResponse call
+func ParseActivateHASeededSlotResponse(rsp *http.Response) (*ActivateHASeededSlotResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &ActivateHASeededSlotResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest StandbySeededSlotActivateResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseCaptureHASeedArtifactResponse parses an HTTP response from a CaptureHASeedArtifactWithResponse call
+func ParseCaptureHASeedArtifactResponse(rsp *http.Response) (*CaptureHASeedArtifactResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &CaptureHASeedArtifactResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest StandbySeedArtifactCaptureResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseFinishHABaseBackupResponse parses an HTTP response from a FinishHABaseBackupWithResponse call
+func ParseFinishHABaseBackupResponse(rsp *http.Response) (*FinishHABaseBackupResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &FinishHABaseBackupResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest StandbyBaseBackupFinishResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseBootstrapHAStandbyResponse parses an HTTP response from a BootstrapHAStandbyWithResponse call
+func ParseBootstrapHAStandbyResponse(rsp *http.Response) (*BootstrapHAStandbyResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &BootstrapHAStandbyResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest StandbyBootstrapResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseAppendHACommitResponse parses an HTTP response from a AppendHACommitWithResponse call
+func ParseAppendHACommitResponse(rsp *http.Response) (*AppendHACommitResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &AppendHACommitResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest StandbyCommitAppendResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseCheckHACommitResponse parses an HTTP response from a CheckHACommitWithResponse call
+func ParseCheckHACommitResponse(rsp *http.Response) (*CheckHACommitResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &CheckHACommitResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest StandbyCommitCheckResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseAcquireHAFenceResponse parses an HTTP response from a AcquireHAFenceWithResponse call
+func ParseAcquireHAFenceResponse(rsp *http.Response) (*AcquireHAFenceResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &AcquireHAFenceResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest StandbyFenceResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseGetHACurrentFenceResponse parses an HTTP response from a GetHACurrentFenceWithResponse call
+func ParseGetHACurrentFenceResponse(rsp *http.Response) (*GetHACurrentFenceResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &GetHACurrentFenceResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest StandbyCurrentFenceResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseCheckHAOwnerJobResponse parses an HTTP response from a CheckHAOwnerJobWithResponse call
+func ParseCheckHAOwnerJobResponse(rsp *http.Response) (*CheckHAOwnerJobResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &CheckHAOwnerJobResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest StandbyOwnerJobCheckResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseGetHAPrimaryStatusResponse parses an HTTP response from a GetHAPrimaryStatusWithResponse call
+func ParseGetHAPrimaryStatusResponse(rsp *http.Response) (*GetHAPrimaryStatusResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &GetHAPrimaryStatusResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest StandbyPrimaryStatusResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParsePromoteHAResponse parses an HTTP response from a PromoteHAWithResponse call
+func ParsePromoteHAResponse(rsp *http.Response) (*PromoteHAResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &PromoteHAResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest StandbyPromotionResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseAssessHAPromotionResponse parses an HTTP response from a AssessHAPromotionWithResponse call
+func ParseAssessHAPromotionResponse(rsp *http.Response) (*AssessHAPromotionResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &AssessHAPromotionResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest StandbyPromotionAssessResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParsePromoteHAWithCurrentFenceResponse parses an HTTP response from a PromoteHAWithCurrentFenceWithResponse call
+func ParsePromoteHAWithCurrentFenceResponse(rsp *http.Response) (*PromoteHAWithCurrentFenceResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &PromoteHAWithCurrentFenceResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest StandbyPromotionResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseCheckHAReadResponse parses an HTTP response from a CheckHAReadWithResponse call
+func ParseCheckHAReadResponse(rsp *http.Response) (*CheckHAReadResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &CheckHAReadResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest StandbyReadCheckResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseAssessHARejoinResponse parses an HTTP response from a AssessHARejoinWithResponse call
+func ParseAssessHARejoinResponse(rsp *http.Response) (*AssessHARejoinResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &AssessHARejoinResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest StandbyRejoinAssessResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseReseedHARejoinResponse parses an HTTP response from a ReseedHARejoinWithResponse call
+func ParseReseedHARejoinResponse(rsp *http.Response) (*ReseedHARejoinResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &ReseedHARejoinResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest StandbyRejoinAssessResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseRewindHARejoinResponse parses an HTTP response from a RewindHARejoinWithResponse call
+func ParseRewindHARejoinResponse(rsp *http.Response) (*RewindHARejoinResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &RewindHARejoinResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest StandbyRejoinAssessResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseListHAReplicationSlotsResponse parses an HTTP response from a ListHAReplicationSlotsWithResponse call
+func ParseListHAReplicationSlotsResponse(rsp *http.Response) (*ListHAReplicationSlotsResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &ListHAReplicationSlotsResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest StandbyReplicationSlotListResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseCreateHAReplicationSlotResponse parses an HTTP response from a CreateHAReplicationSlotWithResponse call
+func ParseCreateHAReplicationSlotResponse(rsp *http.Response) (*CreateHAReplicationSlotResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &CreateHAReplicationSlotResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest StandbyReplicationSlotActionResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseDropHAReplicationSlotResponse parses an HTTP response from a DropHAReplicationSlotWithResponse call
+func ParseDropHAReplicationSlotResponse(rsp *http.Response) (*DropHAReplicationSlotResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &DropHAReplicationSlotResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest StandbyReplicationSlotActionResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParsePauseHAReplicationSlotResponse parses an HTTP response from a PauseHAReplicationSlotWithResponse call
+func ParsePauseHAReplicationSlotResponse(rsp *http.Response) (*PauseHAReplicationSlotResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &PauseHAReplicationSlotResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest StandbyReplicationSlotActionResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseResumeHAReplicationSlotResponse parses an HTTP response from a ResumeHAReplicationSlotWithResponse call
+func ParseResumeHAReplicationSlotResponse(rsp *http.Response) (*ResumeHAReplicationSlotResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &ResumeHAReplicationSlotResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest StandbyReplicationSlotActionResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseGetHASeedLifecycleReceiptsResponse parses an HTTP response from a GetHASeedLifecycleReceiptsWithResponse call
+func ParseGetHASeedLifecycleReceiptsResponse(rsp *http.Response) (*GetHASeedLifecycleReceiptsResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &GetHASeedLifecycleReceiptsResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest StandbySeedLifecycleReceiptInventoryResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case rsp.StatusCode == 500:
+		break // No content-type
+
+	}
+
+	return response, nil
+}
+
+// ParseGetHAStandbyStatusResponse parses an HTTP response from a GetHAStandbyStatusWithResponse call
+func ParseGetHAStandbyStatusResponse(rsp *http.Response) (*GetHAStandbyStatusResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &GetHAStandbyStatusResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest StandbyStatusResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseSetHAStandbyUpstreamResponse parses an HTTP response from a SetHAStandbyUpstreamWithResponse call
+func ParseSetHAStandbyUpstreamResponse(rsp *http.Response) (*SetHAStandbyUpstreamResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &SetHAStandbyUpstreamResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest StandbyUpstreamResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseGetHAWatchdogProofResponse parses an HTTP response from a GetHAWatchdogProofWithResponse call
+func ParseGetHAWatchdogProofResponse(rsp *http.Response) (*GetHAWatchdogProofResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &GetHAWatchdogProofResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest StandbyWatchdogProofResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseCheckHAWriteResponse parses an HTTP response from a CheckHAWriteWithResponse call
+func ParseCheckHAWriteResponse(rsp *http.Response) (*CheckHAWriteResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &CheckHAWriteResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest StandbyWriteCheckResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	}
+
+	return response, nil
+}
+
 // Base64 encoded, compressed with deflate, json marshaled OpenAPI spec.
 // Stored as a slice of fixed-width chunks rather than one concatenated
 // const string: with thousands of chunks the chained `+` fold is several
 // times slower for the Go compiler than parsing a slice literal.
 var swaggerSpec = []string{
-	"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",
-	"XE/Dika6PmfLFZlawdkCJ7efbv9/AAAA//8=",
+	"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",
 }
 
 // decodeSpec returns the embedded OpenAPI spec as raw JSON bytes,

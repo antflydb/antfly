@@ -75,6 +75,14 @@ components:
         error:
           type: string
           description: Error message
+        message:
+          type: string
+        input_index:
+          type: integer
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+        stage:
+          type: string
 
     # Multimodal Content Types (OpenAI-compatible)
     TextContentPart:
@@ -289,7 +297,6 @@ components:
       required:
         - model
         - query
-        - prompts
       properties:
         model:
           type: string
@@ -299,18 +306,26 @@ components:
           type: string
           description: Search query for relevance scoring
           example: "machine learning applications"
-        prompts:
+        documents:
           type: array
           items:
-            type: string
+            $ref: "#/components/schemas/ChatMessageContent"
           description: |
-            Pre-rendered document texts to rerank. The client is responsible for extracting
-            and rendering document fields/templates before calling this endpoint.
+            Documents to rerank. Each entry is a string or an array of text and image
+            content parts. Exactly one of `documents` and `prompts` is required.
           example:
             [
               "Introduction to machine learning...",
               "Deep learning fundamentals...",
             ]
+        prompts:
+          type: array
+          deprecated: true
+          items:
+            type: string
+          description: |
+            Deprecated text-only form of `documents`. Accepted so older clients keep
+            working; send `documents` instead.
 
     RerankResponse:
       type: object
@@ -1293,8 +1308,6 @@ components:
               $ref: "#/components/schemas/AdmissionConfig"
     RuntimeConfig:
       type: object
-      required:
-        - api_url
       properties:
         max_concurrent_requests:
           type: integer
@@ -1310,7 +1323,12 @@ components:
         api_url:
           type: string
           format: uri
-          description: "URL of the Antfly inference embedding/chunking service"
+          description: |
+            URL of an out-of-process Antfly inference service that the Antfly
+            server should call for embedding, chunking, reranking, and
+            generation. Omit it to use the in-process inference runtime
+            (the default in standalone mode). `antfly inference run` ignores
+            this field; it configures the client side only.
           example: "http://localhost:8080"
         api_key:
           type: string
@@ -1574,28 +1592,22 @@ paths:
 
   /rerank:
     post:
-      summary: Rerank prompts by relevance
+      summary: Rerank documents by relevance
       description: |
-        Re-scores pre-rendered text prompts based on relevance to a query using ONNX reranking models.
+        Re-scores documents by relevance to a text query. Returns one score per
+        document, in request order.
 
-        ## Client Responsibilities
-
-        The client must:
-        1. Extract relevant fields from documents
-        2. Render any templates
-        3. Send pre-rendered text strings as `prompts`
-
-        This design keeps Antfly inference stateless and allows clients to customize rendering logic.
+        Each entry in `documents` is either a string or an array of text and image
+        content parts, in the same format that generation and embedding use. The client
+        renders document fields or templates to text before calling this endpoint.
+        Documents with images require a multimodal reranker (ColQwen-style
+        late-interaction, or Qwen3-VL with its GGUF vision projector).
 
         ## Models
 
         - Models are auto-discovered from `models_dir/rerankers/`
-        - Supports quantized models (`model_quantized.onnx`)
         - Automatically prefers quantized variants if available
-
-        For document-based reranking with field extraction, use the client-side
-        `lib/reranking` package which handles rendering before calling this endpoint.
-      operationId: rerankPrompts
+      operationId: rerankDocuments
       requestBody:
         required: true
         content:
@@ -1604,7 +1616,7 @@ paths:
               $ref: "#/components/schemas/RerankRequest"
       responses:
         "200":
-          description: Prompts reranked successfully
+          description: Documents reranked successfully
           content:
             application/json:
               schema:
@@ -1984,6 +1996,12 @@ paths:
       description: |
         Canonical schema-driven extraction API.
 
+        schema_version 2 opts into strict mixed tasks, attributes, constrained
+        classification, record grouping and typed JointIE. Per-input schema and
+        options replace their shared values. Requests are atomic; half-open
+        offsets default to UTF-8 bytes in text parts joined by a single newline.
+        Unsupported features and text truncation fail explicitly.
+
         Image-backed extraction uses the same byte-reserving and image-count-weighted
         admission policy as `/read`, before model resolution or download. Text-only
         extraction consumes one admission unit.
@@ -2009,6 +2027,18 @@ paths:
                 $ref: "#/components/schemas/Error"
         "404":
           description: Model not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "413":
+          description: Extraction text, schema, candidate graph, or output exceeds configured limits
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "422":
+          description: Extraction constraints are infeasible, required fields are missing, or bounded search is exhausted
           content:
             application/json:
               schema:

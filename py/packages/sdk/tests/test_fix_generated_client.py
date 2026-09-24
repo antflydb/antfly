@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from fix_generated_client import FILES, NDJSON_HEADER, fix_generated_client
+from fix_generated_client import FILES, NDJSON_HEADER, NDJSON_RESPONSE, RELATIONAL_QUERY, fix_generated_client
 
 
 def write_generated_files(root: Path, signature_count: int) -> None:
@@ -11,6 +11,9 @@ def write_generated_files(root: Path, signature_count: int) -> None:
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("\n".join([NDJSON_HEADER, *([signature] * signature_count)]))
+    path = root / RELATIONAL_QUERY
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(NDJSON_RESPONSE)
 
 
 def test_required_ndjson_body_is_not_made_optional(tmp_path: Path) -> None:
@@ -22,6 +25,7 @@ def test_required_ndjson_body_is_not_made_optional(tmp_path: Path) -> None:
         source = (tmp_path / relative).read_text()
         assert source.count("body: StatefulQueryRequest | File") == 5
         assert "Unset = UNSET" not in source
+    assert (tmp_path / RELATIONAL_QUERY).read_text() == "response_200 = response.text"
 
 
 def test_generator_shape_drift_fails_before_writing(tmp_path: Path) -> None:

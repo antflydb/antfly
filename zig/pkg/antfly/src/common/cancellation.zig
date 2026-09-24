@@ -1,5 +1,16 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 //! Transport-neutral borrowed cancellation contract.
 //!
@@ -12,6 +23,10 @@ const std = @import("std");
 pub const CancellationToken = struct {
     ptr: ?*const anyopaque = null,
     is_cancelled_fn: ?*const fn (*const anyopaque) bool = null,
+    /// Optional fallible checkpoint for scoped execution (for example a
+    /// renewable publication lease). This is authoritative when supplied;
+    /// the boolean callback remains available to transport-only adapters.
+    check_fn: ?*const fn (*const anyopaque) anyerror!void = null,
 
     pub const none: CancellationToken = .{};
 
@@ -29,12 +44,19 @@ pub const CancellationToken = struct {
 
     pub fn isCancelled(self: CancellationToken) bool {
         const ptr = self.ptr orelse return false;
+        if (self.check_fn) |check_fn| {
+            check_fn(ptr) catch return true;
+            return false;
+        }
         const callback = self.is_cancelled_fn orelse return false;
         return callback(ptr);
     }
 
     pub fn check(self: CancellationToken) !void {
-        if (self.isCancelled()) return error.Canceled;
+        if (self.ptr) |ptr| if (self.check_fn) |check_fn| return check_fn(ptr);
+        if (self.ptr) |ptr| if (self.is_cancelled_fn) |callback| {
+            if (callback(ptr)) return error.Canceled;
+        };
     }
 };
 

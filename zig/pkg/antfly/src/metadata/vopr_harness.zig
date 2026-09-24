@@ -37,10 +37,10 @@ const api_distributed_graph = @import("../api/distributed_graph.zig");
 const api_operation = @import("../api/operation.zig");
 const backups_api = @import("../api/backups.zig");
 const api_table_catalog = @import("../api/table_catalog.zig");
-const api_table_reads = @import("../api/table_reads.zig");
+const api_table_reads = @import("antfly_source_root").antfly_sources.table_reads;
 const api_table_router = @import("../api/table_router.zig");
 const test_contract_helpers = @import("../api/test_contract_helpers.zig");
-const api_table_writes = @import("../api/table_writes.zig");
+const api_table_writes = @import("antfly_source_root").antfly_sources.table_writes;
 const api_tables = @import("../api/tables.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const raft_catalog = @import("../raft/catalog.zig");
@@ -63,7 +63,7 @@ const io_http_executor = @import("../common/http/io_http_executor.zig");
 const std_http_executor = @import("../raft/transport/std_http_executor.zig");
 const common_config = @import("../common/config.zig");
 const docstore_mod = @import("../storage/docstore.zig");
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = @import("antfly_source_root").antfly_sources.selected_db;
 const db_root_identity = @import("../storage/db/root_identity.zig");
 const internal_keys = @import("../storage/internal_keys.zig");
 const storage_sim = @import("../storage/sim_runtime.zig");
@@ -998,7 +998,7 @@ fn expectCountProfile(
     client_base: []const u8,
     table_name: []const u8,
     query_text: []const u8,
-    expected_total_hits: i64,
+    expected_total_hits: u64,
     expected_shards: i64,
     expected_merged: bool,
 ) !void {
@@ -1027,7 +1027,7 @@ fn expectHelloCountProfile(
     client: *api_http_client.ApiHttpClient,
     client_base: []const u8,
     table_name: []const u8,
-    expected_total_hits: i64,
+    expected_total_hits: u64,
     expected_shards: i64,
     expected_merged: bool,
 ) !void {
@@ -1039,7 +1039,7 @@ const CountProfileProgressContext = struct {
     client_base: []const u8,
     table_name: []const u8,
     query_text: []const u8,
-    expected_total_hits: i64,
+    expected_total_hits: u64,
     expected_shards: i64,
     expected_merged: bool,
 };
@@ -1060,7 +1060,7 @@ fn waitForCountProfile(
     client_base: []const u8,
     table_name: []const u8,
     query_text: []const u8,
-    expected_total_hits: i64,
+    expected_total_hits: u64,
     expected_shards: i64,
     expected_merged: bool,
     max_rounds: usize,
@@ -1082,7 +1082,7 @@ fn waitForHelloCountProfile(
     client: *api_http_client.ApiHttpClient,
     client_base: []const u8,
     table_name: []const u8,
-    expected_total_hits: i64,
+    expected_total_hits: u64,
     expected_shards: i64,
     expected_merged: bool,
     max_rounds: usize,
@@ -3972,7 +3972,7 @@ pub const MetadataHttpNodeVopr = struct {
         defer changed_indices.deinit(self.cluster.alloc);
         for (reports) |report| {
             const index = metadata_store_observer.findStoreIndex(projected, report.store_id) orelse return error.UnknownStore;
-            if (!metadata_store_observer.observationChangesRecord(projected[index], report)) continue;
+            if (!try metadata_store_observer.observationChangesRecord(self.cluster.alloc, projected[index], report)) continue;
             try changed_indices.append(self.cluster.alloc, index);
         }
 
@@ -6656,6 +6656,8 @@ pub const MetadataAdminVoprSource = struct {
         return .{
             .ptr = self,
             .vtable = &.{
+                .system_catalog = systemCatalog,
+                .catalog_identity = catalogIdentity,
                 .head = head,
                 .linearizable_head = linearizableHead,
                 .linearizable_snapshot = linearizableSnapshot,
@@ -6684,6 +6686,61 @@ pub const MetadataAdminVoprSource = struct {
                 .request_merge = requestMerge,
             },
         };
+    }
+
+    /// Model the production read protocol against the actual replicated
+    /// store. A missing capability is an upgrade failure, not a legacy read.
+    fn catalogIdentity(ptr: *anyopaque) !metadata_api.CatalogIdentity {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return .{
+            .metadata_group_id = self.node.cluster.metadata_group_id,
+            .metadata_incarnation = (try self.node.metadataIncarnation()) orelse return error.MetadataIncarnationUnavailable,
+        };
+    }
+
+    fn systemCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: @import("../system_catalog/domain.zig").Call) ![]u8 {
+        try context.ensureActive();
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (input == .mutate) return error.UnsupportedOperation;
+        const target = try authoritativePublicApiRoutingNode(self.node, .{ .deadline_ns = context.deadline_ns, .io = context.deadline_io }, null);
+        const store = target.sim().runtime.svc.host.owned_metadata_store orelse return error.MissingMetadataStore;
+        const group_id = target.cluster.metadata_group_id;
+        const result = switch (input) {
+            .write_validation_revision => try std.json.Stringify.valueAlloc(alloc, metadata_api.MetadataHead{
+                .metadata_group_id = group_id,
+                .metadata_incarnation = try target.metadataIncarnation(),
+                .metadata_epoch = try store.writeValidationRevision(group_id),
+            }, .{}),
+            .write_validation => |name| try store.tableWriteValidation(alloc, group_id, name),
+            .query_definition => |name| blk: {
+                const definition = try store.queryTableDefinition(alloc, group_id, name);
+                defer if (definition) |value| value.deinit(alloc);
+                break :blk try std.json.Stringify.valueAlloc(alloc, definition, .{});
+            },
+            .resolve => |name| blk: {
+                const value = try store.resolveSystemCatalogIdentity(alloc, group_id, name);
+                defer if (value) |record| record.deinit(alloc);
+                break :blk try std.json.Stringify.valueAlloc(alloc, value, .{});
+            },
+            .resolve_many => |request| blk: {
+                const value = try store.resolveSystemCatalogIdentities(alloc, group_id, request);
+                defer value.deinit(alloc);
+                break :blk try std.json.Stringify.valueAlloc(alloc, value, .{});
+            },
+            .snapshot => blk: {
+                var value = try store.systemCatalogSnapshot(alloc, group_id);
+                defer value.deinit();
+                break :blk try std.json.Stringify.valueAlloc(alloc, value.value, .{});
+            },
+            .export_snapshot => try store.exportSystemCatalog(alloc, group_id),
+            .read => |request| try store.systemCatalogRead(alloc, group_id, request),
+            .list_tables => |request| try store.listSystemCatalogTables(alloc, group_id, request),
+            .table_status => |request| try store.listSystemCatalogTables(alloc, group_id, request.listing()),
+            .mutate => unreachable,
+        };
+        errdefer alloc.free(result);
+        try context.ensureActive();
+        return result;
     }
 
     fn head(ptr: *anyopaque) !metadata_api.MetadataHead {
@@ -7764,6 +7821,11 @@ pub const VoprPublicClusterFixture = struct {
             .{ .resource_managers = &self.resource_managers },
             &self.api_base_uris,
         );
+        // Publish listener and cache ownership before range bootstrap can
+        // suspend while opening writers. A cutoff must be able to stop the
+        // public stack even when those writes have not finished initializing.
+        self.uri_count = node_count;
+        self.stack_live = true;
         // The hosted public stack owns the resident group writers. Retain
         // those exact writers for the real merge coordinator instead of
         // reopening live LSM roots through a parallel test-only path.
@@ -7785,8 +7847,6 @@ pub const VoprPublicClusterFixture = struct {
             .reach_fn = reachDistributedGraphLifecycle,
         };
         for (&self.read_sources) |*source| _ = source.withDistributedGraphLifecycleHook(graph_hook);
-        self.uri_count = node_count;
-        self.stack_live = true;
         self.client = api_http_client.ApiHttpClient.init(alloc, self.client_http_executor.executor());
         for (0..node_count) |index| try self.cluster.node(index).runRound();
         self.bootstrap_phase = .public_stack_ready;
@@ -8006,10 +8066,14 @@ pub const VoprPublicClusterFixture = struct {
         workflow: *metadata_table_workflow.TableWorkflow,
         ranges: []const metadata_table_manager.RangeRecord,
     ) !void {
+        // This fixture bypasses the public create API. Supply its canonical
+        // default schema before any owner creates postings, so later split
+        // admission does not install a different projection provenance.
         const docs_summary = try workflow.createTableWithRanges(&self.cluster.node(self.metadata_leader_index), .{
             .table_id = table_id,
             .name = "docs",
             .description = "full cluster VOPR documents",
+            .schema_json = api_tables.default_schema_json,
             .indexes_json = graph_indexes_json,
             .desired_replica_count = 2,
             .min_ranges = 1,
@@ -8037,6 +8101,7 @@ pub const VoprPublicClusterFixture = struct {
             .table_id = tenant_table_id,
             .name = "tenant_b_docs",
             .description = "full cluster VOPR tenant-isolation documents",
+            .schema_json = api_tables.default_schema_json,
             .indexes_json = api_tables.default_indexes_json,
             .desired_replica_count = 2,
             .min_ranges = 1,
@@ -8089,6 +8154,7 @@ pub const VoprPublicClusterFixture = struct {
             },
             .resource_pressure => {
                 try self.saturateNodeMemory();
+                self.resource_pressure_observed = self.allNodeMemorySaturated();
                 _ = self.sim.io().async(runResourcePressure, .{self});
             },
         }
@@ -8667,16 +8733,27 @@ pub const VoprPublicClusterFixture = struct {
     }
 
     fn runResourcePressure(self: *VoprPublicClusterFixture) void {
-        self.resource_pressure_observed = self.allNodeMemorySaturated();
-        if (self.client.fetchBatch(self.api_base_uris[self.client_index], "docs",
+        // Background owners can release bytes after injection. Observe the
+        // actual admission rejection, not exact occupancy at a later tick.
+        var rejections_before: u64 = 0;
+        for (self.resource_managers[0..self.resource_manager_count]) |*manager|
+            rejections_before +|= manager.snapshot().memory.hard_limit_rejections;
+        if (self.client.fetchBatchResponse(self.api_base_uris[self.client_index], "docs",
             \\{"inserts":{"pressure:probe":{"title":"pressure","body":"node-local-resource-pressure"}}}
         )) |response| {
-            var unexpected = response;
-            unexpected.deinit(self.alloc);
+            var denied = response;
+            defer denied.deinit(self.alloc);
+            var rejections_after: u64 = 0;
+            for (self.resource_managers[0..self.resource_manager_count]) |*manager|
+                rejections_after +|= manager.snapshot().memory.hard_limit_rejections;
+            self.resource_denial_sound = self.resource_pressure_observed and
+                denied.status == 503 and rejections_after > rejections_before;
+            if (!self.resource_denial_sound) std.debug.print("resource pressure status={d} body={s} injected={} rejections={d}->{d}\n", .{
+                denied.status, denied.body, self.resource_pressure_observed, rejections_before, rejections_after,
+            });
         } else |err| {
             self.resource_denial_error_code = @intFromError(err);
-            self.resource_denial_sound = self.resource_pressure_observed and
-                (err == error.LeaderUnavailable or err == error.UnexpectedHttpStatus);
+            std.debug.print("resource pressure transport error={s}\n", .{@errorName(err)});
         }
 
         self.releaseNodeMemory();
@@ -11319,7 +11396,7 @@ test "metadata VOPR http cluster serves public lifecycle from a non-host node af
     var query_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.heap.page_allocator, query.body, .{});
     defer query_responses.deinit();
     const query_result = query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 2), query_result.hits.?.total.?.value);
+    try std.testing.expectEqual(@as(u64, 2), query_result.hits.?.total.?.value);
     try std.testing.expectEqual(@as(usize, 0), query_result.hits.?.hits.?.len);
     try std.testing.expect(query_result.profile != null);
     try std.testing.expectEqual(@as(i64, 1), query_result.profile.?.object.get("shards").?.object.get("total").?.integer);
@@ -14590,12 +14667,13 @@ test "metadata VOPR http cluster survives leader restart before forced automatic
     try cluster.stepAll();
 
     try cluster.node(leader_index).requestReallocation(1);
-    try std.testing.expect((try cluster.node(leader_index).getProjectedReallocationRequest()) != null);
+    const requested = (try cluster.node(leader_index).getProjectedReallocationRequest()) orelse return error.TestExpectedEqual;
 
     try cluster.restartNode(leader_index);
     const new_leader = (try cluster.waitForMetadataLeader(32)) orelse return error.TestExpectedEqual;
 
     const request = (try cluster.node(new_leader).getProjectedReallocationRequest()) orelse return error.TestExpectedReallocationRequest;
+    try std.testing.expectEqual(requested.request_id, request.request_id);
     // Pre-request size reports cannot acknowledge a forced scan. The durable
     // request must survive restart until every placed voter observes its ID.
     const awaiting_reports = try requireLeasedReconcile(cluster.node(new_leader), &auto_loop);
@@ -15847,10 +15925,25 @@ test "metadata VOPR http cluster reconverges placement from committed node membe
 
     const reconcile_summary = try requireLeasedReconcile(cluster.node(leader_index), workflow.controlLoop());
     try std.testing.expectEqual(@as(usize, 3), reconcile_summary.placement_upserts);
-    try std.testing.expectEqual(@as(usize, 1), reconcile_summary.placement_removals);
-    try std.testing.expect(try cluster.waitForNodeGroupStatus(0, 4701, .absent, 40));
+    try std.testing.expectEqual(@as(usize, 0), reconcile_summary.placement_removals);
+    // Legacy node records provide placement candidates but no store-status
+    // channel. Reconciliation can safely expand the Raft membership and stage
+    // the source for draining, but must not retire it without store evidence.
+    try std.testing.expect(try cluster.waitForNodeGroupStatus(0, 4701, .active, 1));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(1, 4701, .active, 1));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(2, 4701, .active, 40));
+
+    const intents = try cluster.node(leader_index).listProjectedPlacementIntents(std.testing.allocator);
+    defer cluster.node(leader_index).freeProjectedPlacementIntents(std.testing.allocator, intents);
+    var saw_draining_one = false;
+    var saw_bootstrapping_three = false;
+    for (intents) |intent| {
+        if (intent.record.group_id != 4701) continue;
+        if (intent.record.local_node_id == 1 and intent.serving_state == .draining) saw_draining_one = true;
+        if (intent.record.local_node_id == 3 and intent.serving_state == .bootstrapping) saw_bootstrapping_three = true;
+    }
+    try std.testing.expect(saw_draining_one);
+    try std.testing.expect(saw_bootstrapping_three);
 
     const nodes = try cluster.node(leader_index).listProjectedNodes(std.testing.allocator);
     defer cluster.node(leader_index).freeProjectedNodes(std.testing.allocator, nodes);
@@ -15942,8 +16035,15 @@ test "metadata VOPR http cluster reconverges placement from committed live store
 
     const reconcile_summary = try requireLeasedReconcile(cluster.node(leader_index), workflow.controlLoop());
     try std.testing.expectEqual(@as(usize, 3), reconcile_summary.placement_upserts);
-    try std.testing.expectEqual(@as(usize, 1), reconcile_summary.placement_removals);
-    try std.testing.expect(try cluster.waitForNodeGroupStatus(0, 4801, .absent, 40));
+    try std.testing.expectEqual(@as(usize, 0), reconcile_summary.placement_removals);
+    try std.testing.expect(try reconcileUntilNodeGroupStatus(
+        &cluster,
+        workflow.controlLoop(),
+        0,
+        4801,
+        .absent,
+        40,
+    ));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(1, 4801, .active, 1));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(2, 4801, .active, 40));
 
@@ -16034,8 +16134,8 @@ test "metadata VOPR http cluster drains node through shutdown API" {
 
     const reconcile_summary = try requireLeasedReconcile(cluster.node(leader_index), workflow.controlLoop());
     try std.testing.expectEqual(@as(usize, 3), reconcile_summary.placement_upserts);
-    try std.testing.expectEqual(@as(usize, 1), reconcile_summary.placement_removals);
-    try std.testing.expect(try cluster.waitForNodeGroupStatus(0, 4821, .absent, 64));
+    try std.testing.expectEqual(@as(usize, 0), reconcile_summary.placement_removals);
+    try std.testing.expect(try reconcileUntilNodeGroupStatus(&cluster, workflow.controlLoop(), 0, 4821, .absent, 64));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(1, 4821, .active, 1));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(2, 4821, .active, 64));
 
@@ -16250,8 +16350,8 @@ test "metadata VOPR http cluster rebalances after store capacity churn" {
 
     const summary = try requireLeasedReconcile(cluster.node(leader_index), workflow.controlLoop());
     try std.testing.expectEqual(@as(usize, 3), summary.placement_upserts);
-    try std.testing.expectEqual(@as(usize, 1), summary.placement_removals);
-    try std.testing.expect(try cluster.waitForNodeGroupStatus(0, 5001, .absent, 40));
+    try std.testing.expectEqual(@as(usize, 0), summary.placement_removals);
+    try std.testing.expect(try reconcileUntilNodeGroupStatus(&cluster, workflow.controlLoop(), 0, 5001, .absent, 40));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(1, 5001, .active, 1));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(2, 5001, .active, 40));
 }
@@ -16347,8 +16447,8 @@ test "metadata VOPR http cluster survives leader restart after reported store st
     const new_leader = (try cluster.waitForMetadataLeader(32)) orelse return error.TestExpectedEqual;
     const summary = try requireLeasedReconcile(cluster.node(new_leader), workflow.controlLoop());
     try std.testing.expectEqual(@as(usize, 3), summary.placement_upserts);
-    try std.testing.expectEqual(@as(usize, 1), summary.placement_removals);
-    try std.testing.expect(try cluster.waitForNodeGroupStatus(0, 5201, .absent, 40));
+    try std.testing.expectEqual(@as(usize, 0), summary.placement_removals);
+    try std.testing.expect(try reconcileUntilNodeGroupStatus(&cluster, workflow.controlLoop(), 0, 5201, .absent, 40));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(1, 5201, .active, 1));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(2, 5201, .active, 40));
 }
@@ -17140,7 +17240,7 @@ test "metadata VOPR http cluster rebalances away from high lease pressure" {
 
     const summary = try requireLeasedReconcile(cluster.node(leader_index), workflow.controlLoop());
     try std.testing.expectEqual(@as(usize, 3), summary.placement_upserts);
-    try std.testing.expectEqual(@as(usize, 1), summary.placement_removals);
+    try std.testing.expectEqual(@as(usize, 0), summary.placement_removals);
     try std.testing.expectEqual(@as(usize, 0), summary.repair_placement_groups);
     try std.testing.expectEqual(@as(usize, 1), summary.rebalance_placement_groups);
     const status = try cluster.node(leader_index).metadataStatus();
@@ -17150,7 +17250,7 @@ test "metadata VOPR http cluster rebalances away from high lease pressure" {
     var admin_snapshot = try cluster.node(leader_index).adminSnapshot();
     defer cluster.node(leader_index).freeAdminSnapshot(&admin_snapshot);
     try std.testing.expectEqual(status.rebalance_placement_groups, admin_snapshot.status.rebalance_placement_groups);
-    try std.testing.expect(try cluster.waitForNodeGroupStatus(0, 5301, .absent, 40));
+    try std.testing.expect(try reconcileUntilNodeGroupStatus(&cluster, workflow.controlLoop(), 0, 5301, .absent, 40));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(1, 5301, .active, 1));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(2, 5301, .active, 40));
 }
@@ -17229,7 +17329,9 @@ test "metadata VOPR http cluster repairs replica count after store recovery" {
     try cluster.stepAll();
 
     const repair_summary = try requireLeasedReconcile(cluster.node(leader_index), workflow.controlLoop());
-    try std.testing.expectEqual(@as(usize, 2), repair_summary.placement_upserts);
+    // Adding the missing voter updates the new learner and both retained
+    // voters so every placement carries the same expanded peer set.
+    try std.testing.expectEqual(@as(usize, 3), repair_summary.placement_upserts);
     try std.testing.expectEqual(@as(usize, 0), repair_summary.placement_removals);
     try std.testing.expectEqual(@as(usize, 1), repair_summary.repair_placement_groups);
     try std.testing.expectEqual(@as(usize, 0), repair_summary.rebalance_placement_groups);
@@ -17640,7 +17742,8 @@ test "metadata VOPR http cluster rebalances one table while preserving another v
 
     const summary = try requireLeasedReconcile(cluster.node(leader_index), workflow.controlLoop());
     try std.testing.expectEqual(@as(usize, 3), summary.placement_upserts);
-    try std.testing.expectEqual(@as(usize, 1), summary.placement_removals);
+    try std.testing.expectEqual(@as(usize, 0), summary.placement_removals);
+    try std.testing.expect(try reconcileUntilNodeGroupStatus(&cluster, workflow.controlLoop(), 1, 5601, .absent, 40));
 
     const intents_after = try cluster.node(leader_index).listProjectedPlacementIntents(std.testing.allocator);
     defer cluster.node(leader_index).freeProjectedPlacementIntents(std.testing.allocator, intents_after);
@@ -17761,10 +17864,25 @@ test "metadata VOPR http cluster prefers healthy stores before degraded ones" {
 
     const summary = try requireLeasedReconcile(cluster.node(leader_index), workflow.controlLoop());
     try std.testing.expectEqual(@as(usize, 3), summary.placement_upserts);
-    try std.testing.expectEqual(@as(usize, 1), summary.placement_removals);
+    try std.testing.expectEqual(@as(usize, 0), summary.placement_removals);
+    // The degraded store is a last-resort target. It may join the expanded
+    // membership, but it cannot pass the healthy-target cutover gate, so the
+    // healthy source must remain serving until target health recovers.
     try std.testing.expect(try cluster.waitForNodeGroupStatus(0, 5801, .active, 40));
-    try std.testing.expect(try cluster.waitForNodeGroupStatus(1, 5801, .absent, 1));
+    try std.testing.expect(try cluster.waitForNodeGroupStatus(1, 5801, .active, 1));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(2, 5801, .active, 1));
+
+    const intents = try cluster.node(leader_index).listProjectedPlacementIntents(std.testing.allocator);
+    defer cluster.node(leader_index).freeProjectedPlacementIntents(std.testing.allocator, intents);
+    var saw_degraded_target = false;
+    var saw_draining_source = false;
+    for (intents) |intent| {
+        if (intent.record.group_id != 5801) continue;
+        if (intent.record.local_node_id == 1 and intent.serving_state == .bootstrapping) saw_degraded_target = true;
+        if (intent.record.local_node_id == 2 and intent.serving_state == .draining) saw_draining_source = true;
+    }
+    try std.testing.expect(saw_degraded_target);
+    try std.testing.expect(saw_draining_source);
 }
 
 test "metadata VOPR http cluster prefers cross-domain placement for a range" {
@@ -17947,7 +18065,8 @@ test "metadata VOPR http cluster mixes health domain and minimal-movement policy
 
     const summary = try requireLeasedReconcile(cluster.node(leader_index), workflow.controlLoop());
     try std.testing.expectEqual(@as(usize, 3), summary.placement_upserts);
-    try std.testing.expectEqual(@as(usize, 1), summary.placement_removals);
+    try std.testing.expectEqual(@as(usize, 0), summary.placement_removals);
+    try std.testing.expect(try reconcileUntilNodeGroupStatus(&cluster, workflow.controlLoop(), 1, 6001, .absent, 40));
 
     const intents_after = try cluster.node(leader_index).listProjectedPlacementIntents(std.testing.allocator);
     defer cluster.node(leader_index).freeProjectedPlacementIntents(std.testing.allocator, intents_after);
@@ -18105,7 +18224,8 @@ test "metadata VOPR http cluster respects table placement roles under churn" {
 
     const summary = try requireLeasedReconcile(cluster.node(leader_index), workflow.controlLoop());
     try std.testing.expectEqual(@as(usize, 3), summary.placement_upserts);
-    try std.testing.expectEqual(@as(usize, 1), summary.placement_removals);
+    try std.testing.expectEqual(@as(usize, 0), summary.placement_removals);
+    try std.testing.expect(try reconcileUntilNodeGroupStatus(&cluster, workflow.controlLoop(), 1, 6201, .absent, 40));
     {
         const intents = try cluster.node(leader_index).listProjectedPlacementIntents(std.testing.allocator);
         defer cluster.node(leader_index).freeProjectedPlacementIntents(std.testing.allocator, intents);
@@ -18315,9 +18435,9 @@ test "metadata VOPR http cluster rebalances after store class promotion and demo
 
     const summary = try requireLeasedReconcile(cluster.node(leader_index), workflow.controlLoop());
     try std.testing.expectEqual(@as(usize, 3), summary.placement_upserts);
-    try std.testing.expectEqual(@as(usize, 1), summary.placement_removals);
-    try std.testing.expect(try cluster.waitForNodeGroupStatus(0, 6501, .active, 40));
+    try std.testing.expectEqual(@as(usize, 0), summary.placement_removals);
+    try std.testing.expect(try reconcileUntilNodeGroupStatus(&cluster, workflow.controlLoop(), 3, 6501, .absent, 40));
+    try std.testing.expect(try cluster.waitForNodeGroupStatus(0, 6501, .active, 1));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(1, 6501, .active, 1));
     try std.testing.expectEqual(raft_host.HostedReplicaStatus.absent, cluster.node(2).status(6501));
-    try std.testing.expect(try cluster.waitForNodeGroupStatus(3, 6501, .absent, 40));
 }

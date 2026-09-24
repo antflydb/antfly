@@ -21,11 +21,14 @@ pub const probe_operations = @import("probe_operations.zig");
 pub const storage_maintenance_operations = @import("storage_maintenance_operations.zig");
 pub const batch = @import("batch.zig");
 pub const backups = @import("backups.zig");
+pub const restore_owner = @import("restore_owner.zig");
 pub const linear_merge = @import("linear_merge.zig");
 pub const query = @import("query.zig");
 pub const query_contract = @import("query_contract.zig");
+pub const runtime_status = @import("runtime_status.zig");
 pub const cluster_api_http = @import("cluster_api_http.zig");
 pub const retrieval_agent = @import("retrieval_agent.zig");
+pub const document_renderer = @import("document_renderer.zig");
 pub const public_table_http = @import("public_table_http.zig");
 pub const public_embedding_query = @import("public_embedding_query.zig");
 pub const public_graph_query = @import("public_graph_query.zig");
@@ -40,6 +43,7 @@ const multi_node_e2e = @import("multi_node_e2e.zig");
 pub const table_catalog = @import("table_catalog.zig");
 pub const table_router = @import("table_router.zig");
 pub const tables = @import("tables.zig");
+pub const relational_contract = @import("relational_contract.zig");
 pub const table_contract = @import("table_contract.zig");
 pub const indexes = @import("indexes.zig");
 const openapi_contract = @import("openapi_contract.zig");
@@ -47,10 +51,13 @@ pub const http_routes = @import("http_routes.zig");
 pub const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
 pub const raft_mutation_forwarding = @import("raft_mutation_forwarding.zig");
 pub const provisioned_storage = @import("provisioned_storage.zig");
-pub const table_reads = @import("table_reads.zig");
-pub const table_writes = @import("table_writes.zig");
+pub const table_reads = @import("antfly_source_root").antfly_sources.table_reads;
+pub const table_writes = @import("antfly_source_root").antfly_sources.table_writes;
+pub const kernel_owner_source = @import("kernel_owner_source.zig");
+pub const storage_maintenance_source = @import("storage_maintenance_source.zig");
 pub const distributed_candidate_source = @import("distributed_candidate_source.zig");
 pub const distributed_entity_sink = @import("distributed_entity_sink.zig");
+pub const join_planning = @import("join_planning.zig");
 pub const distributed_join = @import("distributed_join.zig");
 pub const distributed_graph = @import("distributed_graph.zig");
 pub const artifact_reprocess_jobs = @import("artifact_reprocess_jobs.zig");
@@ -60,6 +67,7 @@ pub const contextual_operations = @import("contextual_operations.zig");
 pub const internal_join_operations = @import("internal_join_operations.zig");
 pub const internal_repair_operations = @import("internal_repair_operations.zig");
 pub const restore_jobs = @import("restore_jobs.zig");
+pub const relational_rewrite_driver = @import("relational_rewrite_driver.zig");
 pub const internal_query_operations = @import("internal_query_operations.zig");
 pub const internal_transition_wire = @import("internal_transition_wire.zig");
 pub const http_server = @import("http_server.zig");
@@ -91,6 +99,7 @@ pub const TableWriteSource = table_writes.TableWriteSource;
 pub const BoundTableWriteSource = table_writes.BoundTableWriteSource;
 pub const ProvisionedTableWriteCache = table_writes.ProvisionedTableWriteCache;
 pub const ProvisionedTableWriteSource = table_writes.ProvisionedTableWriteSource;
+pub const ProvisionedKernelOwnerSource = kernel_owner_source.ProvisionedKernelOwnerSource;
 pub const HostedProvisionedTableWriteSource = table_writes.HostedProvisionedTableWriteSource;
 pub const HostedGroupRouter = table_router.HostedGroupRouter;
 pub const ApiHttpServer = kernel_bridge.ApiHttpServer;
@@ -98,6 +107,7 @@ pub const ApiHttpClient = http_client.ApiHttpClient;
 
 test "api restore jobs module compiles" {
     _ = restore_jobs;
+    _ = relational_rewrite_driver;
 }
 
 test "api query contract preserves filter-only query string filters" {
@@ -243,6 +253,7 @@ test "api module compiles" {
     _ = table_catalog;
     _ = table_router;
     _ = tables;
+    _ = relational_contract;
     _ = table_contract;
     _ = indexes;
     _ = openapi_contract;
@@ -329,7 +340,7 @@ test "public graph result_ref fail-closed guards are covered" {
 }
 
 test "api table reads reject distributed resolved doc filters" {
-    const db_mod = @import("../storage/db/mod.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.selected_db;
 
     var sentinel: u8 = 0;
     var req: db_mod.types.SearchRequest = .{
@@ -463,7 +474,7 @@ test "api public table query rejects only top-level internal fields" {
 
 test "api query contract tensor program envelope preserves dictionary identity" {
     const alloc = std.testing.allocator;
-    const algebraic = @import("../storage/db/mod.zig").algebraic;
+    const algebraic = @import("antfly_source_root").antfly_sources.selected_db.algebraic;
     const dictionary = algebraic.lexical.DictionaryIdentity.analyzedText("docs", "body", "default");
     const input_expr = algebraic.ir.TensorExpr{
         .fragment = .automaton_select,

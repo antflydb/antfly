@@ -21,6 +21,8 @@ const Allocator = std.mem.Allocator;
 pub const Provider = openapi.EmbedderProvider;
 pub const OpenApiConfig = openapi.EmbedderConfig;
 
+pub const openrouter_default_url = "https://openrouter.ai/api/v1";
+
 const RetrievalCapabilities = struct {
     legacy_input_type: bool = false,
     role_input_types: bool = false,
@@ -43,6 +45,60 @@ fn retrievalCapabilities(provider: Provider, model: []const u8, request_format: 
     };
 }
 
+/// Input types an embedding model accepts. Configuration sets this only to
+/// override discovered capabilities; see `Config.inputs`.
+pub const Inputs = struct {
+    text: bool = false,
+    image: bool = false,
+    audio: bool = false,
+
+    pub fn hasMedia(self: Inputs) bool {
+        return self.image or self.audio;
+    }
+
+    fn fromNames(input_names: []const []const u8) !Inputs {
+        if (input_names.len == 0) return error.InvalidEmbedderConfig;
+        var inputs = Inputs{};
+        for (input_names) |name| {
+            const slot: *bool = if (std.mem.eql(u8, name, "text"))
+                &inputs.text
+            else if (std.mem.eql(u8, name, "image"))
+                &inputs.image
+            else if (std.mem.eql(u8, name, "audio"))
+                &inputs.audio
+            else
+                return error.InvalidEmbedderConfig;
+            if (slot.*) return error.InvalidEmbedderConfig;
+            slot.* = true;
+        }
+        return inputs;
+    }
+
+    pub fn subsetOf(self: Inputs, other: Inputs) bool {
+        return (!self.text or other.text) and (!self.image or other.image) and (!self.audio or other.audio);
+    }
+
+    fn index(self: Inputs) usize {
+        return @as(usize, @intFromBool(self.text)) | @as(usize, @intFromBool(self.image)) << 1 | @as(usize, @intFromBool(self.audio)) << 2;
+    }
+
+    /// Canonical names in a fixed order, borrowed from static storage.
+    fn names(self: Inputs) []const []const u8 {
+        const table = comptime blk: {
+            var out: [8][]const []const u8 = undefined;
+            for (0..8) |bits| {
+                var list: []const []const u8 = &.{};
+                if (bits & 1 != 0) list = list ++ &[_][]const u8{"text"};
+                if (bits & 2 != 0) list = list ++ &[_][]const u8{"image"};
+                if (bits & 4 != 0) list = list ++ &[_][]const u8{"audio"};
+                out[bits] = list;
+            }
+            break :blk out;
+        };
+        return table[self.index()];
+    }
+};
+
 pub const Config = struct {
     rate_limit: ?openapi.RateLimitConfig = null,
     provider: Provider,
@@ -63,7 +119,10 @@ pub const Config = struct {
     truncate: []const u8 = "",
     batch_size: ?u32 = null,
     strip_new_lines: ?bool = null,
-    multimodal: bool = false,
+    /// Declared input types. Null means "use the model's discovered
+    /// capabilities"; a value replaces them, for models Antfly cannot
+    /// discover yet.
+    inputs: ?Inputs = null,
 
     pub fn clone(self: Config, alloc: Allocator) !Config {
         return .{
@@ -86,7 +145,7 @@ pub const Config = struct {
             .truncate = if (self.truncate.len > 0) try alloc.dupe(u8, self.truncate) else "",
             .batch_size = self.batch_size,
             .strip_new_lines = self.strip_new_lines,
-            .multimodal = self.multimodal,
+            .inputs = self.inputs,
         };
     }
 
@@ -125,6 +184,16 @@ pub const Config = struct {
         if (self.batch_size) |batch_size| {
             if (batch_size == 0) return error.InvalidEmbedderConfig;
         }
+        if (self.inputs) |inputs| {
+            // Only adapters that can carry media may declare it; the others
+            // would otherwise drop images or audio without a trace.
+            const allowed: Inputs = switch (self.provider) {
+                .antfly => .{ .text = true, .image = true, .audio = true },
+                .bedrock => .{ .text = true, .image = true },
+                else => .{ .text = true },
+            };
+            if (!inputs.subsetOf(allowed)) return error.InvalidEmbedderConfig;
+        }
         const capabilities = retrievalCapabilities(self.provider, self.model, self.request_format);
         if (!capabilities.legacy_input_type and self.input_type.len > 0)
             return error.UnsupportedEmbeddingRetrievalConfig;
@@ -139,6 +208,7 @@ pub const Config = struct {
         if (self.url.len > 0) return self.url;
         return switch (self.provider) {
             .openai => "https://api.openai.com",
+            .openrouter => openrouter_default_url,
             .ollama => "http://127.0.0.1:11434",
             .antfly => "http://127.0.0.1:8082",
             else => "",
@@ -212,7 +282,7 @@ pub fn configFromOpenApi(alloc: Allocator, generated: openapi.EmbedderConfig) !C
         else
             null,
         .strip_new_lines = generated.strip_new_lines,
-        .multimodal = generated.multimodal orelse false,
+        .inputs = if (generated.inputs) |input_names| try Inputs.fromNames(input_names) else null,
     };
     errdefer cfg.deinit(alloc);
     try cfg.validate();
@@ -251,7 +321,7 @@ pub fn openApiFromConfig(cfg: Config) openapi.EmbedderConfig {
         .truncate = if (cfg.truncate.len > 0) cfg.truncate else null,
         .batch_size = if (cfg.batch_size) |batch_size| batch_size else null,
         .strip_new_lines = cfg.strip_new_lines,
-        .multimodal = if (cfg.multimodal) true else null,
+        .inputs = if (cfg.inputs) |inputs| inputs.names() else null,
     };
 }
 
@@ -282,6 +352,41 @@ fn validBedrockRequestFormat(value: []const u8) bool {
         std.mem.eql(u8, value, "titan_multimodal") or
         std.mem.eql(u8, value, "cohere_v3") or
         std.mem.eql(u8, value, "cohere_v4");
+}
+
+test "embedder inputs override parses, validates per provider, and round trips" {
+    const alloc = std.testing.allocator;
+    var cfg = try parseConfigFromSlice(alloc,
+        \\{"provider":"antfly","model":"future","inputs":["image","text"]}
+    );
+    defer cfg.deinit(alloc);
+    try cfg.validate();
+    try std.testing.expect(cfg.inputs.?.text and cfg.inputs.?.image and !cfg.inputs.?.audio);
+    try std.testing.expect(cfg.inputs.?.hasMedia());
+    const encoded = try stringifyAlloc(alloc, cfg);
+    defer alloc.free(encoded);
+    // Serialized in canonical order.
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"inputs\":[\"text\",\"image\"]") != null);
+
+    var absent = try parseConfigFromSlice(alloc, "{\"provider\":\"antfly\",\"model\":\"m\"}");
+    defer absent.deinit(alloc);
+    try std.testing.expect(absent.inputs == null);
+
+    var bedrock = try parseConfigFromSlice(alloc, "{\"provider\":\"bedrock\",\"model\":\"m\",\"inputs\":[\"text\",\"image\"]}");
+    defer bedrock.deinit(alloc);
+    try bedrock.validate();
+    try std.testing.expectError(error.InvalidEmbedderConfig, parseConfigFromSlice(alloc, "{\"provider\":\"bedrock\",\"model\":\"m\",\"inputs\":[\"audio\"]}"));
+    // A text-only adapter must not silently drop declared media.
+    try std.testing.expectError(error.InvalidEmbedderConfig, parseConfigFromSlice(alloc, "{\"provider\":\"openai\",\"model\":\"m\",\"inputs\":[\"text\",\"image\"]}"));
+    var openai_text = try parseConfigFromSlice(alloc, "{\"provider\":\"openai\",\"model\":\"m\",\"inputs\":[\"text\"]}");
+    defer openai_text.deinit(alloc);
+    try openai_text.validate();
+
+    for ([_][]const u8{
+        "{\"provider\":\"antfly\",\"inputs\":[]}",
+        "{\"provider\":\"antfly\",\"inputs\":[\"text\",\"text\"]}",
+        "{\"provider\":\"antfly\",\"inputs\":[\"video\"]}",
+    }) |raw| try std.testing.expectError(error.InvalidEmbedderConfig, parseConfigFromSlice(alloc, raw));
 }
 
 test "embedder config round trip" {

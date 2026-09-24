@@ -19,7 +19,7 @@ const current_domain = "antfly-document-unit-fingerprint-v2";
 // Adding extraction metadata is a persisted-format change: update the encoder,
 // assign a new stable tag, and bump the fingerprint version deliberately.
 comptime {
-    if (@typeInfo(document_extraction.Unit).@"struct".fields.len != 32) {
+    if (@typeInfo(document_extraction.Unit).@"struct".fields.len != 33) {
         @compileError("document_extraction.Unit changed; update and version document_unit_fingerprint");
     }
 }
@@ -57,6 +57,7 @@ const Field = enum(u8) {
     text_regions = 30,
     char_start = 31,
     char_end = 32,
+    transcript_spans = 33,
 };
 
 /// Computes the current document-unit fingerprint without constructing an
@@ -97,6 +98,11 @@ pub fn fingerprintAlloc(alloc: Allocator, unit: document_extraction.Unit) ![]u8 
     hashTaggedOptionalBbox(&hasher, .page_bbox, unit.page_bbox);
     hashTaggedOptionalI32(&hasher, .page_rotation, unit.page_rotation);
     hashTaggedTextRegions(&hasher, unit.text_regions);
+    // Transcript timing joined the format after v2 shipped. The tag is
+    // written only when spans exist, so every unit without them (all
+    // non-audio units, and audio units transcribed before timing was kept)
+    // keeps the digest it already has and is not re-materialized.
+    if (unit.transcript_spans.len > 0) hashTaggedTranscriptSpans(&hasher, unit.transcript_spans);
     hashTaggedOptionalU32(&hasher, .char_start, unit.char_start);
     hashTaggedOptionalU32(&hasher, .char_end, unit.char_end);
 
@@ -196,6 +202,154 @@ pub fn legacyFingerprintAlloc(alloc: Allocator, unit: document_extraction.Unit) 
     var digest: [Sha256.digest_length]u8 = undefined;
     hasher.final(&digest);
     return try prefixedLowerHexAlloc(alloc, "", &digest);
+}
+
+/// Reconstructs the legacy digest from a stored unit that predates the
+/// persisted `duf2:` marker. Kept in this contract module so control-side
+/// projection validation does not import the physical DB implementation.
+pub fn storedPayloadLegacyFingerprintAlloc(alloc: Allocator, stored: []const u8) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var parsed = try std.json.parseFromSlice(std.json.Value, scratch, stored, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidDocumentExtractionState;
+    const object = parsed.value.object;
+    const provenance_value = object.get("provenance") orelse return error.InvalidDocumentExtractionState;
+    if (provenance_value != .object) return error.InvalidDocumentExtractionState;
+    const provenance = provenance_value.object;
+
+    const unit = document_extraction.Unit{
+        .unit_id = @constCast(try requiredString(object, "unit_id")),
+        .unit_type = @constCast(try requiredString(object, "unit_type")),
+        .text = @constCast(try requiredString(object, "text")),
+        .method = @constCast(try requiredString(provenance, "method")),
+        .source_path = if (try optionalString(object, "source_path")) |value| @constCast(value) else null,
+        .extraction_status = if (try optionalString(object, "extraction_status")) |value| @constCast(value) else null,
+        .source_sha256 = if (try optionalString(object, "source_sha256")) |value| @constCast(value) else null,
+        .byte_length = try optionalInteger(u64, object, "byte_length"),
+        .ocr_used = try requiredBool(provenance, "ocr_used"),
+        .ocr_attempted = try requiredBool(object, "ocr_attempted"),
+        .ocr_render_dpi = try optionalInteger(u16, object, "ocr_render_dpi"),
+        .ocr_effective_render_dpi = try optionalInteger(u16, object, "ocr_effective_render_dpi"),
+        .ocr_rendered_width = try optionalInteger(u32, object, "ocr_rendered_width"),
+        .ocr_rendered_height = try optionalInteger(u32, object, "ocr_rendered_height"),
+        .ocr_rendered_bytes = try optionalInteger(u64, object, "ocr_rendered_bytes"),
+        .ocr_failure_stage = if (try optionalString(object, "ocr_failure_stage")) |value| @constCast(value) else null,
+        .ocr_failure_retryable = try optionalBool(object, "ocr_failure_retryable"),
+        .ocr_trigger_reasons = if (try optionalString(object, "ocr_trigger_reasons")) |value| @constCast(value) else null,
+        .ocr_embedded_quality = if (try optionalString(object, "ocr_embedded_quality")) |value| @constCast(value) else null,
+        .ocr_output_quality = if (try optionalString(object, "ocr_output_quality")) |value| @constCast(value) else null,
+        .ocr_confidence = try optionalFloat(object, "ocr_confidence"),
+        .ocr_bbox = try optionalBbox(object, "ocr_bbox"),
+        .transcript_used = try requiredBool(provenance, "transcript_used"),
+        .transcript_confidence = try optionalFloat(object, "transcript_confidence"),
+        .extraction_warning = if (try optionalString(object, "extraction_warning")) |value| @constCast(value) else null,
+        .page_number = try optionalInteger(u32, provenance, "page_number"),
+        .page_label = if (try optionalString(provenance, "page_label")) |value| @constCast(value) else null,
+        .page_bbox = try optionalBbox(provenance, "page_bbox"),
+        .page_rotation = try optionalInteger(i32, provenance, "page_rotation"),
+        .text_regions = try textRegionsAlloc(scratch, provenance.get("text_regions")),
+        .char_start = try optionalInteger(u32, provenance, "char_start"),
+        .char_end = try optionalInteger(u32, provenance, "char_end"),
+    };
+    return try legacyFingerprintAlloc(alloc, unit);
+}
+
+fn requiredString(object: std.json.ObjectMap, name: []const u8) ![]const u8 {
+    return (try optionalString(object, name)) orelse error.InvalidDocumentExtractionState;
+}
+
+fn optionalString(object: std.json.ObjectMap, name: []const u8) !?[]const u8 {
+    const value = object.get(name) orelse return null;
+    return switch (value) {
+        .null => null,
+        .string => |text| text,
+        else => error.InvalidDocumentExtractionState,
+    };
+}
+
+fn requiredBool(object: std.json.ObjectMap, name: []const u8) !bool {
+    return (try optionalBool(object, name)) orelse error.InvalidDocumentExtractionState;
+}
+
+fn optionalBool(object: std.json.ObjectMap, name: []const u8) !?bool {
+    const value = object.get(name) orelse return null;
+    return switch (value) {
+        .null => null,
+        .bool => |boolean| boolean,
+        else => error.InvalidDocumentExtractionState,
+    };
+}
+
+fn optionalInteger(comptime T: type, object: std.json.ObjectMap, name: []const u8) !?T {
+    const value = object.get(name) orelse return null;
+    return switch (value) {
+        .null => null,
+        .integer => |integer| std.math.cast(T, integer) orelse error.InvalidDocumentExtractionState,
+        .number_string => |text| std.fmt.parseInt(T, text, 10) catch error.InvalidDocumentExtractionState,
+        else => error.InvalidDocumentExtractionState,
+    };
+}
+
+fn optionalFloat(object: std.json.ObjectMap, name: []const u8) !?f64 {
+    const value = object.get(name) orelse return null;
+    return switch (value) {
+        .null => null,
+        .integer => |integer| @floatFromInt(integer),
+        .float => |float| if (std.math.isFinite(float)) float else error.InvalidDocumentExtractionState,
+        .number_string => |text| blk: {
+            const parsed = std.fmt.parseFloat(f64, text) catch return error.InvalidDocumentExtractionState;
+            if (!std.math.isFinite(parsed)) return error.InvalidDocumentExtractionState;
+            break :blk parsed;
+        },
+        else => error.InvalidDocumentExtractionState,
+    };
+}
+
+fn optionalBbox(object: std.json.ObjectMap, name: []const u8) !?[4]f64 {
+    const value = object.get(name) orelse return null;
+    if (value == .null) return null;
+    if (value != .array or value.array.items.len != 4) return error.InvalidDocumentExtractionState;
+    var bbox: [4]f64 = undefined;
+    for (value.array.items, 0..) |coordinate, i| {
+        bbox[i] = switch (coordinate) {
+            .integer => |integer| @floatFromInt(integer),
+            .float => |float| if (std.math.isFinite(float)) float else return error.InvalidDocumentExtractionState,
+            .number_string => |text| std.fmt.parseFloat(f64, text) catch return error.InvalidDocumentExtractionState,
+            else => return error.InvalidDocumentExtractionState,
+        };
+        if (!std.math.isFinite(bbox[i])) return error.InvalidDocumentExtractionState;
+    }
+    return bbox;
+}
+
+fn textRegionsAlloc(alloc: Allocator, value: ?std.json.Value) ![]document_extraction.TextRegion {
+    const regions_value = value orelse return &.{};
+    if (regions_value == .null) return &.{};
+    if (regions_value != .array) return error.InvalidDocumentExtractionState;
+    const regions = try alloc.alloc(document_extraction.TextRegion, regions_value.array.items.len);
+    for (regions_value.array.items, 0..) |item, i| {
+        if (item != .object) return error.InvalidDocumentExtractionState;
+        const span_value = item.object.get("span") orelse return error.InvalidDocumentExtractionState;
+        if (span_value != .array or span_value.array.items.len != 2) return error.InvalidDocumentExtractionState;
+        regions[i] = .{
+            .span = .{
+                try integerValue(u32, span_value.array.items[0]),
+                try integerValue(u32, span_value.array.items[1]),
+            },
+            .bbox = (try optionalBbox(item.object, "bbox")) orelse return error.InvalidDocumentExtractionState,
+        };
+    }
+    return regions;
+}
+
+fn integerValue(comptime T: type, value: std.json.Value) !T {
+    return switch (value) {
+        .integer => |integer| std.math.cast(T, integer) orelse error.InvalidDocumentExtractionState,
+        .number_string => |text| std.fmt.parseInt(T, text, 10) catch error.InvalidDocumentExtractionState,
+        else => error.InvalidDocumentExtractionState,
+    };
 }
 
 pub fn isCurrent(fingerprint: []const u8) bool {
@@ -309,6 +463,20 @@ fn hashTaggedTextRegions(hasher: *Sha256, regions: []const document_extraction.T
     }
 }
 
+fn hashTaggedTranscriptSpans(hasher: *Sha256, spans: []const document_extraction.TranscriptSpan) void {
+    hashField(hasher, .transcript_spans);
+    hashU64(hasher, @intCast(spans.len));
+    for (spans) |span| {
+        hashU64(hasher, span.char_start);
+        hashU64(hasher, span.char_end);
+        hashU64(hasher, span.start_ms);
+        hashU64(hasher, span.end_ms);
+        // Turning diarization on changes what the artifact says, so it has
+        // to change the fingerprint too or the unit is never re-enriched.
+        hashU64(hasher, if (span.speaker_index) |index| @as(u64, index) + 1 else 0);
+    }
+}
+
 fn hashU64(hasher: *Sha256, value: u64) void {
     var encoded: [@sizeOf(u64)]u8 = undefined;
     std.mem.writeInt(u64, &encoded, value, .big);
@@ -387,4 +555,33 @@ test "document unit fingerprint state version rejects legacy encodings" {
     try std.testing.expect(!stateVersionIsCurrent(.{ .integer = 1 }));
     try std.testing.expect(stateVersionIsCurrent(.{ .integer = current_state_version }));
     try std.testing.expect(!stateVersionIsCurrent(.{ .string = "2" }));
+}
+
+test "document unit fingerprint folds transcript spans in only when present" {
+    const alloc = std.testing.allocator;
+    const base = document_extraction.Unit{
+        .unit_id = @constCast("audio:000001"),
+        .unit_type = @constCast("audio"),
+        .text = @constCast("hello there"),
+        .method = @constCast("transcription"),
+        .transcript_used = true,
+    };
+    var spans = [_]document_extraction.TranscriptSpan{
+        .{ .char_start = 0, .char_end = 11, .start_ms = 0, .end_ms = 800 },
+    };
+    var timed = base;
+    timed.transcript_spans = &spans;
+
+    // A unit without spans keeps the digest it had before timing existed,
+    // so previously materialized audio is not rebuilt on upgrade.
+    const untimed_fingerprint = try fingerprintAlloc(alloc, base);
+    defer alloc.free(untimed_fingerprint);
+    const timed_fingerprint = try fingerprintAlloc(alloc, timed);
+    defer alloc.free(timed_fingerprint);
+    try std.testing.expect(!std.mem.eql(u8, untimed_fingerprint, timed_fingerprint));
+
+    spans[0].end_ms = 900;
+    const moved_fingerprint = try fingerprintAlloc(alloc, timed);
+    defer alloc.free(moved_fingerprint);
+    try std.testing.expect(!std.mem.eql(u8, timed_fingerprint, moved_fingerprint));
 }

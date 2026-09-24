@@ -1,3 +1,17 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use pgrx::prelude::*;
 use pgrx::trigger_support::PgTriggerOperation;
 use std::num::NonZero;
@@ -8,10 +22,10 @@ use std::num::NonZero;
 ///   CREATE TRIGGER sync_to_antfly
 ///     AFTER INSERT OR UPDATE OR DELETE ON my_table
 ///     FOR EACH ROW
-///     EXECUTE FUNCTION antfly_sync_trigger('http://localhost:8080/api/v1/', 'my_table', 'id');
+///     EXECUTE FUNCTION antfly_sync_trigger('http://localhost:8080/db/v1/', 'my_table', 'id');
 ///
 /// Arguments:
-///   1. base_url  - Antfly server URL (including /api/v1/ prefix)
+///   1. base_url  - Antfly server URL (including /db/v1/ prefix)
 ///   2. table     - Target Antfly table name
 ///   3. id_column - Column to use as the document ID (default: "id")
 #[pg_trigger]

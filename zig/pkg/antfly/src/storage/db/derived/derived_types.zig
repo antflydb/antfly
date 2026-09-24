@@ -14,8 +14,8 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const types = @import("../types.zig");
 const enrichment_types = @import("../enrichment/enrichment_types.zig");
+const graph_edge_types = @import("../graph_edge_types.zig");
 
 pub const DerivedAction = enum {
     upsert,
@@ -81,8 +81,8 @@ pub const DerivedBatch = struct {
     dense_embeddings: []const DerivedDenseEmbeddingWrite = &.{},
     sparse_embeddings: []const DerivedSparseEmbeddingWrite = &.{},
     generated_enrichment_refs: []const enrichment_types.GeneratedEnrichmentRef = &.{},
-    graph_writes: []const types.GraphEdgeWrite = &.{},
-    graph_deletes: []const types.GraphEdgeDelete = &.{},
+    graph_writes: []const graph_edge_types.GraphEdgeWrite = &.{},
+    graph_deletes: []const graph_edge_types.GraphEdgeDelete = &.{},
 };
 
 pub const DerivedLogRecord = struct {
@@ -135,19 +135,21 @@ pub fn deinitDerivedSparseEmbedding(alloc: Allocator, embedding: DerivedSparseEm
     if (embedding.values.len > 0) alloc.free(embedding.values);
 }
 
-pub fn deinitDerivedGraphWrite(alloc: Allocator, write: types.GraphEdgeWrite) void {
+pub fn deinitDerivedGraphWrite(alloc: Allocator, write: graph_edge_types.GraphEdgeWrite) void {
     alloc.free(@constCast(write.index_name));
     alloc.free(@constCast(write.source));
     alloc.free(@constCast(write.target));
     alloc.free(@constCast(write.edge_type));
     if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
+    if (write.owner.len > 0) alloc.free(@constCast(write.owner));
 }
 
-pub fn deinitDerivedGraphDelete(alloc: Allocator, delete: types.GraphEdgeDelete) void {
+pub fn deinitDerivedGraphDelete(alloc: Allocator, delete: graph_edge_types.GraphEdgeDelete) void {
     alloc.free(@constCast(delete.index_name));
     alloc.free(@constCast(delete.source));
     alloc.free(@constCast(delete.target));
     alloc.free(@constCast(delete.edge_type));
+    if (delete.owner.len > 0) alloc.free(@constCast(delete.owner));
 }
 
 fn cloneDerivedTargetRefs(alloc: Allocator, targets: []const DerivedTargetRef) ![]DerivedTargetRef {
@@ -241,7 +243,7 @@ pub fn cloneDerivedSparseEmbedding(
     };
 }
 
-pub fn cloneDerivedGraphWrite(alloc: Allocator, write: types.GraphEdgeWrite) !types.GraphEdgeWrite {
+pub fn cloneDerivedGraphWrite(alloc: Allocator, write: graph_edge_types.GraphEdgeWrite) !graph_edge_types.GraphEdgeWrite {
     const index_name = try alloc.dupe(u8, write.index_name);
     errdefer alloc.free(index_name);
     const source = try alloc.dupe(u8, write.source);
@@ -254,6 +256,8 @@ pub fn cloneDerivedGraphWrite(alloc: Allocator, write: types.GraphEdgeWrite) !ty
         try alloc.dupe(u8, write.metadata_json)
     else
         "";
+    errdefer if (metadata_json.len > 0) alloc.free(metadata_json);
+    const owner = if (write.owner.len > 0) try alloc.dupe(u8, write.owner) else "";
     return .{
         .index_name = index_name,
         .source = source,
@@ -263,10 +267,11 @@ pub fn cloneDerivedGraphWrite(alloc: Allocator, write: types.GraphEdgeWrite) !ty
         .created_at = write.created_at,
         .updated_at = write.updated_at,
         .metadata_json = metadata_json,
+        .owner = owner,
     };
 }
 
-pub fn cloneDerivedGraphDelete(alloc: Allocator, delete: types.GraphEdgeDelete) !types.GraphEdgeDelete {
+pub fn cloneDerivedGraphDelete(alloc: Allocator, delete: graph_edge_types.GraphEdgeDelete) !graph_edge_types.GraphEdgeDelete {
     const index_name = try alloc.dupe(u8, delete.index_name);
     errdefer alloc.free(index_name);
     const source = try alloc.dupe(u8, delete.source);
@@ -274,11 +279,14 @@ pub fn cloneDerivedGraphDelete(alloc: Allocator, delete: types.GraphEdgeDelete) 
     const target = try alloc.dupe(u8, delete.target);
     errdefer alloc.free(target);
     const edge_type = try alloc.dupe(u8, delete.edge_type);
+    errdefer alloc.free(edge_type);
+    const owner = if (delete.owner.len > 0) try alloc.dupe(u8, delete.owner) else "";
     return .{
         .index_name = index_name,
         .source = source,
         .target = target,
         .edge_type = edge_type,
+        .owner = owner,
     };
 }
 
@@ -400,7 +408,7 @@ pub fn cloneBatch(alloc: Allocator, batch: DerivedBatch) !DerivedBatch {
     const generated_enrichment_refs = try enrichment_types.cloneGeneratedRefs(alloc, batch.generated_enrichment_refs);
     errdefer enrichment_types.deinitGeneratedRefs(alloc, generated_enrichment_refs);
 
-    var graph_writes = try alloc.alloc(types.GraphEdgeWrite, batch.graph_writes.len);
+    var graph_writes = try alloc.alloc(graph_edge_types.GraphEdgeWrite, batch.graph_writes.len);
     var initialized_graph_writes: usize = 0;
     errdefer {
         for (graph_writes[0..initialized_graph_writes]) |write|
@@ -412,7 +420,7 @@ pub fn cloneBatch(alloc: Allocator, batch: DerivedBatch) !DerivedBatch {
         initialized_graph_writes += 1;
     }
 
-    var graph_deletes = try alloc.alloc(types.GraphEdgeDelete, batch.graph_deletes.len);
+    var graph_deletes = try alloc.alloc(graph_edge_types.GraphEdgeDelete, batch.graph_deletes.len);
     var initialized_graph_deletes: usize = 0;
     errdefer {
         for (graph_deletes[0..initialized_graph_deletes]) |delete|
@@ -440,7 +448,10 @@ pub fn cloneBatch(alloc: Allocator, batch: DerivedBatch) !DerivedBatch {
 }
 
 const binary_magic = "ADLG";
-const binary_version: u16 = 5;
+// v6 adds the graph mutation owner (entity-sourced relations,
+// zig/AUTOSCHEMA.md); older records decode with an empty owner, the legacy
+// source-is-owner shape.
+const binary_version: u16 = 6;
 const min_supported_binary_version: u16 = 2;
 
 pub fn encodeLogRecord(alloc: Allocator, batch: DerivedBatch) ![]u8 {
@@ -518,6 +529,7 @@ pub fn encodeLogRecordInto(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), b
         try appendInt(out, alloc, u64, write.created_at);
         try appendInt(out, alloc, u64, write.updated_at);
         try writeBytes(out, alloc, write.metadata_json);
+        try writeBytes(out, alloc, write.owner);
     }
 
     try appendInt(out, alloc, u32, @intCast(batch.graph_deletes.len));
@@ -526,6 +538,7 @@ pub fn encodeLogRecordInto(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), b
         try writeBytes(out, alloc, delete.source);
         try writeBytes(out, alloc, delete.target);
         try writeBytes(out, alloc, delete.edge_type);
+        try writeBytes(out, alloc, delete.owner);
     }
 
     return out.items;
@@ -813,7 +826,7 @@ fn decodeBinaryLogRecord(alloc: Allocator, payload: []const u8) !DecodedLogRecor
     batch.generated_enrichment_refs = generated_enrichment_refs;
 
     const graph_write_count = try reader.readInt(u32);
-    const graph_writes = try alloc.alloc(types.GraphEdgeWrite, graph_write_count);
+    const graph_writes = try alloc.alloc(graph_edge_types.GraphEdgeWrite, graph_write_count);
     errdefer alloc.free(graph_writes);
     var initialized_graph_writes: usize = 0;
     errdefer {
@@ -823,6 +836,7 @@ fn decodeBinaryLogRecord(alloc: Allocator, payload: []const u8) !DecodedLogRecor
             alloc.free(write.target);
             alloc.free(write.edge_type);
             if (write.metadata_json.len > 0) alloc.free(write.metadata_json);
+            if (write.owner.len > 0) alloc.free(write.owner);
         }
     }
     for (graph_writes) |*write| {
@@ -835,13 +849,14 @@ fn decodeBinaryLogRecord(alloc: Allocator, payload: []const u8) !DecodedLogRecor
             .created_at = try reader.readInt(u64),
             .updated_at = try reader.readInt(u64),
             .metadata_json = try reader.readBytesOrEmpty(alloc),
+            .owner = if (version >= 6) try reader.readBytesOrEmpty(alloc) else "",
         };
         initialized_graph_writes += 1;
     }
     batch.graph_writes = graph_writes;
 
     const graph_delete_count = try reader.readInt(u32);
-    const graph_deletes = try alloc.alloc(types.GraphEdgeDelete, graph_delete_count);
+    const graph_deletes = try alloc.alloc(graph_edge_types.GraphEdgeDelete, graph_delete_count);
     errdefer alloc.free(graph_deletes);
     var initialized_graph_deletes: usize = 0;
     errdefer {
@@ -850,6 +865,7 @@ fn decodeBinaryLogRecord(alloc: Allocator, payload: []const u8) !DecodedLogRecor
             alloc.free(delete.source);
             alloc.free(delete.target);
             alloc.free(delete.edge_type);
+            if (delete.owner.len > 0) alloc.free(delete.owner);
         }
     }
     for (graph_deletes) |*delete| {
@@ -858,6 +874,7 @@ fn decodeBinaryLogRecord(alloc: Allocator, payload: []const u8) !DecodedLogRecor
             .source = try reader.readBytesAlloc(alloc),
             .target = try reader.readBytesAlloc(alloc),
             .edge_type = try reader.readBytesAlloc(alloc),
+            .owner = if (version >= 6) try reader.readBytesOrEmpty(alloc) else "",
         };
         initialized_graph_deletes += 1;
     }
@@ -911,9 +928,11 @@ test "derived log record binary round trips" {
         },
         .graph_writes = &.{
             .{ .index_name = "gr_v1", .source = "doc:a", .target = "doc:b", .edge_type = "cites", .weight = 2.0 },
+            .{ .index_name = "gr_v1", .source = "person/ada", .owner = "doc:a", .target = "org/antfly", .edge_type = "works_at" },
         },
         .graph_deletes = &.{
             .{ .index_name = "gr_v1", .source = "doc:b", .target = "doc:c", .edge_type = "replies" },
+            .{ .index_name = "gr_v1", .source = "person/ada", .owner = "doc:a", .target = "event/x", .edge_type = "participates_in" },
         },
     });
     defer alloc.free(payload);
@@ -937,6 +956,21 @@ test "derived log record binary round trips" {
     try std.testing.expectEqualStrings("body_chunks_v1", decoded.batch.generated_enrichment_refs[0].artifact_name);
     try std.testing.expectEqual(@as(f64, 2.0), decoded.batch.graph_writes[0].weight);
     try std.testing.expectEqualStrings("replies", decoded.batch.graph_deletes[0].edge_type);
+    // Entity-sourced mutations round-trip owner alongside the topological
+    // source (v6); legacy-shaped mutations keep an empty owner.
+    try std.testing.expectEqual(@as(usize, 0), decoded.batch.graph_writes[0].owner.len);
+    try std.testing.expectEqualStrings("person/ada", decoded.batch.graph_writes[1].source);
+    try std.testing.expectEqualStrings("doc:a", decoded.batch.graph_writes[1].owner);
+    try std.testing.expectEqual(@as(usize, 0), decoded.batch.graph_deletes[0].owner.len);
+    try std.testing.expectEqualStrings("person/ada", decoded.batch.graph_deletes[1].source);
+    try std.testing.expectEqualStrings("doc:a", decoded.batch.graph_deletes[1].owner);
+
+    // The clone path preserves owner too (the derived-batch clone previously
+    // dropped it, collapsing entity-sourced mutations back to their source).
+    var cloned = try cloneBatch(std.testing.allocator, decoded.batch);
+    defer deinitDerivedBatch(std.testing.allocator, &cloned);
+    try std.testing.expectEqualStrings("doc:a", cloned.graph_writes[1].owner);
+    try std.testing.expectEqualStrings("doc:a", cloned.graph_deletes[1].owner);
 }
 
 test "derived log record decodes legacy json payloads" {

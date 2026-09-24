@@ -24,7 +24,7 @@ antfly agents retrieval --table help \
   --reranker '{"provider": "antfly", "model": "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0",
                "field": "content", "candidate_count": 50}' \
   --pruner '{"min_score_ratio": 0.6, "max_score_gap_percent": 40}' \
-  --generator '{"provider": "ollama", "model": "gemma3:4b"}' \
+  --generator '{"provider": "ollama", "model": "gemma3:4b-it-qat"}' \
   --no-streaming --generate
 ```
 
@@ -58,7 +58,7 @@ Antfly running in standalone mode with the embedding and reranking models pulled
 curl -s http://127.0.0.1:8080/db/v1/status | head -c 200
 antfly inference pull hf:Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1 --tasks embed
 antfly inference pull hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0 --tasks rerank
-ollama pull gemma3:4b
+ollama pull gemma3:4b-it-qat
 ```
 
 ## Build It
@@ -148,7 +148,7 @@ antfly agents retrieval --table help \
   --pruner '{"min_score_ratio": 0.6, "max_score_gap_percent": 40}' \
   --generator '{
     "provider": "ollama",
-    "model": "gemma3:4b"
+    "model": "gemma3:4b-it-qat"
   }' \
   --no-streaming --generate
 ```
@@ -176,11 +176,11 @@ curl -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
     }],
     "generator": {
       "provider": "ollama",
-      "model": "gemma3:4b"
+      "model": "gemma3:4b-it-qat"
     },
     "stream": false,
     "steps": {
-      "generation": {"enabled": true}
+      "generation": {}
     }
   }'
 ```
@@ -189,7 +189,7 @@ curl -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
 
 The response carries `generation`, the answer in markdown with the article ids it drew on, and `hits`, the articles that survived pruning. Render the answer, link the hits as sources. Streaming is the default: drop `"stream": false` (or `--no-streaming`) and the answer arrives as server-sent events instead of one JSON body.
 
-The generator here is Ollama on the same machine. Gemini, Vertex, OpenAI, and Antfly Inference work the same way; the [Quickstart](/docs/guides/quickstart#rag-with-alternative-providers) shows each config.
+The generator here is Ollama on the same machine. Gemini, Vertex, OpenAI, OpenRouter, and Antfly Inference work the same way; the [Quickstart](/docs/guides/quickstart#rag-with-alternative-providers) shows each config.
 
 ## Tradeoffs
 

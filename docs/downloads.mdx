@@ -25,7 +25,7 @@ Or pin a specific version:
 curl -fsSL https://releases.antfly.io/antfly/latest/install.sh | sh -s -- {ANTFLY_VERSION}
 ```
 
-On macOS you can also use Homebrew:
+On macOS or Linux you can also use Homebrew:
 
 ```bash
 brew install antflydb/taps/antfly
@@ -115,7 +115,7 @@ export PATH=$PATH:$(pwd)
 tar -xzf antfly_{ANTFLY_VERSION}_Linux_x86_64.tar.gz
 ```
 
-For ARM64, use `Linux_arm64` instead.
+For ARM64, use `Linux_arm64` instead. The unsuffixed archives are portable, CPU-only musl builds. Use the `_gnu` archives (glibc 2.28 or newer) for CUDA and for the `libantfly` C ABI that the Lite bindings load.
 
 ### Make the binaries executable
 
@@ -145,7 +145,7 @@ Run a single node with Docker Compose, with the public API on port 8080 and data
 services:
   antfly:
     image: ghcr.io/antflydb/antfly:latest
-    command: ["standalone", "--host", "0.0.0.0"]
+    command: ["standalone", "--host", "0.0.0.0", "--data-dir", "/antflydb"]
     ports:
       - "8080:8080" # Public API
     volumes:

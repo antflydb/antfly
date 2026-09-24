@@ -30,7 +30,9 @@ Antfly supports three explicit multimodal workflows:
    into a media part with `remoteMedia`, and the model embeds that part directly.
 2. **Application-managed descriptions** run OCR, captioning, or transcription
    before the write. Store the resulting text in a document field and use any
-   managed text embedder supported for index creation.
+   managed text embedder supported for index creation. For recordings, the
+   `transcriber` enrichment does this inside Antfly and keeps the timing; see
+   [Index Recorded Calls and Podcasts](/docs/guides/transcription).
 3. **Application-managed vectors** create an `external: true` embeddings index
    and write vectors through `_embeddings`. This is the escape hatch for a model
    or provider that Antfly's managed indexing runtime does not execute.
@@ -49,8 +51,26 @@ ClipClap embeds text, images, and audio into one vector space. Install it once:
 antfly inference pull antflydb/clipclap:gguf:Q4_K
 ```
 
-Restart `antfly standalone` if the running inference service does not discover
-the newly installed model.
+The running service discovers the newly installed model on its next model-list
+or inference request; no restart is needed.
+
+Antfly learns which inputs a model accepts from its capabilities, which Antfly
+inference publishes for every model it serves, so the index needs no extra
+setting to embed images or audio. For a model whose capabilities Antfly cannot
+discover yet, such as one a provider released after your Antfly version,
+declare them on the embedder:
+
+```json
+"embedder": {
+  "provider": "antfly",
+  "model": "some-new-multimodal-model",
+  "inputs": ["text", "image"]
+}
+```
+
+`inputs` replaces the discovered input types. Only the `antfly` (`image`,
+`audio`) and `bedrock` (`image`) providers accept media inputs; other providers
+reject them instead of silently dropping media.
 
 ### Define the Source Field
 
@@ -147,6 +167,37 @@ curl -X POST http://127.0.0.1:8080/db/v1/query \
 For an inline data URI, use `{{media url=this}}` instead. Avoid logging or
 persisting large data URIs in query histories.
 
+### Rerank with Images
+
+A reranker `template` accepts the same `media` and `remoteMedia` helpers as an
+embedding template. Each candidate is then sent to the reranker as its text
+plus its images, so a multimodal reranker can score page scans and product
+photos directly:
+
+```bash
+curl -X POST http://127.0.0.1:8080/db/v1/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "table": "product_catalog",
+    "semantic_search": "brown leather jacket with zipper",
+    "indexes": ["visual_search"],
+    "reranker": {
+      "provider": "antfly",
+      "model": "vidore/colqwen2-v1.0",
+      "template": "{{name}}{{#if image_url}}{{remoteMedia url=image_url}}{{/if}}",
+      "candidate_count": 50
+    },
+    "limit": 10
+  }'
+```
+
+The model must accept images: a ColQwen-style late-interaction reranker or
+the qualified Qwen3-VL reranker bundle. A text-only reranker, a Cohere or
+Vertex reranker, or a remote inference server older than this feature rejects
+the query with a `400` instead of silently dropping the images. Candidates
+whose template renders no image are scored on their text. Image fetches follow
+the same content security policy as embedding templates.
+
 ## Precomputed Descriptions for Text Retrieval
 
 If users search for detailed attributes that a joint embedding model does not
@@ -199,9 +250,8 @@ application owns provider retries, batching, and vector-space consistency;
 Antfly owns storage and retrieval. Do not mix vectors from different models or
 model revisions in one index.
 
-Managed index creation accepts `antfly`, `ollama`, `openai`, and `bedrock`.
-Provider names exposed by broader embedding APIs are not automatically valid
-for managed indexing.
+Managed index creation accepts `antfly`, `ollama`, `openai`, `openrouter`,
+`cohere`, `gemini`, `vertex`, and `bedrock`.
 
 ## Durable PDF Ingestion
 

@@ -38,6 +38,7 @@ import base64
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import shutil
@@ -62,6 +63,27 @@ pytest_plugins = ("e2e_scheduler",)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ANTFLY_BIN = REPO_ROOT / "zig-out" / "bin" / "antfly"
+
+
+def publication_retry_delay(
+    response: requests.Response | None, interval_s: float
+) -> float | None:
+    """Retry only explicit publication contention, never arbitrary server errors.
+
+    The current runtime emits Retry-After delta-seconds for temporary authority
+    failures. A 503 without that signal (e.g. missing source resolution) needs
+    intervention. This policy must not be applied to document mutation POSTs.
+    """
+    if response is None:
+        return None
+    if response.status_code == 409:
+        return interval_s
+    if response.status_code != 503:
+        return None
+    retry_after = response.headers.get("Retry-After", "").strip()
+    if not re.fullmatch(r"[0-9]+", retry_after):
+        return None
+    return max(interval_s, float(retry_after))
 
 
 def finish_create_table(api, table_name: str, response, *, timeout_s: float = 30.0):
@@ -92,6 +114,33 @@ def finish_create_table(api, table_name: str, response, *, timeout_s: float = 30
     raise AssertionError(
         f"Committed table create did not become visible: {table_name}: {last}"
     )
+
+
+def annotate_metadata_table_names(
+    snapshot: dict[str, Any], public_api_urls: list[str], *, timeout_s: float = 1.0
+) -> dict[str, Any]:
+    """Join public labels to physical metadata by immutable ID for diagnostics.
+
+    Keep ``name`` untouched: internal mutation routes must use storage names.
+    Polling callers retry if public catalog visibility is temporarily behind.
+    """
+    if not any(
+        str(table.get("name", "")).startswith("table:")
+        for table in snapshot.get("tables", [])
+    ):
+        return snapshot
+    for base in public_api_urls:
+        try:
+            response = requests.get(base.rstrip("/") + "/tables", timeout=timeout_s)
+            response.raise_for_status()
+            names = {int(table["table_id"]): table["name"] for table in response.json()}
+            for table in snapshot.get("tables", []):
+                if int(table.get("table_id", 0)) in names:
+                    table["logical_name"] = names[int(table["table_id"])]
+            return snapshot
+        except (requests.RequestException, ValueError, KeyError, TypeError):
+            continue
+    return snapshot
 
 
 E2E_BACKUP_CONNECTION = "e2e-backups"
@@ -645,7 +694,11 @@ def ready_serverless_build_status(status: dict[str, Any]) -> dict[str, Any] | No
 
 
 def _wait_for_restore_job(
-    get_job: Callable[[str], Any], accepted: dict[str, Any], *, timeout_s: float = 120.0
+    get_job: Callable[[str], Any],
+    accepted: dict[str, Any],
+    *,
+    timeout_s: float = 120.0,
+    debug_logs: Callable[[], str] | None = None,
 ) -> dict[str, Any]:
     job_id = accepted.get("job_id")
     if not isinstance(job_id, str) or not job_id:
@@ -661,11 +714,13 @@ def _wait_for_restore_job(
             return result if isinstance(result, dict) else job
         if phase in {"failed", "cancelled"}:
             raise AssertionError(
-                f"restore job {job_id} ended in {phase}: {job.get('error')}"
+                f"restore job {job_id} ended in {phase}: {job.get('error')}\n"
+                f"{debug_logs() if debug_logs else ''}"
             )
         if time.monotonic() >= deadline:
             raise AssertionError(
-                f"restore job {job_id} did not complete within {timeout_s}s: {job}"
+                f"restore job {job_id} did not complete within {timeout_s}s: {job}\n"
+                f"{_bounded_failure_log_tail(debug_logs()) if debug_logs else ''}"
             )
         time.sleep(0.1)
 
@@ -2437,12 +2492,12 @@ def serverless_api(serverless_runtime):
                 raise requests.HTTPError(message, response=response)
             return response.json()
 
-        def get(self, path: str) -> dict:
-            return self._check(self.s.get(f"{self.url}{path}", timeout=10))
+        def get(self, path: str, *, timeout_s: float = 10.0) -> dict:
+            return self._check(self.s.get(f"{self.url}{path}", timeout=timeout_s))
 
-        def post(self, path: str, payload: dict) -> dict:
+        def post(self, path: str, payload: dict, *, timeout_s: float = 10.0) -> dict:
             return self._check(
-                self.s.post(f"{self.url}{path}", json=payload, timeout=10)
+                self.s.post(f"{self.url}{path}", json=payload, timeout=timeout_s)
             )
 
         def put(self, path: str, payload: dict) -> dict:
@@ -2540,28 +2595,37 @@ def serverless_api(serverless_runtime):
         def build_table(
             self, table_name: str, *, timeout_s: float = 10.0, interval_s: float = 0.1
         ) -> dict:
+            if not math.isfinite(timeout_s) or timeout_s <= 0:
+                raise ValueError("publication timeout must be finite and positive")
+            if not math.isfinite(interval_s) or interval_s <= 0:
+                raise ValueError("publication interval must be finite and positive")
             deadline = time.monotonic() + timeout_s
             while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"Publication deadline expired: {table_name}")
                 try:
                     return self.post(
-                        antfly_internal_api_path(f"/tables/{table_name}/build"), {}
+                        antfly_internal_api_path(f"/tables/{table_name}/build"),
+                        {},
+                        timeout_s=min(10.0, remaining),
                     )
                 except requests.HTTPError as exc:
-                    response = exc.response
-                    retryable_build_race = response is not None and (
-                        response.status_code == 409
-                        or (
-                            response.status_code == 500
-                            and response.text.strip() == "build failed"
-                        )
-                    )
-                    if not retryable_build_race or time.monotonic() >= deadline:
+                    delay = publication_retry_delay(exc.response, interval_s)
+                    # Never retry earlier than requested or give each attempt
+                    # a fresh timeout. Preserve the last HTTP error on expiry.
+                    if delay is None or delay >= deadline - time.monotonic():
                         raise
-                    time.sleep(interval_s)
+                    time.sleep(delay)
+                    if time.monotonic() >= deadline:
+                        raise
 
-        def table_build_status(self, table_name: str) -> dict:
+        def table_build_status(
+            self, table_name: str, *, timeout_s: float = 10.0
+        ) -> dict:
             return self.get(
-                antfly_internal_api_path(f"/tables/{table_name}/build-status")
+                antfly_internal_api_path(f"/tables/{table_name}/build-status"),
+                timeout_s=timeout_s,
             )
 
         def batch_table(
@@ -2905,7 +2969,8 @@ def stateful_api(request: pytest.FixtureRequest):
                 raise AssertionError(
                     "artifact corruption is only available for locally managed stateful servers"
                 )
-            internal_url = f"{server.url}{antfly_internal_api_path(f'/tables/{table_name}/corrupt-embedding-artifact')}"
+            encoded_name = quote(table_name, safe="")
+            internal_url = f"{server.url}{antfly_internal_api_path(f'/tables/{encoded_name}/corrupt-embedding-artifact')}"
             try:
                 with self._request_lock:
                     self._check(
@@ -2913,6 +2978,7 @@ def stateful_api(request: pytest.FixtureRequest):
                             internal_url,
                             headers=internal_service_headers(),
                             json={
+                                "logical_table": True,
                                 "doc_key": doc_key,
                                 "index_name": index_name,
                             },
@@ -3109,12 +3175,19 @@ def stateful_api(request: pytest.FixtureRequest):
                         timeout=120,
                     )
                 accepted = self._check(response)
-                return _wait_for_restore_job(self.get, accepted)
+                return _wait_for_restore_job(
+                    self.get, accepted, debug_logs=self.debug_logs
+                )
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
         def cluster_backup(
-            self, *, backup_id: str, location: str, table_names: list[str] | None = None
+            self,
+            *,
+            backup_id: str,
+            location: str,
+            table_names: list[str] | None = None,
+            backup_format: str | None = None,
         ) -> dict:
             payload: dict[str, object] = {
                 "backup_id": backup_id,
@@ -3123,6 +3196,8 @@ def stateful_api(request: pytest.FixtureRequest):
             }
             if table_names is not None:
                 payload["table_names"] = table_names
+            if backup_format is not None:
+                payload["format"] = backup_format
             try:
                 with self._request_lock:
                     return self._check(
@@ -3153,7 +3228,9 @@ def stateful_api(request: pytest.FixtureRequest):
                     accepted = self._check(
                         self.s.post(f"{self.url}/restore", json=payload, timeout=120)
                     )
-                return _wait_for_restore_job(self.get, accepted)
+                return _wait_for_restore_job(
+                    self.get, accepted, debug_logs=self.debug_logs
+                )
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
@@ -3338,7 +3415,7 @@ def stateful_api(request: pytest.FixtureRequest):
                 "POST", f"/transactions/{transaction_id}/commit", payload or None
             )
             if response.status_code not in (200, 409):
-                response.raise_for_status()
+                self._check(response)
             return response.status_code, self._decode(response)
 
         def abort_transaction_session(self, transaction_id: str) -> dict:
@@ -3370,11 +3447,6 @@ def stateful_api(request: pytest.FixtureRequest):
 
         def delete_index(self, table_name: str, index_name: str) -> dict:
             return self.delete(f"/tables/{table_name}/indexes/{index_name}")
-
-        def debug_logs(self) -> str:
-            if self._server is None:
-                return ""
-            return self._server.debug_logs().strip()
 
     api = PublicApi(session, base, server)
     yield api
@@ -3537,8 +3609,16 @@ def backup_api(request: pytest.FixtureRequest):
             num_shards: int = 1,
             description: str | None = None,
             indexes: dict[str, dict] | None = None,
+            storage: dict[str, str] | None = None,
         ) -> dict:
-            payload: dict[str, object] = {"num_shards": num_shards}
+            # Backup qualification still requires primary ownership until
+            # snapshots preserve source-vector reference closure.
+            payload: dict[str, object] = {
+                "num_shards": num_shards,
+                "storage": storage
+                if storage is not None
+                else {"dense_embeddings": "primary_lsm"},
+            }
             if description is not None:
                 payload["description"] = description
             if indexes is not None:
@@ -3728,12 +3808,19 @@ def backup_api(request: pytest.FixtureRequest):
                         timeout=120,
                     )
                 accepted = self._check(response)
-                return _wait_for_restore_job(self.get, accepted)
+                return _wait_for_restore_job(
+                    self.get, accepted, debug_logs=self.debug_logs
+                )
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
         def cluster_backup(
-            self, *, backup_id: str, location: str, table_names: list[str] | None = None
+            self,
+            *,
+            backup_id: str,
+            location: str,
+            table_names: list[str] | None = None,
+            backup_format: str | None = None,
         ) -> dict:
             payload: dict[str, object] = {
                 "backup_id": backup_id,
@@ -3742,6 +3829,8 @@ def backup_api(request: pytest.FixtureRequest):
             }
             if table_names is not None:
                 payload["table_names"] = table_names
+            if backup_format is not None:
+                payload["format"] = backup_format
             try:
                 with self._request_lock:
                     return self._check(
@@ -3772,7 +3861,9 @@ def backup_api(request: pytest.FixtureRequest):
                     accepted = self._check(
                         self.s.post(f"{self.url}/restore", json=payload, timeout=120)
                     )
-                return _wait_for_restore_job(self.get, accepted)
+                return _wait_for_restore_job(
+                    self.get, accepted, debug_logs=self.debug_logs
+                )
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
@@ -3864,20 +3955,30 @@ def table_api(request):
             if self.backend == "stateful":
                 return None
             deadline = time.monotonic() + timeout_s
-            while True:
+            while (remaining := deadline - time.monotonic()) > 0:
                 try:
-                    self.raw.build_table(table_name)
+                    self.raw.build_table(
+                        table_name, timeout_s=remaining, interval_s=interval_s
+                    )
                 except requests.HTTPError as exc:
-                    assert exc.response is not None
-                    if exc.response.status_code != 409:
+                    if publication_retry_delay(exc.response, interval_s) is None:
                         raise
-                status = self.raw.table_build_status(table_name)
+                    # The inner retry loop has exhausted this same deadline
+                    # (or Retry-After exceeds it). Do not restart its budget.
+                    return None
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                status = self.raw.table_build_status(
+                    table_name, timeout_s=min(10.0, remaining)
+                )
                 ready = ready_serverless_build_status(status)
                 if ready is not None:
                     return ready
                 if time.monotonic() >= deadline:
                     return None
-                time.sleep(interval_s)
+                time.sleep(max(0.0, min(interval_s, deadline - time.monotonic())))
+            return None
 
         def query_table(self, table_name: str, payload: dict) -> dict:
             if self.backend == "serverless":

@@ -80,6 +80,8 @@ const Builder = ml.graph.Builder;
 const NodeId = ml.graph.NodeId;
 
 const deberta_config = @import("../models/deberta.zig");
+const deberta_arch = @import("deberta.zig");
+const eager_head = @import("gliner_head.zig");
 
 /// Configuration for the GLiNER2 head graph.  Mirrors the runtime
 /// `gliner_head.zig` parameters and reuses `deberta_config.Config`'s
@@ -874,7 +876,9 @@ pub const PreparedInputs = struct {
 /// Pre-process the raw GLiNER inputs into the index tensors and
 /// zero-init buffers the graph expects to be bound to placeholders.
 /// Mirrors the index-derivation logic in `gliner_head.forward` /
-/// `forwardCt`.
+/// `forwardCt` for a single sample. The current graph binding has one label
+/// set, so batched execution must use runHeadGraph/runFullGraph, which select
+/// the contextual eager path. The low-level autodiff builders are unchanged.
 pub fn prepGlinerInputs(
     allocator: std.mem.Allocator,
     input_ids: []const i64,
@@ -898,6 +902,8 @@ pub fn prepGlinerInputsWithLabelMarkers(
     H: u32,
     label_markers: LabelMarkerTokens,
 ) !PreparedInputs {
+    if (batch > 1) return error.BatchedGlinerGraphPreparationUnsupported;
+    try validateRuntimeInputs(input_ids, words_mask, span_idx, batch, seq_len, H);
     // 1. Walk words_mask once to derive num_words + count valid tokens.
     var max_word_id: i64 = 0;
     var num_valid: usize = 0;
@@ -926,8 +932,7 @@ pub fn prepGlinerInputsWithLabelMarkers(
     }
 
     // 3. Label positions: token offsets where input_ids is a GLiNER label marker.
-    //    Eager `extractLabelEmbeddings` only checks the first batch item
-    //    (labels are shared across batch); we follow that.
+    //    This preparation API is deliberately restricted to one sample.
     var label_pos: std.ArrayListUnmanaged(i64) = .empty;
     errdefer label_pos.deinit(allocator);
     for (0..seq_len) |t| {
@@ -1017,7 +1022,9 @@ const ops_mod = @import("../ops/ops.zig");
 const ComputeBackend = ops_mod.ComputeBackend;
 const CT = ops_mod.CT;
 
-/// Result of `runHeadGraph`.  Owns the logits buffer; caller frees.
+/// Result of `runHeadGraph`. Owns the logits buffer; caller frees.
+/// num_words and num_spans are totals across the batch. runFullGraph uses
+/// the same field layout with per-sample counts for Session output shaping.
 pub const HeadGraphResult = struct {
     logits: []f32, // [num_spans, num_labels]
     num_words: u32,
@@ -1027,6 +1034,64 @@ pub const HeadGraphResult = struct {
 
 pub const FullGraphResult = HeadGraphResult;
 
+fn validateRuntimeInputs(
+    input_ids: []const i64,
+    words_mask: []const i64,
+    span_idx: []const i64,
+    batch: usize,
+    seq_len: usize,
+    hidden_size: u32,
+) !void {
+    if (batch == 0 or seq_len == 0 or hidden_size == 0) return error.UnexpectedInputShape;
+    const tokens = std.math.mul(usize, batch, seq_len) catch return error.UnexpectedInputShape;
+    const span_row = std.math.mul(usize, batch, 2) catch return error.UnexpectedInputShape;
+    if (input_ids.len != tokens or words_mask.len != tokens or span_idx.len % span_row != 0)
+        return error.UnexpectedInputShape;
+}
+
+fn useContextualEagerBatch(config: Config, batch: usize) !bool {
+    if (batch <= 1) return false;
+    // The eager runtime implements the published head geometry. Do not
+    // silently discard custom graph-only transformer settings on fallback.
+    const defaults = Config{ .hidden_size = config.hidden_size, .entity_token_id = config.entity_token_id };
+    if (config.downscaled_dim != defaults.downscaled_dim or
+        config.downscaled_ffn_dim != defaults.downscaled_ffn_dim or
+        config.downscaled_num_layers != defaults.downscaled_num_layers or
+        config.downscaled_num_heads != defaults.downscaled_num_heads)
+        return error.UnsupportedBatchedGlinerGraphConfig;
+    return true;
+}
+
+fn runContextualEagerHead(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden_ct: CT,
+    input_ids: []const i64,
+    words_mask: []const i64,
+    span_idx: []const i64,
+    batch: usize,
+    seq_len: usize,
+) !HeadGraphResult {
+    try cb.checkExecutionControl();
+    const result = try eager_head.forwardCtWithLabelMarkers(cb, allocator, hidden_ct, input_ids, words_mask, span_idx, batch, seq_len, config.hidden_size, .{
+        .classification = config.classification_token_id,
+        .entity = config.entity_token_id,
+        .relation = config.relation_token_id,
+    });
+    defer cb.free(result.logits);
+    const words = std.math.mul(usize, batch, result.num_words) catch return error.UnexpectedInputShape;
+    const num_words = std.math.cast(u32, words) orelse return error.UnexpectedInputShape;
+    // Public graph callers may supply a sparse span list, not a rectangular
+    // word-by-width grid. Input validation already checked complete pairs.
+    const num_spans = std.math.cast(u32, span_idx.len / 2) orelse return error.UnexpectedInputShape;
+    const num_labels = std.math.cast(u32, result.num_labels) orelse return error.UnexpectedInputShape;
+    const logits = try cb.toFloat32(result.logits, allocator);
+    errdefer allocator.free(logits);
+    try cb.checkExecutionControl();
+    return .{ .logits = logits, .num_words = num_words, .num_spans = num_spans, .num_labels = num_labels };
+}
+
 /// Run the GLiNER head as a graph against the supplied encoder hidden
 /// state.  Builds the graph, binds the placeholders the prep helpers
 /// produce, executes via the interpreter, and converts the logits back
@@ -1035,6 +1100,8 @@ pub const FullGraphResult = HeadGraphResult;
 /// Returns logits as `[num_spans, num_labels]` -- callers reshape to
 /// the user-facing `[batch, num_words, max_width, num_labels]` Tensor
 /// shape themselves (same as the eager `forward` path).
+/// Batches use the eager head so label attention stays within each sample;
+/// this entrypoint does not claim graph execution for batch > 1.
 pub fn runHeadGraph(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -1046,6 +1113,10 @@ pub fn runHeadGraph(
     batch: usize,
     seq_len: usize,
 ) !HeadGraphResult {
+    try cb.checkExecutionControl();
+    try validateRuntimeInputs(input_ids, words_mask, span_idx, batch, seq_len, config.hidden_size);
+    if (try useContextualEagerBatch(config, batch))
+        return runContextualEagerHead(cb, allocator, config, hidden_ct, input_ids, words_mask, span_idx, batch, seq_len);
     var prep = try prepGlinerInputsWithLabelMarkers(allocator, input_ids, words_mask, span_idx, batch, seq_len, config.hidden_size, LabelMarkerTokens.fromConfig(config));
     errdefer prep.deinit(allocator);
 
@@ -1196,6 +1267,10 @@ pub fn runHeadGraph(
 /// Run the full GLiNER encoder + head as one graph-runtime execution.
 /// The graph still receives dynamic token/mask/index buffers as runtime
 /// inputs, while all model weights resolve through the active backend.
+/// For batch > 1, use one eager batched encoder and the contextual eager head.
+/// The requested graph strategy is not used for that explicit fallback.
+/// Required compilation rejects rather than permitting an eager fallback.
+/// Returned word/span counts are per sample, including padded word slots.
 pub fn runFullGraph(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -1209,6 +1284,20 @@ pub fn runFullGraph(
     seq_len: usize,
     strategy: graph_runtime.Strategy,
 ) !FullGraphResult {
+    try cb.checkExecutionControl();
+    try validateRuntimeInputs(input_ids, words_mask, span_idx, batch, seq_len, head_cfg.hidden_size);
+    if (attention_mask.len != input_ids.len or deberta_cfg.hidden_size != head_cfg.hidden_size)
+        return error.UnexpectedInputShape;
+    if (try useContextualEagerBatch(head_cfg, batch)) {
+        if (strategy == .compiled_required) return error.UnsupportedBatchedGlinerGraphStrategy;
+        cb.preferEagerQuantMirrors(true);
+        const hidden = try deberta_arch.forwardCt(cb, allocator, deberta_cfg, input_ids, attention_mask, batch, seq_len, true);
+        defer cb.free(hidden);
+        var result = try runContextualEagerHead(cb, allocator, head_cfg, hidden, input_ids, words_mask, span_idx, batch, seq_len);
+        result.num_words = @intCast(@as(usize, result.num_words) / batch);
+        result.num_spans = @intCast(@as(usize, result.num_spans) / batch);
+        return result;
+    }
     var prep = try prepGlinerInputsWithLabelMarkers(allocator, input_ids, words_mask, span_idx, batch, seq_len, head_cfg.hidden_size, LabelMarkerTokens.fromConfig(head_cfg));
     errdefer prep.deinit(allocator);
 
@@ -1464,4 +1553,194 @@ test "prepGlinerInputs accepts GLiNER classification and relation markers" {
 
     try std.testing.expectEqual(@as(u32, 3), prep.num_labels);
     try std.testing.expectEqualSlices(i64, &.{ 0, 2, 4 }, prep.label_positions);
+}
+
+const BatchRouteProbe = struct {
+    const native = @import("../ops/native_compute.zig");
+    var expected_ids: []const i64 = &.{};
+    var expected_mask: []const i64 = &.{};
+    var expected_words: []const i64 = &.{};
+    var expected_hidden: []const f32 = &.{};
+    var encoder_calls: usize = 0;
+    var head_calls: usize = 0;
+    var weight_calls: usize = 0;
+    var stop_at_encoder: bool = true;
+
+    fn reset() void {
+        encoder_calls = 0;
+        head_calls = 0;
+        weight_calls = 0;
+        stop_at_encoder = true;
+    }
+
+    fn weight(ctx: *anyopaque, _: []const u8) anyerror!CT {
+        weight_calls += 1;
+        const compute: *native.NativeCompute = @ptrCast(@alignCast(ctx));
+        return compute.computeBackend().fromFloat32Shape(&.{ 1, 1 }, &.{2});
+    }
+
+    fn encoder(ctx: *anyopaque, request: *const ops_mod.DebertaEmbeddingsRequest) anyerror!?CT {
+        encoder_calls += 1;
+        try std.testing.expectEqual(@as(usize, 8), request.total);
+        try std.testing.expectEqual(@as(usize, 2), request.hidden_size);
+        try std.testing.expectEqualSlices(i64, expected_ids, request.input_ids);
+        try std.testing.expectEqualSlices(i64, expected_mask, request.attention_mask);
+        if (stop_at_encoder) return error.GraphBatchEncoderObserved;
+        const compute: *native.NativeCompute = @ptrCast(@alignCast(ctx));
+        return compute.computeBackend().fromFloat32Shape(expected_hidden, &.{ 8, 2 });
+    }
+
+    fn relative(ctx: *anyopaque, request: *const ops_mod.DebertaRelativeEmbeddingRequest) anyerror!?CT {
+        const compute: *native.NativeCompute = @ptrCast(@alignCast(ctx));
+        const data = try compute.allocator.alloc(f32, request.bucket_ids.len * request.hidden_size);
+        defer compute.allocator.free(data);
+        @memset(data, 0);
+        return compute.computeBackend().fromFloat32Shape(data, &.{ @intCast(request.bucket_ids.len), @intCast(request.hidden_size) });
+    }
+
+    fn head(ctx: *anyopaque, request: *const ops_mod.GlinerWordEmbeddingsRequest) anyerror!?CT {
+        head_calls += 1;
+        try std.testing.expectEqual(@as(usize, 2), request.batch);
+        try std.testing.expectEqual(@as(usize, 4), request.seq_len);
+        try std.testing.expectEqualSlices(i64, expected_words, request.words_mask);
+        const compute: *native.NativeCompute = @ptrCast(@alignCast(ctx));
+        const hidden = try compute.computeBackend().toFloat32(request.hidden, compute.allocator);
+        defer compute.allocator.free(hidden);
+        try std.testing.expectEqualSlices(f32, expected_hidden, hidden);
+        return error.GraphBatchHeadObserved;
+    }
+
+    fn cancelled(_: ?*anyopaque) anyerror!void {
+        return error.Cancelled;
+    }
+};
+
+test "GLiNER graph batch public routes preserve distinct ragged rows and cancellation" {
+    const a = std.testing.allocator;
+    var store = BatchRouteProbe.native.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer store.deinitOwned();
+    var compute = BatchRouteProbe.native.NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    var cb = compute.computeBackend();
+    var vtable = cb.vtable.*;
+    vtable.getWeight = BatchRouteProbe.weight;
+    vtable.debertaEmbeddings = BatchRouteProbe.encoder;
+    vtable.glinerWordEmbeddings = BatchRouteProbe.head;
+    cb.vtable = &vtable;
+    const config = Config{ .hidden_size = 2, .entity_token_id = 51, .classification_token_id = 52, .relation_token_id = 53 };
+    const encoder_config = deberta_config.Config{ .hidden_size = 2, .num_attention_heads = 1, .num_hidden_layers = 0 };
+    const ids = [_]i64{ 51, 52, 53, 11, 51, 52, 53, 21 };
+    const mask = [_]i64{ 1, 1, 1, 1, 1, 1, 1, 0 };
+    const words = [_]i64{ 0, 0, 0, 1, 0, 0, 0, 0 };
+    const hidden = [_]f32{ 1, 0, 0, 1, 1, 1, 3, 4, 2, 0, 0, 3, 2, 3, 0, 0 };
+    const reversed_ids = ids[4..].* ++ ids[0..4].*;
+    const reversed_mask = mask[4..].* ++ mask[0..4].*;
+    const reversed_words = words[4..].* ++ words[0..4].*;
+    const reversed_hidden = hidden[8..].* ++ hidden[0..8].*;
+    const spans = [_]i64{ 0, 0, 0, 0 };
+    for ([_]bool{ false, true }) |reversed| {
+        BatchRouteProbe.expected_ids = if (reversed) &reversed_ids else &ids;
+        BatchRouteProbe.expected_mask = if (reversed) &reversed_mask else &mask;
+        BatchRouteProbe.expected_words = if (reversed) &reversed_words else &words;
+        BatchRouteProbe.expected_hidden = if (reversed) &reversed_hidden else &hidden;
+        const hidden_ct = try cb.fromFloat32Shape(BatchRouteProbe.expected_hidden, &.{ 8, 2 });
+        defer cb.free(hidden_ct);
+        BatchRouteProbe.reset();
+        try std.testing.expectError(error.GraphBatchHeadObserved, runHeadGraph(&cb, a, config, hidden_ct, BatchRouteProbe.expected_ids, BatchRouteProbe.expected_words, &spans, 2, 4));
+        try std.testing.expectEqual(@as(usize, 1), BatchRouteProbe.head_calls);
+        try std.testing.expectEqual(@as(usize, 0), BatchRouteProbe.weight_calls);
+        for ([_]graph_runtime.Strategy{ .interpreter, .partitioned, .compiled_preferred }) |strategy| {
+            BatchRouteProbe.reset();
+            try std.testing.expectError(error.GraphBatchEncoderObserved, runFullGraph(&cb, a, encoder_config, config, BatchRouteProbe.expected_ids, BatchRouteProbe.expected_mask, BatchRouteProbe.expected_words, &spans, 2, 4, strategy));
+            // The encoder sees the whole batch once, not one request per row.
+            try std.testing.expectEqual(@as(usize, 1), BatchRouteProbe.encoder_calls);
+            try std.testing.expectEqual(@as(usize, 3), BatchRouteProbe.weight_calls);
+        }
+        BatchRouteProbe.reset();
+        cb.execution_control = .{ .check_fn = BatchRouteProbe.cancelled };
+        try std.testing.expectError(error.Cancelled, runHeadGraph(&cb, a, config, hidden_ct, BatchRouteProbe.expected_ids, BatchRouteProbe.expected_words, &spans, 2, 4));
+        try std.testing.expectError(error.Cancelled, runFullGraph(&cb, a, encoder_config, config, BatchRouteProbe.expected_ids, BatchRouteProbe.expected_mask, BatchRouteProbe.expected_words, &spans, 2, 4, .partitioned));
+        cb.execution_control = null;
+        try std.testing.expectEqual(@as(usize, 0), BatchRouteProbe.head_calls);
+        try std.testing.expectEqual(@as(usize, 0), BatchRouteProbe.weight_calls);
+    }
+}
+
+test "GLiNER graph batch fallback keeps exact sparse spans and per sample session shapes" {
+    const a = std.testing.allocator;
+    var store = BatchRouteProbe.native.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer store.deinitOwned();
+    var compute = BatchRouteProbe.native.NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    var cb = compute.computeBackend();
+    var vtable = cb.vtable.*;
+    vtable.getWeight = BatchRouteProbe.weight;
+    vtable.debertaEmbeddings = BatchRouteProbe.encoder;
+    vtable.debertaRelativeEmbeddings = BatchRouteProbe.relative;
+    cb.vtable = &vtable;
+    const config = Config{ .hidden_size = 2, .entity_token_id = 51 };
+    const encoder_config = deberta_config.Config{ .hidden_size = 2, .num_attention_heads = 1, .num_hidden_layers = 0, .max_position_embeddings = 8, .position_buckets = 4 };
+    const ids = [_]i64{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const labeled_ids = [_]i64{ 51, 2, 3, 4, 51, 6, 7, 8 };
+    const mask = [_]i64{ 1, 1, 1, 1, 1, 1, 0, 0 };
+    const hidden = [_]f32{0} ** 16;
+    const hidden_ct = try cb.fromFloat32Shape(&hidden, &.{ 8, 2 });
+    defer cb.free(hidden_ct);
+    const no_labels_words = [_]i64{ 0, 1, 1, 2, 0, 1, 0, 0 };
+    const no_words = [_]i64{0} ** 8;
+    // Three spans per sample over two padded word slots. Deriving the count
+    // from floor(spans / words) would incorrectly report four total spans.
+    const spans = [_]i64{ 0, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 1 };
+    BatchRouteProbe.expected_mask = &mask;
+    BatchRouteProbe.expected_hidden = &hidden;
+    for ([_]bool{ false, true }) |empty_words| {
+        const input_ids: []const i64 = if (empty_words) &labeled_ids else &ids;
+        BatchRouteProbe.expected_ids = input_ids;
+        const word_mask: []const i64 = if (empty_words) &no_words else &no_labels_words;
+        const span_indices: []const i64 = if (empty_words) &.{} else &spans;
+        const head = try runHeadGraph(&cb, a, config, hidden_ct, input_ids, word_mask, span_indices, 2, 4);
+        defer a.free(head.logits);
+        try std.testing.expectEqual(@as(usize, 0), head.logits.len);
+        try std.testing.expectEqual(@as(u32, if (empty_words) 1 else 0), head.num_labels);
+        try std.testing.expectEqual(@as(u32, if (empty_words) 0 else 4), head.num_words);
+        try std.testing.expectEqual(@as(u32, if (empty_words) 0 else 6), head.num_spans);
+        BatchRouteProbe.reset();
+        BatchRouteProbe.stop_at_encoder = false;
+        const full = try runFullGraph(&cb, a, encoder_config, config, input_ids, &mask, word_mask, span_indices, 2, 4, .partitioned);
+        defer a.free(full.logits);
+        try std.testing.expectEqual(@as(usize, 1), BatchRouteProbe.encoder_calls);
+        try std.testing.expectEqual(@as(usize, 0), full.logits.len);
+        try std.testing.expectEqual(@as(u32, if (empty_words) 1 else 0), full.num_labels);
+        try std.testing.expectEqual(@as(u32, if (empty_words) 0 else 2), full.num_words);
+        try std.testing.expectEqual(@as(u32, if (empty_words) 0 else 3), full.num_spans);
+    }
+}
+
+test "GLiNER graph batch rejects incompatible preparation geometry and required compilation" {
+    const a = std.testing.allocator;
+    var store = BatchRouteProbe.native.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer store.deinitOwned();
+    var compute = BatchRouteProbe.native.NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const hidden = try cb.fromFloat32Shape(&([_]f32{0} ** 16), &.{ 8, 2 });
+    defer cb.free(hidden);
+    const ids = [_]i64{ 51, 52, 53, 11, 51, 52, 53, 21 };
+    const mask = [_]i64{1} ** 8;
+    const words = [_]i64{ 0, 0, 0, 1, 0, 0, 0, 1 };
+    const spans = [_]i64{ 0, 0, 0, 0 };
+    const config = Config{ .hidden_size = 2, .entity_token_id = 51 };
+    const encoder_config = deberta_config.Config{ .hidden_size = 2 };
+    try std.testing.expectError(error.BatchedGlinerGraphPreparationUnsupported, prepGlinerInputs(a, &ids, &words, &spans, 2, 4, 2, 51));
+    try std.testing.expectError(error.BatchedGlinerGraphPreparationUnsupported, prepGlinerInputsWithLabelMarkers(a, &ids, &words, &spans, 2, 4, 2, .{ .entity = 51 }));
+    try std.testing.expectError(error.UnsupportedBatchedGlinerGraphStrategy, runFullGraph(&cb, a, encoder_config, config, &ids, &mask, &words, &spans, 2, 4, .compiled_required));
+    inline for (.{ "downscaled_dim", "downscaled_ffn_dim", "downscaled_num_layers", "downscaled_num_heads" }) |field| {
+        var custom = config;
+        @field(custom, field) += 1;
+        try std.testing.expectError(error.UnsupportedBatchedGlinerGraphConfig, runHeadGraph(&cb, a, custom, hidden, &ids, &words, &spans, 2, 4));
+        try std.testing.expectError(error.UnsupportedBatchedGlinerGraphConfig, runFullGraph(&cb, a, encoder_config, custom, &ids, &mask, &words, &spans, 2, 4, .partitioned));
+        try std.testing.expect(!(try useContextualEagerBatch(custom, 1)));
+    }
+    try std.testing.expectError(error.UnexpectedInputShape, runHeadGraph(&cb, a, config, hidden, ids[0..7], &words, &spans, 2, 4));
+    try std.testing.expectError(error.UnexpectedInputShape, runFullGraph(&cb, a, encoder_config, config, &ids, mask[0..7], &words, &spans, 2, 4, .partitioned));
 }

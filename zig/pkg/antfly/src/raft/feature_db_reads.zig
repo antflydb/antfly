@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = @import("../storage/db/selected_root.zig").db;
 const db_query_search = @import("../storage/db/query/search_exec.zig");
 const feature_reads = @import("feature_reads.zig");
 const read_gate = @import("read_gate.zig");

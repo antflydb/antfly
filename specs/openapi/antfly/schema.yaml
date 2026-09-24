@@ -90,6 +90,336 @@ components:
           minLength: 1
           description: Timestamp field used as the expiration reference.
 
+    TableStorageMode:
+      type: string
+      enum: [document, relational]
+      description: |
+        Storage representation for the table. Omission selects "document".
+        "relational" stores schema-bound typed rows and requires exactly one
+        closed document schema with declared properties. It implies
+        enforce_types; explicitly setting enforce_types to false is invalid.
+        Existing JSON document write and read APIs remain available. This
+        setting alone does not declare primary keys or unique constraints.
+
+    RelationalIndexAccessMethod:
+      type: string
+      enum: [scalar_column, ordered_tuple, algebraic_filter, text_search]
+      description: Physical access method of a relational index.
+
+    RelationalIndexLifecycle:
+      type: string
+      enum: [ready, building, invalid, dropping, catching_up, stale, rebuild_required, failed]
+      description: |
+        Lifecycle of a relational index generation. Query eligibility additionally
+        requires complete coverage and no unapplied mutations; ready alone is
+        not an integrity proof.
+
+    RelationalIndexKeyDirection:
+      type: string
+      enum: [asc, desc]
+      description: Direction of one ordered index key component. Omission selects asc.
+
+    RelationalIndexKeyNulls:
+      type: string
+      enum: [default, first, last]
+      description: |
+        Null placement for one ordered index key component. The default is
+        last for ascending keys and first for descending keys. Omission selects default.
+
+    RelationalIndexKey:
+      type: object
+      additionalProperties: false
+      description: |
+        Ordered component of a relational ordered-tuple index key. Supply
+        either a declared column or a deterministic typed scalar expression
+        with its result_type. Composite keys may mix both forms. Bounds use
+        the expression result type, not its input columns.
+      properties:
+        column:
+          type: string
+          minLength: 1
+          description: Declared relational column used by this key component.
+        expression:
+          $ref: "#/components/schemas/RelationalScalarExpression"
+        result_type:
+          $ref: "#/components/schemas/RelationalExpressionType"
+        collation:
+          type: string
+          minLength: 1
+          description: |
+            String-key collation. Omission selects binary ordering. Supported
+            binary aliases are C, POSIX, and binary. The aliases ci,
+            case_insensitive, and antfly.case_insensitive select ASCII-only
+            case folding, not locale-aware or Unicode case folding.
+        direction:
+          $ref: "#/components/schemas/RelationalIndexKeyDirection"
+        nulls:
+          $ref: "#/components/schemas/RelationalIndexKeyNulls"
+
+    RelationalIndexOwnerKind:
+      type: string
+      enum: [relational_column, unique_constraint, table]
+      description: Logical schema object that owns a relational index.
+
+    ForeignKeyAction:
+      type: string
+      enum: [restrict, set_null, cascade, no_action]
+      description: Action on referencing rows when a referenced row is changed or removed.
+
+    ForeignKeyTiming:
+      type: string
+      enum: [immediate, deferred]
+      description: |
+        Enforcement timing for atomic mutations and transaction sessions. Deferred
+        requires deferrable=true and validates the final transaction state.
+        NO ACTION permits a valid final-state parent replacement; RESTRICT
+        still rejects referenced parent removal. Existing multi-request
+        transaction sessions retain deferred checks until commit; immediate
+        checks apply to each staged statement. SET CONSTRAINTS is not provided.
+
+    ForeignKeyMatch:
+      type: string
+      enum: [simple, full, partial]
+      description: |
+        Null matching semantics of a composite foreign key. Partial requires
+        at least one parent matching every non-null child component; all-null
+        children are exempt. Compatible parent witnesses are guarded through
+        commit, including concurrent deletion of alternative witnesses.
+
+    RelationalConstraintValidationState:
+      type: string
+      enum: [enforced, unvalidated, validating, invalid]
+      description: Validation state of an existing-row constraint.
+
+    RelationalComparisonOp:
+      type: string
+      enum: [is_null, is_not_null, eq, ne, gt, gte, lt, lte, is_distinct, is_not_distinct]
+
+    RelationalCheckConstraint:
+      type: object
+      additionalProperties: false
+      required: [name]
+      description: |
+        A typed CHECK. Supply either expression or column and op (with optional
+        value and collation), never both forms. Expressions must return boolean
+        and use the shared bounded immutable scalar expression vocabulary.
+        New writes are checked from schema publication;
+        existing rows are validated separately. SQL UNKNOWN satisfies CHECK.
+        Comparison values must match the column type. Integer values may also
+        use exact decimal strings to avoid client-side floating-point rounding.
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 256
+        column:
+          type: string
+          minLength: 1
+        op:
+          $ref: "#/components/schemas/RelationalComparisonOp"
+        value:
+          description: Scalar comparison operand. Omission represents NULL. Null tests require a NULL operand.
+        collation:
+          type: string
+          description: String comparison collation; uses the same rules as ordered indexes.
+        expression:
+          $ref: "#/components/schemas/RelationalScalarExpression"
+
+    RelationalUniqueConstraint:
+      type: object
+      additionalProperties: false
+      required: [name, columns]
+      description: |
+        A named, ordered composite unique key. Validation status is maintained
+        by the server. TTL expiry uses the distributed integrity coordinator.
+        Referenced unique keys are nondeferrable.
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 256
+        columns:
+          type: array
+          minItems: 1
+          maxItems: 32
+          items:
+            type: string
+            minLength: 1
+        nulls_not_distinct:
+          type: boolean
+          description: When true, NULL components compare equal for uniqueness.
+
+    RelationalForeignKeyConstraint:
+      type: object
+      additionalProperties: false
+      required: [name, child_columns, parent_table, parent_columns]
+      description: |
+        Composite foreign key. Child and parent columns correspond by position
+        and must have the same physical comparison types. The parent columns
+        must identify a unique key. Existing-row validation is independent of
+        new-write enforcement and is never client-writable.
+        Enforcement and referential actions share the bounded distributed
+        transaction path, including TTL expiry. Partial matching uses ordered
+        support indexes on the parent; activation waits until these are ready.
+        SET NULL requires every child column to accept explicit NULL.
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 256
+        child_columns:
+          type: array
+          minItems: 1
+          maxItems: 32
+          items:
+            type: string
+            minLength: 1
+        parent_table:
+          type: string
+          minLength: 1
+          description: |
+            Literal parent table name in the child table's database and namespace.
+            Resolved to an immutable table identity when the constraint is declared;
+            renaming a parent preserves the reference. Public schemas show its current name.
+        parent_columns:
+          type: array
+          minItems: 1
+          maxItems: 32
+          items:
+            type: string
+            minLength: 1
+        on_delete:
+          $ref: "#/components/schemas/ForeignKeyAction"
+        on_update:
+          $ref: "#/components/schemas/ForeignKeyAction"
+        timing:
+          $ref: "#/components/schemas/ForeignKeyTiming"
+        match:
+          $ref: "#/components/schemas/ForeignKeyMatch"
+        deferrable:
+          type: boolean
+
+    RelationalIndexPredicate:
+      type: object
+      additionalProperties: false
+      required: [column, op]
+      description: A typed partial-index conjunct. Only TRUE is indexed; FALSE and SQL UNKNOWN are excluded.
+      properties:
+        column:
+          type: string
+          minLength: 1
+        op:
+          $ref: "#/components/schemas/RelationalComparisonOp"
+        value:
+          description: Typed scalar operand; integer columns also accept exact decimal strings. Omission means NULL.
+        collation:
+          type: string
+          description: String comparison collation with the same semantics as ordered keys.
+
+    RelationalIndexDefinition:
+      type: object
+      additionalProperties: false
+      required: [name, keys]
+      description: |
+        Declarative table-owned ordered index. Keys are compared lexicographically
+        in the declared order, with independent direction, null placement, and
+        string collation. Creation builds existing rows asynchronously; queries
+        must wait for range-local coverage. Unique constraints and expression
+        keys are not implied by this object. Optional WHERE conjuncts select
+        only matching rows. INCLUDE columns
+        store typed values alongside keys for index-only projected reads.
+      properties:
+        description:
+          type: string
+          description: Optional human-readable description, also exposed by the shared indexes API.
+        name:
+          type: string
+          minLength: 1
+          maxLength: 256
+        keys:
+          type: array
+          minItems: 1
+          maxItems: 32
+          items:
+            $ref: "#/components/schemas/RelationalIndexKey"
+
+        include_columns:
+          type: array
+          maxItems: 256
+          uniqueItems: true
+          description: Non-key columns stored in the index; must be distinct from key columns.
+          items:
+            type: string
+            minLength: 1
+
+        where:
+          type: array
+          maxItems: 256
+          description: Conjunction of typed predicates. Indexed queries must explicitly contain every conjunct with equivalent typed comparison semantics.
+          items:
+            $ref: "#/components/schemas/RelationalIndexPredicate"
+
+    RelationalExpressionOp:
+      type: string
+      enum: [literal, column, add, subtract, multiply, divide, negate, concat, coalesce, lower_ascii, upper_ascii, eq, ne, gt, gte, lt, lte, is_null, is_not_null, is_distinct, is_not_distinct, and, or, not]
+
+    RelationalExpressionType:
+      type: string
+      enum: [string, blob, boolean, datetime, integer, number]
+
+    RelationalScalarExpression:
+      type: object
+      additionalProperties: false
+      required: [op]
+      description: |
+        Immutable typed scalar expression, limited to 128 nodes and 16 levels.
+        A literal requires type; omitted value means typed null. A column
+        requires column; other
+        operations require args. Unknown or irrelevant fields are rejected.
+        Arithmetic operands have the same integer or number type. Integer
+        division truncates toward zero. Overflow and division by zero reject
+        the write. Arithmetic and string operations propagate null. ASCII case
+        operations leave non-ASCII bytes unchanged. No volatile functions are
+        accepted. Allocated results are bounded to 1 MiB each. Allocations
+        and byte-comparison operand work share a 4 MiB evaluation budget per
+        row and expression set. An integer literal may use a decimal string
+        for exact int64 transport; blob uses base64 and datetime uses the
+        normal relational datetime representation.
+        Comparisons require operands of the same type and return boolean or
+        SQL UNKNOWN (null); is_distinct and is_not_distinct always return a
+        boolean. Unary is_null and is_not_null test presence/null. AND and OR
+        evaluate left to right with SQL three-valued short-circuit semantics;
+        NOT preserves UNKNOWN. CHECK accepts TRUE and UNKNOWN, rejecting FALSE.
+      properties:
+        op:
+          $ref: "#/components/schemas/RelationalExpressionOp"
+        type:
+          $ref: "#/components/schemas/RelationalExpressionType"
+        value:
+          description: Typed literal value, including null.
+        column:
+          type: string
+          minLength: 1
+        collation:
+          type: string
+          description: Optional binary or ASCII case-insensitive collation for binary string comparison operations only; aliases match ordered indexes.
+        args:
+          type: array
+          maxItems: 32
+          items:
+            $ref: "#/components/schemas/RelationalScalarExpression"
+
+    RelationalColumnExpression:
+      type: object
+      additionalProperties: false
+      required: [column, expression]
+      properties:
+        column:
+          type: string
+          minLength: 1
+        expression:
+          $ref: "#/components/schemas/RelationalScalarExpression"
+
     TableSchema:
       type: object
       description: Schema definition for a table with multiple document types
@@ -99,6 +429,74 @@ components:
           format: uint32
           readOnly: true
           description: Backend-managed schema generation used for migrations. Omit it from create and update requests.
+        storage_mode:
+          $ref: "#/components/schemas/TableStorageMode"
+        column_defaults:
+          type: array
+          maxItems: 256
+          items:
+            $ref: "#/components/schemas/RelationalColumnExpression"
+          description: |
+            Immutable typed expressions applied only to absent columns on new
+            writes, never explicit null. Defaults cannot reference columns.
+            A column cannot have both a default and a generated expression.
+            Omission or [] declares none. Relational tables only.
+        generated_columns:
+          type: array
+          maxItems: 256
+          items:
+            $ref: "#/components/schemas/RelationalColumnExpression"
+          description: |
+            Stored immutable generated columns, evaluated in dependency order
+            on writes before validation and indexing. Cycles are rejected.
+            Generated columns are output-only; submitted values are replaced
+            by the computed value. Omission or [] declares none. Defaults
+            and generated declarations together are limited to 256 columns,
+            4096 expression nodes, and 4 MiB of literal data. Evaluation has
+            a shared 4 MiB allocation budget across all column expressions.
+            Restore verifies stored results instead of silently recomputing
+            them. Changing, adding, or removing generated semantics through
+            an existing table's schema update requires explicit rewrite=true
+            on the PUT or PATCH schema route. This returns a durable restore
+            job and replaces the complete authorized dependency cohort only
+            after distributed transformation and validation. Ordinary schema
+            updates reject these changes, even when a table appears empty.
+            Declaration reordering and default-only changes remain allowed.
+            Relational tables only.
+        checks:
+          type: array
+          maxItems: 256
+          items:
+            $ref: "#/components/schemas/RelationalCheckConstraint"
+          description: |
+            Named scalar CHECK constraints for a relational schema. This is
+            part of the complete schema: omission or [] declares no checks.
+            New writes enforce every check. Existing-row validation status is
+            maintained separately and is never accepted from the client.
+        unique_constraints:
+          type: array
+          maxItems: 256
+          items:
+            $ref: "#/components/schemas/RelationalUniqueConstraint"
+          description: Complete set of composite unique declarations. Omission or [] declares none.
+        foreign_keys:
+          type: array
+          maxItems: 256
+          items:
+            $ref: "#/components/schemas/RelationalForeignKeyConstraint"
+          description: Complete set of outgoing composite foreign keys. Omission or [] declares none.
+        relational_indexes:
+          type: array
+          x-go-type-skip-optional-pointer: false
+          maxItems: 4096
+          items:
+            $ref: "#/components/schemas/RelationalIndexDefinition"
+          description: |
+            Desired ordered indexes for a relational table. Names must be unique.
+            An explicit array replaces the declarations; an empty array drops
+            them. Omission preserves existing declarations during schema updates.
+            Index definitions commit atomically with the schema; build progress
+            and readiness are local to each owning shard, not client-writable.
         default_type:
           type: string
           description: Default type to use from the document_types.

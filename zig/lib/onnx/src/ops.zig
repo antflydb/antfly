@@ -921,56 +921,60 @@ fn materializeConstantValues(builder: *Builder, node_id: NodeId, buf: []f32) ?[]
     }
 }
 
-fn nodeDependsOnRuntimeValue(builder: *Builder, node_id: NodeId, depth: usize) bool {
-    if (node_id == null_node) return false;
-    // Shape expressions are deliberately small. Treat unexpectedly deep DAGs
-    // as runtime-dependent rather than accidentally folding them to a stale
-    // import-time value.
-    if (depth >= 64) return true;
-    const n = builder.graph.node(node_id);
-    return switch (n.op) {
-        .constant => false,
-        .parameter, .fused_from_float32 => true,
-        else => blk: {
-            for (n.getInputs()) |input| {
-                if (nodeDependsOnRuntimeValue(builder, input, depth + 1)) break :blk true;
-            }
-            break :blk false;
-        },
-    };
+fn nodeDependsOnRuntimeValue(builder: *Builder, node_id: NodeId, _: usize) bool {
+    return nodeRuntimeDependency(builder, node_id, false);
 }
 
-fn nodeHasRuntimeDependentShape(builder: *Builder, node_id: NodeId, depth: usize) bool {
+fn nodeHasRuntimeDependentShape(builder: *Builder, node_id: NodeId, _: usize) bool {
+    return nodeRuntimeDependency(builder, node_id, true);
+}
+
+// The append-only graph is topological. Evaluate dependency facts once per
+// node instead of recursively revisiting shared ancestors or mistaking deep
+// transformer graphs for data-dependent shapes at an arbitrary depth limit.
+fn nodeRuntimeDependency(builder: *Builder, node_id: NodeId, shape_only: bool) bool {
     if (node_id == null_node) return false;
-    // Conservatively preserve Shape as a runtime operation when a dynamic
-    // shape transform may be hidden behind otherwise-concrete import-time
-    // inference. This prevents Shape(Reshape(x, runtime_target)) from
-    // capturing the representative import dimensions.
-    if (depth >= 64) return true;
-
-    const n = builder.graph.node(node_id);
-    for (0..n.output_shape.rank()) |axis| {
-        if (n.output_shape.dim(@intCast(axis)) < 0) return true;
+    const facts = builder.graph.allocator.alloc(bool, @as(usize, node_id) + 1) catch return true;
+    defer builder.graph.allocator.free(facts);
+    for (facts, 0..) |*fact, i| {
+        const n = builder.graph.node(@intCast(i));
+        fact.* = false;
+        if (shape_only) {
+            for (n.output_shape.dims[0..n.output_shape.rank()]) |dim| {
+                if (dim < 0) {
+                    fact.* = true;
+                    break;
+                }
+            }
+            switch (n.op) {
+                .constant, .parameter, .fused_from_float32 => continue,
+                .reshape => |attrs| {
+                    if (attrs.runtime_shape) fact.* = true;
+                },
+                .broadcast_in_dim => {
+                    if (n.num_inputs > 1 and nodeDependsOnRuntimeValue(builder, n.inputs[1], 0)) fact.* = true;
+                },
+                .slice => |attrs| {
+                    if (attrs.runtime_starts or attrs.runtime_limits) fact.* = true;
+                },
+                else => {},
+            }
+        } else switch (n.op) {
+            .constant => continue,
+            .parameter, .fused_from_float32 => {
+                fact.* = true;
+                continue;
+            },
+            else => {},
+        }
+        for (n.getInputs()) |input| {
+            if (input != null_node and (input >= i or facts[input])) {
+                fact.* = true;
+                break;
+            }
+        }
     }
-
-    switch (n.op) {
-        .constant, .parameter, .fused_from_float32 => return false,
-        .reshape => |attrs| {
-            if (attrs.runtime_shape) return true;
-        },
-        .broadcast_in_dim => {
-            if (n.num_inputs > 1 and nodeDependsOnRuntimeValue(builder, n.inputs[1], 0)) return true;
-        },
-        .slice => |attrs| {
-            if (attrs.runtime_starts or attrs.runtime_limits) return true;
-        },
-        else => {},
-    }
-
-    for (n.getInputs()) |input| {
-        if (nodeHasRuntimeDependentShape(builder, input, depth + 1)) return true;
-    }
-    return false;
+    return facts[node_id];
 }
 
 fn foldSymbolicShapeArithmetic(op: OpCode, a: f32, b: f32) ?f32 {
@@ -1324,8 +1328,7 @@ fn convertReshape(allocator: std.mem.Allocator, builder: *Builder, node: *const 
     };
 
     const result = try builder.reshape(inputs[0], new_shape);
-    const target_node = builder.graph.node(inputs[1]);
-    const runtime_shape = std.meta.activeTag(target_node.op) != .constant;
+    const runtime_shape = nodeDependsOnRuntimeValue(builder, inputs[1], 0);
     if (runtime_shape or allow_zero) {
         const reshape_node = builder.graph.nodeMut(result);
         reshape_node.op.reshape.runtime_shape = runtime_shape;
@@ -1508,11 +1511,36 @@ fn convertReduce(builder: *Builder, comptime op: ReduceTag, node: *const NodePro
         }
     }
 
-    return switch (op) {
+    const reduced = try switch (op) {
         .reduce_sum => builder.reduceSum(inputs[0], axes_buf[0..num_axes]),
         .reduce_mean => builder.reduceMean(inputs[0], axes_buf[0..num_axes]),
         .reduce_max => builder.reduceMax(inputs[0], axes_buf[0..num_axes]),
     };
+
+    // The primitive keeps the reduced axes as size 1; ONNX `keepdims=0`
+    // drops them, which is a pure reshape of the same data.
+    const keepdims = getInt(node.attributes, "keepdims", 1) != 0;
+    if (keepdims or num_axes == 0) return reduced;
+    const reduced_shape = builder.graph.node(reduced).output_shape;
+    var out_dims: [8]i64 = .{0} ** 8;
+    var out_rank: u8 = 0;
+    for (0..reduced_shape.rank()) |d| {
+        var dropped = false;
+        for (axes_buf[0..num_axes]) |ax| {
+            if (ax == d) dropped = true;
+        }
+        if (dropped) continue;
+        out_dims[out_rank] = reduced_shape.dim(@intCast(d));
+        out_rank += 1;
+    }
+    if (out_rank == 0) {
+        // A full reduction is a scalar; keep a one-element vector so later
+        // broadcasts see a concrete rank.
+        out_dims[0] = 1;
+        out_rank = 1;
+    }
+    const out_shape = Shape{ .dtype = reduced_shape.dtype, .dims = out_dims, .rank_ = out_rank };
+    return builder.reshape(reduced, out_shape);
 }
 
 fn convertGather(builder: *Builder, node: *const NodeProto, inputs: []const NodeId) ConvertError!NodeId {
@@ -1520,6 +1548,8 @@ fn convertGather(builder: *Builder, node: *const NodeProto, inputs: []const Node
     const axis_raw = getInt(node.attributes, "axis", 0);
     const table_shape = builder.graph.node(inputs[0]).output_shape;
     const indices_shape = builder.graph.node(inputs[1]).output_shape;
+    if (axis_raw < -@as(i64, table_shape.rank()) or axis_raw >= table_shape.rank()) return error.InvalidAttribute;
+    if (@as(usize, table_shape.rank()) + indices_shape.rank() - 1 > 8) return error.UnsupportedOp;
     const axis: u8 = if (axis_raw < 0) @intCast(@as(i64, table_shape.rank()) + axis_raw) else @intCast(axis_raw);
 
     // Output shape: data.shape[:axis] + indices.shape + data.shape[axis+1:]
@@ -1542,6 +1572,33 @@ fn convertGather(builder: *Builder, node: *const NodeProto, inputs: []const Node
     }
 
     const out_shape = Shape{ .dtype = table_shape.dtype, .dims = out_dims, .rank_ = out_rank };
+    // A scalar constant gather is a strided slice. Flatten the dimensions
+    // around the selected axis so the GPU's row-slice kernel can keep pooled
+    // activations resident (e.g. CLS from [batch, sequence, hidden]).
+    if (table_shape.rank() >= 2 and indices_shape.rank() == 0 and table_shape.numElements() != null) scalar_gather: {
+        const index_node = builder.graph.node(inputs[1]);
+        const constant = switch (index_node.op) {
+            .constant => |attrs| attrs,
+            else => break :scalar_gather,
+        };
+        if (constant.data_len != 1) break :scalar_gather;
+        var index: i64 = switch (index_node.output_shape.dtype) {
+            .i64 => builder.graph.constantDataAs(i64, constant.data_offset, 1)[0],
+            .i32 => builder.graph.constantDataAs(i32, constant.data_offset, 1)[0],
+            else => break :scalar_gather,
+        };
+        const width = table_shape.dim(axis);
+        if (width <= 0 or index < -width or index >= width) break :scalar_gather;
+        if (index < 0) index += width;
+        var outer: i64 = 1;
+        var inner: i64 = 1;
+        for (table_shape.dims[0..axis]) |dim| outer = std.math.mul(i64, outer, dim) catch return error.ShapeMismatch;
+        for (table_shape.dims[axis + 1 .. table_shape.rank()]) |dim| inner = std.math.mul(i64, inner, dim) catch return error.ShapeMismatch;
+        const columns = std.math.mul(i64, width, inner) catch return error.ShapeMismatch;
+        const flat = try builder.reshape(inputs[0], Shape.init(table_shape.dtype, &.{ outer, columns }));
+        const sliced = try builder.sliceLastDim(flat, index * inner, (index + 1) * inner);
+        return builder.reshape(sliced, out_shape);
+    }
     return builder.graph.addNode(.{
         .op = .{ .gather = .{ .axis = axis } },
         .output_shape = out_shape,
@@ -1551,7 +1608,9 @@ fn convertGather(builder: *Builder, node: *const NodeProto, inputs: []const Node
 }
 
 fn convertConcat(builder: *Builder, node: *const NodeProto, inputs: []const NodeId) ConvertError!NodeId {
-    if (inputs.len < 2) return error.MissingInput;
+    // ONNX permits one or more inputs. SentenceTransformers exports a
+    // single-input Concat when exactly one pooling mode is enabled.
+    if (inputs.len == 0) return error.MissingInput;
     const axis_raw = getInt(node.attributes, "axis", 0);
 
     var concat_rank: u8 = 0;
@@ -2030,7 +2089,15 @@ fn convertMatMul(builder: *Builder, _: *const NodeProto, a: NodeId, b: NodeId) C
     // dot_general in our graph currently assumes paired lhs/rhs batch dims.
     // Lower this common case through a flattened 2D GEMM instead.
     if (a_shape.rank() >= 3 and b_shape.rank() == 2) {
-        const flat_lhs = try builder.reshape(a, Shape.init(a_shape.dtype, &.{ -1, a_shape.dim(@intCast(a_shape.rank() - 1)) }));
+        var rows: i64 = 1;
+        for (a_shape.dims[0 .. a_shape.rank() - 1]) |dim| {
+            if (dim < 0) {
+                rows = -1;
+                break;
+            }
+            rows = std.math.mul(i64, rows, dim) catch return error.ShapeMismatch;
+        }
+        const flat_lhs = try builder.reshape(a, Shape.init(a_shape.dtype, &.{ rows, a_shape.dim(@intCast(a_shape.rank() - 1)) }));
         const mm = try builder.matmul(flat_lhs, b);
 
         var out_dims: [8]i64 = .{0} ** 8;
@@ -2131,8 +2198,8 @@ fn convertExpand(builder: *Builder, inputs: []const NodeId) ConvertError!NodeId 
     // Use broadcast_in_dim
     var broadcast_axes: [8]u8 = .{0} ** 8;
     const start = out_rank - in_rank;
-    for (0..in_rank) |i| {
-        broadcast_axes[i] = @intCast(start + i);
+    for (0..out_rank) |i| {
+        broadcast_axes[i] = @intCast(i);
     }
 
     // If input needs prepended 1-dims first, reshape
@@ -2149,7 +2216,7 @@ fn convertExpand(builder: *Builder, inputs: []const NodeId) ConvertError!NodeId 
         .op = .{ .broadcast_in_dim = .{
             .target_shape = out_shape,
             .broadcast_axes = broadcast_axes,
-            .num_axes = @min(in_rank, out_rank),
+            .num_axes = out_rank,
         } },
         .output_shape = out_shape,
         // Keep the ONNX shape input live. Static dimensions remain embedded
@@ -2339,11 +2406,11 @@ fn convertShape(builder: *Builder, node: *const NodeProto, input: NodeId) Conver
     const end: usize = @intCast(end_i);
     const rank: usize = end - start;
     var has_dynamic = false;
-    var dims_f32: [8]f32 = .{0} ** 8;
+    var dims: [8]i64 = .{0} ** 8;
     for (0..rank) |i| {
         const dim = in_shape.dim(@intCast(start + i));
         if (dim < 0) has_dynamic = true;
-        dims_f32[i] = @floatFromInt(dim);
+        dims[i] = dim;
     }
     if (has_dynamic or nodeHasRuntimeDependentShape(builder, input, 0)) {
         return builder.graph.addNode(.{
@@ -2356,8 +2423,8 @@ fn convertShape(builder: *Builder, node: *const NodeProto, input: NodeId) Conver
             .num_inputs = 1,
         });
     }
-    const out_shape = Shape.init(.f32, &.{@intCast(rank)});
-    return builder.tensorConst(dims_f32[0..rank], out_shape);
+    const out_shape = Shape.init(.i64, &.{@intCast(rank)});
+    return builder.tensorConstBytes(std.mem.sliceAsBytes(dims[0..rank]), out_shape);
 }
 
 fn convertConstantOfShape(allocator: std.mem.Allocator, builder: *Builder, node: *const NodeProto, inputs: []const NodeId) ConvertError!NodeId {
@@ -2492,26 +2559,40 @@ fn convertRange(allocator: std.mem.Allocator, builder: *Builder, node: *const No
     _ = allocator;
     _ = node;
     if (inputs.len < 3) return error.MissingInput;
-    // Range(start, limit, delta) → 1-D tensor
-    // Materialize start/limit/delta from constants (may be behind Cast/Reshape)
-    var start_buf: [1]f32 = undefined;
-    var limit_buf: [1]f32 = undefined;
-    var delta_buf: [1]f32 = undefined;
-    const start_data = materializeConstantValues(builder, inputs[0], &start_buf);
-    const limit_data = materializeConstantValues(builder, inputs[1], &limit_buf);
-    const delta_data = materializeConstantValues(builder, inputs[2], &delta_buf);
+    // Range(start, limit, delta) → 1-D tensor.  Shape programs use integer
+    // ranges, so never send their values through f32 while folding them.
+    const out_dtype = builder.graph.node(inputs[0]).output_shape.dtype;
+    if (isIntegerDType(out_dtype)) {
+        const start = materializeIntegerScalar(builder, inputs[0]);
+        const limit = materializeIntegerScalar(builder, inputs[1]);
+        const delta = materializeIntegerScalar(builder, inputs[2]);
+        if (start != null and limit != null and delta != null) {
+            const count = try integerRangeCount(start.?, limit.?, delta.?);
+            var values: [4096]i64 = undefined;
+            for (0..count) |i| {
+                const value = @as(i128, start.?) + @as(i128, @intCast(i)) * @as(i128, delta.?);
+                values[i] = std.math.cast(i64, value) orelse return error.ShapeMismatch;
+            }
+            return integerTensorConst(builder, values[0..count], out_dtype);
+        }
+        return builder.graph.addNode(.{
+            .op = .{ .range = {} },
+            .output_shape = Shape.init(out_dtype, &.{@as(i64, -1)}),
+            .inputs = .{ inputs[0], inputs[1], inputs[2], null_node },
+            .num_inputs = 3,
+        });
+    }
 
-    const start = if (start_data) |d| (if (d.len > 0) d[0] else null) else null;
-    const limit = if (limit_data) |d| (if (d.len > 0) d[0] else null) else null;
-    const delta = if (delta_data) |d| (if (d.len > 0) d[0] else null) else null;
+    // Floating-point Range remains a floating-point program.
+    const start = materializeFloatScalar(builder, inputs[0]);
+    const limit = materializeFloatScalar(builder, inputs[1]);
+    const delta = materializeFloatScalar(builder, inputs[2]);
 
     // If any value is dynamic (-1) or not materializable, emit a parameter
     // so the caller provides position IDs at runtime (common GPT-2 pattern).
-    const is_dynamic = (start == null or limit == null or delta == null or
-        start.? < 0 or limit.? < 0 or delta.? < 0);
+    const is_dynamic = start == null or limit == null or delta == null;
 
     if (is_dynamic) {
-        const out_dtype = builder.graph.node(inputs[0]).output_shape.dtype;
         return builder.graph.addNode(.{
             .op = .{ .range = {} },
             .output_shape = Shape.init(out_dtype, &.{@as(i64, -1)}),
@@ -2526,17 +2607,20 @@ fn convertRange(allocator: std.mem.Allocator, builder: *Builder, node: *const No
 
     if (d == 0) return error.InvalidAttribute;
 
-    const count: usize = @intFromFloat(@ceil((l - s) / d));
+    const raw_count = @ceil((l - s) / d);
+    const count: usize = if (raw_count <= 0) 0 else blk: {
+        if (!std.math.isFinite(raw_count) or raw_count > @as(f32, @floatFromInt(std.math.maxInt(usize)))) return error.ShapeMismatch;
+        break :blk @intFromFloat(raw_count);
+    };
     if (count > 4096) return error.ShapeMismatch; // sanity limit
 
     // Build constant data
-    var buf: [4096]f32 = undefined;
+    var buf: [4096]f64 = undefined;
     for (0..count) |i| {
-        buf[i] = s + @as(f32, @floatFromInt(i)) * d;
+        buf[i] = s + @as(f64, @floatFromInt(i)) * d;
     }
 
-    const out_shape = Shape.init(.f32, &.{@as(i64, @intCast(count))});
-    return builder.tensorConst(buf[0..count], out_shape);
+    return floatTensorConst(builder, buf[0..count], out_dtype);
 }
 
 // ── Phase 2: Normalization Ops ──────────────────────────────────────
@@ -2877,9 +2961,10 @@ fn convertConv(builder: *Builder, node: *const NodeProto, inputs: []const NodeId
     conv_attrs.num_spatial = num_spatial;
     conv_attrs.groups = group;
 
-    // Strides
+    // Strides and dilations
     for (0..num_spatial) |i| {
         conv_attrs.strides[i] = if (i < strides_attr.len) @intCast(strides_attr[i]) else 1;
+        conv_attrs.dilations[i] = if (i < dilations_attr.len and dilations_attr[i] > 0) @intCast(dilations_attr[i]) else 1;
     }
 
     // Padding: ONNX format is [begin_0, begin_1, ..., end_0, end_1, ...]
@@ -3343,13 +3428,27 @@ fn convertGatherElements(builder: *Builder, node: *const NodeProto, inputs: []co
 // ── Phase 3: CumSum ─────────────────────────────────────────────────
 
 fn convertCumSum(builder: *Builder, node: *const NodeProto, inputs: []const NodeId) ConvertError!NodeId {
-    _ = node;
-    _ = builder;
-
-    // CumSum can't be efficiently decomposed without scan primitive.
-    // Return input as-is for now — models that need cumsum will need
-    // a scan primitive added to inference.
-    return inputs[0];
+    if (inputs.len != 2 or inputs[1] == null_node) return error.MissingInput;
+    const shape = builder.graph.node(inputs[0]).output_shape;
+    var buffer: [1]f32 = undefined;
+    const axis_values = materializeConstantValues(builder, inputs[1], &buffer) orelse return error.ConstantMaterializationFailed;
+    if (axis_values.len != 1 or !std.math.isFinite(axis_values[0]) or
+        axis_values[0] < -@as(f32, @floatFromInt(shape.rank())) or
+        axis_values[0] >= @as(f32, @floatFromInt(shape.rank()))) return error.InvalidAttribute;
+    const axis: i64 = @intFromFloat(axis_values[0]);
+    const exclusive = getInt(node.attributes, "exclusive", 0);
+    const reverse = getInt(node.attributes, "reverse", 0);
+    if (exclusive < 0 or exclusive > 1 or reverse < 0 or reverse > 1) return error.InvalidAttribute;
+    return builder.graph.addNode(.{
+        .op = .{ .cumulative_sum = .{
+            .axis = @intCast(if (axis < 0) axis + shape.rank() else axis),
+            .exclusive = exclusive == 1,
+            .reverse = reverse == 1,
+        } },
+        .output_shape = shape,
+        .inputs = .{ inputs[0], null_node, null_node, null_node },
+        .num_inputs = 1,
+    });
 }
 
 // ── Phase 3: DequantizeLinear ───────────────────────────────────────
@@ -3656,6 +3755,27 @@ fn broadcastPerAxis(builder: *Builder, input: NodeId, target_shape: Shape, axis_
 
 // ── Phase 3: Pooling Ops ────────────────────────────────────────────
 
+/// Static slice `[start, end)` along `axis` of a tensor of any rank.
+fn sliceAxisStatic(builder: *Builder, input: NodeId, axis: u8, start: i64, end: i64) ConvertError!NodeId {
+    const in_shape = builder.graph.node(input).output_shape;
+    var attrs = ml.graph.node.SliceAttrs{};
+    attrs.num_axes = in_shape.rank();
+    var out_dims: [8]i64 = .{0} ** 8;
+    for (0..in_shape.rank()) |d| {
+        const dim = in_shape.dim(@intCast(d));
+        attrs.starts[d] = if (d == axis) start else 0;
+        attrs.limits[d] = if (d == axis) end else dim;
+        attrs.strides[d] = 1;
+        out_dims[d] = if (d == axis) end - start else dim;
+    }
+    return builder.graph.addNode(.{
+        .op = .{ .slice = attrs },
+        .output_shape = Shape{ .dtype = in_shape.dtype, .dims = out_dims, .rank_ = in_shape.rank_ },
+        .inputs = .{ input, null_node, null_node, null_node },
+        .num_inputs = 1,
+    });
+}
+
 fn convertAveragePool(builder: *Builder, node: *const NodeProto, inputs: []const NodeId) ConvertError!NodeId {
     // AveragePool: reduce_mean over spatial window
     // For global average pool variant or simple cases
@@ -3680,8 +3800,54 @@ fn convertAveragePool(builder: *Builder, node: *const NodeProto, inputs: []const
         return convertGlobalAveragePool(builder, inputs);
     }
 
+    // Exact path for the common 1-D "segment pooling" shape: non-overlapping
+    // windows (stride == kernel) over a static last axis. Full windows are a
+    // reshape plus a mean over the window axis; with `ceil_mode` the partial
+    // trailing window is averaged over the elements it actually covers, as
+    // ONNX Runtime does when no explicit padding is declared.
+    const pads = getInts(node.attributes, "pads");
+    var pads_zero = true;
+    for (pads) |p| if (p != 0) {
+        pads_zero = false;
+    };
+    if (num_spatial == 1 and in_shape.rank() == 3 and pads_zero and kernel[0] > 0) {
+        const k: i64 = kernel[0];
+        const stride: i64 = if (strides.len > 0) strides[0] else 1;
+        const length = in_shape.dim(2);
+        if (stride == k and length > 0) {
+            const ceil_mode = getInt(node.attributes, "ceil_mode", 0) != 0;
+            const n_full = @divTrunc(length, k);
+            const remainder = length - n_full * k;
+            const has_tail = ceil_mode and remainder > 0;
+            if (n_full == 0 and !has_tail) return error.InvalidAttribute;
+
+            var full: ?NodeId = null;
+            if (n_full > 0) {
+                const full_slice = try sliceAxisStatic(builder, inputs[0], 2, 0, n_full * k);
+                var windowed_dims: [8]i64 = .{0} ** 8;
+                windowed_dims[0] = in_shape.dim(0);
+                windowed_dims[1] = in_shape.dim(1);
+                windowed_dims[2] = n_full;
+                windowed_dims[3] = k;
+                const windowed = try builder.reshape(full_slice, Shape{ .dtype = in_shape.dtype, .dims = windowed_dims, .rank_ = 4 });
+                const window_mean = try builder.reduceMean(windowed, &[_]u8{3});
+                var pooled_dims: [8]i64 = .{0} ** 8;
+                pooled_dims[0] = in_shape.dim(0);
+                pooled_dims[1] = in_shape.dim(1);
+                pooled_dims[2] = n_full;
+                full = try builder.reshape(window_mean, Shape{ .dtype = in_shape.dtype, .dims = pooled_dims, .rank_ = 3 });
+            }
+            if (!has_tail) return full.?;
+            const tail_slice = try sliceAxisStatic(builder, inputs[0], 2, n_full * k, length);
+            const tail = try builder.reduceMean(tail_slice, &[_]u8{2});
+            if (full) |head| return builder.concat(head, tail, 2);
+            return tail;
+        }
+    }
+
     // Non-global: compute output shape and use reduce_mean windowed
     // This is an approximation — proper sliding window needs conv_general
+    log.warn("AveragePool '{s}' lowered to a whole-axis mean: overlapping or padded windows are not modelled exactly", .{node.name});
     var out_dims: [8]i64 = .{0} ** 8;
     out_dims[0] = in_shape.dim(0); // batch
     out_dims[1] = in_shape.dim(1); // channels
@@ -3979,9 +4145,16 @@ fn convertIsNaN(builder: *Builder, input: NodeId) ConvertError!NodeId {
 
 fn convertSize(builder: *Builder, input: NodeId) ConvertError!NodeId {
     const in_shape = builder.graph.node(input).output_shape;
-    const count = in_shape.numElements() orelse std.math.maxInt(i32);
-    const out_shape = Shape.init(.f32, &.{1});
-    return builder.tensorConst(&.{@as(f32, @floatFromInt(count))}, out_shape);
+    const out_shape = Shape.scalar(.i64);
+    if (in_shape.numElements()) |count| {
+        return builder.tensorConstBytes(std.mem.sliceAsBytes(&[_]i64{count}), out_shape);
+    }
+    return builder.graph.addNode(.{
+        .op = .{ .size_of = {} },
+        .output_shape = out_shape,
+        .inputs = .{ input, null_node, null_node, null_node },
+        .num_inputs = 1,
+    });
 }
 
 // ── Phase 4: ArgMax, ArgMin ────────────────────────────────────────
@@ -5248,6 +5421,136 @@ fn clampF32ToI64(v: f32) i64 {
     return @intFromFloat(v);
 }
 
+fn isIntegerDType(dtype: ml.graph.DType) bool {
+    return switch (dtype) {
+        .i8, .i16, .i32, .i64, .u8, .bool_ => true,
+        else => false,
+    };
+}
+
+fn materializeFloatScalar(builder: *Builder, node_id: NodeId) ?f64 {
+    if (node_id == null_node) return null;
+    const n = builder.graph.node(node_id);
+    switch (n.op) {
+        .constant => |attrs| {
+            if (attrs.data_len != 1) return null;
+            return switch (n.output_shape.dtype) {
+                .f32 => @floatCast(@as(f32, @bitCast(builder.graph.constantDataAs(u32, attrs.data_offset, 1)[0]))),
+                .f64 => @bitCast(builder.graph.constantDataAs(u64, attrs.data_offset, 1)[0]),
+                .f16 => @floatCast(@as(f16, @bitCast(builder.graph.constantDataAs(u16, attrs.data_offset, 1)[0]))),
+                .bf16 => blk: {
+                    const bits: u32 = @as(u32, builder.graph.constantDataAs(u16, attrs.data_offset, 1)[0]) << 16;
+                    break :blk @floatCast(@as(f32, @bitCast(bits)));
+                },
+                else => null,
+            };
+        },
+        .reshape, .convert_dtype => {
+            const inputs = n.getInputs();
+            return if (inputs.len == 1) materializeFloatScalar(builder, inputs[0]) else null;
+        },
+        else => return null,
+    }
+}
+
+fn floatTensorConst(builder: *Builder, values: []const f64, dtype: ml.graph.DType) ConvertError!NodeId {
+    const bytes = try builder.graph.allocator.alloc(u8, values.len * dtype.byteSize());
+    defer builder.graph.allocator.free(bytes);
+    for (values, 0..) |value, i| switch (dtype) {
+        .f64 => std.mem.writeInt(u64, bytes[i * 8 ..][0..8], @bitCast(value), .little),
+        .f32 => std.mem.writeInt(u32, bytes[i * 4 ..][0..4], @bitCast(@as(f32, @floatCast(value))), .little),
+        .f16 => std.mem.writeInt(u16, bytes[i * 2 ..][0..2], @bitCast(@as(f16, @floatCast(value))), .little),
+        .bf16 => {
+            const bits: u32 = @bitCast(@as(f32, @floatCast(value)));
+            std.mem.writeInt(u16, bytes[i * 2 ..][0..2], @intCast(bits >> 16), .little);
+        },
+        else => return error.InvalidAttribute,
+    };
+    return builder.tensorConstBytes(bytes, Shape.init(dtype, &.{@as(i64, @intCast(values.len))}));
+}
+
+/// Materialize a scalar integer control value without narrowing i64 constants
+/// through f32. Shape expressions commonly place Cast or Reshape between the
+/// initializer and the consumer, so those value-preserving nodes are followed.
+fn materializeIntegerScalar(builder: *Builder, node_id: NodeId) ?i64 {
+    if (node_id == null_node) return null;
+    const n = builder.graph.node(node_id);
+    switch (n.op) {
+        .constant => |attrs| {
+            if (attrs.data_len != 1) return null;
+            return switch (n.output_shape.dtype) {
+                .i8 => builder.graph.constantDataAs(i8, attrs.data_offset, attrs.data_len)[0],
+                .i16 => builder.graph.constantDataAs(i16, attrs.data_offset, attrs.data_len)[0],
+                .i32 => builder.graph.constantDataAs(i32, attrs.data_offset, attrs.data_len)[0],
+                .i64 => builder.graph.constantDataAs(i64, attrs.data_offset, attrs.data_len)[0],
+                .u8, .bool_ => builder.graph.constantDataAs(u8, attrs.data_offset, attrs.data_len)[0],
+                else => null,
+            };
+        },
+        .reshape, .convert_dtype => {
+            const inputs = n.getInputs();
+            return if (inputs.len == 1) materializeIntegerScalar(builder, inputs[0]) else null;
+        },
+        .add, .sub, .mul, .div => {
+            const inputs = n.getInputs();
+            if (inputs.len != 2) return null;
+            const lhs = materializeIntegerScalar(builder, inputs[0]) orelse return null;
+            const rhs = materializeIntegerScalar(builder, inputs[1]) orelse return null;
+            return switch (n.op) {
+                .add => std.math.add(i64, lhs, rhs) catch null,
+                .sub => std.math.sub(i64, lhs, rhs) catch null,
+                .mul => std.math.mul(i64, lhs, rhs) catch null,
+                .div => if (rhs == 0 or (lhs == std.math.minInt(i64) and rhs == -1)) null else @divTrunc(lhs, rhs),
+                else => unreachable,
+            };
+        },
+        else => return null,
+    }
+}
+
+fn integerRangeCount(start: i64, limit: i64, delta: i64) ConvertError!usize {
+    if (delta == 0) return error.InvalidAttribute;
+    const distance: i128 = if (delta > 0)
+        @as(i128, limit) - @as(i128, start)
+    else
+        @as(i128, start) - @as(i128, limit);
+    if (distance <= 0) return 0;
+    const step: i128 = if (delta > 0) @as(i128, delta) else -@as(i128, delta);
+    const count_i128 = @divTrunc(distance + step - 1, step);
+    const count = std.math.cast(usize, count_i128) orelse return error.ShapeMismatch;
+    if (count > 4096) return error.ShapeMismatch;
+    return count;
+}
+
+fn integerTensorConst(builder: *Builder, values: []const i64, dtype: ml.graph.DType) ConvertError!NodeId {
+    const shape = Shape.init(dtype, &.{@as(i64, @intCast(values.len))});
+    switch (dtype) {
+        .i64 => return builder.tensorConstBytes(std.mem.sliceAsBytes(values), shape),
+        .i32 => {
+            var data: [4096]i32 = undefined;
+            for (values, 0..) |value, i| data[i] = std.math.cast(i32, value) orelse return error.ShapeMismatch;
+            return builder.tensorConstBytes(std.mem.sliceAsBytes(data[0..values.len]), shape);
+        },
+        .i16 => {
+            var data: [4096]i16 = undefined;
+            for (values, 0..) |value, i| data[i] = std.math.cast(i16, value) orelse return error.ShapeMismatch;
+            return builder.tensorConstBytes(std.mem.sliceAsBytes(data[0..values.len]), shape);
+        },
+        .i8 => {
+            var data: [4096]i8 = undefined;
+            for (values, 0..) |value, i| data[i] = std.math.cast(i8, value) orelse return error.ShapeMismatch;
+            return builder.tensorConstBytes(std.mem.sliceAsBytes(data[0..values.len]), shape);
+        },
+        .u8 => {
+            var data: [4096]u8 = undefined;
+            for (values, 0..) |value, i| data[i] = std.math.cast(u8, value) orelse return error.ShapeMismatch;
+            return builder.tensorConstBytes(std.mem.sliceAsBytes(data[0..values.len]), shape);
+        },
+        .bool_ => return error.InvalidAttribute,
+        else => return error.InvalidAttribute,
+    }
+}
+
 fn materializeConstantNodeValues(
     graph: *const Graph,
     n: *const ml.graph.Node,
@@ -5558,9 +5861,10 @@ test "convertNode Shape materializes dims" {
     // Should be a 1-D tensor with 3 elements
     try std.testing.expectEqual(@as(u8, 1), out_shape.rank());
     try std.testing.expectEqual(@as(i64, 3), out_shape.dim(0));
+    try std.testing.expectEqual(.i64, out_shape.dtype);
 }
 
-test "convertNode Shape stays runtime after runtime-targeted Reshape" {
+test "convertNode Shape folds a reshape built from constant expressions" {
     const allocator = std.testing.allocator;
     var g = Graph.init(allocator);
     defer g.deinit();
@@ -5575,12 +5879,12 @@ test "convertNode Shape stays runtime after runtime-targeted Reshape" {
 
     const reshape_node = NodeProto{ .op_type = "Reshape" };
     const reshaped = try convertNode(allocator, &b, &reshape_node, &.{ x, target }, null);
-    try std.testing.expect(g.node(reshaped).op.reshape.runtime_shape);
+    try std.testing.expect(!g.node(reshaped).op.reshape.runtime_shape);
     try std.testing.expectEqual(@as(i64, 12), g.node(reshaped).output_shape.dim(0));
 
     const shape_node = NodeProto{ .op_type = "Shape" };
     const result = try convertNode(allocator, &b, &shape_node, &.{reshaped}, null);
-    try std.testing.expectEqual(.shape_of, std.meta.activeTag(g.node(result).op));
+    try std.testing.expectEqual(.constant, std.meta.activeTag(g.node(result).op));
 }
 
 test "convertNode LayerNormalization emits fused" {
@@ -6237,9 +6541,58 @@ test "convertNode Size" {
     const node = NodeProto{ .op_type = "Size" };
     const result = try convertNode(allocator, &b, &node, &.{x}, null);
     const out_shape = g.node(result).output_shape;
-    try std.testing.expectEqual(@as(u8, 1), out_shape.rank());
+    try std.testing.expectEqual(@as(u8, 0), out_shape.rank());
     // Should be a constant with value 24
     try std.testing.expect(std.meta.activeTag(g.node(result).op) == .constant);
+    try std.testing.expectEqual(.i64, out_shape.dtype);
+}
+
+test "convertNode Size keeps dynamic input sizes at runtime" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+    const x = try b.parameter("x", Shape.init(.f32, &.{ -1, 3 }));
+    const result = try convertNode(allocator, &b, &.{ .op_type = "Size" }, &.{x}, null);
+    try std.testing.expect(std.meta.activeTag(g.node(result).op) == .size_of);
+    try std.testing.expectEqual(.i64, g.node(result).output_shape.dtype);
+    try std.testing.expectEqual(@as(u8, 0), g.node(result).output_shape.rank());
+}
+
+test "convertNode Range folds signed i64 controls exactly" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+    const start = try b.tensorConstBytes(std.mem.sliceAsBytes(&[_]i64{9007199254740993}), Shape.scalar(.i64));
+    const limit = try b.tensorConstBytes(std.mem.sliceAsBytes(&[_]i64{9007199254740996}), Shape.scalar(.i64));
+    const delta = try b.tensorConstBytes(std.mem.sliceAsBytes(&[_]i64{1}), Shape.scalar(.i64));
+    const result = try convertNode(allocator, &b, &.{ .op_type = "Range" }, &.{ start, limit, delta }, null);
+    const out = g.node(result);
+    const attrs = switch (out.op) {
+        .constant => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(.i64, out.output_shape.dtype);
+    try std.testing.expectEqualSlices(i64, &.{ 9007199254740993, 9007199254740994, 9007199254740995 }, g.constantDataAs(i64, attrs.data_offset, attrs.data_len));
+}
+
+test "convertNode Range preserves floating storage dtype" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+    const start = try b.tensorConstBytes(std.mem.sliceAsBytes(&[_]f64{1.0}), Shape.scalar(.f64));
+    const limit = try b.tensorConstBytes(std.mem.sliceAsBytes(&[_]f64{3.0}), Shape.scalar(.f64));
+    const delta = try b.tensorConstBytes(std.mem.sliceAsBytes(&[_]f64{1.0}), Shape.scalar(.f64));
+    const result = try convertNode(allocator, &b, &.{ .op_type = "Range" }, &.{ start, limit, delta }, null);
+    const out = g.node(result);
+    const attrs = switch (out.op) {
+        .constant => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(.f64, out.output_shape.dtype);
+    try std.testing.expectEqualSlices(f64, &.{ 1.0, 2.0 }, g.constantDataAs(f64, attrs.data_offset, attrs.data_len));
 }
 
 test "convertNode Einsum matmul" {
@@ -7200,6 +7553,18 @@ test "convertNode broadcast Sub scalar" {
 
 // ── Coverage Tests: Error Handling ──────────────────────────────────
 
+test "convertNode Concat with one input preserves the pooling tensor" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+    const x = try b.parameter("cls", Shape.init(.f32, &.{ -1, 1024 }));
+    var attrs = [_]AttributeProto{.{ .name = "axis", .i = 1 }};
+    const node = NodeProto{ .op_type = "Concat", .attributes = &attrs };
+    const result = try convertNode(allocator, &b, &node, &.{x}, null);
+    try std.testing.expectEqual(x, result);
+}
+
 test "convertNode Concat missing inputs" {
     const allocator = std.testing.allocator;
     var g = Graph.init(allocator);
@@ -8153,4 +8518,34 @@ test "OpType.fromString recognizes control flow ops" {
     try std.testing.expect(OpType.fromString("If") == .If);
     try std.testing.expect(OpType.fromString("Loop") == .Loop);
     try std.testing.expect(OpType.fromString("Scan") == .Scan);
+}
+
+test "CumSum preserves dynamic shape and rejects a runtime axis" {
+    const allocator = std.testing.allocator;
+    var graph = Graph.init(allocator);
+    defer graph.deinit();
+    var builder = Builder.init(&graph);
+    const input = try builder.parameter("mask", Shape.init(.i64, &.{ -1, -1 }));
+    const axis = try builder.scalarConst(.i64, -1);
+    const output = try convertNode(allocator, &builder, &.{ .op_type = "CumSum" }, &.{ input, axis }, null);
+    try std.testing.expectEqual(@as(u8, 1), graph.node(output).op.cumulative_sum.axis);
+    try std.testing.expectEqualDeep(graph.node(input).output_shape, graph.node(output).output_shape);
+    const runtime_axis = try builder.parameter("axis", Shape.init(.i64, &.{}));
+    try std.testing.expectError(error.ConstantMaterializationFailed, convertNode(allocator, &builder, &.{ .op_type = "CumSum" }, &.{ input, runtime_axis }, null));
+}
+
+test "concrete deep ONNX projections retain static planning shapes" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+    var x = try b.parameter("x", Shape.init(.f32, &.{ 2, 7, 4 }));
+    for (0..200) |_| x = try b.neg(x);
+    const w = try b.parameter("w", Shape.init(.f32, &.{ 4, 8 }));
+    const mm = try convertMatMul(&b, &.{ .op_type = "MatMul" }, x, w);
+    const flat_mm = g.node(mm).inputs[0];
+    try std.testing.expectEqual(@as(i64, 14), g.node(flat_mm).output_shape.dim(0));
+    try std.testing.expect(!nodeHasRuntimeDependentShape(&b, mm, 0));
+    const shape = try convertShape(&b, &.{ .op_type = "Shape" }, mm);
+    try std.testing.expectEqual(.constant, std.meta.activeTag(g.node(shape).op));
 }

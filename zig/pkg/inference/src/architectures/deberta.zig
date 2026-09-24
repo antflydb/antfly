@@ -676,10 +676,11 @@ fn embeddings(
     }
 
     const result = try cb.embeddingLookup(word_emb, input_ids, total, H);
+    defer cb.free(result);
 
     // LayerNorm
     const normed = try cb.layerNorm(result, ln_w, ln_b, H, config.layer_norm_eps);
-    cb.free(result);
+    errdefer cb.free(normed);
 
     // Multiply by attention mask (DeBERTa-v3 zeros out padding embeddings).
     if (allAttentionMaskOnes(attention_mask, total)) return normed;
@@ -887,6 +888,7 @@ fn encoderLayer(
             .num_attention_heads = num_heads,
             .head_dim = head_dim,
             .norm_eps = eps,
+            .activation = if (config.use_exact_gelu) .gelu_exact else .gelu,
         })) |planned| {
             return planned;
         }
@@ -1108,7 +1110,7 @@ fn encoderLayer(
                 .hidden_size = H,
                 .intermediate_size = I,
                 .eps = eps,
-                .activation = .gelu,
+                .activation = if (config.use_exact_gelu) .gelu_exact else .gelu,
             })) |layer_out| {
                 if (profile) |p| p.ffn_output_ns += profileElapsed(timer);
                 return layer_out;
@@ -1120,7 +1122,7 @@ fn encoderLayer(
                 .residual = attn_normed,
                 .hidden_size = H,
                 .intermediate_size = I,
-                .activation = .gelu,
+                .activation = if (config.use_exact_gelu) .gelu_exact else .gelu,
             })) |ffn_res| {
                 defer cb.free(ffn_res);
                 const layer_out = try cb.layerNorm(ffn_res, ffn_ln_w, ffn_ln_b, H, eps);
@@ -1141,7 +1143,7 @@ fn encoderLayer(
             .hidden_size = H,
             .intermediate_size = I,
             .eps = eps,
-            .activation = .gelu,
+            .activation = if (config.use_exact_gelu) .gelu_exact else .gelu,
         })) |fused| {
             if (profile) |p| p.ffn_output_ns += profileElapsed(timer);
             return fused;
@@ -1151,7 +1153,7 @@ fn encoderLayer(
     var ffn_inter_is_gelu = false;
     const ffn_inter = if (use_tp)
         try linearReplicatedToMaybeSharded(cb, attn_normed, ffn_i_w, ffn_i_b, total, H, I)
-    else if (try cb.linearGelu(attn_normed, ffn_i_w, ffn_i_b, total, H, I)) |fused| blk: {
+    else if (if (config.use_exact_gelu) null else try cb.linearGelu(attn_normed, ffn_i_w, ffn_i_b, total, H, I)) |fused| blk: {
         ffn_inter_is_gelu = true;
         break :blk fused;
     } else try cb.linear(attn_normed, ffn_i_w, ffn_i_b, total, H, I);
@@ -1161,10 +1163,11 @@ fn encoderLayer(
     const ffn_gelu = if (ffn_inter_is_gelu)
         ffn_inter
     else blk: {
-        const gelu = cb.gelu(ffn_inter) catch |err| {
-            cb.free(ffn_inter);
-            return err;
-        };
+        errdefer cb.free(ffn_inter);
+        const gelu = if (config.use_exact_gelu)
+            (try cb.geluExact(ffn_inter)) orelse return error.UnsupportedDebertaActivation
+        else
+            try cb.gelu(ffn_inter);
         cb.free(ffn_inter);
         break :blk gelu;
     };
@@ -1180,18 +1183,16 @@ fn encoderLayer(
         }
         break :blk try cb.linear(ffn_gelu, ffn_o_w, ffn_o_b, total, local_intermediate, H);
     };
+    defer cb.free(ffn_out);
     if (profile) |p| p.ffn_output_ns += profileElapsed(timer);
 
     timer = profileStart(profile);
     const out = if (ffn_out_has_residual) blk: {
-        defer cb.free(ffn_out);
         break :blk try cb.layerNorm(ffn_out, ffn_ln_w, ffn_ln_b, H, eps);
     } else if (try cb.addLayerNorm(ffn_out, attn_normed, ffn_ln_w, ffn_ln_b, H, eps)) |fused| blk: {
-        cb.free(ffn_out);
         break :blk fused;
     } else blk: {
         const ffn_res = try cb.add(ffn_out, attn_normed);
-        cb.free(ffn_out);
         defer cb.free(ffn_res);
         break :blk try cb.layerNorm(ffn_res, ffn_ln_w, ffn_ln_b, H, eps);
     };

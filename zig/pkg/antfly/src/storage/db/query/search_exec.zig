@@ -37,6 +37,7 @@ const roaring = @import("../../../encoding/roaring.zig");
 const snappy = @import("../../../encoding/snappy.zig");
 const distributed_stats_mod = @import("../../../search/distributed_stats.zig");
 const runtime_preflight = @import("../runtime_preflight.zig");
+const control_contract = @import("control_contract.zig");
 const analysis_mod = @import("../../../search/analysis.zig");
 const introducer_mod = @import("../../../introducer.zig");
 const mapper_mod = @import("../document_mapper.zig");
@@ -88,42 +89,13 @@ const bench_query_profile_unknown = std.math.maxInt(u64);
 const bench_query_profile_disabled = std.math.maxInt(u64) - 1;
 var bench_query_profile_every_cache: std.atomic.Value(u64) = .init(bench_query_profile_unknown);
 
-pub const SortRejectionDiagnostic = struct {
-    field: []const u8 = "",
-    reason: []const u8 = "unsupported_exact_sort",
-    detail: []const u8 = "unsupported_exact_sort",
-};
-
-threadlocal var last_sort_rejection_diagnostic: ?SortRejectionDiagnostic = null;
-threadlocal var last_sort_rejection_field_buf: [256]u8 = undefined;
-
-pub fn resetLastSortRejectionDiagnostic() void {
-    last_sort_rejection_diagnostic = null;
-}
-
-pub fn takeLastSortRejectionDiagnostic() ?SortRejectionDiagnostic {
-    const diagnostic = last_sort_rejection_diagnostic;
-    last_sort_rejection_diagnostic = null;
-    return diagnostic;
-}
-
-pub fn peekLastSortRejectionDiagnostic() ?SortRejectionDiagnostic {
-    return last_sort_rejection_diagnostic;
-}
-
-pub fn recordSortRejectionDiagnostic(field: []const u8, reason: []const u8, detail: []const u8) void {
-    const field_len = @min(field.len, last_sort_rejection_field_buf.len);
-    if (field_len > 0) @memcpy(last_sort_rejection_field_buf[0..field_len], field[0..field_len]);
-    last_sort_rejection_diagnostic = .{
-        .field = last_sort_rejection_field_buf[0..field_len],
-        .reason = reason,
-        .detail = detail,
-    };
-}
-
-pub fn recordSortRejectionDiagnosticForTesting(field: []const u8, reason: []const u8, detail: []const u8) void {
-    recordSortRejectionDiagnostic(field, reason, detail);
-}
+pub const SortRejectionDiagnostic = runtime_preflight.SortRejectionDiagnostic;
+pub const resetLastSortRejectionDiagnostic = runtime_preflight.resetLastSortRejectionDiagnostic;
+pub const takeLastSortRejectionDiagnostic = runtime_preflight.takeLastSortRejectionDiagnostic;
+pub const peekLastSortRejectionDiagnostic = runtime_preflight.peekLastSortRejectionDiagnostic;
+pub const recordSortRejectionDiagnostic = runtime_preflight.recordSortRejectionDiagnostic;
+pub const recordSortRejectionDiagnosticForTesting = runtime_preflight.recordSortRejectionDiagnosticForTesting;
+const textQueryIsScoreBearing = runtime_preflight.textQueryIsScoreBearing;
 
 pub const SearchTextDispatcher = struct {
     ctx: ?*anyopaque,
@@ -137,6 +109,7 @@ pub const SearchTextDispatcher = struct {
 
 pub const SearchTextQueryExecutor = struct {
     ctx: ?*anyopaque,
+    load_projected_documents: ?LoadProjectedDocuments = null,
     text_index_entry: *const fn (
         ctx: ?*anyopaque,
         index_name: ?[]const u8,
@@ -225,21 +198,8 @@ pub const SearchTextStatsExecutor = struct {
     ) anyerror![]?[]u8 = null,
 };
 
-pub const ExplicitTextStatRequest = struct {
-    index_name: ?[]const u8 = null,
-    field: []const u8,
-    terms: []const []const u8 = &.{},
-    resolved_doc_filter: ?*const doc_set.ResolvedDocFilter = null,
-};
-
-pub const ExplicitBackgroundTextStatRequest = struct {
-    aggregation_name: []const u8,
-    index_name: ?[]const u8 = null,
-    field: []const u8,
-    terms: []const []const u8 = &.{},
-    background_query: aggregations_mod.BackgroundQuery,
-    resolved_doc_filter: ?*const doc_set.ResolvedDocFilter = null,
-};
+pub const ExplicitTextStatRequest = control_contract.ExplicitTextStatRequest;
+pub const ExplicitBackgroundTextStatRequest = control_contract.ExplicitBackgroundTextStatRequest;
 
 const SearchRequestTextStatEntry = struct {
     field: []const u8 = "",
@@ -366,162 +326,7 @@ pub const DenseSearchExecutor = struct {
     ) anyerror!types.SearchResult,
 };
 
-pub const DenseSearchProfile = struct {
-    pub const DebugHit = struct {
-        id: u64 = 0,
-        distance: f32 = 0,
-        error_bound: f32 = 0,
-        lower_bound: f32 = 0,
-        upper_bound: f32 = 0,
-    };
-
-    pub const DebugPair = struct {
-        left: DebugHit = .{},
-        right: DebugHit = .{},
-        distance_gap: f32 = 0,
-        interval_gap: f32 = 0,
-        overlaps: bool = false,
-    };
-
-    total_ns: u64 = 0,
-    index_lookup_ns: u64 = 0,
-    constraint_ns: u64 = 0,
-    hbc_search_ns: u64 = 0,
-    hbc_runtime_txn_ns: u64 = 0,
-    hbc_admission_wait_ns: u64 = 0,
-    hbc_scan_admission_wait_ns: u64 = 0,
-    hbc_rerank_admission_wait_ns: u64 = 0,
-    hbc_admission_estimated_scan_bytes: u64 = 0,
-    hbc_admission_selected_scan_bytes: u64 = 0,
-    hbc_admission_peak_reserved_bytes: u64 = 0,
-    hbc_admission_reservations: u64 = 0,
-    hbc_admission_fallback_leaves: u64 = 0,
-    hbc_leaf_scan_bytes: u64 = 0,
-    hbc_native_leaf_lookup_ns: u64 = 0,
-    hbc_projection_completion_ns: u64 = 0,
-    hbc_scratch_acquire_ns: u64 = 0,
-    hbc_node_cache_lookup_ns: u64 = 0,
-    hbc_quantized_cache_lookup_ns: u64 = 0,
-    hbc_child_expand_ns: u64 = 0,
-    hbc_leaf_score_ns: u64 = 0,
-    hbc_filter_candidates: u64 = 0,
-    hbc_filter_rejected: u64 = 0,
-    hbc_filter_metadata_batches: u64 = 0,
-    hbc_filter_metadata_batch_ns: u64 = 0,
-    hbc_traversal_waves: u64 = 0,
-    hbc_traversal_initial_wave_leaves: u64 = 0,
-    hbc_traversal_max_wave_leaves: u64 = 0,
-    hbc_traversal_bound_resolutions: u64 = 0,
-    hbc_traversal_bound_fallbacks: u64 = 0,
-    hbc_traversal_bound_stops: u64 = 0,
-    hbc_traversal_bound_unresolved_frontier: u64 = 0,
-    hbc_traversal_bound_incomplete_topk: u64 = 0,
-    hbc_traversal_bound_overlap: u64 = 0,
-    hbc_traversal_unresolved_posting_bounds: u64 = 0,
-    hbc_traversal_incomplete_routing_directory: u64 = 0,
-    hbc_traversal_frontier_remaining: u64 = 0,
-    hbc_traversal_eligible_vectors: u64 = 0,
-    hbc_traversal_stop_lower_bound: f32 = 0,
-    hbc_traversal_stop_result_upper_bound: f32 = 0,
-    resolved_search_width: u32 = 0,
-    resolved_epsilon: f32 = 0,
-    native_filter_candidate_count: u64 = 0,
-    search_route: []const u8 = "",
-    route_reason: []const u8 = "",
-    route_estimated_exact_storage_bytes: u64 = 0,
-    route_estimated_hbc_storage_bytes: u64 = 0,
-    route_estimated_exact_work_ns: u64 = 0,
-    route_estimated_hbc_work_ns: u64 = 0,
-    exact_candidate_count: u64 = 0,
-    exact_batch_count: u64 = 0,
-    exact_max_batch_size: u64 = 0,
-    exact_workspace_bytes: u64 = 0,
-    exact_request_vector_cache_entries: u64 = 0,
-    exact_raw_batch_reads: u64 = 0,
-    exact_raw_scalar_reads: u64 = 0,
-    exact_missing_vectors: u64 = 0,
-    exact_candidate_prepare_ns: u64 = 0,
-    exact_metadata_lookup_ns: u64 = 0,
-    exact_artifact_key_ns: u64 = 0,
-    exact_artifact_read_ns: u64 = 0,
-    exact_artifact_decode_ns: u64 = 0,
-    exact_distance_ns: u64 = 0,
-    exact_lsm_cache_hits: u64 = 0,
-    exact_lsm_cache_misses: u64 = 0,
-    exact_artifact_cache_hits: u64 = 0,
-    exact_artifact_vectors_loaded: u64 = 0,
-    hbc_nodes_visited: u64 = 0,
-    hbc_leaves_explored: u64 = 0,
-    hbc_approx_vectors_scored: u64 = 0,
-    hbc_exact_vectors_scored: u64 = 0,
-    hbc_leaf_payload_stale: u64 = 0,
-    hbc_leaf_payload_missing: u64 = 0,
-    hbc_native_leaf_scan_hits: u64 = 0,
-    hbc_native_leaf_scan_fallbacks: u64 = 0,
-    hbc_subgroup_leaves_scored: u64 = 0,
-    hbc_subgroup_vectors_skipped: u64 = 0,
-    hbc_subgroup_compact_groups_scored: u64 = 0,
-    hbc_subgroup_routing_ns: u64 = 0,
-    hbc_reranked_vectors: u64 = 0,
-    hbc_approx_candidate_count: u64 = 0,
-    hbc_rerank_candidate_count: u64 = 0,
-    hbc_rerank_batches: u64 = 0,
-    hbc_rerank_max_batch_size: u64 = 0,
-    hbc_rerank_candidates_skipped_by_bound: u64 = 0,
-    hbc_ambiguous_top_k_pairs: u64 = 0,
-    hbc_ambiguous_boundary_pairs: u64 = 0,
-    hbc_ambiguous_distance_over_hits: u64 = 0,
-    hbc_ambiguous_distance_under_hits: u64 = 0,
-    hbc_full_rerank_due_to_threshold: bool = false,
-    hbc_top_k_count: u64 = 0,
-    hbc_min_distance_gap_top_k: f32 = 0,
-    hbc_min_interval_gap_top_k: f32 = 0,
-    hbc_closest_pair_top_k: ?DebugPair = null,
-    hbc_boundary_pair: ?DebugPair = null,
-    hbc_boundary_tail_error_avg: f32 = 0,
-    hbc_boundary_tail_error_max: f32 = 0,
-    hbc_boundary_tail_distance_gap_avg: f32 = 0,
-    hbc_boundary_tail_distance_gap_min: f32 = 0,
-    hbc_boundary_tail_distance_gap_max: f32 = 0,
-    hbc_boundary_tail_interval_gap_avg: f32 = 0,
-    hbc_boundary_tail_interval_gap_min: f32 = 0,
-    hbc_boundary_tail_interval_gap_max: f32 = 0,
-    hbc_approx_top_count: u64 = 0,
-    hbc_approx_top: [5]DebugHit = .{ .{}, .{}, .{}, .{}, .{} },
-    hbc_rerank_external_score_ns: u64 = 0,
-    hbc_rerank_vector_load_ns: u64 = 0,
-    hbc_rerank_metadata_lookup_ns: u64 = 0,
-    hbc_rerank_metadata_vectors_loaded: u64 = 0,
-    hbc_rerank_artifact_key_ns: u64 = 0,
-    hbc_rerank_artifact_read_ns: u64 = 0,
-    hbc_rerank_artifact_decode_ns: u64 = 0,
-    hbc_rerank_artifact_distance_ns: u64 = 0,
-    hbc_rerank_lsm_cache_hits: u64 = 0,
-    hbc_rerank_lsm_cache_misses: u64 = 0,
-    hbc_rerank_vector_block_hits: u64 = 0,
-    hbc_rerank_vector_projection_reads: u64 = 0,
-    hbc_rerank_vector_projection_borrows: u64 = 0,
-    hbc_rerank_vector_projection_bytes: u64 = 0,
-    hbc_rerank_vector_residual_reads: u64 = 0,
-    hbc_rerank_vector_residual_bytes: u64 = 0,
-    hbc_rerank_vector_physical_reads: u64 = 0,
-    hbc_rerank_vector_physical_bytes: u64 = 0,
-    hbc_rerank_vector_location_reuses: u64 = 0,
-    hbc_rerank_vector_block_misses: u64 = 0,
-    hbc_rerank_vector_block_fallbacks: u64 = 0,
-    hbc_rerank_artifact_cache_hits: u64 = 0,
-    hbc_rerank_artifact_vectors_loaded: u64 = 0,
-    hbc_rerank_distance_ns: u64 = 0,
-    doc_key_resolve_ns: u64 = 0,
-    doc_ordinal_lookup_ns: u64 = 0,
-    load_projected_document_ns: u64 = 0,
-    postprocess_ns: u64 = 0,
-    raw_hit_count: u32 = 0,
-    returned_hit_count: u32 = 0,
-    inline_metadata_hits: u32 = 0,
-    fetched_metadata_hits: u32 = 0,
-    lookup_doc_key_hits: u32 = 0,
-};
+pub const DenseSearchProfile = control_contract.DenseSearchProfile;
 
 pub const ProfiledDenseSearchResult = struct {
     result: types.SearchResult,
@@ -917,122 +722,7 @@ pub fn preflightSearchRequestAlloc(
 }
 
 pub fn deriveEstimateFields(summary: *RuntimePreflightSummary) void {
-    summary.text_result_upper_bound = textResultUpperBound(summary.*);
-    summary.text_term_doc_freq_total = textTermDocFreqTotal(summary.*);
-    summary.corpus_doc_count_estimate = estimatedCorpusDocCount(summary.*);
-    summary.result_doc_upper_bound = resultDocUpperBound(summary.*);
-    summary.result_doc_estimate = resultDocEstimate(summary.*);
-    summary.selectivity_lower_bound_ratio = selectivityLowerBoundRatio(summary.*);
-    summary.selectivity_sample_ratio = selectivitySampleRatio(summary.*);
-    summary.selectivity_upper_bound_ratio = selectivityUpperBoundRatio(summary.*);
-    summary.effective_stored_projection_doc_estimate_total = if (summary.result_doc_estimate) |estimate|
-        @min(summary.stored_projection_doc_upper_bound_total, estimate)
-    else
-        null;
-    summary.effective_stored_projection_doc_upper_bound_total = if (summary.result_doc_upper_bound) |bound|
-        @min(summary.stored_projection_doc_upper_bound_total, bound)
-    else
-        summary.stored_projection_doc_upper_bound_total;
-    summary.effective_rerank_doc_estimate = if (summary.result_doc_estimate) |estimate|
-        @min(summary.rerank_doc_upper_bound, estimate)
-    else
-        null;
-    summary.effective_rerank_doc_upper_bound = if (summary.result_doc_upper_bound) |bound|
-        @min(summary.rerank_doc_upper_bound, bound)
-    else
-        summary.rerank_doc_upper_bound;
-    summary.aggregation_second_pass_doc_estimate = if (summary.aggregation_may_scan_full_results) summary.result_doc_estimate else null;
-    summary.aggregation_second_pass_doc_upper_bound = if (summary.aggregation_may_scan_full_results) summary.result_doc_upper_bound else null;
-}
-
-fn textResultUpperBound(summary: RuntimePreflightSummary) ?u32 {
-    var total_bound: u64 = 0;
-    var has_terms = false;
-    for (summary.text_query_stats) |item| {
-        var field_bound: u64 = 0;
-        for (item.term_doc_freqs) |term| {
-            field_bound +|= term.doc_freq;
-            has_terms = true;
-        }
-        if (field_bound == 0) continue;
-        const capped_field_bound = @min(field_bound, item.global_doc_count);
-        total_bound +|= capped_field_bound;
-    }
-    if (!has_terms) return null;
-    if (estimatedCorpusDocCount(summary)) |corpus_docs| {
-        total_bound = @min(total_bound, corpus_docs);
-    }
-    return @intCast(@min(total_bound, @as(u64, std.math.maxInt(u32))));
-}
-
-fn textTermDocFreqTotal(summary: RuntimePreflightSummary) u64 {
-    var total: u64 = 0;
-    for (summary.text_query_stats) |item| {
-        for (item.term_doc_freqs) |term| total +|= term.doc_freq;
-    }
-    return total;
-}
-
-fn estimatedCorpusDocCount(summary: RuntimePreflightSummary) ?u64 {
-    var corpus_docs: u64 = 0;
-    for (summary.text_query_stats) |item| corpus_docs = @max(corpus_docs, item.global_doc_count);
-    for (summary.text_indexes) |item| corpus_docs = @max(corpus_docs, item.doc_count);
-    for (summary.embedding_indexes) |item| corpus_docs = @max(corpus_docs, item.doc_count);
-    for (summary.graph_indexes) |item| corpus_docs = @max(corpus_docs, item.node_count);
-    return if (corpus_docs > 0) corpus_docs else null;
-}
-
-fn selectivityUpperBoundRatio(summary: RuntimePreflightSummary) ?f32 {
-    const bound = summary.result_doc_upper_bound orelse return null;
-    const corpus_docs = estimatedCorpusDocCount(summary) orelse return null;
-    if (corpus_docs == 0) return null;
-    return @as(f32, @floatFromInt(bound)) / @as(f32, @floatFromInt(corpus_docs));
-}
-
-fn selectivityLowerBoundRatio(summary: RuntimePreflightSummary) ?f32 {
-    const lower_bound = summary.structured_filter_doc_count_lower_bound orelse return null;
-    const corpus_docs = estimatedCorpusDocCount(summary) orelse return null;
-    if (corpus_docs == 0) return null;
-    return @as(f32, @floatFromInt(lower_bound)) / @as(f32, @floatFromInt(corpus_docs));
-}
-
-fn selectivitySampleRatio(summary: RuntimePreflightSummary) ?f32 {
-    const sample_estimate = summary.structured_filter_doc_count_sample_estimate orelse return null;
-    const corpus_docs = estimatedCorpusDocCount(summary) orelse return null;
-    if (corpus_docs == 0) return null;
-    return @as(f32, @floatFromInt(sample_estimate)) / @as(f32, @floatFromInt(corpus_docs));
-}
-
-fn resultDocUpperBound(summary: RuntimePreflightSummary) ?u32 {
-    var bound = summary.positive_id_result_upper_bound;
-    if (summary.structured_filter_doc_count_sample_estimate == null) if (summary.structured_filter_doc_count_estimate) |structured_count| {
-        const structured_bound: u32 = @intCast(@min(structured_count, @as(u64, std.math.maxInt(u32))));
-        bound = if (bound) |existing| @min(existing, structured_bound) else structured_bound;
-    };
-    if (summary.text_result_upper_bound) |text_bound| {
-        bound = if (bound) |existing| @min(existing, text_bound) else text_bound;
-    }
-    return bound;
-}
-
-fn resultDocEstimate(summary: RuntimePreflightSummary) ?u32 {
-    var estimate: ?u32 = null;
-    if (summary.structured_filter_count_budget_limit != null) {
-        if (summary.structured_filter_doc_count_sample_estimate) |structured_count| {
-            estimate = @intCast(@min(structured_count, @as(u64, std.math.maxInt(u32))));
-        } else if (summary.structured_filter_doc_count_estimate) |structured_count| {
-            estimate = @intCast(@min(structured_count, @as(u64, std.math.maxInt(u32))));
-        }
-    } else if (summary.structured_filter_doc_count_estimate) |structured_count| {
-        estimate = @intCast(@min(structured_count, @as(u64, std.math.maxInt(u32))));
-    } else if (summary.structured_filter_doc_count_sample_estimate) |structured_count| {
-        estimate = @intCast(@min(structured_count, @as(u64, std.math.maxInt(u32))));
-    }
-    if (estimate) |value| {
-        if (summary.result_doc_upper_bound) |bound| return @min(value, bound);
-        return value;
-    }
-    return null;
+    runtime_preflight.deriveEstimateFields(summary);
 }
 
 pub fn emptySearchResult(alloc: Allocator) !types.SearchResult {
@@ -1065,10 +755,7 @@ fn freeOwnedStringSlice(alloc: Allocator, values: []const []const u8) void {
 }
 
 pub fn isTextQuery(query: types.Query) bool {
-    return switch (query) {
-        .match_none, .match_all, .phrase, .multi_phrase, .term, .fuzzy, .numeric_range, .date_range, .doc_id, .bool_field, .geo_distance, .geo_bbox, .term_range, .ip_range, .geo_shape, .match, .match_phrase, .prefix, .wildcard, .regexp => true,
-        else => false,
-    };
+    return control_contract.isTextQuery(query);
 }
 
 fn searchComposedDenseComponent(
@@ -1527,30 +1214,20 @@ fn findComposedNamedSet(named_sets: []const graph_exec.NamedResultSet, name: []c
 }
 
 pub fn isDefaultMatchAll(query: types.Query) bool {
-    return switch (query) {
-        .match_all => true,
-        else => false,
-    };
+    return control_contract.isDefaultMatchAll(query);
 }
 
 /// Whether request execution binds `index_name` directly as a full-text index.
 /// Keep planning, binding validation, and API lifecycle error classification
 /// on one definition so an unavailable index cannot change a permanent shape
 /// error into a retryable rebuilding response.
-pub fn requestBindsRootTextIndex(req: types.SearchRequest) bool {
-    return req.full_text != null or
-        req.filter_query_json.len > 0 or
-        req.exclusion_query_json.len > 0 or
-        (!isDefaultMatchAll(req.query) and isTextQuery(req.query));
-}
+pub const requestBindsRootTextIndex = control_contract.requestBindsRootTextIndex;
 
 /// Structured text filters use their own resolution chain: the routed primary
 /// text index, then the root index, then the default full-text index. Keep that
 /// distinct from direct root-index binding so preflight does not reject a
 /// valid request merely because its semantic root index is not full-text.
-pub fn requestBindsFilterTextIndex(req: types.SearchRequest) bool {
-    return req.filter_text != null or req.exclusion_text != null;
-}
+pub const requestBindsFilterTextIndex = control_contract.requestBindsFilterTextIndex;
 
 fn hasSearchRequestFullTextResults(req: types.SearchRequest) bool {
     if (req.full_text != null) return true;
@@ -1749,38 +1426,11 @@ fn validateComposedSortPageOptions(req: types.SearchRequest) !void {
     }
 }
 
-const ComponentPaging = struct {
-    offset: u32,
-    limit: u32,
-};
-
-fn componentPaging(req: types.SearchRequest) ComponentPaging {
-    var limit = if (req.reranker) |reranker|
-        reranker.candidate_count orelse (reranker.top_n orelse req.limit) +| req.offset
-    else
-        req.limit +| req.offset;
-    const needs_component_window = requestHasPostprocessPageTransforms(req);
-
-    if (!needs_component_window) {
-        return .{
-            .offset = req.offset,
-            .limit = req.limit,
-        };
-    }
-
-    if (req.merge_config) |merge_config| {
-        if (merge_config.window_size > limit) limit = merge_config.window_size;
-    }
-    if (req.reranker) |reranker| {
-        const reranker_window = reranker.candidate_count orelse (reranker.top_n orelse req.limit) +| req.offset;
-        if (reranker_window > limit) limit = reranker_window;
-    }
-
-    return .{
-        .offset = 0,
-        .limit = limit,
-    };
-}
+const ComponentPaging = control_contract.ComponentPaging;
+const componentPaging = control_contract.componentPaging;
+const pagingCandidateWindow = control_contract.pagingCandidateWindow;
+const scoreOrderCandidateWindowK = control_contract.scoreOrderCandidateWindowK;
+const requestHasPostprocessPageTransforms = control_contract.requestHasPostprocessPageTransforms;
 
 fn composedFusionRequest(req: types.SearchRequest) types.SearchRequest {
     if (req.reranker == null and req.pruner == null) return req;
@@ -1842,10 +1492,32 @@ test "reranker component paging includes the post-rerank offset" {
     try std.testing.expectEqual(@as(u32, 2), legacy_top_n.limit);
 }
 
-fn requestHasPostprocessPageTransforms(req: types.SearchRequest) bool {
-    return req.merge_config != null or
-        req.pruner != null or
-        req.reranker != null;
+test "composed vector component window matches component paging" {
+    // Fusion alone widens the component window to offset zero.
+    try std.testing.expectEqual(@as(u32, 30), control_contract.composedVectorComponentWindow(.{
+        .limit = 30,
+        .merge_config = .{ .strategy = .rrf },
+    }));
+    // A larger fusion window is part of what each component contributes.
+    try std.testing.expectEqual(@as(u32, 50), control_contract.composedVectorComponentWindow(.{
+        .limit = 30,
+        .merge_config = .{ .strategy = .rrf, .window_size = 50 },
+    }));
+    // Reranking reorders every candidate in its window, so the window counts.
+    try std.testing.expectEqual(@as(u32, 80), control_contract.composedVectorComponentWindow(.{
+        .limit = 30,
+        .merge_config = .{ .strategy = .rrf },
+        .reranker = .{ .provider = .antfly, .field = "body", .candidate_count = 80 },
+    }));
+    // Without page transforms the component pages directly.
+    try std.testing.expectEqual(@as(u32, 12), control_contract.composedVectorComponentWindow(.{
+        .limit = 10,
+        .offset = 2,
+    }));
+    // The helper and the executor agree for every shape above.
+    const req: types.SearchRequest = .{ .limit = 30, .merge_config = .{ .strategy = .rrf, .window_size = 40 } };
+    try std.testing.expectEqual(pagingCandidateWindow(componentPaging(req)), control_contract.composedVectorComponentWindow(req));
+    try std.testing.expectEqual(@as(u32, 40), scoreOrderCandidateWindowK(30, componentPaging(req)));
 }
 
 fn hasStoredPatternFilters(req: types.SearchRequest) bool {
@@ -9172,6 +8844,7 @@ fn searchQueryCanUseMappedDocValues(
 
 fn schemaInfersDynamicFieldType(schema: runtime_schema_mod.TableSchema, field: []const u8) bool {
     for (schema.full_text_documents) |document| {
+        if (runtime_schema_mod.pathFallsUnderAnyPrefix(document.unindexed_paths, field)) continue;
         for (document.infer_type_dynamic_paths) |path| {
             if (path.len == 0) return true;
             if (!std.mem.startsWith(u8, field, path)) continue;
@@ -12973,7 +12646,7 @@ fn appendAnalyzedTerms(
     text_analysis: introducer_mod.TextAnalysisConfig,
     runtime_schema: ?runtime_schema_mod.TableSchema,
 ) !void {
-    const analyzer = (try resolveQueryAnalyzer(field, analyzer_name, text_analysis, runtime_schema)) orelse &analysis_mod.default_analyzer;
+    const analyzer = queryTextAnalyzer((try resolveQueryAnalyzer(field, analyzer_name, text_analysis, runtime_schema)) orelse &analysis_mod.default_analyzer);
     const tokens = try analyzer.analyze(alloc, text);
     defer analysis_mod.Analyzer.freeTokens(alloc, tokens);
     for (tokens) |token| {
@@ -13530,6 +13203,26 @@ fn searchDenseInternal(
             profile.hbc_rerank_vector_physical_reads = profiled.profile.rerank_vector_physical_reads;
             profile.hbc_rerank_vector_physical_bytes = profiled.profile.rerank_vector_physical_bytes;
             profile.hbc_rerank_vector_location_reuses = profiled.profile.rerank_vector_location_reuses;
+            profile.hbc_rerank_member_binding_hits = profiled.profile.rerank_member_binding_hits;
+            profile.hbc_rerank_member_binding_batches = profiled.profile.rerank_member_binding_batches;
+            profile.hbc_rerank_member_binding_mixed_batches = profiled.profile.rerank_member_binding_mixed_batches;
+            profile.hbc_rerank_member_binding_bytes = profiled.profile.rerank_member_binding_bytes;
+            profile.hbc_rerank_read_batches = profiled.profile.rerank_read_batches;
+            profile.hbc_rerank_read_requests = profiled.profile.rerank_read_requests;
+            profile.hbc_rerank_read_helpers = profiled.profile.rerank_read_helpers;
+            profile.hbc_rerank_read_denied = profiled.profile.rerank_read_denied;
+            profile.hbc_rerank_read_dispatch_ns = profiled.profile.rerank_read_dispatch_ns;
+            profile.hbc_rerank_read_caller_ns = profiled.profile.rerank_read_caller_ns;
+            profile.hbc_rerank_read_join_ns = profiled.profile.rerank_read_join_ns;
+            profile.hbc_rerank_read_worker_wall_ns = profiled.profile.rerank_read_worker_wall_ns;
+            profile.hbc_rerank_read_adaptive_inline_batches = profiled.profile.rerank_read_adaptive_inline_batches;
+            profile.hbc_rerank_read_adaptive_wide_batches = profiled.profile.rerank_read_adaptive_wide_batches;
+            profile.hbc_rerank_read_adaptive_probe_ns = profiled.profile.rerank_read_adaptive_probe_ns;
+
+            profile.hbc_rerank_read_worker_start_delay_ns = profiled.profile.rerank_read_worker_start_delay_ns;
+            profile.hbc_rerank_read_mapped_requests = profiled.profile.rerank_read_mapped_requests;
+            profile.hbc_rerank_read_mapped_bytes = profiled.profile.rerank_read_mapped_bytes;
+            profile.hbc_rerank_member_binding_misses = profiled.profile.rerank_member_binding_misses;
             profile.hbc_rerank_vector_block_misses = profiled.profile.rerank_vector_block_misses;
             profile.hbc_rerank_vector_block_fallbacks = profiled.profile.rerank_vector_block_fallbacks;
             profile.hbc_rerank_artifact_cache_hits = profiled.profile.rerank_artifact_cache_hits;
@@ -13563,6 +13256,8 @@ fn searchDenseInternal(
             results.candidate_coverage,
             hbc_effective_k,
             bounded_full_candidate_count,
+            raw_hits.len,
+            route.exact_native_filter,
         );
         const candidate_ceiling_reached = candidate_window >= candidate_ceiling;
         if (!candidate_window_incomplete and exhaustive_broad_live_window) {
@@ -14031,14 +13726,6 @@ test "dense search route uses measured per-index costs pressure and hysteresis" 
     try std.testing.expect(sticky_exact.exact_native_filter);
 }
 
-fn pagingCandidateWindow(paging: ComponentPaging) u32 {
-    return paging.offset +| paging.limit;
-}
-
-fn scoreOrderCandidateWindowK(requested_k: u32, paging: ComponentPaging) u32 {
-    return @max(requested_k, pagingCandidateWindow(paging));
-}
-
 fn scoreOrderWindowTotalHitsRelation(effective_k: u32, bounded_candidate_count: u64, raw_hit_count: usize) types.TotalHitsRelation {
     if (@as(u64, effective_k) < bounded_candidate_count and raw_hit_count >= @as(usize, @intCast(effective_k))) return .gte;
     return .exact;
@@ -14102,9 +13789,11 @@ fn denseCandidateWindowIncomplete(
     coverage: vectorindex_mod.CandidateCoverage,
     candidate_window: u32,
     bounded_full_candidate_count: u32,
+    raw_hit_count: usize,
+    exact_native_filter: bool,
 ) bool {
     return switch (coverage) {
-        .exhausted => false,
+        .exhausted => !exact_native_filter and scoreOrderWindowTotalHitsRelation(candidate_window, bounded_full_candidate_count, raw_hit_count) == .gte,
         .more => true,
         .unknown => candidateWindowIncomplete(candidate_window, bounded_full_candidate_count),
     };
@@ -14175,9 +13864,13 @@ test "adaptive candidate window covers requested offset page and grows bounded" 
     try std.testing.expectEqual(@as(u32, 2000), growAdaptiveCandidateWindow(1025, 2000, 1025));
     try std.testing.expect(candidateWindowIncomplete(1025, 2000));
     try std.testing.expect(!candidateWindowIncomplete(2000, 2000));
-    try std.testing.expect(!denseCandidateWindowIncomplete(.exhausted, 10, 1_000_000));
-    try std.testing.expect(denseCandidateWindowIncomplete(.more, 10, 10));
-    try std.testing.expect(denseCandidateWindowIncomplete(.unknown, 10, 1_000_000));
+    try std.testing.expect(denseCandidateWindowIncomplete(.exhausted, 10, 1_000_000, 10, false));
+    try std.testing.expect(!denseCandidateWindowIncomplete(.exhausted, 10, 1_000_000, 9, false));
+    try std.testing.expect(!denseCandidateWindowIncomplete(.exhausted, 10, 10, 10, false));
+    try std.testing.expect(!denseCandidateWindowIncomplete(.exhausted, 10, 1_000_000, 10, true));
+    try std.testing.expect(denseCandidateWindowIncomplete(.more, 10, 10, 9, true));
+    try std.testing.expect(denseCandidateWindowIncomplete(.unknown, 10, 1_000_000, 9, false));
+    try std.testing.expect(!denseCandidateWindowIncomplete(.unknown, 10, 10, 10, false));
     try std.testing.expectEqual(@as(u32, 7), initialAdaptiveCandidateWindow(7, paging));
 
     // Group collection starts with an overfetch window and may grow it again.
@@ -15634,12 +15327,78 @@ fn applyProjectedSourceLoadProfileToSortProfile(
     }
 }
 
+const LoadProjectedDocuments = *const fn (?*anyopaque, Allocator, types.SearchRequest, []const []const u8) anyerror![]?[]u8;
+const projected_source_batch_size = 256;
+
+// Amortize view/lease admission without holding a storage view or allocating
+// temporary key/value arrays for the entire aggregation candidate set.
+fn loadMissingProjectedHitBatches(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    ctx: ?*anyopaque,
+    load_many: LoadProjectedDocuments,
+    hits: []types.SearchHit,
+) !ProjectedSourceLoadProfile {
+    const start_ns = platform_time.monotonicNs();
+    var profile = ProjectedSourceLoadProfile{};
+    var keys: [projected_source_batch_size][]const u8 = undefined;
+    var positions: [projected_source_batch_size]usize = undefined;
+    var cursor: usize = 0;
+    try checkSearchRequestDeadline(req);
+    while (cursor < hits.len) {
+        try checkSearchRequestDeadline(req);
+        const end = cursor + @min(hits.len - cursor, projected_source_batch_size);
+        var count: usize = 0;
+        while (cursor < end) : (cursor += 1) {
+            if (hits[cursor].stored_data != null) continue;
+            keys[count] = hits[cursor].id;
+            positions[count] = cursor;
+            count += 1;
+        }
+        if (count == 0) continue;
+        profile.requested_count += count;
+        const loaded = try load_many(ctx, alloc, req, keys[0..count]);
+        defer freeOptionalOwnedBytes(alloc, loaded);
+        profile.batch_count += 1;
+        try checkSearchRequestDeadline(req);
+        if (loaded.len != count) return error.InvalidSearchResult;
+        for (loaded, positions[0..count]) |*value, position| {
+            hits[position].stored_data = value.* orelse return error.StoredDocMissing;
+            value.* = null;
+            profile.loaded_count += 1;
+        }
+    }
+    profile.total_ns = platform_time.monotonicNs() - start_ns;
+    return profile;
+}
+
 fn loadMissingProjectedMatchAllHitDocuments(
     alloc: Allocator,
     req: types.SearchRequest,
     executor: MatchAllExecutor,
     hits: []types.SearchHit,
 ) !ProjectedSourceLoadProfile {
+    return loadMissingProjectedHitDocuments(alloc, req, executor, hits);
+}
+
+fn loadMissingProjectedTextHitDocuments(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: SearchTextQueryExecutor,
+    hits: []types.SearchHit,
+) !ProjectedSourceLoadProfile {
+    return loadMissingProjectedHitDocuments(alloc, req, executor, hits);
+}
+
+fn loadMissingProjectedHitDocuments(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: anytype,
+    hits: []types.SearchHit,
+) !ProjectedSourceLoadProfile {
+    if (executor.load_projected_documents) |load_many| {
+        return loadMissingProjectedHitBatches(alloc, req, executor.ctx, load_many, hits);
+    }
     const start_ns = platform_time.monotonicNs();
     var profile = ProjectedSourceLoadProfile{};
     errdefer profile.total_ns = platform_time.monotonicNs() - start_ns;
@@ -15655,63 +15414,16 @@ fn loadMissingProjectedMatchAllHitDocuments(
         return profile;
     }
 
-    if (executor.load_projected_documents) |load_many| {
-        try checkSearchRequestDeadline(req);
-        const keys = try alloc.alloc([]const u8, missing_count);
-        defer alloc.free(keys);
-        var key_count: usize = 0;
-        for (hits) |hit| {
-            if (hit.stored_data != null) continue;
-            keys[key_count] = hit.id;
-            key_count += 1;
-        }
-
-        var loaded = try load_many(executor.ctx, alloc, req, keys);
-        profile.batch_count += 1;
-        defer freeOptionalOwnedBytes(alloc, loaded);
-        if (loaded.len != keys.len) return error.InvalidSearchResult;
-
-        var loaded_index: usize = 0;
-        for (hits, 0..) |*hit, i| {
-            if (hit.stored_data != null) continue;
-            if (i % 1024 == 0) try checkSearchRequestDeadline(req);
-            const stored = loaded[loaded_index] orelse return error.StoredDocMissing;
-            hit.stored_data = stored;
-            loaded[loaded_index] = null;
-            profile.loaded_count += 1;
-            loaded_index += 1;
-        }
-        profile.total_ns = platform_time.monotonicNs() - start_ns;
-        return profile;
-    }
-
     for (hits, 0..) |*hit, i| {
         if (hit.stored_data != null) continue;
         if (i % 1024 == 0) try checkSearchRequestDeadline(req);
-        hit.stored_data = try executor.load_projected_document(executor.ctx, alloc, req, hit.id);
-        profile.loaded_count += 1;
-        profile.batch_count += 1;
-    }
-    profile.total_ns = platform_time.monotonicNs() - start_ns;
-    return profile;
-}
-
-fn loadMissingProjectedTextHitDocuments(
-    alloc: Allocator,
-    req: types.SearchRequest,
-    executor: SearchTextQueryExecutor,
-    hits: []types.SearchHit,
-) !ProjectedSourceLoadProfile {
-    const start_ns = platform_time.monotonicNs();
-    var profile = ProjectedSourceLoadProfile{};
-    try checkSearchRequestDeadline(req);
-    for (hits, 0..) |*hit, i| {
-        if (hit.stored_data != null) continue;
-        if (i % 1024 == 0) try checkSearchRequestDeadline(req);
-        profile.requested_count += 1;
-        const stored = (try executor.load_stored(executor.ctx, alloc, hit.id)) orelse return error.StoredDocMissing;
-        defer alloc.free(stored);
-        hit.stored_data = try executor.project_stored_search(executor.ctx, alloc, req, hit.id, stored);
+        hit.stored_data = if (comptime @hasField(@TypeOf(executor), "load_projected_document"))
+            try executor.load_projected_document(executor.ctx, alloc, req, hit.id)
+        else blk: {
+            const stored = (try executor.load_stored(executor.ctx, alloc, hit.id)) orelse return error.StoredDocMissing;
+            defer alloc.free(stored);
+            break :blk try executor.project_stored_search(executor.ctx, alloc, req, hit.id, stored);
+        };
         profile.loaded_count += 1;
         profile.batch_count += 1;
     }
@@ -15733,65 +15445,9 @@ fn requestHasScoreSort(req: types.SearchRequest) bool {
     return false;
 }
 
-fn textQueryIsScoreBearing(query: types.TextQuery) bool {
-    return switch (query) {
-        .phrase,
-        .multi_phrase,
-        .term,
-        .match,
-        .multi_match_bool_prefix,
-        .match_phrase,
-        .fuzzy,
-        .prefix,
-        .wildcard,
-        .regexp,
-        => true,
-        .bool_query => |bool_query| textBoolQueryIsScoreBearing(bool_query),
-        .match_none,
-        .match_all,
-        .numeric_range,
-        .date_range,
-        .term_range,
-        .doc_id,
-        .bool_field,
-        .geo_distance,
-        .geo_bbox,
-        .ip_range,
-        .geo_shape,
-        => false,
-    };
-}
-
-fn textBoolQueryIsScoreBearing(query: types.TextBoolQuery) bool {
-    for (query.must) |child| {
-        if (textQueryIsScoreBearing(child)) return true;
-    }
-    for (query.should) |child| {
-        if (textQueryIsScoreBearing(child)) return true;
-    }
-    return false;
-}
-
-pub fn searchRequestHasScoreBearingTextSource(req: types.SearchRequest) bool {
-    if (req.full_text) |query| {
-        if (textQueryIsScoreBearing(query)) return true;
-    }
-    for (req.full_text_queries) |query| {
-        if (textQueryIsScoreBearing(query.query)) return true;
-    }
-    return false;
-}
-
-pub fn searchRequestHasScoreBearingVectorSource(req: types.SearchRequest) bool {
-    return req.dense != null or
-        req.sparse != null or
-        req.dense_queries.len > 0 or
-        req.sparse_queries.len > 0;
-}
-
-pub fn searchRequestHasScoreBearingSource(req: types.SearchRequest) bool {
-    return searchRequestHasScoreBearingTextSource(req) or searchRequestHasScoreBearingVectorSource(req);
-}
+pub const searchRequestHasScoreBearingTextSource = runtime_preflight.searchRequestHasScoreBearingTextSource;
+pub const searchRequestHasScoreBearingVectorSource = runtime_preflight.searchRequestHasScoreBearingVectorSource;
+pub const searchRequestHasScoreBearingSource = runtime_preflight.searchRequestHasScoreBearingSource;
 
 fn validateScoreSortHasScoreBearingTextSource(req: types.SearchRequest) !void {
     if (requestHasScoreSort(req) and !searchRequestHasScoreBearingTextSource(req)) {
@@ -18042,14 +17698,22 @@ pub fn textQueryToSearchQuery(
             } };
         },
         .multi_match_bool_prefix => |multi_match| try multiMatchBoolPrefixToSearchQuery(alloc, multi_match, text_analysis, runtime_schema),
-        .match_phrase => |phrase| .{ .phrase = .{
-            .field = phrase.field,
-            .text = phrase.text,
-            .analyzer = try resolveQueryAnalyzer(phrase.field, phrase.analyzer, text_analysis, runtime_schema),
-            .max_edits = phrase.max_edits,
-            .auto_fuzzy = phrase.auto_fuzzy,
-            .boost = phrase.boost,
-        } },
+        .match_phrase => |phrase| blk: {
+            const analyzer = try resolveQueryAnalyzer(phrase.field, phrase.analyzer, text_analysis, runtime_schema);
+            if (analyzer == &analysis_mod.substring_analyzer) {
+                // A phrase is contained text; the companion answers that
+                // directly and must never see the query exploded into suffixes.
+                break :blk try substringQueryToSearchQuery(alloc, phrase.field, phrase.text, phrase.boost);
+            }
+            break :blk .{ .phrase = .{
+                .field = phrase.field,
+                .text = phrase.text,
+                .analyzer = analyzer,
+                .max_edits = phrase.max_edits,
+                .auto_fuzzy = phrase.auto_fuzzy,
+                .boost = phrase.boost,
+            } };
+        },
         .prefix => |prefix| blk: {
             if (fieldUsesSubstringAnalyzer(prefix.field, text_analysis, runtime_schema)) {
                 break :blk try substringQueryToSearchQuery(alloc, prefix.field, prefix.prefix, prefix.boost);
@@ -18260,7 +17924,7 @@ fn fieldBoolPrefixSearchQuery(
         } };
     }
 
-    const analyzer = (try resolveQueryAnalyzer(field.field, null, text_analysis, runtime_schema)) orelse &analysis_mod.default_analyzer;
+    const analyzer = queryTextAnalyzer((try resolveQueryAnalyzer(field.field, null, text_analysis, runtime_schema)) orelse &analysis_mod.default_analyzer);
     const tokens = try analyzer.analyze(alloc, text);
     defer analysis_mod.Analyzer.freeTokens(alloc, tokens);
     if (tokens.len == 0) return null;
@@ -18464,8 +18128,13 @@ fn appendHighlightFragments(
 pub fn attachHighlights(
     alloc: Allocator,
     options: types.HighlightRequest,
-    text_query: types.TextQuery,
+    text_queries: []const types.TextQuery,
     hits: []types.SearchHit,
+    /// Optional unprojected stored documents aligned with `hits`, for
+    /// requests whose `_source` was already projected down to fields that
+    /// may not include the highlighted ones. Null entries fall back to the
+    /// hit's own stored data.
+    sources: ?[]const ?[]u8,
     text_analysis: introducer_mod.TextAnalysisConfig,
     runtime_schema: ?runtime_schema_mod.TableSchema,
 ) !void {
@@ -18473,9 +18142,11 @@ pub fn attachHighlights(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const lowered = try textQueryToSearchQuery(arena, text_query, text_analysis, runtime_schema);
     var entries = std.ArrayListUnmanaged(HighlightMatcherEntry).empty;
-    try collectHighlightMatchers(arena, lowered, &entries);
+    for (text_queries) |text_query| {
+        const lowered = try textQueryToSearchQuery(arena, text_query, text_analysis, runtime_schema);
+        try collectHighlightMatchers(arena, lowered, &entries);
+    }
     if (entries.items.len == 0) return;
 
     var fields = std.ArrayListUnmanaged([]const u8).empty;
@@ -18496,10 +18167,22 @@ pub fn attachHighlights(
     const fragment_size = @max(options.fragment_size, 1);
     const max_fragments = @max(options.max_fragments, 1);
 
-    for (hits) |*hit| {
+    // Parsed documents live only as long as their own hit so peak memory is
+    // one document, not the whole page.
+    var hit_arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer hit_arena_state.deinit();
+
+    for (hits, 0..) |*hit, hit_index| {
         if (hit.highlights.len > 0) continue;
-        const stored = hit.stored_data orelse continue;
-        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, stored, .{}) catch continue;
+        const stored = blk: {
+            if (sources) |items| {
+                if (items[hit_index]) |source| break :blk source;
+            }
+            break :blk hit.stored_data orelse continue;
+        };
+        _ = hit_arena_state.reset(.retain_capacity);
+        const hit_arena = hit_arena_state.allocator();
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, hit_arena, stored, .{}) catch continue;
 
         var highlighted = std.ArrayListUnmanaged(types.HighlightedField).empty;
         errdefer {
@@ -18510,7 +18193,7 @@ pub fn attachHighlights(
             const value = jsonValueAtDottedPath(parsed, field) orelse continue;
             var matchers = std.ArrayListUnmanaged(highlight_mod.Matcher).empty;
             for (entries.items) |entry| {
-                if (std.mem.eql(u8, entry.field, field)) try matchers.append(arena, entry.matcher);
+                if (std.mem.eql(u8, entry.field, field)) try matchers.append(hit_arena, entry.matcher);
             }
             if (matchers.items.len == 0) continue;
             const analyzer = (resolveQueryAnalyzer(field, null, text_analysis, runtime_schema) catch null) orelse &analysis_mod.default_analyzer;
@@ -18563,11 +18246,12 @@ test "attachHighlights marks analyzed, prefix, and substring matches on stored s
     const must = [_]types.TextQuery{
         .{ .match = .{ .field = "title", .text = "handbooks" } },
         .{ .match = .{ .field = "sku._substring", .text = "g3 we" } },
-        .{ .prefix = .{ .field = "tags", .prefix = "zu" } },
     };
     const query: types.TextQuery = .{ .bool_query = .{ .must = &must } };
+    // Named full-text queries contribute matchers alongside the primary one.
+    const named: types.TextQuery = .{ .prefix = .{ .field = "tags", .prefix = "zu" } };
 
-    try attachHighlights(alloc, .{ .fragment_size = 64, .max_fragments = 2 }, query, &hits, text_analysis, null);
+    try attachHighlights(alloc, .{ .fragment_size = 64, .max_fragments = 2 }, &.{ query, named }, &hits, null, text_analysis, null);
 
     try std.testing.expectEqual(@as(usize, 0), hits[1].highlights.len);
     try std.testing.expectEqual(@as(usize, 3), hits[0].highlights.len);
@@ -18604,11 +18288,32 @@ test "attachHighlights marks analyzed, prefix, and substring matches on stored s
     };
     defer for (&narrowed) |*hit| hit.deinit(alloc);
     const only_title = [_][]const u8{"title"};
-    try attachHighlights(alloc, .{ .fields = &only_title }, query, &narrowed, text_analysis, null);
+    try attachHighlights(alloc, .{ .fields = &only_title }, &.{query}, &narrowed, null, text_analysis, null);
     try std.testing.expectEqual(@as(usize, 1), narrowed[0].highlights.len);
     var cloned = try narrowed[0].clone(alloc);
     defer cloned.deinit(alloc);
     try std.testing.expectEqualStrings("title", cloned.highlights[0].field);
+
+    // A projected `_source` without the field still highlights when the
+    // caller supplies the unprojected document.
+    var projected = [_]types.SearchHit{
+        .{ .id = try alloc.dupe(u8, "doc:1"), .stored_data = try alloc.dupe(u8, "{\"n\":3}") },
+    };
+    defer for (&projected) |*hit| hit.deinit(alloc);
+    try attachHighlights(alloc, .{ .fields = &only_title }, &.{query}, &projected, null, text_analysis, null);
+    try std.testing.expectEqual(@as(usize, 0), projected[0].highlights.len);
+    const full_sources = [_]?[]u8{hits[0].stored_data.?};
+    try attachHighlights(alloc, .{ .fields = &only_title }, &.{query}, &projected, &full_sources, text_analysis, null);
+    try std.testing.expectEqual(@as(usize, 1), projected[0].highlights.len);
+    try std.testing.expectEqualStrings("title", projected[0].highlights[0].field);
+}
+
+/// The analyzer to apply to *query* text for a field. A substring companion is
+/// indexed with suffix expansion, which must never be applied to query text:
+/// two-byte suffixes would match nearly every document. Paths that cannot
+/// lower to containment lookups fall back to plain word tokens.
+fn queryTextAnalyzer(analyzer: *const analysis_mod.Analyzer) *const analysis_mod.Analyzer {
+    return if (analyzer == &analysis_mod.substring_analyzer) &analysis_mod.substring_query_analyzer else analyzer;
 }
 
 fn fieldUsesSubstringAnalyzer(
@@ -18683,6 +18388,11 @@ test "substring field queries lower to suffix-dictionary prefix lookups" {
     // Single-byte lookups cannot exist in the suffix dictionary.
     const short = try textQueryToSearchQuery(alloc, .{ .match = .{ .field = "name._substring", .text = "a" } }, text_analysis, null);
     try std.testing.expect(short == .match_none);
+
+    // Phrases on the companion are contained text as well.
+    const phrase = try textQueryToSearchQuery(alloc, .{ .match_phrase = .{ .field = "name._substring", .text = "Rag3 Weaver" } }, text_analysis, null);
+    try std.testing.expect(phrase == .prefix);
+    try std.testing.expectEqualStrings("rag3weaver", phrase.prefix.prefix);
 
     // Prefix queries on the companion get the same normalization.
     const prefix_query = try textQueryToSearchQuery(alloc, .{ .prefix = .{ .field = "name._substring", .prefix = "G3-We" } }, text_analysis, null);
@@ -18790,6 +18500,7 @@ fn resolveDynamicTemplateFieldAnalyzer(schema: runtime_schema_mod.TableSchema, f
 
 fn fallsUnderDynamicTextPath(schema: runtime_schema_mod.TableSchema, field: []const u8) bool {
     for (schema.full_text_documents) |document_schema| {
+        if (runtime_schema_mod.pathFallsUnderAnyPrefix(document_schema.unindexed_paths, field)) continue;
         for (document_schema.open_dynamic_paths) |open_path| {
             if (open_path.len == 0) return true;
             if (!std.mem.startsWith(u8, field, open_path)) continue;
@@ -26709,6 +26420,77 @@ test "native doc values sort plan requires a native loader" {
     }, null, testUnexpectedLoadStoredCallback, .{ .kind = .native_doc_values_top_n, .require_native = true }, null));
 }
 
+test "text projected source batch preserves selection and cleans up failed hydration" {
+    const Harness = struct {
+        const Mode = enum { success, missing, invalid_count, expired };
+        mode: Mode,
+        calls: usize = 0,
+
+        fn loadMany(ctx: ?*anyopaque, alloc: Allocator, req: types.SearchRequest, keys: []const []const u8) ![]?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.calls += 1;
+            try std.testing.expectEqual(@as(usize, 2), keys.len);
+            try std.testing.expectEqualStrings("doc:c", keys[0]);
+            try std.testing.expectEqualStrings("doc:a", keys[1]);
+            try std.testing.expectEqualStrings("age", req.fields[0]);
+            const values = try alloc.alloc(?[]u8, if (self.mode == .invalid_count) 3 else keys.len);
+            @memset(values, null);
+            errdefer freeOptionalOwnedBytes(alloc, values);
+            for (keys, 0..) |key, i| {
+                if (self.mode == .missing and i == 1) continue;
+                values[i] = try std.fmt.allocPrint(alloc, "projected:{s}", .{key});
+            }
+            return values;
+        }
+
+        fn run(alloc: Allocator, mode: Mode) !void {
+            var harness = @This(){ .mode = mode };
+            var hits = [_]types.SearchHit{
+                .{ .id = @constCast("present"), .stored_data = null },
+                .{ .id = @constCast("doc:c") },
+                .{ .id = @constCast("doc:a") },
+            };
+            defer for (&hits) |hit| if (hit.stored_data) |stored| alloc.free(stored);
+            hits[0].stored_data = try alloc.dupe(u8, "already projected");
+            const executor: SearchTextQueryExecutor = .{
+                .ctx = &harness,
+                .text_index_entry = undefined,
+                .text_index_is_chunk_backed = undefined,
+                .search_match_all = undefined,
+                .project_stored_search = undefined,
+                .load_stored = undefined,
+                .load_projected_documents = loadMany,
+                .postprocess = undefined,
+            };
+            const result = loadMissingProjectedTextHitDocuments(alloc, .{
+                .fields = &.{"age"},
+                .execution_deadline_ns = if (mode == .expired) 1 else null,
+            }, executor, &hits);
+            switch (mode) {
+                .success => {
+                    const profile = try result;
+                    try std.testing.expectEqual(@as(usize, 1), profile.batch_count);
+                    try std.testing.expectEqual(@as(usize, 2), profile.loaded_count);
+                    try std.testing.expectEqualStrings("already projected", hits[0].stored_data.?);
+                    try std.testing.expectEqualStrings("projected:doc:c", hits[1].stored_data.?);
+                    try std.testing.expectEqualStrings("projected:doc:a", hits[2].stored_data.?);
+                    _ = try loadMissingProjectedTextHitDocuments(alloc, .{}, executor, &hits);
+                    try std.testing.expectEqual(@as(usize, 1), harness.calls);
+                },
+                .missing => try std.testing.expectError(error.StoredDocMissing, result),
+                .invalid_count => try std.testing.expectError(error.InvalidSearchResult, result),
+                .expired => {
+                    try std.testing.expectError(error.Timeout, result);
+                    try std.testing.expectEqual(@as(usize, 0), harness.calls);
+                },
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{Harness.Mode.success});
+    inline for (.{ Harness.Mode.missing, Harness.Mode.invalid_count, Harness.Mode.expired }) |mode|
+        try Harness.run(std.testing.allocator, mode);
+}
+
 test "text field sort source loading happens only for selected missing hits" {
     const alloc = std.testing.allocator;
 
@@ -26769,6 +26551,106 @@ test "text field sort source loading happens only for selected missing hits" {
     try std.testing.expect(result.hits[0].stored_data != null);
     try std.testing.expect(result.hits[1].stored_data != null);
     try std.testing.expectEqualStrings("{\"id\":\"doc:b\"}", result.hits[1].stored_data.?);
+}
+
+test "projected source batches bound admission and preserve loaded hits and order" {
+    const alloc = std.testing.allocator;
+    const Harness = struct {
+        calls: usize = 0,
+        fn load(ctx: ?*anyopaque, a: Allocator, _: types.SearchRequest, keys: []const []const u8) ![]?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.calls += 1;
+            try std.testing.expect(keys.len <= projected_source_batch_size);
+            const values = try a.alloc(?[]u8, keys.len);
+            @memset(values, null);
+            errdefer freeOptionalOwnedBytes(a, values);
+            for (keys, values) |key, *value| value.* = try a.dupe(u8, key);
+            return values;
+        }
+    };
+    var harness = Harness{};
+    const hits = try alloc.alloc(types.SearchHit, projected_source_batch_size * 2 + 1);
+    var result: types.SearchResult = .{ .alloc = alloc, .hits = hits, .total_hits = @intCast(hits.len), .graph_results = &.{} };
+    // Initialize all slots so cleanup also covers allocation failures.
+    for (hits) |*hit| hit.* = .{ .id = "" };
+    defer result.deinit();
+    for (hits, 0..) |*hit, i| {
+        hit.id = try std.fmt.allocPrint(alloc, "row-{d}", .{i});
+        if (i % 7 == 0) hit.stored_data = try alloc.dupe(u8, "already loaded");
+    }
+    const profile = try loadMissingProjectedTextHitDocuments(alloc, .{}, .{
+        .ctx = &harness,
+        .load_projected_documents = Harness.load,
+        .text_index_entry = undefined,
+        .text_index_is_chunk_backed = undefined,
+        .search_match_all = undefined,
+        .project_stored_search = undefined,
+        .load_stored = undefined,
+        .postprocess = undefined,
+    }, hits);
+    try std.testing.expectEqual(@as(usize, 3), harness.calls);
+    try std.testing.expectEqual(harness.calls, profile.batch_count);
+    try std.testing.expectEqual(hits.len - (hits.len + 6) / 7, profile.loaded_count);
+    try std.testing.expectEqual(profile.loaded_count, profile.requested_count);
+    for (hits, 0..) |hit, i| try std.testing.expectEqualStrings(if (i % 7 == 0) "already loaded" else hit.id, hit.stored_data.?);
+}
+
+test "projected source batches clean up malformed missing and failed loads" {
+    const alloc = std.testing.allocator;
+    const Harness = struct {
+        mode: enum { short, missing, failure },
+        fn load(ctx: ?*anyopaque, a: Allocator, _: types.SearchRequest, keys: []const []const u8) ![]?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (self.mode == .failure) return error.InjectedFailure;
+            const values = try a.alloc(?[]u8, if (self.mode == .short) 1 else keys.len);
+            @memset(values, null);
+            errdefer freeOptionalOwnedBytes(a, values);
+            values[0] = try a.dupe(u8, keys[0]);
+            return values;
+        }
+    };
+    for ([_]Harness{ .{ .mode = .short }, .{ .mode = .missing }, .{ .mode = .failure } }) |mode| {
+        var harness = mode;
+        var hits = [_]types.SearchHit{ .{ .id = @constCast("a") }, .{ .id = @constCast("b") } };
+        defer for (hits) |hit| if (hit.stored_data) |value| alloc.free(value);
+        const expected = switch (mode.mode) {
+            .short => error.InvalidSearchResult,
+            .missing => error.StoredDocMissing,
+            .failure => error.InjectedFailure,
+        };
+        try std.testing.expectError(expected, loadMissingProjectedHitBatches(alloc, .{}, &harness, Harness.load, &hits));
+        try std.testing.expect(hits[1].stored_data == null);
+    }
+}
+
+test "projected source batches observe cancellation before publishing loaded values" {
+    const alloc = std.testing.allocator;
+    const Harness = struct {
+        canceled: bool = false,
+        calls: usize = 0,
+        fn isCancelled(ctx: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(ctx));
+            return self.canceled;
+        }
+        fn load(ctx: ?*anyopaque, a: Allocator, _: types.SearchRequest, keys: []const []const u8) ![]?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.calls += 1;
+            const values = try a.alloc(?[]u8, keys.len);
+            @memset(values, null);
+            errdefer freeOptionalOwnedBytes(a, values);
+            for (keys, values) |key, *value| value.* = try a.dupe(u8, key);
+            self.canceled = true;
+            return values;
+        }
+    };
+    var harness = Harness{};
+    var hits = [_]types.SearchHit{ .{ .id = @constCast("a") }, .{ .id = @constCast("b") } };
+    defer for (hits) |hit| if (hit.stored_data) |value| alloc.free(value);
+    try std.testing.expectError(error.Cancelled, loadMissingProjectedHitBatches(alloc, .{
+        .cancellation = .{ .ptr = &harness, .is_cancelled_fn = Harness.isCancelled },
+    }, &harness, Harness.load, &hits));
+    try std.testing.expectEqual(@as(usize, 1), harness.calls);
+    for (hits) |hit| try std.testing.expect(hit.stored_data == null);
 }
 
 test "text projected source load rejects expired deadline before stored load" {

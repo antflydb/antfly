@@ -350,6 +350,108 @@ pub const QueryParams = struct {
     node_filter: pattern_mod.NodeFilter = .{},
 };
 
+/// Exact graph-metric filtering and ordering must observe the full candidate
+/// set. Bound that set explicitly so a broad traversal cannot turn a small
+/// requested page into unbounded memory and sort work.
+pub const graph_metric_candidate_limit: u32 = 100_000;
+/// Public and internal graph metric query bounds. These limits keep request
+/// parsing, metric materialization, and comparison work predictable even when
+/// an internal caller bypasses the OpenAPI layer.
+pub const graph_metric_projection_limit: usize = 16;
+pub const graph_metric_order_limit: usize = 8;
+pub const graph_metric_filter_limit: usize = 32;
+pub const graph_metric_dependency_limit: usize = 16;
+/// Query-seeded personalization resolves each seed key against the metric
+/// topology; bound the per-read seed set so request parsing and seed
+/// resolution stay proportional to the query, not the graph.
+pub const graph_metric_seed_limit: usize = 128;
+
+/// Backend-independent late-materialization plan. Names borrow the validated
+/// query; each stage is deduplicated and ordering remains user-defined.
+pub const MetricReadPlan = struct {
+    const Names = struct {
+        buffer: [graph_metric_dependency_limit][]const u8 = undefined,
+        len: usize = 0,
+
+        pub fn slice(self: *const @This()) []const []const u8 {
+            return self.buffer[0..self.len];
+        }
+        fn append(self: *@This(), name: []const u8) void {
+            for (self.slice()) |prior| if (std.mem.eql(u8, name, prior)) return;
+            std.debug.assert(self.len < self.buffer.len);
+            self.buffer[self.len] = name;
+            self.len += 1;
+        }
+    };
+    dependencies: Names = .{},
+    filters: Names = .{},
+    orders: Names = .{},
+    projections: Names = .{},
+    policies: [graph_metric_dependency_limit]graph_mod.GraphIndex.GraphMetricColumnReadPolicy = @splat(.{}),
+    /// Dependency-aligned personalization. A personalized dependency never
+    /// reads a published column, so it carries no publication policy; its
+    /// column is computed fresh from the current edge snapshot instead.
+    personalizations: [graph_metric_dependency_limit]?GraphMetricPersonalization = @splat(null),
+
+    fn require(self: *@This(), name: []const u8, freshness: GraphMetricFreshness, published: bool) void {
+        const i = self.dependencyIndex(name);
+        self.policies[i].require_published = self.policies[i].require_published or published;
+        self.policies[i].require_fresh = self.policies[i].require_fresh or freshness == .fresh;
+    }
+
+    fn dependencyIndex(self: *const @This(), name: []const u8) usize {
+        for (self.dependencies.slice(), 0..) |dependency, i| {
+            if (std.mem.eql(u8, dependency, name)) return i;
+        }
+        unreachable;
+    }
+
+    pub fn personalizationFor(self: *const @This(), name: []const u8) ?GraphMetricPersonalization {
+        for (self.dependencies.slice(), 0..) |dependency, i| {
+            if (std.mem.eql(u8, dependency, name)) return self.personalizations[i];
+        }
+        return null;
+    }
+
+    pub fn init(query: GraphQuery) !MetricReadPlan {
+        try validateGraphMetricQueryShape(query);
+        var plan = MetricReadPlan{};
+        for (query.metrics) |metric| {
+            plan.dependencies.append(metric.name);
+            plan.projections.append(metric.name);
+            if (metric.seed_nodes.len != 0) {
+                plan.personalizations[plan.dependencyIndex(metric.name)] = .{
+                    .seed_nodes = metric.seed_nodes,
+                    .damping = metric.damping,
+                };
+                continue;
+            }
+            plan.require(metric.name, metric.freshness, false);
+        }
+        for (query.order_by) |order| {
+            plan.dependencies.append(order.name);
+            plan.orders.append(order.name);
+            if (plan.personalizationFor(order.name) != null) {
+                // Ordering consumes the personalized column; a published
+                // policy here would silently mix global and seeded scores.
+                if (order.freshness != .fresh) return error.GraphMetricPersonalizationRequiresFresh;
+                continue;
+            }
+            plan.require(order.name, order.freshness, true);
+        }
+        for (query.where_metric) |filter| {
+            plan.dependencies.append(filter.name);
+            plan.filters.append(filter.name);
+            if (plan.personalizationFor(filter.name) != null) {
+                if (filter.freshness != .fresh) return error.GraphMetricPersonalizationRequiresFresh;
+                continue;
+            }
+            plan.require(filter.name, filter.freshness, true);
+        }
+        return plan;
+    }
+};
+
 pub fn nodeFilterActive(filter: pattern_mod.NodeFilter) bool {
     return filter.filter_prefix.len > 0 or filter.filter_query_json != null;
 }
@@ -390,6 +492,10 @@ pub const GraphQuery = struct {
     include_documents: bool = false,
     fields: []const []const u8 = &.{},
     include_all_fields: bool = true,
+    metrics: []const GraphMetricRead = &.{},
+    order_by: []const GraphMetricOrder = &.{},
+    where_metric: []const GraphMetricFilter = &.{},
+    include_metric_status: bool = false,
 };
 
 pub const NamedCountAggregate = struct {
@@ -400,18 +506,102 @@ pub const NamedCountAggregate = struct {
 
 pub const ExpandStrategy = enum { @"union", intersection };
 
+pub const GraphMetricFreshness = enum { published, fresh };
+
+pub const GraphMetricRead = struct {
+    name: []const u8,
+    freshness: GraphMetricFreshness = .published,
+    /// Query-seeded personalized PageRank: teleport mass restricted to these
+    /// node keys (uniform per seed). The column is computed at query time from
+    /// the current edge snapshot, so personalization requires freshness=fresh;
+    /// published generations are global-only and reads against them fail
+    /// closed. Seed keys absent from the graph are skipped, not errors.
+    seed_nodes: []const []const u8 = &.{},
+    /// Damping override for personalized reads. Null keeps the metric's
+    /// configured damping. Only valid together with seed_nodes.
+    damping: ?f64 = null,
+};
+
+/// Personalization parameters carried per read-plan dependency. Borrowed from
+/// the validated query like every other plan name.
+pub const GraphMetricPersonalization = struct {
+    seed_nodes: []const []const u8,
+    damping: ?f64 = null,
+};
+
+pub const GraphMetricOrderDirection = enum { asc, desc };
+pub const GraphMetricNullOrder = enum { first, last };
+
+pub const GraphMetricOrder = struct {
+    name: []const u8,
+    direction: GraphMetricOrderDirection = .desc,
+    nulls: GraphMetricNullOrder = .last,
+    freshness: GraphMetricFreshness = .published,
+};
+
+pub const GraphMetricFilterOp = enum { gt, gte, lt, lte, eq, neq };
+
+pub const GraphMetricFilter = struct {
+    name: []const u8,
+    op: GraphMetricFilterOp,
+    value: f64,
+    freshness: GraphMetricFreshness = .published,
+};
+
+/// Validate metric cardinality and comparison semantics before graph fan-out.
+pub fn validateGraphMetricQueryShape(query: GraphQuery) !void {
+    if (query.metrics.len > graph_metric_projection_limit or
+        query.order_by.len > graph_metric_order_limit or
+        query.where_metric.len > graph_metric_filter_limit)
+        return error.InvalidQueryRequest;
+
+    var dependency_names: [graph_metric_dependency_limit][]const u8 = undefined;
+    var dependency_count: usize = 0;
+    for (query.metrics, 0..) |metric, i| {
+        if (metric.name.len == 0) return error.InvalidQueryRequest;
+        for (query.metrics[0..i]) |previous|
+            if (std.mem.eql(u8, previous.name, metric.name)) return error.InvalidQueryRequest;
+        if (metric.seed_nodes.len > graph_metric_seed_limit) return error.InvalidQueryRequest;
+        for (metric.seed_nodes) |seed| if (seed.len == 0) return error.InvalidQueryRequest;
+        if (metric.damping) |damping| {
+            if (metric.seed_nodes.len == 0 or !std.math.isFinite(damping) or damping <= 0 or damping >= 1)
+                return error.InvalidQueryRequest;
+        }
+        // Published generations are global-only; a seeded read against one
+        // would silently return unpersonalized scores. Fail closed instead.
+        if (metric.seed_nodes.len != 0 and metric.freshness != .fresh)
+            return error.GraphMetricPersonalizationRequiresFresh;
+        try appendGraphMetricDependencyName(&dependency_names, &dependency_count, metric.name);
+    }
+    for (query.order_by, 0..) |order, i| {
+        if (order.name.len == 0) return error.InvalidQueryRequest;
+        for (query.order_by[0..i]) |previous|
+            if (std.mem.eql(u8, previous.name, order.name)) return error.InvalidQueryRequest;
+        try appendGraphMetricDependencyName(&dependency_names, &dependency_count, order.name);
+    }
+    for (query.where_metric) |filter| {
+        if (filter.name.len == 0 or !std.math.isFinite(filter.value)) return error.InvalidQueryRequest;
+        try appendGraphMetricDependencyName(&dependency_names, &dependency_count, filter.name);
+    }
+}
+
+fn appendGraphMetricDependencyName(
+    names: *[graph_metric_dependency_limit][]const u8,
+    count: *usize,
+    name: []const u8,
+) !void {
+    for (names[0..count.*]) |existing|
+        if (std.mem.eql(u8, existing, name)) return;
+    if (count.* == names.len) return error.InvalidQueryRequest;
+    names[count.*] = name;
+    count.* += 1;
+}
+
 // ============================================================================
 // Result types
 // ============================================================================
 
-pub const PathEdgeInfo = struct {
-    source: []const u8,
-    target: []const u8,
-    edge_type: []const u8,
-    weight: f64,
-    metadata: []const u8 = "",
-    traversal_direction: ?graph_mod.EdgeDirection = null,
-};
+pub const PathEdgeInfo = paths_mod.PathEdge;
 
 pub const GraphResultNode = struct {
     key: []const u8,
@@ -429,10 +619,16 @@ pub const GraphResultNode = struct {
     /// node is same-table (hydrated locally). Lets the api hydrate a cross-table
     /// entity node from its own table instead of failing closed.
     table: ?[]const u8 = null,
+    metrics: []GraphMetricValue = &.{},
+    /// False when metrics is a row view into GraphQueryResult's contiguous
+    /// metric_values_slab. Values still own any promoted names individually.
+    metrics_owned: bool = true,
 
     pub fn deinit(self: *GraphResultNode, alloc: Allocator) void {
         alloc.free(self.key);
         if (self.table) |t| alloc.free(t);
+        for (self.metrics) |*metric| metric.deinit(alloc);
+        if (self.metrics_owned and self.metrics.len > 0) alloc.free(self.metrics);
         if (self.path) |p| {
             for (p) |s| alloc.free(s);
             alloc.free(p);
@@ -532,6 +728,109 @@ test "canonical graph result node path is self-consistent" {
     }));
 }
 
+pub const GraphMetricValue = struct {
+    name: []const u8,
+    score: ?f64 = null,
+    name_owned: bool = true,
+
+    pub fn ensureNameOwned(self: *GraphMetricValue, alloc: Allocator) !void {
+        if (self.name_owned) return;
+        self.name = try alloc.dupe(u8, self.name);
+        self.name_owned = true;
+    }
+
+    pub fn deinit(self: *GraphMetricValue, alloc: Allocator) void {
+        if (self.name_owned) alloc.free(self.name);
+        self.* = undefined;
+    }
+};
+
+pub const GraphMetricStatus = struct {
+    name: []const u8,
+    state: graph_mod.GraphIndex.GraphMetricState = .not_ready,
+    phase: graph_mod.GraphIndex.GraphMetricBuildPhase = .idle,
+    edge_filter: graph_mod.GraphMetricEdgeFilter = .{},
+    metadata_version: u32 = 0,
+    config_fingerprint: u64 = 0,
+    maintenance_paused: bool = false,
+    build_queued: bool = false,
+    published_generation: u64 = 0,
+    published_edge_generation: u64 = 0,
+    edge_generation: u64 = 0,
+    target_edge_generation: u64 = 0,
+    queued_generation: u64 = 0,
+    building_generation: u64 = 0,
+    build_job_id: u64 = 0,
+    build_started_at_ms: u64 = 0,
+    build_iteration: u32 = 0,
+    build_lease_expires_at_ms: u64 = 0,
+    build_worker_id: []const u8 = "",
+    retry_count: u64 = 0,
+    last_error: []const u8 = "",
+    progress: f64 = 0,
+    converged: bool = false,
+    iterations_completed: u32 = 0,
+    delta: f64 = 0,
+    computed_at_ms: u64 = 0,
+    last_event: ?graph_mod.GraphIndex.GraphMetricEvent = null,
+    recent_events: []graph_mod.GraphIndex.GraphMetricEvent = &.{},
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.name);
+        self.edge_filter.deinit(alloc);
+        if (self.build_worker_id.len > 0) alloc.free(self.build_worker_id);
+        if (self.last_error.len > 0) alloc.free(self.last_error);
+        if (self.recent_events.len > 0) alloc.free(self.recent_events);
+        self.* = undefined;
+    }
+};
+
+fn cloneGraphMetricStatus(alloc: Allocator, source: graph_mod.GraphIndex.GraphMetricStatus) !GraphMetricStatus {
+    const name = try alloc.dupe(u8, source.name);
+    errdefer alloc.free(name);
+    var edge_filter = try source.edge_filter.cloneAlloc(alloc);
+    errdefer edge_filter.deinit(alloc);
+    const recent_events = if (source.recent_events.len > 0)
+        try alloc.dupe(graph_mod.GraphIndex.GraphMetricEvent, source.recent_events)
+    else
+        @constCast((&[_]graph_mod.GraphIndex.GraphMetricEvent{})[0..]);
+    errdefer if (recent_events.len > 0) alloc.free(recent_events);
+    const last_error = if (source.last_error.len > 0) try alloc.dupe(u8, source.last_error) else "";
+    errdefer if (last_error.len > 0) alloc.free(last_error);
+    const build_worker_id = if (source.build_worker_id.len > 0) try alloc.dupe(u8, source.build_worker_id) else "";
+    errdefer if (build_worker_id.len > 0) alloc.free(build_worker_id);
+    return .{
+        .name = name,
+        .state = source.state,
+        .phase = source.phase,
+        .edge_filter = edge_filter,
+        .metadata_version = source.metadata_version,
+        .config_fingerprint = source.config_fingerprint,
+        .maintenance_paused = source.maintenance_paused,
+        .build_queued = source.build_queued,
+        .published_generation = source.published_generation,
+        .published_edge_generation = source.published_edge_generation,
+        .edge_generation = source.edge_generation,
+        .target_edge_generation = source.target_edge_generation,
+        .queued_generation = source.queued_generation,
+        .building_generation = source.building_generation,
+        .build_job_id = source.build_job_id,
+        .build_started_at_ms = source.build_started_at_ms,
+        .build_iteration = source.build_iteration,
+        .build_lease_expires_at_ms = source.build_lease_expires_at_ms,
+        .build_worker_id = build_worker_id,
+        .retry_count = source.retry_count,
+        .last_error = last_error,
+        .progress = source.progress,
+        .converged = source.converged,
+        .iterations_completed = source.iterations_completed,
+        .delta = source.delta,
+        .computed_at_ms = source.computed_at_ms,
+        .last_event = source.last_event,
+        .recent_events = recent_events,
+    };
+}
+
 test "graph result node JSON accepts omitted optional path fields" {
     var parsed = try std.json.parseFromSlice(
         GraphResultNode,
@@ -549,11 +848,19 @@ test "graph result node JSON accepts omitted optional path fields" {
 pub const GraphQueryResult = struct {
     nodes: []GraphResultNode,
     matches: []pattern_mod.PatternMatch = &.{},
+    metric_status: []GraphMetricStatus = &.{},
+    metric_values_slab: []GraphMetricValue = &.{},
+    metric_value_names: [][]u8 = &.{},
 
     pub fn deinit(self: *GraphQueryResult, alloc: Allocator) void {
         for (self.nodes) |*node| node.deinit(alloc);
         alloc.free(self.nodes);
+        if (self.metric_values_slab.len > 0) alloc.free(self.metric_values_slab);
+        for (self.metric_value_names) |name| alloc.free(name);
+        if (self.metric_value_names.len > 0) alloc.free(self.metric_value_names);
         pattern_mod.freeMatches(alloc, self.matches);
+        for (self.metric_status) |*status| status.deinit(alloc);
+        if (self.metric_status.len > 0) alloc.free(self.metric_status);
     }
 };
 
@@ -561,12 +868,33 @@ pub const GraphQueryResult = struct {
 // Graph Query Engine
 // ============================================================================
 
+/// Per-request scope for the local graph executors, derived by the caller
+/// from what it knows about the executing snapshot. It rides the executor
+/// vtables so the storage layer, which knows neither its table's name nor
+/// its group count, can apply the caller's routing knowledge.
+pub const ExecutionScope = struct {
+    /// Physical name of the index-owning table. A `target_table` tag naming
+    /// it canonicalizes to the local (null) identity, mirroring the
+    /// distributed coordinator's canonicalGraphNodeTable, so a self-table
+    /// tag never stops expansion or splits node identity.
+    owning_table: []const u8 = "",
+    /// True when the executing snapshot holds the graph index's COMPLETE
+    /// row set (a single-group table, or an embedded caller): local
+    /// traversal, paths, and MATCH may then expand THROUGH cross-table
+    /// tagged nodes, because entity-sourced edges are document-owned rows
+    /// in this same index (same-snapshot single-index read).
+    expand_cross_table_local: bool = false,
+};
+
 pub const GraphQueryEngine = struct {
     alloc: Allocator,
     node_admission: ?NodeAdmission = null,
     /// Public request coordinators install one shared budget here. Internal
     /// callers may omit it and retain the graph algorithms' standalone limit.
     work_budget: ?*work_budget_mod.WorkBudget = null,
+    /// See ExecutionScope; defaults keep the historical terminal behavior at
+    /// cross-table tagged nodes.
+    scope: ExecutionScope = .{},
 
     /// Execute a graph query. For result_ref node selectors, the caller must
     /// resolve refs to keys and pass them as resolved_keys.
@@ -576,18 +904,609 @@ pub const GraphQueryEngine = struct {
         gq: GraphQuery,
         resolved_keys: []const []const u8,
     ) !GraphQueryResult {
-        return switch (gq.query_type) {
-            .traverse => self.executeTraverse(graph_index, gq.params, resolved_keys, resolveTargetKeys(gq)),
+        try validateGraphMetricQueryShape(gq);
+        const defer_result_limit = graphMetricPostProcessingNeedsFullCandidateSet(gq);
+        var execution_params = gq.params;
+        if (defer_result_limit) execution_params.max_results = graph_metric_candidate_limit + 1;
+
+        var execution_query = gq;
+        execution_query.params = execution_params;
+
+        var result = try switch (execution_query.query_type) {
+            .traverse => self.executeTraverse(graph_index, execution_params, resolved_keys, resolveTargetKeys(gq)),
             .neighbors => blk: {
-                var params = gq.params;
+                var params = execution_params;
                 params.max_depth = 1;
                 break :blk self.executeTraverse(graph_index, params, resolved_keys, resolveTargetKeys(gq));
             },
-            .shortest_path => self.executeShortestPath(graph_index, gq, resolved_keys),
-            .k_shortest_paths => self.executeKShortestPaths(graph_index, gq, resolved_keys),
-            .pattern => self.executePattern(graph_index, gq, resolved_keys),
+            .shortest_path => self.executeShortestPath(graph_index, execution_query, resolved_keys),
+            .k_shortest_paths => self.executeKShortestPaths(graph_index, execution_query, resolved_keys),
+            .pattern => self.executePattern(graph_index, execution_query, resolved_keys),
+        };
+        errdefer result.deinit(self.alloc);
+        if (defer_result_limit and result.nodes.len > graph_metric_candidate_limit) {
+            return error.QueryCandidateBudgetExceeded;
+        }
+        if (gq.metrics.len != 0 or gq.order_by.len != 0 or gq.where_metric.len != 0) {
+            try self.applyMetricDependenciesColumnar(graph_index, gq, defer_result_limit, &result);
+        }
+        return result;
+    }
+
+    fn graphMetricPostProcessingNeedsFullCandidateSet(gq: GraphQuery) bool {
+        return gq.where_metric.len > 0 or gq.order_by.len > 0;
+    }
+
+    fn metricFilterMatches(score: f64, filter: GraphMetricFilter) bool {
+        return switch (filter.op) {
+            .gt => score > filter.value,
+            .gte => score >= filter.value,
+            .lt => score < filter.value,
+            .lte => score <= filter.value,
+            .eq => score == filter.value,
+            .neq => score != filter.value,
         };
     }
+
+    const MetricColumnSortContext = struct {
+        orders: []const GraphMetricOrder,
+        metric_indexes: []const usize,
+        score_columns: []const []?f64,
+    };
+
+    fn metricColumnCandidateLessThan(context: MetricColumnSortContext, left: usize, right: usize) bool {
+        for (context.orders, context.metric_indexes) |order, metric_index| {
+            const cmp = compareOptionalMetricScore(
+                context.score_columns[metric_index][left],
+                context.score_columns[metric_index][right],
+                order,
+            );
+            if (cmp) |less| return less;
+        }
+        return left < right;
+    }
+
+    fn siftWorstMetricCandidateUp(context: MetricColumnSortContext, heap: []usize, start: usize) void {
+        var child = start;
+        while (child > 0) {
+            const parent = (child - 1) / 2;
+            if (!metricColumnCandidateLessThan(context, heap[parent], heap[child])) break;
+            std.mem.swap(usize, &heap[parent], &heap[child]);
+            child = parent;
+        }
+    }
+
+    fn siftWorstMetricCandidateDown(context: MetricColumnSortContext, heap: []usize, start: usize) void {
+        var parent = start;
+        while (true) {
+            const left = parent * 2 + 1;
+            if (left >= heap.len) return;
+            const right = left + 1;
+            var worse_child = left;
+            if (right < heap.len and metricColumnCandidateLessThan(context, heap[left], heap[right])) {
+                worse_child = right;
+            }
+            if (!metricColumnCandidateLessThan(context, heap[parent], heap[worse_child])) return;
+            std.mem.swap(usize, &heap[parent], &heap[worse_child]);
+            parent = worse_child;
+        }
+    }
+
+    /// Select and order only the externally observable prefix. This changes a
+    /// 100k-candidate query with a 100-row limit from O(N log N) to O(N log K)
+    /// while retaining deterministic original-order tie breaking.
+    fn retainOrderedMetricCandidatePrefix(
+        candidates: []usize,
+        keep_count: usize,
+        context: MetricColumnSortContext,
+    ) []usize {
+        const keep = @min(candidates.len, keep_count);
+        if (keep == 0) return candidates[0..0];
+        if (keep == candidates.len) {
+            std.mem.sort(usize, candidates, context, metricColumnCandidateLessThan);
+            return candidates;
+        }
+        const heap = candidates[0..keep];
+        for (1..heap.len) |i| siftWorstMetricCandidateUp(context, heap, i);
+        for (candidates[keep..]) |candidate| {
+            if (!metricColumnCandidateLessThan(context, candidate, heap[0])) continue;
+            heap[0] = candidate;
+            siftWorstMetricCandidateDown(context, heap, 0);
+        }
+        std.mem.sort(usize, heap, context, metricColumnCandidateLessThan);
+        return heap;
+    }
+
+    fn compareOptionalMetricScore(left: ?f64, right: ?f64, order: GraphMetricOrder) ?bool {
+        if (left == null and right == null) return null;
+        if (left == null) return order.nulls == .first;
+        if (right == null) return order.nulls != .first;
+        if (left.? == right.?) return null;
+        return if (order.direction == .desc) left.? > right.? else left.? < right.?;
+    }
+
+    fn metricColumnNameIndex(dependency_names: []const []const u8, name: []const u8) ?usize {
+        for (dependency_names, 0..) |dependency_name, i| {
+            if (std.mem.eql(u8, dependency_name, name)) return i;
+        }
+        return null;
+    }
+
+    fn metricCandidatePassesFilters(
+        candidate_index: usize,
+        filters: []const GraphMetricFilter,
+        filter_metric_indexes: []const usize,
+        score_columns: []const []?f64,
+    ) bool {
+        for (filters, filter_metric_indexes) |filter, metric_index| {
+            const score = score_columns[metric_index][candidate_index] orelse return false;
+            if (!metricFilterMatches(score, filter)) return false;
+        }
+        return true;
+    }
+
+    /// Returns source row indexes after metric filtering, ordering, and the
+    /// optional response limit. Serverless uses this to compact and reuse
+    /// already-fetched columns between its filter/order/projection stages.
+    pub fn selectLoadedMetricCandidateIndexesAlloc(
+        alloc: Allocator,
+        dependency_names: []const []const u8,
+        score_columns: []const []?f64,
+        query: GraphQuery,
+        apply_result_limit: bool,
+        node_count: usize,
+    ) ![]usize {
+        try validateGraphMetricQueryShape(query);
+        if (dependency_names.len != score_columns.len) return error.InvalidQueryRequest;
+        for (score_columns, dependency_names, 0..) |column, dependency_name, i| {
+            if (column.len != node_count) return error.InvalidQueryRequest;
+            for (dependency_names[0..i]) |prior_name| {
+                if (std.mem.eql(u8, prior_name, dependency_name)) return error.InvalidQueryRequest;
+            }
+        }
+
+        var filter_index_buffer: [graph_metric_filter_limit]usize = undefined;
+        const filter_metric_indexes = filter_index_buffer[0..query.where_metric.len];
+        for (query.where_metric, 0..) |filter, i| {
+            filter_metric_indexes[i] = metricColumnNameIndex(dependency_names, filter.name) orelse
+                return error.InvalidQueryRequest;
+        }
+        const candidate_indexes = try alloc.alloc(usize, node_count);
+        defer alloc.free(candidate_indexes);
+        var candidate_count: usize = 0;
+        for (0..node_count) |original_index| {
+            if (!metricCandidatePassesFilters(
+                original_index,
+                query.where_metric,
+                filter_metric_indexes,
+                score_columns,
+            )) continue;
+            candidate_indexes[candidate_count] = original_index;
+            candidate_count += 1;
+        }
+        var selected = candidate_indexes[0..candidate_count];
+        const requested_limit: usize = if (apply_result_limit and query.params.max_results != 0)
+            @intCast(query.params.max_results)
+        else
+            selected.len;
+        if (query.order_by.len > 0 and selected.len > 0) {
+            var order_index_buffer: [graph_metric_order_limit]usize = undefined;
+            const order_metric_indexes = order_index_buffer[0..query.order_by.len];
+            for (query.order_by, 0..) |order, i| {
+                order_metric_indexes[i] = metricColumnNameIndex(dependency_names, order.name) orelse
+                    return error.InvalidQueryRequest;
+            }
+            selected = retainOrderedMetricCandidatePrefix(selected, requested_limit, .{
+                .orders = query.order_by,
+                .metric_indexes = order_metric_indexes,
+                .score_columns = score_columns,
+            });
+        } else if (selected.len > requested_limit) {
+            selected = selected[0..requested_limit];
+        }
+        return try alloc.dupe(usize, selected);
+    }
+
+    /// Storage-independent graph-metric post-processing. Callers retain score
+    /// columns in their native storage representation until this routine has
+    /// filtered and selected the externally visible prefix. Metric objects are
+    /// allocated only for surviving rows.
+    pub fn applyLoadedMetricColumns(
+        alloc: Allocator,
+        dependency_names: []const []const u8,
+        metric_value_names: []const []const u8,
+        score_columns: []const []?f64,
+        query: GraphQuery,
+        apply_result_limit: bool,
+        nodes: *[]GraphResultNode,
+    ) ![]GraphMetricValue {
+        try validateGraphMetricQueryShape(query);
+        if (dependency_names.len != score_columns.len or metric_value_names.len != score_columns.len)
+            return error.InvalidQueryRequest;
+        for (score_columns, dependency_names, metric_value_names, 0..) |column, dependency_name, metric_value_name, i| {
+            if (column.len != nodes.*.len or !std.mem.eql(u8, dependency_name, metric_value_name))
+                return error.InvalidQueryRequest;
+            for (dependency_names[0..i]) |prior_name| {
+                if (std.mem.eql(u8, prior_name, dependency_name)) return error.InvalidQueryRequest;
+            }
+        }
+
+        const selected = try selectLoadedMetricCandidateIndexesAlloc(
+            alloc,
+            dependency_names,
+            score_columns,
+            query,
+            apply_result_limit,
+            nodes.*.len,
+        );
+        defer alloc.free(selected);
+
+        return try applySelectedMetricColumns(
+            alloc,
+            dependency_names,
+            metric_value_names,
+            score_columns,
+            query,
+            selected,
+            nodes,
+        );
+    }
+
+    /// Materializes a selection previously produced by
+    /// `selectLoadedMetricCandidateIndexesAlloc`. Keeping selection separate
+    /// lets staged backends reuse the exact same indexes for node mutation and
+    /// score-column compaction instead of repeating filtering and top-k work.
+    pub fn applySelectedMetricColumns(
+        alloc: Allocator,
+        dependency_names: []const []const u8,
+        metric_value_names: []const []const u8,
+        score_columns: []const []?f64,
+        query: GraphQuery,
+        selected: []const usize,
+        nodes: *[]GraphResultNode,
+    ) ![]GraphMetricValue {
+        try validateGraphMetricQueryShape(query);
+        if (dependency_names.len != score_columns.len or metric_value_names.len != score_columns.len)
+            return error.InvalidQueryRequest;
+        for (score_columns, dependency_names, metric_value_names, 0..) |column, dependency_name, metric_value_name, i| {
+            if (column.len != nodes.*.len or !std.mem.eql(u8, dependency_name, metric_value_name))
+                return error.InvalidQueryRequest;
+            for (dependency_names[0..i]) |prior_name| {
+                if (std.mem.eql(u8, prior_name, dependency_name)) return error.InvalidQueryRequest;
+            }
+        }
+
+        var projection_index_buffer: [graph_metric_projection_limit]usize = undefined;
+        const projection_metric_indexes = projection_index_buffer[0..query.metrics.len];
+        for (query.metrics, 0..) |metric, i| {
+            projection_metric_indexes[i] = metricColumnNameIndex(dependency_names, metric.name) orelse
+                return error.InvalidQueryRequest;
+        }
+
+        var selected_mask = try std.DynamicBitSetUnmanaged.initEmpty(alloc, nodes.*.len);
+        defer selected_mask.deinit(alloc);
+        for (selected) |source_index| {
+            if (source_index >= nodes.*.len or selected_mask.isSet(source_index)) return error.InvalidQueryRequest;
+            selected_mask.set(source_index);
+        }
+
+        const slab_len = std.math.mul(usize, selected.len, query.metrics.len) catch return error.QueryCandidateBudgetExceeded;
+        const metric_values_slab = if (slab_len == 0)
+            @constCast((&[_]GraphMetricValue{})[0..])
+        else
+            try alloc.alloc(GraphMetricValue, slab_len);
+        errdefer if (metric_values_slab.len > 0) alloc.free(metric_values_slab);
+        for (selected, 0..) |source_index, row_index| {
+            const row = metric_values_slab[row_index * query.metrics.len ..][0..query.metrics.len];
+            for (row, projection_metric_indexes) |*value, metric_index| {
+                value.* = .{
+                    .name = metric_value_names[metric_index],
+                    .score = score_columns[metric_index][source_index],
+                    .name_owned = false,
+                };
+            }
+        }
+
+        const final_nodes = try alloc.alloc(GraphResultNode, selected.len);
+        for (selected, 0..) |source_index, out_index| {
+            var node = nodes.*[source_index];
+            for (node.metrics) |*metric| metric.deinit(alloc);
+            if (node.metrics_owned and node.metrics.len > 0) alloc.free(node.metrics);
+            node.metrics = metric_values_slab[out_index * query.metrics.len ..][0..query.metrics.len];
+            node.metrics_owned = false;
+            final_nodes[out_index] = node;
+        }
+        for (nodes.*, 0..) |*node, source_index| if (!selected_mask.isSet(source_index)) node.deinit(alloc);
+        alloc.free(nodes.*);
+        nodes.* = final_nodes;
+        return metric_values_slab;
+    }
+
+    /// Installs an already-selected row set whose score columns are aligned
+    /// with output order rather than the original candidate array. Staged
+    /// backends use this to carry stable source ordinals through filtering and
+    /// ordering, then move nodes and materialize projected values exactly once.
+    pub fn materializeSelectedMetricColumns(
+        alloc: Allocator,
+        metric_value_names: []const []const u8,
+        aligned_score_columns: []const []?f64,
+        selected_source_indexes: []const usize,
+        nodes: *[]GraphResultNode,
+    ) ![]GraphMetricValue {
+        return materializeSelectedMetricColumnsWithAllocators(alloc, alloc, alloc, metric_value_names, aligned_score_columns, selected_source_indexes, nodes);
+    }
+
+    fn materializeSelectedMetricColumnsWithAllocators(
+        node_alloc: Allocator,
+        alloc: Allocator,
+        scratch: Allocator,
+        metric_value_names: []const []const u8,
+        aligned_score_columns: []const []?f64,
+        selected_source_indexes: []const usize,
+        nodes: *[]GraphResultNode,
+    ) ![]GraphMetricValue {
+        if (metric_value_names.len != aligned_score_columns.len)
+            return error.InvalidQueryRequest;
+        for (aligned_score_columns, metric_value_names, 0..) |column, name, i| {
+            if (column.len != selected_source_indexes.len or name.len == 0)
+                return error.InvalidQueryRequest;
+            for (metric_value_names[0..i]) |prior_name| {
+                if (std.mem.eql(u8, prior_name, name)) return error.InvalidQueryRequest;
+            }
+        }
+
+        var selected_mask = try std.DynamicBitSetUnmanaged.initEmpty(scratch, nodes.*.len);
+        defer selected_mask.deinit(scratch);
+        for (selected_source_indexes) |source_index| {
+            if (source_index >= nodes.*.len or selected_mask.isSet(source_index))
+                return error.InvalidQueryRequest;
+            selected_mask.set(source_index);
+        }
+
+        const slab_len = std.math.mul(usize, selected_source_indexes.len, metric_value_names.len) catch
+            return error.QueryCandidateBudgetExceeded;
+        const metric_values_slab = if (slab_len == 0)
+            @constCast((&[_]GraphMetricValue{})[0..])
+        else
+            try alloc.alloc(GraphMetricValue, slab_len);
+        errdefer if (metric_values_slab.len > 0) alloc.free(metric_values_slab);
+        for (selected_source_indexes, 0..) |_, row_index| {
+            const row = metric_values_slab[row_index * metric_value_names.len ..][0..metric_value_names.len];
+            for (row, metric_value_names, aligned_score_columns) |*value, name, column| {
+                value.* = .{ .name = name, .score = column[row_index], .name_owned = false };
+            }
+        }
+
+        const final_nodes = try alloc.alloc(GraphResultNode, selected_source_indexes.len);
+        for (selected_source_indexes, 0..) |source_index, out_index| {
+            var node = nodes.*[source_index];
+            for (node.metrics) |*metric| metric.deinit(node_alloc);
+            if (node.metrics_owned and node.metrics.len > 0) node_alloc.free(node.metrics);
+            node.metrics = metric_values_slab[out_index * metric_value_names.len ..][0..metric_value_names.len];
+            node.metrics_owned = false;
+            final_nodes[out_index] = node;
+        }
+        for (nodes.*, 0..) |*node, source_index| if (!selected_mask.isSet(source_index)) node.deinit(node_alloc);
+        node_alloc.free(nodes.*);
+        nodes.* = final_nodes;
+        return metric_values_slab;
+    }
+
+    /// Keep metric scores columnar through filtering, ordering, and limiting.
+    /// Per-node public metric objects are created only for the surviving result
+    /// page, avoiding candidate-count heap fragmentation and needless copies.
+    fn applyMetricDependenciesColumnar(
+        self: *GraphQueryEngine,
+        graph_index: *graph_mod.GraphIndex,
+        query: GraphQuery,
+        apply_result_limit: bool,
+        result: *GraphQueryResult,
+    ) !void {
+        var scratch_budget = work_budget_mod.RetainedAllocator{ .backing = self.alloc, .budget = self.work_budget };
+        var output_budget = work_budget_mod.RetainedAllocator{ .backing = self.alloc, .budget = self.work_budget };
+        defer std.debug.assert(scratch_budget.live_bytes == 0 and output_budget.live_bytes == 0);
+        self.applyStagedMetricDependencies(graph_index, query, apply_result_limit, result, scratch_budget.allocator(), output_budget.allocator()) catch |err| {
+            if (err == error.OutOfMemory and (scratch_budget.denied or output_budget.denied)) return error.GraphWorkBudgetExceeded;
+            return err;
+        };
+        output_budget.detach();
+    }
+
+    fn applyStagedMetricDependencies(
+        self: *GraphQueryEngine,
+        graph_index: *graph_mod.GraphIndex,
+        query: GraphQuery,
+        apply_result_limit: bool,
+        result: *GraphQueryResult,
+        scratch: Allocator,
+        output: Allocator,
+    ) !void {
+        const plan = try MetricReadPlan.init(query);
+        var session = try graph_index.openGraphMetricReadSessionAlloc(scratch, plan.dependencies.slice(), plan.policies[0..plan.dependencies.len]);
+        defer session.deinit();
+        var workspace = try MetricStageWorkspace.init(scratch, plan, result.nodes.len);
+        defer workspace.deinit();
+        if (plan.filters.len != 0) {
+            try workspace.ensure(&session, plan.filters.slice(), result.nodes);
+            var filter_query = query;
+            filter_query.metrics = &.{};
+            filter_query.order_by = &.{};
+            try workspace.select(filter_query, apply_result_limit and plan.orders.len == 0, plan.filters.slice(), plan.orders.slice(), plan.projections.slice());
+        }
+        if (plan.orders.len != 0) {
+            try workspace.ensure(&session, plan.orders.slice(), result.nodes);
+            var order_query = query;
+            order_query.metrics = &.{};
+            order_query.where_metric = &.{};
+            try workspace.select(order_query, apply_result_limit, plan.orders.slice(), plan.projections.slice(), &.{});
+        }
+        try workspace.ensure(&session, plan.projections.slice(), result.nodes);
+
+        const statuses = try output.alloc(GraphMetricStatus, plan.dependencies.len);
+        var initialized_statuses: usize = 0;
+        errdefer {
+            for (statuses[0..initialized_statuses]) |*status| status.deinit(output);
+            output.free(statuses);
+        }
+        for (session.statuses, statuses) |status, *out| {
+            out.* = try cloneGraphMetricStatus(output, status);
+            initialized_statuses += 1;
+        }
+        const metric_value_names = try output.alloc([]u8, plan.projections.len);
+        var initialized_metric_names: usize = 0;
+        errdefer {
+            for (metric_value_names[0..initialized_metric_names]) |name| output.free(name);
+            output.free(metric_value_names);
+        }
+        for (plan.projections.slice(), metric_value_names) |name, *out| {
+            out.* = try output.dupe(u8, name);
+            initialized_metric_names += 1;
+        }
+        var columns: [graph_metric_dependency_limit][]?f64 = undefined;
+        workspace.columnsFor(plan.projections.slice(), columns[0..plan.projections.len]);
+        const slab = try materializeSelectedMetricColumnsWithAllocators(
+            self.alloc,
+            output,
+            scratch,
+            metric_value_names,
+            columns[0..plan.projections.len],
+            workspace.rows,
+            &result.nodes,
+        );
+        if (result.metric_values_slab.len > 0) self.alloc.free(result.metric_values_slab);
+        for (result.metric_value_names) |name| self.alloc.free(name);
+        if (result.metric_value_names.len > 0) self.alloc.free(result.metric_value_names);
+        result.metric_values_slab = slab;
+        result.metric_value_names = metric_value_names;
+        for (result.metric_status) |*status| status.deinit(self.alloc);
+        if (result.metric_status.len > 0) self.alloc.free(result.metric_status);
+        result.metric_status = statuses;
+    }
+
+    /// A stable source-row selection and only the columns needed by future
+    /// stages. The reader is snapshot-owned; this executor never opens storage.
+    pub const MetricStageWorkspace = struct {
+        alloc: Allocator,
+        plan: MetricReadPlan,
+        rows: []usize,
+        columns: [graph_metric_dependency_limit]?[]?f64 = @splat(null),
+
+        pub fn init(alloc: Allocator, plan: MetricReadPlan, node_count: usize) !@This() {
+            const rows = try alloc.alloc(usize, node_count);
+            for (rows, 0..) |*row, i| row.* = i;
+            return .{ .alloc = alloc, .plan = plan, .rows = rows };
+        }
+
+        pub fn deinit(self: *@This()) void {
+            for (self.columns) |column| if (column) |scores| self.alloc.free(scores);
+            self.alloc.free(self.rows);
+        }
+
+        fn index(self: *const @This(), name: []const u8) usize {
+            return metricColumnNameIndex(self.plan.dependencies.slice(), name).?;
+        }
+
+        pub fn columnsFor(self: *const @This(), names: []const []const u8, out: [][]?f64) void {
+            for (names, out) |name, *column| column.* = self.columns[self.index(name)].?;
+        }
+
+        pub fn ensure(self: *@This(), reader: anytype, names: []const []const u8, nodes: []const GraphResultNode) !void {
+            var missing: MetricReadPlan.Names = .{};
+            for (names) |name| if (self.columns[self.index(name)] == null) {
+                missing.append(name);
+            };
+            if (missing.len == 0) return;
+            var local_count: usize = 0;
+            for (self.rows) |row| local_count += @intFromBool(nodes[row].table == null);
+            const keys = try self.alloc.alloc([]const u8, local_count);
+            defer self.alloc.free(keys);
+            var local_index: usize = 0;
+            for (self.rows) |row| if (nodes[row].table == null) {
+                keys[local_index] = nodes[row].key;
+                local_index += 1;
+            };
+            var columns: [graph_metric_dependency_limit][]?f64 = undefined;
+            var local_columns: [graph_metric_dependency_limit][]?f64 = undefined;
+            var initialized: usize = 0;
+            errdefer for (columns[0..initialized]) |column| self.alloc.free(column);
+            for (columns[0..missing.len]) |*column| {
+                column.* = try self.alloc.alloc(?f64, self.rows.len);
+                local_columns[initialized] = column.*[0..local_count];
+                initialized += 1;
+            }
+            // Personalized dependencies compute a fresh seeded column instead
+            // of reading the published generation; only readers that can run
+            // the seeded kernel expose readPersonalizedColumn, everything else
+            // fails closed (for example the serverless published-segment
+            // reader).
+            var published_names: MetricReadPlan.Names = .{};
+            var published_columns: [graph_metric_dependency_limit][]?f64 = undefined;
+            for (missing.slice(), local_columns[0..missing.len]) |name, local_column| {
+                if (self.plan.personalizationFor(name)) |personalization| {
+                    if (comptime std.meta.hasMethod(@TypeOf(reader), "readPersonalizedColumn")) {
+                        try reader.readPersonalizedColumn(
+                            self.alloc,
+                            name,
+                            personalization.seed_nodes,
+                            personalization.damping,
+                            keys,
+                            local_column,
+                        );
+                    } else {
+                        return error.GraphMetricPersonalizationUnsupported;
+                    }
+                } else {
+                    published_columns[published_names.len] = local_column;
+                    published_names.append(name);
+                }
+            }
+            if (published_names.len != 0)
+                try reader.readColumns(self.alloc, published_names.slice(), keys, published_columns[0..published_names.len]);
+            // Expand backwards in-place: qualified identities must not alias a
+            // local document with the same key. No second score slab is needed.
+            if (local_count != self.rows.len) for (columns[0..missing.len]) |column| {
+                var source = local_count;
+                var target = self.rows.len;
+                while (target != 0) {
+                    target -= 1;
+                    if (nodes[self.rows[target]].table == null) {
+                        source -= 1;
+                        column[target] = column[source];
+                    } else column[target] = null;
+                }
+            };
+            for (missing.slice(), columns[0..missing.len]) |name, column| self.columns[self.index(name)] = column;
+        }
+
+        pub fn select(self: *@This(), query: GraphQuery, apply_limit: bool, names: []const []const u8, future: []const []const u8, later: []const []const u8) !void {
+            var columns: [graph_metric_dependency_limit][]?f64 = undefined;
+            self.columnsFor(names, columns[0..names.len]);
+            const selected = try selectLoadedMetricCandidateIndexesAlloc(self.alloc, names, columns[0..names.len], query, apply_limit, self.rows.len);
+            defer self.alloc.free(selected);
+            const rows = try self.alloc.alloc(usize, selected.len);
+            errdefer self.alloc.free(rows);
+            for (selected, rows) |parent, *row| row.* = self.rows[parent];
+            var replacements: [graph_metric_dependency_limit]?[]?f64 = @splat(null);
+            errdefer for (replacements) |column| if (column) |scores| self.alloc.free(scores);
+            for (self.plan.dependencies.slice(), self.columns[0..self.plan.dependencies.len], 0..) |name, *maybe_column, i| {
+                const column = maybe_column.* orelse continue;
+                if (metricColumnNameIndex(future, name) == null and metricColumnNameIndex(later, name) == null) {
+                    self.alloc.free(column);
+                    maybe_column.* = null;
+                    continue;
+                }
+                const rebased = try self.alloc.alloc(?f64, selected.len);
+                for (selected, rebased) |parent, *value| value.* = column[parent];
+                replacements[i] = rebased;
+            }
+            for (&self.columns, replacements) |*column, replacement| if (replacement) |scores| {
+                self.alloc.free(column.*.?);
+                column.* = scores;
+            };
+            self.alloc.free(self.rows);
+            self.rows = rows;
+        }
+    };
 
     fn executeTraverse(
         self: *GraphQueryEngine,
@@ -632,6 +1551,8 @@ pub const GraphQueryEngine = struct {
             .include_paths = params.include_paths,
             .node_admission = self.node_admission,
             .work_budget = self.work_budget,
+            .owning_table = self.scope.owning_table,
+            .expand_cross_table_local = self.scope.expand_cross_table_local,
             .result_admission = .{
                 .ctx = &result_admission_context,
                 .admit_one = TraverseResultAdmissionContext.admit,
@@ -772,6 +1693,8 @@ pub const GraphQueryEngine = struct {
             .max_weight = gq.params.max_weight,
             .node_admission = self.node_admission,
             .work_budget = self.work_budget,
+            .owning_table = self.scope.owning_table,
+            .expand_cross_table_local = self.scope.expand_cross_table_local,
         };
         const admitted_starts = try self.admittedStartKeysAlloc(start_keys, gq.params.direction);
         defer if (admitted_starts) |mask| self.alloc.free(mask);
@@ -782,7 +1705,7 @@ pub const GraphQueryEngine = struct {
             all_results.deinit(self.alloc);
         }
 
-        for (start_keys, 0..) |sk, start_index| {
+        outer: for (start_keys, 0..) |sk, start_index| {
             if (admitted_starts) |mask| if (!mask[start_index]) continue;
             for (target_keys) |tk| {
                 const path = try paths_mod.findShortestPath(self.alloc, graph_index, sk, tk, opts);
@@ -793,6 +1716,7 @@ pub const GraphQueryEngine = struct {
                     errdefer if (node_owned) node.deinit(self.alloc);
                     try all_results.append(self.alloc, node);
                     node_owned = false;
+                    if (gq.params.max_results != 0 and all_results.items.len >= gq.params.max_results) break :outer;
                 }
             }
         }
@@ -826,11 +1750,12 @@ pub const GraphQueryEngine = struct {
         defer if (admitted_starts) |mask| self.alloc.free(mask);
         if (self.node_admission != null and admitted_starts == null) return null;
 
-        for (start_keys, 0..) |start_key, start_index| {
+        outer: for (start_keys, 0..) |start_key, start_index| {
             if (admitted_starts) |mask| if (!mask[start_index]) continue;
             for (target_keys) |target_key| {
                 if (std.mem.eql(u8, start_key, target_key)) {
                     try all_results.append(self.alloc, try trivialPathResultNode(self.alloc, start_key));
+                    if (params.max_results > 0 and all_results.items.len >= params.max_results) break :outer;
                     continue;
                 }
 
@@ -863,6 +1788,7 @@ pub const GraphQueryEngine = struct {
                 if (reached.len != 1) return null;
                 const node = (try algebraicShortestPathResultNodeAlloc(self.alloc, graph_index, params, start_key, target_key, reached[0])) orelse return null;
                 try all_results.append(self.alloc, node);
+                if (params.max_results > 0 and all_results.items.len >= params.max_results) break :outer;
             }
         }
 
@@ -892,6 +1818,8 @@ pub const GraphQueryEngine = struct {
             .max_weight = gq.params.max_weight,
             .node_admission = self.node_admission,
             .work_budget = self.work_budget,
+            .owning_table = self.scope.owning_table,
+            .expand_cross_table_local = self.scope.expand_cross_table_local,
         };
         const admitted_starts = try self.admittedStartKeysAlloc(start_keys, gq.params.direction);
         defer if (admitted_starts) |mask| self.alloc.free(mask);
@@ -902,10 +1830,13 @@ pub const GraphQueryEngine = struct {
             all_results.deinit(self.alloc);
         }
 
-        for (start_keys, 0..) |sk, start_index| {
+        outer: for (start_keys, 0..) |sk, start_index| {
             if (admitted_starts) |mask| if (!mask[start_index]) continue;
             for (target_keys) |tk| {
-                const found = try paths_mod.findKShortestPaths(self.alloc, graph_index, sk, tk, gq.k, opts);
+                // Limit search work as well as output allocation. Metric
+                // filtering/order supplies its larger candidate bound here.
+                const remaining: u32 = if (gq.params.max_results == 0) gq.k else @intCast(gq.params.max_results - all_results.items.len);
+                const found = try paths_mod.findKShortestPaths(self.alloc, graph_index, sk, tk, @min(gq.k, remaining), opts);
                 defer paths_mod.freePaths(self.alloc, found);
 
                 for (found) |p| {
@@ -914,6 +1845,7 @@ pub const GraphQueryEngine = struct {
                     errdefer if (node_owned) node.deinit(self.alloc);
                     try all_results.append(self.alloc, node);
                     node_owned = false;
+                    if (gq.params.max_results != 0 and all_results.items.len >= gq.params.max_results) break :outer;
                 }
             }
         }
@@ -956,6 +1888,8 @@ pub const GraphQueryEngine = struct {
                 .return_aliases = gq.return_aliases,
                 .node_admission = self.node_admission,
                 .work_budget = self.work_budget,
+                .owning_table = self.scope.owning_table,
+                .expand_cross_table_local = self.scope.expand_cross_table_local,
             },
         );
         errdefer pattern_mod.freeMatches(self.alloc, matches);
@@ -1106,6 +2040,17 @@ fn traversalResultNodeAlloc(
         null;
     errdefer if (path_tables) |tables| freePathTables(alloc, tables);
 
+    const path_edges = if (result.path_edges) |edges| blk: {
+        const owned = try alloc.alloc(PathEdgeInfo, edges.len);
+        var initialized: usize = 0;
+        errdefer freePathEdgeItems(alloc, owned, initialized);
+        for (edges, owned) |edge, *out| {
+            out.* = try pathEdgeInfoFromPathEdge(alloc, edge);
+            initialized += 1;
+        }
+        break :blk owned;
+    } else null;
+
     return .{
         .key = key,
         .table = table,
@@ -1113,7 +2058,7 @@ fn traversalResultNodeAlloc(
         .distance = result.distance,
         .path = path,
         .path_tables = path_tables,
-        .path_edges = null,
+        .path_edges = path_edges,
     };
 }
 
@@ -1125,6 +2070,12 @@ fn traversalGraphResultNodeOwnedBytes(result: traversal_mod.TraversalResult) !us
         for (items) |item| total = try std.math.add(usize, total, item.len);
         total = try std.math.add(usize, total, try std.math.mul(usize, items.len, @sizeOf(?[]const u8)));
         if (result.target_table) |table| total = try std.math.add(usize, total, table.len);
+    }
+    if (result.path_edges) |edges| {
+        total = try std.math.add(usize, total, try std.math.mul(usize, edges.len, @sizeOf(PathEdgeInfo)));
+        for (edges) |edge| inline for (.{ "source", "target", "edge_type", "metadata" }) |field| {
+            total = try std.math.add(usize, total, @field(edge, field).len);
+        };
     }
     return total;
 }
@@ -1952,17 +2903,28 @@ const TestCtx = struct {
     }
 };
 
-fn setupGraph(alloc: Allocator, store_label: []const u8, rev_label: []const u8, sb: *[256]u8, rb: *[256]u8) !*TestCtx {
+fn setupGraphWithOptions(
+    alloc: Allocator,
+    store_label: []const u8,
+    rev_label: []const u8,
+    sb: *[256]u8,
+    rb: *[256]u8,
+    opts: graph_mod.GraphIndexOptions,
+) !*TestCtx {
     const sp = tmpPath(sb, store_label);
     const rp = tmpPath(rb, rev_label);
     const ctx = try alloc.create(TestCtx);
     errdefer alloc.destroy(ctx);
     ctx.store = try docstore.DocStore.open(alloc, sp, .{});
     errdefer ctx.store.close();
-    ctx.graph = try graph_mod.GraphIndex.open(alloc, &ctx.store, rp, "test", .{});
+    ctx.graph = try graph_mod.GraphIndex.open(alloc, &ctx.store, rp, "test", opts);
     ctx.sp = sp;
     ctx.rp = rp;
     return ctx;
+}
+
+fn setupGraph(alloc: Allocator, store_label: []const u8, rev_label: []const u8, sb: *[256]u8, rb: *[256]u8) !*TestCtx {
+    return try setupGraphWithOptions(alloc, store_label, rev_label, sb, rb, .{});
 }
 
 fn expectAlgebraicTraversalReject(proof: AlgebraicTraversalProof, reason: AlgebraicTraversalRejectReason) !void {
@@ -2027,11 +2989,11 @@ test "NodeSelector keys vs result_ref" {
     }
 }
 
-test "QueryParams defaults match TraversalRules defaults" {
+test "QueryParams uses the public one-hop default and shared traversal options" {
     const qp = QueryParams{};
     const tr = traversal_mod.TraversalRules{};
     try std.testing.expectEqual(qp.direction, tr.direction);
-    try std.testing.expectEqual(qp.max_depth, tr.max_depth);
+    try std.testing.expectEqual(@as(u32, 1), qp.max_depth);
     try std.testing.expectEqual(qp.min_weight, tr.min_weight);
     try std.testing.expectEqual(qp.max_weight, tr.max_weight);
     try std.testing.expectEqual(qp.max_results, tr.max_results);
@@ -2157,6 +3119,67 @@ test "traverse preserves table-scoped identities across result dedup and algebra
     }
     try std.testing.expectEqual(@as(usize, 1), local_count);
     try std.testing.expectEqual(@as(usize, 1), external_count);
+}
+
+test "engine execution scope expands through cross-table nodes and canonicalizes self-table tags" {
+    const alloc = std.testing.allocator;
+    var sb: [256]u8 = undefined;
+    var rb: [256]u8 = undefined;
+    const ctx = try setupGraph(alloc, "gq-scope-s", "gq-scope-r", &sb, &rb);
+    defer {
+        ctx.deinit();
+        alloc.destroy(ctx);
+    }
+
+    // The autoschema shape: a mention edge into a resolved cross-table
+    // entity, an entity-sourced relation row in THIS index, plus a
+    // self-table tag that must canonicalize instead of splitting identity.
+    try ctx.graph.addEdge("doc:a", "entity/ada", "mentions", 1.0, 0, 0, "{\"target_table\":\"entities\"}");
+    try ctx.graph.addEdge("entity/ada", "event/xyz", "participates_in", 1.0, 0, 0, "{\"target_table\":\"events\"}");
+    try ctx.graph.addEdge("doc:a", "doc:b", "cites", 1.0, 0, 0, "{\"target_table\":\"documents\"}");
+
+    const start_keys: []const []const u8 = &.{"doc:a"};
+    const gq = GraphQuery{
+        .query_type = .traverse,
+        .index_name = "test",
+        .start_nodes = .{ .keys = start_keys },
+        .params = .{ .max_depth = 3, .max_results = 0, .deduplicate = true },
+    };
+
+    // Default scope keeps the historical terminal behavior.
+    var terminal_engine = GraphQueryEngine{ .alloc = alloc };
+    var terminal = try terminal_engine.execute(&ctx.graph, gq, start_keys);
+    defer terminal.deinit(alloc);
+    for (terminal.nodes) |node| {
+        try std.testing.expect(!std.mem.eql(u8, node.key, "event/xyz"));
+    }
+
+    // A complete-snapshot scope walks doc -> entity -> event in one
+    // traversal, and the self-table tag neither stops expansion nor
+    // qualifies the node.
+    var engine = GraphQueryEngine{
+        .alloc = alloc,
+        .scope = .{ .owning_table = "documents", .expand_cross_table_local = true },
+    };
+    var result = try engine.execute(&ctx.graph, gq, start_keys);
+    defer result.deinit(alloc);
+
+    var saw_entity = false;
+    var saw_event = false;
+    var saw_doc_b = false;
+    for (result.nodes) |node| {
+        if (std.mem.eql(u8, node.key, "entity/ada")) {
+            try std.testing.expectEqualStrings("entities", node.table.?);
+            saw_entity = true;
+        } else if (std.mem.eql(u8, node.key, "event/xyz")) {
+            try std.testing.expectEqualStrings("events", node.table.?);
+            saw_event = true;
+        } else if (std.mem.eql(u8, node.key, "doc:b")) {
+            try std.testing.expect(node.table == null);
+            saw_doc_b = true;
+        }
+    }
+    try std.testing.expect(saw_entity and saw_event and saw_doc_b);
 }
 
 test "traverse can execute through algebraic provenance semiring path" {
@@ -2683,7 +3706,7 @@ test "shortest_path via engine" {
         .index_name = "test",
         .start_nodes = .{ .keys = start_keys },
         .target_nodes = .{ .keys = &.{"C"} },
-        .params = .{ .weight_mode = .min_weight },
+        .params = .{ .max_depth = 2, .include_paths = true, .weight_mode = .min_weight },
     }, start_keys);
     defer result.deinit(alloc);
 
@@ -2890,6 +3913,640 @@ test "shortest_path algebraic provenance applies exact edge weight filters" {
     try std.testing.expectEqualStrings("E\x1fok\x1fD", provenance[2]);
 }
 
+test "graph metric query shape bounds clauses and unique dependencies" {
+    const names = [_][]const u8{
+        "m00", "m01", "m02", "m03", "m04", "m05", "m06", "m07", "m08",
+        "m09", "m10", "m11", "m12", "m13", "m14", "m15", "m16",
+    };
+    var reads: [graph_metric_projection_limit + 1]GraphMetricRead = undefined;
+    for (&reads, names) |*read, name| read.* = .{ .name = name };
+
+    try std.testing.expectError(error.InvalidQueryRequest, validateGraphMetricQueryShape(.{
+        .query_type = .traverse,
+        .index_name = "g",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+        .metrics = &reads,
+    }));
+
+    var too_many_orders: [graph_metric_order_limit + 1]GraphMetricOrder = undefined;
+    for (&too_many_orders) |*order| order.* = .{ .name = "pagerank" };
+    try std.testing.expectError(error.InvalidQueryRequest, validateGraphMetricQueryShape(.{
+        .query_type = .traverse,
+        .index_name = "g",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+        .order_by = &too_many_orders,
+    }));
+
+    var too_many_filters: [graph_metric_filter_limit + 1]GraphMetricFilter = undefined;
+    for (&too_many_filters) |*filter| filter.* = .{ .name = "pagerank", .op = .gte, .value = 0.1 };
+    try std.testing.expectError(error.InvalidQueryRequest, validateGraphMetricQueryShape(.{
+        .query_type = .traverse,
+        .index_name = "g",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+        .where_metric = &too_many_filters,
+    }));
+
+    const extra_order = [_]GraphMetricOrder{.{ .name = names[graph_metric_dependency_limit] }};
+    try std.testing.expectError(error.InvalidQueryRequest, validateGraphMetricQueryShape(.{
+        .query_type = .traverse,
+        .index_name = "g",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+        .metrics = reads[0..graph_metric_dependency_limit],
+        .order_by = &extra_order,
+    }));
+
+    const duplicate_reads = [_]GraphMetricRead{ .{ .name = "pagerank" }, .{ .name = "pagerank" } };
+    try std.testing.expectError(error.InvalidQueryRequest, validateGraphMetricQueryShape(.{
+        .query_type = .traverse,
+        .index_name = "g",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+        .metrics = &duplicate_reads,
+    }));
+
+    const duplicate_orders = [_]GraphMetricOrder{ .{ .name = "pagerank" }, .{ .name = "pagerank", .direction = .asc } };
+    try std.testing.expectError(error.InvalidQueryRequest, validateGraphMetricQueryShape(.{
+        .query_type = .traverse,
+        .index_name = "g",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+        .order_by = &duplicate_orders,
+    }));
+
+    const range_filters = [_]GraphMetricFilter{
+        .{ .name = "pagerank", .op = .gte, .value = 0.1 },
+        .{ .name = "pagerank", .op = .lt, .value = 0.9 },
+    };
+    try validateGraphMetricQueryShape(.{
+        .query_type = .traverse,
+        .index_name = "g",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+        .where_metric = &range_filters,
+    });
+
+    const invalid_filters = [_]GraphMetricFilter{.{
+        .name = "pagerank",
+        .op = .gte,
+        .value = std.math.nan(f64),
+    }};
+    try std.testing.expectError(error.InvalidQueryRequest, validateGraphMetricQueryShape(.{
+        .query_type = .traverse,
+        .index_name = "g",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+        .where_metric = &invalid_filters,
+    }));
+}
+
+test "borrowed graph metric names do not allocate per node" {
+    var value = GraphMetricValue{ .name = "pagerank", .score = 0.5, .name_owned = false };
+    try value.ensureNameOwned(std.testing.allocator);
+    try std.testing.expect(value.name_owned);
+    try std.testing.expectEqualStrings("pagerank", value.name);
+    value.deinit(std.testing.allocator);
+}
+
+test "graph metric column selection retains deterministic bounded top k" {
+    var scores = [_]?f64{ 0.3, null, 0.9, 0.8, 0.9, 0.1 };
+    const columns = [_][]?f64{&scores};
+    const orders = [_]GraphMetricOrder{.{
+        .name = "rank",
+        .direction = .desc,
+        .nulls = .last,
+    }};
+    const metric_indexes = [_]usize{0};
+    const context = GraphQueryEngine.MetricColumnSortContext{
+        .orders = &orders,
+        .metric_indexes = &metric_indexes,
+        .score_columns = &columns,
+    };
+    var candidates = [_]usize{ 0, 1, 2, 3, 4, 5 };
+    const selected = GraphQueryEngine.retainOrderedMetricCandidatePrefix(&candidates, 3, context);
+    try std.testing.expectEqualSlices(usize, &.{ 2, 4, 3 }, selected);
+
+    var ascending_candidates = [_]usize{ 0, 1, 2, 3, 4, 5 };
+    const ascending_orders = [_]GraphMetricOrder{.{
+        .name = "rank",
+        .direction = .asc,
+        .nulls = .first,
+    }};
+    const ascending = GraphQueryEngine.retainOrderedMetricCandidatePrefix(
+        &ascending_candidates,
+        2,
+        .{
+            .orders = &ascending_orders,
+            .metric_indexes = &metric_indexes,
+            .score_columns = &columns,
+        },
+    );
+    try std.testing.expectEqualSlices(usize, &.{ 1, 5 }, ascending);
+}
+
+test "graph metric shared column application is allocation-failure safe" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            var metric_values_slab: []GraphMetricValue = &.{};
+            var nodes = try alloc.alloc(GraphResultNode, 3);
+            var initialized: usize = 0;
+            defer {
+                for (nodes[0..initialized]) |*node| node.deinit(alloc);
+                alloc.free(nodes);
+                if (metric_values_slab.len > 0) alloc.free(metric_values_slab);
+            }
+            for (&[_][]const u8{ "a", "b", "c" }, 0..) |key, i| {
+                nodes[i] = .{ .key = try alloc.dupe(u8, key), .depth = 1, .distance = 1 };
+                initialized += 1;
+            }
+
+            var scores = [_]?f64{ 0.1, 0.9, 0.5 };
+            const columns = [_][]?f64{&scores};
+            const names = [_][]const u8{"rank"};
+            const reads = [_]GraphMetricRead{.{ .name = "rank" }};
+            const orders = [_]GraphMetricOrder{.{ .name = "rank", .direction = .desc }};
+            metric_values_slab = try GraphQueryEngine.applyLoadedMetricColumns(
+                alloc,
+                &names,
+                &names,
+                &columns,
+                .{
+                    .query_type = .neighbors,
+                    .index_name = "g",
+                    .start_nodes = .{ .keys = &.{"root"} },
+                    .params = .{ .max_results = 2 },
+                    .metrics = &reads,
+                    .order_by = &orders,
+                },
+                true,
+                &nodes,
+            );
+            initialized = nodes.len;
+            try std.testing.expectEqual(@as(usize, 2), nodes.len);
+            try std.testing.expectEqualStrings("b", nodes[0].key);
+            try std.testing.expectEqual(@as(?f64, 0.9), nodes[0].metrics[0].score);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "graph metric stable row materialization moves nodes once and is allocation-failure safe" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            var metric_values_slab: []GraphMetricValue = &.{};
+            var nodes = try alloc.alloc(GraphResultNode, 3);
+            var initialized: usize = 0;
+            defer {
+                for (nodes[0..initialized]) |*node| node.deinit(alloc);
+                alloc.free(nodes);
+                if (metric_values_slab.len > 0) alloc.free(metric_values_slab);
+            }
+            for (&[_][]const u8{ "a", "b", "c" }, 0..) |key, i| {
+                nodes[i] = .{ .key = try alloc.dupe(u8, key), .depth = 1, .distance = 1 };
+                initialized += 1;
+            }
+
+            var aligned_scores = [_]?f64{ 0.8, 0.2 };
+            const columns = [_][]?f64{&aligned_scores};
+            const names = [_][]const u8{"rank"};
+            metric_values_slab = try GraphQueryEngine.materializeSelectedMetricColumns(
+                alloc,
+                &names,
+                &columns,
+                &.{ 2, 0 },
+                &nodes,
+            );
+            initialized = nodes.len;
+            try std.testing.expectEqual(@as(usize, 2), nodes.len);
+            try std.testing.expectEqualStrings("c", nodes[0].key);
+            try std.testing.expectEqual(@as(?f64, 0.8), nodes[0].metrics[0].score);
+            try std.testing.expectEqualStrings("a", nodes[1].key);
+            try std.testing.expectEqual(@as(?f64, 0.2), nodes[1].metrics[0].score);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "graph metric staged reads only load display columns for selected rows" {
+    const Runner = struct {
+        const Reader = struct {
+            keys: usize = 0,
+            pub fn readColumns(self: *@This(), _: Allocator, names: []const []const u8, keys: []const []const u8, columns: []const []?f64) !void {
+                self.keys += names.len * keys.len;
+                for (columns) |column| for (keys, column) |key, *value| {
+                    value.* = @floatFromInt(key[0] - '0');
+                };
+            }
+        };
+        fn run(alloc: Allocator) !void {
+            const query = GraphQuery{
+                .query_type = .neighbors,
+                .index_name = "graph",
+                .start_nodes = .{ .keys = &.{"0"} },
+                .params = .{ .max_results = 2 },
+                .metrics = &.{ .{ .name = "rank" }, .{ .name = "display" } },
+                .order_by = &.{.{ .name = "rank" }},
+                .where_metric = &.{.{ .name = "rank", .op = .gte, .value = 2 }},
+            };
+            const nodes = [_]GraphResultNode{
+                .{ .key = "0", .depth = 0, .distance = 0 }, .{ .key = "1", .depth = 0, .distance = 0 }, .{ .key = "2", .depth = 0, .distance = 0 },
+                .{ .key = "3", .depth = 0, .distance = 0 }, .{ .key = "4", .depth = 0, .distance = 0 }, .{ .key = "5", .depth = 0, .distance = 0 },
+            };
+            const plan = try MetricReadPlan.init(query);
+            var work = try GraphQueryEngine.MetricStageWorkspace.init(alloc, plan, nodes.len);
+            defer work.deinit();
+            var reader = Reader{};
+            try work.ensure(&reader, plan.filters.slice(), &nodes);
+            var filter = query;
+            filter.metrics = &.{};
+            filter.order_by = &.{};
+            try work.select(filter, false, plan.filters.slice(), plan.orders.slice(), plan.projections.slice());
+            try work.ensure(&reader, plan.orders.slice(), &nodes);
+            var order = query;
+            order.metrics = &.{};
+            order.where_metric = &.{};
+            try work.select(order, true, plan.orders.slice(), plan.projections.slice(), &.{});
+            try work.ensure(&reader, plan.projections.slice(), &nodes);
+            try std.testing.expectEqual(@as(usize, 8), reader.keys);
+            try std.testing.expectEqualSlices(usize, &.{ 5, 4 }, work.rows);
+            for (work.columns[0..2]) |column| try std.testing.expectEqualSlices(?f64, &.{ 5, 4 }, column.?);
+        }
+    };
+    try Runner.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "graph metric staged columns do not alias qualified node identities" {
+    const alloc = std.testing.allocator;
+    const query = GraphQuery{ .query_type = .neighbors, .index_name = "graph", .start_nodes = .{ .keys = &.{} }, .metrics = &.{.{ .name = "rank" }} };
+    const nodes = [_]GraphResultNode{
+        .{ .key = "same", .table = "other", .depth = 0, .distance = 0 },
+        .{ .key = "same", .depth = 0, .distance = 0 },
+        .{ .key = "same", .table = "other", .depth = 0, .distance = 0 },
+    };
+    var work = try GraphQueryEngine.MetricStageWorkspace.init(alloc, try MetricReadPlan.init(query), nodes.len);
+    defer work.deinit();
+    const Reader = struct {
+        pub fn readColumns(_: *@This(), _: Allocator, _: []const []const u8, keys: []const []const u8, columns: []const []?f64) !void {
+            try std.testing.expectEqual(@as(usize, 1), keys.len);
+            columns[0][0] = 7;
+        }
+    };
+    var reader = Reader{};
+    try work.ensure(&reader, &.{"rank"}, &nodes);
+    try std.testing.expectEqualSlices(?f64, &.{ null, 7, null }, work.columns[0].?);
+}
+
+test "graph metric personalization requires fresh reads and bounded seed sets" {
+    const seeds = [_][]const u8{"doc:a"};
+    const base = GraphQuery{
+        .query_type = .traverse,
+        .index_name = "g",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+    };
+
+    var published_seeded = base;
+    published_seeded.metrics = &.{.{ .name = "pagerank", .seed_nodes = &seeds }};
+    try std.testing.expectError(error.GraphMetricPersonalizationRequiresFresh, validateGraphMetricQueryShape(published_seeded));
+
+    var fresh_seeded = base;
+    fresh_seeded.metrics = &.{.{ .name = "pagerank", .freshness = .fresh, .seed_nodes = &seeds, .damping = 0.9 }};
+    try validateGraphMetricQueryShape(fresh_seeded);
+
+    var damping_without_seeds = base;
+    damping_without_seeds.metrics = &.{.{ .name = "pagerank", .freshness = .fresh, .damping = 0.9 }};
+    try std.testing.expectError(error.InvalidQueryRequest, validateGraphMetricQueryShape(damping_without_seeds));
+
+    var damping_out_of_range = base;
+    damping_out_of_range.metrics = &.{.{ .name = "pagerank", .freshness = .fresh, .seed_nodes = &seeds, .damping = 1.0 }};
+    try std.testing.expectError(error.InvalidQueryRequest, validateGraphMetricQueryShape(damping_out_of_range));
+
+    var empty_seed_key = base;
+    empty_seed_key.metrics = &.{.{ .name = "pagerank", .freshness = .fresh, .seed_nodes = &.{""} }};
+    try std.testing.expectError(error.InvalidQueryRequest, validateGraphMetricQueryShape(empty_seed_key));
+
+    var too_many_seed_keys: [graph_metric_seed_limit + 1][]const u8 = undefined;
+    for (&too_many_seed_keys) |*seed| seed.* = "doc:a";
+    var too_many_seeds = base;
+    too_many_seeds.metrics = &.{.{ .name = "pagerank", .freshness = .fresh, .seed_nodes = &too_many_seed_keys }};
+    try std.testing.expectError(error.InvalidQueryRequest, validateGraphMetricQueryShape(too_many_seeds));
+
+    // A personalized dependency carries no publication policy: its column is
+    // computed fresh rather than read from a published generation.
+    var ordered_fresh = fresh_seeded;
+    ordered_fresh.order_by = &.{.{ .name = "pagerank", .freshness = .fresh }};
+    const plan = try MetricReadPlan.init(ordered_fresh);
+    try std.testing.expect(plan.personalizationFor("pagerank") != null);
+    try std.testing.expect(!plan.policies[0].require_published and !plan.policies[0].require_fresh);
+
+    // Ordering or filtering a personalized metric with published freshness
+    // would mix global and seeded scores; fail closed.
+    var ordered_published = fresh_seeded;
+    ordered_published.order_by = &.{.{ .name = "pagerank", .freshness = .published }};
+    try std.testing.expectError(error.GraphMetricPersonalizationRequiresFresh, MetricReadPlan.init(ordered_published));
+    var filtered_published = fresh_seeded;
+    filtered_published.where_metric = &.{.{ .name = "pagerank", .op = .gte, .value = 0.1, .freshness = .published }};
+    try std.testing.expectError(error.GraphMetricPersonalizationRequiresFresh, MetricReadPlan.init(filtered_published));
+}
+
+test "graph metric personalized reads fail closed on readers without a seeded kernel" {
+    const alloc = std.testing.allocator;
+    const seeds = [_][]const u8{"a"};
+    const query = GraphQuery{
+        .query_type = .neighbors,
+        .index_name = "graph",
+        .start_nodes = .{ .keys = &.{} },
+        .metrics = &.{.{ .name = "rank", .freshness = .fresh, .seed_nodes = &seeds }},
+    };
+    const nodes = [_]GraphResultNode{.{ .key = "a", .depth = 0, .distance = 0 }};
+    var work = try GraphQueryEngine.MetricStageWorkspace.init(alloc, try MetricReadPlan.init(query), nodes.len);
+    defer work.deinit();
+    // Models the serverless published-segment reader: readColumns only.
+    const Reader = struct {
+        pub fn readColumns(_: *@This(), _: Allocator, _: []const []const u8, _: []const []const u8, _: []const []?f64) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var reader = Reader{};
+    try std.testing.expectError(error.GraphMetricPersonalizationUnsupported, work.ensure(&reader, &.{"rank"}, &nodes));
+}
+
+test "personalized graph metric reads compute seeded pagerank at query time" {
+    const alloc = std.testing.allocator;
+    var sb: [256]u8 = undefined;
+    var rb: [256]u8 = undefined;
+    const metrics = [_]graph_mod.GraphMetricConfig{.{ .name = "rank", .kind = .pagerank }};
+    const ctx = try setupGraphWithOptions(alloc, "gq-metric-ppr-s", "gq-metric-ppr-r", &sb, &rb, .{ .metric_configs = &metrics });
+    defer {
+        ctx.deinit();
+        alloc.destroy(ctx);
+    }
+
+    // Seed cluster A<->B bridged to hub H, which dominates global PageRank.
+    try ctx.graph.addEdge("A", "B", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("B", "A", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("B", "C", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("C", "H", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("D", "H", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("E", "H", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("F", "H", "e", 1.0, 0, 0, "");
+
+    // No published generation exists: the personalized column must be
+    // computed fresh, and absent seeds must be skipped without failing.
+    const seeds = [_][]const u8{ "A", "missing-node" };
+    const reads = [_]GraphMetricRead{.{ .name = "rank", .freshness = .fresh, .seed_nodes = &seeds, .damping = 0.9 }};
+    const start_keys: []const []const u8 = &.{"A"};
+    const query = GraphQuery{
+        .query_type = .traverse,
+        .index_name = "test",
+        .start_nodes = .{ .keys = start_keys },
+        .params = .{ .edge_types = &.{"e"}, .direction = .out, .max_depth = 3, .max_results = 16 },
+        .metrics = &reads,
+    };
+
+    var engine = GraphQueryEngine{ .alloc = alloc };
+    var result = try engine.execute(&ctx.graph, query, start_keys);
+    defer result.deinit(alloc);
+
+    var seed_neighbor_score: ?f64 = null;
+    var hub_score: ?f64 = null;
+    for (result.nodes) |node| {
+        try std.testing.expectEqual(@as(usize, 1), node.metrics.len);
+        if (std.mem.eql(u8, node.key, "B")) seed_neighbor_score = node.metrics[0].score;
+        if (std.mem.eql(u8, node.key, "H")) hub_score = node.metrics[0].score;
+    }
+    // Teleport mass restricted to seed A keeps its one-hop neighbor above the
+    // globally dominant hub.
+    try std.testing.expect(seed_neighbor_score.? > hub_score.?);
+
+    // Deterministic across runs for a fixed seed set.
+    var replay = try engine.execute(&ctx.graph, query, start_keys);
+    defer replay.deinit(alloc);
+    try std.testing.expectEqual(result.nodes.len, replay.nodes.len);
+    for (result.nodes, replay.nodes) |expected, actual| {
+        try std.testing.expectEqualStrings(expected.key, actual.key);
+        try std.testing.expectEqual(expected.metrics[0].score, actual.metrics[0].score);
+    }
+
+    // Direct column read reports how many seeds resolved.
+    var column: [2]?f64 = undefined;
+    const resolution = try ctx.graph.personalizedPageRankColumnInto(alloc, "rank", &seeds, 0.9, &.{ "B", "missing-node" }, &column);
+    try std.testing.expectEqual(@as(usize, 2), resolution.requested);
+    try std.testing.expectEqual(@as(usize, 1), resolution.matched);
+    try std.testing.expectEqual(@as(usize, 1), resolution.skipped());
+    try std.testing.expect(column[0] != null);
+    try std.testing.expectEqual(@as(?f64, null), column[1]);
+}
+
+test "graph metric staged query admits scratch and output and pins publication" {
+    const alloc = std.testing.allocator;
+    var sb: [256]u8 = undefined;
+    var rb: [256]u8 = undefined;
+    const configs = [_]graph_mod.GraphMetricConfig{.{ .name = "degree", .kind = .degree }};
+    const ctx = try setupGraphWithOptions(alloc, "gq-staged-budget-s", "gq-staged-budget-r", &sb, &rb, .{ .metric_configs = &configs });
+    defer {
+        ctx.deinit();
+        alloc.destroy(ctx);
+    }
+    try ctx.graph.addEdge("A", "B", "e", 1, 0, 0, "");
+    var published = try ctx.graph.runDegreeMetric("degree");
+    published.deinit(alloc);
+    var session = try ctx.graph.openGraphMetricReadSession(&.{"degree"}, &.{.{ .require_fresh = true }});
+    defer session.deinit();
+    var scores: [1]?f64 = undefined;
+    try session.readColumns(alloc, &.{"degree"}, &.{"A"}, &.{&scores});
+    try std.testing.expectEqual(@as(?f64, 1), scores[0]);
+    try ctx.graph.addEdge("A", "C", "e", 1, 0, 0, "");
+    published = try ctx.graph.runDegreeMetric("degree");
+    published.deinit(alloc);
+    try session.readColumns(alloc, &.{"degree"}, &.{"A"}, &.{&scores});
+    try std.testing.expectEqual(@as(?f64, 1), scores[0]);
+
+    const Runner = struct {
+        fn run(out_alloc: Allocator, index: *graph_mod.GraphIndex, maximum: usize) !void {
+            var result = GraphQueryResult{ .nodes = try out_alloc.alloc(GraphResultNode, 1) };
+            result.nodes[0] = .{ .key = out_alloc.dupe(u8, "A") catch |err| {
+                out_alloc.free(result.nodes);
+                return err;
+            }, .depth = 0, .distance = 0 };
+            defer result.deinit(out_alloc);
+            var budget = work_budget_mod.WorkBudget.initWithLimits(.{ .max_retained_state_bytes = maximum });
+            var engine = GraphQueryEngine{ .alloc = out_alloc, .work_budget = &budget };
+            const query = GraphQuery{ .query_type = .neighbors, .index_name = "graph", .start_nodes = .{ .keys = &.{"A"} }, .metrics = &.{.{ .name = "degree" }} };
+            engine.applyMetricDependenciesColumnar(index, query, false, &result) catch |err| {
+                try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+                return err;
+            };
+            try std.testing.expect(budget.retained_state_bytes > 0 and budget.retained_state_bytes <= maximum);
+            try std.testing.expectEqual(@as(?f64, 2), result.nodes[0].metrics[0].score);
+        }
+    };
+    try std.testing.expectError(error.GraphWorkBudgetExceeded, Runner.run(alloc, &ctx.graph, 1));
+    for ([_]usize{ 64, 256, 512, 1024, 2048, 4096, 8192 }) |maximum| {
+        Runner.run(alloc, &ctx.graph, maximum) catch |err| {
+            try std.testing.expectEqual(error.GraphWorkBudgetExceeded, err);
+        };
+    }
+    try Runner.run(alloc, &ctx.graph, 64 * 1024);
+    try std.testing.checkAllAllocationFailures(alloc, Runner.run, .{ &ctx.graph, @as(usize, 64 * 1024) });
+}
+
+test "graph metric order and filter dependencies attach status without projection" {
+    const alloc = std.testing.allocator;
+    var sb: [256]u8 = undefined;
+    var rb: [256]u8 = undefined;
+    const metrics = [_]graph_mod.GraphMetricConfig{.{
+        .name = "degree",
+        .kind = .degree,
+    }};
+    const ctx = try setupGraphWithOptions(alloc, "gq-metric-deps-s", "gq-metric-deps-r", &sb, &rb, .{ .metric_configs = &metrics });
+    defer {
+        ctx.deinit();
+        alloc.destroy(ctx);
+    }
+
+    try ctx.graph.addEdge("A", "B", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("A", "C", "e", 1.0, 0, 0, "");
+    var degree_status = try ctx.graph.runDegreeMetric("degree");
+    degree_status.deinit(alloc);
+
+    const metric_orders = [_]GraphMetricOrder{.{
+        .name = "degree",
+        .direction = .desc,
+        .freshness = .published,
+    }};
+    const metric_filters = [_]GraphMetricFilter{.{
+        .name = "degree",
+        .op = .gte,
+        .value = 1.0,
+        .freshness = .published,
+    }};
+
+    var engine = GraphQueryEngine{ .alloc = alloc };
+    const start_keys: []const []const u8 = &.{"A"};
+    var result = try engine.execute(&ctx.graph, .{
+        .query_type = .neighbors,
+        .index_name = "test",
+        .start_nodes = .{ .keys = start_keys },
+        .params = .{ .edge_types = &.{"e"}, .direction = .out, .max_results = 8 },
+        .order_by = &metric_orders,
+        .where_metric = &metric_filters,
+    }, start_keys);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), result.nodes.len);
+    try std.testing.expectEqual(@as(usize, 0), result.nodes[0].metrics.len);
+    try std.testing.expectEqual(@as(usize, 1), result.metric_status.len);
+    try std.testing.expectEqualStrings("degree", result.metric_status[0].name);
+    try std.testing.expect(result.metric_status[0].published_generation != 0);
+}
+
+test "graph metric order and filter apply max results after metric processing" {
+    const alloc = std.testing.allocator;
+    var sb: [256]u8 = undefined;
+    var rb: [256]u8 = undefined;
+    const metrics = [_]graph_mod.GraphMetricConfig{.{ .name = "degree", .kind = .degree }};
+    const ctx = try setupGraphWithOptions(alloc, "gq-metric-limit-s", "gq-metric-limit-r", &sb, &rb, .{ .metric_configs = &metrics });
+    defer {
+        ctx.deinit();
+        alloc.destroy(ctx);
+    }
+
+    try ctx.graph.addEdge("A", "B", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("A", "C", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("A", "D", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("C", "X", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("C", "Y", "e", 1.0, 0, 0, "");
+    var degree_status = try ctx.graph.runDegreeMetric("degree");
+    degree_status.deinit(alloc);
+
+    const metric_orders = [_]GraphMetricOrder{.{ .name = "degree", .direction = .desc, .freshness = .published }};
+    const metric_filters = [_]GraphMetricFilter{.{ .name = "degree", .op = .gte, .value = 3.0, .freshness = .published }};
+    var engine = GraphQueryEngine{ .alloc = alloc };
+    const start_keys: []const []const u8 = &.{"A"};
+    var result = try engine.execute(&ctx.graph, .{
+        .query_type = .neighbors,
+        .index_name = "test",
+        .start_nodes = .{ .keys = start_keys },
+        .params = .{ .edge_types = &.{"e"}, .direction = .out, .max_results = 1 },
+        .order_by = &metric_orders,
+        .where_metric = &metric_filters,
+    }, start_keys);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), result.nodes.len);
+    try std.testing.expectEqualStrings("C", result.nodes[0].key);
+}
+
+test "shortest path metric filtering evaluates the complete bounded candidate set" {
+    const alloc = std.testing.allocator;
+    var sb: [256]u8 = undefined;
+    var rb: [256]u8 = undefined;
+    const metrics = [_]graph_mod.GraphMetricConfig{.{ .name = "degree", .kind = .degree }};
+    const ctx = try setupGraphWithOptions(alloc, "gq-metric-shortest-s", "gq-metric-shortest-r", &sb, &rb, .{ .metric_configs = &metrics });
+    defer {
+        ctx.deinit();
+        alloc.destroy(ctx);
+    }
+
+    try ctx.graph.addEdge("A", "B", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("A", "C", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("C", "X", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("C", "Y", "e", 1.0, 0, 0, "");
+    var degree_status = try ctx.graph.runDegreeMetric("degree");
+    degree_status.deinit(alloc);
+
+    const filters = [_]GraphMetricFilter{.{ .name = "degree", .op = .gte, .value = 3.0, .freshness = .published }};
+    var engine = GraphQueryEngine{ .alloc = alloc };
+    const starts: []const []const u8 = &.{"A"};
+    var result = try engine.execute(&ctx.graph, .{
+        .query_type = .shortest_path,
+        .index_name = "test",
+        .start_nodes = .{ .keys = starts },
+        .target_nodes = .{ .keys = &.{ "B", "C" } },
+        .params = .{ .max_depth = 2, .max_results = 1 },
+        .where_metric = &filters,
+    }, starts);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), result.nodes.len);
+    try std.testing.expectEqualStrings("C", result.nodes[0].key);
+}
+
+test "pattern metric filtering evaluates matches beyond the response limit" {
+    const alloc = std.testing.allocator;
+    var sb: [256]u8 = undefined;
+    var rb: [256]u8 = undefined;
+    const metrics = [_]graph_mod.GraphMetricConfig{.{ .name = "degree", .kind = .degree }};
+    const ctx = try setupGraphWithOptions(alloc, "gq-metric-pattern-s", "gq-metric-pattern-r", &sb, &rb, .{ .metric_configs = &metrics });
+    defer {
+        ctx.deinit();
+        alloc.destroy(ctx);
+    }
+
+    try ctx.graph.addEdge("A", "B", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("A", "C", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("C", "X", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("C", "Y", "e", 1.0, 0, 0, "");
+    var degree_status = try ctx.graph.runDegreeMetric("degree");
+    degree_status.deinit(alloc);
+
+    const filters = [_]GraphMetricFilter{.{ .name = "degree", .op = .gte, .value = 3.0, .freshness = .published }};
+    const steps: []const pattern_mod.PatternStep = &.{
+        .{ .alias = "start", .edge = .{ .direction = .out } },
+        .{ .alias = "neighbor", .edge = .{ .direction = .out } },
+    };
+    var engine = GraphQueryEngine{ .alloc = alloc };
+    const starts: []const []const u8 = &.{"A"};
+    var result = try engine.execute(&ctx.graph, .{
+        .query_type = .pattern,
+        .index_name = "test",
+        .start_nodes = .{ .keys = starts },
+        .pattern = steps,
+        .params = .{ .max_results = 1 },
+        .where_metric = &filters,
+    }, starts);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), result.nodes.len);
+    try std.testing.expectEqualStrings("C", result.nodes[0].key);
+}
+
 test "k_shortest_paths via engine" {
     const alloc = std.testing.allocator;
     var sb: [256]u8 = undefined;
@@ -2913,13 +4570,39 @@ test "k_shortest_paths via engine" {
         .start_nodes = .{ .keys = start_keys },
         .target_nodes = .{ .keys = &.{"C"} },
         .k = 2,
-        .params = .{ .weight_mode = .min_weight },
+        .params = .{ .max_depth = 2, .include_paths = true, .weight_mode = .min_weight },
     }, start_keys);
     defer result.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 2), result.nodes.len);
     // First path should be shorter/lighter
     try std.testing.expect(result.nodes[0].distance <= result.nodes[1].distance);
+
+    var limited = try engine.execute(&ctx.graph, .{
+        .query_type = .k_shortest_paths,
+        .index_name = "test",
+        .start_nodes = .{ .keys = start_keys },
+        .target_nodes = .{ .keys = &.{"C"} },
+        .k = 2,
+        .params = .{ .max_depth = 2, .include_paths = true, .weight_mode = .min_weight, .max_results = 1 },
+    }, start_keys);
+    defer limited.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), limited.nodes.len);
+    // The response limit applies across start/target pairs on both ordinary
+    // pathfinders, not independently to each pair or only to algebraic paths.
+    for ([_]QueryType{ .shortest_path, .k_shortest_paths }) |query_type| {
+        var bounded = try engine.execute(&ctx.graph, .{
+            .query_type = query_type,
+            .index_name = "test",
+            .start_nodes = .{ .keys = &.{ "A", "B" } },
+            .target_nodes = .{ .keys = &.{ "C", "D" } },
+            .k = 64,
+            .params = .{ .max_depth = 2, .weight_mode = .min_weight, .max_results = 1 },
+        }, &.{ "A", "B" });
+        defer bounded.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), bounded.nodes.len);
+        try std.testing.expectEqualStrings("C", bounded.nodes[0].key);
+    }
 }
 
 test "path result node conversion preserves endpoint semantics and allocation safety" {
@@ -3010,6 +4693,7 @@ test "k_shortest_paths k greater than one stays on normal pathfinder" {
         .start_nodes = .{ .keys = start_keys },
         .target_nodes = .{ .keys = &.{"C"} },
         .k = 2,
+        .params = .{ .max_depth = 2 },
     }, start_keys);
     defer result.deinit(alloc);
 
@@ -3210,4 +4894,50 @@ test "pattern algebraic provenance falls back for ambiguous linear chain" {
     defer fallback_result.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 2), fallback_result.matches.len);
+}
+
+test "BFS traversal preserves physical edge provenance for distributed paths" {
+    const alloc = std.testing.allocator;
+    var sb: [256]u8 = undefined;
+    var rb: [256]u8 = undefined;
+    const ctx = try setupGraph(alloc, "gq-bfs-path-return-s", "gq-bfs-path-return-r", &sb, &rb);
+    defer {
+        ctx.deinit();
+        alloc.destroy(ctx);
+    }
+
+    ctx.graph.algebraic_semiring_traversal = false;
+    try ctx.graph.addEdge("A", "B", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("B", "C", "e", 1.0, 0, 0, "");
+
+    var engine = GraphQueryEngine{ .alloc = alloc };
+    const start_keys: []const []const u8 = &.{"A"};
+    var result = try engine.execute(&ctx.graph, .{
+        .query_type = .traverse,
+        .index_name = "test",
+        .start_nodes = .{ .keys = start_keys },
+        .params = .{
+            .max_depth = 2,
+            .include_paths = true,
+        },
+    }, start_keys);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), result.nodes.len);
+    try std.testing.expectEqualStrings("B", result.nodes[0].key);
+    try std.testing.expect(result.nodes[0].path != null);
+    try std.testing.expect(result.nodes[0].path_edges != null);
+    try std.testing.expect(result.nodes[0].provenance == null);
+    try std.testing.expectEqualStrings("C", result.nodes[1].key);
+    const c_path = result.nodes[1].path orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 3), c_path.len);
+    try std.testing.expectEqualStrings("A", c_path[0]);
+    try std.testing.expectEqualStrings("B", c_path[1]);
+    try std.testing.expectEqualStrings("C", c_path[2]);
+    const c_edges = result.nodes[1].path_edges orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 2), c_edges.len);
+    try std.testing.expectEqualStrings("A", c_edges[0].source);
+    try std.testing.expectEqualStrings("B", c_edges[0].target);
+    try std.testing.expectEqualStrings("B", c_edges[1].source);
+    try std.testing.expectEqualStrings("C", c_edges[1].target);
 }

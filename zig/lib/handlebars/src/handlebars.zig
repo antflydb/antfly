@@ -241,6 +241,29 @@ test "render simple template" {
     try std.testing.expectEqualStrings("Hello, World!", result);
 }
 
+test "integer literals outside i64 evaluate as floats instead of trapping" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const Echo = struct {
+        fn helper(ctx: HelperContext) anyerror!Value {
+            return switch (ctx.params[0]) {
+                .integer => Value.str("int"),
+                .float => Value.str("float"),
+                else => Value.str("other"),
+            };
+        }
+    };
+    var helpers: HelperMap = .{};
+    try helpers.put(arena, "kind", Helper.from(&Echo.helper));
+    const partials: std.StringArrayHashMapUnmanaged([]const u8) = .{};
+
+    try std.testing.expectEqualStrings("float", try render(arena, "{{kind 99999999999999999999}}", .null, &helpers, &partials));
+    try std.testing.expectEqualStrings("int", try render(arena, "{{kind 9223372036854775807}}", .null, &helpers, &partials));
+    try std.testing.expectEqualStrings("int", try render(arena, "{{kind -42}}", .null, &helpers, &partials));
+}
+
 test "render multiple substitutions" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

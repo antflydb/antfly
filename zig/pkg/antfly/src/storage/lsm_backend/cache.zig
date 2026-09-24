@@ -271,7 +271,11 @@ pub const Cache = struct {
     stats: AtomicStats = .{},
 
     pub fn init(allocator: Allocator, max_bytes: usize) Cache {
-        const shards = allocator.alloc(Shard, default_shard_count) catch @panic("OOM");
+        return initFallible(allocator, max_bytes) catch @panic("OOM");
+    }
+
+    pub fn initFallible(allocator: Allocator, max_bytes: usize) Allocator.Error!Cache {
+        const shards = try allocator.alloc(Shard, default_shard_count);
         @memset(shards, .{});
         return .{
             .allocator = allocator,
@@ -1361,10 +1365,17 @@ test "cache pending load waiter survives finish removal" {
     };
 
     var waiter = Waiter{};
-    var thread = try std.testing.io.concurrent(Waiter.run, .{ &waiter, &cache });
-    sleepNs(10 * std.time.ns_per_ms);
-    cache.finishLoad("run-1", 1, 1, .run_table_index);
-    thread.await(std.testing.io);
+    {
+        var thread = try std.testing.io.concurrent(Waiter.run, .{ &waiter, &cache });
+        defer thread.await(std.testing.io);
+        defer cache.finishLoad("run-1", 1, 1, .run_table_index);
+        // beginLoad increments waits under pending_sync before releasing the
+        // mutex in wait(). finishLoad takes that same mutex, so observing the
+        // counter guarantees removal follows waiter enrollment, even if the
+        // worker starts late. A scheduling delay cannot prove that ordering.
+        while (cache.snapshotStats().run_table_index.waits == 0)
+            platform.time.yieldBriefly();
+    }
 
     if (waiter.err) |err| return err;
     try std.testing.expectEqual(@as(usize, 0), cache.pendingLoadCountForTests());

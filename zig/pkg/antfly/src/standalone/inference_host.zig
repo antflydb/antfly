@@ -101,6 +101,10 @@ const LinkedResourceBudgetContext = struct {
 
 const InferenceRuntimeConfig = struct {
     embedded_enabled: bool = true,
+    /// False runs every backend in this process, even those whose calls can
+    /// only be stopped by killing the process. For library hosts (libantfly),
+    /// whose process is the caller's program and cannot be restarted.
+    process_isolation: bool = true,
     worker_environment: []const worker_runtime.EnvironmentEntry = &.{},
     max_concurrent_requests: ?usize = null,
     kernel_jit: inference.graph.kernel_jit.Config = .{},
@@ -341,6 +345,88 @@ test "standalone attachment ABI maps several payloads to one generator item" {
     try std.testing.expectEqualSlices(u8, &second, attachments[1].bytes);
     try std.testing.expectEqualStrings("request-7", attachments[0].identity.item_id);
     try std.testing.expectEqual(@as(usize, 0), refs[0].item_index);
+}
+
+const RerankDocumentsRequest = struct {
+    model: []const u8,
+    query: []const u8,
+    documents: []const []const antfly.template.ContentPart,
+    attachment_count: usize = 0,
+};
+
+/// Convert decoded linked-provider parts into the content-part JSON the
+/// inference server's rerank core accepts. Binary parts become
+/// `attachment:N` media references into the returned attachment list; all
+/// strings and bytes stay borrowed from `documents`.
+fn rerankDocumentValuesAlloc(
+    arena: std.mem.Allocator,
+    documents: []const []const antfly.template.ContentPart,
+) !struct { values: []std.json.Value, attachments: []httpx.attachment_envelope.Attachment } {
+    var attachments = std.ArrayListUnmanaged(httpx.attachment_envelope.Attachment).empty;
+    const values = try arena.alloc(std.json.Value, documents.len);
+    for (documents, values) |document, *value| {
+        var parts = std.json.Array.init(arena);
+        for (document) |part| {
+            var object: std.json.ObjectMap = .empty;
+            switch (part) {
+                .text => |text| {
+                    try object.put(arena, "type", .{ .string = "text" });
+                    try object.put(arena, "text", .{ .string = text });
+                },
+                .media_url => |url| {
+                    var image_url: std.json.ObjectMap = .empty;
+                    try image_url.put(arena, "url", .{ .string = url });
+                    try object.put(arena, "type", .{ .string = "image_url" });
+                    try object.put(arena, "image_url", .{ .object = image_url });
+                },
+                .binary => |binary| {
+                    try object.put(arena, "type", .{ .string = "media" });
+                    try object.put(arena, "mime_type", .{ .string = binary.mime_type });
+                    try object.put(arena, "data", .{ .string = try std.fmt.allocPrint(arena, "attachment:{d}", .{attachments.items.len}) });
+                    try attachments.append(arena, .{ .mime_type = binary.mime_type, .data = binary.data });
+                },
+            }
+            try parts.append(.{ .object = object });
+        }
+        value.* = .{ .array = parts };
+    }
+    return .{ .values = values, .attachments = attachments.items };
+}
+
+test "linked rerank documents become server content parts with attachment references" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const png = [_]u8{ 0x89, 'P', 'N', 'G' };
+    const with_image = [_]antfly.template.ContentPart{
+        .{ .text = "page one" },
+        .{ .binary = .{ .mime_type = "image/png", .data = &png } },
+        .{ .media_url = "https://example.invalid/page.png" },
+    };
+    const text_only = [_]antfly.template.ContentPart{.{ .text = "plain" }};
+    const converted = try rerankDocumentValuesAlloc(arena_state.allocator(), &.{ &with_image, &text_only });
+    try std.testing.expectEqual(@as(usize, 2), converted.values.len);
+    try std.testing.expectEqual(@as(usize, 1), converted.attachments.len);
+    try std.testing.expect(converted.attachments[0].data.ptr == &png);
+    const first = converted.values[0].array.items;
+    try std.testing.expectEqualStrings("text", first[0].object.get("type").?.string);
+    try std.testing.expectEqualStrings("media", first[1].object.get("type").?.string);
+    try std.testing.expectEqualStrings("attachment:0", first[1].object.get("data").?.string);
+    try std.testing.expectEqualStrings("https://example.invalid/page.png", first[2].object.get("image_url").?.object.get("url").?.string);
+    try std.testing.expectEqualStrings("plain", converted.values[1].array.items[0].object.get("text").?.string);
+    try std.testing.expectEqual(error.InvalidArguments, rerankDocumentsStatusError(400));
+    try std.testing.expectEqual(error.ModelNotFound, rerankDocumentsStatusError(404));
+    try std.testing.expectEqual(error.QueueFull, rerankDocumentsStatusError(503));
+}
+
+/// Map a non-success rerank core response onto the stable provider ABI.
+fn rerankDocumentsStatusError(status: u16) anyerror {
+    return switch (status) {
+        400, 403, 413 => error.InvalidArguments,
+        404 => error.ModelNotFound,
+        408, 504 => error.Timeout,
+        429, 503 => error.QueueFull,
+        else => error.InferenceProviderFailure,
+    };
 }
 
 const RerankTextsRequest = struct {
@@ -726,8 +812,10 @@ pub fn linkedInferenceCreateLocal(context: *const inference_bridge.CreateContext
     errdefer runtime_config.deinit();
     try runtime_config.value.kernel_jit.validate();
     try runtime_config.value.prompt_cache.validate();
+    if (!runtime_config.value.process_isolation) inference.execution_control.allowUninterruptibleInProcess();
     const use_worker = !supervised and !@import("builtin").is_test and
         runtime_config.value.embedded_enabled and
+        runtime_config.value.process_isolation and
         inference.backends.BackendRuntime.availableRequiresProcessIsolation();
 
     const state = try alloc.create(LinkedInferenceState);
@@ -914,6 +1002,9 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
     var progress_adapter = ProgressAdapter{ .view = context.progress };
     const execution_control = inference.InferenceExecutionControl{
         .deadline_ns = deadline_ns,
+        // Give any model's current native call time to reach a safe boundary
+        // before a cancelled request forces the supervisor to replace it.
+        .cancellation_grace_ns = 5 * std.time.ns_per_s,
         .cancellation = if (context.cancellation.is_cancelled != null)
             .{ .ptr = &cancellation_adapter, .is_cancelled_fn = CancellationAdapter.requested }
         else
@@ -1006,6 +1097,75 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 for (result) |values| alloc.free(values);
                 alloc.free(result);
             }
+            break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
+        },
+        .rerank_documents => blk: {
+            var parsed = try std.json.parseFromSlice(RerankDocumentsRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            var part_count: usize = 0;
+            for (parsed.value.documents) |document| part_count += document.len;
+            const flat_parts = try alloc.alloc(antfly.template.ContentPart, part_count);
+            defer alloc.free(flat_parts);
+            var offset: usize = 0;
+            for (parsed.value.documents) |document| {
+                @memcpy(flat_parts[offset .. offset + document.len], document);
+                offset += document.len;
+            }
+            const decoded = try decodeProviderEmbeddingParts(
+                alloc,
+                flat_parts,
+                parsed.value.attachment_count,
+                context.binary_payloads,
+                context.binary_payloads_len,
+                context.attachment_refs,
+                context.attachment_refs_len,
+            );
+            defer alloc.free(decoded);
+            var arena_state = std.heap.ArenaAllocator.init(alloc);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            const documents = try arena.alloc([]const antfly.template.ContentPart, parsed.value.documents.len);
+            offset = 0;
+            for (parsed.value.documents, documents) |document, *decoded_document| {
+                decoded_document.* = decoded[offset .. offset + document.len];
+                offset += document.len;
+            }
+            const converted = try rerankDocumentValuesAlloc(arena, documents);
+            var http_request = try httpx.Request.init(alloc, .POST, "/ai/v1/rerank");
+            defer http_request.deinit();
+            var http_context = httpx.Context.init(alloc, state.io, &http_request);
+            defer http_context.deinit();
+            var response = try state.node.rerankDocumentValues(
+                &http_context,
+                execution_control,
+                parsed.value.model,
+                parsed.value.query,
+                converted.values,
+                converted.attachments,
+            );
+            defer response.deinit();
+            if (response.status.code != 200) return rerankDocumentsStatusError(response.status.code);
+            const ScoresResponse = struct { data: []const struct { index: usize, score: f32 } };
+            var scores_json = try std.json.parseFromSlice(ScoresResponse, alloc, response.body orelse return error.InferenceProviderFailure, .{ .ignore_unknown_fields = true });
+            defer scores_json.deinit();
+            if (scores_json.value.data.len != parsed.value.documents.len) return error.InferenceProviderFailure;
+            const result = try alloc.alloc(f32, scores_json.value.data.len);
+            for (scores_json.value.data) |item| {
+                if (item.index >= result.len) {
+                    alloc.free(result);
+                    return error.InferenceProviderFailure;
+                }
+                result[item.index] = item.score;
+            }
+            if (context.out_numeric_result != null) {
+                errdefer alloc.free(result);
+                const rows = try alloc.alloc([]f32, 1);
+                errdefer alloc.free(rows);
+                rows[0] = result;
+                try publishNumericProviderResponse(context, alloc, rows, .scores);
+                return;
+            }
+            defer alloc.free(result);
             break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
         },
         .rerank_texts => blk: {
@@ -1719,7 +1879,7 @@ fn routeMetadata(method: http_abi.HttpMethod, path: []const u8) RouteMetadata {
     else
         path;
     for (inference_api.server.routes) |route| {
-        if (std.mem.eql(u8, route.method, method_name) and std.mem.eql(u8, route.path, relative_path)) {
+        if (std.mem.eql(u8, route.method, method_name) and routeTemplateMatches(route.path, relative_path)) {
             return .{
                 .request_body = switch (route.request_body) {
                     .none => .none,
@@ -1733,6 +1893,43 @@ fn routeMetadata(method: http_abi.HttpMethod, path: []const u8) RouteMetadata {
         .request_body = if (method == .get) .none else .buffered,
         .streaming_response = false,
     };
+}
+
+/// The generated route table keeps OpenAPI templates (`/x/{id}`) while the
+/// router registers httpx patterns (`/x/:id`). Compare segment by segment so
+/// path-parameter routes keep their declared body and streaming modes.
+fn routeTemplateMatches(template: []const u8, registered: []const u8) bool {
+    var template_segments = std.mem.splitScalar(u8, template, '/');
+    var registered_segments = std.mem.splitScalar(u8, registered, '/');
+    while (true) {
+        const expected = template_segments.next();
+        const actual = registered_segments.next();
+        if (expected == null or actual == null) return expected == null and actual == null;
+        const t = expected.?;
+        const r = actual.?;
+        const t_is_param = t.len >= 2 and t[0] == '{' and t[t.len - 1] == '}';
+        const r_is_param = r.len >= 1 and r[0] == ':';
+        if (t_is_param and r_is_param) {
+            if (!std.mem.eql(u8, t[1 .. t.len - 1], r[1..])) return false;
+            continue;
+        }
+        if (!std.mem.eql(u8, t, r)) return false;
+    }
+}
+
+test "route templates match registered path-parameter patterns" {
+    try std.testing.expect(routeTemplateMatches("/transcribe", "/transcribe"));
+    try std.testing.expect(routeTemplateMatches("/transcription/sessions/{session_id}/audio", "/transcription/sessions/:session_id/audio"));
+    try std.testing.expect(!routeTemplateMatches("/transcription/sessions/{session_id}", "/transcription/sessions/:other"));
+    try std.testing.expect(!routeTemplateMatches("/transcription/sessions/{session_id}", "/transcription/sessions"));
+    try std.testing.expect(!routeTemplateMatches("/a", "/a/b"));
+    const metadata = routeMetadata(.post, inference.server.ai_api_prefix ++ "/transcription/sessions/:session_id/audio");
+    try std.testing.expectEqual(http_abi.RequestBodyMode.buffered, metadata.request_body);
+    try std.testing.expect(!metadata.streaming_response);
+    const dictate = routeMetadata(.post, inference.server.ai_api_prefix ++ "/dictate");
+    try std.testing.expect(dictate.streaming_response);
+    const status = routeMetadata(.get, inference.server.ai_api_prefix ++ "/transcription/sessions/:session_id");
+    try std.testing.expectEqual(http_abi.RequestBodyMode.none, status.request_body);
 }
 
 const DirectServer = struct {
@@ -2593,6 +2790,35 @@ fn localModelCapabilities(
     return localModelCapabilitiesInScope(node, io, model, task, null);
 }
 
+test "encoded reader ABI enforces resolved model capabilities for Qwen3-VL generator bundles" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "generators/owner/qwen");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "generators/owner/qwen/config.json",
+        .data = "{\"model_type\":\"qwen3_vl\"}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "generators/owner/qwen/model_manifest.json",
+        .data = "{\"type\":\"generator\",\"inputs\":[\"text\",\"image\"]}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "generators/owner/qwen/antfly_inference_bundle.json",
+        .data = "{\"family\":\"qwen3_vl_gguf_bundle/v1\",\"decoder\":\"config.json\",\"projector\":\"model_manifest.json\"}",
+    });
+    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(models_root);
+    var node = try inference.server.Node.init(allocator, .{ .models_dir = models_root });
+    defer node.deinit();
+    const capabilities = try localModelCapabilities(&node, std.testing.io, "owner/qwen", .read);
+    try std.testing.expect(capabilities.input_modalities.image);
+    try std.testing.expectEqual(.serial_compatibility, capabilities.batch.mode);
+    try std.testing.expectEqual(.read_result, capabilities.output);
+    try std.testing.expect(capabilities.borrowed_attachments);
+    try std.testing.expect(!capabilities.borrowed_rasters);
+}
+
 fn localModelCapabilitiesInScope(
     node: *inference.server.Node,
     io: std.Io,
@@ -2679,6 +2905,7 @@ fn localModelCapabilitiesInScope(
         modalities.image,
         modalities.audio,
         modalities.document,
+        inference.server.resolvedExecutorKind(@tagName(task), &manifest),
     );
     modalities = .{
         .text = executor_modalities.text,
@@ -3279,3 +3506,114 @@ test "linked generator validates concrete MIME and decoded pixels" {
 }
 
 // ---------------------------------------------------------------
+
+/// Body of `antfly_inference_pull_json`; see `inference_bridge.PullModelContext`.
+const PullModelRequest = struct {
+    model: []const u8,
+    /// Pulls `model:variant` for each; empty pulls `model` as given.
+    variants: []const []const u8 = &.{},
+    /// Hub token for private or gated models; defaults to `$HF_TOKEN`.
+    token: ?[]const u8 = null,
+    tasks: []const []const u8 = &.{},
+    capabilities: []const []const u8 = &.{},
+    /// "auto" (default), "none", or "match".
+    projector: ?[]const u8 = null,
+    max_artifact_bytes: ?u64 = null,
+    max_model_bytes: ?u64 = null,
+};
+
+pub fn linkedInferencePullModel(context: *const inference_bridge.PullModelContext) !void {
+    const alloc = std.heap.c_allocator;
+    var executor = try context.executor.receive();
+    const io = executor.io();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const result = pullModels(arena, io, context) catch |err| {
+        const failure = std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(.{
+            .@"error" = @errorName(err),
+            .message = pullErrorMessage(err),
+        }, .{})}) catch "{\"error\":\"OutOfMemory\"}";
+        context.on_result(context.result_context, .init(failure));
+        return err;
+    };
+    context.on_result(context.result_context, .init(result));
+}
+
+fn pullErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.HubModelNotFound => "the model was not found on the hub",
+        error.HubAccessDenied => "the hub denied access; the model may be private or gated, so set token or HF_TOKEN",
+        error.InvalidModelRef, error.InvalidModelVariant => "invalid model reference; use owner/name or owner/name:variant",
+        error.NoModelFilesFound => "the model has no files in a supported format",
+        error.DownloadSizeLimitExceeded, error.ModelSizeLimitExceeded => "the model exceeds max_artifact_bytes or max_model_bytes",
+        error.UnknownField, error.MissingField, error.SyntaxError, error.UnexpectedToken, error.InvalidArgument => "invalid pull request",
+        else => "model pull failed",
+    };
+}
+
+fn pullModels(arena: std.mem.Allocator, io: std.Io, context: *const inference_bridge.PullModelContext) ![]const u8 {
+    const request = try std.json.parseFromSliceLeaky(PullModelRequest, arena, context.request_json.slice(), .{});
+    if (request.model.len == 0) return error.InvalidArgument;
+    const download = inference.registry.download;
+    const projector: download.ProjectorSelection = if (request.projector) |value|
+        download.parseProjectorSelection(value) orelse return error.InvalidArgument
+    else
+        .auto;
+    const models_dir = context.models_dir.slice() orelse
+        try antfly.inference_runtime.defaultModelsDirForDataDirAlloc(arena, ".");
+    const hub_config = download.HubConfig{
+        .token = request.token orelse @import("antfly_platform").env.getenv("HF_TOKEN"),
+        .max_artifact_bytes = request.max_artifact_bytes orelse download.default_max_artifact_bytes,
+        .max_model_bytes = request.max_model_bytes orelse download.default_max_model_bytes,
+    };
+    const tasks_csv = if (request.tasks.len == 0) null else try std.mem.join(arena, ",", request.tasks);
+    const capabilities_csv = if (request.capabilities.len == 0) null else try std.mem.join(arena, ",", request.capabilities);
+
+    var refs: std.ArrayListUnmanaged([]const u8) = .empty;
+    if (request.variants.len == 0) {
+        try refs.append(arena, request.model);
+    } else for (request.variants) |variant| {
+        if (variant.len == 0) return error.InvalidArgument;
+        try refs.append(arena, try std.fmt.allocPrint(arena, "{s}:{s}", .{ request.model, variant }));
+    }
+
+    var registry = inference.registry.ModelRegistry.init(arena, models_dir);
+    defer registry.deinit();
+    for (refs.items) |ref| {
+        var reporter = PullProgressReporter{ .context = context, .model = ref };
+        try registry.pullWithProgress(io, ref, hub_config, tasks_csv, capabilities_csv, projector, .{
+            .callback = PullProgressReporter.report,
+            .context = &reporter,
+            .cancelled = &reporter.cancelled,
+        });
+    }
+    return std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(.{
+        .models = refs.items,
+        .models_dir = models_dir,
+    }, .{})});
+}
+
+const PullProgressReporter = struct {
+    context: *const inference_bridge.PullModelContext,
+    model: []const u8,
+    cancelled: std.atomic.Value(bool) = .init(false),
+
+    fn report(progress: inference.registry.download.DownloadProgress, raw: ?*anyopaque) void {
+        const self: *PullProgressReporter = @ptrCast(@alignCast(raw.?));
+        const callback = self.context.on_progress orelse return;
+        const view = inference_bridge.PullProgress{
+            // The registry names the model each report belongs to, which
+            // differs from the request for a companion model.
+            .model = .init(if (progress.model.len > 0) progress.model else self.model),
+            .file = .init(progress.file),
+            .bytes_downloaded = progress.bytes_downloaded,
+            .total_bytes = progress.total_bytes orelse 0,
+            .files_done = progress.files_done,
+            .files_total = progress.files_total,
+            .cached = @intFromBool(progress.cached),
+        };
+        if (callback(self.context.progress_context, &view) == 0) self.cancelled.store(true, .release);
+    }
+};

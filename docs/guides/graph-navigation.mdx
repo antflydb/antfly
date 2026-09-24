@@ -1,0 +1,87 @@
+---
+title: "Explore trees and graphs with the retrieval agent"
+description: "Choose branches or follow a graph path through a retrieval-step navigation policy."
+---
+
+Configure `steps.retrieval.navigation` to explore one query's authorized data.
+`strategy: "tree"` lets the model explore branches and return to unvisited
+siblings. `strategy: "graph"` follows a single model-selected path.
+
+```bash
+curl -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": "Compare recovery options across the deployment runbook",
+    "stream": false,
+    "max_internal_iterations": 12,
+    "generator": {"provider": "antfly", "model": "your-tool-capable-model"},
+    "queries": [{
+      "table": "runbooks",
+      "full_text_search": {"match": "deployment", "field": "title"},
+      "filter_query": {"term": "published", "field": "status"},
+      "fields": ["title", "body"]
+    }],
+    "steps": {
+      "retrieval": {
+        "navigation": {
+          "query_index": 0,
+          "strategy": "tree",
+          "selection": "agentic",
+          "index": "section_hierarchy",
+          "start_key": "deployment-guide",
+          "max_depth": 5,
+          "beam_width": 3
+        }
+      },
+      "generation": {}
+    }
+  }'
+```
+
+Omit `start_key` to start at the first search hit. Explicit starts and subsequent
+reads enforce query filters, authenticated row filters, and fields projection.
+Exploration stays in the configured table. The agent calls `search` once to
+start, then `navigate` to choose an offered, unvisited key. For trees, siblings
+remain in the frontier while another branch is explored. `max_depth` counts
+from the start at depth zero; `beam_width` bounds children per expansion.
+
+For a workflow path, replace the navigation object with:
+
+```json
+{
+  "query_index": 0,
+  "strategy": "graph",
+  "selection": "agentic",
+  "index": "workflow",
+  "direction": "out",
+  "edge_types": ["next"],
+  "max_steps": 8,
+  "neighbor_limit": 8
+}
+```
+
+Graph direction and edge types apply at every hop. `max_steps` limits moves
+after the start node. Both agentic strategies share the enclosing model,
+conversation, iteration budget, 20-tool-call cap, and accumulated context budget.
+Candidate lists are pruned to fit context; only offered keys remain selectable.
+An exhausted model/context budget returns `status: "incomplete"` with collected
+evidence and steps. Narrow the fields projection for large documents.
+
+Optional `instruction` supplies a workflow rule. `instruction_field` opts into
+a top-level string field on each visited document; include it in your projection.
+Instructions accumulate alongside earlier evidence. Other fields and unvisited
+candidates remain untrusted evidence. Instructions cannot change permissions or
+budgets. Tree navigation requires the `tree_search` tool permission; graph
+navigation requires `graph_search`, alongside the seed query's permissions.
+
+For deterministic tree retrieval, use `strategy: "tree", selection: "ranked"`.
+No model is required for navigation. Supply a literal `start_key`, omit it to
+use seed results, or use the ranked-only `start_nodes` selector (`$roots`,
+comma-separated keys, or a prior-result selector). Query-level `tree_search`
+and `graph_navigation` are no longer accepted; policy belongs on the step.
+
+Read visited documents from `hits`, the optional answer from `generation`, and
+agentic steps named `tree_navigation` or `graph_navigation`. Tree steps include
+depth and the actual branch parent. With `stream: true`, execution emits the
+standard retrieval events. Query-builder tree output returns the query and
+`retrieval_navigation` separately; copy the latter into the retrieval step.

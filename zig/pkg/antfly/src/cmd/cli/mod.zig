@@ -17,6 +17,9 @@ const platform = @import("antfly_platform");
 const antfly_client = @import("antfly-client");
 const httpx = @import("httpx");
 
+pub const database_cmd = @import("database.zig");
+pub const namespace_cmd = @import("namespace.zig");
+pub const tablespace = @import("tablespace.zig");
 pub const table = @import("table.zig");
 pub const index = @import("index.zig");
 pub const artifact = @import("artifact.zig");
@@ -33,6 +36,35 @@ pub const GlobalConfig = struct {
     url: []const u8 = "http://127.0.0.1:8080",
     token: ?[]const u8 = null,
     output: OutputFormat = .json,
+};
+
+pub const CatalogFlags = struct {
+    database: ?[]const u8 = null,
+    namespace: ?[]const u8 = null,
+
+    pub const Explicit = struct {
+        database: []const u8,
+        namespace: []const u8,
+    };
+
+    pub fn defaultsFromEnv() CatalogFlags {
+        return .{
+            .database = @import("antfly_platform").env.getenv("ANTFLY_DATABASE"),
+            .namespace = @import("antfly_platform").env.getenv("ANTFLY_NAMESPACE"),
+        };
+    }
+
+    pub fn explicit(self: CatalogFlags) ?Explicit {
+        if (self.database == null and self.namespace == null) return null;
+        return .{
+            .database = self.database orelse fatal("--database is required when --namespace is set or ANTFLY_NAMESPACE is configured", .{}),
+            .namespace = self.namespace orelse fatal("--namespace is required when --database is set or ANTFLY_DATABASE is configured", .{}),
+        };
+    }
+
+    pub fn databaseOrFatal(self: CatalogFlags) []const u8 {
+        return self.database orelse fatal("--database is required or ANTFLY_DATABASE must be configured", .{});
+    }
 };
 
 pub fn isHelpArg(arg: []const u8) bool {
@@ -82,14 +114,25 @@ pub fn commandUsage(command: []const u8) ?[]const u8 {
     \\
     ;
     if (std.mem.eql(u8, command, "index")) return
-    \\usage: antfly index <create|drop|list|get|wait> --table <table> [options]
+    \\usage: antfly index <create|drop|list|get|wait|maintenance> --table <table> [options]
     \\
     \\  index create --table <table> --index <index> --type <type> [--publication-policy progressive|atomic] [--coverage-policy strict|partial|best_effort] [--distance-metric l2_squared|inner_product|cosine] [--external]
+    \\  index maintenance <issues|status|repair|rebuild|pause|resume|cancel> --table <table> --index <index>
+    \\  index maintenance <refresh|rebuild|pause|resume|delete> --table <table> --index <graph-index> --metric <metric>
+    \\  maintenance repair/rebuild/controls create durable jobs; --once runs one bounded pass
+    \\  maintenance <status|advance|cancel> --table <table> --job <job-id>
+    \\  repair controls accept --repair-id; issues/repair/controls accept --limit and --cursor
     \\  index list --table <table> [--output json|--verbose]
     \\  index wait --table <table> --index <index> --until <complete|searchable-artifacts=N|source-covered=N%> [--timeout 10m]
     \\
     ;
-    if (std.mem.eql(u8, command, "artifact")) return "usage: antfly artifact <list|get|put|delete|reprocess|job> [options]\n";
+    if (std.mem.eql(u8, command, "artifact")) return
+    \\usage: antfly artifact <list|get|put|delete|reprocess|job|maintenance> [options]
+    \\  artifact maintenance <issues|repair> --table <table> [--kind <kind>] [--index <index>] [--limit <n>] [--cursor <cursor>]
+    \\  repair creates a durable job; --once runs one bounded pass
+    \\  artifact maintenance <status|advance|cancel> --table <table> --job <job-id>
+    \\  reprocess and job retain their existing artifact reprocessing semantics
+    ;
     if (std.mem.eql(u8, command, "lookup")) return "usage: antfly lookup --table <table> --key <key> [--read-consistency read_index|stale]\n";
     if (std.mem.eql(u8, command, "insert")) return
     \\usage: antfly insert --table <table> --key <key> --document <json> [options]
@@ -106,7 +149,7 @@ pub fn commandUsage(command: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, command, "agents")) return
     \\usage: antfly agents <retrieval|query-builder> [options]
     \\
-    \\  agents retrieval --table <table> (--intent <text>|--semantic-search <text>|--full-text-search <query>) --generator <json> [options]
+    \\  agents retrieval [--table <table>] [--web-search-connection <name>] (--intent <text>|--semantic-search <text>|--full-text-search <query>) --generator <json> [options]
     \\  agents retrieval options: --indexes <names> --fields <names> --limit <n> --reranker <json> --pruner <json>
     \\                            --max-context-tokens <n> --streaming|--no-streaming
     \\                            --classify --reasoning --generate --followup --confidence
@@ -126,6 +169,10 @@ pub fn commandUsage(command: []const u8) ?[]const u8 {
 pub fn printCommandUsage(command: []const u8) void {
     const usage = commandUsage(command) orelse return;
     std.debug.print("{s}", .{usage});
+    for ([_][]const u8{ "table", "index", "query", "lookup", "load", "insert", "delete", "backup", "restore" }) |name| if (std.mem.eql(u8, command, name)) {
+        std.debug.print("\nTable scope: --database NAME --namespace NAME (defaults: default/public).\nTable names are literal; dots do not select a namespace.\n", .{});
+        break;
+    };
 }
 
 pub fn takeUniqueValue(

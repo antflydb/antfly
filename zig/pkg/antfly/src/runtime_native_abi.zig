@@ -10,7 +10,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-pub const abi_version: u32 = 6;
+// Routed writers and Raft batchers now carry their owning error-domain
+// dispatcher. Reject older native handles before reading the added field.
+pub const abi_version: u32 = 8;
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 
 pub const TypeContract = extern struct {
@@ -180,7 +182,7 @@ fn hashInteger(hash: *u64, comptime value: anytype) void {
 }
 
 pub fn assertUniqueMethodIds(comptime VTable: type) void {
-    @setEvalBranchQuota(100_000);
+    @setEvalBranchQuota(1_000_000);
     const fields = std.meta.fields(VTable);
     inline for (fields, 0..) |left, left_index| {
         inline for (fields[left_index + 1 ..]) |right| {

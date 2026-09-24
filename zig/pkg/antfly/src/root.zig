@@ -16,7 +16,7 @@ pub const build_options = @import("build_options");
 
 // Encoding & data structures
 pub const roaring = @import("encoding/roaring.zig");
-pub const vellum = @import("antfly_vellum");
+pub const fst = @import("antfly_fst");
 pub const snappy = @import("encoding/snappy.zig");
 pub const streamvbyte = @import("encoding/streamvbyte.zig");
 pub const simd_bitpack = @import("encoding/simd_bitpack.zig");
@@ -79,6 +79,7 @@ pub const sparse = @import("sparse/sparse.zig");
 // Inference clients (Antfly, OpenAI/Ollama)
 pub const inference = @import("inference/mod.zig");
 pub const table_schema = @import("schema/mod.zig");
+pub const capi_dependencies = @import("capi_dependencies.zig");
 pub const image = @import("antfly_image");
 pub const font = @import("antfly_font");
 pub const pdf = @import("antfly_pdf");
@@ -108,16 +109,18 @@ pub const db_index_races_vopr = @import("vopr/db_index_races.zig");
 pub const provider_boundaries_vopr = @import("vopr/provider_boundaries.zig");
 pub const composed_query_vopr = @import("vopr/composed_query.zig");
 pub const query_embedding_cache_vopr = @import("vopr/query_embedding_cache.zig");
-pub const production_ha_vopr = @import("vopr/production_ha.zig");
+pub const production_standby_vopr = @import("vopr/production_standby.zig");
 pub const production_cluster_vopr = @import("vopr/production_cluster.zig");
 pub const full_cluster_vopr = @import("vopr/full_cluster.zig");
 pub const generation_reranking_vopr = @import("vopr/generation_reranking.zig");
 pub const distributed_query_vopr = @import("vopr/distributed_query.zig");
 pub const parquet_cache_vopr = @import("vopr/parquet_cache.zig");
 pub const provisioning_startup_vopr = @import("vopr/provisioning_startup.zig");
+pub const restore_admission_vopr = @import("vopr/restore_admission.zig");
 pub const generation_lifecycle_vopr = @import("vopr/generation_lifecycle.zig");
 pub const backfill_marker_discovery_vopr = @import("vopr/backfill_marker_discovery.zig");
 pub const config_extension_lifecycle_vopr = @import("vopr/config_extension_lifecycle.zig");
+pub const secrets_vopr = @import("vopr/secrets.zig");
 pub const vopr_determinism_audit = @import("vopr/determinism_audit.zig");
 pub const external_lake_vopr = @import("vopr/external_lake.zig");
 pub const media_runtime_vopr = @import("vopr/media_runtime.zig");
@@ -145,6 +148,9 @@ pub const metadata_table_workflow = @import("metadata/table_workflow.zig");
 pub const metadata_replication_backfill = @import("metadata/replication_backfill.zig");
 pub const metadata_placement_planner = @import("metadata/placement_planner.zig");
 pub const data = @import("data/mod.zig");
+pub const vector_migration = @import("common/vector_migration.zig");
+pub const vector_migration_offline = @import("storage/vector_migration_offline.zig");
+pub const migration_files = @import("common/migration_files.zig");
 pub const standalone = @import("standalone/mod.zig");
 pub const inference_runtime = @import("inference_runtime/runtime.zig");
 pub const usermgr = @import("usermgr/mod.zig");
@@ -168,6 +174,7 @@ pub const asset_producer_runtime = @import("asset_producer_runtime.zig");
 
 // Storage backends
 pub const platform_clock = @import("antfly_platform").clock;
+pub const platform_sync = @import("antfly_platform").sync;
 pub const platform_time = @import("antfly_platform").time;
 pub const storage_backend = @import("storage/backend_types.zig");
 pub const storage_backend_erased = @import("storage/backend_erased.zig");
@@ -192,8 +199,8 @@ pub const lmdb_engine = @import("lmdb_engine");
 pub const hbc = @import("storage/hbc_adapter.zig");
 pub const posting_segment_store = @import("storage/posting_segment_store.zig");
 pub const vector_block_store = @import("storage/vector_block_store.zig");
-pub const ha = @import("storage/ha/mod.zig");
-pub const ha_vopr = @import("storage/ha/vopr.zig");
+pub const hot_standby = @import("storage/hot_standby/mod.zig");
+pub const standby_vopr = @import("storage/hot_standby/vopr.zig");
 pub const wal = @import("storage/wal.zig");
 pub const wal_vopr = @import("storage/wal_vopr.zig");
 pub const persistent = @import("storage/persistent.zig");
@@ -212,11 +219,13 @@ pub const ttl = @import("storage/ttl.zig");
 pub const transactions = @import("storage/transactions.zig");
 pub const transaction_vopr = @import("storage/transaction_vopr.zig");
 pub const schema = @import("storage/schema.zig");
-pub const db = @import("storage/db/mod.zig");
+pub const db = @import("antfly_source_root").antfly_sources.selected_db;
 pub const index_manager_vopr = @import("storage/index_manager_vopr.zig");
 pub const db_split_vopr = @import("storage/db_split_vopr.zig");
 
 test {
+    _ = @import("vopr/index_maintenance.zig");
+    _ = @import("cmd/serverless.zig");
     // Storage shard builds compile this authoritative discovery root and then
     // select disjoint test-name prefixes. Keep it unconditional in test mode:
     // an unimported test file must fail the pre-build audit, never disappear.
@@ -230,7 +239,7 @@ test {
 
     // Encoding
     _ = roaring;
-    _ = vellum;
+    _ = fst;
     _ = snappy;
     _ = streamvbyte;
     _ = simd_bitpack;
@@ -359,8 +368,8 @@ test {
     _ = lmdb_vopr;
     _ = lmdb_engine;
     _ = hbc;
-    _ = ha;
-    _ = ha_vopr;
+    _ = hot_standby;
+    _ = standby_vopr;
     _ = wal;
     _ = wal_vopr;
     _ = persistent;
@@ -391,14 +400,16 @@ test {
     _ = composed_query_vopr;
     _ = query_embedding_cache_vopr;
     _ = full_cluster_vopr;
-    _ = production_ha_vopr;
+    _ = production_standby_vopr;
     _ = generation_reranking_vopr;
     _ = distributed_query_vopr;
     _ = parquet_cache_vopr;
     _ = provisioning_startup_vopr;
+    _ = restore_admission_vopr;
     _ = generation_lifecycle_vopr;
     _ = backfill_marker_discovery_vopr;
     _ = config_extension_lifecycle_vopr;
+    _ = secrets_vopr;
     _ = vopr_determinism_audit;
     _ = external_lake_vopr;
     _ = media_runtime_vopr;
@@ -422,3 +433,6 @@ test {
     _ = index_manager_vopr;
     _ = db_split_vopr;
 }
+
+/// Implementation source choices for this compilation root.
+pub const antfly_sources = @import("source_owner_physical.zig");

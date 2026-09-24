@@ -17,6 +17,8 @@ const platform_build = @import("../../../lib/platform/build_support.zig");
 const addSnowballModule = @import("snowball.zig").addSnowballModule;
 
 pub const AntflyRootImports = struct {
+    storage_boundary: @import("storage_boundary.zig").Modules,
+    boundary_profile: @import("storage_boundary.zig").Profile = .all,
     build_info: @import("../../../lib/build_info/build_support.zig").BuildInfo,
     build_options: *std.Build.Step.Options,
     lite_options: *std.Build.Module,
@@ -29,6 +31,7 @@ pub const AntflyRootImports = struct {
     indexes_openapi: *std.Build.Module,
     sort_openapi: *std.Build.Module,
     generating_api_openapi: *std.Build.Module,
+    websearch_openapi: *std.Build.Module,
     eval_openapi: *std.Build.Module,
     query_openapi: *std.Build.Module,
     admin_openapi: *std.Build.Module,
@@ -67,11 +70,12 @@ pub const AntflyRootImports = struct {
     matcher: *std.Build.Module,
     resolver: *std.Build.Module,
     casbin: *std.Build.Module,
-    vellum: *std.Build.Module,
+    fst: *std.Build.Module,
     regex: *std.Build.Module,
     json: *std.Build.Module,
     jsonschema: *std.Build.Module,
     mcp: *std.Build.Module,
+    toon: *std.Build.Module,
     a2a: *std.Build.Module,
     generating: *std.Build.Module,
     reranking: *std.Build.Module,
@@ -83,6 +87,8 @@ pub const AntflyRootImports = struct {
     font: *std.Build.Module,
     pdf: *std.Build.Module,
     openai_api: *std.Build.Module,
+    exa_api: *std.Build.Module,
+    tavily_api: *std.Build.Module,
     handlebars: *std.Build.Module,
     inference_server: *std.Build.Module,
     prometheus: *std.Build.Module,
@@ -100,6 +106,7 @@ pub const AntflyRootImports = struct {
         .{ .name = "antfly_indexes_openapi", .field = "indexes_openapi" },
         .{ .name = "antfly_sort_openapi", .field = "sort_openapi" },
         .{ .name = "antfly_generating_api_openapi", .field = "generating_api_openapi" },
+        .{ .name = "antfly_websearch_openapi", .field = "websearch_openapi" },
         .{ .name = "antfly_eval_openapi", .field = "eval_openapi" },
         .{ .name = "antfly_query_openapi", .field = "query_openapi" },
         .{ .name = "antfly_admin_openapi", .field = "admin_openapi" },
@@ -138,11 +145,12 @@ pub const AntflyRootImports = struct {
         .{ .name = "antfly_matcher", .field = "matcher" },
         .{ .name = "antfly_resolver", .field = "resolver" },
         .{ .name = "antfly_casbin", .field = "casbin" },
-        .{ .name = "antfly_vellum", .field = "vellum" },
+        .{ .name = "antfly_fst", .field = "fst" },
         .{ .name = "antfly_regex", .field = "regex" },
         .{ .name = "antfly-json", .field = "json" },
         .{ .name = "antfly_jsonschema", .field = "jsonschema" },
         .{ .name = "antfly_mcp", .field = "mcp" },
+        .{ .name = "antfly_toon", .field = "toon" },
         .{ .name = "antfly_a2a", .field = "a2a" },
         .{ .name = "antfly_generating", .field = "generating" },
         .{ .name = "antfly_reranking", .field = "reranking" },
@@ -154,6 +162,8 @@ pub const AntflyRootImports = struct {
         .{ .name = "antfly_font", .field = "font" },
         .{ .name = "antfly_pdf", .field = "pdf" },
         .{ .name = "openai_api", .field = "openai_api" },
+        .{ .name = "exa_api", .field = "exa_api" },
+        .{ .name = "tavily_api", .field = "tavily_api" },
         .{ .name = "handlebars", .field = "handlebars" },
         .{ .name = "inference_server", .field = "inference_server" },
         .{ .name = "prometheus", .field = "prometheus" },
@@ -226,7 +236,7 @@ pub const AntflyRootImports = struct {
             "logging_openapi", "metadata_openapi",   "objectstore",       "openai_api",
             "pdf",             "query_openapi",      "reader_config",     "readers",
             "regex",           "reranking",          "scraping",          "synthesizing",
-            "transcribing",    "vector",             "vellum",
+            "transcribing",    "vector",             "fst",               "schema_openapi",
         }) |field| self.addImport(mod, field);
     }
 
@@ -237,8 +247,18 @@ pub const AntflyRootImports = struct {
         "vectorindex",
     };
     const api_imports = .{
-        "a2a", "casbin",      "eval_openapi",   "generating_api_openapi", "generating_openapi",
-        "mcp", "raft_engine", "schema_openapi", "usermgr_openapi",
+        "exa_api",
+        "tavily_api",
+        "websearch_openapi",
+        "a2a",
+        "casbin",
+        "eval_openapi",
+        "generating_api_openapi",
+        "generating_openapi",
+        "mcp",
+        "raft_engine",
+        "toon",
+        "usermgr_openapi",
     };
 
     pub fn configureStorage(self: @This(), b: *std.Build, mod: *std.Build.Module, link_libc: bool) void {
@@ -250,6 +270,16 @@ pub const AntflyRootImports = struct {
         self.configureDatabase(mod, link_libc);
         inline for (storage_imports) |field| self.addImport(mod, field);
         addSnowballModule(b, mod);
+    }
+
+    pub fn configureEnrichment(self: @This(), b: *std.Build, mod: *std.Build.Module, link_libc: bool) void {
+        const options = b.addOptions();
+        options.addOption(bool, "bench_minimal_deps", false);
+        mod.addOptions("build_options", options);
+        self.storage_boundary.configureProfile(mod, false, false, self.boundary_profile);
+        mod.addImport("antfly_platform", self.platform);
+        mod.link_libc = link_libc;
+        inline for (.{ "image", "font", "pdf", "json", "scraping", "scraping_openapi", "reader_config", "chunking", "hash", "httpx", "structlog" }) |field| self.addImport(mod, field);
     }
 
     pub fn configureApi(self: @This(), mod: *std.Build.Module, link_libc: bool) void {
@@ -275,6 +305,7 @@ pub const AntflyRootImports = struct {
     }
 
     fn configureBase(self: @This(), mod: *std.Build.Module, link_libc: bool) void {
+        self.storage_boundary.configureProfile(mod, false, false, self.boundary_profile);
         mod.addOptions("build_options", self.build_options);
         mod.addImport("antfly_platform", self.platform);
         if (link_libc and !self.platform_link_libc) {

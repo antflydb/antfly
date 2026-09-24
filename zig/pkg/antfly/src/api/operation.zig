@@ -61,17 +61,72 @@ pub const AdmissionReservation = struct {
     }
 };
 
+/// Bounded, request-owned diagnostic context. Operations may populate this
+/// while unwinding an error so ingress adapters can return actionable details
+/// without thread-local state or heap allocation.
+pub const GraphMetricRejectionDiagnostic = struct {
+    graph_index_name: [256]u8 = undefined,
+    graph_index_name_len: u16 = 0,
+    metric_name: [128]u8 = undefined,
+    metric_name_len: u8 = 0,
+    materializer_fingerprint: u64 = 0,
+
+    pub fn graphIndexName(self: *const GraphMetricRejectionDiagnostic) []const u8 {
+        return self.graph_index_name[0..self.graph_index_name_len];
+    }
+
+    pub fn metricName(self: *const GraphMetricRejectionDiagnostic) []const u8 {
+        return self.metric_name[0..self.metric_name_len];
+    }
+};
+
+pub const RequestDiagnostics = struct {
+    graph_metric_rejection: ?GraphMetricRejectionDiagnostic = null,
+
+    pub fn recordGraphMetricRejection(
+        self: *RequestDiagnostics,
+        graph_index_name: []const u8,
+        metric_name: []const u8,
+        materializer_fingerprint: u64,
+    ) void {
+        var diagnostic = GraphMetricRejectionDiagnostic{
+            .materializer_fingerprint = materializer_fingerprint,
+        };
+        const graph_len = @min(graph_index_name.len, diagnostic.graph_index_name.len);
+        @memcpy(diagnostic.graph_index_name[0..graph_len], graph_index_name[0..graph_len]);
+        diagnostic.graph_index_name_len = @intCast(graph_len);
+        const metric_len = @min(metric_name.len, diagnostic.metric_name.len);
+        @memcpy(diagnostic.metric_name[0..metric_len], metric_name[0..metric_len]);
+        diagnostic.metric_name_len = @intCast(metric_len);
+        self.graph_metric_rejection = diagnostic;
+    }
+};
+
 pub const RequestContext = struct {
+    /// Set only by the administrator-authorized relational recovery routes.
+    relational_recovery: enum { none, repair, retry, retire } = .none,
+    relational_retirement_target: ?[]const u8 = null,
+    relational_retirement_drop: bool = false,
     cancellation: CancellationToken = .none,
     /// Absolute monotonic deadline. This deliberately does not use a wall
     /// clock or a transport timeout duration.
     deadline_ns: ?u64 = null,
     deadline_io: ?@import("../runtime_io_abi.zig").Borrow = null,
+    /// Execution capability for bounded request fanout. Independent of the
+    /// deadline clock: native-monotonic HTTP budgets can still schedule Io.
+    fanout_io: ?@import("../runtime_io_abi.zig").Borrow = null,
     /// Borrowed request identity used for correlation. An empty value means
     /// the caller did not supply one; adapters may generate one in middleware.
     request_id: []const u8 = "",
     principal: ?Principal = null,
+    /// Request-lifetime capability for writes discovered after initial route
+    /// admission (for example FK cascades). Adapters retain the admitted
+    /// credential scopes; a username alone cannot reconstruct API-key rights.
+    table_write_authorization: ?TableWriteAuthorization = null,
     admission: ?*AdmissionReservation = null,
+    /// Borrowed for the duration of the operation. This is deliberately
+    /// request-scoped: std.Io tasks may resume on a different worker thread.
+    diagnostics: ?*RequestDiagnostics = null,
     /// Durable hash of an externally sourced table definition that was
     /// authorized before asynchronous restore admission.
     destination_authorization_fingerprint: []const u8 = "",
@@ -93,6 +148,27 @@ pub const RequestContext = struct {
             if (now_ns >= deadline) return error.DeadlineExceeded;
         }
     }
+
+    /// Preserve remaining time when entering native owners or HTTP timeout
+    /// APIs, whose absolute clock is platform monotonic rather than Io awake.
+    pub fn platformDeadline(self: RequestContext) !RequestContext {
+        try self.ensureActive();
+        const deadline = self.deadline_ns orelse return self;
+        const borrow = self.deadline_io orelse return self;
+        const platform_now = platform_time.monotonicNs();
+        var receiver = try borrow.receive();
+        const source_now: u64 = @intCast(@max(0, std.Io.Clock.now(.awake, receiver.io()).nanoseconds));
+        if (source_now >= deadline) return error.DeadlineExceeded;
+        var normalized = self;
+        normalized.deadline_ns = platform_now +| (deadline - source_now);
+        normalized.deadline_io = null;
+        return normalized;
+    }
+};
+
+pub const TableWriteAuthorization = struct {
+    ptr: *const anyopaque,
+    allows: *const fn (*const anyopaque, []const u8) bool,
 };
 
 /// A synchronous sink applies backpressure by not returning from `writeAll`
@@ -177,4 +253,21 @@ test "admission reservation releases exactly once" {
     reservation.release();
     reservation.release();
     try std.testing.expectEqual(@as(usize, 1), counter.count);
+}
+
+test "serverless request diagnostics remain isolated across interleaved operations" {
+    var first = RequestDiagnostics{};
+    var second = RequestDiagnostics{};
+
+    first.recordGraphMetricRejection("graph-a", "pagerank", 11);
+    second.recordGraphMetricRejection("graph-b", "degree", 22);
+
+    const first_rejection = first.graph_metric_rejection.?;
+    const second_rejection = second.graph_metric_rejection.?;
+    try std.testing.expectEqualStrings("graph-a", first_rejection.graphIndexName());
+    try std.testing.expectEqualStrings("pagerank", first_rejection.metricName());
+    try std.testing.expectEqual(@as(u64, 11), first_rejection.materializer_fingerprint);
+    try std.testing.expectEqualStrings("graph-b", second_rejection.graphIndexName());
+    try std.testing.expectEqualStrings("degree", second_rejection.metricName());
+    try std.testing.expectEqual(@as(u64, 22), second_rejection.materializer_fingerprint);
 }

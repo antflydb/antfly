@@ -41,6 +41,12 @@ SDK_PREFIXES = (
     "go/pkg/sdk/",
     "rs/crates/sdk/",
     "specs/openapi/",
+    # Embedded Lite bindings and the conformance cases they all run.
+    "go/pkg/lite/",
+    "py/packages/lite/",
+    "rs/crates/lite/",
+    "rs/crates/lite-sys/",
+    "zig/pkg/antfly/capi-conformance/",
 )
 SDK_FILES = {
     "openapi.yaml",
@@ -81,9 +87,11 @@ RELEASE_FILES = {
     ".github/dependabot.yml",
 }
 FORMAT_INFRASTRUCTURE = {
+    "ruff.toml",
     "scripts/format.sh",
     "py/packages/sdk/pyproject.toml",
     "py/packages/sdk/uv.lock",
+    "py/packages/lite/pyproject.toml",
     "ts/biome.json",
     "ts/package.json",
     "ts/pnpm-lock.yaml",

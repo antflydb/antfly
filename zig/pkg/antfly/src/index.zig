@@ -2060,8 +2060,16 @@ pub const IndexWriter = struct {
             idx += 1;
         }
 
-        var global_field_lens = try self.buildGlobalFieldLens(new_segments);
+        // Appends retain every old segment, so their field-name storage and
+        // aggregate totals remain valid. Read only the newly added segments.
+        var global_field_lens = if (old_ids.len == 0)
+            try cloneGlobalFieldLens(self.alloc, old.global_total_field_len)
+        else
+            try self.buildGlobalFieldLens(new_segments);
         errdefer global_field_lens.deinit(self.alloc);
+        if (old_ids.len == 0) for (replacement_readers) |*reader| {
+            try addSegmentFieldLens(self.alloc, &global_field_lens, reader);
+        };
         const new_snap = try self.alloc.create(IndexSnapshot);
         new_snap.* = .{
             .alloc = self.alloc,
@@ -2671,7 +2679,8 @@ test "multi-segment search merges per-segment top-k globally" {
     defer alloc.free(results.hits);
 
     try std.testing.expectEqual(@as(usize, 2), results.hits.len);
-    try std.testing.expectEqual(scorer_mod.TotalHitsRelation.gte, results.total_relation);
+    try std.testing.expectEqual(@as(u32, 4), results.total_count);
+    try std.testing.expectEqual(scorer_mod.TotalHitsRelation.exact, results.total_relation);
     try std.testing.expectEqual(@as(u32, 0), results.hits[0].doc_id);
     try std.testing.expectEqual(@as(u32, 2), results.hits[1].doc_id);
     try std.testing.expect(results.hits[0].score >= results.hits[1].score);

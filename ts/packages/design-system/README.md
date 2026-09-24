@@ -102,7 +102,7 @@ The library ships three type registers: **Aeonik** (display / brand moments), **
 
 > *Is this content read as a label/identifier, or as a phrase? Mono if label. Inter if phrase. Aeonik only when it's a brand moment.*
 
-See [`TYPOGRAPHY.md`](./TYPOGRAPHY.md) for the full register breakdown, when to use each, tracking and weight conventions, and a per-component reference table.
+See [`TYPOGRAPHY.md`](TYPOGRAPHY.md) for the full register breakdown, when to use each, tracking and weight conventions, and a per-component reference table.
 
 ## Dashboard Shell
 

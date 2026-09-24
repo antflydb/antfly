@@ -31,6 +31,7 @@ const tensor_mod = @import("tensor.zig");
 const token = @import("token.zig");
 const value_mod = @import("value.zig");
 const symbol = @import("symbol.zig");
+const index_config = @import("index_config.zig");
 const backend_erased = @import("../../backend_erased.zig");
 const backend_types = @import("../../backend_types.zig");
 const docstore_mod = @import("../../docstore.zig");
@@ -119,11 +120,7 @@ const expression_bucket_output_dims = [_]ir.Dimension{.bucket};
 const expression_kind_scalar_output_dims = [_]ir.Dimension{ .kind, .scalar };
 const expression_time_bucket_scalar_output_dims = [_]ir.Dimension{ .time, .bucket, .scalar };
 
-pub const FieldConfig = struct {
-    name: []const u8,
-    path: []const u8,
-    type: []const u8,
-};
+pub const FieldConfig = index_config.FieldConfig;
 
 pub const ResolvedField = struct {
     public: []const u8,
@@ -137,155 +134,15 @@ pub const ResolvedMeasureField = struct {
     field: ResolvedField,
 };
 
-pub const JoinConfig = struct {
-    name: []const u8,
-    left_fields: []const []const u8 = &.{},
-    right_fields: []const []const u8 = &.{},
-    left_type_field: ?[]const u8 = null,
-    left_type_value: ?[]const u8 = null,
-    right_type_field: ?[]const u8 = null,
-    right_type_value: ?[]const u8 = null,
-    left_time_field: ?[]const u8 = null,
-    right_time_field: ?[]const u8 = null,
-    temporal_bucket: ?[]const u8 = null,
-    temporal_window_seconds: ?i64 = null,
-    max_fanout: ?usize = null,
-};
+pub const JoinConfig = index_config.JoinConfig;
+pub const MaterializationConfig = index_config.MaterializationConfig;
+pub const LawConfig = index_config.LawConfig;
+pub const AdaptiveConfig = index_config.AdaptiveConfig;
+pub const PathFactPolicyConfig = index_config.PathFactPolicyConfig;
+pub const Config = index_config.Config;
 
-pub const MaterializationConfig = struct {
-    name: []const u8,
-    op: []const u8,
-    group_by: []const []const u8 = &.{},
-    measure: ?[]const u8 = null,
-    time: ?[]const u8 = null,
-    bucket: ?[]const u8 = null,
-    join: ?[]const u8 = null,
-    group_side: ?[]const u8 = null,
-    measure_side: ?[]const u8 = null,
-    implicit_query: bool = false,
-    law: ?[]const u8 = null,
-    axes: []const []const u8 = &.{},
-};
-
-pub const LawConfig = struct {
-    name: []const u8,
-    id: []const u8,
-    structure: []const u8 = "",
-    invertible: bool = false,
-};
-
-// A materialized approximate distinct-count. Per group key, a HyperLogLog
-// sketch over the canonical tokens of `value_field` is maintained incrementally
-// on ingest, so a cardinality query reads one sketch per group instead of
-// rescanning and deduplicating every document's value. `precision` of 0 selects
-// the default; larger precision trades memory (2^precision bytes/sketch) for a
-// smaller standard error. Maintenance is append-only: deletes require a rebuild
-// and are not folded back into the sketch.
-pub const HllCardinalityConfig = struct {
-    name: []const u8,
-    group_by: []const []const u8 = &.{},
-    value_field: []const u8,
-    precision: u8 = 0,
-};
-
-/// Static and adaptive sketches share one runtime registry. Keep the registry
-/// small enough that every foreground mutation has a predictable upper bound
-/// even when each sketch uses the maximum dense precision.
-pub const max_hll_cardinality_materializations: usize = 64;
-
-pub const AdaptiveConfig = struct {
-    observe: bool = true,
-    lazy_materialization: bool = false,
-    dematerialization: bool = false,
-    min_observations: u64 = 3,
-    max_auto_materializations_per_index: u64 = 32,
-    max_backfill_rows_per_tick: u64 = 10_000,
-    min_estimated_scan_rows_saved: u64 = 1_000,
-    dematerialize_after_observation_misses: u64 = 3,
-    observation_decay_after_misses: u64 = 0,
-    observation_decay_retain_percent: u8 = 50,
-    path_profile_history_retention: u64 = 64,
-
-    pub fn policy(self: AdaptiveConfig) adaptive_mod.Policy {
-        return .{
-            .observe = self.observe,
-            .lazy_materialization = self.lazy_materialization,
-            .dematerialization = self.dematerialization,
-            .min_observations = self.min_observations,
-            .max_auto_materializations_per_index = self.max_auto_materializations_per_index,
-            .max_backfill_rows_per_tick = self.max_backfill_rows_per_tick,
-            .min_estimated_scan_rows_saved = self.min_estimated_scan_rows_saved,
-            .dematerialize_after_observation_misses = self.dematerialize_after_observation_misses,
-            .observation_decay_after_misses = self.observation_decay_after_misses,
-            .observation_decay_retain_percent = self.observation_decay_retain_percent,
-            .path_profile_history_retention = self.path_profile_history_retention,
-        };
-    }
-};
-
-pub const PathFactPolicyConfig = struct {
-    allow_numeric_string_coercion: bool = true,
-    allow_datetime_string_coercion: bool = true,
-};
-
-pub const Config = struct {
-    version: u16 = 2,
-    table: []const u8 = "",
-    schema_version: u32 = 0,
-    capability_fingerprint: []const u8 = "",
-    capability_lifecycle_status: []const u8 = "current",
-    capability_change_added_fields: u32 = 0,
-    capability_change_removed_fields: u32 = 0,
-    capability_change_changed_type_fields: u32 = 0,
-    skipped_dynamic_fields: u32 = 0,
-    skipped_complex_fields: u32 = 0,
-    skipped_unbounded_fields: u32 = 0,
-    group_fields: []const FieldConfig = &.{},
-    measure_fields: []const FieldConfig = &.{},
-    time_fields: []const FieldConfig = &.{},
-    dynamic_field_rules: []const fact_mod.DynamicRule = &.{},
-    // Set when dynamic_field_rules changed against a table that already holds
-    // documents, so existing docs have not been re-projected through the new
-    // rules. While true, query-time resolution of dynamic-template fields is
-    // withheld (those queries fall back to a complete scan) so aggregates are
-    // never computed over only the post-change subset. Static fields are
-    // unaffected. The durable flag remains conservative; a generation-local
-    // completion marker releases the runtime gate after a full rebuild.
-    dynamic_rules_backfill_pending: bool = false,
-    laws: []const LawConfig = &.{},
-    joins: []const JoinConfig = &.{},
-    materializations: []const MaterializationConfig = &.{},
-    hll_cardinalities: []const HllCardinalityConfig = &.{},
-    adaptive: AdaptiveConfig = .{},
-    pathfact_policy: PathFactPolicyConfig = .{},
-    max_result_buckets: ?usize = null,
-    max_planner_scan_rows: ?usize = null,
-    max_batch_accumulator_entries: ?usize = null,
-    max_cardinality_cache_bytes: ?usize = null,
-    // Hard ingest/backfill bound for the Cartesian group tuples multiplied by
-    // distinct value tokens contributed by one document across every HLL.
-    max_hll_contributions_per_document: usize = 4096,
-    // Hard bound on dense sketch bytes merged/written for one document across
-    // every HLL. This closes the gap between a contribution-count limit and the
-    // 2^precision cost of each dense group sketch.
-    max_hll_contribution_bytes_per_document: usize = 8 * 1024 * 1024,
-    // Hard raw-byte budget for HLL sketches exported by one distributed shard
-    // request. The internal wire format base64-encodes these bytes, so the
-    // default leaves headroom below the HTTP executor's 4 MiB response limit.
-    // Exceeding the budget makes the optimized route unavailable and lets auto
-    // mode fall back to the exact execution path.
-    max_distributed_hll_partial_bytes: usize = 2 * 1024 * 1024,
-    // Durable HLL repair advances by at most this many document-fact rows per
-    // transaction, independently of whether adaptive materialization is on.
-    max_hll_maintenance_rows_per_tick: u64 = 10_000,
-    // Query observations are best-effort telemetry. Bound both the hash table
-    // and owned key storage so adversarial dynamic-field shapes cannot turn
-    // adaptive cardinality into an unbounded memory sink.
-    max_pending_hll_observation_entries: usize = 4096,
-    max_pending_hll_observation_bytes: usize = 1024 * 1024,
-    min_max_candidate_cache_size: ?usize = null,
-    enable_temporal_range_pruning: bool = true,
-};
+pub const HllCardinalityConfig = index_config.HllCardinalityConfig;
+pub const max_hll_cardinality_materializations = index_config.max_hll_cardinality_materializations;
 
 pub fn validateConfig(cfg: Config) !void {
     if (cfg.version != 1 and cfg.version != 2) return error.InvalidAlgebraicConfig;
@@ -3226,6 +3083,15 @@ pub const Index = struct {
     // a time; readers are unaffected (they use the store's snapshots).
     write_mutex: std.atomic.Mutex = .unlocked,
 
+    // Per-index barriers keep the threaded maintenance regression independent
+    // of scheduler timing. No hook state or calls exist in production builds.
+    test_hll_hooks: if (builtin.is_test) ?HllTestHooks else void = if (builtin.is_test) null else {},
+    const HllTestHooks = struct {
+        context: *anyopaque,
+        maintenance_locked: *const fn (*anyopaque) void,
+        foreground_lock: *const fn (*anyopaque) void,
+    };
+
     pub fn open(alloc: Allocator, name: []const u8, config_json: []const u8) !Index {
         return try openWithStorageNamespace(alloc, name, name, config_json);
     }
@@ -3745,6 +3611,7 @@ pub const Index = struct {
         batch: derived_types.DerivedBatch,
         options: ApplyOptions,
     ) !void {
+        if (builtin.is_test) if (self.test_hll_hooks) |hooks| hooks.foreground_lock(hooks.context);
         self.lockWrites();
         defer self.unlockWrites();
 
@@ -18516,6 +18383,7 @@ pub const Index = struct {
         // store). The dirty re-check inside the lock collapses redundant jobs.
         self.lockWrites();
         defer self.unlockWrites();
+        if (builtin.is_test) if (self.test_hll_hooks) |hooks| hooks.maintenance_locked(hooks.context);
         if (!try self.anyHllCardinalityDirty(store)) return false;
         var storage_accounting = self.storageAccountingScope();
         defer storage_accounting.deinit();
@@ -20709,7 +20577,9 @@ fn accountedPutForTest(
 }
 
 test "algebraic storage accounting reuses transaction reads for updates" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     const cfg =
         \\{
         \\  "version": 1,
@@ -21566,7 +21436,9 @@ fn factRoleFromFieldClass(class: FieldClass) ?fact_mod.Role {
 }
 
 test "algebraic config validation rejects ambiguous or malformed plans" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     try std.testing.expectError(error.InvalidAlgebraicConfig, Index.open(alloc, "bad",
         \\{
@@ -21732,7 +21604,9 @@ test "algebraic config validation rejects ambiguous or malformed plans" {
 }
 
 test "algebraic index maintains direct count sum avg min max" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -21899,7 +21773,9 @@ test "algebraic index maintains direct count sum avg min max" {
 }
 
 test "algebraic index materializes approximate per-group cardinality" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -21977,7 +21853,9 @@ test "algebraic index materializes approximate per-group cardinality" {
 }
 
 test "algebraic HLL materialization preserves multivalued group and value facts" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -22032,7 +21910,9 @@ test "algebraic HLL materialization preserves multivalued group and value facts"
 }
 
 test "algebraic HLL readers reject corrupt grouped sketches" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -22101,7 +21981,9 @@ test "algebraic HLL readers reject corrupt grouped sketches" {
 }
 
 test "algebraic HLL bounds per-document expansion and resumes accounted repairs" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -22179,7 +22061,9 @@ test "algebraic HLL bounds per-document expansion and resumes accounted repairs"
 }
 
 test "algebraic HLL batches values and bounds dense sketch bytes" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -22225,7 +22109,9 @@ test "algebraic HLL batches values and bounds dense sketch bytes" {
 }
 
 test "algebraic HLL registry has a hard materialization limit" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var configs: [max_hll_cardinality_materializations + 1]HllCardinalityConfig = undefined;
     var names: [max_hll_cardinality_materializations + 1][]u8 = undefined;
     var initialized: usize = 0;
@@ -22244,7 +22130,9 @@ test "algebraic HLL registry has a hard materialization limit" {
 }
 
 test "adaptive group-key NDV sizes a grouped materialization below the doc-row overestimate" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -22304,7 +22192,9 @@ test "adaptive group-key NDV sizes a grouped materialization below the doc-row o
 }
 
 test "derived join fanout pre-gate fails soft on a guaranteed blowup" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -22359,7 +22249,9 @@ test "derived join fanout pre-gate fails soft on a guaranteed blowup" {
 }
 
 test "adaptive HLL observations honor policy and remain bounded" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var disabled = try Index.open(alloc, "alg",
         \\{"version":1,"table":"orders","group_fields":[{"name":"customer","path":"customer","type":"string"}],"adaptive":{"observe":false,"lazy_materialization":true}}
     );
@@ -22383,7 +22275,9 @@ test "adaptive HLL observations honor policy and remain bounded" {
 }
 
 test "adaptive HLL registry publication is synchronized with readers" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var idx = try Index.open(alloc, "alg",
         \\{"version":1,"table":"orders","group_fields":[{"name":"customer","path":"customer","type":"string"}],"hll_cardinalities":[{"name":"base","value_field":"customer"}]}
     );
@@ -22412,7 +22306,9 @@ test "adaptive HLL registry publication is synchronized with readers" {
 }
 
 test "algebraic HLL cardinality is adaptively promoted from a recurring query shape" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -22500,7 +22396,9 @@ test "algebraic HLL cardinality is adaptively promoted from a recurring query sh
 }
 
 test "adaptive HLL promotion honors shared count and durable row budgets" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -22568,7 +22466,9 @@ test "adaptive HLL promotion honors shared count and durable row budgets" {
 }
 
 test "algebraic HLL cardinality rebuilds after deletes via maintenance lane" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -22632,9 +22532,76 @@ test "algebraic HLL cardinality rebuilds after deletes via maintenance lane" {
     try std.testing.expectEqual(@as(?u64, 1), try westEstimate(&idx, &store, west_group, alloc));
 }
 
+// Event.waitTimeout may return Timeout on a spurious futex wake. Keep one
+// absolute deadline across retries so wakeups neither fail early nor extend
+// the test's watchdog indefinitely.
+fn waitForHllTestEvent(event: *std.Io.Event, io: std.Io, duration: std.Io.Clock.Duration) !void {
+    const deadline = std.Io.Clock.Timestamp.fromNow(io, duration);
+    while (!event.isSet()) {
+        if (deadline.durationFromNow(io).raw.toNanoseconds() <= 0) return error.Timeout;
+        event.waitTimeout(io, .{ .deadline = deadline }) catch |err| switch (err) {
+            error.Timeout => continue,
+            else => return err,
+        };
+    }
+}
+
+test "algebraic HLL event waits tolerate spurious wakeups without extending the deadline" {
+    const Mode = enum { signal, signal_at_deadline, timeout, canceled };
+    const Clock = struct {
+        event: std.Io.Event = .unset,
+        now_ns: i96 = 0,
+        waits: usize = 0,
+        mode: Mode,
+
+        fn now(raw: ?*anyopaque, clock: std.Io.Clock) std.Io.Timestamp {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            std.debug.assert(clock == .awake);
+            return .{ .nanoseconds = self.now_ns };
+        }
+
+        fn wait(raw: ?*anyopaque, _: *const u32, _: u32, timeout: std.Io.Timeout) std.Io.Cancelable!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            std.debug.assert(timeout == .deadline);
+            std.debug.assert(timeout.deadline.raw.toNanoseconds() == 3 * std.time.ns_per_s);
+            self.waits += 1;
+            self.now_ns += std.time.ns_per_s;
+            if (self.mode == .canceled and self.waits == 2) return error.Canceled;
+            if ((self.mode == .signal and self.waits == 2) or
+                (self.mode == .signal_at_deadline and self.waits == 3))
+                self.event.set(std.testing.io);
+            // Otherwise return a spurious wake while the event remains unset.
+        }
+    };
+    for (std.enums.values(Mode)) |mode| {
+        var clock: Clock = .{ .mode = mode };
+        var vtable = std.testing.io.vtable.*;
+        vtable.now = Clock.now;
+        vtable.futexWait = Clock.wait;
+        const io: std.Io = .{ .userdata = &clock, .vtable = &vtable };
+        const duration: std.Io.Clock.Duration = .{ .raw = .fromSeconds(3), .clock = .awake };
+        const result = waitForHllTestEvent(&clock.event, io, duration);
+        switch (mode) {
+            .signal, .signal_at_deadline => {
+                try result;
+                try std.testing.expect(clock.event.isSet());
+                const waits = clock.waits;
+                // An already-set event must not wait, even with no time left.
+                try waitForHllTestEvent(&clock.event, io, .{ .raw = .zero, .clock = .awake });
+                try std.testing.expectEqual(waits, clock.waits);
+            },
+            .timeout => try std.testing.expectError(error.Timeout, result),
+            .canceled => try std.testing.expectError(error.Canceled, result),
+        }
+        try std.testing.expectEqual(@as(usize, if (mode == .signal or mode == .canceled) 2 else 3), clock.waits);
+    }
+}
+
 test "algebraic HLL cardinality stays correct under a concurrent threaded maintenance lane" {
     if (builtin.os.tag == .freestanding) return error.SkipZigTest;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -22662,42 +22629,84 @@ test "algebraic HLL cardinality stays correct under a concurrent threaded mainte
     ;
     var idx = try Index.open(alloc, "alg", cfg);
     defer idx.close();
-    idx.attachHllMaintenanceLane(runtime.durable_jobs, try runtime.allocOwnerId());
 
     const west_token = try idx.constraintTokenAlloc(alloc, "region", "west");
     defer alloc.free(west_token);
     const west_group = try token.canonicalTupleAlloc(alloc, &.{west_token});
     defer alloc.free(west_group);
 
-    // Insert 200 distinct west customers across many small batches, deleting the
-    // previous batch's docs each round. Every delete schedules a background
-    // rebuild that races the next round's insert.
-    var round: usize = 0;
-    while (round < 40) : (round += 1) {
-        var docs: [5]derived_types.DerivedDocument = undefined;
-        var bufs: [5][64]u8 = undefined;
-        for (0..5) |i| {
-            const n = round * 5 + i;
-            const key = try std.fmt.bufPrint(&bufs[i], "k{d}", .{n});
-            // Reuse the buffer tail for the value via a second format into a dup.
-            const value = try std.fmt.allocPrint(alloc, "{{\"region\":\"west\",\"customer\":\"c{d}\"}}", .{n});
-            docs[i] = .{ .key = try alloc.dupe(u8, key), .action = .upsert, .cleaned_value = value };
+    // A real deletion is required: append-only inserts never dirty the sketch
+    // and therefore never exercise the maintenance lane.
+    try idx.applyBatch(&store, .{ .documents = &.{
+        .{ .key = "a", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"a\"}" },
+        .{ .key = "b", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"b\"}" },
+        .{ .key = "c", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"c\"}" },
+    } });
+    try idx.applyBatch(&store, .{ .deleted_keys = &.{"b"} });
+    try std.testing.expect(try idx.anyHllCardinalityDirty(&store));
+
+    const Race = struct {
+        index: *Index,
+        store: *docstore_mod.DocStore,
+        locked: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        foreground_attempted: std.Io.Event = .unset,
+        contended: bool = false,
+        maintenance_passes: usize = 0,
+        failure: ?anyerror = null,
+
+        fn maintenanceLocked(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.maintenance_passes += 1;
+            self.locked.set(std.testing.io);
+            self.release.waitUncancelable(std.testing.io);
         }
-        defer for (docs) |d| {
-            alloc.free(@constCast(d.key));
-            if (d.cleaned_value) |v| alloc.free(@constCast(v));
-        };
-        try idx.applyBatch(&store, .{ .documents = docs[0..] });
+
+        fn foregroundLock(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            // Observe contention at the actual foreground lock boundary while
+            // the background job is parked holding that same lock.
+            self.contended = !self.index.write_mutex.tryLock();
+            if (!self.contended) self.index.write_mutex.unlock();
+            self.foreground_attempted.set(std.testing.io);
+        }
+
+        fn apply(self: *@This()) void {
+            self.index.applyBatch(self.store, .{ .documents = &.{
+                .{ .key = "d", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"d\"}" },
+            } }) catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+    var race: Race = .{ .index = &idx, .store = &store };
+    idx.test_hll_hooks = .{ .context = &race, .maintenance_locked = Race.maintenanceLocked, .foreground_lock = Race.foregroundLock };
+    idx.attachHllMaintenanceLane(runtime.durable_jobs, try runtime.allocOwnerId());
+    // Always release and drain before the hook context or index can disappear,
+    // including an assertion error or failure to create the foreground thread.
+    defer {
+        race.release.set(std.testing.io);
+        runtime.durable_jobs.drainOwner(idx.hll_maintenance_owner_id);
+        idx.test_hll_hooks = null;
     }
-
-    // Drain all background rebuilds, then run one final maintenance pass so any
-    // outstanding dirty marker is resolved deterministically before asserting.
+    idx.resumeHllMaintenance(&store);
+    try waitForHllTestEvent(&race.locked, std.testing.io, .{ .raw = .fromSeconds(10), .clock = .awake });
+    const foreground = try std.Thread.spawn(.{}, Race.apply, .{&race});
+    var joined = false;
+    defer if (!joined) {
+        race.release.set(std.testing.io);
+        foreground.join();
+    };
+    try waitForHllTestEvent(&race.foreground_attempted, std.testing.io, .{ .raw = .fromSeconds(10), .clock = .awake });
+    try std.testing.expect(race.contended);
+    race.release.set(std.testing.io);
+    foreground.join();
+    joined = true;
+    if (race.failure) |err| return err;
     runtime.durable_jobs.drainOwner(idx.hll_maintenance_owner_id);
-    _ = try idx.runHllMaintenance(&store);
-
-    // All 200 customers are distinct and all in west; the estimate must be close
-    // to 200 (HLL error), and must not be corrupted by a lost update or a torn
-    // read from the concurrent rebuilds.
+    try std.testing.expectEqual(@as(usize, 1), race.maintenance_passes);
+    try std.testing.expect(!try idx.anyHllCardinalityDirty(&store));
+    try std.testing.expect(!try idx.runHllMaintenance(&store));
     const entries = try idx.approxCardinalityEntriesAlloc(&store, "customers_by_region");
     defer {
         for (entries) |*entry| entry.deinit(alloc);
@@ -22708,14 +22717,14 @@ test "algebraic HLL cardinality stays correct under a concurrent threaded mainte
         if (std.mem.eql(u8, entry.group_key, west_group)) west_estimate = entry.estimate;
     }
     try std.testing.expect(west_estimate != null);
-    const est = west_estimate.?;
-    // Generous bound: p=14 standard error is ~0.8%, allow well beyond that. The
-    // point is to catch corruption (estimate near 0, or far off), not precision.
-    try std.testing.expect(est >= 180 and est <= 220);
+    // a, c, d: retain the foreground insert and remove the deleted contribution.
+    try std.testing.expectEqual(@as(u64, 3), west_estimate.?);
 }
 
 test "algebraic HLL cardinality is corrected after an in-place value change" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -22768,7 +22777,9 @@ test "algebraic HLL cardinality is corrected after an in-place value change" {
 }
 
 test "algebraic HLL cardinality is not dirtied by an unrelated field update" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -22821,7 +22832,9 @@ test "algebraic HLL cardinality is not dirtied by an unrelated field update" {
 }
 
 test "algebraic HLL cardinality tokenizes bytes fields identically on ingest and rebuild" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -22871,7 +22884,9 @@ test "algebraic HLL cardinality tokenizes bytes fields identically on ingest and
 }
 
 test "algebraic raw metric doc id reads canonicalize measure path aliases" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -22901,7 +22916,9 @@ test "algebraic raw metric doc id reads canonicalize measure path aliases" {
 }
 
 test "algebraic materialized expression ids include materialization semantics" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -22948,7 +22965,9 @@ test "algebraic materialized expression ids include materialization semantics" {
 }
 
 test "algebraic scans single materialization entries from expression cache" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -22992,7 +23011,9 @@ test "algebraic scans single materialization entries from expression cache" {
 }
 
 test "algebraic scans compact materialization rows from expression cache" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -23053,7 +23074,9 @@ fn expectProjectionFact(projection: pathfact_mod.StoredProjection, path: []const
 }
 
 test "algebraic index stores schemaless path facts and lookup rows" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -23322,7 +23345,9 @@ fn factHasField(facts: []const fact_mod.Fact, role: fact_mod.Role, field: []cons
 }
 
 test "algebraic dynamic templates project typed docfacts without a schema rebuild" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -23388,7 +23413,9 @@ test "algebraic dynamic templates project typed docfacts without a schema rebuil
 }
 
 test "algebraic dynamic templates exclude schema ignored paths at ingest and query" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     const rules = [_]fact_mod.DynamicRule{
         .{ .name = "all", .match = "*", .type = "string" },
         .{ .name = "nested", .path_match = "meta.*", .type = "string" },
@@ -23417,7 +23444,9 @@ test "algebraic dynamic templates exclude schema ignored paths at ingest and que
 }
 
 test "algebraic reloadConfigJson applies new dynamic template rules to live writes" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -23461,7 +23490,9 @@ test "algebraic reloadConfigJson applies new dynamic template rules to live writ
 }
 
 test "algebraic dynamic template fields resolve and aggregate at query time" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -23636,7 +23667,9 @@ test "algebraic dynamic template fields resolve and aggregate at query time" {
 }
 
 test "algebraic dynamic template arrays remain exact after adaptive materialization" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -23749,7 +23782,9 @@ test "algebraic dynamic template arrays remain exact after adaptive materializat
 }
 
 test "algebraic withholds dynamic field resolution while backfill pending" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     // Same rules; the only difference is the backfill-pending flag. While pending,
     // dynamic-template fields must not resolve (queries fall back to a complete
     // scan) so aggregates are never computed over a partial post-change subset.
@@ -23772,7 +23807,9 @@ test "algebraic withholds dynamic field resolution while backfill pending" {
 }
 
 test "algebraic dynamic template rebuild proof releases static lifecycle gate" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var idx = try Index.open(alloc, "alg_rebuilt",
         \\{"version":1,"table":"events","capability_lifecycle_status":"rebuild_required","dynamic_rules_backfill_pending":true,"dynamic_field_rules":[{"name":"ids","match":"*_id","type":"string"}]}
     );
@@ -23785,7 +23822,9 @@ test "algebraic dynamic template rebuild proof releases static lifecycle gate" {
 }
 
 test "algebraic config rejects dynamic rule without a name or path selector" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     // A match_mapping_type-only rule can be evaluated at ingest but never at query
     // time, so it must be rejected to keep ingest and query symmetric.
     try std.testing.expectError(error.InvalidAlgebraicConfig, Index.open(alloc, "bad",
@@ -23798,7 +23837,9 @@ test "algebraic config rejects dynamic rule without a name or path selector" {
 }
 
 test "algebraic dynamic field resolution agrees with ingest under overlapping rules" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -23848,7 +23889,9 @@ test "algebraic dynamic field resolution agrees with ingest under overlapping ru
 }
 
 test "algebraic dynamic template query declines value-dependent overlap" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var idx = try Index.open(alloc, "alg_mapping_overlap",
         \\{"version":1,"table":"events","dynamic_field_rules":[
         \\  {"name":"numeric","match":"value","match_mapping_type":"number","type":"number"},
@@ -23865,7 +23908,9 @@ test "algebraic dynamic template query declines value-dependent overlap" {
 }
 
 test "algebraic path profile recomputes max string token count after deleting max row" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -23917,7 +23962,9 @@ test "algebraic path profile recomputes max string token count after deleting ma
 }
 
 test "algebraic path profile stats expose selectivity for promotion decisions" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -24118,7 +24165,9 @@ test "algebraic path profile stats expose selectivity for promotion decisions" {
 }
 
 test "algebraic adaptive backfill materializes schemaless path recommendations" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -24454,7 +24503,9 @@ test "algebraic adaptive backfill materializes schemaless path recommendations" 
 }
 
 test "algebraic resolved doc filters honor identity generation for explicit ids" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -24537,7 +24588,9 @@ test "algebraic resolved doc filters honor identity generation for explicit ids"
 }
 
 test "algebraic adaptive path promotion defers fst rebuild until backfill completion" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -24613,7 +24666,9 @@ test "algebraic adaptive path promotion defers fst rebuild until backfill comple
 }
 
 test "algebraic adaptive path promotion honors existing dictionary owner" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -24686,7 +24741,9 @@ test "algebraic adaptive path promotion honors existing dictionary owner" {
 }
 
 test "algebraic adaptive backfill promotes scalar array parent paths without duplicate value deltas" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -24804,7 +24861,9 @@ test "algebraic adaptive backfill promotes scalar array parent paths without dup
 }
 
 test "algebraic promoted datetime path dictionary supports date ranges" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -24901,7 +24960,9 @@ test "algebraic promoted datetime path dictionary supports date ranges" {
 }
 
 test "algebraic dictionary registry preserves an existing shared owner" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -25006,7 +25067,9 @@ test "algebraic dictionary registry preserves an existing shared owner" {
 }
 
 test "algebraic path dictionary reads require ready registry owner" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -25091,7 +25154,9 @@ test "algebraic path dictionary reads require ready registry owner" {
 }
 
 test "algebraic dictionary registry does not duplicate analyzed text ownership" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -25143,7 +25208,9 @@ test "algebraic dictionary registry does not duplicate analyzed text ownership" 
 }
 
 test "algebraic index materialized expression rows use tensor law mutation" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -25187,7 +25254,9 @@ test "algebraic index materialized expression rows use tensor law mutation" {
 }
 
 test "algebraic index rebuilds materialized expression cache from aggregate materialization" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -25294,7 +25363,9 @@ test "algebraic index rebuilds materialized expression cache from aggregate mate
 }
 
 test "algebraic bulk ingest existing doc falls back through docfact compensation" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -25348,7 +25419,9 @@ test "algebraic bulk ingest existing doc falls back through docfact compensation
 }
 
 test "algebraic bulk ingest configured materializations use tensor mutations" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -25394,7 +25467,9 @@ test "algebraic bulk ingest configured materializations use tensor mutations" {
 }
 
 test "algebraic bulk ingest maintains ready adaptive aggregate tensors" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -25492,7 +25567,9 @@ test "algebraic bulk ingest maintains ready adaptive aggregate tensors" {
 }
 
 test "algebraic doc facts expose doc id candidate sets for symbolic constraints" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -26580,7 +26657,9 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
 }
 
 test "algebraic index uses bounded exact min max candidate cache" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -26632,7 +26711,9 @@ test "algebraic index uses bounded exact min max candidate cache" {
 }
 
 test "algebraic index fails fast on symbol id collision" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -26676,7 +26757,9 @@ test "algebraic index fails fast on symbol id collision" {
 }
 
 test "algebraic index maintains composite equi join aggregate" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -26787,7 +26870,9 @@ test "algebraic index maintains composite equi join aggregate" {
 }
 
 test "algebraic index executes proven docfact bucket fold tensor program" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -26933,7 +27018,9 @@ test "algebraic index executes proven docfact bucket fold tensor program" {
 }
 
 test "child cardinality cache releases partial builds and falls back at its byte budget" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -26988,7 +27075,9 @@ test "child cardinality cache releases partial builds and falls back at its byte
 }
 
 test "algebraic index executes cardinality partial tensor programs" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -27376,7 +27465,9 @@ test "algebraic index executes cardinality partial tensor programs" {
 }
 
 test "algebraic index can execute pathfact bucket fold tensor program" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -27654,7 +27745,9 @@ test "algebraic index can execute pathfact bucket fold tensor program" {
 }
 
 test "algebraic pathfact fold constraints preserve scalar kind" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -28378,7 +28471,9 @@ test "algebraic pathfact fold constraints preserve scalar kind" {
 }
 
 test "algebraic index rejects numeric pathfact string fold on mixed string profile" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -28435,7 +28530,9 @@ test "algebraic index rejects numeric pathfact string fold on mixed string profi
 }
 
 test "algebraic index rejects numeric pathfact string fold when policy disables coercion" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -28492,7 +28589,9 @@ test "algebraic index rejects numeric pathfact string fold when policy disables 
 }
 
 test "algebraic index rejects date pathfact string fold on mixed datetime profile" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -28550,7 +28649,9 @@ test "algebraic index rejects date pathfact string fold on mixed datetime profil
 }
 
 test "algebraic index rejects date pathfact string fold when policy disables coercion" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -28608,7 +28709,9 @@ test "algebraic index rejects date pathfact string fold when policy disables coe
 }
 
 test "algebraic index rejects date pathfact string measure fold on mixed numeric profile" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -28668,7 +28771,9 @@ test "algebraic index rejects date pathfact string measure fold on mixed numeric
 }
 
 test "algebraic index maintains temporal bucket window join aggregate" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -28742,7 +28847,9 @@ test "algebraic index maintains temporal bucket window join aggregate" {
 }
 
 test "algebraic index range prunes temporal window join scans" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -28794,7 +28901,9 @@ test "algebraic index range prunes temporal window join scans" {
 }
 
 test "algebraic lsm bulk ingest uses cursor-capable join matching" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = lsm_backend.Backend.init(alloc, .{ .flush_threshold = 2 });
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{ .name = "docs" });
@@ -28861,7 +28970,9 @@ test "algebraic lsm bulk ingest uses cursor-capable join matching" {
 }
 
 test "algebraic index can execute bounded derived distributive join fold from join facts" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -29174,7 +29285,9 @@ test "algebraic index can execute bounded derived distributive join fold from jo
 }
 
 test "algebraic distributed derived join partials merge canonical axes across shards" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var left_backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer left_backend.close();
     var right_backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
@@ -29303,7 +29416,9 @@ test "algebraic distributed derived join partials merge canonical axes across sh
 }
 
 test "algebraic derived join tensor reads subtract identity tombstones at generation" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -29454,7 +29569,9 @@ test "algebraic derived join tensor reads subtract identity tombstones at genera
 }
 
 test "algebraic derived join fold rejects unbounded fanout" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -29489,7 +29606,9 @@ test "algebraic derived join fold rejects unbounded fanout" {
 }
 
 test "algebraic index records malformed json and marks status unhealthy" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -29522,7 +29641,9 @@ test "algebraic index records malformed json and marks status unhealthy" {
 }
 
 test "algebraic index records query shape recommendations" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     const cfg =
         \\{
         \\  "version": 1,
@@ -29560,7 +29681,9 @@ test "algebraic index records query shape recommendations" {
 }
 
 test "algebraic index persists query shape observations and recommendations" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -29644,7 +29767,9 @@ test "algebraic index persists query shape observations and recommendations" {
 }
 
 test "algebraic adaptive observations decay across idle evaluation windows" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -29707,7 +29832,9 @@ test "algebraic adaptive observations decay across idle evaluation windows" {
 }
 
 test "algebraic adaptive backfill builds tensor rows from doc facts" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -29828,7 +29955,9 @@ test "algebraic adaptive backfill builds tensor rows from doc facts" {
 }
 
 test "algebraic adaptive dematerialization cleanup survives lsm reopen" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var memory_storage = lsm_storage_io.MemoryStorage.init(alloc);
     defer memory_storage.deinit();
 
@@ -29953,7 +30082,9 @@ test "algebraic adaptive dematerialization cleanup survives lsm reopen" {
 }
 
 test "algebraic adaptive scans skip corrupt sidecar state rows" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -30004,7 +30135,9 @@ test "algebraic adaptive scans skip corrupt sidecar state rows" {
 }
 
 test "algebraic adaptive progress marks rebuild required on schema drift" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -30070,7 +30203,9 @@ test "algebraic adaptive progress marks rebuild required on schema drift" {
 }
 
 test "algebraic adaptive backfill resumes after interrupted index reopen" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -30158,7 +30293,9 @@ test "algebraic adaptive backfill resumes after interrupted index reopen" {
 }
 
 test "algebraic adaptive stale state blocks ready materialization selection" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -30220,7 +30357,9 @@ test "algebraic adaptive stale state blocks ready materialization selection" {
 }
 
 test "algebraic adaptive backfill covers laws buckets partial ticks and doc churn" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -30372,7 +30511,9 @@ test "algebraic adaptive backfill covers laws buckets partial ticks and doc chur
 }
 
 test "algebraic adaptive recommendation scans entries from expression cache" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});
@@ -30440,7 +30581,9 @@ test "algebraic adaptive recommendation scans entries from expression cache" {
 }
 
 test "algebraic adaptive backfill supports configured join tensors" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
     const runtime_store = try backend.runtimeStore(alloc, .{});

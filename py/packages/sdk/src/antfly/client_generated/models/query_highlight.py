@@ -14,12 +14,13 @@ T = TypeVar("T", bound="QueryHighlight")
 @_attrs_define
 class QueryHighlight:
     """Ask for highlighted fragments of the stored fields matched by
-    `full_text_search`. Matches are located by re-analyzing the stored
-    value with the field's analyzer, so stemmed and stop-word-filtered
-    terms highlight the surface form. `prefix`, `wildcard`, `regexp`, and
-    `fuzzy` clauses mark whole tokens; `match` or `prefix` on a
-    `substring` companion (`field._substring`) marks the exact contained
-    bytes, including matches that span two adjacent tokens.
+    `full_text_search` and by named full-text queries. Matches are located
+    by re-analyzing the stored value with the field's analyzer, so stemmed
+    and stop-word-filtered terms highlight the surface form. `prefix`,
+    `wildcard`, `regexp`, and `fuzzy` clauses mark whole tokens; `match`,
+    `match_phrase`, or `prefix` on a `substring` companion
+    (`field._substring`) marks the exact contained bytes, including
+    matches that span two adjacent words.
 
         Attributes:
             fields (list[str] | Unset): Source fields to highlight. Defaults to every field the full-text

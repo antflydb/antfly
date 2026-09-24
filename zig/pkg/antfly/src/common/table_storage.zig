@@ -10,7 +10,17 @@ pub const DenseEmbeddings = enum {
 };
 
 pub const Settings = struct {
+    // Compatibility default for persisted records, not fresh-table admission.
     dense_embeddings: DenseEmbeddings = .primary_lsm,
+
+    pub fn resolveStandaloneCreate(requested: ?Settings, num_shards: u32, replicated: bool, external_storage: bool) !Settings {
+        const settings = requested orelse if (num_shards == 1 and !replicated and !external_storage)
+            Settings{ .dense_embeddings = .vector_store }
+        else
+            Settings{};
+        try settings.validateStandalone(num_shards, replicated, external_storage);
+        return settings;
+    }
 
     pub fn parse(value: std.json.Value) !Settings {
         if (value != .object) return error.InvalidTableStorageSettings;
@@ -48,4 +58,19 @@ test "table storage settings reject malformed and unknown ownership" {
     try std.testing.expectError(error.VectorStoreRequiresLocalSingleShardTable, settings.validateStandalone(2, false, false));
     try std.testing.expectError(error.VectorStoreRequiresLocalSingleShardTable, settings.validateStandalone(1, true, false));
     try std.testing.expectError(error.VectorStoreRequiresLocalSingleShardTable, settings.validateStandalone(1, false, true));
+}
+
+test "table storage creation policy preserves explicit choices and legacy records" {
+    try std.testing.expectEqual(.vector_store, (try Settings.resolveStandaloneCreate(null, 1, false, false)).dense_embeddings);
+    try std.testing.expectEqual(.primary_lsm, (try Settings.resolveStandaloneCreate(.{}, 1, false, false)).dense_embeddings);
+    try std.testing.expectEqual(.primary_lsm, (try Settings.resolveStandaloneCreate(null, 2, false, false)).dense_embeddings);
+    try std.testing.expectEqual(.primary_lsm, (try Settings.resolveStandaloneCreate(null, 1, true, false)).dense_embeddings);
+    try std.testing.expectEqual(.primary_lsm, (try Settings.resolveStandaloneCreate(null, 1, false, true)).dense_embeddings);
+    const source = Settings{ .dense_embeddings = .vector_store };
+    try std.testing.expectError(error.VectorStoreRequiresLocalSingleShardTable, Settings.resolveStandaloneCreate(source, 2, false, false));
+    try std.testing.expectError(error.VectorStoreRequiresLocalSingleShardTable, Settings.resolveStandaloneCreate(source, 1, true, false));
+    try std.testing.expectError(error.VectorStoreRequiresLocalSingleShardTable, Settings.resolveStandaloneCreate(source, 1, false, true));
+    var legacy = try std.json.parseFromSlice(Settings, std.testing.allocator, "{}", .{});
+    defer legacy.deinit();
+    try std.testing.expectEqual(.primary_lsm, legacy.value.dense_embeddings);
 }

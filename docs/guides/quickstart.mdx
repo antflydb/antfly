@@ -43,7 +43,7 @@ antfly --version
   </TabsContent>
 
   <TabsContent value="docker">
-See the [Downloads page](/docs/downloads) for a complete Docker Compose setup with Antfly and Ollama.
+See the [Downloads page](/docs/downloads) for a complete Docker Compose setup with Antfly.
   </TabsContent>
 </Tabs>
 
@@ -61,7 +61,7 @@ If you installed with Homebrew, you can run Antfly as a service instead:
 brew services start antfly
 ```
 
-Standalone mode runs metadata, data, and Antfly Inference in one process. The 8 GiB inference budget is what lets the all-local RAG step at the end run the embedding, reranking, and Gemma models in one request; drop the flag if you plan to use a hosted generator. The web dashboard is at `http://127.0.0.1:8080` once it is up. Every command on this page uses the numeric loopback address because it matches standalone's default bind on systems where `localhost` resolves to IPv6 first.
+Standalone mode runs metadata, data, and Antfly Inference together. On macOS (Metal) and other GPU builds, model execution runs in a supervised child worker that standalone starts and restarts for you. The 8 GiB inference budget is what lets the all-local RAG step at the end run the embedding, reranking, and Gemma models in one request; drop the flag if you plan to use a hosted generator. The web dashboard is at `http://127.0.0.1:8080` once it is up. Every command on this page uses the numeric loopback address because it matches standalone's default bind on systems where `localhost` resolves to IPv6 first.
 
 ### Verify the basic data path
 
@@ -85,7 +85,7 @@ The last command returns the document with key `first`. If it does not, stop her
 
 ### Install the text embedding model
 
-Pull the text embedding model used for semantic search. [Antfly Inference](/docs/guides/inference) runs it inside the same process, with no external API:
+Pull the text embedding model used for semantic search. [Antfly Inference](/docs/guides/inference) runs it locally under standalone, with no external API:
 
 ```bash
 antfly inference pull hf:Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1
@@ -98,12 +98,11 @@ artifact writes use the document role, while semantic searches use the query
 role. The Q8_0 bundle runs on native CPU on Linux and macOS, and uses Metal
 automatically when it is available.
 
-If the running process does not pick up the new model, restart it once before creating the index.
-
-Once the embeddings index reaches `queryable`, Antfly durably preserves that
-published snapshot across later restarts while the remaining embeddings resume
-in the background. `complete` still means all source outcomes and the final
-vector publication have settled.
+<Callout type="info">
+The running process picks up the new model on its next model-list or inference
+request. The Antfarm dashboard refreshes its model list about every 30 seconds,
+so allow up to a minute for it to appear there.
+</Callout>
 
 ## Download Sample Data
 
@@ -307,6 +306,11 @@ antfly index wait --table wikipedia \
 
 Continue as soon as it returns. Results improve as the remaining documents are indexed; `antfly index list --table wikipedia` shows progress. To wait for the full corpus instead, use `--until complete`. Timing depends on hardware. If the wait times out, do not press on; see [Troubleshooting](#troubleshooting).
 
+The index turns `queryable_partial` as soon as a generation is published. Antfly
+keeps that snapshot across restarts. The remaining embeddings resume in the
+background. `complete` means every source outcome and the final vector
+publication have settled.
+
 Articles can produce multiple chunks, so `SEARCHABLE` in the status output may exceed the document count, and `avg_embeddings` measures chunk embeddings per second, not documents.
 
 ## Search
@@ -490,7 +494,9 @@ antfly inference pull hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0 --task
 ```
 
 <Callout type="info">
-If Antfly doesn't detect the new model, restart `antfly standalone`.
+The running process picks up the new model on its next model-list or inference
+request. The Antfarm dashboard refreshes its model list about every 30 seconds,
+so allow up to a minute for it to appear there.
 </Callout>
 
 The Q8 model is about 610 MiB and runs on native CPU or Metal. The first query
@@ -621,7 +627,9 @@ antfly inference pull antflydb/clipclap:gguf:Q4_K
 ```
 
 <Callout type="info">
-If Antfly doesn't detect the new model, restart `antfly standalone`.
+The running process picks up the new model on its next model-list or inference
+request. The Antfarm dashboard refreshes its model list about every 30 seconds,
+so allow up to a minute for it to appear there.
 </Callout>
 
 ### Add an image index to your table

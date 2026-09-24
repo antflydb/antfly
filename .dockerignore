@@ -64,7 +64,6 @@ zig/zig-out/
 zig/e2e/
 zig/testdata/
 zig/bench/
-zig/deps/antfly-zig
 !zig/lib/pjrt/
 !zig/lib/pjrt/**
 !zig/pkg/antfly/src/data/

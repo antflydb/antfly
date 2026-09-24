@@ -2231,14 +2231,20 @@ pub fn repairDirtyPostingsTxnWithOptions(
     var result: posting.PostingMaintenanceResult = .{};
     if (options.max_postings == 0) {
         result.limit_reached = true;
+        result.next_node = @max(1, options.start_node);
         return result;
     }
 
     var layout_changes: usize = 0;
     var boundary_moves: usize = 0;
 
-    var node_id: u64 = 1;
+    var node_id: u64 = @max(1, options.start_node);
+    var visited: usize = 0;
     while (node_id <= self.metadata.node_count) : (node_id += 1) {
+        if (visited >= options.max_scanned_nodes) {
+            result.limit_reached = true;
+            break;
+        }
         if (options.should_continue) |should_continue| {
             const context = options.continue_context orelse return error.MissingMaintenanceContinueContext;
             if (!should_continue(context)) {
@@ -2246,6 +2252,7 @@ pub fn repairDirtyPostingsTxnWithOptions(
                 break;
             }
         }
+        visited += 1;
         var node = self.loadNode(txn, node_id) catch |err| {
             if (isNotFoundGeneric(err)) {
                 result.skipped_missing += 1;
@@ -2357,6 +2364,7 @@ pub fn repairDirtyPostingsTxnWithOptions(
         }
     }
 
+    if (node_id <= self.metadata.node_count) result.next_node = node_id;
     self.write_profile.posting_maintenance_scanned_nodes += result.scanned_nodes;
     self.write_profile.posting_maintenance_scanned_postings += result.scanned_postings;
     self.write_profile.posting_maintenance_dirty_postings += result.dirty_postings;

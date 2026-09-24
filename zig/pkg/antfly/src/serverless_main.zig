@@ -20,6 +20,7 @@ const serverless_default_max_request_bytes: usize = antfly.public_api.http_serve
 const serverless_default_max_connection_threads: u32 = 64;
 const serverless_default_query_cache_max_bytes: u64 = 4 * 1024 * 1024 * 1024;
 const serverless_default_query_cache_payload_max_bytes: u64 = 64 * 1024 * 1024;
+const serverless_default_graph_metric_max_parallelism: u8 = @intCast(serverless.build.default_graph_metric_compute_parallelism);
 
 const CliConfig = struct {
     config_path: ?[]const u8 = null,
@@ -32,6 +33,7 @@ const CliConfig = struct {
     query_cache_dir: ?[]const u8 = null,
     query_cache_max_bytes: ?u64 = null,
     query_cache_payload_max_bytes: ?u64 = null,
+    manifest_write_version: ?u16 = null,
     embedding_indexes_json: ?[]const u8 = null,
     sparse_embedding_index_name: ?[]const u8 = null,
     chunk_embedding_index_name: ?[]const u8 = null,
@@ -41,6 +43,7 @@ const CliConfig = struct {
     health_port: ?u16 = null,
     max_request_bytes: ?usize = null,
     max_connection_threads: ?u32 = null,
+    graph_metric_max_parallelism: ?u8 = null,
     role: ?[]const u8 = null,
     tick_ms: ?u64 = null,
     publish_enabled: ?bool = null,
@@ -91,11 +94,41 @@ pub fn runFromIterator(
     defer runtime_io_impl.deinit();
     const runtime_io = runtime_io_impl.io();
 
-    var secret_store: ?antfly.common.secrets.FileStore = if (cli.secret_store_path orelse init.environ_map.get("ANTFLY_SECRET_STORE_PATH")) |path|
-        try antfly.common.secrets.FileStore.initWithIo(alloc, runtime_io, path)
-    else
-        null;
+    const legacy_secret_path = cli.secret_store_path orelse init.environ_map.get("ANTFLY_SECRET_STORE_PATH");
+    var secret_store = try antfly.common.secrets.initFromConfigPathWithIo(
+        alloc,
+        runtime_io,
+        cli.config_path,
+        if (legacy_secret_path) |path| &.{path} else &.{},
+    );
     defer if (secret_store) |*store| store.deinit();
+    var native_keys: @import("common/secret_keyring.zig").Keyring = undefined;
+    var native_objects: ?@import("serverless/object_store_support.zig").OpenedObjectStore = null;
+    defer if (native_objects) |*objects| objects.deinit();
+    var native_secrets: ?@import("serverless/secret_store.zig").Store = null;
+    defer if (native_secrets) |*store| store.deinit();
+    if (secret_store) |*facade| {
+        if (facade.native_config) |native| {
+            const cfg = native.value;
+            if (cfg.backend != .serverless) return error.InvalidConfig;
+            // Bootstrap credentials come from workload identity/environment,
+            // independently of the encrypted store being opened.
+            if (!(std.mem.startsWith(u8, cfg.path, "s3://") or std.mem.startsWith(u8, cfg.path, "gs://") or std.mem.startsWith(u8, cfg.path, "file://"))) return error.InvalidConfig;
+            native_objects = try @import("serverless/object_store_support.zig").OpenedObjectStore.initRemoteUriWithS3AndOpenOptions(alloc, cfg.path, "native-secrets", null, .{ .ensure_bucket = false });
+            native_keys = .{ .alloc = alloc, .io = runtime_io, .path = cfg.keyring_path.? };
+            try native_keys.validate();
+            native_secrets = try @import("serverless/secret_store.zig").Store.init(alloc, runtime_io, cfg.scope, native_keys.provider(), .{
+                .client = native_objects.?.client,
+                .gcs_client = native_objects.?.gcs_client,
+                .bucket = native_objects.?.bucket,
+                .prefix = native_objects.?.prefix,
+                .consistency = .linearizable_cas,
+            });
+            const handle = native_secrets.?.nativeStore();
+            facade.attachNative(handle.source, handle.writer);
+            _ = try handle.source.refresh(cfg.scope);
+        }
+    }
     var loaded_config: ?antfly.common.config.Config = if (cli.config_path) |path|
         try antfly.common.config.loadFromPathWithSecretsForDeploymentWithIo(alloc, runtime_io, path, if (secret_store) |*store| store else null, .serverless)
     else
@@ -123,6 +156,8 @@ pub fn runFromIterator(
     }
 
     const bootstrap = serverless.BootstrapConfig{
+        .secret_store = if (secret_store) |*store| store else null,
+        .node_config = if (loaded_config) |*cfg| cfg else null,
         .artifacts_uri = try resolveRequired(init.environ_map, cli.artifacts_uri, configured_uris.artifacts, "ANTFLY_SERVERLESS_ARTIFACTS_URI"),
         .manifests_uri = try resolveRequired(init.environ_map, cli.manifests_uri, configured_uris.manifests, "ANTFLY_SERVERLESS_MANIFESTS_URI"),
         .wal_uri = try resolveRequired(init.environ_map, cli.wal_uri, configured_uris.wal, "ANTFLY_SERVERLESS_WAL_URI"),
@@ -133,6 +168,12 @@ pub fn runFromIterator(
         .query_cache_dir = cli.query_cache_dir orelse init.environ_map.get("ANTFLY_SERVERLESS_QUERY_CACHE_DIR"),
         .query_cache_max_bytes = cli.query_cache_max_bytes orelse try parseEnvIntOrDefault(init.environ_map, u64, "ANTFLY_SERVERLESS_QUERY_CACHE_MAX_BYTES", serverless_default_query_cache_max_bytes),
         .query_cache_payload_max_bytes = cli.query_cache_payload_max_bytes orelse try parseEnvIntOrDefault(init.environ_map, u64, "ANTFLY_SERVERLESS_QUERY_CACHE_PAYLOAD_MAX_BYTES", serverless_default_query_cache_payload_max_bytes),
+        .manifest_write_version = cli.manifest_write_version orelse try parseEnvIntOrDefault(
+            init.environ_map,
+            u16,
+            "ANTFLY_SERVERLESS_MANIFEST_WRITE_VERSION",
+            serverless.manifest.codec.wire_version,
+        ),
         .embedding_indexes_json = cli.embedding_indexes_json orelse init.environ_map.get("ANTFLY_SERVERLESS_EMBEDDING_INDEXES_JSON"),
         .sparse_embedding_index_name = cli.sparse_embedding_index_name orelse init.environ_map.get("ANTFLY_SERVERLESS_SPARSE_EMBEDDING_INDEX_NAME") orelse "serverless_sparse",
         .chunk_embedding_index_name = cli.chunk_embedding_index_name orelse init.environ_map.get("ANTFLY_SERVERLESS_CHUNK_EMBEDDING_INDEX_NAME") orelse "serverless_chunk",
@@ -148,12 +189,19 @@ pub fn runFromIterator(
         .query_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.query.max_concurrent_requests else antfly.common.config.default_query_max_concurrent_requests,
         .graph_execution_limits = if (loaded_config) |*cfg| cfg.graph_execution else .{},
         .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
+        .graph_metric_max_parallelism = cli.graph_metric_max_parallelism orelse try parseEnvIntOrDefault(
+            init.environ_map,
+            u8,
+            "ANTFLY_SERVERLESS_GRAPH_METRIC_MAX_PARALLELISM",
+            serverless_default_graph_metric_max_parallelism,
+        ),
     };
     const listener_enabled = forced_listener orelse listenerEnabledForRole(bootstrap.role);
     const listener = if (listener_enabled) try serverless_serverConfigFromEnv(init.environ_map, cli) else null;
 
     var srv = serverless.ServerlessServer.init(alloc, runtime_io, .{
         .bootstrap = bootstrap,
+        .http = .{ .secret_store = if (secret_store) |*store| store else null, .secret_admin_token = init.environ_map.get("ANTFLY_SECRET_ADMIN_TOKEN") },
         .listener = listener,
     }) catch |err| {
         reportStartupError(err);
@@ -307,6 +355,10 @@ fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
             cfg.query_cache_payload_max_bytes = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
+        if (std.mem.eql(u8, arg, "--manifest-write-version")) {
+            cfg.manifest_write_version = try std.fmt.parseInt(u16, args.next() orelse return error.InvalidArguments, 10);
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--embedding-indexes-json")) {
             cfg.embedding_indexes_json = args.next() orelse return error.InvalidArguments;
             continue;
@@ -341,6 +393,10 @@ fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
         }
         if (std.mem.eql(u8, arg, "--max-connection-threads")) {
             cfg.max_connection_threads = try std.fmt.parseInt(u32, args.next() orelse return error.InvalidArguments, 10);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--graph-metric-max-parallelism")) {
+            cfg.graph_metric_max_parallelism = try std.fmt.parseInt(u8, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
         if (std.mem.eql(u8, arg, "--role")) {
@@ -652,12 +708,14 @@ fn printUsage(argv0: []const u8) void {
         \\  --catalog-uri <uri>
         \\  --query-cache-dir <path>
         \\  --query-cache-max-bytes <bytes>
+        \\  --manifest-write-version <18>
         \\  --query-cache-payload-max-bytes <bytes>
         \\  --host <host>
         \\  --port <port>
         \\  --health-port <port>
         \\  --max-request-bytes <bytes>
         \\  --max-connection-threads <count>
+        \\  --graph-metric-max-parallelism <1..16>
         \\  --role <combined|api|query|maintenance>
         \\  --tick-ms <milliseconds>
         \\  --publish-enabled <true|false>
@@ -682,11 +740,13 @@ fn printUsage(argv0: []const u8) void {
         \\  ANTFLY_SERVERLESS_QUERY_CACHE_DIR
         \\  ANTFLY_SERVERLESS_QUERY_CACHE_MAX_BYTES default: 4294967296
         \\  ANTFLY_SERVERLESS_QUERY_CACHE_PAYLOAD_MAX_BYTES default: 67108864
+        \\  ANTFLY_SERVERLESS_MANIFEST_WRITE_VERSION default: 18 (only the current version is supported)
         \\  ANTFLY_SERVERLESS_BIND_HOST      default: 127.0.0.1
         \\  ANTFLY_SERVERLESS_BIND_PORT      default: 8080
         \\  ANTFLY_SERVERLESS_HEALTH_PORT    default: unset (disables dedicated health server)
         \\  ANTFLY_SERVERLESS_MAX_REQUEST_BYTES default: 33554432
         \\  ANTFLY_SERVERLESS_MAX_CONNECTION_THREADS default: 64 (0 unbounded)
+        \\  ANTFLY_SERVERLESS_GRAPH_METRIC_MAX_PARALLELISM default: 4
         \\  ANTFLY_SERVERLESS_ROLE           default: combined
         \\  ANTFLY_SERVERLESS_TICK_INTERVAL_MS default: 25
         \\  ANTFLY_SERVERLESS_PUBLISH_ENABLED default: true
@@ -715,6 +775,7 @@ fn startupErrorHint(err: anyerror) ?[]const u8 {
         error.InvalidQueryCacheBudget => "invalid query cache budget; ANTFLY_SERVERLESS_QUERY_CACHE_MAX_BYTES must be greater than zero when the cache is enabled",
         error.InvalidQueryCachePayloadBudget => "invalid query cache payload budget; ANTFLY_SERVERLESS_QUERY_CACHE_PAYLOAD_MAX_BYTES must be greater than zero when the cache is enabled",
         error.QueryCachePayloadExceedsBudget => "invalid query cache budgets; the per-payload limit cannot exceed the total cache limit",
+        error.InvalidGraphMetricBuildOptions => "invalid graph metric build options; ANTFLY_SERVERLESS_GRAPH_METRIC_MAX_PARALLELISM must be between 1 and 16",
         error.InvalidRuntimeRole => "invalid runtime role; expected combined, api, query, or maintenance",
         error.InvalidEnvironmentValue => "invalid serverless environment configuration; see the preceding variable-specific error",
         error.MissingEndpoint => "missing S3-compatible endpoint; configure the storage connection endpoint or AWS_ENDPOINT_URL",

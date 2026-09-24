@@ -22,12 +22,49 @@ const Allocator = std.mem.Allocator;
 /// defers the next embed batch while it is non-zero so interactive embeds
 /// get the embedder first. Lives here so the embed loop has no dependency
 /// on HTTP wiring.
-pub var interactive_embed_inflight: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+pub const interactive_embed_inflight = InteractiveCounter{ .kind = 0 };
 
 /// Process-wide count of interactive generation requests. Background asset
 /// producers (including GLiNER extraction) yield between batches while this is
 /// non-zero so long-running backfills do not contend with user-facing answers.
-pub var interactive_generate_inflight: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+pub const interactive_generate_inflight = InteractiveCounter{ .kind = 1 };
+
+var local_interactive_counters = [_]std.atomic.Value(u32){ .init(0), .init(0) };
+
+const InteractiveCounter = struct {
+    kind: u32,
+
+    pub fn fetchAdd(self: @This(), value: u32, comptime order: std.builtin.AtomicOrder) u32 {
+        if (comptime @import("storage_source_options").control_only)
+            return @import("kernel_owner_abi").antfly_storage_interactive_activity(self.kind, @intCast(value));
+        return local_interactive_counters[self.kind].fetchAdd(value, order);
+    }
+
+    pub fn fetchSub(self: @This(), value: u32, comptime order: std.builtin.AtomicOrder) u32 {
+        if (comptime @import("storage_source_options").control_only)
+            return @import("kernel_owner_abi").antfly_storage_interactive_activity(self.kind, -@as(i32, @intCast(value)));
+        return local_interactive_counters[self.kind].fetchSub(value, order);
+    }
+
+    pub fn load(self: @This(), comptime order: std.builtin.AtomicOrder) u32 {
+        if (comptime @import("storage_source_options").control_only)
+            return @import("kernel_owner_abi").antfly_storage_interactive_activity(self.kind, 0);
+        return local_interactive_counters[self.kind].load(order);
+    }
+};
+
+/// Called only by the physical storage archive. Returns the previous count.
+/// One call surrounds an interactive inference operation, never a record loop.
+pub fn interactiveActivity(kind: u32, delta: i32) callconv(.c) u32 {
+    std.debug.assert(kind < local_interactive_counters.len);
+    const counter = &local_interactive_counters[kind];
+    if (delta == 0) return counter.load(.monotonic);
+    if (delta > 0) return counter.fetchAdd(@intCast(delta), .monotonic);
+    const amount: u32 = @intCast(-@as(i64, delta));
+    const previous = counter.fetchSub(amount, .monotonic);
+    std.debug.assert(previous >= amount);
+    return previous;
+}
 
 pub const ExecutionPolicy = struct {
     batch_items: ?usize = null,
@@ -139,6 +176,10 @@ pub const GeneratedEnrichmentRequest = struct {
     persist_artifact: bool = false,
     content_type: []const u8 = "",
     producer_json: []const u8 = "",
+    /// Serialized neighbor-context configuration for asset producers. When
+    /// non-empty, the runtime samples the document's same-shard graph
+    /// adjacency into the rendered producer input before dispatch.
+    neighbor_context_json: []const u8 = "",
     execution_json: []const u8 = "",
     /// Upstream materialized asset for a chunk-backed request, pinned with the
     /// same catalog generation as the rest of the plan.
@@ -177,6 +218,7 @@ pub fn freeGeneratedRequest(alloc: Allocator, request: GeneratedEnrichmentReques
     if (request.chunker_json.len > 0) alloc.free(request.chunker_json);
     if (request.content_type.len > 0) alloc.free(request.content_type);
     if (request.producer_json.len > 0) alloc.free(request.producer_json);
+    if (request.neighbor_context_json.len > 0) alloc.free(request.neighbor_context_json);
     if (request.execution_json.len > 0) alloc.free(request.execution_json);
     if (request.upstream_artifact_name.len > 0) alloc.free(request.upstream_artifact_name);
     for (request.consumer_indexes) |name| alloc.free(name);
@@ -202,6 +244,8 @@ pub fn cloneGeneratedRequest(alloc: Allocator, request: GeneratedEnrichmentReque
     errdefer if (content_type.len > 0) alloc.free(content_type);
     const producer_json = if (request.producer_json.len > 0) try alloc.dupe(u8, request.producer_json) else "";
     errdefer if (producer_json.len > 0) alloc.free(producer_json);
+    const neighbor_context_json = if (request.neighbor_context_json.len > 0) try alloc.dupe(u8, request.neighbor_context_json) else "";
+    errdefer if (neighbor_context_json.len > 0) alloc.free(neighbor_context_json);
     const execution_json = if (request.execution_json.len > 0) try alloc.dupe(u8, request.execution_json) else "";
     errdefer if (execution_json.len > 0) alloc.free(execution_json);
     const upstream_artifact_name = if (request.upstream_artifact_name.len > 0) try alloc.dupe(u8, request.upstream_artifact_name) else "";
@@ -234,6 +278,7 @@ pub fn cloneGeneratedRequest(alloc: Allocator, request: GeneratedEnrichmentReque
         .persist_artifact = request.persist_artifact,
         .content_type = content_type,
         .producer_json = producer_json,
+        .neighbor_context_json = neighbor_context_json,
         .execution_json = execution_json,
         .upstream_artifact_name = upstream_artifact_name,
         .consumer_indexes = consumer_indexes,

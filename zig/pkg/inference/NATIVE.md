@@ -19,47 +19,44 @@ Today two concerns are coupled:
 
 That makes Linux and cross-platform builds more fragile than they need to be. The code already contains pure Zig SIMD/scalar fallbacks for the hot GEMM entry points, so the right move is to make the portable CPU backend always available and treat OpenBLAS/Accelerate as an optimization layer.
 
-## Current Status
+## Status
 
-- [x] Native CPU backend availability decoupled from system BLAS linkage.
-- [x] `-Dsystem-blas` controls optional system BLAS acceleration.
-- [x] Native builds report the `native` backend explicitly.
-- [x] Backend identity stays `native`.
-- [x] Shared pure Zig kernels live in `lib/linalg` and are reused by native and WASM.
-- [x] Add explicit build/docs support for optional system BLAS roots on non-macOS.
-- [x] CLI/help/version surfaces describe native vs system BLAS cleanly.
+- Native CPU backend availability is decoupled from system BLAS linkage.
+- `-Dsystem-blas` controls optional system BLAS acceleration.
+- Native builds report the `native` backend explicitly.
+- Backend identity stays `native`.
+- Shared pure Zig kernels live in `lib/linalg` and are reused by native and WASM.
+- Optional system BLAS roots on non-macOS have explicit build/docs support.
+- CLI/help/version surfaces describe native vs system BLAS cleanly.
 
-## Phase Plan
+## Design
 
-### Phase 1: Decouple availability from acceleration
+### Availability decoupled from acceleration
 
-Done in this change.
+Native builds always expose the CPU fallback backend.
 
-- Native builds always expose the CPU fallback backend.
 - `build_options.enable_native` means the portable CPU backend is available.
 - `build_options.enable_system_blas` controls whether `cblas`/Accelerate is imported and linked.
 
-### Phase 2: Shared kernel layer
+### Shared kernel layer
 
-Done in this change.
-
-Created `lib/linalg/src/mod.zig` as the shared pure Zig linear algebra module for:
+`lib/linalg/src/mod.zig` is the shared pure Zig linear algebra module for:
 
 - `sgemm`
 - `sgemmTransA`
 - `sgemmTransB`
 - simple normalization/reduction helpers where reuse is clean
 
-`src/backends/native.zig` should become a thin dispatch layer:
+`src/backends/native.zig` is a thin dispatch layer:
 
 - use system BLAS when available
 - otherwise call the shared Zig kernels
 
-WASM now calls the same shared kernels directly where that reduces duplication.
+WASM calls the same shared kernels directly where that reduces duplication.
 
-### Phase 3: Backend cleanup
+### Backend surface
 
-Done for the public backend surface:
+The public backend surface is consistent across:
 
 - backend enums
 - backend selection logic
@@ -67,9 +64,9 @@ Done for the public backend surface:
 - server version reporting
 - docs
 
-### Phase 4: Optional system BLAS configuration
+### Optional system BLAS configuration
 
-Done for non-macOS native acceleration:
+Non-macOS native acceleration is configured with:
 
 - `-Dblas-root=/path`
 - `-Dsystem-blas=true|false`
@@ -91,11 +88,11 @@ for the current format and shape.
 
 Dense dequant+SGEMM remains an explicit rollout and benchmark path:
 
-- `ANTFLY_INFERENCE_QUANT_DEQUANT_SGEMM=1` enables the supported-format dense dequant
+- `TERMITE_QUANT_DEQUANT_SGEMM=1` enables the supported-format dense dequant
   path.
-- `ANTFLY_INFERENCE_QUANT_DEQUANT_SGEMM_CACHE_BYTES` bounds the persistent f32 cache.
-- `ANTFLY_INFERENCE_QUANT_DEQUANT_CACHE=0` disables the persistent dense cache.
-- `ANTFLY_INFERENCE_QUANT_DEQUANT_SGEMM_SCRATCH=1` enables transient dense scratch for
+- `TERMITE_QUANT_DEQUANT_SGEMM_CACHE_BYTES` bounds the persistent f32 cache.
+- `TERMITE_QUANT_DEQUANT_CACHE=0` disables the persistent dense cache.
+- `TERMITE_QUANT_DEQUANT_SGEMM_SCRATCH=1` enables transient dense scratch for
   benchmark/debug runs.
 
 Cache denial falls back to the direct quant kernel instead of silently
@@ -105,9 +102,9 @@ normal native backend configuration. Production paths should rely on dispatcher
 defaults and the bounded dequant controls above.
 
 Quantized direct kernels use the persistent native worker pool by default. Use
-`ANTFLY_INFERENCE_QUANT_PARALLEL=0` for single-threaded debugging,
-`ANTFLY_INFERENCE_QUANT_PARALLEL_WORKERS` to cap worker count, and
-`ANTFLY_INFERENCE_QUANT_PARALLEL_DEBUG=1` to print dispatch decisions.
+`TERMITE_QUANT_PARALLEL=0` for single-threaded debugging,
+`TERMITE_QUANT_PARALLEL_WORKERS` to cap worker count, and
+`TERMITE_QUANT_PARALLEL_DEBUG=1` to print dispatch decisions.
 
 ## Notes
 

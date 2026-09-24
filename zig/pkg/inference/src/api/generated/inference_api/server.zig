@@ -17,6 +17,11 @@ pub fn parseChunkTextBody(allocator: std.mem.Allocator, body: []const u8) !std.j
     return std.json.parseFromSlice(types.ChunkRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Parse the JSON request body for dictate.
+pub fn parseDictateBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.DictateRequest) {
+    return std.json.parseFromSlice(types.DictateRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Parse the JSON request body for generateEmbeddings.
 pub fn parseGenerateEmbeddingsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.EmbedRequest) {
     return std.json.parseFromSlice(types.EmbedRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -52,14 +57,9 @@ pub fn parseReadImagesBody(allocator: std.mem.Allocator, body: []const u8) !std.
     return std.json.parseFromSlice(types.ReadRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
-/// Parse the JSON request body for rerankPrompts.
-pub fn parseRerankPromptsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RerankRequest) {
+/// Parse the JSON request body for rerankDocuments.
+pub fn parseRerankDocumentsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RerankRequest) {
     return std.json.parseFromSlice(types.RerankRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Parse the JSON request body for rerankMultimodalPrompts.
-pub fn parseRerankMultimodalPromptsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RerankMultimodalRequest) {
-    return std.json.parseFromSlice(types.RerankMultimodalRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// Parse the JSON request body for rewriteText.
@@ -71,6 +71,50 @@ pub fn parseRewriteTextBody(allocator: std.mem.Allocator, body: []const u8) !std
 pub fn parseTranscribeAudioBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TranscribeRequest) {
     return std.json.parseFromSlice(types.TranscribeRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
+
+/// Parse the JSON request body for createTranscriptionSession.
+pub fn parseCreateTranscriptionSessionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TranscriptionSessionRequest) {
+    return std.json.parseFromSlice(types.TranscriptionSessionRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Inspect a streaming transcription session
+pub const GetTranscriptionSessionPathParams = struct {
+    session_id: []const u8,
+};
+
+/// Close a streaming transcription session
+pub const DeleteTranscriptionSessionPathParams = struct {
+    session_id: []const u8,
+};
+
+/// Append audio to a streaming transcription session
+pub const AppendTranscriptionAudioPathParams = struct {
+    session_id: []const u8,
+};
+
+/// Parse the JSON request body for appendTranscriptionAudio.
+pub fn parseAppendTranscriptionAudioBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TranscriptionAudioAppend) {
+    return std.json.parseFromSlice(types.TranscriptionAudioAppend, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Subscribe to a session's transcript events
+pub const StreamTranscriptionSessionEventsPathParams = struct {
+    session_id: []const u8,
+};
+
+/// Stream raw audio into a session and receive events as they occur
+pub const StreamTranscriptionAudioPathParams = struct {
+    session_id: []const u8,
+};
+
+pub const StreamTranscriptionAudioParams = struct {
+    /// Raw sample format. Default pcm16.
+    format: ?[]const u8 = null,
+    /// Sample rate of the raw stream. Default 16000.
+    sample_rate: ?[]const u8 = null,
+    /// Finalize open speech at end of body. Default true.
+    commit: ?[]const u8 = null,
+};
 
 /// Route metadata for all operations.
 pub const RequestBodyMode = enum { none, buffered };
@@ -86,6 +130,7 @@ pub const Route = struct {
 pub const routes = [_]Route{
     .{ .method = "POST", .path = "/chat/completions", .operation_id = "chatCompletions", .request_body = .buffered, .streaming_response = true },
     .{ .method = "POST", .path = "/chunk", .operation_id = "chunkText", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/dictate", .operation_id = "dictate", .request_body = .buffered, .streaming_response = true },
     .{ .method = "POST", .path = "/embed", .operation_id = "generateEmbeddings", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/embeddings", .operation_id = "createEmbedding", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/extract", .operation_id = "extract", .request_body = .buffered, .streaming_response = false },
@@ -95,10 +140,15 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/predict", .operation_id = "predict", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/predictors", .operation_id = "listPredictors", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/read", .operation_id = "readImages", .request_body = .buffered, .streaming_response = false },
-    .{ .method = "POST", .path = "/rerank", .operation_id = "rerankPrompts", .request_body = .buffered, .streaming_response = false },
-    .{ .method = "POST", .path = "/rerank_multimodal", .operation_id = "rerankMultimodalPrompts", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/rerank", .operation_id = "rerankDocuments", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/rewrite", .operation_id = "rewriteText", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/transcribe", .operation_id = "transcribeAudio", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/transcription/sessions", .operation_id = "createTranscriptionSession", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/transcription/sessions/{session_id}", .operation_id = "getTranscriptionSession", .request_body = .none, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/transcription/sessions/{session_id}", .operation_id = "deleteTranscriptionSession", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/transcription/sessions/{session_id}/audio", .operation_id = "appendTranscriptionAudio", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/transcription/sessions/{session_id}/events", .operation_id = "streamTranscriptionSessionEvents", .request_body = .none, .streaming_response = true },
+    .{ .method = "POST", .path = "/transcription/sessions/{session_id}/stream", .operation_id = "streamTranscriptionAudio", .request_body = .none, .streaming_response = true },
 };
 
 /// Generated server router for httpx. Register routes on an httpx.Server
@@ -114,6 +164,7 @@ pub fn ServerRouter(comptime Impl: type) type {
     comptime {
         if (!@hasDecl(Impl, "chatCompletions")) @compileError("ServerRouter: Impl missing required method 'chatCompletions'");
         if (!@hasDecl(Impl, "chunkText")) @compileError("ServerRouter: Impl missing required method 'chunkText'");
+        if (!@hasDecl(Impl, "dictate")) @compileError("ServerRouter: Impl missing required method 'dictate'");
         if (!@hasDecl(Impl, "generateEmbeddings")) @compileError("ServerRouter: Impl missing required method 'generateEmbeddings'");
         if (!@hasDecl(Impl, "createEmbedding")) @compileError("ServerRouter: Impl missing required method 'createEmbedding'");
         if (!@hasDecl(Impl, "extract")) @compileError("ServerRouter: Impl missing required method 'extract'");
@@ -123,10 +174,15 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "predict")) @compileError("ServerRouter: Impl missing required method 'predict'");
         if (!@hasDecl(Impl, "listPredictors")) @compileError("ServerRouter: Impl missing required method 'listPredictors'");
         if (!@hasDecl(Impl, "readImages")) @compileError("ServerRouter: Impl missing required method 'readImages'");
-        if (!@hasDecl(Impl, "rerankPrompts")) @compileError("ServerRouter: Impl missing required method 'rerankPrompts'");
-        if (!@hasDecl(Impl, "rerankMultimodalPrompts")) @compileError("ServerRouter: Impl missing required method 'rerankMultimodalPrompts'");
+        if (!@hasDecl(Impl, "rerankDocuments")) @compileError("ServerRouter: Impl missing required method 'rerankDocuments'");
         if (!@hasDecl(Impl, "rewriteText")) @compileError("ServerRouter: Impl missing required method 'rewriteText'");
         if (!@hasDecl(Impl, "transcribeAudio")) @compileError("ServerRouter: Impl missing required method 'transcribeAudio'");
+        if (!@hasDecl(Impl, "createTranscriptionSession")) @compileError("ServerRouter: Impl missing required method 'createTranscriptionSession'");
+        if (!@hasDecl(Impl, "getTranscriptionSession")) @compileError("ServerRouter: Impl missing required method 'getTranscriptionSession'");
+        if (!@hasDecl(Impl, "deleteTranscriptionSession")) @compileError("ServerRouter: Impl missing required method 'deleteTranscriptionSession'");
+        if (!@hasDecl(Impl, "appendTranscriptionAudio")) @compileError("ServerRouter: Impl missing required method 'appendTranscriptionAudio'");
+        if (!@hasDecl(Impl, "streamTranscriptionSessionEvents")) @compileError("ServerRouter: Impl missing required method 'streamTranscriptionSessionEvents'");
+        if (!@hasDecl(Impl, "streamTranscriptionAudio")) @compileError("ServerRouter: Impl missing required method 'streamTranscriptionAudio'");
     }
 
     return struct {
@@ -140,6 +196,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         pub fn register(self: *const @This(), server: anytype) !void {
             try server.post("/chat/completions", httpx.Handler.bind(self.impl, chatCompletions));
             try server.post("/chunk", httpx.Handler.bind(self.impl, chunkText));
+            try server.post("/dictate", httpx.Handler.bind(self.impl, dictate));
             try server.post("/embed", httpx.Handler.bind(self.impl, generateEmbeddings));
             try server.post("/embeddings", httpx.Handler.bind(self.impl, createEmbedding));
             try server.post("/extract", httpx.Handler.bind(self.impl, extract));
@@ -149,10 +206,15 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/predict", httpx.Handler.bind(self.impl, predict));
             try server.get("/predictors", httpx.Handler.bind(self.impl, listPredictors));
             try server.post("/read", httpx.Handler.bind(self.impl, readImages));
-            try server.post("/rerank", httpx.Handler.bind(self.impl, rerankPrompts));
-            try server.post("/rerank_multimodal", httpx.Handler.bind(self.impl, rerankMultimodalPrompts));
+            try server.post("/rerank", httpx.Handler.bind(self.impl, rerankDocuments));
             try server.post("/rewrite", httpx.Handler.bind(self.impl, rewriteText));
             try server.post("/transcribe", httpx.Handler.bind(self.impl, transcribeAudio));
+            try server.post("/transcription/sessions", httpx.Handler.bind(self.impl, createTranscriptionSession));
+            try server.get("/transcription/sessions/:session_id", httpx.Handler.bind(self.impl, getTranscriptionSession));
+            try server.delete("/transcription/sessions/:session_id", httpx.Handler.bind(self.impl, deleteTranscriptionSession));
+            try server.post("/transcription/sessions/:session_id/audio", httpx.Handler.bind(self.impl, appendTranscriptionAudio));
+            try server.get("/transcription/sessions/:session_id/events", httpx.Handler.bind(self.impl, streamTranscriptionSessionEvents));
+            try server.post("/transcription/sessions/:session_id/stream", httpx.Handler.bind(self.impl, streamTranscriptionAudio));
         }
 
         /// OpenAI Chat Completions endpoint
@@ -165,6 +227,12 @@ pub fn ServerRouter(comptime Impl: type) type {
         /// POST /chunk
         fn chunkText(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.chunkText(ctx);
+        }
+
+        /// Dictate speech into clean written text
+        /// POST /dictate
+        fn dictate(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.dictate(ctx);
         }
 
         /// Create embeddings (alias of `/embeddings`)
@@ -221,16 +289,10 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.readImages(ctx);
         }
 
-        /// Rerank prompts by relevance
+        /// Rerank documents by relevance
         /// POST /rerank
-        fn rerankPrompts(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
-            return impl.rerankPrompts(ctx);
-        }
-
-        /// Rerank multimodal documents by relevance
-        /// POST /rerank_multimodal
-        fn rerankMultimodalPrompts(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
-            return impl.rerankMultimodalPrompts(ctx);
+        fn rerankDocuments(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.rerankDocuments(ctx);
         }
 
         /// Rewrite text using Seq2Seq models
@@ -244,6 +306,52 @@ pub fn ServerRouter(comptime Impl: type) type {
         fn transcribeAudio(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.transcribeAudio(ctx);
         }
+
+        /// Open a streaming transcription session
+        /// POST /transcription/sessions
+        fn createTranscriptionSession(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.createTranscriptionSession(ctx);
+        }
+
+        /// Inspect a streaming transcription session
+        /// GET /transcription/sessions/{session_id}
+        fn getTranscriptionSession(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const session_id = ctx.param("session_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: session_id" });
+            return impl.getTranscriptionSession(ctx, session_id);
+        }
+
+        /// Close a streaming transcription session
+        /// DELETE /transcription/sessions/{session_id}
+        fn deleteTranscriptionSession(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const session_id = ctx.param("session_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: session_id" });
+            return impl.deleteTranscriptionSession(ctx, session_id);
+        }
+
+        /// Append audio to a streaming transcription session
+        /// POST /transcription/sessions/{session_id}/audio
+        fn appendTranscriptionAudio(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const session_id = ctx.param("session_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: session_id" });
+            return impl.appendTranscriptionAudio(ctx, session_id);
+        }
+
+        /// Subscribe to a session's transcript events
+        /// GET /transcription/sessions/{session_id}/events
+        fn streamTranscriptionSessionEvents(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const session_id = ctx.param("session_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: session_id" });
+            return impl.streamTranscriptionSessionEvents(ctx, session_id);
+        }
+
+        /// Stream raw audio into a session and receive events as they occur
+        /// POST /transcription/sessions/{session_id}/stream
+        fn streamTranscriptionAudio(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const session_id = ctx.param("session_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: session_id" });
+            const query_params = StreamTranscriptionAudioParams{
+                .format = try ctx.queryDecoded("format"),
+                .sample_rate = try ctx.queryDecoded("sample_rate"),
+                .commit = try ctx.queryDecoded("commit"),
+            };
+            return impl.streamTranscriptionAudio(ctx, session_id, query_params);
+        }
     };
 }
 
@@ -251,6 +359,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //
 //   fn chatCompletions(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn chunkText(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn dictate(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn generateEmbeddings(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn createEmbedding(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn extract(self: *Impl, ctx: *httpx.Context) !httpx.Response
@@ -260,7 +369,12 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn predict(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listPredictors(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn readImages(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn rerankPrompts(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn rerankMultimodalPrompts(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn rerankDocuments(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn rewriteText(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn transcribeAudio(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn createTranscriptionSession(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn getTranscriptionSession(self: *Impl, ctx: *httpx.Context, session_id: []const u8) !httpx.Response
+//   fn deleteTranscriptionSession(self: *Impl, ctx: *httpx.Context, session_id: []const u8) !httpx.Response
+//   fn appendTranscriptionAudio(self: *Impl, ctx: *httpx.Context, session_id: []const u8) !httpx.Response
+//   fn streamTranscriptionSessionEvents(self: *Impl, ctx: *httpx.Context, session_id: []const u8) !httpx.Response
+//   fn streamTranscriptionAudio(self: *Impl, ctx: *httpx.Context, session_id: []const u8, params: StreamTranscriptionAudioParams) !httpx.Response

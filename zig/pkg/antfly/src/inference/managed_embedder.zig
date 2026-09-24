@@ -62,6 +62,8 @@ const shared_vector = @import("antfly_vector").vector;
 const antfly_image = @import("antfly_image");
 var traced_local_batches = std.atomic.Value(u64).init(0);
 
+pub const SparseEmbedding = db_embedder.SparseEmbedding;
+
 fn getenv(name: [*:0]const u8) ?[*:0]u8 {
     if (!builtin.link_libc) return null;
     return std.c.getenv(name);
@@ -69,6 +71,7 @@ fn getenv(name: [*:0]const u8) ?[*:0]u8 {
 
 pub const ProviderKind = enum {
     openai,
+    openrouter,
     ollama,
     bedrock,
     cohere,
@@ -168,6 +171,16 @@ pub const AntflyProvider = struct {
         model: []const u8,
         query: []const u8,
         documents: []const []const u8,
+        context: RequestContext,
+    ) anyerror![]f32 = null,
+    /// Reranks documents given as ordered content parts, which may include
+    /// images. Binary media stays borrowed for the synchronous call.
+    rerank_documents_with_context: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        query: []const u8,
+        documents: []const []const template_mod.ContentPart,
         context: RequestContext,
     ) anyerror![]f32 = null,
     generate_text: ?*const fn (
@@ -629,7 +642,10 @@ pub const ManagedEmbeddingEntry = struct {
     provider_runtime: ?*ProviderRuntime = null,
     dimensions: u32,
     sparse: bool = false,
-    multimodal: bool = false,
+    /// Configured `inputs`: replaces the model's discovered input types, for
+    /// models whose capabilities Antfly cannot discover yet. Null means the
+    /// capabilities come from the model.
+    declared_inputs: ?embeddings_types.Inputs = null,
     requests_per_minute: u32 = 0,
     burst: u32 = default_pacing_burst,
     rate_limit: provider_limits.Policy = .{},
@@ -652,6 +668,24 @@ pub const ManagedEmbeddingEntry = struct {
         overlay.shared_remote_capability_cache = self.capabilityCache();
         overlay.remote_capability_cache = null;
         return overlay;
+    }
+
+    /// True when configuration declares image or audio inputs.
+    fn declaresMedia(self: *const ManagedEmbeddingEntry) bool {
+        return if (self.declared_inputs) |inputs| inputs.hasMedia() else false;
+    }
+
+    /// Whether media may be sent to this entry at all. Declared inputs
+    /// decide when present. Otherwise an Antfly model is eligible and its
+    /// capabilities, resolved per request, decide; Bedrock is eligible for
+    /// the request formats that carry images; other adapters are text-only.
+    fn mayEmbedMedia(self: *const ManagedEmbeddingEntry) bool {
+        if (self.declared_inputs) |inputs| return inputs.hasMedia();
+        return switch (self.provider) {
+            .antfly => true,
+            .bedrock => self.bedrock_request_format == .titan_multimodal or self.bedrock_request_format == .cohere_v4,
+            else => false,
+        };
     }
 
     fn httpClient(self: *const ManagedEmbeddingEntry, alloc: std.mem.Allocator, fallback: *?httpx.Client) !*httpx.Client {
@@ -742,7 +776,7 @@ fn managedEmbeddingCredentialSourceIdentity(
 ) credential_source_identity.CredentialSourceIdentity {
     const Identity = credential_source_identity.CredentialSourceIdentity;
     return switch (entry.provider) {
-        .openai, .cohere, .gemini, .antfly => credential_source_identity.fromSecretValue(entry.api_key),
+        .openai, .openrouter, .cohere, .gemini, .antfly => credential_source_identity.fromSecretValue(entry.api_key),
         .vertex => Identity.googleAdc(if (entry.credentials_path.len > 0) entry.credentials_path else null),
         // Managed Bedrock currently exposes the process-wide AWS default
         // chain. Profile and web-identity constructors live in the shared
@@ -760,7 +794,7 @@ fn managedEmbeddingEntriesEquivalentForLookup(
     return managedEmbeddingEndpointIdentity(lhs).eql(managedEmbeddingEndpointIdentity(rhs)) and
         lhs.dimensions == rhs.dimensions and
         lhs.sparse == rhs.sparse and
-        lhs.multimodal == rhs.multimodal and
+        std.meta.eql(lhs.declared_inputs, rhs.declared_inputs) and
         std.meta.eql(lhs.rate_limit, rhs.rate_limit) and
         lhs.requests_per_minute == rhs.requests_per_minute and
         lhs.burst == rhs.burst and
@@ -789,7 +823,7 @@ fn managedEmbeddingEntriesSemanticallyEquivalent(
     return lhs.provider == rhs.provider and
         lhs.dimensions == rhs.dimensions and
         lhs.sparse == rhs.sparse and
-        lhs.multimodal == rhs.multimodal and
+        std.meta.eql(lhs.declared_inputs, rhs.declared_inputs) and
         std.mem.eql(u8, lhs.model, rhs.model) and
         std.mem.eql(u8, lhs.base_url, rhs.base_url) and
         std.mem.eql(u8, lhs.region, rhs.region) and
@@ -1088,7 +1122,20 @@ pub const ManagedEmbedder = struct {
         return try initFromIndexValueObjectWithOptions(alloc, root, .{});
     }
 
-    fn initFromIndexValueObjectWithOptions(alloc: std.mem.Allocator, root: std.json.Value, supplied_options: InitOptions) !ManagedEmbedder {
+    pub fn initFromIndexValueObjectWithOptions(alloc: std.mem.Allocator, root: std.json.Value, options: InitOptions) !ManagedEmbedder {
+        return try initFromIndexValueObjectWithOptionsAndKind(alloc, root, options, null);
+    }
+
+    pub fn initDenseFromIndexValueObjectWithOptions(alloc: std.mem.Allocator, root: std.json.Value, options: InitOptions) !ManagedEmbedder {
+        return try initFromIndexValueObjectWithOptionsAndKind(alloc, root, options, false);
+    }
+
+    fn initFromIndexValueObjectWithOptionsAndKind(
+        alloc: std.mem.Allocator,
+        root: std.json.Value,
+        supplied_options: InitOptions,
+        sparse_kind: ?bool,
+    ) !ManagedEmbedder {
         const object = switch (root) {
             .object => |object| object,
             else => return error.InvalidManagedEmbeddingIndex,
@@ -1106,14 +1153,14 @@ pub const ManagedEmbedder = struct {
 
         var it = object.iterator();
         while (it.next()) |entry| {
-            var managed = try parseManagedEmbeddingEntry(alloc, entry.key_ptr.*, entry.value_ptr.*, options) orelse continue;
+            var managed = try parseManagedEmbeddingEntry(alloc, entry.key_ptr.*, entry.value_ptr.*, options, sparse_kind) orelse continue;
             entries.append(alloc, managed) catch |err| {
                 managed.deinit(alloc);
                 return err;
             };
         }
-        try validateAllEmbeddingEnrichmentProducers(alloc, root, options, entries.items);
-        try addArtifactBackedManagedEmbeddingEntries(alloc, root, options, &entries);
+        try validateAllEmbeddingEnrichmentProducers(alloc, root, options, entries.items, sparse_kind);
+        try addArtifactBackedManagedEmbeddingEntries(alloc, root, options, &entries, sparse_kind);
         var vector_spaces = VectorSpaceMap.empty;
         defer vector_spaces.deinit(alloc);
         try collectEmbeddingVectorSpaces(root, &vector_spaces, alloc);
@@ -1271,9 +1318,19 @@ pub const ManagedEmbedder = struct {
         indexes_json: []const u8,
         options: InitOptions,
     ) !?db_embedder.DenseEmbedder {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
+        defer parsed.deinit();
+        return try createDenseEmbedderFromIndexValueWithOptions(alloc, parsed.value, options);
+    }
+
+    pub fn createDenseEmbedderFromIndexValueWithOptions(
+        alloc: std.mem.Allocator,
+        root: std.json.Value,
+        options: InitOptions,
+    ) !?db_embedder.DenseEmbedder {
         const owned = try alloc.create(ManagedEmbedder);
         errdefer alloc.destroy(owned);
-        owned.* = try initFromIndexesJsonWithOptions(alloc, indexes_json, options);
+        owned.* = try initFromIndexValueObjectWithOptionsAndKind(alloc, root, options, false);
         if (!owned.hasDenseEntries()) {
             owned.deinit();
             alloc.destroy(owned);
@@ -1299,9 +1356,19 @@ pub const ManagedEmbedder = struct {
         indexes_json: []const u8,
         options: InitOptions,
     ) !?db_embedder.SparseEmbedder {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
+        defer parsed.deinit();
+        return try createSparseEmbedderFromIndexValueWithOptions(alloc, parsed.value, options);
+    }
+
+    pub fn createSparseEmbedderFromIndexValueWithOptions(
+        alloc: std.mem.Allocator,
+        root: std.json.Value,
+        options: InitOptions,
+    ) !?db_embedder.SparseEmbedder {
         const owned = try alloc.create(ManagedEmbedder);
         errdefer alloc.destroy(owned);
-        owned.* = try initFromIndexesJsonWithOptions(alloc, indexes_json, options);
+        owned.* = try initFromIndexValueObjectWithOptionsAndKind(alloc, root, options, true);
         if (!owned.hasSparseEntries()) {
             owned.deinit();
             alloc.destroy(owned);
@@ -1342,7 +1409,7 @@ pub const ManagedEmbedder = struct {
         text: []const u8,
     ) ![32]u8 {
         const entry = self.findQueryEntry(index_name) orelse return error.EmbeddingIndexNotFound;
-        if (entry.sparse or entry.multimodal) return error.QueryEmbeddingNotCacheable;
+        if (entry.sparse or entry.declaresMedia()) return error.QueryEmbeddingNotCacheable;
         const endpoint = managedEmbeddingEndpointIdentity(entry);
         // Only effective file-backed credentials depend on this store. Other
         // credential sources must neither refresh it nor invalidate on rotation.
@@ -1577,7 +1644,7 @@ pub const ManagedEmbedder = struct {
             applyRequestContext(&local_entry, value, &cancellation);
         }
         const entry = &local_entry;
-        if (entry.sparse or !entry.multimodal) return error.UnsupportedEmbeddingProvider;
+        if (entry.sparse or !entry.mayEmbedMedia()) return error.UnsupportedEmbeddingProvider;
         const lease = resolved_lease orelse try densePartLeaseForEntry(entry, alloc);
         var capabilities = lease.capabilities orelse return error.EmbeddingCapabilitiesUnavailable;
         capabilities.batch.max_items = try densePartBatchLimit(ptr, embedding_name, dims, lease, capabilities.batch.max_items);
@@ -1663,7 +1730,7 @@ pub const ManagedEmbedder = struct {
             applyRequestContext(&local_entry, value, &cancellation);
         }
         const entry = &local_entry;
-        if (entry.sparse or !entry.multimodal) return error.UnsupportedEmbeddingProvider;
+        if (entry.sparse or !entry.mayEmbedMedia()) return error.UnsupportedEmbeddingProvider;
         const local = entry.antfly_provider orelse return error.UnsupportedEmbeddingProvider;
         const embed_rasters = local.embed_dense_rasters orelse return error.UnsupportedEmbeddingProvider;
         if (items.len == 0) return try alloc.alloc([]const f32, 0);
@@ -1705,7 +1772,7 @@ pub const ManagedEmbedder = struct {
         // The local multimodal embedding ABI treats every part as one
         // independently addressable input. The limit is a model/task semantic,
         // not a blanket property of the Antfly provider.
-        return if (entry.multimodal and isAntflyProvider(entry.provider)) 1 else null;
+        return if (isAntflyProvider(entry.provider) and entry.mayEmbedMedia()) 1 else null;
     }
 
     fn jsonStringUpperBound(value: []const u8) !usize {
@@ -1854,6 +1921,12 @@ pub const ManagedEmbedder = struct {
     }
 
     fn densePartLeaseForEntry(entry: *const ManagedEmbeddingEntry, alloc: std.mem.Allocator) !inference_work.CapabilityLease {
+        var lease = try discoveredDensePartLeaseForEntry(entry, alloc);
+        if (entry.declared_inputs) |inputs| if (lease.capabilities) |*capabilities| applyDeclaredInputs(capabilities, inputs);
+        return lease;
+    }
+
+    fn discoveredDensePartLeaseForEntry(entry: *const ManagedEmbeddingEntry, alloc: std.mem.Allocator) !inference_work.CapabilityLease {
         if (entry.sparse) return error.UnsupportedEmbeddingProvider;
         if (entry.antfly_provider) |local| {
             if (local.model_capabilities) |resolve| {
@@ -1911,12 +1984,12 @@ pub const ManagedEmbedder = struct {
         }
         // Unknown remote capability is deliberately conservative. It remains
         // usable, but the document planner cannot assume fused batching or a
-        // provider-specific memory ceiling.
+        // provider-specific memory ceiling, and media needs declared inputs.
         return .{ .capabilities = .{
             .task = .embed,
-            .input_modalities = .{ .text = true, .image = entry.multimodal },
-            .accepted_mime_types = .{ .text_plain = true, .image_png = entry.multimodal, .image_jpeg = entry.multimodal },
-            .input_granularity = if (entry.multimodal) .page else .chunk,
+            .input_modalities = .{ .text = true },
+            .accepted_mime_types = .{ .text_plain = true },
+            .input_granularity = .chunk,
             .batch = .{ .mode = .serial_compatibility, .preferred_items = 1, .max_items = 1, .max_media_parts_per_item = 1 },
             .output = .embedding,
             .borrowed_attachments = false,
@@ -2210,12 +2283,33 @@ fn applyAntflyEmbeddingRequestControls(
     provider.setRequestTimeoutMs(timeout_ms);
     provider.setMaxResponseBytes(remote_embedding_max_response_bytes);
 }
+/// Replace discovered input types with configured `inputs`. Transport and
+/// batch facts stay as discovered; only what the model accepts changes.
+fn applyDeclaredInputs(capabilities: *inference_work.InferenceCapabilities, inputs: embeddings_types.Inputs) void {
+    capabilities.input_modalities = .{ .text = inputs.text, .image = inputs.image, .audio = inputs.audio };
+    var mime_types = capabilities.accepted_mime_types;
+    mime_types.text_plain = inputs.text;
+    mime_types.image_png = inputs.image;
+    mime_types.image_jpeg = inputs.image;
+    mime_types.image_webp = inputs.image;
+    mime_types.audio_wav = inputs.audio;
+    mime_types.audio_mpeg = inputs.audio;
+    capabilities.accepted_mime_types = mime_types;
+    if (!inputs.image) capabilities.borrowed_rasters = false;
+    if (inputs.hasMedia()) {
+        if (capabilities.input_granularity == .chunk) capabilities.input_granularity = .page;
+        if (capabilities.batch.max_media_parts_per_item == 0) capabilities.batch.max_media_parts_per_item = 1;
+    } else if (capabilities.input_granularity == .page) {
+        capabilities.input_granularity = .chunk;
+    }
+}
+
 fn entryForegroundBounded(entry: *const ManagedEmbeddingEntry, sparse: bool) bool {
     if (isAntflyProvider(entry.provider)) {
         if (entry.antfly_provider) |local| {
             if (sparse) return local.embed_sparse_texts_with_context != null;
             if (local.embed_dense_texts_with_context == null) return false;
-            if (entry.multimodal and local.embed_dense_parts_with_context == null)
+            if (entry.declaresMedia() and local.embed_dense_parts_with_context == null)
                 return false;
             return true;
         }
@@ -2520,6 +2614,7 @@ pub fn embeddingSemanticProducerJsonAllocWithOptions(
     defer alloc.free(project_id);
     const endpoint = switch (provider) {
         .openai => try resolveOpenAiBaseUrl(alloc, embedder_cfg),
+        .openrouter => try resolveOpenRouterBaseUrl(alloc, embedder_cfg),
         .ollama => try resolveOllamaBaseUrl(alloc, embedder_cfg),
         .bedrock => try resolveBedrockEndpoint(alloc, embedder_cfg, region),
         .cohere => try resolveCohereBaseUrl(alloc, embedder_cfg),
@@ -2542,7 +2637,6 @@ pub fn embeddingSemanticProducerJsonAllocWithOptions(
         project_id: ?[]const u8 = null,
         request_format: []const u8,
         sparse: bool,
-        multimodal: bool,
         input_type: []const u8,
         truncate: []const u8,
         query_input_type: ?[]const u8 = null,
@@ -2557,7 +2651,6 @@ pub fn embeddingSemanticProducerJsonAllocWithOptions(
         .project_id = if (project_id.len > 0) project_id else null,
         .request_format = embedder_cfg.request_format,
         .sparse = cfg.sparse orelse false,
-        .multimodal = embedder_cfg.multimodal,
         .input_type = embedder_cfg.input_type,
         .truncate = embedder_cfg.truncate,
         .query_input_type = if (embedder_cfg.query_input_type.len > 0) embedder_cfg.query_input_type else null,
@@ -3312,7 +3405,9 @@ fn semanticProducerComparisonConfigJsonAlloc(
             std.mem.eql(u8, field.key_ptr.*, "project_id") or
             std.mem.eql(u8, field.key_ptr.*, "request_format") or
             std.mem.eql(u8, field.key_ptr.*, "sparse") or
-            std.mem.eql(u8, field.key_ptr.*, "multimodal") or
+            // Identities written before input types were derived from
+            // capabilities carry this; it no longer affects identity.
+            std.mem.eql(u8, field.key_ptr.*, legacy_identity_multimodal_field) or
             std.mem.eql(u8, field.key_ptr.*, "input_type") or
             std.mem.eql(u8, field.key_ptr.*, "truncate") or
             std.mem.eql(u8, field.key_ptr.*, "query_input_type") or
@@ -3350,7 +3445,6 @@ fn semanticProducerComparisonConfigJsonAlloc(
         query_input_type: ?[]const u8 = null,
         document_input_type: ?[]const u8 = null,
         query_instruction: ?[]const u8 = null,
-        multimodal: ?bool = null,
     };
     const optionalString = struct {
         fn get(source: std.json.ObjectMap, name: []const u8) !?[]const u8 {
@@ -3359,10 +3453,9 @@ fn semanticProducerComparisonConfigJsonAlloc(
             return field.string;
         }
     }.get;
-    const multimodal = if (object.get("multimodal")) |field| switch (field) {
-        .bool => |enabled| enabled,
-        else => return error.InvalidEmbeddingArtifactProducer,
-    } else null;
+    if (object.get(legacy_identity_multimodal_field)) |field| {
+        if (field != .bool) return error.InvalidEmbeddingArtifactProducer;
+    }
     return try std.json.Stringify.valueAlloc(alloc, SemanticExecutionConfig{
         .provider = provider.string,
         .model = model.string,
@@ -3375,7 +3468,6 @@ fn semanticProducerComparisonConfigJsonAlloc(
         .query_input_type = try optionalString(object, "query_input_type"),
         .document_input_type = try optionalString(object, "document_input_type"),
         .query_instruction = try optionalString(object, "query_instruction"),
-        .multimodal = multimodal,
     }, .{ .emit_null_optional_fields = false });
 }
 
@@ -3475,9 +3567,14 @@ fn validateEmbeddingEnrichmentProducerValue(
     producer: std.json.Value,
     options: InitOptions,
     executable_entries: ?[]const ManagedEmbeddingEntry,
+    sparse_kind: ?bool,
 ) !void {
     const producer_sparse = try semanticProducerV2Sparse(producer);
     if (producer_sparse) |sparse| {
+        // Stage factories own only one executable registry. Do not mistake
+        // the other stage's deliberately omitted owner for an orphan.
+        // Unfiltered catalog admission still validates every producer.
+        if (sparse_kind) |selected| if (sparse != selected) return;
         if (sparse and enrichment_dims != null) return error.ConflictingEmbeddingArtifactDimensions;
         if (!sparse and enrichment_dims == null) return error.EmbeddingArtifactDimensionRequired;
     }
@@ -3521,6 +3618,7 @@ fn validateEmbeddingEnrichmentProducer(
     enrichment: std.json.Value,
     options: InitOptions,
     executable_entries: ?[]const ManagedEmbeddingEntry,
+    sparse_kind: ?bool,
 ) !void {
     const object = switch (enrichment) {
         .object => |object| object,
@@ -3564,6 +3662,7 @@ fn validateEmbeddingEnrichmentProducer(
                 producer.value,
                 options,
                 executable_entries,
+                sparse_kind,
             );
         },
         .object => try validateEmbeddingEnrichmentProducerValue(
@@ -3573,6 +3672,7 @@ fn validateEmbeddingEnrichmentProducer(
             producer_json,
             options,
             executable_entries,
+            sparse_kind,
         ),
         else => return error.InvalidEmbeddingArtifactProducer,
     }
@@ -3583,23 +3683,24 @@ fn validateAllEmbeddingEnrichmentProducers(
     value: std.json.Value,
     options: InitOptions,
     executable_entries: []const ManagedEmbeddingEntry,
+    sparse_kind: ?bool,
 ) !void {
     switch (value) {
         .object => |object| {
             if (object.get("enrichments")) |enrichments| {
                 if (enrichments != .array) return error.InvalidManagedEmbeddingIndex;
                 for (enrichments.array.items) |enrichment| {
-                    try validateEmbeddingEnrichmentProducer(alloc, enrichment, options, executable_entries);
+                    try validateEmbeddingEnrichmentProducer(alloc, enrichment, options, executable_entries, sparse_kind);
                 }
             }
             var it = object.iterator();
             while (it.next()) |entry| {
                 if (std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
-                try validateAllEmbeddingEnrichmentProducers(alloc, entry.value_ptr.*, options, executable_entries);
+                try validateAllEmbeddingEnrichmentProducers(alloc, entry.value_ptr.*, options, executable_entries, sparse_kind);
             }
         },
         .array => |array| for (array.items) |item|
-            try validateAllEmbeddingEnrichmentProducers(alloc, item, options, executable_entries),
+            try validateAllEmbeddingEnrichmentProducers(alloc, item, options, executable_entries, sparse_kind),
         else => {},
     }
 }
@@ -3614,7 +3715,7 @@ pub fn validateEmbeddingEnrichmentProducerJsonWithOptions(
 ) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, enrichment_json, .{});
     defer parsed.deinit();
-    try validateEmbeddingEnrichmentProducer(alloc, parsed.value, options, null);
+    try validateEmbeddingEnrichmentProducer(alloc, parsed.value, options, null, null);
 }
 
 const CatalogProducerOwner = struct {
@@ -3698,10 +3799,6 @@ fn validateCatalogOwnerSemanticIdentity(
     {
         return error.InvalidEmbeddingArtifactProducer;
     }
-    const multimodal = parsed_identity.value.object.get("multimodal") orelse
-        return error.InvalidEmbeddingArtifactProducer;
-    if (multimodal != .bool or multimodal.bool != embedder_cfg.multimodal)
-        return error.InvalidEmbeddingArtifactProducer;
     // Region is part of the canonical v2 identity even for providers where it
     // is empty. Runtime binding must not discover that an extension-installed
     // owner omitted the field only after the catalog has committed.
@@ -3720,6 +3817,7 @@ fn validateCatalogOwnerSemanticIdentity(
     if (embedder_cfg.url.len > 0) {
         const endpoint = switch (provider) {
             .openai, .ollama => try appendPathIfMissing(alloc, embedder_cfg.url, "/v1"),
+            .openrouter => try normalizeOpenRouterBaseUrl(alloc, embedder_cfg.url),
             .cohere => try appendPathIfMissing(alloc, embedder_cfg.url, "/v2"),
             .gemini, .vertex => try alloc.dupe(u8, std.mem.trimEnd(u8, embedder_cfg.url, "/")),
             .bedrock => try alloc.dupe(u8, embedder_cfg.url),
@@ -3853,8 +3951,12 @@ fn semanticIdentityFieldsEqual(lhs: std.json.Value, rhs: std.json.Value) bool {
     };
 }
 
+/// Written by identities before embedder input types were derived from model
+/// capabilities. Accepted on read and ignored: what a model accepts does not
+/// change the vectors it produces.
+const legacy_identity_multimodal_field = "multimodal";
+
 fn semanticIdentityDefaultField(name: []const u8) ?std.json.Value {
-    if (std.mem.eql(u8, name, "multimodal")) return .{ .bool = false };
     if (std.mem.eql(u8, name, "region") or
         std.mem.eql(u8, name, "project_id") or
         std.mem.eql(u8, name, "request_format") or
@@ -3892,6 +3994,7 @@ fn validateCatalogSemanticProducerOwner(
 
     var fields = owner_identity.value.object.iterator();
     while (fields.next()) |field| {
+        if (std.mem.eql(u8, field.key_ptr.*, legacy_identity_multimodal_field)) continue;
         const producer_field = producer.object.get(field.key_ptr.*) orelse
             semanticIdentityDefaultField(field.key_ptr.*) orelse
             return error.InvalidEmbeddingArtifactProducer;
@@ -3905,6 +4008,7 @@ fn validateCatalogSemanticProducerOwner(
     // that was absent from the admitted owner identity.
     var producer_fields = producer.object.iterator();
     while (producer_fields.next()) |field| {
+        if (std.mem.eql(u8, field.key_ptr.*, legacy_identity_multimodal_field)) continue;
         const owner_field = owner_identity.value.object.get(field.key_ptr.*) orelse
             semanticIdentityDefaultField(field.key_ptr.*) orelse
             return error.InvalidEmbeddingArtifactProducer;
@@ -4013,6 +4117,7 @@ fn validateCatalogEmbeddingProducerOwnership(
                             expected_dims,
                             producer,
                             .{},
+                            null,
                             null,
                         );
                     }
@@ -4249,6 +4354,7 @@ fn addArtifactBackedManagedEmbeddingEntries(
     root: std.json.Value,
     options: InitOptions,
     entries: *std.ArrayListUnmanaged(ManagedEmbeddingEntry),
+    sparse_kind: ?bool,
 ) !void {
     const object = root.object;
     var it = object.iterator();
@@ -4265,6 +4371,7 @@ fn addArtifactBackedManagedEmbeddingEntries(
         defer parsed_cfg.deinit();
         const cfg = parsed_cfg.value;
         if (cfg.external orelse false) continue;
+        if (sparse_kind) |selected| if ((cfg.sparse orelse false) != selected) continue;
 
         if (cfg.embedding_name) |artifact_name| {
             try registerArtifactManagedEmbeddingLookup(
@@ -4298,6 +4405,7 @@ fn parseManagedEmbeddingEntry(
     index_name: []const u8,
     value: std.json.Value,
     options: InitOptions,
+    sparse_kind: ?bool,
 ) !?ManagedEmbeddingEntry {
     const root = switch (value) {
         .object => |object| object,
@@ -4315,6 +4423,7 @@ fn parseManagedEmbeddingEntry(
     if (external) return null;
 
     const sparse = cfg.sparse orelse false;
+    if (sparse_kind) |expected_sparse| if (sparse != expected_sparse) return null;
 
     const embedder = root.get("embedder") orelse return null;
     const declared_dims = if (sparse) null else try resolveDeclaredEmbeddingDimensions(cfg);
@@ -4457,7 +4566,8 @@ fn buildManagedEmbeddingEntry(
         if (rate_limit.requests_per_minute != 0 and rate_limit.burst == 1)
             rate_limit.pacing = .completion;
     }
-    if (rate_limit.tokens_per_minute != 0 and embedder_cfg.multimodal) return error.UnsupportedMediaTokenBudget;
+    if (rate_limit.tokens_per_minute != 0 and embedder_cfg.inputs != null and embedder_cfg.inputs.?.hasMedia())
+        return error.UnsupportedMediaTokenBudget;
     const requests_per_minute = rate_limit.requests_per_minute;
     const burst = rate_limit.burst;
     const antfly_provider = if (semantic_binding) |binding|
@@ -4517,6 +4627,7 @@ fn buildManagedEmbeddingEntry(
         try alloc.dupe(u8, if (binding.embedded) "" else binding.endpoint)
     else switch (provider) {
         .openai => try resolveOpenAiBaseUrl(alloc, embedder_cfg),
+        .openrouter => try resolveOpenRouterBaseUrl(alloc, embedder_cfg),
         .ollama => try resolveOllamaBaseUrl(alloc, embedder_cfg),
         .bedrock => try resolveBedrockEndpoint(alloc, embedder_cfg, provider_region),
         .cohere => try resolveCohereBaseUrl(alloc, embedder_cfg),
@@ -4545,6 +4656,7 @@ fn buildManagedEmbeddingEntry(
     errdefer if (source_table.len > 0) alloc.free(source_table);
     const api_key = switch (provider) {
         .openai => try common_secrets.SecretValue.initConfigOrEnv(alloc, embedder_cfg.api_key, "OPENAI_API_KEY"),
+        .openrouter => try common_secrets.SecretValue.initConfigOrEnv(alloc, embedder_cfg.api_key, "OPENROUTER_API_KEY"),
         .cohere => try common_secrets.SecretValue.initConfigOrEnv(alloc, embedder_cfg.api_key, "COHERE_API_KEY"),
         .gemini => try common_secrets.SecretValue.initConfigOrEnv(alloc, embedder_cfg.api_key, "GEMINI_API_KEY"),
         .antfly => try common_secrets.SecretValue.initConfigOrEnv(
@@ -4585,7 +4697,7 @@ fn buildManagedEmbeddingEntry(
         .remote_content = options.remote_content,
         .dimensions = dimensions,
         .sparse = sparse,
-        .multimodal = embedder_cfg.multimodal,
+        .declared_inputs = embedder_cfg.inputs,
         .rate_limit = rate_limit,
         .requests_per_minute = requests_per_minute,
         .burst = burst,
@@ -4613,6 +4725,7 @@ fn resolveDeclaredEmbeddingDimensions(cfg: indexes_openapi.EmbeddingsIndexConfig
         const declared = switch (embedder) {
             .ollama_embedder_config => null,
             .open_ai_embedder_config => |value| value.dimensions,
+            .open_router_embedder_config => |value| value.dimensions,
             .bedrock_embedder_config => |value| value.dimension orelse value.dimensions,
             .cohere_embedder_config => null,
             .google_embedder_config => |value| value.dimension,
@@ -4669,10 +4782,11 @@ fn resolveEmbeddingDimensionsForManagedConfigWithSemanticBinding(
     defer deinitOwnedHttpIo(alloc, owned_http_io);
     var managed = buildManagedEmbeddingEntry(alloc, index_name, cfg, embedder, options, 0, semantic_binding) catch |err| switch (err) {
         error.InvalidManagedEmbeddingIndex, error.InvalidAntflyInferenceBaseUrl => return error.InvalidCreateTableRequest,
-        error.UnsupportedEmbeddingProvider => return error.UnsupportedCreateTableRequest,
         else => return err,
     };
     defer managed.deinit(alloc);
+    try attachManagedBedrockCredentialCaches(alloc, (&managed)[0..1], options.provider_runtime);
+    if (managed.provider == .bedrock) managed.provider_runtime = options.provider_runtime;
     return try resolveEmbeddingDimensionsForEntry(alloc, cfg, &managed);
 }
 
@@ -4690,11 +4804,12 @@ fn resolveEmbeddingDimensionsForManagedConfigWithValidation(
     defer deinitOwnedHttpIo(alloc, owned_http_io);
     var managed = buildManagedEmbeddingEntry(alloc, index_name, cfg, embedder, options, declared orelse 0, null) catch |err| switch (err) {
         error.InvalidManagedEmbeddingIndex, error.InvalidAntflyInferenceBaseUrl => return error.InvalidCreateTableRequest,
-        error.UnsupportedEmbeddingProvider => return error.UnsupportedCreateTableRequest,
         else => return err,
     };
     defer managed.deinit(alloc);
     try attachProviderQuota(&managed, options);
+    try attachManagedBedrockCredentialCaches(alloc, (&managed)[0..1], options.provider_runtime);
+    if (managed.provider == .bedrock) managed.provider_runtime = options.provider_runtime;
     return try resolveEmbeddingDimensionsForEntryWithValidation(alloc, &managed, declared, validation);
 }
 
@@ -4710,7 +4825,6 @@ fn validateSparseEmbeddingForManagedConfig(
     defer deinitOwnedHttpIo(alloc, owned_http_io);
     var managed = buildManagedEmbeddingEntry(alloc, index_name, cfg, embedder, options, 0, null) catch |err| switch (err) {
         error.InvalidManagedEmbeddingIndex, error.InvalidAntflyInferenceBaseUrl => return error.InvalidCreateTableRequest,
-        error.UnsupportedEmbeddingProvider => return error.UnsupportedCreateTableRequest,
         else => return err,
     };
     defer managed.deinit(alloc);
@@ -4838,13 +4952,13 @@ fn parseEmbeddingsIndexConfigFromValue(
 fn parseEmbedderProvider(embedder: embeddings_types.Config) !ProviderKind {
     return switch (embedder.provider) {
         .openai => .openai,
+        .openrouter => .openrouter,
         .ollama => .ollama,
         .bedrock => .bedrock,
         .cohere => .cohere,
         .gemini => .gemini,
         .vertex => .vertex,
         .antfly => .antfly,
-        else => error.UnsupportedEmbeddingProvider,
     };
 }
 
@@ -4895,6 +5009,7 @@ fn envOptionalU32(name: [:0]const u8) ?u32 {
 fn providerRequestsPerMinuteEnv(provider: ProviderKind) [:0]const u8 {
     return switch (provider) {
         .openai => "ANTFLY_OPENAI_EMBED_REQUESTS_PER_MINUTE",
+        .openrouter => "ANTFLY_OPENROUTER_EMBED_REQUESTS_PER_MINUTE",
         .ollama => "ANTFLY_OLLAMA_EMBED_REQUESTS_PER_MINUTE",
         .bedrock => "ANTFLY_BEDROCK_EMBED_REQUESTS_PER_MINUTE",
         .cohere => "ANTFLY_COHERE_EMBED_REQUESTS_PER_MINUTE",
@@ -4907,6 +5022,7 @@ fn providerRequestsPerMinuteEnv(provider: ProviderKind) [:0]const u8 {
 fn providerBurstEnv(provider: ProviderKind) [:0]const u8 {
     return switch (provider) {
         .openai => "ANTFLY_OPENAI_EMBED_BURST",
+        .openrouter => "ANTFLY_OPENROUTER_EMBED_BURST",
         .ollama => "ANTFLY_OLLAMA_EMBED_BURST",
         .bedrock => "ANTFLY_BEDROCK_EMBED_BURST",
         .cohere => "ANTFLY_COHERE_EMBED_BURST",
@@ -5446,7 +5562,7 @@ fn embedWithEntryPartsForTask(
     );
     if (entry.rate_limit.tokens_per_minute != 0 and partsContainMedia(parts))
         return error.UnsupportedMediaTokenBudget;
-    if (entry.provider == .bedrock and (entry.multimodal or partsContainMedia(parts))) {
+    if (entry.provider == .bedrock and (entry.declaresMedia() or partsContainMedia(parts))) {
         try checkEntryDispatchDeadline(entry);
         var fallback_http: ?httpx.Client = null;
         defer if (fallback_http) |*client| client.deinit();
@@ -5473,7 +5589,7 @@ fn embedWithEntryPartsForTask(
         return try alloc.dupe(f32, result.vectors[0]);
     }
 
-    if (isAntflyProvider(entry.provider) and (entry.multimodal or partsContainMedia(parts))) {
+    if (isAntflyProvider(entry.provider) and (entry.declaresMedia() or partsContainMedia(parts))) {
         if (parts.len == 0) return error.EmptyEmbeddingResponse;
         if (entry.antfly_provider) |local| {
             if (local.embed_dense_parts) |embed_parts| {
@@ -6155,7 +6271,7 @@ fn embedSparseBatchWithEntry(
             try validateSparseBatch(embeddings, texts.len);
             return embeddings;
         },
-        .openai, .ollama, .bedrock, .cohere, .gemini, .vertex => return error.UnsupportedEmbeddingProvider,
+        .openai, .openrouter, .ollama, .bedrock, .cohere, .gemini, .vertex => return error.UnsupportedEmbeddingProvider,
     }
 }
 
@@ -6194,6 +6310,22 @@ fn resolveOpenAiBaseUrl(alloc: std.mem.Allocator, embedder: embeddings_types.Con
     );
     defer alloc.free(raw);
     return try appendPathIfMissing(alloc, raw, "/v1");
+}
+
+fn resolveOpenRouterBaseUrl(alloc: std.mem.Allocator, embedder: embeddings_types.Config) ![]u8 {
+    const raw = try resolveConfigString(
+        alloc,
+        if (embedder.url.len > 0) embedder.url else null,
+        "OPENROUTER_BASE_URL",
+        embeddings_types.openrouter_default_url,
+    );
+    defer alloc.free(raw);
+    return try normalizeOpenRouterBaseUrl(alloc, raw);
+}
+
+fn normalizeOpenRouterBaseUrl(alloc: std.mem.Allocator, raw: []const u8) ![]u8 {
+    // Match model discovery: add /v1 only to a bare origin, preserving gateway paths.
+    return try appendPathIfMissing(alloc, std.mem.trimEnd(u8, raw, "/"), "/v1");
 }
 
 fn resolveOllamaBaseUrl(alloc: std.mem.Allocator, embedder: embeddings_types.Config) ![]u8 {
@@ -6449,7 +6581,7 @@ fn embedBatchWithEntryForTask(
         @tagName(entry.provider),
     );
     switch (entry.provider) {
-        .openai, .ollama => {
+        .openai, .openrouter, .ollama => {
             if (entry.requests_per_minute > 0 and texts.len > entry.burst) {
                 return try embedBatchWithOpenAiCompatiblePacedChunks(alloc, entry, texts, dims, task_type);
             }
@@ -7245,7 +7377,7 @@ test "managed embedder owned numeric lease executes without cache residency and 
         .model = @constCast("clipclap"),
         .base_url = url,
         .dimensions = 2,
-        .multimodal = true,
+        .declared_inputs = .{ .text = true, .image = true },
         .io = std.testing.io,
         .shared_remote_capability_cache = &cache,
     }};
@@ -7696,6 +7828,67 @@ test "managed embedder interface deinit uses owner allocator" {
         \\}
     , local.provider())) orelse return error.TestUnexpectedResult;
     dense.deinit(std.heap.page_allocator);
+}
+
+test "serverless managed embedder stage factories ignore unrelated provider construction" {
+    var local = TestLocalDenseProvider{ .dimensions = 3 };
+
+    var sparse_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{
+        \\  "sparse_idx":{"type":"embeddings","field":"body","sparse":true,"embedder":{"provider":"antfly","model":"antflydb/splade"}},
+        \\  "broken_dense":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"openai","model":""}}
+        \\}
+    , .{});
+    defer sparse_parsed.deinit();
+    const sparse = (try ManagedEmbedder.createSparseEmbedderFromIndexValueWithOptions(
+        std.testing.allocator,
+        sparse_parsed.value,
+        .{ .antfly_provider = local.provider() },
+    )) orelse return error.TestUnexpectedResult;
+    sparse.deinit(std.testing.allocator);
+
+    var dense_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{
+        \\  "dense_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}},
+        \\  "broken_sparse":{"type":"embeddings","field":"body","sparse":true,"embedder":{"provider":"openai","model":""}}
+        \\}
+    , .{});
+    defer dense_parsed.deinit();
+    const dense = (try ManagedEmbedder.createDenseEmbedderFromIndexValueWithOptions(
+        std.testing.allocator,
+        dense_parsed.value,
+        .{ .antfly_provider = local.provider() },
+    )) orelse return error.TestUnexpectedResult;
+    dense.deinit(std.testing.allocator);
+}
+
+test "serverless managed embedder stage selection includes producer validation and artifact consumers" {
+    const alloc = std.testing.allocator;
+    var local = TestLocalDenseProvider{ .dimensions = 3 };
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{
+        \\  "dense_owner":{"type":"embeddings","field":"body","dimension":3,"embedding_name":"dense_v1","embedder":{"provider":"antfly","model":"test-model"}},
+        \\  "sparse_owner":{"type":"embeddings","field":"body","sparse":true,"embedding_name":"sparse_v1","embedder":{"provider":"antfly","model":"test-model"}},
+        \\  "dense_consumer":{"type":"embeddings","dimension":3,"sources":[{"artifact":"dense_v1"}]},
+        \\  "sparse_consumer":{"type":"embeddings","sparse":true,"sources":[{"artifact":"sparse_v1"}]},
+        \\  "enrichments":[
+        \\    {"name":"dense_v1","kind":"embedding","field":"body","expected_dims":3,"producer_json":{"version":2,"provider":"antfly","model":"test-model","endpoint":"antfly:embedded","sparse":false}},
+        \\    {"name":"sparse_v1","kind":"embedding","field":"body","producer_json":{"version":2,"provider":"antfly","model":"test-model","endpoint":"antfly:embedded","sparse":true}}
+        \\  ]
+        \\}
+    , .{});
+    defer parsed.deinit();
+    for ([_]?bool{ null, false, true }) |kind| {
+        var managed = try ManagedEmbedder.initFromIndexValueObjectWithOptionsAndKind(alloc, parsed.value, .{ .antfly_provider = local.provider() }, kind);
+        defer managed.deinit();
+        try std.testing.expectEqual(@as(usize, if (kind == null) 2 else 1), managed.entries.len);
+        try std.testing.expectEqual(kind == null or !kind.?, managed.hasDenseEntries());
+        try std.testing.expectEqual(kind == null or kind.?, managed.hasSparseEntries());
+    }
+    // In-stage validation must still reject an orphan; selecting a factory
+    // must not disable ownership validation altogether.
+    _ = parsed.value.object.swapRemove("dense_owner");
+    try std.testing.expectError(error.InvalidEmbeddingArtifactProducer, ManagedEmbedder.initDenseFromIndexValueObjectWithOptions(alloc, parsed.value, .{ .antfly_provider = local.provider() }));
 }
 
 test "managed embedder uses embedder dimensions metadata at runtime" {
@@ -8289,6 +8482,106 @@ test "managed embedder preserves chunker full text config" {
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"full_text_index\":{}") != null);
 }
 
+test "managed embedder openrouter defaults and credential identity stay separate from openai" {
+    const alloc = std.testing.allocator;
+    var managed = try ManagedEmbedder.initFromIndexesJson(alloc,
+        \\{"router":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"openrouter","model":"openai/text-embedding-3-small"}},"custom":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"openrouter","model":"openai/text-embedding-3-small","url":"https://gateway.example/api/v1/","api_key":"${secret:team.router}"}}}
+    );
+    defer managed.deinit();
+    const router = managed.findQueryEntry("router") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(ProviderKind.openrouter, router.provider);
+    try std.testing.expectEqualStrings("https://openrouter.ai/api/v1", router.base_url);
+    try std.testing.expectEqualStrings("OPENROUTER_API_KEY", router.api_key.?.env_var);
+    const custom = managed.findQueryEntry("custom") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("https://gateway.example/api/v1", custom.base_url);
+    try std.testing.expectEqualStrings("team.router", custom.api_key.?.secret_ref);
+    const identity = managedEmbeddingEndpointIdentity(custom);
+    try std.testing.expectEqual(provider_limits.Provider.openrouter, identity.provider);
+    var openai_entry = custom.requestOverlay();
+    openai_entry.provider = .openai;
+    const router_key = try managed.queryCacheKey("custom", .principal, "alice", "same query");
+    const openai = ManagedEmbedder{ .alloc = alloc, .entries = (&openai_entry)[0..1] };
+    const openai_key = try openai.queryCacheKey("custom", .principal, "alice", "same query");
+    try std.testing.expect(!std.mem.eql(u8, &router_key, &openai_key));
+}
+
+test "managed embedder openrouter probes dimensions and embeds queries and document batches" {
+    const alloc = std.testing.allocator;
+    const FakeApp = struct {
+        fn executor() http_common.RequestExecutor {
+            return .{ .ptr = undefined, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(_: *anyopaque, response_alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expectEqualStrings("/openrouter/embeddings", req.uri);
+            try std.testing.expectEqualStrings("Bearer router-test-key", req.authorization orelse req.header("authorization") orelse "");
+            var body = try std.json.parseFromSlice(std.json.Value, response_alloc, req.body, .{});
+            defer body.deinit();
+            const object = body.value.object;
+            try std.testing.expectEqualStrings("openai/text-embedding-3-small", object.get("model").?.string);
+            const inputs = object.get("input").?.array.items;
+            if (!std.mem.eql(u8, inputs[0].string, dimension_probe_text)) {
+                try std.testing.expectEqual(@as(i64, 3), object.get("dimensions").?.integer);
+            }
+            var response = std.ArrayList(u8).empty;
+            defer response.deinit(response_alloc);
+            try response.appendSlice(response_alloc, "{\"data\":[");
+            for (inputs, 0..) |_, i| {
+                if (i > 0) try response.append(response_alloc, ',');
+                try response.appendSlice(response_alloc, "{\"embedding\":[0.125,0.25,0.5]}");
+            }
+            try response.appendSlice(response_alloc, "]}");
+            return .{
+                .status = 200,
+                .content_type = try response_alloc.dupe(u8, "application/json"),
+                .body = try response.toOwnedSlice(response_alloc),
+            };
+        }
+    };
+    var listener = std_http_listener.StdHttpListener.init(alloc, .{}, FakeApp.executor());
+    defer listener.deinit();
+    try listener.start();
+    const base_uri = try listener.baseUri(alloc);
+    defer alloc.free(base_uri);
+    const config = try std.fmt.allocPrint(alloc,
+        \\{{"type":"embeddings","field":"body","embedder":{{"provider":"openrouter","model":"openai/text-embedding-3-small","url":"{s}/openrouter/","api_key":"router-test-key"}}}}
+    , .{base_uri});
+    defer alloc.free(config);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, config, .{});
+    defer parsed.deinit();
+    const normalized = (try normalizeEmbeddingsIndexDimensionJsonWithOptions(alloc, "semantic_idx", parsed.value, .{})) orelse return error.TestUnexpectedResult;
+    defer alloc.free(normalized);
+    var normalized_parsed = try std.json.parseFromSlice(std.json.Value, alloc, normalized, .{});
+    defer normalized_parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 3), normalized_parsed.value.object.get("dimension").?.integer);
+    const semantic = try embeddingSemanticProducerJsonAlloc(alloc, parsed.value);
+    defer alloc.free(semantic);
+    try validateCatalogOwnerSemanticIdentity(alloc, .{
+        .sparse = false,
+        .dimensions = 3,
+        .semantic_producer_json = semantic,
+        .index_value = normalized_parsed.value,
+    });
+    var identity = try std.json.parseFromSlice(std.json.Value, alloc, semantic, .{});
+    defer identity.deinit();
+    try std.testing.expectEqualStrings("openrouter", identity.value.object.get("provider").?.string);
+    try std.testing.expect(std.mem.endsWith(u8, identity.value.object.get("endpoint").?.string, "/openrouter"));
+    const indexes = try std.fmt.allocPrint(alloc, "{{\"semantic_idx\":{s}}}", .{normalized});
+    defer alloc.free(indexes);
+    var managed = try ManagedEmbedder.initFromIndexesJson(alloc, indexes);
+    defer managed.deinit();
+    const query = try managed.embedQuery(alloc, "semantic_idx", "alpha concept");
+    defer alloc.free(query);
+    try std.testing.expectEqualSlices(f32, &.{ 0.125, 0.25, 0.5 }, query);
+    const entry = managed.findQueryEntry("semantic_idx") orelse return error.TestUnexpectedResult;
+    const documents = try embedBatchWithEntryForTask(alloc, entry, &.{ "first document", "second document" }, 3, .retrieval_document);
+    defer db_embedder.freeDenseEmbeddingBatch(alloc, documents);
+    try std.testing.expectEqual(@as(usize, 2), documents.len);
+    for (documents) |vector| try std.testing.expectEqualSlices(f32, &.{ 0.125, 0.25, 0.5 }, vector);
+    try std.testing.expectError(error.UnsupportedEmbeddingProvider, embedSparseBatchWithEntry(alloc, entry, &.{"text"}));
+}
+
 test "managed embedder calls openai compatible embeddings endpoint" {
     const FakeApp = struct {
         fn executor() http_common.RequestExecutor {
@@ -8526,11 +8819,14 @@ pub fn testFileBackedApiKeyRotation() !void {
         }
     };
 
-    const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/test-managed-embedder-secret-rotation-{d}.json", .{monotonicNowNs()});
-    defer alloc.free(store_path);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
-    defer std.Io.Dir.cwd().deleteFile(io_impl.io(), store_path) catch {};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try tmp.dir.realPathFileAlloc(io_impl.io(), ".", alloc);
+    defer alloc.free(directory);
+    const store_path = try std.fs.path.join(alloc, &.{ directory, "secrets.json" });
+    defer alloc.free(store_path);
 
     try std.Io.Dir.cwd().writeFile(io_impl.io(), .{
         .sub_path = store_path,
@@ -9170,7 +9466,7 @@ pub fn testLocalAdmissionOverloadNormalization() !void {
         \\{
         \\  "dense_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"local-model"}},
         \\  "sparse_idx":{"type":"embeddings","field":"body","sparse":true,"embedder":{"provider":"antfly","model":"local-model"}},
-        \\  "multimodal_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"local-model","multimodal":true}}
+        \\  "multimodal_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"local-model","inputs":["text","image"]}}
         \\}
     , provider);
     defer managed.deinit();
@@ -9460,7 +9756,7 @@ pub fn testAntflyEmbedPartSelectionAndCardinality() !void {
     };
 
     const indexes_json =
-        \\{"semantic_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"local-model","multimodal":true}}}
+        \\{"semantic_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"local-model","inputs":["text","image"]}}}
     ;
     var managed = try ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator, indexes_json, provider);
     defer managed.deinit();
@@ -9469,7 +9765,7 @@ pub fn testAntflyEmbedPartSelectionAndCardinality() !void {
     try std.testing.expectEqual(@as(?usize, null), dense_interface.mediaPartLimit("missing"));
 
     var bedrock_managed = try ManagedEmbedder.initFromIndexesJson(std.testing.allocator,
-        \\{"bedrock_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"bedrock","model":"amazon.titan-embed-image-v1","region":"us-east-1","multimodal":true}}}
+        \\{"bedrock_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"bedrock","model":"amazon.titan-embed-image-v1","region":"us-east-1","inputs":["text","image"]}}}
     );
     defer bedrock_managed.deinit();
     try std.testing.expectEqual(@as(?usize, null), bedrock_managed.denseInterface().mediaPartLimit("bedrock_idx"));
@@ -9721,4 +10017,136 @@ test "managed embedder query template supports remoteText and surfaces permanent
     const rendered_pdf = try renderQueryTemplate(std.testing.allocator, "{{remotePDF url=this}}", pdf_url);
     defer std.testing.allocator.free(rendered_pdf);
     try std.testing.expectError(QueryTemplateError.PermanentPromptFailure, validateRenderedTemplate(std.testing.allocator, rendered_pdf));
+}
+
+fn testManagedBedrockDimensionProbeCache(validation: bool) !void {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"type":"embeddings","field":"body","embedder":{"provider":"bedrock","model":"amazon.titan-embed-text-v2:0","region":"us-east-1","url":"http://127.0.0.1:1","requests_per_minute":0}}
+    , .{});
+    defer parsed.deinit();
+    var cfg = try parseEmbeddingsIndexConfigFromValue(alloc, parsed.value);
+    defer cfg.deinit();
+    var registry = provider_limits.Registry.init(alloc);
+    defer registry.deinit();
+    var runtime = ProviderRuntime.init(alloc, std.testing.io);
+    runtime.limits = &registry;
+    defer runtime.deinit();
+    const cache = try runtime.bedrock_credentials.cacheForRegion("us-east-1");
+    cache.deinit(alloc);
+    const options = InitOptions{ .io = std.testing.io, .provider_runtime = &runtime };
+    const embedder = parsed.value.object.get("embedder").?;
+    for (0..2) |attempt| {
+        std.debug.print("BEDROCK_PROBE_CACHE validation={} attempt={d} expects CredentialCacheClosed\n", .{ validation, attempt });
+        const result = if (validation)
+            resolveEmbeddingDimensionsForManagedConfigWithValidation(alloc, "probe", cfg.value, embedder, options, .strict)
+        else
+            resolveEmbeddingDimensionsForManagedConfig(alloc, "probe", cfg.value, embedder, options);
+        try std.testing.expectError(error.CredentialCacheClosed, result);
+        try std.testing.expect(runtime.http_client.load(.acquire) != null);
+        try std.testing.expect(cache == try runtime.bedrock_credentials.cacheForRegion("us-east-1"));
+        try std.testing.expectEqual(@as(usize, 1), runtime.bedrock_credentials.by_region.count());
+    }
+}
+
+test "managed embedder temporary dimension probe reaches borrowed Bedrock cache" {
+    try testManagedBedrockDimensionProbeCache(false);
+}
+
+test "managed embedder validating dimension probe reaches borrowed Bedrock cache" {
+    try testManagedBedrockDimensionProbeCache(true);
+}
+
+fn testManagedBedrockCacheEntry(alloc: std.mem.Allocator, region: []const u8) !ManagedEmbeddingEntry {
+    const index_name = try alloc.dupe(u8, "probe");
+    errdefer alloc.free(index_name);
+    const model = try alloc.dupe(u8, "amazon.titan-embed-text-v2:0");
+    errdefer alloc.free(model);
+    const base_url = try alloc.dupe(u8, "http://127.0.0.1:1");
+    errdefer alloc.free(base_url);
+    return .{
+        .alloc = alloc,
+        .io = std.testing.io,
+        .index_name = index_name,
+        .provider = .bedrock,
+        .model = model,
+        .base_url = base_url,
+        .region = try alloc.dupe(u8, region),
+        .dimensions = 2,
+    };
+}
+
+fn testManagedBedrockOwnedCacheCleanup(alloc: std.mem.Allocator) !void {
+    var entries = [_]ManagedEmbeddingEntry{try testManagedBedrockCacheEntry(alloc, "us-east-1")};
+    defer entries[0].deinit(alloc);
+    try attachManagedBedrockCredentialCaches(alloc, &entries, null);
+    try std.testing.expect(entries[0].owns_bedrock_credentials);
+    try std.testing.expect(!entries[0].bedrock_credentials.?.closed.load(.acquire));
+    try std.testing.expect(entries[0].provider_runtime == null);
+}
+
+fn testManagedBedrockBorrowedCacheCleanup(alloc: std.mem.Allocator) !void {
+    var runtime = ProviderRuntime.init(alloc, std.testing.io);
+    defer runtime.deinit();
+    var east: ?*bedrock_provider.CredentialCache = null;
+    for ([_][]const u8{ "us-east-1", "us-west-2", "us-east-1" }) |region| {
+        var entries = [_]ManagedEmbeddingEntry{try testManagedBedrockCacheEntry(alloc, region)};
+        defer entries[0].deinit(alloc);
+        try attachManagedBedrockCredentialCaches(alloc, &entries, &runtime);
+        const cache = entries[0].bedrock_credentials.?;
+        try std.testing.expect(!entries[0].owns_bedrock_credentials);
+        try std.testing.expect(!cache.closed.load(.acquire));
+        if (std.mem.eql(u8, region, "us-east-1")) {
+            if (east) |previous| try std.testing.expect(previous == cache);
+            east = cache;
+        } else {
+            try std.testing.expect(east.? != cache);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), runtime.bedrock_credentials.by_region.count());
+    try std.testing.expect(!east.?.closed.load(.acquire));
+}
+
+test "managed embedder probe cache owned allocation failures clean up" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testManagedBedrockOwnedCacheCleanup, .{});
+}
+
+test "managed embedder probe cache borrowed allocation failures preserve region ownership" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testManagedBedrockBorrowedCacheCleanup, .{});
+}
+
+test "managed embedder probe cache attachment leaves other providers unchanged" {
+    const alloc = std.testing.allocator;
+    var runtime = ProviderRuntime.init(alloc, std.testing.io);
+    defer runtime.deinit();
+    var entries = [_]ManagedEmbeddingEntry{try testManagedBedrockCacheEntry(alloc, "us-east-1")};
+    defer entries[0].deinit(alloc);
+    entries[0].provider = .openai;
+    try attachManagedBedrockCredentialCaches(alloc, &entries, &runtime);
+    try std.testing.expect(entries[0].bedrock_credentials == null);
+    try std.testing.expect(!entries[0].owns_bedrock_credentials);
+    try std.testing.expect(entries[0].provider_runtime == null);
+    try std.testing.expectEqual(@as(usize, 0), runtime.bedrock_credentials.by_region.count());
+}
+
+test "managed embedder declared dimensions skip temporary Bedrock cache construction" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"type":"embeddings","field":"body","dimension":2,"embedder":{"provider":"bedrock","model":"amazon.titan-embed-text-v2:0","region":"us-east-1","url":"http://127.0.0.1:1"}}
+    , .{});
+    defer parsed.deinit();
+    var cfg = try parseEmbeddingsIndexConfigFromValue(alloc, parsed.value);
+    defer cfg.deinit();
+    var runtime = ProviderRuntime.init(alloc, std.testing.io);
+    defer runtime.deinit();
+    const dimensions = try resolveEmbeddingDimensionsForManagedConfig(
+        alloc,
+        "probe",
+        cfg.value,
+        parsed.value.object.get("embedder").?,
+        .{ .io = std.testing.io, .provider_runtime = &runtime },
+    );
+    try std.testing.expectEqual(@as(u32, 2), dimensions);
+    try std.testing.expectEqual(@as(usize, 0), runtime.bedrock_credentials.by_region.count());
+    try std.testing.expect(runtime.http_client.load(.acquire) == null);
 }

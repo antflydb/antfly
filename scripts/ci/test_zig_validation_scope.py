@@ -14,6 +14,7 @@
 
 """Exercise the Zig workflow's actual Git path filter against tracked inputs."""
 
+import re
 import shlex
 import subprocess
 import tempfile
@@ -24,13 +25,60 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class ZigValidationScopeTests(unittest.TestCase):
-    def test_codegen_inputs_select_zig_validation(self):
+    def test_vopr_changes_select_qualification_and_the_base_gate(self):
         workflow = (ROOT / ".github/workflows/zig-tests.yml").read_text()
-        command = workflow.split("if git diff --quiet", 1)[1].split(
-            "\n          then", 1
-        )[0]
+        focused = workflow.split("      - name: Detect VOPR qualification changes", 1)[
+            1
+        ]
+        inputs = {
+            "zig/lib/vopr/src/runner.zig",
+            "zig/pkg/antfly/src/vopr/cli.zig",
+            "zig/pkg/antfly/src/storage/hot_standby/vopr.zig",
+            "zig/pkg/antfly/src/storage/hot_standby/standby.zig",
+            "zig/pkg/antfly/src/raft/transport/http_driver.zig",
+            "zig/pkg/antfly/src/raft/transport/http_snapshot.zig",
+            "zig/pkg/antfly/src/raft/host.zig",
+            "zig/pkg/antfly/src/raft/reconciler.zig",
+            "zig/pkg/antfly/src/raft/vopr_harness.zig",
+            "zig/pkg/antfly/src/data/runtime.zig",
+            "zig/build.zig",
+            "scripts/ci/zig_vopr_soak.py",
+            "scripts/ci/test_zig_vopr_soak.py",
+            "scripts/ci/zig_vopr_qualification.py",
+            ".github/workflows/zig-vopr-soak.yml",
+        }
+        unrelated = {"scripts/unrelated.py", "docs/guide.md"}
+        for source in (workflow, focused):
+            command = source.split('if ! "$helper"', 1)[1].split("\n          then", 1)[
+                0
+            ]
+            pathspecs = shlex.split(command.split(" -- ", 1)[1].replace("\\\n", " "))
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                subprocess.run(["git", "init", "-q", temporary], check=True)
+                for name in inputs | unrelated:
+                    path = root / name
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.touch()
+                subprocess.run(["git", "add", "."], cwd=root, check=True)
+                selected = subprocess.check_output(
+                    ["git", "ls-files", "-z", "--", *pathspecs], cwd=root
+                )
+            self.assertEqual(
+                {path.decode() for path in selected.split(b"\0") if path}, inputs
+            )
+
+    def test_codegen_and_laya_inputs_select_zig_validation(self):
+        workflow = (ROOT / ".github/workflows/zig-tests.yml").read_text()
+        command = workflow.split('if ! "$helper"', 1)[1].split("\n          then", 1)[0]
         pathspecs = shlex.split(command.split(" -- ", 1)[1].replace("\\\n", " "))
         inputs = {
+            "scripts/laya/prepare_laya_finetune.py",
+            "scripts/laya/qualify_laya_finetune_quality.py",
+            "scripts/laya/test_run_laya_qualification.py",
+            "scripts/laya/test_prepare_laya_finetune.py",
+            "scripts/laya/test_qualify_laya_finetune_quality.py",
+            "scripts/laya/test_benchmark_laya_metal.py",
             "scripts/openapi_inputs.py",
             "scripts/openapi_joiner.py",
             "scripts/join_openapi.py",
@@ -45,6 +93,8 @@ class ZigValidationScopeTests(unittest.TestCase):
             "openapi.yaml",
             "zig/lib/yacc/src/main.zig",
             "zig/tools/test_runtime_cache.py",
+            "zig/tools/test_linked_tests.py",
+            "zig/tools/test_audit_test_selection.py",
             "scripts/ci/test_zig_validation_scope.py",
         }
         unrelated = {
@@ -66,6 +116,137 @@ class ZigValidationScopeTests(unittest.TestCase):
         self.assertEqual(
             {path.decode() for path in selected.split(b"\0") if path}, inputs
         )
+
+
+def embedded_helper() -> str:
+    """Return the change-filter script exactly as the workflow writes it.
+
+    The workflow runs from the default branch but checks out the PR head, so
+    the filter is embedded in the workflow rather than read from the checkout;
+    this test exercises that embedded text.
+    """
+    workflow = (ROOT / ".github/workflows/zig-tests.yml").read_text()
+    match = re.search(
+        r'cat > "\$helper" <<\'HELPER\'\n(.*?)\n {10}HELPER\n', workflow, re.DOTALL
+    )
+    assert match, "embedded zig-relevant-changes helper not found in zig-tests.yml"
+    lines = [
+        line[10:] if line.startswith(" " * 10) else line
+        for line in match.group(1).splitlines()
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _relevant(root: Path, base: str, head: str, *pathspecs: str) -> int:
+    return subprocess.run(
+        [str(SCRIPT), base, head, "--", *pathspecs],
+        cwd=root,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    ).returncode
+
+
+def _commit(root: Path, message: str) -> None:
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            message,
+        ],
+        cwd=root,
+        check=True,
+    )
+
+
+SCRIPT: Path
+
+
+class ZigRelevantChangesScriptTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        global SCRIPT
+        cls.script_dir = tempfile.TemporaryDirectory()
+        SCRIPT = Path(cls.script_dir.name) / "zig-relevant-changes.sh"
+        SCRIPT.write_text(embedded_helper())
+        SCRIPT.chmod(0o755)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.script_dir.cleanup()
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        subprocess.run(["git", "init", "-q", self.temporary.name], check=True)
+        for name in (
+            "zig/source.zig",
+            "zig/DESIGN.md",
+            "zig/pkg/inference/testdata/gliner25/README.md",
+            "zig/pkg/inference/QUANT_KERNEL_COMPILER.md",
+        ):
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("v1\n")
+        _commit(self.root, "base")
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def _change(self, name: str, text: str = "v2\n") -> None:
+        (self.root / name).write_text(text)
+
+    def test_markdown_only_change_is_not_relevant(self):
+        self._change("zig/DESIGN.md")
+        _commit(self.root, "docs")
+        self.assertEqual(_relevant(self.root, "HEAD~1", "HEAD", ":(glob)zig/**"), 1)
+
+    def test_code_change_is_relevant(self):
+        self._change("zig/source.zig")
+        _commit(self.root, "code")
+        self.assertEqual(_relevant(self.root, "HEAD~1", "HEAD", ":(glob)zig/**"), 0)
+
+    def test_testdata_readme_is_relevant(self):
+        self._change("zig/pkg/inference/testdata/gliner25/README.md")
+        _commit(self.root, "fixture policy")
+        self.assertEqual(_relevant(self.root, "HEAD~1", "HEAD", ":(glob)zig/**"), 0)
+
+    def test_markdown_read_by_a_test_is_relevant(self):
+        self._change("zig/pkg/inference/QUANT_KERNEL_COMPILER.md")
+        _commit(self.root, "doc contract")
+        self.assertEqual(_relevant(self.root, "HEAD~1", "HEAD", ":(glob)zig/**"), 0)
+
+    def test_renaming_code_to_markdown_is_relevant(self):
+        (self.root / "zig/source.zig").rename(self.root / "zig/source.md")
+        _commit(self.root, "rename")
+        self.assertEqual(_relevant(self.root, "HEAD~1", "HEAD", ":(glob)zig/**"), 0)
+
+    def test_pathspec_outside_the_change_is_not_relevant(self):
+        self._change("zig/source.zig")
+        _commit(self.root, "code")
+        self.assertEqual(_relevant(self.root, "HEAD~1", "HEAD", ":(glob)go/**"), 1)
+
+    def test_git_failure_selects_tests(self):
+        self.assertEqual(
+            _relevant(self.root, "no-such-revision", "HEAD", ":(glob)zig/**"), 0
+        )
+
+    def test_missing_separator_is_a_usage_error(self):
+        code = subprocess.run(
+            [str(SCRIPT), "HEAD", "HEAD", ":(glob)zig/**"],
+            cwd=self.root,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        ).returncode
+        self.assertEqual(code, 2)
 
 
 if __name__ == "__main__":

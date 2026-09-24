@@ -38,7 +38,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .cpu_features_add = std.Target.wasm.featureSet(&.{ .atomics, .bulk_memory, .simd128 }),
     });
     const lmdb_build_options = storage_build.makeLmdbBuildOptions(b, .zig, false, false);
-    const build_options = storage_build.makeRootBuildOptions(b, .zig, false, false, false, false, false, true);
+    const build_options = storage_build.makeRootBuildOptions(b, .zig, false, false, false, false, false, true, false);
     const json_mod = b.createModule(.{ .root_source_file = b.path("lib/json/src/mod.zig"), .target = wasm_target, .optimize = optimize });
     const httpx_mod = b.createModule(.{ .root_source_file = b.path("lib/httpx/src/httpx.zig"), .target = wasm_target, .optimize = optimize });
     httpx_mod.addImport("antfly-json", json_mod);
@@ -117,9 +117,9 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     wasm_vectorindex_mod.addImport("antfly_vector", wasm_vector_mod);
     wasm_vectorindex_mod.addImport("antfly_platform", wasm_platform_mod);
     wasm_vectorindex_mod.addImport("antfly_hash", wasm_hash_mod);
-    const vellum_mod = b.createModule(.{ .root_source_file = b.path("lib/vellum/src/mod.zig"), .target = wasm_target, .optimize = optimize });
+    const fst_mod = b.createModule(.{ .root_source_file = b.path("lib/fst/src/mod.zig"), .target = wasm_target, .optimize = optimize });
     const regex_mod = b.createModule(.{ .root_source_file = b.path("lib/regex/src/mod.zig"), .target = wasm_target, .optimize = optimize });
-    regex_mod.addImport("antfly_vellum", vellum_mod);
+    regex_mod.addImport("antfly_fst", fst_mod);
     const chunking_mod = b.createModule(.{ .root_source_file = b.path("lib/chunking/src/mod.zig"), .target = wasm_target, .optimize = optimize });
     chunking_mod.addImport("antfly-json", json_mod);
     chunking_mod.addImport("antfly_chunking_api_openapi", api.chunking_api);
@@ -137,6 +137,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         api.indexes,
         api.sort,
         api.metadata,
+        api.schema,
         reranking_mod,
         wasm_objectstore_mod,
         httpx_mod,
@@ -146,7 +147,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         wasm_vector_mod,
         wasm_vectorindex_mod,
         wasm_hash_mod,
-        vellum_mod,
+        fst_mod,
         regex_mod,
         wasm_image_mod,
         wasm_font_mod,
@@ -159,7 +160,8 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .target = wasm_target,
         .optimize = optimize,
     });
-    @call(.auto, configureEmbeddedModule, .{ b, embedded_support_wasm_mod } ++ embedded_wasm_deps ++ .{addSnowballModule});
+    const wasm_storage_boundary = @import("storage_boundary.zig").create(b, b.path("pkg/antfly/src"), wasm_target, optimize);
+    @call(.auto, configureEmbeddedModule, .{ b, wasm_storage_boundary, embedded_support_wasm_mod } ++ embedded_wasm_deps ++ .{addSnowballModule});
 
     const embedded_wasm_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/embedded/root.zig"),

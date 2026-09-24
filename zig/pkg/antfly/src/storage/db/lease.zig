@@ -32,6 +32,14 @@ pub const AcquireResult = struct {
     acquired: bool,
     epoch: u64 = 0,
     expires_at_ms: u64 = 0,
+    kind: AcquireKind = .blocked,
+};
+
+pub const AcquireKind = enum {
+    acquired,
+    renewed,
+    takeover,
+    blocked,
 };
 
 pub const Lease = struct {
@@ -66,6 +74,7 @@ pub const Lease = struct {
             .allocate = .alloc_always,
         });
         defer parsed.deinit();
+        if (parsed.value.expires_at_ms == 0) return null;
         return try cloneRecord(alloc, parsed.value);
     }
 
@@ -84,6 +93,7 @@ pub const Lease = struct {
         };
 
         var epoch: u64 = 1;
+        var kind: AcquireKind = .acquired;
         if (current_raw) |raw| {
             const parsed = try std.json.parseFromSlice(LeaseRecord, self.allocator, raw, .{
                 .allocate = .alloc_always,
@@ -98,6 +108,7 @@ pub const Lease = struct {
                 @max(current.epoch, 1)
             else
                 std.math.add(u64, current.epoch, 1) catch return error.LeaseEpochOverflow;
+            kind = if (current.expires_at_ms == 0) .acquired else if (current.expires_at_ms > now_ms) .renewed else .takeover;
         }
 
         const expires_at_ms = std.math.add(u64, now_ms, ttl_ms) catch std.math.maxInt(u64);
@@ -112,7 +123,7 @@ pub const Lease = struct {
         try txn.put(self.key, payload);
         try txn.commit();
         committed = true;
-        return .{ .acquired = true, .epoch = epoch, .expires_at_ms = expires_at_ms };
+        return .{ .acquired = true, .epoch = epoch, .expires_at_ms = expires_at_ms, .kind = kind };
     }
 
     pub fn renew(self: *Lease, owner_id: []const u8, now_ms: u64, ttl_ms: u64) !bool {
@@ -172,8 +183,17 @@ pub const Lease = struct {
         defer parsed.deinit();
 
         if (!std.mem.eql(u8, parsed.value.owner_id, owner_id) or
+            parsed.value.expires_at_ms == 0 or
             (epoch != null and parsed.value.epoch != epoch.?)) return false;
-        try txn.delete(self.key);
+        // Keep the tenure counter after release. Deleting it would let a
+        // restarted owner reuse epoch one and revive stale work or releases.
+        const released = try std.json.Stringify.valueAlloc(self.allocator, LeaseRecord{
+            .owner_id = "",
+            .expires_at_ms = 0,
+            .epoch = parsed.value.epoch,
+        }, .{});
+        defer self.allocator.free(released);
+        try txn.put(self.key, released);
         try txn.commit();
         committed = true;
         return true;
@@ -290,6 +310,30 @@ test "lease epochs fence renewal and release after takeover" {
     try std.testing.expect(!(try lease.renewFenced("stable-worker-id", first.epoch, 1_102, 100)));
     try std.testing.expect(!(try lease.releaseFenced("stable-worker-id", first.epoch)));
     try std.testing.expect(try lease.releaseFenced("stable-worker-id", second.epoch));
+}
+
+test "lease release preserves tenure fencing across owner ID reuse" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{ .name = "lease-tenure" });
+    defer runtime.deinit();
+    var lease = try Lease.init(alloc, runtime, "\x00\x00__metadata__:lease_tenure");
+    defer lease.deinit();
+    const first = try lease.tryAcquireFenced("worker", 1000, 250);
+    try std.testing.expect(first.acquired);
+    try std.testing.expect(try lease.releaseFenced("worker", first.epoch));
+    try std.testing.expect((try lease.load(alloc)) == null);
+    const second = try lease.tryAcquireFenced("worker", 1100, 250);
+    try std.testing.expect(second.acquired);
+    try std.testing.expect(second.epoch > first.epoch);
+    try std.testing.expect(!(try lease.releaseFenced("worker", first.epoch)));
+    try std.testing.expect(!(try lease.renewFenced("worker", first.epoch, 1200, 250)));
+    try std.testing.expect(try lease.renewFenced("worker", second.epoch, 1200, 250));
+    const third = try lease.tryAcquireFenced("worker", 1500, 250);
+    try std.testing.expect(third.epoch > second.epoch);
+    try std.testing.expectEqual(AcquireKind.takeover, third.kind);
+    try std.testing.expect(!(try lease.renewFenced("worker", second.epoch, 1501, 250)));
 }
 
 test "lease works with memory backend store" {

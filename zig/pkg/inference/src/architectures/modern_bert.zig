@@ -155,6 +155,7 @@ fn preplanMetalModernBertEncoder(
 // ---------------------------------------------------------------------------
 
 pub const Config = struct {
+    laya: ?@import("../models/laya.zig").Config = null,
     vocab_size: u32 = 50368,
     hidden_size: u32 = 768,
     num_hidden_layers: u32 = 22,
@@ -211,6 +212,7 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
 
     const obj = parsed.value.object;
     var config = Config{};
+    if (obj.get("laya")) |value| config.laya = try @import("../models/laya.zig").Config.parse(value);
     if (obj.get("vocab_size")) |value| config.vocab_size = jsonU32(value) orelse config.vocab_size;
     if (obj.get("hidden_size")) |value| config.hidden_size = jsonU32(value) orelse config.hidden_size;
     if (obj.get("num_hidden_layers")) |value| config.num_hidden_layers = jsonU32(value) orelse config.num_hidden_layers;
@@ -232,6 +234,9 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
             // consecutive (interleaved) pairs.
             config.rope_interleaved = false;
         }
+    }
+    if (config.laya) |laya| {
+        if (config.hidden_size < 64 or config.hidden_size % 64 != 0 or config.num_attention_heads == 0 or config.hidden_size % config.num_attention_heads != 0 or config.num_hidden_layers == 0 or laya.max_len > config.max_position_embeddings) return error.InvalidLayaConfig;
     }
     return config;
 }
@@ -457,30 +462,34 @@ fn encoderLayer(
     const K = try cb.rope(qkv.k, seq_len, head_dim, head_dim, rope_theta, 1.0, 0, config.rope_interleaved);
     defer cb.free(K);
 
-    // For local layers build a sliding-window additive attention bias.
-    // Shape: [num_heads * seq_len * seq_len] (shared across the batch).
-    // The BLAS sdpaOp detects len == num_heads*seq_len*seq_len and applies it
-    // as a per-head shared bias added to raw dot-product scores before softmax.
-    const window_bias: ?CT = if (!is_global) blk: {
-        const half: usize = @intCast(config.local_attention_window / 2);
-        break :blk try buildSlidingWindowBias(cb, allocator, seq_len, num_heads, half);
-    } else null;
-    defer if (window_bias) |wb| cb.free(wb);
+    const attn_out = if (!is_global and cb.kind() == .cuda)
+        (try cb.encoderLocalAttention(Q, K, qkv.v, attention_mask, batch, seq_len, num_heads, head_dim, config.local_attention_window / 2)) orelse return error.UnsupportedLayaBackend
+    else fallback: {
+        // For local layers build a sliding-window additive attention bias.
+        // Shape: [num_heads * seq_len * seq_len] (shared across the batch).
+        // The BLAS sdpaOp detects len == num_heads*seq_len*seq_len and applies it
+        // as a per-head shared bias added to raw dot-product scores before softmax.
+        const window_bias: ?CT = if (!is_global) blk: {
+            const half: usize = @intCast(config.local_attention_window / 2);
+            break :blk try buildSlidingWindowBias(cb, allocator, seq_len, num_heads, half);
+        } else null;
+        defer if (window_bias) |wb| cb.free(wb);
 
-    // Bidirectional scaled dot-product attention (encoder, no causal mask).
-    // The padding mask (attention_mask) is consumed by the backend: positions
-    // where mask[b*seq_len + ki] == 0 are set to -inf before softmax.
-    const attn_out = try cb.scaledDotProductAttention(
-        Q,
-        K,
-        qkv.v,
-        attention_mask,
-        window_bias,
-        batch,
-        seq_len,
-        num_heads,
-        head_dim,
-    );
+        // Bidirectional scaled dot-product attention (encoder, no causal mask).
+        // The padding mask (attention_mask) is consumed by the backend: positions
+        // where mask[b*seq_len + ki] == 0 are set to -inf before softmax.
+        break :fallback try cb.scaledDotProductAttention(
+            Q,
+            K,
+            qkv.v,
+            attention_mask,
+            window_bias,
+            batch,
+            seq_len,
+            num_heads,
+            head_dim,
+        );
+    };
     defer cb.free(attn_out);
 
     // Output projection
@@ -531,6 +540,7 @@ fn encoderLayer(
         total,
         H,
         intermediate,
+        config.checkpoint_layout == .huggingface_fused_qkv_no_bias,
         if (resident_slots) modernBertLinearSlot(layer_idx, .ffn_in) else null,
         if (resident_slots) modernBertLinearSlot(layer_idx, .ffn_out) else null,
     );
@@ -674,6 +684,7 @@ fn geGluFfn(
     total: usize,
     hidden_size: usize,
     intermediate_size: usize,
+    exact_gelu: bool,
     wi_slot: ?usize,
     wo_slot: ?usize,
 ) !CT {
@@ -690,13 +701,23 @@ fn geGluFfn(
     );
     defer cb.free(gated_ct);
 
+    if (exact_gelu) {
+        if (try cb.packedGegluExact(gated_ct, total, intermediate_size)) |activated| {
+            defer cb.free(activated);
+            return linearNoBiasWithSlot(cb, activated, Wo_w, total, intermediate_size, hidden_size, wo_slot);
+        }
+    }
+
     const gate_ct = try cb.sliceLastDim(gated_ct, 0, intermediate_size);
     defer cb.free(gate_ct);
     const value_ct = try cb.sliceLastDim(gated_ct, intermediate_size, 2 * intermediate_size);
     defer cb.free(value_ct);
 
-    const activated_ct = (try cb.activationMultiply(gate_ct, value_ct, .gelu)) orelse blk: {
-        const gate_gelu_ct = try cb.gelu(gate_ct);
+    // HF ACT2FN["gelu"] uses erf, not the tanh approximation. The small
+    // per-layer difference accumulates across released 28-layer encoders.
+    const activation: ops.DecoderRuntimeActivationKind = if (exact_gelu) .gelu_exact else .gelu;
+    const activated_ct = (try cb.activationMultiply(gate_ct, value_ct, activation)) orelse blk: {
+        const gate_gelu_ct = if (exact_gelu) (try cb.geluExact(gate_ct)) orelse return error.UnsupportedModernBertActivation else try cb.gelu(gate_ct);
         defer cb.free(gate_gelu_ct);
         break :blk try cb.multiply(gate_gelu_ct, value_ct);
     };
@@ -1106,7 +1127,7 @@ fn encoderLayerWithNormedAttn(
     const Wo_w = try getLayerWeight(cb, layer_idx, "mlp.Wo.weight", &name_buf);
     defer cb.free(Wo_w);
 
-    const ffn_out = try geGluFfn(cb, normed_ffn, Wi_w, Wo_w, total, H, intermediate, null, null);
+    const ffn_out = try geGluFfn(cb, normed_ffn, Wi_w, Wo_w, total, H, intermediate, config.checkpoint_layout == .huggingface_fused_qkv_no_bias, null, null);
     defer cb.free(ffn_out);
 
     return .{
@@ -1246,7 +1267,7 @@ fn encoderLayerCapturing(
     const Wo_w = try getLayerWeight(cb, layer_idx, "mlp.Wo.weight", &name_buf);
     defer cb.free(Wo_w);
 
-    const ffn_out = try geGluFfn(cb, normed_ffn, Wi_w, Wo_w, total, H, intermediate, null, null);
+    const ffn_out = try geGluFfn(cb, normed_ffn, Wi_w, Wo_w, total, H, intermediate, config.checkpoint_layout == .huggingface_fused_qkv_no_bias, null, null);
     defer cb.free(ffn_out);
 
     // Residual: add FFN output to post-attention hidden state
@@ -1323,4 +1344,25 @@ test "HuggingFace ModernBERT fused checkpoint omits layer zero attention norm an
     }, &.{ 0, 1 }, &.{ 1, 1 }, 1, 2);
     defer allocator.free(output);
     try std.testing.expectEqual(@as(usize, 8), output.len);
+}
+
+test "HuggingFace ModernBERT GeGLU uses exact erf activation" {
+    const a = std.testing.allocator;
+    var store = native_compute.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer deinitTestWeightStore(a, &store);
+    var compute = native_compute.NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const input = try cb.fromFloat32Shape(&.{1}, &.{ 1, 1 });
+    defer cb.free(input);
+    const wi = try cb.fromFloat32Shape(&.{ -2, 1 }, &.{ 2, 1 });
+    defer cb.free(wi);
+    const wo = try cb.fromFloat32Shape(&.{1}, &.{ 1, 1 });
+    defer cb.free(wo);
+    const result = try geGluFfn(&cb, input, wi, wo, 1, 1, 1, true, null, null);
+    defer cb.free(result);
+    const values = try cb.toFloat32(result, a);
+    defer a.free(values);
+    // GELU(-2) = -1 * (1 + erf(-sqrt(2))). Tanh gives -0.0454023.
+    try std.testing.expectApproxEqAbs(@as(f32, -0.0455002639), values[0], 3e-7);
 }

@@ -21,6 +21,8 @@ class InferenceError:
         reason (InferenceErrorReason | Unset): Machine-readable capacity source when the failure is retryable
         retryable (bool | Unset): Whether retrying the request may succeed
         retry_after_ms (int | Unset): Minimum retry delay in milliseconds
+        input_index (int | Unset): Input whose atomic extraction validation or decoding failed, when known
+        stage (str | Unset): Extraction failure stage, when known
     """
 
     error: str
@@ -28,6 +30,8 @@ class InferenceError:
     reason: InferenceErrorReason | Unset = UNSET
     retryable: bool | Unset = UNSET
     retry_after_ms: int | Unset = UNSET
+    input_index: int | Unset = UNSET
+    stage: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -42,6 +46,10 @@ class InferenceError:
         retryable = self.retryable
 
         retry_after_ms = self.retry_after_ms
+
+        input_index = self.input_index
+
+        stage = self.stage
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -58,6 +66,10 @@ class InferenceError:
             field_dict["retryable"] = retryable
         if retry_after_ms is not UNSET:
             field_dict["retry_after_ms"] = retry_after_ms
+        if input_index is not UNSET:
+            field_dict["input_index"] = input_index
+        if stage is not UNSET:
+            field_dict["stage"] = stage
 
         return field_dict
 
@@ -79,12 +91,18 @@ class InferenceError:
 
         retry_after_ms = d.pop("retry_after_ms", UNSET)
 
+        input_index = d.pop("input_index", UNSET)
+
+        stage = d.pop("stage", UNSET)
+
         inference_error = cls(
             error=error,
             message=message,
             reason=reason,
             retryable=retryable,
             retry_after_ms=retry_after_ms,
+            input_index=input_index,
+            stage=stage,
         )
 
         inference_error.additional_properties = d

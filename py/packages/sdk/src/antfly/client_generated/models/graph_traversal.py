@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 from attrs import define as _attrs_define
 
 from ..models.edge_direction import EdgeDirection
+from ..models.graph_traversal_metric_freshness import GraphTraversalMetricFreshness
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -27,6 +28,8 @@ if TYPE_CHECKING:
     from ..models.graph_edge_weight_range import GraphEdgeWeightRange
     from ..models.graph_identity_node_selector import GraphIdentityNodeSelector
     from ..models.graph_key_node_selector import GraphKeyNodeSelector
+    from ..models.graph_metric_filter import GraphMetricFilter
+    from ..models.graph_metric_order import GraphMetricOrder
     from ..models.graph_result_ref_node_selector import GraphResultRefNodeSelector
 
 
@@ -55,6 +58,15 @@ class GraphTraversal:
             include_documents (bool | Unset): Include each result node's stored document when it exists at the pinned
                 snapshot. A dangling graph identity omits document. When false, document is always omitted. Default: False.
             fields (list[str] | Unset): Requires include_documents=true. Omit to include all document fields.
+            metrics (list[str] | Unset): Graph metric names to project onto returned traversal nodes.
+            order_by (list[GraphMetricOrder] | Unset): Sort traversal candidates by graph metric score before applying
+                limit.
+            where_metric (list[GraphMetricFilter] | Unset): Filter traversal candidates by graph metric score before
+                applying limit.
+            metric_freshness (GraphTraversalMetricFreshness | Unset): Freshness required for projected, ordered, and
+                filtered graph metrics. Default: GraphTraversalMetricFreshness.PUBLISHED.
+            include_metric_status (bool | Unset): Include graph metric status metadata in the traversal profile. Default:
+                False.
             filter_ (GraphDocumentBoolFieldFilter | GraphDocumentDateRangeFilter | GraphDocumentFilterBoolean |
                 GraphDocumentFilterConjunction | GraphDocumentFilterDisjunction | GraphDocumentFuzzyFilter |
                 GraphDocumentIdsFilter | GraphDocumentMatchAllFilter | GraphDocumentMatchNoneFilter |
@@ -76,6 +88,11 @@ class GraphTraversal:
     include_paths: bool | Unset = False
     include_documents: bool | Unset = False
     fields: list[str] | Unset = UNSET
+    metrics: list[str] | Unset = UNSET
+    order_by: list[GraphMetricOrder] | Unset = UNSET
+    where_metric: list[GraphMetricFilter] | Unset = UNSET
+    metric_freshness: GraphTraversalMetricFreshness | Unset = GraphTraversalMetricFreshness.PUBLISHED
+    include_metric_status: bool | Unset = False
     filter_: (
         GraphDocumentBoolFieldFilter
         | GraphDocumentDateRangeFilter
@@ -145,6 +162,30 @@ class GraphTraversal:
         if not isinstance(self.fields, Unset):
             fields = self.fields
 
+        metrics: list[str] | Unset = UNSET
+        if not isinstance(self.metrics, Unset):
+            metrics = self.metrics
+
+        order_by: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.order_by, Unset):
+            order_by = []
+            for order_by_item_data in self.order_by:
+                order_by_item = order_by_item_data.to_dict()
+                order_by.append(order_by_item)
+
+        where_metric: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.where_metric, Unset):
+            where_metric = []
+            for where_metric_item_data in self.where_metric:
+                where_metric_item = where_metric_item_data.to_dict()
+                where_metric.append(where_metric_item)
+
+        metric_freshness: str | Unset = UNSET
+        if not isinstance(self.metric_freshness, Unset):
+            metric_freshness = self.metric_freshness.value
+
+        include_metric_status = self.include_metric_status
+
         filter_: dict[str, Any] | Unset
         if isinstance(self.filter_, Unset):
             filter_ = UNSET
@@ -202,6 +243,16 @@ class GraphTraversal:
             field_dict["include_documents"] = include_documents
         if fields is not UNSET:
             field_dict["fields"] = fields
+        if metrics is not UNSET:
+            field_dict["metrics"] = metrics
+        if order_by is not UNSET:
+            field_dict["order_by"] = order_by
+        if where_metric is not UNSET:
+            field_dict["where_metric"] = where_metric
+        if metric_freshness is not UNSET:
+            field_dict["metric_freshness"] = metric_freshness
+        if include_metric_status is not UNSET:
+            field_dict["include_metric_status"] = include_metric_status
         if filter_ is not UNSET:
             field_dict["filter"] = filter_
 
@@ -227,6 +278,8 @@ class GraphTraversal:
         from ..models.graph_edge_weight_range import GraphEdgeWeightRange
         from ..models.graph_identity_node_selector import GraphIdentityNodeSelector
         from ..models.graph_key_node_selector import GraphKeyNodeSelector
+        from ..models.graph_metric_filter import GraphMetricFilter
+        from ..models.graph_metric_order import GraphMetricOrder
         from ..models.graph_result_ref_node_selector import GraphResultRefNodeSelector
 
         d = dict(src_dict)
@@ -281,6 +334,35 @@ class GraphTraversal:
         include_documents = d.pop("include_documents", UNSET)
 
         fields = cast(list[str], d.pop("fields", UNSET))
+
+        metrics = cast(list[str], d.pop("metrics", UNSET))
+
+        _order_by = d.pop("order_by", UNSET)
+        order_by: list[GraphMetricOrder] | Unset = UNSET
+        if _order_by is not UNSET:
+            order_by = []
+            for order_by_item_data in _order_by:
+                order_by_item = GraphMetricOrder.from_dict(order_by_item_data)
+
+                order_by.append(order_by_item)
+
+        _where_metric = d.pop("where_metric", UNSET)
+        where_metric: list[GraphMetricFilter] | Unset = UNSET
+        if _where_metric is not UNSET:
+            where_metric = []
+            for where_metric_item_data in _where_metric:
+                where_metric_item = GraphMetricFilter.from_dict(where_metric_item_data)
+
+                where_metric.append(where_metric_item)
+
+        _metric_freshness = d.pop("metric_freshness", UNSET)
+        metric_freshness: GraphTraversalMetricFreshness | Unset
+        if isinstance(_metric_freshness, Unset):
+            metric_freshness = UNSET
+        else:
+            metric_freshness = GraphTraversalMetricFreshness(_metric_freshness)
+
+        include_metric_status = d.pop("include_metric_status", UNSET)
 
         def _parse_filter_(
             data: object,
@@ -434,6 +516,11 @@ class GraphTraversal:
             include_paths=include_paths,
             include_documents=include_documents,
             fields=fields,
+            metrics=metrics,
+            order_by=order_by,
+            where_metric=where_metric,
+            metric_freshness=metric_freshness,
+            include_metric_status=include_metric_status,
             filter_=filter_,
         )
 

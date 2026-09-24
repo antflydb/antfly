@@ -29,29 +29,68 @@ import (
 // Re-export commonly used types from oapi package
 type (
 	// Table and Index types
-	CreateTableRequest           = oapi.CreateTableRequest
-	TableStatus                  = oapi.TableStatus
-	TableMigration               = oapi.TableMigration
-	TableSchema                  = oapi.TableSchema
-	IndexConfig                  = oapi.IndexConfig
-	CreateIndexRequest           = oapi.CreateIndexRequest
-	CreateFullTextIndexRequest   = oapi.CreateFullTextIndexRequest
-	CreateEmbeddingsIndexRequest = oapi.CreateEmbeddingsIndexRequest
-	CreateGraphIndexRequest      = oapi.CreateGraphIndexRequest
-	CreateAlgebraicIndexRequest  = oapi.CreateAlgebraicIndexRequest
-	CreatedFullTextIndex         = oapi.CreatedFullTextIndex
-	CreatedEmbeddingsIndex       = oapi.CreatedEmbeddingsIndex
-	CreatedGraphIndex            = oapi.CreatedGraphIndex
-	CreatedAlgebraicIndex        = oapi.CreatedAlgebraicIndex
-	CreatedFullTextIndexType     = oapi.CreatedFullTextIndexType
-	CreatedEmbeddingsIndexType   = oapi.CreatedEmbeddingsIndexType
-	CreatedGraphIndexType        = oapi.CreatedGraphIndexType
-	CreatedAlgebraicIndexType    = oapi.CreatedAlgebraicIndexType
-	IndexStatus                  = oapi.IndexStatus
-	IndexType                    = oapi.IndexType
-	IndexPublicationPolicy       = oapi.IndexPublicationPolicy
-	IndexReadinessState          = oapi.IndexReadinessState
-	DerivedCoveragePolicy        = oapi.DerivedCoveragePolicy
+	CreateTableRequest                    = oapi.CreateTableRequest
+	TableStatus                           = oapi.TableStatus
+	TableMigration                        = oapi.TableMigration
+	TableSchema                           = oapi.TableSchema
+	TableStorageMode                      = oapi.TableStorageMode
+	RelationalIndexDefinition             = oapi.RelationalIndexDefinition
+	RelationalIndexPredicate              = oapi.RelationalIndexPredicate
+	RelationalScalarExpression            = oapi.RelationalScalarExpression
+	RelationalColumnExpression            = oapi.RelationalColumnExpression
+	RelationalExpressionOp                = oapi.RelationalExpressionOp
+	RelationalExpressionType              = oapi.RelationalExpressionType
+	RelationalCheckConstraint             = oapi.RelationalCheckConstraint
+	RelationalUniqueConstraint            = oapi.RelationalUniqueConstraint
+	RelationalForeignKeyConstraint        = oapi.RelationalForeignKeyConstraint
+	RelationalRow                         = oapi.RelationalRow
+	RelationalRowCondition                = oapi.RelationalRowCondition
+	RelationalRowQueryRequest             = oapi.RelationalRowQueryRequest
+	RelationalRowMutation                 = oapi.RelationalRowMutation
+	RelationalRowMutationRequest          = oapi.RelationalRowMutationRequest
+	RelationalConstraintStatus            = oapi.RelationalConstraintStatus
+	RelationalConstraintRetryRequest      = oapi.RelationalConstraintRetryRequest
+	RelationalConstraintRetirementRequest = oapi.RelationalConstraintRetirementRequest
+	RelationalConstraintRetirementStatus  = oapi.RelationalConstraintRetirementStatus
+	RelationalConstraintRetryResponse     = oapi.RelationalConstraintRetryResponse
+	RelationalConstraintRangeStatus       = oapi.RelationalConstraintRangeStatus
+	RelationalConstraintConflictReason    = oapi.RelationalConstraintConflictReason
+	RelationalComparisonOp                = oapi.RelationalComparisonOp
+	RelationalIndexKey                    = oapi.RelationalIndexKey
+	RelationalIndexKeyDirection           = oapi.RelationalIndexKeyDirection
+	RelationalIndexKeyNulls               = oapi.RelationalIndexKeyNulls
+	IndexConfig                           = oapi.IndexConfig
+	CreateIndexRequest                    = oapi.CreateIndexRequest
+	CreateFullTextIndexRequest            = oapi.CreateFullTextIndexRequest
+	CreateEmbeddingsIndexRequest          = oapi.CreateEmbeddingsIndexRequest
+	CreateGraphIndexRequest               = oapi.CreateGraphIndexRequest
+	CreateAlgebraicIndexRequest           = oapi.CreateAlgebraicIndexRequest
+	CreateRelationalIndexRequest          = oapi.CreateRelationalIndexRequest
+	CreatedRelationalIndex                = oapi.CreatedRelationalIndex
+	CreatedRelationalIndexType            = oapi.CreatedRelationalIndexType
+	RelationalIndexConfig                 = oapi.RelationalIndexConfig
+	RelationalIndexStats                  = oapi.RelationalIndexStats
+	RelationalIndexStatus                 = oapi.RelationalIndexStatus
+	RelationalIndexRangeStatus            = oapi.RelationalIndexRangeStatus
+	RelationalIndexBuildState             = oapi.RelationalIndexBuildState
+	RelationalIndexBuildFailure           = oapi.RelationalIndexBuildFailure
+	RelationalRowIndexBound               = oapi.RelationalRowIndexBound
+	CreatedFullTextIndex                  = oapi.CreatedFullTextIndex
+	CreatedEmbeddingsIndex                = oapi.CreatedEmbeddingsIndex
+	CreatedGraphIndex                     = oapi.CreatedGraphIndex
+	CreatedAlgebraicIndex                 = oapi.CreatedAlgebraicIndex
+	CreatedFullTextIndexType              = oapi.CreatedFullTextIndexType
+	CreatedEmbeddingsIndexType            = oapi.CreatedEmbeddingsIndexType
+	CreatedGraphIndexType                 = oapi.CreatedGraphIndexType
+	CreatedAlgebraicIndexType             = oapi.CreatedAlgebraicIndexType
+	IndexStatus                           = oapi.IndexStatus
+	IndexMaintenanceRequest               = oapi.IndexMaintenanceRequest
+	IndexMaintenanceResponse              = oapi.IndexMaintenanceResponse
+	IndexMaintenanceOwnerProof            = oapi.IndexMaintenanceOwnerProof
+	IndexType                             = oapi.IndexType
+	IndexPublicationPolicy                = oapi.IndexPublicationPolicy
+	IndexReadinessState                   = oapi.IndexReadinessState
+	DerivedCoveragePolicy                 = oapi.DerivedCoveragePolicy
 
 	// Artifact types
 	DocumentArtifactChildRange               = oapi.DocumentArtifactChildRange
@@ -214,6 +253,10 @@ type (
 	AgentStepKind       = oapi.AgentStepKind
 	AgentStepStatus     = oapi.AgentStepStatus
 
+	// Provider-specific web search options
+	WebSearchProviderConfig = oapi.WebSearchProviderConfig
+	ExaSearchConfig         = oapi.ExaSearchConfig
+
 	// Query Builder types
 	QueryBuilderRequest = oapi.QueryBuilderRequest
 	QueryBuilderResult  = oapi.QueryBuilderResult
@@ -234,10 +277,10 @@ type (
 	SSEToolMode      = oapi.SSEToolMode
 	SSEError         = oapi.SSEError
 
-	RetrievalQueryRequest = oapi.RetrievalQueryRequest
-	RetrievalStrategy     = oapi.RetrievalStrategy
-	TreeSearchConfig      = oapi.TreeSearchConfig
-	QueryHit              = oapi.QueryHit
+	RetrievalQueryRequest     = oapi.QueryRequest
+	RetrievalStrategy         = oapi.RetrievalStrategy
+	RetrievalNavigationConfig = oapi.RetrievalNavigationConfig
+	QueryHit                  = oapi.QueryHit
 
 	// Evaluation types
 	EvalConfig    = oapi.EvalConfig
@@ -276,6 +319,7 @@ type (
 	// Graph index types
 	GraphIndexConfig                      = oapi.GraphIndexConfig
 	GraphIndexStats                       = oapi.GraphIndexStats
+	GraphIndexStatsIndexType              = oapi.GraphIndexStatsIndexType
 	GraphArtifactSourceConfig             = oapi.GraphArtifactSourceConfig
 	GraphArtifactSourceConfigFormat       = oapi.GraphArtifactSourceConfigFormat
 	GraphArtifactProducerConfig           = oapi.GraphArtifactProducerConfig
@@ -292,11 +336,41 @@ type (
 	GraphTemplateValue                    = oapi.GraphTemplateValue
 	GraphTemplateValue0                   = oapi.GraphTemplateValue0
 	GraphTemplateValue1                   = oapi.GraphTemplateValue1
-	EdgeTypeConfig                        = oapi.EdgeTypeConfig
-	EdgeTypeConfigTopology                = oapi.EdgeTypeConfigTopology
-	EdgeDirection                         = oapi.EdgeDirection
-	Edge                                  = oapi.Edge
-	EdgesResponse                         = oapi.EdgesResponse
+	GraphMetricActionResponse             = oapi.GraphMetricActionResponse
+	GraphMetricBuildPageStatus            = oapi.GraphMetricBuildPageStatus
+	GraphMetricBuildPageStatusRangeKind   = oapi.GraphMetricBuildPageStatusRangeKind
+	GraphMetricBuildPageStatusState       = oapi.GraphMetricBuildPageStatusState
+	GraphMetricEdgeFilterStatus           = oapi.GraphMetricEdgeFilterStatus
+	GraphMetricEdgeFilterStatusMode       = oapi.GraphMetricEdgeFilterStatusMode
+	GraphMetricEvent                      = oapi.GraphMetricEvent
+	GraphMetricEventKind                  = oapi.GraphMetricEventKind
+	GraphMetricFilter                     = oapi.GraphMetricFilter
+	GraphMetricFilterOp                   = oapi.GraphMetricFilterOp
+	GraphMetricOrder                      = oapi.GraphMetricOrder
+	GraphMetricOrderDirection             = oapi.GraphMetricOrderDirection
+	GraphMetricOrderNulls                 = oapi.GraphMetricOrderNulls
+	GraphMetricProfile                    = oapi.GraphMetricProfile
+	GraphMetricQuery                      = oapi.GraphMetricQuery
+	GraphMetricQueryMetricFreshness       = oapi.GraphMetricQueryMetricFreshness
+	GraphMetricRerank                     = oapi.GraphMetricRerank
+	GraphMetricRerankMetricFreshness      = oapi.GraphMetricRerankMetricFreshness
+	GraphMetricRerankScoreDetails         = oapi.GraphMetricRerankScoreDetails
+	GraphMetricResult                     = oapi.GraphMetricResult
+	GraphMetricRuntimeStats               = oapi.GraphMetricRuntimeStats
+	GraphMetricRuntimeStatsRole           = oapi.GraphMetricRuntimeStatsRole
+	GraphMetricScore                      = oapi.GraphMetricScore
+	GraphMetricStatus                     = oapi.GraphMetricStatus
+	GraphMetricStatusPhase                = oapi.GraphMetricStatusPhase
+	// GraphQueryMetricFreshness is retained for source compatibility; metric
+	// freshness now belongs to the canonical traversal operation.
+	GraphQueryMetricFreshness     = oapi.GraphTraversalMetricFreshness
+	GraphTraversalMetricFreshness = oapi.GraphTraversalMetricFreshness
+	QueryScoreDetails             = oapi.QueryScoreDetails
+	EdgeTypeConfig                = oapi.EdgeTypeConfig
+	EdgeTypeConfigTopology        = oapi.EdgeTypeConfigTopology
+	EdgeDirection                 = oapi.EdgeDirection
+	Edge                          = oapi.Edge
+	EdgesResponse                 = oapi.EdgesResponse
 
 	// Graph query types
 	GraphQuery                     = oapi.GraphQuery
@@ -431,6 +505,8 @@ func (c CreatedIndex) Value() (any, error) {
 		return c.AsCreatedGraphIndex()
 	case IndexTypeAlgebraic:
 		return c.AsCreatedAlgebraicIndex()
+	case IndexTypeRelational:
+		return c.AsCreatedRelationalIndex()
 	default:
 		return nil, fmt.Errorf("unknown created index discriminator %q", kind)
 	}
@@ -492,6 +568,20 @@ func (c CreatedIndex) AsCreatedAlgebraicIndex() (CreatedAlgebraicIndex, error) {
 	return value, nil
 }
 
+func (c CreatedIndex) AsCreatedRelationalIndex() (CreatedRelationalIndex, error) {
+	if err := c.requireKind(IndexTypeRelational); err != nil {
+		return CreatedRelationalIndex{}, err
+	}
+	value, err := c.generated.AsCreatedRelationalIndex()
+	if err != nil {
+		return CreatedRelationalIndex{}, err
+	}
+	if value.Name == "" || value.Type != CreatedRelationalIndexTypeRelational || len(value.Keys) == 0 {
+		return CreatedRelationalIndex{}, fmt.Errorf("invalid relational create-index response")
+	}
+	return value, nil
+}
+
 func (c CreatedIndex) requireKind(expected IndexType) error {
 	actual, err := c.Kind()
 	if err != nil {
@@ -504,6 +594,24 @@ func (c CreatedIndex) requireKind(expected IndexType) error {
 }
 
 const (
+	TableStorageModeDocument            = oapi.TableStorageModeDocument
+	TableStorageModeRelational          = oapi.TableStorageModeRelational
+	RelationalIndexKeyDirectionAsc      = oapi.RelationalIndexKeyDirectionAsc
+	RelationalIndexKeyDirectionDesc     = oapi.RelationalIndexKeyDirectionDesc
+	RelationalIndexKeyNullsDefault      = oapi.RelationalIndexKeyNullsDefault
+	RelationalIndexKeyNullsFirst        = oapi.RelationalIndexKeyNullsFirst
+	RelationalIndexKeyNullsLast         = oapi.RelationalIndexKeyNullsLast
+	RelationalComparisonOpEq            = oapi.RelationalComparisonOpEq
+	RelationalComparisonOpNe            = oapi.RelationalComparisonOpNe
+	RelationalComparisonOpGt            = oapi.RelationalComparisonOpGt
+	RelationalComparisonOpGte           = oapi.RelationalComparisonOpGte
+	RelationalComparisonOpLt            = oapi.RelationalComparisonOpLt
+	RelationalComparisonOpLte           = oapi.RelationalComparisonOpLte
+	RelationalComparisonOpIsNull        = oapi.RelationalComparisonOpIsNull
+	RelationalComparisonOpIsNotNull     = oapi.RelationalComparisonOpIsNotNull
+	RelationalComparisonOpIsDistinct    = oapi.RelationalComparisonOpIsDistinct
+	RelationalComparisonOpIsNotDistinct = oapi.RelationalComparisonOpIsNotDistinct
+
 	QueryHitsTotalRelationExact = oapi.QueryHitsTotalRelationExact
 	QueryHitsTotalRelationGte   = oapi.QueryHitsTotalRelationGte
 
@@ -600,6 +708,9 @@ const (
 	IndexTypeFullText                          = oapi.IndexTypeFullText
 	IndexTypeGraph                             = oapi.IndexTypeGraph
 	IndexTypeAlgebraic                         = oapi.IndexTypeAlgebraic
+	IndexTypeRelational                        = oapi.IndexTypeRelational
+	CreatedRelationalIndexTypeRelational       = oapi.CreatedRelationalIndexTypeRelational
+	CreateRelationalIndexRequestTypeRelational = oapi.CreateRelationalIndexRequestTypeRelational
 	CreatedFullTextIndexTypeFullText           = oapi.CreatedFullTextIndexTypeFullText
 	CreatedGraphIndexTypeGraph                 = oapi.CreatedGraphIndexTypeGraph
 	CreatedAlgebraicIndexTypeAlgebraic         = oapi.CreatedAlgebraicIndexTypeAlgebraic

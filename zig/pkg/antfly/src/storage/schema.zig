@@ -168,7 +168,38 @@ pub const FullTextDocument = struct {
     dynamic_rules: []const FullTextDynamicRule = &.{},
     open_dynamic_paths: []const []const u8 = &.{},
     infer_type_dynamic_paths: []const []const u8 = &.{},
+    /// Every dotted path declared under `properties`, whether or not the
+    /// declaration emits a text field. An explicit declaration owns its path:
+    /// the dynamic mapper must never treat a declared path as an undeclared
+    /// field, even when the enclosing object opts into dynamic indexing.
+    declared_paths: []const []const u8 = &.{},
+    /// Subtrees declared with `x-antfly-index: false`. Nothing at or below
+    /// these paths is indexed by any dynamic rule, open path, or type
+    /// inference.
+    unindexed_paths: []const []const u8 = &.{},
 };
+
+/// Whether `path` is `prefix` itself or a dotted descendant of it. An empty
+/// prefix covers every path.
+pub fn pathFallsUnderPrefix(prefix: []const u8, path: []const u8) bool {
+    if (prefix.len == 0) return true;
+    if (!std.mem.startsWith(u8, path, prefix)) return false;
+    return path.len == prefix.len or path[prefix.len] == '.';
+}
+
+pub fn pathFallsUnderAnyPrefix(prefixes: []const []const u8, path: []const u8) bool {
+    for (prefixes) |prefix| {
+        if (pathFallsUnderPrefix(prefix, path)) return true;
+    }
+    return false;
+}
+
+pub fn containsPath(paths: []const []const u8, path: []const u8) bool {
+    for (paths) |candidate| {
+        if (std.mem.eql(u8, candidate, path)) return true;
+    }
+    return false;
+}
 
 /// Storage profile for a table. Relational mode stores a self-describing packed
 /// row as the authoritative document value instead of retaining a JSON blob.
@@ -240,7 +271,7 @@ pub const TableSchema = struct {
 // Schema storage key
 // ============================================================================
 
-const schema_key = "\x00\x00__metadata__:schema";
+pub const schema_key = "\x00\x00__metadata__:schema";
 const schema_version_prefix = "\x00\x00__metadata__:schema_v";
 
 // ============================================================================
@@ -250,7 +281,7 @@ const schema_version_prefix = "\x00\x00__metadata__:schema_v";
 /// Current durable runtime-schema format. Catalog compatibility checks use the
 /// same exported constant so a writer can never silently drift from the format
 /// it advertises in transactional table metadata.
-pub const storage_format_version: u32 = 13;
+pub const storage_format_version: u32 = 14;
 
 /// Serialize a TableSchema to bytes. Caller owns the returned slice.
 pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
@@ -269,23 +300,51 @@ pub fn schemasEqual(alloc: Allocator, a: TableSchema, b: TableSchema) !bool {
     return std.mem.eql(u8, encoded_a, encoded_b);
 }
 
+fn encodedSchemasEqual(alloc: Allocator, existing: []const u8, incoming: []const u8) !bool {
+    if (std.mem.eql(u8, existing, incoming)) return true;
+    if (existing.len < 12 or incoming.len < 12 or
+        !std.mem.eql(u8, existing[0..4], "ASCH") or
+        !std.mem.eql(u8, incoming[0..4], "ASCH")) return false;
+    // A logical epoch is independent of its durable encoding version. Decode
+    // only a format transition; ordinary retries retain the byte-comparison
+    // fast path. Compare every field, including the public-validator contract.
+    if (std.mem.eql(u8, existing[4..8], incoming[4..8]) or
+        !std.mem.eql(u8, existing[8..12], incoming[8..12])) return false;
+    const old_schema = try deserializeSchema(alloc, existing);
+    defer freeSchema(alloc, old_schema);
+    const next_schema = try deserializeSchema(alloc, incoming);
+    defer freeSchema(alloc, next_schema);
+    return schemasEqual(alloc, old_schema, next_schema);
+}
+
 /// Serialize only the schema state that changes a full-text generation's
 /// physical projection. This encoding is deliberately independent of the
 /// current schema storage format: schemas without executable exact mappings
 /// retain the deployed v11 byte representation, while exact mappings use the
 /// v12 extension. Capability-only declarations are excluded because changing
-/// query diagnostics must not make existing postings unavailable.
+/// query diagnostics must not make existing postings unavailable. The v14
+/// declared/unindexed path lists are excluded for the same reason: they are
+/// derived from the same public schema whose logical version already
+/// participates in projection provenance, so encoding them here would only
+/// re-fingerprint every existing generation on upgrade.
 pub fn serializeTextProjectionSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
     var projection_schema = schema;
     projection_schema.declared_fields = &.{};
     projection_schema.storage_mode = .document;
     projection_schema.relational_columns = &.{};
+    const projection_documents = try alloc.dupe(FullTextDocument, schema.full_text_documents);
+    defer alloc.free(projection_documents);
+    for (projection_documents) |*doc| {
+        doc.declared_paths = &.{};
+        doc.unindexed_paths = &.{};
+    }
+    projection_schema.full_text_documents = projection_documents;
     const projection_format_version: u32 = if (projection_schema.exact_fields.len == 0) 11 else 12;
     return serializeSchemaFormat(alloc, projection_schema, projection_format_version);
 }
 
 fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: u32) ![]u8 {
-    std.debug.assert(format_version == 11 or format_version == 12 or format_version == 13);
+    std.debug.assert(format_version >= 11 and format_version <= storage_format_version);
     if (!exactFieldsValid(schema.exact_fields)) return error.InvalidSchema;
     try validateRelationalSchema(alloc, schema);
     if (format_version < 12 and (schema.declared_fields.len != 0 or schema.exact_fields.len != 0)) {
@@ -295,6 +354,11 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
         (schema.storage_mode != .document or schema.relational_columns.len != 0))
     {
         return error.InvalidSchema;
+    }
+    if (format_version < 14) {
+        for (schema.full_text_documents) |doc| {
+            if (doc.declared_paths.len != 0 or doc.unindexed_paths.len != 0) return error.InvalidSchema;
+        }
     }
 
     var buf = std.ArrayListUnmanaged(u8).empty;
@@ -388,6 +452,12 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
         for (doc.open_dynamic_paths) |path| try appendStr(&buf, alloc, path);
         try appendU32(&buf, alloc, @intCast(doc.infer_type_dynamic_paths.len));
         for (doc.infer_type_dynamic_paths) |path| try appendStr(&buf, alloc, path);
+        if (format_version >= 14) {
+            try appendU32(&buf, alloc, @intCast(doc.declared_paths.len));
+            for (doc.declared_paths) |path| try appendStr(&buf, alloc, path);
+            try appendU32(&buf, alloc, @intCast(doc.unindexed_paths.len));
+            for (doc.unindexed_paths) |path| try appendStr(&buf, alloc, path);
+        }
     }
 
     try appendU32(&buf, alloc, @intCast(schema.index_sort.len));
@@ -437,7 +507,7 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
 
     var pos: usize = 4;
     const fmt_version = readU32(data, &pos);
-    if (fmt_version < 1 or fmt_version > 13) return error.UnsupportedVersion;
+    if (fmt_version < 1 or fmt_version > storage_format_version) return error.UnsupportedVersion;
 
     const version = readU32(data, &pos);
     const default_type = try alloc.dupe(u8, readStr(data, &pos));
@@ -685,6 +755,8 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
                 if (doc.open_dynamic_paths.len > 0) alloc.free(doc.open_dynamic_paths);
                 for (doc.infer_type_dynamic_paths) |infer_path| alloc.free(infer_path);
                 if (doc.infer_type_dynamic_paths.len > 0) alloc.free(doc.infer_type_dynamic_paths);
+                freeOwnedPaths(alloc, doc.declared_paths);
+                freeOwnedPaths(alloc, doc.unindexed_paths);
             }
             alloc.free(docs);
         }
@@ -812,6 +884,12 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
                     infer_type_dynamic_paths_initialized += 1;
                 }
                 doc.infer_type_dynamic_paths = infer_type_dynamic_paths;
+            }
+            if (fmt_version >= 14) {
+                const declared_paths = try readOwnedPaths(alloc, data, &pos);
+                errdefer freeOwnedPaths(alloc, declared_paths);
+                doc.unindexed_paths = try readOwnedPaths(alloc, data, &pos);
+                doc.declared_paths = declared_paths;
             }
             docs_initialized += 1;
         }
@@ -1001,7 +1079,7 @@ fn validateSerializedSchema(data: []const u8) !void {
     cursor.pos = 4;
 
     const format_version = try cursor.readU32();
-    if (format_version < 1 or format_version > 13) return error.UnsupportedVersion;
+    if (format_version < 1 or format_version > storage_format_version) return error.UnsupportedVersion;
     _ = try cursor.readU32(); // logical schema version
     try cursor.readStr(); // default type
     try cursor.readU64(); // TTL duration
@@ -1063,6 +1141,7 @@ fn validateSerializedSchema(data: []const u8) !void {
         if (format_version >= 3) minimum_document_size += 4;
         if (format_version >= 6) minimum_document_size += 4;
         if (format_version >= 8) minimum_document_size += 4;
+        if (format_version >= 14) minimum_document_size += 8;
         try cursor.ensureCount(document_count, minimum_document_size);
         for (0..document_count) |_| {
             try cursor.readStr();
@@ -1102,6 +1181,14 @@ fn validateSerializedSchema(data: []const u8) !void {
                 const infer_path_count = try cursor.readU32();
                 try cursor.ensureCount(infer_path_count, 4);
                 for (0..infer_path_count) |_| try cursor.readStr();
+            }
+            if (format_version >= 14) {
+                const declared_path_count = try cursor.readU32();
+                try cursor.ensureCount(declared_path_count, 4);
+                for (0..declared_path_count) |_| try cursor.readStr();
+                const unindexed_path_count = try cursor.readU32();
+                try cursor.ensureCount(unindexed_path_count, 4);
+                for (0..unindexed_path_count) |_| try cursor.readStr();
             }
         }
     }
@@ -1220,8 +1307,31 @@ fn freeFullTextDocuments(alloc: Allocator, documents: []const FullTextDocument) 
         if (doc.open_dynamic_paths.len > 0) alloc.free(doc.open_dynamic_paths);
         for (doc.infer_type_dynamic_paths) |infer_path| alloc.free(infer_path);
         if (doc.infer_type_dynamic_paths.len > 0) alloc.free(doc.infer_type_dynamic_paths);
+        freeOwnedPaths(alloc, doc.declared_paths);
+        freeOwnedPaths(alloc, doc.unindexed_paths);
     }
     if (documents.len > 0) alloc.free(documents);
+}
+
+fn readOwnedPaths(alloc: Allocator, data: []const u8, pos: *usize) ![]const []const u8 {
+    const count = readU32(data, pos);
+    if (count == 0) return &.{};
+    const paths = try alloc.alloc([]const u8, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (paths[0..initialized]) |path| alloc.free(path);
+        alloc.free(paths);
+    }
+    for (paths) |*path| {
+        path.* = try alloc.dupe(u8, readStr(data, pos));
+        initialized += 1;
+    }
+    return paths;
+}
+
+pub fn freeOwnedPaths(alloc: Allocator, paths: []const []const u8) void {
+    for (paths) |path| alloc.free(path);
+    if (paths.len > 0) alloc.free(paths);
 }
 
 /// Save a schema to DocStore. Returns whether durable state changed.
@@ -1265,6 +1375,78 @@ pub fn saveEncodedSchemaWithMetadata(
     metadata_writes: []const docstore.KVPair,
     metadata_deletes: []const []const u8,
 ) !bool {
+    return saveEncodedSchemaWithMetadataAndStage(store, alloc, schema_version, data, metadata_writes, metadata_deletes, null);
+}
+
+/// A prepared participant may CAS/stage schema-dependent metadata after the
+/// schema puts, but before the SAME transaction commits. The caller publishes
+/// its already-compiled runtime state only after this function succeeds.
+/// Prove an idempotent metadata installation without acquiring write authority.
+/// A participant must expose the same effects without its mutation gate. The
+/// adapter stops at the first differing effect, so it never needs an overlay.
+pub fn encodedSchemaMetadataUnchanged(
+    store: anytype,
+    alloc: Allocator,
+    schema_version: u32,
+    data: []const u8,
+    metadata_writes: []const docstore.KVPair,
+    metadata_deletes: []const []const u8,
+    participant: anytype,
+) !bool {
+    var runtime = try initRuntimeStore(alloc, store);
+    defer runtime.deinit();
+    var probe = try runtime.store.beginRead();
+    defer probe.abort();
+    const Compare = struct {
+        probe: *@TypeOf(probe),
+
+        pub fn get(self: @This(), key: []const u8) ![]const u8 {
+            return self.probe.get(key);
+        }
+        pub fn openCursor(self: @This()) !backend_erased.Cursor {
+            return self.probe.openCursor();
+        }
+        pub fn put(self: @This(), key: []const u8, value: []const u8) !void {
+            const existing = self.get(key) catch |err| switch (err) {
+                error.NotFound => return error.SchemaMetadataChanged,
+                else => return err,
+            };
+            if (!std.mem.eql(u8, existing, value)) return error.SchemaMetadataChanged;
+        }
+        pub fn delete(self: @This(), key: []const u8) !void {
+            _ = self.get(key) catch |err| switch (err) {
+                error.NotFound => return,
+                else => return err,
+            };
+            return error.SchemaMetadataChanged;
+        }
+        fn compare(self: *@This(), version: u32, encoded: []const u8, writes: []const docstore.KVPair, deletes: []const []const u8, stage: @TypeOf(participant), allocator: Allocator) !void {
+            try self.put(schema_key, encoded);
+            const version_key = try schemaVersionKeyAlloc(allocator, version);
+            defer allocator.free(version_key);
+            try self.put(version_key, encoded);
+            for (writes) |write| try self.put(write.key, write.value);
+            for (deletes) |key| try self.delete(key);
+            try stage.stageChanges(self);
+        }
+    };
+    var comparison = Compare{ .probe = &probe };
+    comparison.compare(schema_version, data, metadata_writes, metadata_deletes, participant, alloc) catch |err| switch (err) {
+        error.SchemaMetadataChanged => return false,
+        else => return err,
+    };
+    return true;
+}
+
+pub fn saveEncodedSchemaWithMetadataAndStage(
+    store: anytype,
+    alloc: Allocator,
+    schema_version: u32,
+    data: []const u8,
+    metadata_writes: []const docstore.KVPair,
+    metadata_deletes: []const []const u8,
+    participant: anytype,
+) !bool {
     if (data.len < 12 or !std.mem.eql(u8, data[0..4], "ASCH") or
         std.mem.readInt(u32, data[8..12], .little) != schema_version)
         return error.InvalidSchema;
@@ -1282,7 +1464,10 @@ pub fn saveEncodedSchemaWithMetadata(
             error.NotFound => null,
             else => return err,
         };
-        const changed = if (previous_data) |loaded| !std.mem.eql(u8, loaded, data) else true;
+        // Reopening an unchanged epoch with a newer serializer must not rewrite
+        // either its active or historical bytes. Other metadata can still be
+        // committed below, including an identical public-validator backfill.
+        const changed = if (previous_data) |loaded| !try encodedSchemasEqual(alloc, loaded, data) else true;
         if (!changed) break :changed_blk false;
 
         if (previous_data) |loaded| {
@@ -1308,7 +1493,9 @@ pub fn saveEncodedSchemaWithMetadata(
         };
         break :changed_blk true;
     };
-    if (!schema_changed and metadata_writes.len == 0 and metadata_deletes.len == 0) return false;
+    if (comptime @TypeOf(participant) == @TypeOf(null)) {
+        if (!schema_changed and metadata_writes.len == 0 and metadata_deletes.len == 0) return false;
+    }
 
     var txn = try runtime.store.beginWrite();
     errdefer txn.abort();
@@ -1326,6 +1513,7 @@ pub fn saveEncodedSchemaWithMetadata(
         error.NotFound => {},
         else => return err,
     };
+    if (comptime @TypeOf(participant) != @TypeOf(null)) _ = try participant.stage(&txn);
     try txn.commit();
     return schema_changed;
 }
@@ -2503,6 +2691,8 @@ test "schema serialize/deserialize round-trip" {
                 },
                 .open_dynamic_paths = &.{ "", "meta" },
                 .infer_type_dynamic_paths = &.{"typed"},
+                .declared_paths = &.{ "title", "stored_only", "meta" },
+                .unindexed_paths = &.{"stored_only"},
             },
         },
         .index_sort = &.{
@@ -2515,7 +2705,7 @@ test "schema serialize/deserialize round-trip" {
     defer alloc.free(data);
 
     var format_pos: usize = 4;
-    try std.testing.expectEqual(@as(u32, 13), readU32(data, &format_pos));
+    try std.testing.expectEqual(@as(u32, 14), readU32(data, &format_pos));
 
     const loaded = try deserializeSchema(alloc, data);
     defer freeSchema(alloc, loaded);
@@ -2565,6 +2755,12 @@ test "schema serialize/deserialize round-trip" {
     try std.testing.expectEqualStrings("meta", loaded.full_text_documents[0].open_dynamic_paths[1]);
     try std.testing.expectEqual(@as(usize, 1), loaded.full_text_documents[0].infer_type_dynamic_paths.len);
     try std.testing.expectEqualStrings("typed", loaded.full_text_documents[0].infer_type_dynamic_paths[0]);
+    try std.testing.expectEqual(@as(usize, 3), loaded.full_text_documents[0].declared_paths.len);
+    try std.testing.expectEqualStrings("title", loaded.full_text_documents[0].declared_paths[0]);
+    try std.testing.expectEqualStrings("stored_only", loaded.full_text_documents[0].declared_paths[1]);
+    try std.testing.expectEqualStrings("meta", loaded.full_text_documents[0].declared_paths[2]);
+    try std.testing.expectEqual(@as(usize, 1), loaded.full_text_documents[0].unindexed_paths.len);
+    try std.testing.expectEqualStrings("stored_only", loaded.full_text_documents[0].unindexed_paths[0]);
     try std.testing.expectEqual(@as(usize, 2), loaded.index_sort.len);
     try std.testing.expectEqualStrings("created_at", loaded.index_sort[0].field);
     try std.testing.expect(loaded.index_sort[0].desc);
@@ -2745,6 +2941,21 @@ test "text projection serialization preserves v11 witnesses and excludes declara
     defer alloc.free(projection_without_declaration);
     try std.testing.expectEqualSlices(u8, projection, projection_without_declaration);
 
+    // Declared/unindexed path lists are v14 storage state. They must neither
+    // leak into the v11 witness nor be representable in a pre-v14 encoding.
+    const documents_with_paths = [_]FullTextDocument{.{
+        .name = "doc",
+        .fields = &fields,
+        .declared_paths = &.{ "created_at", "stored_only" },
+        .unindexed_paths = &.{"stored_only"},
+    }};
+    var with_paths = schema;
+    with_paths.full_text_documents = &documents_with_paths;
+    const projection_with_paths = try serializeTextProjectionSchema(alloc, with_paths);
+    defer alloc.free(projection_with_paths);
+    try std.testing.expectEqualSlices(u8, projection, projection_with_paths);
+    try std.testing.expectError(error.InvalidSchema, serializeSchemaFormat(alloc, with_paths, 13));
+
     const exact_fields = [_]ExactField{.{
         .source_field = "created_at",
         .field = "created_at",
@@ -2864,6 +3075,58 @@ test "schema and generation metadata commit in one transaction" {
     try std.testing.expectError(error.NotFound, store.get(alloc, public_key));
 }
 
+test "relational index system schema rehydration proves every durable effect" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "schema-rehydration-proof");
+    defer alloc.free(path);
+    defer cleanupTestDir(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    const active_public = "\x00\x00__metadata__:schema_json_test";
+    const participant_key = "\x00\x00__metadata__:participant_test";
+    const absent_key = "\x00\x00__metadata__:absent_test";
+    const outbox_key = "\x00\x00__metadata__:ha_outbox_test";
+    const value = "durable";
+    const table_schema = TableSchema{ .version = 9, .default_type = "doc" };
+    const writes = [_]docstore.KVPair{
+        .{ .key = active_public, .value = value },
+        .{ .key = participant_key, .value = value },
+    };
+    _ = try saveSchemaWithMetadata(&store, alloc, table_schema, &writes, &.{});
+    const encoded = try serializeSchema(alloc, table_schema);
+    defer alloc.free(encoded);
+    const Participant = struct {
+        bytes: []const u8 = value,
+        remove: []const u8 = absent_key,
+        pub fn stageChanges(self: @This(), txn: anytype) !void {
+            // Exercise the full read-only interface used by catalog effects.
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            try txn.put(participant_key, self.bytes);
+            try txn.delete(self.remove);
+        }
+    };
+    try std.testing.expect(try encodedSchemaMetadataUnchanged(&store, alloc, 9, encoded, &writes, &.{absent_key}, Participant{}));
+    try std.testing.expect(!try encodedSchemaMetadataUnchanged(&store, alloc, 9, encoded, &writes, &.{}, Participant{ .bytes = "changed" }));
+    try std.testing.expect(!try encodedSchemaMetadataUnchanged(&store, alloc, 9, encoded, &writes, &.{}, Participant{ .remove = participant_key }));
+    try std.testing.expect(!try encodedSchemaMetadataUnchanged(&store, alloc, 9, encoded, &.{.{ .key = outbox_key, .value = value }}, &.{}, Participant{}));
+    try std.testing.expect(!try encodedSchemaMetadataUnchanged(&store, alloc, 9, encoded, &writes, &.{active_public}, Participant{}));
+    const retained = try store.get(alloc, participant_key);
+    defer alloc.free(retained);
+    try std.testing.expectEqualStrings(value, retained);
+    try std.testing.expectError(error.NotFound, store.get(alloc, outbox_key));
+    try store.put(outbox_key, value);
+    try std.testing.expect(try encodedSchemaMetadataUnchanged(&store, alloc, 9, encoded, &.{.{ .key = outbox_key, .value = value }}, &.{}, Participant{}));
+    try std.testing.expect(!try encodedSchemaMetadataUnchanged(&store, alloc, 9, encoded, &.{.{ .key = outbox_key, .value = "new event" }}, &.{}, Participant{}));
+    try store.delete(participant_key);
+    try std.testing.expect(!try encodedSchemaMetadataUnchanged(&store, alloc, 9, encoded, &.{}, &.{}, Participant{}));
+    try store.put(participant_key, value);
+    const versioned_key = try schemaVersionKeyAlloc(alloc, 9);
+    defer alloc.free(versioned_key);
+    try store.delete(versioned_key);
+    try std.testing.expect(!try encodedSchemaMetadataUnchanged(&store, alloc, 9, encoded, &writes, &.{}, Participant{}));
+}
+
 test "schema preserves versioned history in DocStore" {
     const alloc = std.testing.allocator;
     const path = try tempTestPath(alloc, "schema-history");
@@ -2885,6 +3148,49 @@ test "schema preserves versioned history in DocStore" {
     defer freeSchema(alloc, previous);
     try std.testing.expectEqual(@as(u32, 0), previous.version);
     try std.testing.expectEqualStrings("doc_v0", previous.default_type);
+}
+
+test "schema format-only retries preserve immutable epoch bytes and commit metadata" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "schema-format-retry");
+    defer alloc.free(path);
+    cleanupTestDir(path);
+    defer cleanupTestDir(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+
+    const schema: TableSchema = .{ .version = 4, .default_type = "doc" };
+    const versioned_key = try schemaVersionKeyAlloc(alloc, schema.version);
+    defer alloc.free(versioned_key);
+    for ([_]u32{ 11, 12 }) |format| {
+        const original = try serializeSchemaFormat(alloc, schema, format);
+        defer alloc.free(original);
+        try store.put(schema_key, original);
+        try store.put(versioned_key, original);
+        for (0..3) |_| {
+            try std.testing.expect(!try saveSchemaWithMetadata(&store, alloc, schema, &.{.{
+                .key = "retry-metadata",
+                .value = "published",
+            }}, &.{}));
+            for ([_][]const u8{ schema_key, versioned_key }) |key| {
+                const actual = try store.get(alloc, key);
+                defer alloc.free(actual);
+                try std.testing.expectEqualSlices(u8, original, actual);
+            }
+        }
+        const metadata = try store.get(alloc, "retry-metadata");
+        defer alloc.free(metadata);
+        try std.testing.expectEqualStrings("published", metadata);
+        var changed = schema;
+        changed.default_type = "other";
+        try std.testing.expectError(error.ImmutableSchemaVersionConflict, saveSchema(&store, alloc, changed));
+        changed = schema;
+        changed.requires_public_schema = true;
+        try std.testing.expectError(error.ImmutableSchemaVersionConflict, saveSchema(&store, alloc, changed));
+        const current = try serializeSchema(alloc, schema);
+        defer alloc.free(current);
+        try std.testing.expectError(error.InvalidFormat, encodedSchemasEqual(alloc, original[0 .. original.len - 1], current));
+    }
 }
 
 test "schema epochs reject version reuse and active regression" {

@@ -57,6 +57,18 @@ pub const Config = struct {
     /// parsed from user configuration: only a successful capability lease may
     /// enable the task-neutral binary attachment envelope.
     framed_attachments: bool = false,
+    /// Canonical extraction schema protocol; omitted configurations retain v1.
+    schema_version: u32 = 1,
+    /// True only when the configuration JSON carried an explicit
+    /// `schema_version` field. A boundary-architecture model (see
+    /// GLINER25.md) auto-upgrades a plain, schema-version-less wire request
+    /// to v2 on the provider side; a caller that never asked for a specific
+    /// version has no basis to reject that upgraded response as a mismatch.
+    /// Response-side validators should key strict schema_version equality
+    /// off this flag, not off `schema_version` alone, since the latter
+    /// cannot distinguish "the caller pinned v1" from "the caller never
+    /// said" -- both read 1.
+    schema_version_explicit: bool = false,
     schema_json: []const u8 = "",
     options_json: []const u8 = "",
 
@@ -73,6 +85,7 @@ pub const Config = struct {
     }
 
     pub fn validate(self: Config) !void {
+        if (self.schema_version != 1 and self.schema_version != 2) return error.UnsupportedExtractionSchemaVersion;
         if (self.provider != .mock and self.model.len == 0) return error.InvalidExtractionConfig;
         if ((self.provider == .pioneer or self.provider == .openai) and self.url.len == 0) return error.InvalidExtractionConfig;
     }
@@ -88,10 +101,15 @@ pub const Input = struct {
     content_json: []const u8,
     tokens_json: ?[]const u8 = null,
     metadata_json: ?[]const u8 = null,
+    /// V2 whole replacements. Null inherits; "{}" is an explicit replacement.
+    schema_json: ?[]const u8 = null,
+    options_json: ?[]const u8 = null,
 };
 
 pub const Request = struct {
     inputs: []const Input,
+    /// Null inherits the provider config; direct Node callers inherit v1.
+    schema_version: ?u32 = null,
     schema_json: []const u8 = "",
     options_json: []const u8 = "",
     /// Borrowed binary media associated with one logical input. Embedded
@@ -236,6 +254,12 @@ pub fn parseConfigFromSlice(alloc: Allocator, raw: []const u8) !Config {
 
     const provider_raw = stringField(parsed.value, "provider") orelse return error.InvalidExtractionConfig;
     const provider = try parseProvider(provider_raw);
+    const schema_version_field = parsed.value.object.get("schema_version");
+    const schema_version: u32 = if (schema_version_field) |version| blk: {
+        if (version != .integer or (version.integer != 1 and version.integer != 2)) return error.UnsupportedExtractionSchemaVersion;
+        break :blk @intCast(version.integer);
+    } else 1;
+    const schema_version_explicit = schema_version_field != null;
     const model = if (stringField(parsed.value, "model")) |value| try alloc.dupe(u8, value) else "";
     errdefer if (model.len > 0) alloc.free(model);
 
@@ -270,6 +294,8 @@ pub fn parseConfigFromSlice(alloc: Allocator, raw: []const u8) !Config {
         .capability_token = null,
         .capability_revision = null,
         .framed_attachments = false,
+        .schema_version = schema_version,
+        .schema_version_explicit = schema_version_explicit,
         .schema_json = schema_json,
         .options_json = options_json,
     };
@@ -278,18 +304,22 @@ pub fn parseConfigFromSlice(alloc: Allocator, raw: []const u8) !Config {
 }
 
 pub fn cloneConfig(alloc: Allocator, cfg: Config) !Config {
-    return .{
+    var owned = Config{
         .provider = cfg.provider,
-        .model = if (cfg.model.len > 0) try alloc.dupe(u8, cfg.model) else "",
-        .url = if (cfg.url.len > 0) try alloc.dupe(u8, cfg.url) else "",
-        .api_key = if (cfg.api_key) |value| try alloc.dupe(u8, value) else null,
-        .bearer_token = if (cfg.bearer_token) |value| try alloc.dupe(u8, value) else null,
-        .capability_token = if (cfg.capability_token) |value| try alloc.dupe(u8, value) else null,
-        .capability_revision = if (cfg.capability_revision) |value| try alloc.dupe(u8, value) else null,
+        .schema_version = cfg.schema_version,
+        .schema_version_explicit = cfg.schema_version_explicit,
         .framed_attachments = cfg.framed_attachments,
-        .schema_json = try alloc.dupe(u8, cfg.schema_json),
-        .options_json = try alloc.dupe(u8, cfg.options_json),
     };
+    errdefer owned.deinit(alloc);
+    if (cfg.model.len > 0) owned.model = try alloc.dupe(u8, cfg.model);
+    if (cfg.url.len > 0) owned.url = try alloc.dupe(u8, cfg.url);
+    if (cfg.api_key) |value| owned.api_key = try alloc.dupe(u8, value);
+    if (cfg.bearer_token) |value| owned.bearer_token = try alloc.dupe(u8, value);
+    if (cfg.capability_token) |value| owned.capability_token = try alloc.dupe(u8, value);
+    if (cfg.capability_revision) |value| owned.capability_revision = try alloc.dupe(u8, value);
+    if (cfg.schema_json.len > 0) owned.schema_json = try alloc.dupe(u8, cfg.schema_json);
+    if (cfg.options_json.len > 0) owned.options_json = try alloc.dupe(u8, cfg.options_json);
+    return owned;
 }
 
 pub const RemoteOptions = struct {
@@ -327,17 +357,84 @@ pub fn extractWithConfigAndOptions(
     return try extractor.extract(alloc, req);
 }
 
-pub fn firstResultJsonAlloc(alloc: Allocator, response_json: []const u8) ![]u8 {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response_json, .{});
-    defer parsed.deinit();
-    if (parsed.value == .object) {
-        if (parsed.value.object.get("data")) |data| {
-            if (data == .array and data.array.items.len > 0) {
-                return try std.json.Stringify.valueAlloc(alloc, data.array.items[0], .{});
-            }
+pub const ResponseExpectation = struct {
+    model: ?[]const u8 = null,
+    item_count: usize,
+    /// V1 may omit its version; a v2 request must receive an explicit v2.
+    schema_version: ?u32 = null,
+    max_response_bytes: ?usize = null,
+};
+
+/// Own the raw canonical envelope so callers can validate typed fields without
+/// losing extensions through a DTO roundtrip. Numeric lexemes remain exact.
+/// Depth is checked before parsing or recursive serialization can allocate.
+pub fn parseResponse(alloc: Allocator, payload: []const u8, expected: ResponseExpectation) !std.json.Parsed(std.json.Value) {
+    if (expected.max_response_bytes) |limit| if (payload.len > limit) return error.InvalidExtractionResponse;
+    try validateResponseDepth(payload);
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, payload, .{
+        .allocate = .alloc_always,
+        .parse_numbers = false,
+        .duplicate_field_behavior = .@"error",
+    }) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidExtractionResponse,
+    };
+    errdefer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidExtractionResponse;
+    const fields = parsed.value.object;
+    const object = fields.get("object") orelse return error.InvalidExtractionResponse;
+    const model = fields.get("model") orelse return error.InvalidExtractionResponse;
+    const data = fields.get("data") orelse return error.InvalidExtractionResponse;
+    if (object != .string or !std.mem.eql(u8, object.string, "extraction") or model != .string or data != .array or data.array.items.len != expected.item_count)
+        return error.InvalidExtractionResponse;
+    if (expected.model) |name| if (!std.mem.eql(u8, model.string, name)) return error.InvalidExtractionResponse;
+    const version: u32 = if (fields.get("schema_version")) |value| blk: {
+        const number = switch (value) {
+            .integer => |integer| std.math.cast(u32, integer) orelse return error.InvalidExtractionResponse,
+            .number_string => |lexeme| std.fmt.parseUnsigned(u32, lexeme, 10) catch return error.InvalidExtractionResponse,
+            else => return error.InvalidExtractionResponse,
+        };
+        if (number != 1 and number != 2) return error.InvalidExtractionResponse;
+        break :blk number;
+    } else 1;
+    if (expected.schema_version) |requested| if (version != requested) return error.InvalidExtractionResponse;
+    for (data.array.items) |item| {
+        if (item != .object) return error.InvalidExtractionResponse;
+        if (item.object.get("id")) |id| if (id != .null and id != .string) return error.InvalidExtractionResponse;
+    }
+    return parsed;
+}
+
+fn validateResponseDepth(payload: []const u8) !void {
+    var stack: [64]u8 = undefined;
+    var depth: usize = 0;
+    var quoted = false;
+    var escaped = false;
+    for (payload) |byte| {
+        if (quoted) {
+            if (escaped) escaped = false else if (byte == '\\') escaped = true else if (byte == '"') quoted = false;
+        } else switch (byte) {
+            '"' => quoted = true,
+            '[', '{' => {
+                if (depth == stack.len) return error.InvalidExtractionResponse;
+                stack[depth] = byte;
+                depth += 1;
+            },
+            ']', '}' => {
+                if (depth == 0) return error.InvalidExtractionResponse;
+                depth -= 1;
+                if (stack[depth] != (if (byte == ']') @as(u8, '[') else '{')) return error.InvalidExtractionResponse;
+            },
+            else => {},
         }
     }
-    return try alloc.dupe(u8, response_json);
+    if (quoted or depth != 0) return error.InvalidExtractionResponse;
+}
+
+pub fn firstResultJsonAlloc(alloc: Allocator, response_json: []const u8) ![]u8 {
+    var parsed = try parseResponse(alloc, response_json, .{ .item_count = 1 });
+    defer parsed.deinit();
+    return try std.json.Stringify.valueAlloc(alloc, parsed.value.object.get("data").?.array.items[0], .{});
 }
 
 const HttpExtractorState = struct {
@@ -402,7 +499,7 @@ const HttpExtractorState = struct {
             framed_body = try httpx.attachment_envelope.encodeSegmentsAlloc(alloc, metadata, attachments);
         }
 
-        const base = self.cfg.resolvedUrl() orelse switch (self.cfg.provider) {
+        const base_raw = self.cfg.resolvedUrl() orelse switch (self.cfg.provider) {
             .antfly => "http://127.0.0.1:8080",
             else => return error.InvalidExtractionConfig,
         };
@@ -410,6 +507,16 @@ const HttpExtractorState = struct {
             .pioneer => "/inference",
             else => "/extract",
         };
+        // A configured antfly extractor `url`/`api_url` is commonly a bare
+        // `scheme://host:port` (the same value a caller reuses for the
+        // embedder and chunker on the same inference service), which must
+        // resolve under the joined public API's `/ai/v1` prefix rather than
+        // the process root. Other providers' URLs are used exactly as given.
+        const base = if (self.cfg.provider == .antfly)
+            try normalizedAntflyExtractionBaseAlloc(alloc, base_raw)
+        else
+            try alloc.dupe(u8, base_raw);
+        defer alloc.free(base);
         const url = try std.fmt.allocPrint(alloc, "{s}{s}", .{ base, path });
         defer alloc.free(url);
 
@@ -444,7 +551,30 @@ const HttpExtractorState = struct {
         else
             error.ExtractionRequestFailed;
         const payload = resp.body orelse return error.EmptyExtractionResponse;
-        const canonical = try canonicalResponseJsonAlloc(alloc, payload);
+        // Only pin the response to a specific schema_version when the
+        // caller actually asked for one -- either this request explicitly
+        // (`req.schema_version`) or the provider config explicitly
+        // (`cfg.schema_version_explicit`). A boundary-architecture model
+        // (fastino/gliner2.5-base-v1) auto-upgrades a plain,
+        // schema-version-less wire request to v2 on the provider side (see
+        // zig/pkg/inference's extractWithAdmission); a caller that left
+        // schema_version unset everywhere -- as
+        // examples/dogfood/index_config.go's knowledgeGraphIndexJSON and
+        // GRAPH.md's shorthand extractor config both do -- has no basis to
+        // reject that upgrade as a mismatch. Before this, `req.schema_version
+        // orelse self.cfg.schema_version` always produced a concrete value
+        // (`Config.schema_version` defaults to 1, never null), so every such
+        // response failed this exact check with InvalidExtractionResponse --
+        // surfacing to Lite's enrichment runtime as "InvalidExtractorResponse"
+        // and silently producing zero relations/entities per call.
+        const expected_schema_version = req.schema_version orelse
+            (if (self.cfg.schema_version_explicit) self.cfg.schema_version else null);
+        const canonical = try canonicalResponseJsonAlloc(alloc, payload, .{
+            .model = self.cfg.model,
+            .item_count = req.inputs.len,
+            .schema_version = expected_schema_version,
+            .max_response_bytes = req.max_response_bytes,
+        }, req.inputs);
         return .{ .allocator = alloc, .json = canonical };
     }
 };
@@ -455,12 +585,80 @@ fn responseCapabilityStale(response: httpx.Response) bool {
     return std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t"), "true");
 }
 
-fn requestJsonAlloc(alloc: Allocator, cfg: Config, req: Request) ![]u8 {
+pub fn requestJsonAlloc(alloc: Allocator, cfg: Config, req: Request) ![]u8 {
+    return requestJsonAllocCapacity(alloc, cfg, req, null);
+}
+
+/// The v2 direct bridge has text JSON and no borrowed media. Count its exact
+/// escaped envelope size before allocating, then reserve precisely once.
+/// Legacy HTTP attachment serialization retains its existing entrypoint.
+pub fn requestJsonAllocBounded(alloc: Allocator, cfg: Config, req: Request, max_bytes: usize) ![]u8 {
+    if (req.attachments.len != 0) return error.UnsupportedExtractionInput;
+    var count = RequestByteCount{ .limit = max_bytes };
+    try count.add("{\"model\":".len);
+    try count.quoted(cfg.model);
+    if ((req.schema_version orelse cfg.schema_version) == 2) try count.add(",\"schema_version\":2".len);
+    try count.add(",\"inputs\":[".len);
+    for (req.inputs, 0..) |input, i| {
+        if (i > 0) try count.add(1);
+        try count.add(1);
+        if (input.id) |id| {
+            try count.add("\"id\":".len);
+            try count.quoted(id);
+            try count.add(1);
+        }
+        try count.add("\"content\":".len);
+        try count.add(input.content_json.len);
+        inline for (.{ .{ "tokens", "tokens_json" }, .{ "metadata", "metadata_json" }, .{ "schema", "schema_json" }, .{ "options", "options_json" } }) |field| {
+            if (@field(input, field[1])) |raw| {
+                try count.add((",\"" ++ field[0] ++ "\":").len);
+                try count.add(raw.len);
+            }
+        }
+        try count.add(1);
+    }
+    const schema_json = if (req.schema_json.len > 0) req.schema_json else cfg.schema_json;
+    const options_json = if (req.options_json.len > 0) req.options_json else cfg.options_json;
+    try count.add("],\"schema\":".len);
+    try count.add(if (schema_json.len > 0) schema_json.len else 2);
+    if (options_json.len > 0 and !std.mem.eql(u8, options_json, "{}")) {
+        try count.add(",\"options\":".len);
+        try count.add(options_json.len);
+    }
+    try count.add(1);
+    return requestJsonAllocCapacity(alloc, cfg, req, count.bytes);
+}
+const RequestByteCount = struct {
+    limit: usize,
+    bytes: usize = 0,
+    fn add(self: *RequestByteCount, count: usize) !void {
+        self.bytes = std.math.add(usize, self.bytes, count) catch return error.ExtractionRequestLimitExceeded;
+        if (self.bytes > self.limit) return error.ExtractionRequestLimitExceeded;
+    }
+    fn quoted(self: *RequestByteCount, text: []const u8) !void {
+        if (!std.unicode.utf8ValidateSlice(text)) return error.InvalidExtractionRequest;
+        // Every input byte contributes at least one output byte, plus quotes.
+        if (text.len > self.limit - self.bytes) return error.ExtractionRequestLimitExceeded;
+        var counter = std.Io.Writer.Discarding.init(&.{});
+        try std.json.Stringify.value(text, .{}, &counter.writer);
+        try self.add(std.math.cast(usize, counter.fullCount()) orelse return error.ExtractionRequestLimitExceeded);
+    }
+};
+
+fn requestJsonAllocCapacity(alloc: Allocator, cfg: Config, req: Request, capacity: ?usize) ![]u8 {
+    const schema_version = req.schema_version orelse cfg.schema_version;
+    if (schema_version != 1 and schema_version != 2) return error.UnsupportedExtractionSchemaVersion;
+    for (req.inputs) |input| if (schema_version == 1 and (input.schema_json != null or input.options_json != null))
+        return error.AdvancedExtractionSchemaRequiresVersion2;
     try validateAttachments(req);
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
+    if (capacity) |bytes| try out.ensureTotalCapacityPrecise(alloc, bytes);
     try out.appendSlice(alloc, "{\"model\":");
     try appendJsonString(alloc, &out, cfg.model);
+    // Preserve the exact legacy omission. An explicit v1 override also needs
+    // no wire field once config inheritance has been resolved locally.
+    if (schema_version == 2) try out.appendSlice(alloc, ",\"schema_version\":2");
     try out.appendSlice(alloc, ",\"inputs\":[");
     var attachment_cursor: usize = 0;
     for (req.inputs, 0..) |input, i| {
@@ -492,6 +690,14 @@ fn requestJsonAlloc(alloc: Allocator, cfg: Config, req: Request) ![]u8 {
             try out.appendSlice(alloc, ",\"metadata\":");
             try out.appendSlice(alloc, metadata_json);
         }
+        if (input.schema_json) |schema_json| {
+            try out.appendSlice(alloc, ",\"schema\":");
+            try out.appendSlice(alloc, schema_json);
+        }
+        if (input.options_json) |options_json| {
+            try out.appendSlice(alloc, ",\"options\":");
+            try out.appendSlice(alloc, options_json);
+        }
         try out.append(alloc, '}');
     }
     const schema_json = if (req.schema_json.len > 0) req.schema_json else cfg.schema_json;
@@ -503,6 +709,7 @@ fn requestJsonAlloc(alloc: Allocator, cfg: Config, req: Request) ![]u8 {
         try out.appendSlice(alloc, options_json);
     }
     try out.append(alloc, '}');
+    if (capacity) |bytes| std.debug.assert(out.items.len == bytes);
     return try out.toOwnedSlice(alloc);
 }
 
@@ -572,23 +779,55 @@ fn validateAttachments(req: Request) !void {
     }
 }
 
-fn canonicalResponseJsonAlloc(alloc: Allocator, payload: []const u8) ![]u8 {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
+fn canonicalResponseJsonAlloc(alloc: Allocator, payload: []const u8, expected: ResponseExpectation, inputs: []const Input) ![]u8 {
+    var parsed = try parseResponse(alloc, payload, expected);
     defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidExtractionResponse;
-
-    if (parsed.value.object.get("object")) |object_value| {
-        if (object_value == .string and std.mem.eql(u8, object_value.string, "extraction")) {
-            return try alloc.dupe(u8, payload);
-        }
+    const data = parsed.value.object.get("data").?.array.items;
+    if (data.len != inputs.len) return error.InvalidExtractionResponse;
+    var by_id = std.StringHashMapUnmanaged(usize).empty;
+    defer by_id.deinit(alloc);
+    for (inputs, 0..) |input, index| if (input.id) |id| {
+        const entry = try by_id.getOrPut(alloc, id);
+        if (entry.found_existing) return error.InvalidExtractionResponse;
+        entry.value_ptr.* = index;
+    };
+    const seen = try alloc.alloc(bool, inputs.len);
+    defer alloc.free(seen);
+    @memset(seen, false);
+    for (data, 0..) |item, position| {
+        const id = item.object.get("id") orelse .null;
+        const index = if (id == .string)
+            by_id.get(id.string) orelse return error.InvalidExtractionResponse
+        else if (inputs[position].id == null)
+            position
+        else
+            return error.InvalidExtractionResponse;
+        if (seen[index]) return error.InvalidExtractionResponse;
+        seen[index] = true;
     }
-    return error.InvalidExtractionResponse;
+    return try alloc.dupe(u8, payload);
 }
 
 fn appendJsonString(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
     const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
     defer alloc.free(encoded);
     try out.appendSlice(alloc, encoded);
+}
+
+/// A bare `scheme://host:port` antfly extractor base gets `/ai/v1` appended
+/// so it lands on the joined public API instead of the process root; a base
+/// that already carries a path (including one already ending in `/ai/v1`) is
+/// left exactly as configured. Mirrors
+/// `managed_embedder.zig`'s `normalizeAntflyInferenceBaseUrl` for the
+/// embedder/chunker paths.
+fn normalizedAntflyExtractionBaseAlloc(alloc: Allocator, raw: []const u8) ![]u8 {
+    const trimmed = std.mem.trimEnd(u8, raw, "/");
+    if (std.mem.endsWith(u8, trimmed, "/ai/v1")) return try alloc.dupe(u8, trimmed);
+    const scheme_pos = std.mem.indexOf(u8, trimmed, "://");
+    const host_start = if (scheme_pos) |pos| pos + 3 else 0;
+    const path_pos = std.mem.indexOfPos(u8, trimmed, host_start, "/");
+    if (path_pos == null) return try std.fmt.allocPrint(alloc, "{s}/ai/v1", .{trimmed});
+    return try alloc.dupe(u8, trimmed);
 }
 
 fn parseProvider(raw: []const u8) !Provider {
@@ -630,18 +869,67 @@ test "extracting request json uses content parts" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"text\"") != null);
 }
 
+test "extracting v2 config inheritance and per-input replacements survive transport" {
+    const alloc = std.testing.allocator;
+    var cfg = try parseConfigFromSlice(alloc,
+        \\{"provider":"antfly","model":"gliner2.5","schema_version":2,"schema":{"entities":["person"]},"options":{"include_spans":true}}
+    );
+    defer cfg.deinit(alloc);
+    var cloned = try cloneConfig(alloc, cfg);
+    defer cloned.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), cloned.schema_version);
+    const req = Request{ .inputs = &.{ .{ .content_json = "\"Ada\"" }, .{ .content_json = "\"Bob\"", .schema_json = "{\"classifications\":[{\"name\":\"t\",\"labels\":[\"a\",\"b\"],\"max_labels\":null}]}", .options_json = "{}" } } };
+    const body = try requestJsonAlloc(alloc, cloned, req);
+    defer alloc.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("schema_version").?.integer);
+    const items = parsed.value.object.get("inputs").?.array.items;
+    try std.testing.expect(!items[0].object.contains("options"));
+    try std.testing.expectEqual(@as(usize, 0), items[1].object.get("options").?.object.count());
+    try std.testing.expectEqual(std.json.Value.null, items[1].object.get("schema").?.object.get("classifications").?.array.items[0].object.get("max_labels").?);
+    const legacy = try requestJsonAlloc(alloc, cloned, .{ .inputs = req.inputs[0..1], .schema_version = 1 });
+    defer alloc.free(legacy);
+    try std.testing.expect(std.mem.indexOf(u8, legacy, "schema_version") == null);
+    try std.testing.expectError(error.AdvancedExtractionSchemaRequiresVersion2, requestJsonAlloc(alloc, cloned, .{ .inputs = req.inputs, .schema_version = 1 }));
+    try std.testing.expectError(error.UnsupportedExtractionSchemaVersion, parseConfigFromSlice(alloc, "{\"provider\":\"antfly\",\"model\":\"m\",\"schema_version\":3}"));
+}
+
+test "extracting bounded v2 envelope counts escaping before allocation" {
+    const alloc = std.testing.allocator;
+    const cfg = Config{ .provider = .antfly, .model = "quoted\"model\n😀", .schema_version = 2, .schema_json = "{\"entities\":[\"p\"]}", .options_json = "{\"threshold\":0.5}" };
+    const req = Request{ .inputs = &.{ .{ .id = "\x01\t\\", .content_json = "[{\"type\":\"text\",\"text\":\"Ada\"}]", .metadata_json = "{}", .tokens_json = "[]" }, .{ .content_json = "\"Bob\"", .schema_json = "{\"entities\":[\"e\"]}", .options_json = "{}" } } };
+    const ordinary = try requestJsonAlloc(alloc, cfg, req);
+    defer alloc.free(ordinary);
+    const bounded = try requestJsonAllocBounded(alloc, cfg, req, ordinary.len);
+    defer alloc.free(bounded);
+    try std.testing.expectEqualStrings(ordinary, bounded);
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectError(error.ExtractionRequestLimitExceeded, requestJsonAllocBounded(failing.allocator(), cfg, req, ordinary.len - 1));
+    try std.testing.expect(!failing.has_induced_failure);
+}
+
+fn cloneVersionedConfigAllocationTest(alloc: Allocator) !void {
+    var cloned = try cloneConfig(alloc, .{ .provider = .antfly, .model = "m", .url = "http://localhost", .api_key = "placeholder", .bearer_token = "token", .capability_token = "lease", .capability_revision = "revision", .schema_version = 2, .schema_json = "{\"entities\":[\"p\"]}", .options_json = "{}" });
+    defer cloned.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), cloned.schema_version);
+}
+test "extracting v2 config clone releases partial allocations" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, cloneVersionedConfigAllocationTest, .{});
+}
+
 test "extracting rejects non-canonical extract response" {
     const alloc = std.testing.allocator;
     try std.testing.expectError(error.InvalidExtractionResponse, canonicalResponseJsonAlloc(alloc,
         \\{"object":"list","model":"gliner","data":[{"results":{"person":[{"name":{"value":"Ada"}}]}}]}
-    ));
+    , .{ .model = "gliner", .item_count = 1 }, &.{.{ .content_json = "\"Ada\"" }}));
 }
 
 test "extracting accepts canonical extract response" {
     const alloc = std.testing.allocator;
     const canonical = try canonicalResponseJsonAlloc(alloc,
         \\{"object":"extraction","model":"gliner","data":[{"entities":[{"label":"person","text":"Ada"}]}]}
-    );
+    , .{ .model = "gliner", .item_count = 1 }, &.{.{ .content_json = "\"Ada\"" }});
     defer alloc.free(canonical);
     try std.testing.expect(std.mem.indexOf(u8, canonical, "\"object\":\"extraction\"") != null);
 }
@@ -669,6 +957,65 @@ test "extracting first result returns asset value" {
     defer alloc.free(value);
     try std.testing.expect(std.mem.indexOf(u8, value, "\"entities\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, value, "\"object\"") == null);
+}
+
+test "extracting response envelope rejects identity cardinality version and duplicate fields" {
+    const a = std.testing.allocator;
+    const expected = ResponseExpectation{ .model = "m", .item_count = 1, .schema_version = 1 };
+    const invalid = [_][]const u8{
+        "{}",
+        "{\"object\":\"extraction\",\"data\":[{}]}",
+        "{\"object\":\"extraction\",\"model\":\"other\",\"data\":[{}]}",
+        "{\"object\":\"extraction\",\"model\":\"m\"}",
+        "{\"object\":\"extraction\",\"model\":\"m\",\"data\":[]}",
+        "{\"object\":\"extraction\",\"model\":\"m\",\"data\":[{},{}]}",
+        "{\"object\":\"extraction\",\"model\":\"m\",\"data\":[null]}",
+        "{\"object\":\"extraction\",\"model\":\"m\",\"schema_version\":2,\"data\":[{}]}",
+        "{\"object\":\"extraction\",\"model\":\"m\",\"schema_version\":\"1\",\"data\":[{}]}",
+        "{\"object\":\"extraction\",\"model\":\"m\",\"data\":[{\"id\":1}]}",
+        "{\"object\":\"extraction\",\"model\":\"other\",\"model\":\"m\",\"data\":[{}]}",
+        "{\"object\":\"extraction\",\"model\":\"m\",\"data\":[{\"future\":{\"x\":1,\"x\":2}}]}",
+    };
+    for (invalid) |payload| try std.testing.expectError(error.InvalidExtractionResponse, parseResponse(a, payload, expected));
+    try std.testing.expectError(error.InvalidExtractionResponse, parseResponse(a, "{\"object\":\"extraction\",\"model\":\"m\",\"data\":[{}]}", .{ .model = "m", .item_count = 1, .schema_version = 2 }));
+    try std.testing.expectError(error.InvalidExtractionResponse, firstResultJsonAlloc(a, "{}"));
+    try std.testing.expectError(error.InvalidExtractionResponse, canonicalResponseJsonAlloc(
+        a,
+        "{\"object\":\"extraction\",\"model\":\"m\",\"data\":[{\"id\":\"invented\"}]}",
+        expected,
+        &.{.{ .content_json = "\"text\"" }},
+    ));
+    try std.testing.expectError(error.InvalidExtractionResponse, canonicalResponseJsonAlloc(
+        a,
+        "{\"object\":\"extraction\",\"model\":\"m\",\"data\":[{}]}",
+        expected,
+        &.{.{ .id = "expected", .content_json = "\"text\"" }},
+    ));
+}
+
+fn exerciseCanonicalResponse(a: Allocator) !void {
+    const payload = "{\"object\":\"extraction\",\"model\":\"m\",\"schema_version\":2,\"data\":[{\"id\":\"b\",\"extension\":1.2345678901234567890123456789},{\"id\":\"a\"}]}";
+    const result = try canonicalResponseJsonAlloc(a, payload, .{ .model = "m", .item_count = 2, .schema_version = 2 }, &.{
+        .{ .id = "a", .content_json = "\"first\"" },
+        .{ .id = "b", .content_json = "\"second\"" },
+    });
+    defer a.free(result);
+    try std.testing.expectEqualStrings(payload, result);
+    const first = try firstResultJsonAlloc(a, "{\"object\":\"extraction\",\"model\":\"m\",\"data\":[{\"extension\":1.2345678901234567890123456789}]}");
+    defer a.free(first);
+    try std.testing.expectEqualStrings("{\"extension\":1.2345678901234567890123456789}", first);
+}
+
+test "extracting response envelope ownership and exact extension numbers survive allocation failure" {
+    try exerciseCanonicalResponse(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseCanonicalResponse, .{});
+}
+
+test "extracting response envelope bounds nesting before allocating" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const deeply_nested = "[" ** 65 ++ "0" ++ "]" ** 65;
+    try std.testing.expectError(error.InvalidExtractionResponse, parseResponse(failing.allocator(), deeply_nested, .{ .item_count = 1 }));
+    try std.testing.expectError(error.InvalidExtractionResponse, parseResponse(failing.allocator(), "{}", .{ .item_count = 1, .max_response_bytes = 1 }));
 }
 
 test "extracting HTTP boundary encodes borrowed media only in final content" {

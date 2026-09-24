@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const automaton = @import("automaton.zig");
-const vellum = @import("antfly_vellum");
+const fst = @import("antfly_fst");
 
 const Allocator = std.mem.Allocator;
 
@@ -294,7 +294,7 @@ pub fn matches(alloc: Allocator, pattern: []const u8, text: []const u8) Error!bo
     return prepared.matches(alloc, text);
 }
 
-fn verifyCompiledFrom(automaton_view: vellum.Automaton, anchored_end: bool, text: []const u8, start_idx: usize) bool {
+fn verifyCompiledFrom(automaton_view: fst.Automaton, anchored_end: bool, text: []const u8, start_idx: usize) bool {
     var state = automaton_view.start();
     if (automaton_view.isMatch(state) and (!anchored_end or start_idx == text.len)) return true;
 

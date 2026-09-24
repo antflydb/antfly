@@ -15,10 +15,59 @@
 const std = @import("std");
 const build_test_filters = @import("../../../build_test_filters.zig");
 
+/// Keep test diagnostics without holding Zig's global terminal lock for the
+/// lifetime of the child. Explicit side effects preserve execution on every
+/// invocation even though stdout is retained as a captured output file.
+pub fn configureTestRun(run: *std.Build.Step.Run) void {
+    // Preserve explicit output/exit contracts, including expected failures.
+    if (run.stdio == .zig_test or run.stdio == .check) return;
+    if (run.stdio == .inherit) run.stdio = .infer_from_args;
+    run.expectExitCode(0);
+    run.has_side_effects = true;
+    if (run.captured_stdout == null) _ = run.captureStdOut(.{});
+}
+
+/// Apply the same execution policy to simple runners constructed by library
+/// owners. Inventories remain cacheable; server-protocol tests retain Zig's
+/// native execution policy.
+pub fn configureSimpleTestRuns(b: *std.Build, root: *std.Build.Step) void {
+    var visited = std.AutoHashMap(*std.Build.Step, void).init(b.allocator);
+    defer visited.deinit();
+    configureSimpleTestRunsRecursive(root, &visited);
+}
+
+fn configureSimpleTestRunsRecursive(step: *std.Build.Step, visited: *std.AutoHashMap(*std.Build.Step, void)) void {
+    if ((visited.getOrPut(step) catch @panic("OOM")).found_existing) return;
+    if (step.cast(std.Build.Step.Run)) |run| {
+        if (run.producer) |producer| {
+            if (producer.kind == .@"test") {
+                if (producer.test_runner) |runner| {
+                    const inventory = for (run.argv.items) |arg| {
+                        if (arg == .bytes and std.mem.eql(u8, arg.bytes, "--list-tests")) break true;
+                    } else false;
+                    if (runner.mode == .simple and !inventory) configureTestRun(run);
+                }
+            }
+        }
+    }
+    for (step.dependencies.items) |dependency| configureSimpleTestRunsRecursive(dependency, visited);
+}
+
 pub const Imports = struct {
     runtime: @import("imports.zig").AntflyRootImports,
     vopr: *std.Build.Module,
     lmdb_engine: *std.Build.Module,
+
+    /// Consumer tests compile only the control-side dependency profile. The
+    /// final executable receives provider archives from root composition.
+    pub fn configureConsumer(self: Imports, b: *std.Build, module: *std.Build.Module) void {
+        var imports = self.runtime;
+        imports.boundary_profile = .owner;
+        imports.configureApi(module, true);
+        module.addImport("vopr", self.vopr);
+        imports.storage_boundary.configureProfile(module, true, true, .owner);
+        @import("snowball.zig").addSnowballModule(b, module);
+    }
 
     /// Tests and simulation tools explicitly own VOPR and LMDB dependencies.
     pub fn configure(self: Imports, b: *std.Build, module: *std.Build.Module, include_lmdb_c: bool, link_libc: bool) void {
@@ -204,9 +253,9 @@ pub fn configureUnitStorageTestRun(
     if (allow_empty_filter) run.addArg("--allow-empty-test-filter");
     addRuntimeSkipTestFilters(run, unit_skip_filters);
     for (root_skip_filters) |filter| {
-        // `storage.ha` keeps the HA suite out of broad root-module test runs.
+        // `storage.hot_standby` keeps the HA suite out of broad root-module test runs.
         // Applying it to the dedicated shard would select zero tests.
-        if (is_ha_shard and std.mem.eql(u8, filter, "storage.ha")) continue;
+        if (is_ha_shard and std.mem.eql(u8, filter, "storage.hot_standby")) continue;
         run.addArgs(&.{ "--skip-test-filter", filter });
     }
     addRuntimeSkipTestFilters(run, extra_skip_filters);
@@ -248,7 +297,9 @@ pub fn addAntflyTestRunArtifact(
         tests.test_runner = .{ .path = runner_path, .mode = .simple };
         runner_path.addStepDependencies(&tests.step);
     }
-    return b.addRunArtifact(tests);
+    const run = b.addRunArtifact(tests);
+    configureTestRun(run);
+    return run;
 }
 
 /// Zig's compile-time filters can retain imported anonymous tests needed for
@@ -281,6 +332,52 @@ pub fn addCuratedTestRunArtifact(
     return run;
 }
 
+/// An owner can span disjoint compiler shards without turning caller filters
+/// into compiler inputs. Validate the selection against their combined inventory
+/// before running; Zig retains ownership of native/foreign execution.
+pub const OwnerTests = struct {
+    artifact: *std.Build.Step.Compile,
+    filters: []const []const u8,
+    skip_filters: []const []const u8 = &.{},
+};
+
+pub fn addOwnerTestRuns(b: *std.Build, owner: *std.Build.Step, shards: []const OwnerTests, skips: []const []const u8) void {
+    const selected = selectTestFilters(b, &.{});
+    const audit = b.addSystemCommand(&.{"python3"});
+    audit.addFileArg(b.path("tools/audit_test_selection.py"));
+    for (selected) |filter| audit.addArgs(&.{ "--filter", filter });
+    for (skips) |filter| audit.addArgs(&.{ "--skip-filter", filter });
+    const args = b.args orelse &.{};
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        if (std.mem.eql(u8, args[index], "--allow-empty-test-filter")) {
+            audit.addArg("--allow-empty");
+        } else if (std.mem.eql(u8, args[index], "--skip-test-filter")) {
+            index += 1;
+            if (index >= args.len) @panic("missing skip test filter");
+            audit.addArgs(&.{ "--skip-filter", args[index] });
+        } else if (std.mem.startsWith(u8, args[index], "--skip-test-filter=")) {
+            audit.addArgs(&.{ "--skip-filter", args[index]["--skip-test-filter=".len..] });
+        }
+    }
+    var previous: *std.Build.Step = &audit.step;
+    for (shards) |shard| {
+        const inventory = b.addRunArtifact(shard.artifact);
+        inventory.addArgs(&.{ "--list-tests", "--allow-empty-test-filter" });
+        for (shard.filters) |filter| inventory.addArgs(&.{ "--suite-filter", filter });
+        addRuntimeSkipTestFilters(inventory, shard.skip_filters);
+        audit.addArg("--inventory");
+        audit.addFileArg(inventory.captureStdErr(.{}));
+        const run = addCuratedTestRunArtifact(b, shard.artifact, shard.filters);
+        run.addArg("--allow-empty-test-filter");
+        addRuntimeSkipTestFilters(run, skips);
+        addRuntimeSkipTestFilters(run, shard.skip_filters);
+        run.step.dependOn(previous);
+        previous = &run.step;
+    }
+    owner.dependOn(previous);
+}
+
 pub fn expectQuietSuccess(run: *std.Build.Step.Run) *std.Build.Step {
     run.has_side_effects = true;
     run.expectExitCode(0);
@@ -289,6 +386,12 @@ pub fn expectQuietSuccess(run: *std.Build.Step.Run) *std.Build.Step {
 }
 
 pub const release_scale_test_filters = [_][]const u8{
+    "graph metric sparse vector chunks production scale",
+    "relational columnar bound scan benchmark",
+    "relational columnar decoded reuse production scale benchmark",
+    "hbc binary monotone insertion production scale",
+    "db doc set bitmap promotion production scale",
+    "compaction phase handoff production scale",
     "db dense default dynamic 0.2 percent numeric filter exact scores bounded candidates",
     "one percent native filter routes through integrated dense search exactly",
     "db one real delete keeps filtered full text on complement path across restart",
@@ -296,5 +399,9 @@ pub const release_scale_test_filters = [_][]const u8{
 };
 
 pub fn productionVoprCompileMaxRss(target: std.Build.ResolvedTarget) usize {
-    return @as(usize, if (target.result.os.tag == .macos) 18 else 7) * 1024 * 1024 * 1024;
+    // The production DataServer VOPR root reached 13,255,065,600 bytes on
+    // Linux ReleaseSafe in soak qualification run 34927431365. Reserve 16 GiB
+    // for production-owner roots so build admission reflects their compiler
+    // footprint; this is not an Antfly runtime memory limit.
+    return @as(usize, if (target.result.os.tag == .macos) 18 else 16) * 1024 * 1024 * 1024;
 }

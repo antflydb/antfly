@@ -18,6 +18,7 @@ const backend_lmdb_adapter = @import("backend_lmdb_adapter.zig");
 const backend_erased = @import("backend_erased.zig");
 const backend_types = @import("backend_types.zig");
 const lmdb = @import("lmdb.zig");
+const platform = @import("antfly_platform");
 
 fn identityNamespace(namespace: backend_types.Namespace) !backend_types.Namespace {
     return namespace;
@@ -58,6 +59,7 @@ pub const Backend = struct {
     allocator: Allocator,
     env: lmdb.Environment,
     open_options: backend_types.OpenOptions,
+    read_fork_enabled: bool = false,
 
     const BoundStore = struct {
         backend: *Backend,
@@ -93,6 +95,19 @@ pub const Backend = struct {
         allocator: Allocator,
         raw: lmdb.Transaction,
         dbi: lmdb.Dbi,
+        read_mutex: ?*std.atomic.Mutex = null,
+        owns_raw: bool = true,
+        fork_enabled: bool = false,
+
+        // MDB_NOTLS permits sharing a read transaction, but MDB still requires
+        // serialized calls. Erased parents pin raw/mutex until the last fork
+        // and cursor closes; each cursor has independent positioning state.
+        pub fn forkBorrowedRead(self: *@This()) !BoundTxn {
+            if (!self.fork_enabled or self.read_mutex == null) return error.ReadSnapshotForkUnsupported;
+            var fork = self.*;
+            fork.owns_raw = false;
+            return fork;
+        }
 
         fn open(backend: *Backend, namespace: backend_types.Namespace, read_only: bool) !BoundTxn {
             var raw = try backend.env.begin(.{ .read_only = read_only });
@@ -103,40 +118,93 @@ pub const Backend = struct {
                 namespace,
                 !read_only and backend.open_options.create_if_missing,
             );
+            const read_mutex = if (read_only) try backend.allocator.create(std.atomic.Mutex) else null;
+            if (read_mutex) |mutex| mutex.* = .unlocked;
             return .{
                 .allocator = backend.allocator,
                 .raw = raw,
                 .dbi = dbi,
+                .read_mutex = read_mutex,
+                .fork_enabled = backend.read_fork_enabled,
             };
         }
 
         pub fn abort(self: *@This()) void {
+            if (!self.owns_raw) return;
             self.raw.abort();
+            if (self.read_mutex) |mutex| self.allocator.destroy(mutex);
         }
 
         pub fn commit(self: *@This()) !void {
+            if (self.read_mutex != null) return error.ReadOnly;
             try self.raw.commit();
         }
 
         pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+            if (self.read_mutex) |mutex| platform.sync.lockYielding(mutex);
+            defer if (self.read_mutex) |mutex| mutex.unlock();
             return try self.raw.get(self.dbi, key);
         }
 
         pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {
+            if (self.read_mutex != null) return error.ReadOnly;
             try self.raw.put(self.dbi, key, value, .{});
         }
 
         pub fn appendPut(self: *@This(), key: []const u8, value: []const u8) !void {
+            if (self.read_mutex != null) return error.ReadOnly;
             try self.raw.put(self.dbi, key, value, .{ .append = true });
         }
 
         pub fn delete(self: *@This(), key: []const u8) !void {
+            if (self.read_mutex != null) return error.ReadOnly;
             try self.raw.delete(self.dbi, key);
         }
 
-        pub fn openCursor(self: *@This()) !backend_lmdb_adapter.Cursor {
-            _ = self.allocator;
-            return backend_lmdb_adapter.Cursor.init(try self.raw.cursor(self.dbi));
+        pub fn openCursor(self: *@This()) !BoundCursor {
+            if (self.read_mutex) |mutex| platform.sync.lockYielding(mutex);
+            defer if (self.read_mutex) |mutex| mutex.unlock();
+            return .{ .inner = backend_lmdb_adapter.Cursor.init(try self.raw.cursor(self.dbi)), .read_mutex = self.read_mutex };
+        }
+    };
+
+    const BoundCursor = struct {
+        inner: backend_lmdb_adapter.Cursor,
+        read_mutex: ?*std.atomic.Mutex,
+        pub fn close(self: *@This()) void {
+            if (self.read_mutex) |mutex| platform.sync.lockYielding(mutex);
+            defer if (self.read_mutex) |mutex| mutex.unlock();
+            self.inner.close();
+        }
+        pub fn first(self: *@This()) !?backend_erased.Entry {
+            if (self.read_mutex) |mutex| platform.sync.lockYielding(mutex);
+            defer if (self.read_mutex) |mutex| mutex.unlock();
+            return self.inner.first();
+        }
+        pub fn last(self: *@This()) !?backend_erased.Entry {
+            if (self.read_mutex) |mutex| platform.sync.lockYielding(mutex);
+            defer if (self.read_mutex) |mutex| mutex.unlock();
+            return self.inner.last();
+        }
+        pub fn next(self: *@This()) !?backend_erased.Entry {
+            if (self.read_mutex) |mutex| platform.sync.lockYielding(mutex);
+            defer if (self.read_mutex) |mutex| mutex.unlock();
+            return self.inner.next();
+        }
+        pub fn prev(self: *@This()) !?backend_erased.Entry {
+            if (self.read_mutex) |mutex| platform.sync.lockYielding(mutex);
+            defer if (self.read_mutex) |mutex| mutex.unlock();
+            return self.inner.prev();
+        }
+        pub fn seekAtOrAfter(self: *@This(), key: []const u8) !?backend_erased.Entry {
+            if (self.read_mutex) |mutex| platform.sync.lockYielding(mutex);
+            defer if (self.read_mutex) |mutex| mutex.unlock();
+            return self.inner.seekAtOrAfter(key);
+        }
+        pub fn seekAtOrBefore(self: *@This(), key: []const u8) !?backend_erased.Entry {
+            if (self.read_mutex) |mutex| platform.sync.lockYielding(mutex);
+            defer if (self.read_mutex) |mutex| mutex.unlock();
+            return self.inner.seekAtOrBefore(key);
         }
     };
 
@@ -310,6 +378,7 @@ pub const Backend = struct {
             .allocator = allocator,
             .env = env,
             .open_options = options.backend,
+            .read_fork_enabled = options.env.no_tls,
         };
     }
 
@@ -393,6 +462,46 @@ fn cleanupTmp(path: [*:0]const u8) void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
+}
+
+test "lmdb backend read forks retain snapshots and cursor lifetimes and reject TLS sharing" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |no_tls| {
+        var path_buf: [256]u8 = undefined;
+        const path = tmpPath(&path_buf, "forks");
+        defer cleanupTmp(path);
+        var backend = try Backend.open(a, path, .{ .env = .{ .max_dbs = 32, .no_tls = no_tls } });
+        defer backend.close();
+        var runtime = try backend.runtimeStore(a, .{ .name = "docs" });
+        defer runtime.deinit();
+        var writer = try runtime.beginWrite();
+        try writer.put("a", "before");
+        try writer.put("b", "second");
+        try writer.commit();
+        var original = try runtime.beginRead();
+        if (!no_tls) {
+            defer original.abort();
+            try std.testing.expectError(error.ReadSnapshotForkUnsupported, original.forkRead());
+            continue;
+        }
+        var first = try original.forkRead();
+        defer first.abort();
+        var second = try original.forkRead();
+        original.abort();
+        var cursor = try second.openCursor();
+        defer cursor.close();
+        second.abort();
+        writer = try runtime.beginWrite();
+        try writer.put("a", "after");
+        try writer.commit();
+        try std.testing.expectEqualStrings("before", try first.get("a"));
+        try std.testing.expectEqualStrings("before", (try cursor.first()).?.value);
+        var other = try first.openCursor();
+        defer other.close();
+        try std.testing.expectEqualStrings("second", (try other.last()).?.value);
+        try std.testing.expectEqualStrings("second", (try cursor.next()).?.value);
+        try std.testing.expectEqualStrings("before", (try other.prev()).?.value);
+    }
 }
 
 test "lmdb backend runtime erases namespace store handles" {

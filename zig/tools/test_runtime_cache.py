@@ -28,7 +28,15 @@ import unittest
 from pathlib import Path
 
 ZIG_ROOT = Path(__file__).resolve().parents[1]
-UNITS = ("cli", "distributed", "serverless", "inference", "api_kernel")
+UNITS = (
+    "cli",
+    "distributed",
+    "storage_kernel",
+    "enrichment_compute",
+    "serverless",
+    "inference",
+    "api_kernel",
+)
 SCHEMAS = (
     "specs/openapi/ard/api.yaml",
     "openapi.yaml",
@@ -140,7 +148,7 @@ class RuntimeCacheTest(unittest.TestCase):
     def assert_compile(self, output, unit, status):
         name = (
             "antfly-storage-kernel"
-            if unit == "distributed"
+            if unit == "storage_kernel"
             else f"antfly-runtime-{unit}"
         )
         self.assertRegex(output, rf"compile lib {name} Debug \S+ {status}")
@@ -400,7 +408,10 @@ class RuntimeCacheTest(unittest.TestCase):
         for relative, consumers in (
             ("zig/lib/mcp/src/root.zig", ("api_kernel",)),
             ("zig/lib/a2a/src/root.zig", ("api_kernel",)),
-            ("zig/lib/raft/src/root.zig", ("distributed", "api_kernel")),
+            (
+                "zig/lib/raft/src/root.zig",
+                ("distributed", "storage_kernel", "api_kernel"),
+            ),
         ):
             with self.subTest(source=relative):
                 source = self.own(relative)
@@ -428,7 +439,7 @@ class RuntimeCacheTest(unittest.TestCase):
         self.assert_archives(self.build("cache-probe"))
         settings = ("-Dlite-local-inference-runtime=true",)
         changed = self.build("cache-probe", settings=settings)
-        self.assert_archives(changed, rebuilt=("distributed",))
+        self.assert_archives(changed, rebuilt=("distributed", "storage_kernel"))
         # The actual capability implementation must still report the new value.
         self.assertNotEqual(self.probe(baseline), self.probe(changed))
         self.assert_archives(self.build("cache-probe", settings=settings))
@@ -1085,13 +1096,115 @@ class RuntimeCacheTest(unittest.TestCase):
         # compiling the missing command or maintaining another test inventory.
         integration = self.own("zig/pkg/inference/build/integration.zig")
         contents = integration.read_text()
-        registration = (
-            "for (commands) |command| finetune_step.dependOn(&command.executable.step);"
-        )
+        registration = 'finetune_step.dependOn(finetune.addCommandChecks(finetune_ctx, &(@import("finetune/tools.zig").specs ++ @import("finetune/workflows.zig").specs)));'
         self.assertIn(registration, contents)
-        integration.write_text(contents.replace(registration, "_ = commands;"))
+        integration.write_text(contents.replace(registration, ""))
         failure = self.build("cache-finetune-registry", succeeds=False)
         self.assertIn("finetune aggregate does not compile", failure)
+        integration.write_text(contents)
+        common = self.own("zig/pkg/inference/build/finetune/common.zig")
+        contents = common.read_text()
+        attachment = (
+            'check.root_module.addImport(b.fmt("command_{d}", .{index}), module);'
+        )
+        self.assertIn(attachment, contents)
+        common.write_text(
+            contents.replace(
+                attachment,
+                'module.addImport("undeclared-test-import", ctx.jinja_mod);\n'
+                + attachment,
+            )
+        )
+        failure = self.build("cache-finetune-registry", succeeds=False)
+        self.assertIn("received undeclared import undeclared-test-import", failure)
+
+    def test_finetune_shared_test_ownership(self):
+        shutil.copyfile(
+            ZIG_ROOT / "tools/fixtures/finetune_commands.zig",
+            self.root / "zig/build.zig",
+        )
+        self.build("cache-finetune-registry")
+        tests = self.own("zig/pkg/inference/build/finetune/tests.zig")
+        contents = tests.read_text()
+        attachment = "aggregate.dependOn(&run.step);"
+        self.assertIn(attachment, contents)
+        tests.write_text(
+            contents.replace(
+                attachment,
+                attachment
+                + "\n    aggregate.dependOn(&ctx.b.addRunArtifact(shared).step);",
+            )
+        )
+        failure = self.build("cache-finetune-registry", succeeds=False)
+        self.assertIn(
+            "finetune gate must execute one shared test artifact once", failure
+        )
+        tests.write_text(contents)
+        root = self.own("zig/pkg/inference/src/finetune_test_root.zig")
+        contents = root.read_text()
+        imported = '    _ = @import("finetune/test/test_gliner2_data.zig");'
+        self.assertIn(imported, contents)
+        root.write_text(contents.replace(imported, ""))
+        failure = self.build("cache-finetune-registry", succeeds=False)
+        self.assertIn("shared finetune root must import", failure)
+        root.write_text(contents)
+        inference = self.own("zig/pkg/inference/build/tests.zig")
+        contents = inference.read_text()
+        exclusion = 'run_tests.addArgs(&.{ "--skip-test-filter", filter });'
+        self.assertIn(exclusion, contents)
+        inference.write_text(contents.replace(exclusion, "_ = filter;"))
+        failure = self.build("cache-finetune-registry", succeeds=False)
+        self.assertIn("inference repeats a finetuning-owned test group", failure)
+
+    def test_finetune_standalone_shared_targets(self):
+        self.use_standalone()
+        shutil.copyfile(
+            ZIG_ROOT / "tools/fixtures/finetune_standalone.zig",
+            self.build_directory / "build.zig",
+        )
+        self.build("cache-finetune-standalone")
+        project = self.build_directory / "project_build.zig"
+        contents = project.read_text()
+        attachment = 'default_test_step.dependOn(&b.top_level_steps.get("test-finetune-unit").?.step);'
+        self.assertIn(attachment, contents)
+        project.write_text(contents.replace(attachment, "_ = default_test_step;"))
+        failure = self.build("cache-finetune-standalone", succeeds=False)
+        self.assertIn(
+            "standalone gate must reach shared finetuning owner once", failure
+        )
+
+    def test_vopr_workflow_memory_admission(self):
+        shutil.copyfile(
+            ZIG_ROOT / "tools/fixtures/vopr_memory.zig", self.root / "zig/build.zig"
+        )
+        self.build(
+            "cache-vopr-memory",
+            settings=("-Dtarget=x86_64-linux-gnu", "-Doptimize=ReleaseSafe"),
+        )
+        project = self.root / "zig/project_build.zig"
+        contents = project.read_text()
+        injection = 'b.top_level_steps.get("vopr-build").?.step.dependencies.items[0].dependencies.items[0].max_rss = 0;'
+        anchor = "    const hbc_trace_mod ="
+        self.assertIn(anchor, contents)
+        project.write_text(contents.replace(anchor, injection + "\n" + anchor))
+        failure = self.build(
+            "cache-vopr-memory",
+            settings=("-Dtarget=x86_64-linux-gnu", "-Doptimize=ReleaseSafe"),
+            succeeds=False,
+        )
+        self.assertIn("unbudgeted VOPR work", failure)
+        project.write_text(contents)
+        tests = self.own("zig/pkg/antfly/build/tests.zig")
+        source = tests.read_text()
+        selection = '.filters = &.{"VOPR command entrypoint"},'
+        self.assertIn(selection, source)
+        tests.write_text(source.replace(selection, ".filters = &.{},"))
+        failure = self.build(
+            "cache-vopr-memory",
+            settings=("-Dtarget=x86_64-linux-gnu", "-Doptimize=ReleaseSafe"),
+            succeeds=False,
+        )
+        self.assertIn("VOPR command build includes unrelated unit tests", failure)
 
     def test_wasm_profile_cache_contracts(self):
         for source in ("zig/lib/httpx/src/httpx.zig", "zig/lib/json/src/mod.zig"):
@@ -1269,14 +1382,17 @@ class RuntimeCacheTest(unittest.TestCase):
                 path.write_bytes(path.read_bytes() + b"\n# cache regression edit\n")
                 output = self.build("cache-probe")
                 self.assert_archives(output, rebuilt=("api_kernel",))
-                self.assertNotEqual(self.probe(output).split()[-1], before.split()[-1])
+                self.assertNotEqual(self.probe(output).split()[5], before.split()[5])
                 before = self.probe(output)
 
         tokenizer = self.own("zig/lib/tokenizer/testdata/embedder/tokenizer.json")
         tokenizer.write_bytes(tokenizer.read_bytes() + b"\n")
         output = self.build("cache-probe", "cache-tokenizer")
         self.assert_archives(
-            output, rebuilt=tuple(unit for unit in UNITS if unit != "cli")
+            output,
+            rebuilt=tuple(
+                unit for unit in UNITS if unit not in ("cli", "enrichment_compute")
+            ),
         )
         self.assertNotEqual(self.probe(output, "TOKENIZER_PROBE"), tokenizer_before)
 
@@ -1294,7 +1410,10 @@ class RuntimeCacheTest(unittest.TestCase):
         output = self.build("cache-probe")
         self.assertRegex(output, r"run exe patch_sentencepiece_proto .* success")
         self.assert_archives(
-            output, rebuilt=tuple(unit for unit in UNITS if unit != "cli")
+            output,
+            rebuilt=tuple(
+                unit for unit in UNITS if unit not in ("cli", "enrichment_compute")
+            ),
         )
 
         versioned = self.build("cache-probe", version="cache-after")
@@ -1321,7 +1440,8 @@ class RuntimeCacheTest(unittest.TestCase):
             "cache-probe", version="cache-after", settings=("-Dwith_tla=true",)
         )
         self.assert_archives(
-            storage_options, rebuilt=("distributed", "serverless", "api_kernel")
+            storage_options,
+            rebuilt=("distributed", "serverless", "api_kernel", "storage_kernel"),
         )
 
         # Served schemas remain unnecessary to all non-HTTP archive targets.

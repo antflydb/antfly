@@ -22,12 +22,12 @@ const runtime_http_bridge = @import("../runtime_http_bridge.zig");
 const abi = @import("kernel_abi.zig");
 const server_mod = @import("http_server.zig");
 const handler_mod = @import("httpx_handler.zig");
-const table_reads = @import("table_reads.zig");
-const table_writes = @import("table_writes.zig");
+const table_reads = @import("table_read_source.zig");
+const table_writes = @import("table_write_source.zig");
 const restore_jobs = @import("restore_jobs.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const backend_erased = @import("../storage/backend_erased.zig");
-const ha_http_operation = @import("../storage/ha/http_operation.zig");
+const ha_http_operation = @import("../storage/hot_standby/http_operation.zig");
 const httpx = @import("httpx");
 const internal_routes = @import("../internal/routes.zig");
 
@@ -206,6 +206,20 @@ fn createOpaqueServer(
 ) !OpaqueApiHttpServer {
     const functions = try validateFunctionTable();
     var cfg_copy = cfg;
+    const api_io = if (cfg.backend_runtime) |runtime| runtime.apiIo() else null;
+    const api_network_io = if (cfg.backend_runtime) |runtime| runtime.apiNetworkIo() else null;
+    const api_filesystem_io = if (cfg.backend_runtime) |runtime| runtime.apiFilesystemIo() else null;
+    const durable_io = if (cfg.backend_runtime) |runtime| runtime.io() else null;
+    const api_borrow: ?abi.native_abi.IoBorrow = if (api_io) |io| .init(&io) else null;
+    const api_network_borrow: ?abi.native_abi.IoBorrow = if (api_network_io) |io| .init(&io) else null;
+    const api_filesystem_borrow: ?abi.native_abi.IoBorrow = if (api_filesystem_io) |io| .init(&io) else null;
+    const durable_borrow: ?abi.native_abi.IoBorrow = if (durable_io) |io| .init(&io) else null;
+    const runtime_io: abi.RuntimeIoBorrows = .{
+        .api = if (api_borrow) |*borrow| borrow else null,
+        .api_network = if (api_network_borrow) |*borrow| borrow else null,
+        .api_filesystem = if (api_filesystem_borrow) |*borrow| borrow else null,
+        .durable = if (durable_borrow) |*borrow| borrow else null,
+    };
     var source_copy = source;
     var reads_copy = read_source;
     var writes_copy = write_source;
@@ -220,6 +234,7 @@ fn createOpaqueServer(
         .owner_alloc = &boundary_allocator.abi_allocator,
         .cfg = &cfg_copy,
         .cfg_contract = .of(server_mod.ApiHttpServerConfig),
+        .runtime_io = if (cfg.backend_runtime != null) &runtime_io else null,
         .source = &source_copy,
         .source_contract = .of(server_mod.StatusSource),
         .table_reads = &reads_copy,
@@ -431,8 +446,10 @@ const OpaqueHttpxHandler = struct {
 fn requiresHostInternalServicePrincipal(path: []const u8) bool {
     const in_internal_namespace = std.mem.eql(u8, path, internal_routes.base) or
         std.mem.startsWith(u8, path, internal_routes.base ++ "/");
-    const ha_exempt = std.mem.eql(u8, path, internal_routes.ha) or
-        std.mem.startsWith(u8, path, internal_routes.ha ++ "/");
+    const ha_exempt = std.mem.eql(u8, path, internal_routes.standby) or
+        std.mem.startsWith(u8, path, internal_routes.standby ++ "/") or
+        std.mem.eql(u8, path, internal_routes.legacy_standby) or
+        std.mem.startsWith(u8, path, internal_routes.legacy_standby ++ "/");
     return in_internal_namespace and !ha_exempt;
 }
 

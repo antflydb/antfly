@@ -243,6 +243,27 @@ pub const Socket = struct {
         self.io.vtable.netShutdown(self.io.userdata, self.handle, .both) catch {};
     }
 
+    /// Wake an abandoned HTTP/1 request without first sending an orderly FIN.
+    /// Its owner still closes the descriptor after the request task unwinds;
+    /// zero linger makes that close a reset the peer can observe as cancellation.
+    pub fn abortRequest(self: *Self) void {
+        // Cleanup must still wake the owner when its parent task is cancelled.
+        const protection = self.io.swapCancelProtection(.blocked);
+        defer _ = self.io.swapCancelProtection(protection);
+        if (isThreadedNetworkIo(self.io)) {
+            const Linger = if (is_windows) std.os.windows.ws2_32.linger else posix.linger;
+            const linger = Linger{ .onoff = 1, .linger = 0 };
+            setSocketOption(self.handle, posix.SOL.SOCKET, posix.SO.LINGER, std.mem.asBytes(&linger)) catch {
+                self.shutdown();
+                return;
+            };
+            self.io.vtable.netShutdown(self.io.userdata, self.handle, .recv) catch {};
+        } else {
+            // Custom Io handles are not necessarily native descriptors.
+            self.shutdown();
+        }
+    }
+
     /// Half-closes the write side while keeping the read side available for a
     /// response. The operation stays on the supplied std.Io backend so virtual
     /// transports can preserve stream ordering between queued bytes and FIN.
@@ -256,11 +277,23 @@ pub const Socket = struct {
         while (true) {
             try self.checkRequestCancellation();
             const wait = try self.operationWait(operation_deadline_ms);
-            const sent = self.netWriteWithTimeout(data, wait.timeout_ms) catch |err| {
+            // Abortive cancellation shuts down reads without sending FIN.
+            // A blocked native send must also wake to observe cancellation;
+            // unlike reads, writes can safely retry after a polling timeout.
+            const poll_cancellation = self.native_timeouts and !is_windows and self.request_cancel_cb != null;
+            const timeout_ms = if (poll_cancellation)
+                @min(wait.timeout_ms orelse 25, 25)
+            else
+                wait.timeout_ms;
+            const sent = self.netWriteWithTimeout(data, timeout_ms) catch |err| {
                 if (err == error.Canceled) self.io.recancel();
                 try self.checkRequestCancellation();
                 if (err == error.Timeout or err == error.WouldBlock) {
                     try self.checkRequestDeadline();
+                    if (poll_cancellation) {
+                        _ = try self.operationWait(operation_deadline_ms);
+                        continue;
+                    }
                     return error.Timeout;
                 }
                 return error.SendFailed;
@@ -432,8 +465,11 @@ pub const Socket = struct {
         var operation_result: net.Stream.Reader.Error!usize = undefined;
         var outcomes: [2]Outcome = undefined;
         var select = Io.Select(Outcome).init(self.io, &outcomes);
-        select.async(.operation, netReadTask, .{ self, buffer, &operation_result });
-        select.async(.timer, timeoutTask, .{ self.io, timeout });
+        try select.concurrent(.timer, timeoutTask, .{ self.io, timeout });
+        select.concurrent(.operation, netReadTask, .{ self, buffer, &operation_result }) catch |err| {
+            select.cancelDiscard();
+            return err;
+        };
         const outcome = select.await() catch |err| {
             select.cancelDiscard();
             return err;
@@ -461,8 +497,11 @@ pub const Socket = struct {
         var operation_result: net.Stream.Writer.Error!usize = undefined;
         var outcomes: [2]Outcome = undefined;
         var select = Io.Select(Outcome).init(self.io, &outcomes);
-        select.async(.operation, netWriteTask, .{ self, data, &operation_result });
-        select.async(.timer, timeoutTask, .{ self.io, timeout });
+        try select.concurrent(.timer, timeoutTask, .{ self.io, timeout });
+        select.concurrent(.operation, netWriteTask, .{ self, data, &operation_result }) catch |err| {
+            select.cancelDiscard();
+            return err;
+        };
         const outcome = select.await() catch |err| {
             select.cancelDiscard();
             return err;
@@ -501,7 +540,7 @@ pub const Socket = struct {
 
     /// Sets the send timeout in milliseconds.
     pub fn setSendTimeout(self: *Self, ms: u64) !void {
-        if (self.native_timeouts) return self.setNativeTimeout(posix.SO.SNDTIMEO, ms);
+        if (self.native_timeouts) try self.setNativeTimeout(posix.SO.SNDTIMEO, ms);
         self.send_timeout_ms = if (ms == 0) null else ms;
     }
 
@@ -662,6 +701,7 @@ pub const IoReaderHelpers = struct {
 pub const SocketIoReader = struct {
     socket: *Socket,
     reader_iface: Io.Reader,
+    last_read_error: ?anyerror = null,
 
     pub fn init(socket: *Socket, buffer: []u8) SocketIoReader {
         return .{
@@ -687,7 +727,11 @@ pub const SocketIoReader = struct {
         if (dest.len == 0 or dest[0].len == 0) return 0;
         // Route TLS transport reads through Socket.recv so absolute request
         // deadlines and per-request kernel timeout resets apply consistently.
-        const n = p.socket.recv(dest[0]) catch return error.ReadFailed;
+        p.last_read_error = null;
+        const n = p.socket.recv(dest[0]) catch |err| {
+            p.last_read_error = err;
+            return error.ReadFailed;
+        };
         if (n == 0) return error.EndOfStream;
         if (n > data_size) {
             r.end += n - data_size;
@@ -1604,6 +1648,58 @@ test "Socket cancellation polling preserves the configured receive timeout" {
     try sender.await(io);
 }
 
+test "Socket abort interrupts a backpressured native send" {
+    if (is_windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var listener = try TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+    defer listener.deinit();
+    var sender = try Socket.connect(listener.getLocalAddress(), io);
+    defer sender.close();
+    var accepted = try listener.accept();
+    defer accepted.socket.close();
+    const send_buffer: u32 = 4096;
+    try Socket.setSocketOption(sender.handle, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&send_buffer));
+    try sender.setSendTimeout(5);
+    var payload: [64 * 1024]u8 = @splat(0xa5);
+    for (0..1024) |_| {
+        _ = sender.send(&payload) catch |err| {
+            try std.testing.expectEqual(error.Timeout, err);
+            break;
+        };
+    } else return error.TestUnexpectedResult;
+    try sender.setSendTimeout(0);
+    var cancelled = std.atomic.Value(bool).init(false);
+    var done = std.atomic.Value(bool).init(false);
+    sender.setRequestCancellation(struct {
+        fn check(raw: ?*anyopaque) bool {
+            const signal: *std.atomic.Value(bool) = @ptrCast(@alignCast(raw.?));
+            return signal.load(.acquire);
+        }
+    }.check, &cancelled);
+    var writer = try io.concurrent(struct {
+        fn run(socket: *Socket, data: []const u8, completed: *std.atomic.Value(bool)) anyerror!void {
+            defer completed.store(true, .release);
+            while (true) try socket.sendAll(data);
+        }
+    }.run, .{ &sender, &payload, &done });
+    defer {
+        sender.shutdown();
+        writer.cancel(io) catch {};
+    }
+    try io.sleep(.fromMilliseconds(100), .awake);
+    cancelled.store(true, .release);
+    sender.abortRequest();
+    for (0..250) |_| {
+        if (done.load(.acquire)) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    const prompt = done.load(.acquire);
+    // Bound failure cleanup even if cancellation cannot wake a native send.
+    sender.shutdown();
+    try std.testing.expectError(error.Canceled, writer.await(io));
+    try std.testing.expect(prompt);
+}
+
 test "Socket send timeout reports backpressure without panicking" {
     if (is_windows) return;
 
@@ -1619,6 +1715,12 @@ test "Socket send timeout reports backpressure without panicking" {
     const send_buffer: u32 = 4096;
     try Socket.setSocketOption(sender.handle, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&send_buffer));
     try sender.setSendTimeout(5);
+    // Cancellation polling must retain the configured native write deadline.
+    sender.setRequestCancellation(struct {
+        fn check(_: ?*anyopaque) bool {
+            return false;
+        }
+    }.check, null);
 
     var payload: [64 * 1024]u8 = @splat(0xa5);
     var attempts: usize = 0;
@@ -1718,4 +1820,128 @@ test "ChunkedBodyReader handles inner reader that buffers before producing bytes
     const got = try chunked.reader_iface.readSliceShort(out[0..5]);
     try std.testing.expectEqual(@as(usize, 5), got);
     try std.testing.expectEqualStrings("hello", out[0..got]);
+}
+
+const TimedFallbackTest = struct {
+    fn pair(io: Io) ![2]Socket {
+        var handles: [2]posix.fd_t = undefined;
+        const rc = posix.system.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0, &handles);
+        if (posix.errno(rc) != .SUCCESS) return error.FixtureSocketPair;
+        return .{ Socket.fromHandle(handles[0], io), Socket.fromHandle(handles[1], io) };
+    }
+
+    fn elapsed(io: Io, start: Io.Timestamp) i64 {
+        return @intCast(@divTrunc(start.durationTo(Io.Timestamp.now(io, .awake)).toNanoseconds(), std.time.ns_per_ms));
+    }
+
+    fn healthy(comptime write: bool) !void {
+        var lane = Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(4) });
+        defer lane.deinit();
+        const io = lane.io();
+        var sockets = try pair(io);
+        defer for (&sockets) |*socket| socket.close();
+        sockets[0].native_timeouts = false;
+        try sockets[0].setRecvTimeout(250);
+        try sockets[0].setSendTimeout(250);
+        if (!write) try sockets[1].sendAll("r");
+        var byte: [1]u8 = undefined;
+        const start = Io.Timestamp.now(io, .awake);
+        const count = if (write) try sockets[0].send("w") else try sockets[0].recv(&byte);
+        const ms = elapsed(io, start);
+        std.debug.print("HEALTHY direction={s} elapsed_ms={d} timeout_ms=250 count={d}\n", .{ if (write) "write" else "read", ms, count });
+        try std.testing.expectEqual(@as(usize, 1), count);
+        if (write) {
+            try std.testing.expectEqual(@as(usize, 1), try sockets[1].recv(&byte));
+            try std.testing.expectEqual(@as(u8, 'w'), byte[0]);
+        } else try std.testing.expectEqual(@as(u8, 'r'), byte[0]);
+        try std.testing.expect(ms < 125);
+    }
+
+    fn fill(handle: posix.fd_t) !void {
+        var data: [65536]u8 = @splat(0x61);
+        var iov: posix.iovec_const = .{ .base = &data, .len = data.len };
+        var message: posix.msghdr_const = .{ .name = null, .namelen = 0, .iov = @ptrCast(&iov), .iovlen = 1, .control = null, .controllen = 0, .flags = 0 };
+        for (0..1024) |_| {
+            const rc = posix.system.sendmsg(handle, &message, posix.MSG.DONTWAIT | posix.MSG.NOSIGNAL);
+            switch (posix.errno(rc)) {
+                .SUCCESS, .INTR => {},
+                .AGAIN => return,
+                else => return error.FixtureBackpressure,
+            }
+        }
+        return error.FixtureBufferDidNotFill;
+    }
+
+    fn stalled(comptime write: bool) !void {
+        var lane = Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(4) });
+        defer lane.deinit();
+        const io = lane.io();
+        var sockets = try pair(io);
+        defer for (&sockets) |*socket| socket.close();
+        sockets[0].native_timeouts = false;
+        try sockets[0].setRecvTimeout(250);
+        try sockets[0].setSendTimeout(250);
+        if (write) try fill(sockets[0].handle);
+        var byte: [1]u8 = undefined;
+        std.debug.print("STALLED_WAIT direction={s}\n", .{if (write) "write" else "read"});
+        const start = Io.Timestamp.now(io, .awake);
+        if (write) try std.testing.expectError(error.Timeout, sockets[0].send("x")) else try std.testing.expectError(error.Timeout, sockets[0].recv(&byte));
+        const ms = elapsed(io, start);
+        std.debug.print("STALLED_TIMEOUT direction={s} elapsed_ms={d}\n", .{ if (write) "write" else "read", ms });
+        try std.testing.expect(ms >= 125 and ms < 750);
+    }
+
+    fn denied(comptime write: bool, limit: usize) !void {
+        var lane = Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(limit) });
+        defer lane.deinit();
+        const io = lane.io();
+        var sockets = try pair(io);
+        defer for (&sockets) |*socket| socket.close();
+        sockets[0].native_timeouts = false;
+        try sockets[0].setRecvTimeout(250);
+        try sockets[0].setSendTimeout(250);
+        if (!write) try sockets[1].sendAll("r");
+        var byte: [1]u8 = undefined;
+        std.debug.print("RESIDUAL_RED admission direction={s} limit={d}\n", .{ if (write) "write" else "read", limit });
+        const start = Io.Timestamp.now(io, .awake);
+        if (write) try std.testing.expectError(error.SendFailed, sockets[0].send("w")) else try std.testing.expectError(error.RecvFailed, sockets[0].recv(&byte));
+        const ms = elapsed(io, start);
+        std.debug.print("ADMISSION_DENIED direction={s} limit={d} elapsed_ms={d}\n", .{ if (write) "write" else "read", limit, ms });
+        try std.testing.expect(ms < 125);
+        if (write) {
+            try sockets[1].setRecvTimeout(25);
+            try std.testing.expectError(error.Timeout, sockets[1].recv(&byte));
+        } else {
+            sockets[0].native_timeouts = true;
+            try std.testing.expectEqual(@as(usize, 1), try sockets[0].recv(&byte));
+            try std.testing.expectEqual(@as(u8, 'r'), byte[0]);
+        }
+    }
+};
+
+test "timed fallback healthy read never runs timer eagerly" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    try TimedFallbackTest.healthy(false);
+}
+test "timed fallback healthy write never runs timer eagerly" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    try TimedFallbackTest.healthy(true);
+}
+test "timed fallback stalled read remains bounded at zero async allowance" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    try TimedFallbackTest.stalled(false);
+}
+test "timed fallback stalled write remains bounded at zero async allowance" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    try TimedFallbackTest.stalled(true);
+}
+test "timed fallback denied read preserves bytes" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    try TimedFallbackTest.denied(false, 0);
+    try TimedFallbackTest.denied(false, 1);
+}
+test "timed fallback denied write sends no bytes" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    try TimedFallbackTest.denied(true, 0);
+    try TimedFallbackTest.denied(true, 1);
 }

@@ -45,15 +45,7 @@ pub const FieldSpec = struct {
 /// `integer`/`number`). Templates resolving to unbounded text are intentionally
 /// NOT compiled into rules — that cardinality guard lives in
 /// `schema_capability.zig`; such fields remain on the schemaless path-fact path.
-pub const DynamicRule = struct {
-    name: []const u8 = "",
-    match: ?[]const u8 = null,
-    unmatch: ?[]const u8 = null,
-    path_match: ?[]const u8 = null,
-    path_unmatch: ?[]const u8 = null,
-    match_mapping_type: ?[]const u8 = null,
-    type: []const u8 = "string",
-};
+pub const DynamicRule = @import("index_config.zig").DynamicRule;
 
 pub const Fact = struct {
     role: Role,

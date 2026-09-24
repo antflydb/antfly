@@ -52,7 +52,7 @@ antfly inference pull hf:nomic-ai/nomic-embed-text-v1.5 --tasks embed
 antfly inference pull hf:BAAI/bge-m3 --tasks embed
 antfly inference pull hf:Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1
 antfly inference pull hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0 --tasks rerank
-antfly inference pull hf:antflydb/clipclap:gguf:Q4_K --tasks embed
+antfly inference pull antflydb/clipclap:gguf:Q4_K --tasks embed
 antfly inference pull hf:ggml-org/gemma-4-E4B-it-GGUF:gguf:Q4_0 --tasks generate --projector auto
 ```
 
@@ -98,17 +98,11 @@ A known-incompatible generation request returns HTTP 400:
 }
 ```
 
-An artifact whose compatibility cannot be determined is attempted anyway, and the backend validates it when it loads. Under a strict policy the same artifact returns `UNKNOWN_MODEL_COMPATIBILITY` instead:
-
-```bash
-antfly inference run --allow-unknown-models
-```
-
-The flag is accepted for compatibility and selects what is already the default. Nothing lifts `INCOMPATIBLE_MODEL` or resource limits.
+An artifact whose compatibility cannot be determined is attempted anyway, and the backend validates it when it loads. `antfly inference run` always attempts unknown artifacts; its `--allow-unknown-models` flag is accepted for compatibility and changes nothing. `UNKNOWN_MODEL_COMPATIBILITY` is returned only by runtime embeddings that set a strict policy. Nothing lifts `INCOMPATIBLE_MODEL` or resource limits.
 
 ## Resource Fit Is a Separate Check
 
-Model weights are admitted against stable host and accelerator limits before load; KV-cache and scratch estimates join the same shared reservation ledger for each request. A request that can never fit returns `MODEL_RESOURCE_LIMIT`; temporary contention returns `MODEL_RESOURCE_BUSY`. A one-shot live memory-pressure check protects the process without letting the published compatibility state flap with momentary system load.
+Model weights are admitted against stable host and accelerator limits before load; KV-cache and scratch estimates join the same shared reservation ledger for each request. A request that can never fit returns `MODEL_RESOURCE_LIMIT`; temporary contention returns `MODEL_RESOURCE_BUSY`. Just before each inference allocation, admission also checks the increment against live process or cgroup usage. Live pressure is retryable and never changes the published compatibility state. The process envelope is set with `--process-memory-budget-mb` or `ANTFLY_PROCESS_MEMORY_BUDGET_MB`.
 
 Automatic backend selection may fall back to another compatible backend (for example, from Metal to native when a quant is not implemented on Metal). An explicitly requested backend is strict and never silently falls back.
 
@@ -124,7 +118,7 @@ These artifacts were checked for a meaningful result, not merely a successful re
 | Dense embedding | `BAAI/bge-base-en-v1.5` | dim 768, unit norm |
 | Dense embedding | `BAAI/bge-large-en-v1.5` | dim 1024; relevant 0.86 vs irrelevant 0.35 |
 | Dense embedding | `mixedbread-ai/mxbai-embed-large-v1` | dim 1024; relevant 0.885 vs irrelevant 0.312 |
-| Dense embedding | `BAAI/bge-m3` | dim 1024, unit norm; Metal output parity with the qualified PyTorch MPS checkpoint |
+| Dense embedding | `BAAI/bge-m3` | dim 1024, unit norm; ONNX and safetensors CPU/Metal parity against the official ONNX Runtime export |
 | Dense embedding | `sentence-transformers/all-MiniLM-L6-v2` | dim 384; relevant 0.824 vs irrelevant −0.007 |
 | Sparse embedding | `sparse-encoder-testing/splade-bert-tiny-nq-onnx` | 90 non-zero terms |
 | Reranking | `mixedbread-ai/mxbai-rerank-base-v1` | relevant 0.9997 vs irrelevant 0.0003 |
@@ -136,7 +130,7 @@ These artifacts were checked for a meaningful result, not merely a successful re
 | Transcription | `openai/whisper-tiny` | transcribes recorded speech |
 | Generation | Gemma 3, Gemma 4, Llama 3.x, Qwen3 dense GGUF | see below |
 
-`BAAI/bge-m3` resolves to the official immutable safetensors revision `84790c1a606f60d06c6932e4ecdd174b466d84ac`, because the repository's current `main` revision no longer publishes `model.safetensors`. The managed receipt and install-directory identity retain the full `safetensors@<commit>` variant. The local embeddings API exposes BGE-M3's normalized 1024-dimensional dense vector; its sparse lexical weights and ColBERT token vectors require separate response contracts and are not exposed by the dense embeddings endpoint.
+`antfly inference pull BAAI/bge-m3` resolves to the official repository at `main`, whose current supported artifact is ONNX. A pull records the immutable commit it resolved. The historical safetensors checkpoint remains available explicitly as `BAAI/bge-m3:safetensors@84790c1a606f60d06c6932e4ecdd174b466d84ac`; community GGUF conversions also require an explicit repository reference. See [Model Downloads](/docs/guides/model-downloads) for the format qualification and commands. The local embeddings API exposes BGE-M3's normalized 1024-dimensional dense vector; its sparse lexical weights and ColBERT token vectors require separate response contracts and are not exposed by the dense embeddings endpoint.
 
 ### Generation Families
 
@@ -151,7 +145,7 @@ Text generation works with the decoder artifacts listed above. Multimodal genera
 
 Gemma 4 26B-A4B support is intentionally narrower than dense Gemma 4. The GGUF must match the qualified 30-layer, 128-expert, top-8 Q4_0 layout. Metal supports bounded or resident placement. CUDA requires a 16 GiB resident A4B envelope and an SM89 GPU. Unsupported geometry, streamed CUDA, or unavailable kernels are rejected at load time rather than falling back to host MoE execution. Server deployments must also leave transient host/combined admission headroom for the encoded GGUF during CUDA upload; only the 16 GiB CUDA envelope remains leased after load.
 
-CUDA uses a bounded multithreaded pinned-host load pipeline by default. Clean GGUF pages remain kernel-reclaimable and shared across rolling workers unless `--a4b-drop-host-cache-after-load` is selected. Production images can install a versioned `$MODEL/a4b-cuda-pack-v2` created with `antfly-inference a4b-pack`; use `a4b-pack --verify` after copying it and `--a4b-prepared-pack required` to fail closed if that artifact is absent or stale. The default `auto` policy warns and uses the canonical GGUF when an optional pack is unusable. This is deliberately a full-model residency contract, not an `ngl`-style layer split. Cache retention and server `startup_strategy: "prefetch"` are deployment tools rather than a latency guarantee; hosts must have enough reclaimable memory for their checkpoint and loader working set, and should measure replacement-worker load time on the actual storage topology.
+CUDA uses a bounded multithreaded pinned-host load pipeline by default. Clean GGUF pages remain kernel-reclaimable and shared across rolling workers unless `--a4b-drop-host-cache-after-load` is passed to `antfly inference generate`. Production images can install a versioned `$MODEL/a4b-cuda-pack-v2` pre-sharded expert pack; use `--a4b-prepared-pack required` to fail closed if that artifact is absent or stale. The default `auto` policy warns and uses the canonical GGUF when an optional pack is unusable. This is deliberately a full-model residency contract, not an `ngl`-style layer split. Cache retention and `startup_strategy: "prefetch"` in the standalone `antfly-inference` server's preload config are deployment tools rather than a latency guarantee; hosts must have enough reclaimable memory for their checkpoint and loader working set, and should measure replacement-worker load time on the actual storage topology.
 
 ## Known Incompatible Artifacts and Families
 

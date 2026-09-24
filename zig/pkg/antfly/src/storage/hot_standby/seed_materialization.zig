@@ -1,0 +1,737 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the License at https://www.antfly.io/licensing/ELv2-license.
+
+//! Offline materialization of a portable HA logical seed into a bootable data
+//! directory. Raw transport bytes remain immutable; the returned live tree is
+//! a separate generation that the runtime may mutate after ACTIVE publication.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const Sha256 = std.crypto.hash.sha2.Sha256;
+const data_format = @import("../../common/data_format.zig");
+const fs_paths = @import("../../common/fs_paths.zig");
+const raft_catalog = @import("../../raft/storage/catalog.zig");
+const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
+const generation_lifecycle = @import("../db/generation_lifecycle.zig");
+const backend_types = @import("../backend_types.zig");
+const lsm_backend = @import("../lsm_backend.zig");
+const validation = @import("validation.zig");
+const topology_records = @import("../../common/topology_records.zig");
+const seed_topology = @import("seed_topology.zig");
+
+pub const topology_format_version = seed_topology.topology_format_version;
+pub const topology_name = seed_topology.topology_name;
+pub const private_provisioning_name = seed_topology.private_provisioning_name;
+pub const standalone_metadata_name = seed_topology.standalone_metadata_name;
+pub const materialized_receipt_name = ".antfly-ha-materialized.json";
+pub const max_topology_bytes = seed_topology.max_topology_bytes;
+pub const max_materialized_receipt_bytes: usize = 64 * 1024 * 1024;
+pub const max_files = seed_topology.max_files;
+pub const max_file_bytes = seed_topology.max_file_bytes;
+const auth_users_namespace: backend_types.Namespace = .{ .name = "usermgr_users" };
+const auth_casbin_namespace: backend_types.Namespace = .{ .name = "usermgr_casbin" };
+
+pub const PortableAuthSeedEntry = seed_topology.PortableAuthSeedEntry;
+pub const PortableAuthSeed = seed_topology.PortableAuthSeed;
+pub const LogicalCatalog = seed_topology.LogicalCatalog;
+pub const ReplicaSnapshot = seed_topology.ReplicaSnapshot;
+pub const ExtensionArtifact = seed_topology.ExtensionArtifact;
+pub const AuthArtifact = seed_topology.AuthArtifact;
+pub const Topology = seed_topology.Topology;
+
+pub const MaterializeRequest = struct {
+    io: std.Io = std.Options.debug_io,
+    raw_generation_root: []const u8,
+    live_installing_root: []const u8,
+    generation: []const u8,
+    target_local_node_id: u64,
+    target_replica_id: u64 = 1,
+    seed_receipt_sha256: []const u8,
+    capture_receipt_sha256: []const u8,
+    raw_manifest_sha256: []const u8,
+    raw_aggregate_sha256: []const u8,
+};
+
+pub const MaterializedFile = struct {
+    path: []const u8,
+    size_bytes: u64,
+    sha256: []const u8,
+};
+
+pub const MaterializedReceipt = struct {
+    format_version: u16 = 1,
+    generation: []const u8,
+    seed_receipt_sha256: []const u8,
+    capture_receipt_sha256: []const u8,
+    raw_manifest_sha256: []const u8,
+    raw_aggregate_sha256: []const u8,
+    target_local_node_id: u64,
+    target_replica_id: u64,
+    topology_sha256: []const u8,
+    aggregate_sha256: []const u8,
+    file_count: usize,
+    total_bytes: u64,
+    files: []const MaterializedFile,
+};
+
+pub const MaterializeResult = struct {
+    receipt_json: []u8,
+    receipt_sha256: [Sha256.digest_length * 2]u8,
+    aggregate_sha256: [Sha256.digest_length * 2]u8,
+
+    pub fn deinit(self: *MaterializeResult, alloc: Allocator) void {
+        alloc.free(self.receipt_json);
+        self.* = undefined;
+    }
+};
+
+pub const PublishedEvidence = struct {
+    receipt_json: []u8,
+    receipt_sha256: [Sha256.digest_length * 2]u8,
+    aggregate_sha256: [Sha256.digest_length * 2]u8,
+
+    pub fn deinit(self: *PublishedEvidence, alloc: Allocator) void {
+        alloc.free(self.receipt_json);
+        self.* = undefined;
+    }
+};
+
+pub fn materialize(alloc: Allocator, request: MaterializeRequest) !MaterializeResult {
+    try validateMaterializeRequest(request);
+    const io = request.io;
+
+    if (try pathExists(io, request.live_installing_root)) return error.LiveInstallingRootExists;
+    try fs_paths.createDirPathPortable(io, request.live_installing_root);
+    errdefer std.Io.Dir.cwd().deleteTree(io, request.live_installing_root) catch {};
+
+    const topology_path = try std.fs.path.join(alloc, &.{ request.raw_generation_root, topology_name });
+    defer alloc.free(topology_path);
+    const topology_json = try readFileAlloc(io, alloc, topology_path, max_topology_bytes);
+    defer alloc.free(topology_json);
+    var parsed = std.json.parseFromSlice(Topology, alloc, topology_json, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = false,
+    }) catch return error.InvalidSeedTopology;
+    defer parsed.deinit();
+    try validateTopology(alloc, io, request.raw_generation_root, request.generation, parsed.value);
+
+    try data_format.ensureCompatible(alloc, io, request.live_installing_root);
+    const data_root = try std.fs.path.join(alloc, &.{ request.live_installing_root, "data" });
+    defer alloc.free(data_root);
+    const replicas_root = try std.fs.path.join(alloc, &.{ data_root, "replicas" });
+    defer alloc.free(replicas_root);
+    const metadata_root = try std.fs.path.join(alloc, &.{ request.live_installing_root, "metadata" });
+    defer alloc.free(metadata_root);
+    const extension_root = try std.fs.path.join(alloc, &.{ request.live_installing_root, "extensions" });
+    defer alloc.free(extension_root);
+    try fs_paths.createDirPathPortable(io, replicas_root);
+    try fs_paths.createDirPathPortable(io, metadata_root);
+
+    if (parsed.value.auth_artifact) |artifact| {
+        const source = try std.fs.path.join(alloc, &.{ request.raw_generation_root, artifact.path });
+        defer alloc.free(source);
+        const artifact_json = try readFileAlloc(io, alloc, source, @intCast(max_file_bytes));
+        defer alloc.free(artifact_json);
+        const auth_root = try std.fs.path.join(alloc, &.{ metadata_root, "auth" });
+        defer alloc.free(auth_root);
+        try materializePortableAuthSeedToPath(alloc, auth_root, request.generation, artifact_json);
+    }
+
+    const local_catalog_path = try std.fs.path.join(alloc, &.{ metadata_root, "local-metadata.json" });
+    defer alloc.free(local_catalog_path);
+    const local_catalog_json = try std.json.Stringify.valueAlloc(alloc, parsed.value.catalog, .{ .emit_null_optional_fields = false });
+    defer alloc.free(local_catalog_json);
+    try writeNewFileDurably(io, local_catalog_path, local_catalog_json);
+    if (parsed.value.standalone_metadata) |artifact| {
+        const source_path = try std.fs.path.join(alloc, &.{ request.raw_generation_root, artifact.path });
+        defer alloc.free(source_path);
+        const metadata_store_root = try std.fs.path.join(alloc, &.{ metadata_root, "local-state" });
+        defer alloc.free(metadata_store_root);
+        var metadata_store = try @import("../../metadata/storage/raft_apply_store.zig").RaftApplyStore.init(alloc, .{ .root_dir = metadata_store_root });
+        defer metadata_store.deinit();
+        try metadata_store.importHACheckpoint(io, source_path, artifact.size_bytes);
+        try verifyStandaloneMetadataTopology(alloc, &metadata_store, parsed.value);
+    }
+    if (parsed.value.private_provisioning) |projection| {
+        const private_path = try std.fs.path.join(alloc, &.{ metadata_root, private_provisioning_name });
+        defer alloc.free(private_path);
+        const private_json = try std.json.Stringify.valueAlloc(alloc, projection, .{});
+        defer alloc.free(private_json);
+        try writeNewFileDurably(io, private_path, private_json);
+    }
+    const native_owners = try @import("restore_owner_registry.zig").expand(alloc, parsed.value.native_restore_tables, parsed.value.native_restore_owners);
+    defer alloc.free(native_owners);
+    for (native_owners) |owner| try @import("restore_owner_registry.zig").record(alloc, io, metadata_root, owner);
+    if (parsed.value.restore_terminals) |artifact| {
+        const terminal_path = try std.fs.path.join(alloc, &.{ request.raw_generation_root, artifact.path });
+        defer alloc.free(terminal_path);
+        var ledger = try @import("restore_terminal_ledger.zig").Ledger.open(alloc, io, metadata_root);
+        defer ledger.deinit();
+        try ledger.importFile(io, terminal_path, artifact.size_bytes);
+        var terminals = try ledger.snapshot();
+        defer terminals.deinit();
+        for (native_owners) |owner| if (try terminals.get(owner.scope.target_namespace.shard_id) != null) return error.NonCanonicalSeedTopology;
+        for (parsed.value.catalog.ranges) |range| if (try terminals.get(range.group_id) != null) return error.NonCanonicalSeedTopology;
+        if (parsed.value.private_provisioning) |projection| for (projection.ranges) |range| {
+            if (try terminals.get(range.group_id) != null) return error.NonCanonicalSeedTopology;
+        };
+    }
+
+    const replica_catalog_path = try std.fs.path.join(alloc, &.{ data_root, "catalog.txt" });
+    defer alloc.free(replica_catalog_path);
+    var catalog = try raft_catalog.FileReplicaCatalog.init(alloc, replica_catalog_path);
+    defer catalog.deinit();
+
+    for (parsed.value.replicas) |replica| {
+        const snapshot_root = try std.fs.path.join(alloc, &.{ request.raw_generation_root, replica.snapshot_path });
+        defer alloc.free(snapshot_root);
+        const relative_db_path = try std.fmt.allocPrint(alloc, "group-{d}/table-db", .{replica.group_id});
+        defer alloc.free(relative_db_path);
+        const db_path = try std.fs.path.join(alloc, &.{ replicas_root, relative_db_path });
+        defer alloc.free(db_path);
+
+        var transition = try generation_lifecycle.beginProcessExclusiveWithIo(db_path, io);
+        defer transition.deinit();
+        var staged = try transition.beginStaging();
+        defer staged.deinit();
+        try db_mod.DB.restoreCoherentHASeedReplicaToStagedGeneration(&staged, alloc, snapshot_root, staged.path(), .{
+            .identity_namespace = .{
+                .table_id = replica.identity_table_id,
+                .shard_id = replica.identity_shard_id,
+                .range_id = replica.identity_range_id,
+            },
+            .start_index_workers = false,
+            .start_optional_runtimes = false,
+        }, .{
+            .table_id = replica.identity_table_id,
+            .shard_id = replica.identity_shard_id,
+            .range_id = replica.identity_range_id,
+        });
+        var native_ha_owner = false;
+        for (native_owners) |owner| {
+            if (owner.scope.target_namespace.shard_id != replica.group_id) continue;
+            native_ha_owner = true;
+            var verified = try db_mod.DB.open(alloc, staged.path(), .{ .open_mode = .query_readonly, .primary_only_readonly = true, .identity_namespace = owner.scope.target_namespace, .start_index_workers = false, .start_optional_runtimes = false });
+            defer verified.close();
+            var bootstrap = (try verified.readRestoreStagingBootstrap(alloc)) orelse return error.SeedReplicaIdentityMismatch;
+            defer bootstrap.deinit();
+            const actual = try bootstrap.value.encode(alloc);
+            defer alloc.free(actual);
+            const expected = try owner.encode(alloc);
+            defer alloc.free(expected);
+            if (!std.mem.eql(u8, actual, expected)) return error.SeedReplicaIdentityMismatch;
+            var progress = (try verified.restoreStagingStatus(alloc)) orelse return error.SeedReplicaIdentityMismatch;
+            defer progress.deinit();
+            if (!std.mem.eql(u8, &progress.value.scope.digest(), &owner.scope.digest())) return error.SeedReplicaIdentityMismatch;
+        }
+        if (try staged.publish() != .durable) return error.LiveDBPublicationConflict;
+        // Stream authority reconstructs an owner, not Raft membership. The
+        // independent registry keeps it discoverable for replay and reseeding.
+        if (native_ha_owner) continue;
+        try catalog.catalog().upsertReplica(.{
+            .group_id = replica.group_id,
+            .replica_id = request.target_replica_id,
+            .local_node_id = request.target_local_node_id,
+            .bootstrap_mode = .persisted,
+            .metadata_version = parsed.value.catalog.epoch,
+        });
+    }
+
+    for (parsed.value.extension_artifacts) |artifact| {
+        const source = try std.fs.path.join(alloc, &.{ request.raw_generation_root, artifact.path });
+        defer alloc.free(source);
+        const relative = artifact.path["extensions/".len..];
+        const destination = try std.fs.path.join(alloc, &.{ extension_root, relative });
+        defer alloc.free(destination);
+        try copyFileDurably(io, source, destination);
+    }
+
+    try fs_paths.syncDirPortable(io, request.live_installing_root);
+    const files = try collectMaterializedFiles(alloc, io, request.live_installing_root);
+    defer freeMaterializedFiles(alloc, files);
+    var total_bytes: u64 = 0;
+    for (files) |file| total_bytes = std.math.add(u64, total_bytes, file.size_bytes) catch return error.MaterializedSeedTooLarge;
+    const aggregate_sha256 = aggregateFiles(files);
+    var topology_digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(topology_json, &topology_digest, .{});
+    var topology_sha256: [Sha256.digest_length * 2]u8 = undefined;
+    encodeHex(&topology_sha256, &topology_digest);
+
+    const receipt_json = try std.json.Stringify.valueAlloc(alloc, MaterializedReceipt{
+        .generation = request.generation,
+        .seed_receipt_sha256 = request.seed_receipt_sha256,
+        .capture_receipt_sha256 = request.capture_receipt_sha256,
+        .raw_manifest_sha256 = request.raw_manifest_sha256,
+        .raw_aggregate_sha256 = request.raw_aggregate_sha256,
+        .target_local_node_id = request.target_local_node_id,
+        .target_replica_id = request.target_replica_id,
+        .topology_sha256 = &topology_sha256,
+        .aggregate_sha256 = &aggregate_sha256,
+        .file_count = files.len,
+        .total_bytes = total_bytes,
+        .files = files,
+    }, .{});
+    errdefer alloc.free(receipt_json);
+    const receipt_path = try std.fs.path.join(alloc, &.{ request.live_installing_root, materialized_receipt_name });
+    defer alloc.free(receipt_path);
+    try writeNewFileDurably(io, receipt_path, receipt_json);
+    try fs_paths.syncDirPortable(io, request.live_installing_root);
+
+    var receipt_digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(receipt_json, &receipt_digest, .{});
+    var receipt_sha256: [Sha256.digest_length * 2]u8 = undefined;
+    encodeHex(&receipt_sha256, &receipt_digest);
+    return .{
+        .receipt_json = receipt_json,
+        .receipt_sha256 = receipt_sha256,
+        .aggregate_sha256 = aggregate_sha256,
+    };
+}
+
+pub fn validatePublishedBeforeRuntime(
+    alloc: Allocator,
+    live_root: []const u8,
+    expected_generation: []const u8,
+    expected_receipt_sha256: []const u8,
+) !void {
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const receipt_path = try std.fs.path.join(alloc, &.{ live_root, materialized_receipt_name });
+    defer alloc.free(receipt_path);
+    const receipt_json = try readFileAlloc(io_impl.io(), alloc, receipt_path, max_materialized_receipt_bytes);
+    defer alloc.free(receipt_json);
+    try expectSha256(receipt_json, expected_receipt_sha256, error.MaterializedReceiptDigestMismatch);
+    var parsed = std.json.parseFromSlice(MaterializedReceipt, alloc, receipt_json, .{ .ignore_unknown_fields = false }) catch
+        return error.InvalidMaterializedReceipt;
+    defer parsed.deinit();
+    if (parsed.value.format_version != 1 or
+        !std.mem.eql(u8, parsed.value.generation, expected_generation) or
+        parsed.value.file_count != parsed.value.files.len or
+        !isCanonicalSha256(parsed.value.aggregate_sha256)) return error.InvalidMaterializedReceipt;
+    try validateMaterializedFiles(alloc, io_impl.io(), live_root, parsed.value);
+}
+
+pub fn loadPublishedEvidence(alloc: Allocator, live_root: []const u8, expected_generation: []const u8) !PublishedEvidence {
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const receipt_path = try std.fs.path.join(alloc, &.{ live_root, materialized_receipt_name });
+    defer alloc.free(receipt_path);
+    const receipt_json = try readFileAlloc(io_impl.io(), alloc, receipt_path, max_materialized_receipt_bytes);
+    errdefer alloc.free(receipt_json);
+    var parsed = std.json.parseFromSlice(MaterializedReceipt, alloc, receipt_json, .{ .ignore_unknown_fields = false }) catch
+        return error.InvalidMaterializedReceipt;
+    defer parsed.deinit();
+    if (parsed.value.format_version != 1 or !std.mem.eql(u8, parsed.value.generation, expected_generation) or
+        !isCanonicalSha256(parsed.value.aggregate_sha256)) return error.InvalidMaterializedReceipt;
+    var receipt_digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(receipt_json, &receipt_digest, .{});
+    var receipt_sha256: [Sha256.digest_length * 2]u8 = undefined;
+    encodeHex(&receipt_sha256, &receipt_digest);
+    var aggregate_sha256: [Sha256.digest_length * 2]u8 = undefined;
+    @memcpy(&aggregate_sha256, parsed.value.aggregate_sha256);
+    return .{
+        .receipt_json = receipt_json,
+        .receipt_sha256 = receipt_sha256,
+        .aggregate_sha256 = aggregate_sha256,
+    };
+}
+
+/// Startup validation intentionally does not hash mutable runtime files. It
+/// checks the immutable materialization marker and opens every declared DB with
+/// its exact logical identity; normal storage recovery validates file framing.
+pub fn validateRuntimeIdentity(
+    alloc: Allocator,
+    raw_generation_root: []const u8,
+    live_root: []const u8,
+    expected_generation: []const u8,
+    expected_receipt_sha256: []const u8,
+) !void {
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const receipt_path = try std.fs.path.join(alloc, &.{ live_root, materialized_receipt_name });
+    defer alloc.free(receipt_path);
+    const receipt_json = try readFileAlloc(io_impl.io(), alloc, receipt_path, max_materialized_receipt_bytes);
+    defer alloc.free(receipt_json);
+    try expectSha256(receipt_json, expected_receipt_sha256, error.MaterializedReceiptDigestMismatch);
+    var receipt = std.json.parseFromSlice(MaterializedReceipt, alloc, receipt_json, .{ .ignore_unknown_fields = false }) catch
+        return error.InvalidMaterializedReceipt;
+    defer receipt.deinit();
+    if (receipt.value.format_version != 1 or !std.mem.eql(u8, receipt.value.generation, expected_generation))
+        return error.InvalidMaterializedReceipt;
+
+    const topology_path = try std.fs.path.join(alloc, &.{ raw_generation_root, topology_name });
+    defer alloc.free(topology_path);
+    const topology_json = try readFileAlloc(io_impl.io(), alloc, topology_path, max_topology_bytes);
+    defer alloc.free(topology_json);
+    var topology_digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(topology_json, &topology_digest, .{});
+    var topology_sha256: [Sha256.digest_length * 2]u8 = undefined;
+    encodeHex(&topology_sha256, &topology_digest);
+    if (!std.mem.eql(u8, &topology_sha256, receipt.value.topology_sha256)) return error.MaterializedTopologyMismatch;
+    var topology = std.json.parseFromSlice(Topology, alloc, topology_json, .{ .ignore_unknown_fields = false }) catch
+        return error.InvalidSeedTopology;
+    defer topology.deinit();
+    if (topology.value.auth_enabled) {
+        const auth_root = try std.fs.path.join(alloc, &.{ live_root, "metadata/auth" });
+        defer alloc.free(auth_root);
+        var auth_dir = std.Io.Dir.cwd().openDir(io_impl.io(), auth_root, .{}) catch
+            return error.LiveAuthStoreMissing;
+        auth_dir.close(io_impl.io());
+    }
+
+    const data_catalog_path = try std.fs.path.join(alloc, &.{ live_root, "data/catalog.txt" });
+    defer alloc.free(data_catalog_path);
+    var catalog = try raft_catalog.FileReplicaCatalog.init(alloc, data_catalog_path);
+    defer catalog.deinit();
+    const records = try catalog.catalog().listReplicas(alloc);
+    defer raft_catalog.freeReplicaRecords(alloc, records);
+    if (records.len != topology.value.replicas.len) return error.LiveReplicaCatalogMismatch;
+
+    for (topology.value.replicas) |replica| {
+        var found = false;
+        for (records) |record| if (record.group_id == replica.group_id) {
+            found = true;
+            if (record.local_node_id != receipt.value.target_local_node_id or
+                record.replica_id != receipt.value.target_replica_id or
+                record.bootstrap_mode != .persisted) return error.LiveReplicaCatalogMismatch;
+        };
+        if (!found) return error.LiveReplicaCatalogMismatch;
+        const db_path = try std.fmt.allocPrint(alloc, "{s}/data/replicas/group-{d}/table-db", .{ live_root, replica.group_id });
+        defer alloc.free(db_path);
+        var db = try db_mod.DB.open(alloc, db_path, .{
+            .identity_namespace = .{
+                .table_id = replica.identity_table_id,
+                .shard_id = replica.identity_shard_id,
+                .range_id = replica.identity_range_id,
+            },
+            .start_index_workers = false,
+            .start_optional_runtimes = false,
+        });
+        db.close();
+    }
+}
+
+fn verifyStandaloneMetadataTopology(alloc: Allocator, store: *@import("../../metadata/storage/raft_apply_store.zig").RaftApplyStore, topology: Topology) !void {
+    const manager = @import("../../metadata/table_manager.zig");
+    const group_id = @import("../../common/group_ids.zig").main_metadata_group_id;
+    if (try store.standaloneRevision() != topology.catalog.epoch) return error.SeedMetadataTopologyMismatch;
+    var projection = try store.captureProvisioningCatalog(alloc, group_id);
+    defer projection.deinit(alloc);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const catalog = @import("../../system_catalog/domain.zig");
+    var actual_catalog = try store.systemCatalogSnapshot(alloc, group_id);
+    defer actual_catalog.deinit();
+    const expected_catalog = topology.catalog.system_catalog orelse catalog.State{};
+    if (actual_catalog.value.revision != expected_catalog.revision or actual_catalog.value.next_id != expected_catalog.next_id) return error.SeedMetadataTopologyMismatch;
+    var expected_state = try catalog.MutableState.clone(scratch, expected_catalog);
+    defer expected_state.deinit();
+    var actual_state = try catalog.MutableState.clone(scratch, actual_catalog.value);
+    defer actual_state.deinit();
+    if (actual_state.value.resources.len != expected_state.value.resources.len) return error.SeedMetadataTopologyMismatch;
+    for (actual_state.value.resources) |resource| {
+        const expected = expected_state.index.byId(resource.kind, resource.id) orelse return error.SeedMetadataTopologyMismatch;
+        const left = try std.json.Stringify.valueAlloc(scratch, resource, .{});
+        const right = try std.json.Stringify.valueAlloc(scratch, expected, .{});
+        if (!std.mem.eql(u8, left, right)) return error.SeedMetadataTopologyMismatch;
+    }
+    const expected_tables = if (topology.private_provisioning) |private| try std.mem.concat(scratch, topology_records.TableRecord, &.{ topology.catalog.tables, private.tables }) else topology.catalog.tables;
+    const expected_ranges = if (topology.private_provisioning) |private| try std.mem.concat(scratch, topology_records.RangeRecord, &.{ topology.catalog.ranges, private.ranges }) else topology.catalog.ranges;
+    if (projection.tables.len != expected_tables.len or projection.ranges.len != expected_ranges.len) return error.SeedMetadataTopologyMismatch;
+    var table_indices: std.AutoHashMapUnmanaged(u64, usize) = .empty;
+    var range_indices: std.AutoHashMapUnmanaged(u64, usize) = .empty;
+    for (expected_tables, 0..) |table, index| {
+        const entry = try table_indices.getOrPut(scratch, table.table_id);
+        if (entry.found_existing) return error.SeedMetadataTopologyMismatch;
+        entry.value_ptr.* = index;
+    }
+    for (projection.tables) |table| {
+        const index = table_indices.get(table.table_id) orelse return error.SeedMetadataTopologyMismatch;
+        if (!manager.tableDefinitionsEqual(table, expected_tables[index])) return error.SeedMetadataTopologyMismatch;
+    }
+    for (expected_ranges, 0..) |range, index| {
+        const entry = try range_indices.getOrPut(scratch, range.group_id);
+        if (entry.found_existing) return error.SeedMetadataTopologyMismatch;
+        entry.value_ptr.* = index;
+    }
+    for (projection.ranges) |range| {
+        const index = range_indices.get(range.group_id) orelse return error.SeedMetadataTopologyMismatch;
+        var actual = range;
+        var expected = expected_ranges[index];
+        // Seed descriptors make the released implicit identity explicit.
+        actual.doc_identity_shard_id = manager.rangeDocIdentityShardId(actual);
+        actual.doc_identity_range_id = manager.rangeDocIdentityRangeId(actual);
+        expected.doc_identity_shard_id = manager.rangeDocIdentityShardId(expected);
+        expected.doc_identity_range_id = manager.rangeDocIdentityRangeId(expected);
+        if (!manager.rangeRecordsEqual(actual, expected)) return error.SeedMetadataTopologyMismatch;
+    }
+    const expected_jobs = if (topology.private_provisioning) |private| private.jobs_json else &.{};
+    if (projection.jobs_json.len != expected_jobs.len) return error.SeedMetadataTopologyMismatch;
+    var jobs: std.StringHashMapUnmanaged(void) = .empty;
+    for (expected_jobs) |job| try jobs.put(scratch, job, {});
+    for (projection.jobs_json) |job| if (!jobs.remove(job)) return error.SeedMetadataTopologyMismatch;
+}
+
+const validateTableIdentityName = seed_topology.validateTableIdentityName;
+
+const validateLogicalCatalog = seed_topology.validateLogicalCatalog;
+
+pub fn validateTopology(
+    alloc: Allocator,
+    io: std.Io,
+    raw_root: []const u8,
+    expected_generation: []const u8,
+    topology: Topology,
+) !void {
+    var proof_arena = std.heap.ArenaAllocator.init(alloc);
+    defer proof_arena.deinit();
+    const proof_alloc = proof_arena.allocator();
+    const private = topology.private_provisioning;
+    if (private) |projection| _ = try @import("../../data/private_provisioning.zig").validate(proof_alloc, topology.catalog.tables, topology.catalog.ranges, projection);
+    return seed_topology.validate(alloc, io, raw_root, expected_generation, topology);
+}
+
+fn materializePortableAuthSeedToPath(
+    alloc: Allocator,
+    target_root: []const u8,
+    expected_generation: []const u8,
+    artifact_json: []const u8,
+) !void {
+    try validatePortableAuthSeedBody(alloc, expected_generation, artifact_json);
+    var parsed = std.json.parseFromSlice(PortableAuthSeed, alloc, artifact_json, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = false,
+    }) catch return error.InvalidPortableAuthSeed;
+    defer parsed.deinit();
+    var backend = try lsm_backend.BackendHandle.open(alloc, target_root, .{ .flush_threshold = 1 });
+    defer backend.close();
+    var store = try backend.backend.runtimeNamespaceStore(alloc);
+    defer store.deinit();
+    var batch = try store.beginBatch();
+    errdefer batch.abort();
+    for (parsed.value.entries) |entry| {
+        const namespace = if (std.mem.eql(u8, entry.namespace, auth_users_namespace.name.?))
+            auth_users_namespace
+        else if (std.mem.eql(u8, entry.namespace, auth_casbin_namespace.name.?))
+            auth_casbin_namespace
+        else
+            return error.InvalidPortableAuthSeed;
+        const key = decodeBase64Alloc(alloc, entry.key_base64) catch return error.InvalidPortableAuthSeed;
+        defer alloc.free(key);
+        const value = decodeBase64Alloc(alloc, entry.value_base64) catch return error.InvalidPortableAuthSeed;
+        defer alloc.free(value);
+        try batch.put(namespace, key, value);
+    }
+    try batch.commit();
+}
+
+fn validatePortableAuthSeedBody(alloc: Allocator, expected_generation: []const u8, artifact_json: []const u8) !void {
+    return seed_topology.validatePortableAuthSeedBody(alloc, expected_generation, artifact_json);
+}
+
+fn decodeBase64Alloc(alloc: Allocator, raw: []const u8) ![]u8 {
+    const size = try std.base64.standard.Decoder.calcSizeForSlice(raw);
+    const out = try alloc.alloc(u8, size);
+    errdefer alloc.free(out);
+    try std.base64.standard.Decoder.decode(out, raw);
+    return out;
+}
+
+fn validateMaterializeRequest(request: MaterializeRequest) !void {
+    if (!validation.isAbsoluteNormalizedPath(request.raw_generation_root) or
+        !validation.isAbsoluteNormalizedPath(request.live_installing_root) or
+        !validation.isIdentifier(request.generation) or request.target_local_node_id == 0 or
+        request.target_replica_id == 0 or
+        !isCanonicalSha256(request.seed_receipt_sha256) or
+        !isCanonicalSha256(request.capture_receipt_sha256) or
+        !isCanonicalSha256(request.raw_manifest_sha256) or
+        !isCanonicalSha256(request.raw_aggregate_sha256)) return error.InvalidMaterializeRequest;
+}
+
+fn collectMaterializedFiles(alloc: Allocator, io: std.Io, root: []const u8) ![]MaterializedFile {
+    var dir = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
+    defer dir.close(io);
+    var walker = try dir.walk(alloc);
+    defer walker.deinit();
+    var files = std.ArrayListUnmanaged(MaterializedFile).empty;
+    errdefer freeMaterializedFiles(alloc, files.items);
+    while (try walker.next(io)) |entry| {
+        if (entry.kind == .directory) continue;
+        if (entry.kind != .file or !isSafeRelativePath(entry.path)) return error.UnsafeMaterializedSeedEntry;
+        if (std.mem.eql(u8, entry.path, materialized_receipt_name)) continue;
+        if (files.items.len >= max_files) return error.MaterializedSeedTooManyFiles;
+        const path = try std.fs.path.join(alloc, &.{ root, entry.path });
+        defer alloc.free(path);
+        const stat = try std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
+        if (stat.kind != .file or stat.size > max_file_bytes) return error.MaterializedSeedFileTooLarge;
+        const digest = try fileSha256HexAlloc(alloc, io, path);
+        errdefer alloc.free(digest);
+        const owned_path = try alloc.dupe(u8, entry.path);
+        errdefer alloc.free(owned_path);
+        try files.append(alloc, .{ .path = owned_path, .size_bytes = stat.size, .sha256 = digest });
+    }
+    std.mem.sort(MaterializedFile, files.items, {}, struct {
+        fn lessThan(_: void, left: MaterializedFile, right: MaterializedFile) bool {
+            return std.mem.order(u8, left.path, right.path) == .lt;
+        }
+    }.lessThan);
+    return try files.toOwnedSlice(alloc);
+}
+
+fn validateMaterializedFiles(alloc: Allocator, io: std.Io, root: []const u8, receipt: MaterializedReceipt) !void {
+    var total: u64 = 0;
+    for (receipt.files, 0..) |file, index| {
+        if (!isSafeRelativePath(file.path) or !isCanonicalSha256(file.sha256)) return error.InvalidMaterializedReceipt;
+        if (index > 0 and std.mem.order(u8, receipt.files[index - 1].path, file.path) != .lt) return error.InvalidMaterializedReceipt;
+        const path = try std.fs.path.join(alloc, &.{ root, file.path });
+        defer alloc.free(path);
+        const stat = try std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
+        if (stat.kind != .file or stat.size != file.size_bytes) return error.MaterializedFileMismatch;
+        try expectFileSha256(io, alloc, path, file.sha256);
+        total = std.math.add(u64, total, file.size_bytes) catch return error.MaterializedSeedTooLarge;
+    }
+    if (total != receipt.total_bytes) return error.InvalidMaterializedReceipt;
+    const aggregate = aggregateFiles(receipt.files);
+    if (!std.mem.eql(u8, &aggregate, receipt.aggregate_sha256)) return error.MaterializedAggregateMismatch;
+}
+
+fn aggregateFiles(files: []const MaterializedFile) [Sha256.digest_length * 2]u8 {
+    var hasher = Sha256.init(.{});
+    hasher.update("antfly-ha-materialized-v1\x00");
+    for (files) |file| {
+        var len_buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &len_buf, file.path.len, .big);
+        hasher.update(&len_buf);
+        hasher.update(file.path);
+        std.mem.writeInt(u64, &len_buf, file.size_bytes, .big);
+        hasher.update(&len_buf);
+        hasher.update(file.sha256);
+    }
+    var digest: [Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    var encoded: [Sha256.digest_length * 2]u8 = undefined;
+    encodeHex(&encoded, &digest);
+    return encoded;
+}
+
+fn freeMaterializedFiles(alloc: Allocator, files: []MaterializedFile) void {
+    for (files) |file| {
+        alloc.free(file.path);
+        alloc.free(file.sha256);
+    }
+    if (files.len > 0) alloc.free(files);
+}
+
+fn expectFileSha256(io: std.Io, alloc: Allocator, path: []const u8, expected: []const u8) !void {
+    const digest = try fileSha256HexAlloc(alloc, io, path);
+    defer alloc.free(digest);
+    if (!std.mem.eql(u8, digest, expected)) return error.SeedLogicalDigestMismatch;
+}
+
+fn fileSha256HexAlloc(alloc: Allocator, io: std.Io, path: []const u8) ![]u8 {
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    var reader = file.reader(io, &.{});
+    var hasher = Sha256.init(.{});
+    var buffer: [64 * 1024]u8 = undefined;
+    while (true) {
+        const n = try reader.interface.readSliceShort(&buffer);
+        if (n == 0) break;
+        hasher.update(buffer[0..n]);
+    }
+    var digest: [Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    const encoded = try alloc.alloc(u8, Sha256.digest_length * 2);
+    encodeHex(encoded, &digest);
+    return encoded;
+}
+
+fn copyFileDurably(io: std.Io, source: []const u8, destination: []const u8) !void {
+    try std.Io.Dir.copyFile(std.Io.Dir.cwd(), source, std.Io.Dir.cwd(), destination, io, .{
+        .make_path = true,
+        .replace = false,
+    });
+    try fs_paths.syncFileAndParentPortable(io, destination);
+}
+
+fn writeNewFileDurably(io: std.Io, path: []const u8, body: []const u8) !void {
+    const parent = std.fs.path.dirname(path) orelse return error.InvalidMaterializedPath;
+    try fs_paths.createDirPathPortable(io, parent);
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{ .exclusive = true });
+    defer file.close(io);
+    try file.writeStreamingAll(io, body);
+    try file.sync(io);
+    try fs_paths.syncDirPortable(io, parent);
+}
+
+fn expectSha256(body: []const u8, expected: []const u8, mismatch: anyerror) !void {
+    if (!isCanonicalSha256(expected)) return mismatch;
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(body, &digest, .{});
+    var encoded: [Sha256.digest_length * 2]u8 = undefined;
+    encodeHex(&encoded, &digest);
+    if (!std.mem.eql(u8, &encoded, expected)) return mismatch;
+}
+
+fn isCanonicalSha256(value: []const u8) bool {
+    if (value.len != Sha256.digest_length * 2) return false;
+    for (value) |byte| if ((byte < '0' or byte > '9') and (byte < 'a' or byte > 'f')) return false;
+    return true;
+}
+
+fn isSafeRelativePath(path: []const u8) bool {
+    return !std.fs.path.isAbsolute(path) and validation.isNormalizedPath(path);
+}
+
+fn encodeHex(out: []u8, bytes: []const u8) void {
+    for (bytes, 0..) |byte, index| {
+        out[index * 2] = std.fmt.digitToChar(byte >> 4, .lower);
+        out[index * 2 + 1] = std.fmt.digitToChar(byte & 0x0f, .lower);
+    }
+}
+
+fn readFileAlloc(io: std.Io, alloc: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
+    return try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(max_bytes));
+}
+
+fn pathExists(io: std.Io, path: []const u8) !bool {
+    std.Io.Dir.cwd().access(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
+}
+
+test "storage.ha system catalog seed versions require complete logical identities" {
+    const alloc = std.testing.allocator;
+    const legacy: LogicalCatalog = .{ .epoch = 1, .tables = &.{}, .ranges = &.{} };
+    try validateLogicalCatalog(alloc, 3, legacy);
+    try std.testing.expectError(error.InvalidSeedTopology, validateLogicalCatalog(alloc, 4, legacy));
+    var current = legacy;
+    current.system_catalog = .{};
+    try validateLogicalCatalog(alloc, 4, current);
+    current.system_catalog = .{ .revision = 1, .next_id = 5, .resources = &.{
+        .{ .kind = .database, .id = 3, .name = "analytics" },
+        .{ .kind = .namespace, .id = 4, .parent_id = 3, .name = "serving" },
+        .{ .kind = .table, .id = 99, .parent_id = 4, .name = "events", .storage_name = "table:99" },
+    } };
+    try std.testing.expectError(error.InvalidSeedTopology, validateLogicalCatalog(alloc, 4, current));
+    current.tables = &.{.{ .table_id = 99, .name = "table:99" }};
+    try validateLogicalCatalog(alloc, 4, current);
+    current.tables = &.{.{ .table_id = 99, .name = "replacement" }};
+    try std.testing.expectError(error.InvalidSeedTopology, validateLogicalCatalog(alloc, 4, current));
+}
+
+test "storage.ha system catalog portable table names preserve literal and restore identities" {
+    const domain = @import("../../system_catalog/domain.zig");
+    for ([_][]const u8{ "docs", "sales/archive", "..", "docs table", "*" }) |name| try validateTableIdentityName(name);
+    try std.testing.expectError(error.InvalidSeedTopology, validateTableIdentityName("bad\nname"));
+    const component: [domain.max_name_bytes]u8 = @splat('a');
+    const restore = try domain.restoreStorageNameAlloc(std.testing.allocator, "table:00000000000000000000000000000000", .{ .database = &component, .namespace = &component, .table = &component });
+    defer std.testing.allocator.free(restore);
+    try validateTableIdentityName(restore);
+}

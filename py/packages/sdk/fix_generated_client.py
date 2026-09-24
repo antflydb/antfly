@@ -10,6 +10,7 @@ from pathlib import Path
 FILES = {
     Path("api/query_operations/global_query.py"): 5,
     Path("api/query_operations/query_table.py"): 5,
+    Path("api/query_operations/query_namespace_table.py"): 5,
 }
 # The public HTTP operations intentionally expose the stateful compatibility
 # envelope, while the SDK's primary QueryRequest model remains canonical.
@@ -20,6 +21,8 @@ REQUIRED_BODY = re.compile(
     r"\s+\|\s+Unset\s*=\s*UNSET"
 )
 NDJSON_HEADER = 'headers["Content-Type"] = "application/x-ndjson"'
+RELATIONAL_QUERY = Path("api/data_operations/query_relational_rows.py")
+NDJSON_RESPONSE = "response_200 = cast(str, response.content)"
 
 
 def fix_generated_client(root: Path) -> None:
@@ -34,6 +37,14 @@ def fix_generated_client(root: Path) -> None:
                 f"required-body signatures={count}, NDJSON headers={source.count(NDJSON_HEADER)}"
             )
         updates[path] = REQUIRED_BODY.sub(r"\1", source)
+
+    # The generator treats unknown NDJSON media as binary while annotating
+    # the schema as str. Decode text, without JSON parsing or integer coercion.
+    path = root / RELATIONAL_QUERY
+    source = path.read_text(encoding="utf-8")
+    if source.count(NDJSON_RESPONSE) != 1:
+        raise RuntimeError(f"unexpected generated shape in {RELATIONAL_QUERY}: NDJSON response")
+    updates[path] = source.replace(NDJSON_RESPONSE, "response_200 = response.text")
 
     for path, source in updates.items():
         path.write_text(source, encoding="utf-8")

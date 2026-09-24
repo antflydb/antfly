@@ -14,9 +14,13 @@
 
 pub const provider_registry = @import("provider_registry.zig");
 pub const config = @import("config.zig");
+pub const vector_migration = @import("vector_migration.zig");
+pub const table_storage = @import("table_storage.zig");
 pub const http = @import("http/mod.zig");
 pub const audio_runtime = @import("audio_runtime.zig");
 pub const secrets = @import("secrets.zig");
+pub const secret_contract = @import("secret_contract.zig");
+pub const secret_record = @import("secret_record.zig");
 pub const credential_source_identity = @import("credential_source_identity.zig");
 pub const remote_content_runtime = @import("remote_content_runtime.zig");
 pub const health_server = @import("health_server.zig");
@@ -34,9 +38,13 @@ pub const threaded_connect_io = @import("threaded_connect_io.zig");
 test {
     _ = provider_registry;
     _ = config;
+    _ = table_storage;
+    _ = vector_migration;
     _ = http;
     _ = audio_runtime;
     _ = secrets;
+    _ = secret_contract;
+    _ = secret_record;
     _ = credential_source_identity;
     _ = remote_content_runtime;
     _ = health_server;

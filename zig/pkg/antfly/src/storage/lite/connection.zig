@@ -15,8 +15,10 @@
 const std = @import("std");
 
 const backend = @import("backend.zig");
-const db_mod = @import("../db/db.zig");
+const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
 const group_ids = @import("../../common/group_ids.zig");
+const full_text_index_defaults = @import("../../common/full_text_index_defaults.zig");
+const db_types = @import("../db/types.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -41,7 +43,7 @@ pub const Connection = struct {
         });
         errdefer lite_backend.deinit();
 
-        return try openWithBackend(allocator, path, open_mode, &lite_backend);
+        return try openWithBackend(allocator, path, open_mode, &lite_backend, false);
     }
 
     /// Opens an existing Lite database or atomically creates a new one. The
@@ -70,7 +72,7 @@ pub const Connection = struct {
         });
         errdefer lite_backend.deinit();
 
-        var connection = try openWithBackend(allocator, path, .writer, &lite_backend);
+        var connection = try openWithBackend(allocator, path, .writer, &lite_backend, true);
         errdefer connection.close();
         try connection.backend.markEmbeddedArtifact();
         return connection;
@@ -90,6 +92,13 @@ pub const Connection = struct {
 /// Embedded Lite's root is the future standalone `default` table. Assigning
 /// that deterministic identity at file creation avoids an O(live documents)
 /// namespace rewrite when the artifact is first served through `/db/v1`.
+///
+/// This is the single source of truth for the identity every Antfly Lite
+/// `.aflite` file is created with, regardless of which surface creates it
+/// (the CLI through `Connection`, the C ABI, or the native `embedded`
+/// package). All three call `identityOpenOptions` and
+/// `provisionDefaultFullTextIndex` below so a file produced by one surface
+/// stays fully openable by the others.
 pub fn embeddedRootIdentity() db_mod.DocIdentityNamespace {
     const table_name = "default";
     const table_id = std.hash.Wyhash.hash(0x54424c45, table_name);
@@ -101,20 +110,60 @@ pub fn embeddedRootIdentity() db_mod.DocIdentityNamespace {
     };
 }
 
+pub const IdentityOpenOptions = struct {
+    identity_namespace: ?db_mod.DocIdentityNamespace,
+    prefer_existing_identity_namespace: bool,
+};
+
+/// The identity-namespace fields every Lite `OpenOptions` should carry.
+/// `create` requests are pinned to `embeddedRootIdentity()` (nothing is
+/// stored yet, so there is nothing to defer to); opens of an existing file
+/// prefer whatever identity is already durable there -- including a legacy
+/// file whose first write persisted the zero-value default namespace before
+/// every surface agreed on `embeddedRootIdentity()` -- so a valid `.aflite`
+/// file is never rejected outright for its identity.
+pub fn identityOpenOptions(create: bool) IdentityOpenOptions {
+    return .{
+        .identity_namespace = embeddedRootIdentity(),
+        .prefer_existing_identity_namespace = !create,
+    };
+}
+
+/// Provisions the same default full-text index every Antfly table is
+/// provisioned with on creation (see `full_text_index_defaults.zig`), so a
+/// freshly created Lite database supports text search without a separate
+/// `lite index create` step. Must only be called once, immediately after a
+/// brand-new database is opened for the first time.
+pub fn provisionDefaultFullTextIndex(db: *db_mod.DB) !void {
+    try db.addIndex(.{
+        .name = full_text_index_defaults.default_full_text_index_name,
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+}
+
 fn openWithBackend(
     allocator: Allocator,
     path: []const u8,
     open_mode: db_mod.OpenOptions.OpenMode,
     lite_backend: *backend.Handle,
+    create: bool,
 ) !Connection {
+    const identity = identityOpenOptions(create);
     var opts = db_mod.OpenOptions{
         .open_mode = open_mode,
         .external_derived_checkpoints = false,
-        .identity_namespace = embeddedRootIdentity(),
+        .identity_namespace = identity.identity_namespace,
+        .prefer_existing_identity_namespace = identity.prefer_existing_identity_namespace,
     };
     try lite_backend.configureDbOpenOptions(&opts);
 
-    const db = try db_mod.DB.open(allocator, path, opts);
+    var db = try db_mod.DB.open(allocator, path, opts);
+    errdefer db.close();
+
+    if (create) {
+        try provisionDefaultFullTextIndex(&db);
+    }
 
     const moved_backend = lite_backend.*;
     lite_backend.* = undefined;
@@ -166,6 +215,57 @@ test "lite connection propagates fsync policy to native file" {
     var connection = try Connection.openWithOptions(allocator, path, .writer, .{ .fsync = false });
     defer connection.close();
     try std.testing.expect(connection.backend.native_docstore.?.file.no_sync);
+}
+
+test "lite connection create provisions the default full text index" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/default-index.aflite", .{tmp.sub_path});
+    defer allocator.free(path);
+
+    var created = try Connection.create(allocator, path, true);
+    defer created.close();
+
+    const indexes = try created.db.listIndexes(allocator);
+    defer db_types.freeIndexConfigs(allocator, indexes);
+    try std.testing.expectEqual(@as(usize, 1), indexes.len);
+    try std.testing.expectEqualStrings(full_text_index_defaults.default_full_text_index_name, indexes[0].name);
+}
+
+test "lite connection adopts a legacy file whose first write persisted the default namespace" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/legacy-null-identity.aflite", .{tmp.sub_path});
+    defer allocator.free(path);
+
+    // Reproduces a Lite file created by a surface that (before this fix)
+    // never configured an identity namespace: the first write silently
+    // persists the zero-value default namespace as the durable identity.
+    {
+        var lite_backend = try backend.Handle.createWithOptions(allocator, path, .{ .exclusive = true });
+        defer lite_backend.deinit();
+        var opts = db_mod.OpenOptions{
+            .open_mode = .writer,
+            .external_derived_checkpoints = false,
+            .identity_namespace = null,
+        };
+        try lite_backend.configureDbOpenOptions(&opts);
+        var db = try db_mod.DB.open(allocator, path, opts);
+        defer db.close();
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:legacy", .value = "{}" }},
+            .sync_level = .write,
+        });
+    }
+
+    // The CLI path must still open it -- and every other surface's writes
+    // are visible -- instead of rejecting it with IdentityNamespaceMismatch.
+    var reopened = try Connection.open(allocator, path, .query_readonly);
+    defer reopened.close();
+    var result = (try reopened.db.lookup(allocator, "doc:legacy", .{})) orelse return error.MissingDocument;
+    defer result.deinit(allocator);
 }
 
 test "lite connection open or create initializes a missing file" {

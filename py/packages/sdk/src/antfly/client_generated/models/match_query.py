@@ -17,6 +17,7 @@ class MatchQuery:
     resulting terms. On a `substring` companion field (`fieldName._substring`)
     the text is lowercased and matched as a contained substring instead:
     `{"match": "g3we", "field": "sku._substring"}` finds `RAG3-WEAVER`.
+    `match_phrase` on a companion behaves the same way.
 
         Attributes:
             match (str):

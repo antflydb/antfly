@@ -52,9 +52,9 @@ currently live under `pkg/inference/`.
 
 - Zig `0.16.0` or newer.
 - `uv` for Python e2e suites and repository helper scripts.
-- Optional native runtime dependencies for some inference features, such as MLX,
-  ONNX Runtime, FFmpeg, or platform GPU support. The build detects available
-  local support and exposes flags such as `-Dmlx=...`, `-Dmetal=...`, and
+- Optional native runtime dependencies for some inference features, such as
+  ONNX Runtime, FFmpeg, CUDA, or Metal. The build detects available local
+  support and exposes flags such as `-Dmetal=...`, `-Dcuda=...`, and
   `-Donnx=...`.
 
 ## Common Builds
@@ -160,9 +160,9 @@ Artifact targets build and install into `zig-out/bin`. Run binaries directly,
 so a comparison can build once and execute several workloads:
 
 ```sh
-zig build graph-pattern-bench antfly-storage-bench -Doptimize=ReleaseFast
-./zig-out/bin/graph_pattern_query_bench --mode exact --fanout 10000 --target-degree 100000
-./zig-out/bin/graph_pattern_query_bench --mode generic --fanout 10000 --target-degree 100000
+zig build antfly-graph-bench antfly-storage-bench -Doptimize=ReleaseFast
+./zig-out/bin/antfly-graph-bench pattern --mode exact --fanout 10000 --target-degree 100000
+./zig-out/bin/antfly-graph-bench pattern --mode generic --fanout 10000 --target-degree 100000
 ```
 
 [BENCHMARKS.md](BENCHMARKS.md) lists binaries, previous smoke/stress arguments,
@@ -231,3 +231,51 @@ pkg/inference/.debug/
   top-level files.
 - Preserve build step names when moving benchmark or test sources; scripts and
   compatibility harnesses depend on those names.
+
+### Index and artifact maintenance
+
+Maintenance commands use the normal server URL and credentials. Work stays with
+its server-side owner; these commands never open the server's DB files.
+
+```sh
+antfly index maintenance issues --table docs --index embeddings
+antfly index maintenance repair --table docs --index embeddings
+antfly index maintenance rebuild --table docs --index embeddings
+antfly index maintenance status --table docs --index embeddings
+antfly index maintenance pause --table docs --index embeddings --repair-id 17
+antfly index maintenance resume --table docs --index embeddings --repair-id 17
+
+antfly index maintenance refresh --table docs --index graph --metric rank
+antfly index maintenance rebuild --table docs --index graph --metric rank
+antfly index maintenance pause --table docs --index graph --metric rank
+antfly index maintenance resume --table docs --index graph --metric rank
+
+antfly artifact maintenance issues --table docs --limit 50
+antfly artifact maintenance repair --table docs --limit 50
+```
+
+Index/artifact `repair` and index `rebuild` create a durable table repair job and
+advance its first bounded pass. Use the returned job ID with `maintenance status`,
+`maintenance advance`, or `maintenance cancel`, together with `--table` and
+`--job`. Job IDs already identify their resource; additional resource filters
+are rejected. `--once` instead runs one bounded repair pass; `--cursor` continues
+artifact or index repair pages. Index rebuild explicitly forces a replacement
+generation.
+Index `pause`, `resume`, and `cancel` start durable control jobs. The server
+advances them across all table groups, including after restart; `--repair-id`
+fences every pass against a newer attempt. `--once` runs a bounded control pass;
+continue its `next_cursor` with `--cursor` and optionally `--limit`. Cancelling a
+control job stops its remaining work; it does not reverse controls already
+applied. Control-job creation uses `/repair/control-jobs`, so older servers
+reject it instead of mistaking it for ordinary repair. Graph actions require
+`--metric` and use the
+existing graph-index lifecycle API. Graph `delete` clears materialization and
+disables automatic maintenance; it does not drop the index configuration.
+`index maintenance status` returns the index status, including its graph metrics.
+
+Artifact `reprocess` and its existing `job` commands retain their reprocessing
+semantics. Repair commands use the shared table repair API and job store.
+
+The former `graph-metric-maintenance` and hidden worker commands are removed
+from the product binary. Worker launch, injected time, and lease/crash controls
+live in the process integration fixture; they are not operator commands.

@@ -35,6 +35,19 @@ on the hot metadata loop.
 
 Provisioning should reconcile from cached runtime state or durable summaries first, then enqueue background reconcile/open work when needed.
 
+## Implementation Status
+
+This is a mixed-progress document: the request-path and provisioning contracts
+above are enforced today, the "First Slice" and "Second Slice" work below has
+shipped, and most of "Long-Term Shape" is implemented (see "Startup Execution
+Order" for the current per-step state). The node-local runtime registry
+(`ShardRuntimeRegistry`/`ShardProvisioner` split, item 1-2 below) has not been
+built; runtime status today is served from the provisioned-cache warm path
+described in "Second Slice" rather than a dedicated registry. Cold-open
+latency work ("Open Performance Plan" onward) is partially done: instrumentation
+has shipped, parallel index load and cache warmup are in progress, and the
+replay-mode follow-through work is gated on further measurement.
+
 ## Long-Term Shape
 
 ### 1. Node-local runtime registry
@@ -87,9 +100,12 @@ Stale is acceptable. Invented freshness is not.
 
 ### 5. Explicit DB open modes
 
-`DB.open()` must stop smuggling writer-side recovery into read/status paths.
+`DB.open()` no longer smuggles writer-side recovery into read/status paths:
+`.query_readonly` and `.status_only` open modes exist and skip
+`replayPendingDerivedBatches()` (this is "Startup Execution Order" step 1,
+implemented).
 
-Long-term contract:
+Contract:
 
 - `DB.open(..., .query_readonly)`
   - mounts durable primary/index state
@@ -109,7 +125,8 @@ Read/status correctness then comes from explicit replay debt, not from forcing o
 
 ### 6. Replay debt must be durable and visible
 
-Per derived index we need durable watermarks/status such as:
+Per derived index there are durable watermarks/status such as (implemented,
+"Startup Execution Order" step 2):
 
 - `applied_sequence`
 - `pending_sequence` or equivalent derived target
@@ -253,15 +270,9 @@ Guardrails:
 
 Status: in progress.
 
-Current benchmark signal:
-
-- `./zig-out/bin/open_bench --docs 200 --batch-size 25 --indexes-text 2 --indexes-dense 1 --indexes-sparse 1 --stage-backlog --index-open-parallelism 1`
-  - `open_ms=9.056`
-- `./zig-out/bin/open_bench --docs 200 --batch-size 25 --indexes-text 2 --indexes-dense 1 --indexes-sparse 1 --stage-backlog`
-  - `open_ms=5.622`
-
-That is roughly a `1.6x` improvement on the replay-heavy reopen case before
-touching replay semantics.
+Current benchmark signal: `open_bench` on the replay-heavy reopen scenario
+shows parallel-safe detached index opening is measurably faster than serial
+(`--index-open-parallelism 1`) opening, before touching replay semantics.
 
 ### Provisioned Cache Warmup
 
@@ -298,26 +309,19 @@ Current progress:
   - `antfly_data_replay_debt_*`
   - `antfly_data_runtime_status_*`
 
-Current warmup-bench signal on
-`--docs 200 --batch-size 25 --body-repeat 8`:
+Current warmup-bench signal: warmed first lookup and first write batch are
+both substantially faster than cold, confirming warmup moves `DB.open()` cost
+off the first request.
 
-- first lookup: `9.750 ms` cold -> `0.134 ms` warmed
-- first write batch: `113.307 ms` cold -> `6.740 ms` warmed
+Current raft-apply-bench signal on the same workload: raft apply and
+reopen/group-state-scan latency stay small relative to the warmup savings
+above, so the adjacent raft-backed apply path is not the bottleneck this
+benchmark isolates.
 
-Current raft-apply-bench signal on the same workload:
-
-- raft apply total: `8.199 ms`
-- max raft apply batch: `1.183 ms`
-- reopen latest batch + state read: `0.066 ms` reopen,
-  `0.247 ms` group-state scan
-
-Current managed-host-wal-bench signal on the same workload:
-
-- leader election: `3.225 ms`
-- propose + commit + apply: `30.830 ms` total, `4.964 ms` max batch
-- restart: `1.506 ms`
-- WAL/apply indexes after restart: `201` persisted, `201` applied,
-  `201` latest commit index
+Current managed-host-wal-bench signal on the same workload: the full
+managed-host proposal path (leader election, propose/commit/apply, restart)
+completes with WAL and apply indexes fully consistent after restart,
+confirming durability across the same workload shape.
 
 ### Open Performance Follow-Through
 

@@ -123,7 +123,10 @@ pub fn parseManifest(alloc: std.mem.Allocator, encoded: []const u8) !ParsedManif
     var parsed = std.json.parseFromSlice(Manifest, alloc, encoded, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = false,
-    }) catch return error.InvalidBackupManifest;
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidBackupManifest,
+    };
     errdefer parsed.deinit();
     try validateManifest(parsed.value);
     return parsed;
@@ -363,6 +366,10 @@ pub const FooterIndexEntry = struct {
     stored_size_bytes: u64,
 };
 
+pub fn decodeFooterIndexEntry(encoded: *const [48]u8) FooterIndexEntry {
+    return .{ .sha256 = encoded[0..32].*, .header_offset = std.mem.readInt(u64, encoded[32..40], .little), .stored_size_bytes = std.mem.readInt(u64, encoded[40..48], .little) };
+}
+
 pub const Trailer = struct {
     footer_offset: u64,
     footer_payload_size: u64,
@@ -426,11 +433,7 @@ pub fn decodeFooterIndexAlloc(alloc: std.mem.Allocator, encoded: []const u8) ![]
     const entries = try alloc.alloc(FooterIndexEntry, count);
     var pos: usize = 4;
     for (entries) |*entry| {
-        entry.* = .{
-            .sha256 = encoded[pos..][0..std.crypto.hash.sha2.Sha256.digest_length].*,
-            .header_offset = std.mem.readInt(u64, encoded[pos + std.crypto.hash.sha2.Sha256.digest_length ..][0..8], .little),
-            .stored_size_bytes = std.mem.readInt(u64, encoded[pos + std.crypto.hash.sha2.Sha256.digest_length + 8 ..][0..8], .little),
-        };
+        entry.* = decodeFooterIndexEntry(encoded[pos..][0..48]);
         pos += entry_size;
     }
     return entries;

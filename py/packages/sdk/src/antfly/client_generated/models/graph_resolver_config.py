@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 
@@ -25,6 +25,10 @@ class GraphResolverConfig:
         key_template (str):
         source_artifact_kind (GraphResolverConfigSourceArtifactKind | Unset):  Default:
             GraphResolverConfigSourceArtifactKind.ASSET.
+        labels (list[str] | Unset): Mention labels this resolver consumes; empty consumes every label (catch-all).
+            Labeled resolvers sharing a source artifact must claim disjoint label sets, and every catch-all on that artifact
+            skips the labels claimed by labeled siblings, so extraction labels stay open-vocabulary while each mention
+            routes to exactly one labeled resolver (label-routed tables, e.g. event mentions to an events table).
         type_must_match (bool | Unset):  Default: True.
         scorer_json (str | Unset):
         candidate_search (GraphResolverConfigCandidateSearch | Unset):
@@ -36,6 +40,10 @@ class GraphResolverConfig:
         fusion_trust (float | Unset):
         fusion_prior (float | Unset):
         fusion_prior_weight (float | Unset):
+        min_confidence (float | Unset): Mention admission floor: mentions whose extractor-asserted confidence is below
+            this are never resolved — no canonical entity key, no mention edge, and relation endpoints referencing them are
+            withheld. The cheap post-extraction junk filter for score-carrying extractors; 0 (the default) admits
+            everything.
         config_generation (int | Unset):
     """
 
@@ -45,6 +53,7 @@ class GraphResolverConfig:
     resolution_artifact: str
     key_template: str
     source_artifact_kind: GraphResolverConfigSourceArtifactKind | Unset = GraphResolverConfigSourceArtifactKind.ASSET
+    labels: list[str] | Unset = UNSET
     type_must_match: bool | Unset = True
     scorer_json: str | Unset = UNSET
     candidate_search: GraphResolverConfigCandidateSearch | Unset = UNSET
@@ -56,6 +65,7 @@ class GraphResolverConfig:
     fusion_trust: float | Unset = UNSET
     fusion_prior: float | Unset = UNSET
     fusion_prior_weight: float | Unset = UNSET
+    min_confidence: float | Unset = UNSET
     config_generation: int | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
@@ -72,6 +82,10 @@ class GraphResolverConfig:
         source_artifact_kind: str | Unset = UNSET
         if not isinstance(self.source_artifact_kind, Unset):
             source_artifact_kind = self.source_artifact_kind.value
+
+        labels: list[str] | Unset = UNSET
+        if not isinstance(self.labels, Unset):
+            labels = self.labels
 
         type_must_match = self.type_must_match
 
@@ -99,6 +113,8 @@ class GraphResolverConfig:
 
         fusion_prior_weight = self.fusion_prior_weight
 
+        min_confidence = self.min_confidence
+
         config_generation = self.config_generation
 
         field_dict: dict[str, Any] = {}
@@ -114,6 +130,8 @@ class GraphResolverConfig:
         )
         if source_artifact_kind is not UNSET:
             field_dict["source_artifact_kind"] = source_artifact_kind
+        if labels is not UNSET:
+            field_dict["labels"] = labels
         if type_must_match is not UNSET:
             field_dict["type_must_match"] = type_must_match
         if scorer_json is not UNSET:
@@ -136,6 +154,8 @@ class GraphResolverConfig:
             field_dict["fusion_prior"] = fusion_prior
         if fusion_prior_weight is not UNSET:
             field_dict["fusion_prior_weight"] = fusion_prior_weight
+        if min_confidence is not UNSET:
+            field_dict["min_confidence"] = min_confidence
         if config_generation is not UNSET:
             field_dict["config_generation"] = config_generation
 
@@ -160,6 +180,8 @@ class GraphResolverConfig:
             source_artifact_kind = UNSET
         else:
             source_artifact_kind = GraphResolverConfigSourceArtifactKind(_source_artifact_kind)
+
+        labels = cast(list[str], d.pop("labels", UNSET))
 
         type_must_match = d.pop("type_must_match", UNSET)
 
@@ -193,6 +215,8 @@ class GraphResolverConfig:
 
         fusion_prior_weight = d.pop("fusion_prior_weight", UNSET)
 
+        min_confidence = d.pop("min_confidence", UNSET)
+
         config_generation = d.pop("config_generation", UNSET)
 
         graph_resolver_config = cls(
@@ -202,6 +226,7 @@ class GraphResolverConfig:
             resolution_artifact=resolution_artifact,
             key_template=key_template,
             source_artifact_kind=source_artifact_kind,
+            labels=labels,
             type_must_match=type_must_match,
             scorer_json=scorer_json,
             candidate_search=candidate_search,
@@ -213,6 +238,7 @@ class GraphResolverConfig:
             fusion_trust=fusion_trust,
             fusion_prior=fusion_prior,
             fusion_prior_weight=fusion_prior_weight,
+            min_confidence=min_confidence,
             config_generation=config_generation,
         )
 

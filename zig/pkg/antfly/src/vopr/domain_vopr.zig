@@ -15,7 +15,7 @@ const transactions = @import("../storage/transactions.zig");
 const tracing = @import("../tracing/antfly_trace_writer.zig");
 const background_runtime = @import("../storage/background_runtime.zig");
 const durable_job_lane = @import("../storage/vopr_durable_job_lane.zig");
-const backup_manifest = @import("../storage/ha/backup_manifest.zig");
+const backup_manifest = @import("../storage/hot_standby/backup_manifest.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -683,7 +683,7 @@ pub const DerivedWorkflowScenario = struct {
 };
 
 pub const BackupRestoreScenario = struct {
-    pub const name: []const u8 = "backup-restore-ha-seed-lifecycle";
+    pub const name: []const u8 = "backup-restore-standby-seed-lifecycle";
     pub const version: u32 = 2;
     const atomic_id = propertyId(name, "restore_is_atomic_and_fail_closed");
     const pin_id = propertyId(name, "active_generation_remains_pinned");
@@ -992,6 +992,12 @@ pub fn recordClockLeaseTtl(allocator: Allocator, seed: u64) !vopr.trace.Trace {
 }
 
 pub fn replayKnown(allocator: Allocator, artifact: *const vopr.trace.Trace) !vopr.trace.Trace {
+    if (std.mem.eql(u8, artifact.header.scenario, @import("secrets.zig").Scenario.name))
+        return vopr.replay.exact(@import("secrets.zig").Scenario, allocator, artifact);
+    if (std.mem.eql(u8, artifact.header.scenario, @import("index_maintenance.zig").OwnerScenario.name))
+        return vopr.replay.exact(@import("index_maintenance.zig").OwnerScenario, allocator, artifact);
+    if (std.mem.eql(u8, artifact.header.scenario, @import("index_maintenance.zig").Scenario.name))
+        return vopr.replay.exact(@import("index_maintenance.zig").Scenario, allocator, artifact);
     if (std.mem.eql(u8, artifact.header.scenario, DistributedTransactionScenario.name))
         return vopr.replay.exact(DistributedTransactionScenario, allocator, artifact);
     if (std.mem.eql(u8, artifact.header.scenario, DataPlaneScenario.name))
@@ -1006,6 +1012,9 @@ pub fn replayKnown(allocator: Allocator, artifact: *const vopr.trace.Trace) !vop
 }
 
 pub const Kind = enum {
+    secrets,
+    index_maintenance,
+    index_ownership,
     distributed_transaction,
     data_plane,
     derived_workflow,
@@ -1019,16 +1028,34 @@ pub const Kind = enum {
             .derived_workflow => "derived-workflow",
             .backup_restore => "backup-restore",
             .clock_fault => "clock-fault",
+            .index_maintenance => "index-maintenance",
+            .index_ownership => "index-ownership",
+            .secrets => "secrets",
+        };
+    }
+
+    pub fn scenario(comptime self: Kind) type {
+        return switch (self) {
+            .distributed_transaction => DistributedTransactionScenario,
+            .data_plane => DataPlaneScenario,
+            .derived_workflow => DerivedWorkflowScenario,
+            .backup_restore => BackupRestoreScenario,
+            .clock_fault => ClockLeaseTtlScenario,
+            .index_maintenance => @import("index_maintenance.zig").Scenario,
+            .index_ownership => @import("index_maintenance.zig").OwnerScenario,
+            .secrets => @import("secrets.zig").Scenario,
+        };
+    }
+
+    pub fn supportsCollectors(self: Kind) bool {
+        return switch (self) {
+            inline else => |kind| @hasDecl(kind.scenario(), "collect"),
         };
     }
 
     pub fn scenarioName(self: Kind) []const u8 {
         return switch (self) {
-            .distributed_transaction => DistributedTransactionScenario.name,
-            .data_plane => DataPlaneScenario.name,
-            .derived_workflow => DerivedWorkflowScenario.name,
-            .backup_restore => BackupRestoreScenario.name,
-            .clock_fault => ClockLeaseTtlScenario.name,
+            inline else => |kind| kind.scenario().name,
         };
     }
 
@@ -1037,6 +1064,9 @@ pub const Kind = enum {
             .distributed_transaction => 20,
             .data_plane, .derived_workflow, .backup_restore => 16,
             .clock_fault => 8,
+            .index_maintenance => 256,
+            .index_ownership => 8,
+            .secrets => 32,
         };
     }
 };
@@ -1062,6 +1092,9 @@ pub fn recordNamed(allocator: Allocator, cli_name: []const u8, seed: u64) !vopr.
         .derived_workflow => recordDerivedWorkflow(allocator, seed),
         .backup_restore => recordBackupRestore(allocator, seed),
         .clock_fault => recordClockLeaseTtl(allocator, seed),
+        .index_maintenance => record(@import("index_maintenance.zig").Scenario, allocator, seed, 256),
+        .index_ownership => record(@import("index_maintenance.zig").OwnerScenario, allocator, seed, 8),
+        .secrets => record(@import("secrets.zig").Scenario, allocator, seed, 32),
     };
 }
 
@@ -1109,6 +1142,9 @@ pub fn runKnownWithChoicesAndRecorder(
         .derived_workflow => runWithChoices(DerivedWorkflowScenario, allocator, artifact, source, recorder),
         .backup_restore => runWithChoices(BackupRestoreScenario, allocator, artifact, source, recorder),
         .clock_fault => runWithChoices(ClockLeaseTtlScenario, allocator, artifact, source, recorder),
+        .index_maintenance => runWithChoices(@import("index_maintenance.zig").Scenario, allocator, artifact, source, recorder),
+        .index_ownership => runWithChoices(@import("index_maintenance.zig").OwnerScenario, allocator, artifact, source, recorder),
+        .secrets => runWithChoices(@import("secrets.zig").Scenario, allocator, artifact, source, recorder),
     };
 }
 
@@ -1119,6 +1155,9 @@ pub fn reduceKnown(allocator: Allocator, artifact: *const vopr.trace.Trace, targ
         .derived_workflow => vopr.reducer.reduce(DerivedWorkflowScenario, allocator, artifact, target, config),
         .backup_restore => vopr.reducer.reduce(BackupRestoreScenario, allocator, artifact, target, config),
         .clock_fault => vopr.reducer.reduce(ClockLeaseTtlScenario, allocator, artifact, target, config),
+        .index_maintenance => vopr.reducer.reduce(@import("index_maintenance.zig").Scenario, allocator, artifact, target, config),
+        .index_ownership => vopr.reducer.reduce(@import("index_maintenance.zig").OwnerScenario, allocator, artifact, target, config),
+        .secrets => vopr.reducer.reduce(@import("secrets.zig").Scenario, allocator, artifact, target, config),
     };
 }
 

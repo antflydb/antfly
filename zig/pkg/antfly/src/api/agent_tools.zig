@@ -48,6 +48,7 @@ pub const Conversation = struct {
             try self.reserve(call.id.len + call.name.len + call.arguments.len);
         }
         try self.reserve(result.content.len);
+        if (result.google_parts_json) |parts| try self.reserve(parts.len);
         const calls = try self.alloc.alloc(generating.ToolCall, result.tool_calls.len);
         for (calls, result.tool_calls) |*copy, call| copy.* = .{
             .id = try self.alloc.dupe(u8, call.id),
@@ -58,6 +59,7 @@ pub const Conversation = struct {
             .role = .assistant,
             .content = if (result.content.len > 0) .{ .text = try self.alloc.dupe(u8, result.content) } else null,
             .tool_calls = if (calls.len > 0) calls else null,
+            .google_parts_json = if (result.google_parts_json) |parts| try self.alloc.dupe(u8, parts) else null,
         });
         return calls;
     }
@@ -66,15 +68,28 @@ pub const Conversation = struct {
 pub fn withTools(alloc: std.mem.Allocator, chain: []const generating.ChainLink, schema: []const u8) ![]const generating.ChainLink {
     const copy = try alloc.dupe(generating.ChainLink, chain);
     for (copy) |*link| {
-        // These providers preserve both function definitions and tool history.
-        switch (link.generator.provider) {
-            .antfly, .openai => {},
-            else => return error.UnsupportedAgentToolProvider,
-        }
-        link.generator.tools_json = schema;
-        link.generator.tool_choice_json = "\"auto\"";
+        if (!link.generator.provider.supportsTools()) return error.UnsupportedAgentToolProvider;
+        // A finished graph walk can leave no available tools. Omit both
+        // fields for the final answer instead of sending an empty tool list
+        // with a provider-dependent automatic-tool choice.
+        const has_tools = !std.mem.eql(u8, schema, "[]");
+        link.generator.tools_json = if (has_tools) schema else null;
+        link.generator.tool_choice_json = if (has_tools) "\"auto\"" else null;
     }
     return copy;
+}
+
+test "agent tools accept OpenRouter generators" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const chain = try withTools(arena_impl.allocator(), &.{.{ .generator = .{
+        .provider = .openrouter,
+        .model = "test-model",
+        .url = "https://openrouter.ai/api/v1",
+    } }}, "[{\"type\":\"function\",\"function\":{\"name\":\"search\",\"parameters\":{\"type\":\"object\"}}}]");
+    try std.testing.expectEqual(.openrouter, chain[0].generator.provider);
+    try std.testing.expect(chain[0].generator.tools_json != null);
+    try std.testing.expectEqualStrings("\"auto\"", chain[0].generator.tool_choice_json.?);
 }
 
 test "agent conversation rejects duplicate IDs and parallel budget overflow" {
@@ -88,4 +103,33 @@ test "agent conversation rejects duplicate IDs and parallel budget overflow" {
     try history.append(.tool, "{\"hits\":[]}", "call-1");
     try std.testing.expectEqualStrings("call-1", history.messages.items[1].tool_call_id.?);
     try std.testing.expectError(error.InvalidAgentToolCall, history.accept(result, 1));
+}
+
+test "agent tools enable every real generator adapter and omit empty schemas" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    for (std.enums.values(generating.Provider)) |provider| {
+        const chain = [_]generating.ChainLink{.{ .generator = .{ .provider = provider, .model = "m", .url = "" } }};
+        if (provider == .mock) {
+            try std.testing.expectError(error.UnsupportedAgentToolProvider, withTools(arena.allocator(), &chain, "[]"));
+            continue;
+        }
+        const configured = try withTools(arena.allocator(), &chain, "[]");
+        try std.testing.expect(configured[0].generator.tools_json == null);
+        try std.testing.expect(configured[0].generator.tool_choice_json == null);
+    }
+}
+
+test "agent conversation owns Google replay parts and charges the context budget" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var history = Conversation{ .alloc = arena.allocator() };
+    var parts = [_]u8{ '[', ']' };
+    const result = generating.GenerateResult{ .allocator = arena.allocator(), .content = "ok", .google_parts_json = &parts };
+    _ = try history.accept(result, 1);
+    parts[0] = 'x';
+    try std.testing.expectEqualStrings("[]", history.messages.items[0].google_parts_json.?);
+    try std.testing.expectEqual(@as(usize, 4), history.bytes);
+    history.bytes = Conversation.max_bytes - 3;
+    try std.testing.expectError(error.AgentContextLimitExceeded, history.accept(result, 1));
 }

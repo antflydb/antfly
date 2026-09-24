@@ -93,11 +93,22 @@ pub fn highlightMatchers(
 
     const tokens = try analyzer.analyze(alloc, text);
     defer analysis_mod.Analyzer.freeTokens(alloc, tokens);
-    if (tokens.len == 0) return &.{};
 
     var spans = std.ArrayListUnmanaged(Span).empty;
     defer spans.deinit(alloc);
-    try collectMatchSpans(alloc, text, tokens, matchers, &spans);
+    try collectMatchSpans(alloc, tokens, matchers, &spans);
+
+    // `contains` matchers come from substring companions, which index every
+    // surface word and every adjacent word pair regardless of the root
+    // field's stop words or stemming. Evaluate them over the plain surface
+    // words so a span can never bridge a word the companion never joined.
+    var has_contains = false;
+    for (matchers) |matcher| has_contains = has_contains or matcher == .contains;
+    if (has_contains) {
+        const words = try analysis_mod.substring_query_analyzer.analyze(alloc, text);
+        defer analysis_mod.Analyzer.freeTokens(alloc, words);
+        try collectContainsSpans(alloc, text, words, matchers, &spans);
+    }
     if (spans.items.len == 0) return &.{};
     normalizeSpans(&spans);
 
@@ -182,15 +193,13 @@ pub fn highlightMatchers(
 
 fn collectMatchSpans(
     alloc: Allocator,
-    text: []const u8,
     tokens: []const analysis_mod.Token,
     matchers: []const Matcher,
     spans: *std.ArrayListUnmanaged(Span),
 ) !void {
-    for (tokens, 0..) |tok, i| {
+    for (tokens) |tok| {
         // Analyzers may emit several tokens for one surface span (shingles,
         // n-grams); the surface span is what gets highlighted.
-        const surface = text[tok.start_byte..tok.end_byte];
         for (matchers) |matcher| {
             switch (matcher) {
                 .term => |term| if (std.mem.eql(u8, tok.term, term)) try spans.append(alloc, .{ .start = tok.start_byte, .end = tok.end_byte }),
@@ -198,42 +207,52 @@ fn collectMatchSpans(
                 .wildcard => |pattern| if (wildcard_mod.match(pattern, tok.term)) try spans.append(alloc, .{ .start = tok.start_byte, .end = tok.end_byte }),
                 .fuzzy => |fuzzy| if (boundedEditDistance(tok.term, fuzzy.term, fuzzy.max_edits) <= fuzzy.max_edits) try spans.append(alloc, .{ .start = tok.start_byte, .end = tok.end_byte }),
                 .regexp => |regexp| if (regex_mod.matchesCompiled(regexp.pattern, regexp.compiled, tok.term)) try spans.append(alloc, .{ .start = tok.start_byte, .end = tok.end_byte }),
-                .contains => |needle| {
-                    if (needle.len == 0) continue;
-                    if (indexOfIgnoreCase(surface, needle)) |index| {
-                        try spans.append(alloc, .{
-                            .start = tok.start_byte + @as(u32, @intCast(index)),
-                            .end = tok.start_byte + @as(u32, @intCast(index + needle.len)),
-                        });
-                        continue;
-                    }
-                    // A substring companion joins adjacent tokens without a
-                    // separator, so a match may start inside this token and
-                    // end inside the next one.
-                    const next = nextSurfaceToken(tokens, i) orelse continue;
-                    const next_surface = text[next.start_byte..next.end_byte];
-                    if (try joinedContainsIgnoreCase(alloc, surface, next_surface, needle)) |joined_index| {
-                        if (joined_index >= surface.len or joined_index + needle.len <= surface.len) continue;
-                        try spans.append(alloc, .{
-                            .start = tok.start_byte + @as(u32, @intCast(joined_index)),
-                            .end = next.start_byte + @as(u32, @intCast(joined_index + needle.len - surface.len)),
-                        });
-                    }
-                },
+                .contains => {},
             }
         }
     }
 }
 
-/// The first later token whose surface span starts after this one's, skipping
-/// tokens that share the same surface bytes (shingles, n-grams, suffixes).
-fn nextSurfaceToken(tokens: []const analysis_mod.Token, index: usize) ?analysis_mod.Token {
-    const current = tokens[index];
-    var j = index + 1;
-    while (j < tokens.len) : (j += 1) {
-        if (tokens[j].start_byte >= current.end_byte) return tokens[j];
+/// `words` are the surface words of `text` as the substring companion sees
+/// them (unicode words, lowercased, no stop words, no stemming). Matching is
+/// ASCII case-insensitive, which is exactly the folding the companion's
+/// `lowercase` filter applies at index time.
+fn collectContainsSpans(
+    alloc: Allocator,
+    text: []const u8,
+    words: []const analysis_mod.Token,
+    matchers: []const Matcher,
+    spans: *std.ArrayListUnmanaged(Span),
+) !void {
+    for (words, 0..) |word, i| {
+        const surface = text[word.start_byte..word.end_byte];
+        for (matchers) |matcher| {
+            const needle = switch (matcher) {
+                .contains => |needle| needle,
+                else => continue,
+            };
+            if (needle.len == 0) continue;
+            if (indexOfIgnoreCase(surface, needle)) |index| {
+                try spans.append(alloc, .{
+                    .start = word.start_byte + @as(u32, @intCast(index)),
+                    .end = word.start_byte + @as(u32, @intCast(index + needle.len)),
+                });
+                continue;
+            }
+            // The companion joins adjacent words without a separator, so a
+            // match may start inside this word and end inside the next one.
+            if (i + 1 >= words.len) continue;
+            const next = words[i + 1];
+            const next_surface = text[next.start_byte..next.end_byte];
+            if (try joinedContainsIgnoreCase(alloc, surface, next_surface, needle)) |joined_index| {
+                if (joined_index >= surface.len or joined_index + needle.len <= surface.len) continue;
+                try spans.append(alloc, .{
+                    .start = word.start_byte + @as(u32, @intCast(joined_index)),
+                    .end = next.start_byte + @as(u32, @intCast(joined_index + needle.len - surface.len)),
+                });
+            }
+        }
     }
-    return null;
 }
 
 fn joinedContainsIgnoreCase(alloc: Allocator, a: []const u8, b: []const u8, needle: []const u8) !?usize {
@@ -415,6 +434,15 @@ test "highlight contains matcher marks bytes inside and across tokens" {
 
     const none = try highlightMatchers(alloc, "rag3 kit weaver", &.{.{ .contains = "g3we" }}, analyzer, 1, 200);
     try std.testing.expectEqual(@as(usize, 0), none.len);
+
+    // The root analyzer drops "the", but the companion never joined
+    // "rag3" with "weaver", so the highlight must not bridge them either.
+    const stop_word = try highlightMatchers(alloc, "rag3 the weaver", &.{.{ .contains = "g3we" }}, &analysis_mod.default_analyzer, 1, 200);
+    try std.testing.expectEqual(@as(usize, 0), stop_word.len);
+    const stemmed = try highlightMatchers(alloc, "Rag3 Weavers", &.{.{ .contains = "g3weaver" }}, &analysis_mod.default_analyzer, 1, 200);
+    defer freeFragments(alloc, stemmed);
+    try std.testing.expectEqual(@as(usize, 1), stemmed.len);
+    try std.testing.expectEqualStrings("g3 Weaver", stemmed[0].text[stemmed[0].highlights[0].start..stemmed[0].highlights[0].end]);
 }
 
 test "highlight prefix wildcard fuzzy and regexp matchers mark whole tokens" {

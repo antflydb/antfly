@@ -494,9 +494,12 @@ All sources in one index must have the same dense dimension and inhabit a
 compatible vector space. `vector_space` is optional. When every source omits
 it, Antfly compares the durable canonical semantic producer identity stored on
 every embedding enrichment: provider, model, effective normalized endpoint and
-region, dense/sparse mode, multimodal mode, input type, and truncation. Unknown
-or incompatible producers are rejected. Credentials, pacing, retries, and
-batch limits are execution settings and are excluded from that identity.
+region, dense/sparse mode, input type, and truncation. Unknown or incompatible
+producers are rejected. Credentials, pacing, retries, and batch limits are
+execution settings and are excluded from that identity. So are the input types
+a model accepts (the embedder's `inputs`, or its discovered capabilities):
+they decide what may be sent, not which vectors come back. Identities written
+before this carry a `multimodal` field, which is still accepted and ignored.
 
 To combine intentionally compatible but distinct or externally produced
 embeddings, every source must declare the same non-empty `vector_space` on its
@@ -735,6 +738,20 @@ The model-facing producer types are separate from artifact kinds:
   OCR providers and multimodal LLMs.
 - **chunkers**, **embedders**, and **rerankers** keep their current index-facing
   roles.
+
+### Text-to-speech (not implemented)
+
+Speech-to-text shipped as the `transcriber` producer type above; the symmetric
+text-to-speech capability has not been implemented in Zig. The design intent
+carried forward from the earlier Go-era proposal, recorded here as unimplemented
+direction rather than current behavior, called for a provider registry mirroring
+the reader/generator pattern -- OpenAI, Google Vertex, and ElevenLabs-class
+providers behind one interface -- with the caller selecting an output audio
+format per request. Output placement was meant to follow the same
+inline-vs-object-storage split used elsewhere in this document: small
+synthesized audio returned inline in the response, and larger or streamed
+output written to object storage with a reference returned instead of the raw
+bytes.
 
 For Zig providers, `antfly` is the canonical local/remote provider name. A
 provider config with `provider: "antfly"` and no `url` uses the local Antfly

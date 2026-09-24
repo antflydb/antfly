@@ -44,6 +44,21 @@ pub fn fusionStrategy(name: []const u8) ?matcher.FusionStrategy {
     return null;
 }
 
+fn cloneLabels(alloc: Allocator, labels: []const []const u8) ![]const []const u8 {
+    if (labels.len == 0) return &.{};
+    const out = try alloc.alloc([]const u8, labels.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |l| alloc.free(@constCast(l));
+        alloc.free(out);
+    }
+    for (labels, 0..) |l, i| {
+        out[i] = try alloc.dupe(u8, l);
+        initialized += 1;
+    }
+    return out;
+}
+
 pub const ResolverSourceArtifactKind = enum {
     /// Root and unit-scoped asset artifacts. This is the legacy default.
     asset,
@@ -71,6 +86,13 @@ pub const ResolverConfig = struct {
     resolution_artifact: []const u8,
     /// Template that renders a canonical entity key from a mention.
     key_template: []const u8,
+    /// Mention labels this resolver consumes. Empty means all labels
+    /// (catch-all). Labeled resolvers sharing a source artifact must claim
+    /// disjoint label sets (admission-enforced), and catch-alls skip labels
+    /// claimed by labeled siblings at runtime, so each mention routes to at
+    /// most one labeled resolver while extraction labels stay
+    /// open-vocabulary (label-routed tables, e.g. events vs entities).
+    labels: []const []const u8 = &.{},
     /// Require the candidate entity label to match the mention label.
     type_must_match: bool = true,
     /// Optional matcher scorer config; empty means deterministic minting only.
@@ -107,8 +129,37 @@ pub const ResolverConfig = struct {
     fusion_prior: f64 = 0.0,
     /// Weight of `fusion_prior` in the fusion; 0 ignores the prior.
     fusion_prior_weight: f64 = 0.0,
+    /// Mention admission floor in [0, 1]: mentions whose extractor-asserted
+    /// confidence is below this are never resolved (no canonical key, no
+    /// mention edge; relation endpoints referencing them stay unresolvable
+    /// and are dropped by the canonical-only rule). The cheap
+    /// post-extraction junk filter for score-carrying extractors (GLiNER);
+    /// 0 admits everything.
+    min_confidence: f64 = 0.0,
     /// Bumped to force a versioned re-resolution pass.
     config_generation: u64 = 0,
+
+    pub fn eql(self: ResolverConfig, other: ResolverConfig) bool {
+        inline for (std.meta.fields(ResolverConfig)) |field| {
+            if (field.type == []const u8) {
+                if (!std.mem.eql(u8, @field(self, field.name), @field(other, field.name))) return false;
+            } else if (field.type == []const []const u8) {
+                const a = @field(self, field.name);
+                const b = @field(other, field.name);
+                if (a.len != b.len) return false;
+                for (a, b) |as, bs| if (!std.mem.eql(u8, as, bs)) return false;
+            } else if (!std.meta.eql(@field(self, field.name), @field(other, field.name))) return false;
+        }
+        return true;
+    }
+
+    /// Whether this resolver consumes mentions with the given label. An empty
+    /// `labels` set is a catch-all.
+    pub fn resolvesLabel(self: ResolverConfig, label: []const u8) bool {
+        if (self.labels.len == 0) return true;
+        for (self.labels) |l| if (std.mem.eql(u8, l, label)) return true;
+        return false;
+    }
 
     pub fn clone(alloc: Allocator, cfg: ResolverConfig) !ResolverConfig {
         return .{
@@ -118,6 +169,7 @@ pub const ResolverConfig = struct {
             .source_artifact_kind = cfg.source_artifact_kind,
             .resolution_artifact = try alloc.dupe(u8, cfg.resolution_artifact),
             .key_template = try alloc.dupe(u8, cfg.key_template),
+            .labels = try cloneLabels(alloc, cfg.labels),
             .type_must_match = cfg.type_must_match,
             .scorer_json = if (cfg.scorer_json.len > 0) try alloc.dupe(u8, cfg.scorer_json) else "",
             .candidate_search = if (cfg.candidate_search.len > 0) try alloc.dupe(u8, cfg.candidate_search) else "",
@@ -129,6 +181,7 @@ pub const ResolverConfig = struct {
             .fusion_trust = cfg.fusion_trust,
             .fusion_prior = cfg.fusion_prior,
             .fusion_prior_weight = cfg.fusion_prior_weight,
+            .min_confidence = cfg.min_confidence,
             .config_generation = cfg.config_generation,
         };
     }
@@ -139,6 +192,8 @@ pub const ResolverConfig = struct {
         alloc.free(@constCast(self.source_artifact));
         alloc.free(@constCast(self.resolution_artifact));
         alloc.free(@constCast(self.key_template));
+        for (self.labels) |l| alloc.free(@constCast(l));
+        if (self.labels.len > 0) alloc.free(self.labels);
         if (self.scorer_json.len > 0) alloc.free(@constCast(self.scorer_json));
         if (self.candidate_search.len > 0) alloc.free(@constCast(self.candidate_search));
         if (self.candidate_ann_index.len > 0) alloc.free(@constCast(self.candidate_ann_index));
@@ -162,6 +217,12 @@ pub const ResolverConfig = struct {
             return error.InvalidResolverConfig;
         }
         if (std.mem.eql(u8, self.source_artifact, self.resolution_artifact)) return error.InvalidResolverConfig;
+        for (self.labels, 0..) |label, i| {
+            if (label.len == 0) return error.InvalidResolverConfig;
+            for (self.labels[0..i]) |prior| {
+                if (std.mem.eql(u8, prior, label)) return error.InvalidResolverConfig;
+            }
+        }
         if (self.candidate_search.len > 0 and
             !std.mem.eql(u8, self.candidate_search, "exact_key") and
             !std.mem.eql(u8, self.candidate_search, "prefix") and
@@ -172,6 +233,7 @@ pub const ResolverConfig = struct {
         if (std.mem.eql(u8, self.candidate_search, "ann")) {
             if (self.candidate_ann_index.len == 0 and self.name_embedding.len == 0) return error.InvalidResolverConfig;
         }
+        if (!(self.min_confidence >= 0.0 and self.min_confidence <= 1.0)) return error.InvalidResolverConfig;
         if (self.fusion_combine.len == 0) return;
         if (fusionStrategy(self.fusion_combine) == null) return error.InvalidResolverConfig;
         if (!(self.fusion_trust > 0.0 and self.fusion_trust <= 1.0)) return error.InvalidResolverConfig;
@@ -337,6 +399,69 @@ test "resolver config validates fusion strategy and folds confidence into the we
     bad_prior.fusion_combine = "max";
     bad_prior.fusion_prior = 1.5;
     try std.testing.expectError(error.InvalidResolverConfig, bad_prior.validate());
+}
+
+test "resolver catalog round trips label routing and filters by label" {
+    const alloc = std.testing.allocator;
+
+    const encoded = try serializeCatalog(alloc, &.{
+        .{
+            .name = "events",
+            .table = "events",
+            .source_artifact = "kg_v1",
+            .resolution_artifact = "events_resolution_v1",
+            .key_template = "event/{{ hash _entity.text }}",
+            .labels = &.{"event"},
+        },
+        .{
+            .name = "entities",
+            .table = "entities",
+            .source_artifact = "kg_v1",
+            .resolution_artifact = "entities_resolution_v1",
+            .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        },
+    });
+    defer alloc.free(encoded);
+
+    const decoded = try deserializeCatalog(alloc, encoded);
+    defer {
+        for (decoded) |*cfg| cfg.deinit(alloc);
+        alloc.free(decoded);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), decoded.len);
+    try std.testing.expectEqual(@as(usize, 1), decoded[0].labels.len);
+    try std.testing.expectEqualStrings("event", decoded[0].labels[0]);
+    try std.testing.expect(decoded[0].resolvesLabel("event"));
+    try std.testing.expect(!decoded[0].resolvesLabel("person"));
+    // Catch-all: empty labels consume every mention label.
+    try std.testing.expectEqual(@as(usize, 0), decoded[1].labels.len);
+    try std.testing.expect(decoded[1].resolvesLabel("event"));
+    try std.testing.expect(decoded[1].resolvesLabel("person"));
+    try std.testing.expect(decoded[0].eql(decoded[0]));
+    try std.testing.expect(!decoded[0].eql(decoded[1]));
+}
+
+test "resolver config rejects empty and duplicate labels" {
+    const base = ResolverConfig{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ _entity.text }}",
+    };
+
+    var empty_label = base;
+    empty_label.labels = &.{""};
+    try std.testing.expectError(error.InvalidResolverConfig, empty_label.validate());
+
+    var duplicate_label = base;
+    duplicate_label.labels = &.{ "event", "event" };
+    try std.testing.expectError(error.InvalidResolverConfig, duplicate_label.validate());
+
+    var routed = base;
+    routed.labels = &.{ "event", "person" };
+    try routed.validate();
 }
 
 test "resolver config validates required references and candidate mode" {

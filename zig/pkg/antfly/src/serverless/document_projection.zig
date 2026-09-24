@@ -146,8 +146,9 @@ pub const NamedSparseEmbedding = struct {
 };
 
 pub fn parseAlloc(alloc: Allocator, body: []const u8) !Projection {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch {
-        return .{ .text = try alloc.dupe(u8, body) };
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return .{ .text = try alloc.dupe(u8, body) },
     };
     defer parsed.deinit();
 

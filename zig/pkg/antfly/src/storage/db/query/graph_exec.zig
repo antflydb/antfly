@@ -15,6 +15,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const types = @import("../types.zig");
+const graph_mod = @import("../../../graph/graph.zig");
 const graph_query_mod = @import("../../../graph/query.zig");
 const graph_pattern_mod = @import("../../../graph/pattern.zig");
 const graph_node_identity = @import("../../../graph/node_identity.zig");
@@ -83,6 +84,10 @@ pub const PatternQueryExecutor = struct {
     ctx: ?*anyopaque,
     graph_ctx: ?*anyopaque = null,
     predicate_aware: bool = false,
+    /// Caller-derived local execution scope (owning table name, snapshot
+    /// completeness); rides the vtable because the storage layer knows
+    /// neither its table's name nor its group count.
+    scope: graph_query_mod.ExecutionScope = .{},
     match_pattern: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -90,6 +95,7 @@ pub const PatternQueryExecutor = struct {
         start_key_refs: []const []const u8,
         target_nodes: []const graph_node_identity.Ref,
         budgets: RequestGraphBudgets,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror![]graph_pattern_mod.PatternMatch,
     match_conjunctive: ?*const fn (
         ctx: ?*anyopaque,
@@ -97,6 +103,7 @@ pub const PatternQueryExecutor = struct {
         named: *const types.NamedGraphQuery,
         start_key_refs: []const []const u8,
         budgets: RequestGraphBudgets,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror![]graph_pattern_mod.PatternMatch = null,
     aggregate_conjunctive: ?*const fn (
         ctx: ?*anyopaque,
@@ -104,6 +111,7 @@ pub const PatternQueryExecutor = struct {
         named: *const types.NamedGraphQuery,
         start_key_refs: []const []const u8,
         budgets: RequestGraphBudgets,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror![]types.GraphAggregateResult = null,
     load_projected_document: *const fn (
         ctx: ?*anyopaque,
@@ -141,6 +149,10 @@ pub const NonPatternQueryExecutor = struct {
     ctx: ?*anyopaque,
     graph_ctx: ?*anyopaque = null,
     predicate_aware: bool = false,
+    /// Caller-derived local execution scope (owning table name, snapshot
+    /// completeness); rides the vtable because the storage layer knows
+    /// neither its table's name nor its group count.
+    scope: graph_query_mod.ExecutionScope = .{},
     find_shortest_path: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -148,6 +160,7 @@ pub const NonPatternQueryExecutor = struct {
         source: []const u8,
         target: []const u8,
         work_budget: *graph_pattern_mod.WorkBudget,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror!?types.GraphPath,
     find_k_shortest_paths: *const fn (
         ctx: ?*anyopaque,
@@ -156,6 +169,7 @@ pub const NonPatternQueryExecutor = struct {
         source: []const u8,
         target: []const u8,
         work_budget: *graph_pattern_mod.WorkBudget,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror![]types.GraphPath,
     execute_graph_query: *const fn (
         ctx: ?*anyopaque,
@@ -164,6 +178,7 @@ pub const NonPatternQueryExecutor = struct {
         start_key_refs: []const []const u8,
         target_keys: [][]u8,
         work_budget: *graph_pattern_mod.WorkBudget,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror!graph_query_mod.GraphQueryResult,
     load_projected_document: *const fn (
         ctx: ?*anyopaque,
@@ -222,12 +237,17 @@ pub const SearchGraphExecutor = struct {
     ctx: ?*anyopaque,
     graph_ctx: ?*anyopaque = null,
     predicate_aware: bool = false,
+    /// Caller-derived local execution scope (owning table name, snapshot
+    /// completeness); rides the vtable because the storage layer knows
+    /// neither its table's name nor its group count.
+    scope: graph_query_mod.ExecutionScope = .{},
     execute_graph_query: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
         graph_query: graph_query_mod.GraphQuery,
         start_key_refs: []const []const u8,
         target_keys: [][]u8,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror!graph_query_mod.GraphQueryResult,
     load_projected_document: *const fn (
         ctx: ?*anyopaque,
@@ -1192,6 +1212,7 @@ pub fn executeSinglePatternQueryWithSets(
                 named,
                 start_key_refs,
                 budgets,
+                executor.scope,
             );
             errdefer {
                 for (aggregates) |*aggregate| aggregate.deinit(alloc);
@@ -1231,6 +1252,7 @@ pub fn executeSinglePatternQueryWithSets(
             named,
             start_key_refs,
             budgets,
+            executor.scope,
         )
     else
         try executor.match_pattern(
@@ -1240,6 +1262,7 @@ pub fn executeSinglePatternQueryWithSets(
             start_key_refs,
             target_nodes,
             budgets,
+            executor.scope,
         );
     defer graph_pattern_mod.freeMatches(alloc, raw_matches);
     if (!executor.predicate_aware and searchRequestHasGraphPredicates(req)) {
@@ -1552,6 +1575,7 @@ pub fn executeSingleNonPatternQueryWithSetsWithBudgets(
                 start_keys[0],
                 target_keys[0],
                 budgets.work,
+                executor.scope,
             );
             errdefer if (path) |owned| paths_mod.freePath(alloc, owned);
             if (!executor.predicate_aware and path != null and searchRequestHasGraphPredicates(req) and
@@ -1580,6 +1604,7 @@ pub fn executeSingleNonPatternQueryWithSetsWithBudgets(
                 start_keys[0],
                 target_keys[0],
                 budgets.work,
+                executor.scope,
             );
             errdefer freeOwnedGraphPaths(alloc, paths);
             if (!executor.predicate_aware and searchRequestHasGraphPredicates(req)) {
@@ -1607,8 +1632,9 @@ pub fn executeSingleNonPatternQueryWithSetsWithBudgets(
         start_key_refs,
         target_keys,
         budgets.work,
+        executor.scope,
     );
-    errdefer graph_result.deinit(alloc);
+    defer graph_result.deinit(alloc);
     if (!executor.predicate_aware and searchRequestHasGraphPredicates(req)) {
         graph_result.nodes = try filterGraphResultNodes(
             alloc,
@@ -1630,16 +1656,29 @@ pub fn executeSingleNonPatternQueryWithSetsWithBudgets(
     );
 
     const name = try alloc.dupe(u8, named.name);
+    errdefer alloc.free(name);
+    const metric_status = if (named.query.include_metric_status)
+        try cloneGraphMetricStatusesFromGraph(alloc, graph_result.metric_status)
+    else
+        @constCast((&[_]types.GraphMetricStatus{})[0..]);
+    errdefer types.freeGraphMetricStatuses(alloc, metric_status);
     const nodes = graph_result.nodes;
     graph_result.nodes = &.{};
+    const metric_values_slab = graph_result.metric_values_slab;
+    graph_result.metric_values_slab = &.{};
+    const metric_value_names = graph_result.metric_value_names;
+    graph_result.metric_value_names = &.{};
 
     return .{
         .name = name,
         .nodes = nodes,
+        .metric_values_slab = metric_values_slab,
+        .metric_value_names = metric_value_names,
         .paths = &.{},
         .matches = &.{},
         .hits = hits,
         .total_hits = total_hits,
+        .metric_status = metric_status,
     };
 }
 
@@ -1675,6 +1714,75 @@ fn buildPathGraphSearchResult(
         .hits = hits,
         .total_hits = @intCast(paths.len),
     };
+}
+
+fn cloneGraphMetricStatusesFromGraph(
+    alloc: Allocator,
+    statuses: []const graph_query_mod.GraphMetricStatus,
+) ![]types.GraphMetricStatus {
+    if (statuses.len == 0) return &.{};
+    const out = try alloc.alloc(types.GraphMetricStatus, statuses.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*status| status.deinit(alloc);
+        alloc.free(out);
+    }
+    for (statuses, 0..) |status, i| {
+        const name = try alloc.dupe(u8, status.name);
+        var name_moved = false;
+        errdefer if (!name_moved) alloc.free(name);
+        var edge_filter = try status.edge_filter.cloneAlloc(alloc);
+        var edge_filter_moved = false;
+        errdefer if (!edge_filter_moved) edge_filter.deinit(alloc);
+        const recent_events = if (status.recent_events.len > 0)
+            try alloc.dupe(graph_mod.GraphIndex.GraphMetricEvent, status.recent_events)
+        else
+            @constCast((&[_]graph_mod.GraphIndex.GraphMetricEvent{})[0..]);
+        var recent_events_moved = false;
+        errdefer if (!recent_events_moved and recent_events.len > 0) alloc.free(recent_events);
+        const last_error = if (status.last_error.len > 0) try alloc.dupe(u8, status.last_error) else "";
+        var last_error_moved = false;
+        errdefer if (!last_error_moved and last_error.len > 0) alloc.free(last_error);
+        const build_worker_id = if (status.build_worker_id.len > 0) try alloc.dupe(u8, status.build_worker_id) else "";
+        var build_worker_id_moved = false;
+        errdefer if (!build_worker_id_moved and build_worker_id.len > 0) alloc.free(build_worker_id);
+        out[i] = .{
+            .name = name,
+            .state = status.state,
+            .phase = status.phase,
+            .edge_filter = edge_filter,
+            .metadata_version = status.metadata_version,
+            .config_fingerprint = status.config_fingerprint,
+            .maintenance_paused = status.maintenance_paused,
+            .build_queued = status.build_queued,
+            .published_generation = if (status.published_edge_generation != 0) status.published_edge_generation else status.published_generation,
+            .edge_generation = status.edge_generation,
+            .target_edge_generation = status.target_edge_generation,
+            .queued_generation = status.queued_generation,
+            .building_generation = status.building_generation,
+            .build_job_id = status.build_job_id,
+            .build_started_at_ms = status.build_started_at_ms,
+            .build_iteration = status.build_iteration,
+            .build_lease_expires_at_ms = status.build_lease_expires_at_ms,
+            .build_worker_id = build_worker_id,
+            .retry_count = status.retry_count,
+            .last_error = last_error,
+            .progress = status.progress,
+            .converged = status.converged,
+            .iterations_completed = status.iterations_completed,
+            .delta = status.delta,
+            .computed_at_ms = status.computed_at_ms,
+            .last_event = status.last_event,
+            .recent_events = recent_events,
+        };
+        name_moved = true;
+        edge_filter_moved = true;
+        recent_events_moved = true;
+        last_error_moved = true;
+        build_worker_id_moved = true;
+        initialized += 1;
+    }
+    return out;
 }
 
 pub fn executeSearchGraphWithSets(
@@ -1738,6 +1846,7 @@ fn executeResolvedSearchGraph(
         effective_query,
         start_key_refs,
         target_keys,
+        executor.scope,
     );
     defer result.deinit(alloc);
     if (!executor.predicate_aware and searchRequestHasGraphPredicates(req)) {
@@ -5524,6 +5633,7 @@ test "executeSingleNonPatternQueryWithSets hydrates graph documents from include
             _: []const u8,
             _: []const u8,
             _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror!?types.GraphPath {
             return null;
         }
@@ -5535,6 +5645,7 @@ test "executeSingleNonPatternQueryWithSets hydrates graph documents from include
             _: []const u8,
             _: []const u8,
             _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror![]types.GraphPath {
             return try alloc_inner.alloc(types.GraphPath, 0);
         }
@@ -5546,6 +5657,7 @@ test "executeSingleNonPatternQueryWithSets hydrates graph documents from include
             start_key_refs: []const []const u8,
             target_keys: [][]u8,
             _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror!graph_query_mod.GraphQueryResult {
             try std.testing.expectEqualStrings("tree_search", named.name);
             try std.testing.expectEqual(@as(usize, 1), start_key_refs.len);
@@ -5720,6 +5832,7 @@ test "stateful path results materialize endpoint nodes for result refs" {
             source: []const u8,
             target: []const u8,
             _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror!?types.GraphPath {
             return try makePath(alloc_inner, source, target);
         }
@@ -5731,6 +5844,7 @@ test "stateful path results materialize endpoint nodes for result refs" {
             source: []const u8,
             target: []const u8,
             _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror![]types.GraphPath {
             const paths = try alloc_inner.alloc(types.GraphPath, 1);
             errdefer alloc_inner.free(paths);
@@ -5745,6 +5859,7 @@ test "stateful path results materialize endpoint nodes for result refs" {
             _: []const []const u8,
             _: [][]u8,
             _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror!graph_query_mod.GraphQueryResult {
             return error.TestUnexpectedResult;
         }
@@ -5817,6 +5932,7 @@ test "executeSearchGraphWithSets preserves node ordinals" {
             graph_query: graph_query_mod.GraphQuery,
             start_key_refs: []const []const u8,
             target_keys: [][]u8,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror!graph_query_mod.GraphQueryResult {
             try std.testing.expectEqualStrings("doc_hierarchy", graph_query.index_name);
             try std.testing.expectEqual(@as(usize, 1), start_key_refs.len);
@@ -5961,6 +6077,7 @@ test "buildPatternDocumentHits preserves resolved binding ordinals" {
             _: []const []const u8,
             _: []const graph_node_identity.Ref,
             _: RequestGraphBudgets,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror![]graph_pattern_mod.PatternMatch {
             return error.TestUnexpectedResult;
         }
@@ -6485,6 +6602,7 @@ test "executeGraphQueries projects base hits to resolved doc-set for unbounded s
             _: []const u8,
             _: []const u8,
             _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror!?types.GraphPath {
             return error.TestUnexpectedResult;
         }
@@ -6496,6 +6614,7 @@ test "executeGraphQueries projects base hits to resolved doc-set for unbounded s
             _: []const u8,
             _: []const u8,
             _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror![]types.GraphPath {
             return error.TestUnexpectedResult;
         }
@@ -6507,6 +6626,7 @@ test "executeGraphQueries projects base hits to resolved doc-set for unbounded s
             start_key_refs: []const []const u8,
             target_keys: [][]u8,
             _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror!graph_query_mod.GraphQueryResult {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             self.projected = true;
@@ -6627,6 +6747,7 @@ test "executeGraphQueries supports limited embeddings result_ref without base do
             _: []const u8,
             _: []const u8,
             _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror!?types.GraphPath {
             return error.TestUnexpectedResult;
         }
@@ -6638,6 +6759,7 @@ test "executeGraphQueries supports limited embeddings result_ref without base do
             _: []const u8,
             _: []const u8,
             _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror![]types.GraphPath {
             return error.TestUnexpectedResult;
         }
@@ -6649,6 +6771,7 @@ test "executeGraphQueries supports limited embeddings result_ref without base do
             start_key_refs: []const []const u8,
             target_keys: [][]u8,
             _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror!graph_query_mod.GraphQueryResult {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             self.projected = true;
@@ -6790,6 +6913,7 @@ test "graph result_ref uses resolved doc-set for unbounded selectors" {
             _: []const u8,
             _: []const u8,
             _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror!?types.GraphPath {
             return error.TestUnexpectedResult;
         }
@@ -6801,6 +6925,7 @@ test "graph result_ref uses resolved doc-set for unbounded selectors" {
             _: []const u8,
             _: []const u8,
             _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror![]types.GraphPath {
             return error.TestUnexpectedResult;
         }
@@ -6812,6 +6937,7 @@ test "graph result_ref uses resolved doc-set for unbounded selectors" {
             start_key_refs: []const []const u8,
             target_keys: [][]u8,
             _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror!graph_query_mod.GraphQueryResult {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             self.projected = true;
@@ -7102,6 +7228,7 @@ test "graph result_ref with limit preserves hit order" {
             _: []const u8,
             _: []const u8,
             _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror!?types.GraphPath {
             return error.TestUnexpectedResult;
         }
@@ -7113,6 +7240,7 @@ test "graph result_ref with limit preserves hit order" {
             _: []const u8,
             _: []const u8,
             _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror![]types.GraphPath {
             return error.TestUnexpectedResult;
         }
@@ -7124,6 +7252,7 @@ test "graph result_ref with limit preserves hit order" {
             start_key_refs: []const []const u8,
             target_keys: [][]u8,
             _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror!graph_query_mod.GraphQueryResult {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             self.projected = true;
@@ -7258,4 +7387,129 @@ test "graph query result doc-set resolution receives identity generation" {
     }
 
     try std.testing.expect(harness.saw_generation);
+}
+test "db query result shape executeSingleNonPatternQueryWithSets hides metric status unless requested" {
+    const alloc = std.testing.allocator;
+
+    const Harness = struct {
+        fn findShortestPath(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: *const types.NamedGraphQuery,
+            _: []const u8,
+            _: []const u8,
+            _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
+        ) anyerror!?types.GraphPath {
+            return null;
+        }
+
+        fn findKShortestPaths(
+            _: ?*anyopaque,
+            alloc_inner: Allocator,
+            _: *const types.NamedGraphQuery,
+            _: []const u8,
+            _: []const u8,
+            _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
+        ) anyerror![]types.GraphPath {
+            return try alloc_inner.alloc(types.GraphPath, 0);
+        }
+
+        fn executeGraphQuery(
+            _: ?*anyopaque,
+            alloc_inner: Allocator,
+            _: *const types.NamedGraphQuery,
+            _: []const []const u8,
+            _: [][]u8,
+            _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
+        ) anyerror!graph_query_mod.GraphQueryResult {
+            const metric_status = try alloc_inner.alloc(graph_query_mod.GraphMetricStatus, 1);
+            metric_status[0] = .{
+                .name = try alloc_inner.dupe(u8, "pagerank"),
+                .state = .fresh,
+                .published_generation = 5,
+                .edge_generation = 5,
+                .target_edge_generation = 5,
+                .progress = 1.0,
+                .converged = true,
+            };
+            return .{
+                .nodes = try alloc_inner.alloc(graph_query_mod.GraphResultNode, 0),
+                .matches = &.{},
+                .metric_status = metric_status,
+            };
+        }
+
+        fn loadProjectedDocument(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: []const u8,
+        ) anyerror!?[]u8 {
+            return null;
+        }
+    };
+
+    const graph_metric_orders = [_]graph_query_mod.GraphMetricOrder{.{
+        .name = "pagerank",
+        .freshness = .published,
+    }};
+    var named = types.NamedGraphQuery{
+        .name = "tree_search",
+        .query = .{
+            .query_type = .traverse,
+            .index_name = "doc_hierarchy",
+            .start_nodes = .{ .keys = &.{"doc:root"} },
+            .params = .{},
+            .order_by = &graph_metric_orders,
+        },
+    };
+    const executor = NonPatternQueryExecutor{
+        .ctx = null,
+        .find_shortest_path = Harness.findShortestPath,
+        .find_k_shortest_paths = Harness.findKShortestPaths,
+        .execute_graph_query = Harness.executeGraphQuery,
+        .load_projected_document = Harness.loadProjectedDocument,
+    };
+
+    var hidden = try executeSingleNonPatternQueryWithSets(alloc, .{ .limit = 10 }, &named, &.{}, executor);
+    defer hidden.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), hidden.metric_status.len);
+
+    named.query.include_metric_status = true;
+    var included = try executeSingleNonPatternQueryWithSets(alloc, .{ .limit = 10 }, &named, &.{}, executor);
+    defer included.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), included.metric_status.len);
+    try std.testing.expectEqualStrings("pagerank", included.metric_status[0].name);
+    try std.testing.expectEqual(@as(u64, 5), included.metric_status[0].published_generation);
+}
+
+test "graph metric status clone owns active build worker id" {
+    const alloc = std.testing.allocator;
+
+    const worker_id = try alloc.dupe(u8, "worker-a");
+    defer alloc.free(worker_id);
+    const statuses = [_]graph_query_mod.GraphMetricStatus{.{
+        .name = "pagerank",
+        .state = .building,
+        .phase = .computing,
+        .build_queued = true,
+        .building_generation = 7,
+        .build_job_id = 12345,
+        .build_iteration = 3,
+        .build_worker_id = worker_id,
+    }};
+
+    const cloned = try cloneGraphMetricStatusesFromGraph(alloc, &statuses);
+    defer {
+        for (cloned) |*status| status.deinit(alloc);
+        alloc.free(cloned);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), cloned.len);
+    try std.testing.expectEqualStrings("worker-a", cloned[0].build_worker_id);
+    try std.testing.expect(cloned[0].build_worker_id.ptr != worker_id.ptr);
+    try std.testing.expectEqual(@as(u64, 12345), cloned[0].build_job_id);
 }

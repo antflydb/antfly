@@ -23,10 +23,53 @@ letters, numbers, `.`, `_`, and `-`.
 
 ## Sources and precedence
 
-For a referenced key, Antfly checks:
+Configure an optional Antfly-managed native override store and ordered read-only
+sources:
 
-1. each `--secret-store-path` file in command-line order;
-2. the corresponding environment variable.
+```json
+{
+  "secrets": {
+    "native": {
+      "name": "native",
+      "path": "/var/lib/antfly/secrets.json"
+    },
+    "sources": [
+      {
+        "name": "tenant",
+        "type": "file",
+        "path": "/run/secrets/tenant/secrets.json"
+      },
+      {
+        "name": "platform",
+        "type": "file",
+        "path": "/run/secrets/platform/secrets.json"
+      }
+    ],
+    "environment": true
+  }
+}
+```
+
+For a referenced key, Antfly checks native first, then sources in array order,
+then the environment. `environment` defaults to `true`; set it to `false` to
+disable environment fallback for secret references and discovery. Omitting
+`native` disables API writes. PUT creates a native override; DELETE removes only
+that override and can reveal an external value again. Native storage is currently
+file-backed and node-local, even in a distributed deployment.
+
+This section is startup-only; file contents can still rotate live. Paths are
+literal (relative to the working directory). Source names must be unique and
+`environment` is reserved. Keep the native file separate from external files,
+including symlink aliases. Startup rejects canonical native/source path overlap,
+even when the destination does not exist yet. Writes recheck that separation so
+a source redirected after startup cannot be overwritten. Keep these configured
+paths and their parent directories under trusted administration; the check is
+not a filesystem lock against concurrent path replacement. Only `type: "file"`
+is supported today.
+
+When the section is absent, legacy path flags and deployment defaults continue
+to apply. Do not combine it with `--secret-store-path` or the serverless legacy
+`ANTFLY_SECRET_STORE_PATH` setting.
 
 The environment name is the uppercased key with punctuation replaced by `_`.
 For example, `openai.api_key` maps to `OPENAI_API_KEY`.
@@ -56,9 +99,7 @@ container and restrict it to the Antfly service account:
 ```
 
 ```console
-antfly standalone \
-  --config /etc/antfly/config.json \
-  --secret-store-path /run/secrets/antfly/secrets.json
+antfly standalone --config /etc/antfly/config.json
 ```
 
 The service account should own the file with mode `0600`; the containing
@@ -67,15 +108,10 @@ replace the mounted file atomically, never rewrite it in place. Antfly notices
 the metadata change and reloads it while retaining the previous snapshot if
 the replacement is malformed.
 
-Multiple paths provide explicit fallback layers. Put the most specific and
-most frequently rotated source first:
-
-```console
-antfly standalone \
-  --config /etc/antfly/config.json \
-  --secret-store-path /run/secrets/tenant/secrets.json \
-  --secret-store-path /run/secrets/platform/secrets.json
-```
+Put projected secret files in `secrets.sources`, with the most specific source
+first. Omit `native` for deployments where all credentials are externally managed.
+Legacy repeated `--secret-store-path` flags remain supported, but designate their
+first file as writable; prefer explicit source configuration for mounted volumes.
 
 Environment variables are convenient for local development and platform
 workload identity. Avoid process arguments because they may be visible in
@@ -227,6 +263,17 @@ and must be protected by normal authentication and admin authorization. Use a
 platform secret manager rather than the API when the mounted file is
 read-only.
 
+For a writable store configured through a file symlink, API updates preserve
+the link and atomically replace its current target. Reads continue through the
+configured path, and each write resolves the target again. A missing symlink
+target causes the write to fail without replacing the link.
+
+Use one writer per store. Do not update a store through the API while an
+external publisher is rotating or replacing it; these operations do not share
+a locking protocol. To combine API-managed values with externally published
+secrets, configure a separate writable file first and the external files as
+fallbacks. Deleting a local value exposes any matching fallback value.
+
 ## Storage credentials and remote-read credentials
 
 Primary database storage and user-provided remote content are separate trust
@@ -255,8 +302,11 @@ Static S3-compatible credentials can use references:
       "external_io": {
         "protocol": "s3",
         "endpoint": "minio.internal:9000",
-        "access_key_id": "${secret:storage.access_key_id}",
-        "secret_access_key": "${secret:storage.secret_access_key}",
+        "credentials": {
+          "source": "static",
+          "access_key_id": "${secret:storage.access_key_id}",
+          "secret_access_key": "${secret:storage.secret_access_key}"
+        },
         "buckets": ["antfly-data"]
       }
     }

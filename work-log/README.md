@@ -2,92 +2,77 @@
 
 This directory tracks major features and architectural changes in Antfly. Each document preserves design decisions and implementation context for future reference.
 
+Go-era design documents whose content now lives in the Zig design docs were removed from this directory; see [`zig/ROADMAP.md`](../zig/ROADMAP.md) as the index for those.
+
 ## Completed Features
 
-### Core Infrastructure
+### Ingestion
 
 | Feature | Document | Summary |
 |---------|----------|---------|
-| Metadata Port Consolidation | [metadata-architecture.md](completed/metadata-architecture.md) | 3 servers → 2, `/_internal/v1/` prefix |
-| Indexes in Snapshots | [indexes-in-snapshots.md](completed/indexes-in-snapshots.md) | Pause/Resume interface for all index types during snapshots |
-| Versioned Snapshots | [versioned-snapshots.md](completed/versioned-snapshots.md) | Compression auto-detection, format v3 with metadata |
-| Remote Content Config v2 | [remote-content-configs-v2.md](completed/remote-content-configs-v2.md) | S3/HTTP credential resolution with per-bucket matching |
+| DOCX/PPTX & Google Docs/Slides Support | [ppt-docx.md](completed/ingestion/ppt-docx.md) | Structured extraction for Office and Google Workspace document formats in docsaf, using only the standard library |
+| Reader Interface (OCR/Vision) | [reader-integration.md](completed/ingestion/reader-integration.md) | A reusable `Reader` interface for OCR/vision integrations, replacing ad-hoc per-app implementations |
 
-### Distributed Systems & Transactions
+### Relocated Implementation Logs
 
-| Feature | Document | Summary |
-|---------|----------|---------|
-| Distributed Write Transactions | [distributed-write-transactions/](completed/distributed-write-transactions/) | 2PC with coordinator recovery, cross-shard atomic writes |
-| Cross-Table Transactions & OCC RMW | [rmw-multi-table-transactions.md](completed/rmw-multi-table-transactions.md) | Version tokens, optimistic concurrency, 409 conflict |
-| TLA+ Stuck-Pending Fix | [tla-stuck-pending-fix.md](completed/tla-stuck-pending-fix.md) | Formal model + auto-abort for stale pending transactions |
-| E2E 2PC Tests | [e2e-2pc-test-plan.md](completed/e2e-2pc-test-plan.md) | Multi-node commit, abort, and recovery test suite |
-| Online Shard Splits | [online-shard-splits/](completed/online-shard-splits/) | Initial shard splitting implementation |
-| Zero-Downtime Shard Splits | [online-shard-splits-v2/](completed/online-shard-splits-v2/) | Shadow IndexManager, dual-write routing, archive inclusion |
-| External Table Replication | [external-table-replication.md](completed/external-table-replication.md) | PostgreSQL logical replication (CDC) via pglogrepl |
+Dated implementation logs, defect ledgers, benchmark diaries, and roadmap
+restatements moved out of the Zig design docs on 2026-09-16. Each file is a
+verbatim copy of the range it replaced; durable decisions were folded into the
+design doc first, and the design doc keeps a pointer. The placement rule is
+recorded under Planning Rules in [`zig/ROADMAP.md`](../zig/ROADMAP.md).
 
-### Search & Indexing
-
-| Feature | Document | Summary |
-|---------|----------|---------|
-| Aggregations | [aggregations.md](completed/aggregations.md) | Sum, avg, min, max, count, terms, histogram, date_histogram |
-| Bleve _all Field | [bleve-all-field.md](completed/bleve-all-field.md) | `x-antfly-include-in-all` schema configuration |
-| Dynamic Templates | [dynamic-templates.md](completed/dynamic-templates.md) | Pattern-based field mapping with Bleve translation |
-| Full-Text Chunks | [full-text-chunks.md](completed/full-text-chunks.md) | Full-text indexing for document chunks |
-| Sparse Embeddings (SPLADE) | [sparse-embeddings.md](completed/sparse-embeddings.md) | Sparse vector index, Termite SPLADE pipeline, hybrid fusion |
-| Graph Index Enricher | [pageindex-infra.md](completed/pageindex-infra.md) | Field-based edges, topology, summarizer with LeaderFactory |
-| Graph Database | [graphdb/](completed/graphdb/) | Citation networks, knowledge graphs, edge types, traversal |
-| Linear Merge API | [linear-merge-api.md](completed/linear-merge-api.md) | Stateless progressive sync from external sources |
-| Foreign Tables | [foreign-tables.md](completed/foreign-tables.md) | PostgreSQL as federated data source with SQL translation |
-
-### RAG & Agents
-
-| Feature | Document | Summary |
-|---------|----------|---------|
-| RAG Streaming Evolution | [rag-streaming-evolution.md](completed/rag-streaming-evolution.md) | Token-by-token streaming, multi-table, parallel LLM |
-| Link Processing | [link-processing.md](completed/link-processing.md) | Schema-aware link download: HTML, PDF, images |
-
-### ML & Termite
-
-| Feature | Document | Summary |
-|---------|----------|---------|
-| HuggingFace Direct Pull | [huggingface-direct.md](completed/huggingface-direct.md) | `hf:` prefix support with variant auto-detection |
-| Termite Controllers GKE Autopilot | [termite-operator-autopilot.md](completed/termite-operator-autopilot.md) | GKE Autopilot compute classes and spot scheduling |
-| Termite Controllers TPUs | [termite-operator-tpus.md](completed/termite-operator-tpus.md) | GKE TPU node pool integration |
-| Reader Interface (OCR/Vision) | [reader-integration.md](completed/reader-integration.md) | TrOCR, Donut, Florence-2, multi-stage readers |
-| INT8 Fixups | [int8-fixups.md](completed/int8-fixups.md) | Worker pool and SIMD optimization for quantized inference |
-| Termite Enhancements | [../termite-enhancements.md](termite-enhancements.md) | Ollama parity: lazy loading, queuing, metrics, caching |
-
-### Document Processing & API
-
-| Feature | Document | Summary |
-|---------|----------|---------|
-| DOCX/PPTX Support | [ppt-docx.md](completed/ppt-docx.md) | Heading-aware chunking, slide extraction, OOXML metadata |
-| JPEG2000 Encoder | [jpeg2000-encoder.md](completed/jpeg2000-encoder.md) | Implemented in go-jpeg2000 |
-| API Key/Bearer Auth | [auth-types.md](completed/auth-types.md) | Salted SHA-256 API keys, bearer tokens, permission scoping |
-| Website Termite Refactor | [website-termite-refactor.md](completed/website-termite-refactor.md) | Product switcher, Termite docs section, models page |
+| Area | Document | Design doc | Summary |
+|------|----------|------------|---------|
+| VOPR | [vopr/status-history.md](completed/vopr/status-history.md) | [zig/VOPR.md](../zig/VOPR.md) | Scenario-version status preamble (v9–v53) and verification-audit narrative |
+| VOPR | [vopr/defects-found.md](completed/vopr/defects-found.md) | [zig/VOPR.md](../zig/VOPR.md) | Per-defect ledger of production and harness bugs VOPR found |
+| VOPR | [vopr/follow-ups-2026-09.md](completed/vopr/follow-ups-2026-09.md) | [zig/VOPR.md](../zig/VOPR.md) | Dated runtime-correctness, merge, and deadline follow-ups (2026-09-06/07) |
+| Vector store | [vector-store/experiments-2026-09.md](completed/vector-store/experiments-2026-09.md) | [zig/VECTOR_STORE.md](../zig/VECTOR_STORE.md) | September 2026 experiment write-ups and 1M qualification tables |
+| Full text | [full-text/implementation-progress-2026-07.md](completed/full-text/implementation-progress-2026-07.md) | [zig/FULL_TEXT.md](../zig/FULL_TEXT.md) | v29–v38 posting-format increments and kernel qualification (2026-07) |
+| Graph metrics | [graph-metrics/roadmap-restatements.md](completed/graph-metrics/roadmap-restatements.md) | [zig/GRAPH_METRICS.md](../zig/GRAPH_METRICS.md) | Per-phase progress blocks and successive remaining-roadmap restatements |
+| Derived documents | [derived-documents/implementation-status-history.md](completed/derived-documents/implementation-status-history.md) | [zig/DERIVED_DOCUMENT_HIERARCHY.md](../zig/DERIVED_DOCUMENT_HIERARCHY.md) | Per-phase implementation-status bullets |
+| LSM writes | [lsm-writes/follow-ups-2026-04.md](completed/lsm-writes/follow-ups-2026-04.md) | [WRITES.md](../zig/pkg/antfly/src/storage/lsm/WRITES.md) | 2026-04-16 write-amplification follow-ups and execution checklist |
+| LSM writes | [lsm-writes/baseline-evidence-2026-06.md](completed/lsm-writes/baseline-evidence-2026-06.md) | [LSM.md](../zig/pkg/antfly/src/storage/lsm/LSM.md) | Sampled ns/op baseline (2026-06-02) |
+| LSM publication | [lsm-version-publication/validation-2026-09.md](completed/lsm-version-publication/validation-2026-09.md) | [lsm-version-publication.md](../docs/design/lsm-version-publication.md) | Dated validation runs and local ReleaseFast measurements |
+| DOCID | [docid/query-bench-diary.md](completed/docid/query-bench-diary.md) | [zig/DOCID.md](../zig/DOCID.md) | Query and bulk-load optimization diary |
+| Algebraic | [algebraic/churn-benchmarks-2026-05.md](completed/algebraic/churn-benchmarks-2026-05.md) | [zig/ALGEBRAIC.md](../zig/ALGEBRAIC.md) | May 2026 churn smoke and microbench chain |
+| Relational | [relational/benchmarks.md](completed/relational/benchmarks.md) | [zig/RELATIONAL.md](../zig/RELATIONAL.md) | Single-host LSM benchmark tables with repro commands |
+| HTTP runtime | [http-runtime/implementation-checkpoint.md](completed/http-runtime/implementation-checkpoint.md) | [zig/HTTP_API_RUNTIME.md](../zig/HTTP_API_RUNTIME.md) | Route-by-route migration checkpoint |
+| PDF | [pdf/render-control-verification-2026-09.md](completed/pdf/render-control-verification-2026-09.md) | [zig/PDF.md](../zig/PDF.md) | September 2026 render-control verification notes |
+| Status | [status/dated-e2e-observations-2026-05.md](completed/status/dated-e2e-observations-2026-05.md) | [zig/STATUS.md](../zig/STATUS.md) | 2026-05-01 E2E observations |
+| E2E | [e2e/resolved-failures-2026-05.md](completed/e2e/resolved-failures-2026-05.md) | [zig/TODO.md](../zig/TODO.md) | 2026-05-11 full-suite run and per-test resolutions |
+| Inference | [inference/gemma4/a4b-perf.md](completed/inference/gemma4/a4b-perf.md) | [CUDA.md](../zig/pkg/inference/CUDA.md), [METAL.md](../zig/pkg/inference/METAL.md) | Former PERF.md: Gemma 4 26B-A4B dated performance sessions |
+| Inference | [inference/metal/status-history.md](completed/inference/metal/status-history.md) | [METAL.md](../zig/pkg/inference/METAL.md) | Metal backend bisection narrative and dated benchmark anchors |
+| Inference | [inference/metal/slice-plans.md](completed/inference/metal/slice-plans.md) | [METAL.md](../zig/pkg/inference/METAL.md) | Four per-slice command-planner implementation plans |
+| Inference | [inference/gemma4/metal-perf-plan.md](completed/inference/gemma4/metal-perf-plan.md) | [GEMMA4.md](../zig/pkg/inference/models/gemma4/GEMMA4.md#metal-performance-plan) | Plan §9–16 implementation and readiness ledgers |
+| Inference | [inference/gemma4/mtp-cuda.md](completed/inference/gemma4/mtp-cuda.md) | [GEMMA4.md](../zig/pkg/inference/models/gemma4/GEMMA4.md) | MTP smoke transcripts and dated CUDA branch updates |
+| Inference | [inference/gemma4/e2b-sm89.md](completed/inference/gemma4/e2b-sm89.md) | [CUDA_TUNING.md](../zig/pkg/inference/CUDA_TUNING.md) | E2B SM89 optimization status and split-KV validation |
+| Inference | [inference/cuda/turboquant-l4.md](completed/inference/cuda/turboquant-l4.md) | [CUDA.md](../zig/pkg/inference/CUDA.md) | L4 TurboQuant qualification checklist |
+| Inference | [inference/ggml-graph-execution-history.md](completed/inference/ggml-graph-execution-history.md) | [GGML.md](../zig/pkg/inference/GGML.md) | Partition executor and quant-matmul routing history |
+| Inference | [inference/turboquant-history.md](completed/inference/turboquant-history.md) | [TURBOQUANT.md](../zig/pkg/inference/TURBOQUANT.md) | Compressed-KV history including the removed MLX provider |
+| Inference | [inference/llms-plan.md](completed/inference/llms-plan.md) | [LLMS.md](../zig/pkg/inference/LLMS.md) | The original LLM plan: MLX-era status, KV cache design, delivery phases, and testing strategy |
+| Inference | [inference/qwen/performance-evidence.md](completed/inference/qwen/performance-evidence.md) | [PERFORMANCE.md](../zig/pkg/inference/models/qwen/PERFORMANCE.md) | Dated campaigns, pass counts, and evidence-artifact ledger |
+| Inference | [inference/qwen/qwen3vl-qualification-2026-08.md](completed/inference/qwen/qwen3vl-qualification-2026-08.md) | [QWEN3VL.md](../zig/pkg/inference/models/qwen/QWEN3VL.md) | August 2026 qualification runs |
+| Inference | [inference/onnx-quantized-status-history.md](completed/inference/onnx-quantized-status-history.md) | [ONNX.md](../zig/pkg/inference/ONNX.md) | Quantized export proof runs and debugger bisection |
+| Inference | [inference/finetuning-implementation-log.md](completed/inference/finetuning-implementation-log.md) | [FINETUNING.md](../zig/pkg/inference/finetuning/FINETUNING.md) | Session narrative and 37-item task changelog |
+| Inference | [inference/graph-current-progress-history.md](completed/inference/graph-current-progress-history.md) | [GRAPH.md](../zig/pkg/inference/GRAPH.md) | Backend graph current-progress notes |
+| Inference | [inference/wasm-status-history.md](completed/inference/wasm-status-history.md) | [WASM.md](../zig/pkg/inference/WASM.md) | Build-profile and GPU-resident-weight status bullets |
+| Inference | [inference/ml-graph-ir-proposal.md](completed/inference/ml-graph-ir-proposal.md) | [GRAPH.md](../zig/pkg/inference/GRAPH.md) | Former ML.md: the superseded computation-graph IR proposal |
+| Inference | [inference/pjrt-status-history.md](completed/inference/pjrt-status-history.md) | [PJRT.md](../zig/pkg/inference/PJRT.md) | PJRT whole-model artifact status bullets |
+| Inference | [inference/gliner2/cuda-qualification-2026-07.md](completed/inference/gliner2/cuda-qualification-2026-07.md) | [gliner2/CUDA.md](../zig/pkg/inference/models/gliner2/CUDA.md) | July 2026 GLiNER2 CUDA environment, results, and route evidence |
+| Audio | [audio/benchmark-baseline-2026-04.md](completed/audio/benchmark-baseline-2026-04.md) | [AUDIO.md](../zig/lib/audio/AUDIO.md) | 2026-04-14 single-run codec benchmark baseline |
 
 ## Planned Features
 
-### Partially Implemented
-
-| Feature | Document | Status |
-|---------|----------|--------|
-| Native Agents And A2A | [A2A.md](../zig/A2A.md) | Canonical bounded-agent, retrieval, query-builder, frontend, and A2A integration design |
-| Audio TTS/STT | [audio.md](planned/audio.md) | STT done (OpenAI, Vertex, Termite); TTS partial (ElevenLabs only) |
-| Separate Termite Packages | [separate-termite-packages.md](planned/separate-termite-packages.md) | Operator/proxy/client separated; core module still at root |
-| Admission Webhooks | [admission-webhooks.md](planned/admission-webhooks.md) | Validation logic exists; webhook infrastructure not wired |
-
-### Not Yet Started
-
 | Feature | Document | Summary |
 |---------|----------|---------|
-| Query Samplers | [query-samplers/plan.md](planned/query-samplers/plan.md) | Capture query embeddings + results for ML training |
-| Pipelined Query API | [pipelined-query-api/plan.md](planned/pipelined-query-api/plan.md) | Multi-stage query pipelines, delete-by-query |
+| Agentic Warehouse Memory | [agentic-warehouse-memory.md](planned/agentic-warehouse-memory.md) | Antfly as an agentic memory layer over BigQuery/Snowflake warehouses |
+| Operator Standalone Mode | [operator-standalone-mode.md](planned/operator-standalone-mode.md) | Explicit operator-managed standalone mode for `AntflyCluster`, without breaking the existing clustered topology |
+| Pipelined Query API | [pipelined-query-api.md](planned/pipelined-query-api.md) | Multi-stage query pipelines supporting delete-by-query, update-by-query, and cross-table joins |
+| Query Sampler Feature | [query-samplers.md](planned/query-samplers.md) | Named query samplers that capture query embeddings and results for ML training |
 
 ## Quick Links
 
 - **Completed Features**: [completed/](completed/)
 - **Planned Features**: [planned/](planned/)
-- **Termite Enhancements**: [termite-enhancements.md](termite-enhancements.md)
 - **Main Documentation**: [../CLAUDE.md](../CLAUDE.md)
-- **API Specification**: [../src/metadata/api.yaml](../src/metadata/api.yaml)
+- **API Specification**: [../specs/openapi/](../specs/openapi/)

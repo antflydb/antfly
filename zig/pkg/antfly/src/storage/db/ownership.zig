@@ -30,9 +30,13 @@ pub const Stats = struct {
     lease_owned: bool = false,
     has_lease: bool = false,
     acquisition_count: u64 = 0,
+    takeover_count: u64 = 0,
     lease_acquire_failures: u64 = 0,
     lost_leases: u64 = 0,
     last_acquired_ms: u64 = 0,
+    lease_expires_at_ms: u64 = 0,
+    lease_renew_after_ms: u64 = 0,
+    renewal_count: u64 = 0,
     lease_epoch: u64 = 0,
 };
 
@@ -43,11 +47,14 @@ pub const State = struct {
     lease_ttl_ms: u64,
     has_lease: bool,
     acquisition_count: u64,
+    takeover_count: u64,
     lease_acquire_failures: u64,
     lost_leases: u64,
     last_acquired_ms: u64,
-    lease_epoch: u64,
     lease_expires_at_ms: u64,
+    lease_renew_after_ms: u64,
+    renewal_count: u64,
+    lease_epoch: u64,
 
     pub fn init(alloc: Allocator, store: anytype, key: []const u8, config: Config) !State {
         return .{
@@ -57,16 +64,25 @@ pub const State = struct {
             .lease_ttl_ms = config.lease_ttl_ms,
             .has_lease = !config.lease_owned,
             .acquisition_count = 0,
+            .takeover_count = 0,
             .lease_acquire_failures = 0,
             .lost_leases = 0,
             .last_acquired_ms = 0,
-            .lease_epoch = 0,
             .lease_expires_at_ms = 0,
+            .lease_renew_after_ms = 0,
+            .renewal_count = 0,
+            .lease_epoch = 0,
         };
     }
 
     pub fn deinit(self: *State, alloc: Allocator) void {
         self.release();
+        self.lease.deinit();
+        alloc.free(self.owner_id);
+        self.* = undefined;
+    }
+
+    pub fn deinitPreserveLease(self: *State, alloc: Allocator) void {
         self.lease.deinit();
         alloc.free(self.owner_id);
         self.* = undefined;
@@ -79,6 +95,10 @@ pub const State = struct {
         }
 
         const had_lease = self.has_lease;
+        // A lease cannot be taken by a conforming peer before its durable
+        // expiry. Keep the overwhelmingly common runtime tick on this
+        // in-memory path and renew early enough to tolerate scheduler stalls.
+        if (had_lease and now_ms < self.lease_renew_after_ms) return true;
         const acquired = try self.lease.tryAcquireFenced(self.owner_id, now_ms, self.lease_ttl_ms);
         if (acquired.acquired) {
             self.has_lease = true;
@@ -88,11 +108,28 @@ pub const State = struct {
                 self.acquisition_count += 1;
                 self.last_acquired_ms = now_ms;
             }
+            if (had_lease and acquired.kind == .renewed) self.renewal_count += 1;
+            if (acquired.kind == .takeover) self.takeover_count += 1;
+            self.updateRenewalDeadline();
             return true;
         }
 
         self.noteAcquireFailure();
         return false;
+    }
+
+    fn updateRenewalDeadline(self: *State) void {
+        // Renew with one third of the TTL remaining. A deterministic
+        // per-owner jitter spreads writers sharing the same TTL without
+        // making tests or restart behavior nondeterministic.
+        const renewal_slack = @max(@as(u64, 1), self.lease_ttl_ms / 3);
+        const jitter_window = self.lease_ttl_ms / 10;
+        const jitter = if (jitter_window == 0)
+            0
+        else
+            std.hash.Wyhash.hash(0, self.owner_id) % (jitter_window + 1);
+        const base_renew_after = self.lease_expires_at_ms -| renewal_slack;
+        self.lease_renew_after_ms = base_renew_after -| jitter;
     }
 
     pub fn heartbeat(self: *State, now_ms: u64) !bool {
@@ -109,6 +146,8 @@ pub const State = struct {
             return false;
         }
         self.lease_expires_at_ms = std.math.add(u64, now_ms, self.lease_ttl_ms) catch std.math.maxInt(u64);
+        self.renewal_count += 1;
+        self.updateRenewalDeadline();
         return true;
     }
 
@@ -129,6 +168,8 @@ pub const State = struct {
             self.lease_expires_at_ms = 0;
             self.lost_leases += 1;
         }
+        self.lease_expires_at_ms = 0;
+        self.lease_renew_after_ms = 0;
     }
 
     pub fn release(self: *State) void {
@@ -138,6 +179,23 @@ pub const State = struct {
         self.has_lease = !self.lease_owned;
         self.lease_epoch = 0;
         self.lease_expires_at_ms = 0;
+        self.lease_renew_after_ms = 0;
+    }
+
+    pub fn releaseHeldLease(self: *State) !bool {
+        const released = if (self.lease_owned and self.has_lease)
+            try self.lease.releaseFenced(self.owner_id, self.lease_epoch)
+        else
+            false;
+        self.has_lease = !self.lease_owned;
+        self.lease_epoch = 0;
+        self.lease_expires_at_ms = 0;
+        self.lease_renew_after_ms = 0;
+        return released;
+    }
+
+    pub fn loadLease(self: *State, alloc: Allocator) !?lease_mod.LeaseRecord {
+        return try self.lease.load(alloc);
     }
 
     pub fn stats(self: *const State) Stats {
@@ -145,9 +203,13 @@ pub const State = struct {
             .lease_owned = self.lease_owned,
             .has_lease = self.has_lease,
             .acquisition_count = self.acquisition_count,
+            .takeover_count = self.takeover_count,
             .lease_acquire_failures = self.lease_acquire_failures,
             .lost_leases = self.lost_leases,
             .last_acquired_ms = self.last_acquired_ms,
+            .lease_expires_at_ms = self.lease_expires_at_ms,
+            .lease_renew_after_ms = self.lease_renew_after_ms,
+            .renewal_count = self.renewal_count,
             .lease_epoch = self.lease_epoch,
         };
     }
@@ -202,6 +264,39 @@ test "ownership state tracks lease takeover and loss" {
     try std.testing.expectEqual(@as(u64, 1), owner_a.lost_leases);
     try std.testing.expect(!owner_a.has_lease);
     try std.testing.expect(owner_b.has_lease);
+}
+
+test "ownership state renews only at the cached renewal deadline" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{ .name = "lease-renewal" });
+    defer runtime.deinit();
+    var owner = try State.init(alloc, runtime, "\x00\x00__metadata__:ownership_renewal_test", .{
+        .lease_owned = true,
+        .owner_id = "worker-renewal",
+        .lease_ttl_ms = 30_000,
+    });
+    defer owner.deinit(alloc);
+
+    try std.testing.expect(try owner.ensureLease(1_000));
+    const first_deadline = owner.lease_renew_after_ms;
+    try std.testing.expect(first_deadline > 1_000);
+    var first = (try owner.loadLease(alloc)) orelse return error.TestExpectedLease;
+    defer lease_mod.deinitRecord(alloc, &first);
+    try std.testing.expectEqual(@as(u64, 31_000), first.expires_at_ms);
+
+    try std.testing.expect(try owner.ensureLease(first_deadline - 1));
+    try std.testing.expectEqual(@as(u64, 0), owner.renewal_count);
+    var unchanged = (try owner.loadLease(alloc)) orelse return error.TestExpectedLease;
+    defer lease_mod.deinitRecord(alloc, &unchanged);
+    try std.testing.expectEqual(first.expires_at_ms, unchanged.expires_at_ms);
+
+    try std.testing.expect(try owner.ensureLease(first_deadline));
+    try std.testing.expectEqual(@as(u64, 1), owner.renewal_count);
+    var renewed = (try owner.loadLease(alloc)) orelse return error.TestExpectedLease;
+    defer lease_mod.deinitRecord(alloc, &renewed);
+    try std.testing.expectEqual(first_deadline + 30_000, renewed.expires_at_ms);
 }
 
 test "ownership state works with memory backend store" {

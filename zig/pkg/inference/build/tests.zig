@@ -22,6 +22,7 @@ pub const Suite = struct {
     selected_test_filters: []const []const u8,
     run_tests: *std.Build.Step.Run,
     run_cli_tests: *std.Build.Step.Run,
+    run_gliner25_fuzz_tests: *std.Build.Step.Run,
 };
 
 pub fn create(ctx: Context) Suite {
@@ -32,9 +33,11 @@ pub fn create(ctx: Context) Suite {
         .path = ctx.path("src/test_runner_filter.zig"),
         .mode = .simple,
     };
-    // Full CPU inference tests measured about 6 GiB to compile.
+    // Full CPU inference tests including GLiNER2.5 measured 7.2 GiB; the
+    // macOS build with Metal measured 11.2 GiB. Reserve target-specific
+    // headroom rather than rejecting successful accelerator compilations.
     const tests = b.addTest(.{
-        .max_rss = 7 * 1024 * 1024 * 1024,
+        .max_rss = @as(usize, if (ctx.target.result.os.tag == .macos) 14 else 9) * 1024 * 1024 * 1024,
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/inference.zig"),
             .target = ctx.target,
@@ -48,10 +51,24 @@ pub fn create(ctx: Context) Suite {
     tests.root_module.addImport("build_options", ctx.graph.qualification_build_options_mod);
     tests.root_module.addImport("antfly-json", ctx.graph.json_mod);
     tests.root_module.addImport("httpx", ctx.graph.httpx_mod);
+    tests.root_module.addImport("protobuf", ctx.graph.protobuf_mod);
     tests.root_module.addImport("inference_api", ctx.graph.inference_api_mod);
     tests.root_module.addImport("antfly_generating_openapi", ctx.graph.generating_openapi_mod);
     tests.root_module.addImport("antfly_extraction_openapi", ctx.graph.extraction_openapi_mod);
     tests.root_module.addImport("antfly_extracting", ctx.graph.extracting_mod);
+    // Direct reader API tests share the runtime's request and result types.
+    const readers_mod = b.createModule(.{
+        .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/readers/src/mod.zig" })),
+        .target = ctx.target,
+        .optimize = ctx.optimize,
+    });
+    readers_mod.addImport("httpx", ctx.graph.httpx_mod);
+    readers_mod.addImport("inference_api", ctx.graph.inference_api_mod);
+    readers_mod.addImport("antfly_google", ctx.graph.google_mod);
+    readers_mod.addImport("antfly_reader_config", ctx.graph.reader_config_mod);
+    readers_mod.addImport("antfly_scraping", ctx.graph.scraping_mod);
+    readers_mod.addImport("antfly_image", ctx.graph.image_mod);
+    tests.root_module.addImport("antfly_readers", readers_mod);
     tests.root_module.addImport("antfly_transcribing", ctx.graph.transcribing_mod);
     tests.root_module.addImport("inference_audio", ctx.graph.inference_audio_mod);
     tests.root_module.addImport("inference_chunker", ctx.graph.inference_chunker_mod);
@@ -114,7 +131,19 @@ pub fn create(ctx: Context) Suite {
         run_tests.addArgs(&.{ "--test-filter", filter });
     }
     build_test_filters.addRuntimeControls(run_tests, ctx.args orelse &.{});
-    return .{ .tests = tests, .selected_test_filters = selected_test_filters, .run_tests = run_tests, .run_cli_tests = run_cli_tests };
+    // Focused inference invocations retain their historical reachability;
+    // the default gates assign these tests to the shared finetuning owner.
+    if (selected_test_filters.len == 0) {
+        for (@import("finetune/tests.zig").inference_overlap_filters) |filter|
+            run_tests.addArgs(&.{ "--skip-test-filter", filter });
+    }
+    return .{
+        .tests = tests,
+        .selected_test_filters = selected_test_filters,
+        .run_tests = run_tests,
+        .run_cli_tests = run_cli_tests,
+        .run_gliner25_fuzz_tests = addGliner25Fuzz(ctx),
+    };
 }
 
 pub const Checks = struct {
@@ -159,11 +188,93 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
     test_step.dependOn(&cuda_artifact_source_policy_check.step);
     test_step.dependOn(&run_quant_kernel_metal_runtime_check_tests.step);
     test_step.dependOn(&run_tests.step);
+    const laya_cuda_tests = b.addTest(.{
+        .name = "laya-cuda-tests",
+        .max_rss = 9 * 1024 * 1024 * 1024,
+        .root_module = suite.tests.root_module,
+        .filters = &.{ "laya ", "cuda support gate", "readiness inventory" },
+        .test_runner = .{ .path = ctx.path("src/test_runner_filter.zig"), .mode = .simple },
+    });
+    const install_laya_cuda_tests = b.addInstallArtifact(laya_cuda_tests, .{});
+    ctx.step("laya-cuda-test-build", "Build Laya CUDA qualification executable without running it").dependOn(&install_laya_cuda_tests.step);
+    const run_laya_cuda_tests = ctx.addRunArtifact(laya_cuda_tests);
+    run_laya_cuda_tests.setEnvironmentVariable("ANTFLY_LAYA_REQUIRE_TESTS", "1");
+    run_laya_cuda_tests.setEnvironmentVariable("ANTFLY_LAYA_BACKEND", "cuda");
+    ctx.step("laya-cuda-test", "Require CUDA and pinned Laya fixtures").dependOn(&run_laya_cuda_tests.step);
+    // Dedicated hardware gate: reuse the inference test module and frozen
+    // CPU/Metal exercises, but missing CUDA must never become a successful skip.
+    const gliner25_cuda_tests = b.addTest(.{
+        .name = "gliner25-cuda-tests",
+        .max_rss = 7 * 1024 * 1024 * 1024,
+        .root_module = suite.tests.root_module,
+        .filters = &.{ "CUDA boundary", "deberta training CUDA", "trainer CUDA", "adapter CUDA" },
+        .test_runner = .{ .path = ctx.path("src/test_runner_filter.zig"), .mode = .simple },
+    });
+    const run_gliner25_cuda_tests = ctx.addRunArtifact(gliner25_cuda_tests);
+    run_gliner25_cuda_tests.setEnvironmentVariable("TERMITE_REQUIRE_CUDA_TESTS", "1");
+    const cuda_step = ctx.step("test-gliner25-cuda", "Run required-hardware GLiNER2.5 CUDA parity, optimizer and lifecycle tests");
+    cuda_step.dependOn(&run_gliner25_cuda_tests.step);
+    cuda_step.dependOn(&quant_kernel_codegen_test_check.step);
+    cuda_step.dependOn(&cuda_artifact_source_policy_check.step);
     // A focused server/library filter need not match an executable-root test.
     // The default aggregate still owns the complete executable-root suites.
     if (selected_test_filters.len == 0) {
         test_step.dependOn(&run_cli_tests.step);
         test_step.dependOn(&run_bge_m3_e2e_bench_tests.step);
+        test_step.dependOn(&suite.run_gliner25_fuzz_tests.step);
     }
     return test_step;
+}
+
+pub fn addGliner25Trained(ctx: Context, gliner25_trained_check_module: *std.Build.Module) void {
+    const b = ctx.b;
+    const gliner25_trained_tests = b.addTest(.{
+        .root_module = gliner25_trained_check_module,
+        .filters = build_test_filters.select(b.allocator, ctx.args orelse &.{}, &.{"trained execution"}),
+    });
+    const run_gliner25_trained_tests = ctx.addRunArtifact(gliner25_trained_tests);
+    ctx.step("gliner25-trained-check-test", "Test trained GLiNER2.5 execution envelopes, identity, admission and lifetimes without a model").dependOn(&run_gliner25_trained_tests.step);
+}
+
+fn addGliner25Fuzz(ctx: Context) *std.Build.Step.Run {
+    const b = ctx.b;
+    const no_error_tracing = b.option(bool, "gliner25-fuzz-no-error-tracing", "Work around Zig 0.16.0 fuzz runner error-trace mismatch for GLiNER25 only (use with --fuzz)") orelse false;
+    // Keep the standard test runner for deterministic corpus and --fuzz runs.
+    // This pure-Zig platform instance deliberately omits filesystem_capacity.c:
+    // Zig 0.16 cannot instrument that C helper with its fuzz sanitizer profile.
+    // Construct it from shared paths so root and package builds need no nested
+    // package dependency and the ML imports share exactly this module identity.
+    const platform = b.createModule(.{
+        .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/platform/src/root.zig" })),
+        .target = ctx.target,
+        .optimize = ctx.optimize,
+        .link_libc = false,
+    });
+    const ml = b.createModule(.{
+        .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/ml/src/root.zig" })),
+        .target = ctx.target,
+        .optimize = ctx.optimize,
+    });
+    ml.addImport("antfly_platform", platform);
+    const tests = b.addTest(.{
+        .name = "gliner25-parser-properties",
+        .root_module = b.createModule(.{
+            .root_source_file = ctx.path("src/gliner25_fuzz.zig"),
+            .target = ctx.target,
+            .optimize = ctx.optimize,
+            .link_libc = ctx.backend.link_libc,
+            .error_tracing = if (no_error_tracing) false else null,
+        }),
+        .filters = &.{"GLiNER25 fuzz"},
+    });
+    tests.root_module.addImport("build_options", ctx.graph.build_options_mod);
+    tests.root_module.addImport("antfly_platform", platform);
+    tests.root_module.addImport("antfly_image", ctx.graph.image_mod);
+    tests.root_module.addImport("inference_tokenizer", ctx.graph.inference_tokenizer_mod);
+    tests.root_module.addImport("inference_hf_tokenizer", ctx.graph.inference_hf_tokenizer_mod);
+    tests.root_module.addImport("inference_linalg", ctx.graph.inference_linalg_mod);
+    tests.root_module.addImport("ml", ml);
+    const run = ctx.addRunArtifact(tests);
+    ctx.step("test-gliner25-fuzz", "Run bounded GLiNER2.5 parser, schema and document property tests").dependOn(&run.step);
+    return run;
 }

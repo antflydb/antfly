@@ -5,7 +5,11 @@
 
 import createClient, { type Client } from "openapi-fetch";
 import { readLimitedResponseBytes, readLimitedResponseText } from "./client.js";
-import { deserializeEmbeddings } from "./inference-codec.js";
+import {
+  decodeNumericDenseFrame,
+  NUMERIC_RESPONSE_ACCEPT,
+  NUMERIC_RESPONSE_MEDIA_TYPE,
+} from "./inference-codec.js";
 import type {
   ChunkConfig,
   ChunkResponse,
@@ -15,6 +19,7 @@ import type {
   EntityExtractionResult,
   ExtractRequest,
   ExtractResponse,
+  ExtractV2Request,
   GenerateChunk,
   GenerateRequest,
   GenerateResponse,
@@ -22,6 +27,7 @@ import type {
   InferenceError,
   ModelsResponse,
   RequestOptions,
+  RerankDocument,
   RerankResponse,
   RewriteResponse,
   TranscribeResponse,
@@ -40,7 +46,9 @@ export class InferenceAPIError extends Error {
     readonly status: number,
     readonly code: string | undefined,
     detail: string,
-    readonly retryable: boolean | undefined
+    readonly retryable: boolean | undefined,
+    readonly inputIndex?: number,
+    readonly stage?: string
   ) {
     super(`inference request failed (${status}): ${detail}`);
     this.name = "InferenceAPIError";
@@ -86,7 +94,10 @@ export function isTransientCapacityError(
 }
 
 export class InferenceClient {
-  private client: Client<paths>;
+  // The embedding and reranking operations also describe a negotiated binary
+  // response; naming the media type keeps each `data` typed as its JSON body,
+  // which is what the Accept header below asks for.
+  private client: Client<paths, "application/json">;
   private baseUrl: string;
   private headers: Record<string, string>;
   private maxBinaryResponseBytes: number;
@@ -103,7 +114,7 @@ export class InferenceClient {
       throw new Error("maxBinaryResponseBytes must be a positive safe integer");
     }
 
-    this.client = createClient<paths>({
+    this.client = createClient<paths, "application/json">({
       baseUrl: this.baseUrl,
       headers: {
         ...this.headers,
@@ -235,8 +246,9 @@ export class InferenceClient {
   /**
    * Generate dense embeddings as a plain array of vectors.
    *
-   * Current servers return the OpenAI-compatible JSON response. Bounded
-   * application/octet-stream responses from legacy servers remain supported.
+   * The request asks for the packed numeric frame, which keeps every float out
+   * of JSON text, and reads the JSON body when the server answers with that
+   * instead -- an older server, or a model whose vectors are sparse.
    *
    * @param model - Name of the embedder model (e.g., "bge-small-en-v1.5")
    * @param input - Text string, array of strings, or array of content parts (for multimodal)
@@ -245,11 +257,11 @@ export class InferenceClient {
    *
    * @example
    * ```typescript
-   * const embeddings = await client.embedBinary("bge-small-en-v1.5", ["hello", "world"]);
+   * const embeddings = await client.embedDense("bge-small-en-v1.5", ["hello", "world"]);
    * console.log(embeddings[0]); // [0.0123, -0.0456, ...]
    * ```
    */
-  async embedBinary(
+  async embedDense(
     model: string,
     input: EmbedInput,
     options?: { truncate?: boolean }
@@ -258,7 +270,7 @@ export class InferenceClient {
       method: "POST",
       headers: {
         ...this.headers,
-        Accept: "application/octet-stream",
+        Accept: NUMERIC_RESPONSE_ACCEPT,
       },
       body: JSON.stringify({
         model,
@@ -270,7 +282,7 @@ export class InferenceClient {
     if (!response.ok) throw await inferenceAPIErrorResponse(response);
 
     const contentType = responseMediaType(response);
-    if (contentType !== "application/json" && contentType !== "application/octet-stream") {
+    if (contentType !== "application/json" && contentType !== NUMERIC_RESPONSE_MEDIA_TYPE) {
       await response.body?.cancel();
       throw new Error(`Unexpected embedding response content type ${JSON.stringify(contentType)}`);
     }
@@ -286,8 +298,8 @@ export class InferenceClient {
     switch (contentType) {
       case "application/json":
         return denseEmbeddingsFromJSON(bytes);
-      case "application/octet-stream":
-        return deserializeEmbeddings(bytes.buffer);
+      case NUMERIC_RESPONSE_MEDIA_TYPE:
+        return decodeNumericDenseFrame(bytes);
     }
   }
 
@@ -345,12 +357,16 @@ export class InferenceClient {
   }
 
   /**
-   * Rerank prompts by relevance to a query
+   * Rerank documents by relevance to a query
+   *
+   * Each document is a string or an array of text and image content parts.
+   * Documents with images need a multimodal reranker (ColQwen or Qwen3-VL);
+   * other models reject them.
    *
    * @param model - Name of the reranker model (e.g., "bge-reranker-v2-m3")
    * @param query - Search query for relevance scoring
-   * @param prompts - Pre-rendered text prompts to rerank
-   * @returns RerankResponse with relevance scores for each prompt
+   * @param documents - Documents to rerank, rendered to text or content parts
+   * @returns RerankResponse with one relevance score per document
    *
    * @example
    * ```typescript
@@ -363,16 +379,15 @@ export class InferenceClient {
    *     "Cooking recipes for beginners"
    *   ]
    * );
-   * // result.scores might be [0.85, 0.92, 0.12]
-   * // Higher scores indicate more relevance to the query
+   * // result.data[i].score is the relevance of documents[result.data[i].index]
    * ```
    */
-  async rerank(model: string, query: string, prompts: string[]): Promise<RerankResponse> {
+  async rerank(model: string, query: string, documents: RerankDocument[]): Promise<RerankResponse> {
     const { data, error, response } = await this.client.POST("/ai/v1/rerank", {
       body: {
         model,
         query,
-        prompts,
+        documents,
       },
     });
     if (!response.ok) throw inferenceAPIError(response.status, error);
@@ -426,12 +441,23 @@ export class InferenceClient {
    * Run the canonical schema-driven extraction API.
    */
   async extractRaw(request: ExtractRequest): Promise<ExtractResponse> {
+    const expectedModel = request.model;
+    const expectedIds =
+      request.schema_version === 2 ? request.inputs.map((input) => input.id) : undefined;
     const { data, error, response } = await this.client.POST("/ai/v1/extract", {
       body: request,
     });
     if (!response.ok) throw inferenceAPIError(response.status, error);
     if (!data) throw new Error("Extract failed: unexpected empty response");
+    if (expectedIds !== undefined) {
+      validateExtractionV2Response(data, expectedModel, expectedIds);
+    }
     return data;
+  }
+
+  /** Strict mixed-task extraction with complete per-input schema/options replacements. */
+  async extractV2(request: ExtractV2Request): Promise<ExtractResponse> {
+    return this.extractRaw({ ...request, schema_version: 2 });
   }
 
   /**
@@ -614,6 +640,37 @@ export class InferenceClient {
   }
 }
 
+function validateExtractionV2Response(
+  response: unknown,
+  expectedModel: string,
+  expectedIds: readonly (string | undefined)[]
+): void {
+  if (typeof response !== "object" || response === null || Array.isArray(response)) {
+    throw new Error("Invalid extraction v2 response: expected an extraction object");
+  }
+  const envelope = response as Record<string, unknown>;
+  if (envelope.object !== "extraction" || envelope.schema_version !== 2) {
+    throw new Error("Invalid extraction v2 response: object or schema version");
+  }
+  if (envelope.model !== expectedModel) {
+    throw new Error("Invalid extraction v2 response: model mismatch");
+  }
+  if (!Array.isArray(envelope.data) || envelope.data.length !== expectedIds.length) {
+    throw new Error("Invalid extraction v2 response: item cardinality");
+  }
+  for (let index = 0; index < expectedIds.length; index++) {
+    const row: unknown = envelope.data[index];
+    if (typeof row !== "object" || row === null || Array.isArray(row)) {
+      throw new Error(`Invalid extraction v2 response: item ${index} must be an object`);
+    }
+    const item = row as Record<string, unknown>;
+    const hasId = Object.getOwnPropertyDescriptor(item, "id") !== undefined;
+    if ((hasId && typeof item.id !== "string") || item.id !== expectedIds[index]) {
+      throw new Error(`Invalid extraction v2 response: item ${index} id mismatch`);
+    }
+  }
+}
+
 function inferenceAPIError(status: number, error: InferenceError | unknown): InferenceAPIError {
   if (status === 503 && isTransientCapacityError(error)) {
     return new InferenceCapacityError(error);
@@ -627,7 +684,14 @@ function inferenceAPIError(status: number, error: InferenceError | unknown): Inf
     message && message !== code
       ? `${message}${code ? ` (${code})` : ""}`
       : message || code || "Unknown inference error";
-  return new InferenceAPIError(status, code, detail, retryable);
+  const inputIndex =
+    typeof payload.input_index === "number" &&
+    Number.isSafeInteger(payload.input_index) &&
+    payload.input_index >= 0
+      ? payload.input_index
+      : undefined;
+  const stage = typeof payload.stage === "string" ? payload.stage : undefined;
+  return new InferenceAPIError(status, code, detail, retryable, inputIndex, stage);
 }
 
 async function inferenceAPIErrorResponse(response: Response): Promise<InferenceAPIError> {
@@ -673,7 +737,7 @@ async function fetchLimitedInferenceResponse(
 
   const limit = !response.ok
     ? MAX_INFERENCE_ERROR_BYTES
-    : mediaType === "application/octet-stream" || mediaType === "application/x-sparse-vectors"
+    : mediaType === NUMERIC_RESPONSE_MEDIA_TYPE || mediaType === "application/octet-stream"
       ? maxBinaryResponseBytes
       : MAX_INFERENCE_JSON_RESPONSE_BYTES;
   const tooLarge = new Error(`Inference response exceeded ${limit} bytes`);

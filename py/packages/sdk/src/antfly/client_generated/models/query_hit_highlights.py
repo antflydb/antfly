@@ -16,9 +16,11 @@ T = TypeVar("T", bound="QueryHitHighlights")
 @_attrs_define
 class QueryHitHighlights:
     """Highlighted fragments keyed by source field, present when the request
-    set `highlight` and the hit carried the field. Each fragment is a
-    window of the stored field value with byte-offset spans marking the
-    text the full-text query matched.
+    set `highlight` and the stored document has the field. Highlights are
+    computed from the unprojected document, so a `fields` projection that
+    omits a highlighted field does not suppress its highlights. Each
+    fragment is a window of the stored field value with byte-offset spans
+    marking the text the full-text query matched.
 
     """
 

@@ -22,21 +22,30 @@ const projector_format = @import("../architectures/projector_format.zig");
 const gguf_format = @import("../gguf/format.zig");
 const gguf_writer = @import("../gguf/writer.zig");
 const manifest_mod = @import("../models/manifest.zig");
+const gliner_boundary = @import("../models/gliner_boundary.zig");
+const gliner_qualification = @import("../models/gliner_boundary_qualification.zig");
+const boundary_bundle = @import("../models/gliner_boundary_bundle.zig");
+const safetensors_mod = @import("../models/safetensors.zig");
 const managed_receipt = @import("managed_receipt.zig");
+const c_file = @import("../util/c_file.zig");
 pub const download = @import("download.zig");
 pub const qwen3vl_catalog = @import("qwen3vl_catalog.zig");
 pub const qwen3_embedding_catalog = @import("qwen3_embedding_catalog.zig");
+pub const qwen3_reranker_catalog = @import("qwen3_reranker_catalog.zig");
 
 pub const ModelKind = enum {
     embedder,
     chunker,
     reranker,
     generator,
-    recognizer,
     classifier,
     rewriter,
     reader,
     transcriber,
+    /// GLiNER-style entity/relation/classification extraction models. Also
+    /// the discovery hint for the legacy `extractors/` subdirectory layout
+    /// (`inferModelKindFromPath`/`discoverLegacy`), so both the manifest-
+    /// declared and path-inferred routes to this kind now agree on one name.
     extractor,
 };
 
@@ -45,6 +54,7 @@ pub const ModelEntry = struct {
     kind: ModelKind,
     path: []const u8,
     variant: []const u8,
+    gliner_architecture: @import("../models/gliner_boundary.zig").Architecture = .unknown,
 };
 
 const DiscoverKindMode = enum {
@@ -56,12 +66,11 @@ test {
     _ = download;
     _ = qwen3vl_catalog;
     _ = qwen3_embedding_catalog;
+    _ = qwen3_reranker_catalog;
 }
 
-/// Friendly short names accepted by user-facing commands in place of a full
-/// HuggingFace `owner/name[:variant]` reference. Every entry selects a qualified
-/// production artifact explicitly rather than relying on repository contents
-/// to remain unambiguous.
+/// Legacy short names accepted by runtime lookup and chat. Pull requires an
+/// explicit HuggingFace `owner/name[:variant][@revision]` reference.
 pub const FriendlyAlias = struct {
     alias: []const u8,
     ref: []const u8,
@@ -71,35 +80,22 @@ pub const bge_m3_pinned_revision = "84790c1a606f60d06c6932e4ecdd174b466d84ac";
 pub const bge_m3_pinned_ref = "BAAI/bge-m3:safetensors@" ++ bge_m3_pinned_revision;
 
 pub const friendly_aliases = [_]FriendlyAlias{
-    .{ .alias = "bge-m3", .ref = bge_m3_pinned_ref },
+    .{ .alias = "bge-m3", .ref = "BAAI/bge-m3" },
     .{ .alias = "gemma4-e2b", .ref = "google/gemma-4-E2B-it-qat-q4_0-gguf:gguf" },
     .{ .alias = "gemma-4-e2b", .ref = "google/gemma-4-E2B-it-qat-q4_0-gguf:gguf" },
     .{ .alias = "gemma4-e2b-it", .ref = "google/gemma-4-E2B-it-qat-q4_0-gguf:gguf" },
     .{ .alias = "gemma4-e4b", .ref = "google/gemma-4-E4B-it-qat-q4_0-gguf:gguf" },
     .{ .alias = "gemma-4-e4b", .ref = "google/gemma-4-E4B-it-qat-q4_0-gguf:gguf" },
     .{ .alias = "gemma4-e4b-it", .ref = "google/gemma-4-E4B-it-qat-q4_0-gguf:gguf" },
-    .{ .alias = "qwen3-vl-2b", .ref = "Qwen/Qwen3-VL-2B-Instruct-GGUF:q4-k-m-bundle-v1" },
-    .{ .alias = "qwen3-vl-2b-bf16", .ref = "Qwen/Qwen3-VL-2B-Instruct:bf16-safetensors-bundle-v1" },
-    .{ .alias = "qwen3-vl-4b", .ref = "Qwen/Qwen3-VL-4B-Instruct-GGUF:q4-k-m-bundle-v1" },
-    .{ .alias = "qwen3-vl-8b", .ref = "Qwen/Qwen3-VL-8B-Instruct-GGUF:q4-k-m-bundle-v1" },
-    .{ .alias = "qwen3-vl-reranker-2b", .ref = "Qwen/Qwen3-VL-Reranker-2B:bf16-safetensors-bundle-v1" },
-    .{ .alias = "qwen3-embedding", .ref = "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1" },
-    .{ .alias = "qwen3-embedding-0.6b", .ref = "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1" },
-    .{ .alias = "qwen3-embedding-0.6b-f16", .ref = "Qwen/Qwen3-Embedding-0.6B-GGUF:f16-bundle-v1" },
-    .{ .alias = "qwen3-embedding-0.6b-safetensors", .ref = "Qwen/Qwen3-Embedding-0.6B:bf16-safetensors-bundle-v1" },
 };
 
-/// Resolve a friendly alias to its pinned `owner/name:variant` reference.
+/// Resolve a friendly alias to its public repository or explicit bundle reference.
 /// Returns null when the name is not a known alias (callers then treat it as
 /// a raw model reference or path).
 pub fn resolveFriendlyRef(name: []const u8) ?[]const u8 {
-    const without_hf = if (std.mem.startsWith(u8, name, "hf:")) name[3..] else name;
-    // BGE-M3 main currently publishes framework weights but no safetensors.
-    // Resolve the canonical repo reference to the qualified official commit so
-    // pull, local chat, and server lookup all share one immutable cache key.
-    if (std.ascii.eqlIgnoreCase(without_hf, "BAAI/bge-m3")) return bge_m3_pinned_ref;
+    const alias = if (std.mem.startsWith(u8, name, "hf:")) name[3..] else name;
     for (friendly_aliases) |entry| {
-        if (std.ascii.eqlIgnoreCase(entry.alias, name)) return entry.ref;
+        if (std.ascii.eqlIgnoreCase(entry.alias, alias)) return entry.ref;
     }
     return null;
 }
@@ -116,81 +112,75 @@ test "resolveFriendlyRef resolves gemma4 aliases case-insensitively" {
     try std.testing.expect(resolveFriendlyRef("ggml-org/gemma-4-e2b-it-gguf") == null);
 }
 
-test "resolveFriendlyRef pins BGE-M3 to the qualified safetensors commit" {
-    try std.testing.expectEqualStrings(bge_m3_pinned_ref, resolveFriendlyRef("bge-m3").?);
-    try std.testing.expectEqualStrings(bge_m3_pinned_ref, resolveFriendlyRef("BAAI/bge-m3").?);
-    try std.testing.expectEqualStrings(bge_m3_pinned_ref, resolveFriendlyRef("hf:BAAI/bge-m3").?);
+test "BGE-M3 alias uses main without rewriting canonical references" {
+    try std.testing.expectEqualStrings("BAAI/bge-m3", resolveFriendlyRef("bge-m3").?);
+    try std.testing.expect(resolveFriendlyRef("BAAI/bge-m3") == null);
+    try std.testing.expect(resolveFriendlyRef("hf:BAAI/bge-m3") == null);
     const ref = try ModelRef.parse(bge_m3_pinned_ref);
     try std.testing.expectEqualStrings("safetensors@" ++ bge_m3_pinned_revision, ref.variant);
 }
 
-test "friendly alias refs parse as explicit model refs" {
+test "friendly alias refs parse as public model refs" {
     for (friendly_aliases) |entry| {
         const ref = try ModelRef.parse(entry.ref);
         try std.testing.expect(ref.owner.len > 0);
         try std.testing.expect(ref.name.len > 0);
-        try std.testing.expect(!std.mem.eql(u8, "auto", ref.variant));
-        if (std.mem.eql(u8, entry.alias, "qwen3-vl-reranker-2b")) {
-            try std.testing.expectEqualStrings(qwen3vl_catalog.reranker_bundle_variant, ref.variant);
-        } else if (std.mem.eql(u8, entry.alias, "qwen3-vl-2b-bf16")) {
-            try std.testing.expectEqualStrings(qwen3vl_catalog.generation_safetensors_bundle_variant, ref.variant);
-        } else if (std.mem.startsWith(u8, entry.alias, "qwen3-vl-")) {
-            try std.testing.expectEqualStrings(qwen3vl_catalog.generation_bundle_variant, ref.variant);
-        } else if (std.mem.startsWith(u8, entry.alias, "qwen3-embedding")) {
-            try std.testing.expect(
-                qwen3_embedding_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant) != null,
-            );
-        } else if (std.mem.eql(u8, entry.alias, "bge-m3")) {
-            try std.testing.expectEqualStrings("safetensors@" ++ bge_m3_pinned_revision, ref.variant);
+        if (!std.mem.eql(u8, entry.alias, "bge-m3")) try std.testing.expect(!std.mem.eql(u8, "auto", ref.variant));
+        if (std.mem.eql(u8, entry.alias, "bge-m3")) {
+            try std.testing.expectEqualStrings("auto", ref.variant);
         } else {
             try std.testing.expectEqualStrings("gguf", ref.variant);
         }
     }
 }
 
-/// Pull accepts the public HuggingFace owner/model[:variant] syntax. Local
-/// command aliases must not silently select a different repository or bundle.
+/// Pull always names the public repository explicitly; format and revision
+/// selection must not depend on a friendly runtime alias.
 fn parsePullModelRef(value: []const u8) !ModelRef {
-    const ref = try ModelRef.parse(value);
-    // This repository's main branch has no safetensors; retain the canonical
-    // pull repair without accepting a short-name alias.
-    if (std.ascii.eqlIgnoreCase(ref.owner, "BAAI") and
-        std.ascii.eqlIgnoreCase(ref.name, "bge-m3") and
-        std.mem.eql(u8, ref.variant, "auto"))
-        return ModelRef.parse(bge_m3_pinned_ref);
-    return ref;
+    return ModelRef.parse(value);
 }
 
-test "pull uses canonical repository refs without short-name bundle aliases" {
-    const gguf = try parsePullModelRef("Qwen/Qwen3-Embedding-0.6B-GGUF");
-    try std.testing.expectEqualStrings("Qwen", gguf.owner);
-    try std.testing.expectEqualStrings("Qwen3-Embedding-0.6B-GGUF", gguf.name);
-    try std.testing.expectEqualStrings("auto", gguf.variant);
-    const safetensors = try parsePullModelRef("hf:Qwen/Qwen3-Embedding-0.6B:safetensors");
-    try std.testing.expectEqualStrings("safetensors", safetensors.variant);
-    try std.testing.expectError(error.InvalidModelRef, parsePullModelRef("qwen3-embedding-0.6b-safetensors"));
-    try std.testing.expectError(error.InvalidModelRef, parsePullModelRef("gemma4-e2b"));
+test "pull model refs require owner and model even for runtime aliases" {
+    const a = std.testing.allocator;
+    for (friendly_aliases) |entry| {
+        _ = try parseModelRefOrAlias(entry.alias);
+        _ = try parsePullModelRef(entry.ref);
+        for ([_][]const u8{ "", ":onnx", "@main", ":onnx@feature/export", "@feature/export" }) |suffix| {
+            const value = try std.fmt.allocPrint(a, "hf:{s}{s}", .{ entry.alias, suffix });
+            defer a.free(value);
+            try std.testing.expectError(error.InvalidModelRef, parsePullModelRef(value));
+            try std.testing.expectError(error.InvalidModelRef, parsePullModelRef(value[3..]));
+        }
+    }
 }
 
 fn parseModelRefOrAlias(value: []const u8) !ModelRef {
     return ModelRef.parse(resolveFriendlyRef(value) orelse value);
 }
 
-test "pull model refs accept friendly Qwen aliases" {
-    const generation = try parseModelRefOrAlias("qwen3-vl-2b");
-    try std.testing.expectEqualStrings("Qwen", generation.owner);
-    try std.testing.expectEqualStrings("Qwen3-VL-2B-Instruct-GGUF", generation.name);
-    try std.testing.expectEqualStrings(qwen3vl_catalog.generation_bundle_variant, generation.variant);
-
-    const bf16_generation = try parseModelRefOrAlias("qwen3-vl-2b-bf16");
-    try std.testing.expectEqualStrings("Qwen", bf16_generation.owner);
-    try std.testing.expectEqualStrings("Qwen3-VL-2B-Instruct", bf16_generation.name);
-    try std.testing.expectEqualStrings(qwen3vl_catalog.generation_safetensors_bundle_variant, bf16_generation.variant);
-
-    const reranker = try parseModelRefOrAlias("QWEN3-VL-RERANKER-2B");
-    try std.testing.expectEqualStrings("Qwen", reranker.owner);
-    try std.testing.expectEqualStrings("Qwen3-VL-Reranker-2B", reranker.name);
-    try std.testing.expectEqualStrings(qwen3vl_catalog.reranker_bundle_variant, reranker.variant);
+test "Qwen model refs require canonical repositories and preserve bundle variants" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "qwen3-vl-2b",                      "qwen3-vl-2b-bf16", "qwen3-vl-4b",          "qwen3-vl-8b",
+        "qwen3-vl-reranker-2b",             "qwen3-embedding",  "qwen3-embedding-0.6b", "qwen3-embedding-0.6b-f16",
+        "qwen3-embedding-0.6b-safetensors", "qwen3-reranker",   "qwen3-reranker-0.6b",  "qwen3-reranker-0.6b-safetensors",
+    }) |alias| {
+        try std.testing.expect(resolveFriendlyRef(alias) == null);
+        for ([_][]const u8{ "", "@main", ":gguf@feature/export" }) |suffix| {
+            const value = try std.fmt.allocPrint(a, "hf:{s}{s}", .{ alias, suffix });
+            defer a.free(value);
+            try std.testing.expectError(error.InvalidModelRef, parsePullModelRef(value));
+            try std.testing.expectError(error.InvalidModelRef, parseModelRefOrAlias(value));
+        }
+    }
+    const embedding = try parsePullModelRef("Qwen/Qwen3-Embedding-0.6B-GGUF:f16-bundle-v1");
+    try std.testing.expect(qwen3_embedding_catalog.findBundleForHubRef(embedding.owner, embedding.name, embedding.variant) != null);
+    const reranker = try parsePullModelRef("ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:q8-0-bundle-v1");
+    try std.testing.expect(qwen3_reranker_catalog.findBundleForHubRef(reranker.owner, reranker.name, reranker.variant) != null);
+    const explicit = try parsePullModelRef("Qwen/Qwen3-Embedding-0.6B-GGUF:f16-bundle-v1@main");
+    const parts = try download.parseVariantRevision(explicit.variant);
+    try std.testing.expectEqualStrings("f16-bundle-v1", parts.variant);
+    try std.testing.expectEqualStrings("main", parts.revision.?);
 }
 
 test "gemma4 qat gguf pulls derive the MTP assistant companion ref" {
@@ -231,6 +221,9 @@ pub const ModelRef = struct {
         if (std.mem.indexOfScalar(u8, input, ':')) |colon| {
             variant = input[colon + 1 ..];
             name_part = input[0..colon];
+        } else if (std.mem.indexOfScalar(u8, input, '@')) |at| {
+            variant = input[at..];
+            name_part = input[0..at];
         }
 
         if (std.mem.indexOfScalar(u8, name_part, '/')) |slash| {
@@ -260,19 +253,12 @@ fn hubRepoComponentIsSafe(component: []const u8) bool {
 }
 
 pub fn modelVariantIsSafe(variant: []const u8) bool {
-    if (variant.len == 0 or variant.len > 256 or
-        std.mem.indexOfAny(u8, variant, "/\\") != null)
-    {
-        return false;
-    }
-    var components = std.mem.splitScalar(u8, variant, ':');
+    if (variant.len == 0 or variant.len > 512) return false;
+    const parts = download.parseVariantRevision(variant) catch return false;
+    if (std.mem.indexOfAny(u8, parts.variant, "/\\") != null) return false;
+    var components = std.mem.splitScalar(u8, parts.variant, ':');
     while (components.next()) |component| {
-        if (component.len == 0 or
-            std.mem.eql(u8, component, ".") or
-            std.mem.eql(u8, component, ".."))
-        {
-            return false;
-        }
+        if (component.len == 0 or std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) return false;
         for (component) |byte| {
             if (byte < 0x20 or byte == 0x7f) return false;
         }
@@ -508,7 +494,7 @@ pub const ModelRegistry = struct {
         }
     }
 
-    /// Pull a model from HuggingFace Hub.
+    /// Pull a model from HuggingFace Hub, printing progress to stderr.
     pub fn pull(
         self: *ModelRegistry,
         io: std.Io,
@@ -518,6 +504,28 @@ pub const ModelRegistry = struct {
         capabilities_csv: ?[]const u8,
         projector_selection: download.ProjectorSelection,
     ) !void {
+        var progress = ProgressPrinter{};
+        return self.pullWithProgress(io, ref_str, hub_config, tasks_csv, capabilities_csv, projector_selection, .{
+            .callback = ProgressPrinter.onProgress,
+            .context = &progress,
+        });
+    }
+
+    /// Pull a model from HuggingFace Hub, reporting progress to `progress_sink`
+    /// on the calling thread.
+    pub fn pullWithProgress(
+        self: *ModelRegistry,
+        io: std.Io,
+        ref_str: []const u8,
+        hub_config: download.HubConfig,
+        tasks_csv: ?[]const u8,
+        capabilities_csv: ?[]const u8,
+        projector_selection: download.ProjectorSelection,
+        caller_sink: download.ProgressSink,
+    ) !void {
+        // Label every report with the model it belongs to.
+        var labeler = ProgressLabeler{ .inner = caller_sink, .model = ref_str };
+        const progress_sink = labeler.sink();
         const ref = try parsePullModelRef(ref_str);
         const resolved_models_dir = try resolveModelsDirForWriteAlloc(self.allocator, io, self.models_dir);
         defer self.allocator.free(resolved_models_dir);
@@ -540,11 +548,6 @@ pub const ModelRegistry = struct {
         var transaction = try download.ManagedModelTransaction.begin(self.allocator, io, dest);
         defer transaction.deinit(io);
 
-        var progress = ProgressPrinter{};
-        const progress_sink: download.ProgressSink = .{
-            .callback = ProgressPrinter.onProgress,
-            .context = &progress,
-        };
         if (qwen3vl_catalog.findGenerationBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle| {
             try download.downloadPinnedQwen3VlGenerationBundle(
                 self.allocator,
@@ -592,6 +595,18 @@ pub const ModelRegistry = struct {
                 hub_config,
                 progress_sink,
             );
+        } else if (qwen3_reranker_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle| {
+            try download.downloadPinnedQwen3RerankerBundle(
+                self.allocator,
+                io,
+                ref.owner,
+                ref.name,
+                ref.variant,
+                bundle,
+                transaction.staging,
+                hub_config,
+                progress_sink,
+            );
         } else {
             try download.downloadModel(
                 self.allocator,
@@ -607,7 +622,6 @@ pub const ModelRegistry = struct {
         }
         try self.writePulledModelManifest(io, transaction.staging, tasks_csv, capabilities_csv);
         try download.completeManagedDownload(self.allocator, io, transaction.staging);
-        try transaction.commit(io);
 
         // Gemma4 QAT gguf checkpoints ship a sibling MTP assistant repo that
         // enables self-speculative decoding; fetch it best-effort so the
@@ -615,7 +629,9 @@ pub const ModelRegistry = struct {
         // repos must not fail the primary pull. The companion never inherits
         // the caller's task/capability overrides (it is a drafter, not a
         // servable generator), and an already-installed companion is not
-        // re-fetched on primary re-pulls.
+        // re-fetched on primary re-pulls. It runs before the primary commits
+        // so that a cancellation during it leaves nothing installed; any
+        // other companion failure is logged and the primary still commits.
         if (try gemma4MtpAssistantCompanionRefAlloc(self.allocator, ref)) |companion_ref| {
             defer self.allocator.free(companion_ref);
             const companion_installed = blk: {
@@ -625,14 +641,20 @@ pub const ModelRegistry = struct {
                 break :blk isModelDir(io, companion_dest);
             };
             if (!companion_installed) {
-                self.pull(io, companion_ref, hub_config, null, null, projector_selection) catch |err| {
+                self.pullWithProgress(io, companion_ref, hub_config, null, null, projector_selection, caller_sink) catch |err| {
                     std.log.warn(
                         "optional Gemma4 MTP assistant pull failed for {s}: {s}",
                         .{ companion_ref, @errorName(err) },
                     );
                 };
+                // A cancel during the companion (from the progress callback or
+                // the task's Io) cancels the whole pull. Checked here rather
+                // than by error name because this call is recursive.
+                try progress_sink.checkCancelled();
+                try io.checkCancel();
             }
         }
+        try transaction.commit(io);
     }
 
     /// Companion MTP assistant ref for a Gemma4 QAT gguf model
@@ -672,10 +694,12 @@ pub const ModelRegistry = struct {
             return err;
         };
 
+        var gliner_architecture: @import("../models/gliner_boundary.zig").Architecture = .unknown;
         const kind = switch (kind_mode) {
             .manifest => blk: {
                 var manifest = try manifest_mod.loadFromDir(self.allocator, model_path);
                 defer manifest.deinit();
+                gliner_architecture = manifest.gliner_architecture;
                 break :blk modelKindFromManifestType(manifest.model_type);
             },
             .path => kind_hint orelse inferModelKindFromPath(model_path),
@@ -693,6 +717,7 @@ pub const ModelRegistry = struct {
             .kind = kind,
             .path = owned_path,
             .variant = "f32",
+            .gliner_architecture = gliner_architecture,
         });
     }
 
@@ -769,6 +794,27 @@ pub const ModelRegistry = struct {
             else => 0,
         };
     }
+
+    /// Forwards reports to `inner` with `model` set.
+    const ProgressLabeler = struct {
+        inner: download.ProgressSink,
+        model: []const u8,
+
+        fn sink(self: *ProgressLabeler) download.ProgressSink {
+            return .{
+                .callback = if (self.inner.callback != null) forward else null,
+                .context = self,
+                .cancelled = self.inner.cancelled,
+            };
+        }
+
+        fn forward(progress: download.DownloadProgress, raw: ?*anyopaque) void {
+            const self: *ProgressLabeler = @ptrCast(@alignCast(raw.?));
+            var labeled = progress;
+            labeled.model = self.model;
+            self.inner.callback.?(labeled, self.inner.context);
+        }
+    };
 
     const ProgressPrinter = struct {
         active_file: ?[]const u8 = null,
@@ -941,7 +987,7 @@ fn modelKindFromManifestType(model_type: manifest_mod.ModelType) ModelKind {
         .chunker => .chunker,
         .reranker => .reranker,
         .generator => .generator,
-        .recognizer => .recognizer,
+        .extractor => .extractor,
         .classifier => .classifier,
         .rewriter => .rewriter,
         .reader => .reader,
@@ -984,7 +1030,7 @@ fn modelTypeName(model_type: manifest_mod.ModelType) []const u8 {
         .chunker => "chunker",
         .reranker => "reranker",
         .generator => "generator",
-        .recognizer => "recognizer",
+        .extractor => "extractor",
         .classifier => "classifier",
         .rewriter => "rewriter",
         .reader => "reader",
@@ -1005,11 +1051,59 @@ fn appendUniqueOwnedString(
     try items.append(allocator, try allocator.dupe(u8, trimmed));
 }
 
+/// True only if the actual bytes just staged to `dest_dir`/the manifest's
+/// resolved paths match a reviewed row in
+/// models/gliner_boundary_qualification.zig's production table exactly:
+/// backbone, precision, and every one of the five weight/sidecar digests.
+/// This is a deliberate, one-time file read done at pull time -- it must
+/// never be called from a per-request listing path. Any missing file,
+/// unrecognized architecture, or parse failure fails closed to `false`
+/// rather than erroring the whole pull; a genuinely broken download is
+/// caught by the normal artifact validation elsewhere.
+///
+/// A directory produced by `antfly-inference-gliner25-convert` carries its
+/// own `gliner_boundary_bundle` receipt (`antfly_inference_bundle.json`),
+/// which is the only source of truth for which precision its `model.gguf`
+/// actually stores -- the manifest's `gguf_path` alone does not say. A plain
+/// HuggingFace pull never writes that receipt and is always the published
+/// fp32 `model.safetensors` checkpoint, so its identity is derived from that
+/// file directly, unchanged from before this function recognized converted
+/// bundles.
+fn boundaryIdentityIsQualified(allocator: std.mem.Allocator, manifest: *const manifest_mod.ModelManifest) bool {
+    if (manifest.gliner_architecture != .boundary) return false;
+    const config = manifest.gliner_boundary_config orelse return false;
+    const sidecars = manifest.boundarySidecarDigests() catch return false;
+    if (manifest.gliner_boundary_bundle) |receipt| {
+        const weight_path = manifest.gguf_path orelse return false;
+        var region = c_file.MmapRegion.init(allocator, weight_path) catch return false;
+        defer region.deinit();
+        const identity = boundary_bundle.Identity{
+            .backbone = config.backbone,
+            .precision = receipt.value.precision,
+            .weight = boundary_bundle.Digest.of(region.data),
+            .sidecars = sidecars,
+        };
+        return gliner_qualification.hasQualifiedIdentity(identity);
+    }
+    const weight_path = manifest.safetensors_path orelse return false;
+    var reader = safetensors_mod.MMapReader.openFileAbsolute(allocator, weight_path) catch return false;
+    defer reader.deinit();
+    const identity = boundary_bundle.Identity{
+        .backbone = config.backbone,
+        .precision = .fp32,
+        .weight = boundary_bundle.Digest.of(reader.file_bytes),
+        .sidecars = sidecars,
+    };
+    return gliner_qualification.hasQualifiedIdentity(identity);
+}
+
 fn appendManifestTasks(
     allocator: std.mem.Allocator,
     manifest: *const manifest_mod.ModelManifest,
     tasks: *std.ArrayListUnmanaged([]const u8),
+    qualified_boundary: bool,
 ) !void {
+    if (!manifest.hasSupportedGlinerRuntime() and !qualified_boundary) return;
     for (manifest.tasks) |task| try appendUniqueOwnedString(allocator, tasks, task);
 
     switch (manifest.model_type) {
@@ -1017,27 +1111,118 @@ fn appendManifestTasks(
         .chunker => try appendUniqueOwnedString(allocator, tasks, "chunk"),
         .reranker => try appendUniqueOwnedString(allocator, tasks, "rerank"),
         .generator => try appendUniqueOwnedString(allocator, tasks, "generate"),
-        .recognizer => try appendUniqueOwnedString(allocator, tasks, "extract"),
+        .extractor => try appendUniqueOwnedString(allocator, tasks, "extract"),
         .classifier => try appendUniqueOwnedString(allocator, tasks, "classify"),
         .rewriter => try appendUniqueOwnedString(allocator, tasks, "rewrite"),
         .reader => try appendUniqueOwnedString(allocator, tasks, "read"),
         .transcriber => try appendUniqueOwnedString(allocator, tasks, "transcribe"),
     }
 
-    try appendSupplementalTasks(allocator, manifest, tasks);
+    try appendSupplementalTasks(allocator, manifest, tasks, qualified_boundary);
 }
 
 fn appendSupplementalTasks(
     allocator: std.mem.Allocator,
     manifest: *const manifest_mod.ModelManifest,
     tasks: *std.ArrayListUnmanaged([]const u8),
+    qualified_boundary: bool,
 ) !void {
+    if (!manifest.hasSupportedGlinerRuntime() and !qualified_boundary) return;
     if (manifest.hasCapability("extraction")) {
         try appendUniqueOwnedString(allocator, tasks, "extract");
     }
     if (std.mem.eql(u8, manifest.gliner_model_type, "gliner2")) {
         try appendUniqueOwnedString(allocator, tasks, "extract");
     }
+}
+
+test "gliner boundary registry withholds tasks until runtime support exists" {
+    const allocator = std.testing.allocator;
+    var declared_tasks = [_][]const u8{"extract"};
+    var declared_capabilities = [_][]const u8{ "classification", "relations", "extraction" };
+    var manifest = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .model_type = .extractor,
+        .gliner_architecture = .boundary,
+        .tasks = &declared_tasks,
+        .capabilities = &declared_capabilities,
+    };
+    var tasks = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (tasks.items) |task| allocator.free(task);
+        tasks.deinit(allocator);
+    }
+    var capabilities = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (capabilities.items) |capability| allocator.free(capability);
+        capabilities.deinit(allocator);
+    }
+    // An unreviewed digest/variant: architecture is recognized as boundary,
+    // but nothing established that THIS artifact matches a production row,
+    // so synthesis must still withhold tasks and capabilities.
+    try appendManifestTasks(allocator, &manifest, &tasks, false);
+    try appendSupplementalTasks(allocator, &manifest, &tasks, false);
+    try appendInferredCapabilities(allocator, &manifest, &declared_tasks, &capabilities, false);
+    try std.testing.expectEqual(@as(usize, 0), tasks.items.len);
+    try std.testing.expectEqual(@as(usize, 0), capabilities.items.len);
+}
+
+test "gliner boundary registry serves tasks and derived capabilities once the artifact is qualified" {
+    const allocator = std.testing.allocator;
+    var declared_tasks = [_][]const u8{};
+    var declared_capabilities = [_][]const u8{};
+    var config = gliner_boundary.HeadConfig{};
+    var manifest = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .model_type = .extractor,
+        .gliner_architecture = .boundary,
+        .tasks = &declared_tasks,
+        .capabilities = &declared_capabilities,
+        .gliner_boundary_config = .{
+            .version = gliner_boundary.config_version,
+            .architecture_version = gliner_boundary.architecture_version,
+            .max_len = 4096,
+            .backbone = .base,
+            .head = config,
+            .encoder = undefined,
+        },
+    };
+    var tasks = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (tasks.items) |task| allocator.free(task);
+        tasks.deinit(allocator);
+    }
+    var capabilities = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (capabilities.items) |capability| allocator.free(capability);
+        capabilities.deinit(allocator);
+    }
+    // Caller has independently matched this artifact's exact consumed bytes
+    // against a production row (see boundaryIdentityIsQualified below); only
+    // then may synthesis advertise it.
+    try appendManifestTasks(allocator, &manifest, &tasks, true);
+    try appendInferredCapabilities(allocator, &manifest, tasks.items, &capabilities, true);
+    try std.testing.expect(taskListContains(tasks.items, "extract"));
+    try std.testing.expect(taskListContains(capabilities.items, "extraction"));
+    try std.testing.expect(taskListContains(capabilities.items, "classification"));
+    try std.testing.expect(taskListContains(capabilities.items, "relations"));
+    try std.testing.expect(taskListContains(capabilities.items, "records"));
+
+    // A head config that genuinely disables relations/records must not
+    // advertise capabilities the artifact itself does not implement.
+    for (tasks.items) |task| allocator.free(task);
+    tasks.clearRetainingCapacity();
+    for (capabilities.items) |cap| allocator.free(cap);
+    capabilities.clearRetainingCapacity();
+    config.enable_relations = false;
+    config.enable_records = false;
+    manifest.gliner_boundary_config.?.head = config;
+    try appendManifestTasks(allocator, &manifest, &tasks, true);
+    try appendInferredCapabilities(allocator, &manifest, tasks.items, &capabilities, true);
+    try std.testing.expect(taskListContains(tasks.items, "extract"));
+    try std.testing.expect(taskListContains(capabilities.items, "extraction"));
+    try std.testing.expect(!taskListContains(capabilities.items, "relations"));
+    try std.testing.expect(!taskListContains(capabilities.items, "records"));
 }
 
 fn taskListContains(tasks: []const []const u8, needle: []const u8) bool {
@@ -1065,11 +1250,25 @@ fn appendInferredCapabilities(
     manifest: *const manifest_mod.ModelManifest,
     tasks: []const []const u8,
     capabilities: *std.ArrayListUnmanaged([]const u8),
+    qualified_boundary: bool,
 ) !void {
+    if (!manifest.hasSupportedGlinerRuntime() and !qualified_boundary) return;
     for (manifest.capabilities) |cap| try appendUniqueOwnedString(allocator, capabilities, cap);
 
     if (taskListContains(tasks, "embed") and manifest.sparse_3d_output_layout != null) {
         try appendUniqueOwnedString(allocator, capabilities, "sparse");
+    }
+
+    // Entity extraction and classification are structural to every boundary
+    // checkpoint; relations and records are declared per artifact in its own
+    // reviewed config.json and only advertised when that config enables them.
+    if (qualified_boundary) {
+        try appendUniqueOwnedString(allocator, capabilities, "extraction");
+        try appendUniqueOwnedString(allocator, capabilities, "classification");
+        if (manifest.gliner_boundary_config) |config| {
+            if (config.head.enable_relations) try appendUniqueOwnedString(allocator, capabilities, "relations");
+            if (config.head.enable_records) try appendUniqueOwnedString(allocator, capabilities, "records");
+        }
     }
 }
 
@@ -1103,8 +1302,20 @@ fn normalizeTaskHint(raw_task: []const u8) []const u8 {
         "transcribe"
     else if (std.mem.eql(u8, raw_task, "extractors"))
         "extract"
+    else if (std.mem.eql(u8, raw_task, "vads") or std.mem.eql(u8, raw_task, "voice-activity"))
+        "vad"
     else
         raw_task;
+}
+
+/// Voice activity detection models (Silero) are frame classifiers over audio.
+/// They keep the classifier registry kind but advertise the `vad` task and an
+/// audio input so dictation and session requests can find them.
+pub const vad_task = "vad";
+
+fn tasksIncludeVad(tasks: []const []const u8) bool {
+    for (tasks) |task| if (std.mem.eql(u8, task, vad_task)) return true;
+    return false;
 }
 
 fn appendCsvCapabilities(
@@ -1163,7 +1374,7 @@ fn appendInferredInputs(
             if (has_visual) try appendUniqueOwnedString(allocator, inputs, "image");
             if (has_audio) try appendUniqueOwnedString(allocator, inputs, "audio");
         },
-        .chunker, .reranker, .generator, .recognizer, .classifier, .rewriter => {
+        .chunker, .reranker, .generator, .extractor, .classifier, .rewriter => {
             try appendUniqueOwnedString(allocator, inputs, "text");
             if (effective_type == .generator and has_visual) {
                 try appendUniqueOwnedString(allocator, inputs, "image");
@@ -1221,8 +1432,9 @@ fn appendJsonStringArray(
 
 fn manifestTypeFromTasks(tasks: []const []const u8, fallback: manifest_mod.ModelType) manifest_mod.ModelType {
     for (tasks) |task| {
-        if (std.mem.eql(u8, task, "extract") or std.mem.eql(u8, task, "extractors")) return .recognizer;
+        if (std.mem.eql(u8, task, "extract") or std.mem.eql(u8, task, "extractors")) return .extractor;
     }
+    if (tasksIncludeVad(tasks)) return .classifier;
     for (tasks) |task| {
         if (std.mem.eql(u8, task, "rerank") or std.mem.eql(u8, task, "rerankers")) return .reranker;
     }
@@ -1250,7 +1462,14 @@ fn manifestTypeFromTasks(tasks: []const []const u8, fallback: manifest_mod.Model
     return fallback;
 }
 
-fn synthesizePulledModelManifestJson(
+/// Synthesize `model_manifest.json` contents for an already-published,
+/// fully-materialized model directory (as opposed to
+/// `synthesizePulledModelManifestJsonFromPlan`, which reads a `pull`
+/// transaction's staging plan). Exported so a local conversion tool (for
+/// example `gliner25-convert`, which never goes through `pull`'s network/
+/// staging path) can synthesize the same reviewed-identity-gated manifest
+/// for a directory it just finished writing to disk.
+pub fn synthesizePulledModelManifestJson(
     allocator: std.mem.Allocator,
     dest_dir: []const u8,
     tasks_csv: ?[]const u8,
@@ -1295,6 +1514,15 @@ fn synthesizePulledModelManifestJsonInternal(
     };
     defer manifest.deinit();
 
+    // A one-time, pull-scoped check: hash the actual downloaded weight file
+    // and compare it against the reviewed production table. This must never
+    // run on the per-request listing path (loadListingFromDir), only here,
+    // where the artifact was just staged to disk.
+    const qualified_boundary = boundaryIdentityIsQualified(allocator, &manifest);
+
+    if (!manifest.hasSupportedGlinerRuntime() and !qualified_boundary and (tasks_csv != null or capabilities_csv != null))
+        return error.UnsupportedGlinerBoundaryRuntime;
+
     var tasks = std.ArrayListUnmanaged([]const u8).empty;
     defer {
         for (tasks.items) |task| allocator.free(task);
@@ -1302,9 +1530,9 @@ fn synthesizePulledModelManifestJsonInternal(
     }
     if (tasks_csv) |csv| {
         try appendCsvTasks(allocator, &tasks, csv);
-        try appendSupplementalTasks(allocator, &manifest, &tasks);
+        try appendSupplementalTasks(allocator, &manifest, &tasks, qualified_boundary);
     } else {
-        try appendManifestTasks(allocator, &manifest, &tasks);
+        try appendManifestTasks(allocator, &manifest, &tasks, qualified_boundary);
     }
 
     const manifest_type = manifestTypeFromTasks(tasks.items, manifest.model_type);
@@ -1314,14 +1542,17 @@ fn synthesizePulledModelManifestJsonInternal(
         for (inputs.items) |input| allocator.free(input);
         inputs.deinit(allocator);
     }
-    try appendInferredInputs(allocator, &manifest, manifest_type, &inputs);
+    if (tasksIncludeVad(tasks.items))
+        try appendUniqueOwnedString(allocator, &inputs, "audio")
+    else
+        try appendInferredInputs(allocator, &manifest, manifest_type, &inputs);
 
     var capabilities = std.ArrayListUnmanaged([]const u8).empty;
     defer {
         for (capabilities.items) |cap| allocator.free(cap);
         capabilities.deinit(allocator);
     }
-    try appendInferredCapabilities(allocator, &manifest, tasks.items, &capabilities);
+    try appendInferredCapabilities(allocator, &manifest, tasks.items, &capabilities, qualified_boundary);
     if (capabilities_csv) |csv| try appendCsvCapabilities(allocator, &capabilities, csv);
 
     const sparse_3d_output_layout = inferredSparse3DOutputLayout(&manifest);
@@ -1712,6 +1943,32 @@ test "synthesized pulled manifest accepts plural task directory hints" {
     try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"capabilities\"") == null);
 }
 
+test "synthesized pulled manifest records a vad task as an audio classifier" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "models/silero-vad/onnx");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/silero-vad/config.json",
+        .data = "{}",
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/silero-vad/onnx/model.onnx", .data = "" });
+
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "models/silero-vad" });
+    defer allocator.free(model_dir);
+
+    const manifest_json = try synthesizePulledModelManifestJson(allocator, model_dir, "vad", null);
+    defer allocator.free(manifest_json);
+
+    try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"type\":\"classifier\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"tasks\":[\"vad\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"inputs\":[\"audio\"]") != null);
+    try std.testing.expectEqualStrings("vad", normalizeTaskHint("vads"));
+}
+
 test "synthesized pulled manifest keeps generate read gguf as generator" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -2078,4 +2335,42 @@ test "pull preserves the pinned Qwen3 BF16 executable profile through manifest f
     try std.testing.expectEqual(manifest_mod.ModelType.embedder, loaded.model_type);
     try std.testing.expect(loaded.embedding_profile.isResolved());
     try std.testing.expectEqual(manifest_mod.PoolingStrategy.last, loaded.pooling);
+}
+
+test "model refs accept independent formats and revisions" {
+    for ([_][]const u8{ "BAAI/bge-m3@main", "BAAI/bge-m3:onnx@feature/export", "BAAI/bge-m3:onnx@v1.0", "hf:BAAI/bge-m3@main" }) |raw| {
+        const ref = try ModelRef.parse(raw);
+        try std.testing.expectEqualStrings("BAAI", ref.owner);
+        try std.testing.expectEqualStrings("bge-m3", ref.name);
+        const requested = try download.parseVariantRevision(ref.variant);
+        try std.testing.expect(requested.revision != null);
+    }
+    try std.testing.expectError(error.InvalidModelRef, ModelRef.parse("BAAI/bge-m3:onnx@../../main"));
+    try std.testing.expectError(error.InvalidModelRef, ModelRef.parse("BAAI/bge-m3:onnx@main?x=1"));
+}
+
+test "pull progress reports carry the model they belong to" {
+    const Capture = struct {
+        model: []const u8 = "",
+        file: []const u8 = "",
+        fn report(progress: download.DownloadProgress, raw: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.model = progress.model;
+            self.file = progress.file;
+        }
+    };
+    var capture = Capture{};
+    var cancelled = std.atomic.Value(bool).init(false);
+    const caller: download.ProgressSink = .{ .callback = Capture.report, .context = &capture, .cancelled = &cancelled };
+    var labeler = ModelRegistry.ProgressLabeler{ .inner = caller, .model = "owner/companion" };
+    const sink = labeler.sink();
+    sink.callback.?(.{ .file = "model.gguf", .bytes_downloaded = 0, .total_bytes = null, .files_done = 0, .files_total = 1 }, sink.context);
+    try std.testing.expectEqualStrings("owner/companion", capture.model);
+    try std.testing.expectEqualStrings("model.gguf", capture.file);
+    // Cancellation still reaches the download through the labeled sink.
+    cancelled.store(true, .release);
+    try std.testing.expectError(error.Canceled, sink.checkCancelled());
+    // A caller without a callback gets none.
+    var bare = ModelRegistry.ProgressLabeler{ .inner = .{}, .model = "owner/model" };
+    try std.testing.expect(bare.sink().callback == null);
 }

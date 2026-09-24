@@ -369,6 +369,22 @@ pub const Reconciler = struct {
         defer manager.freeSplitTransitions(self.alloc, desired_splits);
         const desired_merges = try manager.listDesiredMergeTransitions(self.alloc);
         defer manager.freeMergeTransitions(self.alloc, desired_merges);
+        for (desired_splits) |*record| {
+            if (findSplitRecord(current.split_transitions, record.transition_id) == null) {
+                @import("relational_topology_admission.zig").prepare(self.alloc, &record.table_contract, current.stores) catch |err| switch (err) {
+                    error.RelationalTopologyProtocolUpgradeRequired, error.RelationalTopologyMigrationUnsupported => record.table_contract.integrity_protocol = .none,
+                    else => return err,
+                };
+            }
+        }
+        for (desired_merges) |*record| {
+            if (findMergeRecord(current.merge_transitions, record.transition_id) == null) {
+                @import("relational_topology_admission.zig").prepare(self.alloc, &record.table_contract, current.stores) catch |err| switch (err) {
+                    error.RelationalTopologyProtocolUpgradeRequired, error.RelationalTopologyMigrationUnsupported => record.table_contract.integrity_protocol = .none,
+                    else => return err,
+                };
+            }
+        }
         const split_provisioning_ranges = try allocSplitProvisioningRanges(self.alloc, desired_ranges, desired_splits);
         defer self.alloc.free(split_provisioning_ranges);
 
@@ -531,8 +547,10 @@ pub const Reconciler = struct {
                 }
             }
         }
+        var schema_readiness = try SchemaMigrationReadiness.init(self.alloc, current, desired_tables);
+        defer schema_readiness.deinit();
         for (desired_tables) |*desired| {
-            try maybeFinalizeSchemaMigration(self.alloc, current, desired);
+            try maybeFinalizeSchemaMigration(self.alloc, &schema_readiness, desired);
             const existing = findTableRecord(current.tables, desired.table_id);
             if (existing == null or !tableRecordsEqual(existing.?, desired.*)) {
                 if (active_transition_contracts.get(desired.table_id)) |contract| {
@@ -589,6 +607,9 @@ pub const Reconciler = struct {
         for (desired_splits) |desired| {
             const existing = findSplitRecord(current.split_transitions, desired.transition_id);
             if (existing == null) {
+                if (desired.table_contract.integrity_protocol == .none and
+                    (try @import("relational_topology_admission.zig").coordinated(self.alloc, desired.table_contract.schema_json) or
+                        try @import("relational_topology_admission.zig").coordinated(self.alloc, desired.table_contract.read_schema_json))) continue;
                 try desired.table_contract.validateForSplit();
                 const current_table = findTableRecord(
                     current.tables,
@@ -643,6 +664,9 @@ pub const Reconciler = struct {
         for (desired_merges) |desired| {
             const existing = findMergeRecord(current.merge_transitions, desired.transition_id);
             if (existing == null) {
+                if (desired.table_contract.integrity_protocol == .none and
+                    (try @import("relational_topology_admission.zig").coordinated(self.alloc, desired.table_contract.schema_json) or
+                        try @import("relational_topology_admission.zig").coordinated(self.alloc, desired.table_contract.read_schema_json))) continue;
                 desired.table_contract.validateForMerge(
                     desired.allow_doc_identity_reassignment,
                 ) catch continue;
@@ -1349,6 +1373,10 @@ fn backupRestoreBootstrapEqual(
         std.mem.eql(u8, a.?.location, b.?.location) and
         std.mem.eql(u8, a.?.snapshot_path, b.?.snapshot_path) and
         std.mem.eql(u8, a.?.connection, b.?.connection) and
+        std.mem.eql(u8, a.?.destination_table_name, b.?.destination_table_name) and
+        a.?.destination_table_id == b.?.destination_table_id and
+        a.?.destination_shard_id == b.?.destination_shard_id and
+        a.?.destination_range_id == b.?.destination_range_id and
         a.?.artifact_size_bytes == b.?.artifact_size_bytes and
         std.mem.eql(u8, a.?.artifact_sha256, b.?.artifact_sha256) and
         a.?.native_manifest_size_bytes == b.?.native_manifest_size_bytes and
@@ -1475,6 +1503,10 @@ fn normalizeRestoreBootstrapIntent(
         effective.record.bootstrap_mode = .fetch_snapshot;
         effective.record.snapshot_bootstrap = null;
         effective.record.backup_restore_bootstrap = .{
+            .destination_table_name = table.name,
+            .destination_table_id = table.table_id,
+            .destination_shard_id = table_manager.rangeDocIdentityShardId(range),
+            .destination_range_id = table_manager.rangeDocIdentityRangeId(range),
             .backup_id = range.restore_backup_id,
             .artifact_backup_id = range.restore_artifact_backup_id,
             .location = range.restore_location,
@@ -3469,6 +3501,7 @@ const ActiveTransitionContractIndex = struct {
         table_id: u64,
         table_name: []const u8,
         schema_json: []const u8,
+        read_schema_json: []const u8,
         indexes_json: []const u8,
 
         fn fromContract(
@@ -3478,6 +3511,7 @@ const ActiveTransitionContractIndex = struct {
                 .table_id = contract.table_id,
                 .table_name = contract.table_name,
                 .schema_json = contract.schema_json,
+                .read_schema_json = contract.read_schema_json,
                 .indexes_json = contract.indexes_json,
             };
         }
@@ -3486,6 +3520,7 @@ const ActiveTransitionContractIndex = struct {
             return self.table_id == other.table_id and
                 std.mem.eql(u8, self.table_name, other.table_name) and
                 std.mem.eql(u8, self.schema_json, other.schema_json) and
+                std.mem.eql(u8, self.read_schema_json, other.read_schema_json) and
                 std.mem.eql(u8, self.indexes_json, other.indexes_json);
         }
 
@@ -3496,6 +3531,7 @@ const ActiveTransitionContractIndex = struct {
             return table.table_id == self.table_id and
                 std.mem.eql(u8, table.name, self.table_name) and
                 std.mem.eql(u8, table.schema_json, self.schema_json) and
+                std.mem.eql(u8, table.read_schema_json, self.read_schema_json) and
                 std.mem.eql(u8, table.indexes_json, self.indexes_json);
         }
     };
@@ -3720,6 +3756,7 @@ fn tableMatchesTransitionContract(
     return table.table_id == contract.table_id and
         std.mem.eql(u8, table.name, contract.table_name) and
         std.mem.eql(u8, table.schema_json, contract.schema_json) and
+        std.mem.eql(u8, table.read_schema_json, contract.read_schema_json) and
         std.mem.eql(u8, table.indexes_json, contract.indexes_json);
 }
 
@@ -3790,15 +3827,60 @@ fn tableRecordsEqual(a: table_manager.TableRecord, b: table_manager.TableRecord)
         std.mem.eql(u8, a.name, b.name);
 }
 
+/// One immutable readiness view per reconciliation round. Each placement and
+/// acknowledgement is visited once, independent of the number of migrations.
+const SchemaMigrationReadiness = struct {
+    arena: std.heap.ArenaAllocator,
+    tables: std.AutoHashMapUnmanaged(u64, State) = .empty,
+    const State = struct {
+        version: u32,
+        hosts: usize = 0,
+        missing: usize = 0,
+        fn ready(self: State) bool {
+            return self.hosts != 0 and self.missing == 0;
+        }
+    };
+    fn deinit(self: *SchemaMigrationReadiness) void {
+        self.arena.deinit();
+    }
+    fn init(alloc: std.mem.Allocator, current: CurrentMetadataState, desired_tables: []const table_manager.TableRecord) !SchemaMigrationReadiness {
+        var result: SchemaMigrationReadiness = .{ .arena = std.heap.ArenaAllocator.init(alloc) };
+        errdefer result.deinit();
+        const a = result.arena.allocator();
+        for (desired_tables) |table| {
+            if (table.read_schema_json.len == 0) continue;
+            try result.tables.put(a, table.table_id, .{ .version = try schemaVersion(a, table.schema_json) });
+        }
+        if (result.tables.count() == 0) return result;
+        var ranges: std.AutoHashMapUnmanaged(u64, u64) = .empty;
+        for (current.ranges) |range| try ranges.put(a, range.group_id, range.table_id);
+        var progress: std.AutoHashMapUnmanaged(struct { table_id: u64, node_id: u64, version: u32 }, void) = .empty;
+        for (current.schema_progresses) |record| try progress.put(a, .{ .table_id = record.table_id, .node_id = record.node_id, .version = record.schema_version }, {});
+        const HostKey = struct { table_id: u64, node_id: u64 };
+        var hosts: std.AutoHashMapUnmanaged(HostKey, void) = .empty;
+        for (current.placement_intents) |intent| {
+            const table_id = ranges.get(intent.record.group_id) orelse continue;
+            const state = result.tables.getPtr(table_id) orelse continue;
+            const key: HostKey = .{ .table_id = table_id, .node_id = intent.record.local_node_id };
+            const entry = try hosts.getOrPut(a, key);
+            if (entry.found_existing) continue;
+            state.hosts += 1;
+            if (!progress.contains(.{ .table_id = table_id, .node_id = key.node_id, .version = state.version })) state.missing += 1;
+        }
+        return result;
+    }
+};
+
 fn maybeFinalizeSchemaMigration(
     alloc: std.mem.Allocator,
-    current: CurrentMetadataState,
+    readiness: *const SchemaMigrationReadiness,
     desired: *table_manager.TableRecord,
 ) !void {
     if (desired.read_schema_json.len == 0) return;
 
-    const target_version = try schemaVersion(alloc, desired.schema_json);
-    if (!try schemaMigrationReady(alloc, current, desired.table_id, target_version)) return;
+    const state = readiness.tables.get(desired.table_id) orelse return;
+    if (!state.ready()) return;
+    const target_version = state.version;
 
     const read_version = try schemaVersion(alloc, desired.read_schema_json);
     if (read_version != target_version) {
@@ -3810,7 +3892,8 @@ fn maybeFinalizeSchemaMigration(
     desired.read_schema_json = try alloc.dupe(u8, "");
 }
 
-fn schemaMigrationReady(
+// Retained solely as the workload equality oracle.
+fn schemaMigrationReadyReference(
     alloc: std.mem.Allocator,
     current: CurrentMetadataState,
     table_id: u64,
@@ -3986,6 +4069,9 @@ fn allocSplitProvisioningRanges(
     var out = std.ArrayListUnmanaged(table_manager.RangeRecord).empty;
     errdefer out.deinit(alloc);
     for (splits) |split| {
+        if (split.table_contract.integrity_protocol == .none and
+            (try @import("relational_topology_admission.zig").coordinated(alloc, split.table_contract.schema_json) or
+                try @import("relational_topology_admission.zig").coordinated(alloc, split.table_contract.read_schema_json))) continue;
         if (findRangeRecord(ranges, split.destination_group_id) != null) continue;
         const source = findRangeRecord(ranges, split.source_group_id) orelse continue;
         const split_key = split.split_key orelse continue;
@@ -4009,6 +4095,7 @@ fn cloneMergeRecord(alloc: std.mem.Allocator, record: transition_state.MergeTran
         owned_contract.deinitOwned(alloc);
     }
     return .{
+        .online = record.online,
         .transition_id = record.transition_id,
         .donor_group_id = record.donor_group_id,
         .receiver_group_id = record.receiver_group_id,
@@ -4032,7 +4119,7 @@ fn splitRecordsEqual(a: transition_state.SplitTransitionRecord, b: transition_st
 }
 
 fn mergeRecordsEqual(a: transition_state.MergeTransitionRecord, b: transition_state.MergeTransitionRecord) bool {
-    return a.transition_id == b.transition_id and
+    return std.meta.eql(a.online, b.online) and a.transition_id == b.transition_id and
         a.donor_group_id == b.donor_group_id and
         a.receiver_group_id == b.receiver_group_id and
         a.phase == b.phase and
@@ -4188,6 +4275,39 @@ test "metadata reconciler publishes table contracts before admitting transitions
     try std.testing.expectEqual(@as(u64, 0), admission_plan.split_admissions[0].expected_source_epoch);
     try std.testing.expectEqual(@as(usize, 0), admission_plan.split_upserts.len);
     try std.testing.expectEqual(@as(usize, 1), admission_plan.merge_upserts.len);
+}
+
+test "relational topology admission leaves unavailable transitions pending without blocking catalog work" {
+    const alloc = std.testing.allocator;
+    var manager = table_manager.TableManager.init(alloc);
+    defer manager.deinit();
+    const constrained: table_manager.TableRecord = .{ .table_id = 10, .name = "rows", .schema_json = "{\"unique_constraints\":[{\"name\":\"pk\"}]}" };
+    const range: table_manager.RangeRecord = .{ .group_id = 101, .table_id = 10, .start_key = "" };
+    try manager.upsertTable(constrained);
+    try manager.upsertTable(.{ .table_id = 11, .name = "unrelated" });
+    try manager.upsertRange(range);
+    try manager.requestSplit(.{ .transition_id = 9001, .table_id = 10, .source_group_id = 101, .destination_group_id = 102, .split_key = "m" });
+    const requested_splits = try manager.listDesiredSplitTransitions(alloc);
+    defer manager.freeSplitTransitions(alloc, requested_splits);
+    const blocked_provisioning = try allocSplitProvisioningRanges(alloc, &.{range}, requested_splits);
+    defer alloc.free(blocked_provisioning);
+    try std.testing.expectEqual(@as(usize, 0), blocked_provisioning.len);
+    var reconciler = Reconciler.init(alloc);
+    var pending = try reconciler.computePlan(&manager, &.{}, &.{}, .{ .tables = &.{constrained}, .ranges = &.{range} });
+    defer pending.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), pending.split_admissions.len);
+    try std.testing.expectEqual(@as(usize, 1), pending.table_upserts.len);
+    const capable: table_manager.StoreRecord = .{ .store_id = 1, .node_id = 1, .reporter_incarnation = 8, .relational_topology_protocol_version = 1 };
+    var ready = try reconciler.computePlan(&manager, &.{}, &.{}, .{ .tables = &.{constrained}, .ranges = &.{range}, .stores = &.{capable} });
+    defer ready.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), ready.split_admissions.len);
+    try std.testing.expectEqual(.distributed_quiescent_v1, ready.split_admissions[0].record.table_contract.integrity_protocol);
+    var migrating = constrained;
+    migrating.read_schema_json = "{}";
+    try manager.upsertTable(migrating);
+    var migration = try reconciler.computePlan(&manager, &.{}, &.{}, .{ .tables = &.{migrating}, .ranges = &.{range}, .stores = &.{capable} });
+    defer migration.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), migration.split_admissions.len);
 }
 
 test "metadata reconciler provisions split destination without publishing overlapping range" {
@@ -9754,4 +9874,65 @@ test "metadata reconciler skips automatic split when live median key lookup fail
     defer plan.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 0), plan.split_upserts.len);
+}
+
+test "system catalog migration finalization matches scan and scales across tenant migrations" {
+    const benchmark = std.c.getenv("ANTFLY_CATALOG_REPORT_BENCH") != null;
+    const a = if (benchmark) std.heap.c_allocator else std.testing.allocator;
+    const table_count: usize = if (benchmark) 100 else 4;
+    const group_count: usize = if (benchmark) 1000 else 12;
+    const tables = try a.alloc(table_manager.TableRecord, table_count + 1);
+    defer a.free(tables);
+    for (tables, 0..) |*table, i| table.* = .{ .table_id = i + 1, .name = "tenant", .schema_json = "{\"version\":1}", .read_schema_json = "{\"version\":0}" };
+    const ranges = try a.alloc(table_manager.RangeRecord, group_count);
+    defer a.free(ranges);
+    const placements = try a.alloc(raft_reconciler.PlacementIntent, group_count * 3);
+    defer a.free(placements);
+    for (ranges, 0..) |*range, i| {
+        range.* = .{ .group_id = i + 100, .table_id = i % table_count + 1, .start_key = "" };
+        for (0..3) |node| placements[i * 3 + node] = .{ .record = .{ .group_id = range.group_id, .replica_id = node + 1, .local_node_id = node + 1 }, .store_id = node + 1 };
+    }
+    const progress = try a.alloc(table_manager.SchemaProgressRecord, table_count * 3);
+    defer a.free(progress);
+    for (progress, 0..) |*record, i| record.* = .{ .table_id = i / 3 + 1, .node_id = i % 3 + 1, .schema_version = 1 };
+    var current: CurrentMetadataState = .{ .tables = tables, .ranges = ranges, .placement_intents = placements, .schema_progresses = progress };
+    var reference_ns: [5]u64 = undefined;
+    var indexed_ns: [5]u64 = undefined;
+    for (0..if (benchmark) @as(usize, 6) else 1) |sample| {
+        const expected = try a.alloc(bool, tables.len);
+        defer a.free(expected);
+        const start = platform_time.monotonicNs();
+        for (tables, expected) |table, *ready| ready.* = try schemaMigrationReadyReference(a, current, table.table_id, 1);
+        const middle = platform_time.monotonicNs();
+        var index = try SchemaMigrationReadiness.init(a, current, tables);
+        defer index.deinit();
+        for (tables, expected) |table, ready| try std.testing.expectEqual(ready, index.tables.get(table.table_id).?.ready());
+        const end = platform_time.monotonicNs();
+        try std.testing.expect(!index.tables.get(table_count + 1).?.ready());
+        if (benchmark and sample > 0) {
+            reference_ns[sample - 1] = middle - start;
+            indexed_ns[sample - 1] = end - middle;
+        }
+    }
+    // An old-version acknowledgement and an absent node both withhold cutover.
+    progress[0].schema_version = 0;
+    current.schema_progresses = progress[0 .. progress.len - 1];
+    var partial = try SchemaMigrationReadiness.init(a, current, tables);
+    defer partial.deinit();
+    for (tables) |table| try std.testing.expectEqual(try schemaMigrationReadyReference(a, current, table.table_id, 1), partial.tables.get(table.table_id).?.ready());
+    try std.testing.expect(!partial.tables.get(1).?.ready());
+    try std.testing.expect(!partial.tables.get(table_count).?.ready());
+    if (benchmark) std.debug.print("MIGRATION_FINALIZATION_BENCH tables={d} ranges={d} placements={d} scan_ns={any} indexed_ns={any}\n", .{ tables.len, ranges.len, placements.len, reference_ns, indexed_ns });
+}
+
+test "system catalog migration finalization releases partial index allocations" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const tables = [_]table_manager.TableRecord{.{ .table_id = 1, .name = "tenant", .schema_json = "{\"version\":1}", .read_schema_json = "{\"version\":0}" }};
+            var index = try SchemaMigrationReadiness.init(a, .{ .ranges = &.{.{ .group_id = 100, .table_id = 1, .start_key = "" }}, .placement_intents = &.{.{ .record = .{ .group_id = 100, .replica_id = 1, .local_node_id = 3 }, .store_id = 3 }}, .schema_progresses = &.{.{ .table_id = 1, .node_id = 3, .schema_version = 1 }} }, &tables);
+            defer index.deinit();
+            try std.testing.expect(index.tables.get(1).?.ready());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }

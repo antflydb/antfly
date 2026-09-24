@@ -97,7 +97,7 @@ pub const RerankerConfig = struct {
     provider: RerankerProvider,
     /// Field name to extract from documents for reranking.
     field: ?[]const u8 = null,
-    /// Handlebars template to render document text for reranking.
+    /// Handlebars template that renders each candidate for reranking. The `media` and `remoteMedia` helpers add images, which are sent to the reranker alongside the rendered text; only an Antfly reranker whose model accepts images can score them, and any other reranker rejects the query with `400`.
     template: ?[]const u8 = null,
     /// Optional provider model name. When omitted, the selected provider's documented default is used.
     model: ?[]const u8 = null,

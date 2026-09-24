@@ -218,7 +218,7 @@ pub const DisjunctionQuery = struct {
     disjuncts: []const Query,
     boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
     /// Minimum number of disjuncts that must match. Omit for conventional disjunction semantics; set to 0 to make a pure disjunction optional.
-    min: ?i64 = null,
+    min: ?u32 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -701,7 +701,7 @@ pub const MatchPhraseQuery = struct {
     }
 };
 
-/// Analyze the text with the field's analyzer and match any of the resulting terms. On a `substring` companion field (`fieldName._substring`) the text is lowercased and matched as a contained substring instead: `{"match": "g3we", "field": "sku._substring"}` finds `RAG3-WEAVER`.
+/// Analyze the text with the field's analyzer and match any of the resulting terms. On a `substring` companion field (`fieldName._substring`) the text is lowercased and matched as a contained substring instead: `{"match": "g3we", "field": "sku._substring"}` finds `RAG3-WEAVER`. `match_phrase` on a companion behaves the same way.
 pub const MatchQuery = struct {
     match: []const u8,
     field: ?[]const u8 = null,

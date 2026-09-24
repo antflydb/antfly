@@ -185,11 +185,18 @@ type QueryRequest struct {
 	// SemanticSearch text to use for semantic similarity search
 	SemanticSearch string `json:"semantic_search,omitempty"`
 
-	// DocumentRenderer optional Go template string for rendering document content to the prompt
+	// DocumentRenderer is not supported on queries, which do not generate text;
+	// set document_renderer on a retrieval agent request instead.
 	DocumentRenderer string `json:"document_renderer,omitempty"`
 
 	// GraphQueries contains declarative graph matching, traversal, and path queries.
 	GraphQueries map[string]GraphQuery `json:"graph_queries,omitempty"`
+
+	// GraphMetric reads one globally ranked, published graph metric generation.
+	GraphMetric *GraphMetricQuery `json:"graph_metric,omitempty"`
+
+	// GraphMetricRerank blends a published graph metric into search hit scores.
+	GraphMetricRerank *GraphMetricRerank `json:"graph_metric_rerank,omitempty"`
 
 	// Hierarchy controls top-level result shape, bounded child hits, and projected ancestors.
 	// A non-nil empty object selects direct index matches without ancestor hydration.
@@ -241,6 +248,12 @@ func (q QueryRequest) MarshalJSON() ([]byte, error) {
 		GraphQueries:     q.GraphQueries,
 		Hierarchy:        q.Hierarchy,
 		ForeignSources:   q.ForeignSources,
+	}
+	if q.GraphMetric != nil {
+		oapiReq.GraphMetric = *q.GraphMetric
+	}
+	if q.GraphMetricRerank != nil {
+		oapiReq.GraphMetricRerank = *q.GraphMetricRerank
 	}
 	// Preserve the distinction between an omitted projection and an explicitly
 	// empty identity-only projection. The generated OpenAPI type uses a pointer
@@ -322,6 +335,14 @@ func (q *QueryRequest) UnmarshalJSON(data []byte) error {
 	q.Pruner = oapiReq.Pruner
 	q.SemanticSearch = oapiReq.SemanticSearch
 	q.DocumentRenderer = oapiReq.DocumentRenderer
+	q.GraphMetric = nil
+	if !reflect.ValueOf(oapiReq.GraphMetric).IsZero() {
+		q.GraphMetric = &oapiReq.GraphMetric
+	}
+	q.GraphMetricRerank = nil
+	if !reflect.ValueOf(oapiReq.GraphMetricRerank).IsZero() {
+		q.GraphMetricRerank = &oapiReq.GraphMetricRerank
+	}
 	q.GraphQueries = oapiReq.GraphQueries
 	if q.GraphQueries != nil {
 		if err := validateNamedGraphQueries(q.GraphQueries); err != nil {

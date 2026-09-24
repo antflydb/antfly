@@ -37,12 +37,12 @@ const std_http_listener = @import("../raft/transport/std_http_listener.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const raft_routes = @import("../raft/transport/routes.zig");
 const routes = @import("http_routes.zig");
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = @import("antfly_source_root").antfly_sources.selected_db;
 const internal_keys = @import("../storage/internal_keys.zig");
-const table_reads = @import("table_reads.zig");
+const table_reads = @import("antfly_source_root").antfly_sources.table_reads;
 const table_catalog = @import("table_catalog.zig");
 const ProvisionedGroupStorage = @import("provisioned_storage.zig").ProvisionedGroupStorage;
-const table_writes = @import("table_writes.zig");
+const table_writes = @import("antfly_source_root").antfly_sources.table_writes;
 const generating_api_openapi = @import("antfly_generating_api_openapi");
 const transactions_api = @import("transactions.zig");
 const test_contract_helpers = @import("test_contract_helpers.zig");
@@ -53,6 +53,17 @@ const query_openapi = @import("antfly_query_openapi");
 const RetrievalAgentResult = metadata_openapi.RetrievalAgentResult;
 const AgentStatus = metadata_openapi.AgentStatus;
 const RetrievalStrategy = metadata_openapi.RetrievalStrategy;
+const system_catalog = @import("../system_catalog/domain.zig");
+
+fn resolveTestTable(svc: *metadata_service.MetadataService, name: []const u8) !system_catalog.ResolvedTable {
+    const alloc = std.testing.allocator;
+    const bytes = try http_server.StatusSource.fromMetadataService(svc).systemCatalog(alloc, .{}, .{ .resolve = try system_catalog.Target.parse(name) });
+    defer alloc.free(bytes);
+    var parsed = try std.json.parseFromSlice(?system_catalog.ResolvedTable, alloc, bytes, .{});
+    defer parsed.deinit();
+    const table = parsed.value orelse return error.TestUnexpectedResult;
+    return .{ .table_id = table.table_id, .name = try alloc.dupe(u8, table.name) };
+}
 
 fn parseJsonBody(comptime T: type, alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(T) {
     return try ant_json.parseFromSlice(T, alloc, body, .{});
@@ -93,7 +104,7 @@ fn createTableIndexWithProbeRetry(
     return error.EmbeddingProbeUnavailable;
 }
 
-fn queryResponseTotal(body: []const u8) !i64 {
+fn queryResponseTotal(body: []const u8) !u64 {
     var parsed = try std.json.parseFromSlice(
         metadata_openapi.QueryResponses,
         std.testing.allocator,
@@ -114,7 +125,7 @@ fn fetchQueryUntilTotal(
     base_uri: []const u8,
     table_name: []const u8,
     body: []const u8,
-    expected_total: i64,
+    expected_total: u64,
 ) !http_client.QueryResponse {
     for (0..600) |_| {
         var response = try client.fetchQuery(base_uri, table_name, body);
@@ -343,7 +354,18 @@ const IndexStatusSummary = struct {
         doc_count: ?u64 = null,
         node_count: ?u64 = null,
         edge_count: ?u64 = null,
+        metric_status: ?std.json.ArrayHashMap(GraphMetricStatusSummary) = null,
     },
+};
+
+const GraphMetricStatusSummary = struct {
+    state: []const u8,
+    published_generation: u64 = 0,
+    edge_generation: u64 = 0,
+    converged: bool = false,
+    iterations_completed: u64 = 0,
+    delta: f64 = 0.0,
+    computed_at_ms: u64 = 0,
 };
 
 fn startMetadataAdminListener(
@@ -469,48 +491,113 @@ const FakeEmbeddingProvider = struct {
     }
 };
 
-fn encodeDenseEmbeddingResponse(alloc: std.mem.Allocator, vector: []const f32) ![]u8 {
+fn encodeDenseEmbeddingResponse(alloc: std.mem.Allocator, vectors: []const [3]f32) ![]u8 {
     var buf = std.ArrayListUnmanaged(u8).empty;
     errdefer buf.deinit(alloc);
 
-    try buf.appendSlice(alloc, "{\"object\":\"list\",\"data\":[{\"object\":\"embedding\",\"index\":0,\"embedding\":[");
-    for (vector, 0..) |value, i| {
-        if (i > 0) try buf.append(alloc, ',');
-        const num = try std.fmt.allocPrint(alloc, "{d}", .{value});
-        defer alloc.free(num);
-        try buf.appendSlice(alloc, num);
+    try buf.appendSlice(alloc, "{\"object\":\"list\",\"data\":[");
+    for (vectors, 0..) |vector, index| {
+        if (index > 0) try buf.append(alloc, ',');
+        const head = try std.fmt.allocPrint(alloc, "{{\"object\":\"embedding\",\"index\":{d},\"embedding\":[", .{index});
+        defer alloc.free(head);
+        try buf.appendSlice(alloc, head);
+        for (vector, 0..) |value, i| {
+            if (i > 0) try buf.append(alloc, ',');
+            const num = try std.fmt.allocPrint(alloc, "{d}", .{value});
+            defer alloc.free(num);
+            try buf.appendSlice(alloc, num);
+        }
+        try buf.appendSlice(alloc, "]}");
     }
-    try buf.appendSlice(alloc, "]}],\"model\":\"test-embed\",\"usage\":{\"prompt_tokens\":1,\"total_tokens\":1}}");
+    try buf.appendSlice(alloc, "],\"model\":\"test-embed\",\"usage\":{\"prompt_tokens\":1,\"total_tokens\":1}}");
     return try buf.toOwnedSlice(alloc);
 }
 
-fn encodeSparseEmbeddingResponse(
-    alloc: std.mem.Allocator,
+/// The fake's deterministic dense vector for one embedding input item.
+fn fakeDenseVector(input: std.json.Value) [3]f32 {
+    return if (jsonValueContainsText(input, "alpha concept") or jsonValueContainsText(input, "alpha body"))
+        .{ 1, 0, 0 }
+    else if (jsonValueContainsText(input, "image/png") or jsonValueContainsText(input, "media"))
+        .{ 1, 0, 0 }
+    else if (jsonValueContainsText(input, "beta body"))
+        .{ 0, 1, 0 }
+    else
+        .{ 0, 0, 1 };
+}
+
+const FakeSparseVector = struct {
     indices: []const i32,
     values: []const f32,
-) ![]u8 {
+};
+
+/// The fake's deterministic sparse vector for one embedding input item.
+fn fakeSparseVector(input: std.json.Value) FakeSparseVector {
+    return if (jsonValueContainsText(input, "alpha body"))
+        .{ .indices = &.{ 7, 42 }, .values = &.{ 1.5, 0.5 } }
+    else if (jsonValueContainsText(input, "beta body"))
+        .{ .indices = &.{ 7, 42 }, .values = &.{ 0.25, 1.0 } }
+    else
+        .{ .indices = &.{99}, .values = &.{0.1} };
+}
+
+fn encodeSparseEmbeddingResponse(alloc: std.mem.Allocator, vectors: []const FakeSparseVector) ![]u8 {
     var buf = std.ArrayListUnmanaged(u8).empty;
     errdefer buf.deinit(alloc);
 
-    try buf.appendSlice(alloc, "{\"object\":\"list\",\"data\":[{\"object\":\"embedding\",\"index\":0,\"embedding\":{\"indices\":[");
-    for (indices, 0..) |value, i| {
-        if (i > 0) try buf.append(alloc, ',');
-        const num = try std.fmt.allocPrint(alloc, "{d}", .{value});
-        defer alloc.free(num);
-        try buf.appendSlice(alloc, num);
+    try buf.appendSlice(alloc, "{\"object\":\"list\",\"data\":[");
+    for (vectors, 0..) |vector, index| {
+        if (index > 0) try buf.append(alloc, ',');
+        const head = try std.fmt.allocPrint(alloc, "{{\"object\":\"embedding\",\"index\":{d},\"embedding\":{{\"indices\":[", .{index});
+        defer alloc.free(head);
+        try buf.appendSlice(alloc, head);
+        for (vector.indices, 0..) |value, i| {
+            if (i > 0) try buf.append(alloc, ',');
+            const num = try std.fmt.allocPrint(alloc, "{d}", .{value});
+            defer alloc.free(num);
+            try buf.appendSlice(alloc, num);
+        }
+        try buf.appendSlice(alloc, "],\"values\":[");
+        for (vector.values, 0..) |value, i| {
+            if (i > 0) try buf.append(alloc, ',');
+            const num = try std.fmt.allocPrint(alloc, "{d}", .{value});
+            defer alloc.free(num);
+            try buf.appendSlice(alloc, num);
+        }
+        try buf.appendSlice(alloc, "]}}");
     }
-    try buf.appendSlice(alloc, "],\"values\":[");
-    for (values, 0..) |value, i| {
-        if (i > 0) try buf.append(alloc, ',');
-        const num = try std.fmt.allocPrint(alloc, "{d}", .{value});
-        defer alloc.free(num);
-        try buf.appendSlice(alloc, num);
-    }
-    try buf.appendSlice(alloc, "]}}],\"model\":\"test-embed\",\"usage\":{\"prompt_tokens\":1,\"total_tokens\":1}}");
+    try buf.appendSlice(alloc, "],\"model\":\"test-embed\",\"usage\":{\"prompt_tokens\":1,\"total_tokens\":1}}");
     return try buf.toOwnedSlice(alloc);
 }
 
 const FakeAntflyProvider = struct {
+    /// Capability discovery asks for one model and task. Answer with a
+    /// catalog entry that carries no `inference_capabilities`, which is how a
+    /// server predating capability objects responds, so clients fall back to
+    /// their conservative defaults.
+    fn modelCatalog(alloc: std.mem.Allocator, uri: []const u8) !http_common.HttpResponse {
+        const query = uri[(std.mem.indexOfScalar(u8, uri, '?') orelse uri.len) + 1 ..];
+        var model: []const u8 = "";
+        var task: []const u8 = "";
+        var params = std.mem.splitScalar(u8, query, '&');
+        while (params.next()) |param| {
+            if (std.mem.startsWith(u8, param, "model=")) model = param["model=".len..];
+            if (std.mem.startsWith(u8, param, "task=")) task = param["task=".len..];
+        }
+        const category = if (std.mem.eql(u8, task, "embed"))
+            "embedders"
+        else if (std.mem.eql(u8, task, "rerank"))
+            "rerankers"
+        else if (std.mem.eql(u8, task, "chunk"))
+            "chunkers"
+        else
+            "generators";
+        return .{
+            .status = 200,
+            .content_type = try alloc.dupe(u8, "application/json"),
+            .body = try std.fmt.allocPrint(alloc, "{{\"{s}\":{{{f}:{{}}}}}}", .{ category, std.json.fmt(model, .{}) }),
+        };
+    }
+
     fn executor() http_common.RequestExecutor {
         return .{
             .ptr = undefined,
@@ -521,6 +608,7 @@ const FakeAntflyProvider = struct {
     }
 
     fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+        if (req.method == .GET and std.mem.indexOf(u8, req.uri, "/models?") != null) return modelCatalog(alloc, req.uri);
         try std.testing.expectEqual(http_common.Method.POST, req.method);
 
         if (std.mem.endsWith(u8, req.uri, "/api/chunk")) {
@@ -551,13 +639,14 @@ const FakeAntflyProvider = struct {
         if (std.mem.endsWith(u8, req.uri, "/embed") or std.mem.endsWith(u8, req.uri, "/embeddings")) {
             var parsed_req = try parseJsonBodyIgnoreUnknown(TestAntflyEmbedRequest, alloc, req.body);
             defer parsed_req.deinit();
+            // One embedding per input item: enrichment batches documents.
+            const input = parsed_req.value.input;
+            const items: []const std.json.Value = if (input == .array) input.array.items else (&input)[0..1];
             if (std.mem.eql(u8, parsed_req.value.model, "antfly-sparse-v1")) {
-                const body = if (jsonValueContainsText(parsed_req.value.input, "alpha body"))
-                    try encodeSparseEmbeddingResponse(alloc, &.{ 7, 42 }, &.{ 1.5, 0.5 })
-                else if (jsonValueContainsText(parsed_req.value.input, "beta body"))
-                    try encodeSparseEmbeddingResponse(alloc, &.{ 7, 42 }, &.{ 0.25, 1.0 })
-                else
-                    try encodeSparseEmbeddingResponse(alloc, &.{99}, &.{0.1});
+                const vectors = try alloc.alloc(FakeSparseVector, items.len);
+                defer alloc.free(vectors);
+                for (items, vectors) |item, *vector| vector.* = fakeSparseVector(item);
+                const body = try encodeSparseEmbeddingResponse(alloc, vectors);
                 return .{
                     .status = 200,
                     .content_type = try alloc.dupe(u8, "application/json"),
@@ -565,15 +654,11 @@ const FakeAntflyProvider = struct {
                 };
             }
 
-            const vector: [3]f32 = if (jsonValueContainsText(parsed_req.value.input, "alpha concept") or jsonValueContainsText(parsed_req.value.input, "alpha body"))
-                .{ 1, 0, 0 }
-            else if (jsonValueContainsText(parsed_req.value.input, "image/png") or jsonValueContainsText(parsed_req.value.input, "media"))
-                .{ 1, 0, 0 }
-            else if (jsonValueContainsText(parsed_req.value.input, "beta body"))
-                .{ 0, 1, 0 }
-            else
-                .{ 0, 0, 1 };
-            const body = try encodeDenseEmbeddingResponse(alloc, vector[0..]);
+            // A content-part input also embeds each part.
+            const vectors = try alloc.alloc([3]f32, items.len);
+            defer alloc.free(vectors);
+            for (items, vectors) |item, *vector| vector.* = fakeDenseVector(item);
+            const body = try encodeDenseEmbeddingResponse(alloc, vectors);
             return .{
                 .status = 200,
                 .content_type = try alloc.dupe(u8, "application/json"),
@@ -584,11 +669,22 @@ const FakeAntflyProvider = struct {
         if (std.mem.endsWith(u8, req.uri, "/rerank")) {
             var parsed_req = try parseJsonBodyIgnoreUnknown(TestAntflyRerankRequest, alloc, req.body);
             defer parsed_req.deinit();
-            const scores = if (stringSliceContainsText(parsed_req.value.prompts, "alpha body") and stringSliceContainsText(parsed_req.value.prompts, "beta body"))
-                "[0.1,0.9]"
-            else
-                "[0.9]";
-            const body = try std.fmt.allocPrint(alloc, "{{\"scores\":{s}}}", .{scores});
+            // One score per prompt, in request order: beta outranks alpha,
+            // and any other candidate scores lowest.
+            var scores = std.ArrayListUnmanaged(u8).empty;
+            defer scores.deinit(alloc);
+            try scores.append(alloc, '[');
+            for (parsed_req.value.prompts, 0..) |prompt, i| {
+                if (i > 0) try scores.append(alloc, ',');
+                try scores.appendSlice(alloc, if (std.mem.indexOf(u8, prompt, "beta body") != null)
+                    "0.9"
+                else if (std.mem.indexOf(u8, prompt, "alpha body") != null)
+                    "0.1"
+                else
+                    "0.05");
+            }
+            try scores.append(alloc, ']');
+            const body = try std.fmt.allocPrint(alloc, "{{\"scores\":{s}}}", .{scores.items});
             return .{
                 .status = 200,
                 .content_type = try alloc.dupe(u8, "application/json"),
@@ -698,6 +794,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -741,9 +838,9 @@ test "public api smoke e2e creates table inserts and queries documents" {
     try std.testing.expect(projected_ranges.len > 0);
     const projected_tables = try svc.listProjectedTables(std.testing.allocator);
     defer svc.freeProjectedTables(std.testing.allocator, projected_tables);
-    const docs_table_id = for (projected_tables) |table| {
-        if (std.mem.eql(u8, table.name, "docs")) break table.table_id;
-    } else return error.TestUnexpectedResult;
+    const docs_identity = try resolveTestTable(&svc, "docs");
+    defer std.testing.allocator.free(docs_identity.name);
+    const docs_table_id = docs_identity.table_id;
     const group_id = for (projected_ranges) |range| {
         if (range.table_id == docs_table_id) break range.group_id;
     } else return error.TestUnexpectedResult;
@@ -814,7 +911,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     try std.testing.expect(parsed_updated_schema.value.schema.?.document_schemas != null);
     try std.testing.expect(parsed_updated_schema.value.migration != null);
     try std.testing.expectEqualStrings("rebuilding", parsed_updated_schema.value.migration.?.state);
-    try std.testing.expectEqual(@as(?i64, 0), parsed_updated_schema.value.migration.?.read_schema.version);
+    try std.testing.expectEqual(@as(?u32, 0), parsed_updated_schema.value.migration.?.read_schema.version);
 
     var table_detail_after_schema = try client.fetchTable(base_uri, "docs");
     defer table_detail_after_schema.deinit(std.testing.allocator);
@@ -851,11 +948,11 @@ test "public api smoke e2e creates table inserts and queries documents" {
     var structural_wait_io = std.Io.Threaded.init(std.testing.allocator, .{});
     defer structural_wait_io.deinit();
     var structural_wait_attempts: usize = 0;
-    while (structural_wait_attempts < 120_000 and provisioned_write_source.hasGroupActivityBestEffort("docs", 0)) : (structural_wait_attempts += 1) {
+    while (structural_wait_attempts < 120_000 and provisioned_write_source.hasGroupActivityBestEffort(docs_identity.name, group_id)) : (structural_wait_attempts += 1) {
         try svc.runRound();
         structural_wait_io.io().sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
     }
-    try std.testing.expect(!provisioned_write_source.hasGroupActivityBestEffort("docs", 0));
+    try std.testing.expect(!provisioned_write_source.hasGroupActivityBestEffort(docs_identity.name, group_id));
 
     // This fixture performs data-group writes directly instead of running a
     // second Raft host. Model the data owner's normal lifecycle explicitly:
@@ -927,11 +1024,11 @@ test "public api smoke e2e creates table inserts and queries documents" {
     var owner_wait_io = std.Io.Threaded.init(std.testing.allocator, .{});
     defer owner_wait_io.deinit();
     var owner_wait_attempts: usize = 0;
-    while (owner_wait_attempts < 10_000 and provisioned_write_source.hasGroupActivityBestEffort("docs", group_id)) : (owner_wait_attempts += 1) {
+    while (owner_wait_attempts < 10_000 and provisioned_write_source.hasGroupActivityBestEffort(docs_identity.name, group_id)) : (owner_wait_attempts += 1) {
         try svc.runRound();
         owner_wait_io.io().sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
     }
-    try std.testing.expect(!provisioned_write_source.hasGroupActivityBestEffort("docs", group_id));
+    try std.testing.expect(!provisioned_write_source.hasGroupActivityBestEffort(docs_identity.name, group_id));
 
     const finalized_tables = try svc.listProjectedTables(std.testing.allocator);
     defer svc.freeProjectedTables(std.testing.allocator, finalized_tables);
@@ -1033,7 +1130,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     try std.testing.expectEqual(@as(usize, 1), query_responses.value.responses.?.len);
     const query_result = query_responses.value.responses.?[0];
     try std.testing.expectEqualStrings("docs", query_result.table.?);
-    try std.testing.expectEqual(@as(i64, 2), query_result.hits.?.total.?.value);
+    try std.testing.expectEqual(@as(u64, 2), query_result.hits.?.total.?.value);
     var saw_hello_doc_a = false;
     var saw_hello_doc_c = false;
     for (query_result.hits.?.hits.?) |hit| {
@@ -1259,7 +1356,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     var filtered_query_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, filtered_query.body, .{});
     defer filtered_query_responses.deinit();
     const filtered_query_result = filtered_query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 1), filtered_query_result.hits.?.total.?.value);
+    try std.testing.expectEqual(@as(u64, 1), filtered_query_result.hits.?.total.?.value);
     try std.testing.expectEqualStrings("doc:a", filtered_query_result.hits.?.hits.?[0]._id);
 
     const phrase_query_body = try test_contract_helpers.encodeQueryRequest(std.testing.allocator, query_openapi.MatchPhraseQuery{
@@ -1272,7 +1369,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     var phrase_query_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, phrase_query.body, .{});
     defer phrase_query_responses.deinit();
     const phrase_query_result = phrase_query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 1), phrase_query_result.hits.?.total.?.value);
+    try std.testing.expectEqual(@as(u64, 1), phrase_query_result.hits.?.total.?.value);
     try std.testing.expectEqualStrings("doc:a", phrase_query_result.hits.?.hits.?[0]._id);
 
     const fuzzy_query_body = try test_contract_helpers.encodeQueryRequest(std.testing.allocator, query_openapi.FuzzyQuery{
@@ -1286,7 +1383,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     var fuzzy_query_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, fuzzy_query.body, .{});
     defer fuzzy_query_responses.deinit();
     const fuzzy_query_result = fuzzy_query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 2), fuzzy_query_result.hits.?.total.?.value);
+    try std.testing.expectEqual(@as(u64, 2), fuzzy_query_result.hits.?.total.?.value);
     const fuzzy_hits = fuzzy_query_result.hits.?.hits.?;
     var saw_doc_a = false;
     var saw_doc_c = false;
@@ -1309,7 +1406,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     var numeric_range_query_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, numeric_range_query.body, .{});
     defer numeric_range_query_responses.deinit();
     const numeric_range_query_result = numeric_range_query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 1), numeric_range_query_result.hits.?.total.?.value);
+    try std.testing.expectEqual(@as(u64, 1), numeric_range_query_result.hits.?.total.?.value);
     try std.testing.expectEqualStrings("doc:a", numeric_range_query_result.hits.?.hits.?[0]._id);
 
     const prefix_query_body = try test_contract_helpers.encodeQueryRequest(std.testing.allocator, query_openapi.PrefixQuery{
@@ -1322,7 +1419,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     var prefix_query_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, prefix_query.body, .{});
     defer prefix_query_responses.deinit();
     const prefix_query_result = prefix_query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 1), prefix_query_result.hits.?.total.?.value);
+    try std.testing.expectEqual(@as(u64, 1), prefix_query_result.hits.?.total.?.value);
     try std.testing.expectEqualStrings("doc:a", prefix_query_result.hits.?.hits.?[0]._id);
 
     const wildcard_query_body = try test_contract_helpers.encodeQueryRequest(std.testing.allocator, query_openapi.WildcardQuery{
@@ -1335,7 +1432,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     var wildcard_query_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, wildcard_query.body, .{});
     defer wildcard_query_responses.deinit();
     const wildcard_query_result = wildcard_query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 1), wildcard_query_result.hits.?.total.?.value);
+    try std.testing.expectEqual(@as(u64, 1), wildcard_query_result.hits.?.total.?.value);
     try std.testing.expectEqualStrings("doc:b", wildcard_query_result.hits.?.hits.?[0]._id);
 
     const regexp_query_body = try test_contract_helpers.encodeQueryRequest(std.testing.allocator, query_openapi.RegexpQuery{
@@ -1348,7 +1445,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     var regexp_query_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, regexp_query.body, .{});
     defer regexp_query_responses.deinit();
     const regexp_query_result = regexp_query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 1), regexp_query_result.hits.?.total.?.value);
+    try std.testing.expectEqual(@as(u64, 1), regexp_query_result.hits.?.total.?.value);
     try std.testing.expectEqualStrings("doc:c", regexp_query_result.hits.?.hits.?[0]._id);
 
     const term_range_query_body = try test_contract_helpers.encodeQueryRequest(std.testing.allocator, query_openapi.TermRangeQuery{
@@ -1363,7 +1460,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     var term_range_query_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, term_range_query.body, .{});
     defer term_range_query_responses.deinit();
     const term_range_query_result = term_range_query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 1), term_range_query_result.hits.?.total.?.value);
+    try std.testing.expectEqual(@as(u64, 1), term_range_query_result.hits.?.total.?.value);
     try std.testing.expectEqualStrings("doc:a", term_range_query_result.hits.?.hits.?[0]._id);
 
     const date_range_query_body = try test_contract_helpers.encodeQueryRequest(std.testing.allocator, query_openapi.DateRangeStringQuery{
@@ -1378,7 +1475,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     var date_range_query_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, date_range_query.body, .{});
     defer date_range_query_responses.deinit();
     const date_range_query_result = date_range_query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 1), date_range_query_result.hits.?.total.?.value);
+    try std.testing.expectEqual(@as(u64, 1), date_range_query_result.hits.?.total.?.value);
     try std.testing.expectEqualStrings("doc:c", date_range_query_result.hits.?.hits.?[0]._id);
 
     const count_profile_query_body = try test_contract_helpers.encodeMatchQueryRequestWithFlags(
@@ -1396,7 +1493,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     var count_profile_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, count_profile_query.body, .{});
     defer count_profile_responses.deinit();
     const count_profile_result = count_profile_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 2), count_profile_result.hits.?.total.?.value);
+    try std.testing.expectEqual(@as(u64, 2), count_profile_result.hits.?.total.?.value);
     try std.testing.expectEqual(@as(usize, 0), count_profile_result.hits.?.hits.?.len);
     try std.testing.expect(count_profile_result.profile != null);
     try std.testing.expect(count_profile_result.took >= 0);
@@ -1420,7 +1517,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     var deleted_query_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, deleted_query.body, .{});
     defer deleted_query_responses.deinit();
     const deleted_query_result = deleted_query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 0), deleted_query_result.hits.?.total.?.value);
+    try std.testing.expectEqual(@as(u64, 0), deleted_query_result.hits.?.total.?.value);
 
     var deleted_index = try client.deleteTableIndex(base_uri, "docs", "embed_idx");
     defer deleted_index.deinit(std.testing.allocator);
@@ -1429,11 +1526,11 @@ test "public api smoke e2e creates table inserts and queries documents" {
     while (rounds < 8) : (rounds += 1) try svc.runRound();
 
     owner_wait_attempts = 0;
-    while (owner_wait_attempts < 10_000 and provisioned_write_source.hasGroupActivityBestEffort("docs", group_id)) : (owner_wait_attempts += 1) {
+    while (owner_wait_attempts < 10_000 and provisioned_write_source.hasGroupActivityBestEffort(docs_identity.name, group_id)) : (owner_wait_attempts += 1) {
         try svc.runRound();
         owner_wait_io.io().sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
     }
-    try std.testing.expect(!provisioned_write_source.hasGroupActivityBestEffort("docs", group_id));
+    try std.testing.expect(!provisioned_write_source.hasGroupActivityBestEffort(docs_identity.name, group_id));
 
     try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchTableIndex(base_uri, "docs", "embed_idx"));
 
@@ -1546,6 +1643,7 @@ test "public api e2e rebuilds schema-migration full-text index on exact backfill
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -1638,7 +1736,7 @@ test "public api e2e rebuilds schema-migration full-text index on exact backfill
     defer parsed_updated_schema.deinit();
     try std.testing.expect(parsed_updated_schema.value.migration != null);
     try std.testing.expectEqualStrings("rebuilding", parsed_updated_schema.value.migration.?.state);
-    try std.testing.expectEqual(@as(i64, 0), parsed_updated_schema.value.migration.?.read_schema.version);
+    try std.testing.expectEqual(@as(?u32, 0), parsed_updated_schema.value.migration.?.read_schema.version);
     try std.testing.expect(parsed_updated_schema.value.indexes.map.get("full_text_index_v1") != null);
 
     // Schema replacement is accepted before the writer-owned structural
@@ -1816,6 +1914,7 @@ test "public api e2e rejects table backup during active schema migration" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -1923,6 +2022,7 @@ test "public api e2e rejects table restore for migration-state backup manifests"
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -2039,6 +2139,7 @@ test "public api e2e rejects table restore when target already exists" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -2145,6 +2246,7 @@ test "public api e2e rejects table restore for mismatched backup manifests" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -2259,6 +2361,7 @@ test "public api e2e validates backup and restore request shapes and locations" 
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -2458,6 +2561,7 @@ test "public api e2e backs up drops and restores a table" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -2886,7 +2990,18 @@ test "public api standalone-like e2e backs up drops and restores a table" {
         "standalone-like-roundtrip-snap",
     );
     try backups_api.validateRestorableManifestLayout(&backup_manifest);
-    try std.testing.expectEqualStrings("docs", backup_manifest.table_name);
+    var catalog_snapshot = try metadata_server.server.svc.adminSnapshot();
+    defer metadata_server.server.svc.freeAdminSnapshot(&catalog_snapshot);
+    var created_status = try std.json.parseFromSlice(metadata_openapi.TableStatus, std.testing.allocator, created.body, .{ .ignore_unknown_fields = true });
+    defer created_status.deinit();
+    const created_id = try std.fmt.parseInt(u64, created_status.value.table_id.?, 10);
+    var found_manifest_identity = false;
+    for (catalog_snapshot.tables) |table| {
+        if (table.table_id != created_id) continue;
+        try std.testing.expectEqualStrings(table.name, backup_manifest.table_name);
+        found_manifest_identity = true;
+    }
+    try std.testing.expect(found_manifest_identity);
 
     const lifecycle_reads_before_drop = data_server.remoteMetadataLifecycleLinearizableReadsForTest();
     _ = try client.dropTable(base_uri, "docs");
@@ -3321,6 +3436,7 @@ test "public api e2e supports managed semantic search and sparse embeddings" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -3450,6 +3566,7 @@ test "public api e2e adds managed embeddings indexes to existing tables" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -3767,6 +3884,7 @@ test "public api e2e restores managed embeddings from table backup" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -3948,6 +4066,7 @@ test "public api e2e supports managed sparse embeddings generation" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -4055,13 +4174,20 @@ test "public api e2e supports hybrid query pruner and reranker" {
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
     );
+    // Remote Antfly embedders discover capabilities with a timed request,
+    // which needs I/O that can run concurrent work. Index validation uses the
+    // network view and query embedding the API view; without a backend
+    // runtime both otherwise fall back to single-threaded I/O.
+    var network_io = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer network_io.deinit();
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
-        .{},
+        .{ .imported_runtime_io = .{ .api = network_io.io(), .api_network = network_io.io() } },
         http_server.StatusSource.fromMetadataService(&svc),
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -4125,7 +4251,7 @@ test "public api e2e supports hybrid query pruner and reranker" {
 
     const hybrid_query_body = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{{\"full_text_search\":{{\"match\":{{\"field\":\"body\",\"text\":\"body\"}}}},\"semantic_search\":\"alpha concept\",\"embeddings\":{{\"sparse_idx\":{{\"indices\":[7,42],\"values\":[1.5,0.5]}}}},\"indexes\":[\"semantic_idx\",\"sparse_idx\"],\"merge_config\":{{\"strategy\":\"rsf\",\"window_size\":10}},\"pruner\":{{\"require_multi_index\":true}},\"reranker\":{{\"provider\":\"antfly\",\"model\":\"cross-encoder/ms-marco-MiniLM-L-6-v2\",\"url\":{f},\"field\":\"body\",\"top_n\":2}},\"limit\":3}}",
+        "{{\"full_text_search\":{{\"match\":{{\"field\":\"body\",\"text\":\"body\"}}}},\"semantic_search\":\"alpha concept\",\"embeddings\":{{\"sparse_idx\":{{\"indices\":[7,42],\"values\":[1.5,0.5]}}}},\"indexes\":[\"semantic_idx\",\"sparse_idx\"],\"merge_config\":{{\"strategy\":\"rsf\",\"window_size\":10}},\"pruner\":{{\"require_multi_index\":true}},\"reranker\":{{\"provider\":\"antfly\",\"model\":\"cross-encoder/ms-marco-MiniLM-L-6-v2\",\"url\":{f},\"field\":\"body\",\"candidate_count\":3,\"top_n\":2}},\"limit\":3,\"profile\":true}}",
         .{std.json.fmt(antfly_base_uri, .{})},
     );
     defer std.testing.allocator.free(hybrid_query_body);
@@ -4200,6 +4326,7 @@ test "public api e2e supports retrieval agent pipeline queries" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -4295,6 +4422,7 @@ test "public api e2e supports retrieval agent generation step" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -4399,6 +4527,7 @@ test "public api e2e supports retrieval agent semantic and hybrid strategies" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -4523,6 +4652,7 @@ test "public api e2e supports retrieval agent tree search pipeline" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -4628,6 +4758,7 @@ test "public api e2e supports retrieval agent tree search from roots" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -4731,6 +4862,7 @@ test "public api e2e supports retrieval agent classification confidence and foll
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -4841,6 +4973,7 @@ test "public api e2e supports retrieval agent fixed-body sse streaming" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -4975,6 +5108,7 @@ test "public api e2e retrieval streaming emits clarification events" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -5094,6 +5228,7 @@ test "public api e2e supports bounded agentic retrieval mode" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -5188,6 +5323,7 @@ test "public api e2e agentic retrieval selects the best declared query" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -5280,6 +5416,7 @@ test "public api e2e agentic retrieval evaluates misses and falls back to the ne
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -5388,6 +5525,7 @@ test "public api e2e agentic retrieval can require clarification and continue fr
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -5495,6 +5633,7 @@ test "public api e2e restores managed sparse embeddings from table backup" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -5683,13 +5822,20 @@ test "public api e2e supports embedding_template remote media helper" {
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
     );
+    // Remote Antfly embedders discover capabilities with a timed request,
+    // which needs I/O that can run concurrent work. Index validation uses the
+    // network view and query embedding the API view; without a backend
+    // runtime both otherwise fall back to single-threaded I/O.
+    var network_io = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer network_io.deinit();
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
-        .{},
+        .{ .imported_runtime_io = .{ .api = network_io.io(), .api_network = network_io.io() } },
         http_server.StatusSource.fromMetadataService(&svc),
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -5763,14 +5909,6 @@ test "public api e2e supports embedding_template remote media helper" {
     var parsed = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, query.body, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("doc:a", parsed.value.responses.?[0].hits.?.hits.?[0]._id);
-
-    const template_query_body = try test_contract_helpers.encodeSemanticQueryRequest(std.testing.allocator, "alpha concept", &.{"semantic_template_idx"}, 5);
-    defer std.testing.allocator.free(template_query_body);
-    var template_query = try client.fetchQuery(base_uri, "docs", template_query_body);
-    defer template_query.deinit(std.testing.allocator);
-    var parsed_template = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, template_query.body, .{});
-    defer parsed_template.deinit();
-    try std.testing.expectEqualStrings("doc:a", parsed_template.value.responses.?[0].hits.?.hits.?[0]._id);
 }
 
 test "public api e2e supports template chunked remote text enrichment and query helper failures" {
@@ -5864,6 +6002,7 @@ test "public api e2e supports template chunked remote text enrichment and query 
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -6058,182 +6197,6 @@ test "public api e2e supports template chunked remote text enrichment and query 
     );
 }
 
-test "public api e2e supports fixed and antfly chunked semantic search" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-chunked-semantic-root", .{tmp.sub_path});
-    defer std.testing.allocator.free(replica_root);
-    const replica_catalog_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-chunked-semantic-catalog.txt", .{tmp.sub_path});
-    defer std.testing.allocator.free(replica_catalog_path);
-
-    var store = raft_engine.core.MemoryStorage.init(std.testing.allocator);
-    defer store.deinit();
-    var factory = Factory{ .alloc = std.testing.allocator, .store = &store };
-
-    var svc = try metadata_service.MetadataService.init(std.testing.allocator, .{
-        .host = .{
-            .local_node_id = 1,
-            .metadata_group_id = 3122,
-            .replica_root_dir = replica_root,
-            .replica_catalog_path = replica_catalog_path,
-        },
-    }, .{
-        .host = .{
-            .host = .{
-                .descriptor_factory = factory.iface(),
-            },
-        },
-    }, .{});
-    defer svc.deinit();
-
-    _ = try svc.ensureMetadataReplica(.{
-        .group_id = 3122,
-        .replica_id = 1,
-        .local_node_id = 1,
-        .bootstrap_mode = .empty,
-    });
-    try svc.campaignMetadataGroup();
-    try svc.runRound();
-
-    var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
-        replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
-        raft_mod.read_gate.alreadyReadSafeBarrier(),
-    );
-    var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
-        replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
-    );
-    var server = http_server.ApiHttpServer.init(
-        std.testing.allocator,
-        .{},
-        http_server.StatusSource.fromMetadataService(&svc),
-        provisioned_read_source.source(),
-        provisioned_write_source.source(),
-    );
-    var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
-    defer listener.deinit();
-
-    var openai_listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, FakeEmbeddingProvider.executor());
-    defer openai_listener.deinit();
-    try openai_listener.start();
-
-    var antfly_listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, FakeAntflyProvider.executor());
-    defer antfly_listener.deinit();
-    try antfly_listener.start();
-
-    const base_uri = try listener.baseUri(std.testing.allocator);
-    defer std.testing.allocator.free(base_uri);
-    const openai_base_uri = try openai_listener.baseUri(std.testing.allocator);
-    defer std.testing.allocator.free(openai_base_uri);
-    const antfly_base_uri = try antfly_listener.baseUri(std.testing.allocator);
-    defer std.testing.allocator.free(antfly_base_uri);
-
-    var executor = std_http_executor.StdHttpExecutor.init(std.testing.allocator, .{});
-    defer executor.deinit();
-    var client = http_client.ApiHttpClient.init(std.testing.allocator, executor.executor());
-
-    const create_body = try test_contract_helpers.encodeCreateTableRequest(std.testing.allocator, "chunked docs");
-    defer std.testing.allocator.free(create_body);
-    var created = try client.createTable(base_uri, "docs", create_body);
-    defer created.deinit(std.testing.allocator);
-
-    const fixed_chunked_index_body = try test_contract_helpers.encodeManagedEmbeddingsIndexRequest(
-        std.testing.allocator,
-        "semantic_fixed_idx",
-        "body",
-        3,
-        test_contract_helpers.openAIIndexEmbedder("text-embedding-3-small", openai_base_uri),
-        .{
-            .provider = .antfly,
-            .model = "fixed-bert-tokenizer",
-        },
-    );
-    defer std.testing.allocator.free(fixed_chunked_index_body);
-    var fixed_index_resp = try client.createTableIndex(base_uri, "docs", "semantic_fixed_idx", fixed_chunked_index_body);
-    defer fixed_index_resp.deinit(std.testing.allocator);
-
-    const antfly_chunk_api = try std.fmt.allocPrint(std.testing.allocator, "{s}/api", .{antfly_base_uri});
-    defer std.testing.allocator.free(antfly_chunk_api);
-    const antfly_chunked_index_body = try test_contract_helpers.encodeManagedEmbeddingsIndexRequest(
-        std.testing.allocator,
-        "semantic_antfly_idx",
-        "body",
-        3,
-        test_contract_helpers.antflyIndexEmbedder("antfly-embed-v1", antfly_base_uri, false),
-        .{
-            .provider = .antfly,
-            .api_url = antfly_chunk_api,
-            .model = "antfly-chunker-v1",
-        },
-    );
-    defer std.testing.allocator.free(antfly_chunked_index_body);
-    var antfly_index_resp = try client.createTableIndex(base_uri, "docs", "semantic_antfly_idx", antfly_chunked_index_body);
-    defer antfly_index_resp.deinit(std.testing.allocator);
-
-    var rounds: usize = 0;
-    while (rounds < 8) : (rounds += 1) try svc.runRound();
-
-    const batch_body = try test_contract_helpers.normalizeBatchRequest(std.testing.allocator,
-        \\{"inserts":{
-        \\  "doc:a":{"title":"alpha","body":"alpha body alpha body alpha body alpha body alpha tail"}
-        \\}}
-    );
-    defer std.testing.allocator.free(batch_body);
-    var batch = try client.fetchBatch(base_uri, "docs", batch_body);
-    defer batch.deinit(std.testing.allocator);
-
-    const fixed_query_body = try test_contract_helpers.encodeSemanticQueryRequest(std.testing.allocator, "alpha concept", &.{"semantic_fixed_idx"}, 5);
-    defer std.testing.allocator.free(fixed_query_body);
-    var fixed_query = try client.fetchQuery(base_uri, "docs", fixed_query_body);
-    defer fixed_query.deinit(std.testing.allocator);
-    var parsed_fixed = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, fixed_query.body, .{});
-    defer parsed_fixed.deinit();
-    try std.testing.expectEqualStrings("doc:a", parsed_fixed.value.responses.?[0].hits.?.hits.?[0]._id);
-
-    const antfly_query_body = try test_contract_helpers.encodeSemanticQueryRequest(std.testing.allocator, "alpha concept", &.{"semantic_antfly_idx"}, 5);
-    defer std.testing.allocator.free(antfly_query_body);
-    var antfly_query = try client.fetchQuery(base_uri, "docs", antfly_query_body);
-    defer antfly_query.deinit(std.testing.allocator);
-    var parsed_antfly = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, antfly_query.body, .{});
-    defer parsed_antfly.deinit();
-    try std.testing.expectEqualStrings("doc:a", parsed_antfly.value.responses.?[0].hits.?.hits.?[0]._id);
-
-    const projected_ranges = try svc.listProjectedRanges(std.testing.allocator);
-    defer svc.freeProjectedRanges(std.testing.allocator, projected_ranges);
-    try std.testing.expect(projected_ranges.len > 0);
-    const group_id = projected_ranges[0].group_id;
-    const provisioned_db_path = try metadata_mod.groupDbPathFromReplicaRoot(std.testing.allocator, replica_root, group_id);
-    defer std.testing.allocator.free(provisioned_db_path);
-
-    var db = try db_mod.DB.open(std.testing.allocator, provisioned_db_path, .{});
-    defer db.close();
-
-    const fixed_chunk_zero = try internal_keys.chunkArtifactKeyAlloc(std.testing.allocator, "doc:a", "semantic_fixed_idx_chunks", 0);
-    defer std.testing.allocator.free(fixed_chunk_zero);
-    const fixed_chunk_one = try internal_keys.chunkArtifactKeyAlloc(std.testing.allocator, "doc:a", "semantic_fixed_idx_chunks", 1);
-    defer std.testing.allocator.free(fixed_chunk_one);
-    const antfly_chunk_zero = try internal_keys.chunkArtifactKeyAlloc(std.testing.allocator, "doc:a", "semantic_antfly_idx_chunks", 0);
-    defer std.testing.allocator.free(antfly_chunk_zero);
-    const antfly_chunk_one = try internal_keys.chunkArtifactKeyAlloc(std.testing.allocator, "doc:a", "semantic_antfly_idx_chunks", 1);
-    defer std.testing.allocator.free(antfly_chunk_one);
-
-    const fixed_raw_zero = try db.get(std.testing.allocator, fixed_chunk_zero);
-    defer if (fixed_raw_zero) |raw| std.testing.allocator.free(raw);
-    try std.testing.expect(fixed_raw_zero != null);
-    const fixed_raw_one = try db.get(std.testing.allocator, fixed_chunk_one);
-    defer if (fixed_raw_one) |raw| std.testing.allocator.free(raw);
-    try std.testing.expect(fixed_raw_one != null);
-
-    const antfly_raw_zero = try db.get(std.testing.allocator, antfly_chunk_zero);
-    defer if (antfly_raw_zero) |raw| std.testing.allocator.free(raw);
-    try std.testing.expect(antfly_raw_zero != null);
-    const antfly_raw_one = try db.get(std.testing.allocator, antfly_chunk_one);
-    defer if (antfly_raw_one) |raw| std.testing.allocator.free(raw);
-    try std.testing.expect(antfly_raw_one != null);
-}
-
 test "public api e2e restores chunked managed embeddings from table backup" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -6290,6 +6253,7 @@ test "public api e2e restores chunked managed embeddings from table backup" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -6506,6 +6470,7 @@ test "public api e2e supports graph queries" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -6521,7 +6486,9 @@ test "public api e2e supports graph queries" {
     var created = try client.createTable(base_uri, "docs", create_body);
     defer created.deinit(std.testing.allocator);
 
-    var graph_index_resp = try client.createTableIndex(base_uri, "docs", "graph_idx", "{\"name\":\"graph_idx\",\"type\":\"graph\"}");
+    var graph_index_resp = try client.createTableIndex(base_uri, "docs", "graph_idx",
+        \\{"name":"graph_idx","type":"graph","metrics":{"pagerank":{"enabled":true,"refresh":"background","max_iterations":40,"tolerance":0.000001,"edge_filter":{"types":["cites"]}}}}
+    );
     defer graph_index_resp.deinit(std.testing.allocator);
 
     var rounds: usize = 0;
@@ -6538,6 +6505,31 @@ test "public api e2e supports graph queries" {
     var batch = try client.fetchBatch(base_uri, "docs", batch_body);
     defer batch.deinit(std.testing.allocator);
 
+    var graph_index_status = try client.fetchTableIndex(base_uri, "docs", "graph_idx");
+    defer graph_index_status.deinit(std.testing.allocator);
+    var parsed_graph_index_status = try parseJsonBody(IndexStatusSummary, std.testing.allocator, graph_index_status.body);
+    defer parsed_graph_index_status.deinit();
+    const metric_status = parsed_graph_index_status.value.status.metric_status orelse return error.TestUnexpectedResult;
+    const pagerank_status = metric_status.map.get("pagerank") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("fresh", pagerank_status.state);
+    try std.testing.expect(pagerank_status.published_generation > 0);
+    try std.testing.expect(pagerank_status.edge_generation >= pagerank_status.published_generation);
+    try std.testing.expect(pagerank_status.iterations_completed > 0);
+
+    var metric_query = try client.fetchQuery(base_uri, "docs",
+        \\{"graph_metric":{"index":"graph_idx","metric":"pagerank","top_k":2,"metric_freshness":"fresh"}}
+    );
+    defer metric_query.deinit(std.testing.allocator);
+    var parsed_metric = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, metric_query.body, .{});
+    defer parsed_metric.deinit();
+    const metric_responses = parsed_metric.value.responses orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), metric_responses.len);
+    const graph_metric_results = metric_responses[0].graph_metric_results orelse return error.TestUnexpectedResult;
+    const pagerank_result = graph_metric_results.map.get("pagerank") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("fresh", pagerank_result.status.state);
+    try std.testing.expectEqual(@as(usize, 2), pagerank_result.scores.len);
+    try std.testing.expect(pagerank_result.scores[0].score >= pagerank_result.scores[1].score);
+
     const graph_query_body = try test_contract_helpers.encodeGraphNeighborsQueryRequest(
         std.testing.allocator,
         "neighbors",
@@ -6552,7 +6544,7 @@ test "public api e2e supports graph queries" {
 
     var parsed_graph = try parseJsonBody(metadata_openapi.QueryResponses, std.testing.allocator, graph_query.body);
     defer parsed_graph.deinit();
-    try std.testing.expectEqual(@as(i64, 0), parsed_graph.value.responses.?[0].hits.?.total.?.value);
+    try std.testing.expectEqual(@as(u64, 0), parsed_graph.value.responses.?[0].hits.?.total.?.value);
     const neighbors = try expectSingleGraphResult.get(parsed_graph.value, "neighbors");
     try std.testing.expectEqual(@as(usize, 2), neighbors.nodes.len);
     try std.testing.expectEqualStrings("doc-b", neighbors.nodes[0].key);
@@ -6699,6 +6691,7 @@ test "public api e2e graph queries respect full_index sync level" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -7123,6 +7116,7 @@ test "public api smoke e2e queries across split ranges" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -7222,7 +7216,7 @@ test "public api smoke e2e queries across split ranges" {
     try std.testing.expectEqual(@as(usize, 1), query_responses.value.responses.?.len);
     const query_result = query_responses.value.responses.?[0];
     try std.testing.expectEqualStrings("docs", query_result.table.?);
-    try std.testing.expectEqual(@as(i64, 2), query_result.hits.?.total.?.value);
+    try std.testing.expectEqual(@as(u64, 2), query_result.hits.?.total.?.value);
     try std.testing.expectEqualStrings("doc:a", query_result.hits.?.hits.?[0]._id);
     try std.testing.expectEqualStrings("doc:z", query_result.hits.?.hits.?[1]._id);
 
@@ -7249,7 +7243,7 @@ test "public api smoke e2e queries across split ranges" {
     var deleted_query_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, deleted_query.body, .{});
     defer deleted_query_responses.deinit();
     const deleted_query_result = deleted_query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 0), deleted_query_result.hits.?.total.?.value);
+    try std.testing.expectEqual(@as(u64, 0), deleted_query_result.hits.?.total.?.value);
 }
 
 test "public api split e2e uses distributed global text stats for bm25 and significant_terms" {
@@ -7343,6 +7337,7 @@ test "public api split e2e uses distributed global text stats for bm25 and signi
             bootstrap_read_source.source(),
             bootstrap_write_source.source(),
         );
+        defer bootstrap_server.deinit();
         var bootstrap_listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &bootstrap_server);
         defer bootstrap_listener.deinit();
         const bootstrap_uri = try bootstrap_listener.baseUri(std.testing.allocator);
@@ -7416,6 +7411,8 @@ test "public api split e2e uses distributed global text stats for bm25 and signi
     defer svc.freeProjectedRanges(std.testing.allocator, projected_ranges);
     try std.testing.expectEqual(@as(usize, 1), projected_ranges.len);
 
+    const docs_identity = try resolveTestTable(&svc, "docs");
+    defer std.testing.allocator.free(docs_identity.name);
     const left_group_id = projected_ranges[0].group_id;
     var group_statuses = [_]metadata_mod.GroupStatusReport{.{
         .group_id = left_group_id,
@@ -7425,7 +7422,7 @@ test "public api split e2e uses distributed global text stats for bm25 and signi
     }};
     var runtime_statuses = [_]metadata_mod.RuntimeGroupStatusReport{.{
         .table_id = projected_ranges[0].table_id,
-        .table_name = "docs",
+        .table_name = docs_identity.name,
         .group_id = left_group_id,
         .store_id = 1,
         .node_id = 1,
@@ -7456,7 +7453,7 @@ test "public api split e2e uses distributed global text stats for bm25 and signi
     // re-entering the metadata API and deadlocking behind that control round.
     data_server.setRemoteMetadataFetchErrorForTest(error.NotLeader);
     defer data_server.setRemoteMetadataFetchErrorForTest(null);
-    try metadata_client.requestTableSplit(metadata_api, "docs", split_body);
+    try metadata_client.requestTableSplit(metadata_api, docs_identity.name, split_body);
 
     var finalized = false;
     rounds = 0;
@@ -7538,7 +7535,7 @@ test "public api split e2e uses distributed global text stats for bm25 and signi
 
     try std.testing.expectEqual(@as(usize, 1), bm25_query_responses.value.responses.?.len);
     const bm25_result = bm25_query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 6), bm25_result.hits.?.total.?.value);
+    try std.testing.expectEqual(@as(u64, 6), bm25_result.hits.?.total.?.value);
     try std.testing.expectEqualStrings("doc:a", bm25_result.hits.?.hits.?[0]._id);
 
     const significant_terms_body = try std.testing.allocator.dupe(u8,
@@ -7649,6 +7646,7 @@ test "public api e2e serves cluster backup list and restore routes" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -7903,6 +7901,7 @@ test "public api e2e does not publish or restore a partial cluster backup" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -8039,6 +8038,7 @@ test "public api e2e reports unsupported multi-range tables in cluster backup" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -8234,6 +8234,7 @@ test "public api smoke e2e commits transaction across split ranges" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -8403,6 +8404,7 @@ test "public api smoke e2e commits transactions across two tables atomically" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -8606,6 +8608,7 @@ test "public api smoke e2e queries after merge finalization" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -8735,7 +8738,7 @@ test "public api smoke e2e queries after merge finalization" {
     defer query_responses.deinit();
     try std.testing.expectEqual(@as(usize, 1), query_responses.value.responses.?.len);
     const query_result = query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 1), query_result.hits.?.total.?.value);
+    try std.testing.expectEqual(@as(u64, 1), query_result.hits.?.total.?.value);
     try std.testing.expectEqualStrings("doc:z", query_result.hits.?.hits.?[0]._id);
 
     const delete_body = try test_contract_helpers.normalizeBatchRequest(std.testing.allocator, "{\"deletes\":[\"doc:z\"]}");
@@ -8755,5 +8758,5 @@ test "public api smoke e2e queries after merge finalization" {
     var deleted_query_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, deleted_query.body, .{});
     defer deleted_query_responses.deinit();
     const deleted_query_result = deleted_query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 0), deleted_query_result.hits.?.total.?.value);
+    try std.testing.expectEqual(@as(u64, 0), deleted_query_result.hits.?.total.?.value);
 }

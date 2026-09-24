@@ -173,10 +173,11 @@ antfly query --table wikipedia \
 
 ### 5. Show Why a Hit Matched
 
-Add `highlight` to any query that carries `full_text_search` and every hit that
-returns stored source also carries `_highlights`: a map from field name to
+Add `highlight` to any query that carries `full_text_search` (or named
+full-text queries) and every hit carries `_highlights`: a map from field name to
 fragments of the stored value, each with byte-offset spans marking the text the
-query matched.
+query matched. Highlights come from the unprojected document, so a `fields`
+projection that leaves the highlighted field out of `_source` does not hide it.
 
 ```json
 {
@@ -203,7 +204,8 @@ root, so a `sku._substring` query highlights `sku`, and substring matches mark
 the exact contained bytes even when they cross a separator. Omit `fields` to
 highlight every field the query references. Highlights are computed on the
 node that owns the documents, so they add no coordinator round trips; the cost
-is one re-analysis of each highlighted field per returned hit.
+is one re-analysis of each highlighted field per returned hit, plus one stored
+document load per hit when `_source` was projected or omitted.
 
 ## Tradeoffs
 

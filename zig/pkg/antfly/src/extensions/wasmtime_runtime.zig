@@ -293,9 +293,14 @@ const WasmtimeFunc = extern struct {
     private: ?*anyopaque = null,
 };
 
-const WasmtimeMemory = extern struct {
+// v45 embeds a store/index struct; its trailing padding is part of the ABI.
+const WasmtimeStoreIndex = extern struct {
     store_id: u64 = 0,
     private1: u32 = 0,
+};
+
+const WasmtimeMemory = extern struct {
+    store: WasmtimeStoreIndex = .{},
     private2: u32 = 0,
 };
 
@@ -311,12 +316,12 @@ const WASMTIME_EXTERN_MEMORY: WasmtimeExternKind = 3;
 const WasmtimeExternUnion = extern union {
     func: WasmtimeFunc,
     memory: WasmtimeMemory,
-    bytes: [32]u8,
+    bytes: [24]u8,
 };
 
 const WasmtimeExtern = extern struct {
     kind: WasmtimeExternKind = 0,
-    of: WasmtimeExternUnion = .{ .bytes = [_]u8{0} ** 32 },
+    of: WasmtimeExternUnion = .{ .bytes = [_]u8{0} ** 24 },
 };
 
 const WasmtimeValRaw = extern union {
@@ -332,8 +337,7 @@ const WasmtimeComponentInstance = extern struct {
 };
 
 const WasmtimeComponentFunc = extern struct {
-    store_id: u64 = 0,
-    private1: u32 = 0,
+    store: WasmtimeStoreIndex = .{},
     private2: u32 = 0,
 };
 
@@ -442,9 +446,9 @@ const WasmtimeLib = struct {
     wasm_byte_vec_new: *const fn (*WasmName, usize, [*]const u8) callconv(.c) void,
     wasm_config_new: *const fn () callconv(.c) ?*wasm_config_t,
     wasm_engine_new_with_config: *const fn (?*wasm_config_t) callconv(.c) ?*wasm_engine_t,
-    wasm_engine_new: *const fn () callconv(.c) ?*wasm_engine_t,
     wasm_engine_delete: *const fn (?*wasm_engine_t) callconv(.c) void,
     wasmtime_config_wasm_component_model_set: *const fn (?*wasm_config_t, bool) callconv(.c) void,
+    wasmtime_config_parallel_compilation_set: *const fn (?*wasm_config_t, bool) callconv(.c) void,
     wasmtime_config_consume_fuel_set: *const fn (?*wasm_config_t, bool) callconv(.c) void,
     wasi_config_new: *const fn () callconv(.c) ?*wasi_config_t,
     wasi_config_delete: *const fn (?*wasi_config_t) callconv(.c) void,
@@ -507,9 +511,9 @@ const WasmtimeLib = struct {
             .wasm_byte_vec_new = try lookup(&dynlib, "wasm_byte_vec_new", *const fn (*WasmName, usize, [*]const u8) callconv(.c) void),
             .wasm_config_new = try lookup(&dynlib, "wasm_config_new", *const fn () callconv(.c) ?*wasm_config_t),
             .wasm_engine_new_with_config = try lookup(&dynlib, "wasm_engine_new_with_config", *const fn (?*wasm_config_t) callconv(.c) ?*wasm_engine_t),
-            .wasm_engine_new = try lookup(&dynlib, "wasm_engine_new", *const fn () callconv(.c) ?*wasm_engine_t),
             .wasm_engine_delete = try lookup(&dynlib, "wasm_engine_delete", *const fn (?*wasm_engine_t) callconv(.c) void),
             .wasmtime_config_wasm_component_model_set = try lookup(&dynlib, "wasmtime_config_wasm_component_model_set", *const fn (?*wasm_config_t, bool) callconv(.c) void),
+            .wasmtime_config_parallel_compilation_set = try lookup(&dynlib, "wasmtime_config_parallel_compilation_set", *const fn (?*wasm_config_t, bool) callconv(.c) void),
             .wasmtime_config_consume_fuel_set = try lookup(&dynlib, "wasmtime_config_consume_fuel_set", *const fn (?*wasm_config_t, bool) callconv(.c) void),
             .wasi_config_new = try lookup(&dynlib, "wasi_config_new", *const fn () callconv(.c) ?*wasi_config_t),
             .wasi_config_delete = try lookup(&dynlib, "wasi_config_delete", *const fn (?*wasi_config_t) callconv(.c) void),
@@ -554,8 +558,21 @@ const WasmtimeLib = struct {
         self.dynlib.close();
     }
 
+    fn newEngine(self: WasmtimeLib, component_model: bool) InvokeError!*wasm_engine_t {
+        const config = self.wasm_config_new() orelse return error.WasmtimeUnavailable;
+        // Compile on the caller's admitted worker. Wasmtime's process-global
+        // Rayon pool is outside our worker accounting, and its 2 MiB stacks
+        // leave no usable stack beside the partitioned executable's static
+        // TLS on glibc. This policy applies to core modules and components;
+        // do not mutate process-wide Rust thread settings from a request.
+        self.wasmtime_config_parallel_compilation_set(config, false);
+        self.wasmtime_config_wasm_component_model_set(config, component_model);
+        self.wasmtime_config_consume_fuel_set(config, component_model);
+        return self.wasm_engine_new_with_config(config) orelse error.WasmtimeUnavailable;
+    }
+
     fn invokeExtensionCAbi(self: WasmtimeLib, alloc: std.mem.Allocator, wasm: []const u8, tool_name: []const u8, request_json: []const u8) InvokeError![]u8 {
-        const engine = self.wasm_engine_new() orelse return error.WasmtimeUnavailable;
+        const engine = try self.newEngine(false);
         defer self.wasm_engine_delete(engine);
 
         const store = self.wasmtime_store_new(engine, null, null) orelse return error.WasmtimeUnavailable;
@@ -622,10 +639,7 @@ const WasmtimeLib = struct {
     }
 
     fn invokeExtensionComponent(self: WasmtimeLib, alloc: std.mem.Allocator, wasm: []const u8, entrypoint: []const u8, tool_name: []const u8, request_json: []const u8, options: InvokeOptions) InvokeError![]u8 {
-        const config = self.wasm_config_new() orelse return error.WasmtimeUnavailable;
-        self.wasmtime_config_wasm_component_model_set(config, true);
-        self.wasmtime_config_consume_fuel_set(config, true);
-        const engine = self.wasm_engine_new_with_config(config) orelse return error.WasmtimeUnavailable;
+        const engine = try self.newEngine(true);
         defer self.wasm_engine_delete(engine);
 
         const store = self.wasmtime_store_new(engine, null, null) orelse return error.WasmtimeUnavailable;
@@ -994,4 +1008,12 @@ fn wasmNameDupe(alloc: std.mem.Allocator, name: WasmName) ![]u8 {
 
 fn lookup(dynlib: *std.DynLib, name: [:0]const u8, comptime T: type) InvokeError!T {
     return dynlib.lookup(T, name) orelse error.WasmtimeSymbolMissing;
+}
+
+test "wasmtime v45 C handle layouts retain nested struct padding" {
+    try std.testing.expectEqual(@as(usize, 24), @sizeOf(WasmtimeMemory));
+    try std.testing.expectEqual(@as(usize, 16), @offsetOf(WasmtimeMemory, "private2"));
+    try std.testing.expectEqual(@as(usize, 24), @sizeOf(WasmtimeComponentFunc));
+    try std.testing.expectEqual(@as(usize, 16), @offsetOf(WasmtimeComponentFunc, "private2"));
+    try std.testing.expectEqual(@as(usize, 32), @sizeOf(WasmtimeExtern));
 }

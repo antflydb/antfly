@@ -268,6 +268,17 @@ pub const dense_hbc_lsm_options_default = lsm_backend_mod.Options{
     .obsolete_retention_ns = 250 * std.time.ns_per_ms,
 };
 
+/// Resumable, private portable decoders retain WAL recovery but acknowledge
+/// progress only after the importer synchronizes rows and their checkpoint.
+/// Use the production primary-store pressure policy, not the low-level LSM's
+/// eight-entry default (which would produce tiny runs on every row page).
+pub const portable_decoder_lsm_options_default: lsm_backend_mod.Options = blk: {
+    var options = primary_lsm_options_default;
+    options.backend.durability = .none;
+    options.flush_threshold_bytes = 16 * mib;
+    break :blk options;
+};
+
 pub const graph_reverse_lsm_options_default = lsm_backend_mod.Options{
     .flush_threshold_bytes = 16 * 1024 * 1024,
     .read_snapshot_rotate_mutable_bytes = 16 * 1024 * 1024,
@@ -299,14 +310,7 @@ pub const sparse_lsm_options_default = graph_reverse_lsm_options_default;
 /// transition. A missing source means the DB is a standalone owner and may
 /// cut over locally; provisioned/distributed DBs always install a source that
 /// remains closed until every possible shard owner advertises support.
-pub const DenseNativeMigrationPolicySource = struct {
-    ptr: *const anyopaque,
-    authority_permitted: *const fn (ptr: *const anyopaque) bool,
-
-    pub fn authorityPermitted(self: @This()) bool {
-        return self.authority_permitted(self.ptr);
-    }
-};
+pub const DenseNativeMigrationPolicySource = @import("runtime_callbacks.zig").DenseNativeMigrationPolicySource;
 
 pub const IndexBackendOptions = struct {
     text_main_backend: persistent_mod.MainBackend = .lsm,

@@ -8,7 +8,7 @@
 
 const std = @import("std");
 const ant_json = @import("antfly-json");
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = @import("antfly_source_root").antfly_sources.selected_db;
 
 pub const Dialect = db_mod.types.GraphQueryWireDialect;
 pub const deprecation_header_name = "Deprecation";

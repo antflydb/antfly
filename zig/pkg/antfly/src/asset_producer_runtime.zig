@@ -56,6 +56,18 @@ const default_provider_response_envelope_bytes: usize = 1 << 20;
 // A JSON string may encode one logical byte as a six-byte \u00XX escape. Use
 // the task-neutral worst case until a provider publishes a tighter wire codec.
 const provider_json_result_wire_multiplier: usize = 6;
+// GLiNER boundary extraction's reviewed long-document contract (see
+// zig/pkg/inference/models/gliner2/GLINER25.md's LengthContract) qualifies
+// documents up to 182 KB / 28,275 words / 29 windows for the embedded
+// extraction path. A small, fixed fraction of the embedded node's own
+// host/scratch budget (tens of GiB by default; see
+// standalone/inference_provider.zig's createEmbeddedInferenceNode) --
+// comfortably covering that qualified bound -- so
+// invocationMemoryForRequests's allocator ceiling for local extraction never
+// falls below what a single qualified-length document needs, regardless of
+// what the generic caller-side response-envelope arithmetic happens to
+// produce for a given result-size configuration.
+const extraction_qualified_document_allocator_floor_bytes: usize = 256 << 20;
 
 pub const ResultLimits = struct {
     reader_bytes_per_item: usize = 256 << 10,
@@ -197,6 +209,115 @@ test "asset producer runtime local invocation ownership fails closed without exe
     );
 }
 
+// Regression test for the "a single 182 KB document is rejected on a fixed
+// constant" defect: the generic nonmedia-bytes/response-envelope arithmetic
+// in invocationMemoryForRequests has no notion of GLiNER boundary
+// extraction's qualified long-document bound (GLINER25.md's LengthContract,
+// 182 KB / 28,275 words / 29 windows). For the local/embedded extraction
+// path the allocator ceiling must be floored at
+// extraction_qualified_document_allocator_floor_bytes so a document at that
+// qualified bound is comfortably admitted.
+test "asset producer runtime floors the local extractor allocator ceiling at the qualified document bound" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
+    defer client.deinit();
+
+    const Local = struct {
+        fn extract(_: *anyopaque, _: Allocator, _: []const u8, _: extracting.Request) !extracting.Response {
+            return error.TestUnexpectedResult;
+        }
+        fn embedDense(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+        fn embedSparse(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![]@import("storage/db/enrichment/embedder.zig").SparseEmbedding {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var context: u8 = 0;
+    const provider = managed_embedder.AntflyProvider{
+        .ptr = &context,
+        .owns_invocation_admission = true,
+        .embed_dense_texts = Local.embedDense,
+        .embed_sparse_texts = Local.embedSparse,
+        .extract = Local.extract,
+    };
+    var runtime = Runtime.initWithOptions(alloc, &client, .{ .antfly_provider = provider });
+    defer runtime.deinit();
+
+    // A document at the qualified long-document bound (182 KB), plus a
+    // modest schema, as the sole item in the invocation.
+    const document = try alloc.alloc(u8, 182 * 1024);
+    defer alloc.free(document);
+    @memset(document, 'a');
+    const request = asset_producer.Request{
+        .producer_type = .extractor,
+        .config_json = "{\"provider\":\"antfly\",\"model\":\"gliner-boundary\",\"schema\":{\"entities\":[\"person\"]}}",
+        .source_text = document,
+        .content_type = "application/json",
+    };
+
+    const plan = try runtime.producer().invocationMemoryForRequests(alloc, &.{request});
+    try std.testing.expectEqual(inference_work.InvocationAllocatorOwner.executor, plan.allocator_owner);
+    try std.testing.expect(plan.allocator_limit_bytes >= extraction_qualified_document_allocator_floor_bytes);
+    // The floor must never shrink the ceiling below what the generic
+    // arithmetic would have produced for a larger, well-provisioned response
+    // budget, and the invariant fixed_bytes >= allocator_limit_bytes >=
+    // max_result_bytes must still hold after flooring.
+    try plan.validate();
+}
+
+// Regression for the dogfood ingest's six terminal failures: planning a tiny
+// section (150-560 bytes) with the ordinary GLiNER extractor config parses
+// that config into a JSON value tree whose allocations exceed a budget scaled
+// only from the request's own bytes. Resolution must reach the provider (which
+// here fails with a sentinel) rather than failing closed with
+// InferenceInvocationMemoryExceeded before the invocation.
+test "asset producer runtime resolves a plan for a tiny local extractor request" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
+    defer client.deinit();
+
+    const Local = struct {
+        fn extract(_: *anyopaque, _: Allocator, _: []const u8, _: extracting.Request) !extracting.Response {
+            return error.TestUnexpectedResult;
+        }
+        fn embedDense(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+        fn embedSparse(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![]@import("storage/db/enrichment/embedder.zig").SparseEmbedding {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var context: u8 = 0;
+    const provider = managed_embedder.AntflyProvider{
+        .ptr = &context,
+        .owns_invocation_admission = true,
+        .embed_dense_texts = Local.embedDense,
+        .embed_sparse_texts = Local.embedSparse,
+        .extract = Local.extract,
+    };
+    var runtime = Runtime.initWithOptions(alloc, &client, .{ .antfly_provider = provider });
+    defer runtime.deinit();
+
+    const request = asset_producer.Request{
+        .producer_type = .extractor,
+        .config_json =
+        \\{"model":"fastino/gliner2.5-base-v1","options":{"include_confidence":true,"include_spans":true,"long_document":{"mode":"window"}},"provider":"antfly","schema":{"entities":["component","subsystem","file","test","invariant","decision","person","model","backend","format","protocol"],"relations":[{"type":"depends_on"},{"type":"owns"},{"type":"implements"},{"type":"supersedes"},{"type":"tested_by"},{"type":"documented_in"}]}}
+        ,
+        .source_text = "This document tracks reader and OCR parity between the Zig server in this repo and the reference.",
+        .content_type = "application/json",
+    };
+    try std.testing.expectError(error.TestUnexpectedResult, runtime.producer().produce(alloc, request));
+}
+
+/// Two in-flight local transcriptions keep the model busy while the other
+/// recording is decoded and windowed; more only adds memory pressure.
+pub const default_local_transcriber_width: usize = 2;
+
 pub const Runtime = struct {
     alloc: Allocator,
     http: *httpx.Client,
@@ -214,6 +335,11 @@ pub const Runtime = struct {
     max_provider_response_bytes: usize = default_asset_provider_response_bytes,
     provider_response_envelope_bytes: usize = default_provider_response_envelope_bytes,
     result_limits: ResultLimits = .{},
+    /// Recordings transcribed concurrently on the in-process (antfly) route.
+    /// Model runs serialise on the session's execution gate, so the width
+    /// only overlaps audio decoding, feature extraction and token decoding
+    /// of one recording with the model time of another.
+    local_transcriber_width: usize = default_local_transcriber_width,
 
     pub const Options = struct {
         limits: *provider_limits.Registry = &provider_limits.process_registry,
@@ -624,7 +750,7 @@ pub const Runtime = struct {
             response_limit,
             invocation_response_resident_multiplier - 1,
         ) catch return error.InferenceEncodedBytesExceeded;
-        const allocator_limit = std.math.add(usize, fixed, parser_and_copy_limit) catch
+        var allocator_limit = std.math.add(usize, fixed, parser_and_copy_limit) catch
             return error.InferenceEncodedBytesExceeded;
         const response_peak = std.math.mul(
             usize,
@@ -632,6 +758,28 @@ pub const Runtime = struct {
             invocation_response_resident_multiplier,
         ) catch return error.InferenceEncodedBytesExceeded;
         fixed = std.math.add(usize, fixed, response_peak) catch return error.InferenceEncodedBytesExceeded;
+
+        // The arithmetic above sizes a caller-side JSON adapter's parsing and
+        // response-copy overhead; it has no notion of a document-extraction
+        // model's own qualified length contract (GLINER25.md's long-document
+        // LengthContract admits documents up to
+        // extraction_qualified_document_bound_bytes, windowed into dozens of
+        // sub-requests inside the executor). For the LOCAL/embedded
+        // extraction path -- allocator_owner == .executor, meaning the
+        // executor is admitted against the embedded node's own host/scratch
+        // budget (see standalone/inference_provider.zig's
+        // createEmbeddedInferenceNode, tens of GiB by default) rather than
+        // being purely a JSON transport -- floor the allocator ceiling well
+        // above what the generic response-envelope formula happens to
+        // produce, so a single document at or under the qualified bound is
+        // admitted instead of rejected by a constant sized for a small
+        // adapter. This is a small, fixed fraction of the embedded node's own
+        // budget, not a per-document scaling that could itself be exhausted
+        // by one oversized document.
+        if (requests[0].producer_type == .extractor and allocator_owner == .executor) {
+            allocator_limit = @max(allocator_limit, extraction_qualified_document_allocator_floor_bytes);
+            fixed = @max(fixed, allocator_limit);
+        }
         return .{
             .attachment_transport = transport,
             .fixed_bytes = fixed,
@@ -951,8 +1099,9 @@ pub const Runtime = struct {
                 break :blk capabilities.batch.mode;
             },
             // Transcription has one input per provider call. The compatibility
-            // batch preserves result order and uses bounded concurrency only
-            // for remote/stateless routes; linked model state stays serial.
+            // batch preserves result order with bounded concurrency: 8 calls
+            // for remote routes, `local_transcriber_width` for the in-process
+            // model, whose runs serialise on its execution gate.
             .transcriber => .serial_compatibility,
             .extractor => blk: {
                 if (!try self.canExtractBatch(alloc, requests)) break :blk .none;
@@ -1489,7 +1638,15 @@ pub const Runtime = struct {
     /// allocator thread-safety out of the executor contract and bounds retained
     /// response memory even when a provider route fans out across nodes.
     fn produceRemoteCompatibilityBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) ![][]u8 {
+        return self.produceCompatibilityBatchWithWidth(alloc, requests, 8);
+    }
+
+    /// Runs `requests` one provider call at a time but up to `max_width`
+    /// calls concurrently, preserving result order. Remote routes use 8;
+    /// the in-process transcriber uses `local_transcriber_width`.
+    fn produceCompatibilityBatchWithWidth(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request, max_width: usize) ![][]u8 {
         if (requests.len == 0) return try alloc.alloc([]u8, 0);
+        if (max_width <= 1) return self.produceBatchSequential(alloc, requests);
         const io = self.execution.io orelse return self.produceBatchSequential(alloc, requests);
         const per_item_response_bytes = @max(
             @as(usize, 1),
@@ -1499,7 +1656,7 @@ pub const Runtime = struct {
         const width = @max(
             @as(usize, 1),
             @min(
-                @as(usize, 8),
+                max_width,
                 @min(requests.len, response_budget / @min(per_item_response_bytes, response_budget)),
             ),
         );
@@ -1545,6 +1702,16 @@ pub const Runtime = struct {
             var group: std.Io.Group = .init;
             for (tasks[start..end]) |*task| group.async(io, Task.run, .{task});
             try group.await(io);
+            // A concurrent wave can exceed the inference node's admission
+            // budget; such items are retried one at a time rather than
+            // failing the whole batch.
+            for (tasks[start..end]) |*task| {
+                const failure = task.failure orelse continue;
+                if (failure == error.QueueFull and task.output == null) {
+                    task.failure = null;
+                    try Task.run(task);
+                }
+            }
             for (tasks[start..end]) |task| if (task.failure) |err| return err;
 
             // Transfer and release this wave before admitting the next one.
@@ -1667,6 +1834,18 @@ pub const Runtime = struct {
 
         const extract_request = extracting.Request{
             .inputs = inputs,
+            // `extracting.Request.schema_version` is `?u32`; leaving this an
+            // implicit-default `cfg.schema_version` (always a concrete `u32`,
+            // never itself null) would silently wrap it into `Some(1)`,
+            // erasing exactly the explicit-vs-defaulted distinction
+            // `schema_version_explicit` exists to preserve. `extract()`'s
+            // HTTP transport (`HttpExtractorState.extract` in
+            // lib/extracting/src/mod.zig) reads this same field back via
+            // `req.schema_version orelse ...` to decide whether to enforce
+            // the response's schema_version -- an always-concrete `Some(1)`
+            // here would make that check fire unconditionally regardless of
+            // whether the caller ever asked for v1, defeating the fix there.
+            .schema_version = if (cfg.schema_version_explicit) cfg.schema_version else null,
             .schema_json = cfg.schema_json,
             .options_json = cfg.options_json,
             .attachments = attachments,
@@ -1700,11 +1879,22 @@ pub const Runtime = struct {
         }) catch |err| {
             if (err == error.InferenceCapabilitiesStale)
                 try self.invalidateExtractorCapabilityLease(alloc, cfg);
+            if (err == error.InvalidExtractionResponse) return error.InvalidExtractorResponse;
             return err;
         };
         defer response.deinit();
 
-        return try extractionResultsJsonAlloc(alloc, response.json, cfg.model, input_ids, output_ids);
+        return try extractionResultsJsonAllocExpected(alloc, response.json, .{
+            .model = cfg.model,
+            .item_count = input_ids.len,
+            // See the single-item extract() call site's comment: only pin
+            // the response to a specific schema_version when the caller's
+            // config asked for one explicitly, so a boundary model's
+            // provider-side auto-upgrade to v2 is not rejected as a mismatch
+            // when nothing pinned the request to v1.
+            .schema_version = if (cfg.schema_version_explicit) cfg.schema_version else null,
+            .max_response_bytes = extract_request.max_response_bytes,
+        }, input_ids, output_ids);
     }
 
     fn tryGenerateBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) ![][]u8 {
@@ -1978,6 +2168,12 @@ pub const Runtime = struct {
             return self.produceRemoteCompatibilityBatch(alloc, requests);
         const model = requiredAntflyTranscriberModel(cfg_parsed.value) catch return error.BatchIncompatible;
         const local = self.antfly_provider orelse return error.BatchIncompatible;
+        // Each recording is one provider call; overlap a bounded number of
+        // them so one recording's decode and feature work runs while the
+        // model is busy with another.
+        if (self.local_transcriber_width > 1 and self.execution.io != null and requests.len > 1) {
+            return self.produceCompatibilityBatchWithWidth(alloc, requests, self.local_transcriber_width);
+        }
 
         const out = try alloc.alloc([]u8, requests.len);
         errdefer {
@@ -1991,6 +2187,8 @@ pub const Runtime = struct {
             const transcribe_request = transcribing.Request{
                 .url = request.source_text,
                 .language = cfg_parsed.value.language_code,
+                .timestamps = cfg_parsed.value.timestamps orelse true,
+                .diarization = cfg_parsed.value.diarization orelse false,
             };
             var result = if (local.transcribe_audio_with_context) |transcribe_audio|
                 try managed_embedder.AntflyProviderBoundary.call(
@@ -2010,10 +2208,12 @@ pub const Runtime = struct {
                 return error.BatchIncompatible;
             defer transcribing.deinitResponse(alloc, &result);
 
+            // Diarized transcripts keep their speaker turns in the text
+            // form too (`SPEAKER_00: ...` lines); JSON carries them as fields.
             out[i] = if (isJsonContentType(request.content_type))
                 try std.json.Stringify.valueAlloc(alloc, result, .{})
             else
-                try alloc.dupe(u8, result.text orelse "");
+                try transcribing.speakerAttributedTextAlloc(alloc, &result);
         }
         return out;
     }
@@ -2765,6 +2965,8 @@ pub const Runtime = struct {
             const transcribe_request = transcribing.Request{
                 .url = request.source_text,
                 .language = cfg_parsed.value.language_code,
+                .timestamps = cfg_parsed.value.timestamps orelse true,
+                .diarization = cfg_parsed.value.diarization orelse false,
             };
             var result = if (local.transcribe_audio_with_context) |transcribe_audio|
                 try managed_embedder.AntflyProviderBoundary.call(
@@ -2787,7 +2989,7 @@ pub const Runtime = struct {
             if (isJsonContentType(request.content_type)) {
                 return try std.json.Stringify.valueAlloc(alloc, result, .{});
             }
-            return try alloc.dupe(u8, result.text orelse "");
+            return try transcribing.speakerAttributedTextAlloc(alloc, &result);
         }
 
         var capability_auth_value: ?[]u8 = null;
@@ -2834,7 +3036,11 @@ pub const Runtime = struct {
             alloc,
             self.http,
             cfg_parsed.value,
-            .{ .url = request.source_text },
+            .{
+                .url = request.source_text,
+                .timestamps = cfg_parsed.value.timestamps orelse true,
+                .diarization = cfg_parsed.value.diarization orelse false,
+            },
             .{
                 .source_table = self.execution.routing.source_table,
                 .timeout_ms = try self.execution.remainingTimeoutMs(platform.time.monotonicNs(), max_asset_provider_timeout_ms),
@@ -2860,7 +3066,7 @@ pub const Runtime = struct {
         if (isJsonContentType(request.content_type)) {
             return try std.json.Stringify.valueAlloc(alloc, result, .{});
         }
-        return try alloc.dupe(u8, result.text orelse "");
+        return try transcribing.speakerAttributedTextAlloc(alloc, &result);
     }
 
     fn extract(self: *Runtime, alloc: Allocator, request: asset_producer.Request) ![]u8 {
@@ -2896,6 +3102,18 @@ pub const Runtime = struct {
         };
         const extract_request = extracting.Request{
             .inputs = &.{input},
+            // `extracting.Request.schema_version` is `?u32`; leaving this an
+            // implicit-default `cfg.schema_version` (always a concrete `u32`,
+            // never itself null) would silently wrap it into `Some(1)`,
+            // erasing exactly the explicit-vs-defaulted distinction
+            // `schema_version_explicit` exists to preserve. `extract()`'s
+            // HTTP transport (`HttpExtractorState.extract` in
+            // lib/extracting/src/mod.zig) reads this same field back via
+            // `req.schema_version orelse ...` to decide whether to enforce
+            // the response's schema_version -- an always-concrete `Some(1)`
+            // here would make that check fire unconditionally regardless of
+            // whether the caller ever asked for v1, defeating the fix there.
+            .schema_version = if (cfg.schema_version_explicit) cfg.schema_version else null,
             .schema_json = cfg.schema_json,
             .options_json = cfg.options_json,
             .attachments = attachments,
@@ -2930,14 +3148,35 @@ pub const Runtime = struct {
         }) catch |err| {
             if (err == error.InferenceCapabilitiesStale)
                 try self.invalidateExtractorCapabilityLease(alloc, cfg);
+            if (err == error.InvalidExtractionResponse) return error.InvalidExtractorResponse;
             return err;
         };
         defer response.deinit();
 
-        if (isJsonContentType(request.content_type) or request.content_type.len == 0) {
-            return try extracting.firstResultJsonAlloc(alloc, response.json);
-        }
-        return try alloc.dupe(u8, response.json);
+        return try extractionResultJsonAlloc(alloc, response.json, .{
+            .model = cfg.model,
+            .item_count = 1,
+            // Only pin the response to a specific schema_version when the
+            // producer config asked for one explicitly. A boundary-
+            // architecture model (fastino/gliner2.5-base-v1) auto-upgrades a
+            // plain, schema-version-less wire request to v2 on the provider
+            // side (see zig/pkg/inference's extractWithAdmission); a caller
+            // that left schema_version unset -- as
+            // examples/dogfood/index_config.go's knowledgeGraphIndexJSON and
+            // GRAPH.md's shorthand extractor config both do -- has no basis
+            // to reject that upgraded response as a schema_version mismatch.
+            // parseExtractionResponse still derives the actual `v2` parsing
+            // flag from the response body itself, independent of this
+            // expectation, so relations/entities validate correctly either
+            // way; this only controls whether an unrequested upgrade is
+            // treated as an error. Previously every extraction call against
+            // such a model failed downstream with InvalidExtractorResponse
+            // (logged as "enrichment request failed ... InvalidExtractorResponse"),
+            // silently producing zero relations/edges for graph indexes fed
+            // by the extractor asset producer.
+            .schema_version = if (cfg.schema_version_explicit) cfg.schema_version else null,
+            .max_response_bytes = extract_request.max_response_bytes,
+        }, input.id, !(isJsonContentType(request.content_type) or request.content_type.len == 0));
     }
 
     fn effectiveGeneratorConfig(self: *const Runtime, cfg: generating_runtime.GeneratorConfig) generating_runtime.GeneratorConfig {
@@ -3737,8 +3976,19 @@ fn validateExtractorBatchCompatibility(
     attachment_transport: inference_work.AttachmentTransport,
     requests: []const asset_producer.Request,
 ) !void {
-    if (capabilities.task != .extract or capabilities.result_cardinality != .one_per_item or
-        capabilities.batch.mode == .none) return error.InvalidInferenceCapabilities;
+    if (capabilities.task != .extract or capabilities.result_cardinality != .one_per_item)
+        return error.InvalidInferenceCapabilities;
+    // An executor that advertises no batching (the GLiNER boundary contract:
+    // mode = .none, max_items = 1 -- see resolvedExecutorBatchImplementation
+    // in zig/pkg/inference/src/server/server.zig) is not a malformed
+    // capability, it is simply not batchable. `canExtractBatch` already
+    // treats this as "return false, use sequential production" without
+    // erroring; this gate must classify it the same way its caller
+    // (`produceBatch`'s `error.BatchIncompatible => {}` fallback) expects, so
+    // a direct `produceBatch`/`produceBatchReported` call against a
+    // one-item-at-a-time executor degrades to sequential instead of
+    // surfacing a hard failure.
+    if (capabilities.batch.mode == .none) return error.BatchIncompatible;
     var uses_media: ?bool = null;
     var media_prompt: ?[]u8 = null;
     defer if (media_prompt) |prompt| alloc.free(prompt);
@@ -4500,6 +4750,194 @@ fn extractionContentJsonAlloc(alloc: Allocator, source_text: []const u8, source_
     return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(source_text, .{})});
 }
 
+fn extractionInteger(alloc: Allocator, value: std.json.Value) !i64 {
+    switch (value) {
+        .integer, .float, .number_string => {},
+        else => return error.InvalidExtractorResponse,
+    }
+    return std.json.innerParseFromValue(i64, alloc, value, .{}) catch return error.InvalidExtractorResponse;
+}
+
+fn extractionNumber(value: std.json.Value, probability: bool) !f64 {
+    const number: f64 = switch (value) {
+        .integer => |integer| @floatFromInt(integer),
+        .float => |float| float,
+        .number_string => |text| std.fmt.parseFloat(f64, text) catch return error.InvalidExtractorResponse,
+        else => return error.InvalidExtractorResponse,
+    };
+    if (!std.math.isFinite(number) or (probability and (number < 0 or number > 1))) return error.InvalidExtractorResponse;
+    return number;
+}
+
+fn extractionOptionalNumber(item: std.json.Value, key: []const u8, probability: bool) !void {
+    if (item != .object) return error.InvalidExtractorResponse;
+    if (item.object.get(key)) |value| if (value != .null) {
+        _ = try extractionNumber(value, probability);
+    };
+}
+
+fn extractionOffsets(alloc: Allocator, item: std.json.Value, nonnegative: bool, required: bool) !void {
+    if (item != .object) return error.InvalidExtractorResponse;
+    const raw_start = item.object.get("start") orelse .null;
+    const raw_end = item.object.get("end") orelse .null;
+    if (required and (raw_start == .null or raw_end == .null)) return error.InvalidExtractorResponse;
+    const start = if (raw_start == .null) null else try extractionInteger(alloc, raw_start);
+    const end = if (raw_end == .null) null else try extractionInteger(alloc, raw_end);
+    if (nonnegative) {
+        if (start) |value| if (value < 0) return error.InvalidExtractorResponse;
+        if (end) |value| if (value < 0) return error.InvalidExtractorResponse;
+    }
+    if (start) |first| if (end) |last| if (last < first) return error.InvalidExtractorResponse;
+}
+
+fn extractionString(item: std.json.Value, key: []const u8) ![]const u8 {
+    if (item != .object) return error.InvalidExtractorResponse;
+    const value = item.object.get(key) orelse return error.InvalidExtractorResponse;
+    if (value != .string) return error.InvalidExtractorResponse;
+    return value.string;
+}
+
+fn extractionStringChoice(item: std.json.Value, key: []const u8, choices: []const []const u8) !void {
+    const value = try extractionString(item, key);
+    for (choices) |choice| if (std.mem.eql(u8, value, choice)) return;
+    return error.InvalidExtractorResponse;
+}
+
+fn validateExtractionAttribute(item: std.json.Value) !void {
+    _ = try extractionString(item, "label");
+    _ = try extractionNumber(item.object.get("confidence") orelse return error.InvalidExtractorResponse, true);
+}
+
+fn validateExtractionField(alloc: Allocator, item: std.json.Value) !void {
+    _ = try extractionString(item, "value");
+    try extractionOptionalNumber(item, "score", true);
+    try extractionOffsets(alloc, item, true, false);
+    if (item.object.get("source")) |source| if (source != .null) {
+        try extractionStringChoice(item, "source", &.{ "document", "schema" });
+        if (std.mem.eql(u8, source.string, "schema")) {
+            if (item.object.get("start")) |value| if (value != .null) return error.InvalidExtractorResponse;
+            if (item.object.get("end")) |value| if (value != .null) return error.InvalidExtractorResponse;
+        }
+    };
+}
+
+fn validateExtractionEndpoint(alloc: Allocator, item: std.json.Value, endpoint: extraction_api.ExtractionRelationEndpoint, entity_count: usize) !void {
+    for ([_][]const u8{ "id", "label", "text" }) |key| if (item.object.get(key)) |value| if (value != .null and value != .string) return error.InvalidExtractorResponse;
+    try extractionOffsets(alloc, item, true, false);
+    try extractionOptionalNumber(item, "score", false);
+    if (endpoint.score) |score| if (!std.math.isFinite(score)) return error.InvalidExtractorResponse;
+    if (endpoint.entity_index) |index| {
+        _ = try extractionInteger(alloc, item.object.get("entity_index").?);
+        if (index < 0 or @as(u64, @intCast(index)) >= entity_count) return error.InvalidExtractorResponse;
+    }
+}
+
+fn validateExtractionResult(alloc: Allocator, item: std.json.Value, typed: extraction_api.ExtractionObject, v2: bool) !void {
+    // Generated DTOs establish object/array/string structure, but JSON's
+    // generic scalar parser can coerce numeric strings and overflow f32.
+    // Check actual numeric tokens and the ranges declared by the wire schema.
+    if (typed.offset_unit) |unit| if (unit != .null)
+        try extractionStringChoice(item, "offset_unit", &.{ "utf8_bytes", "unicode_codepoints", "utf16_codeunits" });
+    const entity_count = if (typed.entities) |entities| entities.len else 0;
+    if (typed.entities) |entities| for (item.object.get("entities").?.array.items, entities) |raw, entity| {
+        _ = try extractionString(raw, "label");
+        _ = try extractionString(raw, "text");
+        try extractionOffsets(alloc, raw, v2, false);
+        try extractionOptionalNumber(raw, "score", false);
+        if (entity.score) |score| if (!std.math.isFinite(score)) return error.InvalidExtractorResponse;
+        if (entity.attributes) |_| {
+            var groups = raw.object.get("attributes").?.object.iterator();
+            while (groups.next()) |group| switch (group.value_ptr.*) {
+                .object => try validateExtractionAttribute(group.value_ptr.*),
+                .array => |labels| {
+                    if (labels.items.len > 128) return error.InvalidExtractorResponse;
+                    for (labels.items) |label| try validateExtractionAttribute(label);
+                },
+                else => return error.InvalidExtractorResponse,
+            };
+        }
+    };
+    if (typed.classifications) |classifications| for (item.object.get("classifications").?.array.items, classifications) |raw, classification| {
+        _ = try extractionString(raw, "name");
+        _ = try extractionString(raw, "label");
+        try extractionOptionalNumber(raw, "score", false);
+        if (classification.score) |score| if (!std.math.isFinite(score)) return error.InvalidExtractorResponse;
+    };
+    if (typed.decisions) |decisions| for (item.object.get("decisions").?.array.items, decisions) |raw, decision| {
+        if (!v2) return error.InvalidExtractorResponse;
+        _ = try extractionString(raw, "name");
+        _ = try extractionString(raw, "label");
+        try extractionStringChoice(raw, "type", &.{ "choice", "score", "boolean" });
+        try extractionStringChoice(raw, "confidence_method", &.{ "normalized_inverse_entropy", "max_probability" });
+        _ = try extractionNumber(raw.object.get("confidence") orelse return error.InvalidExtractorResponse, true);
+        _ = try extractionNumber(raw.object.get("act_probability") orelse return error.InvalidExtractorResponse, true);
+        try extractionOptionalNumber(raw, "true_probability", true);
+        if (raw.object.get("expected_value")) |value| if (try extractionNumber(value, false) < 0) return error.InvalidExtractorResponse;
+        if (decision.expected_value) |value| if (!std.math.isFinite(value)) return error.InvalidExtractorResponse;
+        const probabilities = raw.object.get("probabilities") orelse return error.InvalidExtractorResponse;
+        if (probabilities != .array or probabilities.array.items.len < 2) return error.InvalidExtractorResponse;
+        for (probabilities.array.items) |probability| {
+            _ = try extractionString(probability, "label");
+            _ = try extractionNumber(probability.object.get("probability") orelse return error.InvalidExtractorResponse, true);
+        }
+    };
+    if (typed.relations) |relations| for (item.object.get("relations").?.array.items, relations) |raw, relation| {
+        _ = try extractionString(raw, "type");
+        try extractionOptionalNumber(raw, "score", false);
+        if (relation.score) |score| if (!std.math.isFinite(score)) return error.InvalidExtractorResponse;
+        if (relation.source) |endpoint| try validateExtractionEndpoint(alloc, raw.object.get("source").?, endpoint, entity_count);
+        if (relation.target) |endpoint| try validateExtractionEndpoint(alloc, raw.object.get("target").?, endpoint, entity_count);
+    };
+    if (v2 and typed.structures != null) {
+        var structures = item.object.get("structures").?.object.iterator();
+        while (structures.next()) |structure| {
+            if (structure.value_ptr.* != .array) return error.InvalidExtractorResponse;
+            for (structure.value_ptr.array.items) |record| {
+                if (record != .object) return error.InvalidExtractorResponse;
+                var fields = record.object.iterator();
+                while (fields.next()) |field| switch (field.value_ptr.*) {
+                    .object => try validateExtractionField(alloc, field.value_ptr.*),
+                    .array => |values| for (values.items) |value| try validateExtractionField(alloc, value),
+                    else => return error.InvalidExtractorResponse,
+                };
+            }
+        }
+    }
+    if (typed.structure_metadata != null) {
+        var groups = item.object.get("structure_metadata").?.object.iterator();
+        while (groups.next()) |group| {
+            const structures = item.object.get("structures") orelse return error.InvalidExtractorResponse;
+            if (structures != .object) return error.InvalidExtractorResponse;
+            const records = structures.object.get(group.key_ptr.*) orelse return error.InvalidExtractorResponse;
+            if (records != .array or records.array.items.len != group.value_ptr.array.items.len) return error.InvalidExtractorResponse;
+            for (group.value_ptr.array.items) |metadata| {
+                try extractionOptionalNumber(metadata, "score", true);
+                if (metadata.object.get("anchor")) |anchor| if (anchor != .null) try extractionOffsets(alloc, anchor, true, true);
+            }
+        }
+    }
+    if (typed.solvers) |solvers| if (solvers != .null) {
+        if (solvers != .object) return error.InvalidExtractorResponse;
+        for ([_][]const u8{ "classification", "joint_ie", "records" }) |name| if (solvers.object.get(name)) |status| if (status != .null) {
+            try extractionStringChoice(status, "status", &.{ "optimal", "feasible" });
+            _ = try extractionNumber(status.object.get("utility") orelse return error.InvalidExtractorResponse, false);
+            if (try extractionInteger(alloc, status.object.get("visited_nodes") orelse return error.InvalidExtractorResponse) < 0) return error.InvalidExtractorResponse;
+            if ((status.object.get("exhausted") orelse return error.InvalidExtractorResponse) != .bool) return error.InvalidExtractorResponse;
+        };
+    };
+    if (typed.long_document) |metadata| if (metadata != .null) {
+        if (metadata != .object) return error.InvalidExtractorResponse;
+        if (try extractionInteger(alloc, metadata.object.get("version") orelse return error.InvalidExtractorResponse) != 1 or
+            try extractionInteger(alloc, metadata.object.get("window_count") orelse return error.InvalidExtractorResponse) < 1) return error.InvalidExtractorResponse;
+        try extractionStringChoice(metadata, "window_policy", &.{"source_words_midpoint_ownership"});
+        try extractionStringChoice(metadata, "classification_aggregation", &.{"owned_word_weighted_mean_raw_logits"});
+        try extractionStringChoice(metadata, "duplicate_score", &.{"maximum_calibrated_score"});
+        try extractionStringChoice(metadata, "natural_record_identity", &.{"exact_source_anchor"});
+        try extractionStringChoice(metadata, "other_record_identity", &.{ "occurrence", "semantic" });
+        try extractionStringChoice(metadata, "solver_optimality_scope", &.{"retained_candidate_graph"});
+    };
+}
+
 fn extractionResultsJsonAlloc(
     alloc: Allocator,
     response_json: []const u8,
@@ -4507,23 +4945,15 @@ fn extractionResultsJsonAlloc(
     wire_ids: []const []const u8,
     output_ids: []const []const u8,
 ) ![][]u8 {
-    if (wire_ids.len != output_ids.len) return error.InvalidWorkIdentity;
-    var expected_by_id = std.StringHashMapUnmanaged(usize).empty;
-    defer expected_by_id.deinit(alloc);
-    for (wire_ids, 0..) |id, index| {
-        if (id.len == 0) return error.InvalidWorkIdentity;
-        const entry = try expected_by_id.getOrPut(alloc, id);
-        if (entry.found_existing) return error.InvalidWorkIdentity;
-        entry.value_ptr.* = index;
-    }
+    return extractionResultsJsonAllocExpected(alloc, response_json, .{ .model = expected_model, .item_count = wire_ids.len }, wire_ids, output_ids);
+}
 
-    var raw = std.json.parseFromSlice(std.json.Value, alloc, response_json, .{
-        .duplicate_field_behavior = .@"error",
-    }) catch |err| return switch (err) {
+fn parseExtractionResponse(alloc: Allocator, response_json: []const u8, expected: extracting.ResponseExpectation) !std.json.Parsed(std.json.Value) {
+    var raw = extracting.parseResponse(alloc, response_json, expected) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => error.InvalidExtractorResponse,
     };
-    defer raw.deinit();
+    errdefer raw.deinit();
     var typed = std.json.parseFromValue(extraction_api.ExtractionResponse, alloc, raw.value, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
@@ -4533,14 +4963,48 @@ fn extractionResultsJsonAlloc(
         else => error.InvalidExtractorResponse,
     };
     defer typed.deinit();
-    if (!std.mem.eql(u8, typed.value.object, "extraction") or
-        !std.mem.eql(u8, typed.value.model, expected_model))
-        return error.InvalidExtractorResponse;
-    if (typed.value.data.len != wire_ids.len) return error.InvalidExtractorResponse;
-    if (raw.value != .object) return error.InvalidExtractorResponse;
-    const raw_data = raw.value.object.get("data") orelse return error.InvalidExtractorResponse;
-    if (raw_data != .array or raw_data.array.items.len != wire_ids.len)
-        return error.InvalidExtractorResponse;
+    const version = if (raw.value.object.get("schema_version")) |value| try extractionInteger(alloc, value) else 1;
+    const data = raw.value.object.get("data").?.array.items;
+    for (data, typed.value.data) |item, typed_item| try validateExtractionResult(alloc, item, typed_item, version == 2);
+    return raw;
+}
+
+fn extractionResultJsonAlloc(alloc: Allocator, response_json: []const u8, expected: extracting.ResponseExpectation, wire_id: ?[]const u8, whole_envelope: bool) ![]u8 {
+    if (expected.item_count != 1) return error.InvalidWorkIdentity;
+    var raw = try parseExtractionResponse(alloc, response_json, expected);
+    defer raw.deinit();
+    const item = raw.value.object.get("data").?.array.items[0];
+    const id = item.object.get("id") orelse .null;
+    if (wire_id) |requested| {
+        if (id != .string or !std.mem.eql(u8, id.string, requested)) return error.InvalidExtractorResponse;
+    } else if (id != .null) return error.InvalidExtractorResponse;
+    // The single-item wire request remains anonymous, even if the enclosing
+    // enrichment has a durable item_id. Never invent or accept another ID.
+    if (whole_envelope) return alloc.dupe(u8, response_json);
+    return std.json.Stringify.valueAlloc(alloc, item, .{});
+}
+
+fn extractionResultsJsonAllocExpected(
+    alloc: Allocator,
+    response_json: []const u8,
+    expected: extracting.ResponseExpectation,
+    wire_ids: []const []const u8,
+    output_ids: []const []const u8,
+) ![][]u8 {
+    if (wire_ids.len != output_ids.len) return error.InvalidWorkIdentity;
+    if (expected.item_count != wire_ids.len) return error.InvalidWorkIdentity;
+    var expected_by_id = std.StringHashMapUnmanaged(usize).empty;
+    defer expected_by_id.deinit(alloc);
+    for (wire_ids, 0..) |id, index| {
+        if (id.len == 0) return error.InvalidWorkIdentity;
+        const entry = try expected_by_id.getOrPut(alloc, id);
+        if (entry.found_existing) return error.InvalidWorkIdentity;
+        entry.value_ptr.* = index;
+    }
+
+    var raw = try parseExtractionResponse(alloc, response_json, expected);
+    defer raw.deinit();
+    const raw_data = raw.value.object.get("data").?;
 
     const out = try alloc.alloc([]u8, wire_ids.len);
     for (out) |*item| item.* = &.{};
@@ -4558,7 +5022,24 @@ fn extractionResultsJsonAlloc(
         const index = expected_by_id.get(id_value.string) orelse return error.InvalidExtractorResponse;
         if (seen[index]) return error.InvalidExtractorResponse;
         if (output_ids[index].len > 0) {
-            try item.object.put(alloc, "id", .{ .string = output_ids[index] });
+            // `item.object` is a `std.json.Value.Object` (ArrayHashMapUnmanaged)
+            // built by `parseExtractionResponse`'s `std.json.parseFromSlice`
+            // using `raw.arena.allocator()` (see std/json/static.zig's
+            // `Parsed(T)`: parsed values are always leaked into the arena,
+            // never the base allocator passed to `parseFromSlice`). Growing
+            // the map with a *different* allocator -- `alloc` here, which for
+            // a real caller is `std.heap.c_allocator` and in tests is
+            // `std.testing.allocator` -- frees the old backing storage
+            // through an allocator that never allocated it the moment `put`
+            // needs to grow capacity: a canary-detected "Invalid free" panic
+            // under the testing allocator, and silent heap corruption under
+            // `c_allocator` in production, which manifested as extraction
+            // batch responses failing validation
+            // (`error.InvalidExtractorResponse`) as soon as a multi-document
+            // batch's response items grew a JSON object past its initial
+            // parsed capacity -- exactly what a real GLiNER2.5 boundary
+            // response's richer per-relation fields do.
+            try item.object.put(raw.arena.allocator(), "id", .{ .string = output_ids[index] });
         } else {
             _ = item.object.orderedRemove("id");
         }
@@ -4666,6 +5147,218 @@ test "asset producer runtime typed extractor response parsing is allocation-fail
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+const extraction_v2_response_fixture =
+    \\{"object":"extraction","model":"owner/model","schema_version":2,"data":[{"offset_unit":"utf8_bytes","entities":[{"label":"person","text":"Ada","start":0,"end":3,"score":0.9,"attributes":{"tone":{"label":"positive","confidence":0.8}},"provider_entity":{"rank":1}}],"relations":[{"type":"works_for","source":{"entity_index":0},"target":{"text":"Antfly","start":13,"end":19},"score":0.7,"derived":false}],"classifications":[{"name":"topic","label":"work","score":0.6}],"structures":{"person":[{"role":{"value":"staff","source":"schema","score":0.5}}]},"structure_metadata":{"person":[{"score":0.4,"anchor":{"start":0,"end":3}}]},"solvers":{"records":{"status":"feasible","utility":-0.25,"visited_nodes":3,"exhausted":true}},"long_document":{"version":1,"window_count":2,"window_policy":"source_words_midpoint_ownership","classification_aggregation":"owned_word_weighted_mean_raw_logits","duplicate_score":"maximum_calibrated_score","natural_record_identity":"exact_source_anchor","other_record_identity":"occurrence","solver_optimality_scope":"retained_candidate_graph"},"provider_extension":{"exact":1.2345678901234567890123456789}}]}
+;
+
+fn exerciseSingleExtractionResponse(alloc: Allocator) !void {
+    const expected = extracting.ResponseExpectation{ .model = "owner/model", .item_count = 1, .schema_version = 2 };
+    const result = blk: {
+        var response = extracting.Response{ .allocator = alloc, .json = try alloc.dupe(u8, extraction_v2_response_fixture) };
+        defer response.deinit();
+        break :blk try extractionResultJsonAlloc(alloc, response.json, expected, null, false);
+    };
+    defer alloc.free(result);
+    // The response and both parse arenas are gone; the result owns every byte.
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"provider_entity\":{\"rank\":1}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"exact\":1.2345678901234567890123456789") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"long_document\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"exhausted\":true") != null);
+    const envelope = try extractionResultJsonAlloc(alloc, extraction_v2_response_fixture, expected, null, true);
+    defer alloc.free(envelope);
+    try std.testing.expectEqualStrings(extraction_v2_response_fixture, envelope);
+}
+
+test "asset producer runtime single extractor response preserves v2 extensions and ownership" {
+    try exerciseSingleExtractionResponse(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseSingleExtractionResponse, .{});
+}
+
+test "asset producer runtime single extractor response rejects malformed envelopes and typed values" {
+    const a = std.testing.allocator;
+    const expected = extracting.ResponseExpectation{ .model = "owner/model", .item_count = 1, .schema_version = 1 };
+    const envelopes = [_][]const u8{
+        "{}",
+        "[]",
+        "{\"object\":\"extraction\",\"data\":[{}]}",
+        "{\"object\":\"extraction\",\"model\":\"other/model\",\"data\":[{}]}",
+        "{\"object\":\"extraction\",\"model\":\"owner/model\",\"data\":[]}",
+        "{\"object\":\"extraction\",\"model\":\"owner/model\",\"data\":[{},{}]}",
+        "{\"object\":\"extraction\",\"model\":\"owner/model\",\"data\":[1]}",
+        "{\"object\":\"extraction\",\"model\":\"owner/model\",\"data\":[{\"id\":\"invented\"}]}",
+        "{\"object\":\"extraction\",\"model\":\"owner/model\",\"data\":[{\"entities\":[1]}]}",
+        "{\"object\":\"extraction\",\"model\":\"owner/model\",\"data\":[{\"entities\":[{\"label\":\"person\",\"text\":\"Ada\",\"text\":\"Grace\"}]}]}",
+    };
+    for (envelopes) |payload| for ([_]bool{ false, true }) |whole_envelope|
+        try std.testing.expectError(error.InvalidExtractorResponse, extractionResultJsonAlloc(a, payload, expected, null, whole_envelope));
+
+    const malformed_items = [_][]const u8{
+        "{\"entities\":[{\"label\":\"person\",\"text\":[65]}]}",
+        "{\"entities\":[{\"label\":\"person\",\"text\":\"Ada\",\"score\":\"0.9\"}]}",
+        "{\"entities\":[{\"label\":\"person\",\"text\":\"Ada\",\"score\":1e100}]}",
+        "{\"entities\":[{\"label\":\"person\",\"text\":\"Ada\",\"start\":\"0\",\"end\":3}]}",
+        "{\"entities\":[{\"label\":\"person\",\"text\":\"Ada\",\"start\":3,\"end\":0}]}",
+        "{\"classifications\":[{\"name\":\"topic\",\"label\":\"work\",\"score\":1e999}]}",
+        "{\"relations\":[{\"type\":\"knows\",\"source\":{\"entity_index\":0}}]}",
+        "{\"relations\":[{\"type\":\"knows\",\"source\":{\"start\":-1}}]}",
+        "{\"relations\":[{\"type\":\"knows\",\"source\":{\"text\":[65]}}]}",
+        "{\"entities\":[{\"label\":\"person\",\"text\":\"Ada\",\"attributes\":{\"tone\":{\"label\":\"positive\",\"confidence\":1.1}}}]}",
+        "{\"entities\":[{\"label\":\"person\",\"text\":\"Ada\",\"attributes\":{\"tone\":{\"label\":\"positive\",\"confidence\":\"0.8\"}}}]}",
+        "{\"offset_unit\":\"utf16\"}",
+        "{\"solvers\":{\"records\":{\"status\":\"optimal\",\"utility\":1e999,\"visited_nodes\":1,\"exhausted\":false}}}",
+        "{\"solvers\":{\"records\":{\"status\":\"optimal\",\"utility\":0,\"visited_nodes\":-1,\"exhausted\":false}}}",
+        "{\"structure_metadata\":{\"missing\":[{}]}}",
+    };
+    for (malformed_items) |item| {
+        const payload = try std.fmt.allocPrint(a, "{{\"object\":\"extraction\",\"model\":\"owner/model\",\"data\":[{s}]}}", .{item});
+        defer a.free(payload);
+        try std.testing.expectError(error.InvalidExtractorResponse, extractionResultJsonAlloc(a, payload, expected, null, false));
+    }
+    const v2_items = [_][]const u8{
+        "{\"entities\":[{\"label\":\"p\",\"text\":\"x\",\"start\":-1,\"end\":1}]}",
+        "{\"structures\":{\"record\":[{\"field\":{\"value\":\"x\",\"score\":-0.1}}]}}",
+        "{\"structures\":{\"record\":[{\"field\":{\"value\":\"x\",\"source\":\"schema\",\"start\":0,\"end\":1}}]}}",
+        "{\"structures\":{\"record\":[{\"field\":\"x\"}]}}",
+        "{\"long_document\":{\"version\":1,\"window_count\":0}}",
+    };
+    for (v2_items) |item| {
+        const payload = try std.fmt.allocPrint(a, "{{\"object\":\"extraction\",\"model\":\"owner/model\",\"schema_version\":2,\"data\":[{s}]}}", .{item});
+        defer a.free(payload);
+        try std.testing.expectError(error.InvalidExtractorResponse, extractionResultJsonAlloc(a, payload, .{ .model = "owner/model", .item_count = 1, .schema_version = 2 }, null, false));
+    }
+}
+
+test "asset producer runtime single extractor response preserves legacy optional fields and exact identity" {
+    const a = std.testing.allocator;
+    const expected = extracting.ResponseExpectation{ .model = "m", .item_count = 1, .schema_version = 1 };
+    // Legacy generic scores are finite floats, not declared probabilities;
+    // legacy structure payloads remain open-ended. Anonymous IDs are omitted:
+    // the original v1 schema and generated serializer do not admit null IDs.
+    const payload = "{\"object\":\"extraction\",\"model\":\"m\",\"data\":[{\"entities\":[{\"label\":\"p\",\"text\":\"x\",\"score\":2.5}],\"structures\":{\"legacy\":{\"arbitrary\":true}}}]}";
+    const value = try extractionResultJsonAlloc(a, payload, expected, null, false);
+    defer a.free(value);
+    try std.testing.expect(std.mem.indexOf(u8, value, "\"score\":2.5") != null);
+    const named = "{\"object\":\"extraction\",\"model\":\"m\",\"data\":[{\"id\":\"wire-1\"}]}";
+    const echoed = try extractionResultJsonAlloc(a, named, expected, "wire-1", false);
+    defer a.free(echoed);
+    try std.testing.expectEqualStrings("{\"id\":\"wire-1\"}", echoed);
+    try std.testing.expectError(error.InvalidExtractorResponse, extractionResultJsonAlloc(a, "{\"object\":\"extraction\",\"model\":\"m\",\"data\":[{\"id\":null}]}", expected, null, false));
+    try std.testing.expectError(error.InvalidExtractorResponse, extractionResultJsonAlloc(a, named, expected, "wire-2", false));
+    try std.testing.expectError(error.InvalidExtractorResponse, extractionResultJsonAlloc(a, payload, expected, "wire-1", false));
+    try std.testing.expectError(error.InvalidExtractorResponse, extractionResultJsonAlloc(a, payload, .{ .model = "m", .item_count = 1, .schema_version = 2 }, null, false));
+}
+
+// A boundary-architecture model (fastino/gliner2.5-base-v1; see GLINER25.md
+// and zig/pkg/inference's extractWithAdmission) auto-upgrades a plain,
+// schema-version-less wire request to a schema_version=2 response. A
+// producer config that never asked for a specific schema_version -- as
+// examples/dogfood/index_config.go's knowledgeGraphIndexJSON and GRAPH.md's
+// shorthand extractor config both do -- has no basis to reject that upgrade
+// as a mismatch: before Config.schema_version_explicit existed, `extract()`
+// (asset_producer_runtime.zig) pinned `expected.schema_version` to
+// `cfg.schema_version`'s implicit-default value of 1 regardless of whether
+// the caller actually requested it, so every such response failed
+// parseResponse's strict equality check with InvalidExtractorResponse --
+// logged only as a warning by the enrichment runtime, so the extraction call
+// itself was reported as having "succeeded" while silently producing zero
+// relations/entities and therefore zero graph edges for any index whose
+// extractor asset producer omits schema_version. This test exercises the
+// same derivation `extract()` and its batch counterpart now use directly
+// against `extracting.parseConfigFromSlice`, so a regression in either call
+// site's `if (cfg.schema_version_explicit) cfg.schema_version else null`
+// expression would be caught here even though it lives past this file's own
+// unit-test boundary.
+test "asset producer runtime accepts an unrequested boundary-model schema_version upgrade" {
+    const a = std.testing.allocator;
+    const response = "{\"object\":\"extraction\",\"model\":\"fastino/gliner2.5-base-v1\",\"schema_version\":2,\"data\":[{\"entities\":[{\"label\":\"component\",\"text\":\"VOPR\",\"start\":0,\"end\":4}],\"relations\":[{\"type\":\"depends_on\",\"source\":{\"entity_index\":0},\"target\":{\"text\":\"antfly-core\",\"start\":10,\"end\":21}}]}]}";
+
+    // Config JSON with no "schema_version" field, matching dogfood's real
+    // producer config shape exactly (examples/dogfood/index_config.go's
+    // knowledgeGraphIndexJSON never sets one).
+    var implicit_cfg = try extracting.parseConfigFromSlice(
+        a,
+        "{\"provider\":\"antfly\",\"model\":\"fastino/gliner2.5-base-v1\",\"schema\":{\"entities\":[\"component\"],\"relations\":[{\"type\":\"depends_on\"}]}}",
+    );
+    defer implicit_cfg.deinit(a);
+    try std.testing.expect(!implicit_cfg.schema_version_explicit);
+    try std.testing.expectEqual(@as(u32, 1), implicit_cfg.schema_version);
+
+    const accepted = try extractionResultJsonAlloc(a, response, .{
+        .model = implicit_cfg.model,
+        .item_count = 1,
+        .schema_version = if (implicit_cfg.schema_version_explicit) implicit_cfg.schema_version else null,
+    }, null, false);
+    defer a.free(accepted);
+    try std.testing.expect(std.mem.indexOf(u8, accepted, "\"depends_on\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, accepted, "\"antfly-core\"") != null);
+
+    // An explicit v1 request must still reject an upgraded v2 response: the
+    // caller pinned a version this time, so serving a different one is a
+    // real mismatch, not a sanctioned upgrade.
+    var explicit_cfg = try extracting.parseConfigFromSlice(
+        a,
+        "{\"provider\":\"antfly\",\"model\":\"fastino/gliner2.5-base-v1\",\"schema_version\":1,\"schema\":{\"entities\":[\"component\"],\"relations\":[{\"type\":\"depends_on\"}]}}",
+    );
+    defer explicit_cfg.deinit(a);
+    try std.testing.expect(explicit_cfg.schema_version_explicit);
+    try std.testing.expectError(error.InvalidExtractorResponse, extractionResultJsonAlloc(a, response, .{
+        .model = explicit_cfg.model,
+        .item_count = 1,
+        .schema_version = if (explicit_cfg.schema_version_explicit) explicit_cfg.schema_version else null,
+    }, null, false));
+}
+
+// Batch-path counterpart of the previous test: Lite's graph-fed extractor
+// asset producer runs multiple documents through
+// `extractionResultsJsonAllocExpected` (the "extract_batches=1
+// extract_items=2" runUntilIdle summary line), not the single-item
+// `extractionResultJsonAlloc` path, whenever more than one document changes
+// in the same replay pass -- exactly what
+// TestLiteNativeGraphEdgesFromExtractionArtifactBoundaryV2
+// (go/pkg/lite/lite_cgo_test.go) exercises with its two documents.
+test "asset producer runtime batch path accepts an unrequested boundary-model schema_version upgrade" {
+    const a = std.testing.allocator;
+    const item_shape =
+        "\"entities\":[{\"label\":\"component\",\"text\":\"VOPR\",\"start\":0,\"end\":4,\"score\":0.95}," ++
+        "{\"label\":\"component\",\"text\":\"antfly-core\",\"start\":10,\"end\":21,\"score\":0.9}]," ++
+        "\"relations\":[{\"type\":\"depends_on\"," ++
+        "\"source\":{\"entity_index\":0,\"label\":\"component\",\"text\":\"VOPR\",\"start\":0,\"end\":4,\"score\":0.95}," ++
+        "\"target\":{\"entity_index\":1,\"label\":\"component\",\"text\":\"antfly-core\",\"start\":10,\"end\":21,\"score\":0.9}," ++
+        "\"score\":0.88,\"derived\":false}]," ++
+        "\"long_document\":{\"version\":1,\"window_count\":2,\"window_policy\":\"source_words_midpoint_ownership\"," ++
+        "\"classification_aggregation\":\"owned_word_weighted_mean_raw_logits\"," ++
+        "\"duplicate_score\":\"maximum_calibrated_score\",\"natural_record_identity\":\"exact_source_anchor\"," ++
+        "\"other_record_identity\":\"occurrence\",\"solver_optimality_scope\":\"retained_candidate_graph\"}";
+    const response = "{\"object\":\"extraction\",\"model\":\"fastino/gliner2.5-base-v1\",\"schema_version\":2,\"data\":[" ++
+        "{\"id\":\"antfly-batch-item-0\"," ++ item_shape ++ "}," ++
+        "{\"id\":\"antfly-batch-item-1\"," ++ item_shape ++ "}" ++
+        "]}";
+
+    var implicit_cfg = try extracting.parseConfigFromSlice(
+        a,
+        "{\"provider\":\"antfly\",\"model\":\"fastino/gliner2.5-base-v1\",\"schema\":{\"entities\":[\"component\"],\"relations\":[{\"type\":\"depends_on\"}]}}",
+    );
+    defer implicit_cfg.deinit(a);
+    try std.testing.expect(!implicit_cfg.schema_version_explicit);
+
+    const wire_ids = [_][]const u8{ "antfly-batch-item-0", "antfly-batch-item-1" };
+    const output_ids = [_][]const u8{ "doc:vopr-design", "doc:vopr-tests" };
+    const results = try extractionResultsJsonAllocExpected(a, response, .{
+        .model = implicit_cfg.model,
+        .item_count = wire_ids.len,
+        .schema_version = if (implicit_cfg.schema_version_explicit) implicit_cfg.schema_version else null,
+    }, &wire_ids, &output_ids);
+    defer {
+        for (results) |item| a.free(item);
+        a.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    for (results) |item| {
+        try std.testing.expect(std.mem.indexOf(u8, item, "\"depends_on\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, item, "\"antfly-core\"") != null);
+    }
 }
 
 fn antflyGenerateBatchUrlAlloc(alloc: Allocator, base_url: []const u8) ![]u8 {
@@ -6696,6 +7389,7 @@ test "asset producer runtime routes antfly extractor without url to local provid
 
     const Local = struct {
         extract_calls: usize = 0,
+        response_json: ?[]const u8 = null,
 
         fn provider(self: *@This()) managed_embedder.AntflyProvider {
             return .{
@@ -6734,11 +7428,12 @@ test "asset producer runtime routes antfly extractor without url to local provid
             self.extract_calls += 1;
             try std.testing.expectEqualStrings("local-extractor", model);
             try std.testing.expectEqual(@as(usize, 1), request.inputs.len);
+            try std.testing.expect(request.inputs[0].id == null);
             try std.testing.expect(std.mem.indexOf(u8, request.inputs[0].content_json, "Ada") != null);
             try std.testing.expect(std.mem.indexOf(u8, request.schema_json, "person") != null);
             return .{
                 .allocator = a,
-                .json = try a.dupe(u8, "{\"object\":\"extraction\",\"model\":\"local-extractor\",\"data\":[{\"entities\":[{\"label\":\"person\",\"text\":\"Ada\"}],\"relations\":[]}]}"),
+                .json = try a.dupe(u8, self.response_json orelse "{\"object\":\"extraction\",\"model\":\"local-extractor\",\"data\":[{\"entities\":[{\"label\":\"person\",\"text\":\"Ada\"}],\"relations\":[]}]}"),
             };
         }
     };
@@ -6761,6 +7456,25 @@ test "asset producer runtime routes antfly extractor without url to local provid
     try std.testing.expect(std.mem.indexOf(u8, result, "\"entities\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"Ada\"") != null);
     try std.testing.expectEqual(@as(usize, 1), local.extract_calls);
+
+    const invalid = [_][]const u8{
+        "{\"object\":\"extraction\",\"model\":\"wrong-model\",\"data\":[{}]}",
+        "{\"object\":\"extraction\",\"model\":\"local-extractor\",\"data\":[]}",
+        "{\"object\":\"extraction\",\"model\":\"local-extractor\",\"data\":[{},{}]}",
+        "{\"object\":\"extraction\",\"model\":\"local-extractor\",\"data\":[{\"id\":\"different-document\"}]}",
+        "{\"object\":\"extraction\",\"model\":\"local-extractor\",\"data\":[{\"entities\":[1]}]}",
+        "{\"object\":\"extraction\",\"model\":\"local-extractor\",\"data\":[{\"entities\":[],\"entities\":[]}]}",
+    };
+    for (invalid) |payload| for ([_][]const u8{ "application/json", "text/plain" }) |content_type| {
+        local.response_json = payload;
+        try std.testing.expectError(error.InvalidExtractorResponse, producer.produce(alloc, .{
+            .producer_type = .extractor,
+            .config_json = "{\"provider\":\"antfly\",\"model\":\"local-extractor\",\"schema\":{\"entities\":[\"person\"]}}",
+            .source_text = "Ada works at Antfly.",
+            .item_id = "caller-page:000001",
+            .content_type = content_type,
+        }));
+    };
 }
 
 test "asset producer runtime batches compatible antfly extractor requests" {
@@ -6854,4 +7568,125 @@ test "asset producer runtime batches compatible antfly extractor requests" {
     try std.testing.expect(std.mem.indexOf(u8, results[0], "\"Ada\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, results[1], "\"Grace\"") != null);
     try std.testing.expectEqual(@as(usize, 1), local.extract_calls);
+}
+
+// Regression test for the "9 of 1,231" GLiNER boundary incident: an executor
+// that advertises `mode = .none, max_items = 1` (the boundary extraction
+// contract; see zig/pkg/inference/src/server/server.zig's
+// resolvedExecutorBatchImplementation and GLINER25.md's LengthContract) must
+// never see more than one document per extract() invocation, no matter how
+// many compatible requests the caller offers at once. `canExtractBatch`
+// (consulted by `batchMode`/`canProduceBatch`) must refuse batching outright,
+// and `tryExtractBatchReported`'s own `validateExtractorBatchCompatibility`
+// gate must independently refuse it too -- both read the same freshly
+// resolved capabilities, so there is no path that can silently widen the
+// group after admission.
+test "asset producer runtime never batches an extractor that advertises max_items=1" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const Local = struct {
+        extract_calls: usize = 0,
+        max_inputs_seen: usize = 0,
+
+        fn provider(self: *@This()) managed_embedder.AntflyProvider {
+            return .{
+                .ptr = self,
+                .owns_invocation_admission = true,
+                .embed_dense_texts = embedDense,
+                .embed_sparse_texts = embedSparse,
+                .extract = extract,
+                .model_capabilities = modelCapabilities,
+            };
+        }
+
+        fn embedDense(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+
+        fn embedSparse(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![]@import("storage/db/enrichment/embedder.zig").SparseEmbedding {
+            return error.TestUnexpectedResult;
+        }
+
+        // Mirrors the fixed native_gliner_extraction advertisement: batching
+        // is disabled outright (mode = .none), which BatchCapabilities.validate
+        // requires to carry preferred_items = max_items = 1.
+        fn modelCapabilities(_: *anyopaque, _: Allocator, _: []const u8, task: inference_work.Task) !inference_work.InferenceCapabilities {
+            try std.testing.expectEqual(inference_work.Task.extract, task);
+            return .{
+                .task = .extract,
+                .input_modalities = .{ .text = true },
+                .accepted_mime_types = .{ .text_plain = true },
+                .input_granularity = .item,
+                .batch = .{ .mode = .none, .preferred_items = 1, .max_items = 1 },
+                .output = .extraction,
+                .prompt_policy = .structured_schema,
+            };
+        }
+
+        fn extract(ptr: *anyopaque, a: Allocator, model: []const u8, request: extracting.Request) !extracting.Response {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.extract_calls += 1;
+            self.max_inputs_seen = @max(self.max_inputs_seen, request.inputs.len);
+            try std.testing.expectEqualStrings("gliner-boundary", model);
+            // The one invariant this regression test exists to lock in: every
+            // wire request the provider path issues carries exactly one
+            // document, matching the executor's advertised max_items. Falling
+            // back to sequential production (BatchIncompatible, not a batch
+            // chunk) leaves each Input.id null, so the response envelope
+            // matches the single-item shape (no "id" field) rather than the
+            // native-batch shape.
+            try std.testing.expectEqual(@as(usize, 1), request.inputs.len);
+            try std.testing.expect(request.inputs[0].id == null);
+            return .{
+                .allocator = a,
+                .json = try a.dupe(u8, "{\"object\":\"extraction\",\"model\":\"gliner-boundary\",\"data\":[{\"entities\":[],\"relations\":[]}]}"),
+            };
+        }
+    };
+
+    var local = Local{};
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+    defer client.deinit();
+    var runtime = Runtime.initWithOptions(alloc, &client, .{ .antfly_provider = local.provider() });
+    defer runtime.deinit();
+    const producer = runtime.producer();
+
+    const config_json = "{\"provider\":\"antfly\",\"model\":\"gliner-boundary\",\"schema\":{\"entities\":[\"person\"]}}";
+    const requests = [_]asset_producer.Request{
+        .{ .producer_type = .extractor, .config_json = config_json, .source_text = "Ada works at Antfly.", .content_type = "application/json" },
+        .{ .producer_type = .extractor, .config_json = config_json, .source_text = "Grace works at Antfly.", .content_type = "application/json" },
+        .{ .producer_type = .extractor, .config_json = config_json, .source_text = "Alan works at Antfly.", .content_type = "application/json" },
+    };
+
+    // The admission check must independently agree that this producer cannot
+    // batch: canProduceBatch/batchMode consult the same capabilities.
+    try std.testing.expect(!try producer.canProduceBatch(alloc, &requests));
+
+    const results = try producer.produceBatch(alloc, &requests);
+    defer {
+        for (results) |result| alloc.free(result);
+        alloc.free(results);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+    try std.testing.expectEqual(@as(usize, 3), local.extract_calls);
+    try std.testing.expectEqual(@as(usize, 1), local.max_inputs_seen);
+}
+
+test "laya enrichment preserves typed decisions and rejects invalid probabilities" {
+    const a = std.testing.allocator;
+    const payload =
+        \\{"object":"extraction","model":"laya","schema_version":2,"data":[{"classifications":[{"name":"tool","label":"search","score":0.75}],"decisions":[{"name":"tool","type":"choice","label":"search","probabilities":[{"label":"search","probability":0.75},{"label":"none","probability":0.25}],"confidence":0.1887,"confidence_method":"normalized_inverse_entropy","act_probability":0.8}]}]}
+    ;
+    const expected = extracting.ResponseExpectation{ .model = "laya", .item_count = 1, .schema_version = 2 };
+    const result = try extractionResultJsonAlloc(a, payload, expected, null, false);
+    defer a.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"decisions\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"probability\":0.75") != null);
+    const invalid = try std.mem.replaceOwned(u8, a, payload, "\"probability\":0.75", "\"probability\":1.5");
+    defer a.free(invalid);
+    try std.testing.expectError(error.InvalidExtractorResponse, extractionResultJsonAlloc(a, invalid, expected, null, false));
 }

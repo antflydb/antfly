@@ -41,6 +41,20 @@ const namespaceOf = state_mod.namespaceOf;
 const compareNamespace = state_mod.compareNamespace;
 const compareEntryTo = state_mod.compareEntryTo;
 
+/// CPU work slices share the I/O authority used for cooperative continuation.
+/// Storage timestamps separately govern retention and durable file ages.
+pub fn workNowNs(backend: anytype) u64 {
+    return workIoNowNs(if (comptime @hasDecl(@TypeOf(backend.*), "manifestCoordinationIo")) backend.manifestCoordinationIo() else null);
+}
+
+fn workIoNowNs(io: ?std.Io) u64 {
+    if (io) |owner| {
+        const now = std.Io.Clock.awake.now(owner).toNanoseconds();
+        return @intCast(@max(0, @min(now, std.math.maxInt(u64))));
+    }
+    return @import("antfly_platform").time.monotonicNs();
+}
+
 const OwnedBytes = struct {
     allocator: Allocator,
     bytes: []u8,
@@ -794,6 +808,8 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         mutable_source_entry_bytes: ?[]u8 = null,
         mutable_entry_cursor: State.EntryCursor = .{},
         current_key: ?[]const u8 = null,
+        test_full_forward_seek: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
+        test_seek_sources: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
         current_visible_source: ?usize = null,
         upper_bound: ?[]const u8 = null,
         backend_locked: bool = false,
@@ -1056,10 +1072,37 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         pub fn seekAtOrAfter(self: *@This(), key: []const u8) !?backend_adapter.Entry {
-            try self.initForwardPositions(key, true);
+            const restart = if (comptime builtin.is_test) self.test_full_forward_seek else false;
+            if (!restart and self.current_key != null) {
+                const current = self.current_key.?;
+                if (std.mem.order(u8, key, current) != .lt) {
+                    try self.skipForwardTo(key);
+                } else {
+                    try self.initForwardPositions(key, true);
+                }
+            } else {
+                try self.initForwardPositions(key, true);
+            }
             const entry = try self.selectVisibleForward();
             self.current_key = if (entry) |e| e.key else null;
             return entry;
+        }
+
+        /// Monotone seeks only move sources that precede the requested key.
+        /// The heap already proves every other source is at or beyond it;
+        /// those sources retain their block, position, and heap membership.
+        /// Stabilize the target because it may alias a source's borrowed key.
+        fn skipForwardTo(self: *@This(), target: []const u8) !void {
+            if (self.source_heap_len == 0) return;
+            if (std.mem.order(u8, self.source_entries[self.source_heap[0]].?.key, target) != .lt) return;
+            const stable_target = try self.allocator.dupe(u8, target);
+            defer self.allocator.free(stable_target);
+            while (self.source_heap_len != 0) {
+                const source = self.source_heap[0];
+                if (std.mem.order(u8, self.source_entries[source].?.key, stable_target) != .lt) break;
+                try self.setSourceAtOrAfter(source, stable_target, true);
+                self.updateForwardHeapSource(source);
+            }
         }
 
         pub fn seekAtOrBefore(self: *@This(), key: []const u8) !?backend_adapter.Entry {
@@ -1425,6 +1468,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn setSourceAtOrAfter(self: *@This(), source_index: usize, target: []const u8, inclusive: bool) !void {
+            if (comptime builtin.is_test) self.test_seek_sources += 1;
             if (source_index == 0 and comptime MutableType == ActiveMemTable) {
                 try self.setMutableSourceAtOrAfter(target, inclusive);
                 return;
@@ -3254,6 +3298,7 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
         namespace: backend_types.Namespace,
         mutable_snapshot: *const State,
         owns_mutable_snapshot: bool = false,
+        owns_snapshot: bool = true,
         read_view: RunReadView,
         immutable_memtables: []const *const State = &.{},
         runs: []Run = &.{},
@@ -3339,8 +3384,35 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
             };
         }
 
+        /// The erased read handle retains the parent snapshot until all forks
+        /// and their cursors close. Only immutable metadata is shared here.
+        pub fn forkBorrowedRead(self: *@This()) !@This() {
+            // Do not copy mutable read scratch even transiently: the source
+            // handle may be serving a read while another worker forks it.
+            return .{
+                .allocator = self.allocator,
+                .metadata_allocator = self.metadata_allocator,
+                .backend = self.backend,
+                .namespace = self.namespace,
+                .mutable_snapshot = self.mutable_snapshot,
+                .owns_mutable_snapshot = self.owns_mutable_snapshot,
+                .owns_snapshot = false,
+                .read_view = self.read_view,
+                .immutable_memtables = self.immutable_memtables,
+                .runs = self.runs,
+                .l0_groups = self.l0_groups,
+                .levels = self.levels,
+            };
+        }
+
         pub fn abort(self: *@This()) void {
             const backend = self.backend;
+            if (!self.owns_snapshot) {
+                releaseHeldBlocks(&self.held_blocks, backend.allocator);
+                releaseHeldValues(&self.held_values, self.allocator);
+                self.* = undefined;
+                return;
+            }
             if (self.owns_mutable_snapshot) {
                 var owned = @constCast(self.mutable_snapshot);
                 owned.deinit(self.allocator);
@@ -3688,10 +3760,16 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
         }
 
         pub fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
+            return self.getManySortedWithStats(keys, values, true);
+        }
+
+        fn getManySortedWithStats(self: *@This(), keys: []const []const u8, values: []?[]const u8, record_batch: bool) !void {
             if (keys.len != values.len) return error.InvalidBatch;
             @memset(values, null);
-            self.backend.recordGetManySorted(keys.len);
-            self.backend.recordGetManySortedLocality(keys);
+            if (record_batch) {
+                self.backend.recordGetManySorted(keys.len);
+                self.backend.recordGetManySortedLocality(keys);
+            }
 
             var result: BatchCursorReadResult = .{};
             if (self.stable_point_view) {
@@ -3776,6 +3854,10 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
 
                 if (maybe_layout) |*layout| {
                     defer layout.deinitAfterUnlockedRead();
+                    // Writer batches use this probe path. Inject publication
+                    // or cancellation only after the exact tip is pinned and
+                    // the backend lock is released, as for single-key reads.
+                    if (builtin.is_test) if (test_current_point_unlocked_hook) |hook| try hook(self.backend);
 
                     const unresolved_keys = try self.metadata_allocator.alloc([]const u8, unresolved_count);
                     defer self.metadata_allocator.free(unresolved_keys);
@@ -3835,7 +3917,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                     result.add(unresolved_result);
                 }
             }
-            self.backend.recordGetManySortedResults(result.hits, result.misses);
+            if (record_batch) self.backend.recordGetManySortedResults(result.hits, result.misses);
         }
 
         /// Apply a per-read block-cache policy without changing namespace
@@ -4583,6 +4665,57 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             return self.backend.getMergedWithOverlay(&self.backend.mutable, &self.mutable, self.namespace, key);
         }
 
+        pub fn containsManySorted(self: *@This(), keys: []const []const u8, present: []bool) !void {
+            if (self.closed) return error.TransactionClosed;
+            if (keys.len != present.len or !keysAreSorted(keys)) return error.InvalidBatch;
+            @memset(present, false);
+            self.backend.recordGetManySorted(keys.len);
+            self.backend.recordGetManySortedLocality(keys);
+            var offset: usize = 0;
+            while (offset < keys.len) {
+                const end = @min(keys.len, offset + 256);
+                // Pin the exact epoch under the lock, then perform directory
+                // and SST reads unlocked: their index-cache access takes the
+                // backend lock itself. All borrowed sources outlive this page.
+                var layout = blk: {
+                    const locked = lockBackend(BackendType, self.backend);
+                    defer unlockBackend(BackendType, self.backend, locked);
+                    break :blk try CurrentReadLayout(BackendType).init(self.backend, self.allocator);
+                };
+                defer layout.deinitAfterUnlockedRead();
+                var blocks = std.ArrayListUnmanaged(cache_mod.Handle).empty;
+                defer releaseHeldBlocks(&blocks, self.backend.allocator);
+                var values = std.ArrayListUnmanaged([]u8).empty;
+                defer {
+                    for (values.items) |value| self.allocator.free(value);
+                    values.deinit(self.allocator);
+                }
+                var group: ?usize = null;
+                var hint: ?BorrowedReadHint = null;
+                for (keys[offset..end], present[offset..end]) |key, *exists| {
+                    var bulk = self.bulk_appends.entries.items.len;
+                    while (bulk != 0) {
+                        bulk -= 1;
+                        const entry = self.bulk_appends.entries.items[bulk];
+                        if (compareEntryTo(entry, self.namespace, key) == .eq) {
+                            exists.* = !entry.tombstone;
+                            break;
+                        }
+                    } else {
+                        if (self.mutable.findIndex(self.namespace, key)) |i| {
+                            exists.* = !self.mutable.entryAt(i).tombstone;
+                            continue;
+                        }
+                        exists.* = if (getFromReadView(self.backend, layout.mutable_snapshot.?.state, layout.immutable_memtables, layout.read_view, &group, &hint, &blocks, &values, self.allocator, self.namespace, key)) |_| true else |err| switch (err) {
+                            error.NotFound => false,
+                            else => return err,
+                        };
+                    }
+                }
+                offset = end;
+            }
+        }
+
         pub fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
             if (self.closed) return error.TransactionClosed;
             if (keys.len != values.len) return error.InvalidBatch;
@@ -4638,59 +4771,28 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             if (miss_count > 0) {
                 const miss_values = try self.metadata_allocator.alloc(?[]const u8, miss_count);
                 defer self.metadata_allocator.free(miss_values);
-                if (@hasDecl(BackendType, "createReadVersionFromDirectory") or miss_count > max_current_batch_read_keys_per_backend_lock) {
-                    const locked = lockBackend(BackendType, self.backend);
-                    defer unlockBackend(BackendType, self.backend, locked);
-                    var layout = try CurrentReadLayout(BackendType).init(self.backend, self.allocator);
-                    defer layout.deinit();
-
-                    var offset: usize = 0;
-                    while (offset < miss_count) {
-                        const end = @min(offset + max_current_batch_read_keys_per_backend_lock, miss_count);
-                        const plan = chooseMultiGetPlan(miss_keys[offset..end], .current_live);
-                        recordMultiGetPlan(self.backend, plan);
-                        const result = switch (plan) {
-                            .cursor => try readManySortedCurrentWithLayoutLocked(BackendType, self.backend, &layout, self.namespace, self.allocator, null, &self.held_values, miss_keys[offset..end], miss_values[offset..end]),
-                            .sorted_by_run => try readManySortedByRunFromSnapshot(
-                                self.backend,
-                                layout.mutable_snapshot.?.state,
-                                layout.immutable_memtables,
-                                layout.runs,
-                                layout.l0_groups,
-                                layout.levels,
-                                self.allocator,
-                                null,
-                                &self.held_values,
-                                self.namespace,
-                                miss_keys[offset..end],
-                                miss_values[offset..end],
-                                true,
-                            ),
-                            .point => try readManySortedCurrentWithLayoutLocked(BackendType, self.backend, &layout, self.namespace, self.allocator, null, &self.held_values, miss_keys[offset..end], miss_values[offset..end]),
-                        };
-                        hits += result.hits;
-                        misses += result.misses;
-                        offset = end;
-                    }
-                } else {
-                    var offset: usize = 0;
-                    while (offset < miss_count) {
-                        const end = @min(offset + max_current_batch_read_keys_per_backend_lock, miss_count);
-                        const plan = chooseMultiGetPlan(miss_keys[offset..end], .current_live);
-                        recordMultiGetPlan(self.backend, plan);
-                        const result = blk: {
-                            const locked = lockBackend(BackendType, self.backend);
-                            defer unlockBackend(BackendType, self.backend, locked);
-                            break :blk switch (plan) {
-                                .cursor => try readManySortedCurrentLocked(BackendType, self.backend, self.namespace, self.allocator, null, &self.held_values, miss_keys[offset..end], miss_values[offset..end]),
-                                .sorted_by_run => try readManyCurrentSortedPointByRunLocked(BackendType, self.backend, self.namespace, self.allocator, null, &self.held_values, miss_keys[offset..end], miss_values[offset..end]),
-                                .point => try readManyCurrentPointLocked(BackendType, self.backend, self.namespace, self.allocator, null, &self.held_values, miss_keys[offset..end], miss_values[offset..end]),
-                            };
-                        };
-                        hits += result.hits;
-                        misses += result.misses;
-                        offset = end;
-                    }
+                // Select mutable values and pin immutable generations under
+                // the writer lock, then read/decode blocks outside it. Holding
+                // the lock here disabled bounded parallel point reads and
+                // serialized ingestion behind ANN split payload lookups.
+                var probe = try BoundProbeTxn(BackendType).open(self.backend, self.namespace);
+                defer probe.abort();
+                // Write reads select the current mutable and immutable view
+                // together, even if the backend was empty when probe opened.
+                probe.stable_point_view = false;
+                try probe.getManySortedWithStats(miss_keys[0..miss_count], miss_values, false);
+                for (miss_values) |*value| {
+                    const present = value.* orelse {
+                        misses += 1;
+                        continue;
+                    };
+                    // The write transaction owns returned values beyond the
+                    // probe's pinned-block lifetime, including across writes.
+                    const owned = try self.allocator.dupe(u8, present);
+                    errdefer self.allocator.free(owned);
+                    try self.held_values.append(self.allocator, owned);
+                    value.* = owned;
+                    hits += 1;
                 }
                 for (miss_values, 0..) |maybe_value, miss_index| {
                     values[miss_indexes[miss_index]] = maybe_value;
@@ -4974,6 +5076,7 @@ fn borrowRunSnapshotList(comptime BackendType: type, backend: *BackendType, allo
     var initialized: usize = 0;
     errdefer {
         for (runs[0..initialized]) |*run| {
+            if (run.releaseMemory()) continue;
             if (@hasDecl(BackendType, "releaseRunSnapshotRef")) {
                 backend.releaseRunSnapshotRef(run);
             }
@@ -4989,6 +5092,7 @@ fn borrowRunSnapshotList(comptime BackendType: type, backend: *BackendType, allo
         runs[i] = try repository_mod.cloneRunCompactionSnapshot(allocator, run);
         runs[i].shared_read_version = true;
         initialized = i + 1;
+        if (runs[i].shared_memory != null) continue;
         if (@hasDecl(BackendType, "retainRunSnapshotRef")) {
             try backend.retainRunSnapshotRef(&runs[i]);
         }
@@ -4998,6 +5102,7 @@ fn borrowRunSnapshotList(comptime BackendType: type, backend: *BackendType, allo
 
 fn freeRunSnapshotList(comptime BackendType: type, backend: *BackendType, allocator: Allocator, runs: []Run) void {
     for (runs) |*run| {
+        if (run.releaseMemory()) continue;
         if (@hasDecl(BackendType, "releaseRunSnapshotRef")) {
             backend.releaseRunSnapshotRef(run);
         }
@@ -8286,6 +8391,39 @@ test "lsm bounded merge cursor spills inactive persisted block" {
     try std.testing.expectEqual(@as(?usize, null), cursor.source_block_indices[run_source]);
     try std.testing.expectEqualStrings("replay:1", cursor.source_key_copies[run_source].?);
     try std.testing.expectEqual(@as(usize, 0), cursor.source_entries[run_source].?.value.len);
+}
+
+test "graph metric batch presence uses directory backed runs without a flat projection" {
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const allocator = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(allocator);
+    defer storage.deinit();
+    // No block cache: indexForRunNoCache must acquire its own backend lock.
+    // The existence probe must not hold that lock across directory/SST I/O.
+    var backend = try Backend.open(allocator, "/graph-directory-presence", .{ .storage = storage.storage(), .flush_threshold = 1 });
+    defer backend.close();
+    var store = try backend.runtimeStore(allocator, .{ .name = "graph" });
+    defer store.deinit();
+    {
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        try write.put("persisted", "node");
+        try write.commit();
+    }
+    while (try backend.runMaintenanceStep()) {}
+    try std.testing.expect(run_store.count(&backend) != 0);
+    var batch = try store.beginBatch();
+    defer batch.abort();
+    var present: [2]bool = undefined;
+    try batch.containsManySorted(&.{ "missing", "persisted" }, &present);
+    try std.testing.expectEqualSlices(bool, &.{ false, true }, &present);
+    const version = backend.read_version orelse return error.MissingReadVersion;
+    try std.testing.expect(version.directory != null);
+    try std.testing.expectEqual(@as(usize, 0), version.runs.len);
+    try batch.delete("persisted");
+    try batch.put("missing", "new node");
+    try batch.containsManySorted(&.{ "missing", "persisted" }, &present);
+    try std.testing.expectEqualSlices(bool, &.{ true, false }, &present);
 }
 
 test "lsm async batch reads tree backed mutable and immutable snapshots" {

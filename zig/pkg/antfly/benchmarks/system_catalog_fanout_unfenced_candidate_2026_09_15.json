@@ -1,0 +1,50 @@
+{
+  "binary": "/Users/ajroetker/antfly/.worktrees/feature-catalog-core/zig/zig-out/bin/antfly",
+  "binary_sha256": "6bd564517fe387786e03a9a1fcb5eb1178484bdbb1d11b1107eb238c022e9097",
+  "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+  "settings": {
+    "binary": "zig-out/bin/antfly",
+    "scenario": "catalog",
+    "deployment": "cluster",
+    "restart_after_ddl": false,
+    "listing_distinct_schemas": false,
+    "listing_page_size": 0,
+    "listing_concurrent": false,
+    "listing_reader_rate": 0,
+    "table_counts": [
+      10
+    ],
+    "catalog_shards": 8,
+    "catalog_ingress": "first",
+    "mixed_seconds": 0,
+    "resolution_workload": "exact",
+    "schema_fields": 32,
+    "tenant_counts": [
+      10,
+      100
+    ],
+    "storage_mode": "document",
+    "entity_shards": 1,
+    "entity_key_layout": "clustered",
+    "mentions": [
+      10,
+      100
+    ],
+    "documents": 5,
+    "concurrency": 8,
+    "samples": 20,
+    "lookup_seconds": 0,
+    "warmup": 2,
+    "ndjson_lines": 20,
+    "poll_ms": 20,
+    "readiness_timeout": 115,
+    "output": "/private/tmp/catalog-budget-fanout-final.json",
+    "diagnostics_dir": "/private/tmp/catalog-budget-fanout-final-run"
+  },
+  "scenarios": {},
+  "failure": {
+    "scenario": "catalog",
+    "error_type": "RuntimeError",
+    "message": "POST /query: 500 query failed"
+  }
+}
