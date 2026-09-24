@@ -700,7 +700,8 @@ pub fn Pool(comptime Backend: type) type {
         /// A new transaction record is a future decision/ACK obligation. Even
         /// while full control capacity is disabled, its accepted physical
         /// mutation must be the exact fresh BEGIN understood by the native
-        /// owner codec. Existing records may be rewritten by later controls.
+        /// owner codec. Existing records may be rewritten by later controls
+        /// only when no staged native owner holds their future control debt.
         fn validateNewTransactionRecord(self: *Self, backend: *Backend, alloc: Allocator, entry: *const entry_codec.OwnedEntry) !?control_begin.Declaration {
             if (entry.entry.kind != .mutation) return null;
             const namespace = entry.decoded_descriptor.descriptor.namespace;
@@ -713,6 +714,29 @@ pub fn Pool(comptime Backend: type) type {
                 }
             }
             return null;
+        }
+
+        /// The generic document cell has no authority to spend a retained
+        /// BEGIN owner's decision/ACK budget. Until control transitions and
+        /// replay are wired to that owner, reject every exact metadata key for
+        /// its transaction before allocating or publishing a document cell.
+        /// Inspect prepared outcome templates too, so they cannot later write
+        /// one of the retained owner's metadata keys through a different cell.
+        fn rejectUnownedControlTransition(self: *const Self, entry: *const entry_codec.OwnedEntry) !void {
+            if (!self.config.control_owner_staging) return;
+            const descriptor = entry.decoded_descriptor.descriptor;
+            for ([_][]const slot_codec.Operation{ entry.entry.prepare_operations, descriptor.commit, descriptor.abort }) |operations| {
+                for (operations) |op| {
+                    inline for (.{ control_shape.records_prefix, control_shape.participants_prefix, control_shape.resolved_participants_prefix, control_shape.completion_prefix, control_shape.intent_admission_prefix, control_shape.intent_keys_prefix, control_shape.schema_leases_prefix }) |prefix| {
+                        if (op.key.len == prefix.len + 16 and std.mem.startsWith(u8, op.key, prefix)) {
+                            const id = op.key[prefix.len..][0..16];
+                            for (self.control_owners) |owner| if (owner) |active| {
+                                if (std.mem.eql(u8, id, &active.declaration.txn_id)) return error.CompletionAdmissionUnavailable;
+                            };
+                        }
+                    }
+                }
+            }
         }
 
         /// Allocate independent control debt before publishing the accepted
@@ -994,6 +1018,7 @@ pub fn Pool(comptime Backend: type) type {
             try Slot.validateFootprint(backend, checked.decoded_descriptor.descriptor);
             if (checked.entry.kind == .mutation)
                 try Slot.validateCanonicalFootprint(backend, checked.decoded_descriptor.descriptor.namespace, checked.entry.prepare_operations);
+            try self.rejectUnownedControlTransition(&checked);
             const fresh_begin = try self.validateNewTransactionRecord(backend, scratch, &checked);
             try self.validateBaseline(backend, scratch, &checked);
             const growth = try entryCapacity(&checked);
@@ -1457,9 +1482,39 @@ pub fn Pool(comptime Backend: type) type {
                 if (cell.term != identity.term or cell.index != identity.index or
                     !std.mem.eql(u8, &cell.entry.?.digest, &identity.digest)) continue;
                 if (cell.phase != .accepted) return error.RecoveryRequired;
-                return self.retireUnappliedCell(backend, i);
+                try self.retireUnappliedCell(backend, i);
+                return self.retireRejectedControlBegin(backend, identity);
             }
             return error.NotFound;
+        }
+
+        /// A direct proposal rejection proves that this exact provisional
+        /// BEGIN never entered the local log. Delete its document sidecar first;
+        /// a failure to remove/sync the independent control guard retains the
+        /// owner and fences further admission rather than refunding uncertainty.
+        fn retireRejectedControlBegin(self: *Self, backend: *Backend, identity: completion.AcceptedIdentity) !void {
+            for (&self.control_owners, 0..) |*owner, i| if (owner.*) |*active| {
+                if (!std.meta.eql(active.begin, identity)) continue;
+                const path = std.fs.path.join(backend.allocator, &.{ backend.root_dir.?, control_guard.filenames[i] }) catch |err| {
+                    self.failed = true;
+                    backend.fenceFailedBulkWal();
+                    return err;
+                };
+                defer backend.allocator.free(path);
+                backend.storage.?.deleteFileAbsolute(path) catch |err| {
+                    self.failed = true;
+                    backend.fenceFailedBulkWal();
+                    return err;
+                };
+                backend.storage.?.syncParentAbsolute(path) catch |err| {
+                    self.failed = true;
+                    backend.fenceFailedBulkWal();
+                    return err;
+                };
+                active.held.destroy();
+                owner.* = null;
+                return;
+            };
         }
 
         fn retireUnappliedCell(self: *Self, backend: *Backend, i: usize) !void {

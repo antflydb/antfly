@@ -143236,8 +143236,136 @@ test "workload admission physical completion staged control BEGIN retains a pool
         lease.vtable.proposal_result(lease.context, &.{ .state = proposal.state, .first_index = 1, .last_index = 1, .payloads = proposal.proposals });
         try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.apply_accepted.?(lease.context, 1, 1, payloads[0]));
         try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try db.getTransactionStatus(id));
+
+        // The real metadata decision compiler produces a fresh mutation ID.
+        // A generic document cell must not spend the retained BEGIN owner's
+        // control capacity before owner-backed decision replay exists.
+        var manager = try transactions_mod.TxnManager.init(alloc, db.core.store);
+        defer manager.deinit();
+        manager.completion_limits = .{
+            .max_transaction_bytes = db.core.table_catalog.transaction_admission_bytes,
+            .max_count = db.core.table_catalog.transaction_recovery_max_count,
+            .max_bytes = db.core.table_catalog.transaction_recovery_max_bytes,
+        };
+        const decision_wire = blk: {
+            var read = try manager.store.beginRead();
+            defer read.abort();
+            break :blk try manager.compileControlMutation(alloc, &read, .{
+                .txn_id = id,
+                .action = .{ .resolve_metadata = .{ .status = .committed, .timestamp = 200 } },
+            }, .{
+                .group_id = binding.identity.group_id,
+                .incarnation = binding.identity.incarnation,
+                .policy_digest = binding.identity.policy_digest,
+                .schema_catalog_digest = binding.schema_catalog_digest,
+                .previous_term = 1,
+                .previous_index = 1,
+            }, @splat(19), "staged-control-decision-test", &.{});
+        };
+        defer alloc.free(decision_wire);
+        {
+            const backend_runtime = @import("../lsm_backend/runtime.zig");
+            const locked = backend_runtime.lockBackend(lsm_backend_mod.Backend, backend);
+            defer backend_runtime.unlockBackend(lsm_backend_mod.Backend, backend, locked);
+            try pool.maintainLocked(backend);
+            try pool.qualifyFresh(backend);
+            var guard_before = (try control_guard.load(alloc, backend.storage.?, backend.root_dir.?, 0, authority)) orelse return error.TestUnexpectedResult;
+            defer guard_before.deinit();
+            try std.testing.expectError(error.CompletionAdmissionUnavailable, pool.accept(backend, 2, 2, 1, 1, decision_wire));
+            try std.testing.expect(pool.control_owners[0] != null);
+            try std.testing.expectEqual(@import("../lsm_backend/completion_pool.zig").Pool(lsm_backend_mod.Backend).Phase.free, pool.cells[0].phase);
+            try std.testing.expectError(error.FileNotFound, pool.io.storage().fileSize(pool.accepted_paths[0]));
+            var guard_after = (try control_guard.load(alloc, backend.storage.?, backend.root_dir.?, 0, authority)) orelse return error.TestUnexpectedResult;
+            defer guard_after.deinit();
+            try std.testing.expectEqualDeep(guard_before.guard.record, guard_after.guard.record);
+        }
+        try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try db.getTransactionStatus(id));
     }
     try std.testing.expectError(error.CompletionRecoveryCapacityRequired, DB.open(alloc, std.mem.span(tmp.path().ptr), options));
+}
+
+test "workload admission physical completion rejected staged BEGIN retires native owner before reopen" {
+    const alloc = std.testing.allocator;
+    const abi = @import("kernel_owner_abi").completion_pool;
+    const local = @import("../local_write.zig");
+    const control_guard = @import("../lsm_backend/completion_control_guard.zig");
+    var tmp = try TestDirectory.init("completion-rejected-control-begin");
+    defer tmp.cleanup();
+    const path = std.mem.span(tmp.path().ptr);
+    var resources = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer resources.deinit(alloc);
+    try resources.configureTransactionCompletion(1024 * 1024);
+    const settings: table_storage_mod.Settings = .{ .transaction_recovery = .{
+        .protocol_version = 1,
+        .max_count = 4,
+        .max_bytes = 1024 * 1024,
+        .max_transaction_bytes = 64 * 1024,
+        .completion_protocol_version = 1,
+        .profile_version = 1,
+    } };
+    const options: OpenOptions = .{
+        .resource_manager = &resources,
+        .durable_completion_enabled = true,
+        .durable_completion_authority = .standalone_local,
+        .table_storage = settings,
+        .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    };
+    const binding: abi.InstallBinding = .{
+        .identity = .{ .group_id = 2, .node_id = 7, .capacity = 4, .generation = 1, .incarnation = @splat(27), .policy_digest = @import("../../metadata/completion_activation.zig").policyDigest(settings.transaction_recovery.?) },
+        .table_id = 1,
+        .range_id = 3,
+        .schema_catalog_digest = try @import("../../common/completion_catalog_digest.zig").digest(alloc, "", "", "{}"),
+    };
+    {
+        var db = try DB.open(alloc, path, options);
+        defer db.close();
+        try db.installCompletionBinding(binding, "", "", "{}", settings);
+        const lease = try db.acquireCompletionLease(2, 7);
+        defer lease.vtable.release(lease.context);
+        const startup: abi.DurableLog = .{ .mode = .startup_complete };
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.reconcile_durable.?(lease.context, &startup));
+        const backend = db.core.primary_store_owner.lsmBackend().?;
+        {
+            const backend_runtime = @import("../lsm_backend/runtime.zig");
+            const locked = backend_runtime.lockBackend(lsm_backend_mod.Backend, backend);
+            defer backend_runtime.unlockBackend(lsm_backend_mod.Backend, backend, locked);
+            try backend.completion_pool.?.enableControlOwnerStaging(backend);
+        }
+        const local_participant = try @import("../../api/distributed_txn.zig").participantIdForGroup(alloc, "docs", 2);
+        defer alloc.free(local_participant);
+        const peer = try @import("../../api/distributed_txn.zig").participantIdForGroup(alloc, "docs", 3);
+        defer alloc.free(peer);
+        const id: transactions_mod.TxnId = @splat(212);
+        const request: types.BatchRequest = .{ .transaction = .{ .begin = .{
+            .txn_id = id,
+            .begin_timestamp = 100,
+            .created_at_ns = 90,
+            .topology_epoch = 1,
+            .retain_terminal = true,
+            .participants = &.{ local_participant, peer },
+        } } };
+        const wire = try local.compileStorageKernelReplicatedCompletion(alloc, &db, "docs", 2, request, .{ .term = 0, .index = 0 });
+        defer alloc.free(wire);
+        const payloads = [_]abi.Bytes{.{ .ptr = wire.ptr, .len = wire.len }};
+        const proposal: abi.Check = .{ .kind = .proposal, .new_work_allowed = 1, .state = .{ .term = 1, .applied_term_known = 1 }, .proposals = .{ .ptr = &payloads, .len = 1 } };
+        var result: abi.CheckResult = undefined;
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.check(lease.context, &proposal, &result));
+        try std.testing.expect(backend.completion_pool.?.control_owners[0] != null);
+        lease.vtable.proposal_result(lease.context, &.{ .state = proposal.state, .payloads = proposal.proposals });
+        try std.testing.expect(backend.completion_pool.?.control_owners[0] == null);
+        try std.testing.expect(!try control_guard.hasAny(backend.storage.?, alloc, backend.root_dir.?));
+        try std.testing.expectError(error.TxnNotFound, db.getTransactionStatus(id));
+    }
+    const config = (try DB.completionInstallationPreflight(alloc, std.Options.debug_io, path, binding, "", "", "{}")).?;
+    var reopen = options;
+    reopen.durable_completion_authority = .raft_apply;
+    reopen.completion_pool_config = config;
+    var db = try DB.open(alloc, path, reopen);
+    defer db.close();
+    try db.installCompletionBinding(binding, "", "", "{}", settings);
 }
 
 test "workload admission physical completion single-phase restart after WAL and manifest publication" {
