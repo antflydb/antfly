@@ -82,9 +82,12 @@ refresh interval. Previous entries age out normally without exposing secret
 material.
 
 Text is not trimmed, lowercased, or whitespace-normalized. Those changes can
-alter tokenizer output. Templated and multimodal queries currently bypass the
-cache because templates can resolve mutable remote content. They can be added
-after query preparation exposes a stable, fully rendered text-only operation.
+alter tokenizer output. Templated queries, and queries to an embedder whose
+configured `inputs` declare image or audio, currently bypass the cache because
+templates can resolve mutable remote content. They can be added after query
+preparation exposes a stable, fully rendered text-only operation. Media input
+learned from discovered capabilities does not disable caching: a plain text
+query to such a model is still text-only.
 
 ## Ownership and concurrency
 

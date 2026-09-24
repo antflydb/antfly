@@ -396,17 +396,47 @@ func (c *InferenceClient) ChunkMedia(ctx context.Context, data []byte, mimeType 
 	return chunksFromBody(resp.Body)
 }
 
-// Rerank re-scores pre-rendered text prompts based on relevance to a query.
-func (c *InferenceClient) Rerank(ctx context.Context, model string, query string, prompts []string) ([]float32, error) {
+// Rerank scores text documents by relevance to a query, one score per
+// document in request order. The caller renders document fields or templates
+// to text first.
+func (c *InferenceClient) Rerank(ctx context.Context, model string, query string, documents []string) ([]float32, error) {
+	contents := make([]oapi.ChatMessageContent, len(documents))
+	for i, document := range documents {
+		raw, err := json.Marshal(document)
+		if err != nil {
+			return nil, fmt.Errorf("encoding document %d: %w", i, err)
+		}
+		contents[i] = raw
+	}
+	return c.rerank(ctx, model, query, contents)
+}
+
+// RerankMultimodal scores documents made of text and image content parts by
+// relevance to a query, one score per document in request order. Documents
+// with images need a multimodal reranker such as ColQwen or Qwen3-VL; other
+// models reject them.
+func (c *InferenceClient) RerankMultimodal(ctx context.Context, model string, query string, documents [][]oapi.ContentPart) ([]float32, error) {
+	contents := make([]oapi.ChatMessageContent, len(documents))
+	for i, parts := range documents {
+		raw, err := json.Marshal(parts)
+		if err != nil {
+			return nil, fmt.Errorf("encoding document %d: %w", i, err)
+		}
+		contents[i] = raw
+	}
+	return c.rerank(ctx, model, query, contents)
+}
+
+func (c *InferenceClient) rerank(ctx context.Context, model string, query string, documents []oapi.ChatMessageContent) ([]float32, error) {
 	req := oapi.InferenceRerankRequest{
-		Model:   model,
-		Query:   query,
-		Prompts: prompts,
+		Model:     model,
+		Query:     query,
+		Documents: documents,
 	}
 
 	// No Accept parameters: this client reads the JSON body, not the
 	// negotiated numeric frame.
-	resp, err := c.client.RerankPromptsWithResponse(ctx, nil, req)
+	resp, err := c.client.RerankDocumentsWithResponse(ctx, nil, req)
 	if err != nil {
 		return nil, fmt.Errorf("sending request: %w", err)
 	}

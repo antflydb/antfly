@@ -52,15 +52,30 @@ def _parse_response(
 
         return response_401
 
+    if response.status_code == 403:
+        response_403 = InferenceError.from_dict(response.json())
+
+        return response_403
+
     if response.status_code == 404:
         response_404 = InferenceError.from_dict(response.json())
 
         return response_404
 
+    if response.status_code == 413:
+        response_413 = InferenceError.from_dict(response.json())
+
+        return response_413
+
     if response.status_code == 500:
         response_500 = InferenceError.from_dict(response.json())
 
         return response_500
+
+    if response.status_code == 502:
+        response_502 = InferenceError.from_dict(response.json())
+
+        return response_502
 
     if response.status_code == 503:
         response_503 = InferenceTransientCapacityError.from_dict(response.json())
@@ -90,34 +105,34 @@ def sync_detailed(
     body: InferenceRerankRequest,
     accept: str | Unset = UNSET,
 ) -> Response[InferenceError | InferenceRerankResponse | InferenceTransientCapacityError]:
-    """Rerank prompts by relevance
+    """Rerank documents by relevance
 
-     Re-scores pre-rendered text prompts based on relevance to a query using native or ONNX reranking
-    models.
+     Re-scores documents by relevance to a text query. Returns one score per
+    document, in request order.
 
-    ## Client Responsibilities
+    Each entry in `documents` is either a string or an array of content parts, in
+    the same format that generation and embedding use: `text` parts, `image_url`
+    parts, and inline `media` parts with an `image/*` MIME type. The client renders
+    document fields or templates to text before calling this endpoint.
 
-    The client must:
-    1. Extract relevant fields from documents
-    2. Render any templates
-    3. Send pre-rendered text strings as `prompts`
-
-    This design keeps inference stateless and allows clients to customize rendering logic.
+    Text-only documents work with any reranker. Documents with images require a
+    model that supports them: a ColQwen-style late-interaction reranker (manifest
+    capability `colqwen` or `multimodal_late_interaction`) or a Qwen3-VL reranker
+    bundled with its GGUF vision projector. Otherwise the request is rejected with
+    a `400`. Within a request that contains images, documents without images are
+    scored by the model's text scorer.
 
     ## Models
 
     - Models are auto-discovered from `models_dir/rerankers/`
-    - Cross-encoder rerankers are supported through the existing text scorer
+    - Cross-encoder rerankers are supported through the text scorer
     - Late-interaction text rerankers such as ColBERT can opt in with `model_manifest.json` capability
     `late_interaction` or `colbert`
-    - Supports quantized models (`model_quantized.onnx`)
     - Automatically prefers quantized variants if available
 
-    This endpoint is still text-only. Real ColQwen-style multimodal reranking requires a future request
-    shape that carries page images or image-derived embeddings.
-
-    For document-based reranking with field extraction, use the client-side
-    `lib/reranking` package which handles rendering before calling this endpoint.
+    Remote image URLs are fetched subject to the configured content security
+    policy. Image headers and aggregate decoded pixels are admitted before the
+    model loads.
 
     Args:
         accept (str | Unset):
@@ -149,34 +164,34 @@ def sync(
     body: InferenceRerankRequest,
     accept: str | Unset = UNSET,
 ) -> InferenceError | InferenceRerankResponse | InferenceTransientCapacityError | None:
-    """Rerank prompts by relevance
+    """Rerank documents by relevance
 
-     Re-scores pre-rendered text prompts based on relevance to a query using native or ONNX reranking
-    models.
+     Re-scores documents by relevance to a text query. Returns one score per
+    document, in request order.
 
-    ## Client Responsibilities
+    Each entry in `documents` is either a string or an array of content parts, in
+    the same format that generation and embedding use: `text` parts, `image_url`
+    parts, and inline `media` parts with an `image/*` MIME type. The client renders
+    document fields or templates to text before calling this endpoint.
 
-    The client must:
-    1. Extract relevant fields from documents
-    2. Render any templates
-    3. Send pre-rendered text strings as `prompts`
-
-    This design keeps inference stateless and allows clients to customize rendering logic.
+    Text-only documents work with any reranker. Documents with images require a
+    model that supports them: a ColQwen-style late-interaction reranker (manifest
+    capability `colqwen` or `multimodal_late_interaction`) or a Qwen3-VL reranker
+    bundled with its GGUF vision projector. Otherwise the request is rejected with
+    a `400`. Within a request that contains images, documents without images are
+    scored by the model's text scorer.
 
     ## Models
 
     - Models are auto-discovered from `models_dir/rerankers/`
-    - Cross-encoder rerankers are supported through the existing text scorer
+    - Cross-encoder rerankers are supported through the text scorer
     - Late-interaction text rerankers such as ColBERT can opt in with `model_manifest.json` capability
     `late_interaction` or `colbert`
-    - Supports quantized models (`model_quantized.onnx`)
     - Automatically prefers quantized variants if available
 
-    This endpoint is still text-only. Real ColQwen-style multimodal reranking requires a future request
-    shape that carries page images or image-derived embeddings.
-
-    For document-based reranking with field extraction, use the client-side
-    `lib/reranking` package which handles rendering before calling this endpoint.
+    Remote image URLs are fetched subject to the configured content security
+    policy. Image headers and aggregate decoded pixels are admitted before the
+    model loads.
 
     Args:
         accept (str | Unset):
@@ -203,34 +218,34 @@ async def asyncio_detailed(
     body: InferenceRerankRequest,
     accept: str | Unset = UNSET,
 ) -> Response[InferenceError | InferenceRerankResponse | InferenceTransientCapacityError]:
-    """Rerank prompts by relevance
+    """Rerank documents by relevance
 
-     Re-scores pre-rendered text prompts based on relevance to a query using native or ONNX reranking
-    models.
+     Re-scores documents by relevance to a text query. Returns one score per
+    document, in request order.
 
-    ## Client Responsibilities
+    Each entry in `documents` is either a string or an array of content parts, in
+    the same format that generation and embedding use: `text` parts, `image_url`
+    parts, and inline `media` parts with an `image/*` MIME type. The client renders
+    document fields or templates to text before calling this endpoint.
 
-    The client must:
-    1. Extract relevant fields from documents
-    2. Render any templates
-    3. Send pre-rendered text strings as `prompts`
-
-    This design keeps inference stateless and allows clients to customize rendering logic.
+    Text-only documents work with any reranker. Documents with images require a
+    model that supports them: a ColQwen-style late-interaction reranker (manifest
+    capability `colqwen` or `multimodal_late_interaction`) or a Qwen3-VL reranker
+    bundled with its GGUF vision projector. Otherwise the request is rejected with
+    a `400`. Within a request that contains images, documents without images are
+    scored by the model's text scorer.
 
     ## Models
 
     - Models are auto-discovered from `models_dir/rerankers/`
-    - Cross-encoder rerankers are supported through the existing text scorer
+    - Cross-encoder rerankers are supported through the text scorer
     - Late-interaction text rerankers such as ColBERT can opt in with `model_manifest.json` capability
     `late_interaction` or `colbert`
-    - Supports quantized models (`model_quantized.onnx`)
     - Automatically prefers quantized variants if available
 
-    This endpoint is still text-only. Real ColQwen-style multimodal reranking requires a future request
-    shape that carries page images or image-derived embeddings.
-
-    For document-based reranking with field extraction, use the client-side
-    `lib/reranking` package which handles rendering before calling this endpoint.
+    Remote image URLs are fetched subject to the configured content security
+    policy. Image headers and aggregate decoded pixels are admitted before the
+    model loads.
 
     Args:
         accept (str | Unset):
@@ -260,34 +275,34 @@ async def asyncio(
     body: InferenceRerankRequest,
     accept: str | Unset = UNSET,
 ) -> InferenceError | InferenceRerankResponse | InferenceTransientCapacityError | None:
-    """Rerank prompts by relevance
+    """Rerank documents by relevance
 
-     Re-scores pre-rendered text prompts based on relevance to a query using native or ONNX reranking
-    models.
+     Re-scores documents by relevance to a text query. Returns one score per
+    document, in request order.
 
-    ## Client Responsibilities
+    Each entry in `documents` is either a string or an array of content parts, in
+    the same format that generation and embedding use: `text` parts, `image_url`
+    parts, and inline `media` parts with an `image/*` MIME type. The client renders
+    document fields or templates to text before calling this endpoint.
 
-    The client must:
-    1. Extract relevant fields from documents
-    2. Render any templates
-    3. Send pre-rendered text strings as `prompts`
-
-    This design keeps inference stateless and allows clients to customize rendering logic.
+    Text-only documents work with any reranker. Documents with images require a
+    model that supports them: a ColQwen-style late-interaction reranker (manifest
+    capability `colqwen` or `multimodal_late_interaction`) or a Qwen3-VL reranker
+    bundled with its GGUF vision projector. Otherwise the request is rejected with
+    a `400`. Within a request that contains images, documents without images are
+    scored by the model's text scorer.
 
     ## Models
 
     - Models are auto-discovered from `models_dir/rerankers/`
-    - Cross-encoder rerankers are supported through the existing text scorer
+    - Cross-encoder rerankers are supported through the text scorer
     - Late-interaction text rerankers such as ColBERT can opt in with `model_manifest.json` capability
     `late_interaction` or `colbert`
-    - Supports quantized models (`model_quantized.onnx`)
     - Automatically prefers quantized variants if available
 
-    This endpoint is still text-only. Real ColQwen-style multimodal reranking requires a future request
-    shape that carries page images or image-derived embeddings.
-
-    For document-based reranking with field extraction, use the client-side
-    `lib/reranking` package which handles rendering before calling this endpoint.
+    Remote image URLs are fetched subject to the configured content security
+    policy. Image headers and aggregate decoded pixels are admitted before the
+    model loads.
 
     Args:
         accept (str | Unset):
