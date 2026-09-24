@@ -270,6 +270,7 @@ pub const RerankingPipeline = struct {
         }
         switch (self.config.mode) {
             .cross_encoder => for (documents, 0..) |document, index| {
+                if ((index & 7) == 0) try self.checkExecution();
                 items[index] = try self.tok.encodeForPair(self.allocator, query, document, self.config.max_length);
                 initialized += 1;
                 const active = activeTokenLength(items[index].attention_mask);
@@ -277,6 +278,7 @@ pub const RerankingPipeline = struct {
                 prepared.prompt_tokens = std.math.add(usize, prepared.prompt_tokens, active) catch return error.ResourceLimitExceeded;
             },
             .generative_yes_no => for (documents, 0..) |document, index| {
+                if ((index & 7) == 0) try self.checkExecution();
                 items[index] = try self.encodeGenerativeYesNoPair(query, document);
                 initialized += 1;
                 const active = activeTokenLength(items[index].attention_mask);
@@ -284,9 +286,11 @@ pub const RerankingPipeline = struct {
                 prepared.prompt_tokens = std.math.add(usize, prepared.prompt_tokens, active) catch return error.ResourceLimitExceeded;
             },
             .late_interaction => {
+                try self.checkExecution();
                 prepared.query = try self.encodeSingleText(query);
                 const query_tokens = activeTokenLength(prepared.query.?.attention_mask);
                 for (documents, 0..) |document, index| {
+                    if ((index & 7) == 0) try self.checkExecution();
                     items[index] = try self.encodeSingleText(document);
                     initialized += 1;
                     const document_tokens = activeTokenLength(items[index].attention_mask);
@@ -296,6 +300,7 @@ pub const RerankingPipeline = struct {
                 }
             },
         }
+        try self.checkExecution();
         if (admit and documents.len != 0) switch (self.config.mode) {
             .cross_encoder => {
                 const fixed_len = hasFixedTextSequenceLength(self.session.inputInfo());
@@ -1072,7 +1077,7 @@ test "cross encoder bounds working memory with configured batches" {
     try std.testing.expectEqual(@as(usize, documents.len * 2), tokenizer_state.encode_count.load(.acquire));
 }
 
-test "cross encoder observes cancellation between bounded batches" {
+test "cross encoder stops a 30-document pass after its first bounded batch" {
     const Control = struct {
         runs: *std.atomic.Value(usize),
 
@@ -1090,10 +1095,11 @@ test "cross encoder observes cancellation between bounded batches" {
         allocator,
         session_state.session(),
         tokenizer_state.tokenizer(),
-        .{ .max_length = 8, .batch_size = 2 },
+        .{ .max_length = 8, .batch_size = 8 },
     );
     pipeline.execution_control = .{ .ptr = &control, .check_fn = Control.check };
-    try std.testing.expectError(error.Cancelled, pipeline.rerank("query", &.{ "one", "two", "three" }));
+    const documents = [_][]const u8{"document"} ** 30;
+    try std.testing.expectError(error.Cancelled, pipeline.rerank("query", &documents));
     try std.testing.expectEqual(@as(usize, 1), session_state.run_count.load(.acquire));
 }
 

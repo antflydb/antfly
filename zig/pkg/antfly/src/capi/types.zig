@@ -97,6 +97,47 @@ pub const OpenOptions = extern struct {
     reserved: [8]u64 = .{0} ** 8,
 };
 
+/// Options for `antfly_inference_open`. Same prefix-compatible contract as
+/// `OpenOptions`: initialize with `antfly_inference_options_init`.
+pub const InferenceOptions = extern struct {
+    abi_size: u32 = @sizeOf(InferenceOptions),
+    /// No flags are defined yet; must be zero.
+    flags: u32 = 0,
+    /// Models directory; empty uses `$ANTFLY_INFERENCE_MODELS_DIR`, else
+    /// `~/.antfly/inference/models`.
+    models_dir: Slice = .{},
+    // Resource budgets in MiB, 0 meaning automatic. Same meaning as the
+    // `inference_*_budget_mb` fields of `OpenOptions`.
+    host_budget_mb: u32 = 0,
+    backend_budget_mb: u32 = 0,
+    process_memory_budget_mb: u32 = 0,
+    combined_budget_mb: u32 = 0,
+    kv_budget_mb: u32 = 0,
+    scratch_budget_mb: u32 = 0,
+    /// Per-call deadline in milliseconds; 0 means none.
+    call_timeout_ms: u64 = 0,
+    reserved: [8]u64 = .{0} ** 8,
+};
+
+/// One progress report passed to an `antfly_inference_pull_json` callback.
+pub const InferencePullProgress = extern struct {
+    abi_size: u32 = @sizeOf(InferencePullProgress),
+    reserved0: u32 = 0,
+    model: Slice = .{},
+    file: Slice = .{},
+    bytes_downloaded: u64 = 0,
+    total_bytes: u64 = 0,
+    files_done: u64 = 0,
+    files_total: u64 = 0,
+    cached: bool = false,
+};
+
+/// Returns false to cancel the pull.
+pub const InferencePullProgressFn = *const fn (?*anyopaque, *const InferencePullProgress) callconv(.c) bool;
+
+/// Receives one streamed chunk's JSON; returns false to stop generating.
+pub const InferenceStreamFn = *const fn (?*anyopaque, Slice) callconv(.c) bool;
+
 pub const DenseSearchHit = extern struct {
     id_ptr: ?[*]u8 = null,
     id_len: usize = 0,
@@ -207,6 +248,9 @@ pub const ErrorCode = enum(c_int) {
     /// succeed. See `antfly_db_run_until_idle_json`
     /// for the stuck index name and indexed/expected counters.
     stalled = 9,
+    /// The caller cancelled the call, by returning false from its progress
+    /// or stream callback.
+    cancelled = 10,
     internal = 255,
 };
 
@@ -222,6 +266,7 @@ pub fn errorCodeName(code: c_int) [*:0]const u8 {
         @intFromEnum(ErrorCode.outcome_unknown) => "ANTFLY_OUTCOME_UNKNOWN",
         @intFromEnum(ErrorCode.unsupported) => "ANTFLY_UNSUPPORTED",
         @intFromEnum(ErrorCode.stalled) => "ANTFLY_STALLED",
+        @intFromEnum(ErrorCode.cancelled) => "ANTFLY_CANCELLED",
         @intFromEnum(ErrorCode.internal) => "ANTFLY_INTERNAL",
         else => "ANTFLY_UNKNOWN_ERROR",
     };
@@ -239,6 +284,7 @@ pub fn errorCodeDescription(code: c_int) [*:0]const u8 {
         @intFromEnum(ErrorCode.outcome_unknown) => "the operation was published, but crash durability could not be confirmed; inspect the destination and do not retry automatically",
         @intFromEnum(ErrorCode.unsupported) => "the operation requires a capability that is not supported by this platform or filesystem",
         @intFromEnum(ErrorCode.stalled) => "a bounded drain made no forward progress for its configured stall window and gave up",
+        @intFromEnum(ErrorCode.cancelled) => "the caller cancelled the operation",
         @intFromEnum(ErrorCode.internal) => "an internal error occurred",
         else => "unknown Antfly error code",
     };
@@ -360,7 +406,14 @@ pub fn mapError(err: anyerror) ErrorCode {
         error.RowPolicyTopologyUnsupported,
         error.RowPolicyMutationUnsupported,
         error.RowPolicyUnsupported,
+        // The inference runtime needs a sandboxed worker process on this
+        // backend and no `antfly` executable was found to run it.
+        error.InferenceWorkerExecutableNotConfigured,
+        // The runtime, or the worker process it runs models in, could not
+        // start; the process log has the cause.
+        error.InferenceRuntimeStartupFailed,
         => .unsupported,
+        error.InferenceProviderCallCapacityExhausted => .busy,
         error.DurabilityOutcomeUnknown => .outcome_unknown,
         error.RunUntilIdleNoProgress => .stalled,
         // A dimension probe against a live embedder hit an operational
