@@ -139,9 +139,11 @@ replica progress'`. Evidence: `/tmp/workload-invalid-participant-data1.log`.
 ## Current integration evidence and boundaries
 
 - Canonical single-phase envelopes use wire version 2 and require Raft batch
-  protocol 8. Version 1 prepares remain byte-compatible. Seven owning codec
-  tests passed. DATA now advertises version 8 and requires that floor for
-  ordinary canonical mutations; prepare retains its version 7 floor. The
+  protocol 14 after the `origin/main` protocol merge. Version 1 prepares remain
+  byte-compatible and require protocol 13. Versions 7–12 belong to source
+  transfer, snapshots, relational transfer, and source-scope authority. Seven
+  owning codec tests passed. DATA advertises version 14 and requires that floor
+  for ordinary canonical mutations. The
   owning DATA selection regression passed. Actual mixed-peer proposal and
   Raft-WAL fault schedules remain to qualify; production activation is disabled.
 - The native capacity certificate stage passed ten owning tests, including
@@ -247,14 +249,14 @@ replica progress'`. Evidence: `/tmp/workload-invalid-participant-data1.log`.
   These component results do not replace real replicated process/quorum faults.
 - The subsequent owning DATA gate passed three tests (one implementation,
   two compiled consumers; zero skips, failures or leaks). A two-voter RawNode
-  fixture rejects a v7 peer before native installation, applies the protocol8
+  fixture rejects a peer below protocol 14 before native installation, applies the protocol-14
   barrier through the real local Raft WAL, and rechecks current membership
   before publishing backing. It then proposes an ordinary write through the
   C physical compiler/native reservation, restarts the whole DATA server with
   admission disabled and no service keys, and applies the retained WAL entry
   after a higher-term leader heartbeat. Document state and the permanent native
-  progress digest match the accepted entry. BEGIN selects protocol8, while
-  prepare retains protocol7. Peer votes/acknowledgements are delivered explicitly
+  progress digest match the accepted entry. BEGIN selects protocol 14, while
+  prepare requires protocol 13. Peer votes/acknowledgements are delivered explicitly
   in-process; this does not certify a real peer's durable acknowledgement or a
   multi-process quorum fault. Fresh production activation remains disabled.
   Evidence: `/tmp/workload-completion-proposal-wal3.log`, actual exit0.
@@ -339,3 +341,46 @@ replica progress'`. Evidence: `/tmp/workload-invalid-participant-data1.log`.
   focused public API smoke and batch-client tests passed 2/2; the direct HTTP
   metadata clock and catalog status tests passed 2/2. The metadata service gate
   passed 131/131, though its fixed filter did not include the new direct test.
+- After merging `origin/main`, native control-owner guard publication stages a
+  complete guard before atomic rename and directory sync. Restoration validates
+  all four guard records against trusted local identity, rejects duplicate
+  transaction/output owners, and rebuilds the aggregate capacity certificate.
+  The owning durable-completion gate passed 42/42. This restores local guard
+  evidence, but the pool still does not own control capacity at BEGIN or retain
+  decision/ACK resources through final retirement; item 1 remains open.
+- Bounded worker batches now reject same-executor reentry before enqueueing,
+  preventing a one-worker protected lane from waiting on itself. The focused
+  five-test lane passed. Process-wide connection, memory, nested I/O, and storage
+  pressure still require item 6 qualification.
+- Native Data Raft leader forwarding now has a separate six-worker executor
+  inside the existing 32-worker forwarding budget. Four general read-forwarding
+  graphs can run concurrently; one Data Raft graph remains available even when
+  those reads and their retiring tasks occupy every general worker. Four
+  focused runtime cases passed for saturation, retirement, shutdown, and a
+  reduced 12-worker configuration. Borrowed schedulers enforce logical quotas
+  but own their physical isolation; aggregate mixed-resource qualification
+  and the throughput effect of reserving this grant remain open.
+- The merged metadata codec now preserves relational retirement metadata,
+  accepts both historical and current table-storage extensions on restore,
+  and encodes current dense-storage migration admissions behind topology
+  protocol 13. Secret-bearing snapshot version 2 is emitted only after durable
+  protocol-13 activation; legacy snapshot installation rejects a target with
+  secrets, and a legacy snapshot build refuses to omit source secrets. The
+  full metadata gate exited successfully; visible lane summaries were 290,
+  221, and 144 passing tests, with no failures or leaks.
+  API transaction qualification then passed 93/93 with no failures or leaks:
+  an unproved peer 404 cannot certify row absence, and a proved read-index miss
+  is accepted only after a key-specific linearizable metadata route check.
+  That check is paid on misses, not successful lookups.
+  Metadata membership changes still lack a durable decoder-capability proof for
+  replacement peers; a v13 snapshot fails closed on an older decoder. An empty
+  target cannot prove that a historical v1 source snapshot omitted no secrets.
+  Fencing joins and adding snapshot provenance before production use remain
+  open for item 4.
+- The post-merge storage-owner gate passed 53/53 with no failures or leaks.
+  Owner open again binds native source authority, installs scoped hidden
+  restore bootstrap, and resumes source-pin recovery before accepting work.
+  DATA completion versions 13/14 no longer collide with source formats 7–12;
+  the focused DATA runtime gate passed 2/2 with those version checks. The
+  owner tests also allow background index repair to complete before the
+  backup assertion, while still requiring quiescent final backup.
