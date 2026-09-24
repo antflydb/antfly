@@ -8910,8 +8910,8 @@ pub const EmbedderConfig = struct {
     /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
     api_url: ?[]const u8 = null,
     rate_limit: ?RateLimitConfig = null,
-    /// Declare that this model supports non-text content (images, audio, video, PDFs), even if the model isn't in Antfly's built-in model registry yet. When `true`, Antfly treats the model as multimodal and sends binary content (images, audio, etc.) through an embedding adapter that supports content parts. Antfly currently provides that contract for local Antfly inference and Bedrock; text-only provider adapters reject media rather than silently discarding it. Not needed for models already in the local registry (e.g., `clip-*`, `clipclap`). **Example:** ```json { "provider": "antfly", "model": "some-future-multimodal-model", "multimodal": true } ```
-    multimodal: ?bool = null,
+    /// Input types the model accepts. Normally omitted: Antfly learns them from the model's capabilities, which Antfly inference publishes for every model it serves. Set it only to use a model whose capabilities Antfly cannot discover yet, such as a newly released model. When set, it replaces the discovered input types. Only providers whose adapters can send media accept media inputs: `antfly` (`image`, `audio`) and `bedrock` (`image`). Other providers reject `image` and `audio` here rather than silently discarding media. **Example:** ```json { "provider": "antfly", "model": "some-future-multimodal-model", "inputs": ["text", "image"] } ```
+    inputs: ?[]const []const u8 = null,
     /// Deprecated compatibility form of `retrieval.query_input_type`. New configurations should use the nested `retrieval` object.
     query_input_type: ?[]const u8 = null,
     /// Deprecated compatibility form of `retrieval.document_input_type`. New configurations should use the nested `retrieval` object.
@@ -8939,7 +8939,7 @@ pub const EmbedderConfig = struct {
         .{ "batch_size", "batch_size", true },
         .{ "api_url", "api_url", true },
         .{ "rate_limit", "rate_limit", true },
-        .{ "multimodal", "multimodal", true },
+        .{ "inputs", "inputs", true },
         .{ "query_input_type", "query_input_type", true },
         .{ "document_input_type", "document_input_type", true },
         .{ "query_instruction", "query_instruction", true },
@@ -9027,8 +9027,8 @@ pub const EmbedderConfig = struct {
             try jw.objectField("rate_limit");
             try jw.write(value);
         }
-        if (self.multimodal) |value| {
-            try jw.objectField("multimodal");
+        if (self.inputs) |value| {
+            try jw.objectField("inputs");
             try jw.write(value);
         }
         if (self.query_input_type) |value| {
@@ -24321,46 +24321,6 @@ pub const InferenceRequestAdmissionConfig = struct {
     }
 };
 
-pub const InferenceRerankMultimodalDocument = struct {
-    /// Optional caller-provided document identifier
-    id: ?[]const u8 = null,
-    content: ChatMessageContent,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "id", "id", true },
-        .{ "content", "content", false },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        if (self.id) |value| {
-            try jw.objectField("id");
-            try jw.write(value);
-        }
-        try jw.objectField("content");
-        try jw.write(self.content);
-        try jw.endObject();
-    }
-};
-
-pub const InferenceRerankMultimodalRequest = struct {
-    /// Name of multimodal reranking model from models_dir/rerankers/
-    model: []const u8,
-    /// Text query for relevance scoring
-    query: []const u8,
-    /// Documents expressed as text and image content parts
-    documents: []const InferenceRerankMultimodalDocument,
-};
-
 pub const InferenceRerankObject = struct {
     object: []const u8,
     /// Original prompt index.
@@ -24374,14 +24334,49 @@ pub const InferenceRerankRequest = struct {
     model: []const u8,
     /// Search query for relevance scoring
     query: []const u8,
-    /// Pre-rendered document texts to rerank. The client is responsible for extracting and rendering document fields/templates before calling this endpoint.
-    prompts: []const []const u8,
+    /// Documents to rerank. Each entry is a string or an array of text and image content parts. Exactly one of `documents` and `prompts` is required.
+    documents: ?[]const ChatMessageContent = null,
+    /// Deprecated text-only form of `documents`. Accepted so older clients keep working; send `documents` instead. Exactly one of `documents` and `prompts` is required.
+    prompts: ?[]const []const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "model", "model", false },
+        .{ "query", "query", false },
+        .{ "documents", "documents", true },
+        .{ "prompts", "prompts", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("model");
+        try jw.write(self.model);
+        try jw.objectField("query");
+        try jw.write(self.query);
+        if (self.documents) |value| {
+            try jw.objectField("documents");
+            try jw.write(value);
+        }
+        if (self.prompts) |value| {
+            try jw.objectField("prompts");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const InferenceRerankResponse = struct {
     /// Object type, always "list"
     object: []const u8,
-    /// Rerank score objects, one per input prompt.
+    /// Rerank score objects, one per input document.
     data: []const InferenceRerankObject,
     /// Name of model used for reranking
     model: []const u8,
@@ -32773,7 +32768,7 @@ pub const RerankerConfig = struct {
     provider: RerankerProvider,
     /// Field name to extract from documents for reranking.
     field: ?[]const u8 = null,
-    /// Handlebars template to render document text for reranking.
+    /// Handlebars template that renders each candidate for reranking. The `media` and `remoteMedia` helpers add images, which are sent to the reranker alongside the rendered text; only an Antfly reranker whose model accepts images can score them, and any other reranker rejects the query with `400`.
     template: ?[]const u8 = null,
     /// Optional provider model name. When omitted, the selected provider's documented default is used.
     model: ?[]const u8 = null,

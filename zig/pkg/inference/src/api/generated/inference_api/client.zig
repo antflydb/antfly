@@ -243,25 +243,10 @@ pub const Client = struct {
         return ApiResponse(types.ReadResponse).fromResponse(self.allocator, &resp);
     }
 
-    /// Rerank prompts by relevance
+    /// Rerank documents by relevance
     /// POST /rerank
-    pub fn rerankPrompts(self: *@This(), body: types.RerankRequest, accept: ?[]const u8) !ApiResponse(types.RerankResponse) {
+    pub fn rerankDocuments(self: *@This(), body: types.RerankRequest, accept: ?[]const u8) !ApiResponse(types.RerankResponse) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/rerank", .{self.base_url});
-        defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
-        defer self.allocator.free(json_body);
-        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
-        defer request_headers.deinit(self.allocator);
-        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
-        if (accept) |value| try request_headers.append(self.allocator, .{ "Accept", value });
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
-        return ApiResponse(types.RerankResponse).fromNegotiatedResponse(self.allocator, &resp);
-    }
-
-    /// Rerank multimodal documents by relevance
-    /// POST /rerank_multimodal
-    pub fn rerankMultimodalPrompts(self: *@This(), body: types.RerankMultimodalRequest, accept: ?[]const u8) !ApiResponse(types.RerankResponse) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/rerank_multimodal", .{self.base_url});
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);

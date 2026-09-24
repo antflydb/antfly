@@ -408,6 +408,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const lib_db_query_default_filters = [_][]const u8{
         "composed fusion preserves the coordinator reranker window",
+        "composed vector component window matches component paging",
         "fuseNamedSets applies offset after fusion and pruning",
         "grouped candidate budget parses disabled and fallback values",
         "adaptive candidate window covers requested offset page and grows bounded",

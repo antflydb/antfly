@@ -324,10 +324,10 @@ pub const ItemControl = struct {
     cancel_requested: ?*const std.atomic.Value(bool) = null,
 
     pub fn check(self: ItemControl) !void {
+        if (self.io) |io| if (deadlineExpired(io, self.deadline)) return error.DeadlineExceeded;
         if (self.cancellation.isCancelled() or
             (if (self.cancel_requested) |signal| signal.load(.acquire) else false))
             return error.Canceled;
-        if (self.io) |io| if (deadlineExpired(io, self.deadline)) return error.DeadlineExceeded;
     }
 };
 
@@ -338,15 +338,18 @@ pub const ExecutionControl = struct {
 
     pub fn check(raw: ?*anyopaque) !void {
         const self: *const @This() = @ptrCast(@alignCast(raw.?));
-        var last_error: anyerror = error.Canceled;
+        var any_deadline_expired = false;
         for (self.items) |item| {
             item.control.check() catch |err| {
-                last_error = err;
+                if (err == error.DeadlineExceeded) any_deadline_expired = true;
                 continue;
             };
             return;
         }
-        return last_error;
+        // Only when every member is gone can the physical forward stop. If
+        // any member timed out, the watchdog must not treat the group as a
+        // cancellation eligible for grace based on item order.
+        return if (any_deadline_expired) error.DeadlineExceeded else error.Canceled;
     }
 };
 
@@ -959,6 +962,20 @@ test "fused execution stays live for healthy members and stops when all members 
     second_canceled.store(false, .release);
     items[1].control.io = std.testing.io;
     items[1].control.deadline = std.Io.Clock.Timestamp.now(std.testing.io, .awake);
+    try std.testing.expectError(error.DeadlineExceeded, ExecutionControl.check(&control));
+
+    // An expired member still makes the group deadline hard when a later
+    // member is cancelled. The result cannot depend on iteration order.
+    first_canceled.store(false, .release);
+    second_canceled.store(true, .release);
+    items[0].control.io = std.testing.io;
+    items[0].control.deadline = std.Io.Clock.Timestamp.now(std.testing.io, .awake);
+    try std.testing.expectError(error.DeadlineExceeded, ExecutionControl.check(&control));
+
+    // Once the same caller is both cancelled and expired, its deadline still
+    // wins so the watchdog cannot extend it with cancellation grace.
+    first_canceled.store(true, .release);
+    try std.testing.expectError(error.DeadlineExceeded, items[0].control.check());
     try std.testing.expectError(error.DeadlineExceeded, ExecutionControl.check(&control));
 }
 

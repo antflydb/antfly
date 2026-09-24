@@ -6969,8 +6969,12 @@ pub const ModelManager = struct {
         if (!backend_runtime.requiresProcessIsolation()) return null;
         self.lockLoadedModels();
         defer self.unlockLoadedModels();
-        if (!self.session_manager.process_isolation_available)
+        if (!self.session_manager.process_isolation_available) {
+            // In-process hosts accept that a wedged close blocks rather than
+            // being ended by killing the worker.
+            if (execution_control_mod.uninterruptibleInProcessAllowed()) return null;
             return error.ProcessIsolationRequired;
+        }
         if (self.teardown_domain == null) {
             // Stabilize a possible manager-owned offline driver runtime before
             // the independent teardown owner takes its lifetime reference.

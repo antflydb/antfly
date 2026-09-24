@@ -494,7 +494,7 @@ pub const ModelRegistry = struct {
         }
     }
 
-    /// Pull a model from HuggingFace Hub.
+    /// Pull a model from HuggingFace Hub, printing progress to stderr.
     pub fn pull(
         self: *ModelRegistry,
         io: std.Io,
@@ -504,6 +504,28 @@ pub const ModelRegistry = struct {
         capabilities_csv: ?[]const u8,
         projector_selection: download.ProjectorSelection,
     ) !void {
+        var progress = ProgressPrinter{};
+        return self.pullWithProgress(io, ref_str, hub_config, tasks_csv, capabilities_csv, projector_selection, .{
+            .callback = ProgressPrinter.onProgress,
+            .context = &progress,
+        });
+    }
+
+    /// Pull a model from HuggingFace Hub, reporting progress to `progress_sink`
+    /// on the calling thread.
+    pub fn pullWithProgress(
+        self: *ModelRegistry,
+        io: std.Io,
+        ref_str: []const u8,
+        hub_config: download.HubConfig,
+        tasks_csv: ?[]const u8,
+        capabilities_csv: ?[]const u8,
+        projector_selection: download.ProjectorSelection,
+        caller_sink: download.ProgressSink,
+    ) !void {
+        // Label every report with the model it belongs to.
+        var labeler = ProgressLabeler{ .inner = caller_sink, .model = ref_str };
+        const progress_sink = labeler.sink();
         const ref = try parsePullModelRef(ref_str);
         const resolved_models_dir = try resolveModelsDirForWriteAlloc(self.allocator, io, self.models_dir);
         defer self.allocator.free(resolved_models_dir);
@@ -526,11 +548,6 @@ pub const ModelRegistry = struct {
         var transaction = try download.ManagedModelTransaction.begin(self.allocator, io, dest);
         defer transaction.deinit(io);
 
-        var progress = ProgressPrinter{};
-        const progress_sink: download.ProgressSink = .{
-            .callback = ProgressPrinter.onProgress,
-            .context = &progress,
-        };
         if (qwen3vl_catalog.findGenerationBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle| {
             try download.downloadPinnedQwen3VlGenerationBundle(
                 self.allocator,
@@ -605,7 +622,6 @@ pub const ModelRegistry = struct {
         }
         try self.writePulledModelManifest(io, transaction.staging, tasks_csv, capabilities_csv);
         try download.completeManagedDownload(self.allocator, io, transaction.staging);
-        try transaction.commit(io);
 
         // Gemma4 QAT gguf checkpoints ship a sibling MTP assistant repo that
         // enables self-speculative decoding; fetch it best-effort so the
@@ -613,7 +629,9 @@ pub const ModelRegistry = struct {
         // repos must not fail the primary pull. The companion never inherits
         // the caller's task/capability overrides (it is a drafter, not a
         // servable generator), and an already-installed companion is not
-        // re-fetched on primary re-pulls.
+        // re-fetched on primary re-pulls. It runs before the primary commits
+        // so that a cancellation during it leaves nothing installed; any
+        // other companion failure is logged and the primary still commits.
         if (try gemma4MtpAssistantCompanionRefAlloc(self.allocator, ref)) |companion_ref| {
             defer self.allocator.free(companion_ref);
             const companion_installed = blk: {
@@ -623,14 +641,20 @@ pub const ModelRegistry = struct {
                 break :blk isModelDir(io, companion_dest);
             };
             if (!companion_installed) {
-                self.pull(io, companion_ref, hub_config, null, null, projector_selection) catch |err| {
+                self.pullWithProgress(io, companion_ref, hub_config, null, null, projector_selection, caller_sink) catch |err| {
                     std.log.warn(
                         "optional Gemma4 MTP assistant pull failed for {s}: {s}",
                         .{ companion_ref, @errorName(err) },
                     );
                 };
+                // A cancel during the companion (from the progress callback or
+                // the task's Io) cancels the whole pull. Checked here rather
+                // than by error name because this call is recursive.
+                try progress_sink.checkCancelled();
+                try io.checkCancel();
             }
         }
+        try transaction.commit(io);
     }
 
     /// Companion MTP assistant ref for a Gemma4 QAT gguf model
@@ -770,6 +794,27 @@ pub const ModelRegistry = struct {
             else => 0,
         };
     }
+
+    /// Forwards reports to `inner` with `model` set.
+    const ProgressLabeler = struct {
+        inner: download.ProgressSink,
+        model: []const u8,
+
+        fn sink(self: *ProgressLabeler) download.ProgressSink {
+            return .{
+                .callback = if (self.inner.callback != null) forward else null,
+                .context = self,
+                .cancelled = self.inner.cancelled,
+            };
+        }
+
+        fn forward(progress: download.DownloadProgress, raw: ?*anyopaque) void {
+            const self: *ProgressLabeler = @ptrCast(@alignCast(raw.?));
+            var labeled = progress;
+            labeled.model = self.model;
+            self.inner.callback.?(labeled, self.inner.context);
+        }
+    };
 
     const ProgressPrinter = struct {
         active_file: ?[]const u8 = null,
@@ -2302,4 +2347,30 @@ test "model refs accept independent formats and revisions" {
     }
     try std.testing.expectError(error.InvalidModelRef, ModelRef.parse("BAAI/bge-m3:onnx@../../main"));
     try std.testing.expectError(error.InvalidModelRef, ModelRef.parse("BAAI/bge-m3:onnx@main?x=1"));
+}
+
+test "pull progress reports carry the model they belong to" {
+    const Capture = struct {
+        model: []const u8 = "",
+        file: []const u8 = "",
+        fn report(progress: download.DownloadProgress, raw: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.model = progress.model;
+            self.file = progress.file;
+        }
+    };
+    var capture = Capture{};
+    var cancelled = std.atomic.Value(bool).init(false);
+    const caller: download.ProgressSink = .{ .callback = Capture.report, .context = &capture, .cancelled = &cancelled };
+    var labeler = ModelRegistry.ProgressLabeler{ .inner = caller, .model = "owner/companion" };
+    const sink = labeler.sink();
+    sink.callback.?(.{ .file = "model.gguf", .bytes_downloaded = 0, .total_bytes = null, .files_done = 0, .files_total = 1 }, sink.context);
+    try std.testing.expectEqualStrings("owner/companion", capture.model);
+    try std.testing.expectEqualStrings("model.gguf", capture.file);
+    // Cancellation still reaches the download through the labeled sink.
+    cancelled.store(true, .release);
+    try std.testing.expectError(error.Canceled, sink.checkCancelled());
+    // A caller without a callback gets none.
+    var bare = ModelRegistry.ProgressLabeler{ .inner = .{}, .model = "owner/model" };
+    try std.testing.expect(bare.sink().callback == null);
 }

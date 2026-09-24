@@ -75,21 +75,106 @@ that runs chunker, embedder, and extractor producers configured with
 `"provider": "antfly"` and no `api_url` locally instead of failing or
 requiring a remote URL.
 
-**Worker executable resolution.** GPU-hosted and driver-backed backends
-(Metal, CUDA, ONNX, PJRT) construct and, for Metal/CUDA/PJRT, execute models
-in a separate, replaceable worker process rather than inside your process --
-crash containment for an unabortable driver call or GPU state corruption
-means the process that made the call must be the one that gets killed and
-respawned, and that must never be your host process. A Rust binary linking
-`libantfly` has no `antfly`-shaped `argv[0]` to re-exec, so the runtime
-resolves the worker executable itself, in order: the `ANTFLY_INFERENCE_WORKER`
-environment variable (a path to the worker executable, typically an `antfly`
-binary); otherwise an `antfly` binary next to the loaded `libantfly`;
-otherwise `antfly` on `PATH`. If none of these resolve, calls into a
-process-isolated backend fail with a clear error naming
-`ANTFLY_INFERENCE_WORKER` -- set it (or place an `antfly` binary next to
-`libantfly` or on `PATH`) before opening a `local_runtime_configured` handle
-that needs Metal/CUDA/ONNX/PJRT models.
+**In-process, every backend.** `libantfly` runs every inference backend,
+including Metal, CUDA, and ONNX, in the calling process -- there is no
+separate worker process, and `ANTFLY_INFERENCE_WORKER` is not used. The
+`antfly` server instead runs those backends in a worker process it can kill
+and restart, because a GPU driver call or an ONNX model load has no
+per-call abort; a library cannot do that to its host program, so
+`libantfly` accepts the trade SQLite makes: once a call reaches the device
+or driver it runs to completion (`call_timeout_ms`/[`InferenceOptions::call_timeout`],
+and closing a handle, take effect only when it returns; calls on CPU
+backends still stop cooperatively), and a GPU driver fault terminates the
+process. See `zig/CAPI.md`'s "Inference In Process" section for the full
+detail.
+
+### Embedded inference without a database
+
+[`Inference`] opens the same embedded inference runtime on its own, with no
+database -- `Inference::open`/`open_default` (options: [`InferenceOptions`],
+covering models directory, resource budgets, and a per-call timeout) and
+`close`. It mirrors `Database`'s handle-safety story (`Send + Sync`, close
+waits for in-flight calls, idempotent, safe from any thread).
+
+Each method mirrors one `/ai/v1` route of the inference HTTP API and takes/
+returns raw JSON bytes: `embed`, `rerank`, `chunk`, `generate`,
+`generate_batch`, `rewrite`, `extract`, `read` (OCR), `transcribe`, and
+`list_models`. Unlike `Database`'s `*_json` methods, these return
+[`InferenceResult<Vec<u8>>`] on failure: [`InferenceError`] carries both the
+mapped [`Error`] and the runtime's JSON error body
+(`{"error":...,"message":...}`), since `antfly_inference_*_json` calls are
+documented to always leave one behind.
+
+```rust,no_run
+use antfly_lite::{Inference, InferenceOptions};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let inference = Inference::open(&InferenceOptions::new())?;
+    let chunks = inference.chunk(r#"{"input":"Ants live in colonies. Workers gather food."}"#)?;
+    println!("{}", String::from_utf8_lossy(&chunks));
+    Ok(())
+}
+```
+
+**Streaming generation.** `generate` always returns a complete response --
+a request with `"stream": true` fails with `Error::InvalidArgument`. Use
+`Inference::generate_stream` to stream instead: it sets `"stream": true`
+for you and calls `on_chunk` on the calling thread for each
+`chat.completion.chunk` JSON chunk as the model produces tokens.
+
+```rust,no_run
+# use antfly_lite::{Inference, InferenceOptions};
+# fn run(inference: &Inference) -> Result<(), Box<dyn std::error::Error>> {
+let mut on_chunk = |chunk: &[u8]| {
+    println!("{}", String::from_utf8_lossy(chunk));
+    true // keep going; return false to stop generating early
+};
+inference.generate_stream(
+    r#"{"model":"owner/name","messages":[{"role":"user","content":"hi"}]}"#,
+    &mut on_chunk,
+)?;
+# Ok(())
+# }
+```
+
+`on_chunk` is a rendezvous -- generation waits for each call to return
+before producing the next chunk -- so returning `false` always stops
+generation at that chunk, and the call fails with `Error::Cancelled`
+(wrapped in `InferenceError`). A pre-stream failure (for example a missing
+model) fails like `generate`, with the JSON error attached; a mid-stream
+failure fails with `Error::Internal` and a JSON body naming
+`"STREAM_FAILED"`.
+
+**Pulling models.** `Inference::pull` downloads a model into the handle's
+models directory (like `antfly inference pull`), with an optional progress
+callback called synchronously on the calling thread as each file starts,
+every 16 MiB, and as it completes:
+
+```rust,no_run
+# use antfly_lite::{Inference, InferenceOptions, PullProgress};
+# fn run(inference: &Inference) -> antfly_lite::InferenceResult<()> {
+let mut on_progress = |p: &PullProgress| {
+    println!("{}: {}/{} bytes", p.file, p.bytes_downloaded, p.total_bytes);
+    true // keep going; return false to cancel the pull
+};
+inference.pull(r#"{"model":"owner/name"}"#, Some(&mut on_progress))?;
+# Ok(())
+# }
+```
+
+Returning `false` cancels the pull -- the call fails with `Error::Cancelled`
+and the model is not installed. The progress callback is a rendezvous (the
+download waits for each call to return before continuing), so cancellation
+is always honored at the report where `on_progress` returns `false`, even
+at the very last report of the last file. Completed files stay staged, so
+pulling the same model again resumes rather than restarts. `Inference::close`
+waits for a pull (or a stream) in progress; neither is cancelled by `close`
+itself.
+
+A panic inside `on_chunk`/`on_progress` is caught and does not unwind
+across the C ABI boundary (unwinding through `extern "C"` is undefined
+behavior): it cancels the call and is resumed once the underlying FFI call
+returns.
 
 ## Thread safety
 
@@ -140,6 +225,14 @@ failing immediately with `Busy`, like `sqlite3_busy_timeout`.
   backup of either kind restores into either kind); `Database::backup`/
   `backup_to_file` produce one, and `Database::import_backup` imports one
   directly into an empty, already-open handle.
+- `Inference::open`/`open_default` (with [`InferenceOptions`]) open an
+  embedded inference runtime with no database; `embed`, `rerank`, `chunk`,
+  `generate`, `generate_batch`, `rewrite`, `extract`, `read`, `transcribe`,
+  `list_models`, and `pull` mirror the `/ai/v1` inference HTTP API 1:1.
+  `generate_stream` streams a generate request chunk by chunk, and both it
+  and `pull` accept a callback that can cancel the call by returning
+  `false`, surfaced as `Error::Cancelled`. See "Embedded inference without a
+  database" above.
 
 See the crate's rustdoc for the full method list.
 
@@ -160,6 +253,17 @@ See the crate's rustdoc for the full method list.
     README), the same declarative suite every language binding runs, plus a
     standalone test that restores a backup into directory storage and
     reopens it.
+  - `tests/inference.rs`: `Inference::open`/`open_default`, chunk/embed/
+    generate/generate_stream/pull error mapping (including the JSON error
+    body carried on `InferenceError` and `Error::Cancelled` from a
+    cancelled `generate_stream`/`pull`), use-after-close and double-close,
+    plus preconditioned tests that skip rather than fail when unmet:
+    embedding with a locally installed `Qwen/Qwen3-Embedding-0.6B-GGUF*`
+    model, streaming/cancelling generation with a locally installed
+    `ggml-org/gemma-4-e2b-it-gguf*` model, and pulling a real model from
+    the network (including cancelling on the first progress report, which
+    reliably fails with `Error::Cancelled` and leaves the model uninstalled)
+    when `ANTFLY_INFERENCE_PULL_TEST_MODEL` is set.
 
 Some conformance/concurrency cases (full-text search under concurrent write
 pressure) need substantially more native stack than a typical fixed-size OS

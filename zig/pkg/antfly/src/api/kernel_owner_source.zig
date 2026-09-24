@@ -3065,7 +3065,13 @@ pub const ProvisionedKernelOwnerSource = struct {
                 // lease. Retire the idle owner so close drains that work, then
                 // reopen with the new exact descriptor. Live configure here
                 // would race the old descriptor's DB-owned maintenance.
-                if (entry.active_users != 0) return error.StorageKernelOwnerTransitionRequired;
+                if (entry.active_users != 0) {
+                    // An admitted descriptor change must close admission before
+                    // waiting, or overlapping readers can starve its drain.
+                    // Periodic inspection still yields without retiring readers.
+                    if (admission != .exclusive_if_idle) entry.retired = true;
+                    return error.StorageKernelOwnerTransitionRequired;
+                }
                 entry.retired = true;
                 stale_index = index;
                 break;
@@ -5348,6 +5354,44 @@ test "storage repair lease downgrade admits readers while fencing configuration"
     try std.testing.expect(Source.tryReserveEntryLeaseLocked(&entry, .shared));
     try std.testing.expectEqual(@as(usize, 2), entry.active_users);
     try std.testing.expect(!Source.tryReserveEntryLeaseLocked(&entry, .exclusive));
+}
+
+test "owner descriptor changes close admission before draining existing readers" {
+    const Source = ProvisionedKernelOwnerSource;
+    for ([_]Source.LeaseAdmission{ .shared, .exclusive, .exclusive_if_idle }) |admission| {
+        var source = Source.init(std.testing.allocator, "/unused", table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+        defer source.entries.deinit(std.testing.allocator);
+        var entry: Source.Entry = .{
+            .group_id = 1,
+            .table_name = @constCast("docs"),
+            .generation = 7,
+            .identity = .{ .table_id = 1, .shard_id = 2, .range_id = 3 },
+            .schema_json = @constCast("old schema"),
+            .indexes_json = @constCast("{}"),
+            .restore_bootstrap_json = @constCast(""),
+            .owner = undefined,
+            .active_users = 1,
+            .resident = true,
+        };
+        try source.entries.append(std.testing.allocator, &entry);
+        const descriptor: descriptor_contract.Descriptor = .{
+            .lsm_root_generation = entry.generation,
+            .identity = entry.identity,
+            .schema_json = "new schema",
+            .indexes_json = entry.indexes_json,
+        };
+        try std.testing.expectError(error.StorageKernelOwnerTransitionRequired, source.acquireDescriptorOnce(1, "docs", "/unused", descriptor, admission, .resident, .{}));
+        // Scheduled inspection yields without interrupting foreground work.
+        // An admitted change must prevent observers from extending the drain.
+        try std.testing.expectEqual(admission != .exclusive_if_idle, entry.retired);
+        if (admission != .exclusive_if_idle) {
+            try std.testing.expectError(error.StorageReadTemporarilyUnavailable, source.borrowEntryLocked(&entry));
+            var old_descriptor = descriptor;
+            old_descriptor.schema_json = entry.schema_json;
+            try std.testing.expectError(error.StorageKernelOwnerTransitionRequired, source.acquireDescriptorOnce(1, "docs", "/unused", old_descriptor, .shared, .resident, .{}));
+        }
+        try std.testing.expectEqual(@as(usize, 1), entry.active_users);
+    }
 }
 
 test "scheduled repair admission yields to readers and reuses exact configured generation" {

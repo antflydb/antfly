@@ -16,6 +16,57 @@ All notable changes to Antfly will be documented in this file.
 
 ### [Unreleased]
 
+- **One rerank endpoint for text and images** — `POST /ai/v1/rerank` takes
+  `documents`, where each entry is a string or an array of text and image
+  content parts, the same format generation and embedding use. Documents with
+  images need a multimodal reranker (ColQwen or Qwen3-VL); other models reject
+  them with `400`. `/ai/v1/rerank_multimodal` is removed; send those requests
+  to `/rerank` with the document content directly in `documents` (the
+  `{id, content}` wrapper is gone). `prompts` is deprecated but still accepted
+  for text. The operation id is now `rerankDocuments`, so generated SDK methods
+  are renamed (`RerankDocumentsWithResponse`, `rerank_documents`). The Go SDK
+  adds `InferenceClient.RerankMultimodal`, and the TypeScript `rerank()` accepts
+  content-part documents. Inference proxy route rules that matched the
+  `rerank_multimodal` operation should match `rerank` and select the model by
+  name instead. Inference servers advertise `rerank_documents_v1` in the model
+  catalog; Antfly sends `documents` only to servers that do and keeps sending
+  `prompts` to older ones, so clusters and inference pools can upgrade in
+  either order. `prompts` can be removed once every client sends `documents`.
+- **Embedder input types come from model capabilities** — the embedder
+  `multimodal` flag is removed. Antfly learns which inputs a model accepts from
+  its capabilities (discovered from Antfly inference, or the linked runtime).
+  For a model whose capabilities cannot be discovered yet, set `inputs`, for
+  example `["text", "image"]`, which replaces the discovered input types; only
+  the `antfly` (`image`, `audio`) and `bedrock` (`image`) providers accept media
+  inputs. Existing indexes keep working: a stored `multimodal` value is ignored,
+  and it no longer takes part in embedding producer identity.
+- **Reranker image support is resolved from the model manifest** — like image
+  embedding, a manifest declaring text-only `inputs` stays text-only, and
+  otherwise a Qwen3-VL GGUF bundle with its projector or a `colqwen` /
+  `multimodal_late_interaction` capability selects the image executor. The
+  model catalog, the executor contract, and the rerank handler share that one
+  answer.
+- **Query rerankers score images** — a reranker `template` can use the `media`
+  and `remoteMedia` helpers, and each candidate's images are sent with its
+  text to an Antfly reranker whose model accepts images, whether it runs in
+  process or on a remote inference server. Other rerankers reject such queries
+  with `400`.
+- **Aggregations on hybrid and semantic queries** — queries that combine
+  `aggregations` with `semantic_search` or `embeddings` no longer fail with
+  `query_candidate_budget_exceeded`. Aggregations now count every full-text
+  match plus each embedding index's top results at the requested limit and
+  `search_effort`, merged across shards. Previously the internal collection
+  widened each vector search to the full-result budget, which approximate
+  search could never prove complete. The ranked page is unchanged, the
+  full-result budget still bounds full-text matches, and a filter with no
+  full-text query contributes no extra rows. Separately, a vector search that
+  exhausts its traversal with a truncated top-k window now reports its total as
+  a lower bound instead of exact.
+- **Aggregation and semantic paging corrections** — full-text facets with fewer
+  matches than the collection budget now complete on larger tables. Explicit
+  `match_all` contributes its text domain to hybrid aggregations, while
+  filter-only vector requests no longer add a match-all retrieval lane to the
+  ranked page.
 - **TOON document rendering in retrieval agents** — the generation prompt now
   encodes each retrieved document's fields as TOON instead of raw JSON, and
   `document_renderer` on a retrieval agent request is accepted again: a

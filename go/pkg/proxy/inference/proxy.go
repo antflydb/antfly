@@ -1360,7 +1360,7 @@ var modelCategoryOperations = map[string][]OperationType{
 	"embedders":    {"embed", "embeddings"},
 	"generators":   {"generate", "generate.batch", "chat.completions"},
 	"readers":      {"read"},
-	"rerankers":    {"rerank", "rerank_multimodal"},
+	"rerankers":    {"rerank"},
 	"chunkers":     {"chunk"},
 	"extractors":   {"extract"},
 	"rewriters":    {"rewrite"},
@@ -2076,7 +2076,6 @@ func (p *Proxy) Start(ctx context.Context) error {
 	apiMux.HandleFunc("/ai/v1/embeddings", p.handleEmbeddings)
 	apiMux.HandleFunc("/ai/v1/chunk", p.handleChunk)
 	apiMux.HandleFunc("/ai/v1/rerank", p.handleRerank)
-	apiMux.HandleFunc("/ai/v1/rerank_multimodal", p.handleRerankMultimodal)
 	apiMux.HandleFunc("/ai/v1/extract", p.handleExtract)
 	apiMux.HandleFunc("/ai/v1/rewrite", p.handleRewrite)
 	apiMux.HandleFunc("/ai/v1/transcribe", p.handleTranscribe)
@@ -2165,12 +2164,6 @@ func (p *Proxy) handleChunk(w http.ResponseWriter, r *http.Request) {
 // handleRerank routes reranking requests
 func (p *Proxy) handleRerank(w http.ResponseWriter, r *http.Request) {
 	p.proxyRequest(w, r, "rerank")
-}
-
-// handleRerankMultimodal preserves the concrete operation so route rules and
-// capability leases can distinguish multimodal rerankers from text rerankers.
-func (p *Proxy) handleRerankMultimodal(w http.ResponseWriter, r *http.Request) {
-	p.proxyRequest(w, r, "rerank_multimodal")
 }
 
 func (p *Proxy) handleExtract(w http.ResponseWriter, r *http.Request) {
@@ -3309,8 +3302,6 @@ func semanticTaskForOperation(operation OperationType) string {
 		return "generate"
 	case "embed", "embeddings":
 		return "embed"
-	case "rerank", "rerank_multimodal":
-		return "rerank"
 	default:
 		return string(operation)
 	}
@@ -3322,8 +3313,6 @@ func semanticOperationsForTask(task string, fallback OperationType) []OperationT
 		return []OperationType{"generate", "generate.batch", "chat.completions"}
 	case "embed":
 		return []OperationType{"embed", "embeddings"}
-	case "rerank":
-		return []OperationType{"rerank", "rerank_multimodal"}
 	default:
 		return []OperationType{fallback}
 	}
@@ -3803,6 +3792,14 @@ func conservativeInferenceCapabilities(left, right any) (map[string]any, bool) {
 				return nil, false
 			}
 			result["numeric_responses_v1"] = aNumeric && bNumeric
+			aDocuments, aok := optionalInferenceCapabilityBool(a, "rerank_documents_v1")
+			bDocuments, bok := optionalInferenceCapabilityBool(b, "rerank_documents_v1")
+			if !aok || !bok {
+				return nil, false
+			}
+			// A pooled reranker accepts `documents` only when every upstream
+			// does; absence means an older server that only takes `prompts`.
+			result["rerank_documents_v1"] = aDocuments && bDocuments
 			aLimits, aok := a["task_limits"].(map[string]any)
 			bLimits, bok := b["task_limits"].(map[string]any)
 			if !aok || !bok {
@@ -3999,6 +3996,9 @@ func validExactInferenceCapabilities(capabilities map[string]any, version int) b
 		return false
 	}
 	if _, ok := optionalInferenceCapabilityBool(capabilities, "numeric_responses_v1"); !ok {
+		return false
+	}
+	if _, ok := optionalInferenceCapabilityBool(capabilities, "rerank_documents_v1"); !ok {
 		return false
 	}
 	if version >= 4 {
