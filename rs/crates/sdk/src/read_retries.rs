@@ -2,7 +2,7 @@
 
 use crate::{AdmissionPool, Admitted, RunError};
 use reqwest::{Method, Request, Response, header::HeaderMap};
-use std::{fmt, time::Duration};
+use std::{collections::HashSet, fmt, time::Duration};
 use tokio::time::{Instant, sleep, timeout_at};
 
 #[derive(Clone, Copy, Debug)]
@@ -86,7 +86,104 @@ fn query_request(request: &Request) -> bool {
     }
 }
 
-fn query_budget(request: &Request, maximum: Duration) -> Option<Duration> {
+struct QueryPlan {
+    budget: Duration,
+    body: Vec<u8>,
+    timeout_spans: Vec<(usize, usize)>,
+}
+
+fn skip_space(bytes: &[u8], mut at: usize) -> usize {
+    while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+        at += 1;
+    }
+    at
+}
+
+fn string_end(bytes: &[u8], mut at: usize) -> usize {
+    at += 1;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\\' => at += 2,
+            b'"' => return at + 1,
+            _ => at += 1,
+        }
+    }
+    bytes.len()
+}
+
+// The line is validated as JSON before this scan. Only top-level values can
+// be rewritten; nested fields and all other source bytes remain untouched.
+fn value_end(bytes: &[u8], mut at: usize) -> usize {
+    let mut depth = 0;
+    let mut quoted = false;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'"' => quoted = !quoted,
+            b'\\' if quoted => at += 1,
+            b'{' | b'[' if !quoted => depth += 1,
+            b'}' | b']' if !quoted => {
+                if depth == 0 {
+                    return at;
+                }
+                depth -= 1;
+            }
+            b',' if !quoted && depth == 0 => return at,
+            _ => {}
+        }
+        at += 1;
+    }
+    at
+}
+
+fn line_plan(
+    line: &[u8],
+    offset: usize,
+    budget: &mut Duration,
+    spans: &mut Vec<(usize, usize)>,
+) -> Option<()> {
+    if !serde_json::from_slice::<serde_json::Value>(line)
+        .ok()?
+        .is_object()
+    {
+        return None;
+    }
+    let mut at = skip_space(line, 0) + 1;
+    let mut keys = HashSet::new();
+    loop {
+        at = skip_space(line, at);
+        if line.get(at) == Some(&b'}') {
+            return Some(());
+        }
+        let end = string_end(line, at);
+        let key: String = serde_json::from_slice(&line[at..end]).ok()?;
+        if !keys.insert(key.clone()) {
+            return None;
+        }
+        at = skip_space(line, end) + 1; // colon
+        at = skip_space(line, at);
+        let start = at;
+        at = value_end(line, at);
+        if key == "timeout_ms" {
+            let value_end = line[start..at]
+                .iter()
+                .rposition(|byte| !byte.is_ascii_whitespace())?
+                + start
+                + 1;
+            let value: serde_json::Value = serde_json::from_slice(&line[start..value_end]).ok()?;
+            if !value.is_null() {
+                *budget = (*budget).min(Duration::from_millis(value.as_u64()?));
+                spans.push((offset + start, offset + value_end));
+            }
+        }
+        at = skip_space(line, at);
+        if line.get(at) == Some(&b'}') {
+            return Some(());
+        }
+        at += 1; // comma
+    }
+}
+
+fn query_plan(request: &Request, maximum: Duration) -> Option<QueryPlan> {
     let body = request.body()?.as_bytes()?;
     if body.len() > 1 << 20 {
         return None;
@@ -103,26 +200,50 @@ fn query_budget(request: &Request, maximum: Duration) -> Option<Duration> {
                 .trim()
                 .eq_ignore_ascii_case("application/x-ndjson")
         });
-    let lines: Vec<&[u8]> = if ndjson {
-        body.split(|byte| *byte == b'\n')
-            .filter(|line| line.iter().any(|byte| !byte.is_ascii_whitespace()))
-            .collect()
-    } else {
-        vec![body]
-    };
-    if lines.is_empty() {
-        return None;
-    }
     let mut budget = maximum;
-    for line in lines {
-        let value: serde_json::Value = serde_json::from_slice(line).ok()?;
-        let object = value.as_object()?;
-        if let Some(timeout) = object.get("timeout_ms").filter(|value| !value.is_null()) {
-            let milliseconds = timeout.as_u64()?;
-            budget = budget.min(Duration::from_millis(milliseconds));
+    let mut spans = Vec::new();
+    let mut seen = false;
+    let mut offset = 0;
+    while offset < body.len() {
+        let end = if ndjson {
+            body[offset..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(body.len(), |position| offset + position + 1)
+        } else {
+            body.len()
+        };
+        let line = &body[offset..end];
+        if line.iter().any(|byte| !byte.is_ascii_whitespace()) {
+            line_plan(line, offset, &mut budget, &mut spans)?;
+            seen = true;
         }
+        offset = end;
     }
-    Some(budget)
+    seen.then(|| QueryPlan {
+        budget,
+        body: body.to_vec(),
+        timeout_spans: spans,
+    })
+}
+
+#[cfg(test)]
+fn query_budget(request: &Request, maximum: Duration) -> Option<Duration> {
+    query_plan(request, maximum).map(|plan| plan.budget)
+}
+
+fn remaining_query_body(plan: &QueryPlan, end: Instant) -> Vec<u8> {
+    let remaining = end.saturating_duration_since(Instant::now()).as_millis();
+    let milliseconds = remaining.to_string();
+    let mut body = Vec::with_capacity(plan.body.len() + plan.timeout_spans.len() * 20);
+    let mut at = 0;
+    for &(start, end) in &plan.timeout_spans {
+        body.extend_from_slice(&plan.body[at..start]);
+        body.extend_from_slice(milliseconds.as_bytes());
+        at = end;
+    }
+    body.extend_from_slice(&plan.body[at..]);
+    body
 }
 
 fn retry_delay(
@@ -186,14 +307,15 @@ impl QueryRetryClient {
             return Err(QueryRetryError::UnsupportedRequest);
         }
         let started = Instant::now();
-        let body_budget = query_budget(&request, self.policy.max_elapsed);
+        let plan = query_plan(&request, self.policy.max_elapsed);
+        let body_budget = plan.as_ref().map(|value| value.budget);
         let budget = request
             .timeout()
             .map_or(body_budget.unwrap_or(self.policy.max_elapsed), |timeout| {
                 (*timeout).min(body_budget.unwrap_or(self.policy.max_elapsed))
             });
         let end = deadline.map_or(started + budget, |value| value.min(started + budget));
-        timeout_at(end, self.execute_until(request, end, body_budget.is_some()))
+        timeout_at(end, self.execute_until(request, end, plan.as_ref()))
             .await
             .map_err(|_| QueryRetryError::Request(RunError::RequestDeadlineExceeded))?
     }
@@ -202,12 +324,20 @@ impl QueryRetryClient {
         &self,
         request: Request,
         end: Instant,
-        allow_retry: bool,
+        plan: Option<&QueryPlan>,
     ) -> Result<Admitted<Response>, QueryRetryError> {
         for attempt in 0..self.policy.max_attempts {
             let mut next = request
                 .try_clone()
                 .ok_or(QueryRetryError::UnsupportedRequest)?;
+            if attempt > 0
+                && let Some(plan) = plan
+            {
+                if !plan.timeout_spans.is_empty() {
+                    *next.body_mut() = Some(remaining_query_body(plan, end).into());
+                    next.headers_mut().remove(reqwest::header::CONTENT_LENGTH);
+                }
+            }
             let mut response = self
                 .pool
                 .run(Some(end), || {
@@ -240,7 +370,7 @@ impl QueryRetryClient {
             }
             // Retire response/permit before backoff, including truncated errors.
             drop(response);
-            let delay = if allow_retry && !truncated && attempt + 1 < self.policy.max_attempts {
+            let delay = if plan.is_some() && !truncated && attempt + 1 < self.policy.max_attempts {
                 retry_delay(self.policy, attempt, status, &headers, &body)
             } else {
                 None
@@ -263,6 +393,45 @@ impl QueryRetryClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_timeout_rewrite_preserves_ndjson_payload_and_nested_fields() {
+        let client = reqwest::Client::new();
+        let original = b" {\"id\":9007199254740993,\"timeout_ms\":900,\"nested\":{\"timeout_ms\":777}}\n{\"timeout_ms\":500, \"text\":\"plain\"}\n";
+        let request = client
+            .post("http://localhost/db/v1/query")
+            .header("content-type", "application/x-ndjson")
+            .body(original.to_vec())
+            .build()
+            .unwrap();
+        let plan = query_plan(&request, Duration::from_secs(2)).unwrap();
+        assert_eq!(plan.budget, Duration::from_millis(500));
+        assert_eq!(plan.timeout_spans.len(), 2);
+        let rewritten = remaining_query_body(&plan, Instant::now() + Duration::from_millis(45));
+        let lines: Vec<_> = rewritten.split(|byte| *byte == b'\n').collect();
+        let first: serde_json::Value = serde_json::from_slice(lines[0]).unwrap();
+        let second: serde_json::Value = serde_json::from_slice(lines[1]).unwrap();
+        assert!(first["timeout_ms"].as_u64().unwrap() <= 45);
+        assert_eq!(first["timeout_ms"], second["timeout_ms"]);
+        assert!(
+            rewritten
+                .windows(b"9007199254740993".len())
+                .any(|part| part == b"9007199254740993")
+        );
+        assert!(
+            rewritten
+                .windows(b"\"nested\":{\"timeout_ms\":777}".len())
+                .any(|part| part == b"\"nested\":{\"timeout_ms\":777}")
+        );
+        assert!(rewritten.ends_with(b"\n"));
+
+        let duplicate = client
+            .post("http://localhost/db/v1/query")
+            .body("{\"timeout_ms\":20,\"timeout_ms\":30}")
+            .build()
+            .unwrap();
+        assert!(query_plan(&duplicate, Duration::from_secs(1)).is_none());
+    }
 
     #[test]
     fn successful_body_keeps_original_budget_after_retry_backoff() {
@@ -288,11 +457,40 @@ mod tests {
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
                 let mut request = Vec::new();
-                while !request.ends_with(br#"{"timeout_ms":300}"#) {
+                let body = loop {
                     let mut part = [0; 1024];
                     let count = socket.read(&mut part).unwrap();
                     assert!(count > 0);
                     request.extend_from_slice(&part[..count]);
+                    if let Some(header_end) =
+                        request.windows(4).position(|part| part == b"\r\n\r\n")
+                    {
+                        let header_end = header_end + 4;
+                        let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .map(str::to_owned)
+                            })
+                            .unwrap()
+                            .trim()
+                            .parse()
+                            .unwrap();
+                        if request.len() >= header_end + length {
+                            break request[header_end..header_end + length].to_vec();
+                        }
+                    }
+                };
+                let timeout =
+                    serde_json::from_slice::<serde_json::Value>(&body).unwrap()["timeout_ms"]
+                        .as_u64()
+                        .unwrap();
+                if attempt == 0 {
+                    assert_eq!(timeout, 300);
+                } else {
+                    assert!(timeout < 300, "retry reused original server timeout");
                 }
                 if attempt == 0 {
                     let body = r#"{"reason":"instance_busy","stage":"admission","execution_started":false}"#;
@@ -384,16 +582,34 @@ mod tests {
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
                 let mut request = Vec::new();
-                loop {
+                let request_body = loop {
                     let mut part = [0; 1024];
                     let count = socket.read(&mut part).unwrap();
                     assert!(count > 0);
                     request.extend_from_slice(&part[..count]);
-                    if request.windows(6).any(|value| value == b"\r\n\r\n{}") {
-                        break;
+                    if let Some(header_end) =
+                        request.windows(4).position(|part| part == b"\r\n\r\n")
+                    {
+                        let header_end = header_end + 4;
+                        let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .map(str::to_owned)
+                            })
+                            .unwrap()
+                            .trim()
+                            .parse()
+                            .unwrap();
+                        if request.len() >= header_end + length {
+                            break request[header_end..header_end + length].to_vec();
+                        }
                     }
-                }
+                };
                 assert!(request.starts_with(b"POST /db/v1/query "));
+                assert_eq!(request_body, b"{}");
                 let body = if attempt == 0 {
                     r#"{"reason":"instance_busy","stage":"admission","execution_started":false}"#
                 } else {
