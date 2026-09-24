@@ -15874,6 +15874,11 @@ fn appendTableRecord(
     try out.appendSlice(alloc, record.restore_backup_id);
     try appendInt(alloc, out, u32, @intCast(record.restore_location.len));
     try out.appendSlice(alloc, record.restore_location);
+    if (record.relational_retirement_json.len != 0) {
+        try appendInt(alloc, out, u32, 0x31524941);
+        try appendInt(alloc, out, u32, @intCast(record.relational_retirement_json.len));
+        try out.appendSlice(alloc, record.relational_retirement_json);
+    }
     // Inactive records keep their historical bytes. The extension is gated
     // by the metadata storage-policy capability before replicated admission.
     if (record.storage.dense_embeddings != .primary_lsm or record.storage.transaction_recovery != null) {
