@@ -5970,6 +5970,7 @@ pub fn storageOwnerOpen(
         }
     else
         null;
+    const online_source_authority = std.enums.fromInt(antfly.capi_dependencies.storage_source_authority.Kind, request.online_source_authority) orelse return .invalid_argument;
     const owner_context = asStorageOwnerContext(request.context);
     const alloc = if (owner_context) |context| context.alloc else std.heap.c_allocator;
     // A metadata restore intent can become visible before Raft bootstrap has
@@ -6055,6 +6056,7 @@ pub fn storageOwnerOpen(
     defer if (context_borrowed) owner_context.?.release();
     var completion_settings: ?std.json.Parsed(@import("../common/table_storage.zig").Settings) = null;
     defer if (completion_settings) |*settings| settings.deinit();
+    if (request.restore_bootstrap_json.len != 0 and request.completion_installation != null) return .invalid_argument;
     const completion_config = if (request.completion_installation) |binding| installed: {
         if (owner_context == null or identity_namespace == null or binding.identity.group_id != request.group_id or
             binding.table_id != request.identity_table_id or binding.range_id != request.identity_range_id or
@@ -6098,6 +6100,7 @@ pub fn storageOwnerOpen(
         .resource_manager = if (owner_context) |context| &context.resources.resource_manager else null,
         .backend_runtime = if (owner_context) |context| context.backend_runtime.ptr() else null,
         .identity_namespace = identity_namespace,
+        .online_source_authority = online_source_authority,
         .prefer_existing_identity_namespace = identity_namespace != null,
         .transaction_recovery = if (recovery) |value| value.dbConfig() else .{},
         .resolution_candidate_source = if (runtime_hooks) |value| value.candidateSource() else null,
@@ -6161,7 +6164,9 @@ pub fn storageOwnerOpen(
     });
     // Configuration can start DB-owned workers. Publish their pointers only
     // after the DB occupies its final address, and drain them on failure.
-    if (completion_config == null) local_write.configureStorageKernelOwnerDb(
+    if (restore_bootstrap) |bootstrap| {
+        local_write.configureRestoreOwnerDb(alloc, &handle.db, bootstrap.value, request.restore_cancel_recovery != 0, request.restore_ha_replay != 0) catch |err| return storageOwnerStatusFromError(err);
+    } else if (completion_config == null) local_write.configureStorageKernelOwnerDb(
         alloc,
         &handle.db,
         table_name,
@@ -6179,8 +6184,11 @@ pub fn storageOwnerOpen(
     // The opaque handle now owns the DB at its final address. Match resident
     // cache installation: source verification and other DB-owned maintenance
     // must progress even when this owner receives no foreground requests.
-    handle.db.activateResolverReplayRuntimes() catch |err| return storageOwnerStatusFromError(err);
-    handle.db.startResidentBackgroundWorkersIfNeeded();
+    // A hidden restore owner stays unpublished until its scoped promotion.
+    if (restore_bootstrap == null) {
+        handle.db.activateResolverReplayRuntimes() catch |err| return storageOwnerStatusFromError(err);
+        handle.db.startResidentBackgroundWorkersIfNeeded();
+    }
     // Register as the last fallible step: on failure the defers above close
     // the DB and release the borrowed context exactly once, as for every
     // earlier failure. (publishHandle's close-on-failure would release the

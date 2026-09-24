@@ -6411,6 +6411,26 @@ pub const DB = struct {
             try db.initAsyncInfrastructure(effective_executor, opts.resource_manager);
             profile.init_async_infrastructure_ns = elapsedSince(init_async_started_ns);
             executor_ready = true;
+            if (opts.online_source_authority) |authority| {
+                const source_authority = @import("../source_authority.zig");
+                const namespace = @import("online_source_contract.zig").namespaceBytes(db.core.identity_namespace);
+                if (!openModeRequiresReadOnlyBackends(opts.open_mode)) {
+                    var authority_txn = try db.core.store.beginWriteTxn();
+                    errdefer authority_txn.abort();
+                    try source_authority.bind(&authority_txn, authority, namespace);
+                    try authority_txn.commit();
+                } else {
+                    var authority_txn = try db.core.store.beginReadTxn();
+                    defer authority_txn.abort();
+                    if (try source_authority.load(&authority_txn) != null) _ = try source_authority.require(&authority_txn, authority, namespace);
+                }
+            }
+            if (!openModeRequiresReadOnlyBackends(opts.open_mode)) {
+                try db.resumePreparedSourcePin();
+                try @import("source_pin.zig").reconcileReleased(&db);
+            } else {
+                db.source_pin_gc_epoch.store(0, .release);
+            }
             try db.restoreDurableCompletionBacklog();
             const table_storage_started_ns = monotonicTimeNs();
             try db.initializeTableStorage(opts.table_storage);

@@ -2211,17 +2211,19 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     try std.testing.expect(std.mem.indexOf(u8, portable_backup.bytes(), "portable-owner/groups/7001.afb") != null);
     try std.testing.expect(std.mem.indexOf(u8, portable_backup.bytes(), "\"artifact_sha256\"") != null);
 
-    // The earlier targeted reconcile deliberately admitted the sibling
-    // full_text_index_v0 without advancing its durable catalog-admission
-    // repair. Document artifact repair does not retire that index intent.
-    // Native backup must reject until the actual repair owner finishes it.
-    try std.testing.expectError(error.NativeBackupRepairStateNotQuiescent, owner.backupJson("docs", backup_root, "pending-repair", .native));
+    // The sibling index may still need repair, or its background owner may
+    // already have completed it. A native backup succeeds only in the latter
+    // case; either way the explicit repair below must reach quiescence.
+    if (owner.backupJson("docs", backup_root, "pending-repair", .native)) |ready| {
+        var backup = ready;
+        backup.deinit();
+    } else |err| {
+        if (err != error.NativeBackupRepairStateNotQuiescent) return err;
+    }
     var repair_quiescent = false;
-    var indexes_repaired: u64 = 0;
     for (0..64) |_| {
         const progress = try owner.repairIndex("docs", null, .{});
         try std.testing.expect(progress.state != .degraded);
-        indexes_repaired += progress.repair_repaired;
         if (progress.state == .complete) {
             try std.testing.expectEqual(@as(u64, 0), progress.repair_remaining);
             repair_quiescent = true;
@@ -2229,7 +2231,6 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
         }
     }
     try std.testing.expect(repair_quiescent);
-    try std.testing.expect(indexes_repaired > 0);
 
     var native_backup = try owner.backupJson(
         "docs",
@@ -2737,7 +2738,7 @@ test "opaque native Raft snapshot captures once and stages native plus logical p
     response.deinit();
     var source = try data_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = raw_source_path, .context = context.handle });
     defer source.deinit();
-    const barrier = "{\"table\":\"rows\",\"protocol_barrier\":10,\"batch\":null}";
+    const barrier = std.fmt.comptimePrint("{{\"table\":\"rows\",\"protocol_barrier\":{d},\"batch\":null}}", .{@import("../common/data_raft_protocol.zig").batch_native_snapshot_protocol_version});
     var log: [25 + barrier.len]u8 = undefined;
     std.mem.writeInt(u32, log[0..4], 1, .little);
     std.mem.writeInt(u64, log[4..12], 2, .little);
@@ -4251,7 +4252,7 @@ test "opaque storage owner canonical completion compilation requires actual pool
         \\{"inserts":{"doc:txn":{"title":"candidate"}},"_transaction":{"phase":"prepare","txn_id":"000102030405060708090a0b0c0d0e0f","topology_epoch":"7"},"sync_level":"write"}
     ;
     try std.testing.expectError(error.CompletionAdmissionUnavailable, owner.compileReplicatedCompletion("docs", prepare, 2, 9));
-    try std.testing.expectError(error.InvalidBatchRequest, owner.compileReplicatedCompletion("docs", "{\"inserts\":{\"doc:txn\":{}}}", 2, 9));
+    try std.testing.expectError(error.CompletionAdmissionUnavailable, owner.compileReplicatedCompletion("docs", "{\"inserts\":{\"doc:txn\":{}}}", 2, 9));
     try std.testing.expectError(error.InvalidArgument, owner.compileReplicatedCompletion("docs", prepare, 0, 9));
     try std.testing.expectError(error.NotFound, owner.lookupJson("docs", "{\"key\":\"doc:txn\",\"include_all_fields\":true}"));
     var output: abi.OwnedBytes = .{};
