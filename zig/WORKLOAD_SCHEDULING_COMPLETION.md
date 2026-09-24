@@ -289,3 +289,12 @@ replica progress'`. Evidence: `/tmp/workload-invalid-participant-data1.log`.
   accept a deadline but no cancellation token; cancellation is checked before
   and after the bounded fetch and before mutation submission. Fresh production
   activation remains disabled.
+- Public batch name resolution now translates its request-owned `std.Io` awake
+  deadline before comparing it with the metadata service's platform monotonic
+  ReadIndex timeout. Both embedded and HTTP metadata services retain the
+  original clock for cancellation checks. A genuine pre-write metadata timeout
+  returns HTTP 503 and the batch client classifies it as retryable availability,
+  while unknown post-admission outcomes retain their separate contract. The
+  focused public API smoke and batch-client tests passed 2/2; the direct HTTP
+  metadata clock and catalog status tests passed 2/2. The metadata service gate
+  passed 131/131, though its fixed filter did not include the new direct test.

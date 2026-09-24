@@ -5283,7 +5283,7 @@ pub const MetadataService = struct {
         self: *MetadataService,
         request: api_operation.RequestContext,
     ) !void {
-        try request.ensureActive();
+        const platform_request = try request.platformDeadline();
         const request_id = try self.linearizable_read_tracker.registerRequest();
         defer self.linearizable_read_tracker.finishRequest(request_id);
         var request_ctx_buf: [64]u8 = undefined;
@@ -5294,7 +5294,7 @@ pub const MetadataService = struct {
         );
 
         const local_deadline_ns = platform_time.monotonicNs() +| linearizable_metadata_read_timeout_ns;
-        const deadline_ns = if (request.deadline_ns) |caller_deadline_ns|
+        const deadline_ns = if (platform_request.deadline_ns) |caller_deadline_ns|
             @min(local_deadline_ns, caller_deadline_ns)
         else
             local_deadline_ns;
@@ -10674,7 +10674,7 @@ pub const MetadataHttpService = struct {
         self: *MetadataHttpService,
         request: api_operation.RequestContext,
     ) !void {
-        try request.ensureActive();
+        const platform_request = try request.platformDeadline();
         const request_id = try self.linearizable_read_tracker.registerRequest();
         defer self.linearizable_read_tracker.finishRequest(request_id);
         var request_ctx_buf: [64]u8 = undefined;
@@ -10685,7 +10685,7 @@ pub const MetadataHttpService = struct {
         );
 
         const local_deadline_ns = platform_time.monotonicNs() +| linearizable_metadata_read_timeout_ns;
-        const deadline_ns = if (request.deadline_ns) |caller_deadline_ns|
+        const deadline_ns = if (platform_request.deadline_ns) |caller_deadline_ns|
             @min(local_deadline_ns, caller_deadline_ns)
         else
             local_deadline_ns;
@@ -21184,6 +21184,14 @@ test "metadata http service linearizable reads leave elections to the cadence dr
     try std.testing.expect(svc.raft.host.http_host.host.isLocalLeader(2910));
     const before_read = svc.raft.host.http_host.host.runtime_host.virtualTimeMs();
     try svc.ensureLinearizableRead();
+    var read_io = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer read_io.deinit();
+    var read_io_iface = read_io.io();
+    const read_clock_now: u64 = @intCast(@max(0, std.Io.Clock.now(.awake, read_io_iface).nanoseconds));
+    try svc.ensureLinearizableReadWithContext(.{
+        .deadline_ns = read_clock_now +| 5 * std.time.ns_per_s,
+        .deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&read_io_iface),
+    });
     try std.testing.expectEqual(before_read, svc.raft.host.http_host.host.runtime_host.virtualTimeMs());
     try std.testing.expect(svc.raft.host.http_host.host.isLocalLeader(2910));
     try std.testing.expect(svc.metrics().read_index_requests > 0);

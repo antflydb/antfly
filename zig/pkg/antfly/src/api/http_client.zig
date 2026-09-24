@@ -4495,6 +4495,9 @@ fn remotePublicBatchError(alloc: std.mem.Allocator, status: u16, body: []const u
         503 => {
             if (std.mem.eql(u8, message, "write unavailable")) return error.LeaderUnavailable;
             if (std.mem.eql(u8, message, "doc identity unavailable")) return error.DocIdentityUnavailable;
+            // Public name resolution runs before storage admission. A failed
+            // metadata read therefore leaves this batch safe to retry.
+            if (std.mem.eql(u8, message, "MetadataLinearizableReadTimeout")) return error.Unavailable;
             if (std.mem.eql(u8, message, "maintenance routes unavailable on query-only runtime")) {
                 return error.Unavailable;
             }
@@ -4841,6 +4844,7 @@ fn consumerTests() type {
                 "transaction outcome is unknown; do not retry this stateless batch",
             ));
             try std.testing.expectEqual(error.LeaderUnavailable, remotePublicBatchError(alloc, 503, "write unavailable"));
+            try std.testing.expectEqual(error.Unavailable, remotePublicBatchError(alloc, 503, "MetadataLinearizableReadTimeout"));
             try std.testing.expectEqual(error.HAReadOnlyStandby, remotePublicBatchError(alloc, 409, "standby is read-only"));
         }
 
