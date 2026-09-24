@@ -6,7 +6,7 @@ import type {
   KernelRoute,
   SourceLink,
 } from "../lib/schema/index.ts";
-import { lineOf, readRepoFile, repoRoot } from "./lib.ts";
+import { readRepoFile, repoRoot } from "./lib.ts";
 import { requireUnique } from "./merge.ts";
 
 const NODE_ZIG = "zig/lib/ml/src/graph/node.zig";
@@ -40,7 +40,7 @@ export function extractOpKinds(): OpKindEntry[] {
       out.push({
         name: m[1],
         group,
-        source: { path: NODE_ZIG, line: lineOf(content, bodyStart + m.index), anchor: `${m[1]},` },
+        source: { path: NODE_ZIG },
       });
     }
   }
@@ -107,11 +107,7 @@ export function parseSchedules(content: string): KernelRoute[] {
       },
       generated: true,
       generatedFile: guessGeneratedFile(format, epilogue),
-      source: {
-        path: COMPILER_ZIG,
-        line: lineOf(content, tableStart + m.index),
-        anchor: `.format = .${format}, .row_bucket = .${rowBucket}, .epilogue = .${epilogue}`,
-      },
+      source: { path: COMPILER_ZIG },
     });
   }
   const expectedRows = [...table.matchAll(/\.format\s*=/g)].length;
@@ -160,7 +156,7 @@ function classifyKernel(name: string): KernelInventoryEntry["family"] {
 
 /**
  * Blank out `//` and `/* *\/` comments with spaces so declaration scans cannot
- * match commented-out code. Offsets and newlines are preserved for lineOf().
+ * match commented-out code. Offsets and newlines are preserved.
  */
 function blankComments(src: string): string {
   return src
@@ -189,7 +185,7 @@ export function extractKernelInventory(): KernelInventoryEntry[] {
       name,
       family: classifyKernel(name),
       generated: inGenerated,
-      source: { path: KERNELS_M, line: lineOf(mContent, m.index), anchor: `kernel void ${name}` },
+      source: { path: KERNELS_M },
     });
   }
 
@@ -204,7 +200,7 @@ export function extractKernelInventory(): KernelInventoryEntry[] {
         name,
         family: classifyKernel(name),
         generated: true,
-        source: { path: rel, line: lineOf(content, g.index), anchor: `kernel void ${name}` },
+        source: { path: rel },
       };
       // Prefer the generated-file location for generated kernels.
       seen.set(name, entry);
@@ -248,8 +244,8 @@ export function extractEnvFlags(): EnvFlagGate[] {
           const name = m[0];
           const rec = byName.get(name) ?? { links: [], count: 0 };
           rec.count++;
-          if (rec.links.length < 5) {
-            rec.links.push({ path: rel, line: lineOf(content, m.index), anchor: name });
+          if (rec.links.length < 5 && !rec.links.some((link) => link.path === rel)) {
+            rec.links.push({ path: rel });
           }
           byName.set(name, rec);
         }

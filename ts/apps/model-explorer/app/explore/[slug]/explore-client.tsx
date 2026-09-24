@@ -1,7 +1,7 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { type ClientSnippet, SnippetProvider } from "@/components/code/snippet-context";
+import { SourceLinkProvider } from "@/components/code/source-link-context";
 import { ChoiceGroup } from "@/components/primitives/choice-group";
 import { OpDagExplorer } from "@/components/viz/op-dag-explorer";
 import type { KernelRoute, ModelSpec } from "@/lib/schema";
@@ -9,21 +9,17 @@ import type { KernelRoute, ModelSpec } from "@/lib/schema";
 export function ExploreClient({
   spec,
   routes,
-  snippets,
-  gitCommit,
   permalinkBase,
   allSlugs,
 }: {
   spec: ModelSpec;
   routes: KernelRoute[];
-  snippets: Record<string, ClientSnippet>;
-  gitCommit: string;
   permalinkBase?: string;
   allSlugs: string[];
 }) {
   const router = useRouter();
   return (
-    <SnippetProvider snippets={snippets} gitCommit={gitCommit} permalinkBase={permalinkBase}>
+    <SourceLinkProvider permalinkBase={permalinkBase}>
       <div className="relative">
         <header className="border-b px-4 py-3">
           <h1 className="text-lg font-semibold">Operation explorer · {spec.displayName}</h1>
@@ -42,6 +38,6 @@ export function ExploreClient({
         </header>
         <OpDagExplorer spec={spec} routes={routes} />
       </div>
-    </SnippetProvider>
+    </SourceLinkProvider>
   );
 }

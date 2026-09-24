@@ -40,16 +40,31 @@ const Shape = shape_mod.Shape;
 const Builder = builder_mod.Builder;
 
 /// Result of evaluating a graph on concrete f32 data.
-const EvalResult = struct {
+pub const EvalResult = struct {
     /// Output values, one slice per graph output.
     values: [][]f32,
     allocator: std.mem.Allocator,
 
-    fn deinit(self: *EvalResult) void {
+    pub fn deinit(self: *EvalResult) void {
         for (self.values) |v| self.allocator.free(v);
         self.allocator.free(self.values);
     }
 };
+
+/// Evaluate a primitive-only graph on the host reference interpreter and
+/// return its output values. Tests use this to pin a graph's forward result
+/// against a hand-computed reference independently of any backend.
+pub fn evaluateOutputs(
+    allocator: std.mem.Allocator,
+    graph: *const Graph,
+    param_values: []const []const f32,
+) !EvalResult {
+    // Fused ops carry their primitive decomposition as `vjp_alternate`; the
+    // reference interpreter only evaluates primitives, so lower first.
+    var lowered = try lower_mod.lower(allocator, graph);
+    defer lowered.deinit();
+    return eval(allocator, &lowered.graph, param_values);
+}
 
 /// Evaluate a primitive-only graph on concrete f32 parameter values.
 /// Returns the output tensor values.
