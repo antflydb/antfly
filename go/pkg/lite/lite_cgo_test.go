@@ -63,6 +63,7 @@ func TestErrorCodeMetadataMatchesCABI(t *testing.T) {
 		OutcomeUnknown,
 		Unsupported,
 		Stalled,
+		Cancelled,
 		Internal,
 		ErrorCode(127),
 	}

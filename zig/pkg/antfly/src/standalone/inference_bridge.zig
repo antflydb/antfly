@@ -322,6 +322,42 @@ pub const Capability = struct {
     pub const route_manifest: u64 = 1 << 1;
     pub const resource_budget: u64 = 1 << 2;
     pub const request_admission: u64 = 1 << 3;
+    pub const model_pull: u64 = 1 << 4;
+};
+
+/// One download progress report from `FunctionTable.pull_model`.
+pub const PullProgress = extern struct {
+    /// The model reference being pulled (one of several with variants).
+    model: String,
+    file: String,
+    bytes_downloaded: u64,
+    /// Zero when unknown.
+    total_bytes: u64,
+    files_done: u64,
+    files_total: u64,
+    /// The file was already present and verified; nothing was transferred.
+    cached: u8,
+    _reserved: [7]u8 = @splat(0),
+};
+
+pub const PullModelContext = extern struct {
+    abi_version: u32,
+    struct_size: u32 = @sizeOf(@This()),
+    /// Host-owned executor for the downloads, borrowed for the call.
+    executor: native_abi.IoBorrow,
+    /// Null uses the default models directory.
+    models_dir: OptionalString,
+    /// `{"model": ..., "variants": [...], "token": ..., ...}`; see
+    /// `antfly_inference_pull_json`.
+    request_json: String,
+    progress_context: ?*anyopaque = null,
+    /// `progress` is valid only during the call. Returns 0 to cancel the pull,
+    /// which then fails with `error.Canceled` before its next artifact.
+    on_progress: ?*const fn (?*anyopaque, *const PullProgress) callconv(.c) u8 = null,
+    /// Receives the result JSON exactly once, on success or failure; the
+    /// bytes are valid only during the call.
+    result_context: ?*anyopaque = null,
+    on_result: *const fn (?*anyopaque, String) callconv(.c) void,
 };
 
 pub const RequestAdmissionStats = extern struct {
@@ -349,6 +385,8 @@ pub const FunctionTable = extern struct {
     try_acquire_request: *const fn (*anyopaque) callconv(.c) u8,
     release_request: *const fn (*anyopaque) callconv(.c) void,
     request_admission_stats: *const fn (*anyopaque, *RequestAdmissionStats) callconv(.c) void,
+    /// Downloads models into a models directory. Needs no runtime handle.
+    pull_model: *const fn (*const PullModelContext) callconv(.c) Status,
 };
 
 pub fn validContext(comptime T: type, version: u32, struct_size: u32) bool {
@@ -370,7 +408,8 @@ pub fn requiredFunctionTableSize(required_capabilities: u64) ?u32 {
     const known = Capability.provider |
         Capability.route_manifest |
         Capability.resource_budget |
-        Capability.request_admission;
+        Capability.request_admission |
+        Capability.model_pull;
     if (required_capabilities & ~known != 0) return null;
     var required = functionTableFieldEnd("capabilities");
     // Provider lifetime includes destruction even though the invoke operations
@@ -383,6 +422,8 @@ pub fn requiredFunctionTableSize(required_capabilities: u64) ?u32 {
         required = @max(required, functionTableFieldEnd("configure"));
     if (required_capabilities & Capability.request_admission != 0)
         required = @max(required, functionTableFieldEnd("request_admission_stats"));
+    if (required_capabilities & Capability.model_pull != 0)
+        required = @max(required, functionTableFieldEnd("pull_model"));
     return required;
 }
 
