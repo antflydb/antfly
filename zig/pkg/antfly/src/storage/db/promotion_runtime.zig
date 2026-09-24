@@ -108,11 +108,13 @@ fn promotedKeysStateKeyAlloc(alloc: Allocator, resolution_key: []const u8) ![]u8
     return try key.toOwnedSlice(alloc);
 }
 
-/// Each durable state value is [table, key, label, canonical_name, alias].
+/// Each durable state value is
+/// [table, key, storage_table, label, canonical_name, alias].
 /// Keep this order in sync with stringifyPromotedKeysState.
 const PromotedRef = struct {
     table: []const u8,
     key: []const u8,
+    storage_table: ?[]const u8,
     label: []const u8,
     canonical_name: []const u8,
     alias: []const u8,
@@ -125,6 +127,10 @@ fn promotedAlias(e: resolver_lib.ResolvedEntity) []const u8 {
 fn promotedRefMatches(previous: PromotedRef, e: resolver_lib.ResolvedEntity) bool {
     return std.mem.eql(u8, previous.table, e.doc_ref.table) and
         std.mem.eql(u8, previous.key, e.doc_ref.key) and
+        (if (previous.storage_table) |physical|
+            if (e.doc_ref.storage_table) |current| std.mem.eql(u8, physical, current) else false
+        else
+            e.doc_ref.storage_table == null) and
         std.mem.eql(u8, previous.label, e.label) and
         std.mem.eql(u8, previous.canonical_name, e.canonical_name) and
         std.mem.eql(u8, previous.alias, promotedAlias(e));
@@ -138,18 +144,22 @@ fn parsePromotedKeysState(a: Allocator, raw: []const u8) !std.StringArrayHashMap
     while (it.next()) |entry| {
         if (entry.value_ptr.* != .array) continue;
         const fields = entry.value_ptr.array.items;
-        if (fields.len != 5) continue;
+        if (fields.len != 6) continue;
         var all_strings = true;
-        for (fields) |field| {
+        for (fields[0..2]) |field| {
             if (field != .string) all_strings = false;
         }
-        if (!all_strings) continue;
+        for (fields[3..]) |field| {
+            if (field != .string) all_strings = false;
+        }
+        if (!all_strings or (fields[2] != .string and fields[2] != .null)) continue;
         try map.put(a, entry.key_ptr.*, .{
             .table = fields[0].string,
             .key = fields[1].string,
-            .label = fields[2].string,
-            .canonical_name = fields[3].string,
-            .alias = fields[4].string,
+            .storage_table = if (fields[2] == .string) fields[2].string else null,
+            .label = fields[3].string,
+            .canonical_name = fields[4].string,
+            .alias = fields[5].string,
         });
     }
     return map;
@@ -162,6 +172,7 @@ fn stringifyPromotedKeysState(a: Allocator, entities: []const resolver_lib.Resol
         var fields = std.json.Array.init(a);
         try fields.append(.{ .string = e.doc_ref.table });
         try fields.append(.{ .string = e.doc_ref.key });
+        try fields.append(if (e.doc_ref.storage_table) |physical| .{ .string = physical } else .null);
         try fields.append(.{ .string = e.label });
         try fields.append(.{ .string = e.canonical_name });
         try fields.append(.{ .string = promotedAlias(e) });
@@ -866,15 +877,18 @@ const CaptureSink = struct {
     alloc: std.mem.Allocator,
     keys: std.ArrayListUnmanaged([]u8) = .empty,
     tables: std.ArrayListUnmanaged([]u8) = .empty,
+    storage_tables: std.ArrayListUnmanaged(?[]u8) = .empty,
     docs: std.ArrayListUnmanaged([]u8) = .empty,
     batch_calls: usize = 0,
 
     fn deinit(self: *CaptureSink) void {
         for (self.keys.items) |k| self.alloc.free(k);
         for (self.tables.items) |t| self.alloc.free(t);
+        for (self.storage_tables.items) |maybe_table| if (maybe_table) |table| self.alloc.free(table);
         for (self.docs.items) |d| self.alloc.free(d);
         self.keys.deinit(self.alloc);
         self.tables.deinit(self.alloc);
+        self.storage_tables.deinit(self.alloc);
         self.docs.deinit(self.alloc);
     }
 
@@ -884,8 +898,9 @@ const CaptureSink = struct {
 
     const vtable = EntitySink.VTable{ .upsert = upsert, .upsert_batch = upsertBatch };
 
-    fn record(self: *CaptureSink, table: []const u8, key: []const u8, doc_json: []const u8) anyerror!void {
+    fn record(self: *CaptureSink, table: []const u8, storage_table: ?[]const u8, key: []const u8, doc_json: []const u8) anyerror!void {
         try self.tables.append(self.alloc, try self.alloc.dupe(u8, table));
+        try self.storage_tables.append(self.alloc, if (storage_table) |physical| try self.alloc.dupe(u8, physical) else null);
         try self.keys.append(self.alloc, try self.alloc.dupe(u8, key));
         try self.docs.append(self.alloc, try self.alloc.dupe(u8, doc_json));
     }
@@ -893,14 +908,14 @@ const CaptureSink = struct {
     fn upsert(ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, key: []const u8, doc_json: []const u8) anyerror!void {
         _ = allocator;
         const self: *CaptureSink = @ptrCast(@alignCast(ptr));
-        try self.record(table, key, doc_json);
+        try self.record(table, null, key, doc_json);
     }
 
     fn upsertBatch(ptr: *anyopaque, allocator: std.mem.Allocator, entries: []const EntityUpsert) anyerror!void {
         _ = allocator;
         const self: *CaptureSink = @ptrCast(@alignCast(ptr));
         self.batch_calls += 1;
-        for (entries) |e| try self.record(e.table, e.key, e.doc_json);
+        for (entries) |e| try self.record(e.table, e.storage_table, e.key, e.doc_json);
     }
 };
 
@@ -970,6 +985,29 @@ test "processResolutionArtifact upserts a canonical entity per resolved mention"
 
     // A missing artifact promotes nothing.
     try testing.expectEqual(@as(usize, 0), try processResolutionArtifact(alloc, map.store(), "no-such-key", capture.sink()));
+}
+
+test "processResolutionArtifact re-promotes when the pinned physical destination changes" {
+    const alloc = testing.allocator;
+    var map = MapStore{ .alloc = alloc };
+    defer map.deinit();
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    var capture = CaptureSink{ .alloc = alloc };
+    defer capture.deinit();
+    try map.put(resolution_key,
+        \\{"config_generation":1,"entities":[{"local_id":"e0","doc_ref":{"table":"entities","storage_table":"table:old","key":"person/ada"},"confidence":1,"decision":"new","label":"person","canonical_name":"Ada","surface_form":"Ada"}]}
+    );
+    try testing.expectEqual(@as(usize, 1), try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
+    try testing.expectEqualStrings("table:old", capture.storage_tables.items[0].?);
+
+    try map.put(resolution_key,
+        \\{"config_generation":1,"entities":[{"local_id":"e0","doc_ref":{"table":"entities","storage_table":"table:new","key":"person/ada"},"confidence":1,"decision":"new","label":"person","canonical_name":"Ada","surface_form":"Ada"}]}
+    );
+    try testing.expectEqual(@as(usize, 1), try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
+    try testing.expectEqualStrings("table:new", capture.storage_tables.items[1].?);
+    try testing.expectEqual(@as(usize, 0), try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
+    try testing.expectEqual(@as(usize, 2), capture.keys.items.len);
 }
 
 test "processResolutionArtifact tombstones the prior key when a mention re-keys" {
@@ -1056,7 +1094,7 @@ test "processResolutionArtifact skips a byte-stable replay of an already-promote
     const state_key = try promotedKeysStateKeyAlloc(alloc, resolution_key);
     defer alloc.free(state_key);
     const state = map.map.get(state_key).?;
-    try testing.expect(std.mem.indexOf(u8, state, "\"e0\":[\"entities\",\"person/ada_lovelace\",\"person\",\"Ada Lovelace\",\"Countess of Lovelace\"]") != null);
+    try testing.expect(std.mem.indexOf(u8, state, "\"e0\":[\"entities\",\"person/ada_lovelace\",null,\"person\",\"Ada Lovelace\",\"Countess of Lovelace\"]") != null);
     try testing.expect(std.mem.indexOf(u8, state, "\"doc\"") == null);
     try testing.expectEqual(@as(usize, 0), try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
     try testing.expectEqual(@as(usize, 3), capture.keys.items.len);

@@ -1269,16 +1269,22 @@ pub const ProvisionedKernelOwnerSource = struct {
         // maintenance callback waiting for this same progress driver.
         var lease = self.acquireDescriptorOnce(group_id, table_name, path, descriptor, .shared, .resident, .{}) catch |err| switch (err) {
             error.StorageKernelOwnerStaleDescriptor => {
-                // A completed entry may be replayed after the catalog advances
-                // but before the Raft apply watermark is checkpointed. Ask the
-                // current physical owner whether its atomic entry marker covers
-                // this log identity. Never apply an unapplied entry under a
-                // descriptor that differs from the committed one.
                 var current = self.acquirePreparedOwner(group_id, table_name) catch return error.StorageBusy;
                 defer current.deinit();
-                if (!current.entry.identity.eql(descriptor.identity)) return error.StorageBusy;
-                if (try current.owner().raftEntryAlreadyApplied(table_name, raft_term, raft_index)) return;
-                return error.StorageBusy;
+                return self.applyStaleRaftEntryOnCurrentOwner(alloc, table_name, descriptor, req, raft_term, raft_index, &current);
+            },
+            error.StorageBusy => {
+                // After restart there may be no cached owner to compare. A
+                // lower schema then fails at the provider's durable open gate.
+                // Refresh only on this failed admission path, not per entry.
+                var loaded = self.loadDescriptor(alloc, group_id, table_name) catch return error.StorageBusy;
+                defer loaded.deinit(alloc);
+                const latest = loaded.view();
+                if (!latest.identity.eql(descriptor.identity) or
+                    !schemaVersionRegresses(latest.schema_json, descriptor.schema_json)) return error.StorageBusy;
+                var current = self.acquireDescriptorOnce(group_id, table_name, loaded.path, latest, .shared, .resident, .{}) catch return error.StorageBusy;
+                defer current.deinit();
+                return self.applyStaleRaftEntryOnCurrentOwner(alloc, table_name, descriptor, req, raft_term, raft_index, &current);
             },
             error.StorageKernelOwnerTransitionRequired => return error.StorageBusy,
             else => return err,
@@ -1293,6 +1299,43 @@ pub const ProvisionedKernelOwnerSource = struct {
             raft_index,
         );
         defer response.deinit();
+    }
+
+    fn applyStaleRaftEntryOnCurrentOwner(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        descriptor: descriptor_contract.Descriptor,
+        req: db_types.BatchRequest,
+        raft_term: u64,
+        raft_index: u64,
+        current: *Lease,
+    ) !void {
+        _ = self;
+        // The committed request is replayable against the current schema only
+        // when it still targets the same physical DB. A restored/replaced root
+        // has a different history and must use its own transition protocol.
+        if (current.entry.generation != descriptor.lsm_root_generation or
+            !current.entry.identity.eql(descriptor.identity) or
+            !restoreBindingsEqual(current.entry.restore, descriptor.restore) or
+            !std.mem.eql(u8, current.entry.restore_bootstrap_json, descriptor.restore_bootstrap_json) or
+            current.entry.restore_cancel_recovery != descriptor.restore_cancel_recovery or
+            current.entry.restore_ha_replay != descriptor.restore_ha_replay or
+            !descriptor_contract.initialRangesEqual(current.entry.initial_range, descriptor.initial_range) or
+            !std.meta.eql(current.entry.table_storage, descriptor.table_storage)) return error.StorageBusy;
+        // The DB replay path checks its atomic entry marker before mutations,
+        // and still repairs any lifecycle HA/outbox work for applied entries.
+        const request_json = try table_writes.encodeStorageKernelBatchRequest(alloc, req);
+        defer alloc.free(request_json);
+        var response = try current.owner().replicatedBatchAtRaftEntryJson(table_name, request_json, raft_term, raft_index);
+        defer response.deinit();
+    }
+
+    fn restoreBindingsEqual(current: ?@import("../storage/restore_identity.zig").Identity, incoming: ?@import("../storage/restore_identity.zig").Identity) bool {
+        return if (current) |admitted|
+            if (incoming) |expected| admitted.eql(expected) else false
+        else
+            incoming == null;
     }
 
     pub fn waitForCurrentSyncGroupLocal(
@@ -5282,7 +5325,7 @@ test "committed owner apply yields admission conflicts and retries the exact ent
     }
 }
 
-test "stale committed owner replay consults the durable entry marker" {
+test "stale committed owner replay applies exactly once under the current schema" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5320,12 +5363,85 @@ test "stale committed owner replay consults the durable entry marker" {
     } else return error.TestOwnerAdmissionDidNotRecover;
 
     try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", stale, increment, 1, 2);
-    try std.testing.expectError(error.StorageBusy, source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", stale, increment, 1, 3));
+    try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", stale, increment, 1, 3);
+    try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", stale, increment, 1, 3);
     var reader = try source.acquireDescriptor(1, "docs", path, current);
     defer reader.deinit();
     var value = try reader.owner().lookupJson("docs", "{\"key\":\"doc:counter\",\"include_all_fields\":true}");
     defer value.deinit();
-    try std.testing.expect(std.mem.indexOf(u8, value.bytes(), "\"count\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, value.bytes(), "\"count\":2") != null);
+}
+
+test "stale committed owner replay reopens the current schema after restart" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(root);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-1/table-db", .{root});
+    defer alloc.free(path);
+    const stale: descriptor_contract.Descriptor = .{
+        .lsm_root_generation = table_reads.backend_current_root_generation,
+        .identity = .{ .table_id = 1, .shard_id = 1, .range_id = 1 },
+        .schema_json = "{\"version\":1,\"default_type\":\"_default\"}",
+        .initial_range = .{ .start = "", .end = "" },
+        .table_storage = .{},
+    };
+    var current = stale;
+    current.schema_json = "{\"version\":2,\"default_type\":\"_default\"}";
+    const increment: db_types.BatchRequest = .{ .transforms = &.{.{
+        .key = "doc:counter",
+        .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }},
+    }} };
+    {
+        var first = ProvisionedKernelOwnerSource.init(alloc, root, table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+        defer first.deinit();
+        try first.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", stale, .{
+            .writes = &.{.{ .key = "doc:counter", .value = "{\"count\":0}" }},
+        }, 1, 1);
+        try first.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", stale, increment, 1, 2);
+        var lease = try first.acquireDescriptor(1, "docs", path, current);
+        lease.deinit();
+    }
+
+    const Catalog = struct {
+        snapshot: metadata_api.AdminSnapshot,
+        fn admin(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.snapshot;
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    var tables = [_]@import("../metadata/table_manager.zig").TableRecord{.{ .table_id = 1, .name = "docs", .schema_json = current.schema_json }};
+    var ranges = [_]@import("../metadata/table_manager.zig").RangeRecord{.{
+        .group_id = 1,
+        .range_id = 1,
+        .table_id = 1,
+        .start_key = "",
+        .doc_identity_shard_id = 1,
+        .doc_identity_range_id = 1,
+    }};
+    var catalog = Catalog{ .snapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = &tables,
+        .ranges = &ranges,
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+    } };
+    var restarted = ProvisionedKernelOwnerSource.init(alloc, root, .{ .ptr = &catalog, .vtable = &.{
+        .admin_snapshot = Catalog.admin,
+        .free_admin_snapshot = Catalog.free,
+    } }, read_gate.alreadyReadSafeBarrier());
+    defer restarted.deinit();
+    try restarted.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", stale, increment, 1, 2);
+    try restarted.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", stale, increment, 1, 3);
+    var reader = try restarted.acquireDescriptor(1, "docs", path, current);
+    defer reader.deinit();
+    var value = try reader.owner().lookupJson("docs", "{\"key\":\"doc:counter\",\"include_all_fields\":true}");
+    defer value.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, value.bytes(), "\"count\":2") != null);
 }
 
 test "pending exclusive storage owner lease blocks new readers until drain" {
