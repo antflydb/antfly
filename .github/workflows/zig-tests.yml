@@ -1367,10 +1367,11 @@ jobs:
       UV_CACHE_DIR: /mnt/cache/antfly/zig/uv
       HF_HOME: /mnt/cache/antfly/zig/hf
       ANTFLY_E2E_DURATION_FILE: /mnt/cache/antfly/zig/e2e-durations/antfly-v1.json
-      # Multi-node tests already create several WALs each. Keep a single
-      # cluster workload per runner so latency/availability checks are not
-      # invalidated by another test's concurrent durable commits.
-      ANTFLY_E2E_PROCESS_SLOTS: "1"
+      # Mixed stateful/serverless groups need two processes on one worker.
+      # Limit process-owning workers instead, so separate cluster workloads
+      # cannot add concurrent durable commits to latency/availability tests.
+      ANTFLY_E2E_PROCESS_SLOTS: "2"
+      ANTFLY_E2E_PROCESS_WORKERS: "1"
       # Permit the diagnostic debugger to attach to disposable test children.
       ANTFLY_E2E_NATIVE_STACKS: "1"
       ANTFLY_CI_TRACE: "1"
