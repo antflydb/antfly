@@ -118,10 +118,21 @@ this requested implementation/correctness scope.
   exact committed payload, document, index/term and progress digest. It passed
   in the same 47/47 durable gate. It uses file IPC and does not exercise
   DataServer networking, catalog recovery, or replacement-leader election.
+- A six-process ordinary DATA quorum driver now checks real metadata/DATA
+  voter identity, all-replica applied progress, successor election after DATA
+  leader kill, and exact reads after the killed node restarts. Its script and
+  existing metadata-runner tests passed 12/12. A live run still needs a fresh
+  pinned umbrella binary; replicated physical completion remains explicitly
+  disabled and is outside this driver's claim.
 - Distributed join now stages all fanout hits until every batch succeeds;
   late-batch and sequential failures leave caller output unchanged. The
   curated focused API regression passed 1/1. This covers atomic result
   publication, not the full distributed/client contract inventory.
+- Parallel table-read preflight now joins each worker wave and checks the
+  request cancellation/deadline before dispatching later waves or publishing
+  success. A deterministic five-group regression cancels during the first
+  two-worker wave, returns `Cancelled`, and proves the remaining three were
+  not dispatched; the focused API test passed 1/1 with no leaks.
 - Parallel graph expansion now charges every worker's transient response arena
   to the request allocator through one synchronized backing object. Its
   lifetime extends through result merge and worker join, including canceled

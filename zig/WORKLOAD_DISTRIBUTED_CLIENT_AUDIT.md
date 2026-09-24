@@ -113,6 +113,13 @@ The broader module inventory remains distinct from this regression:
 | Post-commit visibility and acknowledgement | `distributed txn coordinator never aborts after durable commit decision` covers pending visibility, terminal repair, propagation and acknowledgement errors. | Retained coordinator/participant records across actual restart and all new protected record kinds. |
 | End-to-end caller deadline | The follow-up below adds an ingress context to commit callbacks, `ExecuteOptions`, participant waves and replica attempts. Ambiguous-decision recovery still has a separate bounded deadline and ignores client cancellation. | Owning validation of the follow-up, production DATA routed callback, legacy catalog preemption, and one shared abort/ack cleanup budget remain separate requirements. |
 
+Parallel table-read preflight now joins every started worker wave and checks
+the original request before dispatching a later wave or publishing a result.
+A five-group, two-worker cancellation fixture passed 1/1 with zero leaks: the
+first wave returned summaries while flipping cancellation, the caller returned
+`Cancelled`, and the remaining three groups were not dispatched. This covers
+the preflight handoff, not all late-reply schedules in remote query execution.
+
 The source inventory above is not a claim that all existing tests were rerun.
 Most transaction tests are not in the curated `antfly-api-test` compile inventory;
 passing only a runtime filter without adding the owning compile filter can select
