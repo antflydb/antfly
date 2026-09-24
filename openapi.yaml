@@ -11815,76 +11815,86 @@ components:
             string:
               type: string
               maxLength: 4096
+    SqlSettingDatabaseDefault:
+      type: object
+      additionalProperties: false
+      required:
+        - database
+        - value
+      properties:
+        database:
+          type: string
+        value:
+          $ref: '#/components/schemas/SqlSettingValue'
+    SqlSettingRoleDefault:
+      type: object
+      additionalProperties: false
+      required:
+        - principal
+        - database
+        - value
+      properties:
+        principal:
+          type: string
+        database:
+          type: string
+        value:
+          $ref: '#/components/schemas/SqlSettingValue'
+    SqlSettingPut:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - kind
+        - default
+      properties:
+        name:
+          type: string
+          maxLength: 128
+        kind:
+          type: string
+          enum:
+            - boolean
+            - integer
+            - string
+        policy_sensitive:
+          type: boolean
+        session_writable:
+          type: boolean
+        default:
+          $ref: '#/components/schemas/SqlSettingValue'
+        database_defaults:
+          type: array
+          maxItems: 256
+          items:
+            $ref: '#/components/schemas/SqlSettingDatabaseDefault'
+        role_defaults:
+          type: array
+          maxItems: 1024
+          items:
+            $ref: '#/components/schemas/SqlSettingRoleDefault'
+    SqlSettingMutationPut:
+      type: object
+      additionalProperties: false
+      required:
+        - put
+      properties:
+        put:
+          $ref: '#/components/schemas/SqlSettingPut'
+    SqlSettingMutationDrop:
+      type: object
+      additionalProperties: false
+      required:
+        - drop
+      properties:
+        drop:
+          type: string
+          maxLength: 128
     SqlSettingMutationRequest:
       description: Put a complete definition/default set or drop one by name.
       oneOf:
-        - type: object
-          additionalProperties: false
-          required:
-            - put
-          properties:
-            put:
-              type: object
-              additionalProperties: false
-              required:
-                - name
-                - kind
-                - default
-              properties:
-                name:
-                  type: string
-                  maxLength: 128
-                kind:
-                  type: string
-                  enum:
-                    - boolean
-                    - integer
-                    - string
-                policy_sensitive:
-                  type: boolean
-                session_writable:
-                  type: boolean
-                default:
-                  $ref: '#/components/schemas/SqlSettingValue'
-                database_defaults:
-                  type: array
-                  maxItems: 256
-                  items:
-                    type: object
-                    additionalProperties: false
-                    required:
-                      - database
-                      - value
-                    properties:
-                      database:
-                        type: string
-                      value:
-                        $ref: '#/components/schemas/SqlSettingValue'
-                role_defaults:
-                  type: array
-                  maxItems: 1024
-                  items:
-                    type: object
-                    additionalProperties: false
-                    required:
-                      - principal
-                      - database
-                      - value
-                    properties:
-                      principal:
-                        type: string
-                      database:
-                        type: string
-                      value:
-                        $ref: '#/components/schemas/SqlSettingValue'
-        - type: object
-          additionalProperties: false
-          required:
-            - drop
-          properties:
-            drop:
-              type: string
-              maxLength: 128
+        - $ref: '#/components/schemas/SqlSettingMutationPut'
+        - $ref: '#/components/schemas/SqlSettingMutationDrop'
     SQLRequest:
       type: object
       additionalProperties: false

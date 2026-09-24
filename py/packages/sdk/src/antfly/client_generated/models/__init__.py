@@ -1,5 +1,6 @@
 """Contains all the data models used in inputs/outputs"""
 
+from .administer_sql_settings_response_200 import AdministerSqlSettingsResponse200
 from .advance_table_storage_migration_body import AdvanceTableStorageMigrationBody
 from .advance_table_storage_migration_body_action import AdvanceTableStorageMigrationBodyAction
 from .advance_table_storage_migration_response_200 import AdvanceTableStorageMigrationResponse200
@@ -1145,6 +1146,15 @@ from .sql_prepared_execution_request import SQLPreparedExecutionRequest
 from .sql_prepared_response import SQLPreparedResponse
 from .sql_request import SQLRequest
 from .sql_response import SQLResponse
+from .sql_setting_database_default import SqlSettingDatabaseDefault
+from .sql_setting_mutation_drop import SqlSettingMutationDrop
+from .sql_setting_mutation_put import SqlSettingMutationPut
+from .sql_setting_put import SqlSettingPut
+from .sql_setting_put_kind import SqlSettingPutKind
+from .sql_setting_role_default import SqlSettingRoleDefault
+from .sql_setting_value_type_0 import SqlSettingValueType0
+from .sql_setting_value_type_1 import SqlSettingValueType1
+from .sql_setting_value_type_2 import SqlSettingValueType2
 from .sql_transaction_status import SQLTransactionStatus
 from .sqlddl_receipt import SQLDDLReceipt
 from .sqlddl_receipt_state import SQLDDLReceiptState
@@ -1300,6 +1310,7 @@ from .you_search_config import YouSearchConfig
 from .you_search_config_provider import YouSearchConfigProvider
 
 __all__ = (
+    "AdministerSqlSettingsResponse200",
     "AdvanceTableStorageMigrationBody",
     "AdvanceTableStorageMigrationBodyAction",
     "AdvanceTableStorageMigrationResponse200",
@@ -2435,6 +2446,15 @@ __all__ = (
     "SQLPrepareRequest",
     "SQLRequest",
     "SQLResponse",
+    "SqlSettingDatabaseDefault",
+    "SqlSettingMutationDrop",
+    "SqlSettingMutationPut",
+    "SqlSettingPut",
+    "SqlSettingPutKind",
+    "SqlSettingRoleDefault",
+    "SqlSettingValueType0",
+    "SqlSettingValueType1",
+    "SqlSettingValueType2",
     "SQLTransactionStatus",
     "SSEError",
     "SSEErrorReason",

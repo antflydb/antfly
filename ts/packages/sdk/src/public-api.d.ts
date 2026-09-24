@@ -707,6 +707,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/settings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Publish or remove a durable SQL setting
+         * @description Cluster-administrator-only, revision-fenced publication of typed setting definitions and global, database, and credential-role defaults. SQL SET cannot change policy-sensitive settings. Observe an ambiguous mutation before retrying.
+         */
+        post: operations["administerSqlSettings"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/sql": {
         parameters: {
             query?: never;
@@ -4185,6 +4205,42 @@ export interface components {
             parameter_types: components["schemas"]["SQLColumnType"][];
             columns: components["schemas"]["SQLColumn"][];
         };
+        /** @description One typed setting value, matching the declared kind. */
+        SqlSettingValue: {
+            boolean: boolean;
+        } | {
+            /** Format: int64 */
+            integer: number;
+        } | {
+            string: string;
+        };
+        SqlSettingDatabaseDefault: {
+            database: string;
+            value: components["schemas"]["SqlSettingValue"];
+        };
+        SqlSettingRoleDefault: {
+            principal: string;
+            database: string;
+            value: components["schemas"]["SqlSettingValue"];
+        };
+        SqlSettingPut: {
+            name: string;
+            /** @enum {string} */
+            kind: "boolean" | "integer" | "string";
+            policy_sensitive?: boolean;
+            session_writable?: boolean;
+            default: components["schemas"]["SqlSettingValue"];
+            database_defaults?: components["schemas"]["SqlSettingDatabaseDefault"][];
+            role_defaults?: components["schemas"]["SqlSettingRoleDefault"][];
+        };
+        SqlSettingMutationPut: {
+            put: components["schemas"]["SqlSettingPut"];
+        };
+        SqlSettingMutationDrop: {
+            drop: string;
+        };
+        /** @description Put a complete definition/default set or drop one by name. */
+        SqlSettingMutationRequest: components["schemas"]["SqlSettingMutationPut"] | components["schemas"]["SqlSettingMutationDrop"];
         /**
          * @description Execute one SQL statement. Parameters are positional (`$1`, `$2`, ...),
          *     never interpolated into SQL text. To preserve integer precision in
@@ -20783,6 +20839,74 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["SQLDiagnostic"];
                 };
+            };
+        };
+    };
+    administerSqlSettings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SqlSettingMutationRequest"];
+            };
+        };
+        responses: {
+            /** @description Setting catalog mutation committed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Invalid setting definition or default */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Authentication required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Cluster administrator permission required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Catalog revision or setting generation changed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Metadata peer upgrade required */
+            426: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Mutation outcome unknown or metadata unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };

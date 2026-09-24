@@ -12144,8 +12144,130 @@ pub const SortProfile = struct {
     }
 };
 
+pub const SqlSettingDatabaseDefault = struct {
+    database: []const u8,
+    value: SqlSettingValue,
+};
+
+pub const SqlSettingMutationDrop = struct {
+    drop: []const u8,
+};
+
+pub const SqlSettingMutationPut = struct {
+    put: SqlSettingPut,
+};
+
 /// Put a complete definition/default set or drop one by name.
-pub const SqlSettingMutationRequest = std.json.Value;
+pub const SqlSettingMutationRequest = union(enum) {
+    sql_setting_mutation_drop: *SqlSettingMutationDrop,
+    sql_setting_mutation_put: *SqlSettingMutationPut,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "drop",
+        })) {
+            if (try parseStructuralVariant(SqlSettingMutationDrop, allocator, source, options)) |parsed| return .{ .sql_setting_mutation_drop = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "put",
+        })) {
+            if (try parseStructuralVariant(SqlSettingMutationPut, allocator, source, options)) |parsed| return .{ .sql_setting_mutation_put = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .sql_setting_mutation_drop => |v| try jw.write(v.*),
+            .sql_setting_mutation_put => |v| try jw.write(v.*),
+        }
+    }
+};
+
+pub const SqlSettingPut = struct {
+    name: []const u8,
+    kind: []const u8,
+    policy_sensitive: ?bool = null,
+    session_writable: ?bool = null,
+    default: SqlSettingValue,
+    database_defaults: ?[]const SqlSettingDatabaseDefault = null,
+    role_defaults: ?[]const SqlSettingRoleDefault = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", false },
+        .{ "kind", "kind", false },
+        .{ "policy_sensitive", "policy_sensitive", true },
+        .{ "session_writable", "session_writable", true },
+        .{ "default", "default", false },
+        .{ "database_defaults", "database_defaults", true },
+        .{ "role_defaults", "role_defaults", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("kind");
+        try jw.write(self.kind);
+        if (self.policy_sensitive) |value| {
+            try jw.objectField("policy_sensitive");
+            try jw.write(value);
+        }
+        if (self.session_writable) |value| {
+            try jw.objectField("session_writable");
+            try jw.write(value);
+        }
+        try jw.objectField("default");
+        try jw.write(self.default);
+        if (self.database_defaults) |value| {
+            try jw.objectField("database_defaults");
+            try jw.write(value);
+        }
+        if (self.role_defaults) |value| {
+            try jw.objectField("role_defaults");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const SqlSettingRoleDefault = struct {
+    principal: []const u8,
+    database: []const u8,
+    value: SqlSettingValue,
+};
 
 /// One typed setting value, matching the declared kind.
 pub const SqlSettingValue = std.json.Value;
