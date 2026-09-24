@@ -37,6 +37,7 @@ __all__ = [
     "OUTCOME_UNKNOWN",
     "UNSUPPORTED",
     "STALLED",
+    "CANCELLED",
     "INTERNAL",
     "error_code_name",
     "error_code_description",
@@ -50,6 +51,7 @@ __all__ = [
     "OutcomeUnknownError",
     "UnsupportedError",
     "StalledError",
+    "CancelledError",
     "InternalError",
     "raise_for_code",
     "error_class_for_code",
@@ -71,6 +73,10 @@ UNSUPPORTED = 8
 # A bounded drain (e.g. run_until_idle) detected a managed index making no
 # forward progress and gave up.
 STALLED = 9
+# The caller cancelled the call by returning false from its progress or
+# stream callback (Inference.pull()'s progress, generate_stream()'s
+# on_chunk).
+CANCELLED = 10
 INTERNAL = 255
 
 _NAMES: dict[int, str] = {
@@ -84,6 +90,7 @@ _NAMES: dict[int, str] = {
     OUTCOME_UNKNOWN: "ANTFLY_OUTCOME_UNKNOWN",
     UNSUPPORTED: "ANTFLY_UNSUPPORTED",
     STALLED: "ANTFLY_STALLED",
+    CANCELLED: "ANTFLY_CANCELLED",
     INTERNAL: "ANTFLY_INTERNAL",
 }
 
@@ -101,6 +108,7 @@ _DESCRIPTIONS: dict[int, str] = {
     ),
     UNSUPPORTED: "the operation requires a capability that is not supported by this platform or filesystem",
     STALLED: "a bounded drain made no forward progress for its configured stall window and gave up",
+    CANCELLED: "the caller cancelled the operation",
     INTERNAL: "an internal error occurred",
 }
 
@@ -175,6 +183,10 @@ class StalledError(AntflyError):
     CODE = STALLED
 
 
+class CancelledError(AntflyError):
+    CODE = CANCELLED
+
+
 class InternalError(AntflyError):
     CODE = INTERNAL
 
@@ -189,6 +201,7 @@ _ERROR_CLASSES: dict[int, type[AntflyError]] = {
     OUTCOME_UNKNOWN: OutcomeUnknownError,
     UNSUPPORTED: UnsupportedError,
     STALLED: StalledError,
+    CANCELLED: CancelledError,
     INTERNAL: InternalError,
 }
 

@@ -31,6 +31,7 @@ fn error_names_and_descriptions_are_stable() {
         (Error::OutcomeUnknown, "ANTFLY_OUTCOME_UNKNOWN"),
         (Error::Unsupported, "ANTFLY_UNSUPPORTED"),
         (Error::Stalled, "ANTFLY_STALLED"),
+        (Error::Cancelled, "ANTFLY_CANCELLED"),
         (Error::Internal, "ANTFLY_INTERNAL"),
         (Error::Unknown(12345), "ANTFLY_UNKNOWN_ERROR"),
     ];
@@ -49,6 +50,7 @@ fn error_code_round_trips() {
     assert_eq!(Error::Busy.code(), 6);
     assert_eq!(Error::Internal.code(), 255);
     assert_eq!(Error::Stalled.code(), 9);
+    assert_eq!(Error::Cancelled.code(), 10);
     assert_eq!(Error::Unknown(42).code(), 42);
 }
 

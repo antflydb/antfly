@@ -37,6 +37,7 @@ mod db;
 mod error;
 mod ffi;
 mod files;
+mod inference;
 mod options;
 mod transactions;
 
@@ -51,6 +52,10 @@ pub use db::{
 };
 pub use error::{Error, Result};
 pub use files::{check_file_json, copy_stable_snapshot_file_json, restore, restore_file};
+pub use inference::{
+    Inference, InferenceError, InferenceOptions, InferenceResult, PullProgress,
+    inference_options_size,
+};
 pub use options::{
     GraphDirection, OpenMode, OpenOptions, Profile, RestoreOptions, Storage, TtlCleanupOptions,
     WriteIntent, inference_mode,

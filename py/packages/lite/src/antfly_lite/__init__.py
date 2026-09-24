@@ -39,11 +39,13 @@ from datetime import timedelta
 
 from . import _ffi, errors
 from ._database import Database, GraphDirection, TxnID, TxnStatus, WriteIntent
+from ._inference import Inference, PullProgress
 from ._json import decode_json_response, encode_text
 from ._library import LibraryNotFoundError
 from .errors import (
     AntflyError,
     BusyError,
+    CancelledError,
     IntentConflictError,
     InternalError,
     InvalidArgumentError,
@@ -67,6 +69,8 @@ __all__ = [
     "Storage",
     "OpenOptions",
     "TTLCleanupOptions",
+    "Inference",
+    "PullProgress",
     "LibraryNotFoundError",
     "AntflyError",
     "InvalidArgumentError",
@@ -78,6 +82,7 @@ __all__ = [
     "OutcomeUnknownError",
     "UnsupportedError",
     "StalledError",
+    "CancelledError",
     "InternalError",
     "MIN_THREAD_STACK_SIZE",
     "THREADING_SERIALIZED",
