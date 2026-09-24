@@ -144,22 +144,22 @@
   "server-generate": {
    "path": "zig/pkg/inference/src/server/server.zig",
    "anchor": "fn generateContent(",
-   "line": 11241
+   "line": 11227
   },
   "server-embeddings": {
    "path": "zig/pkg/inference/src/server/server.zig",
    "anchor": "fn generateEmbeddings(",
-   "line": 10247
+   "line": 10254
   },
   "server-rerank": {
    "path": "zig/pkg/inference/src/server/server.zig",
-   "anchor": "fn rerankPrompts(",
-   "line": 10803
+   "anchor": "pub fn rerankDocuments(",
+   "line": 10810
   },
   "server-chat": {
    "path": "zig/pkg/inference/src/server/server.zig",
    "anchor": "fn chatCompletions(",
-   "line": 14800
+   "line": 14786
   },
   "ops-compute-backend": {
    "path": "zig/pkg/inference/src/ops/ops.zig",
@@ -244,22 +244,22 @@
   "gliner-fused-attn-kernel": {
    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
    "anchor": "kernel void termite_disentangled_relative_attention_f32(",
-   "line": 10915
+   "line": 10949
   },
   "gliner-fused-attn-bwd-kernel": {
    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
    "anchor": "kernel void termite_disentangled_relative_attention_bwd_scores_f32(",
-   "line": 11003
+   "line": 11037
   },
   "gliner-word-embeddings-kernel": {
    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
    "anchor": "kernel void termite_gliner_word_embeddings_f32(",
-   "line": 10391
+   "line": 10425
   },
   "gliner-gru-combine-kernel": {
    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
    "anchor": "kernel void termite_gliner_gru_combine_f32(",
-   "line": 10398
+   "line": 10432
   },
   "gliner-span-marker": {
    "path": "zig/pkg/inference/src/architectures/gliner_head_graph.zig",
@@ -304,7 +304,7 @@
   "kernel-sg-q16-f16kv-gqa2": {
    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
    "anchor": "kernel void termite_attention_f32_dense_causal_sg_q16_f16kv_gqa2(",
-   "line": 11810
+   "line": 11844
   },
   "qwen3vl-projector": {
    "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig",
@@ -349,7 +349,7 @@
   "qwen3vl-mrope-kernel": {
    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
    "anchor": "kernel void termite_apply_mrope(",
-   "line": 11309
+   "line": 11343
   },
   "qwen3vl-reranker-score": {
    "path": "zig/pkg/inference/src/architectures/qwen3vl_reranker.zig",
@@ -419,7 +419,7 @@
   "runtime-execution-control": {
    "path": "zig/pkg/inference/src/execution_control.zig",
    "anchor": "pub const InferenceExecutionControl",
-   "line": 104
+   "line": 122
   },
   "gliner25-detect-arch": {
    "path": "zig/pkg/inference/src/models/gliner_boundary.zig",
@@ -594,7 +594,7 @@
   "gliner25-adamw-renorm": {
    "path": "zig/pkg/inference/src/finetune/seeded_gradient_trainer.zig",
    "anchor": "matching GLiNER2.5's _renormalize_partial_accumulation. Parameters absent",
-   "line": 551
+   "line": 608
   },
   "gliner25-hungarian-match": {
    "path": "zig/pkg/inference/src/finetune/gliner/boundary_matching.zig",
@@ -609,7 +609,7 @@
   "train-recipe-cli": {
    "path": "zig/pkg/inference/src/finetune/cli/root.zig",
    "anchor": "antfly inference finetune run <recipe.json>",
-   "line": 374
+   "line": 376
   },
   "train-graph-backward": {
    "path": "zig/lib/ml/src/graph/autodiff.zig",
@@ -754,7 +754,7 @@
   "gliner2-ft-bwd-kernel": {
    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
    "anchor": "kernel void termite_disentangled_relative_attention_bwd_dqr_dkr_f32",
-   "line": 11052
+   "line": 11086
   },
   "gliner2-ft-rank1-gate": {
    "path": "zig/pkg/inference/src/backends/metal_runtime.zig",
@@ -774,7 +774,7 @@
   "gliner2-ft-cli-registry": {
    "path": "zig/pkg/inference/src/finetune/cli/root.zig",
    "anchor": ".subject = \"gliner2-autodiff\"",
-   "line": 144
+   "line": 146
   },
   "gliner2-ft-recipe-steps": {
    "path": "zig/pkg/inference/src/finetune/recipe.zig",
@@ -859,7 +859,7 @@
   "gliner25-ft-dt-kernel": {
    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
    "anchor": "kernel void dt_dkdv(",
-   "line": 46167
+   "line": 46220
   },
   "gliner25-ft-streams": {
    "path": "zig/pkg/inference/src/finetune/gliner/boundary_run.zig",
