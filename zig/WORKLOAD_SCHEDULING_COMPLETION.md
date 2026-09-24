@@ -57,6 +57,19 @@ this requested implementation/correctness scope.
   saturated and after public-listener shutdown (full HTTPX suite 608 passed,
   eight skipped). Production internal endpoint routing/trust and combined
   process-pressure qualification remain open.
+- A real socket fixture now holds all public connection slots, the sole
+  general request task, and the HTTP/1 body-buffer permit while a one-record
+  durable workload journal is full. The protected listener still returns a
+  signed terminal status, and public resources drain within bounded time after
+  release. Its focused DATA runtime gate passed 1/1 with no leaks. Native LSM
+  disk exhaustion and a shared process-wide memory ceiling remain open.
+- A real native FD-pool fixture now blocks a foreground file write at the
+  capacity-two descriptor limit while a preowned completion scope appends and
+  syncs WAL data and atomically publishes/syncs its allowlisted SST. The
+  foreground write resumes only after the scope releases both descriptors;
+  waiter and descriptor counts drain to zero. The focused storage gate passed
+  1/1 with no leaks, and the aggregate storage target exited 0. This proves
+  shared FD-pool progress, not disk-full recovery or all storage domains.
 - Store metadata now has an optional internal HTTP endpoint in JSON and the
   durable record extension. Older empty registrations retain their old wire
   encoding. A nonempty endpoint requires metadata decoder protocol 14 on every
@@ -89,6 +102,22 @@ this requested implementation/correctness scope.
   gate passed 45/45, and the workload gate above exercised its DATA bridge.
   This does not yet restore runnable control resources or certify decision/ACK
   capacity and replay.
+- The real preaccept path now classifies a retained owner's canonical decision
+  and unique named ACKs against current transaction state but still rejects
+  them before a generic cell can be allocated. A separate checksummed v2
+  progress receipt format retains BEGIN/latest identities, decision kind, ACK
+  count and resolved-set digest; control capacity charges its larger row while
+  v1 receipt bytes stay unchanged. Real compiler tests cover decision, three
+  unique ACKs and duplicate rejection; the durable gate passed 47/47. The
+  receipt is not written yet, and the decision/ACK apply and self-contained
+  restoration paths remain fenced.
+- A two-process Raft fixture now sends production binary frames between a
+  leader child and follower parent. The follower reserves native completion
+  capacity and persists its Ready before ACK; after leader process kill it
+  reopens its WAL and native DB, reconciles the accepted cell, and checks the
+  exact committed payload, document, index/term and progress digest. It passed
+  in the same 47/47 durable gate. It uses file IPC and does not exercise
+  DataServer networking, catalog recovery, or replacement-leader election.
 - Distributed join now stages all fanout hits until every batch succeeds;
   late-batch and sequential failures leave caller output unchanged. The
   curated focused API regression passed 1/1. This covers atomic result
@@ -97,8 +126,11 @@ this requested implementation/correctness scope.
   to the request allocator through one synchronized backing object. Its
   lifetime extends through result merge and worker join, including canceled
   groups. A 1 MiB request quota rejects two workers' 2 MiB scratch allocations;
-  the curated graph gate passed 16/16 with no leaks. Hydrate and edge fanout
-  arenas still use page-backed memory, so the operator inventory is incomplete.
+  the curated graph gate passed 16/16 with no leaks. Incoming, root, hydration,
+  and edge fanout now use the same request-backed lifetime rule, with canceled
+  groups joined before slot inspection. The post-merge graph gate passed 17/17,
+  including quota assertions for incoming, root, edge, and expansion/hydration
+  paths. Other operators and real mixed-runtime saturation remain open.
 - An explicit conflicting stable-ID BEGIN no longer uses a pending or
   committed status enum to abort or propagate an older transaction whose
   BEGIN identity has not been proved equal. Coordinator and follower conflict
@@ -150,6 +182,11 @@ this requested implementation/correctness scope.
   `timeout_ms` value tokens to the remaining original budget; writes and
   ambiguous bodies are never replayed. The full Go SDK suite and race-tested
   read-retry tests passed.
+- Go, Python, TypeScript and Rust now reject ambiguous 429 retry proofs with
+  duplicate fields, malformed UTF-8 or case-changed keys; an unambiguous proof
+  with a future extension field still qualifies. Focused gates passed for Go,
+  Python (29/29), TypeScript (27/27) and Rust (4/4). A preexisting Rust loopback
+  fixture also now makes its accepted socket blocking before reading.
 - Fresh transaction BEGIN acceptance now validates the actual canonical
   control shape before spending a native accepted cell. The DB fixture
   truncates a real compiled BEGIN and verifies rejection without sidecar

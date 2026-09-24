@@ -18,6 +18,16 @@ interleavings. The starting implementation was revision `3dc3ac6c4d`.
 
 ## SDK deadline and cleanup slice
 
+The four SDK query-retry classifiers now require exact, unambiguous 429
+non-admission proof. Duplicate JSON fields (including future fields and escaped
+key aliases), malformed UTF-8, and case-changed proof keys cannot authorize a
+retry; a single future extension field remains compatible. Go, Python,
+TypeScript and Rust focused gates passed, with 29/29 Python, 27/27 TypeScript,
+and 4/4 Rust tests. The Rust full retry module also exposed a preexisting
+loopback fixture bug: its accepted socket inherited nonblocking mode. The
+fixture now switches to blocking mode before its bounded read. This matrix is
+SDK parser evidence, not real multi-peer write-loss qualification.
+
 Python async retries previously ended their timeout scope at response headers.
 A delayed streamed success or a paused consumer could exceed the original
 operation deadline. Returned streams now retain that deadline, reject late
