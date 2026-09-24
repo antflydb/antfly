@@ -455,6 +455,13 @@ pub const Scheduler = struct {
             };
             self.lock();
             self.schedule();
+            // The backfill barrier can prevent schedule() from visiting this
+            // waiter at all. Retire its queue ownership at its own bound,
+            // instead of repeatedly waiting for a zero-length interval.
+            if (!waiter.finished and options.now() >= waiter.wait_until) {
+                self.finish(&waiter, error.AdmissionWaitTimeout);
+                self.schedule();
+            }
             if (waiter.finished) {
                 self.mutex.unlock();
                 if (waiter.failure) |err| return err;
@@ -538,6 +545,39 @@ test "workload admission scheduler backfills only until the oldest large admissi
     try std.testing.expect(large_waiter.finished and second_waiter.finished);
     try large_waiter.job.?.release();
     try second_waiter.job.?.release();
+    try std.testing.expectEqual(@as(u64, 0), ledger.snapshot().total.queued);
+}
+
+test "workload admission waiter behind blocked head expires at its own queue bound" {
+    var ledger = try resources.Ledger.init(std.testing.allocator, testPolicy());
+    defer ledger.deinit();
+    var scheduler = try Scheduler.init(&ledger, .{ .max_bypasses = 0, .barrier_age_ms = 60_000, .max_wait_ms = 5 });
+    var holder = try ledger.admit(.general_read, 1);
+    defer holder.release() catch unreachable;
+    var blocker = try scheduler.acquire(&holder, .general_read, .{ .runnable = 1, .retained_bytes = 60 }, 1, 0, .{ .io = std.testing.io });
+    defer blocker.release(1);
+    var large = try ledger.admit(.general_read, 1);
+    defer large.release() catch unreachable;
+    var large_waiter = try testWaiter(&ledger, &large, 50, 1);
+    scheduler.enqueue(&large_waiter);
+    scheduler.schedule();
+    try std.testing.expect(large_waiter.blocked);
+
+    var small = try ledger.admit(.general_read, 1);
+    defer small.release() catch unreachable;
+    try std.testing.expectError(error.AdmissionWaitTimeout, scheduler.acquire(
+        &small,
+        .general_read,
+        .{ .runnable = 1, .retained_bytes = 1 },
+        1,
+        1,
+        .{ .io = std.testing.io },
+    ));
+    // The expired waiter must release its queue slot even though backfill
+    // never reached it; the older large request remains queued and owned.
+    try std.testing.expectEqual(@as(u64, 1), ledger.snapshot().total.queued);
+    try std.testing.expect(!large_waiter.finished);
+    scheduler.cancel(&large_waiter);
     try std.testing.expectEqual(@as(u64, 0), ledger.snapshot().total.queued);
 }
 

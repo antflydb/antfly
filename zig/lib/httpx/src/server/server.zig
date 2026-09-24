@@ -6029,6 +6029,106 @@ test "shared HTTP runtime preserves each listener request reservation" {
     try std.testing.expectEqual(@as(usize, 1), second.runtimeStats().active_requests);
 }
 
+test "separate listener connection reservation survives public socket saturation and shutdown" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
+
+    // Connection admission precedes HTTP parsing. A slow public client can
+    // consume its whole listener, so only a distinct listener can reserve
+    // transport capacity for an internal API. Production callers must also
+    // restrict reachability and authenticate that API's requests.
+
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    var client_io_impl = std.Io.Threaded.init(allocator, .{});
+    defer client_io_impl.deinit();
+    var http_runtime = HttpRuntime.init(allocator, .{
+        .max_active_h1_requests = 0,
+        .max_active_connections = 2,
+        .max_active_requests = 2,
+    });
+    defer http_runtime.deinit();
+
+    var public = Server.initWithConfig(allocator, io_impl.io(), .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .max_connections = 1,
+        .max_request_tasks = 1,
+        .header_read_timeout_ms = 5_000,
+        .http_runtime = &http_runtime,
+        .h1_disconnect_cancellation = .disabled,
+    });
+    defer public.deinit();
+    var internal = Server.initWithConfig(allocator, io_impl.io(), .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .max_connections = 1,
+        .max_request_tasks = 1,
+        .http_runtime = &http_runtime,
+        .h1_disconnect_cancellation = .disabled,
+    });
+    defer internal.deinit();
+    try internal.get("/control", struct {
+        fn handle(ctx: *Context) anyerror!Response {
+            if (!mem.eql(u8, ctx.header("authorization") orelse "", "Bearer protected"))
+                return ctx.status(403).text("forbidden");
+            return ctx.text("ready");
+        }
+    }.handle);
+
+    var public_task = Server.ListenerTask.init(&public);
+    try public_task.start();
+    defer {
+        public_task.requestStop();
+        public_task.join() catch {};
+    }
+    var internal_task = Server.ListenerTask.init(&internal);
+    try internal_task.start();
+    defer {
+        internal_task.requestStop();
+        internal_task.join() catch {};
+    }
+
+    const client_io = client_io_impl.io();
+    var stalled_public = try Socket.connect(public.boundAddress().?, client_io);
+    defer stalled_public.close();
+    try stalled_public.sendAll("GET /slow HTTP/1.1\r\nHost: test\r\n");
+    for (0..5_000) |_| {
+        if (public.runtimeStats().active_connections == 1) break;
+        client_io.sleep(.fromMilliseconds(1), .awake) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 1), public.runtimeStats().active_connections);
+    try std.testing.expect(public.waiting_for_connection_permit.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2), http_runtime.stats().reserved_connection_capacity);
+
+    var unauthenticated = try Socket.connect(internal.boundAddress().?, client_io);
+    defer unauthenticated.close();
+    try unauthenticated.setRecvTimeout(5_000);
+    try unauthenticated.sendAll("GET /control HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
+    var response: [1024]u8 = undefined;
+    const unauthenticated_len = try unauthenticated.recv(&response);
+    try std.testing.expect(mem.indexOf(u8, response[0..unauthenticated_len], " 403 ") != null);
+
+    var internal_client = try Socket.connect(internal.boundAddress().?, client_io);
+    defer internal_client.close();
+    try internal_client.setRecvTimeout(5_000);
+    try internal_client.sendAll("GET /control HTTP/1.1\r\nHost: test\r\nAuthorization: Bearer protected\r\nConnection: close\r\n\r\n");
+    const response_len = try internal_client.recv(&response);
+    try std.testing.expect(mem.indexOf(u8, response[0..response_len], " 200 ") != null);
+
+    public_task.shutdown(1_000);
+    try public_task.join();
+    try std.testing.expectEqual(@as(usize, 1), http_runtime.stats().active_listener_leases);
+    try std.testing.expectEqual(@as(usize, 1), http_runtime.stats().reserved_connection_capacity);
+
+    var after_shutdown = try Socket.connect(internal.boundAddress().?, client_io);
+    defer after_shutdown.close();
+    try after_shutdown.setRecvTimeout(5_000);
+    try after_shutdown.sendAll("GET /control HTTP/1.1\r\nHost: test\r\nAuthorization: Bearer protected\r\nConnection: close\r\n\r\n");
+    const after_shutdown_len = try after_shutdown.recv(&response);
+    try std.testing.expect(mem.indexOf(u8, response[0..after_shutdown_len], " 200 ") != null);
+}
+
 test "bind establishes HTTP runtime ownership before publishing an address" {
     if (builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
 
