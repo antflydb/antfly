@@ -117,9 +117,17 @@ jobs:
       - name: Test production transport, runtime scheduling, and determinism boundaries
         working-directory: zig
         run: |
-          python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build antfly-raft-transport-test standby-vopr-test vopr-runtime-test restore-admission-vopr-test vopr-determinism-audit secrets-test \
+          python3 "$GITHUB_WORKSPACE/scripts/ci/measure_disk_usage.py" --output "$RUNNER_TEMP/vopr-qualify-disk.json" --path /mnt/cache --path "$GITHUB_WORKSPACE" -- \
+            python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build antfly-raft-transport-test standby-vopr-test vopr-runtime-test restore-admission-vopr-test vopr-determinism-audit secrets-test \
             -Doptimize=ReleaseSafe --summary all \
             --cache-dir "$VOPR_LOCAL_CACHE_DIR" --global-cache-dir "$VOPR_GLOBAL_CACHE_DIR"
+      - name: Retain qualification disk measurements
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vopr-qualify-disk
+          path: ${{ runner.temp }}/vopr-qualify-disk.json
+          if-no-files-found: warn
 
   build:
     if: inputs.diagnostic_run == ''
@@ -166,8 +174,16 @@ jobs:
         if: steps.runner_cache.outputs.cache-hit != 'true'
         working-directory: zig
         run: |
-          python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build vopr-build -Doptimize=ReleaseSafe --summary all \
+          python3 "$GITHUB_WORKSPACE/scripts/ci/measure_disk_usage.py" --output "$RUNNER_TEMP/vopr-build-disk.json" --path /mnt/cache --path "$GITHUB_WORKSPACE" -- \
+            python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build vopr-build -Doptimize=ReleaseSafe --summary all \
             --cache-dir "$VOPR_LOCAL_CACHE_DIR" --global-cache-dir "$VOPR_GLOBAL_CACHE_DIR"
+      - name: Retain runner build disk measurements
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vopr-build-disk
+          path: ${{ runner.temp }}/vopr-build-disk.json
+          if-no-files-found: warn
       - name: Restore executable
         if: steps.runner_cache.outputs.cache-hit == 'true'
         run: |
@@ -213,14 +229,13 @@ jobs:
   campaign:
     needs: [build, qualify]
     if: inputs.qualification_only != true
-    runs-on: arc-antfly-heavy
-    timeout-minutes: 300
+    runs-on: arc-antfly-heavy-runtime
+    timeout-minutes: 500
     strategy:
       fail-fast: false
       max-parallel: 2
       matrix:
         scenario: [standby, raft, distributed-data, standby-scaling, secrets]
-        shard: [0, 1]
         include:
           - scenario: standby
             histories: 1000
@@ -232,10 +247,6 @@ jobs:
             histories: 2
           - scenario: secrets
             histories: 1000
-          - shard: 0
-            policy: bounded-fair
-          - shard: 1
-            policy: adversarial
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -259,11 +270,9 @@ jobs:
         working-directory: zig
         env:
           SCENARIO: ${{ matrix.scenario }}
-          SHARD: ${{ matrix.shard }}
           HISTORY_BUDGET: ${{ inputs.histories }}
           DEFAULT_HISTORY_BUDGET: ${{ matrix.histories }}
           RUN_NUMBER: ${{ github.run_number }}
-          EXPLORATION_POLICY: ${{ matrix.policy }}
           REQUIRE_SEED: ${{ inputs.require_seed }}
         run: |
           # Dispatch can supply the string "0", which is truthy in expressions.
@@ -271,42 +280,82 @@ jobs:
           if [ -z "$HISTORY_BUDGET" ] || [ "$HISTORY_BUDGET" = "0" ]; then
             HISTORY_BUDGET="$DEFAULT_HISTORY_BUDGET"
           fi
-          seed=$((0xa17f5500 + RUN_NUMBER * 65536 + SHARD))
           reuse_args=()
           if [ "${REQUIRE_SEED:-false}" = "true" ]; then reuse_args+=(--require-seed); fi
-          python3 ../scripts/ci/zig_vopr_soak.py --binary "$RUNNER_TEMP/runner/vopr" run \
-            --scenario "$SCENARIO" --histories "$HISTORY_BUDGET" --seed "$seed" \
-            --corpus "$RUNNER_TEMP/vopr-corpus-retained" --output "$RUNNER_TEMP/vopr-run" \
-            --exploration-policy "${EXPLORATION_POLICY:-bounded-fair}" "${reuse_args[@]}"
-      - name: Retain small campaign diagnostics first
+          status=0
+          for shard in 0 1; do
+            seed=$((0xa17f5500 + RUN_NUMBER * 65536 + shard))
+            policy=bounded-fair
+            if [ "$shard" = "1" ]; then policy=adversarial; fi
+            python3 ../scripts/ci/zig_vopr_soak.py --binary "$RUNNER_TEMP/runner/vopr" run \
+              --scenario "$SCENARIO" --histories "$HISTORY_BUDGET" --seed "$seed" \
+              --corpus "$RUNNER_TEMP/vopr-corpus-retained" --output "$RUNNER_TEMP/vopr-run/$shard" \
+              --exploration-policy "$policy" "${reuse_args[@]}" || status=1
+          done
+          exit "$status"
+      - name: Retain shard 0 diagnostics first
         if: always()
         timeout-minutes: 5
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: vopr-diagnostics-${{ matrix.scenario }}--${{ matrix.shard }}
+          name: vopr-diagnostics-${{ matrix.scenario }}--0
           path: |
-            ${{ runner.temp }}/vopr-run/run.json
-            ${{ runner.temp }}/vopr-run/results.*
-            ${{ runner.temp }}/vopr-run/*.log
-            ${{ runner.temp }}/vopr-run/*.schedule.json
-            ${{ runner.temp }}/vopr-run/*.progress.json
+            ${{ runner.temp }}/vopr-run/0/run.json
+            ${{ runner.temp }}/vopr-run/0/results.*
+            ${{ runner.temp }}/vopr-run/0/*.log
+            ${{ runner.temp }}/vopr-run/0/*.schedule.json
+            ${{ runner.temp }}/vopr-run/0/*.progress.json
           retention-days: 90
           overwrite: true
           if-no-files-found: error
-      - name: Retain reports, replay traces, and failure diagnostics
+      - name: Retain shard 0 replay traces
         if: always()
         timeout-minutes: 40
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: vopr-run-${{ matrix.scenario }}--${{ matrix.shard }}
+          name: vopr-run-${{ matrix.scenario }}--0
           path: |
-            ${{ runner.temp }}/vopr-run/*.voprtrace
-            ${{ runner.temp }}/vopr-run/*.schedule.json
-            ${{ runner.temp }}/vopr-run/*.flight.json
-            ${{ runner.temp }}/vopr-run/quarantine
+            ${{ runner.temp }}/vopr-run/0/*.voprtrace
+            ${{ runner.temp }}/vopr-run/0/*.schedule.json
+            ${{ runner.temp }}/vopr-run/0/*.flight.json
+            ${{ runner.temp }}/vopr-run/0/quarantine
           retention-days: 90
           overwrite: true
           if-no-files-found: error
+      - name: Retain shard 1 diagnostics first
+        if: always()
+        timeout-minutes: 5
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vopr-diagnostics-${{ matrix.scenario }}--1
+          path: |
+            ${{ runner.temp }}/vopr-run/1/run.json
+            ${{ runner.temp }}/vopr-run/1/results.*
+            ${{ runner.temp }}/vopr-run/1/*.log
+            ${{ runner.temp }}/vopr-run/1/*.schedule.json
+            ${{ runner.temp }}/vopr-run/1/*.progress.json
+          retention-days: 90
+          overwrite: true
+          if-no-files-found: error
+      - name: Retain shard 1 replay traces
+        if: always()
+        timeout-minutes: 40
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vopr-run-${{ matrix.scenario }}--1
+          path: |
+            ${{ runner.temp }}/vopr-run/1/*.voprtrace
+            ${{ runner.temp }}/vopr-run/1/*.schedule.json
+            ${{ runner.temp }}/vopr-run/1/*.flight.json
+            ${{ runner.temp }}/vopr-run/1/quarantine
+          retention-days: 90
+          overwrite: true
+          if-no-files-found: error
+      - name: Report runtime disk headroom
+        if: always()
+        run: |
+          df -h "$RUNNER_TEMP" "$GITHUB_WORKSPACE"
+          du -sh "$RUNNER_TEMP" "$GITHUB_WORKSPACE" || true
 
   # Native production stress complements the replayable scheduling campaigns.
   # Build once, repeat against those bytes, and keep every case's result.
@@ -352,7 +401,8 @@ jobs:
         id: production-build
         working-directory: zig
         run: |
-          python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build antfly antfly-storage-owner-source-test -Doptimize=ReleaseSafe --summary all \
+          python3 "$GITHUB_WORKSPACE/scripts/ci/measure_disk_usage.py" --output "$RUNNER_TEMP/production-e2e-soak/build-disk.json" --path /mnt/cache --path "$GITHUB_WORKSPACE" -- \
+            python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build antfly antfly-storage-owner-source-test -Doptimize=ReleaseSafe --summary all \
             2>&1 | tee "$RUNNER_TEMP/production-e2e-soak/build.log"
           sha256sum zig-out/bin/antfly > "$RUNNER_TEMP/production-e2e-soak/binary.sha256"
           tar -C zig-out/bin -czf "$RUNNER_TEMP/production-e2e-soak/antfly.tar.gz" antfly
@@ -377,7 +427,7 @@ jobs:
 
   production-e2e:
     needs: production-build
-    runs-on: arc-antfly-heavy
+    runs-on: arc-antfly-heavy-runtime
     timeout-minutes: 180
     env:
       SKIP_BUILD: '1'
@@ -510,6 +560,11 @@ jobs:
           path: ${{ runner.temp }}/production-e2e-soak/tmp
           retention-days: 30
           if-no-files-found: warn
+      - name: Report runtime disk headroom
+        if: always()
+        run: |
+          df -h "$RUNNER_TEMP" "$GITHUB_WORKSPACE"
+          du -sh "$RUNNER_TEMP" "$GITHUB_WORKSPACE" || true
 
   cluster-restore:
     needs: production-build
@@ -518,7 +573,7 @@ jobs:
       max-parallel: 2
       matrix:
         profile: [normal, constrained]
-    runs-on: arc-antfly-heavy
+    runs-on: arc-antfly-heavy-runtime
     timeout-minutes: 100
     env:
       SKIP_BUILD: '1'
@@ -601,17 +656,17 @@ jobs:
           path: ${{ runner.temp }}/production-e2e-soak/tmp
           retention-days: 30
           if-no-files-found: warn
+      - name: Report runtime disk headroom
+        if: always()
+        run: |
+          df -h "$RUNNER_TEMP" "$GITHUB_WORKSPACE"
+          du -sh "$RUNNER_TEMP" "$GITHUB_WORKSPACE" || true
 
   corpus:
     needs: [build, qualify, campaign]
     if: always() && needs.build.result == 'success' && needs.qualify.result == 'success' && inputs.qualification_only != true
-    runs-on: arc-antfly-heavy
-    timeout-minutes: 180
-    strategy:
-      fail-fast: false
-      max-parallel: 2
-      matrix:
-        scenario: [standby, raft, distributed-data, standby-scaling, secrets]
+    runs-on: arc-antfly-heavy-runtime
+    timeout-minutes: 600
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -623,42 +678,238 @@ jobs:
           name: vopr-runner
           path: ${{ runner.temp }}/runner
       - run: tar -C "$RUNNER_TEMP/runner" -xzf "$RUNNER_TEMP/runner/vopr.tar.gz"
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - name: Download standby shards
+        if: always() && !cancelled()
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: vopr-run-${{ matrix.scenario }}--*
-          path: ${{ runner.temp }}/vopr-shards
-      - name: Replay, deduplicate, and quarantine incompatible corpus entries
+          pattern: vopr-run-standby--*
+          path: ${{ runner.temp }}/vopr-shards/standby
+      - name: Replay and merge standby corpus
+        id: merge_standby
+        if: always() && !cancelled()
         timeout-minutes: 120
         working-directory: zig
         run: |
           python3 ../scripts/ci/zig_vopr_soak.py --binary "$RUNNER_TEMP/runner/vopr" merge \
-            --inputs "$RUNNER_TEMP/vopr-shards" --output "$RUNNER_TEMP/vopr-corpus" \
+            --inputs "$RUNNER_TEMP/vopr-shards/standby" --output "$RUNNER_TEMP/vopr-corpus/standby" \
             --retained "$RUNNER_TEMP/vopr-corpus-retained"
-      - name: Retain small corpus diagnostics first
+      - name: Retain standby corpus diagnostics
         if: always()
         timeout-minutes: 5
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: vopr-corpus-diagnostics-${{ matrix.scenario }}
+          name: vopr-corpus-diagnostics-standby
           path: |
-            ${{ runner.temp }}/vopr-corpus/*.json
-            ${{ runner.temp }}/vopr-corpus/*.log
+            ${{ runner.temp }}/vopr-corpus/standby/*.json
+            ${{ runner.temp }}/vopr-corpus/standby/*.log
           retention-days: 90
           overwrite: true
           if-no-files-found: error
-      - name: Retain merged corpus and quarantine review evidence
+      - name: Retain standby merged corpus
         if: always()
         timeout-minutes: 40
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: vopr-corpus-${{ matrix.scenario }}
-          path: ${{ runner.temp }}/vopr-corpus
+          name: vopr-corpus-standby
+          path: ${{ runner.temp }}/vopr-corpus/standby
           retention-days: 90
           overwrite: true
           if-no-files-found: error
-
-      - name: Publish corpus for the next scheduled run
+      - name: Publish standby corpus for the next scheduled run
+        if: always() && steps.merge_standby.outcome == 'success'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/vopr-corpus-retained
-          key: vopr-corpus-v2-${{ github.ref_name }}--${{ matrix.scenario }}--${{ needs.build.outputs.binary_sha256 }}--${{ github.run_id }}-${{ github.run_attempt }}
+          key: vopr-corpus-v2-${{ github.ref_name }}--standby--${{ needs.build.outputs.binary_sha256 }}--${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Clear standby corpus before the next scenario
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/vopr-corpus-retained"
+      - name: Download raft shards
+        if: always() && !cancelled()
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: vopr-run-raft--*
+          path: ${{ runner.temp }}/vopr-shards/raft
+      - name: Replay and merge raft corpus
+        id: merge_raft
+        if: always() && !cancelled()
+        timeout-minutes: 120
+        working-directory: zig
+        run: |
+          python3 ../scripts/ci/zig_vopr_soak.py --binary "$RUNNER_TEMP/runner/vopr" merge \
+            --inputs "$RUNNER_TEMP/vopr-shards/raft" --output "$RUNNER_TEMP/vopr-corpus/raft" \
+            --retained "$RUNNER_TEMP/vopr-corpus-retained"
+      - name: Retain raft corpus diagnostics
+        if: always()
+        timeout-minutes: 5
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vopr-corpus-diagnostics-raft
+          path: |
+            ${{ runner.temp }}/vopr-corpus/raft/*.json
+            ${{ runner.temp }}/vopr-corpus/raft/*.log
+          retention-days: 90
+          overwrite: true
+          if-no-files-found: error
+      - name: Retain raft merged corpus
+        if: always()
+        timeout-minutes: 40
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vopr-corpus-raft
+          path: ${{ runner.temp }}/vopr-corpus/raft
+          retention-days: 90
+          overwrite: true
+          if-no-files-found: error
+      - name: Publish raft corpus for the next scheduled run
+        if: always() && steps.merge_raft.outcome == 'success'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/vopr-corpus-retained
+          key: vopr-corpus-v2-${{ github.ref_name }}--raft--${{ needs.build.outputs.binary_sha256 }}--${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Clear raft corpus before the next scenario
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/vopr-corpus-retained"
+      - name: Download distributed-data shards
+        if: always() && !cancelled()
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: vopr-run-distributed-data--*
+          path: ${{ runner.temp }}/vopr-shards/distributed-data
+      - name: Replay and merge distributed-data corpus
+        id: merge_distributed_data
+        if: always() && !cancelled()
+        timeout-minutes: 120
+        working-directory: zig
+        run: |
+          python3 ../scripts/ci/zig_vopr_soak.py --binary "$RUNNER_TEMP/runner/vopr" merge \
+            --inputs "$RUNNER_TEMP/vopr-shards/distributed-data" --output "$RUNNER_TEMP/vopr-corpus/distributed-data" \
+            --retained "$RUNNER_TEMP/vopr-corpus-retained"
+      - name: Retain distributed-data corpus diagnostics
+        if: always()
+        timeout-minutes: 5
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vopr-corpus-diagnostics-distributed-data
+          path: |
+            ${{ runner.temp }}/vopr-corpus/distributed-data/*.json
+            ${{ runner.temp }}/vopr-corpus/distributed-data/*.log
+          retention-days: 90
+          overwrite: true
+          if-no-files-found: error
+      - name: Retain distributed-data merged corpus
+        if: always()
+        timeout-minutes: 40
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vopr-corpus-distributed-data
+          path: ${{ runner.temp }}/vopr-corpus/distributed-data
+          retention-days: 90
+          overwrite: true
+          if-no-files-found: error
+      - name: Publish distributed-data corpus for the next scheduled run
+        if: always() && steps.merge_distributed_data.outcome == 'success'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/vopr-corpus-retained
+          key: vopr-corpus-v2-${{ github.ref_name }}--distributed-data--${{ needs.build.outputs.binary_sha256 }}--${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Clear distributed-data corpus before the next scenario
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/vopr-corpus-retained"
+      - name: Download standby-scaling shards
+        if: always() && !cancelled()
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: vopr-run-standby-scaling--*
+          path: ${{ runner.temp }}/vopr-shards/standby-scaling
+      - name: Replay and merge standby-scaling corpus
+        id: merge_standby_scaling
+        if: always() && !cancelled()
+        timeout-minutes: 120
+        working-directory: zig
+        run: |
+          python3 ../scripts/ci/zig_vopr_soak.py --binary "$RUNNER_TEMP/runner/vopr" merge \
+            --inputs "$RUNNER_TEMP/vopr-shards/standby-scaling" --output "$RUNNER_TEMP/vopr-corpus/standby-scaling" \
+            --retained "$RUNNER_TEMP/vopr-corpus-retained"
+      - name: Retain standby-scaling corpus diagnostics
+        if: always()
+        timeout-minutes: 5
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vopr-corpus-diagnostics-standby-scaling
+          path: |
+            ${{ runner.temp }}/vopr-corpus/standby-scaling/*.json
+            ${{ runner.temp }}/vopr-corpus/standby-scaling/*.log
+          retention-days: 90
+          overwrite: true
+          if-no-files-found: error
+      - name: Retain standby-scaling merged corpus
+        if: always()
+        timeout-minutes: 40
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vopr-corpus-standby-scaling
+          path: ${{ runner.temp }}/vopr-corpus/standby-scaling
+          retention-days: 90
+          overwrite: true
+          if-no-files-found: error
+      - name: Publish standby-scaling corpus for the next scheduled run
+        if: always() && steps.merge_standby_scaling.outcome == 'success'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/vopr-corpus-retained
+          key: vopr-corpus-v2-${{ github.ref_name }}--standby-scaling--${{ needs.build.outputs.binary_sha256 }}--${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Clear standby-scaling corpus before the next scenario
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/vopr-corpus-retained"
+      - name: Download secrets shards
+        if: always() && !cancelled()
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: vopr-run-secrets--*
+          path: ${{ runner.temp }}/vopr-shards/secrets
+      - name: Replay and merge secrets corpus
+        id: merge_secrets
+        if: always() && !cancelled()
+        timeout-minutes: 120
+        working-directory: zig
+        run: |
+          python3 ../scripts/ci/zig_vopr_soak.py --binary "$RUNNER_TEMP/runner/vopr" merge \
+            --inputs "$RUNNER_TEMP/vopr-shards/secrets" --output "$RUNNER_TEMP/vopr-corpus/secrets" \
+            --retained "$RUNNER_TEMP/vopr-corpus-retained"
+      - name: Retain secrets corpus diagnostics
+        if: always()
+        timeout-minutes: 5
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vopr-corpus-diagnostics-secrets
+          path: |
+            ${{ runner.temp }}/vopr-corpus/secrets/*.json
+            ${{ runner.temp }}/vopr-corpus/secrets/*.log
+          retention-days: 90
+          overwrite: true
+          if-no-files-found: error
+      - name: Retain secrets merged corpus
+        if: always()
+        timeout-minutes: 40
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vopr-corpus-secrets
+          path: ${{ runner.temp }}/vopr-corpus/secrets
+          retention-days: 90
+          overwrite: true
+          if-no-files-found: error
+      - name: Publish secrets corpus for the next scheduled run
+        if: always() && steps.merge_secrets.outcome == 'success'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/vopr-corpus-retained
+          key: vopr-corpus-v2-${{ github.ref_name }}--secrets--${{ needs.build.outputs.binary_sha256 }}--${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Clear secrets corpus before the next scenario
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/vopr-corpus-retained"
+      - name: Report runtime disk headroom
+        if: always()
+        run: |
+          df -h "$RUNNER_TEMP" "$GITHUB_WORKSPACE"
+          du -sh "$RUNNER_TEMP" "$GITHUB_WORKSPACE" || true
