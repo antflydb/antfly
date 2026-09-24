@@ -532,6 +532,16 @@ pub fn glinerBoundaryResidentLoadAmounts(mf: manifest_mod.ModelManifest, source_
     return .{ .peak = peak, .resident = resident };
 }
 
+/// Tree-packed Laya models (models/laya/LAYA.md) run the generic masked
+/// encoder and never the resident Metal kernels. Unreadable configs are not
+/// packed; session creation reports their real error.
+pub fn isPackedLayaModel(allocator: std.mem.Allocator, model_path: []const u8) bool {
+    const bytes = @import("../util/c_file.zig").readFileFromDir(allocator, model_path, "config.json") catch return false;
+    defer allocator.free(bytes);
+    const config = modern_bert_arch.parseConfig(allocator, bytes) catch return false;
+    return if (config.laya) |laya| laya.packing.enabled() else false;
+}
+
 /// Laya keeps native projection storage plus F32 embedding/norm constants.
 /// Two encoded copies bound even an all-F16 artifact; staging and host cache
 /// coexist only during preparation. No request workspace is retained here.
@@ -554,7 +564,8 @@ pub fn prepareLayaResident(session: Session, control: ?InferenceExecutionControl
     if (comptime !build_options.enable_metal) return;
     if (session.vtable != &arch_vtable or !@import("../ops/laya_metal.zig").enabled()) return;
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
-    if (self.backend_type != .metal or self.arch_config != .modern_bert or self.arch_config.modern_bert.laya == null) return;
+    // Packed rows use the generic masked encoder, not the fused resident kernels.
+    if (self.backend_type != .metal or self.arch_config != .modern_bert or self.arch_config.modern_bert.laya == null or isPackedLaya(self)) return;
     const active = control orelse InferenceExecutionControl{};
     try active.check();
     var protection = if (control) |c| try c.enterUninterruptible(session.interruption()) else null;
@@ -1747,7 +1758,7 @@ fn cudaProfileForArch(
     return switch (arch_config) {
         .clip, .clap => .clipclap,
         .bert => .bert_encoder,
-        .modern_bert => |cfg| if (cfg.laya != null and cfg.laya.?.max_len <= 512 and cfg.num_attention_heads > 0 and cfg.hidden_size / cfg.num_attention_heads <= 128) .laya else null,
+        .modern_bert => |cfg| if (cfg.laya != null and !cfg.laya.?.packing.enabled() and cfg.laya.?.max_len <= 512 and cfg.num_attention_heads > 0 and cfg.hidden_size / cfg.num_attention_heads <= 128) .laya else null,
         .deberta => .deberta_reranker,
         .gliner => .gliner2,
         .florence => .florence2,
@@ -1787,6 +1798,8 @@ test "cuda support gate admits only supported model roles" {
     try std.testing.expect(!cudaSupportsArch(.{ .modern_bert = .{} }, &generic_manifest));
     try std.testing.expect(cudaSupportsArch(.{ .modern_bert = .{ .laya = .{} } }, &generic_manifest));
     try std.testing.expect(!cudaSupportsArch(.{ .modern_bert = .{ .laya = .{ .max_len = 1024 } } }, &generic_manifest));
+    // Tree-packed rows use the generic masked encoder (models/laya/LAYA.md).
+    try std.testing.expect(!cudaSupportsArch(.{ .modern_bert = .{ .laya = .{ .packing = .{ .mode = .question, .max_packed_len = 2048 } } } }, &generic_manifest));
     try std.testing.expect(cudaSupportsArch(.{ .deberta = .{} }, &generic_manifest));
     try std.testing.expect(cudaSupportsArch(.{ .gliner = .{} }, &generic_manifest));
     try std.testing.expect(cudaSupportsArch(.{ .florence = .{} }, &generic_manifest));
@@ -8040,13 +8053,13 @@ fn isQwen3GenerativeRerankerFamily(family: gpt_arch.ModelFamily) bool {
 fn archHasLayaDecisions(ptr: *anyopaque) bool {
     if (comptime !build_options.enable_metal) return false;
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
-    return self.backend_type == .metal and self.arch_config == .modern_bert and self.arch_config.modern_bert.laya != null and @import("../ops/laya_metal.zig").enabled();
+    return self.backend_type == .metal and self.arch_config == .modern_bert and self.arch_config.modern_bert.laya != null and !isPackedLaya(self) and @import("../ops/laya_metal.zig").enabled();
 }
 
 fn archRunLayaDecisions(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !?[]Tensor {
     if (comptime !build_options.enable_metal) return null;
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
-    if (self.backend_type != .metal or self.arch_config != .modern_bert or self.arch_config.modern_bert.laya == null or !@import("../ops/laya_metal.zig").enabled()) return null;
+    if (self.backend_type != .metal or self.arch_config != .modern_bert or self.arch_config.modern_bert.laya == null or isPackedLaya(self) or !@import("../ops/laya_metal.zig").enabled()) return null;
     if (inputs.len != 4) return error.InvalidLayaInputs;
     const bi = try parseBertRunInputs(inputs[0..2]);
     const kinds = try validateI64Matrix(inputs[2], .{ bi.batch, 1 });
@@ -8154,6 +8167,7 @@ fn archRunImpl(
         },
         .modern_bert => |cfg| {
             if (cfg.laya) |laya| {
+                if (laya.packing.enabled()) return @import("laya_packed.zig").run(&cb, allocator, cfg, inputs);
                 if (inputs.len != 4) return error.InvalidLayaInputs;
                 const bi = try parseBertRunInputs(inputs[0..2]);
                 const kinds = try validateI64Matrix(inputs[2], .{ bi.batch, 1 });
@@ -9160,6 +9174,16 @@ fn archRunGeometry(ptr: *anyopaque, inputs: @import("../backends/session.zig").S
         },
         .modern_bert => |cfg| blk: {
             if (cfg.laya) |laya| {
+                if (laya.packing.enabled()) {
+                    const packed_rows = @import("laya_packed.zig");
+                    if (inputs.len() != packed_rows.input_count) return error.InvalidLayaInputs;
+                    const markers = inputs.get(5);
+                    if (first.shape[0] != 1 or input_seq > laya.packing.max_packed_len or markers.shape.len != 2 or markers.shape[0] <= 0 or markers.shape[1] < 2 or markers.shape[1] > laya.maxOptions()) return error.InvalidLayaInputs;
+                    // One row of `Q` decisions: logits plus action logits per question.
+                    output_seq = @intCast(markers.shape[0]);
+                    workspace_bytes = try packed_rows.workspaceBytes(cfg, input_seq);
+                    break :blk @as(usize, @intCast(markers.shape[1])) + laya.n_act;
+                }
                 if (inputs.len() != 4) return error.InvalidLayaInputs;
                 const markers = inputs.get(3);
                 if (markers.shape.len != 2 or markers.shape[1] < 2 or markers.shape[1] > 20 or input_seq > laya.max_len) return error.InvalidLayaInputs;
@@ -9256,7 +9280,11 @@ fn archIndependentBatchRows(ptr: *anyopaque, inputs: []const Tensor) bool {
     // Only stateless forward stages are qualified here. Native generation
     // caches and resident multimodal stages use their own scheduler contracts.
     return switch (self.arch_config) {
-        .bert, .deberta, .modern_bert, .nomic_bert => inputs.len >= 2 and
+        // Packed Laya rows are one tree; marker rows are questions, not batch rows.
+        .modern_bert => !isPackedLaya(self) and inputs.len >= 2 and
+            inputs[0].dtype == .i64 and inputs[0].shape.len == 2 and
+            inputs[1].dtype == .i64 and inputs[1].shape.len == 2,
+        .bert, .deberta, .nomic_bert => inputs.len >= 2 and
             inputs[0].dtype == .i64 and inputs[0].shape.len == 2 and
             inputs[1].dtype == .i64 and inputs[1].shape.len == 2,
         .whisper => if (inputs.len == 1)
@@ -9271,8 +9299,13 @@ fn archIndependentBatchRows(ptr: *anyopaque, inputs: []const Tensor) bool {
     };
 }
 
+fn isPackedLaya(self: *const ArchSession) bool {
+    return self.arch_config == .modern_bert and self.arch_config.modern_bert.laya != null and self.arch_config.modern_bert.laya.?.packing.enabled();
+}
+
 fn archInputInfo(ptr: *anyopaque) []const TensorInfo {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    if (isPackedLaya(self)) return &@import("laya_packed.zig").inputs_info;
     if (self.arch_config == .modern_bert and self.arch_config.modern_bert.laya != null) return &.{
         .{ .name = "input_ids", .dtype = .i64, .shape = &.{ -1, -1 } },
         .{ .name = "attention_mask", .dtype = .i64, .shape = &.{ -1, -1 } },

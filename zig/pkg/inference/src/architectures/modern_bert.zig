@@ -290,6 +290,47 @@ pub fn forwardCT(
     batch: usize,
     seq_len: usize,
 ) !CT {
+    return forwardImpl(cb, allocator, config, input_ids, attention_mask, batch, seq_len, null);
+}
+
+/// One tree-packed row (see pipelines/laya_tree.zig). RoPE uses the logical
+/// `positions`; global layers apply `global_bias` and local layers apply
+/// `local_bias`, each a dense `[seq_len, seq_len]` additive mask shared by
+/// every head. Both biases already exclude keys outside a token's ancestry,
+/// and `local_bias` also applies the sliding window in logical positions.
+pub const Packed = struct {
+    positions: []const i64,
+    global_bias: CT,
+    local_bias: CT,
+};
+
+/// Encode one tree-packed row. The result is `[seq_len, hidden]`.
+pub fn forwardPackedCT(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_ids: []const i64,
+    packed_row: Packed,
+) !CT {
+    const seq_len = input_ids.len;
+    if (seq_len == 0 or packed_row.positions.len != seq_len) return error.InvalidInputShape;
+    for (packed_row.positions) |p| if (p < 0 or p >= config.max_position_embeddings) return error.InvalidInputShape;
+    const mask = try allocator.alloc(i64, seq_len);
+    defer allocator.free(mask);
+    @memset(mask, 1);
+    return forwardImpl(cb, allocator, config, input_ids, mask, 1, seq_len, packed_row);
+}
+
+fn forwardImpl(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_ids: []const i64,
+    attention_mask: []const i64,
+    batch: usize,
+    seq_len: usize,
+    packed_row: ?Packed,
+) !CT {
     const zero_bias: ?CT = if (config.checkpoint_layout == .huggingface_fused_qkv_no_bias)
         try makeZeroBias(cb, allocator, config.hidden_size)
     else
@@ -309,7 +350,8 @@ pub fn forwardCT(
     // does not submit and wait after every projection.  The frame is owned
     // only here; callers that already compose a frame retain control.
     var encoder_frame_active = false;
-    if (cb.kind() == .metal and metalEncoderFrameEnabled() and !cb.decoderRuntimeHasActiveFrame()) {
+    // Interleaved packed RoPE rotates on the host, so those rows run unframed.
+    if ((packed_row == null or !config.rope_interleaved) and cb.kind() == .metal and metalEncoderFrameEnabled() and !cb.decoderRuntimeHasActiveFrame()) {
         encoder_frame_active = try cb.decoderRuntimeBeginFrame();
     }
     errdefer if (encoder_frame_active) cb.decoderRuntimeCancelFrame() catch {};
@@ -334,6 +376,7 @@ pub fn forwardCT(
             layer_idx,
             zero_bias,
             resident_slots,
+            packed_row,
         );
         cb.free(hidden);
         hidden = new_hidden;
@@ -411,6 +454,7 @@ fn encoderLayer(
     layer_idx: usize,
     zero_bias: ?CT,
     resident_slots: bool,
+    packed_row: ?Packed,
 ) !CT {
     const H: usize = @intCast(config.hidden_size);
     const num_heads: usize = @intCast(config.num_attention_heads);
@@ -457,12 +501,20 @@ fn encoderLayer(
     // Apply RoPE to Q and K. HuggingFace ModernBERT's `rotate_half` uses
     // split-half rotation; the legacy checkpoint retains interleaved pairs.
     // rope_dim == head_dim: the full head dimension is rotated.
-    const Q = try cb.rope(qkv.q, seq_len, head_dim, head_dim, rope_theta, 1.0, 0, config.rope_interleaved);
+    const Q = if (packed_row) |row|
+        try ropeAtPositions(cb, allocator, qkv.q, row.positions, num_heads, head_dim, rope_theta, config.rope_interleaved)
+    else
+        try cb.rope(qkv.q, seq_len, head_dim, head_dim, rope_theta, 1.0, 0, config.rope_interleaved);
     defer cb.free(Q);
-    const K = try cb.rope(qkv.k, seq_len, head_dim, head_dim, rope_theta, 1.0, 0, config.rope_interleaved);
+    const K = if (packed_row) |row|
+        try ropeAtPositions(cb, allocator, qkv.k, row.positions, num_heads, head_dim, rope_theta, config.rope_interleaved)
+    else
+        try cb.rope(qkv.k, seq_len, head_dim, head_dim, rope_theta, 1.0, 0, config.rope_interleaved);
     defer cb.free(K);
 
-    const attn_out = if (!is_global and cb.kind() == .cuda)
+    const attn_out = if (packed_row) |row|
+        try cb.scaledDotProductAttention(Q, K, qkv.v, attention_mask, if (is_global) row.global_bias else row.local_bias, batch, seq_len, num_heads, head_dim)
+    else if (!is_global and cb.kind() == .cuda)
         (try cb.encoderLocalAttention(Q, K, qkv.v, attention_mask, batch, seq_len, num_heads, head_dim, config.local_attention_window / 2)) orelse return error.UnsupportedLayaBackend
     else fallback: {
         // For local layers build a sliding-window additive attention bias.
@@ -733,6 +785,42 @@ fn geGluFfn(
         hidden_size,
         wo_slot,
     );
+}
+
+/// RoPE at explicit per-token positions for a token-major `[tokens, heads *
+/// head_dim]` projection. Packed rows restart positions at every branch, which
+/// the contiguous `rope` op cannot express. The rotation matches `rope` for
+/// positions 0..n-1 (see the packed-encoder degenerate-tree test).
+///
+/// Split-half rotation is M-RoPE with every frequency pair on the first axis,
+/// so device backends that implement `mrope` rotate in place; others use the
+/// host rotation.
+fn ropeAtPositions(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    input: CT,
+    positions: []const i64,
+    num_heads: usize,
+    head_dim: usize,
+    theta: f32,
+    interleaved: bool,
+) !CT {
+    if (!interleaved) {
+        const axes = try allocator.alloc(u32, 3 * positions.len);
+        defer allocator.free(axes);
+        for (0..3) |axis| for (positions, axes[axis * positions.len ..][0..positions.len]) |p, *dst| {
+            dst.* = @intCast(p);
+        };
+        if (try cb.mrope(input, positions.len, head_dim, theta, 1.0, axes, .{ @intCast(head_dim / 2), 0, 0 })) |rotated| return rotated;
+    }
+    const values = try cb.toFloat32(input, allocator);
+    defer allocator.free(values);
+    if (values.len != positions.len * num_heads * head_dim) return error.InvalidRoPEInput;
+    const chunks = try allocator.alloc(usize, positions.len * num_heads);
+    defer allocator.free(chunks);
+    for (chunks, 0..) |*chunk, i| chunk.* = @intCast(positions[i / num_heads]);
+    native_compute.ropeCore(values, chunks, head_dim, head_dim, theta, 1.0, interleaved);
+    return cb.fromFloat32Shape(values, &[_]i32{ @intCast(positions.len), @intCast(num_heads * head_dim) });
 }
 
 // ---------------------------------------------------------------------------

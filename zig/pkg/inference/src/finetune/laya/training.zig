@@ -11,11 +11,46 @@ const tensors = @import("../../models/safetensors.zig");
 const Tensor = @import("../../backends/tensor.zig").Tensor;
 pub const controller = @import("../seeded_gradient_trainer.zig");
 
+const Kind = @import("../../models/laya.zig").QuestionType;
+const tree = @import("../../pipelines/laya_tree.zig");
+
+/// One training sequence. An unpacked example holds a single question in
+/// `markers`/`kind`/`target`. A tree-packed example (`packed_row`) holds every
+/// question of one row, in row order; its `markers`/`kind`/`target` are unused.
 pub const Example = struct {
     ids: []const i64,
-    markers: []const i64,
-    kind: @import("../../models/laya.zig").QuestionType,
-    target: []const f32,
+    markers: []const i64 = &.{},
+    kind: Kind = .choice,
+    target: []const f32 = &.{},
+    packed_row: ?*const Packed = null,
+
+    pub fn questions(self: Example) usize {
+        return if (self.packed_row) |p| p.row.questions() else 1;
+    }
+    pub fn question(self: Example, q: usize) Question {
+        const p = self.packed_row orelse return .{ .markers = self.markers, .kind = self.kind, .target = self.target };
+        const target = p.targets[q];
+        return .{ .markers = p.row.markers[q * p.row.width ..][0..target.len], .kind = p.kinds[q], .target = target };
+    }
+    /// Logical position and visibility of physical tokens (0..ids.len).
+    fn position(self: Example, i: usize) i64 {
+        return if (self.packed_row) |p| p.row.positions[i] else @intCast(i);
+    }
+    fn visible(self: Example, q: usize, k: usize) bool {
+        return if (self.packed_row) |p| p.row.visible(q, k) else true;
+    }
+    /// Question type for the type embedding; null for the shared trunk.
+    fn tokenKind(self: Example, i: usize) ?Kind {
+        const p = self.packed_row orelse return self.kind;
+        const kind = p.row.kinds[i];
+        return if (kind == tree.trunk_kind) null else @enumFromInt(kind);
+    }
+};
+pub const Question = struct { markers: []const i64, kind: Kind, target: []const f32 };
+pub const Packed = struct {
+    row: tree.Row,
+    kinds: []const Kind,
+    targets: []const []const f32,
 };
 
 pub fn floatValues(a: std.mem.Allocator, tensor: Tensor) ![]f32 {
@@ -53,14 +88,31 @@ pub fn layout(examples: []const Example) !architecture.Layout {
     if (examples.len == 0 or examples.len > 128) return error.InvalidLayaTrainingBatch;
     var sequence: usize = 0;
     var options: usize = 0;
+    var questions: usize = 0;
     for (examples) |e| {
-        try objective.validateTarget(e.kind, e.target);
-        if (e.ids.len == 0 or e.ids.len > 8192 or e.markers.len != e.target.len) return error.InvalidLayaTrainingBatch;
-        for (e.markers) |pos| if (pos < 0 or pos >= e.ids.len) return error.InvalidLayaTrainingBatch;
+        if (e.ids.len == 0 or e.ids.len > 8192 or e.questions() == 0) return error.InvalidLayaTrainingBatch;
+        if (e.packed_row) |p| if (p.row.ids.ptr != e.ids.ptr or p.kinds.len != p.row.questions() or p.targets.len != p.row.questions()) return error.InvalidLayaTrainingBatch;
+        for (0..e.questions()) |qi| {
+            const q = e.question(qi);
+            try objective.validateTarget(q.kind, q.target);
+            if (q.markers.len != q.target.len) return error.InvalidLayaTrainingBatch;
+            for (q.markers) |pos| if (pos < 0 or pos >= e.ids.len) return error.InvalidLayaTrainingBatch;
+            options = @max(options, q.markers.len);
+        }
         sequence = @max(sequence, e.ids.len);
-        options = @max(options, e.markers.len);
+        questions += e.questions();
     }
-    return .{ .batch = @intCast(examples.len), .sequence = @intCast(sequence), .options = @intCast(options) };
+    return .{ .batch = @intCast(examples.len), .sequence = @intCast(sequence), .options = @intCast(options), .questions = @intCast(questions) };
+}
+
+/// Decision rows in logit order.
+pub fn rows(a: std.mem.Allocator, examples: []const Example) ![]objective.Row {
+    var out: std.ArrayListUnmanaged(objective.Row) = .empty;
+    for (examples) |e| for (0..e.questions()) |qi| {
+        const q = e.question(qi);
+        try out.append(a, .{ .kind = q.kind, .target = q.target });
+    };
+    return out.toOwnedSlice(a);
 }
 
 /// CTs must be freed before the backend; metadata uses the caller's arena.
@@ -71,30 +123,64 @@ pub fn inputs(a: std.mem.Allocator, cb: *const ops.ComputeBackend, graph: *const
     const ids = try a.alloc(i32, l.batch * l.sequence);
     @memset(ids, 0);
     const kinds = try a.alloc(i32, ids.len);
-    const markers = try a.alloc(i32, l.batch * l.options);
+    const type_mask = try a.alloc(f32, ids.len * cfg.hidden_size);
+    const markers = try a.alloc(i32, l.questions * l.options);
+    const positions = try a.alloc(i64, ids.len);
+    var question: usize = 0;
     for (examples, 0..) |e, row| {
         for (e.ids, 0..) |v, i| {
             if (v < 0 or v >= cfg.vocab_size) return error.InvalidLayaTrainingToken;
             ids[row * l.sequence + i] = @intCast(v);
         }
-        @memset(kinds[row * l.sequence ..][0..l.sequence], @intFromEnum(e.kind));
-        @memset(markers[row * l.options ..][0..l.options], @intCast(row * l.sequence));
-        for (e.markers, 0..) |pos, i| markers[row * l.options + i] = @intCast(row * l.sequence + @as(usize, @intCast(pos)));
+        for (0..l.sequence) |i| {
+            // Padding repeats the row's last logical position; keys mask it.
+            const kind = if (i < e.ids.len) e.tokenKind(i) else if (e.packed_row == null) e.kind else null;
+            kinds[row * l.sequence + i] = if (kind) |k| @intFromEnum(k) else 0;
+            @memset(type_mask[(row * l.sequence + i) * cfg.hidden_size ..][0..cfg.hidden_size], if (kind != null) 1 else 0);
+            positions[row * l.sequence + i] = if (i < e.ids.len) e.position(i) else @intCast(i);
+        }
+        for (0..e.questions()) |qi| {
+            const q = e.question(qi);
+            @memset(markers[question * l.options ..][0..l.options], @intCast(row * l.sequence));
+            for (q.markers, 0..) |pos, i| markers[question * l.options + i] = @intCast(row * l.sequence + @as(usize, @intCast(pos)));
+            question += 1;
+        }
     }
     for ([_]ml.NodeId{ built.inputs.ids, built.inputs.kinds, built.inputs.markers }, [_][]const i32{ ids, kinds, markers }) |id, data| {
         const value = (try cb.fromInt32Shape(data, &.{@intCast(data.len)})) orelse return error.UnsupportedLayaTrainingBackend;
         errdefer cb.free(value);
         try result.append(a, .{ .node_id = id, .value = value });
     }
-    for ([_]ml.NodeId{ built.inputs.encoder_bias, built.inputs.head_bias }, [_]u32{ cfg.num_attention_heads, cfg.hidden_size / 64 }) |id, heads| {
+    {
+        const value = try cb.fromFloat32Shape(type_mask, &.{ @intCast(ids.len), @intCast(cfg.hidden_size) });
+        errdefer cb.free(value);
+        try result.append(a, .{ .node_id = built.inputs.type_mask, .value = value });
+    }
+    const window: u64 = cfg.local_attention_window / 2;
+    for ([_]ml.NodeId{ built.inputs.encoder_bias, built.inputs.local_bias, built.inputs.head_bias }, [_]u32{ cfg.num_attention_heads, cfg.num_attention_heads, cfg.hidden_size / 64 }, [_]bool{ false, true, false }) |id, heads, local| {
         const bias = try a.alloc(f32, l.batch * heads * l.sequence * l.sequence);
-        for (bias, 0..) |*v, i| {
-            const row = i / (heads * l.sequence * l.sequence);
-            v.* = if (i % l.sequence < examples[row].ids.len) 0 else -1e9;
+        const plane = l.sequence * l.sequence;
+        for (examples, 0..) |e, row| {
+            const first = bias[row * heads * plane ..][0..plane];
+            for (0..l.sequence) |q| for (0..l.sequence) |k| {
+                var ok = k < e.ids.len and (q >= e.ids.len or e.visible(q, k));
+                if (ok and local) ok = @abs(positions[row * l.sequence + q] - positions[row * l.sequence + k]) <= window;
+                first[q * l.sequence + k] = if (ok) 0 else -1e9;
+            };
+            for (1..heads) |h| @memcpy(bias[(row * heads + h) * plane ..][0..plane], first);
         }
         const value = try cb.fromFloat32Shape(bias, &.{ @intCast(l.batch * heads), @intCast(l.sequence), @intCast(l.sequence) });
         errdefer cb.free(value);
         try result.append(a, .{ .node_id = id, .value = value });
+    }
+    const head_dim = cfg.hidden_size / cfg.num_attention_heads;
+    for (built.inputs.rope, [_]f32{ cfg.global_rope_theta, cfg.local_rope_theta }) |ids_pair, theta| {
+        const tables = try architecture.ropeTables(a, positions, cfg.num_attention_heads, head_dim, theta);
+        for (ids_pair, tables) |id, table| {
+            const value = try cb.fromFloat32Shape(table, &.{ @intCast(ids.len * cfg.num_attention_heads), @intCast(head_dim / 2) });
+            errdefer cb.free(value);
+            try result.append(a, .{ .node_id = id, .value = value });
+        }
     }
     for (built.dropouts.items) |entry| {
         const shape = graph.node(entry.node).output_shape;
@@ -163,15 +249,14 @@ pub fn step(a: std.mem.Allocator, program: *Program, trainer: *controller.Traine
     defer forward.deinit(cb);
     const logits = try cb.toFloat32(forward.outputs[0], scratch);
     const l = try layout(examples);
-    const rows = try scratch.alloc(objective.Row, examples.len);
-    for (rows, examples) |*row, e| row.* = .{ .kind = e.kind, .target = e.target };
+    const decision_rows = try rows(scratch, examples);
     const noise = try scratch.alloc(f32, if (loss_cfg.rl_weight == 0) 0 else loss_cfg.group_size * logits.len);
     for (noise) |*value| value.* = prng.random().floatNorm(f32);
-    const loss = try objective.evaluate(a, loss_cfg, rows, l.options, logits, noise);
+    const loss = try objective.evaluate(a, loss_cfg, decision_rows, l.options, logits, noise);
     defer loss.deinit(a);
     const backward_inputs = try scratch.alloc(interpreter.RuntimeInput, combined.len + 1);
     for (combined, backward_inputs[0..combined.len]) |input, *dst| dst.* = .{ .node_id = program.gradients.id_map[input.node_id], .value = input.value };
-    const cotangent = try cb.fromFloat32Shape(loss.gradient, &.{ @intCast(l.batch), @intCast(l.options) });
+    const cotangent = try cb.fromFloat32Shape(loss.gradient, &.{ @intCast(l.questions), @intCast(l.options) });
     defer cb.free(cotangent);
     backward_inputs[combined.len] = .{ .node_id = program.gradients.id_map[program.seed], .value = cotangent };
     var backward = try interpreter.execute(a, &program.gradients.graph, cb, .{ .runtime_inputs = backward_inputs, .strict_integer_constants = true });

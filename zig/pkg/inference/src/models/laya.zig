@@ -15,6 +15,29 @@
 //! Checkpoint-owned Laya decision configuration; no borrowed JSON storage.
 const std = @import("std");
 pub const QuestionType = enum(u8) { choice, score, noul };
+
+/// Released checkpoints encode one sequence per question and admit 20 options.
+pub const max_options = 20;
+/// Candidate-branch packing gives every option its own branch (see LAYA.md).
+pub const max_packed_options = 255;
+
+/// Tree-packed execution (zig/pkg/inference/models/laya/LAYA.md). The state is a
+/// shared trunk that attends only to itself; each question, and in candidate
+/// mode each option, is a branch that attends to its ancestors and itself.
+/// Positions restart after the parent at every branch. Released checkpoints
+/// use `.none`; a packed mode requires weights fine-tuned for that layout.
+pub const PackingMode = enum(u8) { none, question, candidate };
+pub const Packing = struct {
+    mode: PackingMode = .none,
+    /// Physical tokens in one packed row. `Config.max_len` still bounds the
+    /// logical length (trunk plus the longest root-to-leaf branch path).
+    max_packed_len: usize = 0,
+
+    pub fn enabled(self: Packing) bool {
+        return self.mode != .none;
+    }
+};
+
 pub const Config = struct {
     mask_token: [128]u8 = "[MASK]".* ++ ([_]u8{0} ** 122),
     mask_token_len: usize = 6,
@@ -24,10 +47,15 @@ pub const Config = struct {
     n_act: usize = 2,
     temperature: [3]f32 = .{ 1, 1, 1 },
     buckets: [3][4]?f32 = .{ .{ null, null, null, null }, .{ null, null, null, null }, .{ null, null, null, null } },
+    packing: Packing = .{},
 
     pub fn scale(self: Config, kind: QuestionType, count: usize) f32 {
         const bucket: usize = if (count <= 2) 0 else if (count <= 5) 1 else if (count <= 10) 2 else 3;
         return @max(0.001, self.buckets[@intFromEnum(kind)][bucket] orelse self.temperature[@intFromEnum(kind)]);
+    }
+
+    pub fn maxOptions(self: Config) usize {
+        return if (self.packing.mode == .candidate) max_packed_options else max_options;
     }
 
     pub fn parse(value: std.json.Value) !Config {
@@ -62,9 +90,54 @@ pub const Config = struct {
                 }
             }
         }
+        if (obj.get("packing")) |v| out.packing = try parsePacking(v, out.max_len);
         return out;
     }
 };
+
+fn parsePacking(value: std.json.Value, max_len: usize) !Packing {
+    if (value != .object) return error.InvalidLayaConfig;
+    var out = Packing{};
+    for (value.object.keys()) |key| {
+        if (!std.mem.eql(u8, key, "mode") and !std.mem.eql(u8, key, "max_packed_len")) return error.InvalidLayaConfig;
+    }
+    const mode = value.object.get("mode") orelse return error.InvalidLayaConfig;
+    if (mode != .string) return error.InvalidLayaConfig;
+    out.mode = std.meta.stringToEnum(PackingMode, mode.string) orelse return error.InvalidLayaConfig;
+    if (out.mode == .none) return out;
+    out.max_packed_len = @min(4 * max_len, 8192);
+    if (value.object.get("max_packed_len")) |v| {
+        if (v != .integer or v.integer < 0) return error.InvalidLayaConfig;
+        out.max_packed_len = std.math.cast(usize, v.integer) orelse return error.InvalidLayaConfig;
+    }
+    // Encoder and head attention materialize one [L, L] mask per packed row.
+    if (out.max_packed_len < max_len or out.max_packed_len > 8192) return error.InvalidLayaConfig;
+    return out;
+}
+
+test "laya packing config defaults, bounds, and rejects unknown fields" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { json: []const u8, mode: ?PackingMode, len: usize = 0 }{
+        .{ .json = "{}", .mode = .none },
+        .{ .json = "{\"packing\":{\"mode\":\"question\"}}", .mode = .question, .len = 2048 },
+        .{ .json = "{\"packing\":{\"mode\":\"candidate\",\"max_packed_len\":1024}}", .mode = .candidate, .len = 1024 },
+        .{ .json = "{\"packing\":{\"mode\":\"none\"}}", .mode = .none },
+        .{ .json = "{\"packing\":{\"mode\":\"question\",\"max_packed_len\":256}}", .mode = null },
+        .{ .json = "{\"packing\":{\"mode\":\"question\",\"max_packed_len\":65536}}", .mode = null },
+        .{ .json = "{\"packing\":{\"mode\":\"tree\"}}", .mode = null },
+        .{ .json = "{\"packing\":{\"mode\":\"question\",\"shared\":true}}", .mode = null },
+    };
+    for (cases) |case| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, case.json, .{});
+        defer parsed.deinit();
+        if (case.mode) |mode| {
+            const cfg = try Config.parse(parsed.value);
+            try std.testing.expectEqual(mode, cfg.packing.mode);
+            try std.testing.expectEqual(case.len, cfg.packing.max_packed_len);
+            try std.testing.expectEqual(@as(usize, if (mode == .candidate) 255 else 20), cfg.maxOptions());
+        } else try std.testing.expectError(error.InvalidLayaConfig, Config.parse(parsed.value));
+    }
+}
 fn positive(value: std.json.Value) !f32 {
     const n: f32 = switch (value) {
         .integer => |v| @floatFromInt(v),

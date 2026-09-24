@@ -29,7 +29,7 @@ def description(value):
     return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
 
 
-def convert(case: dict) -> list[dict]:
+def convert(case: dict, max_labels: int = 20) -> list[dict]:
     state = case["state"]
     if isinstance(state, str):
         try:
@@ -59,10 +59,10 @@ def convert(case: dict) -> list[dict]:
             descriptions = [description((criteria or {}).get(key)) for key in labels]
         else:
             raise ValueError(f"Invalid question type/criteria: {qid}")
-        if not 2 <= len(labels) <= 20 or any(
+        if not 2 <= len(labels) <= max_labels or any(
             not isinstance(label, str) or not label for label in labels
         ):
-            raise ValueError(f"Expected 2-20 nonempty labels: {qid}")
+            raise ValueError(f"Expected 2-{max_labels} nonempty labels: {qid}")
         probabilities = gold[qid]["probabilities"]
         if not isinstance(probabilities, dict) or set(probabilities) != set(labels):
             raise ValueError(f"Target keys differ from label keys: {qid}")
@@ -100,6 +100,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--max-labels",
+        type=int,
+        choices=(20, 255),
+        default=20,
+        help="255 only for candidate-packed training (models/laya/LAYA.md)",
+    )
     args = parser.parse_args()
     if args.output.exists():
         parser.error(f"Output already exists: {args.output}")
@@ -118,7 +125,7 @@ def main():
                 if not line.strip():
                     continue
                 try:
-                    records = convert(json.loads(line))
+                    records = convert(json.loads(line), args.max_labels)
                     for record in records:
                         if record["id"] in ids:
                             raise ValueError(f"Duplicate decision ID: {record['id']}")

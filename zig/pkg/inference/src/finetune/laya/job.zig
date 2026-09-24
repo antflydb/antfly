@@ -17,6 +17,7 @@ const run = @import("../gliner/boundary_run.zig");
 const snapshot = @import("../../runtime/file_snapshot.zig");
 const Assets = @import("assets.zig").Assets;
 const Budget = @import("../../runtime/bounded_allocator.zig").BoundedAllocator;
+const model = @import("../../models/laya.zig");
 
 pub const Config = struct {
     version: u32 = 1,
@@ -43,6 +44,10 @@ pub const Config = struct {
     checkpoint_every_steps: u32 = 100,
     stop_after_microbatches: ?u64 = null,
     max_host_bytes: usize = 24 * 1024 * 1024 * 1024,
+    /// Train (and export) a tree-packed layout (models/laya/LAYA.md). Null
+    /// keeps the source checkpoint's layout; released checkpoints are unpacked.
+    packing: ?model.PackingMode = null,
+    max_packed_len: ?u32 = null,
 };
 
 pub fn validate(c: Config) !void {
@@ -56,6 +61,16 @@ pub fn validate(c: Config) !void {
     if (c.resume_from) |value| if (!std.fs.path.isAbsolute(value)) return error.LayaJobRequiresAbsolutePaths;
     if (c.calibration_file) |value| if (!std.fs.path.isAbsolute(value)) return error.LayaJobRequiresAbsolutePaths;
     if (c.stop_after_microbatches == 0) return error.InvalidLayaJob;
+    if (c.max_packed_len != null and (c.packing == null or c.packing.? == .none)) return error.InvalidLayaJob;
+}
+
+/// Apply the job's packing override with the same bounds as `laya.packing`.
+fn packing(c: Config, source: model.Config) !model.Packing {
+    const mode = c.packing orelse return source.packing;
+    if (mode == .none) return .{};
+    const length: usize = c.max_packed_len orelse @min(4 * source.max_len, 8192);
+    if (length < source.max_len or length > 8192) return error.InvalidLayaJob;
+    return .{ .mode = mode, .max_packed_len = length };
 }
 
 fn path(a: std.mem.Allocator, dir: []const u8, name: []const u8) ![]const u8 {
@@ -84,7 +99,7 @@ const Cache = struct {
     config: modern.Config,
     dropout: f32,
     program: ?training.Program = null,
-    last: architecture.Layout = .{ .batch = 0, .sequence = 0, .options = 0 },
+    last: architecture.Layout = .{ .batch = 0, .sequence = 0, .options = 0, .questions = 0 },
     fn get(self: *Cache, examples: []const training.Example) !*training.Program {
         const l = try training.layout(examples);
         if (self.program == null or !std.meta.eql(l, self.last)) {
@@ -100,18 +115,26 @@ const Cache = struct {
     }
 };
 
-const Prediction = struct { id: ?[]const u8 = null, kind: @import("../../models/laya.zig").QuestionType, logits: []const f32, target: []const f32 };
+const Prediction = struct { id: ?[]const u8 = null, kind: model.QuestionType, logits: []const f32, target: []const f32 };
 const Metrics = struct { examples: usize, soft_ce: f64, accuracy: f64, ordinal_mae: ?f64 };
-fn predictions(a: std.mem.Allocator, cache: *Cache, trainer: *training.controller.Trainer, examples: []const training.Example) ![]Prediction {
-    const result = try a.alloc(Prediction, examples.len);
+/// One prediction per record, in record order.
+fn predictions(a: std.mem.Allocator, cache: *Cache, trainer: *training.controller.Trainer, dataset: data.Dataset) ![]Prediction {
+    const rows = try a.alloc([]const f32, dataset.examples.len);
+    const widths = try a.alloc(usize, dataset.examples.len);
     // Evaluation uses one example at a time, independent of training padding.
-    for (examples, result) |e, *dst| {
+    for (dataset.examples, rows, widths) |e, *row, *width| {
         const program = try cache.get(&.{e});
         // Execution scratch must be reclaimable between examples. `a` is the
         // run-lifetime arena: retain only the small prediction in that arena.
         const logits = try training.predict(cache.allocator, program, trainer, cache.config, &.{e});
         defer cache.allocator.free(logits);
-        dst.* = .{ .kind = e.kind, .target = e.target, .logits = try a.dupe(f32, logits) };
+        row.* = try a.dupe(f32, logits);
+        width.* = cache.last.options;
+    }
+    const result = try a.alloc(Prediction, dataset.records.len);
+    for (dataset.placements, result) |place, *dst| {
+        const q = dataset.examples[place.example].question(place.question);
+        dst.* = .{ .kind = q.kind, .target = q.target, .logits = rows[place.example][place.question * widths[place.example] ..][0..q.target.len] };
     }
     return result;
 }
@@ -132,7 +155,7 @@ fn metrics(preds: []const Prediction, temperatures: [3]f32) !Metrics {
         }
         correct += @intFromBool(winner == gold);
         var sum: f64 = 0;
-        var probs: [20]f64 = undefined;
+        var probs: [model.max_packed_options]f64 = undefined;
         for (p.logits, 0..) |z, k| {
             probs[k] = @exp(z / temperatures[@intFromEnum(p.kind)] - max);
             sum += probs[k];
@@ -185,7 +208,7 @@ fn calibrate(a: std.mem.Allocator, preds: []const Prediction) ![3]f32 {
     return temperatures;
 }
 
-fn exportModel(a: std.mem.Allocator, io: std.Io, c: Config, config_json: std.json.Value, assets: Assets, admitted: []const checkpoint.NamedTensor, trainer: *training.controller.Trainer, temperatures: [3]f32) !void {
+fn exportModel(a: std.mem.Allocator, io: std.Io, c: Config, config_json: std.json.Value, layout: model.Packing, assets: Assets, admitted: []const checkpoint.NamedTensor, trainer: *training.controller.Trainer, temperatures: [3]f32) !void {
     try trainer.ensureHostState(null);
     const stage = try path(a, c.output_dir, "model.partial");
     try std.Io.Dir.cwd().createDir(io, stage, .default_dir);
@@ -204,6 +227,16 @@ fn exportModel(a: std.mem.Allocator, io: std.Io, c: Config, config_json: std.jso
     var temp: std.json.Array = .init(a);
     for (temperatures) |t| try temp.append(.{ .float = t });
     try decision.object.put(a, "temperature", .{ .array = temp });
+    // A packing override changes the serving layout the weights were trained for.
+    if (c.packing != null) {
+        _ = decision.object.swapRemove("packing");
+        if (layout.enabled()) {
+            var object: std.json.ObjectMap = .empty;
+            try object.put(a, "mode", .{ .string = @tagName(layout.mode) });
+            try object.put(a, "max_packed_len", .{ .integer = @intCast(layout.max_packed_len) });
+            try decision.object.put(a, "packing", .{ .object = object });
+        }
+    }
     // The old option buckets override per-type temperatures in inference.
     // They must never survive a change to the trained weights.
     _ = decision.object.swapRemove("temperature_by_options");
@@ -222,13 +255,16 @@ fn exportModel(a: std.mem.Allocator, io: std.Io, c: Config, config_json: std.jso
 // A shuffled batch can combine the longest sequence with any other record.
 // Admit a conservative bound for the entire split before backend allocation.
 fn admitExamples(cfg: modern.Config, examples: []const training.Example, batch_size: u32, dropout: f32) !void {
-    var layout = architecture.Layout{ .batch = @intCast(@min(batch_size, examples.len)), .sequence = 0, .options = 0 };
+    var layout = architecture.Layout{ .batch = @intCast(@min(batch_size, examples.len)), .sequence = 0, .options = 0, .questions = 0 };
+    var questions: u32 = 0;
     for (examples) |e| {
         const single = try training.layout(&.{e});
         layout.sequence = @max(layout.sequence, single.sequence);
         layout.options = @max(layout.options, single.options);
+        questions = @max(questions, single.questions);
         for (e.ids) |id| if (id < 0 or id >= cfg.vocab_size) return error.InvalidLayaTrainingToken;
     }
+    layout.questions = @min(questions * layout.batch, 512);
     try architecture.validate(cfg, layout, dropout);
 }
 
@@ -301,8 +337,10 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config) !void {
     const config_bytes = try snapshot.read(permanent, io, model_dir, "config.json", 1024 * 1024, null);
     const config_json = try std.json.parseFromSlice(std.json.Value, permanent, config_bytes, .{ .allocate = .alloc_always });
     try validateEncoderMetadata(config_json.value);
-    const encoder = try modern.parseConfig(a, config_bytes);
-    const laya = encoder.laya orelse return error.InvalidLayaConfig;
+    var encoder = try modern.parseConfig(a, config_bytes);
+    const source_laya = encoder.laya orelse return error.InvalidLayaConfig;
+    encoder.laya.?.packing = try packing(c, source_laya);
+    const laya = encoder.laya.?;
     for ([_][]const u8{ "attention_bias", "mlp_bias", "norm_bias" }) |key| if (config_json.value.object.get(key)) |v| {
         if (v != .bool or v.bool) return error.UnsupportedLayaEncoderBias;
     };
@@ -395,7 +433,7 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config) !void {
     try writeJson(io, try path(permanent, c.output_dir, "job.json"), c);
     const log = try std.Io.Dir.cwd().createFile(io, try path(permanent, c.output_dir, "metrics.jsonl"), .{ .exclusive = true });
     defer log.close(io);
-    const before_predictions = try predictions(permanent, &cache, &trainer, eval.examples);
+    const before_predictions = try predictions(permanent, &cache, &trainer, eval);
     for (before_predictions, eval.records) |*p, r| p.id = r.id;
     const before = try metrics(before_predictions, .{ 1, 1, 1 });
     const initial_by_kind = try metricsByKind(a, before_predictions, .{ 1, 1, 1 });
@@ -404,7 +442,11 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config) !void {
     try event(io, std.Io.File.stdout(), .{ .event = "initial_eval", .metrics = before });
     const order = try permanent.alloc(usize, train.examples.len);
     const batch = try permanent.alloc(training.Example, c.batch_size);
-    const batch_ids = try permanent.alloc([]const u8, c.batch_size);
+    // Record ids per example; a packed example holds several records.
+    const example_records = try permanent.alloc(std.ArrayListUnmanaged([]const u8), train.examples.len);
+    @memset(example_records, .empty);
+    for (train.placements, train.records) |place, record| try example_records[place.example].append(permanent, record.id);
+    var batch_ids: std.ArrayListUnmanaged([]const u8) = .empty;
     for (0..c.epochs) |epoch| {
         if ((epoch + 1) * batches <= completed) continue;
         for (order, 0..) |*index, i| index.* = i;
@@ -415,14 +457,15 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config) !void {
             if (microbatch < completed) continue;
             const start = batch_index * c.batch_size;
             const count = @min(c.batch_size, order.len - start);
-            for (batch[0..count], batch_ids[0..count], order[start..][0..count]) |*e, *id, index| {
+            batch_ids.clearRetainingCapacity();
+            for (batch[0..count], order[start..][0..count]) |*e, index| {
                 e.* = train.examples[index];
-                id.* = train.records[index].id;
+                try batch_ids.appendSlice(permanent, example_records[index].items);
             }
             const program = try cache.get(batch[0..count]);
             const progress = @as(f32, @floatFromInt(epoch)) / @as(f32, @floatFromInt(@max(1, c.epochs - 1)));
             const report = try training.step(a, program, &trainer, encoder, batch[0..count], .{ .group_size = c.group_size, .sigma = c.sigma_start + (c.sigma_end - c.sigma_start) * progress, .rl_weight = if (c.objective == .rlcd) 1 else 0 }, c.seed +% (microbatch *% 0x9e3779b97f4a7c15));
-            try event(io, log, .{ .event = "step", .epoch = epoch + 1, .batch = batch_index + 1, .record_ids = batch_ids[0..count], .report = report });
+            try event(io, log, .{ .event = "step", .epoch = epoch + 1, .batch = batch_index + 1, .record_ids = batch_ids.items, .report = report });
             try event(io, std.Io.File.stdout(), .{ .event = "step", .epoch = epoch + 1, .batch = batch_index + 1, .report = report });
             if (batch_index + 1 == batches) _ = try trainer.flush(trainer.identity(), null);
             if (trainer.identity().microbatch_step % c.checkpoint_every_steps == 0 or batch_index + 1 == batches) try trainer.save(latest, identity, null);
@@ -436,13 +479,13 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config) !void {
         }
     }
     try trainer.save(latest, identity, null);
-    const temperatures = if (calibration) |calib| try calibrate(a, try predictions(permanent, &cache, &trainer, calib.examples)) else [3]f32{ 1, 1, 1 };
-    const final_predictions = try predictions(permanent, &cache, &trainer, eval.examples);
+    const temperatures = if (calibration) |calib| try calibrate(a, try predictions(permanent, &cache, &trainer, calib)) else [3]f32{ 1, 1, 1 };
+    const final_predictions = try predictions(permanent, &cache, &trainer, eval);
     for (final_predictions, eval.records) |*p, r| p.id = r.id;
     const after = try metrics(final_predictions, temperatures);
     try writeJson(io, try path(permanent, c.output_dir, "eval_predictions.json"), final_predictions);
-    try exportModel(permanent, io, c, config_json.value, assets, admitted.export_tensors, &trainer, temperatures);
-    const result = .{ .format = "antfly-laya-finetune/v1", .status = "complete", .backend = c.backend, .objective = c.objective, .source_sha256 = .{ .config = std.fmt.bytesToHex(data.digest(config_bytes), .lower), .tokenizer = std.fmt.bytesToHex(data.digest(tokenizer_bytes), .lower), .weights = std.fmt.bytesToHex(admitted.weights_sha256, .lower) }, .calibration_sha256 = if (calibration) |calib| std.fmt.bytesToHex(calib.sha256, .lower) else null, .resumed_microbatches = completed, .train_examples = train.examples.len, .train_sha256 = std.fmt.bytesToHex(train.sha256, .lower), .eval_sha256 = std.fmt.bytesToHex(eval.sha256, .lower), .run_sha256 = std.fmt.bytesToHex(identity, .lower), .optimizer = trainer.identity(), .initial_eval = before, .initial_by_kind = initial_by_kind, .final_eval = after, .final_by_kind = try metricsByKind(a, final_predictions, temperatures), .final_uncalibrated_eval = try metrics(final_predictions, .{ 1, 1, 1 }), .temperature = temperatures, .calibration_examples = if (calibration) |calib| calib.examples.len else 0, .action_head_trained = false, .host_peak_bytes = budget.peak };
+    try exportModel(permanent, io, c, config_json.value, laya.packing, assets, admitted.export_tensors, &trainer, temperatures);
+    const result = .{ .format = "antfly-laya-finetune/v1", .status = "complete", .backend = c.backend, .objective = c.objective, .source_sha256 = .{ .config = std.fmt.bytesToHex(data.digest(config_bytes), .lower), .tokenizer = std.fmt.bytesToHex(data.digest(tokenizer_bytes), .lower), .weights = std.fmt.bytesToHex(admitted.weights_sha256, .lower) }, .calibration_sha256 = if (calibration) |calib| std.fmt.bytesToHex(calib.sha256, .lower) else null, .resumed_microbatches = completed, .train_examples = train.examples.len, .train_records = train.records.len, .packing = laya.packing.mode, .train_sha256 = std.fmt.bytesToHex(train.sha256, .lower), .eval_sha256 = std.fmt.bytesToHex(eval.sha256, .lower), .run_sha256 = std.fmt.bytesToHex(identity, .lower), .optimizer = trainer.identity(), .initial_eval = before, .initial_by_kind = initial_by_kind, .final_eval = after, .final_by_kind = try metricsByKind(a, final_predictions, temperatures), .final_uncalibrated_eval = try metrics(final_predictions, .{ 1, 1, 1 }), .temperature = temperatures, .calibration_examples = if (calibration) |calib| calib.examples.len else 0, .action_head_trained = false, .host_peak_bytes = budget.peak };
     try writeJson(io, try path(permanent, c.output_dir, "report.json"), result);
     try event(io, std.Io.File.stdout(), result);
 }

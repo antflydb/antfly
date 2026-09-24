@@ -60,11 +60,25 @@ pub fn forward(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder: CT, ma
     const host = try cb.toFloat32(hidden, a);
     defer a.free(host);
     if (host.len != batch * seq * dim) return error.UnexpectedOutputShape;
+    const tokens = try a.alloc(i64, markers.len);
+    defer a.free(tokens);
+    for (markers, tokens, 0..) |pos, *token, i| token.* = if (pos < 0) -1 else @intCast((i / count) * seq + @as(usize, @intCast(pos)));
+    const anchors = try a.alloc(usize, batch);
+    defer a.free(anchors);
+    for (anchors, 0..) |*anchor, row| anchor.* = row * seq;
+    return scoreHost(cb, a, cfg, host, tokens, anchors, count, dim);
+}
+
+/// Score `anchors.len` decisions from host hidden states `[tokens, dim]`.
+/// `markers` holds `[decisions * count]` token indices into `host`, -1 padded;
+/// each decision's action features read the hidden state at its anchor.
+fn scoreHost(cb: *const CB, a: std.mem.Allocator, cfg: Config, host: []const f32, markers: []const i64, anchors: []const usize, count: usize, dim: usize) ![]Tensor {
+    const batch = anchors.len;
+    if (markers.len != batch * count) return error.UnexpectedOutputShape;
     const gathered = try a.alloc(f32, batch * count * dim);
     defer a.free(gathered);
-    for (markers, 0..) |pos, i| {
-        const row = i / count;
-        const offset = (row * seq + @as(usize, @intCast(@max(pos, 0)))) * dim;
+    for (markers, 0..) |token, i| {
+        const offset = @as(usize, @intCast(@max(token, 0))) * dim;
         @memcpy(gathered[i * dim ..][0..dim], host[offset..][0..dim]);
     }
     const m = try cb.fromFloat32Shape(gathered, &.{ @intCast(batch * count), @intCast(dim) });
@@ -87,7 +101,7 @@ pub fn forward(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder: CT, ma
     defer a.free(features);
     for (0..batch) |row| {
         const dst = features[row * (dim + 4) ..][0 .. dim + 4];
-        @memcpy(dst[0..dim], host[row * seq * dim ..][0..dim]);
+        @memcpy(dst[0..dim], host[anchors[row] * dim ..][0..dim]);
         const z = logits[row * count ..][0..count];
         var max: f32 = -std.math.inf(f32);
         var valid: usize = 0;
@@ -133,6 +147,41 @@ pub fn forward(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder: CT, ma
     errdefer result[0].deinit();
     result[1] = try Tensor.initFloat32(a, "action_logits", &.{ @intCast(batch), @intCast(cfg.n_act) }, act);
     return result;
+}
+
+/// Tree-packed decision head for one row (pipelines/laya_tree.zig). `encoder`
+/// is `[seq, dim]`; `head_bias` is the row's dense `[seq, seq]` visibility
+/// mask. Trunk tokens (`kinds` = -1) receive no question-type embedding.
+/// Returns logits `[questions, width]` and action logits `[questions, n_act]`.
+pub fn forwardPacked(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder: CT, head_bias: CT, kinds: []const i64, markers: []const i64, anchors: []const i64, width: usize, dim: usize) ![]Tensor {
+    const seq = kinds.len;
+    const questions = anchors.len;
+    if (seq == 0 or questions == 0 or width < 2 or width > cfg.maxOptions() or markers.len != questions * width or dim < 64 or dim % 64 != 0) return error.InvalidLayaInputs;
+    const type_weight = try cb.getWeight("model.type_emb.weight");
+    defer cb.free(type_weight);
+    const table = try cb.toFloat32(type_weight, a);
+    defer a.free(table);
+    if (table.len != 3 * dim) return error.InvalidLayaWeights;
+    const types = try a.alloc(f32, seq * dim);
+    defer a.free(types);
+    for (kinds, 0..) |kind, i| {
+        const dst = types[i * dim ..][0..dim];
+        if (kind < 0) @memset(dst, 0) else @memcpy(dst, table[@as(usize, @intCast(kind)) * dim ..][0..dim]);
+    }
+    const type_ct = try cb.fromFloat32Shape(types, &.{ @intCast(seq), @intCast(dim) });
+    defer cb.free(type_ct);
+    const mask = try a.alloc(i64, seq);
+    defer a.free(mask);
+    @memset(mask, 1);
+    const hidden = try layers(cb, a, cfg, try cb.add(encoder, type_ct), mask, head_bias, 1, seq, dim);
+    defer cb.free(hidden);
+    const host = try cb.toFloat32(hidden, a);
+    defer a.free(host);
+    if (host.len != seq * dim) return error.UnexpectedOutputShape;
+    const offsets = try a.alloc(usize, questions);
+    defer a.free(offsets);
+    for (anchors, offsets) |anchor, *offset| offset.* = @intCast(anchor);
+    return scoreHost(cb, a, cfg, host, markers, offsets, width, dim);
 }
 
 fn forwardCudaTail(cb: *const CB, a: std.mem.Allocator, cfg: Config, hidden: CT, markers: []const i64, batch: usize, seq: usize, count: usize, dim: usize) ![]Tensor {
@@ -184,7 +233,13 @@ pub fn transform(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder: CT, 
     defer cb.free(type_weight);
     const types = try cb.embeddingLookup(type_weight, repeated, batch * seq, dim);
     defer cb.free(types);
-    var hidden = try cb.add(encoder, types);
+    return layers(cb, a, cfg, try cb.add(encoder, types), mask, null, batch, seq, dim);
+}
+
+/// Pre-norm TransformerEncoder layers. Takes ownership of `input`.
+fn layers(cb: *const CB, a: std.mem.Allocator, cfg: Config, input: CT, mask: []const i64, bias: ?CT, batch: usize, seq: usize, dim: usize) !CT {
+    _ = a;
+    var hidden = input;
     errdefer cb.free(hidden);
     for (0..cfg.head_layers) |layer| {
         try cb.checkExecutionControl();
@@ -205,7 +260,7 @@ pub fn transform(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder: CT, 
         defer cb.free(k);
         const v = try cb.sliceLastDim(qkv, dim * 2, dim * 3);
         defer cb.free(v);
-        const attn = try cb.scaledDotProductAttention(q, k, v, mask, null, batch, seq, dim / 64, 64);
+        const attn = try cb.scaledDotProductAttention(q, k, v, mask, bias, batch, seq, dim / 64, 64);
         defer cb.free(attn);
         const proj = try linear(cb, attn, try std.fmt.bufPrint(&buf, "{s}.self_attn.out_proj", .{prefix}), batch * seq, dim, dim);
         defer cb.free(proj);

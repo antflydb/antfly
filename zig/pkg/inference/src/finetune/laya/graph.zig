@@ -11,13 +11,18 @@ const B = ml.Builder;
 const Id = ml.NodeId;
 const Shape = ml.Shape;
 
-pub const Layout = struct { batch: u32, sequence: u32, options: u32 };
+/// `questions` counts decision rows: one per unpacked sequence, or every
+/// question of every tree-packed row (pipelines/laya_tree.zig).
+pub const Layout = struct { batch: u32, sequence: u32, options: u32, questions: u32 };
 pub const Inputs = struct {
     ids: Id,
-    kinds: Id, // repeated once per token
-    markers: Id, // flattened batch-offset token indices
-    encoder_bias: Id, // [B*encoder_heads,S,S], padding only
-    head_bias: Id, // [B*head_heads,S,S], padding only
+    kinds: Id, // per token; trunk tokens use any valid index with type_mask 0
+    type_mask: Id, // [N,H], 0 where a token receives no question-type embedding
+    markers: Id, // flattened batch-offset token indices, [questions*options]
+    encoder_bias: Id, // [B*encoder_heads,S,S], padding and tree visibility
+    local_bias: Id, // encoder_bias plus the logical sliding window
+    head_bias: Id, // [B*head_heads,S,S], padding and tree visibility
+    rope: [2][2]Id, // [global, local][cos, sin], each [N*heads, head_dim/2]
 };
 pub const Dropout = struct { node: Id, probability: f32 };
 pub const Built = struct {
@@ -88,24 +93,28 @@ fn attention(b: *B, built: *Built, q: Id, k: Id, v: Id, bias: Id, l: Layout, h: 
     return b.reshape(try b.transpose(shaped, &.{ 0, 2, 1, 3 }), Shape.init(.f32, &.{ l.batch * l.sequence, h * d }));
 }
 
-// Split-half RoPE expressed as primitives, preserving the physical token/head
-// layout and an exact VJP without depending on inference-only fused kernels.
-fn rope(b: *B, x: Id, l: Layout, h: u32, d: u32, theta: f32) !Id {
-    const a = b.graph.allocator;
-    const n = l.batch * l.sequence * h;
-    const cosine = try a.alloc(f32, n * (d / 2));
-    defer a.free(cosine);
+/// Split-half RoPE tables for `positions` (one logical position per token),
+/// laid out `[tokens * heads, d/2]` to match `rope`.
+pub fn ropeTables(a: std.mem.Allocator, positions: []const i64, h: u32, d: u32, theta: f32) ![2][]f32 {
+    const cosine = try a.alloc(f32, positions.len * h * (d / 2));
+    errdefer a.free(cosine);
     const sine = try a.alloc(f32, cosine.len);
-    defer a.free(sine);
-    for (0..n) |row| for (0..d / 2) |i| {
-        const pos = (row / h) % l.sequence;
+    for (0..positions.len * h) |row| for (0..d / 2) |i| {
+        const pos = positions[row / h];
         const angle = @as(f32, @floatFromInt(pos)) / std.math.pow(f32, theta, @as(f32, @floatFromInt(2 * i)) / @as(f32, @floatFromInt(d)));
         cosine[row * (d / 2) + i] = @cos(angle);
         sine[row * (d / 2) + i] = @sin(angle);
     };
-    const shape = Shape.init(.f32, &.{ n, d / 2 });
-    const c = try b.tensorConst(cosine, shape);
-    const s = try b.tensorConst(sine, shape);
+    return .{ cosine, sine };
+}
+
+// Split-half RoPE expressed as primitives, preserving the physical token/head
+// layout and an exact VJP without depending on inference-only fused kernels.
+// Tables are runtime inputs because tree-packed rows restart positions.
+fn rope(b: *B, x: Id, tables: [2]Id, l: Layout, h: u32, d: u32) !Id {
+    const n = l.batch * l.sequence * h;
+    const c = tables[0];
+    const s = tables[1];
     const reshaped = try b.reshape(x, Shape.init(.f32, &.{ n, d }));
     const left = try b.sliceLastDim(reshaped, 0, d / 2);
     const right = try b.sliceLastDim(reshaped, d / 2, d);
@@ -123,8 +132,9 @@ pub fn validate(cfg: modern.Config, l: Layout, head_dropout: f32) !void {
         cfg.vocab_size == 0 or cfg.vocab_size > 1024 * 1024 or cfg.intermediate_size == 0 or cfg.intermediate_size > 32768 or lc.head_layers > 16 or
         !std.math.isFinite(cfg.global_rope_theta) or cfg.global_rope_theta <= 0 or !std.math.isFinite(cfg.local_rope_theta) or cfg.local_rope_theta <= 0 or
         !std.math.isFinite(cfg.layer_norm_eps) or cfg.layer_norm_eps <= 0 or
-        l.batch == 0 or l.batch > 128 or l.sequence == 0 or l.sequence > lc.max_len or
-        l.options < 2 or l.options > 20 or !std.math.isFinite(head_dropout) or head_dropout < 0 or head_dropout >= 1)
+        l.batch == 0 or l.batch > 128 or l.sequence == 0 or l.sequence > (if (lc.packing.enabled()) lc.packing.max_packed_len else lc.max_len) or
+        l.questions < l.batch or l.questions > 512 or (!lc.packing.enabled() and l.questions != l.batch) or
+        l.options < 2 or l.options > lc.maxOptions() or !std.math.isFinite(head_dropout) or head_dropout < 0 or head_dropout >= 1)
         return error.InvalidLayaTrainingLayout;
     // Bound the materialized reference attention before allocating constants.
     if (@as(u64, l.batch) * l.sequence * l.sequence * @max(cfg.num_attention_heads, cfg.hidden_size / 64) > 64 * 1024 * 1024)
@@ -138,27 +148,25 @@ pub fn build(b: *B, cfg: modern.Config, l: Layout, head_dropout: f32) !Built {
     const n = l.batch * l.sequence;
     const nh = cfg.num_attention_heads;
     const hh = h / 64;
+    const table = Shape.init(.f32, &.{ n * nh, (h / nh) / 2 });
     var result = Built{ .inputs = .{
         .ids = try b.parameter("__laya_ids", Shape.init(.i32, &.{n})),
         .kinds = try b.parameter("__laya_kinds", Shape.init(.i32, &.{n})),
-        .markers = try b.parameter("__laya_markers", Shape.init(.i32, &.{l.batch * l.options})),
+        .type_mask = try b.parameter("__laya_type_mask", Shape.init(.f32, &.{ n, h })),
+        .markers = try b.parameter("__laya_markers", Shape.init(.i32, &.{l.questions * l.options})),
         .encoder_bias = try b.parameter("__laya_encoder_bias", Shape.init(.f32, &.{ l.batch * nh, l.sequence, l.sequence })),
+        .local_bias = try b.parameter("__laya_local_bias", Shape.init(.f32, &.{ l.batch * nh, l.sequence, l.sequence })),
         .head_bias = try b.parameter("__laya_head_bias", Shape.init(.f32, &.{ l.batch * hh, l.sequence, l.sequence })),
+        .rope = .{
+            .{ try b.parameter("__laya_rope_global_cos", table), try b.parameter("__laya_rope_global_sin", table) },
+            .{ try b.parameter("__laya_rope_local_cos", table), try b.parameter("__laya_rope_local_sin", table) },
+        },
     }, .logits = ml.null_node };
     errdefer result.deinit(b.graph.allocator);
     const embedding = try param(b, "encoder.embeddings.tok_embeddings", "weight", &.{ cfg.vocab_size, h });
     var x = try b.gather(embedding, result.inputs.ids, Shape.init(.f32, &.{ n, h }));
     x = try norm(b, x, "encoder.embeddings.norm", h, cfg.layer_norm_eps, false);
     try result.trace(b.graph.allocator, "encoder.embeddings.norm", x);
-    const local = try b.graph.allocator.alloc(f32, l.batch * nh * l.sequence * l.sequence);
-    defer b.graph.allocator.free(local);
-    for (local, 0..) |*value, i| {
-        const q = (i / l.sequence) % l.sequence;
-        const k = i % l.sequence;
-        const distance = @max(q, k) - @min(q, k);
-        value.* = if (distance > cfg.local_attention_window / 2) -1e9 else 0;
-    }
-    const local_bias = try b.add(result.inputs.encoder_bias, try b.tensorConst(local, b.graph.node(result.inputs.encoder_bias).output_shape));
     for (0..cfg.num_hidden_layers) |layer| {
         var buffer: [128]u8 = undefined;
         var names: [256]u8 = undefined;
@@ -166,11 +174,11 @@ pub fn build(b: *B, cfg: modern.Config, l: Layout, head_dropout: f32) !Built {
         const normalized = if (layer == 0) x else try norm(b, x, try std.fmt.bufPrint(&names, "{s}.attn_norm", .{prefix}), h, cfg.layer_norm_eps, false);
         const qkv = try linear(b, normalized, try std.fmt.bufPrint(&names, "{s}.attn.Wqkv", .{prefix}), n, h, h * 3, false);
         const global = layer % cfg.global_attn_every_n_layers == 0;
-        const theta = if (global) cfg.global_rope_theta else cfg.local_rope_theta;
-        const q = try rope(b, try b.sliceLastDim(qkv, 0, h), l, nh, h / nh, theta);
-        const k = try rope(b, try b.sliceLastDim(qkv, h, h * 2), l, nh, h / nh, theta);
+        const tables = result.inputs.rope[if (global) 0 else 1];
+        const q = try rope(b, try b.sliceLastDim(qkv, 0, h), tables, l, nh, h / nh);
+        const k = try rope(b, try b.sliceLastDim(qkv, h, h * 2), tables, l, nh, h / nh);
         const v = try b.sliceLastDim(qkv, h * 2, h * 3);
-        const attn = try attention(b, &result, q, k, v, if (global) result.inputs.encoder_bias else local_bias, l, nh, h / nh, 0);
+        const attn = try attention(b, &result, q, k, v, if (global) result.inputs.encoder_bias else result.inputs.local_bias, l, nh, h / nh, 0);
         x = try b.add(x, try linear(b, attn, try std.fmt.bufPrint(&names, "{s}.attn.Wo", .{prefix}), n, h, h, false));
         const normed = try norm(b, x, try std.fmt.bufPrint(&names, "{s}.mlp_norm", .{prefix}), h, cfg.layer_norm_eps, false);
         const up = try linear(b, normed, try std.fmt.bufPrint(&names, "{s}.mlp.Wi", .{prefix}), n, h, cfg.intermediate_size * 2, false);
@@ -182,7 +190,7 @@ pub fn build(b: *B, cfg: modern.Config, l: Layout, head_dropout: f32) !Built {
     x = try norm(b, x, "encoder.final_norm", h, cfg.layer_norm_eps, false);
     try result.trace(b.graph.allocator, "encoder.final_norm", x);
     const types = try param(b, "type_emb", "weight", &.{ 3, h });
-    x = try b.add(x, try b.gather(types, result.inputs.kinds, Shape.init(.f32, &.{ n, h })));
+    x = try b.add(x, try b.mul(try b.gather(types, result.inputs.kinds, Shape.init(.f32, &.{ n, h })), result.inputs.type_mask));
     for (0..lc.head_layers) |layer| {
         var buffer: [128]u8 = undefined;
         var names: [256]u8 = undefined;
@@ -203,11 +211,11 @@ pub fn build(b: *B, cfg: modern.Config, l: Layout, head_dropout: f32) !Built {
         x = try b.add(x, try drop(b, &result, down, head_dropout));
         try result.trace(b.graph.allocator, prefix, x);
     }
-    const m = try b.gather(x, result.inputs.markers, Shape.init(.f32, &.{ l.batch * l.options, h }));
+    const m = try b.gather(x, result.inputs.markers, Shape.init(.f32, &.{ l.questions * l.options, h }));
     const normalized = try norm(b, m, "scorer.0", h, 1e-5, true);
-    const up = try linear(b, normalized, "scorer.1", l.batch * l.options, h, h, true);
-    const logits = try linear(b, try b.geluExact(up), "scorer.3", l.batch * l.options, h, 1, true);
-    result.logits = try b.reshape(logits, Shape.init(.f32, &.{ l.batch, l.options }));
+    const up = try linear(b, normalized, "scorer.1", l.questions * l.options, h, h, true);
+    const logits = try linear(b, try b.geluExact(up), "scorer.3", l.questions * l.options, h, 1, true);
+    result.logits = try b.reshape(logits, Shape.init(.f32, &.{ l.questions, l.options }));
     return result;
 }
 
@@ -217,7 +225,7 @@ test "laya training graph retains upstream parameters and all head dropout sites
     defer graph.deinit();
     var b = B.init(&graph);
     const cfg = modern.Config{ .laya = .{ .head_layers = 1 }, .vocab_size = 64, .hidden_size = 64, .num_hidden_layers = 2, .num_attention_heads = 2, .intermediate_size = 96, .checkpoint_layout = .huggingface_fused_qkv_no_bias, .rope_interleaved = false };
-    var built = try build(&b, cfg, .{ .batch = 2, .sequence = 8, .options = 3 }, 0.1);
+    var built = try build(&b, cfg, .{ .batch = 2, .sequence = 8, .options = 3, .questions = 2 }, 0.1);
     defer built.deinit(a);
     try std.testing.expectEqual(@as(usize, 4), built.dropouts.items.len);
     try std.testing.expectEqual(@as(i64, 6), graph.node(built.logits).output_shape.numElements().?);
