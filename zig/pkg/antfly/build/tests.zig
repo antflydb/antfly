@@ -1303,6 +1303,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "reranker admission precedes candidate rendering",
         "reranker component paging includes the post-rerank offset",
         "reranker paging preserves the underlying retrieval total",
+        "reranker templates render media into image documents",
+        "reranker rendering parses only helper directives",
         "query dependency errors expose a stable JSON retry contract",
         "wildcard matching distinguishes operators from escaped literals",
         "wildcard literal escaping round trips metacharacters",
@@ -1460,6 +1462,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lib_unit_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = compileFiltersWithAnchors(b, &.{ "api module compiles", "metadata module compiles" }, lib_unit_filters),
+        // The API compile anchor pulls in the whole API module; macOS Debug
+        // codegen measured 11.04 GB, above the 10 GiB aggregate default.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -4314,6 +4319,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "Lease executor accepts optional CertificateRequest with projected CA and verified hostname",
             "Lease executor accepts TLS 1.2 optional CertificateRequest",
             "Lease executor rejects optional CertificateRequest hostname mismatch",
+            "linked rerank documents become server content parts with attachment references",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

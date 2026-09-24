@@ -72,6 +72,10 @@ const graph_paths = @import("../graph/paths.zig");
 const graph_query_mod = @import("../graph/query.zig");
 const reranking_runtime = @import("../reranking/mod.zig");
 const template_mod = @import("../template.zig");
+const template_remote = if (builtin.os.tag == .freestanding)
+    @import("../storage/db/template_remote_stub.zig")
+else
+    @import("../template_remote.zig");
 const table_catalog = @import("table_catalog.zig");
 const table_router = @import("table_router.zig");
 const tables_api = @import("tables.zig");
@@ -15143,18 +15147,14 @@ fn applyReranker(
         try std.fmt.allocPrint(alloc, "{{{{{s}}}}}", .{cfg.field});
     defer alloc.free(doc_template);
 
-    const documents = try alloc.alloc([]const u8, rerank_count);
-    defer alloc.free(documents);
-    var initialized_docs: usize = 0;
-    defer {
-        for (documents[0..initialized_docs]) |document| alloc.free(document);
-    }
-
+    var documents = try RerankerDocuments.init(alloc, rerank_count);
+    defer documents.deinit();
+    const render_config = rerankerRenderConfig(runtime_cfg, req, io);
     for (result.hits[0..rerank_count], 0..) |hit, i| {
         if ((i & 31) == 0) try inference_context.check();
-        documents[i] = try renderRerankerDocument(alloc, doc_template, hit);
-        initialized_docs += 1;
+        try documents.render(i, doc_template, hit, render_config);
     }
+    const content = try documents.content();
 
     const dependencies: reranking_runtime.Options = .{
         .antfly_provider = runtime_cfg.antfly_provider,
@@ -15171,15 +15171,15 @@ fn applyReranker(
         .execution_context = inference_context,
     };
     const scores = if (runtime_cfg.reranker_runtime) |runtime|
-        runtime.rerankAdmitted(alloc, cfg, dependencies, req.reranker_query_text, documents)
+        runtime.rerankContentAdmitted(alloc, cfg, dependencies, req.reranker_query_text, content)
     else
-        reranking_runtime.rerankDocumentsWithOptions(
+        reranking_runtime.rerankContentWithOptions(
             alloc,
             http,
             cfg,
             dependencies,
             req.reranker_query_text,
-            documents,
+            content,
         );
     const owned_scores = scores catch |err| switch (err) {
         error.InvalidRateLimitPolicy,
@@ -15191,6 +15191,9 @@ fn applyReranker(
         error.UnsupportedRerankerProvider,
         error.MissingVertexCredentials,
         error.SecretNotFound,
+        // The template produced images for a provider or model that cannot
+        // score them; the query's reranker configuration must change.
+        error.RerankerMediaUnsupported,
         => return error.InvalidQueryRequest,
         else => {
             std.log.debug("reranker provider request failed provider={s} err={s}", .{
@@ -15267,14 +15270,142 @@ fn rerankerOutputLimit(query_limit: u32, top_n: ?u32) u32 {
     return top_n orelse query_limit;
 }
 
-fn renderRerankerDocument(
-    alloc: std.mem.Allocator,
-    doc_template: []const u8,
-    hit: db_mod.types.SearchHit,
-) ![]const u8 {
-    const raw = hit.stored_data orelse return try alloc.dupe(u8, "");
-    return template_mod.renderDocument(alloc, doc_template, raw) catch try alloc.dupe(u8, "");
+fn rerankerRenderConfig(
+    runtime_cfg: ManagedReadRuntimeConfig,
+    req: db_mod.types.SearchRequest,
+    io: std.Io,
+) template_remote.RenderConfig {
+    var config: template_remote.RenderConfig = .{};
+    if (comptime @hasField(template_remote.RenderConfig, "remote_content")) config.remote_content = runtime_cfg.remote_content;
+    if (comptime @hasField(template_remote.RenderConfig, "secret_store")) config.secret_store = runtime_cfg.secret_store;
+    if (comptime @hasField(template_remote.RenderConfig, "io")) config.io = io;
+    if (comptime @hasField(template_remote.RenderConfig, "deadline_ns")) config.deadline_ns = req.execution_deadline_ns;
+    if (comptime @hasField(template_remote.RenderConfig, "cancellation")) {
+        if (req.cancellation) |token| if (token.ptr != null and token.is_cancelled_fn != null) {
+            config.cancellation = scraping.CancellationToken.fromCallback(token.ptr.?, token.is_cancelled_fn.?);
+        };
+    }
+    return config;
 }
+
+/// Only the directives the template helpers emit select part parsing. Plain
+/// text that merely contains `<<<`, such as indexed logs, must reach the
+/// scorer unchanged rather than be trimmed or stripped by the part parser.
+fn hasRenderedDirective(rendered: []const u8) bool {
+    for ([_][]const u8{ "<<<dotprompt:media:url ", "<<<error:status=", "<<<error:message=" }) |prefix| {
+        if (std.mem.indexOf(u8, rendered, prefix) != null) return true;
+    }
+    return false;
+}
+
+fn isFatalRerankerRenderError(err: anyerror) bool {
+    return err == error.OutOfMemory or err == error.Timeout or err == error.Canceled or err == error.Cancelled;
+}
+
+/// Rendered reranker candidates. A template renders each hit to text; one
+/// that uses `media` or `remoteMedia` also yields image parts, which only a
+/// multimodal Antfly reranker can score.
+const RerankerDocuments = struct {
+    alloc: std.mem.Allocator,
+    texts: [][]const u8,
+    /// Owned parts for documents whose rendering produced media markers.
+    owned_parts: []?[]template_mod.ContentPart,
+    /// Single text part per document, used as the parts view of a document
+    /// without media when another document in the request has media.
+    text_parts: []template_mod.ContentPart,
+    parts_view: [][]const template_mod.ContentPart,
+    initialized: usize = 0,
+
+    fn init(alloc: std.mem.Allocator, count: usize) !RerankerDocuments {
+        const texts = try alloc.alloc([]const u8, count);
+        errdefer alloc.free(texts);
+        const owned_parts = try alloc.alloc(?[]template_mod.ContentPart, count);
+        errdefer alloc.free(owned_parts);
+        @memset(owned_parts, null);
+        const text_parts = try alloc.alloc(template_mod.ContentPart, count);
+        errdefer alloc.free(text_parts);
+        const parts_view = try alloc.alloc([]const template_mod.ContentPart, count);
+        return .{ .alloc = alloc, .texts = texts, .owned_parts = owned_parts, .text_parts = text_parts, .parts_view = parts_view };
+    }
+
+    fn deinit(self: *RerankerDocuments) void {
+        for (self.texts[0..self.initialized]) |text| self.alloc.free(text);
+        for (self.owned_parts) |maybe_parts| if (maybe_parts) |parts| template_mod.freeContentParts(self.alloc, parts);
+        self.alloc.free(self.texts);
+        self.alloc.free(self.owned_parts);
+        self.alloc.free(self.text_parts);
+        self.alloc.free(self.parts_view);
+        self.* = undefined;
+    }
+
+    /// Renders hit `index`. A hit without stored data, or one whose template
+    /// fails to render, becomes an empty document so one bad row cannot fail
+    /// the query; cancellation, deadline, and allocation failures propagate.
+    fn render(
+        self: *RerankerDocuments,
+        index: usize,
+        doc_template: []const u8,
+        hit: db_mod.types.SearchHit,
+        config: template_remote.RenderConfig,
+    ) !void {
+        std.debug.assert(index == self.initialized);
+        const raw = hit.stored_data orelse {
+            self.texts[index] = try self.alloc.dupe(u8, "");
+            self.initialized += 1;
+            return;
+        };
+        const rendered = template_remote.renderJsonToTextWithConfig(self.alloc, doc_template, raw, config) catch |err| {
+            if (isFatalRerankerRenderError(err)) return err;
+            self.texts[index] = try self.alloc.dupe(u8, "");
+            self.initialized += 1;
+            return;
+        };
+        if (!hasRenderedDirective(rendered)) {
+            self.texts[index] = rendered;
+            self.initialized += 1;
+            return;
+        }
+        defer self.alloc.free(rendered);
+        // Markers are present: split media from text and drop the error
+        // directives a failed remote fetch leaves behind.
+        const parts = try template_mod.textToParts(self.alloc, rendered);
+        var joined: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer joined.deinit(self.alloc);
+        var has_media = false;
+        for (parts) |part| switch (part) {
+            .text => |text| {
+                if (joined.items.len > 0) try joined.append(self.alloc, '\n');
+                try joined.appendSlice(self.alloc, text);
+            },
+            else => has_media = true,
+        };
+        self.texts[index] = try joined.toOwnedSlice(self.alloc);
+        self.initialized += 1;
+        if (has_media) {
+            self.owned_parts[index] = parts;
+        } else {
+            template_mod.freeContentParts(self.alloc, parts);
+        }
+    }
+
+    fn content(self: *RerankerDocuments) !reranking_runtime.Documents {
+        std.debug.assert(self.initialized == self.texts.len);
+        var has_media = false;
+        for (self.owned_parts) |parts| if (parts != null) {
+            has_media = true;
+        };
+        if (!has_media) return .{ .texts = self.texts };
+        for (self.parts_view, self.owned_parts, self.text_parts, self.texts) |*view, owned, *text_part, text| {
+            if (owned) |parts| {
+                view.* = parts;
+            } else {
+                text_part.* = .{ .text = text };
+                view.* = @as(*const [1]template_mod.ContentPart, text_part);
+            }
+        }
+        return .{ .texts = self.texts, .parts = self.parts_view };
+    }
+};
 
 fn pageSearchHitsAfterScoreTransforms(
     alloc: std.mem.Allocator,
@@ -20721,6 +20852,89 @@ fn consumerTests() type {
                 .{ .reranker_runtime = &runtime },
             ));
             try std.testing.expectEqual(@as(usize, 1), runtime.admission.stats().in_flight);
+        }
+
+        test "reranker rendering parses only helper directives" {
+            try std.testing.expect(hasRenderedDirective("page <<<dotprompt:media:url data:image/png;base64,AA==>>>"));
+            try std.testing.expect(hasRenderedDirective("<<<error:message=fetch failed>>>"));
+            try std.testing.expect(!hasRenderedDirective("  build log <<< merge conflict >>>  "));
+            try std.testing.expect(!hasRenderedDirective("<<<error without a directive shape"));
+        }
+
+        test "reranker templates render media into image documents" {
+            const alloc = std.testing.allocator;
+            const State = struct {
+                text_calls: usize = 0,
+                document_calls: usize = 0,
+
+                fn dense(_: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![][]f32 {
+                    return try a.alloc([]f32, 0);
+                }
+                fn sparse(_: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![]db_embedder.SparseEmbedding {
+                    return try a.alloc(db_embedder.SparseEmbedding, 0);
+                }
+                fn rerankTexts(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const u8, documents: []const []const u8, _: inference_request_context.RequestContext) anyerror![]f32 {
+                    const state: *@This() = @ptrCast(@alignCast(ptr));
+                    state.text_calls += 1;
+                    try std.testing.expectEqualStrings("scanned invoice", documents[0]);
+                    const scores = try a.alloc(f32, documents.len);
+                    for (scores, 0..) |*score, i| score.* = @floatFromInt(i);
+                    return scores;
+                }
+                fn rerankDocuments(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const u8, documents: []const []const template_mod.ContentPart, _: inference_request_context.RequestContext) anyerror![]f32 {
+                    const state: *@This() = @ptrCast(@alignCast(ptr));
+                    state.document_calls += 1;
+                    try std.testing.expectEqual(@as(usize, 2), documents.len);
+                    // Hit with an image: its text, then the decoded data URI.
+                    try std.testing.expectEqualStrings("scanned invoice", documents[0][0].text);
+                    try std.testing.expectEqualStrings("image/png", documents[0][1].binary.mime_type);
+                    try std.testing.expectEqualSlices(u8, &.{ 0x89, 'P', 'N', 'G' }, documents[0][1].binary.data);
+                    // Hit without an image is sent as a single text part.
+                    try std.testing.expectEqual(@as(usize, 1), documents[1].len);
+                    try std.testing.expectEqualStrings("plain notes", documents[1][0].text);
+                    const scores = try a.alloc(f32, 2);
+                    scores[0] = 0.2;
+                    scores[1] = 0.9;
+                    return scores;
+                }
+                fn capabilities(_: *anyopaque, _: std.mem.Allocator, _: []const u8, task: @import("../inference/work.zig").Task) anyerror!@import("../inference/work.zig").InferenceCapabilities {
+                    return .{ .task = task, .input_modalities = .{ .text = true, .image = true }, .input_granularity = .item, .output = .ranked_items, .result_cardinality = .one_per_request };
+                }
+            };
+            var state = State{};
+            const local = managed_embedder.AntflyProvider{
+                .ptr = &state,
+                .embed_dense_texts = State.dense,
+                .embed_sparse_texts = State.sparse,
+                .rerank_texts_with_context = State.rerankTexts,
+                .rerank_documents_with_context = State.rerankDocuments,
+                .model_capabilities = State.capabilities,
+            };
+            var hits = [_]db_mod.types.SearchHit{
+                .{ .id = @constCast("doc:1"), .stored_data = @constCast("{\"body\":\"scanned invoice\",\"page\":\"data:image/png;base64,iVBORw==\"}") },
+                .{ .id = @constCast("doc:2"), .stored_data = @constCast("{\"body\":\"plain notes\"}") },
+            };
+            var result = db_mod.types.SearchResult{ .alloc = alloc, .hits = &hits, .total_hits = 2 };
+            var meta = query_api.QueryResponseMeta{};
+            _ = try applyReranker(alloc, .{
+                .reranker = .{ .provider = .antfly, .model = "colqwen", .template = "{{body}}{{#if page}}{{media url=page}}{{/if}}" },
+                .reranker_query_text = "invoice total",
+                .limit = 2,
+            }, &result, &meta, .{ .antfly_provider = local });
+            try std.testing.expectEqual(@as(usize, 1), state.document_calls);
+            try std.testing.expectEqual(@as(usize, 0), state.text_calls);
+            try std.testing.expectEqualStrings("doc:2", result.hits[0].id);
+
+            // A template without media keeps the text path.
+            var text_hits = [_]db_mod.types.SearchHit{.{ .id = @constCast("doc:1"), .stored_data = @constCast("{\"body\":\"scanned invoice\"}") }};
+            var text_result = db_mod.types.SearchResult{ .alloc = alloc, .hits = &text_hits, .total_hits = 1 };
+            _ = try applyReranker(alloc, .{
+                .reranker = .{ .provider = .antfly, .model = "colqwen", .field = "body" },
+                .reranker_query_text = "invoice total",
+                .limit = 1,
+            }, &text_result, &meta, .{ .antfly_provider = local });
+            try std.testing.expectEqual(@as(usize, 1), state.text_calls);
+            try std.testing.expectEqual(@as(usize, 1), state.document_calls);
         }
 
         test "reranker paging preserves the underlying retrieval total" {

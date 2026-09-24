@@ -57,14 +57,9 @@ pub fn parseReadImagesBody(allocator: std.mem.Allocator, body: []const u8) !std.
     return std.json.parseFromSlice(types.ReadRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
-/// Parse the JSON request body for rerankPrompts.
-pub fn parseRerankPromptsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RerankRequest) {
+/// Parse the JSON request body for rerankDocuments.
+pub fn parseRerankDocumentsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RerankRequest) {
     return std.json.parseFromSlice(types.RerankRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Parse the JSON request body for rerankMultimodalPrompts.
-pub fn parseRerankMultimodalPromptsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RerankMultimodalRequest) {
-    return std.json.parseFromSlice(types.RerankMultimodalRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// Parse the JSON request body for rewriteText.
@@ -145,8 +140,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/predict", .operation_id = "predict", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/predictors", .operation_id = "listPredictors", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/read", .operation_id = "readImages", .request_body = .buffered, .streaming_response = false },
-    .{ .method = "POST", .path = "/rerank", .operation_id = "rerankPrompts", .request_body = .buffered, .streaming_response = false },
-    .{ .method = "POST", .path = "/rerank_multimodal", .operation_id = "rerankMultimodalPrompts", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/rerank", .operation_id = "rerankDocuments", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/rewrite", .operation_id = "rewriteText", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/transcribe", .operation_id = "transcribeAudio", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/transcription/sessions", .operation_id = "createTranscriptionSession", .request_body = .buffered, .streaming_response = false },
@@ -180,8 +174,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "predict")) @compileError("ServerRouter: Impl missing required method 'predict'");
         if (!@hasDecl(Impl, "listPredictors")) @compileError("ServerRouter: Impl missing required method 'listPredictors'");
         if (!@hasDecl(Impl, "readImages")) @compileError("ServerRouter: Impl missing required method 'readImages'");
-        if (!@hasDecl(Impl, "rerankPrompts")) @compileError("ServerRouter: Impl missing required method 'rerankPrompts'");
-        if (!@hasDecl(Impl, "rerankMultimodalPrompts")) @compileError("ServerRouter: Impl missing required method 'rerankMultimodalPrompts'");
+        if (!@hasDecl(Impl, "rerankDocuments")) @compileError("ServerRouter: Impl missing required method 'rerankDocuments'");
         if (!@hasDecl(Impl, "rewriteText")) @compileError("ServerRouter: Impl missing required method 'rewriteText'");
         if (!@hasDecl(Impl, "transcribeAudio")) @compileError("ServerRouter: Impl missing required method 'transcribeAudio'");
         if (!@hasDecl(Impl, "createTranscriptionSession")) @compileError("ServerRouter: Impl missing required method 'createTranscriptionSession'");
@@ -213,8 +206,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/predict", httpx.Handler.bind(self.impl, predict));
             try server.get("/predictors", httpx.Handler.bind(self.impl, listPredictors));
             try server.post("/read", httpx.Handler.bind(self.impl, readImages));
-            try server.post("/rerank", httpx.Handler.bind(self.impl, rerankPrompts));
-            try server.post("/rerank_multimodal", httpx.Handler.bind(self.impl, rerankMultimodalPrompts));
+            try server.post("/rerank", httpx.Handler.bind(self.impl, rerankDocuments));
             try server.post("/rewrite", httpx.Handler.bind(self.impl, rewriteText));
             try server.post("/transcribe", httpx.Handler.bind(self.impl, transcribeAudio));
             try server.post("/transcription/sessions", httpx.Handler.bind(self.impl, createTranscriptionSession));
@@ -297,16 +289,10 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.readImages(ctx);
         }
 
-        /// Rerank prompts by relevance
+        /// Rerank documents by relevance
         /// POST /rerank
-        fn rerankPrompts(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
-            return impl.rerankPrompts(ctx);
-        }
-
-        /// Rerank multimodal documents by relevance
-        /// POST /rerank_multimodal
-        fn rerankMultimodalPrompts(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
-            return impl.rerankMultimodalPrompts(ctx);
+        fn rerankDocuments(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.rerankDocuments(ctx);
         }
 
         /// Rewrite text using Seq2Seq models
@@ -383,8 +369,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn predict(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listPredictors(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn readImages(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn rerankPrompts(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn rerankMultimodalPrompts(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn rerankDocuments(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn rewriteText(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn transcribeAudio(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn createTranscriptionSession(self: *Impl, ctx: *httpx.Context) !httpx.Response

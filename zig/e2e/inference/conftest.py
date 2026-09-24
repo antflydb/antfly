@@ -723,7 +723,7 @@ def api(base_url):
 
         def rerank(self, query: str, documents: list[str], model: str = ""):
             r = self.post(
-                "/rerank", json={"model": model, "query": query, "prompts": documents}
+                "/rerank", json={"model": model, "query": query, "documents": documents}
             )
             _check(r)
             return r.json()

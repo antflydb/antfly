@@ -286,6 +286,94 @@ fn hasBinaryPart(parts: []const template_mod.ContentPart) bool {
     return false;
 }
 
+/// True when any document carries a part other than text.
+pub fn rerankDocumentsHaveMedia(parts: ?[]const []const template_mod.ContentPart) bool {
+    const documents = parts orelse return false;
+    for (documents) |document| for (document) |part| if (part != .text) return true;
+    return false;
+}
+
+/// Build a `/rerank` request that sends `documents`. A document without media
+/// is written as its text; one with media as an array of content parts. When
+/// `attachments` is non-null, binary parts become `attachment:N` references
+/// appended to it for the framed envelope; otherwise they are inlined as
+/// base64 `media` parts.
+fn rerankDocumentsRequestJsonAlloc(
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    query: []const u8,
+    texts: []const []const u8,
+    parts: ?[]const []const template_mod.ContentPart,
+    attachments: ?*std.ArrayListUnmanaged(httpx.attachment_envelope.Attachment),
+) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(alloc);
+    defer output.deinit();
+    var stringify: std.json.Stringify = .{ .writer = &output.writer };
+    try stringify.beginObject();
+    try stringify.objectField("model");
+    try stringify.write(model);
+    try stringify.objectField("query");
+    try stringify.write(query);
+    try stringify.objectField("documents");
+    try stringify.beginArray();
+    for (texts, 0..) |text, i| {
+        const document_parts = if (parts) |documents| documents[i] else &.{};
+        var has_media = false;
+        for (document_parts) |part| if (part != .text) {
+            has_media = true;
+        };
+        if (!has_media) {
+            try stringify.write(text);
+            continue;
+        }
+        try stringify.beginArray();
+        for (document_parts) |part| {
+            try stringify.beginObject();
+            switch (part) {
+                .text => |value| {
+                    try stringify.objectField("type");
+                    try stringify.write("text");
+                    try stringify.objectField("text");
+                    try stringify.write(value);
+                },
+                .media_url => |url| {
+                    try stringify.objectField("type");
+                    try stringify.write("image_url");
+                    try stringify.objectField("image_url");
+                    try stringify.beginObject();
+                    try stringify.objectField("url");
+                    try stringify.write(url);
+                    try stringify.endObject();
+                },
+                .binary => |binary_part| {
+                    try stringify.objectField("type");
+                    try stringify.write("media");
+                    try stringify.objectField("mime_type");
+                    try stringify.write(binary_part.mime_type);
+                    try stringify.objectField("data");
+                    if (attachments) |list| {
+                        var reference_buf: [32]u8 = undefined;
+                        try stringify.write(try std.fmt.bufPrint(&reference_buf, "attachment:{d}", .{list.items.len}));
+                        try list.append(alloc, .{ .mime_type = binary_part.mime_type, .data = binary_part.data });
+                    } else {
+                        try stringify.beginWriteRaw();
+                        try stringify.writer.writeByte('"');
+                        const encoded = try stringify.writer.writableSlice(std.base64.standard.Encoder.calcSize(binary_part.data.len));
+                        _ = std.base64.standard.Encoder.encode(encoded, binary_part.data);
+                        try stringify.writer.writeByte('"');
+                        stringify.endWriteRaw();
+                    }
+                },
+            }
+            try stringify.endObject();
+        }
+        try stringify.endArray();
+    }
+    try stringify.endArray();
+    try stringify.endObject();
+    return try output.toOwnedSlice();
+}
+
 pub const Provider = struct {
     allocator: std.mem.Allocator,
     http: *httpx.Client,
@@ -308,6 +396,9 @@ pub const Provider = struct {
     presence_penalty: ?f32 = null,
     max_response_bytes: ?usize = null,
     framed_attachments: bool = false,
+    /// The server's `/rerank` accepts `documents`. Older servers only accept
+    /// the deprecated text `prompts`, which is sent when this is false.
+    rerank_documents: bool = false,
     /// Non-null means the caller admitted only an exact numeric result. JSON
     /// fallback is forbidden before parsing, even if a server ignores Accept.
     numeric_dense_dimensions: ?usize = null,
@@ -409,6 +500,10 @@ pub const Provider = struct {
 
     pub fn setFramedAttachments(self: *Provider, supported: bool) void {
         self.framed_attachments = supported;
+    }
+
+    pub fn setRerankDocuments(self: *Provider, supported: bool) void {
+        self.rerank_documents = supported;
     }
 
     /// Build the task-neutral controls for every request sent to a distributed
@@ -757,11 +852,63 @@ pub const Provider = struct {
 
     fn rerankImpl(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, query: []const u8, documents: []const []const u8) anyerror!inference.RerankResult {
         const self: *Provider = @ptrCast(@alignCast(ptr));
-        const Request = struct {
-            model: []const u8,
-            query: []const u8,
-            prompts: []const []const u8,
+        return self.rerankDocuments(alloc, model, query, documents, null);
+    }
+
+    /// Rerank `texts`, one per document. `parts`, when non-null, holds each
+    /// document's ordered content parts and may carry media. Servers that
+    /// advertise `rerank_documents_v1` receive `documents`; older servers
+    /// receive the text-only `prompts`, and media is rejected for them.
+    pub fn rerankDocuments(
+        self: *Provider,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        query: []const u8,
+        texts: []const []const u8,
+        parts: ?[]const []const template_mod.ContentPart,
+    ) !inference.RerankResult {
+        if (parts) |documents| if (documents.len != texts.len) return error.InvalidArguments;
+        const has_media = rerankDocumentsHaveMedia(parts);
+        if (!self.rerank_documents) {
+            if (has_media) return error.RerankerMediaUnsupported;
+            const json_body = try httpx.json.Json.stringify(self.allocator, struct {
+                model: []const u8,
+                query: []const u8,
+                prompts: []const []const u8,
+            }{ .model = model, .query = query, .prompts = texts });
+            defer self.allocator.free(json_body);
+            return self.rerankBody(alloc, self.controlledJsonRequest(json_body, null), texts.len, false);
+        }
+        var has_binary = false;
+        if (parts) |documents| for (documents) |document| {
+            if (hasBinaryPart(document)) has_binary = true;
         };
+        if (self.framed_attachments and has_binary) {
+            var attachments = std.ArrayListUnmanaged(httpx.attachment_envelope.Attachment).empty;
+            defer attachments.deinit(alloc);
+            const metadata = try rerankDocumentsRequestJsonAlloc(alloc, model, query, texts, parts, &attachments);
+            defer alloc.free(metadata);
+            var envelope = try httpx.attachment_envelope.encodeSegmentsAlloc(alloc, metadata, attachments.items);
+            defer envelope.deinit();
+            return self.rerankBody(
+                alloc,
+                self.controlledSegmentedBodyRequest(envelope.segments, httpx.attachment_envelope.content_type, null),
+                texts.len,
+                has_media,
+            );
+        }
+        const json_body = try rerankDocumentsRequestJsonAlloc(alloc, model, query, texts, parts, null);
+        defer alloc.free(json_body);
+        return self.rerankBody(alloc, self.controlledJsonRequest(json_body, null), texts.len, has_media);
+    }
+
+    fn rerankBody(
+        self: *Provider,
+        alloc: std.mem.Allocator,
+        options: httpx.RequestOptions,
+        document_count: usize,
+        has_media: bool,
+    ) !inference.RerankResult {
         const Response = struct {
             data: ?[]const struct {
                 score: f32,
@@ -770,21 +917,18 @@ pub const Provider = struct {
         };
         const url = try std.fmt.allocPrint(self.allocator, "{s}/rerank", .{self.base_url});
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, Request{
-            .model = model,
-            .query = query,
-            .prompts = documents,
-        });
-        defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, self.numericRequestOptions(self.controlledJsonRequest(json_body, null)));
+        var resp = try self.http.post(url, self.numericRequestOptions(options));
         defer resp.deinit();
-        if (!resp.ok()) return if (isCapabilityStaleResponse(resp))
-            error.InferenceCapabilitiesStale
-        else
-            inference.rerankStatusError(resp.status.code);
+        if (!resp.ok()) {
+            if (isCapabilityStaleResponse(resp)) return error.InferenceCapabilitiesStale;
+            // A 400 for image-bearing documents means this model cannot score
+            // them, which is a query configuration problem, not an outage.
+            if (has_media and resp.status.code == 400) return error.RerankerMediaUnsupported;
+            return inference.rerankStatusError(resp.status.code);
+        }
         const body = resp.body orelse return error.EmptyResponse;
         if (resp.contentType()) |ct| if (std.ascii.eqlIgnoreCase(ct, httpx.numeric_response.content_type)) {
-            const view = try httpx.numeric_response.parse(body, .scores, documents.len, 1);
+            const view = try httpx.numeric_response.parse(body, .scores, document_count, 1);
             return .{ .scores = try view.scoresAlloc(alloc), .allocator = alloc };
         };
         var parsed = try std.json.parseFromSlice(Response, alloc, body, .{ .ignore_unknown_fields = true });
@@ -797,7 +941,7 @@ pub const Provider = struct {
             break :blk out;
         } else return error.InvalidRerankerResponse;
         errdefer alloc.free(scores);
-        if (scores.len != documents.len) return error.InvalidRerankerResponse;
+        if (scores.len != document_count) return error.InvalidRerankerResponse;
         for (scores) |score| if (!std.math.isFinite(score)) return error.InvalidRerankerResponse;
         return .{
             .scores = scores,

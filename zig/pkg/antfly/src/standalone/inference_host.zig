@@ -347,6 +347,88 @@ test "standalone attachment ABI maps several payloads to one generator item" {
     try std.testing.expectEqual(@as(usize, 0), refs[0].item_index);
 }
 
+const RerankDocumentsRequest = struct {
+    model: []const u8,
+    query: []const u8,
+    documents: []const []const antfly.template.ContentPart,
+    attachment_count: usize = 0,
+};
+
+/// Convert decoded linked-provider parts into the content-part JSON the
+/// inference server's rerank core accepts. Binary parts become
+/// `attachment:N` media references into the returned attachment list; all
+/// strings and bytes stay borrowed from `documents`.
+fn rerankDocumentValuesAlloc(
+    arena: std.mem.Allocator,
+    documents: []const []const antfly.template.ContentPart,
+) !struct { values: []std.json.Value, attachments: []httpx.attachment_envelope.Attachment } {
+    var attachments = std.ArrayListUnmanaged(httpx.attachment_envelope.Attachment).empty;
+    const values = try arena.alloc(std.json.Value, documents.len);
+    for (documents, values) |document, *value| {
+        var parts = std.json.Array.init(arena);
+        for (document) |part| {
+            var object: std.json.ObjectMap = .empty;
+            switch (part) {
+                .text => |text| {
+                    try object.put(arena, "type", .{ .string = "text" });
+                    try object.put(arena, "text", .{ .string = text });
+                },
+                .media_url => |url| {
+                    var image_url: std.json.ObjectMap = .empty;
+                    try image_url.put(arena, "url", .{ .string = url });
+                    try object.put(arena, "type", .{ .string = "image_url" });
+                    try object.put(arena, "image_url", .{ .object = image_url });
+                },
+                .binary => |binary| {
+                    try object.put(arena, "type", .{ .string = "media" });
+                    try object.put(arena, "mime_type", .{ .string = binary.mime_type });
+                    try object.put(arena, "data", .{ .string = try std.fmt.allocPrint(arena, "attachment:{d}", .{attachments.items.len}) });
+                    try attachments.append(arena, .{ .mime_type = binary.mime_type, .data = binary.data });
+                },
+            }
+            try parts.append(.{ .object = object });
+        }
+        value.* = .{ .array = parts };
+    }
+    return .{ .values = values, .attachments = attachments.items };
+}
+
+test "linked rerank documents become server content parts with attachment references" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const png = [_]u8{ 0x89, 'P', 'N', 'G' };
+    const with_image = [_]antfly.template.ContentPart{
+        .{ .text = "page one" },
+        .{ .binary = .{ .mime_type = "image/png", .data = &png } },
+        .{ .media_url = "https://example.invalid/page.png" },
+    };
+    const text_only = [_]antfly.template.ContentPart{.{ .text = "plain" }};
+    const converted = try rerankDocumentValuesAlloc(arena_state.allocator(), &.{ &with_image, &text_only });
+    try std.testing.expectEqual(@as(usize, 2), converted.values.len);
+    try std.testing.expectEqual(@as(usize, 1), converted.attachments.len);
+    try std.testing.expect(converted.attachments[0].data.ptr == &png);
+    const first = converted.values[0].array.items;
+    try std.testing.expectEqualStrings("text", first[0].object.get("type").?.string);
+    try std.testing.expectEqualStrings("media", first[1].object.get("type").?.string);
+    try std.testing.expectEqualStrings("attachment:0", first[1].object.get("data").?.string);
+    try std.testing.expectEqualStrings("https://example.invalid/page.png", first[2].object.get("image_url").?.object.get("url").?.string);
+    try std.testing.expectEqualStrings("plain", converted.values[1].array.items[0].object.get("text").?.string);
+    try std.testing.expectEqual(error.InvalidArguments, rerankDocumentsStatusError(400));
+    try std.testing.expectEqual(error.ModelNotFound, rerankDocumentsStatusError(404));
+    try std.testing.expectEqual(error.QueueFull, rerankDocumentsStatusError(503));
+}
+
+/// Map a non-success rerank core response onto the stable provider ABI.
+fn rerankDocumentsStatusError(status: u16) anyerror {
+    return switch (status) {
+        400, 403, 413 => error.InvalidArguments,
+        404 => error.ModelNotFound,
+        408, 504 => error.Timeout,
+        429, 503 => error.QueueFull,
+        else => error.InferenceProviderFailure,
+    };
+}
+
 const RerankTextsRequest = struct {
     model: []const u8,
     query: []const u8,
@@ -1015,6 +1097,75 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 for (result) |values| alloc.free(values);
                 alloc.free(result);
             }
+            break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
+        },
+        .rerank_documents => blk: {
+            var parsed = try std.json.parseFromSlice(RerankDocumentsRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            var part_count: usize = 0;
+            for (parsed.value.documents) |document| part_count += document.len;
+            const flat_parts = try alloc.alloc(antfly.template.ContentPart, part_count);
+            defer alloc.free(flat_parts);
+            var offset: usize = 0;
+            for (parsed.value.documents) |document| {
+                @memcpy(flat_parts[offset .. offset + document.len], document);
+                offset += document.len;
+            }
+            const decoded = try decodeProviderEmbeddingParts(
+                alloc,
+                flat_parts,
+                parsed.value.attachment_count,
+                context.binary_payloads,
+                context.binary_payloads_len,
+                context.attachment_refs,
+                context.attachment_refs_len,
+            );
+            defer alloc.free(decoded);
+            var arena_state = std.heap.ArenaAllocator.init(alloc);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            const documents = try arena.alloc([]const antfly.template.ContentPart, parsed.value.documents.len);
+            offset = 0;
+            for (parsed.value.documents, documents) |document, *decoded_document| {
+                decoded_document.* = decoded[offset .. offset + document.len];
+                offset += document.len;
+            }
+            const converted = try rerankDocumentValuesAlloc(arena, documents);
+            var http_request = try httpx.Request.init(alloc, .POST, "/ai/v1/rerank");
+            defer http_request.deinit();
+            var http_context = httpx.Context.init(alloc, state.io, &http_request);
+            defer http_context.deinit();
+            var response = try state.node.rerankDocumentValues(
+                &http_context,
+                execution_control,
+                parsed.value.model,
+                parsed.value.query,
+                converted.values,
+                converted.attachments,
+            );
+            defer response.deinit();
+            if (response.status.code != 200) return rerankDocumentsStatusError(response.status.code);
+            const ScoresResponse = struct { data: []const struct { index: usize, score: f32 } };
+            var scores_json = try std.json.parseFromSlice(ScoresResponse, alloc, response.body orelse return error.InferenceProviderFailure, .{ .ignore_unknown_fields = true });
+            defer scores_json.deinit();
+            if (scores_json.value.data.len != parsed.value.documents.len) return error.InferenceProviderFailure;
+            const result = try alloc.alloc(f32, scores_json.value.data.len);
+            for (scores_json.value.data) |item| {
+                if (item.index >= result.len) {
+                    alloc.free(result);
+                    return error.InferenceProviderFailure;
+                }
+                result[item.index] = item.score;
+            }
+            if (context.out_numeric_result != null) {
+                errdefer alloc.free(result);
+                const rows = try alloc.alloc([]f32, 1);
+                errdefer alloc.free(rows);
+                rows[0] = result;
+                try publishNumericProviderResponse(context, alloc, rows, .scores);
+                return;
+            }
+            defer alloc.free(result);
             break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
         },
         .rerank_texts => blk: {
@@ -2754,6 +2905,7 @@ fn localModelCapabilitiesInScope(
         modalities.image,
         modalities.audio,
         modalities.document,
+        inference.server.resolvedExecutorKind(@tagName(task), &manifest),
     );
     modalities = .{
         .text = executor_modalities.text,

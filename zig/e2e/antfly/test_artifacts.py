@@ -108,7 +108,6 @@ def _semantic_embedding_producer(*, model: str, endpoint: str) -> dict:
         "region": "",
         "request_format": "",
         "sparse": False,
-        "multimodal": False,
         "input_type": "",
         "truncate": "",
     }

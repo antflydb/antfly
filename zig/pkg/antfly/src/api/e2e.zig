@@ -491,48 +491,113 @@ const FakeEmbeddingProvider = struct {
     }
 };
 
-fn encodeDenseEmbeddingResponse(alloc: std.mem.Allocator, vector: []const f32) ![]u8 {
+fn encodeDenseEmbeddingResponse(alloc: std.mem.Allocator, vectors: []const [3]f32) ![]u8 {
     var buf = std.ArrayListUnmanaged(u8).empty;
     errdefer buf.deinit(alloc);
 
-    try buf.appendSlice(alloc, "{\"object\":\"list\",\"data\":[{\"object\":\"embedding\",\"index\":0,\"embedding\":[");
-    for (vector, 0..) |value, i| {
-        if (i > 0) try buf.append(alloc, ',');
-        const num = try std.fmt.allocPrint(alloc, "{d}", .{value});
-        defer alloc.free(num);
-        try buf.appendSlice(alloc, num);
+    try buf.appendSlice(alloc, "{\"object\":\"list\",\"data\":[");
+    for (vectors, 0..) |vector, index| {
+        if (index > 0) try buf.append(alloc, ',');
+        const head = try std.fmt.allocPrint(alloc, "{{\"object\":\"embedding\",\"index\":{d},\"embedding\":[", .{index});
+        defer alloc.free(head);
+        try buf.appendSlice(alloc, head);
+        for (vector, 0..) |value, i| {
+            if (i > 0) try buf.append(alloc, ',');
+            const num = try std.fmt.allocPrint(alloc, "{d}", .{value});
+            defer alloc.free(num);
+            try buf.appendSlice(alloc, num);
+        }
+        try buf.appendSlice(alloc, "]}");
     }
-    try buf.appendSlice(alloc, "]}],\"model\":\"test-embed\",\"usage\":{\"prompt_tokens\":1,\"total_tokens\":1}}");
+    try buf.appendSlice(alloc, "],\"model\":\"test-embed\",\"usage\":{\"prompt_tokens\":1,\"total_tokens\":1}}");
     return try buf.toOwnedSlice(alloc);
 }
 
-fn encodeSparseEmbeddingResponse(
-    alloc: std.mem.Allocator,
+/// The fake's deterministic dense vector for one embedding input item.
+fn fakeDenseVector(input: std.json.Value) [3]f32 {
+    return if (jsonValueContainsText(input, "alpha concept") or jsonValueContainsText(input, "alpha body"))
+        .{ 1, 0, 0 }
+    else if (jsonValueContainsText(input, "image/png") or jsonValueContainsText(input, "media"))
+        .{ 1, 0, 0 }
+    else if (jsonValueContainsText(input, "beta body"))
+        .{ 0, 1, 0 }
+    else
+        .{ 0, 0, 1 };
+}
+
+const FakeSparseVector = struct {
     indices: []const i32,
     values: []const f32,
-) ![]u8 {
+};
+
+/// The fake's deterministic sparse vector for one embedding input item.
+fn fakeSparseVector(input: std.json.Value) FakeSparseVector {
+    return if (jsonValueContainsText(input, "alpha body"))
+        .{ .indices = &.{ 7, 42 }, .values = &.{ 1.5, 0.5 } }
+    else if (jsonValueContainsText(input, "beta body"))
+        .{ .indices = &.{ 7, 42 }, .values = &.{ 0.25, 1.0 } }
+    else
+        .{ .indices = &.{99}, .values = &.{0.1} };
+}
+
+fn encodeSparseEmbeddingResponse(alloc: std.mem.Allocator, vectors: []const FakeSparseVector) ![]u8 {
     var buf = std.ArrayListUnmanaged(u8).empty;
     errdefer buf.deinit(alloc);
 
-    try buf.appendSlice(alloc, "{\"object\":\"list\",\"data\":[{\"object\":\"embedding\",\"index\":0,\"embedding\":{\"indices\":[");
-    for (indices, 0..) |value, i| {
-        if (i > 0) try buf.append(alloc, ',');
-        const num = try std.fmt.allocPrint(alloc, "{d}", .{value});
-        defer alloc.free(num);
-        try buf.appendSlice(alloc, num);
+    try buf.appendSlice(alloc, "{\"object\":\"list\",\"data\":[");
+    for (vectors, 0..) |vector, index| {
+        if (index > 0) try buf.append(alloc, ',');
+        const head = try std.fmt.allocPrint(alloc, "{{\"object\":\"embedding\",\"index\":{d},\"embedding\":{{\"indices\":[", .{index});
+        defer alloc.free(head);
+        try buf.appendSlice(alloc, head);
+        for (vector.indices, 0..) |value, i| {
+            if (i > 0) try buf.append(alloc, ',');
+            const num = try std.fmt.allocPrint(alloc, "{d}", .{value});
+            defer alloc.free(num);
+            try buf.appendSlice(alloc, num);
+        }
+        try buf.appendSlice(alloc, "],\"values\":[");
+        for (vector.values, 0..) |value, i| {
+            if (i > 0) try buf.append(alloc, ',');
+            const num = try std.fmt.allocPrint(alloc, "{d}", .{value});
+            defer alloc.free(num);
+            try buf.appendSlice(alloc, num);
+        }
+        try buf.appendSlice(alloc, "]}}");
     }
-    try buf.appendSlice(alloc, "],\"values\":[");
-    for (values, 0..) |value, i| {
-        if (i > 0) try buf.append(alloc, ',');
-        const num = try std.fmt.allocPrint(alloc, "{d}", .{value});
-        defer alloc.free(num);
-        try buf.appendSlice(alloc, num);
-    }
-    try buf.appendSlice(alloc, "]}}],\"model\":\"test-embed\",\"usage\":{\"prompt_tokens\":1,\"total_tokens\":1}}");
+    try buf.appendSlice(alloc, "],\"model\":\"test-embed\",\"usage\":{\"prompt_tokens\":1,\"total_tokens\":1}}");
     return try buf.toOwnedSlice(alloc);
 }
 
 const FakeAntflyProvider = struct {
+    /// Capability discovery asks for one model and task. Answer with a
+    /// catalog entry that carries no `inference_capabilities`, which is how a
+    /// server predating capability objects responds, so clients fall back to
+    /// their conservative defaults.
+    fn modelCatalog(alloc: std.mem.Allocator, uri: []const u8) !http_common.HttpResponse {
+        const query = uri[(std.mem.indexOfScalar(u8, uri, '?') orelse uri.len) + 1 ..];
+        var model: []const u8 = "";
+        var task: []const u8 = "";
+        var params = std.mem.splitScalar(u8, query, '&');
+        while (params.next()) |param| {
+            if (std.mem.startsWith(u8, param, "model=")) model = param["model=".len..];
+            if (std.mem.startsWith(u8, param, "task=")) task = param["task=".len..];
+        }
+        const category = if (std.mem.eql(u8, task, "embed"))
+            "embedders"
+        else if (std.mem.eql(u8, task, "rerank"))
+            "rerankers"
+        else if (std.mem.eql(u8, task, "chunk"))
+            "chunkers"
+        else
+            "generators";
+        return .{
+            .status = 200,
+            .content_type = try alloc.dupe(u8, "application/json"),
+            .body = try std.fmt.allocPrint(alloc, "{{\"{s}\":{{{f}:{{}}}}}}", .{ category, std.json.fmt(model, .{}) }),
+        };
+    }
+
     fn executor() http_common.RequestExecutor {
         return .{
             .ptr = undefined,
@@ -543,6 +608,7 @@ const FakeAntflyProvider = struct {
     }
 
     fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+        if (req.method == .GET and std.mem.indexOf(u8, req.uri, "/models?") != null) return modelCatalog(alloc, req.uri);
         try std.testing.expectEqual(http_common.Method.POST, req.method);
 
         if (std.mem.endsWith(u8, req.uri, "/api/chunk")) {
@@ -573,13 +639,14 @@ const FakeAntflyProvider = struct {
         if (std.mem.endsWith(u8, req.uri, "/embed") or std.mem.endsWith(u8, req.uri, "/embeddings")) {
             var parsed_req = try parseJsonBodyIgnoreUnknown(TestAntflyEmbedRequest, alloc, req.body);
             defer parsed_req.deinit();
+            // One embedding per input item: enrichment batches documents.
+            const input = parsed_req.value.input;
+            const items: []const std.json.Value = if (input == .array) input.array.items else (&input)[0..1];
             if (std.mem.eql(u8, parsed_req.value.model, "antfly-sparse-v1")) {
-                const body = if (jsonValueContainsText(parsed_req.value.input, "alpha body"))
-                    try encodeSparseEmbeddingResponse(alloc, &.{ 7, 42 }, &.{ 1.5, 0.5 })
-                else if (jsonValueContainsText(parsed_req.value.input, "beta body"))
-                    try encodeSparseEmbeddingResponse(alloc, &.{ 7, 42 }, &.{ 0.25, 1.0 })
-                else
-                    try encodeSparseEmbeddingResponse(alloc, &.{99}, &.{0.1});
+                const vectors = try alloc.alloc(FakeSparseVector, items.len);
+                defer alloc.free(vectors);
+                for (items, vectors) |item, *vector| vector.* = fakeSparseVector(item);
+                const body = try encodeSparseEmbeddingResponse(alloc, vectors);
                 return .{
                     .status = 200,
                     .content_type = try alloc.dupe(u8, "application/json"),
@@ -587,15 +654,11 @@ const FakeAntflyProvider = struct {
                 };
             }
 
-            const vector: [3]f32 = if (jsonValueContainsText(parsed_req.value.input, "alpha concept") or jsonValueContainsText(parsed_req.value.input, "alpha body"))
-                .{ 1, 0, 0 }
-            else if (jsonValueContainsText(parsed_req.value.input, "image/png") or jsonValueContainsText(parsed_req.value.input, "media"))
-                .{ 1, 0, 0 }
-            else if (jsonValueContainsText(parsed_req.value.input, "beta body"))
-                .{ 0, 1, 0 }
-            else
-                .{ 0, 0, 1 };
-            const body = try encodeDenseEmbeddingResponse(alloc, vector[0..]);
+            // A content-part input also embeds each part.
+            const vectors = try alloc.alloc([3]f32, items.len);
+            defer alloc.free(vectors);
+            for (items, vectors) |item, *vector| vector.* = fakeDenseVector(item);
+            const body = try encodeDenseEmbeddingResponse(alloc, vectors);
             return .{
                 .status = 200,
                 .content_type = try alloc.dupe(u8, "application/json"),
@@ -606,11 +669,22 @@ const FakeAntflyProvider = struct {
         if (std.mem.endsWith(u8, req.uri, "/rerank")) {
             var parsed_req = try parseJsonBodyIgnoreUnknown(TestAntflyRerankRequest, alloc, req.body);
             defer parsed_req.deinit();
-            const scores = if (stringSliceContainsText(parsed_req.value.prompts, "alpha body") and stringSliceContainsText(parsed_req.value.prompts, "beta body"))
-                "[0.1,0.9]"
-            else
-                "[0.9]";
-            const body = try std.fmt.allocPrint(alloc, "{{\"scores\":{s}}}", .{scores});
+            // One score per prompt, in request order: beta outranks alpha,
+            // and any other candidate scores lowest.
+            var scores = std.ArrayListUnmanaged(u8).empty;
+            defer scores.deinit(alloc);
+            try scores.append(alloc, '[');
+            for (parsed_req.value.prompts, 0..) |prompt, i| {
+                if (i > 0) try scores.append(alloc, ',');
+                try scores.appendSlice(alloc, if (std.mem.indexOf(u8, prompt, "beta body") != null)
+                    "0.9"
+                else if (std.mem.indexOf(u8, prompt, "alpha body") != null)
+                    "0.1"
+                else
+                    "0.05");
+            }
+            try scores.append(alloc, ']');
+            const body = try std.fmt.allocPrint(alloc, "{{\"scores\":{s}}}", .{scores.items});
             return .{
                 .status = 200,
                 .content_type = try alloc.dupe(u8, "application/json"),
@@ -4100,9 +4174,15 @@ test "public api e2e supports hybrid query pruner and reranker" {
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
     );
+    // Remote Antfly embedders discover capabilities with a timed request,
+    // which needs I/O that can run concurrent work. Index validation uses the
+    // network view and query embedding the API view; without a backend
+    // runtime both otherwise fall back to single-threaded I/O.
+    var network_io = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer network_io.deinit();
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
-        .{},
+        .{ .imported_runtime_io = .{ .api = network_io.io(), .api_network = network_io.io() } },
         http_server.StatusSource.fromMetadataService(&svc),
         provisioned_read_source.source(),
         provisioned_write_source.source(),
@@ -4171,7 +4251,7 @@ test "public api e2e supports hybrid query pruner and reranker" {
 
     const hybrid_query_body = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{{\"full_text_search\":{{\"match\":{{\"field\":\"body\",\"text\":\"body\"}}}},\"semantic_search\":\"alpha concept\",\"embeddings\":{{\"sparse_idx\":{{\"indices\":[7,42],\"values\":[1.5,0.5]}}}},\"indexes\":[\"semantic_idx\",\"sparse_idx\"],\"merge_config\":{{\"strategy\":\"rsf\",\"window_size\":10}},\"pruner\":{{\"require_multi_index\":true}},\"reranker\":{{\"provider\":\"antfly\",\"model\":\"cross-encoder/ms-marco-MiniLM-L-6-v2\",\"url\":{f},\"field\":\"body\",\"top_n\":2}},\"limit\":3}}",
+        "{{\"full_text_search\":{{\"match\":{{\"field\":\"body\",\"text\":\"body\"}}}},\"semantic_search\":\"alpha concept\",\"embeddings\":{{\"sparse_idx\":{{\"indices\":[7,42],\"values\":[1.5,0.5]}}}},\"indexes\":[\"semantic_idx\",\"sparse_idx\"],\"merge_config\":{{\"strategy\":\"rsf\",\"window_size\":10}},\"pruner\":{{\"require_multi_index\":true}},\"reranker\":{{\"provider\":\"antfly\",\"model\":\"cross-encoder/ms-marco-MiniLM-L-6-v2\",\"url\":{f},\"field\":\"body\",\"candidate_count\":3,\"top_n\":2}},\"limit\":3,\"profile\":true}}",
         .{std.json.fmt(antfly_base_uri, .{})},
     );
     defer std.testing.allocator.free(hybrid_query_body);
@@ -5742,9 +5822,15 @@ test "public api e2e supports embedding_template remote media helper" {
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
     );
+    // Remote Antfly embedders discover capabilities with a timed request,
+    // which needs I/O that can run concurrent work. Index validation uses the
+    // network view and query embedding the API view; without a backend
+    // runtime both otherwise fall back to single-threaded I/O.
+    var network_io = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer network_io.deinit();
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
-        .{},
+        .{ .imported_runtime_io = .{ .api = network_io.io(), .api_network = network_io.io() } },
         http_server.StatusSource.fromMetadataService(&svc),
         provisioned_read_source.source(),
         provisioned_write_source.source(),
@@ -5823,14 +5909,6 @@ test "public api e2e supports embedding_template remote media helper" {
     var parsed = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, query.body, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("doc:a", parsed.value.responses.?[0].hits.?.hits.?[0]._id);
-
-    const template_query_body = try test_contract_helpers.encodeSemanticQueryRequest(std.testing.allocator, "alpha concept", &.{"semantic_template_idx"}, 5);
-    defer std.testing.allocator.free(template_query_body);
-    var template_query = try client.fetchQuery(base_uri, "docs", template_query_body);
-    defer template_query.deinit(std.testing.allocator);
-    var parsed_template = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, template_query.body, .{});
-    defer parsed_template.deinit();
-    try std.testing.expectEqualStrings("doc:a", parsed_template.value.responses.?[0].hits.?.hits.?[0]._id);
 }
 
 test "public api e2e supports template chunked remote text enrichment and query helper failures" {
@@ -6117,183 +6195,6 @@ test "public api e2e supports template chunked remote text enrichment and query 
             "{\"embedding_template\":\"{{remoteText url=this}}\",\"indexes\":[\"semantic_template_chunked_idx\"],\"limit\":5}",
         ),
     );
-}
-
-test "public api e2e supports fixed and antfly chunked semantic search" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-chunked-semantic-root", .{tmp.sub_path});
-    defer std.testing.allocator.free(replica_root);
-    const replica_catalog_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-chunked-semantic-catalog.txt", .{tmp.sub_path});
-    defer std.testing.allocator.free(replica_catalog_path);
-
-    var store = raft_engine.core.MemoryStorage.init(std.testing.allocator);
-    defer store.deinit();
-    var factory = Factory{ .alloc = std.testing.allocator, .store = &store };
-
-    var svc = try metadata_service.MetadataService.init(std.testing.allocator, .{
-        .host = .{
-            .local_node_id = 1,
-            .metadata_group_id = 3122,
-            .replica_root_dir = replica_root,
-            .replica_catalog_path = replica_catalog_path,
-        },
-    }, .{
-        .host = .{
-            .host = .{
-                .descriptor_factory = factory.iface(),
-            },
-        },
-    }, .{});
-    defer svc.deinit();
-
-    _ = try svc.ensureMetadataReplica(.{
-        .group_id = 3122,
-        .replica_id = 1,
-        .local_node_id = 1,
-        .bootstrap_mode = .empty,
-    });
-    try svc.campaignMetadataGroup();
-    try svc.runRound();
-
-    var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
-        replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
-        raft_mod.read_gate.alreadyReadSafeBarrier(),
-    );
-    var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
-        replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
-    );
-    var server = http_server.ApiHttpServer.init(
-        std.testing.allocator,
-        .{},
-        http_server.StatusSource.fromMetadataService(&svc),
-        provisioned_read_source.source(),
-        provisioned_write_source.source(),
-    );
-    defer server.deinit();
-    var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
-    defer listener.deinit();
-
-    var openai_listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, FakeEmbeddingProvider.executor());
-    defer openai_listener.deinit();
-    try openai_listener.start();
-
-    var antfly_listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, FakeAntflyProvider.executor());
-    defer antfly_listener.deinit();
-    try antfly_listener.start();
-
-    const base_uri = try listener.baseUri(std.testing.allocator);
-    defer std.testing.allocator.free(base_uri);
-    const openai_base_uri = try openai_listener.baseUri(std.testing.allocator);
-    defer std.testing.allocator.free(openai_base_uri);
-    const antfly_base_uri = try antfly_listener.baseUri(std.testing.allocator);
-    defer std.testing.allocator.free(antfly_base_uri);
-
-    var executor = std_http_executor.StdHttpExecutor.init(std.testing.allocator, .{});
-    defer executor.deinit();
-    var client = http_client.ApiHttpClient.init(std.testing.allocator, executor.executor());
-
-    const create_body = try test_contract_helpers.encodeCreateTableRequest(std.testing.allocator, "chunked docs");
-    defer std.testing.allocator.free(create_body);
-    var created = try client.createTable(base_uri, "docs", create_body);
-    defer created.deinit(std.testing.allocator);
-
-    const fixed_chunked_index_body = try test_contract_helpers.encodeManagedEmbeddingsIndexRequest(
-        std.testing.allocator,
-        "semantic_fixed_idx",
-        "body",
-        3,
-        test_contract_helpers.openAIIndexEmbedder("text-embedding-3-small", openai_base_uri),
-        .{
-            .provider = .antfly,
-            .model = "fixed-bert-tokenizer",
-        },
-    );
-    defer std.testing.allocator.free(fixed_chunked_index_body);
-    var fixed_index_resp = try client.createTableIndex(base_uri, "docs", "semantic_fixed_idx", fixed_chunked_index_body);
-    defer fixed_index_resp.deinit(std.testing.allocator);
-
-    const antfly_chunk_api = try std.fmt.allocPrint(std.testing.allocator, "{s}/api", .{antfly_base_uri});
-    defer std.testing.allocator.free(antfly_chunk_api);
-    const antfly_chunked_index_body = try test_contract_helpers.encodeManagedEmbeddingsIndexRequest(
-        std.testing.allocator,
-        "semantic_antfly_idx",
-        "body",
-        3,
-        test_contract_helpers.antflyIndexEmbedder("antfly-embed-v1", antfly_base_uri, false),
-        .{
-            .provider = .antfly,
-            .api_url = antfly_chunk_api,
-            .model = "antfly-chunker-v1",
-        },
-    );
-    defer std.testing.allocator.free(antfly_chunked_index_body);
-    var antfly_index_resp = try client.createTableIndex(base_uri, "docs", "semantic_antfly_idx", antfly_chunked_index_body);
-    defer antfly_index_resp.deinit(std.testing.allocator);
-
-    var rounds: usize = 0;
-    while (rounds < 8) : (rounds += 1) try svc.runRound();
-
-    const batch_body = try test_contract_helpers.normalizeBatchRequest(std.testing.allocator,
-        \\{"inserts":{
-        \\  "doc:a":{"title":"alpha","body":"alpha body alpha body alpha body alpha body alpha tail"}
-        \\}}
-    );
-    defer std.testing.allocator.free(batch_body);
-    var batch = try client.fetchBatch(base_uri, "docs", batch_body);
-    defer batch.deinit(std.testing.allocator);
-
-    const fixed_query_body = try test_contract_helpers.encodeSemanticQueryRequest(std.testing.allocator, "alpha concept", &.{"semantic_fixed_idx"}, 5);
-    defer std.testing.allocator.free(fixed_query_body);
-    var fixed_query = try client.fetchQuery(base_uri, "docs", fixed_query_body);
-    defer fixed_query.deinit(std.testing.allocator);
-    var parsed_fixed = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, fixed_query.body, .{});
-    defer parsed_fixed.deinit();
-    try std.testing.expectEqualStrings("doc:a", parsed_fixed.value.responses.?[0].hits.?.hits.?[0]._id);
-
-    const antfly_query_body = try test_contract_helpers.encodeSemanticQueryRequest(std.testing.allocator, "alpha concept", &.{"semantic_antfly_idx"}, 5);
-    defer std.testing.allocator.free(antfly_query_body);
-    var antfly_query = try client.fetchQuery(base_uri, "docs", antfly_query_body);
-    defer antfly_query.deinit(std.testing.allocator);
-    var parsed_antfly = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, antfly_query.body, .{});
-    defer parsed_antfly.deinit();
-    try std.testing.expectEqualStrings("doc:a", parsed_antfly.value.responses.?[0].hits.?.hits.?[0]._id);
-
-    const projected_ranges = try svc.listProjectedRanges(std.testing.allocator);
-    defer svc.freeProjectedRanges(std.testing.allocator, projected_ranges);
-    try std.testing.expect(projected_ranges.len > 0);
-    const group_id = projected_ranges[0].group_id;
-    const provisioned_db_path = try metadata_mod.groupDbPathFromReplicaRoot(std.testing.allocator, replica_root, group_id);
-    defer std.testing.allocator.free(provisioned_db_path);
-
-    var db = try db_mod.DB.open(std.testing.allocator, provisioned_db_path, .{});
-    defer db.close();
-
-    const fixed_chunk_zero = try internal_keys.chunkArtifactKeyAlloc(std.testing.allocator, "doc:a", "semantic_fixed_idx_chunks", 0);
-    defer std.testing.allocator.free(fixed_chunk_zero);
-    const fixed_chunk_one = try internal_keys.chunkArtifactKeyAlloc(std.testing.allocator, "doc:a", "semantic_fixed_idx_chunks", 1);
-    defer std.testing.allocator.free(fixed_chunk_one);
-    const antfly_chunk_zero = try internal_keys.chunkArtifactKeyAlloc(std.testing.allocator, "doc:a", "semantic_antfly_idx_chunks", 0);
-    defer std.testing.allocator.free(antfly_chunk_zero);
-    const antfly_chunk_one = try internal_keys.chunkArtifactKeyAlloc(std.testing.allocator, "doc:a", "semantic_antfly_idx_chunks", 1);
-    defer std.testing.allocator.free(antfly_chunk_one);
-
-    const fixed_raw_zero = try db.get(std.testing.allocator, fixed_chunk_zero);
-    defer if (fixed_raw_zero) |raw| std.testing.allocator.free(raw);
-    try std.testing.expect(fixed_raw_zero != null);
-    const fixed_raw_one = try db.get(std.testing.allocator, fixed_chunk_one);
-    defer if (fixed_raw_one) |raw| std.testing.allocator.free(raw);
-    try std.testing.expect(fixed_raw_one != null);
-
-    const antfly_raw_zero = try db.get(std.testing.allocator, antfly_chunk_zero);
-    defer if (antfly_raw_zero) |raw| std.testing.allocator.free(raw);
-    try std.testing.expect(antfly_raw_zero != null);
-    const antfly_raw_one = try db.get(std.testing.allocator, antfly_chunk_one);
-    defer if (antfly_raw_one) |raw| std.testing.allocator.free(raw);
-    try std.testing.expect(antfly_raw_one != null);
 }
 
 test "public api e2e restores chunked managed embeddings from table backup" {

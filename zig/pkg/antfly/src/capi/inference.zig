@@ -782,7 +782,7 @@ test "capi inference embeds text with a local model" {
 
 // Needs the model pulled locally (`antfly inference pull
 // cross-encoder/ms-marco-MiniLM-L6-v2`); skipped otherwise.
-test "capi inference reranks prompts with a local model" {
+test "capi inference reranks documents with a local model" {
     if (!db.localInferenceRuntimeAvailable()) return error.SkipZigTest;
     if (!modelInstalled("cross-encoder", "ms-marco-MiniLM-L6-v2")) return error.SkipZigTest;
     var handle: ?*anyopaque = null;
@@ -792,7 +792,7 @@ test "capi inference reranks prompts with a local model" {
     var out: capi.Buffer = .{};
     const request =
         \\{"model":"cross-encoder/ms-marco-MiniLM-L6-v2","query":"what do ants eat",
-        \\ "prompts":["Ants eat sugar, seeds, and other insects.","The stock market fell today."]}
+        \\ "documents":["Ants eat sugar, seeds, and other insects.","The stock market fell today."]}
     ;
     const code = antfly_inference_rerank_json(handle, testSlice(request), &out);
     defer db.antfly_buffer_free(&out);

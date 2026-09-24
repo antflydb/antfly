@@ -30,7 +30,9 @@ class RerankerConfig:
             Conflicting policies for an active scope are rejected. These limits do
             not coordinate across replicas or infer the provider's account quota.
         field (str | Unset): Field name to extract from documents for reranking.
-        template (str | Unset): Handlebars template to render document text for reranking.
+        template (str | Unset): Handlebars template that renders each candidate for reranking. The `media` and
+            `remoteMedia` helpers add images, which are sent to the reranker alongside the rendered text; only an Antfly
+            reranker whose model accepts images can score them, and any other reranker rejects the query with `400`.
         model (str | Unset): Optional provider model name. When omitted, the selected provider's documented default is
             used.
         candidate_count (int | Unset): Maximum number of globally highest-ranked retrieval candidates to send to the

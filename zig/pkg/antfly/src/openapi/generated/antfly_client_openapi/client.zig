@@ -611,25 +611,10 @@ pub const Client = struct {
         return ApiResponse(types.InferenceReadResponse).fromResponse(self.allocator, &resp);
     }
 
-    /// Rerank prompts by relevance
+    /// Rerank documents by relevance
     /// POST /ai/v1/rerank
-    pub fn rerankPrompts(self: *@This(), body: types.InferenceRerankRequest, accept: ?[]const u8) !ApiResponse(types.InferenceRerankResponse) {
+    pub fn rerankDocuments(self: *@This(), body: types.InferenceRerankRequest, accept: ?[]const u8) !ApiResponse(types.InferenceRerankResponse) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/rerank", .{self.base_url});
-        defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
-        defer self.allocator.free(json_body);
-        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
-        defer request_headers.deinit(self.allocator);
-        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
-        if (accept) |value| try request_headers.append(self.allocator, .{ "Accept", value });
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
-        return ApiResponse(types.InferenceRerankResponse).fromNegotiatedResponse(self.allocator, &resp);
-    }
-
-    /// Rerank multimodal documents by relevance
-    /// POST /ai/v1/rerank_multimodal
-    pub fn rerankMultimodalPrompts(self: *@This(), body: types.InferenceRerankMultimodalRequest, accept: ?[]const u8) !ApiResponse(types.InferenceRerankResponse) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/rerank_multimodal", .{self.base_url});
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
