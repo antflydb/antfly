@@ -23,19 +23,14 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             {children}
           </main>
           <footer className="border-t px-4 py-6 text-center text-xs text-muted-foreground">
-            Selected model walkthroughs · source snapshot{" "}
-            <a
-              className="underline"
-              href={`${manifest.permalinkBase}/${manifest.gitCommit}`}
-              target="_blank"
-              rel="noreferrer"
-            >
-              {manifest.gitCommit.slice(0, 10)}
+            Selected model walkthroughs · source links open{" "}
+            <a className="underline" href={manifest.permalinkBase} target="_blank" rel="noreferrer">
+              antflydb/antfly
             </a>
             {" · "}
             <a
               className="underline"
-              href={`${manifest.permalinkBase}/${manifest.gitCommit}/zig/pkg/inference/MODEL_COMPATIBILITY.md`}
+              href={`${manifest.permalinkBase}/zig/pkg/inference/MODEL_COMPATIBILITY.md`}
               target="_blank"
               rel="noreferrer"
             >

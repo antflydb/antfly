@@ -3,15 +3,15 @@
  *
  * Extracts ground truth from the Zig runtime (op vocabulary, kernel
  * inventory, production schedules, env flags), merges hand-curated model
- * graphs from data/curated/, verifies + self-heals file:line anchors, and
- * emits validated JSON into data/generated/.
+ * graphs from data/curated/, verifies that every linked source file exists,
+ * and emits validated JSON into data/generated/.
  *
  *   pnpm generate    — regenerate in place
  *   pnpm gen:check   — regenerate in memory and diff (exit 1 on drift)
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { type FrameScenario, KernelsFile, Manifest, SCHEMA_VERSION } from "../lib/schema/index.ts";
+import { type FrameScenario, KernelsFile, SCHEMA_VERSION } from "../lib/schema/index.ts";
 import {
   extractEnvFlags,
   extractKernelInventory,
@@ -19,53 +19,24 @@ import {
   extractSchedules,
 } from "./extract.ts";
 import { validateFrame } from "./frames.ts";
-import { appRoot, gitCommit, toJson, verifySourceRevision } from "./lib.ts";
-import { buildMergeContext, collectLinks, mergeCuratedModels, mergeNamedLinks } from "./merge.ts";
-import { buildSnippets } from "./snippets.ts";
+import { appRoot, toJson } from "./lib.ts";
+import { buildMergeContext, mergeCuratedModels, mergeNamedLinks } from "./merge.ts";
 
 const OUT_DIR = join(appRoot, "data", "generated");
-/**
- * Per-file size budgets for the generated snapshot. These guard repository
- * weight, not client payload: pages ship only the snippets they cite, via
- * `snippetsFor`, so the whole map never reaches a browser.
- *
- * snippets.json scales with the number of curated anchors, which is the point
- * of the app, so it carries its own allowance rather than making every build
- * warn. Lower it again if the anchor set is ever trimmed.
- */
+/** Per-file size budget for the generated snapshot; guards repository weight. */
 const SIZE_WARN_BYTES = 800 * 1024;
-const SIZE_WARN_OVERRIDES: Record<string, number> = {
-  "snippets.json": 1400 * 1024,
-};
-const budgetFor = (name: string) => SIZE_WARN_OVERRIDES[name] ?? SIZE_WARN_BYTES;
+const PERMALINK_BASE = "https://github.com/antflydb/antfly/blob/main";
 const checkMode = process.argv.includes("--check");
-const refIndex = process.argv.indexOf("--source-ref");
-const sourceRef = refIndex >= 0 ? process.argv[refIndex + 1] : "HEAD";
-if (!sourceRef || sourceRef.startsWith("--"))
-  throw new Error("--source-ref requires a Git revision");
-if (checkMode && refIndex >= 0)
-  throw new Error(
-    "--source-ref applies to generation; --check verifies the recorded source revision"
-  );
 
-async function generate(): Promise<Map<string, string>> {
-  // Retain the recorded revision in check mode, and verify its source bytes.
-  // Unrelated app commits need no refresh; changed runtime source does.
-  const saved =
-    checkMode && existsSync(join(OUT_DIR, "manifest.json"))
-      ? Manifest.parse(JSON.parse(readFileSync(join(OUT_DIR, "manifest.json"), "utf8")))
-      : undefined;
-  const commit = saved?.gitCommit ?? gitCommit(sourceRef);
-  const generatedAt = saved?.generatedAt ?? new Date().toISOString();
-
+function generate(): Map<string, string> {
   const opKinds = extractOpKinds();
   const routes = extractSchedules();
   const inventory = extractKernelInventory();
   const flags = extractEnvFlags();
 
-  const ctx = buildMergeContext(opKinds, inventory, routes, flags, commit, generatedAt);
+  const ctx = buildMergeContext(opKinds, inventory, routes, flags);
   const models = mergeCuratedModels(ctx);
-  const namedLinks = mergeNamedLinks(ctx);
+  const namedLinks = mergeNamedLinks();
   for (const warning of ctx.warnings) console.warn(`  warn: ${warning}`);
 
   const files = new Map<string, string>();
@@ -99,35 +70,24 @@ async function generate(): Promise<Map<string, string>> {
     }
   }
 
-  // Snippets only for links the UI shows hover peeks for (model graphs +
-  // schedule rows) — the full kernel/flag inventories link out without peeks.
-  const links = collectLinks([routes, models, frames, Object.values(namedLinks)]);
-  const snippets = await buildSnippets(links);
-  files.set("snippets.json", toJson({ schemaVersion: SCHEMA_VERSION, snippets }));
-  verifySourceRevision(commit);
-
   files.set(
     "manifest.json",
     toJson({
       schemaVersion: SCHEMA_VERSION,
-      gitCommit: commit,
-      generatedAt,
-      permalinkBase: "https://github.com/antflydb/antfly/blob",
+      permalinkBase: PERMALINK_BASE,
       models: models.map((m) => m.id),
       counts: {
         opKinds: opKinds.length,
         kernels: inventory.length,
         routes: routes.length,
-        snippets: Object.keys(snippets).length,
       },
     })
   );
 
   for (const [name, content] of files) {
-    const budget = budgetFor(name);
-    if (Buffer.byteLength(content) > budget) {
+    if (Buffer.byteLength(content) > SIZE_WARN_BYTES) {
       console.warn(
-        `  warn: ${name} is ${(Buffer.byteLength(content) / 1024).toFixed(0)} KB (budget ${(budget / 1024).toFixed(0)} KB)`
+        `  warn: ${name} is ${(Buffer.byteLength(content) / 1024).toFixed(0)} KB (budget ${(SIZE_WARN_BYTES / 1024).toFixed(0)} KB)`
       );
     }
   }
@@ -173,7 +133,7 @@ function check(files: Map<string, string>): number {
   return drift;
 }
 
-const files = await generate();
+const files = generate();
 
 if (checkMode) {
   const drift = check(files);

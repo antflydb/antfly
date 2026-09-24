@@ -46,6 +46,7 @@ def test_table_full_text_sync_level_makes_text_search_visible(table_api):
         sync_level="full_text",
     )
     assert batch["inserted"] == 1
+    assert batch["status"] == "committed", batch
 
     search = table_api.query_table(
         table_name,

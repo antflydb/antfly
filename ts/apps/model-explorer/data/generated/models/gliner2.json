@@ -32,9 +32,7 @@
    "spine": "graph",
    "summary": "Bidirectional encoder: no causal mask, no KV cache, no sampling. Attention scores decompose into content-to-content, content-to-position, and position-to-content terms.",
    "source": {
-    "path": "zig/pkg/inference/src/architectures/deberta_graph.zig",
-    "anchor": "pub fn buildForwardGraph(",
-    "line": 187
+    "path": "zig/pkg/inference/src/architectures/deberta_graph.zig"
    },
    "repeat": {
     "count": 12,
@@ -49,9 +47,7 @@
    "spine": "graph",
    "summary": "First-subtoken word features and entity-marker label features feed span and label heads. Sigmoid scores are thresholded, then flat NER filters overlapping spans.",
    "source": {
-    "path": "zig/pkg/inference/src/architectures/gliner_head.zig",
-    "anchor": "fn extractWordEmbeddings(",
-    "line": 438
+    "path": "zig/pkg/inference/src/architectures/gliner_head.zig"
    },
    "headType": "span"
   }
@@ -175,9 +171,7 @@
       "note": "Schematic graph formulation: normalize the 512-row shared table, then gather by signed distance; position_buckets=256 is the index offset."
      },
      "source": {
-      "path": "zig/pkg/inference/src/models/deberta.zig",
-      "anchor": "pub fn relativePositionBucket(",
-      "line": 122
+      "path": "zig/pkg/inference/src/models/deberta.zig"
      },
      "kernelRouteIds": [],
      "kernels": [],
@@ -275,9 +269,7 @@
       "note": "Schematic fused graph node: packed Q/K/V, packed relative Q/K and additive padding mask. Scores combine all three terms; no causal mask."
      },
      "source": {
-      "path": "zig/pkg/inference/src/architectures/deberta_graph.zig",
-      "anchor": "pub fn fusedDisentangledAttentionEnabledForProduction(",
-      "line": 454
+      "path": "zig/pkg/inference/src/architectures/deberta_graph.zig"
      },
      "kernelRouteIds": [],
      "kernels": [
@@ -511,9 +503,7 @@
       "note": "Serving path selects the first subtoken per word using words_mask. The separate graph-training helper averages subtokens; its pooling semantics differ."
      },
      "source": {
-      "path": "zig/pkg/inference/src/architectures/gliner_head.zig",
-      "anchor": "fn extractWordEmbeddings(",
-      "line": 438
+      "path": "zig/pkg/inference/src/architectures/gliner_head.zig"
      },
      "kernelRouteIds": [],
      "kernels": [
@@ -554,9 +544,7 @@
       "note": "positions where input_ids match the entity marker (and, for other tasks, classification/relation marker ids) — the schema's label names, encoded in the same pass as the text"
      },
      "source": {
-      "path": "zig/pkg/inference/src/architectures/gliner_head_graph.zig",
-      "anchor": "pub fn gatherLabelEmbeddings(",
-      "line": 352
+      "path": "zig/pkg/inference/src/architectures/gliner_head_graph.zig"
      },
      "kernelRouteIds": [],
      "kernels": [],
@@ -600,9 +588,7 @@
      },
      "attrs": {},
      "source": {
-      "path": "zig/pkg/inference/src/architectures/gliner_head_graph.zig",
-      "anchor": "pub fn spanMarkerForward(",
-      "line": 371
+      "path": "zig/pkg/inference/src/architectures/gliner_head_graph.zig"
      },
      "kernelRouteIds": [],
      "kernels": [],
@@ -724,9 +710,7 @@
       "note": "GRU step + residual, then downscaled mini-transformer and output MLP; these are multiple operations, not one fused kernel."
      },
      "source": {
-      "path": "zig/pkg/inference/src/architectures/gliner_head_graph.zig",
-      "anchor": "pub fn downscaledTransformer(",
-      "line": 536
+      "path": "zig/pkg/inference/src/architectures/gliner_head_graph.zig"
      },
      "kernelRouteIds": [],
      "kernels": [
@@ -772,9 +756,7 @@
      },
      "attrs": {},
      "source": {
-      "path": "zig/pkg/inference/src/architectures/gliner_head_graph.zig",
-      "anchor": "pub fn scoreSpansAgainstLabels(",
-      "line": 335
+      "path": "zig/pkg/inference/src/architectures/gliner_head_graph.zig"
      },
      "kernelRouteIds": [],
      "kernels": [],
@@ -942,9 +924,5 @@
     }
    ]
   }
- },
- "sources": {
-  "gitCommit": "8e648048840d064fd6d322f131aac99db728142a",
-  "generatedAt": "2026-09-23T04:21:06.380Z"
  }
 }
