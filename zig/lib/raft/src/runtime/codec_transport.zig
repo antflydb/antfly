@@ -106,7 +106,6 @@ const PendingRetry = struct {
     frame: codec_iface.EncodedFrame,
     attempts: u32,
     retry_round: u64,
-    replaceable_heartbeat: bool = false,
 
     fn deinit(self: *PendingRetry, alloc: std.mem.Allocator) void {
         alloc.free(self.frame.bytes);
@@ -304,9 +303,12 @@ pub const CodecTransportHost = struct {
             // Failure ownership is per group. A later route change/removal
             // cannot send another group's pending messages to the wrong node.
             for (batch.groups) |group| {
+                // Raft emits another context-free heartbeat on the next tick.
+                // Retrying this one later can replace a newer queued heartbeat.
+                if (isReplaceableHeartbeatGroup(group)) continue;
                 const isolated = try self.codec.encodePeerBatch(self.alloc, .{ .peer_id = batch.peer_id, .groups = &.{group} });
                 defer self.codec.freeFrame(self.alloc, isolated);
-                try self.scheduleRetry(group.group_id, if (group.messages.len > 0) group.messages[0].from else null, batch.peer_id, isolated, 1, isReplaceableHeartbeatGroup(group));
+                try self.scheduleRetry(group.group_id, if (group.messages.len > 0) group.messages[0].from else null, batch.peer_id, isolated, 1);
             }
             self.codec.freeFrame(self.alloc, frame);
             return;
@@ -322,7 +324,6 @@ pub const CodecTransportHost = struct {
         peer_id: core.types.NodeId,
         frame: codec_iface.EncodedFrame,
         attempt: u32,
-        replaceable_heartbeat: bool,
     ) !void {
         if (attempt >= self.retry_policy.max_attempts or self.pending_retries.items.len >= self.retry_policy.max_pending_frames or frame.bytes.len > self.retry_policy.max_pending_bytes -| self.pending_retry_bytes) {
             // Raft transport is lossy; bounded retry retention never prevents
@@ -343,7 +344,6 @@ pub const CodecTransportHost = struct {
             },
             .attempts = attempt,
             .retry_round = self.current_round + bounded_delay,
-            .replaceable_heartbeat = replaceable_heartbeat,
         });
         self.pending_retry_bytes += frame.bytes.len;
         self.metrics.retries_scheduled += 1;
@@ -418,6 +418,9 @@ pub const CodecTransportHost = struct {
             var completion = failed;
             defer completion.deinit();
             self.metrics.send_failures += 1;
+            // An asynchronously failed heartbeat is just as stale as one
+            // rejected at enqueue time. Keep read-index and data retries.
+            if (completion.replaceable_heartbeat) continue;
             if (completion.attempt >= self.retry_policy.max_attempts) {
                 self.metrics.retries_exhausted += 1;
                 continue;
@@ -427,9 +430,12 @@ pub const CodecTransportHost = struct {
             switch (decoded) {
                 .raft_peer_batch => |batch| for (batch.groups) |group| {
                     if (!self.peer_routes.contains(.{ .group_id = group.group_id, .node_id = completion.peer_id })) continue;
+                    // Mixed bundles can contain both retryable work and an
+                    // obsolete context-free heartbeat.
+                    if (isReplaceableHeartbeatGroup(group)) continue;
                     const frame = try self.codec.encodePeerBatch(self.alloc, .{ .peer_id = completion.peer_id, .groups = &.{group} });
                     defer self.codec.freeFrame(self.alloc, frame);
-                    try self.scheduleRetry(group.group_id, completion.source_id, completion.peer_id, frame, completion.attempt, completion.replaceable_heartbeat and isReplaceableHeartbeatGroup(group));
+                    try self.scheduleRetry(group.group_id, completion.source_id, completion.peer_id, frame, completion.attempt);
                 },
                 else => {},
             }
@@ -460,7 +466,6 @@ pub const CodecTransportHost = struct {
                 .peer_id = pending.peer_id,
                 .endpoint = endpoint.endpoint(),
                 .frame = pending.frame,
-                .replaceable_heartbeat = pending.replaceable_heartbeat,
             };
             self.driver.sendFrame(req) catch {
                 if (pending.attempts + 1 >= self.retry_policy.max_attempts) {
