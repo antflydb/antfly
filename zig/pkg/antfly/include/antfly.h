@@ -608,7 +608,8 @@ typedef bool (*antfly_inference_stream_fn)(void *context, antfly_slice chunk_jso
 /*
  * Streams a generate request (the same body as antfly_inference_generate_json;
  * "stream" is set for you). on_chunk is called on the calling thread for each
- * chunk, as the model produces tokens. Returns ANTFLY_OK once generation
+ * chunk, as the model produces tokens; generation waits for each call to
+ * return. Returns ANTFLY_OK once generation
  * finishes, or ANTFLY_CANCELLED when on_chunk returned false. A request
  * rejected before generation starts (such as a missing model) fails as
  * antfly_inference_generate_json does, with the JSON error in *out; a failure
@@ -668,9 +669,11 @@ typedef bool (*antfly_inference_pull_progress_fn)(
  *    "max_artifact_bytes": N, "max_model_bytes": N}
  *
  * progress (may be NULL) is called on the calling thread as each file
- * starts, every 16 MiB, and as it completes. Returning false cancels: the
- * download stops and the call returns ANTFLY_CANCELLED. Completed files stay
- * staged, so pulling the same model again resumes rather than restarts.
+ * starts, every 16 MiB, and as it completes; the download waits for each
+ * call to return. Returning false cancels: the call returns ANTFLY_CANCELLED
+ * and the model is not installed, even if that was the last report.
+ * Completed files stay staged, so pulling the same model again resumes
+ * rather than restarts.
  *
  * On success *out is {"models": [...], "models_dir": "..."}; on failure it is
  * {"error": ..., "message": ...}. A model missing from the hub returns

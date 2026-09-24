@@ -131,12 +131,14 @@ handlers:
   false from the callback cancels the download (`ANTFLY_CANCELLED`);
   completed files stay staged, so pulling again resumes. Close waits for a
   pull in progress.
-- Callbacks always run on the thread that made the call. The runtime works
-  on its own threads and hands results to the caller's thread, so bindings
-  whose runtimes require that (koffi for Node, for example) are safe.
-  Cancellation takes effect at the next callback: between generated tokens,
-  or at the next pull report (each file's start, every 16 MiB, and its
-  end).
+- Callbacks always run on the thread that made the call, and the work waits
+  for each one to return. The runtime works on its own threads and hands
+  each result to the caller's thread, so bindings whose runtimes require that
+  (koffi for Node, for example) are safe, and returning false is always
+  honored: no further chunks are generated, and a cancelled pull never
+  installs the model. The callback can only cancel when it is called:
+  between generated tokens, or at a pull report (each file's start, every
+  16 MiB, and its end).
 - Models run in the calling process on every backend; see Inference In
   Process below. If the runtime cannot start, open returns
   `ANTFLY_UNSUPPORTED`.

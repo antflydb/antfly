@@ -369,7 +369,7 @@ pub fn pullEmbeddedInferenceModels(
     models_dir: ?[]const u8,
     request_json: []const u8,
     progress_context: ?*anyopaque,
-    on_progress: ?*const fn (?*anyopaque, *const inference_bridge.PullProgress) callconv(.c) void,
+    on_progress: ?*const fn (?*anyopaque, *const inference_bridge.PullProgress) callconv(.c) u8,
     result_context: ?*anyopaque,
     on_result: *const fn (?*anyopaque, inference_bridge.String) callconv(.c) void,
 ) !void {

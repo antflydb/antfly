@@ -3431,6 +3431,7 @@ fn pullModels(arena: std.mem.Allocator, io: std.Io, context: *const inference_br
         try registry.pullWithProgress(io, ref, hub_config, tasks_csv, capabilities_csv, projector, .{
             .callback = PullProgressReporter.report,
             .context = &reporter,
+            .cancelled = &reporter.cancelled,
         });
     }
     return std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(.{
@@ -3442,6 +3443,7 @@ fn pullModels(arena: std.mem.Allocator, io: std.Io, context: *const inference_br
 const PullProgressReporter = struct {
     context: *const inference_bridge.PullModelContext,
     model: []const u8,
+    cancelled: std.atomic.Value(bool) = .init(false),
 
     fn report(progress: inference.registry.download.DownloadProgress, raw: ?*anyopaque) void {
         const self: *PullProgressReporter = @ptrCast(@alignCast(raw.?));
@@ -3455,6 +3457,6 @@ const PullProgressReporter = struct {
             .files_total = progress.files_total,
             .cached = @intFromBool(progress.cached),
         };
-        callback(self.context.progress_context, &view);
+        if (callback(self.context.progress_context, &view) == 0) self.cancelled.store(true, .release);
     }
 };

@@ -348,8 +348,9 @@ pub const PullModelContext = extern struct {
     /// `antfly_inference_pull_json`.
     request_json: String,
     progress_context: ?*anyopaque = null,
-    /// Called on the calling thread. `progress` is valid only during the call.
-    on_progress: ?*const fn (?*anyopaque, *const PullProgress) callconv(.c) void = null,
+    /// `progress` is valid only during the call. Returns 0 to cancel the pull,
+    /// which then fails with `error.Canceled` before its next artifact.
+    on_progress: ?*const fn (?*anyopaque, *const PullProgress) callconv(.c) u8 = null,
     /// Receives the result JSON exactly once, on success or failure; the
     /// bytes are valid only during the call.
     result_context: ?*anyopaque = null,

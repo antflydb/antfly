@@ -265,28 +265,31 @@ fn CallerThreadRelay(comptime Item: type) type {
 
         mutex: std.Io.Mutex = .init,
         changed: std.Io.Condition = .init,
-        items: std.ArrayListUnmanaged(Item) = .empty,
+        /// The item handed to the caller, if it has not answered yet.
+        pending: ?Item = null,
         done: bool = false,
         /// Set once the caller's callback asks to stop; later items are
-        /// dropped rather than queued.
+        /// dropped without delivery.
         cancelled: std.atomic.Value(bool) = .init(false),
 
-        /// Queues an item from a runtime thread; takes ownership.
-        fn push(self: *Self, item: Item) void {
-            if (self.cancelled.load(.acquire)) {
-                var dropped = item;
-                dropped.deinit();
-                return;
-            }
+        /// Hands an item (taking ownership) to the calling thread and waits
+        /// for its callback to return, so a cancel stops the work before it
+        /// goes past this point. Returns false once the caller cancelled.
+        fn push(self: *Self, item: Item) bool {
+            var owned = item;
             const io = db.handleLockIo();
             self.mutex.lockUncancelable(io);
             defer self.mutex.unlock(io);
-            self.items.append(alloc, item) catch {
-                var dropped = item;
-                dropped.deinit();
-                return;
-            };
-            self.changed.signal(io);
+            // One item at a time: wait for the previous one to be answered.
+            while (self.pending != null and !self.cancelled.load(.acquire)) self.changed.waitUncancelable(io, &self.mutex);
+            if (self.cancelled.load(.acquire)) {
+                owned.deinit();
+                return false;
+            }
+            self.pending = owned;
+            self.changed.broadcast(io);
+            while (self.pending != null and !self.cancelled.load(.acquire)) self.changed.waitUncancelable(io, &self.mutex);
+            return !self.cancelled.load(.acquire);
         }
 
         fn finish(self: *Self) void {
@@ -294,12 +297,12 @@ fn CallerThreadRelay(comptime Item: type) type {
             self.mutex.lockUncancelable(io);
             defer self.mutex.unlock(io);
             self.done = true;
-            self.changed.signal(io);
+            self.changed.broadcast(io);
         }
 
         /// Delivers items on the calling thread until `finish`. `deliver_one`
-        /// returns false to cancel: `on_cancel` then runs once, and the rest
-        /// is drained without delivery.
+        /// returns false to cancel: the waiting producer is released first,
+        /// then `on_cancel` runs once.
         fn run(
             self: *Self,
             context: anytype,
@@ -309,21 +312,22 @@ fn CallerThreadRelay(comptime Item: type) type {
             const io = db.handleLockIo();
             while (true) {
                 self.mutex.lockUncancelable(io);
-                while (self.items.items.len == 0 and !self.done) self.changed.waitUncancelable(io, &self.mutex);
-                var batch = self.items;
-                self.items = .empty;
-                const finished = self.done;
+                while (self.pending == null and !self.done) self.changed.waitUncancelable(io, &self.mutex);
+                var item = self.pending orelse {
+                    self.mutex.unlock(io);
+                    return;
+                };
                 self.mutex.unlock(io);
-                defer batch.deinit(alloc);
-                for (batch.items) |*item| {
-                    defer item.deinit();
-                    if (self.cancelled.load(.acquire)) continue;
-                    if (!deliver_one(context, item)) {
-                        self.cancelled.store(true, .release);
-                        on_cancel(context);
-                    }
-                }
-                if (finished) return;
+
+                const keep_going = self.cancelled.load(.acquire) or deliver_one(context, &item);
+                item.deinit();
+                self.mutex.lockUncancelable(io);
+                self.pending = null;
+                const cancelling = !keep_going;
+                if (cancelling) self.cancelled.store(true, .release);
+                self.changed.broadcast(io);
+                self.mutex.unlock(io);
+                if (cancelling) on_cancel(context);
             }
         }
     };
@@ -353,15 +357,17 @@ const PullCall = struct {
     io: std.Io,
     future: ?std.Io.Future(void) = null,
 
-    fn onProgress(raw: ?*anyopaque, progress: *const inference_provider.inference_bridge.PullProgress) callconv(.c) void {
+    /// Waits for the caller's callback, so returning 0 (cancel) reaches the
+    /// download before it moves past this report.
+    fn onProgress(raw: ?*anyopaque, progress: *const inference_provider.inference_bridge.PullProgress) callconv(.c) u8 {
         const self: *PullCall = @ptrCast(@alignCast(raw.?));
-        if (!self.wants_progress) return;
-        const model = alloc.dupe(u8, progress.model.slice()) catch return;
+        if (!self.wants_progress) return 1;
+        const model = alloc.dupe(u8, progress.model.slice()) catch return 1;
         const file = alloc.dupe(u8, progress.file.slice()) catch {
             alloc.free(model);
-            return;
+            return 1;
         };
-        self.relay.push(.{
+        return @intFromBool(self.relay.push(.{
             .model = model,
             .file = file,
             .progress = .{
@@ -371,7 +377,7 @@ const PullCall = struct {
                 .files_total = progress.files_total,
                 .cached = progress.cached != 0,
             },
-        });
+        }));
     }
 
     fn onResult(raw: ?*anyopaque, result: inference_provider.inference_bridge.String) callconv(.c) void {
@@ -391,8 +397,9 @@ const PullCall = struct {
     }
 
     fn cancel(self: *PullCall) void {
-        // Interrupts blocked downloads; returns once the task has finished,
-        // which also ends the relay.
+        // The download also stops at its next artifact boundary on its own;
+        // cancelling the task interrupts a transfer in progress. Returns once
+        // the task has finished, which also ends the relay.
         if (self.future) |*future| future.cancel(self.io);
         self.future = null;
     }
@@ -509,7 +516,7 @@ const StreamCall = struct {
         const self: *StreamCall = @ptrCast(@alignCast(raw.?));
         if (self.relay.cancelled.load(.acquire)) return .canceled;
         self.pending.appendSlice(alloc, bytes.slice()) catch return .failed;
-        self.splitEvents() catch return .failed;
+        self.splitEvents() catch |err| return if (err == error.Canceled) .canceled else .failed;
         return .ok;
     }
 
@@ -540,7 +547,7 @@ const StreamCall = struct {
             if (std.mem.eql(u8, name, "error")) {
                 if (self.stream_error == null) self.stream_error = try alloc.dupe(u8, data.items);
             } else if (data.items.len > 0 and !std.mem.eql(u8, data.items, "[DONE]")) {
-                self.relay.push(.{ .data = try data.toOwnedSlice(alloc) });
+                if (!self.relay.push(.{ .data = try data.toOwnedSlice(alloc) })) return error.Canceled;
             }
             const rest = self.pending.items.len - (end + 2);
             std.mem.copyForwards(u8, self.pending.items[0..rest], self.pending.items[end + 2 ..]);
@@ -951,6 +958,22 @@ test "capi inference pulls a model with progress into the handle's models direct
     try std.testing.expect(progress.reports > 0 and progress.saw_model);
     // Reports arrive on the calling thread, as the header promises.
     try std.testing.expect(!progress.off_thread);
+
+    // Cancelling even at the final report is honored: the download waits for
+    // each callback's answer before moving on.
+    const fresh_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}-fresh", .{models_dir});
+    defer std.testing.allocator.free(fresh_dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, fresh_dir);
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, fresh_dir) catch {};
+    var fresh_options: capi.InferenceOptions = .{ .models_dir = testSlice(fresh_dir) };
+    var fresh: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_inference_open(&fresh_options, &fresh));
+    defer antfly_inference_close(fresh);
+    var at_last = Progress{ .caller = std.Thread.getCurrentId(), .cancel_at = progress.reports };
+    var at_last_out: capi.Buffer = .{};
+    const at_last_code = antfly_inference_pull_json(fresh, testSlice(request), Progress.report, &at_last, &at_last_out);
+    db.antfly_buffer_free(&at_last_out);
+    try std.testing.expectEqual(capi.ErrorCode.cancelled, at_last_code);
 
     // The same handle sees the pulled model.
     var models: capi.Buffer = .{};
