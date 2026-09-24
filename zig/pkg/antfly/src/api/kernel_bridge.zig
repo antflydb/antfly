@@ -485,6 +485,7 @@ const OpaqueHttpxHandler = struct {
         try server.configureRequestDispatch(.{
             .control_tasks = policy.control_requests,
             .recovery_tasks = policy.recovery_requests,
+            .recovery_h1_bodies = @intFromBool(policy.recovery_requests != 0),
             .classifier = .{ .ctx = self, .classify = classifyTransportIngress },
             .h1_rejection_response = @import("workload_dispatch.zig").busy_response,
         });
@@ -837,6 +838,26 @@ test "opaque host middleware protects direct internal routes across the kernel A
     defer public_response.deinit();
     try std.testing.expectEqual(@as(u16, 204), public_response.status.code);
     try std.testing.expectEqual(@as(usize, 2), FakeKernel.calls);
+}
+
+test "opaque HTTP adapter reserves recovery body ingress from kernel policy" {
+    const FakeKernel = struct {
+        fn policy(context: *const abi.DispatchPolicyContext) callconv(.c) abi.Status {
+            context.out_policy.* = .{ .max_requests = 3, .control_requests = 1, .recovery_requests = 1 };
+            context.out_lane.* = 0;
+            return .ok;
+        }
+    };
+    var functions: abi.FunctionTable = undefined;
+    functions.abi_version = abi.abi_version;
+    functions.struct_size = @sizeOf(abi.FunctionTable);
+    functions.capabilities = abi.Capability.dispatch_admission;
+    functions.handler_dispatch_policy = FakeKernel.policy;
+    var handler = OpaqueHttpxHandler{ .handle = @ptrFromInt(1), .functions = &functions };
+    var server = httpx.Server.initWithConfig(std.testing.allocator, std.testing.io, .{ .max_connections = 3, .max_request_tasks = 3 });
+    defer server.deinit();
+    try handler.configureTransportIngress(&server);
+    try std.testing.expectEqual(@as(u32, 1), server.request_dispatch_config.recovery_h1_bodies);
 }
 
 test "linked transport projects the universal request cancellation callback" {

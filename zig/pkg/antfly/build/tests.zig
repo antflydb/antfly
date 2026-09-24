@@ -1775,6 +1775,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-relational-index-http-test", "Run unified relational index CRUD and document index compatibility").dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, relational_index_http_tests, &.{ "api http server unified relational index CRUD", "api http server serves table index metadata routes", "index maintenance actions require table admin permission" }).step);
+    const api_ingress_adapter_filters = [_][]const u8{
+        "workload admission authenticated recovery control survives full ingress and foreground drain",
+        "opaque HTTP adapter reserves recovery body ingress from kernel policy",
+    };
+    const api_ingress_adapter_tests = b.addTest(.{
+        .name = "api-ingress-adapter-tests",
+        .root_module = api_http_runtime_test_mod,
+        .filters = &api_ingress_adapter_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-ingress-adapters-test", "Run direct and linked API ingress adapter contracts")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, api_ingress_adapter_tests, &api_ingress_adapter_filters).step);
     const api_http_runtime_test_step = b.step("antfly-api-test", "Run API contracts and linked-boundary tests");
     root_test_step.dependOn(&run_api_http_runtime_tests.step);
 

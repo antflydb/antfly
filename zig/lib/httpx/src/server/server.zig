@@ -135,6 +135,10 @@ pub const RequestDispatchConfig = struct {
     /// request-task capacity, not connection slots or header/body ingress.
     control_tasks: u32 = 0,
     recovery_tasks: u32 = 0,
+    /// Nonborrowable HTTP/1 body-ingress slots for authenticated recovery
+    /// requests. These are inside max_h1_inflight_bodies and require a
+    /// recovery classifier; connection slots remain a separate limit.
+    recovery_h1_bodies: u32 = 0,
     classifier: ?struct {
         ctx: ?*anyopaque,
         classify: *const fn (?*anyopaque, RequestDispatchView) RequestTaskLane,
@@ -1622,6 +1626,7 @@ pub const Server = struct {
     connections: Io.Group = Io.Group.init,
     conn_semaphore: Io.Semaphore,
     h1_body_budget: SharedBodyBudget,
+    recovery_h1_body_budget: SharedBodyBudget = SharedBodyBudget.init(0),
     waiting_for_connection_permit: std.atomic.Value(bool) = .init(false),
     body_budget: SharedBodyBudget,
     owned_http_runtime: HttpRuntime,
@@ -1821,12 +1826,21 @@ pub const Server = struct {
         const reserved = @as(u64, config.control_tasks) + config.recovery_tasks;
         if (reserved >= self.config.max_request_tasks or (reserved != 0 and config.classifier == null))
             return error.InvalidRequestDispatchConfiguration;
+        const h1_body_capacity = if (self.config.max_h1_inflight_bodies == 0)
+            self.config.max_connections
+        else
+            self.config.max_h1_inflight_bodies;
+        if (config.recovery_h1_bodies > config.recovery_tasks or
+            config.recovery_h1_bodies >= h1_body_capacity)
+            return error.InvalidRequestDispatchConfiguration;
         if (config.h1_rejection_response) |wire| {
             if (wire.len > 4096 or !std.mem.startsWith(u8, wire, "HTTP/1.1 ") or
                 std.mem.indexOf(u8, wire, "\r\nConnection: close\r\n") == null or
                 std.mem.indexOf(u8, wire, "\r\n\r\n") == null) return error.InvalidRequestDispatchConfiguration;
         }
         self.request_dispatch_config = config;
+        self.h1_body_budget.capacity = h1_body_capacity - config.recovery_h1_bodies;
+        self.recovery_h1_body_budget.capacity = config.recovery_h1_bodies;
         self.request_permits.store(self.config.max_request_tasks - @as(u32, @intCast(reserved)), .release);
         self.control_request_permits.store(config.control_tasks, .release);
         self.recovery_request_permits.store(config.recovery_tasks, .release);
@@ -2394,8 +2408,8 @@ pub const Server = struct {
         var leftover: usize = 0;
         while (self.running and self.shutdown_mode.load(.acquire) == 0) {
             parser.reset();
-            var h1_body_reserved = false;
-            defer if (h1_body_reserved) self.h1_body_budget.release(1);
+            var h1_body_reserved: ?*SharedBodyBudget = null;
+            defer if (h1_body_reserved) |budget| budget.release(1);
 
             // Keep-alive idle, header ingress, and body ingress are separate
             // absolute phases. Bytes cannot renew any of these deadlines.
@@ -2517,9 +2531,11 @@ pub const Server = struct {
                 }
             }
 
-            if (h1_body_reserved and !parser.headers_only) {
-                self.h1_body_budget.release(1);
-                h1_body_reserved = false;
+            if (h1_body_reserved) |budget| {
+                if (!parser.headers_only) {
+                    budget.release(1);
+                    h1_body_reserved = null;
+                }
             }
 
             request_lane = self.classifyRequest(.{
@@ -2769,12 +2785,23 @@ pub const Server = struct {
 
     /// Admit an HTTP/1 request body as soon as headers identify it, rather
     /// than after the parser has waited for an attacker-controlled upload.
-    fn reserveH1BodyAfterHeaders(self: *Self, parser: *const Parser, reserved: *bool) bool {
-        if (reserved.* or !parser.hasCompleteHeaders()) return true;
+    fn reserveH1BodyAfterHeaders(self: *Self, parser: *const Parser, reserved: *?*SharedBodyBudget) bool {
+        if (reserved.* != null or !parser.hasCompleteHeaders()) return true;
         if (parser.isComplete() and !parser.headers_only) return true;
         if (parser.content_length == null and !parser.chunked) return true;
-        if (!self.h1_body_budget.tryReserve(1)) return false;
-        reserved.* = true;
+        const lane = self.classifyRequest(.{
+            .method = @tagName(parser.method orelse .GET),
+            .target = parser.path orelse "/",
+            .body_received_bytes = parser.getBody().len,
+            .body_complete = false,
+            .headers = .{ .h1 = &parser.headers },
+        });
+        const budget = if (lane == .recovery and self.request_dispatch_config.recovery_h1_bodies != 0)
+            &self.recovery_h1_body_budget
+        else
+            &self.h1_body_budget;
+        if (!budget.tryReserve(1)) return false;
+        reserved.* = budget;
         return true;
     }
 
@@ -7307,4 +7334,112 @@ test "request task partitions validate totals and retain lane on dispatch failur
     try std.testing.expectEqual(@as(u32, 1), server.recovery_request_permits.load(.acquire));
     try std.testing.expectEqual(@as(usize, 2), server.runtimeStats().active_requests);
     try std.testing.expectEqual(@as(u64, 1), server.runtimeStats().request_executor_rejections_total);
+}
+
+test "recovery H1 body slot survives saturated general upload ingress" {
+    var server = Server.initWithConfig(std.testing.allocator, std.testing.io, .{
+        .max_connections = 4,
+        .max_request_tasks = 3,
+        .max_h1_inflight_bodies = 2,
+    });
+    defer server.deinit();
+    try std.testing.expectError(error.InvalidRequestDispatchConfiguration, server.configureRequestDispatch(.{
+        .recovery_tasks = 1,
+        .recovery_h1_bodies = 2,
+        .classifier = .{ .ctx = null, .classify = DispatchPartitionTest.classify },
+    }));
+    try server.configureRequestDispatch(.{
+        .recovery_tasks = 1,
+        .recovery_h1_bodies = 1,
+        .classifier = .{ .ctx = null, .classify = DispatchPartitionTest.classify },
+    });
+    try std.testing.expectEqual(@as(usize, 1), server.h1_body_budget.capacity);
+    try std.testing.expectEqual(@as(usize, 1), server.recovery_h1_body_budget.capacity);
+
+    var general = Parser.init(std.testing.allocator);
+    defer general.deinit();
+    _ = try general.feed("POST /work HTTP/1.1\r\nHost: test\r\nContent-Length: 4\r\n\r\n");
+    var general_slot: ?*SharedBodyBudget = null;
+    try std.testing.expect(server.reserveH1BodyAfterHeaders(&general, &general_slot));
+    defer if (general_slot) |slot| slot.release(1);
+    try std.testing.expect(general_slot.? == &server.h1_body_budget);
+
+    var blocked = Parser.init(std.testing.allocator);
+    defer blocked.deinit();
+    _ = try blocked.feed("POST /recover HTTP/1.1\r\nHost: test\r\nContent-Length: 4\r\n\r\n");
+    var blocked_slot: ?*SharedBodyBudget = null;
+    try std.testing.expect(!server.reserveH1BodyAfterHeaders(&blocked, &blocked_slot));
+    try std.testing.expect(blocked_slot == null);
+
+    var recovery = Parser.init(std.testing.allocator);
+    defer recovery.deinit();
+    _ = try recovery.feed("POST /recover HTTP/1.1\r\nHost: test\r\nAuthorization: test-secret\r\nContent-Length: 4\r\n\r\n");
+    var recovery_slot: ?*SharedBodyBudget = null;
+    try std.testing.expect(server.reserveH1BodyAfterHeaders(&recovery, &recovery_slot));
+    defer if (recovery_slot) |slot| slot.release(1);
+    try std.testing.expect(recovery_slot.? == &server.recovery_h1_body_budget);
+    try std.testing.expectEqual(@as(usize, 1), server.h1_body_budget.stats().in_use);
+    try std.testing.expectEqual(@as(usize, 1), server.recovery_h1_body_budget.stats().in_use);
+}
+
+test "recovery H1 upload completes while general body ingress is held and disconnect releases it" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var state: DispatchPartitionTest = .{};
+    var server = Server.initWithConfig(alloc, io, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .max_connections = 4,
+        .max_request_tasks = 3,
+        .max_h1_inflight_bodies = 2,
+        .h1_disconnect_cancellation = .disabled,
+    });
+    defer server.deinit();
+    try server.configureRequestDispatch(.{
+        .recovery_tasks = 1,
+        .recovery_h1_bodies = 1,
+        .classifier = .{ .ctx = null, .classify = DispatchPartitionTest.classify },
+    });
+    try server.any("/work", Handler.bind(&state, DispatchPartitionTest.handler));
+    try server.any("/recover", Handler.bind(&state, DispatchPartitionTest.handler));
+    var task = Server.ListenerTask.init(&server);
+    try task.start();
+    defer {
+        task.requestStop();
+        task.join() catch {};
+    }
+    while (!server.listen_started.load(.acquire)) try io.sleep(.fromMilliseconds(1), .awake);
+
+    var held = try Socket.connect(server.boundAddress().?, io);
+    var held_open = true;
+    defer if (held_open) held.close();
+    try held.sendAll("POST /work HTTP/1.1\r\nHost: test\r\nContent-Length: 4\r\n\r\n");
+    const deadline = Io.Clock.Timestamp.fromNow(io, .{ .raw = .fromSeconds(5), .clock = .awake });
+    while (server.h1_body_budget.stats().in_use != 1) {
+        if (Io.Clock.Timestamp.now(io, .awake).compare(.gte, deadline)) return error.TestUnexpectedResult;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try DispatchPartitionTest.h1(server.boundAddress().?, io, "POST /work HTTP/1.1\r\nHost: test\r\nContent-Length: 4\r\n\r\n", " 429 ");
+
+    var recovery = try Socket.connect(server.boundAddress().?, io);
+    defer recovery.close();
+    try recovery.setRecvTimeout(5000);
+    try recovery.sendAll("POST /recover HTTP/1.1\r\nHost: test\r\nAuthorization: test-secret\r\nContent-Length: 4\r\nConnection: close\r\n\r\n");
+    while (server.recovery_h1_body_budget.stats().in_use != 1) {
+        if (Io.Clock.Timestamp.now(io, .awake).compare(.gte, deadline)) return error.TestUnexpectedResult;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try recovery.sendAll("done");
+    var response: [1024]u8 = undefined;
+    const response_len = try recovery.recv(&response);
+    try std.testing.expect(mem.indexOf(u8, response[0..response_len], " 200 ") != null);
+    held.close();
+    held_open = false;
+    while (server.h1_body_budget.stats().in_use != 0 or server.recovery_h1_body_budget.stats().in_use != 0) {
+        if (Io.Clock.Timestamp.now(io, .awake).compare(.gte, deadline)) return error.TestUnexpectedResult;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
 }

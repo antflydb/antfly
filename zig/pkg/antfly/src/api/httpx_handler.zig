@@ -834,6 +834,7 @@ pub const AntflyApiHandler = struct {
         try server.configureRequestDispatch(.{
             .control_tasks = config.control_requests,
             .recovery_tasks = config.recovery_requests,
+            .recovery_h1_bodies = @intFromBool(config.recovery_requests != 0),
             .classifier = .{ .ctx = self, .classify = classifyTransportIngress },
             .h1_rejection_response = @import("workload_dispatch.zig").busy_response,
         });
@@ -13671,6 +13672,10 @@ test "workload admission authenticated recovery control survives full ingress an
     }, status.iface(), null, null);
     defer server.deinit();
     var handler: AntflyApiHandler = .{ .api_server = &server };
+    var transport = httpx.Server.initWithConfig(alloc, std.testing.io, .{ .max_connections = 3, .max_request_tasks = 3 });
+    defer transport.deinit();
+    try handler.configureTransportIngress(&transport);
+    try std.testing.expectEqual(@as(u32, 1), transport.request_dispatch_config.recovery_h1_bodies);
     const account = try server.ingress_admission.general.memoryAccount(alloc);
     defer account.release();
     var general = try account.acquireOutstanding();
