@@ -375,12 +375,14 @@ impl Inference {
     }
 
     /// Releases the embedded inference handle, waiting for in-flight calls
-    /// on other threads to finish first (including any in-progress
-    /// [`Inference::pull`], which cannot be cancelled). Idempotent and safe
-    /// to call concurrently with itself or from several threads at once;
-    /// calls made after (or racing) `close` fail. Takes `&self`, not
-    /// `self`, for the same reason as [`crate::Database::close`]. [`Drop`]
-    /// also closes, for callers who never need to close early.
+    /// on other threads to finish first -- including any in-progress
+    /// [`Inference::pull`] or [`Inference::generate_stream`], neither of
+    /// which `close` itself cancels (their own progress/chunk callbacks can,
+    /// by returning `false`). Idempotent and safe to call concurrently with
+    /// itself or from several threads at once; calls made after (or racing)
+    /// `close` fail. Takes `&self`, not `self`, for the same reason as
+    /// [`crate::Database::close`]. [`Drop`] also closes, for callers who
+    /// never need to close early.
     pub fn close(&self) -> crate::Result<()> {
         self.gate
             .close(|handle| unsafe { sys::antfly_inference_close(handle) });
@@ -411,11 +413,105 @@ impl Inference {
     }
 
     /// `POST /generate`. A request with `"stream": true` fails with
-    /// [`Error::InvalidArgument`]: responses are always complete.
+    /// [`Error::InvalidArgument`]: responses from this method are always
+    /// complete. Use [`Inference::generate_stream`] to stream.
     pub fn generate(&self, request: impl AsRef<[u8]>) -> InferenceResult<Vec<u8>> {
         self.call_json(request.as_ref(), |h, req, out| unsafe {
             sys::antfly_inference_generate_json(h, req, out)
         })
+    }
+
+    /// Streams a generate request (the same body as [`Inference::generate`];
+    /// `"stream"` is set for the caller). `on_chunk` is called on the
+    /// calling thread for each chunk -- the JSON of a `chat.completion.chunk`,
+    /// valid only for the duration of the call -- as the model produces
+    /// tokens; generation waits for each call to return before producing
+    /// the next chunk.
+    ///
+    /// Returning `false` from `on_chunk` stops generation and this method
+    /// returns [`Error::Cancelled`] (wrapped in [`InferenceError`]);
+    /// cancellation is always honored at the chunk where `on_chunk` returns
+    /// `false`. A request rejected before generation starts (for example a
+    /// missing model) fails like
+    /// [`Inference::generate`], with the JSON error body attached; a
+    /// failure mid-stream fails with [`Error::Internal`] and a JSON body
+    /// naming `"STREAM_FAILED"`.
+    ///
+    /// A panic inside `on_chunk` is caught and does not unwind across the C
+    /// ABI boundary (unwinding through `extern "C"` is undefined behavior):
+    /// it cancels the stream (as if `on_chunk` had returned `false`) and is
+    /// resumed once the underlying call returns.
+    pub fn generate_stream(
+        &self,
+        request: impl AsRef<[u8]>,
+        on_chunk: &mut dyn FnMut(&[u8]) -> bool,
+    ) -> InferenceResult<()> {
+        // Same shape as `pull`'s callback plumbing below: a type-erased
+        // closure plus a slot to stash a panic payload so it can be resumed
+        // after the FFI call returns instead of unwinding through
+        // `extern "C"`.
+        struct CallbackCtx<'a> {
+            on_chunk: &'a mut dyn FnMut(&[u8]) -> bool,
+            panic: Option<Box<dyn std::any::Any + Send>>,
+        }
+
+        unsafe extern "C" fn trampoline(ctx: *mut c_void, chunk_json: antfly_slice) -> bool {
+            if ctx.is_null() {
+                return true;
+            }
+            let ctx = unsafe { &mut *ctx.cast::<CallbackCtx>() };
+            if ctx.panic.is_some() {
+                // A previous invocation already panicked; stop the stream
+                // and don't call into (possibly now-invalid) user code
+                // again before we get a chance to resume that panic.
+                return false;
+            }
+            let bytes: &[u8] = if chunk_json.ptr.is_null() || chunk_json.len == 0 {
+                &[]
+            } else {
+                unsafe { std::slice::from_raw_parts(chunk_json.ptr, chunk_json.len) }
+            };
+            let result = std::panic::catch_unwind(AssertUnwindSafe(|| (ctx.on_chunk)(bytes)));
+            match result {
+                Ok(cont) => cont,
+                Err(payload) => {
+                    ctx.panic = Some(payload);
+                    false
+                }
+            }
+        }
+
+        let raw = self.with_handle(|handle| {
+            let mut out = antfly_buffer::default();
+            let mut ctx = CallbackCtx {
+                on_chunk,
+                panic: None,
+            };
+            let ctx_ptr = std::ptr::addr_of_mut!(ctx).cast::<c_void>();
+
+            let code = unsafe {
+                sys::antfly_inference_generate_stream_json(
+                    handle,
+                    borrow_slice(request.as_ref()),
+                    Some(trampoline),
+                    ctx_ptr,
+                    &mut out,
+                )
+            };
+            let body = unsafe { take_buffer(out) };
+
+            if let Some(payload) = ctx.panic.take() {
+                std::panic::resume_unwind(payload);
+            }
+
+            Ok((code, body))
+        });
+
+        match raw {
+            Ok((code, _body)) if code == sys::ANTFLY_OK => Ok(()),
+            Ok((code, body)) => Err(InferenceError::new(Error::from_code(code), body)),
+            Err(e) => Err(InferenceError::new(e, Vec::new())),
+        }
     }
 
     /// `POST /generate/batch`: up to 128 non-streaming generate requests in
@@ -466,51 +562,61 @@ impl Inference {
     /// (`{"model": "owner/name[:variant]", ...}`).
     ///
     /// `progress`, if given, is called synchronously on the calling thread
-    /// as files download. A panic inside it is caught and does not unwind
-    /// across the C ABI boundary (unwinding through `extern "C"` is
-    /// undefined behavior); it is instead resumed once the underlying
+    /// as each file starts, every 16 MiB, and as it completes; the download
+    /// waits for each call to return before continuing. Returning `false`
+    /// cancels the pull: this method then fails with [`Error::Cancelled`]
+    /// (wrapped in [`InferenceError`]) and the model is not installed.
+    /// Cancellation takes effect at the report where `progress` returns
+    /// `false` -- it is always honored, even at the very last report -- not
+    /// before. Completed files stay staged, so pulling the same model again
+    /// resumes rather than restarts. A panic inside `progress` is caught
+    /// and does not unwind across the C ABI boundary (unwinding through
+    /// `extern "C"` is undefined behavior): it cancels the pull (as if `progress` had
+    /// returned `false`) and is resumed once the underlying
     /// `antfly_inference_pull_json` call returns.
     ///
-    /// The call cannot be cancelled, and [`Inference::close`] waits for it.
-    /// On success the response is `{"models": [...], "models_dir": "..."}`;
-    /// a model missing from the hub fails with [`Error::NotFound`], a bad
-    /// request or a model over the configured size limits with
+    /// [`Inference::close`] waits for a pull in progress. On success the
+    /// response is `{"models": [...], "models_dir": "..."}`; a model
+    /// missing from the hub fails with [`Error::NotFound`], a bad request
+    /// or a model over the configured size limits with
     /// [`Error::InvalidArgument`], and a network or hub failure with
     /// [`Error::Busy`].
     pub fn pull(
         &self,
         request: impl AsRef<[u8]>,
-        progress: Option<&mut dyn FnMut(&PullProgress)>,
+        progress: Option<&mut dyn FnMut(&PullProgress) -> bool>,
     ) -> InferenceResult<Vec<u8>> {
         // Carries the caller's closure (type-erased behind the trait
         // object) plus a slot to stash a panic payload if it panics, so the
         // panic can be resumed after the FFI call returns instead of
         // unwinding through `extern "C"` (undefined behavior).
         struct CallbackCtx<'a> {
-            progress: &'a mut dyn FnMut(&PullProgress),
+            progress: &'a mut dyn FnMut(&PullProgress) -> bool,
             panic: Option<Box<dyn std::any::Any + Send>>,
         }
 
         unsafe extern "C" fn trampoline(
             ctx: *mut c_void,
             raw: *const antfly_inference_pull_progress,
-        ) {
+        ) -> bool {
             if ctx.is_null() || raw.is_null() {
-                return;
+                return true;
             }
             let ctx = unsafe { &mut *ctx.cast::<CallbackCtx>() };
             if ctx.panic.is_some() {
-                // A previous invocation already panicked; don't call into
-                // (possibly now-invalid) user code again before we get a
-                // chance to resume that panic.
-                return;
+                // A previous invocation already panicked; cancel and don't
+                // call into (possibly now-invalid) user code again before we
+                // get a chance to resume that panic.
+                return false;
             }
             let progress = unsafe { PullProgress::from_raw(&*raw) };
-            let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                (ctx.progress)(&progress);
-            }));
-            if let Err(payload) = result {
-                ctx.panic = Some(payload);
+            let result = std::panic::catch_unwind(AssertUnwindSafe(|| (ctx.progress)(&progress)));
+            match result {
+                Ok(cont) => cont,
+                Err(payload) => {
+                    ctx.panic = Some(payload);
+                    false
+                }
             }
         }
 

@@ -49,6 +49,12 @@ export enum ErrorCode {
    * forward progress and gave up.
    */
   Stalled = 9,
+  /**
+   * The caller cancelled the call by returning false from its progress or
+   * stream callback (Inference.pull()'s onProgress, Inference.generateStream()'s
+   * onChunk).
+   */
+  Cancelled = 10,
   Internal = 255,
 }
 
@@ -63,6 +69,7 @@ const ERROR_CODE_NAMES: Readonly<Record<number, string>> = {
   [ErrorCode.OutcomeUnknown]: "ANTFLY_OUTCOME_UNKNOWN",
   [ErrorCode.Unsupported]: "ANTFLY_UNSUPPORTED",
   [ErrorCode.Stalled]: "ANTFLY_STALLED",
+  [ErrorCode.Cancelled]: "ANTFLY_CANCELLED",
   [ErrorCode.Internal]: "ANTFLY_INTERNAL",
 };
 
@@ -81,6 +88,7 @@ const ERROR_CODE_DESCRIPTIONS: Readonly<Record<number, string>> = {
     "the operation requires a capability that is not supported by this platform or filesystem",
   [ErrorCode.Stalled]:
     "a bounded drain made no forward progress for its configured stall window and gave up",
+  [ErrorCode.Cancelled]: "the caller cancelled the operation",
   [ErrorCode.Internal]: "an internal error occurred",
 };
 
@@ -192,6 +200,14 @@ export class StalledError extends AntflyError {
   }
 }
 
+export class CancelledError extends AntflyError {
+  constructor(message?: string) {
+    super(ErrorCode.Cancelled, message);
+    this.name = "CancelledError";
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
 export class InternalError extends AntflyError {
   constructor(message?: string) {
     super(ErrorCode.Internal, message);
@@ -210,6 +226,7 @@ const ERROR_CLASSES: Readonly<Record<number, new (message?: string) => AntflyErr
   [ErrorCode.OutcomeUnknown]: OutcomeUnknownError,
   [ErrorCode.Unsupported]: UnsupportedError,
   [ErrorCode.Stalled]: StalledError,
+  [ErrorCode.Cancelled]: CancelledError,
   [ErrorCode.Internal]: InternalError,
 };
 

@@ -57,6 +57,9 @@ pub const ANTFLY_BUSY: antfly_error_code = 6;
 pub const ANTFLY_OUTCOME_UNKNOWN: antfly_error_code = 7;
 pub const ANTFLY_UNSUPPORTED: antfly_error_code = 8;
 pub const ANTFLY_STALLED: antfly_error_code = 9;
+/// The caller cancelled the call by returning `false` from its progress or
+/// stream callback.
+pub const ANTFLY_CANCELLED: antfly_error_code = 10;
 pub const ANTFLY_INTERNAL: antfly_error_code = 255;
 
 // ---------------------------------------------------------------------
@@ -136,10 +139,23 @@ pub struct antfly_inference_pull_progress {
 /// Progress callback for `antfly_inference_pull_json`. May be `None`
 /// (a NULL function pointer). Called synchronously on the calling thread;
 /// the `*const antfly_inference_pull_progress` it receives is only valid for
-/// the duration of the call.
+/// the duration of the call. Return `true` to continue, `false` to cancel
+/// the pull (the call then returns `ANTFLY_CANCELLED`; completed files stay
+/// staged, so a later pull of the same model resumes rather than restarts).
 pub type antfly_inference_pull_progress_fn = Option<
-    unsafe extern "C" fn(context: *mut c_void, progress: *const antfly_inference_pull_progress),
+    unsafe extern "C" fn(
+        context: *mut c_void,
+        progress: *const antfly_inference_pull_progress,
+    ) -> bool,
 >;
+
+/// Streaming callback for `antfly_inference_generate_stream_json`. Receives
+/// one streamed chunk -- the JSON of a `chat.completion.chunk` -- valid only
+/// during the call, called on the calling thread as the model produces
+/// tokens. Return `true` to continue, `false` to stop generating (the call
+/// then returns `ANTFLY_CANCELLED`).
+pub type antfly_inference_stream_fn =
+    Option<unsafe extern "C" fn(context: *mut c_void, chunk_json: antfly_slice) -> bool>;
 
 // ---------------------------------------------------------------------
 // antfly_txn_status
@@ -811,6 +827,22 @@ unsafe extern "C" {
     pub fn antfly_inference_generate_json(
         inference: *mut antfly_inference,
         request_json: antfly_slice,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
+    /// Streams a generate request (the same body as
+    /// `antfly_inference_generate_json`; `"stream"` is set for the caller).
+    /// `on_chunk` is called on the calling thread for each chunk as the
+    /// model produces tokens. Returns `ANTFLY_OK` once generation finishes,
+    /// or `ANTFLY_CANCELLED` when `on_chunk` returned `false`. A request
+    /// rejected before generation starts (such as a missing model) fails
+    /// like `antfly_inference_generate_json`, with the JSON error in `out`;
+    /// a failure mid-stream returns `ANTFLY_INTERNAL` with
+    /// `{"error": "STREAM_FAILED", ...}`.
+    pub fn antfly_inference_generate_stream_json(
+        inference: *mut antfly_inference,
+        request_json: antfly_slice,
+        on_chunk: antfly_inference_stream_fn,
+        chunk_context: *mut c_void,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
     /// Up to 128 non-streaming generate requests in one call; per-item

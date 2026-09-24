@@ -65,6 +65,7 @@ export {
 export {
   AntflyError,
   BusyError,
+  CancelledError,
   ErrorCode,
   errorCodeDescription,
   errorCodeName,

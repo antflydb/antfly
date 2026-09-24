@@ -162,16 +162,29 @@ export const AntflyInferencePullProgress = koffi.struct("antfly_inference_pull_p
   cached: "bool",
 });
 
-// antfly_inference_pull_progress_fn: void(void *context, const
-// antfly_inference_pull_progress *progress). koffi cannot auto-decode a
+// antfly_inference_pull_progress_fn: bool(void *context, const
+// antfly_inference_pull_progress *progress). Returning true continues the
+// pull, false cancels it (the call then returns ANTFLY_CANCELLED; completed
+// files stay staged so a re-pull resumes). koffi cannot auto-decode a
 // callback's pointer-to-struct argument (see inference.ts's decoding of the
 // raw pointer via koffi.decode); this only declares the ABI shape.
 const AntflyInferencePullProgressFnProto = koffi.proto(
   "antfly_inference_pull_progress_fn",
-  "void",
+  "bool",
   ["void *", koffi.pointer(AntflyInferencePullProgress)]
 );
 export const PAntflyInferencePullProgressFn = koffi.pointer(AntflyInferencePullProgressFnProto);
+
+// antfly_inference_stream_fn: bool(void *context, antfly_slice chunk_json).
+// chunk_json is passed by value (not by pointer), so koffi decodes it
+// directly into a {ptr, len} JS object for the callback -- see
+// inference.ts's decodeSliceUtf8. Returning true continues generation,
+// false stops it (the call then returns ANTFLY_CANCELLED).
+const AntflyInferenceStreamFnProto = koffi.proto("antfly_inference_stream_fn", "bool", [
+  "void *",
+  AntflySlice,
+]);
+export const PAntflyInferenceStreamFn = koffi.pointer(AntflyInferenceStreamFnProto);
 
 export interface NativeLibrary {
   handle: LibraryHandle;
@@ -332,6 +345,15 @@ export interface NativeLibrary {
   inferenceRerankJson: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
   inferenceChunkJson: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
   inferenceGenerateJson: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
+  inferenceGenerateStreamJson: KoffiFunc<
+    (
+      handle: unknown,
+      request: object,
+      onChunk: unknown,
+      chunkContext: unknown,
+      out: object
+    ) => number
+  >;
   inferenceGenerateBatchJson: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
   inferenceRewriteJson: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
   inferenceExtractJson: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
@@ -666,6 +688,13 @@ function buildNative(): NativeLibrary {
     inferenceGenerateJson: f("antfly_inference_generate_json", "uint32_t", [
       PAntflyInference,
       AntflySlice,
+      PAntflyBufferOut,
+    ]),
+    inferenceGenerateStreamJson: f("antfly_inference_generate_stream_json", "uint32_t", [
+      PAntflyInference,
+      AntflySlice,
+      PAntflyInferenceStreamFn,
+      "void *",
       PAntflyBufferOut,
     ]),
     inferenceGenerateBatchJson: f("antfly_inference_generate_batch_json", "uint32_t", [

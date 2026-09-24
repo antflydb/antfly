@@ -67,3 +67,14 @@ separate, database-less embedded inference runtime opened with
 `antfly.h` and `zig/CAPI.md`'s "Inference" section) and closed with
 `antfly_inference_close`. There is a single `antfly_open_options` struct
 (no more separate `antfly_lite_open_options`).
+
+Two callback-taking calls can be cancelled by their callback returning
+`false`, reported as the `ANTFLY_CANCELLED` (10) error code:
+`antfly_inference_pull_json`'s `antfly_inference_pull_progress_fn` (`true`
+continues, `false` cancels the download) and
+`antfly_inference_generate_stream_json`'s `antfly_inference_stream_fn`
+(`true` continues, `false` stops generation). Both callbacks are called
+synchronously on the calling thread and are a rendezvous -- the download/
+generation waits for the callback to return before continuing -- so a
+`false` return always takes effect at that call, even at the very last
+report or chunk.

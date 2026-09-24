@@ -109,7 +109,7 @@ Antfly inference HTTP API (see `specs/openapi/inference/api.yaml`):
 `Embed`, `Rerank`, `Chunk`, `Generate`, `GenerateBatch`, `Rewrite`, `Extract`,
 `Read` (OCR), `Transcribe`, and `ListModels`. `Generate` always returns a
 complete response; a request with `"stream": true` fails with
-`InvalidArgument`.
+`InvalidArgument`. Use `GenerateStream` to stream chunks instead.
 
 ```go
 inf, err := lite.OpenInference(&lite.InferenceOptions{ModelsDir: "/path/to/models"})
@@ -131,7 +131,8 @@ On failure, every JSON method still returns the runtime's JSON error body
 the mapped stable `ErrorCode` (an HTTP 404, such as a model that is not
 installed, maps to `NotFound`; 4xx to `InvalidArgument`; 429/503/504 or an
 elapsed call timeout to `Busy`; 501/507, meaning the model does not fit the
-configured memory budgets, to `Unsupported`). Use `errors.As` for the API
+configured memory budgets, to `Unsupported`; a `Pull` or `GenerateStream`
+callback returning `false`, or its `ctx` becoming done, to `Cancelled`). Use `errors.As` for the API
 error code (e.g. `"MODEL_NOT_FOUND"`) and message, or `errors.Is(err, lite.NotFound)`
 for the stable code:
 
@@ -146,12 +147,35 @@ if errors.As(err, &infErr) {
 Models are not downloaded automatically. Use `Pull` to fetch a model from the
 Hugging Face Hub into the handle's models directory, like
 `antfly inference pull`. The optional progress callback runs synchronously on
-the calling goroutine as files download; the call cannot be cancelled, and
-`Close` waits for it:
+the calling goroutine as each file starts, every 16 MiB, and as each file
+completes:
 
 ```go
-_, err := inf.Pull([]byte(`{"model":"owner/name"}`), func(p lite.PullProgress) {
+_, err := inf.Pull(ctx, []byte(`{"model":"owner/name"}`), func(p lite.PullProgress) bool {
     log.Printf("%s: %s %d/%d bytes (cached=%v)", p.Model, p.File, p.BytesDownloaded, p.TotalBytes, p.Cached)
+    return true // false stops the pull
+})
+```
+
+`Pull` and `GenerateStream` both take a `context.Context` (nil is treated as
+`context.Background()`) alongside their own callback-return-value mechanism
+for stopping early -- the callback returning `false`, or `ctx` being done at
+the point a callback fires, both stop the call, and either way the call
+returns `lite.Cancelled` (the `ANTFLY_CANCELLED` C ABI code). Each progress
+report is a rendezvous: the call waits for the callback to return before
+continuing, so cancellation takes effect exactly at the report where the
+callback returns `false` (or `ctx` is observed done) -- for `Pull`, that can
+be each file start, every 16 MiB, or each file end (`ctx` itself is only
+checked when a report fires, not continuously); for `GenerateStream`, each
+streamed chunk. For `Pull`, files already fully downloaded before
+cancellation stay staged, so pulling the same model again resumes rather than
+restarts.
+
+```go
+err := inf.GenerateStream(ctx, request, func(chunk []byte) bool {
+    // chunk is a "chat.completion.chunk" JSON document; it is only valid
+    // during this call, so copy it before returning if you need to keep it.
+    return true // false stops generation
 })
 ```
 

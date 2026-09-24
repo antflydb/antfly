@@ -18,6 +18,7 @@ package lite
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -119,7 +120,7 @@ func TestInferencePullEmptyRequestIsInvalidArgument(t *testing.T) {
 	}
 	defer inf.Close()
 
-	_, err = inf.Pull([]byte(`{}`), nil)
+	_, err = inf.Pull(context.Background(), []byte(`{}`), nil)
 	if err == nil {
 		t.Fatalf("Pull({}) succeeded, want error")
 	}
@@ -152,6 +153,63 @@ func TestInferenceGenerateStreamingIsInvalidArgument(t *testing.T) {
 	}
 }
 
+func TestInferenceGenerateStreamMissingModelIsNotFound(t *testing.T) {
+	inf, err := OpenInference(&InferenceOptions{ModelsDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("OpenInference: %v", err)
+	}
+	defer inf.Close()
+
+	request := []byte(`{"model":"no/such-model","messages":[{"role":"user","content":"hi"}]}`)
+	err = inf.GenerateStream(context.Background(), request, func(chunk []byte) bool {
+		t.Fatalf("onChunk called for a missing-model request: %s", chunk)
+		return true
+	})
+	if err == nil {
+		t.Fatalf("GenerateStream with missing model succeeded, want error")
+	}
+	if !errors.Is(err, NotFound) {
+		t.Fatalf("GenerateStream with missing model error = %v, want NotFound", err)
+	}
+	var infErr *InferenceError
+	if !errors.As(err, &infErr) {
+		t.Fatalf("GenerateStream error = %v (%T), want *InferenceError", err, err)
+	}
+	if infErr.API.Code != "MODEL_NOT_FOUND" {
+		t.Fatalf("GenerateStream error API code = %q, want MODEL_NOT_FOUND; body=%s", infErr.API.Code, infErr.Body)
+	}
+}
+
+func TestInferenceGenerateStreamNilCallbackIsInvalidArgument(t *testing.T) {
+	inf, err := OpenInference(&InferenceOptions{ModelsDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("OpenInference: %v", err)
+	}
+	defer inf.Close()
+
+	request := []byte(`{"model":"no/such-model","messages":[{"role":"user","content":"hi"}]}`)
+	err = inf.GenerateStream(context.Background(), request, nil)
+	if !errors.Is(err, InvalidArgument) {
+		t.Fatalf("GenerateStream with nil onChunk error = %v, want InvalidArgument", err)
+	}
+}
+
+func TestInferenceGenerateStreamInvalidJSONIsInvalidArgument(t *testing.T) {
+	inf, err := OpenInference(&InferenceOptions{ModelsDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("OpenInference: %v", err)
+	}
+	defer inf.Close()
+
+	err = inf.GenerateStream(context.Background(), []byte(`not json`), func(chunk []byte) bool {
+		t.Fatalf("onChunk called for a malformed request: %s", chunk)
+		return true
+	})
+	if !errors.Is(err, InvalidArgument) {
+		t.Fatalf("GenerateStream with invalid JSON error = %v, want InvalidArgument", err)
+	}
+}
+
 func TestInferenceCallsAfterCloseFail(t *testing.T) {
 	inf, err := OpenInference(&InferenceOptions{ModelsDir: t.TempDir()})
 	if err != nil {
@@ -167,13 +225,92 @@ func TestInferenceCallsAfterCloseFail(t *testing.T) {
 	if _, err := inf.Chunk([]byte(`{"input":"hi"}`)); !errors.Is(err, InvalidArgument) {
 		t.Fatalf("Chunk after Close error = %v, want InvalidArgument", err)
 	}
-	if _, err := inf.Pull([]byte(`{"model":"a/b"}`), nil); !errors.Is(err, InvalidArgument) {
+	if _, err := inf.Pull(context.Background(), []byte(`{"model":"a/b"}`), nil); !errors.Is(err, InvalidArgument) {
 		t.Fatalf("Pull after Close error = %v, want InvalidArgument", err)
+	}
+	if err := inf.GenerateStream(context.Background(), []byte(`{"model":"a/b","messages":[]}`), func([]byte) bool { return true }); !errors.Is(err, InvalidArgument) {
+		t.Fatalf("GenerateStream after Close error = %v, want InvalidArgument", err)
 	}
 
 	// Double close remains safe.
 	if err := inf.Close(); err != nil {
 		t.Fatalf("second Close: %v", err)
+	}
+}
+
+// TestInferencePullNetworkGated pulls a real (tiny) model from the network
+// into a temp models directory when ANTFLY_INFERENCE_PULL_TEST_MODEL is set,
+// asserting the progress callback fires and the pulled model shows up in
+// ListModels. It first cancels on the very first progress report and checks
+// the pull is reported Cancelled after exactly one callback and the model
+// does not appear in ListModels, then pulls the same model to completion.
+//
+// Pull's progress callback is a rendezvous: the download waits for each
+// report to return before continuing, and a false return is always honored
+// as ANTFLY_CANCELLED (even on the final report, before the model is
+// installed), so cancelling on the first report is deterministic rather than
+// a race against the download's own completion.
+func TestInferencePullNetworkGated(t *testing.T) {
+	model := os.Getenv("ANTFLY_INFERENCE_PULL_TEST_MODEL")
+	if model == "" {
+		t.Skip("ANTFLY_INFERENCE_PULL_TEST_MODEL is not set")
+	}
+
+	modelsDir := filepath.Join(t.TempDir(), "models")
+	request := []byte(`{"model":"` + model + `"}`)
+
+	inf, err := OpenInference(&InferenceOptions{ModelsDir: modelsDir})
+	if err != nil {
+		t.Fatalf("OpenInference: %v", err)
+	}
+	defer inf.Close()
+
+	var cancelCalls int
+	_, cancelErr := inf.Pull(context.Background(), request, func(p PullProgress) bool {
+		cancelCalls++
+		return false
+	})
+	if !errors.Is(cancelErr, Cancelled) {
+		t.Fatalf("Pull(%s) cancelled on first report error = %v, want Cancelled", model, cancelErr)
+	}
+	if cancelCalls != 1 {
+		t.Fatalf("Pull(%s) cancelled on first report delivered %d callbacks, want exactly 1", model, cancelCalls)
+	}
+
+	listAfterCancel, err := inf.ListModels()
+	if err != nil {
+		t.Fatalf("ListModels after cancelled pull: %v", err)
+	}
+	if bytes.Contains(listAfterCancel, []byte(model)) {
+		t.Fatalf("ListModels() after cancelled pull = %s, want it to not contain %s", listAfterCancel, model)
+	}
+
+	var progressCalls int
+	var lastModel string
+	body, err := inf.Pull(context.Background(), request, func(p PullProgress) bool {
+		progressCalls++
+		lastModel = p.Model
+		return true
+	})
+	if err != nil {
+		t.Fatalf("Pull(%s): %v", model, err)
+	}
+	if progressCalls == 0 {
+		t.Fatalf("Pull(%s) progress callback was never called", model)
+	}
+	if lastModel == "" {
+		t.Fatalf("Pull(%s) progress callback never reported a model reference", model)
+	}
+	if !bytes.Contains(body, []byte(modelsDir)) {
+		t.Fatalf("Pull(%s) result = %s, want it to mention models_dir %s", model, body, modelsDir)
+	}
+
+	listBody, err := inf.ListModels()
+	if err != nil {
+		t.Fatalf("ListModels: %v", err)
+	}
+	if !bytes.Contains(listBody, []byte(model)) {
+		t.Fatalf("ListModels() = %s, want it to contain pulled model %s", listBody, model)
 	}
 }
 
@@ -207,47 +344,73 @@ func TestInferenceEmbedLocalModel(t *testing.T) {
 	}
 }
 
-// TestInferencePullNetworkGated pulls a real (tiny) model from the network
-// into a temp models directory when ANTFLY_INFERENCE_PULL_TEST_MODEL is set,
-// asserting the progress callback fires and the pulled model shows up in
-// ListModels.
-func TestInferencePullNetworkGated(t *testing.T) {
-	model := os.Getenv("ANTFLY_INFERENCE_PULL_TEST_MODEL")
-	if model == "" {
-		t.Skip("ANTFLY_INFERENCE_PULL_TEST_MODEL is not set")
-	}
-
-	modelsDir := filepath.Join(t.TempDir(), "models")
-	inf, err := OpenInference(&InferenceOptions{ModelsDir: modelsDir})
+// liteGemmaGenerateModelAvailable reports whether a local generative model is
+// present for TestInferenceGenerateStreamLocalModel, mirroring
+// liteLocalEmbeddingModelAvailable's pattern for the embedding model.
+func liteGemmaGenerateModelAvailable() bool {
+	home, err := os.UserHomeDir()
 	if err != nil {
-		t.Fatalf("OpenInference: %v", err)
+		return false
 	}
-	defer inf.Close()
+	matches, err := filepath.Glob(filepath.Join(home, ".antfly", "inference", "models", "ggml-org", "gemma-4-e2b-it-gguf*"))
+	if err != nil {
+		return false
+	}
+	return len(matches) > 0
+}
 
-	var progressCalls int
-	var lastModel string
-	body, err := inf.Pull([]byte(`{"model":"`+model+`"}`), func(p PullProgress) {
-		progressCalls++
-		lastModel = p.Model
+// TestInferenceGenerateStreamLocalModel streams a real local generation when
+// present under ~/.antfly/inference/models, and separately confirms
+// cancelling after a couple of chunks stops generation and reports exactly
+// as many callbacks as were allowed through.
+func TestInferenceGenerateStreamLocalModel(t *testing.T) {
+	if !liteGemmaGenerateModelAvailable() {
+		t.Skip("gemma-4-e2b-it-gguf model is not present under ~/.antfly/inference/models/ggml-org")
+	}
+
+	const model = "ggml-org/gemma-4-e2b-it-gguf:gguf:Q4_0"
+	request := []byte(`{"model":"` + model + `","messages":[{"role":"user","content":"Count from one to twenty in words."}],"max_tokens":48}`)
+
+	t.Run("completes", func(t *testing.T) {
+		inf, err := OpenInference(nil)
+		if err != nil {
+			t.Fatalf("OpenInference: %v", err)
+		}
+		defer inf.Close()
+
+		var chunks int
+		err = inf.GenerateStream(context.Background(), request, func(chunk []byte) bool {
+			chunks++
+			if !bytes.Contains(chunk, []byte("chat.completion.chunk")) {
+				t.Fatalf("chunk %d = %s, want it to contain chat.completion.chunk", chunks, chunk)
+			}
+			return true
+		})
+		if err != nil {
+			t.Fatalf("GenerateStream: %v", err)
+		}
+		if chunks <= 2 {
+			t.Fatalf("GenerateStream delivered %d chunks, want more than 2", chunks)
+		}
 	})
-	if err != nil {
-		t.Fatalf("Pull(%s): %v", model, err)
-	}
-	if progressCalls == 0 {
-		t.Fatalf("Pull(%s) progress callback was never called", model)
-	}
-	if lastModel == "" {
-		t.Fatalf("Pull(%s) progress callback never reported a model reference", model)
-	}
-	if !bytes.Contains(body, []byte(modelsDir)) {
-		t.Fatalf("Pull(%s) result = %s, want it to mention models_dir %s", model, body, modelsDir)
-	}
 
-	listBody, err := inf.ListModels()
-	if err != nil {
-		t.Fatalf("ListModels: %v", err)
-	}
-	if !bytes.Contains(listBody, []byte(model)) {
-		t.Fatalf("ListModels() = %s, want it to contain pulled model %s", listBody, model)
-	}
+	t.Run("cancels", func(t *testing.T) {
+		inf, err := OpenInference(nil)
+		if err != nil {
+			t.Fatalf("OpenInference: %v", err)
+		}
+		defer inf.Close()
+
+		var chunks int
+		err = inf.GenerateStream(context.Background(), request, func(chunk []byte) bool {
+			chunks++
+			return chunks < 2
+		})
+		if !errors.Is(err, Cancelled) {
+			t.Fatalf("GenerateStream stopped after 2 chunks error = %v, want Cancelled", err)
+		}
+		if chunks != 2 {
+			t.Fatalf("GenerateStream stopped after 2 chunks delivered %d callbacks, want exactly 2", chunks)
+		}
+	})
 }

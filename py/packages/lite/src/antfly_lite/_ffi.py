@@ -43,6 +43,7 @@ __all__ = [
     "AntflyInferenceOptions",
     "AntflyInferencePullProgress",
     "AntflyInferencePullProgressFn",
+    "AntflyInferenceStreamFn",
     "AntflyWriteIntent",
     "AntflyVersionPredicate",
     "OPEN_FLAG_NO_SYNC",
@@ -193,10 +194,21 @@ class AntflyInferencePullProgress(ctypes.Structure):
     ]
 
 
-# antfly_inference_pull_progress_fn: void(void *context, const
+# antfly_inference_pull_progress_fn: bool(void *context, const
 # antfly_inference_pull_progress *progress), called synchronously on the
-# calling thread.
-AntflyInferencePullProgressFn = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.POINTER(AntflyInferencePullProgress))
+# calling thread as each file starts, every 16 MiB, and as it completes.
+# Returning true continues the pull; false cancels it (the call then returns
+# ANTFLY_CANCELLED; completed files stay staged, so a later pull resumes).
+AntflyInferencePullProgressFn = ctypes.CFUNCTYPE(
+    ctypes.c_bool, ctypes.c_void_p, ctypes.POINTER(AntflyInferencePullProgress)
+)
+
+# antfly_inference_stream_fn: bool(void *context, antfly_slice chunk_json),
+# called synchronously on the calling thread for each streamed
+# "chat.completion.chunk" JSON chunk (valid only during the callback).
+# Returning true continues generation; false stops it (the call then returns
+# ANTFLY_CANCELLED).
+AntflyInferenceStreamFn = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, AntflySlice)
 
 
 class AntflyWriteIntent(ctypes.Structure):
@@ -358,6 +370,11 @@ _FUNCTIONS: list[tuple[str, list[object], object]] = [
     ("antfly_inference_rerank_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
     ("antfly_inference_chunk_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
     ("antfly_inference_generate_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
+    (
+        "antfly_inference_generate_stream_json",
+        [_VOID_P, AntflySlice, AntflyInferenceStreamFn, _VOID_P, _BUF_P],
+        _ERR,
+    ),
     ("antfly_inference_generate_batch_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
     ("antfly_inference_rewrite_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
     ("antfly_inference_extract_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),

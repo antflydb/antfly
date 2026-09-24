@@ -106,28 +106,73 @@ response, not raised), `rewrite()`, `extract()`, `read()` (OCR),
 / `bytes` JSON forms as `Database` methods, and responses honor the same
 `raw=True` convention. `generate()` and `generate_batch()` requests always
 return complete responses; `"stream": true` raises `InvalidArgumentError`
-(there is no streaming sink across the C ABI).
+-- use `generate_stream()` to stream.
 
 On failure, the C API still returns a JSON error body (`{"error": ...,
 "message": ...}`); this binding folds it into the raised exception's
 message rather than discarding it, using the same `AntflyError` subclasses
 as `Database` (a missing model raises `NotFoundError`, for example).
 
+### Streaming generation
+
+`generate_stream(request, on_chunk)` streams a generate call; it sets
+`"stream": true` for you (do not set it in `request`). `on_chunk` is called
+synchronously on the calling thread for each chunk -- the parsed JSON of a
+`chat.completion.chunk` -- as the model produces tokens:
+
+```python
+def on_chunk(chunk):
+    print(chunk["choices"][0]["delta"].get("content", ""), end="")
+
+
+with antfly_lite.Inference.open() as inf:
+    inf.generate_stream(
+        {"model": "ggml-org/gemma-4-e2b-it-gguf:gguf:Q4_0", "messages": [{"role": "user", "content": "hi"}]},
+        on_chunk,
+    )
+```
+
+A request rejected before generation starts (such as a missing model) fails
+like `generate()`, with the runtime's JSON error folded into the exception.
+A failure partway through the stream raises `InternalError` with a
+`STREAM_FAILED` body. On success `generate_stream()` returns `None` -- there
+is no final response body, only the chunks already delivered to `on_chunk`.
+
+### Pulling models
+
 Models are not downloaded automatically. `pull(request, progress=None)`
 downloads one from the Hugging Face Hub into the handle's models directory,
 like `antfly inference pull` (`request = {"model": "owner/name[:variant]",
-...}`); it cannot be cancelled, and `close()` waits for it. Pass
-`progress=callable` to receive an `antfly_lite.PullProgress` (`model`,
-`file`, `bytes_downloaded`, `total_bytes`, `files_done`, `files_total`,
-`cached`) synchronously on the calling thread as files download; an
-exception raised inside `progress` is captured and re-raised after the
-underlying call returns.
+...}`); `close()` waits for it. Pass `progress=callable` to receive an
+`antfly_lite.PullProgress` (`model`, `file`, `bytes_downloaded`,
+`total_bytes`, `files_done`, `files_total`, `cached`) synchronously on the
+calling thread as each file starts, every 16 MiB, and as it completes.
+Completed files stay staged across a cancelled or interrupted pull, so
+pulling the same model again resumes rather than restarts.
+
+### Cancellation
+
+`pull()`'s `progress` callback and `generate_stream()`'s `on_chunk` callback
+can stop the call in progress by returning `False` (returning `None` or
+`True`, including implicitly by falling off the end of the function, keeps
+going -- existing callbacks that don't return anything keep working
+unchanged). A cancelled call raises `antfly_lite.CancelledError`.
+Cancellation only takes effect at the next report -- for `pull()`, each
+file's start, every 16 MiB, and its end; for `generate_stream()`, each
+chunk -- it does not interrupt work in progress between reports.
+
+If the callback itself raises, this binding captures the exception, cancels
+the call the same way, and re-raises the original exception once the
+underlying C call returns; it never unwinds across the C ABI boundary, and
+it takes priority over whatever error the call itself would otherwise
+report.
 
 `Inference` handles have the same threading contract as `Database` (see
 "Threading" below): safe for concurrent use by multiple threads, and
 `close()` (idempotent, safe to call repeatedly and concurrently) waits for
 in-flight calls before releasing the handle. Calls made after `close()`
-raise `InvalidArgumentError`.
+raise `InvalidArgumentError`. `progress`/`on_chunk` callbacks always run on
+the calling thread, never a library-owned thread.
 
 ### Inference runs in-process
 
@@ -210,10 +255,12 @@ to wait for another writer to close instead of failing immediately with
   module-level `restore()`, `restore_file()` (both accept `storage=` to
   select the destination kind).
 - **Embedded inference (no database)**: `Inference.open()`, `embed()`,
-  `rerank()`, `chunk()`, `generate()`, `generate_batch()`, `rewrite()`,
-  `extract()`, `read()`, `transcribe()`, `list_models()`, `pull()` (with a
-  `PullProgress` dataclass for progress callbacks). See "Embedded inference
-  (no database)" above.
+  `rerank()`, `chunk()`, `generate()`, `generate_stream()`,
+  `generate_batch()`, `rewrite()`, `extract()`, `read()`, `transcribe()`,
+  `list_models()`, `pull()` (with a `PullProgress` dataclass for progress
+  callbacks; both `pull()` and `generate_stream()` accept a callback that
+  can cancel the call by returning `False`). See "Embedded inference (no
+  database)" above.
 - **Module-level, no handle needed**: `check_file()`,
   `copy_stable_snapshot_file()`, `decode_artifact_id()`, `abi_version()`,
   `threading_mode()`, `THREADING_SERIALIZED`, `validate_abi()`.
@@ -222,7 +269,8 @@ to wait for another writer to close instead of failing immediately with
   `InvalidArgumentError`, `NotFoundError`, `VersionConflictError`,
   `IntentConflictError`, `TxnNotFoundError`, `BusyError`,
   `OutcomeUnknownError`, `UnsupportedError`, `StalledError`,
-  `InternalError`. Unrecognized codes raise `AntflyError` directly.
+  `CancelledError`, `InternalError`. Unrecognized codes raise `AntflyError`
+  directly.
 
 `create()` provisions the default `full_text_index_v0` full-text index,
 matching the server's table-create behavior, so `add_index()` is only

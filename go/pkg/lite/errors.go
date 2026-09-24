@@ -39,8 +39,12 @@ const (
 	Unsupported ErrorCode = 8
 	// Stalled reports that a bounded drain such as RunUntilIdle detected a
 	// managed index making no forward progress and gave up.
-	Stalled  ErrorCode = 9
-	Internal ErrorCode = 255
+	Stalled ErrorCode = 9
+	// Cancelled means the caller stopped the operation by returning false
+	// from its progress or streaming callback (see Inference.Pull and
+	// Inference.GenerateStream).
+	Cancelled ErrorCode = 10
+	Internal  ErrorCode = 255
 )
 
 var errorCodeNames = map[ErrorCode]string{
@@ -54,6 +58,7 @@ var errorCodeNames = map[ErrorCode]string{
 	OutcomeUnknown:  "ANTFLY_OUTCOME_UNKNOWN",
 	Unsupported:     "ANTFLY_UNSUPPORTED",
 	Stalled:         "ANTFLY_STALLED",
+	Cancelled:       "ANTFLY_CANCELLED",
 	Internal:        "ANTFLY_INTERNAL",
 }
 
@@ -68,6 +73,7 @@ var errorCodeDescriptions = map[ErrorCode]string{
 	OutcomeUnknown:  "the operation was published, but crash durability could not be confirmed; inspect the destination and do not retry automatically",
 	Unsupported:     "the operation requires a capability that is not supported by this platform or filesystem",
 	Stalled:         "a bounded drain made no forward progress for its configured stall window and gave up",
+	Cancelled:       "the caller cancelled the operation",
 	Internal:        "an internal error occurred",
 }
 

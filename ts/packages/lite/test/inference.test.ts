@@ -30,7 +30,7 @@ import { existsSync, mkdtempSync, readdirSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { InvalidArgumentError, NotFoundError } from "../src/errors.js";
+import { CancelledError, InvalidArgumentError, NotFoundError } from "../src/errors.js";
 import { Inference } from "../src/inference.js";
 import type { PullProgress } from "../src/types.js";
 import { describeWithLibrary } from "./helpers.js";
@@ -39,15 +39,25 @@ function tempModelsDir(): string {
   return mkdtempSync(join(tmpdir(), "antfly-lite-inference-"));
 }
 
-function hasQwenEmbeddingModel(): boolean {
-  const dir = join(homedir(), ".antfly", "inference", "models", "Qwen");
+function hasModelPrefix(owner: string, prefix: string): boolean {
+  const dir = join(homedir(), ".antfly", "inference", "models", owner);
   if (!existsSync(dir)) return false;
   try {
-    return readdirSync(dir).some((name) => name.startsWith("Qwen3-Embedding-0.6B-GGUF"));
+    return readdirSync(dir).some((name) => name.startsWith(prefix));
   } catch {
     return false;
   }
 }
+
+function hasQwenEmbeddingModel(): boolean {
+  return hasModelPrefix("Qwen", "Qwen3-Embedding-0.6B-GGUF");
+}
+
+function hasGemmaGenerateModel(): boolean {
+  return hasModelPrefix("ggml-org", "gemma-4-e2b-it-gguf");
+}
+
+const GEMMA_MODEL = "ggml-org/gemma-4-e2b-it-gguf:gguf:Q4_0";
 
 const PULL_TEST_MODEL = process.env.ANTFLY_INFERENCE_PULL_TEST_MODEL;
 
@@ -158,6 +168,38 @@ describeWithLibrary("Inference", () => {
         await inf.close();
       }
     });
+
+    it("generateStream with a missing model rejects with NotFoundError carrying MODEL_NOT_FOUND", async () => {
+      const inf = await Inference.open({ modelsDir: tempModelsDir() });
+      try {
+        let caught: unknown;
+        try {
+          await inf.generateStream(
+            { model: "no/such-model", messages: [{ role: "user", content: "hi" }] },
+            () => {}
+          );
+        } catch (err) {
+          caught = err;
+        }
+        expect(caught).toBeInstanceOf(NotFoundError);
+        const err = caught as NotFoundError;
+        expect(err.message).toContain("MODEL_NOT_FOUND");
+        expect((err.body as { error?: string } | undefined)?.error).toBe("MODEL_NOT_FOUND");
+      } finally {
+        await inf.close();
+      }
+    });
+
+    it("generateStream with invalid request JSON rejects with InvalidArgumentError", async () => {
+      const inf = await Inference.open({ modelsDir: tempModelsDir() });
+      try {
+        await expect(inf.generateStream("not valid json", () => {})).rejects.toBeInstanceOf(
+          InvalidArgumentError
+        );
+      } finally {
+        await inf.close();
+      }
+    });
   });
 
   describe.skipIf(!hasQwenEmbeddingModel())("with the local Qwen embedding model installed", () => {
@@ -175,12 +217,82 @@ describeWithLibrary("Inference", () => {
     });
   });
 
+  describe.skipIf(!hasGemmaGenerateModel())("with the local Gemma generate model installed", () => {
+    it("streams more than two chat.completion.chunk chunks", async () => {
+      const inf = await Inference.open();
+      try {
+        const chunks: Array<{ object?: string }> = [];
+        await inf.generateStream(
+          {
+            model: GEMMA_MODEL,
+            messages: [{ role: "user", content: "Count from one to twenty in words." }],
+            max_tokens: 48,
+          },
+          (chunk) => {
+            chunks.push(chunk as { object?: string });
+          }
+        );
+        expect(chunks.length).toBeGreaterThan(2);
+        for (const chunk of chunks) {
+          expect(chunk.object).toBe("chat.completion.chunk");
+        }
+      } finally {
+        await inf.close();
+      }
+    });
+
+    it("returning false after 2 chunks rejects CancelledError with exactly 2 callbacks", async () => {
+      const inf = await Inference.open();
+      try {
+        let count = 0;
+        let caught: unknown;
+        try {
+          await inf.generateStream(
+            {
+              model: GEMMA_MODEL,
+              messages: [{ role: "user", content: "Count from one to twenty in words." }],
+              max_tokens: 48,
+            },
+            () => {
+              count++;
+              return count < 2;
+            }
+          );
+        } catch (err) {
+          caught = err;
+        }
+        expect(caught).toBeInstanceOf(CancelledError);
+        expect(count).toBe(2);
+      } finally {
+        await inf.close();
+      }
+    });
+  });
+
   describe.skipIf(!PULL_TEST_MODEL)(
     "pull (network-gated, ANTFLY_INFERENCE_PULL_TEST_MODEL)",
     () => {
-      it("downloads a model into a temp models dir with progress", async () => {
-        const inf = await Inference.open({ modelsDir: tempModelsDir() });
+      it("cancelling on the first report rejects CancelledError and leaves the model unlisted, then a full pull succeeds", async () => {
+        const modelsDir = tempModelsDir();
+        const inf = await Inference.open({ modelsDir });
         try {
+          let reports = 0;
+          let caught: unknown;
+          try {
+            await inf.pull({ model: PULL_TEST_MODEL }, () => {
+              reports++;
+              return false;
+            });
+          } catch (err) {
+            caught = err;
+          }
+          expect(caught).toBeInstanceOf(CancelledError);
+          expect(reports).toBeGreaterThan(0);
+
+          const afterCancel = (await inf.listModels()) as { data: Array<Record<string, unknown>> };
+          const namesAfterCancel = afterCancel.data.map((m) => String(m.id ?? m.model ?? ""));
+          expect(namesAfterCancel.some((n) => n.includes(PULL_TEST_MODEL as string))).toBe(false);
+
           const events: PullProgress[] = [];
           const result = (await inf.pull({ model: PULL_TEST_MODEL }, (p) => {
             events.push(p);
@@ -200,7 +312,7 @@ describeWithLibrary("Inference", () => {
         } finally {
           await inf.close();
         }
-      }, 120_000);
+      }, 180_000);
     }
   );
 });

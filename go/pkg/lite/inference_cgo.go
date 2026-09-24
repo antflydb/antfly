@@ -20,15 +20,20 @@ package lite
 #include "antfly.h"
 #include <stdlib.h>
 
-// antflyLiteInferencePullProgress is defined (and exported) in Go below.
-// This extern declaration matches the signature cgo generates for it, so the
-// trampoline can call it without pulling in the generated _cgo_export.h. The
-// callback handle travels as a uintptr_t rather than void* end to end
-// (including across the cgo.Handle boundary on the Go side) so no Go code
-// has to convert a bare uintptr to unsafe.Pointer -- go vet's unsafeptr
-// check (rightly) flags that pattern, and every C signature here can
-// legitimately use uintptr_t instead of void* for an opaque handle.
-extern void antflyLiteInferencePullProgress(uintptr_t context, antfly_inference_pull_progress *progress);
+// antflyLiteInferencePullProgress and antflyLiteInferenceStreamChunk are
+// defined (and exported) in Go below. These extern declarations match the
+// signatures cgo generates for them, so the trampolines can call them
+// without pulling in the generated _cgo_export.h. Each callback handle
+// travels as a uintptr_t rather than void* end to end (including across the
+// cgo.Handle boundary on the Go side) so no Go code has to convert a bare
+// uintptr to unsafe.Pointer -- go vet's unsafeptr check (rightly) flags that
+// pattern, and every C signature here can legitimately use uintptr_t
+// instead of void* for an opaque handle. Both callbacks return uint8_t
+// (0 or 1) rather than the Go bool cgo would otherwise map, again so the
+// exported function's real C signature is unambiguous and matches the
+// extern declaration exactly.
+extern uint8_t antflyLiteInferencePullProgress(uintptr_t context, antfly_inference_pull_progress *progress);
+extern uint8_t antflyLiteInferenceStreamChunk(uintptr_t context, antfly_slice chunk_json);
 
 // antflyLiteInferencePullProgressTrampoline has the exact C ABI signature
 // antfly_inference_pull_progress_fn requires (including the const the
@@ -36,28 +41,47 @@ extern void antflyLiteInferencePullProgress(uintptr_t context, antfly_inference_
 // function. Passing a Go function value directly to C isn't possible with
 // cgo, so this static C shim is the function pointer actually registered
 // with antfly_inference_pull_json.
-static void antflyLiteInferencePullProgressTrampoline(void *context, const antfly_inference_pull_progress *progress) {
-    antflyLiteInferencePullProgress((uintptr_t)context, (antfly_inference_pull_progress *)progress);
+static bool antflyLiteInferencePullProgressTrampoline(void *context, const antfly_inference_pull_progress *progress) {
+    return antflyLiteInferencePullProgress((uintptr_t)context, (antfly_inference_pull_progress *)progress) != 0;
+}
+
+// antflyLiteInferenceStreamTrampoline is the antfly_inference_stream_fn shim,
+// same idea as antflyLiteInferencePullProgressTrampoline above.
+static bool antflyLiteInferenceStreamTrampoline(void *context, antfly_slice chunk_json) {
+    return antflyLiteInferenceStreamChunk((uintptr_t)context, chunk_json) != 0;
 }
 
 // antflyLiteInferencePull adapts antfly_inference_pull_json's void*
 // progress_context to a uintptr_t handle, doing the int-to-pointer cast in C
-// instead of Go.
+// instead of Go. A progress callback is always registered (Pull always has
+// one internally, to honor context cancellation even with a nil caller
+// callback), so there is no has_progress flag here unlike the stream call
+// below, whose callback is optional at the Go API level.
 static antfly_error_code antflyLiteInferencePull(
     antfly_inference *inference,
     antfly_slice request_json,
-    int has_progress,
     uintptr_t progress_handle,
     antfly_buffer *out
 ) {
-    antfly_inference_pull_progress_fn fn = has_progress ? antflyLiteInferencePullProgressTrampoline : (antfly_inference_pull_progress_fn)0;
-    void *ctx = has_progress ? (void *)progress_handle : (void *)0;
-    return antfly_inference_pull_json(inference, request_json, fn, ctx, out);
+    return antfly_inference_pull_json(inference, request_json, antflyLiteInferencePullProgressTrampoline, (void *)progress_handle, out);
+}
+
+// antflyLiteInferenceGenerateStream adapts
+// antfly_inference_generate_stream_json's void* chunk_context to a uintptr_t
+// handle the same way.
+static antfly_error_code antflyLiteInferenceGenerateStream(
+    antfly_inference *inference,
+    antfly_slice request_json,
+    uintptr_t chunk_handle,
+    antfly_buffer *out
+) {
+    return antfly_inference_generate_stream_json(inference, request_json, antflyLiteInferenceStreamTrampoline, (void *)chunk_handle, out);
 }
 */
 import "C"
 
 import (
+	"context"
 	"runtime"
 	"runtime/cgo"
 	"sync"
@@ -247,10 +271,81 @@ func (inf *Inference) Chunk(request []byte) ([]byte, error) {
 
 // Generate runs the inference API's POST /ai/v1/generate. A request with
 // "stream": true fails with InvalidArgument: responses are always complete.
+// Use GenerateStream to stream chunks instead.
 func (inf *Inference) Generate(request []byte) ([]byte, error) {
 	return inf.call(request, func(handle unsafe.Pointer, input C.antfly_slice, out *C.antfly_buffer) C.antfly_error_code {
 		return C.antfly_inference_generate_json((*C.antfly_inference)(handle), input, out)
 	})
+}
+
+// GenerateStream streams a generate request: request is the same JSON body
+// Generate takes, minus "stream" (antfly_inference_generate_stream_json sets
+// it for you). onChunk is called synchronously on the calling goroutine for
+// each "chat.completion.chunk" JSON chunk as the model produces tokens; the
+// chunk is only valid during the callback, so GenerateStream copies it
+// before calling onChunk. onChunk must be non-nil.
+//
+// ctx is checked before each callback; if it is done, or onChunk returns
+// false, generation stops and GenerateStream returns Cancelled. A nil ctx is
+// treated as context.Background() (no cancellation via ctx).
+//
+// A request rejected before generation starts (such as a missing model)
+// fails like Generate, with the JSON error available via
+// errors.As(err, &InferenceError{}); a failure mid-stream returns Internal
+// with API code "STREAM_FAILED".
+func (inf *Inference) GenerateStream(ctx context.Context, request []byte, onChunk func(chunk []byte) bool) error {
+	if onChunk == nil {
+		return InvalidArgument
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	handle, release, err := inf.acquire()
+	if err != nil {
+		return err
+	}
+	defer release()
+	defer runtime.KeepAlive(inf)
+	cInput, cleanup := makeCStringSlice(request)
+	defer cleanup()
+
+	callback := func(chunk []byte) bool {
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+		}
+		return onChunk(chunk)
+	}
+	h := cgo.NewHandle(callback)
+	defer h.Delete()
+
+	var out C.antfly_buffer
+	code := C.antflyLiteInferenceGenerateStream((*C.antfly_inference)(handle), cInput, C.uintptr_t(h), &out)
+	body := takeBuffer(out)
+	if code == C.ANTFLY_OK {
+		return nil
+	}
+	return newInferenceError(ErrorCode(code), body)
+}
+
+//export antflyLiteInferenceStreamChunk
+func antflyLiteInferenceStreamChunk(handleCtx C.uintptr_t, chunk C.antfly_slice) C.uint8_t {
+	fn, ok := cgo.Handle(uintptr(handleCtx)).Value().(func([]byte) bool)
+	if !ok || fn == nil {
+		return 1
+	}
+	if fn(goBytesFromSlice(chunk)) {
+		return 1
+	}
+	return 0
+}
+
+func goBytesFromSlice(s C.antfly_slice) []byte {
+	if s.ptr == nil || s.len == 0 {
+		return nil
+	}
+	return C.GoBytes(unsafe.Pointer(s.ptr), C.int(s.len))
 }
 
 // GenerateBatch runs up to 128 non-streaming generate requests in one call
@@ -330,9 +425,15 @@ type PullProgress struct {
 // {"model": "owner/name[:variant]"}.
 //
 // progress, if non-nil, is called synchronously on the calling goroutine as
-// files download. The call cannot be cancelled, and Close waits for it to
-// finish.
-func (inf *Inference) Pull(request []byte, progress func(PullProgress)) ([]byte, error) {
+// each file starts, every 16 MiB, and as each file completes. ctx is checked
+// at the same points; if it is done, or progress returns false, the download
+// stops and Pull returns Cancelled. Completed files stay staged, so a later
+// Pull for the same model resumes rather than restarts. A nil ctx is treated
+// as context.Background() (no cancellation via ctx).
+func (inf *Inference) Pull(ctx context.Context, request []byte, progress func(PullProgress) bool) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	handle, release, err := inf.acquire()
 	if err != nil {
 		return nil, err
@@ -342,17 +443,22 @@ func (inf *Inference) Pull(request []byte, progress func(PullProgress)) ([]byte,
 	cInput, cleanup := makeCStringSlice(request)
 	defer cleanup()
 
-	var hasProgress C.int
-	var progressHandle C.uintptr_t
-	if progress != nil {
-		h := cgo.NewHandle(progress)
-		defer h.Delete()
-		hasProgress = 1
-		progressHandle = C.uintptr_t(h)
+	callback := func(p PullProgress) bool {
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+		}
+		if progress == nil {
+			return true
+		}
+		return progress(p)
 	}
+	h := cgo.NewHandle(callback)
+	defer h.Delete()
 
 	var out C.antfly_buffer
-	code := C.antflyLiteInferencePull((*C.antfly_inference)(handle), cInput, hasProgress, progressHandle, &out)
+	code := C.antflyLiteInferencePull((*C.antfly_inference)(handle), cInput, C.uintptr_t(h), &out)
 	body := takeBuffer(out)
 	if code == C.ANTFLY_OK {
 		return body, nil
@@ -361,15 +467,15 @@ func (inf *Inference) Pull(request []byte, progress func(PullProgress)) ([]byte,
 }
 
 //export antflyLiteInferencePullProgress
-func antflyLiteInferencePullProgress(context C.uintptr_t, progress *C.antfly_inference_pull_progress) {
+func antflyLiteInferencePullProgress(handleCtx C.uintptr_t, progress *C.antfly_inference_pull_progress) C.uint8_t {
 	if progress == nil {
-		return
+		return 1
 	}
-	fn, ok := cgo.Handle(uintptr(context)).Value().(func(PullProgress))
+	fn, ok := cgo.Handle(uintptr(handleCtx)).Value().(func(PullProgress) bool)
 	if !ok || fn == nil {
-		return
+		return 1
 	}
-	fn(PullProgress{
+	report := PullProgress{
 		Model:           goStringFromSlice(progress.model),
 		File:            goStringFromSlice(progress.file),
 		BytesDownloaded: uint64(progress.bytes_downloaded),
@@ -377,7 +483,11 @@ func antflyLiteInferencePullProgress(context C.uintptr_t, progress *C.antfly_inf
 		FilesDone:       uint64(progress.files_done),
 		FilesTotal:      uint64(progress.files_total),
 		Cached:          bool(progress.cached),
-	})
+	}
+	if fn(report) {
+		return 1
+	}
+	return 0
 }
 
 func goStringFromSlice(s C.antfly_slice) string {

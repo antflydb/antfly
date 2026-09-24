@@ -29,6 +29,16 @@ the README's "Embedded inference" section.
 On failure, the C API still returns a JSON error body ({"error": ...,
 "message": ...}); this module folds that into the raised exception's message
 and always releases the underlying buffer.
+
+pull()'s progress callback and generate_stream()'s on_chunk callback can
+cancel the call by returning False (None/True continue, so existing
+callbacks that return nothing keep working); a cancelled call raises
+errors.CancelledError. Cancellation only takes effect at the next report
+(pull: each file's start, every 16 MiB, and its end; generate_stream: each
+chunk). If the callback itself raises, the exception is captured, the call
+is cancelled the same way, and the original exception is re-raised after
+the underlying C call returns -- it must never unwind across the C ABI
+boundary. Callbacks always run on the calling thread.
 """
 
 from __future__ import annotations
@@ -250,9 +260,59 @@ class Inference:
 
     def generate(self, request: JSONInput, *, raw: bool = False) -> Any:
         """Responses are always complete: a request with "stream": true
-        raises InvalidArgumentError (there is no streaming sink across the
-        C ABI)."""
+        raises InvalidArgumentError (there is no streaming sink for this
+        call). Use generate_stream() to stream."""
         return self._json_call(self._lib.antfly_inference_generate_json, request, raw=raw)
+
+    def generate_stream(self, request: JSONInput, on_chunk: Callable[[Any], Any]) -> None:
+        """Stream a generate request; "stream": true is set for you (do not
+        set it in `request`).
+
+        on_chunk is called synchronously on the calling thread for each
+        streamed chunk -- the parsed JSON of a "chat.completion.chunk" -- as
+        the model produces tokens. Returning False from on_chunk stops
+        generation and raises CancelledError (None/True continue).
+
+        A request rejected before generation starts (such as a missing
+        model) raises like generate() does, with the runtime's JSON error
+        folded into the exception. A failure mid-stream raises InternalError
+        with a STREAM_FAILED body. On success (generation ran to
+        completion), returns None -- there is no final response body to
+        return, only the chunks already delivered to on_chunk.
+        """
+        data = encode_json_input(request)
+        handle = self._acquire()
+        try:
+            sl, _keep = _ffi.make_slice(data)
+            out = _ffi.AntflyBuffer()
+            callback_exc: list[BaseException] = []
+
+            def _on_chunk(_ctx: object, chunk_slice: Any) -> bool:
+                try:
+                    raw_chunk = _ffi.slice_to_bytes(chunk_slice)
+                    chunk = json.loads(raw_chunk) if raw_chunk else None
+                    result = on_chunk(chunk)
+                    return result is not False
+                except BaseException as exc:  # noqa: BLE001 - must not unwind through C
+                    callback_exc.append(exc)
+                    return False
+
+            c_on_chunk = _ffi.AntflyInferenceStreamFn(_on_chunk)
+            code = self._lib.antfly_inference_generate_stream_json(
+                ctypes.c_void_p(handle), sl, c_on_chunk, None, ctypes.byref(out)
+            )
+            body = _ffi.take_buffer(out)
+            if callback_exc:
+                raise callback_exc[0]
+            if code != errors.OK:
+                # On cancellation raised directly (not via the callback
+                # exception above), the C API leaves *out* empty rather than
+                # a JSON error body; _error_from_body still produces a good
+                # CancelledError from the stable per-code description.
+                raise _error_from_body(code, body)
+            return None
+        finally:
+            self._release()
 
     def generate_batch(self, request: JSONInput, *, raw: bool = False) -> Any:
         """Up to 128 non-streaming generate requests in one call; per-item
@@ -282,7 +342,7 @@ class Inference:
         self,
         request: JSONInput,
         *,
-        progress: Callable[[PullProgress], None] | None = None,
+        progress: Callable[[PullProgress], Any] | None = None,
         raw: bool = False,
     ) -> Any:
         """Download a model from the Hugging Face Hub into this handle's
@@ -290,13 +350,17 @@ class Inference:
 
         request is {"model": "owner/name[:variant]", ...} (see antfly.h);
         "model" is required. progress, if given, is called synchronously on
-        the calling thread as files download. cannot be cancelled, and
-        close() waits for it to finish.
+        the calling thread as each file starts, every 16 MiB, and as it
+        completes; close() waits for the pull to finish.
 
-        If `progress` raises, the exception is captured and re-raised after
-        the underlying C call returns (it must not unwind across the C ABI
-        boundary); it takes priority over any error the pull call itself
-        reports.
+        Returning False from `progress` cancels the pull: the download stops
+        at the next report and CancelledError is raised (None/True
+        continue). Completed files stay staged, so pulling the same model
+        again resumes rather than restarts. If `progress` raises, the
+        exception is captured, the pull is cancelled the same way, and the
+        original exception is re-raised after the underlying C call returns
+        (it must not unwind across the C ABI boundary); it takes priority
+        over any error the pull call itself reports.
         """
         data = encode_json_input(request)
         handle = self._acquire()
@@ -311,10 +375,10 @@ class Inference:
                 c_progress = _ffi.AntflyInferencePullProgressFn(0)
             else:
 
-                def _on_progress(_ctx: object, progress_ptr: Any) -> None:
+                def _on_progress(_ctx: object, progress_ptr: Any) -> bool:
                     try:
                         p = progress_ptr.contents
-                        progress(
+                        result = progress(
                             PullProgress(
                                 model=_ffi.slice_to_bytes(p.model).decode("utf-8", "replace"),
                                 file=_ffi.slice_to_bytes(p.file).decode("utf-8", "replace"),
@@ -325,8 +389,10 @@ class Inference:
                                 cached=bool(p.cached),
                             )
                         )
+                        return result is not False
                     except BaseException as exc:  # noqa: BLE001 - must not unwind through C
                         callback_exc.append(exc)
+                        return False
 
                 c_progress = _ffi.AntflyInferencePullProgressFn(_on_progress)
 
