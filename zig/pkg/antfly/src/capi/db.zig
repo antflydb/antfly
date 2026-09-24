@@ -6594,6 +6594,24 @@ pub fn storageOwnerReplicatedBatchAtRaftEntryJson(
     return .ok;
 }
 
+pub fn storageOwnerRaftEntryAlreadyApplied(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.RaftEntryAppliedRequest,
+    out_applied: *u8,
+) callconv(.c) kernel_owner_abi.Status {
+    out_applied.* = 0;
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    if (request.raft_term == 0 or request.raft_index == 0) return .invalid_argument;
+    const applied = handle.db.raftEntryAlreadyApplied(.{
+        .term = request.raft_term,
+        .index = request.raft_index,
+    }) catch |err| return storageOwnerStatusFromError(err);
+    out_applied.* = @intFromBool(applied);
+    return .ok;
+}
+
 pub fn storageOwnerTransactionStatus(
     owner: ?*anyopaque,
     request: *const kernel_owner_abi.TransactionStatusRequest,

@@ -1268,7 +1268,19 @@ pub const ProvisionedKernelOwnerSource = struct {
         // another owner lease here stalls unrelated groups and can deadlock a
         // maintenance callback waiting for this same progress driver.
         var lease = self.acquireDescriptorOnce(group_id, table_name, path, descriptor, .shared, .resident, .{}) catch |err| switch (err) {
-            error.StorageKernelOwnerTransitionRequired, error.StorageKernelOwnerStaleDescriptor => return error.StorageBusy,
+            error.StorageKernelOwnerStaleDescriptor => {
+                // A completed entry may be replayed after the catalog advances
+                // but before the Raft apply watermark is checkpointed. Ask the
+                // current physical owner whether its atomic entry marker covers
+                // this log identity. Never apply an unapplied entry under a
+                // descriptor that differs from the committed one.
+                var current = self.acquirePreparedOwner(group_id, table_name) catch return error.StorageBusy;
+                defer current.deinit();
+                if (!current.entry.identity.eql(descriptor.identity)) return error.StorageBusy;
+                if (try current.owner().raftEntryAlreadyApplied(table_name, raft_term, raft_index)) return;
+                return error.StorageBusy;
+            },
+            error.StorageKernelOwnerTransitionRequired => return error.StorageBusy,
             else => return err,
         };
         defer lease.deinit();
@@ -5268,6 +5280,52 @@ test "committed owner apply yields admission conflicts and retries the exact ent
         defer value.deinit();
         try std.testing.expect(std.mem.indexOf(u8, value.bytes(), "\"count\":1") != null);
     }
+}
+
+test "stale committed owner replay consults the durable entry marker" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(root);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-1/table-db", .{root});
+    defer alloc.free(path);
+    var source = ProvisionedKernelOwnerSource.init(alloc, root, table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+    defer source.deinit();
+    const stale: descriptor_contract.Descriptor = .{
+        .lsm_root_generation = table_reads.backend_current_root_generation,
+        .identity = .{ .table_id = 1, .shard_id = 1, .range_id = 1 },
+        .schema_json = "{\"version\":1,\"default_type\":\"_default\"}",
+    };
+    try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", stale, .{
+        .writes = &.{.{ .key = "doc:counter", .value = "{\"count\":0}" }},
+    }, 1, 1);
+    const increment: db_types.BatchRequest = .{ .transforms = &.{.{
+        .key = "doc:counter",
+        .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }},
+    }} };
+    try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", stale, increment, 1, 2);
+
+    var current = stale;
+    current.schema_json = "{\"version\":2,\"default_type\":\"_default\"}";
+    // Drain and reopen on the newer catalog schema before the Raft progress
+    // watermark catches up to the already committed entry.
+    for (0..4) |_| {
+        var lease = source.acquireDescriptor(1, "docs", path, current) catch |err| switch (err) {
+            error.StorageBusy => continue,
+            else => return err,
+        };
+        lease.deinit();
+        break;
+    } else return error.TestOwnerAdmissionDidNotRecover;
+
+    try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", stale, increment, 1, 2);
+    try std.testing.expectError(error.StorageBusy, source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", stale, increment, 1, 3));
+    var reader = try source.acquireDescriptor(1, "docs", path, current);
+    defer reader.deinit();
+    var value = try reader.owner().lookupJson("docs", "{\"key\":\"doc:counter\",\"include_all_fields\":true}");
+    defer value.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, value.bytes(), "\"count\":1") != null);
 }
 
 test "pending exclusive storage owner lease blocks new readers until drain" {
