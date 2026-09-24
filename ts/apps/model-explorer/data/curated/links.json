@@ -121,7 +121,7 @@
   },
   "server-rerank": {
     "path": "zig/pkg/inference/src/server/server.zig",
-    "anchor": "fn rerankPrompts("
+    "anchor": "fn rerankDocuments("
   },
   "server-chat": {
     "path": "zig/pkg/inference/src/server/server.zig",

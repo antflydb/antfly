@@ -110,7 +110,7 @@ function Box({
 function HttpDoorsFigure() {
   const doors = [
     { label: "generateEmbeddings", sub: "/ai/v1/embeddings" },
-    { label: "rerankPrompts", sub: "/ai/v1/rerank" },
+    { label: "rerankDocuments", sub: "/ai/v1/rerank" },
     { label: "generateContent", sub: "/ai/v1/generate" },
     { label: "chatCompletions", sub: "/ai/v1/chat/completions" },
   ];
@@ -685,7 +685,7 @@ export function RuntimeClient({
         <ScrollyChapter id="http" number={1} title="A request arrives">
           <Scene id="doors" graphic={<HttpDoorsFigure />}>
             <p>
-              Four doors into one hall. <code>generateEmbeddings</code>, <code>rerankPrompts</code>,{" "}
+              Four doors into one hall. <code>generateEmbeddings</code>, <code>rerankDocuments</code>,{" "}
               <code>generateContent</code>, and <code>chatCompletions</code> are four handlers on
               the same inference server. Extraction also has its own handler. Request parsing, model
               resolution, and resource admission precede task-specific pipelines; a common server
