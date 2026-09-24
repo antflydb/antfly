@@ -7831,7 +7831,23 @@ fn buildTextFilterQueryAlloc(
     } };
 }
 
+/// Public `filter_query` / `exclusion_query` entry point. The whole value is
+/// checked against the traversal budget once here; the recursive walk below
+/// only ever sees a tree that is already known to be bounded, so nested
+/// arrays and bool wrappers cannot exhaust the stack before a leaf clause
+/// reaches its own bounded parser.
 fn appendPublicFilterOrTextClausesAlloc(
+    alloc: std.mem.Allocator,
+    structured: *std.ArrayListUnmanaged([]u8),
+    text: *std.ArrayListUnmanaged(db_mod.types.TextQuery),
+    query_or_queries: std.json.Value,
+    limit: u32,
+) !void {
+    try validatePublicQueryTraversalBudgetAlloc(alloc, query_or_queries);
+    return appendPublicFilterOrTextClausesBoundedAlloc(alloc, structured, text, query_or_queries, limit);
+}
+
+fn appendPublicFilterOrTextClausesBoundedAlloc(
     alloc: std.mem.Allocator,
     structured: *std.ArrayListUnmanaged([]u8),
     text: *std.ArrayListUnmanaged(db_mod.types.TextQuery),
@@ -7841,12 +7857,12 @@ fn appendPublicFilterOrTextClausesAlloc(
     if (query_or_queries == .array) {
         if (query_or_queries.array.items.len == 0) return error.InvalidQueryRequest;
         for (query_or_queries.array.items) |item| {
-            try appendPublicFilterOrTextClausesAlloc(alloc, structured, text, item, limit);
+            try appendPublicFilterOrTextClausesBoundedAlloc(alloc, structured, text, item, limit);
         }
         return;
     }
     if (nonScoringBoolFilterValue(query_or_queries)) |filter| {
-        try appendPublicFilterOrTextClausesAlloc(alloc, structured, text, filter, limit);
+        try appendPublicFilterOrTextClausesBoundedAlloc(alloc, structured, text, filter, limit);
         return;
     }
     if (try appendPositiveMixedFilterConjunctionAlloc(
@@ -14319,7 +14335,9 @@ test "api query contract parses public hierarchy controls" {
     ;
     var projected_matches = try parseQueryRequest(alloc, null, "docs", projected_matches_body);
     defer projected_matches.deinit(alloc);
-    try std.testing.expectEqual(db_mod.types.ReturnMode.chunk, projected_matches.req.return_mode);
+    // Canonical `ancestors` without `group_by` selects direct member hits;
+    // the legacy `return_level: chunk` spelling above is what maps to `.chunk`.
+    try std.testing.expectEqual(db_mod.types.ReturnMode.member, projected_matches.req.return_mode);
     try std.testing.expect(projected_matches.req.hierarchy_include_source);
     try std.testing.expect(projected_matches.req.hierarchy_include_unit);
     try std.testing.expect(!projected_matches.req.hierarchy_source_include_all_fields);
@@ -15619,6 +15637,29 @@ test "api query contract rejects public filters beyond the traversal depth budge
         error.InvalidFilterQueryRequest,
         parsePublicQueryRequest(alloc, null, "files", body.items),
     );
+
+    var exclusion_body = std.ArrayListUnmanaged(u8).empty;
+    defer exclusion_body.deinit(alloc);
+    try exclusion_body.appendSlice(alloc, "{\"exclusion_query\":");
+    for (0..public_query_max_tree_depth + 1) |_| try exclusion_body.append(alloc, '[');
+    try exclusion_body.appendSlice(alloc, "{\"match_all\":{}}");
+    for (0..public_query_max_tree_depth + 1) |_| try exclusion_body.append(alloc, ']');
+    try exclusion_body.append(alloc, '}');
+    try std.testing.expectError(
+        error.InvalidExclusionQueryRequest,
+        parsePublicQueryRequest(alloc, null, "files", exclusion_body.items),
+    );
+
+    // The same nesting one level shallower stays inside the budget.
+    var within_body = std.ArrayListUnmanaged(u8).empty;
+    defer within_body.deinit(alloc);
+    try within_body.appendSlice(alloc, "{\"filter_query\":");
+    for (0..public_query_max_tree_depth - 2) |_| try within_body.append(alloc, '[');
+    try within_body.appendSlice(alloc, "{\"match_all\":{}}");
+    for (0..public_query_max_tree_depth - 2) |_| try within_body.append(alloc, ']');
+    try within_body.append(alloc, '}');
+    var within = try parsePublicQueryRequest(alloc, null, "files", within_body.items);
+    defer within.deinit(alloc);
 }
 
 test "api query contract preserves canonical structured compounds without speculative parsing" {

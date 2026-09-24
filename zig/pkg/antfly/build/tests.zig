@@ -1151,6 +1151,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "highlight prefix wildcard fuzzy and regexp matchers mark whole tokens",
         "highlight fragments respect size and count limits",
         "runtime schema derives substring companions",
+        "api query contract parses public hierarchy controls",
+        "api query contract rejects public filters beyond the traversal depth budget",
         "algebraic wildcard helpers preserve escaped literals",
         "algebraic traversal intersects query-scoped node admission",
         "traverse preserves table-scoped identities across result dedup and algebraic fallback",
