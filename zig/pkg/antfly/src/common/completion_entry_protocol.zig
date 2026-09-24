@@ -12,8 +12,8 @@ pub const mutation_version: u16 = 2;
 pub const Kind = enum(u8) { prepare = 0, mutation = 1 };
 pub const profile: u16 = 1;
 pub const max_wire_bytes = 512 * 1024;
-pub const raft_batch_protocol_version: u16 = 7;
-pub const mutation_raft_batch_protocol_version: u16 = 8;
+pub const raft_batch_protocol_version: u16 = @import("data_raft_protocol.zig").batch_completion_protocol_version;
+pub const mutation_raft_batch_protocol_version: u16 = @import("data_raft_protocol.zig").batch_mutation_completion_protocol_version;
 
 pub fn wireVersion(kind: Kind) u16 {
     return switch (kind) {

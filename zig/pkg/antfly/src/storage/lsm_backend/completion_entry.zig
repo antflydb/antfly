@@ -390,7 +390,7 @@ test "workload admission completion entry distinguishes single-phase mutations f
     const wire = try encode(allocator, input);
     defer allocator.free(wire);
     try std.testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, wire[8..10], .little));
-    try std.testing.expectEqual(@as(u16, 8), protocol.requiredRaftVersion(input.kind));
+    try std.testing.expectEqual(@import("../../common/data_raft_protocol.zig").batch_mutation_completion_protocol_version, protocol.requiredRaftVersion(input.kind));
     var decoded = try decode(allocator, wire);
     defer decoded.deinit();
     try std.testing.expectEqual(protocol.Kind.mutation, decoded.entry.kind);

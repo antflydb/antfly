@@ -53425,9 +53425,9 @@ fn implementationTests() type {
             try std.testing.expect(DataServer.requiresCanonicalCompletion(prepare, settings));
             try std.testing.expect(DataServer.requiresCanonicalCompletion(.{}, settings));
             const ordinary: antfly.db.types.BatchRequest = .{ .writes = &.{.{ .key = "doc", .value = "{}" }} };
-            try std.testing.expectEqual(@as(?u16, 8), DataServer.canonicalCompletionProtocolVersion(ordinary, settings));
-            try std.testing.expectEqual(@as(?u16, 7), DataServer.canonicalCompletionProtocolVersion(prepare, settings));
-            try std.testing.expectEqual(@as(?u16, 8), DataServer.canonicalCompletionProtocolVersion(begin, settings));
+            try std.testing.expectEqual(@as(?u16, data_raft_batch.mutation_completion_protocol_version), DataServer.canonicalCompletionProtocolVersion(ordinary, settings));
+            try std.testing.expectEqual(@as(?u16, data_raft_batch.completion_protocol_version), DataServer.canonicalCompletionProtocolVersion(prepare, settings));
+            try std.testing.expectEqual(@as(?u16, data_raft_batch.mutation_completion_protocol_version), DataServer.canonicalCompletionProtocolVersion(begin, settings));
             try std.testing.expectEqual(@as(?u16, null), DataServer.canonicalCompletionProtocolVersion(begin, null));
             try std.testing.expectEqual(@as(?u16, null), DataServer.canonicalCompletionProtocolVersion(.{ .transaction = .{ .resolve = .{ .txn_id = @splat(7), .status = .committed, .commit_version = 2 } } }, settings));
             try std.testing.expectEqual(@as(?u16, null), DataServer.canonicalCompletionProtocolVersion(ordinary, null));
@@ -53435,7 +53435,7 @@ fn implementationTests() type {
             // legacy logical prepare format; the canonical compiler rejects it.
             settings.transaction_recovery.?.completion_protocol_version = 2;
             try std.testing.expect(DataServer.requiresCanonicalCompletion(prepare, settings));
-            try std.testing.expectEqual(@as(u16, 7), data_raft_batch.completion_protocol_version);
+            try std.testing.expectEqual(@as(u16, 13), data_raft_batch.completion_protocol_version);
             try std.testing.expect(data_raft_batch.protocol_version >= data_raft_batch.completion_protocol_version);
         }
     };
