@@ -23,6 +23,10 @@ const capacity = @import("completion_capacity.zig");
 const generations_mod = @import("completion_generations.zig");
 const control_begin = @import("completion_control_begin.zig");
 const control_shape = @import("../completion_control_budget.zig");
+const control_capacity = @import("completion_control_capacity.zig");
+const control_guard = @import("completion_control_guard.zig");
+const control_record = @import("completion_control_record.zig");
+const control_resources = @import("completion_control_resources.zig");
 comptime {
     if (completion.scratch_bytes != maintenance.compiler_workspace_bytes)
         @compileError("completion maintenance certificate must match installed compiler backing");
@@ -51,6 +55,9 @@ pub const Config = struct {
     schema_catalog_digest: [32]u8,
     namespace: enum(u8) { root, docs } = .docs,
     shape: Shape = .{},
+    /// Staging is an internal component path while replicated activation is
+    /// disabled. It cannot make a control owner runnable after restart yet.
+    control_owner_staging: bool = false,
 };
 
 pub fn encodeProgress(identity: abi.Identity, progress: completion.AcceptedIdentity) [112]u8 {
@@ -409,7 +416,14 @@ pub fn Pool(comptime Backend: type) type {
             restored_prepared: bool = false,
             resolution: ?struct { identity: completion.AcceptedIdentity, commit: bool } = null,
         };
+        const ControlOwner = struct {
+            held: *control_resources.Resources,
+            declaration: control_begin.Declaration,
+            begin: completion.AcceptedIdentity,
+        };
         config: Config,
+        control_owners: [control_record.max_owners]?ControlOwner = @splat(null),
+        control_output_ids: [control_record.max_owners]u64 = @splat(0),
         control: *domains.RecyclingScratch,
         maintenance_active: bool = false,
         maintenance_pending: bool = false,
@@ -470,6 +484,11 @@ pub fn Pool(comptime Backend: type) type {
             if (cohort.initial_runs > 64 or backend.runs.count() > cohort.initial_runs + max_slots or
                 (saved != null and backend.runs.count() < cohort.initial_runs)) return error.CompletionReservationBusy;
             const next_id = std.math.add(u64, cohort.base_run_id, max_slots) catch return error.CompletionReservationBusy;
+            var control_output_ids: [control_record.max_owners]u64 = @splat(0);
+            const next_after_control = if (config.control_owner_staging) blk: {
+                for (&control_output_ids, 0..) |*id, i| id.* = std.math.add(u64, next_id, @intCast(i)) catch return error.CompletionReservationBusy;
+                break :blk std.math.add(u64, next_id, control_record.max_owners) catch return error.CompletionReservationBusy;
+            } else next_id;
             const control = try domains.RecyclingScratch.create(backend.allocator, manager, control_bytes);
             errdefer control.retire();
             const alloc = control.allocator();
@@ -554,6 +573,7 @@ pub fn Pool(comptime Backend: type) type {
             io.allow_wal_reset = true;
             self.* = .{
                 .config = config,
+                .control_output_ids = control_output_ids,
                 .maintenance_pending = journal_maintenance,
                 .control = control,
                 .generations = generations,
@@ -588,7 +608,7 @@ pub fn Pool(comptime Backend: type) type {
                 initial_reservations.items[i] = null;
                 self.cell_count += 1;
             }
-            backend.next_run_id = @max(backend.next_run_id, next_id);
+            backend.next_run_id = @max(backend.next_run_id, next_after_control);
             return self;
         }
 
@@ -606,11 +626,30 @@ pub fn Pool(comptime Backend: type) type {
             self.cell_count = 0;
         }
 
+        /// Internal opt-in for a freshly installed pool. No DATA service path
+        /// calls this while replicated activation remains disabled.
+        pub fn enableControlOwnerStaging(self: *Self, backend: *Backend) !void {
+            if (self.config.control_owner_staging) return;
+            if (!self.ready or self.failed or !self.restored or self.hasAcceptedDebt()) return error.CompletionReservationBusy;
+            for (self.control_owners) |owner| if (owner != null) return error.CompletionReservationBusy;
+            for (self.cells[0..self.cell_count]) |cell| if (cell.phase != .free) return error.CompletionReservationBusy;
+            if (try control_guard.hasAny(backend.storage.?, backend.allocator, backend.root_dir.?)) return error.CompletionRecoveryCapacityRequired;
+            const first = backend.next_run_id;
+            const next = std.math.add(u64, first, control_record.max_owners) catch return error.CompletionReservationBusy;
+            for (&self.control_output_ids, 0..) |*id, i| id.* = first + @as(u64, @intCast(i));
+            backend.next_run_id = next;
+            self.config.control_owner_staging = true;
+        }
+
         /// Native owner calls this only after attached runtime leases are gone
         /// and pooled Slots have returned their cell ownership. Published tree
         /// allocations retain the publication domain through old reader release.
         pub fn destroy(self: *Self) void {
             self.releaseCells();
+            for (&self.control_owners) |*owner| if (owner.*) |*active| {
+                active.held.destroy();
+                owner.* = null;
+            };
             self.compiler.deinit() catch unreachable;
             self.scratch.retire();
             self.io.deinit() catch unreachable;
@@ -662,18 +701,102 @@ pub fn Pool(comptime Backend: type) type {
         /// while full control capacity is disabled, its accepted physical
         /// mutation must be the exact fresh BEGIN understood by the native
         /// owner codec. Existing records may be rewritten by later controls.
-        fn validateNewTransactionRecord(self: *Self, backend: *Backend, alloc: Allocator, entry: *const entry_codec.OwnedEntry) !void {
-            if (entry.entry.kind != .mutation) return;
+        fn validateNewTransactionRecord(self: *Self, backend: *Backend, alloc: Allocator, entry: *const entry_codec.OwnedEntry) !?control_begin.Declaration {
+            if (entry.entry.kind != .mutation) return null;
             const namespace = entry.decoded_descriptor.descriptor.namespace;
             for (entry.entry.prepare_operations) |op| {
                 if (op.kind != .put or !std.mem.startsWith(u8, op.key, control_shape.records_prefix)) continue;
                 const existing = try self.point(backend, alloc, namespace, op.key);
                 defer existing.deinit(alloc);
                 if (existing.value == null) {
-                    _ = try control_begin.inspect(entry.entry.prepare_operations);
-                    return;
+                    return try control_begin.inspect(entry.entry.prepare_operations);
                 }
             }
+            return null;
+        }
+
+        /// Allocate independent control debt before publishing the accepted
+        /// document cell. The durable guard makes any interrupted publication a
+        /// startup obligation; runnable restore and control transitions remain
+        /// disabled until the complete lifecycle is installed.
+        fn stageControlBegin(self: *Self, backend: *Backend, declaration: control_begin.Declaration, identity: completion.AcceptedIdentity, envelope: []const u8, growth: capacity.Cost) !void {
+            const slot = for (self.control_owners, 0..) |owner, i| {
+                if (owner) |active| if (std.mem.eql(u8, &active.declaration.txn_id, &declaration.txn_id)) return error.CompletionReservationBusy;
+                if (owner == null) break i;
+            } else return error.CompletionPlanCapacityExceeded;
+            var rows: [control_record.max_owners][3]control_capacity.NativeRowShape = undefined;
+            var inputs: [control_record.max_owners]control_capacity.OwnerInput = undefined;
+            var count: usize = 0;
+            for (self.control_owners) |owner| if (owner) |active| {
+                const budget = control_capacity.NumericBudget.fromMeasured(active.declaration.budget);
+                rows[count] = control_capacity.ownershipRows(budget.mutations);
+                inputs[count] = .{ .budget = budget, .rows = &rows[count] };
+                count += 1;
+            };
+            const budget = control_capacity.NumericBudget.fromMeasured(declaration.budget);
+            rows[count] = control_capacity.ownershipRows(budget.mutations);
+            inputs[count] = .{ .budget = budget, .rows = &rows[count] };
+            const base_cost = try self.capacity_cost.plus(growth);
+            const mutable_growth = try self.capacity_growth.plus(growth);
+            const proof = try control_capacity.certifyCohort(.{
+                .cost = base_cost,
+                .mutable_growth = mutable_growth,
+                .baseline_frontier_bytes = self.capacity_baseline_frontier,
+                .max_mutable_entries = try std.math.add(usize, completion.foreground_entries, std.math.cast(usize, mutable_growth.records) orelse return error.UnsupportedCompletionProfile),
+                .current_runs = backend.runs.count(),
+                .future_document_outputs = self.cell_count,
+                .append = try (try self.remainingAppendBudget()).plus(completion.foreground_append_budget),
+            }, inputs[0 .. count + 1], .{
+                .format = .{ .metadata_bytes = self.config.shape.max_metadata_bytes },
+                .max_record_bytes = self.config.shape.max_record_bytes,
+                .max_inputs = self.config.shape.max_runs + control_record.max_owners,
+                .max_path_bytes = 544,
+                .single_drain_metadata_bytes = self.config.shape.max_metadata_bytes,
+                .max_retained_wal_bytes = completion.limits.wal_bytes,
+                .replay_workspace_bytes = completion.scratch_bytes,
+                .compiler_workspace_bytes = completion.scratch_bytes,
+            });
+            try proof.requireHeadroom(backend.write_stats, backend.manifest_journal.sequence orelse return error.RecoveryRequired, backend.next_run_id, if (backend.wal_retention.primary) |primary| primary.current_segment else 1, .{
+                .manifest_steps = self.cell_count,
+                .run_ids = self.cell_count,
+                .wal_segments = self.cell_count,
+            });
+            const manager = backend.options.resource_manager orelse return error.CompletionResourceManagerRequired;
+            const held = try control_resources.Resources.create(backend.allocator, manager, &self.compiler, declaration.txn_id, .{
+                .publication_bytes = proof.owners[count].publication_bytes,
+                .wal_bytes = proof.owners[count].append.bytes,
+            });
+            var transferred = false;
+            errdefer if (!transferred) held.destroy();
+            const authority: control_record.Authority = .{
+                .group_id = self.config.identity.group_id,
+                .incarnation = self.config.identity.incarnation,
+                .policy_digest = self.config.identity.policy_digest,
+                .schema_catalog_digest = self.config.schema_catalog_digest,
+                .generation = self.config.identity.generation,
+            };
+            const owner_record: control_record.Record = .{
+                .authority = authority,
+                .txn_id = declaration.txn_id,
+                .begin = .{ .term = identity.term, .index = identity.index, .digest = identity.digest },
+                .participants = declaration.participants,
+                .slot_index = @intCast(slot),
+                .output_run_id = self.control_output_ids[slot],
+            };
+            var publication = try control_guard.Publication.prepare(backend.allocator, backend.root_dir.?, .{ .record = owner_record, .envelope = envelope });
+            defer publication.deinit();
+            self.control_owners[slot] = .{ .held = held, .declaration = declaration, .begin = identity };
+            transferred = true;
+            publication.stage(backend.storage.?) catch |err| {
+                self.failed = true;
+                backend.fenceFailedBulkWal();
+                return err;
+            };
+            publication.publish(backend.storage.?) catch |err| {
+                self.failed = true;
+                backend.fenceFailedBulkWal();
+                return err;
+            };
         }
 
         pub fn validateBaseline(self: *Self, backend: *Backend, alloc: Allocator, entry: *const entry_codec.OwnedEntry) !void {
@@ -871,7 +994,7 @@ pub fn Pool(comptime Backend: type) type {
             try Slot.validateFootprint(backend, checked.decoded_descriptor.descriptor);
             if (checked.entry.kind == .mutation)
                 try Slot.validateCanonicalFootprint(backend, checked.decoded_descriptor.descriptor.namespace, checked.entry.prepare_operations);
-            try self.validateNewTransactionRecord(backend, scratch, &checked);
+            const fresh_begin = try self.validateNewTransactionRecord(backend, scratch, &checked);
             try self.validateBaseline(backend, scratch, &checked);
             const growth = try entryCapacity(&checked);
             try self.checkCapacity(growth);
@@ -905,6 +1028,9 @@ pub fn Pool(comptime Backend: type) type {
             if (cell.publication.?.remainingBytes() < try nativePublicationCapacity(&owned, self.config.shape.max_record_bytes))
                 return error.CompletionPlanCapacityExceeded;
             // Complete all fallible allocation before durable I/O starts.
+            if (fresh_begin) |declaration| if (self.config.control_owner_staging) {
+                try self.stageControlBegin(backend, declaration, .{ .term = term, .index = index, .digest = checked.digest }, envelope, growth);
+            };
             cell.baseline = baseline;
             cell.publication_token = token;
             cell.entry = owned;
@@ -1505,7 +1631,6 @@ pub fn Pool(comptime Backend: type) type {
 
 test "workload admission physical completion control guards fence native restart before ordinary replay" {
     const Backend = @import("../lsm_backend.zig").Backend;
-    const control_guard = @import("completion_control_guard.zig");
     const alloc = std.testing.allocator;
     const config: Config = .{ .identity = .{ .capacity = 4, .group_id = 23, .node_id = 7, .incarnation = @splat(11), .policy_digest = @splat(12), .generation = 19 }, .schema_catalog_digest = @splat(13), .namespace = .root };
     for ([_][]const u8{ control_guard.filenames[0], control_guard.pending_filenames[3] }) |filename| {
