@@ -15670,6 +15670,7 @@ fn scanNdjsonWithConsistencyToSink(
         alloc: std.mem.Allocator,
         sink: ScanStreamSink,
         opts: db_mod.types.ScanOptions,
+        suspend_output: bool,
         line: std.ArrayListUnmanaged(u8) = .empty,
 
         fn visit(raw_context: ?*anyopaque, entry: db_mod.types.ScanVisitEntry) anyerror!void {
@@ -15677,7 +15678,7 @@ fn scanNdjsonWithConsistencyToSink(
             try checkScanOptionsActive(visitor.opts);
             visitor.line.clearRetainingCapacity();
             try appendScanLine(visitor.alloc, &visitor.line, entry.id, entry.document_json, entry.content_hash);
-            const suspended = if (visitor.opts.read_execution) |lease| try lease.suspendOutput() else false;
+            const suspended = if (visitor.suspend_output) try visitor.opts.read_execution.?.suspendOutput() else false;
             // Failure returns through DB cursor/transaction defers first. The
             // outer execution scope then retires the retained continuation.
             try visitor.sink.write(visitor.line.items);
@@ -15686,11 +15687,15 @@ fn scanNdjsonWithConsistencyToSink(
         }
     };
 
-    var visitor = NdjsonVisitor{ .alloc = scan_alloc, .sink = sink, .opts = scan_opts };
+    // Only this function's prepaid scan allocator certifies the buffers that
+    // stay live across output. A borrowed driver may own unrelated prepaid
+    // state, so it must keep its runnable grant during these callbacks.
+    const suspend_output = execution != null and memory != null;
+    var visitor = NdjsonVisitor{ .alloc = scan_alloc, .sink = sink, .opts = scan_opts, .suspend_output = suspend_output };
     defer visitor.line.deinit(scan_alloc);
     try checkScanOptionsActive(scan_opts);
     try reads.reads.prepareScanWithConsistency(reads.group_id, from_key, to_key, scan_opts, consistency);
-    const suspended = if (scan_opts.read_execution) |lease| try lease.suspendOutput() else false;
+    const suspended = if (suspend_output) try scan_opts.read_execution.?.suspendOutput() else false;
     try sink.start();
     if (suspended) try scan_opts.read_execution.?.resumeOutput();
     db.scanVisit(scan_alloc, from_key, to_key, scan_opts, .{
@@ -33330,6 +33335,33 @@ test "workload admission streamed scan parks bounded state and retires after sna
         try std.testing.expectEqual(@as(u64, 0), manager.dense_execution.?.ledger.snapshot().total.handles);
         try std.testing.expectEqual(@as(u64, 0), manager.denseExecutionStats().working_bytes);
     }
+    // A caller-owned prepaid lease is not a scan allocation proof. Its scan
+    // buffers use the caller allocator, so output must keep runnable ownership.
+    var borrowed = (try manager.acquireReadDriverWithState(io, .{ .io = io }, 1024 * 1024)).?;
+    defer borrowed.release();
+    const Borrowed = struct {
+        manager: *resource_manager_mod.ResourceManager,
+        writes: usize = 0,
+        fn start(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expectEqual(@as(u64, 1), self.manager.denseExecutionStats().runnable);
+        }
+        fn write(raw: ?*anyopaque, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.writes += 1;
+            try std.testing.expectEqual(@as(u64, 1), self.manager.denseExecutionStats().runnable);
+        }
+    };
+    var borrowed_sink = Borrowed{ .manager = &manager };
+    try std.testing.expect(try source.source().scanStream(alloc, "docs", "", "", .{
+        .include_documents = true,
+        .read_execution = &borrowed,
+    }, .read_index, .{ .context = &borrowed_sink, .start_fn = Borrowed.start, .write_fn = Borrowed.write }));
+    try std.testing.expectEqual(@as(usize, 2), borrowed_sink.writes);
+    try std.testing.expectEqual(@as(u64, 1), manager.denseExecutionStats().runnable);
+    borrowed.release();
+    try std.testing.expectEqual(@as(u64, 0), manager.dense_execution.?.ledger.snapshot().total.handles);
+
     const Buffered = struct {
         fn visit(raw: ?*anyopaque, _: db_mod.types.ScanVisitEntry) !void {
             const runtime: *resource_manager_mod.DenseExecution.Runtime = @ptrCast(@alignCast(raw.?));
