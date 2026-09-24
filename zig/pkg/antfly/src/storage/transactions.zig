@@ -3635,6 +3635,66 @@ test "workload admission completion compiler derives native control ownership fr
             const restored = try guard.Guard.decode(retained);
             try std.testing.expectEqualDeep(owned_record, restored.record);
             try restored.validateBegin(alloc);
+            if (case == 1) {
+                const storage_io = @import("lsm_backend/storage_io.zig");
+                const repository = @import("lsm_backend/repository.zig");
+                var filesystem = storage_io.IoStorage.init(std.Options.debug_io);
+                var path_buffer: [256]u8 = undefined;
+                const root = repository.tmpPath(&path_buffer, "native-control-publication");
+                defer repository.cleanupTmp(root);
+                try filesystem.storage().createDirPath(std.mem.span(root));
+                var publication = try guard.Publication.prepare(alloc, std.mem.span(root), restored);
+                defer publication.deinit();
+                try std.testing.expectError(error.InvalidCompletionSlot, publication.publish(filesystem.storage()));
+                try publication.stage(filesystem.storage());
+                try std.testing.expect(try guard.hasAny(filesystem.storage(), alloc, std.mem.span(root)));
+                try std.testing.expectError(error.CompletionRecoveryCapacityRequired, guard.load(alloc, filesystem.storage(), std.mem.span(root), owned_record.slot_index, owned_record.authority));
+                try std.testing.expectError(error.CompletionReservationBusy, publication.stage(filesystem.storage()));
+                try publication.publish(filesystem.storage());
+                var installed = (try guard.load(alloc, filesystem.storage(), std.mem.span(root), owned_record.slot_index, owned_record.authority)) orelse return error.TestUnexpectedResult;
+                defer installed.deinit();
+                try std.testing.expectEqualDeep(owned_record, installed.guard.record);
+                try std.testing.expectEqualSlices(u8, wire, installed.guard.envelope);
+                try std.testing.expectEqualDeep(declaration, installed.declaration);
+                try std.testing.expectError(error.CompletionReservationBusy, publication.stage(filesystem.storage()));
+                var owners = try guard.loadAll(alloc, filesystem.storage(), std.mem.span(root), owned_record.authority);
+                try std.testing.expectEqual(@as(usize, 1), owners.count);
+                try std.testing.expectEqualDeep(declaration, owners.owners[owned_record.slot_index].?.declaration);
+                const output_layout = @import("lsm_backend/completion_output_layout.zig");
+                const held_outputs = try output_layout.loadHeld(alloc, filesystem.storage(), std.mem.span(root), owned_record.authority);
+                try std.testing.expectEqual(owned_record.output_run_id, held_outputs.ids[owned_record.slot_index].?);
+                const control_capacity = @import("lsm_backend/completion_control_capacity.zig");
+                const certified = try control_capacity.certifyRestored(.{
+                    .cost = .{},
+                    .mutable_growth = .{},
+                    .baseline_frontier_bytes = 0,
+                    .max_mutable_entries = 0,
+                    .current_runs = 0,
+                    .future_document_outputs = 4,
+                    .append = .{},
+                }, &owners, .{
+                    .format = .{ .metadata_bytes = 2 * 1024 * 1024 },
+                    .max_record_bytes = 256 * 1024,
+                    .max_inputs = 72,
+                    .max_path_bytes = 544,
+                    .single_drain_metadata_bytes = 2 * 1024 * 1024,
+                    .max_retained_wal_bytes = 8 * 1024 * 1024,
+                    .replay_workspace_bytes = 32 * 1024 * 1024,
+                    .compiler_workspace_bytes = 32 * 1024 * 1024,
+                });
+                try std.testing.expectEqual(@as(usize, 1), certified.owner_count);
+                try std.testing.expectEqual(declaration.budget.mutations, certified.owners[0].append.records);
+                owners.deinit();
+                var duplicate_record = owned_record;
+                duplicate_record.slot_index += 1;
+                duplicate_record.output_run_id += 1;
+                var duplicate_publication = try guard.Publication.prepare(alloc, std.mem.span(root), .{ .record = duplicate_record, .envelope = wire });
+                defer duplicate_publication.deinit();
+                try duplicate_publication.stage(filesystem.storage());
+                try duplicate_publication.publish(filesystem.storage());
+                try std.testing.expectError(error.InvalidCompletionSlot, guard.loadAll(alloc, filesystem.storage(), std.mem.span(root), owned_record.authority));
+                try std.testing.expectError(error.InvalidCompletionSlot, output_layout.loadHeld(alloc, filesystem.storage(), std.mem.span(root), owned_record.authority));
+            }
             var wrong_participants = owned_record;
             wrong_participants.participants.digest[0] ^= 1;
             try std.testing.expectError(error.InvalidCompletionSlot, (guard.Guard{

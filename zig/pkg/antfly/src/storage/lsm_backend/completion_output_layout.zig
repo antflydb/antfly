@@ -18,16 +18,12 @@ pub const Held = struct {
 /// establish consensus authority before these IDs can be used.
 pub fn loadHeld(alloc: std.mem.Allocator, storage: anytype, root: []const u8, authority: control_record.Authority) !Held {
     var result: Held = .{};
-    for (0..capacity.control_outputs) |i| {
-        if (try control_guard.load(alloc, storage, root, i, authority)) |owned_value| {
-            var owned = owned_value;
-            defer owned.deinit();
-            const id = owned.guard.record.output_run_id;
-            for (result.ids[0..i]) |previous| if (previous == id) return error.InvalidCompletionSlot;
-            result.ids[i] = id;
-            result.mask |= @as(u8, 1) << @intCast(i);
-        }
-    }
+    var owners = try control_guard.loadAll(alloc, storage, root, authority);
+    defer owners.deinit();
+    for (owners.owners, 0..) |owned, i| if (owned) |value| {
+        result.ids[i] = value.guard.record.output_run_id;
+        result.mask |= @as(u8, 1) << @intCast(i);
+    };
     return result;
 }
 

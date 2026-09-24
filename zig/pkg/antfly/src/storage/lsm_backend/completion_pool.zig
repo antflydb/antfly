@@ -2429,4 +2429,5 @@ test "workload admission completion replay workspace covers unique and replaced 
 
 test {
     _ = @import("completion_control_capacity.zig");
+    _ = @import("completion_output_layout.zig");
 }

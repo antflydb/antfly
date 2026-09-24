@@ -260,6 +260,26 @@ pub fn certifyCohort(base: Base, inputs: []const OwnerInput, limits: Limits) !Ce
     return result;
 }
 
+/// Rebuilds the complete native control reserve from canonical BEGINs retained
+/// in local guards. No metadata service or transaction-manager scan supplies
+/// sizing inputs during restart; the same aggregate certificate used at BEGIN
+/// must be checked before a restored owner can become runnable.
+pub fn certifyRestored(base: Base, restored: *const @import("completion_control_guard.zig").Set, limits: Limits) !Certificate {
+    if (restored.count == 0 or restored.count > max_owners) return error.UnsupportedCompletionProfile;
+    var rows: [max_owners][3]NativeRowShape = undefined;
+    var inputs: [max_owners]OwnerInput = undefined;
+    var count: usize = 0;
+    for (restored.owners) |owner| if (owner) |held| {
+        if (count >= max_owners) return error.UnsupportedCompletionProfile;
+        const budget = NumericBudget.fromMeasured(held.declaration.budget);
+        rows[count] = ownershipRows(budget.mutations);
+        inputs[count] = .{ .budget = budget, .rows = &rows[count] };
+        count += 1;
+    };
+    if (count != restored.count) return error.InvalidCompletionSlot;
+    return certifyCohort(base, inputs[0..count], limits);
+}
+
 fn fixtureBudget(transitions: u64) !NumericBudget {
     const operations = try mul(2, transitions);
     const payload = try mul(operations, 32 + 64);

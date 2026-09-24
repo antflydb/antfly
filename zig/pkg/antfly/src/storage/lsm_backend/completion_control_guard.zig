@@ -75,7 +75,7 @@ pub const Guard = struct {
     /// A checksum only binds opaque bytes. Before restoring an obligation,
     /// prove that those bytes are the canonical fresh BEGIN described by the
     /// immutable owner, and that its installation identity still matches.
-    pub fn validateBegin(self: Guard, alloc: std.mem.Allocator) !void {
+    pub fn inspectBegin(self: Guard, alloc: std.mem.Allocator) !begin.Declaration {
         try self.record.verifyOwner(self.record.authority, self.record.txn_id);
         try self.validate();
         var decoded = try entry_codec.decode(alloc, self.envelope);
@@ -95,6 +95,11 @@ pub const Guard = struct {
         if (!std.mem.eql(u8, &declaration.txn_id, &self.record.txn_id) or
             !std.meta.eql(declaration.participants, self.record.participants))
             return error.InvalidCompletionSlot;
+        return declaration;
+    }
+
+    pub fn validateBegin(self: Guard, alloc: std.mem.Allocator) !void {
+        _ = try self.inspectBegin(alloc);
     }
 };
 
@@ -102,10 +107,70 @@ pub const Owned = struct {
     alloc: std.mem.Allocator,
     bytes: []u8,
     guard: Guard,
+    declaration: begin.Declaration,
 
     pub fn deinit(self: *Owned) void {
         self.alloc.free(self.bytes);
         self.* = undefined;
+    }
+};
+
+/// The caller constructs this before seeking Raft acceptance and keeps it
+/// through publication. `stage` makes an immutable pending obligation durable;
+/// `publish` only renames and syncs preowned paths. A failed stage or publish
+/// never deletes a possibly durable owner without an authoritative log proof.
+pub const Publication = struct {
+    alloc: std.mem.Allocator,
+    pending_path: []u8,
+    final_path: []u8,
+    bytes: []u8,
+    staged: bool = false,
+
+    pub fn prepare(alloc: std.mem.Allocator, root: []const u8, guard: Guard) !Publication {
+        if (guard.record.slot_index >= max_owners) return error.InvalidCompletionSlot;
+        try guard.validateBegin(alloc);
+        const pending_path = try std.fs.path.join(alloc, &.{ root, pending_filenames[guard.record.slot_index] });
+        errdefer alloc.free(pending_path);
+        const final_path = try std.fs.path.join(alloc, &.{ root, filenames[guard.record.slot_index] });
+        errdefer alloc.free(final_path);
+        const bytes = try guard.encode(alloc);
+        return .{ .alloc = alloc, .pending_path = pending_path, .final_path = final_path, .bytes = bytes };
+    }
+
+    pub fn deinit(self: *Publication) void {
+        self.alloc.free(self.bytes);
+        self.alloc.free(self.final_path);
+        self.alloc.free(self.pending_path);
+        self.* = undefined;
+    }
+
+    fn requireAbsent(storage: anytype, path: []const u8) !void {
+        if (storage.fileSize(path)) |_| return error.CompletionReservationBusy else |err| {
+            if (err != error.FileNotFound) return err;
+        }
+    }
+
+    pub fn stage(self: *Publication, storage: anytype) !void {
+        if (self.staged) return error.CompletionReservationBusy;
+        try requireAbsent(storage, self.pending_path);
+        try requireAbsent(storage, self.final_path);
+        var writer = try storage.beginAtomicWrite(self.alloc, self.pending_path);
+        var live = true;
+        errdefer if (live) writer.abort();
+        try writer.appendSlice(self.bytes);
+        live = false;
+        try writer.finish();
+        self.staged = true;
+    }
+
+    pub fn publish(self: *Publication, storage: anytype) !void {
+        if (!self.staged) return error.InvalidCompletionSlot;
+        try requireAbsent(storage, self.final_path);
+        try storage.renameAbsolute(self.pending_path, self.final_path);
+        // A rename without this sync is not yet a durable publication. On any
+        // failure the caller remains uncertain and startup fences both paths.
+        try storage.syncParentAbsolute(self.final_path);
+        self.staged = false;
     }
 };
 
@@ -132,8 +197,42 @@ pub fn load(alloc: std.mem.Allocator, storage: anytype, root: []const u8, index:
     const guard = try Guard.decode(bytes);
     if (guard.record.slot_index != index) return error.InvalidCompletionSlot;
     try guard.record.verifyOwner(authority, guard.record.txn_id);
-    try guard.validateBegin(alloc);
-    return .{ .alloc = alloc, .bytes = bytes, .guard = guard };
+    const declaration = try guard.inspectBegin(alloc);
+    return .{ .alloc = alloc, .bytes = bytes, .guard = guard, .declaration = declaration };
+}
+
+/// Restores every locally published control obligation from trusted
+/// installation identity alone. Cross-slot aliases are corruption, not extra
+/// capacity. The caller still needs durable Raft reconciliation before using
+/// these owners or admitting new work.
+pub const Set = struct {
+    owners: [max_owners]?Owned = @splat(null),
+    count: usize = 0,
+
+    pub fn deinit(self: *Set) void {
+        for (&self.owners) |*slot| if (slot.*) |*owned| owned.deinit();
+        self.* = .{};
+    }
+};
+
+pub fn loadAll(alloc: std.mem.Allocator, storage: anytype, root: []const u8, authority: record_codec.Authority) !Set {
+    var result: Set = .{};
+    errdefer result.deinit();
+    for (0..max_owners) |index| {
+        const owner = try load(alloc, storage, root, index, authority) orelse continue;
+        for (result.owners[0..index]) |previous| if (previous) |held| {
+            if (std.mem.eql(u8, &held.guard.record.txn_id, &owner.guard.record.txn_id) or
+                held.guard.record.output_run_id == owner.guard.record.output_run_id)
+            {
+                var duplicate = owner;
+                duplicate.deinit();
+                return error.InvalidCompletionSlot;
+            }
+        };
+        result.owners[index] = owner;
+        result.count += 1;
+    }
+    return result;
 }
 
 test "workload admission completion compiler control guard retains BEGIN and immutable output ownership" {
