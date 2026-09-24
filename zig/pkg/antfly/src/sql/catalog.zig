@@ -195,6 +195,7 @@ pub const DdlReceipt = struct {
     state: enum { ready, pending, invalid, admission_unknown },
     diagnostic: ?[]const u8 = null,
     restore_job_id: ?[]const u8 = null,
+    idempotency_key: ?[]const u8 = null,
     fk_generation_publication_id: ?[]const u8 = null,
 };
 pub const DdlOutcome = struct { mutation_outcome: ?MutationOutcome = .committed, receipt: ?DdlReceipt = null };

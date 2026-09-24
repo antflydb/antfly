@@ -516,6 +516,18 @@ pub const Owner = struct {
         return response;
     }
 
+    pub fn nativeInitialChildControlJson(self: *Owner, table_name: []const u8, request_json: []const u8, operation_index: u64) !Response {
+        if (operation_index < 1 or operation_index > 3) return error.InvalidArgument;
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_native_initial_child_control_json(self.handle, &.{
+            .table_name = .fromSlice(table_name),
+            .request_json = .fromSlice(request_json),
+            .operation_term = 1,
+            .operation_index = operation_index,
+        }, &response.buffer));
+        return response;
+    }
+
     pub fn transactionStatus(
         self: *Owner,
         table_name: []const u8,

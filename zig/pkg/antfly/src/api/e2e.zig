@@ -3274,6 +3274,177 @@ test "split data runtime registers a store with metadata" {
     try std.testing.expectEqualStrings("alpha", parsed_lookup.value.title);
 }
 
+test "hosted relational parent placement opens a real Raft owner" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const metadata_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/hosted-parent-metadata", .{tmp.sub_path});
+    defer alloc.free(metadata_root);
+    const data_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/hosted-parent-data", .{tmp.sub_path});
+    defer alloc.free(data_root);
+    const catalog_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/hosted-parent-catalog", .{tmp.sub_path});
+    defer alloc.free(catalog_path);
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    defer std.Io.Dir.cwd().deleteTree(io, metadata_root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, data_root) catch {};
+
+    var raft_store = raft_engine.core.MemoryStorage.init(alloc);
+    defer raft_store.deinit();
+    var factory = Factory{ .alloc = alloc, .store = &raft_store };
+    var svc = try metadata_service.MetadataService.init(alloc, .{ .host = .{
+        .local_node_id = 1,
+        .metadata_group_id = 2113,
+        .replica_root_dir = metadata_root,
+        .replica_catalog_path = catalog_path,
+    } }, .{ .host = .{ .host = .{ .descriptor_factory = factory.iface() } } }, .{});
+    defer svc.deinit();
+    _ = try svc.ensureMetadataReplica(.{ .group_id = 2113, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .empty });
+    try svc.campaignMetadataGroup();
+    try runMetadataUntilIncarnationReady(&svc);
+
+    var metadata_server: metadata_http_server.MetadataHttpServer = undefined;
+    var metadata_listener: metadata_http_test_runtime.Runtime = undefined;
+    const metadata_api = try startMetadataAdminListener(alloc, &svc, &metadata_server, &metadata_listener);
+    defer stopMetadataAdminListener(alloc, metadata_api, &metadata_server, &metadata_listener);
+    var data_server = try data_runtime.DataServer.initFromMetadataApiUrl(alloc, .{
+        .replica_root_dir = data_root,
+        .store_registration = .{ .node_id = 9, .store_id = 9, .role = "data", .failure_domain = "rack-a" },
+    }, metadata_api);
+    defer data_server.deinit();
+    try data_server.start();
+    const base_uri = try data_server.baseUri(alloc);
+    defer alloc.free(base_uri);
+    var executor = std_http_executor.StdHttpExecutor.init(alloc, .{});
+    defer executor.deinit();
+    const transport = executor.executor();
+    var metadata_client = metadata_http_client.MetadataHttpClient.init(alloc, transport);
+
+    // The split runtime is deterministic: start() schedules registration,
+    // while this production lane and metadata Raft rounds commit it.
+    var registered = false;
+    for (0..128) |_| {
+        try data_server.runStoreStatusRoundOnly();
+        try svc.runRound();
+        var observed = try metadata_client.fetchSnapshot(metadata_api);
+        registered = observed.value.stores.len == 1;
+        observed.deinit();
+        if (registered) break;
+        try io.sleep(.fromMilliseconds(20), .awake);
+    }
+    try std.testing.expect(registered);
+
+    const parent_uri = try raft_routes.Routes.join(alloc, base_uri, "/db/v1/tables/parents");
+    defer alloc.free(parent_uri);
+    const parent_body =
+        \\{"num_shards":1,"schema":{"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"parent_key","columns":["a","b"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"integer"}},"required":["a","b"],"additionalProperties":false}}}}}
+    ;
+    var created = try transport.execute(alloc, .{ .method = .POST, .uri = parent_uri, .content_type = "application/json", .body = parent_body });
+    defer created.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), created.status);
+
+    var control_loop = metadata_mod.MetadataControlLoop.init(alloc);
+    defer control_loop.deinit();
+    try svc.ensureCatalogWorkflowLease();
+    const summary = (try svc.reconcileSeededFromProjectedIfLeaseHeld(&control_loop)) orelse return error.ReconcileLeaseNotHeld;
+    try std.testing.expectEqual(@as(usize, 1), summary.placement_upserts);
+    var group_id: u64 = 0;
+    var parent_table_id: u64 = 0;
+    var parent_shard_id: u64 = 0;
+    var parent_range_id: u64 = 0;
+    var parent_physical_name: ?[]u8 = null;
+    defer if (parent_physical_name) |name| alloc.free(name);
+    var parent_start_key: ?[]u8 = null;
+    defer if (parent_start_key) |key| alloc.free(key);
+    for (0..128) |_| {
+        try svc.runRound();
+        var observed = try metadata_client.fetchSnapshot(metadata_api);
+        if (observed.value.tables.len == 1 and observed.value.ranges.len == 1 and observed.value.placement_intents.len == 1) {
+            group_id = observed.value.ranges[0].group_id;
+            parent_table_id = observed.value.tables[0].table_id;
+            parent_shard_id = metadata_mod.table_manager.rangeDocIdentityShardId(observed.value.ranges[0]);
+            parent_range_id = metadata_mod.table_manager.rangeDocIdentityRangeId(observed.value.ranges[0]);
+            parent_physical_name = try alloc.dupe(u8, observed.value.tables[0].name);
+            parent_start_key = try alloc.dupe(u8, observed.value.ranges[0].start_key);
+        }
+        observed.deinit();
+        if (group_id != 0) break;
+        try io.sleep(.fromMilliseconds(20), .awake);
+    }
+    try std.testing.expect(group_id != 0);
+    const group_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, data_root, group_id);
+    defer alloc.free(group_path);
+    var opened = false;
+    for (0..128) |_| {
+        try data_server.runRound();
+        if (std.Io.Dir.cwd().statFile(io, group_path, .{})) |_| {
+            opened = true;
+            break;
+        } else |_| {}
+        try io.sleep(.fromMilliseconds(20), .awake);
+    }
+    try std.testing.expect(opened);
+    // Opening the owner directory precedes its first WAL write. Let the
+    // autonomous storage worker reach an idle boundary before fixture teardown
+    // cancels its I/O; an on-disk directory alone is not a ready owner.
+    var maintenance_idle = false;
+    for (0..128) |_| {
+        if (data_server.lsm_maintenance_completed.load(.acquire) > 0 and
+            !data_server.lsm_maintenance_active.load(.acquire))
+        {
+            maintenance_idle = true;
+            break;
+        }
+        try io.sleep(.fromMilliseconds(20), .awake);
+    }
+    try std.testing.expect(maintenance_idle);
+
+    // A directory and an idle LSM worker do not prove the parent can serve the
+    // linearizable topology lookup required by FK generation planning.
+    var metadata_raft_progress = raft_mod.ManagedProgressDriver.init(io, metadataServiceRaftProgressSource(&svc), std.time.ns_per_ms);
+    defer metadata_raft_progress.deinit();
+    try metadata_raft_progress.start();
+    var metadata_control_progress = raft_mod.ManagedProgressDriver.init(io, metadataServiceControlProgressSource(&svc), std.time.ns_per_ms);
+    defer metadata_control_progress.deinit();
+    try metadata_control_progress.start();
+    var data_raft_progress = raft_mod.ManagedProgressDriver.init(io, dataServerRaftProgressSource(&data_server), std.time.ns_per_ms);
+    defer data_raft_progress.deinit();
+    try data_raft_progress.start();
+    var data_control_progress = raft_mod.ManagedProgressDriver.init(io, dataServerControlProgressSource(&data_server), std.time.ns_per_ms);
+    defer data_control_progress.deinit();
+    try data_control_progress.start();
+
+    const reader = if (data_server.http_server) |*server| server.table_reads orelse return error.Unavailable else return error.Unavailable;
+    var read_index_ready = false;
+    var last_read_index_error: ?anyerror = null;
+    for (0..128) |_| {
+        const observed = reader.lookup(alloc, parent_physical_name orelse return error.TableNotFound, parent_start_key orelse return error.TableNotFound, .{
+            .relational_topology_json = "{\"mode\":\"identity\"}",
+            .execution_deadline_ns = platform.time.monotonicNs() +| 500 * std.time.ns_per_ms,
+        }, .read_index) catch |err| {
+            last_read_index_error = err;
+            try io.sleep(.fromMilliseconds(20), .awake);
+            continue;
+        };
+        if (observed) |value| {
+            var response = value;
+            defer response.deinit(alloc);
+            const Identity = struct { namespace: @import("../storage/db/doc_identity.zig").Namespace, catalog_digest: [32]u8, next_epoch: u64 };
+            var identity = try std.json.parseFromSlice(Identity, alloc, response.json, .{ .ignore_unknown_fields = true });
+            defer identity.deinit();
+            try std.testing.expectEqual(parent_table_id, identity.value.namespace.table_id);
+            try std.testing.expectEqual(parent_shard_id, identity.value.namespace.shard_id);
+            try std.testing.expectEqual(parent_range_id, identity.value.namespace.range_id);
+            read_index_ready = true;
+            break;
+        }
+        try io.sleep(.fromMilliseconds(20), .awake);
+    }
+    if (!read_index_ready) std.debug.print("hosted parent read-index readiness failed: {?}\n", .{last_read_index_error});
+    try std.testing.expect(read_index_ready);
+}
+
 test "split data runtime serves retrieval agent pipeline queries" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

@@ -4289,7 +4289,7 @@ export interface components {
         SQLDDLReceiptState: "ready" | "pending" | "invalid" | "admission_unknown";
         /**
          * @description Durable DDL declaration receipt. admission_unknown means admission has
-         *     not been confirmed; reconcile restore_job_id without replaying DDL.
+         *     not been confirmed; reconcile restore_job_id and idempotency_key without replaying DDL.
          *     Pending or invalid means the declaration
          *     committed but validation has not established an active constraint. Do not
          *     replay it. Inspect table constraint status using this immutable table
@@ -4306,6 +4306,8 @@ export interface components {
             diagnostic?: string;
             /** @description Native staging job for an atomic schema rewrite or TRUNCATE generation barrier. table_id identifies the source generation. Poll the job; pending or admission_unknown is not completed DDL and must not be replayed. */
             restore_job_id?: string;
+            /** @description Durable retry identity for an admitted or uncertain schema rewrite. Retain it with restore_job_id when reconciling admission; do not replay the DDL. */
+            idempotency_key?: string;
         };
         SQLDiagnostic: {
             /** @description Five-character SQLSTATE error code. */
@@ -8246,6 +8248,8 @@ export interface components {
         RestoreJob: {
             /** @description Opaque durable restore-job identifier. Clients must not parse it as a number. */
             job_id: string;
+            /** @description Durable admission identity. Retain it with job_id when reconciling an uncertain schema rewrite; do not replay the DDL. */
+            idempotency_key?: string;
             /** Format: int64 */
             attempt_id: number;
             /** @enum {string} */
@@ -12746,6 +12750,8 @@ export interface components {
          */
         RelationalUniqueConstraint: {
             name: string;
+            /** @description SQL primary-key identity. At most one per relational table; all key columns must be required and nonnullable. */
+            primary?: boolean;
             columns?: string[];
             /** @description Typed native unique keys. Specify either columns or keys. */
             keys?: components["schemas"]["RelationalIndexKey"][];
@@ -20906,7 +20912,7 @@ export interface operations {
                     "application/json": components["schemas"]["SQLResponse"];
                 };
             };
-            /** @description DDL declaration committed; constraint validation is pending. Do not replay. */
+            /** @description DDL declaration durably admitted; constraint validation or native staging is pending. Do not replay. */
             202: {
                 headers: {
                     [name: string]: unknown;
@@ -20938,7 +20944,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description Transaction or catalog conflict, or committed DDL whose validation failed */
+            /** @description Transaction or catalog conflict, committed DDL whose validation failed, or uncertain DDL admission with a recovery receipt. Do not replay uncertain DDL. */
             409: {
                 headers: {
                     [name: string]: unknown;

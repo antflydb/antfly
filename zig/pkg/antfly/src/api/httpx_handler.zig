@@ -244,6 +244,13 @@ fn gunzipRequestBodyAlloc(ctx: ?*httpx.Context, alloc: std.mem.Allocator, encode
     return .{ .body = body, .allocation = allocation };
 }
 
+test "SQL DDL receipt status distinguishes unknown admission" {
+    try std.testing.expectEqual(@as(u16, 200), AntflyApiHandler.sqlDdlReceiptHttpStatus(.ready));
+    try std.testing.expectEqual(@as(u16, 202), AntflyApiHandler.sqlDdlReceiptHttpStatus(.pending));
+    try std.testing.expectEqual(@as(u16, 409), AntflyApiHandler.sqlDdlReceiptHttpStatus(.invalid));
+    try std.testing.expectEqual(@as(u16, 409), AntflyApiHandler.sqlDdlReceiptHttpStatus(.admission_unknown));
+}
+
 test "gzip request bodies are decoded with an expanded-size limit" {
     const encoded = [_]u8{ 31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 171, 174, 5, 0, 67, 191, 166, 163, 2, 0, 0, 0 };
     var decoded = try gunzipRequestBodyAlloc(null, std.testing.allocator, &encoded, 2);
@@ -5396,6 +5403,7 @@ pub const AntflyApiHandler = struct {
                 },
                 .diagnostic = receipt.diagnostic,
                 .restore_job_id = receipt.restore_job_id,
+                .idempotency_key = receipt.idempotency_key,
             } else null,
             .transaction_id = if (job.adapter.outcome_transaction_id) |*id| id else null,
             .mutation_outcome = if (result.output.mutation_outcome) |outcome| switch (outcome) {
@@ -5409,14 +5417,18 @@ pub const AntflyApiHandler = struct {
             return err;
         };
         defer encoding_budget.allocator().free(encoded);
-        const response_status: u16 = if (result.output.ddl_receipt) |receipt| switch (receipt.state) {
-            .ready => 200,
-            .pending, .admission_unknown => 202,
-            .invalid => 409,
-        } else 200;
+        const response_status: u16 = if (output.ddl_receipt) |receipt| sqlDdlReceiptHttpStatus(receipt.state) else 200;
         return jsonResponse(ctx, response_status, encoded) catch |err| {
             if (job.is_write) return ctx.status(409).json(sql_wire.SQLDiagnostic{ .code = "40003", .message = "mutation completed but its acknowledgement could not be encoded; do not replay the statement", .retryable = false, .transaction_id = if (job.adapter.outcome_transaction_id) |*id| id else null });
             return err;
+        };
+    }
+
+    fn sqlDdlReceiptHttpStatus(state: sql_wire.SQLDDLReceiptState) u16 {
+        return switch (state) {
+            .ready => 200,
+            .pending => 202,
+            .invalid, .admission_unknown => 409,
         };
     }
 

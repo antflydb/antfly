@@ -2607,9 +2607,25 @@ fn validateParsedRelationalSchema(schema: TableSchema) !void {
     if (schema.document_schemas.len != 1) return error.InvalidSchemaUpdateRequest;
 
     const document_schema = schema.document_schemas[0];
+    var primary_count: usize = 0;
     if (schema.unique_constraints) |constraints| for (constraints.value) |constraint| {
         if ((constraint.columns != null) == (constraint.keys != null)) return error.InvalidSchemaUpdateRequest;
         for (constraint.columns orelse &.{}) |column| if (findDocumentProperty(document_schema.properties, column) == null) return error.InvalidSchemaUpdateRequest;
+        if (constraint.primary orelse false) {
+            primary_count += 1;
+            if (primary_count > 1 or constraint.columns == null or constraint.columns.?.len == 0 or constraint.keys != null or constraint.where != null or (constraint.deferrable orelse false) or constraint.timing != .immediate)
+                return error.InvalidSchemaUpdateRequest;
+            for (constraint.columns.?) |column| {
+                const property = findDocumentProperty(document_schema.properties, column) orelse return error.InvalidSchemaUpdateRequest;
+                if (property.allows_null) return error.InvalidSchemaUpdateRequest;
+                var required = false;
+                for (document_schema.required_fields) |name| if (std.mem.eql(u8, name, column)) {
+                    required = true;
+                    break;
+                };
+                if (!required) return error.InvalidSchemaUpdateRequest;
+            }
+        }
         if (schema.checks) |checks| for (checks.value) |check| if (std.mem.eql(u8, check.name, constraint.name)) return error.InvalidSchemaUpdateRequest;
     };
     if (schema.foreign_keys) |constraints| for (constraints.value) |constraint| {
@@ -2680,6 +2696,20 @@ fn validateParsedRelationalSchema(schema: TableSchema) !void {
         if (!isRelationalStorageProperty(property) or !relationalPhysicalConstraintsAreExact(property)) {
             return error.InvalidSchemaUpdateRequest;
         }
+    }
+}
+
+test "relational primary keys cannot defer enforcement" {
+    const alloc = std.testing.allocator;
+    const prefix = "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\",\"nullable\":false}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"unique_constraints\":[";
+    for ([_][]const u8{
+        "{\"name\":\"pk\",\"columns\":[\"id\"],\"primary\":true,\"deferrable\":true,\"timing\":\"deferred\"}",
+        "{\"name\":\"pk\",\"columns\":[\"id\"],\"primary\":true,\"deferrable\":true,\"timing\":\"immediate\"}",
+        "{\"name\":\"pk\",\"columns\":[],\"primary\":true}",
+    }) |constraint| {
+        const json = try std.fmt.allocPrint(alloc, "{s}{s}]}}", .{ prefix, constraint });
+        defer alloc.free(json);
+        try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(alloc, json));
     }
 }
 

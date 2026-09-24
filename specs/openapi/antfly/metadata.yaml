@@ -1646,7 +1646,7 @@ components:
       required: [database, namespace, table, table_id, schema_version, state]
       description: |
         Durable DDL declaration receipt. admission_unknown means admission has
-        not been confirmed; reconcile restore_job_id without replaying DDL.
+        not been confirmed; reconcile restore_job_id and idempotency_key without replaying DDL.
         Pending or invalid means the declaration
         committed but validation has not established an active constraint. Do not
         replay it. Inspect table constraint status using this immutable table
@@ -1671,6 +1671,9 @@ components:
         restore_job_id:
           type: string
           description: Native staging job for an atomic schema rewrite or TRUNCATE generation barrier. table_id identifies the source generation. Poll the job; pending or admission_unknown is not completed DDL and must not be replayed.
+        idempotency_key:
+          type: string
+          description: Durable retry identity for an admitted or uncertain schema rewrite. Retain it with restore_job_id when reconciling admission; do not replay the DDL.
     SQLDiagnostic:
       type: object
       additionalProperties: false
@@ -6914,6 +6917,9 @@ components:
           maxLength: 19
           pattern: '^[1-9][0-9]{0,18}$'
           description: Opaque durable restore-job identifier. Clients must not parse it as a number.
+        idempotency_key:
+          type: string
+          description: Durable admission identity. Retain it with job_id when reconciling an uncertain schema rewrite; do not replay the DDL.
         attempt_id: { type: integer, format: int64 }
         scope: { type: string, enum: [table, cluster] }
         table_name: { type: string }
@@ -12020,7 +12026,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/SQLResponse"
         "202":
-          description: DDL declaration committed; constraint validation is pending. Do not replay.
+          description: DDL declaration durably admitted; constraint validation or native staging is pending. Do not replay.
           content:
             application/json:
               schema:
@@ -12036,7 +12042,7 @@ paths:
         "403":
           description: Insufficient permission for the statement's catalog resources
         "409":
-          description: Transaction or catalog conflict, or committed DDL whose validation failed
+          description: Transaction or catalog conflict, committed DDL whose validation failed, or uncertain DDL admission with a recovery receipt. Do not replay uncertain DDL.
           content:
             application/json:
               schema:

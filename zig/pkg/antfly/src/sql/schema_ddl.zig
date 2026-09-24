@@ -32,6 +32,51 @@ fn constraintExists(schema: Value, name: []const u8) bool {
     return false;
 }
 
+fn hasPrimary(schema: Value) bool {
+    const constraints = schema.object.get("unique_constraints") orelse return false;
+    if (constraints != .array) return false;
+    for (constraints.array.items) |constraint| {
+        if (constraint != .object) continue;
+        const primary = constraint.object.get("primary") orelse continue;
+        if (primary == .bool and primary.bool) return true;
+    }
+    return false;
+}
+
+fn requirePrimaryColumns(alloc: std.mem.Allocator, schema: *Value, columns: []const []const u8) !void {
+    const default_type = schema.object.get("default_type") orelse return error.InvalidSqlBackendResponse;
+    if (default_type != .string) return error.InvalidSqlBackendResponse;
+    const document_schemas = schema.object.getPtr("document_schemas") orelse return error.InvalidSqlBackendResponse;
+    if (document_schemas.* != .object) return error.InvalidSqlBackendResponse;
+    const document = document_schemas.object.getPtr(default_type.string) orelse return error.InvalidSqlBackendResponse;
+    if (document.* != .object) return error.InvalidSqlBackendResponse;
+    const row = document.object.getPtr("schema") orelse return error.InvalidSqlBackendResponse;
+    if (row.* != .object) return error.InvalidSqlBackendResponse;
+    const properties = row.object.getPtr("properties") orelse return error.InvalidSqlBackendResponse;
+    if (properties.* != .object) return error.InvalidSqlBackendResponse;
+    if (columns.len == 0) return error.InvalidSqlSyntax;
+    // Validate the entire key before changing either the column shape or its
+    // uniqueness declaration. A failed composite key cannot leave a prefix
+    // of columns marked NOT NULL in the caller's candidate schema.
+    for (columns, 0..) |column, index| {
+        if (std.mem.eql(u8, column, "_id")) return error.UnsupportedSqlShape;
+        const property = properties.object.get(column) orelse return error.UndefinedColumn;
+        if (property != .object) return error.InvalidSqlBackendResponse;
+        for (columns[0..index]) |prior| if (std.mem.eql(u8, prior, column)) return error.DuplicateSqlColumn;
+    }
+    const required = try list(row, alloc, "required");
+    for (columns) |column| {
+        const property = properties.object.getPtr(column).?;
+        try property.object.put(alloc, "nullable", .{ .bool = false });
+        var found = false;
+        for (required.items) |entry| if (entry == .string and std.mem.eql(u8, entry.string, column)) {
+            found = true;
+            break;
+        };
+        if (!found) try required.append(.{ .string = try alloc.dupe(u8, column) });
+    }
+}
+
 pub fn apply(alloc: std.mem.Allocator, schema: *Value, ddl: ast.CatalogDdl) !bool {
     const change = ddl.schema_change orelse return error.InvalidSqlSyntax;
     if (schema.* != .object) return error.InvalidSqlBackendResponse;
@@ -59,9 +104,12 @@ pub fn apply(alloc: std.mem.Allocator, schema: *Value, ddl: ast.CatalogDdl) !boo
         },
         .add_unique => |constraint| {
             if (constraintExists(schema.*, constraint.name)) return error.SqlConstraintAlreadyExists;
+            if (constraint.primary and hasPrimary(schema.*)) return error.SqlConstraintAlreadyExists;
+            if (constraint.primary and (constraint.deferrable or !std.mem.eql(u8, constraint.timing, "immediate"))) return error.UnsupportedSqlShape;
+            if (constraint.primary) try requirePrimaryColumns(alloc, schema, constraint.columns);
             const constraints = try list(schema, alloc, "unique_constraints");
             if (named(constraints.items, constraint.name, "name") != null) return error.SqlConstraintAlreadyExists;
-            try constraints.append(try value(alloc, .{ .name = constraint.name, .columns = constraint.columns, .deferrable = constraint.deferrable, .timing = constraint.timing }));
+            try constraints.append(try value(alloc, .{ .name = constraint.name, .columns = constraint.columns, .primary = constraint.primary, .deferrable = constraint.deferrable, .timing = constraint.timing }));
         },
         .add_check => |constraint| {
             if (constraintExists(schema.*, constraint.name)) return error.SqlConstraintAlreadyExists;
@@ -174,4 +222,19 @@ pub fn apply(alloc: std.mem.Allocator, schema: *Value, ddl: ast.CatalogDdl) !boo
         },
     }
     return true;
+}
+
+test "primary key schema lowering rejects deferred timing and empty keys" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const schema_json = "{\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}}}}}}";
+    const input: ast.CatalogDdl = .{ .kind = .table, .action = .alter_schema, .name = .{ .table = "items" }, .schema_change = .{ .add_unique = .{ .name = "items_pk", .columns = &.{"id"}, .primary = true, .deferrable = true, .timing = "deferred" } } };
+    var schema = try std.json.parseFromSliceLeaky(Value, alloc, schema_json, .{});
+    try std.testing.expectError(error.UnsupportedSqlShape, apply(alloc, &schema, input));
+    try std.testing.expect(schema.object.get("unique_constraints") == null);
+    var empty = input;
+    empty.schema_change = .{ .add_unique = .{ .name = "items_pk", .columns = &.{}, .primary = true } };
+    try std.testing.expectError(error.InvalidSqlSyntax, apply(alloc, &schema, empty));
+    try std.testing.expect(schema.object.get("unique_constraints") == null);
 }

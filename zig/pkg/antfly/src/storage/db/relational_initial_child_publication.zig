@@ -46,6 +46,15 @@ pub const Bootstrap = struct {
             std.mem.eql(u8, &self.public_schema_json_digest, &record.public_schema_json_digest) and
             std.mem.eql(u8, &self.catalog_digest, &record.catalog_digest);
     }
+
+    pub fn eql(self: Bootstrap, other: Bootstrap) bool {
+        return std.mem.eql(u8, &self.plan_id, &other.plan_id) and
+            std.mem.eql(u8, &self.plan_digest, &other.plan_digest) and
+            self.namespace.eql(other.namespace) and self.schema_version == other.schema_version and
+            std.mem.eql(u8, &self.schema_digest, &other.schema_digest) and
+            std.mem.eql(u8, &self.public_schema_json_digest, &other.public_schema_json_digest) and
+            std.mem.eql(u8, &self.catalog_digest, &other.catalog_digest);
+    }
 };
 
 pub const Record = struct {

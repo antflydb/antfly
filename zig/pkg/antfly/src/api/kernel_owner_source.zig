@@ -2864,6 +2864,68 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer lease.deinit();
     }
 
+    /// A not-yet-published child has no catalog route. Only the exact hidden
+    /// descriptor admitted by metadata may read its private control record;
+    /// ordinary group reads must continue through the public route fence.
+    pub fn lookupInitialChildPrivate(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        expected: @import("../storage/db/relational_initial_child_publication.zig").Bootstrap,
+        opts: db_types.LookupOptions,
+    ) !?table_read_source.LookupResponse {
+        try expected.validate();
+        if (!std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"initial_child_preflight\"}") and
+            !std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"initial_child_publication\"}"))
+            return error.InvalidInitialChildPublication;
+        try self.prepareLookupRead(group_id, "", opts, .stale);
+        var lease = try self.acquirePreparedOwner(group_id, table_name);
+        defer lease.deinit();
+        if (lease.entry.initial_child_bootstrap_json.len == 0 or
+            lease.entry.identity.table_id != expected.namespace.table_id or
+            lease.entry.identity.shard_id != expected.namespace.shard_id or
+            lease.entry.identity.range_id != expected.namespace.range_id)
+            return error.InitialChildPublicationChanged;
+        var stored = std.json.parseFromSlice(@TypeOf(expected), alloc, lease.entry.initial_child_bootstrap_json, .{ .ignore_unknown_fields = false }) catch return error.InvalidInitialChildPublication;
+        defer stored.deinit();
+        if (!stored.value.eql(expected)) return error.InitialChildPublicationChanged;
+        const request_json = try table_reads.encodeStorageKernelLookupRequest(alloc, "", opts);
+        defer alloc.free(request_json);
+        var response = lease.owner().lookupJson(table_name, request_json) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer response.deinit();
+        return .{ .json = try alloc.dupe(u8, response.bytes()), .version = response.version(), .expected_content_digest = response.expectedContentDigest() };
+    }
+
+    pub fn applyInitialChildNative(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        expected: @import("../storage/db/relational_initial_child_publication.zig").Bootstrap,
+        req: db_types.BatchRequest,
+        operation_index: u64,
+    ) !void {
+        try expected.validate();
+        var lease = try self.acquirePreparedOwner(group_id, table_name);
+        defer lease.deinit();
+        if (lease.entry.initial_child_bootstrap_json.len == 0 or
+            lease.entry.identity.table_id != expected.namespace.table_id or
+            lease.entry.identity.shard_id != expected.namespace.shard_id or
+            lease.entry.identity.range_id != expected.namespace.range_id)
+            return error.InitialChildPublicationChanged;
+        var stored = std.json.parseFromSlice(@TypeOf(expected), alloc, lease.entry.initial_child_bootstrap_json, .{ .ignore_unknown_fields = false }) catch return error.InvalidInitialChildPublication;
+        defer stored.deinit();
+        if (!stored.value.eql(expected)) return error.InitialChildPublicationChanged;
+        const encoded = try table_writes.encodeStorageKernelBatchRequest(alloc, req);
+        defer alloc.free(encoded);
+        var response = try lease.owner().nativeInitialChildControlJson(table_name, encoded, operation_index);
+        defer response.deinit();
+    }
+
     pub fn restoreOwnerControl(
         self: *ProvisionedKernelOwnerSource,
         alloc: std.mem.Allocator,

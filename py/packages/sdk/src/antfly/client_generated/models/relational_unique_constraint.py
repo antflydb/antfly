@@ -24,6 +24,8 @@ class RelationalUniqueConstraint:
 
         Attributes:
             name (str):
+            primary (bool | Unset): SQL primary-key identity. At most one per relational table; all key columns must be
+                required and nonnullable.
             columns (list[str] | Unset):
             keys (list[RelationalIndexKey] | Unset): Typed native unique keys. Specify either columns or keys.
             where (list[RelationalIndexPredicate] | Unset): Conjunction restricting uniqueness to matching rows.
@@ -39,6 +41,7 @@ class RelationalUniqueConstraint:
     """
 
     name: str
+    primary: bool | Unset = UNSET
     columns: list[str] | Unset = UNSET
     keys: list[RelationalIndexKey] | Unset = UNSET
     where: list[RelationalIndexPredicate] | Unset = UNSET
@@ -48,6 +51,8 @@ class RelationalUniqueConstraint:
 
     def to_dict(self) -> dict[str, Any]:
         name = self.name
+
+        primary = self.primary
 
         columns: list[str] | Unset = UNSET
         if not isinstance(self.columns, Unset):
@@ -82,6 +87,8 @@ class RelationalUniqueConstraint:
                 "name": name,
             }
         )
+        if primary is not UNSET:
+            field_dict["primary"] = primary
         if columns is not UNSET:
             field_dict["columns"] = columns
         if keys is not UNSET:
@@ -104,6 +111,8 @@ class RelationalUniqueConstraint:
 
         d = dict(src_dict)
         name = d.pop("name")
+
+        primary = d.pop("primary", UNSET)
 
         columns = cast(list[str], d.pop("columns", UNSET))
 
@@ -138,6 +147,7 @@ class RelationalUniqueConstraint:
 
         relational_unique_constraint = cls(
             name=name,
+            primary=primary,
             columns=columns,
             keys=keys,
             where=where,

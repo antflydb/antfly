@@ -633,6 +633,10 @@ pub const Detail = enum(c_int) {
     sql_statement_snapshot_required,
     invalid_range_tracking_state,
     range_tracking_generation_exhausted,
+    // Absence of a policy publication is an expected proof result. Preserve
+    // it across the native metadata callback instead of turning reads of an
+    // unprotected table into RuntimeBoundaryFailure.
+    row_policy_catalog_changed,
 };
 
 pub const Status = extern struct {
@@ -680,6 +684,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.InvalidTablespacePlacementPolicy => status(.invalid_argument, .invalid_tablespace_placement_policy),
         error.CatalogCommandTooLarge => status(.invalid_argument, .catalog_command_too_large),
         error.InvalidCatalogRecord => status(.corrupt, .invalid_catalog_record),
+        error.RowPolicyCatalogChanged => status(.conflict, .row_policy_catalog_changed),
         error.CatalogIdExhausted => status(.internal, .catalog_id_exhausted),
 
         error.RelationalRewriteTypeChange => status(.invalid_argument, .relational_rewrite_type_change),
@@ -1300,6 +1305,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .invalid_tablespace_placement_policy => "InvalidTablespacePlacementPolicy",
         .catalog_command_too_large => "CatalogCommandTooLarge",
         .invalid_catalog_record => "InvalidCatalogRecord",
+        .row_policy_catalog_changed => "RowPolicyCatalogChanged",
         .catalog_id_exhausted => "CatalogIdExhausted",
 
         .restore_job_commit_not_applied => "RestoreJobCommitNotApplied",

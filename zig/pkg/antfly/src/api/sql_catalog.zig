@@ -7,6 +7,7 @@ const catalog = @import("../sql/catalog.zig");
 const domain = @import("../system_catalog/domain.zig");
 const operation = @import("operation.zig");
 const tables = @import("tables.zig");
+const restore_jobs = @import("restore_jobs.zig");
 
 fn newReceipt(alloc: std.mem.Allocator, target: domain.Target, table_id: u64, version: u32) !catalog.DdlReceipt {
     const database = try alloc.dupe(u8, target.database);
@@ -19,6 +20,8 @@ fn newReceipt(alloc: std.mem.Allocator, target: domain.Target, table_id: u64, ve
 }
 
 fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, alloc: std.mem.Allocator, target: domain.Target, ddl: @import("../sql/ast.zig").CatalogDdl) !catalog.DdlOutcome {
+    // Keep SQL PRIMARY KEY rewrite disabled until mounted positive and negative
+    // publication tests prove the durable metadata-owner path end to end.
     if (ddl.schema_change) |change| if (change == .add_unique and change.add_unique.primary) return error.UnsupportedSqlExecution;
     if (!server.source.vtable.supports_query_definitions) return error.UnsupportedSqlExecution;
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -109,6 +112,9 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
 }
 
 fn rewriteSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, alloc: std.mem.Allocator, target: domain.Target, physical: []const u8, table_id: u64, version: u32, schema: []const u8) !catalog.DdlOutcome {
+    // Rewrite jobs and their staging plan must be committed by the metadata
+    // owner. A data node's local restore history cannot admit this operation.
+    if (server.restore_job_store.replicated == null) return error.SqlSchemaRewriteRequiresMetadataOwner;
     var snapshot = (try server.source.adminSnapshot()) orelse return error.UnsupportedSqlExecution;
     defer server.source.freeAdminSnapshot(&snapshot);
     const table = tables.findTableByName(&snapshot, physical) orelse return error.TableNotFound;
@@ -120,26 +126,101 @@ fn rewriteSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authen
         alloc.free(receipt.namespace);
         alloc.free(receipt.table);
         alloc.free(receipt.table_id);
+        if (receipt.restore_job_id) |id| alloc.free(id);
+        if (receipt.idempotency_key) |key| alloc.free(key);
     }
+    // Own the recovery handle before calling an operation that may admit a
+    // durable job and then fail while constructing its HTTP response.
+    var random: [16]u8 = undefined;
+    const io = server.restore_job_store.io orelse return error.AsyncRestoreUnavailable;
+    try io.randomSecure(&random);
+    receipt.idempotency_key = try std.fmt.allocPrint(alloc, "auto:{s}", .{std.fmt.bytesToHex(random, .lower)});
+    const namespace = try std.fmt.allocPrint(alloc, "schema-rewrite:{s}:{s}", .{ server_mod.storedDestinationPrincipal(identity), physical });
+    defer alloc.free(namespace);
+    const job_id = try restore_jobs.jobIdForIdempotency(alloc, namespace, receipt.idempotency_key.?);
+    receipt.restore_job_id = try std.fmt.allocPrint(alloc, "{d}", .{job_id});
     // Shared native restore machinery reserves the entire dependency cohort,
     // transforms into unpublished storage, validates, and publishes atomically.
-    var response = server.handlePublicSchemaRewrite(table.*, schema, null, identity, context) catch |err| switch (err) {
-        error.Forbidden, error.TableNotFound, error.SchemaVersionChanged, error.UnsupportedOperation => return err,
-        else => return error.SqlMutationOutcomeUnknown,
+    var response = server.handlePublicSchemaRewrite(table.*, schema, receipt.idempotency_key, identity, context) catch |err| {
+        return rewriteCallFailure(receipt, err);
     };
     defer response.deinit(server.alloc);
-    if (response.status != 202 and response.status != 200) return switch (response.status) {
+    return rewriteResponse(alloc, response.status, response.body, receipt);
+}
+
+fn rewriteResponse(alloc: std.mem.Allocator, status: u16, body_bytes: []const u8, input_receipt: catalog.DdlReceipt) !catalog.DdlOutcome {
+    var receipt = input_receipt;
+    if (status != 202 and status != 200 and status != 503) return switch (status) {
         403 => error.Forbidden,
         404 => error.TableNotFound,
         409 => error.SchemaVersionChanged,
         400 => error.InvalidSchemaUpdateRequest,
-        else => error.SqlMutationOutcomeUnknown,
+        else => error.SqlWriteCapacityUnavailable,
     };
-    var body = std.json.parseFromSlice(struct { job_id: []const u8 }, alloc, response.body, .{ .ignore_unknown_fields = true }) catch return error.SqlMutationOutcomeUnknown;
+    var body = std.json.parseFromSlice(struct {
+        job_id: ?[]const u8 = null,
+        idempotency_key: ?[]const u8 = null,
+        admission_outcome: ?[]const u8 = null,
+    }, alloc, body_bytes, .{ .ignore_unknown_fields = true }) catch return unknownRewriteOutcome(receipt);
     defer body.deinit();
-    receipt.restore_job_id = alloc.dupe(u8, body.value.job_id) catch return error.SqlMutationOutcomeUnknown;
+    if (status == 503 and (body.value.admission_outcome == null or !std.mem.eql(u8, body.value.admission_outcome.?, "unknown"))) return error.SqlWriteCapacityUnavailable;
+    if (body.value.job_id == null or !std.mem.eql(u8, body.value.job_id.?, receipt.restore_job_id orelse return unknownRewriteOutcome(receipt))) return unknownRewriteOutcome(receipt);
+    if (body.value.idempotency_key) |key| if (!std.mem.eql(u8, key, receipt.idempotency_key orelse return unknownRewriteOutcome(receipt))) return unknownRewriteOutcome(receipt);
+    if (status == 503) {
+        receipt.state = .admission_unknown;
+        receipt.diagnostic = "Schema rewrite admission is unresolved. Poll the restore job using this receipt and do not replay the DDL.";
+        return .{ .mutation_outcome = null, .receipt = receipt };
+    }
     receipt.diagnostic = "The schema rewrite was durably admitted. Poll the native restore job for atomic publication or failure; do not replay the DDL.";
     return .{ .mutation_outcome = .committed_pending, .receipt = receipt };
+}
+
+fn unknownRewriteOutcome(input: catalog.DdlReceipt) catalog.DdlOutcome {
+    var receipt = input;
+    receipt.state = .admission_unknown;
+    receipt.diagnostic = "Schema rewrite admission is unresolved. Poll this restore job and do not replay the DDL.";
+    return .{ .mutation_outcome = null, .receipt = receipt };
+}
+
+fn rewriteCallFailure(receipt: catalog.DdlReceipt, err: anyerror) anyerror!catalog.DdlOutcome {
+    // These errors are emitted before startRecoverable. Other errors may
+    // occur after durable admission, including response-construction OOM.
+    return switch (err) {
+        error.RestoreValidationPending,
+        error.TableNotFound,
+        error.SchemaVersionChanged,
+        error.InvalidIdempotencyKey,
+        error.Forbidden,
+        error.UnsupportedSqlExecution,
+        error.AsyncRestoreUnavailable,
+        => err,
+        else => unknownRewriteOutcome(receipt),
+    };
+}
+
+test "SQL rewrite response retains admitted and uncertain restore handles" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var receipt = try newReceipt(alloc, .{ .database = "default", .namespace = "public", .table = "items" }, 7, 2);
+    receipt.restore_job_id = "41";
+    receipt.idempotency_key = "auto:abc";
+    const accepted = try rewriteResponse(alloc, 202, "{\"job_id\":\"41\",\"idempotency_key\":\"auto:abc\"}", receipt);
+    try std.testing.expectEqual(catalog.MutationOutcome.committed_pending, accepted.mutation_outcome.?);
+    try std.testing.expectEqualStrings("41", accepted.receipt.?.restore_job_id.?);
+    try std.testing.expectEqualStrings("auto:abc", accepted.receipt.?.idempotency_key.?);
+    const unknown = try rewriteResponse(alloc, 503, "{\"admission_outcome\":\"unknown\",\"job_id\":\"41\",\"idempotency_key\":\"auto:abc\"}", receipt);
+    try std.testing.expect(unknown.mutation_outcome == null);
+    try std.testing.expectEqual(.admission_unknown, unknown.receipt.?.state);
+    try std.testing.expectEqualStrings("41", unknown.receipt.?.restore_job_id.?);
+    try std.testing.expectEqualStrings("auto:abc", unknown.receipt.?.idempotency_key.?);
+    try std.testing.expectError(error.SqlWriteCapacityUnavailable, rewriteResponse(alloc, 503, "{\"error\":\"worker unavailable\"}", receipt));
+    try std.testing.expectEqual(.admission_unknown, (try rewriteResponse(alloc, 503, "{\"admission_outcome\":\"unknown\"}", receipt)).receipt.?.state);
+    try std.testing.expectEqual(.admission_unknown, (try rewriteResponse(alloc, 503, "{malformed", receipt)).receipt.?.state);
+    try std.testing.expectError(error.RestoreValidationPending, rewriteCallFailure(receipt, error.RestoreValidationPending));
+    const response_oom = try rewriteCallFailure(receipt, error.OutOfMemory);
+    try std.testing.expectEqual(.admission_unknown, response_oom.receipt.?.state);
+    try std.testing.expectEqualStrings("41", response_oom.receipt.?.restore_job_id.?);
 }
 
 fn requiresRetirement(alloc: std.mem.Allocator, before: []const u8, after: std.json.Value) !bool {

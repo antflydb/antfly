@@ -1988,7 +1988,10 @@ const LocalStandaloneMetadata = struct {
         const index = if (self.system_catalog_state) |*state| &state.index else &empty;
         const namespace = index.namespaceFor(target.database, target.namespace) catch return null;
         if (index.find(.table, namespace.id, target.table)) |binding| {
-            const table = self.manager.tables.getPtr(binding.id) orelse return error.InvalidCatalogRecord;
+            // Catalog resource IDs are logical IDs; initial FK publication
+            // assigns a separately hash-derived physical table ID. Resolve
+            // through the indexed storage name instead of conflating them.
+            const table = self.manager.findTableByName(binding.storage_name) orelse return error.InvalidCatalogRecord;
             if (!std.mem.eql(u8, table.name, binding.storage_name)) return error.InvalidCatalogRecord;
             return table.*;
         }
@@ -2245,8 +2248,9 @@ const LocalStandaloneMetadata = struct {
                 self.reloadLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
                 const observed = store.fkInitialCreateStatusJson(alloc, group_ids.main_metadata_group_id, command.child_table_id) catch return error.MetadataMutationOutcomeUnknown;
                 errdefer alloc.free(observed);
-                const parsed = std.json.parseFromSliceLeaky(publication.InitialPublication, alloc, observed, .{ .allocate = .alloc_always }) catch return error.MetadataMutationOutcomeUnknown;
-                if (!std.mem.eql(u8, &parsed.plan.id, &command.plan_id) or parsed.revision != command.expected_revision + 1)
+                var parsed = std.json.parseFromSlice(publication.InitialPublication, alloc, observed, .{ .allocate = .alloc_always }) catch return error.MetadataMutationOutcomeUnknown;
+                defer parsed.deinit();
+                if (!std.mem.eql(u8, &parsed.value.plan.id, &command.plan_id) or parsed.value.revision != command.expected_revision + 1)
                     return error.MetadataMutationOutcomeUnknown;
                 return observed;
             },
@@ -10919,6 +10923,150 @@ test "standalone shared restore worker imports a mixed dependency cohort without
     var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", root, path, runtime.ptr(), null, .local);
     defer metadata.deinit();
     try @import("../api/restore_worker_fixture.zig").runWithPersistence(antfly.public_api.http_server.RestoreWorkerTestDriver, false, metadata.statusSource(), metadata.restorePersistence());
+}
+
+test "standalone initial self FK private owners publish two ranges after restart" {
+    const alloc = std.testing.allocator;
+    const publication = @import("../metadata/fk_generation_publication.zig");
+    const control = antfly.public_api.relational_fk_generation_publication;
+    var tmp = std.testing.tmpDir(.{});
+    var preserve = false;
+    defer if (!preserve) tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/standalone-initial-self", .{tmp.sub_path});
+    defer alloc.free(root);
+    errdefer {
+        preserve = true;
+        std.debug.print("standalone initial FK diagnostic root retained at {s}\n", .{root});
+    }
+    const path = try std.fmt.allocPrint(alloc, "{s}/catalog.json", .{root});
+    defer alloc.free(path);
+    var runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer runtime.deinit();
+    var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", root, path, runtime.ptr(), null, .local);
+    var server = antfly.data.runtime.DataServer.initFromLocalMetadataSources(alloc, .{ .replica_root_dir = root, .replica_catalog_path = path, .api_server_cfg = .{ .deployment_mode = .standalone } }, metadata.catalogSource(), metadata.statusSource());
+    if (comptime !control_only_storage_sources) server.write_source.write_cache = &server.provisioned_storage.write_cache;
+    metadata.data_server = &server;
+    var opened = true;
+    defer if (opened) {
+        server.deinit();
+        metadata.deinit();
+    };
+    try std.testing.expect(metadata.localFkPublicationSupported());
+    const logical_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"self_fk","child_columns":["parent_id"],"parent_table":"nodes","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent_id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const group_id = group_ids.main_metadata_group_id;
+    const prepared_json = try metadata.lifecycle_store.?.fkInitialCreatePrepareJson(alloc, group_id, .{
+        .namespace_id = system_catalog.default_namespace_id,
+        .logical_name = "nodes",
+        .min_ranges_explicit = true,
+        .candidate = .{ .table_id = 0, .name = "", .schema_json = logical_schema, .min_ranges = 2 },
+    });
+    defer alloc.free(prepared_json);
+    var prepared = try std.json.parseFromSlice(publication.InitialCreatePrepare, alloc, prepared_json, .{});
+    defer prepared.deinit();
+    try std.testing.expectEqual(@as(usize, 2), prepared.value.child_ranges.len);
+    const child = prepared.value.child;
+    const replacement = try std.fmt.allocPrint(alloc, "\"parent_table\":\"{s}\"", .{child.name});
+    defer alloc.free(replacement);
+    const bound_schema = try std.mem.replaceOwned(u8, alloc, logical_schema, "\"parent_table\":\"nodes\"", replacement);
+    defer alloc.free(bound_schema);
+    var bound_child = child;
+    bound_child.schema_json = bound_schema;
+    const derived = try publication.deriveInitialTransitions(alloc, child.table_id, child.name, bound_schema);
+    defer publication.freeDerivedTransitions(alloc, derived);
+    var id: publication.Id = @splat(0);
+    std.mem.writeInt(u64, id[0..8], 731, .little);
+    std.mem.writeInt(u64, id[8..16], 2, .little);
+    const plan: publication.InitialCreatePlan = .{
+        .id = id,
+        .catalog_id = prepared.value.catalog_id,
+        .expected_catalog_revision = prepared.value.expected_catalog_revision,
+        .min_ranges_explicit = true,
+        .child = bound_child,
+        .child_ranges = prepared.value.child_ranges,
+        .parents = &.{},
+        .self_transitions = &.{derived[0].transition},
+        .logical_name = "nodes",
+        .namespace_id = system_catalog.default_namespace_id,
+    };
+    try plan.validate(alloc);
+    const context: antfly.public_api.operation.RequestContext = .{ .setting_admin = true, .fk_generation_publication_authority = true };
+    const began = try LocalStandaloneMetadata.systemCatalog(&metadata, alloc, context, .{ .fk_initial_create_begin = plan });
+    defer alloc.free(began);
+    var receipts: usize = 0;
+    for (0..24) |step| {
+        const work_json = try metadata.lifecycle_store.?.fkInitialCreateWorkJson(alloc, group_id, 0);
+        defer alloc.free(work_json);
+        var work = try std.json.parseFromSlice(?publication.InitialWork, alloc, work_json, .{});
+        defer work.deinit();
+        const value = work.value orelse break;
+        var command: publication.InitialCommand = .{ .plan_id = value.plan_id, .child_table_id = value.child_table_id, .expected_revision = value.revision, .action = undefined };
+        switch (value.target) {
+            .child => |target| {
+                const request: control.InitialChildRequest = .{ .plan_id = value.plan_id, .child_table_id = value.child_table_id, .child_table_name = value.child_table_name, .child_group_id = target.group_id, .action = target.action };
+                const receipt = server.initialChildControlPort().execute(alloc, value.child_table_name, target.group_id, request, context) catch |err| {
+                    const status: ?[]u8 = metadata.lifecycle_store.?.fkInitialCreateStatusJson(alloc, group_id, child.table_id) catch null;
+                    defer if (status) |bytes| alloc.free(bytes);
+                    std.debug.print("standalone initial FK step={d} root={s} work={s} status={s} error={s}\n", .{ step, root, work_json, status orelse "status unavailable", @errorName(err) });
+                    preserve = true;
+                    return err;
+                };
+                // Metadata may redeliver an owner command after losing the
+                // successful reply. The exact hidden record must yield the
+                // same durable receipt without a second physical mutation.
+                const replay = try server.initialChildControlPort().execute(alloc, value.child_table_name, target.group_id, request, context);
+                try std.testing.expect(std.meta.eql(receipt, replay));
+                if (receipts == 0) {
+                    const hidden = @import("../storage/db/relational_initial_child_publication.zig");
+                    const exact: hidden.Bootstrap = .{
+                        .plan_id = receipt.plan_id,
+                        .plan_digest = receipt.plan_digest,
+                        .namespace = receipt.namespace,
+                        .schema_version = receipt.schema_version,
+                        .schema_digest = receipt.schema_digest,
+                        .public_schema_json_digest = receipt.public_schema_json_digest,
+                        .catalog_digest = receipt.catalog_digest,
+                    };
+                    var response = (try server.kernel_owner_source.?.lookupInitialChildPrivate(alloc, target.group_id, value.child_table_name, exact, .{ .relational_topology_json = "{\"mode\":\"initial_child_publication\"}" })) orelse return error.TestUnexpectedResult;
+                    response.deinit(alloc);
+                    var forged = exact;
+                    forged.plan_digest[0] ^= 1;
+                    try std.testing.expectError(error.InitialChildPublicationChanged, server.kernel_owner_source.?.lookupInitialChildPrivate(alloc, target.group_id, value.child_table_name, forged, .{ .relational_topology_json = "{\"mode\":\"initial_child_publication\"}" }));
+                }
+                receipts += 1;
+                command.action = switch (target.action) {
+                    .provision => .child_provisioned,
+                    .release => .child_released,
+                    .cancel => .child_canceled,
+                };
+                command.child_receipt = receipt;
+            },
+            .parent => return error.TestUnexpectedResult,
+            .publish_child => command.action = .publish_child,
+        }
+        const applied = try LocalStandaloneMetadata.systemCatalog(&metadata, alloc, context, .{ .fk_initial_create_mutate = command });
+        alloc.free(applied);
+        if (receipts == 1) {
+            server.deinit();
+            metadata.deinit();
+            opened = false;
+            metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", root, path, runtime.ptr(), null, .local);
+            server = antfly.data.runtime.DataServer.initFromLocalMetadataSources(alloc, .{ .replica_root_dir = root, .replica_catalog_path = path, .api_server_cfg = .{ .deployment_mode = .standalone } }, metadata.catalogSource(), metadata.statusSource());
+            if (comptime !control_only_storage_sources) server.write_source.write_cache = &server.provisioned_storage.write_cache;
+            metadata.data_server = &server;
+            try std.testing.expect(metadata.localFkPublicationSupported());
+            opened = true;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 4), receipts);
+    const visible = try metadata.lifecycle_store.?.listTables(alloc, group_id);
+    defer metadata.lifecycle_store.?.freeTables(alloc, visible);
+    try std.testing.expectEqual(@as(usize, 1), visible.len);
+    try std.testing.expect(plan.catalog_id != child.table_id);
+    const resolved = (try metadata.resolveSystemCatalogLocked(.{ .table = "nodes" })) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(child.table_id, resolved.table_id);
+    try std.testing.expectEqualStrings(child.name, resolved.name);
 }
 
 test "standalone shared canceled owner retirement resumes from exact metadata proof" {

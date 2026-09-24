@@ -1435,6 +1435,12 @@ pub fn create(b: *std.Build) ?Artifacts {
         inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|
             tests.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(@as(@import("pkg/antfly/build/runtime.zig").RuntimeLibraryUnit, unit))].?);
     }
+    const standalone_initial_fk_tests = owner_tests.standalone_initial_fk_tests;
+    standalone_initial_fk_tests.root_module.addObject(consumer_test_metadata.object);
+    inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|
+        standalone_initial_fk_tests.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(@as(@import("pkg/antfly/build/runtime.zig").RuntimeLibraryUnit, unit))].?);
+    const run_standalone_initial_fk_tests = antfly_tests_build.addFilteredTestRunArtifact(b, standalone_initial_fk_tests);
+    b.step("antfly-standalone-initial-fk-test", "Run linked native standalone initial-FK owner publication tests").dependOn(&run_standalone_initial_fk_tests.step);
 
     const storage_owner_runs = @import("pkg/antfly/build/storage_owner_tests.zig").add(b, target, optimize, production_antfly_imports, vopr_mod, runtime_library_artifacts);
     b.step("antfly-storage-owner-test", "Run real compiled storage owner ABI regressions").dependOn(&storage_owner_runs.runs[0].step);

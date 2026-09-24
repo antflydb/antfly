@@ -26,7 +26,9 @@ pub const InitialOwner = struct {
 
 pub fn validateInitial(alloc: std.mem.Allocator, public_tables: []const tables.TableRecord, public_ranges: []const tables.RangeRecord, projection: staging.ProvisioningProjection) ![]InitialOwner {
     var owners = std.ArrayListUnmanaged(InitialOwner).empty;
+    errdefer owners.deinit(alloc);
     var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer seen.deinit(alloc);
     for (projection.initial_fk_owners) |descriptor| {
         if (std.mem.allEqual(u8, &descriptor.plan_id, 0) or std.mem.allEqual(u8, &descriptor.plan_digest, 0) or
             std.mem.allEqual(u8, &descriptor.schema_digest, 0) or std.mem.allEqual(u8, &descriptor.catalog_digest, 0) or
@@ -64,12 +66,16 @@ pub fn validateInitial(alloc: std.mem.Allocator, public_tables: []const tables.T
 
 pub fn validate(alloc: std.mem.Allocator, public_tables: []const tables.TableRecord, public_ranges: []const tables.RangeRecord, projection: staging.ProvisioningProjection) ![]Owner {
     const initial_owners = try validateInitial(alloc, public_tables, public_ranges, projection);
+    defer alloc.free(initial_owners);
     if (projection.jobs_json.len > staging.max_active_attempts) return error.InvalidRestoreStaging;
     var owners = std.ArrayListUnmanaged(Owner).empty;
+    errdefer owners.deinit(alloc);
     var seen_groups: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer seen_groups.deinit(alloc);
     for (projection.jobs_json) |bytes| {
         if (bytes.len > staging.max_encoded_bytes) return error.InvalidRestoreStaging;
-        const parsed = try std.json.parseFromSlice(staging.Job, alloc, bytes, .{ .allocate = .alloc_always });
+        var parsed = try std.json.parseFromSlice(staging.Job, alloc, bytes, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
         try parsed.value.plan.validate(alloc);
         if (!std.mem.eql(u8, &parsed.value.plan_digest, &(try parsed.value.plan.digest(alloc)))) return error.InvalidRestoreStaging;
         switch (parsed.value.state) {
@@ -109,6 +115,7 @@ pub fn validate(alloc: std.mem.Allocator, public_tables: []const tables.TableRec
             if (!tables.tableDefinitionsEqual(expected, actual)) return error.InvalidRestoreStaging;
             for (target.ranges) |range| {
                 var expected_range = try tables.cloneRange(alloc, range);
+                defer tables.freeRange(alloc, expected_range);
                 try tables.clearOwnedRangeRestoreIntent(alloc, &expected_range);
                 expected_range.completed_restore_fingerprint = tables.empty_restore_completion_fingerprint;
                 const maybe_range: ?tables.RangeRecord = for (projection.ranges) |candidate| {
@@ -127,6 +134,7 @@ pub fn validate(alloc: std.mem.Allocator, public_tables: []const tables.TableRec
     }
     for (initial_owners) |owner| if (seen_groups.contains(owner.range.group_id)) return error.InvalidGenerationPublication;
     var seen_tables: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer seen_tables.deinit(alloc);
     for (projection.tables) |table| {
         const entry = try seen_tables.getOrPut(alloc, table.table_id);
         if (entry.found_existing) return error.InvalidRestoreStaging;
@@ -146,6 +154,7 @@ pub fn validate(alloc: std.mem.Allocator, public_tables: []const tables.TableRec
         }
     }
     var projected_groups: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer projected_groups.deinit(alloc);
     for (projection.ranges) |range| {
         const entry = try projected_groups.getOrPut(alloc, range.group_id);
         if (entry.found_existing) return error.InvalidRestoreStaging;

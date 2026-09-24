@@ -10367,7 +10367,19 @@ pub const DataServer = struct {
         // Raft read index. Its one local compiled owner is authoritative for
         // this private control read after metadata's exact decision check.
         const owner_consistency: @import("../raft/read_gate.zig").ReadConsistency = if (leader_term == null) .stale else .read_index;
-        var preflight_response = (try read_source.lookupGroupLocal(scratch, group_id, table_name, "", .{ .relational_topology_json = "{\"mode\":\"initial_child_preflight\"}" }, owner_consistency)) orelse return error.GenerationAdmissionPending;
+        const private_bootstrap: hidden.Bootstrap = .{
+            .plan_id = request.plan_id,
+            .plan_digest = decision.plan_digest,
+            .namespace = namespace,
+            .schema_version = parsed.version,
+            .schema_digest = decision.schema_digest,
+            .public_schema_json_digest = public_digest,
+            .catalog_digest = catalog_digest,
+        };
+        var preflight_response = (if (leader_term == null)
+            try (try self.ensureKernelOwnerSource()).lookupInitialChildPrivate(scratch, group_id, table_name, private_bootstrap, .{ .relational_topology_json = "{\"mode\":\"initial_child_preflight\"}" })
+        else
+            try read_source.lookupGroupLocal(scratch, group_id, table_name, "", .{ .relational_topology_json = "{\"mode\":\"initial_child_preflight\"}" }, owner_consistency)) orelse return error.GenerationAdmissionPending;
         defer preflight_response.deinit(scratch);
         const preflight = try std.json.parseFromSliceLeaky(struct {
             namespace: @import("../storage/db/doc_identity_namespace.zig").Namespace,
@@ -10411,7 +10423,7 @@ pub const DataServer = struct {
                     if (leader_term) |term|
                         try self.proposeRaftBatchGroup(alloc, group_id, table_name, batch, .{ .discovery = .cached, .required_local_term = term })
                     else
-                        _ = (try self.write_source.source().replicatedBatchGroupLocal(alloc, group_id, table_name, batch, true, .{ .term = 1, .index = 1 })) orelse return error.GroupLeaderUnavailable;
+                        try (try self.ensureKernelOwnerSource()).applyInitialChildNative(scratch, group_id, table_name, private_bootstrap, batch, 1);
                 },
                 .release, .cancel => {
                     if (request.action == .release and (prior == null or prior.?.phase != .hidden or !preflight.has_schema or !preflight.has_catalog)) return error.InitialChildPublicationChanged;
@@ -10431,11 +10443,14 @@ pub const DataServer = struct {
                     if (leader_term) |term|
                         try self.proposeRaftBatchGroup(alloc, group_id, table_name, batch, .{ .discovery = .cached, .required_local_term = term })
                     else
-                        _ = (try self.write_source.source().replicatedBatchGroupLocal(alloc, group_id, table_name, batch, true, .{ .term = 1, .index = if (request.action == .release) 2 else 3 })) orelse return error.GroupLeaderUnavailable;
+                        try (try self.ensureKernelOwnerSource()).applyInitialChildNative(scratch, group_id, table_name, private_bootstrap, batch, if (request.action == .release) 2 else 3);
                 },
             }
         }
-        var status_response = (try read_source.lookupGroupLocal(scratch, group_id, table_name, "", .{ .relational_topology_json = "{\"mode\":\"initial_child_publication\"}" }, owner_consistency)) orelse return error.GenerationAdmissionPending;
+        var status_response = (if (leader_term == null)
+            try (try self.ensureKernelOwnerSource()).lookupInitialChildPrivate(scratch, group_id, table_name, private_bootstrap, .{ .relational_topology_json = "{\"mode\":\"initial_child_publication\"}" })
+        else
+            try read_source.lookupGroupLocal(scratch, group_id, table_name, "", .{ .relational_topology_json = "{\"mode\":\"initial_child_publication\"}" }, owner_consistency)) orelse return error.GenerationAdmissionPending;
         defer status_response.deinit(scratch);
         const status = (try std.json.parseFromSliceLeaky(?hidden.Record, scratch, status_response.json, .{ .allocate = .alloc_always })) orelse return error.GenerationAdmissionPending;
         if (!std.mem.eql(u8, &status.plan_id, &request.plan_id) or
@@ -18756,6 +18771,12 @@ pub const DataServer = struct {
     /// to the same compiled owner used by clustered provisioning.
     pub fn primeInitialChildOwnerDescriptor(self: *DataServer, owner: @import("private_provisioning.zig").InitialOwner) !void {
         return self.primePrivateInitialChildOwner(owner);
+    }
+
+    /// Expose the same private, decision-checked control port to deterministic
+    /// in-process publication tests; it is not a public table route.
+    pub fn initialChildControlPort(self: *DataServer) antfly.public_api.relational_fk_generation_publication.InitialChildPort {
+        return .{ .ptr = self, .execute_fn = fkInitialChildControl };
     }
 
     pub fn primeRestoreOwnerDescriptor(self: *DataServer, group_id: u64, table_name: []const u8, descriptor: @import("../storage/kernel_owner_descriptor.zig").Descriptor) !void {

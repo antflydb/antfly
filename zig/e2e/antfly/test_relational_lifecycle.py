@@ -24,6 +24,50 @@ def _enforced(api, table):
     )
 
 
+def test_standalone_initial_self_fk_publishes_two_ranges_and_survives_restart(
+    stateful_api,
+):
+    api = stateful_api
+    schema = _schema()
+    schema["document_schemas"]["row"]["schema"]["properties"]["parent_id"] = {
+        "type": "integer",
+        "nullable": True,
+    }
+    schema["foreign_keys"] = [
+        {
+            "name": "self_fk",
+            "child_columns": ["parent_id"],
+            "parent_table": "nodes",
+            "parent_columns": ["id"],
+            "on_delete": "cascade",
+        }
+    ]
+    api.post("/tables/nodes", {"num_shards": 2, "schema": schema})
+
+    def enforced():
+        response = api._request("GET", "/tables/nodes/constraints/status")
+        if response.status_code == 200:
+            return response.json().get("state") == "enforced"
+        assert response.status_code in (404, 409, 503), (
+            f"{response.text}\n{api.debug_logs()}"
+        )
+        return False
+
+    assert wait_until(enforced, timeout_s=30), api.debug_logs()
+    api.post("/tables/nodes/batch", {"inserts": {"root": {"id": 1, "parent_id": None}}})
+    api.post("/tables/nodes/batch", {"inserts": {"child": {"id": 2, "parent_id": 1}}})
+    api.restart_server()
+    assert wait_until(enforced, timeout_s=30), api.debug_logs()
+    assert api.lookup_key("nodes", "child") == {"id": 2, "parent_id": 1}
+    rejected = api._request(
+        "POST",
+        "/tables/nodes/batch",
+        {"inserts": {"orphan": {"id": 3, "parent_id": 999}}},
+    )
+    assert rejected.status_code == 409, rejected.text
+    assert api._request("GET", "/tables/nodes/documents/orphan").status_code == 404
+
+
 @pytest.mark.parametrize("permissions", ["admin", "both", "parent_only"])
 def test_cascade_session_keeps_logical_authorization(auth_api, permissions):
     api = auth_api

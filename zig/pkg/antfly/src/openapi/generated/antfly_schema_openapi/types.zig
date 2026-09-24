@@ -1183,6 +1183,8 @@ pub const RelationalScalarExpression = struct {
 /// A named, ordered composite unique key. Validation status is maintained by the server. TTL expiry uses the distributed integrity coordinator. Referenced unique keys are nondeferrable.
 pub const RelationalUniqueConstraint = struct {
     name: []const u8,
+    /// SQL primary-key identity. At most one per relational table; all key columns must be required and nonnullable.
+    primary: ?bool = null,
     columns: ?[]const []const u8 = null,
     /// Typed native unique keys. Specify either columns or keys.
     keys: ?[]const RelationalIndexKey = null,
@@ -1197,6 +1199,7 @@ pub const RelationalUniqueConstraint = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "name", "name", false },
+        .{ "primary", "primary", true },
         .{ "columns", "columns", true },
         .{ "keys", "keys", true },
         .{ "where", "where", true },
@@ -1217,6 +1220,10 @@ pub const RelationalUniqueConstraint = struct {
         try jw.beginObject();
         try jw.objectField("name");
         try jw.write(self.name);
+        if (self.primary) |value| {
+            try jw.objectField("primary");
+            try jw.write(value);
+        }
         if (self.columns) |value| {
             try jw.objectField("columns");
             try jw.write(value);

@@ -37,7 +37,7 @@ class SQLResponse:
                 cause the statement to be replayed. Pending or repair outcomes require
                 visibility convergence or operator action rather than another write.
             ddl_receipt (SQLDDLReceipt | Unset): Durable DDL declaration receipt. admission_unknown means admission has
-                not been confirmed; reconcile restore_job_id without replaying DDL.
+                not been confirmed; reconcile restore_job_id and idempotency_key without replaying DDL.
                 Pending or invalid means the declaration
                 committed but validation has not established an active constraint. Do not
                 replay it. Inspect table constraint status using this immutable table

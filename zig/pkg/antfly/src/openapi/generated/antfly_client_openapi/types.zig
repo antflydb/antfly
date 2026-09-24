@@ -32173,6 +32173,8 @@ pub const RelationalScalarExpression = struct {
 /// A named, ordered composite unique key. Validation status is maintained by the server. TTL expiry uses the distributed integrity coordinator. Referenced unique keys are nondeferrable.
 pub const RelationalUniqueConstraint = struct {
     name: []const u8,
+    /// SQL primary-key identity. At most one per relational table; all key columns must be required and nonnullable.
+    primary: ?bool = null,
     columns: ?[]const []const u8 = null,
     /// Typed native unique keys. Specify either columns or keys.
     keys: ?[]const RelationalIndexKey = null,
@@ -32187,6 +32189,7 @@ pub const RelationalUniqueConstraint = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "name", "name", false },
+        .{ "primary", "primary", true },
         .{ "columns", "columns", true },
         .{ "keys", "keys", true },
         .{ "where", "where", true },
@@ -32207,6 +32210,10 @@ pub const RelationalUniqueConstraint = struct {
         try jw.beginObject();
         try jw.objectField("name");
         try jw.write(self.name);
+        if (self.primary) |value| {
+            try jw.objectField("primary");
+            try jw.write(value);
+        }
         if (self.columns) |value| {
             try jw.objectField("columns");
             try jw.write(value);
@@ -33019,6 +33026,8 @@ pub const ResourceType = enum {
 pub const RestoreJob = struct {
     /// Opaque durable restore-job identifier. Clients must not parse it as a number.
     job_id: []const u8,
+    /// Durable admission identity. Retain it with job_id when reconciling an uncertain schema rewrite; do not replay the DDL.
+    idempotency_key: ?[]const u8 = null,
     attempt_id: i64,
     scope: []const u8,
     table_name: ?[]const u8 = null,
@@ -33045,6 +33054,7 @@ pub const RestoreJob = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "job_id", "job_id", false },
+        .{ "idempotency_key", "idempotency_key", true },
         .{ "attempt_id", "attempt_id", false },
         .{ "scope", "scope", false },
         .{ "table_name", "table_name", true },
@@ -33074,6 +33084,10 @@ pub const RestoreJob = struct {
         try jw.beginObject();
         try jw.objectField("job_id");
         try jw.write(self.job_id);
+        if (self.idempotency_key) |value| {
+            try jw.objectField("idempotency_key");
+            try jw.write(value);
+        }
         try jw.objectField("attempt_id");
         try jw.write(self.attempt_id);
         try jw.objectField("scope");
@@ -34125,7 +34139,7 @@ pub const SQLColumnType = enum {
     }
 };
 
-/// Durable DDL declaration receipt. admission_unknown means admission has not been confirmed; reconcile restore_job_id without replaying DDL. Pending or invalid means the declaration committed but validation has not established an active constraint. Do not replay it. Inspect table constraint status using this immutable table identity and schema generation; a later generation supersedes this receipt.
+/// Durable DDL declaration receipt. admission_unknown means admission has not been confirmed; reconcile restore_job_id and idempotency_key without replaying DDL. Pending or invalid means the declaration committed but validation has not established an active constraint. Do not replay it. Inspect table constraint status using this immutable table identity and schema generation; a later generation supersedes this receipt.
 pub const SQLDDLReceipt = struct {
     database: []const u8,
     namespace: []const u8,
@@ -34136,6 +34150,8 @@ pub const SQLDDLReceipt = struct {
     diagnostic: ?[]const u8 = null,
     /// Native staging job for an atomic schema rewrite or TRUNCATE generation barrier. table_id identifies the source generation. Poll the job; pending or admission_unknown is not completed DDL and must not be replayed.
     restore_job_id: ?[]const u8 = null,
+    /// Durable retry identity for an admitted or uncertain schema rewrite. Retain it with restore_job_id when reconciling admission; do not replay the DDL.
+    idempotency_key: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -34147,6 +34163,7 @@ pub const SQLDDLReceipt = struct {
         .{ "state", "state", false },
         .{ "diagnostic", "diagnostic", true },
         .{ "restore_job_id", "restore_job_id", true },
+        .{ "idempotency_key", "idempotency_key", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -34177,6 +34194,10 @@ pub const SQLDDLReceipt = struct {
         }
         if (self.restore_job_id) |value| {
             try jw.objectField("restore_job_id");
+            try jw.write(value);
+        }
+        if (self.idempotency_key) |value| {
+            try jw.objectField("idempotency_key");
             try jw.write(value);
         }
         try jw.endObject();
@@ -40835,6 +40856,7 @@ pub const OpenApiUpdateSchemaResponse202 = union(enum) {
         if (source != .object) return error.UnexpectedToken;
         if (objectHasAnyKey(source.object, &.{
             "job_id",
+            "idempotency_key",
             "attempt_id",
             "scope",
             "table_name",
@@ -40899,6 +40921,7 @@ pub const OpenApiPatchSchemaResponse202 = union(enum) {
         if (source != .object) return error.UnexpectedToken;
         if (objectHasAnyKey(source.object, &.{
             "job_id",
+            "idempotency_key",
             "attempt_id",
             "scope",
             "table_name",

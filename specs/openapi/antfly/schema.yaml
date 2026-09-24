@@ -236,6 +236,9 @@ components:
           type: string
           minLength: 1
           maxLength: 256
+        primary:
+          type: boolean
+          description: SQL primary-key identity. At most one per relational table; all key columns must be required and nonnullable.
         columns:
           type: array
           minItems: 1

@@ -1971,6 +1971,20 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     test_imports.configure(b, api_backup_restore_test_mod, true, true);
     api_backup_restore_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const hosted_fk_placement_tests = b.addTest(.{
+        .root_module = api_backup_restore_test_mod,
+        .filters = &.{"hosted relational parent placement opens a real Raft owner"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-hosted-fk-placement-test", "Run mounted metadata and relational parent owner placement regression")
+        .dependOn(&addFilteredTestRunArtifact(b, hosted_fk_placement_tests).step);
+    const sql_rewrite_receipt_tests = b.addTest(.{
+        .root_module = api_backup_restore_test_mod,
+        .filters = &.{ "SQL rewrite response retains admitted and uncertain restore handles", "SQL DDL receipt status distinguishes unknown admission", "primary key schema lowering rejects deferred timing and empty keys", "relational primary keys cannot defer enforcement" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-sql-rewrite-receipt-test", "Run SQL rewrite receipt and unknown-admission response regression")
+        .dependOn(&addFilteredTestRunArtifact(b, sql_rewrite_receipt_tests).step);
     const lib_api_standalone_backup_restore_tests = b.addTest(.{
         .root_module = api_backup_restore_test_mod,
         .filters = &.{
@@ -2061,7 +2075,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .run_api_transactions_docid_tests = run_api_transactions_docid_tests,
         .run_api_table_writes_docid_tests = run_api_table_writes_docid_tests,
         .run_api_table_reads_docid_tests = run_api_table_reads_docid_tests,
-        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{ api_table_reads_linked_tests.executable, lib_api_distributed_query_availability_tests.executable, api_table_writes_docid_tests.executable, api_relational_topology_contract_tests.consumer.executable, api_table_writes_production_regression_tests.consumer.executable, hosted_batch_tests.consumer.executable, api_create_structural_retry_tests.consumer.executable, api_table_writes_restore_repeat_tests.consumer.executable }) catch @panic("OOM"),
+        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{ api_table_reads_linked_tests.executable, lib_api_distributed_query_availability_tests.executable, api_table_writes_docid_tests.executable, api_relational_topology_contract_tests.consumer.executable, api_table_writes_production_regression_tests.consumer.executable, hosted_batch_tests.consumer.executable, api_create_structural_retry_tests.consumer.executable, api_table_writes_restore_repeat_tests.consumer.executable, hosted_fk_placement_tests }) catch @panic("OOM"),
         .run_api_public_table_http_docid_tests = run_api_public_table_http_docid_tests,
         .run_raft_transition_runtime_docid_tests = run_raft_transition_runtime_docid_tests,
         .run_api_table_writes_production_regression_unit_tests = run_api_table_writes_production_regression_unit_tests,

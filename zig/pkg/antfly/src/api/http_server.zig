@@ -4967,7 +4967,6 @@ pub const ApiHttpServer = struct {
     /// scope authorization. Metadata assigns the hidden identity and later
     /// publishes it only after child and parent owner receipts are durable.
     pub fn beginFkInitialCreate(self: *ApiHttpServer, alloc: std.mem.Allocator, context: api_operation.RequestContext, identity: ?AuthenticatedIdentity, target: system_catalog.Target, request: tables_api.CreateTableRequest) !FkInitialCreateBegin {
-        if (self.cfg.deployment_mode == .standalone) return error.UnsupportedOperation;
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
@@ -4978,7 +4977,18 @@ pub const ApiHttpServer = struct {
     /// SQL preallocates its public receipt from this immutable plan before the
     /// durable begin, so post-admission allocation failure cannot erase it.
     pub fn submitFkInitialCreatePlan(self: *ApiHttpServer, alloc: std.mem.Allocator, context: api_operation.RequestContext, plan: @import("../metadata/fk_generation_publication.zig").InitialCreatePlan) !FkInitialCreateBegin {
-        if (self.cfg.deployment_mode == .standalone) return error.UnsupportedOperation;
+        if (self.cfg.deployment_mode == .standalone) {
+            // Native hidden owners have an exact local receipt protocol only
+            // for self-FKs. External parent owners still require the data-Raft
+            // generation protocol; hidden MATCH PARTIAL index readiness also
+            // needs a private owner proof before it can be enabled here.
+            if (self.cfg.fk_initial_child == null or plan.parents.len != 0 or plan.self_transitions.len == 0)
+                return error.UnsupportedOperation;
+            var scope = std.heap.ArenaAllocator.init(alloc);
+            defer scope.deinit();
+            const partial_support = try @import("../metadata/fk_generation_publication.zig").initialPartialSupportNames(scope.allocator(), plan.child.schema_json, plan.child);
+            if (partial_support.len != 0) return error.UnsupportedOperation;
+        }
         const expected_digest = try plan.digest(alloc);
         const result: FkInitialCreateBegin = .{
             .plan_id = plan.id,
@@ -21164,6 +21174,7 @@ pub const ApiHttpServer = struct {
 
     const RestoreJobView = struct {
         job_id: []const u8,
+        idempotency_key: ?[]const u8,
         attempt_id: u64,
         scope: restore_jobs.Scope,
         table_name: ?[]const u8,
@@ -21195,6 +21206,7 @@ pub const ApiHttpServer = struct {
         } else null;
         return .{
             .job_id = try std.fmt.allocPrint(arena, "{d}", .{state.job_id}),
+            .idempotency_key = state.idempotency_key,
             .attempt_id = state.attempt_id,
             .scope = state.scope,
             .table_name = if (state.table_name) |table_name| try (try system_catalog.Target.parse(try names.resolve(table_name))).displayNameAlloc(arena) else null,

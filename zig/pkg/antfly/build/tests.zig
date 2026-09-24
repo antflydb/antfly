@@ -81,6 +81,7 @@ pub const AddTestsResult = struct {
     antfly_test_step: *std.Build.Step,
     unit_test_step: *std.Build.Step,
     standalone_runtime_test_step: *std.Build.Step,
+    standalone_initial_fk_tests: *std.Build.Step.Compile,
     vopr_test_step: *std.Build.Step,
     integration_test_step: *std.Build.Step,
     chaos_test_step: *std.Build.Step,
@@ -4335,6 +4336,31 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lib_standalone_runtime_test_step = b.step("antfly-standalone-runtime-test", "Run focused standalone runtime tests");
     const run_lib_standalone_runtime_tests = addFilteredTestRunArtifact(b, lib_standalone_runtime_tests);
     lib_standalone_runtime_test_step.dependOn(&run_lib_standalone_runtime_tests.step);
+    // Real hidden-owner publication crosses the storage-kernel C ABI. Link
+    // this one fixture separately rather than making every standalone
+    // inference/runtime unit test carry the storage owner artifact.
+    const standalone_initial_fk_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/standalone_runtime_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    standalone_runtime_imports.configure(b, standalone_initial_fk_test_mod, true, true);
+    standalone_runtime_imports.runtime.storage_boundary.configureProfile(standalone_initial_fk_test_mod, true, true, .all);
+    standalone_initial_fk_test_mod.addImport("antfly_openapi_specs", standalone_runtime_imports.runtime.embedded_openapi);
+    const usermgr_storage_initial_fk_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    usermgr_storage_initial_fk_test_mod.addImport("antfly_root", standalone_initial_fk_test_mod);
+    usermgr_storage_initial_fk_test_mod.addImport("antfly_platform", platform_mod);
+    standalone_initial_fk_test_mod.addImport("usermgr_storage", usermgr_storage_initial_fk_test_mod);
+    const standalone_initial_fk_tests = b.addTest(.{
+        .root_module = standalone_initial_fk_test_mod,
+        .filters = &.{"standalone initial self FK private owners publish two ranges after restart"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 18 else 7) * 1024 * 1024 * 1024,
+    });
     // Keep the complete API worker fixture out of the inference-heavy runtime
     // object. Compile this narrow integration slice independently so adding
     // restore coverage does not inflate every standalone runtime test build.
@@ -6213,6 +6239,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .antfly_test_step = antfly_test_step,
         .unit_test_step = unit_test_step,
         .standalone_runtime_test_step = lib_standalone_runtime_test_step,
+        .standalone_initial_fk_tests = standalone_initial_fk_tests,
         .vopr_test_step = vopr_test_step,
         .integration_test_step = integration_test_step,
         .chaos_test_step = chaos_test_step,

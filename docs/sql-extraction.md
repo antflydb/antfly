@@ -29,6 +29,11 @@ feature inventory. Current additions include:
   tracking and owner-fenced atomic prepare; unsupported providers reject BEGIN.
 - Native catalog/schema/index/constraint DDL and durable pending/invalid
   receipts; pending activation/rewrite is not reported as synchronous success.
+  ALTER TABLE ADD PRIMARY KEY remains guarded: its non-null/unique fresh-generation
+  rewrite needs stable mounted publication and failure evidence before activation.
+  Uncertain restore admission now retains an idempotency key and deterministic
+  job handle in the SQL receipt, with a non-success HTTP status and no-replay
+  guidance rather than presenting an unconfirmed job as accepted.
 - Generated HTTP clients, authenticated pgwire, a Lite C ABI, interactive CLI,
   and the Antfarm SQL workbench using the same execution contracts.
 
@@ -618,11 +623,14 @@ child publication releases admission. This closes the pre-publication orphan
 window but does not replace end-to-end coordinator crash/lost-ACK evidence.
 Ordinary FK schema edits now have a metadata-owned parent/source publication
 and ACK protocol, while FK-bearing initial CREATE uses hidden child owners and
-publishes the table only after parent and child receipts. Standalone initial FK
-CREATE, self-referential initial FK declarations, and initial MATCH PARTIAL
-declarations remain guarded until their owner or atomic support-index paths
-exist. Hidden-owner standby replay has a Raft-bound batch envelope, but
-seed/promotion fault coverage remains a release gate.
+publishes the table only after parent and child receipts. Standalone initial
+self-referential FK CREATE now uses authenticated native hidden-child owner
+receipts and an atomic local catalog publication; a two-range restart fixture
+and public valid/orphan-write fixture cover this path. Standalone initial FK
+CREATE with external parents and initial MATCH PARTIAL declarations remain
+guarded until their owner or atomic support-index paths are proven. Hidden-owner
+standby replay has a Raft-bound batch envelope, but seed/promotion fault
+coverage remains a release gate.
 
 Acceptance needs crash/lost-ack tests at each fence, publication and activation
 boundary, cancellation on both sides of publication, parent mutations and new

@@ -6697,6 +6697,29 @@ pub fn storageOwnerReplicatedBatchAtRaftEntryJson(
     return .ok;
 }
 
+pub fn storageOwnerNativeInitialChildControlJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.NativeInitialChildControlRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    if (request.operation_term != 1 or request.operation_index < 1 or request.operation_index > 3) return .invalid_argument;
+    var owned = batch_api.parseInternalBatchRequest(handle.alloc, request.request_json.slice()) catch |err|
+        return storageOwnerStatusFromError(err);
+    defer owned.deinit(handle.alloc);
+    handle.db.batchNativeInitialChildApply(owned.req, .{
+        .term = request.operation_term,
+        .index = request.operation_index,
+    }) catch |err| return storageOwnerStatusFromError(err);
+    const response = batch_api.encodeBatchResponse(std.heap.c_allocator, owned.result()) catch |err|
+        return storageOwnerStatusFromError(err);
+    out_response.* = .{ .ptr = response.ptr, .len = response.len };
+    return .ok;
+}
+
 pub fn storageOwnerTransactionStatus(
     owner: ?*anyopaque,
     request: *const kernel_owner_abi.TransactionStatusRequest,

@@ -14,7 +14,7 @@ T = TypeVar("T", bound="SQLDDLReceipt")
 @_attrs_define
 class SQLDDLReceipt:
     """Durable DDL declaration receipt. admission_unknown means admission has
-    not been confirmed; reconcile restore_job_id without replaying DDL.
+    not been confirmed; reconcile restore_job_id and idempotency_key without replaying DDL.
     Pending or invalid means the declaration
     committed but validation has not established an active constraint. Do not
     replay it. Inspect table constraint status using this immutable table
@@ -31,6 +31,8 @@ class SQLDDLReceipt:
             restore_job_id (str | Unset): Native staging job for an atomic schema rewrite or TRUNCATE generation barrier.
                 table_id identifies the source generation. Poll the job; pending or admission_unknown is not completed DDL and
                 must not be replayed.
+            idempotency_key (str | Unset): Durable retry identity for an admitted or uncertain schema rewrite. Retain it
+                with restore_job_id when reconciling admission; do not replay the DDL.
     """
 
     database: str
@@ -41,6 +43,7 @@ class SQLDDLReceipt:
     state: SQLDDLReceiptState
     diagnostic: str | Unset = UNSET
     restore_job_id: str | Unset = UNSET
+    idempotency_key: str | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         database = self.database
@@ -59,6 +62,8 @@ class SQLDDLReceipt:
 
         restore_job_id = self.restore_job_id
 
+        idempotency_key = self.idempotency_key
+
         field_dict: dict[str, Any] = {}
 
         field_dict.update(
@@ -75,6 +80,8 @@ class SQLDDLReceipt:
             field_dict["diagnostic"] = diagnostic
         if restore_job_id is not UNSET:
             field_dict["restore_job_id"] = restore_job_id
+        if idempotency_key is not UNSET:
+            field_dict["idempotency_key"] = idempotency_key
 
         return field_dict
 
@@ -97,6 +104,8 @@ class SQLDDLReceipt:
 
         restore_job_id = d.pop("restore_job_id", UNSET)
 
+        idempotency_key = d.pop("idempotency_key", UNSET)
+
         sqlddl_receipt = cls(
             database=database,
             namespace=namespace,
@@ -106,6 +115,7 @@ class SQLDDLReceipt:
             state=state,
             diagnostic=diagnostic,
             restore_job_id=restore_job_id,
+            idempotency_key=idempotency_key,
         )
 
         return sqlddl_receipt

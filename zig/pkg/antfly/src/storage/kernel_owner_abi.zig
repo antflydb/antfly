@@ -1085,6 +1085,17 @@ pub const ReplicatedBatchAtRaftEntryRequest = extern struct {
     raft_index: u64 = 0,
 };
 
+/// Metadata-authorized hidden-child control on a native owner. This is a
+/// local operation receipt, never a data-Raft entry or source watermark.
+pub const NativeInitialChildControlRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    table_name: BorrowedBytes = .{},
+    request_json: BorrowedBytes = .{},
+    operation_term: u64 = 0,
+    operation_index: u64 = 0,
+};
+
 /// Complete offline HA-seed operations that must remain beside physical DB
 /// restore/validation code. Values are append-only because they are recorded
 /// in `FailureIdentity.operation` for cross-unit diagnostics.
@@ -1871,6 +1882,12 @@ pub extern fn antfly_storage_owner_replicated_batch_json(
 pub extern fn antfly_storage_owner_replicated_batch_at_raft_entry_json(
     owner: ?*anyopaque,
     request: *const ReplicatedBatchAtRaftEntryRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_owner_native_initial_child_control_json(
+    owner: ?*anyopaque,
+    request: *const NativeInitialChildControlRequest,
     out_response: *OwnedBytes,
 ) callconv(.c) Status;
 

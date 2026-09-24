@@ -3095,6 +3095,9 @@ const BatchExecutionOptions = struct {
     ha_applied_lsn_marker: ?u64 = null,
     online_source_applied_index: ?u64 = null,
     raft_applied_entry_marker: ?RaftAppliedEntryIdentity = null,
+    /// Metadata-authorized native hidden-child receipt identity. Never
+    /// writes the data-Raft watermark into a native source-authority root.
+    native_initial_child_entry: ?RaftAppliedEntryIdentity = null,
     suppress_derived_replay_append: bool = false,
     extra_store_writes: []const docstore_mod.KVPair = &.{},
     extra_store_deletes: []const []const u8 = &.{},
@@ -9719,6 +9722,78 @@ pub const DB = struct {
         };
     }
 
+    /// A hidden initial child in native standalone has no data-Raft log. The
+    /// metadata decision names one immutable plan and owner, while the
+    /// hidden Record commits the operation receipt with the schema/phase.
+    /// Keep this distinct from the generic Raft path: native source roots
+    /// must never acquire a fabricated Raft applied-entry watermark.
+    pub fn batchNativeInitialChildApply(self: *DB, req: types.BatchRequest, receipt: RaftAppliedEntryIdentity) !void {
+        const command = req.relational_topology orelse return error.InvalidInitialChildPublication;
+        if (command.action != .provision_initial_child and command.action != .release_initial_child and command.action != .cancel_initial_child)
+            return error.InvalidInitialChildPublication;
+        if (receipt.term != 1 or receipt.index != switch (command.action) {
+            .provision_initial_child => @as(u64, 1),
+            .release_initial_child => @as(u64, 2),
+            .cancel_initial_child => @as(u64, 3),
+            else => unreachable,
+        }) return error.InvalidInitialChildPublication;
+        if (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
+            req.graph_writes.len != 0 or req.graph_deletes.len != 0 or req.predicates.len != 0 or
+            req.integrity.len != 0 or req.integrity_commands.len != 0 or req.range_guards.len != 0 or
+            req.online_source != null or req.restore_staging != null or req.restore_staging_scope != null or
+            req.restore_staging_plan_id != null or req.relational_generation_gc != null or
+            req.relational_activation != null or req.relational_retirement != null or
+            req.relational_index_maintenance != null or req.row_policy_publication != null or
+            req.row_policy_install_bundle.len != 0 or req.row_policy_principal_proof.len != 0 or
+            req.row_policy_database.len != 0 or req.row_policy_admitted_at_seconds != 0 or
+            req.split_checkpoint != null or req.split_replication != null or req.split_transition != null or
+            req.merge_source_transition != null or req.merge_checkpoint != null or req.merge_replication != null or
+            req.merge_page != null or req.merge_artifacts.len != 0 or req.transaction != null or
+            req.relational_repair or req.activate_range_tracking or req.reject_graph_transform_projections or
+            req.schema_version != null or req.relational_schema_version != null or
+            req.relational_integrity_generation_set != null or req.timestamp_ns != 0)
+            return error.InvalidInitialChildPublication;
+        const bootstrap = self.initial_child_bootstrap orelse return error.InvalidInitialChildPublication;
+        if (self.ha_async_batch_mirror != null or self.ha_async_metadata_mirror != null or
+            self.ha_async_effect_mirror != null or self.ha_write_gate != null or
+            openModeRequiresReadOnlyBackends(self.open_mode))
+            return error.InvalidInitialChildPublication;
+        if (!bootstrap.namespace.eql(command.fence.namespace) or
+            !std.mem.eql(u8, &bootstrap.catalog_digest, &command.fence.catalog_digest))
+            return error.InitialChildPublicationChanged;
+        switch (command.action) {
+            .provision_initial_child => {
+                const provision = command.initial_child_provision orelse return error.InvalidInitialChildPublication;
+                if (!std.mem.eql(u8, &bootstrap.plan_id, &provision.plan_id) or
+                    !std.mem.eql(u8, &bootstrap.plan_digest, &provision.plan_digest) or
+                    !std.mem.eql(u8, &bootstrap.schema_digest, &provision.schema_digest) or
+                    !std.mem.eql(u8, &bootstrap.public_schema_json_digest, &provision.public_schema_json_digest) or
+                    !std.mem.eql(u8, &bootstrap.catalog_digest, &provision.catalog_digest))
+                    return error.InitialChildPublicationChanged;
+            },
+            .release_initial_child, .cancel_initial_child => {
+                const control = command.initial_child_control orelse return error.InvalidInitialChildPublication;
+                if (!std.mem.eql(u8, &bootstrap.plan_id, &control.plan_id) or
+                    !std.mem.eql(u8, &bootstrap.plan_digest, &control.plan_digest) or
+                    bootstrap.schema_version != control.schema_version or
+                    !std.mem.eql(u8, &bootstrap.schema_digest, &control.schema_digest) or
+                    !std.mem.eql(u8, &bootstrap.public_schema_json_digest, &control.public_schema_json_digest) or
+                    !std.mem.eql(u8, &bootstrap.catalog_digest, &control.catalog_digest))
+                    return error.InitialChildPublicationChanged;
+            },
+            else => unreachable,
+        }
+        var authority = try self.core.store.beginReadTxn();
+        defer authority.abort();
+        _ = try @import("../source_authority.zig").require(&authority, .native, @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace));
+        return self.batchInternal(req, null, .{
+            .validate_range_ownership = false,
+            .wait_for_sync_level = false,
+            .bypass_ha_write_gate = true,
+            .native_initial_child_entry = receipt,
+        });
+    }
+
     pub fn failNextRestoreProjectionApplyForTest() void {
         std.debug.assert(builtin.is_test);
         test_fail_restore_projection_apply = true;
@@ -10801,7 +10876,7 @@ pub const DB = struct {
         var verified_principal: ?std.json.Parsed(row_policy_authority_mod.Payload) = null;
         defer if (verified_principal) |*principal| principal.deinit();
         var row_policy_lease: ?row_policy_gate_mod.Gate.Lease = null;
-        const trusted_replay = opts.raft_applied_entry_marker != null or opts.ha_applied_lsn_marker != null;
+        const trusted_replay = opts.raft_applied_entry_marker != null or opts.native_initial_child_entry != null or opts.ha_applied_lsn_marker != null;
         if (!trusted_replay) try self.maybeFinalizePendingRowPolicyPublication();
         if (req.row_policy_principal_proof.len != 0) {
             if (req.row_policy_admitted_at_seconds <= 0 or req.row_policy_database.len == 0 or
@@ -27639,12 +27714,13 @@ pub const DB = struct {
         public_schema_json_digest: [32]u8,
         catalog_digest: [32]u8,
         raft_entry: RaftAppliedEntryIdentity,
+        native: bool = false,
     };
 
-    /// Fresh, unroutable FK child owners receive their candidate schema via
-    /// Raft only after a direct metadata read-index decision. The exact AIC,
-    /// public schema, hidden gate, owner receipt and Raft marker are one write;
-    /// no row can enter the owner between provisioning and the gate.
+    /// Fresh, unroutable FK child owners receive their candidate schema only
+    /// after a durable metadata decision. The hidden record and schema share
+    /// one write; Raft owners also persist the Raft marker, while native
+    /// owners use the record itself as their exact durable operation receipt.
     pub fn provisionInitialHiddenChild(self: *DB, schema_json: []const u8, input: InitialHiddenChild, ha_lsn: ?u64, ha_payload: ?[]const u8) !void {
         const hidden = @import("relational_initial_child_publication.zig");
         if (self.initial_child_bootstrap) |bootstrap| {
@@ -27662,8 +27738,13 @@ pub const DB = struct {
             std.mem.allEqual(u8, &input.plan_id, 0) or std.mem.allEqual(u8, &input.plan_digest, 0) or
             (ha_lsn != null and ha_payload != null))
             return error.InvalidInitialChildPublication;
-        if (try self.raftEntryAlreadyApplied(input.raft_entry)) {
-            const raw = (try self.core.getStoreValue(self.alloc, hidden.key)) orelse return error.InitialChildPublicationChanged;
+        const replay = if (input.native)
+            try self.core.getStoreValue(self.alloc, hidden.key)
+        else if (try self.raftEntryAlreadyApplied(input.raft_entry))
+            (try self.core.getStoreValue(self.alloc, hidden.key)) orelse return error.InitialChildPublicationChanged
+        else
+            null;
+        if (replay) |raw| {
             defer self.alloc.free(raw);
             const prior = try hidden.Record.decode(raw);
             if (!std.mem.eql(u8, &prior.plan_id, &input.plan_id) or
@@ -27726,11 +27807,11 @@ pub const DB = struct {
         const self_alloc = self_arena.allocator();
         var writes = try self.alloc.alloc(docstore_mod.KVPair, 6 + fks.len);
         defer self.alloc.free(writes);
-        var write_count: usize = 4;
+        var write_count: usize = if (input.native) 3 else 4;
         writes[0] = schema_writes[0];
         writes[1] = schema_writes[1];
         writes[2] = .{ .key = hidden.key, .value = &encoded_record };
-        writes[3] = marker;
+        if (!input.native) writes[3] = marker;
         for (fks) |fk| {
             if (!std.mem.eql(u8, fk.parent_table, input.child_table_name)) continue;
             const binding = aic.catalog.find(.foreign_key, fk.name) orelse return error.IntegrityCatalogChanged;
@@ -27781,14 +27862,14 @@ pub const DB = struct {
         try self.lockApplyForPortableRuntime();
         var apply_held = true;
         errdefer if (apply_held) self.core.unlockApply();
-        switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), input.raft_entry)) {
+        if (!input.native) switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), input.raft_entry)) {
             .already_applied => {
                 self.core.unlockApply();
                 apply_held = false;
                 return;
             },
             .apply => {},
-        }
+        };
         if (try self.core.getStoreValue(self.alloc, public_schema_json_key)) |prior_schema| {
             self.alloc.free(prior_schema);
             return error.InitialChildPublicationChanged;
@@ -27798,8 +27879,24 @@ pub const DB = struct {
             return error.InitialChildPublicationChanged;
         }
         if (try self.core.getStoreValue(self.alloc, hidden.key)) |prior_hidden| {
-            self.alloc.free(prior_hidden);
-            return error.InitialChildPublicationChanged;
+            defer self.alloc.free(prior_hidden);
+            if (!input.native) return error.InitialChildPublicationChanged;
+            // A second local supervisor may have won the commit after our
+            // optimistic replay probe. The hidden record is the native
+            // operation receipt; acknowledge only its exact immutable plan
+            // and provision ordinal while still under the apply lock.
+            const prior = try hidden.Record.decode(prior_hidden);
+            if (!std.mem.eql(u8, &prior.plan_id, &input.plan_id) or
+                !std.mem.eql(u8, &prior.plan_digest, &input.plan_digest) or
+                !prior.namespace.eql(input.fence.namespace) or
+                !std.mem.eql(u8, &prior.schema_digest, &input.schema_digest) or
+                !std.mem.eql(u8, &prior.public_schema_json_digest, &input.public_schema_json_digest) or
+                !std.mem.eql(u8, &prior.catalog_digest, &input.catalog_digest) or
+                prior.provision_term != input.raft_entry.term or prior.provision_index != input.raft_entry.index)
+                return error.InitialChildPublicationChanged;
+            self.core.unlockApply();
+            apply_held = false;
+            return;
         }
         const row_count = try self.validateStorageModeCompatibilityLocked(runtime_schema);
         if (row_count != null and row_count.? != 0) return error.InitialChildPublicationChanged;
@@ -27812,35 +27909,43 @@ pub const DB = struct {
         self.reconcilePublishedSchemaIndexes(runtime_schema.version);
     }
 
-    fn applyInitialChildPhase(self: *DB, fence: @import("relational_integrity_topology_contract.zig").Fence, control: @import("relational_integrity_topology_contract.zig").InitialChildControl, phase: @import("relational_initial_child_publication.zig").Phase, entry: RaftAppliedEntryIdentity, ha_lsn: ?u64, ha_payload: ?[]const u8) !void {
+    fn applyInitialChildPhase(self: *DB, fence: @import("relational_integrity_topology_contract.zig").Fence, control: @import("relational_integrity_topology_contract.zig").InitialChildControl, phase: @import("relational_initial_child_publication.zig").Phase, entry: RaftAppliedEntryIdentity, native: bool, ha_lsn: ?u64, ha_payload: ?[]const u8) !void {
         const hidden = @import("relational_initial_child_publication.zig");
         if (fence.role != .child_generation_source or !fence.namespace.eql(self.core.identity_namespace) or
             std.mem.allEqual(u8, &control.plan_id, 0) or std.mem.allEqual(u8, &control.plan_digest, 0) or
             !std.mem.eql(u8, &control.catalog_digest, &fence.catalog_digest) or
             phase == .hidden or (ha_lsn != null and ha_payload != null)) return error.InvalidInitialChildPublication;
-        if (try self.raftEntryAlreadyApplied(entry)) {
-            const raw = (try self.core.getStoreValue(self.alloc, hidden.key)) orelse return error.InitialChildPublicationChanged;
+        const replay = if (native)
+            try self.core.getStoreValue(self.alloc, hidden.key)
+        else if (try self.raftEntryAlreadyApplied(entry))
+            (try self.core.getStoreValue(self.alloc, hidden.key)) orelse return error.InitialChildPublicationChanged
+        else
+            null;
+        if (replay) |raw| {
             defer self.alloc.free(raw);
             const prior = try hidden.Record.decode(raw);
-            if (prior.phase != phase or !std.mem.eql(u8, &prior.plan_id, &control.plan_id) or
+            if (!std.mem.eql(u8, &prior.plan_id, &control.plan_id) or
                 !std.mem.eql(u8, &prior.plan_digest, &control.plan_digest) or
                 !prior.namespace.eql(fence.namespace) or prior.schema_version != control.schema_version or
                 !std.mem.eql(u8, &prior.schema_digest, &control.schema_digest) or
                 !std.mem.eql(u8, &prior.public_schema_json_digest, &control.public_schema_json_digest) or
-                !std.mem.eql(u8, &prior.catalog_digest, &control.catalog_digest) or
-                prior.phase_term != entry.term or prior.phase_index != entry.index)
+                !std.mem.eql(u8, &prior.catalog_digest, &control.catalog_digest))
                 return error.InitialChildPublicationChanged;
-            if (ha_lsn) |lsn| try self.markHAReplicationRecordApplied(lsn);
-            return;
+            if (prior.phase == phase) {
+                if (prior.phase_term != entry.term or prior.phase_index != entry.index) return error.InitialChildPublicationChanged;
+                if (ha_lsn) |lsn| try self.markHAReplicationRecordApplied(lsn);
+                return;
+            }
+            if (!native or prior.phase != .hidden) return error.InitialChildPublicationChanged;
         }
         var mutation = self.core.snapshot_admission.acquireMutation();
         defer mutation.release();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
-        switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), entry)) {
+        if (!native) switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), entry)) {
             .already_applied => return,
             .apply => {},
-        }
+        };
         var txn = try self.core.store.beginWriteTxn();
         errdefer txn.abort();
         const before = try hidden.load(&txn);
@@ -27861,9 +27966,11 @@ pub const DB = struct {
                 .phase_index = entry.index,
             };
             _ = try hidden.stageUnprovisionedCancel(&txn, canceled);
-            var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
-            const marker = raftAppliedEntryWrite(entry, &marker_buf);
-            try txn.put(marker.key, marker.value);
+            if (!native) {
+                var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
+                const marker = raftAppliedEntryWrite(entry, &marker_buf);
+                try txn.put(marker.key, marker.value);
+            }
             if (ha_lsn) |lsn| {
                 var lsn_buf: [ha_applied_lsn_value_len]u8 = undefined;
                 const lsn_marker = haAppliedReplicationLsnWrite(lsn, &lsn_buf);
@@ -27882,11 +27989,18 @@ pub const DB = struct {
             current.schema_version != control.schema_version or
             !std.mem.eql(u8, &current.schema_digest, &control.schema_digest) or
             !std.mem.eql(u8, &current.public_schema_json_digest, &control.public_schema_json_digest)) return error.InitialChildPublicationChanged;
+        if (native and current.phase == phase) {
+            if (current.phase_term != entry.term or current.phase_index != entry.index) return error.InitialChildPublicationChanged;
+            return;
+        }
+        if (native and current.phase != .hidden) return error.InitialChildPublicationChanged;
         if (current.provision_term == 0) {
             if (phase != .canceled) return error.InitialChildPublicationChanged;
-            var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
-            const marker = raftAppliedEntryWrite(entry, &marker_buf);
-            try txn.put(marker.key, marker.value);
+            if (!native) {
+                var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
+                const marker = raftAppliedEntryWrite(entry, &marker_buf);
+                try txn.put(marker.key, marker.value);
+            }
             if (ha_lsn) |lsn| {
                 var lsn_buf: [ha_applied_lsn_value_len]u8 = undefined;
                 const lsn_marker = haAppliedReplicationLsnWrite(lsn, &lsn_buf);
@@ -27930,9 +28044,11 @@ pub const DB = struct {
         const table_raw = txn.get(@import("table_catalog.zig").key) catch return error.InitialChildPublicationChanged;
         if ((try @import("table_catalog.zig").Catalog.decode(table_raw)).row_count != 0) return error.InitialChildPublicationChanged;
         _ = try hidden.stagePhase(&txn, current, phase, entry.term, entry.index);
-        var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
-        const marker = raftAppliedEntryWrite(entry, &marker_buf);
-        try txn.put(marker.key, marker.value);
+        if (!native) {
+            var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
+            const marker = raftAppliedEntryWrite(entry, &marker_buf);
+            try txn.put(marker.key, marker.value);
+        }
         if (ha_lsn) |lsn| {
             var lsn_buf: [ha_applied_lsn_value_len]u8 = undefined;
             const lsn_marker = haAppliedReplicationLsnWrite(lsn, &lsn_buf);
@@ -29796,7 +29912,7 @@ pub const DB = struct {
                 command.child_schema_install != null or command.transfer != null or command.parent_retirement != null or
                 command.parent_activation != null or command.child_generations != null) return error.InvalidBatchRequest;
             const provision = command.initial_child_provision.?;
-            const entry = opts.raft_applied_entry_marker orelse return error.InvalidBatchRequest;
+            const entry = opts.raft_applied_entry_marker orelse opts.native_initial_child_entry orelse return error.InvalidBatchRequest;
             var ha_mutation = if (opts.bypass_ha_write_gate) null else self.acquireHAMutationShared();
             defer if (ha_mutation) |*lease| lease.release();
             if (!opts.bypass_ha_write_gate) {
@@ -29820,6 +29936,7 @@ pub const DB = struct {
                 .public_schema_json_digest = provision.public_schema_json_digest,
                 .catalog_digest = provision.catalog_digest,
                 .raft_entry = entry,
+                .native = opts.native_initial_child_entry != null,
             }, opts.ha_applied_lsn_marker, payload);
             if (payload != null) try self.flushDurableHAOutboxes();
             return;
@@ -29828,7 +29945,7 @@ pub const DB = struct {
             if (command.initial_child_control == null or command.initial_child_provision != null or
                 command.child_schema_install != null or command.transfer != null or command.parent_retirement != null or
                 command.parent_activation != null or command.child_generations != null) return error.InvalidBatchRequest;
-            const entry = opts.raft_applied_entry_marker orelse return error.InvalidBatchRequest;
+            const entry = opts.raft_applied_entry_marker orelse opts.native_initial_child_entry orelse return error.InvalidBatchRequest;
             var ha_mutation = if (opts.bypass_ha_write_gate) null else self.acquireHAMutationShared();
             defer if (ha_mutation) |*lease| lease.release();
             if (!opts.bypass_ha_write_gate) {
@@ -29843,7 +29960,7 @@ pub const DB = struct {
             else
                 null;
             defer if (payload) |bytes| self.alloc.free(bytes);
-            try self.applyInitialChildPhase(command.fence, command.initial_child_control.?, if (command.action == .release_initial_child) .released else .canceled, entry, opts.ha_applied_lsn_marker, payload);
+            try self.applyInitialChildPhase(command.fence, command.initial_child_control.?, if (command.action == .release_initial_child) .released else .canceled, entry, opts.native_initial_child_entry != null, opts.ha_applied_lsn_marker, payload);
             if (payload != null) try self.flushDurableHAOutboxes();
             return;
         };
