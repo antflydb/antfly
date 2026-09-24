@@ -84,7 +84,7 @@ fn validateNativeOwnershipKey(key: []const u8) !void {
     // Native ownership records cannot be selected or overwritten by a leader's
     // canonical operation list. Accepted apply appends its own indexed records.
     const control = @import("completion_control_record.zig");
-    inline for (.{ "\x00\x00__metadata__:completion_slot_v1", "\x00\x00__metadata__:completion_applied_v1", receipt_prefix, control.owner_prefix, control.receipt_prefix }) |prefix| {
+    inline for (.{ "\x00\x00__metadata__:completion_slot_v1", "\x00\x00__metadata__:completion_applied_v1", receipt_prefix, control.owner_prefix, control.receipt_prefix, control.progress_prefix }) |prefix| {
         if (std.mem.startsWith(u8, key, prefix)) return error.InvalidCompletionSlot;
     }
 }
@@ -504,7 +504,8 @@ test "workload admission completion compiler cannot forge native transaction con
     defer alloc.free(descriptor);
     const owner_key = control.ownerKey(@splat(7));
     const receipt_key = control.receiptKey(@splat(7));
-    for ([_][]const u8{ &owner_key, &receipt_key }) |private_key| {
+    const progress_key = control.progressKey(@splat(7));
+    for ([_][]const u8{ &owner_key, &receipt_key, &progress_key }) |private_key| {
         var input = fixture(descriptor);
         input.prepare_operations = &.{.{ .kind = .put, .key = private_key, .value = "forged" }};
         // Full sorted baseline coverage makes this an otherwise valid plan;

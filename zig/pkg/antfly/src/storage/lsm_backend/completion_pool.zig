@@ -22,6 +22,7 @@ pub const maintenance = @import("completion_maintenance.zig");
 const capacity = @import("completion_capacity.zig");
 const generations_mod = @import("completion_generations.zig");
 const control_begin = @import("completion_control_begin.zig");
+const control_transition = @import("completion_control_transition.zig");
 const control_shape = @import("../completion_control_budget.zig");
 const control_capacity = @import("completion_control_capacity.zig");
 const control_guard = @import("completion_control_guard.zig");
@@ -728,16 +729,35 @@ pub fn Pool(comptime Backend: type) type {
         /// its transaction before allocating or publishing a document cell.
         /// Inspect prepared outcome templates too, so they cannot later write
         /// one of the retained owner's metadata keys through a different cell.
-        fn rejectUnownedControlTransition(self: *const Self, entry: *const entry_codec.OwnedEntry) !void {
+        fn rejectUnownedControlTransition(self: *Self, backend: *Backend, alloc: Allocator, entry: *const entry_codec.OwnedEntry) !void {
             if (!self.config.control_owner_staging) return;
             const descriptor = entry.decoded_descriptor.descriptor;
             for ([_][]const slot_codec.Operation{ entry.entry.prepare_operations, descriptor.commit, descriptor.abort }) |operations| {
                 for (operations) |op| {
-                    inline for (.{ control_shape.records_prefix, control_shape.participants_prefix, control_shape.resolved_participants_prefix, control_shape.completion_prefix, control_shape.intent_admission_prefix, control_shape.intent_keys_prefix, control_shape.schema_leases_prefix }) |prefix| {
+                    inline for (.{ control_shape.records_prefix, control_shape.participants_prefix, control_shape.resolved_participants_prefix, control_shape.completion_prefix, control_shape.intent_admission_prefix, control_shape.intent_keys_prefix, control_shape.schema_leases_prefix, "\x00\x00__txn_read_admission__:" }) |prefix| {
                         if (op.key.len == prefix.len + 16 and std.mem.startsWith(u8, op.key, prefix)) {
                             const id = op.key[prefix.len..][0..16];
                             for (self.control_owners) |owner| if (owner) |active| {
-                                if (std.mem.eql(u8, id, &active.declaration.txn_id)) return error.CompletionAdmissionUnavailable;
+                                if (!std.mem.eql(u8, id, &active.declaration.txn_id)) continue;
+                                // The exact physical classifier is exercised
+                                // at the real preaccept boundary, but it does
+                                // not license generic-cell application.
+                                if (entry.entry.kind != .mutation or descriptor.commit.len != 0 or descriptor.abort.len != 0)
+                                    return error.CompletionAdmissionUnavailable;
+                                const record_key = try std.mem.concat(alloc, u8, &.{ control_shape.records_prefix, id });
+                                defer alloc.free(record_key);
+                                const participants_key = try std.mem.concat(alloc, u8, &.{ control_shape.participants_prefix, id });
+                                defer alloc.free(participants_key);
+                                const resolved_key = try std.mem.concat(alloc, u8, &.{ control_shape.resolved_participants_prefix, id });
+                                defer alloc.free(resolved_key);
+                                var before = try self.point(backend, alloc, descriptor.namespace, record_key);
+                                defer before.deinit(alloc);
+                                var participants = try self.point(backend, alloc, descriptor.namespace, participants_key);
+                                defer participants.deinit(alloc);
+                                var resolved = try self.point(backend, alloc, descriptor.namespace, resolved_key);
+                                defer resolved.deinit(alloc);
+                                _ = try control_transition.inspect(entry.entry.prepare_operations, active.declaration, before.value orelse return error.UnsupportedCompletionProfile, participants.value orelse return error.UnsupportedCompletionProfile, resolved.value);
+                                return error.CompletionAdmissionUnavailable;
                             };
                         }
                     }
@@ -1036,7 +1056,7 @@ pub fn Pool(comptime Backend: type) type {
             try Slot.validateFootprint(backend, checked.decoded_descriptor.descriptor);
             if (checked.entry.kind == .mutation)
                 try Slot.validateCanonicalFootprint(backend, checked.decoded_descriptor.descriptor.namespace, checked.entry.prepare_operations);
-            try self.rejectUnownedControlTransition(&checked);
+            try self.rejectUnownedControlTransition(backend, scratch, &checked);
             const fresh_begin = try self.validateNewTransactionRecord(backend, scratch, &checked);
             try self.validateBaseline(backend, scratch, &checked);
             const growth = try entryCapacity(&checked);

@@ -3759,6 +3759,10 @@ test "workload admission completion compiler derives native control ownership fr
 
 test "workload admission completion compiler captures actual controls with preowned memory across retries" {
     const alloc = std.testing.allocator;
+    const transition = @import("lsm_backend/completion_control_transition.zig");
+    const control_record = @import("lsm_backend/completion_control_record.zig");
+    const control_shape = @import("completion_control_budget.zig");
+    const entry_codec = @import("lsm_backend/completion_entry.zig");
     const domains = @import("lsm_backend/completion_allocator.zig");
     const resources = @import("resource_manager.zig");
     const control = @import("lsm_backend/completion_control_resources.zig");
@@ -3781,6 +3785,14 @@ test "workload admission completion compiler captures actual controls with preow
     defer manager.deinit();
     manager.completion_limits = .{ .max_count = 4, .max_bytes = 1024 * 1024 };
     const participants = [_][]const u8{ "coordinator", "left", "right" };
+    const declaration: @import("lsm_backend/completion_control_begin.zig").Declaration = .{
+        .txn_id = id,
+        .participants = try control_record.Participants.measure(&participants),
+        .budget = try control_shape.Budget.measure(&participants),
+        .coordinator = true,
+        .retain_terminal = false,
+        .ledger_bytes = (try control_shape.Budget.measure(&participants)).wal_bytes,
+    };
     try manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(id, 100, 90, &participants, true, false);
     const authority: @import("completion_candidate.zig").Authority = .{
         .group_id = 9,
@@ -3817,6 +3829,24 @@ test "workload admission completion compiler captures actual controls with preow
             defer snapshot.abort();
             const expected = try manager.compileControlMutation(alloc, &snapshot, input, authority, @splat(6), "control-resource-test", &.{});
             defer alloc.free(expected);
+            var decoded = try entry_codec.decode(alloc, expected);
+            defer decoded.deinit();
+            const before_record = try manager.getAlloc(alloc, &makeRecordKey(id));
+            defer alloc.free(before_record);
+            const before_participants = try manager.getAlloc(alloc, &makeSidecarKey(participants_prefix, id));
+            defer alloc.free(before_participants);
+            const before_resolved: ?[]u8 = manager.getAlloc(alloc, &makeSidecarKey(resolved_participants_prefix, id)) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            defer if (before_resolved) |value| alloc.free(value);
+            const classified = try transition.inspect(decoded.entry.prepare_operations, declaration, before_record, before_participants, before_resolved);
+            if (step == 0) {
+                try std.testing.expectEqual(.committed, classified.decision);
+            } else {
+                try std.testing.expectEqual(@as(u32, @intCast(step)), classified.acknowledgement.count);
+                try std.testing.expect(!std.mem.allEqual(u8, &classified.acknowledgement.resolved_digest, 0));
+            }
             backing.fail_index = backing.alloc_index;
             backing.resize_fail_index = backing.resize_index;
             resource_manager.memory.budget.hard_limit_bytes = 1;
@@ -3839,6 +3869,27 @@ test "workload admission completion compiler captures actual controls with preow
         // Real publication supplies the next compiler baseline. Application's
         // durable control-owner integration is a separate, still-open stage.
         if (step == 0) try manager.resolveIntents(id, .committed, 200) else try manager.markParticipantResolved(id, participants[step - 1]);
+        if (step != 0) {
+            var retry_snapshot = try manager.store.beginRead();
+            defer retry_snapshot.abort();
+            const duplicate = try manager.compileControlMutation(alloc, &retry_snapshot, input, authority, @splat(6), "control-resource-test", &.{});
+            defer alloc.free(duplicate);
+            var decoded_duplicate = try entry_codec.decode(alloc, duplicate);
+            defer decoded_duplicate.deinit();
+            const after_record = try manager.getAlloc(alloc, &makeRecordKey(id));
+            defer alloc.free(after_record);
+            const after_participants = try manager.getAlloc(alloc, &makeSidecarKey(participants_prefix, id));
+            defer alloc.free(after_participants);
+            const after_resolved = try manager.getAlloc(alloc, &makeSidecarKey(resolved_participants_prefix, id));
+            defer alloc.free(after_resolved);
+            try std.testing.expectError(error.UnsupportedCompletionProfile, transition.inspect(
+                decoded_duplicate.entry.prepare_operations,
+                declaration,
+                after_record,
+                after_participants,
+                after_resolved,
+            ));
+        }
     }
     try std.testing.expectEqualDeep(CompletionUsage{}, (try manager.completionUsage()).?);
 }

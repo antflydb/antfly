@@ -12,10 +12,13 @@ const std = @import("std");
 
 pub const owner_prefix = "\x00\x00__metadata__:completion_control_owner_v1:";
 pub const receipt_prefix = "\x00\x00__metadata__:completion_control_receipt_v1:";
+pub const progress_prefix = "\x00\x00__metadata__:completion_control_receipt_v2:";
 pub const encoded_bytes = 256;
 pub const receipt_bytes = 48;
+pub const progress_bytes = 208;
 pub const owner_key_bytes = owner_prefix.len + 16;
 pub const receipt_key_bytes = receipt_prefix.len + 16;
+pub const progress_key_bytes = progress_prefix.len + 16;
 pub const max_owners = 4;
 const magic = "AFCTLOW1";
 const version: u16 = 1;
@@ -58,6 +61,102 @@ pub const Receipt = struct {
         return self;
     }
 };
+
+/// The v1 receipt above is an identity-only row and keeps its exact ABI. A
+/// control owner needs immutable BEGIN provenance after the Raft suffix is
+/// compacted, plus a bound on the acknowledged set after later overwrites.
+/// This v2 format is reserved in capacity now; writing it is disabled until
+/// owner-backed apply and replay can atomically publish each transition.
+pub const Progress = struct {
+    pub const Phase = enum(u8) { begin = 0, decision = 1, acknowledgement = 2 };
+    pub const Decision = enum(u8) { none = 0, committed = 1, aborted = 2 };
+
+    txn_id: [16]u8,
+    begin: Receipt,
+    latest: Receipt,
+    phase: Phase,
+    decision: Decision,
+    acknowledged: u32,
+    resolved_digest: [32]u8,
+
+    pub fn validate(self: Progress) !void {
+        try self.begin.validate();
+        try self.latest.validate();
+        if (self.latest.index < self.begin.index) return error.InvalidCompletionSlot;
+        switch (self.phase) {
+            .begin => if (!std.meta.eql(self.latest, self.begin) or self.decision != .none or self.acknowledged != 0 or
+                !std.mem.allEqual(u8, &self.resolved_digest, 0)) return error.InvalidCompletionSlot,
+            .decision => if (self.latest.index == self.begin.index or self.decision == .none or self.acknowledged != 0 or
+                !std.mem.allEqual(u8, &self.resolved_digest, 0)) return error.InvalidCompletionSlot,
+            .acknowledgement => if (self.latest.index == self.begin.index or self.decision == .none or self.acknowledged == 0 or
+                std.mem.allEqual(u8, &self.resolved_digest, 0)) return error.InvalidCompletionSlot,
+        }
+    }
+
+    pub fn verifyOwner(self: Progress, owner: Record) !void {
+        try self.validate();
+        if (!std.mem.eql(u8, &self.txn_id, &owner.txn_id) or
+            !std.meta.eql(self.begin, owner.begin) or
+            self.acknowledged > owner.participants.count) return error.InvalidCompletionSlot;
+    }
+
+    pub fn encode(self: Progress) ![progress_bytes]u8 {
+        try self.validate();
+        var bytes: [progress_bytes]u8 = @splat(0);
+        @memcpy(bytes[0..8], "AFCTLRP2");
+        std.mem.writeInt(u16, bytes[8..10], 2, .little);
+        bytes[10] = @intFromEnum(self.phase);
+        bytes[11] = @intFromEnum(self.decision);
+        @memcpy(bytes[16..32], &self.txn_id);
+        @memcpy(bytes[32..80], &try self.begin.encode());
+        @memcpy(bytes[80..128], &try self.latest.encode());
+        std.mem.writeInt(u32, bytes[128..132], self.acknowledged, .little);
+        @memcpy(bytes[144..176], &self.resolved_digest);
+        @memcpy(bytes[176..208], &progressChecksum(&bytes));
+        return bytes;
+    }
+
+    pub fn decode(bytes: []const u8) !Progress {
+        if (bytes.len != progress_bytes or !std.mem.eql(u8, bytes[0..8], "AFCTLRP2"))
+            return error.InvalidCompletionSlot;
+        if (std.mem.readInt(u16, bytes[8..10], .little) != 2)
+            return error.UnsupportedCompletionSlotVersion;
+        if (!std.mem.allEqual(u8, bytes[12..16], 0) or
+            !std.mem.allEqual(u8, bytes[132..144], 0)) return error.InvalidCompletionSlot;
+        if (!std.mem.eql(u8, bytes[176..208], &progressChecksum(bytes)))
+            return error.CompletionSlotChecksumMismatch;
+        const phase: Phase = switch (bytes[10]) {
+            0 => .begin,
+            1 => .decision,
+            2 => .acknowledgement,
+            else => return error.InvalidCompletionSlot,
+        };
+        const decision: Decision = switch (bytes[11]) {
+            0 => .none,
+            1 => .committed,
+            2 => .aborted,
+            else => return error.InvalidCompletionSlot,
+        };
+        const self: Progress = .{
+            .txn_id = bytes[16..32].*,
+            .begin = try Receipt.decode(bytes[32..80]),
+            .latest = try Receipt.decode(bytes[80..128]),
+            .phase = phase,
+            .decision = decision,
+            .acknowledged = std.mem.readInt(u32, bytes[128..132], .little),
+            .resolved_digest = bytes[144..176].*,
+        };
+        try self.validate();
+        return self;
+    }
+};
+
+fn progressChecksum(bytes: []const u8) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly-completion-control-receipt-v2\x00");
+    hash.update(bytes[0..176]);
+    return hash.finalResult();
+}
 
 pub const Participants = struct {
     digest: [32]u8,
@@ -199,6 +298,10 @@ pub fn receiptKey(txn_id: [16]u8) [receipt_key_bytes]u8 {
     return key(receipt_prefix, txn_id);
 }
 
+pub fn progressKey(txn_id: [16]u8) [progress_key_bytes]u8 {
+    return key(progress_prefix, txn_id);
+}
+
 fn key(comptime prefix: []const u8, txn_id: [16]u8) [prefix.len + 16]u8 {
     var bytes: [prefix.len + 16]u8 = undefined;
     @memcpy(bytes[0..prefix.len], prefix);
@@ -244,6 +347,52 @@ test "workload admission completion compiler control record binds installation b
     const empty = try Participants.measure(&.{});
     try std.testing.expectEqual(@as(u32, 4), empty.encoded_list_bytes);
     try empty.validate();
+}
+
+test "workload admission completion compiler v2 progress retains begin and unique ACK frontier without changing v1 receipt" {
+    const owner = try fixture();
+    const v1 = try owner.begin.encode();
+    try std.testing.expectEqual(@as(usize, 48), v1.len);
+    try std.testing.expectEqualDeep(owner.begin, try Receipt.decode(&v1));
+    const key_v1 = receiptKey(owner.txn_id);
+    const key_v2 = progressKey(owner.txn_id);
+    try std.testing.expect(!std.mem.eql(u8, &key_v1, &key_v2));
+    var progress: Progress = .{
+        .txn_id = owner.txn_id,
+        .begin = owner.begin,
+        .latest = owner.begin,
+        .phase = .begin,
+        .decision = .none,
+        .acknowledged = 0,
+        .resolved_digest = @splat(0),
+    };
+    for ([_]Progress.Phase{ .begin, .decision, .acknowledgement }) |phase| {
+        progress.phase = phase;
+        if (phase != .begin) progress.latest.index += 1;
+        if (phase != .begin) progress.decision = .committed;
+        if (phase == .acknowledgement) {
+            progress.acknowledged = 1;
+            progress.resolved_digest = @splat(0x71);
+        }
+        try progress.verifyOwner(owner);
+        const encoded = try progress.encode();
+        try std.testing.expectEqualDeep(progress, try Progress.decode(&encoded));
+        for (0..progress_bytes) |offset| {
+            var damaged = encoded;
+            damaged[offset] ^= 1;
+            if (Progress.decode(&damaged)) |_| return error.TestExpectedError else |_| {}
+        }
+        var other = progress;
+        other.txn_id[0] ^= 1;
+        try std.testing.expectError(error.InvalidCompletionSlot, other.verifyOwner(owner));
+        other = progress;
+        other.begin.digest[0] ^= 1;
+        try std.testing.expectError(error.InvalidCompletionSlot, other.verifyOwner(owner));
+    }
+    progress.acknowledged = owner.participants.count + 1;
+    try std.testing.expectError(error.InvalidCompletionSlot, progress.verifyOwner(owner));
+    progress.acknowledged = 0;
+    try std.testing.expectError(error.InvalidCompletionSlot, progress.encode());
 }
 
 test "workload admission completion compiler control record rejects corruption noncanonical framing and impossible identities" {

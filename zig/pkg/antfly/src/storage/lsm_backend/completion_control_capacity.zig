@@ -67,7 +67,7 @@ pub fn ownershipRows(transitions: u64) [3]NativeRowShape {
     return .{
         .{ .key_bytes = record.owner_key_bytes, .value_bytes = record.encoded_bytes, .max_writes = 1 },
         .{ .key_bytes = record.owner_key_bytes, .value_bytes = 0, .max_writes = 1 },
-        .{ .key_bytes = record.receipt_key_bytes, .value_bytes = record.receipt_bytes, .max_writes = transitions },
+        .{ .key_bytes = record.progress_key_bytes, .value_bytes = record.progress_bytes, .max_writes = transitions },
     };
 }
 
@@ -458,7 +458,16 @@ test "workload admission completion control capacity covers interleaved publicat
         }
         const identity: @import("completion_runtime.zig").AcceptedIdentity = .{ .term = 3, .index = 1 + transition * 4 + owner, .digest = @splat(0x39) };
         const native_progress = @import("completion_pool.zig").encodeProgress(.{ .capacity = 4, .group_id = 7, .node_id = 9, .incarnation = @splat(11), .policy_digest = @splat(13), .generation = 17 }, identity);
-        try incoming.upsert(alloc, .{ .name = "docs" }, &record.receiptKey(txn_id), &identity.encode(), false);
+        const progress = try (record.Progress{
+            .txn_id = txn_id,
+            .begin = .{ .term = 3, .index = 1 + owner, .digest = @splat(0x39) },
+            .latest = .{ .term = 3, .index = 1 + transition * 4 + owner, .digest = @splat(0x39) },
+            .phase = if (transition == 0) .begin else if (transition == 1) .decision else .acknowledgement,
+            .decision = if (transition == 0) .none else .committed,
+            .acknowledged = if (transition <= 1) 0 else @intCast(transition - 1),
+            .resolved_digest = if (transition <= 1) @splat(0) else @splat(0x71),
+        }).encode();
+        try incoming.upsert(alloc, .{ .name = "docs" }, &record.progressKey(txn_id), &progress, false);
         try incoming.upsert(alloc, .{ .name = "docs" }, entry.group_progress_key, &native_progress, false);
         try incoming.upsert(alloc, .{ .name = "docs" }, &internal_keys.raft_document_applied_entry_key, identity.encode()[0..16], false);
         observed[owner] = try observed[owner].plus(.{ .bytes = @import("wal.zig").encodedStateRecordLen(&incoming), .entries = incoming.entryCount(), .records = 1 });
