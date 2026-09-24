@@ -27,6 +27,25 @@ this requested implementation/correctness scope.
   including prepared outcome templates. The owning durable-completion gate
   passed 44/44 tests. Accepted control owners still need owner-backed
   decision/ACK apply, durable retirement, and runnable restart restoration.
+- A staged BEGIN also prepays and pins the exact future output-run path named
+  in its durable guard for the owner's retained life; proven rejection and
+  teardown release that pin. The real DB gate passed 44/44 again. This is one
+  output-capacity prerequisite, not a certificate for interleaved control
+  transitions or their accepted replay.
+- Staged control proof is now capped at the 68 input handles actually prepaid
+  by the native path. A real DB fixture reaches 64 runs after installation and
+  rejects a canonical BEGIN requiring 69 inputs before owner/guard/transaction
+  publication; configured reopen succeeds. Another DB fixture accepts four
+  interleaved staged owners across maintenance with three retained readers.
+  The durable-completion gate passed 45/45, no leaks. Aggregate publication,
+  future control transitions, and restart capacity remain open.
+- Trusted local restart now decodes and validates every staged control guard
+  against the configured installation before retaining the fail-closed fence.
+  The real DB restart test distinguishes a valid guard's
+  `CompletionRecoveryCapacityRequired` from a corrupted envelope's checksum
+  failure; the owning gate passed 45/45. The current durable-log ABI still
+  lacks independent control-owner observations and cannot restore runnable
+  resources, so this validation does not complete item 3.
 - The checksummed local completion capsule now carries the authenticated
   first-open range hint. The two-voter DATA regression passed 1/1 after
   offline restoration and later catalog admission; its prior failure was a
@@ -42,8 +61,15 @@ this requested implementation/correctness scope.
   durable record extension. Older empty registrations retain their old wire
   encoding. A nonempty endpoint requires metadata decoder protocol 14 on every
   applying member before admission; three focused metadata gates passed 1/1
-  each. No DATA process advertises or routes this endpoint yet, so this is a
-  rollout-safe representation, not protected production traffic.
+  each. DATA can now opt into a separately bound and advertised authenticated
+  recovery listener with its own protected listener/connection/request workers
+  and HTTP runtime. The dedicated Data-Raft transaction-status call selects the
+  internal endpoint after protected metadata lookup; ordinary routes keep the
+  public endpoint. The real socket test passed 1/1 under public connection
+  saturation and after public shutdown, with auth/config validation; direct
+  and linked API ingress passed 3/3, and the production DATA artifact built
+  33/33. Full internal client routing, storage/memory pressure, and combined
+  process-wide progress remain open.
 - Distributed join now stages all fanout hits until every batch succeeds;
   late-batch and sequential failures leave caller output unchanged. The
   curated focused API regression passed 1/1. This covers atomic result
@@ -52,8 +78,11 @@ this requested implementation/correctness scope.
   committed status enum to abort or propagate an older transaction whose
   BEGIN identity has not been proved equal. Coordinator and follower conflict
   schedules passed the curated stable-retry regression 1/1. Ambiguous committed
-  retries still need an identity-bearing status contract before they can prove
-  equivalence; this slice fails closed for explicit conflicts.
+  retries also fail closed as `CommitDecisionUnknown`: a status-only committed
+  reply cannot authorize success or phase two without a matching BEGIN
+  timestamp and participant identity. The renamed curated retry regression
+  passed 1/1. Identity-bearing status and eventual successful retry remain
+  open; the wire schema is unchanged for rolling peers.
 - Scan working-memory allocation now clears stale admission failure provenance
   after success and reports backing resize/remap OOM accurately. Its focused
   failing-allocator regression passed 1/1; after a stale HTTP test-call repair
@@ -61,6 +90,12 @@ this requested implementation/correctness scope.
   workload-admission gate passed 302/302 owning tests and 387 broad tests
   (one skip), with no leaks. The WAL fixture now requires state-machine replay
   before reporting a completed applied index.
+- Streamed scan output now suspends a read lease only when the scan owns both
+  that lease and its prepaid working-memory buffer. A borrowed lease stays
+  runnable while a generic caller allocator backs scan state; the real LMDB
+  callback regression passed. The workload-admission gate passed 303/303
+  owning and 387 broad tests (one skip), no leaks. Other operator footprints
+  and mixed-runtime saturation still need qualification.
 - Native restart now fails closed on any published or interrupted transaction
   control guard before ordinary WAL replay, including when a completion pool is
   configured. BEGIN guard validation binds the accepted index and term to the
