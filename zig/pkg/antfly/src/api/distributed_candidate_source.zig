@@ -62,6 +62,7 @@ pub const DistributedCandidateSource = struct {
         binding: @import("../system_catalog/domain.zig").BindingSource,
         names: []const []const u8,
         physical: ?[][]u8 = null,
+        external_physical: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
 
         fn resolve(self: *@This(), table: []const u8) !?[]const u8 {
             // Curated endpoints outside this resolver's declared target retain
@@ -75,7 +76,16 @@ pub const DistributedCandidateSource = struct {
         }
         fn boundTable(ptr: *anyopaque, table: []const u8) anyerror!?[]const u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            return self.resolve(table);
+            if (try self.resolve(table)) |physical| return physical;
+            // Curated endpoints may target a table outside this resolver's
+            // candidate set. Pin that table independently when writing the
+            // resolution artifact, so promotion can later redirect its old
+            // document even if the logical name is rebound.
+            if (self.external_physical.get(table)) |physical| return physical;
+            const a = self.arena.allocator();
+            const physical = try self.binding.bindOne(a, table);
+            try self.external_physical.put(a, try a.dupe(u8, table), physical);
+            return physical;
         }
         fn get(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, key: []const u8) anyerror!?[]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -551,6 +561,33 @@ test "DistributedCandidateSource system catalog batch binds once and retains the
     defer next.deinit(alloc);
     try testing.expectEqualStrings("table:replacement", (try next.source.boundTable("entities")).?);
     try testing.expectEqual(@as(usize, 2), binding.calls);
+}
+
+test "DistributedCandidateSource pins a curated endpoint outside the candidate table" {
+    const alloc = testing.allocator;
+    const Binding = struct {
+        calls: usize = 0,
+        external: []const u8 = "table:old",
+        fn bind(ptr: *anyopaque, a: std.mem.Allocator, names: []const []const u8) anyerror![][]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try testing.expectEqual(@as(usize, 1), names.len);
+            try testing.expectEqualStrings("events", names[0]);
+            const result = try a.alloc([]u8, 1);
+            result[0] = try a.dupe(u8, self.external);
+            return result;
+        }
+    };
+    var binding: Binding = .{};
+    var fake = FakeTableReadSource{ .alloc = alloc, .table = "entities" };
+    defer fake.docs.deinit(alloc);
+    var adapter = DistributedCandidateSource{ .reads = fake.source(), .catalog_binding = .{ .ptr = &binding, .bind_fn = Binding.bind } };
+    const batch = try adapter.candidateSource().beginBatch(alloc, &.{"entities"});
+    defer batch.deinit(alloc);
+    try testing.expectEqualStrings("table:old", (try batch.source.boundTable("events")).?);
+    binding.external = "table:new";
+    try testing.expectEqualStrings("table:old", (try batch.source.boundTable("events")).?);
+    try testing.expectEqual(@as(usize, 1), binding.calls);
 }
 
 test "DistributedCandidateSource system catalog bulk reads are bounded and preserve missing keys" {
