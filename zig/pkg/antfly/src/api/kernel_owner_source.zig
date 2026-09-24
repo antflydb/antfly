@@ -4721,11 +4721,14 @@ pub const ProvisionedKernelOwnerSource = struct {
         errdefer alloc.free(schema);
         const indexes = try alloc.dupe(u8, value.indexes_json);
         errdefer alloc.free(indexes);
+        const initial_range = try descriptor_contract.cloneInitialRange(alloc, value.initial_range);
+        errdefer descriptor_contract.freeInitialRange(alloc, initial_range);
         const descriptor: LoadedDescriptor = .{
             .path = path,
             .schema_json = schema,
             .indexes_json = indexes,
             .table_storage = value.settings,
+            .initial_range = initial_range,
             .generation = value.root_generation,
             .identity = .{ .table_id = value.binding.table_id, .range_id = value.binding.range_id, .shard_id = value.shard_id },
         };
@@ -4805,6 +4808,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .table_name = table_name,
             .shard_id = descriptor.identity.shard_id,
             .root_generation = descriptor.generation,
+            .initial_range = descriptor.initial_range,
             .settings = record.settings,
             .schema_json = schema_json,
             .read_schema_json = record.read_schema_json,

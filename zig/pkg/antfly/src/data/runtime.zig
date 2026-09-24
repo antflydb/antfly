@@ -31672,7 +31672,7 @@ fn consumerTests() type {
                 .profile_version = 1,
             } };
             const Fixture = struct {
-                version: u16 = 7,
+                version: u16 = data_raft_batch.mutation_completion_protocol_version - 1,
                 probes: usize = 0,
                 snapshot: antfly.metadata_api.AdminSnapshot,
                 fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
@@ -31779,25 +31779,25 @@ fn consumerTests() type {
                 try std.testing.expectError(error.CompletionAdmissionUnavailable, server.proposeRaftBatchGroupWithLeaderWait(alloc, 2, "docs", request, .{ .discovery = .cached, .allow_remote_forward = false, .campaign_allowed = false }, 5 * std.time.ns_per_s));
                 try std.testing.expectEqual(initial.last_index, host.raftStatus(2).?.last_index);
                 _ = server.kernel_owner_source.?.retireAll();
-                fixture.version = 8;
+                fixture.version = data_raft_batch.mutation_completion_protocol_version;
                 // A fresh endpoint forces a new capability observation instead
-                // of reusing the deliberately short-lived v7 negative cache.
-                try resolver.upsert(2, 2, &.{.{ .protocol = .http, .address = "http://peer-2-v8" }});
+                // of reusing the deliberately short-lived negative cache.
+                try resolver.upsert(2, 2, &.{.{ .protocol = .http, .address = "http://peer-2-v14" }});
                 try std.testing.expectError(error.CompletionAdmissionUnavailable, server.ensureCompletionInstallationProtocol(2, "docs", deadline));
                 try std.testing.expect(host.raftStatus(2).?.last_index > initial.last_index);
                 try std.testing.expect(!server.kernel_owner_source.?.completionInstallationPresent(2));
                 _ = try host.runRound(0, 16);
                 try Fixture.acknowledge(&server);
                 _ = try server.ensureCompletionInstallationProtocol(2, "docs", deadline);
-                try std.testing.expectEqual(@as(u16, 8), try server.durableDataRaftBatchProtocolVersion(2));
+                try std.testing.expectEqual(data_raft_batch.mutation_completion_protocol_version, try server.durableDataRaftBatchProtocolVersion(2));
                 // A durable floor does not certify a later applying member.
                 // Reobserve the current peer before publishing native backing.
-                fixture.version = 7;
-                try resolver.upsert(2, 2, &.{.{ .protocol = .http, .address = "http://peer-2-current-v7" }});
+                fixture.version = data_raft_batch.mutation_completion_protocol_version - 1;
+                try resolver.upsert(2, 2, &.{.{ .protocol = .http, .address = "http://peer-2-current-v13" }});
                 try std.testing.expectError(error.CompletionAdmissionUnavailable, server.ensureCompletionInstallationProtocol(2, "docs", deadline));
                 try std.testing.expect(!server.kernel_owner_source.?.completionInstallationPresent(2));
-                fixture.version = 8;
-                try resolver.upsert(2, 2, &.{.{ .protocol = .http, .address = "http://peer-2-current-v8" }});
+                fixture.version = data_raft_batch.mutation_completion_protocol_version;
+                try resolver.upsert(2, 2, &.{.{ .protocol = .http, .address = "http://peer-2-current-v14" }});
                 _ = try server.ensureCompletionInstallationProtocol(2, "docs", deadline);
                 const settings_json = try std.json.Stringify.valueAlloc(alloc, settings, .{});
                 defer alloc.free(settings_json);
@@ -31821,6 +31821,7 @@ fn consumerTests() type {
                         .table_name = "docs",
                         .shard_id = 2,
                         .root_generation = 0,
+                        .initial_range = .{ .start = "", .end = "" },
                         .settings = settings,
                         .schema_json = "",
                         .read_schema_json = "",

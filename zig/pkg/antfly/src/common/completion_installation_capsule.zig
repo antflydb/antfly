@@ -23,6 +23,9 @@ pub const Value = struct {
     table_name: []const u8,
     shard_id: u64,
     root_generation: u64,
+    /// Authenticated first-open range hint for offline restoration. The
+    /// durable range remains authoritative once the owner has been created.
+    initial_range: ?@import("../storage/byte_range.zig").ByteRange = null,
     settings: settings_mod.Settings,
     schema_json: []const u8,
     read_schema_json: []const u8,
@@ -65,6 +68,11 @@ fn validate(alloc: Allocator, value: Value) !void {
     if (!std.mem.eql(u8, &actual_policy, &id.policy_digest)) return error.CompletionProfileChanged;
     const actual_catalog = try catalog.digest(alloc, value.schema_json, value.read_schema_json, value.indexes_json);
     if (!std.mem.eql(u8, &actual_catalog, &value.binding.schema_catalog_digest)) return error.CompletionProfileChanged;
+    if (value.initial_range) |range| {
+        if (range.start.len > 1024 * 1024 or range.end.len > 1024 * 1024 or
+            (range.end.len != 0 and range.start.len != 0 and std.mem.order(u8, range.start, range.end) != .lt))
+            return error.CompletionProfileChanged;
+    }
 }
 pub fn encode(alloc: Allocator, value: Value) ![]u8 {
     try validate(alloc, value);
@@ -211,7 +219,8 @@ fn fixture(alloc: Allocator) !Value {
 
 test "workload admission completion capsule validates framing before allocation and preserves configuration" {
     const alloc = std.testing.allocator;
-    const value = try fixture(alloc);
+    var value = try fixture(alloc);
+    value.initial_range = .{ .start = "a", .end = "m" };
     const wire = try encode(alloc, value);
     defer alloc.free(wire);
     var decoded = try decode(alloc, wire);
@@ -227,6 +236,9 @@ test "workload admission completion capsule validates framing before allocation 
     try std.testing.expectError(error.CompletionProfileChanged, encode(alloc, unsupported));
     unsupported = value;
     unsupported.binding.identity.policy_digest[0] ^= 1;
+    try std.testing.expectError(error.CompletionProfileChanged, encode(alloc, unsupported));
+    unsupported = value;
+    unsupported.initial_range = .{ .start = "z", .end = "a" };
     try std.testing.expectError(error.CompletionProfileChanged, encode(alloc, unsupported));
 }
 
