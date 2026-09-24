@@ -186,10 +186,17 @@ components:
         source: { $ref: "#/components/schemas/GraphArtifactProducerSourceConfig" }
         content_type: { type: string }
         execution: { $ref: "#/components/schemas/ExecutionPolicy" }
+        producer:
+          type: object
+          additionalProperties: true
+          writeOnly: true
+          description: "Write-only producer configuration. Cannot be combined with producer_json."
         producer_json:
           type: object
           additionalProperties: true
           writeOnly: true
+          deprecated: true
+          x-deprecated-reason: "Use the producer field."
           description: "Write-only producer configuration; it may contain credentials and is never returned."
     GraphTemplateValue:
       description: "A literal string or finite numeric value, or a Handlebars template evaluated for each materialized graph item."
@@ -298,7 +305,13 @@ components:
             resolver (label-routed tables, e.g. event mentions to an events
             table).
         type_must_match: { type: boolean, default: true }
-        scorer_json: { type: string }
+        scorer:
+          $ref: "#/components/schemas/GraphResolverScorerConfig"
+          description: "Typed matcher scorer. Cannot be combined with scorer_json."
+        scorer_json:
+          type: string
+          deprecated: true
+          x-deprecated-reason: "Use the scorer field."
         candidate_search:
           type: string
           enum: ["", exact_key, prefix, ann]
@@ -324,6 +337,48 @@ components:
             withheld. The cheap post-extraction junk filter for
             score-carrying extractors; 0 (the default) admits everything.
         config_generation: { type: integer, format: uint64, minimum: 0 }
+    GraphResolverScorerConfig:
+      type: object
+      required: [comparisons]
+      additionalProperties: false
+      properties:
+        comparisons:
+          type: array
+          items: { $ref: "#/components/schemas/GraphResolverScorerComparison" }
+        combine:
+          type: object
+          additionalProperties: false
+          properties:
+            bias: { type: number, format: double }
+        decision:
+          type: object
+          additionalProperties: false
+          properties:
+            match: { type: number, format: double }
+            review: { type: number, format: double }
+    GraphResolverScorerComparison:
+      type: object
+      required: [name, left, right, levels]
+      additionalProperties: false
+      properties:
+        name: { type: string }
+        left: { type: string }
+        right: { type: string }
+        levels:
+          type: array
+          items: { $ref: "#/components/schemas/GraphResolverScorerLevel" }
+    GraphResolverScorerLevel:
+      type: object
+      required: [weight]
+      additionalProperties: false
+      properties:
+        when:
+          type: string
+          description: "Matcher condition, such as 'exact' or 'jaro_winkler >= 0.9'."
+        else:
+          type: boolean
+          description: "Catch-all level when no previous condition matched."
+        weight: { type: number, format: double }
     CreateAlgebraicIndexRequest:
       description: "Create a schema-derived algebraic index."
       allOf:
@@ -492,7 +547,11 @@ components:
           description: "Optional stable model/token-space identifier asserted for this embedding artifact."
         chunk_size: { type: integer, minimum: 0 }
         chunk_overlap: { type: integer, minimum: 0 }
-        chunker_json: { type: string }
+        chunker: { $ref: "chunking.yaml#/components/schemas/ChunkerConfig" }
+        chunker_json:
+          type: string
+          deprecated: true
+          x-deprecated-reason: "Use the typed chunker field."
         full_text_index: { type: boolean, default: false }
         content_type: { type: string }
         neighbor_context: { $ref: "#/components/schemas/EnrichmentNeighborContextConfig" }
@@ -728,10 +787,15 @@ components:
           type: integer
           minimum: 0
           description: "Chunk overlap for chunk enrichments."
+        chunker:
+          $ref: "chunking.yaml#/components/schemas/ChunkerConfig"
+          description: "Chunker configuration for chunk enrichments. Cannot be combined with chunker_json."
         chunker_json:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: "Serialized chunker configuration for chunk enrichments."
+          deprecated: true
+          x-deprecated-reason: "Use the typed chunker field."
+          description: "Legacy serialized chunker configuration for chunk enrichments. Cannot be combined with chunker."
         full_text_index:
           x-go-type-skip-optional-pointer: true
           type: boolean
@@ -741,10 +805,17 @@ components:
           x-go-type-skip-optional-pointer: true
           type: string
           description: "Produced asset content type for asset enrichments."
+        producer:
+          type: object
+          additionalProperties: true
+          writeOnly: true
+          description: "Write-only producer configuration. Cannot be combined with producer_json or transcriber."
         producer_json:
           x-go-type-skip-optional-pointer: true
           type: string
           writeOnly: true
+          deprecated: true
+          x-deprecated-reason: "Use the producer field."
           description: "Write-only serialized producer configuration. For managed embedding enrichments Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded."
         neighbor_context:
           $ref: "#/components/schemas/EnrichmentNeighborContextConfig"

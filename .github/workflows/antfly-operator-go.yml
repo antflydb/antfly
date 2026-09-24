@@ -76,6 +76,8 @@ jobs:
           ref: ${{ inputs.head_sha || github.sha }}
           persist-credentials: false
 
+      - name: Sample ARC runner disk use
+        uses: ./.github/actions/runner-disk-audit
       - name: Load pinned toolchain policy
         id: toolchain
         uses: ./.github/actions/load-toolchain-policy

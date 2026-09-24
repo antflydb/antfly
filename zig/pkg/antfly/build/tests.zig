@@ -1592,6 +1592,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lib_bedrock_test_step.dependOn(&run_lib_bedrock_tests.step);
 
     const api_http_runtime_default_filters = [_][]const u8{
+        "artifact enrichment accepts typed chunker and rejects ambiguous legacy config",
+        "artifact enrichment list does not expose internal JSON or producer credentials",
+        "typed enrichment producer and graph scorer normalize to legacy storage fields",
+        "empty legacy graph scorer remains a deterministic resolver",
         "staged restore published metadata wins cancellation only after every owner opens",
         "staged restore worker publishes a dependency complete mixed native cohort",
         "staged restore worker rebuilds a dependency complete mixed portable cohort",

@@ -582,6 +582,11 @@ pub const Status = struct {
     votes_granted: usize = 0,
     votes_rejected: usize = 0,
     votes_unknown: usize = 0,
+    /// Leader-side progress at the time of the status snapshot. These counts
+    /// distinguish a stalled WAL on the leader from a missing follower ACK.
+    voters_at_last_index: usize = 0,
+    recent_active_voters: usize = 0,
+    lowest_voter_match_index: Index = 0,
 };
 
 pub fn cloneEntries(alloc: Allocator, entries: []const Entry) ![]Entry {

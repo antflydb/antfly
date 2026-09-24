@@ -82,6 +82,8 @@ jobs:
           persist-credentials: false
           submodules: true
 
+      - name: Sample ARC runner disk use
+        uses: ./.github/actions/runner-disk-audit
       - name: Load pinned toolchain policy
         id: toolchain
         uses: ./.github/actions/load-toolchain-policy
@@ -126,9 +128,11 @@ jobs:
           grep -q "^cuda_artifact_mode: ${ANTFLY_CI_ZIG_CUDA_ARTIFACTS}$" <<<"$identity"
 
       - name: Package E2E executable
+        env:
+          SCOPE: ${{ inputs.scope }}
         run: |
           artifacts=(zig-out/bin/antfly)
-          if [[ "${{ inputs.scope }}" == laya* ]]; then
+          if [[ "$SCOPE" == laya* ]]; then
             artifacts+=(zig-out/bin/laya-cuda-tests)
           fi
           tar -C zig -czf "${RUNNER_TEMP}/antfly-e2e-cuda.tar.gz" "${artifacts[@]}"
@@ -181,6 +185,8 @@ jobs:
           persist-credentials: false
           submodules: true
 
+      - name: Sample ARC runner disk use
+        uses: ./.github/actions/runner-disk-audit
       - name: Record canary start
         run: |
           date +%s > "${RUNNER_TEMP}/cuda-canary-start"

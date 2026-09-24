@@ -1107,7 +1107,10 @@ pub const OpenRequest = extern struct {
     /// Immutable native ownership domain; not inferred from the first row or
     /// from a caller-supplied source control request. 1 = Raft, 2 = native.
     online_source_authority: u8 = 1,
-    _restore_reserved: [5]u8 = @splat(0),
+    /// This owner is being opened to apply an entry whose catalog descriptor
+    /// may predate the configuration already persisted by this replica.
+    historical_raft_apply: u8 = 0,
+    _restore_reserved: [4]u8 = @splat(0),
     target_observer: TargetObserver = .{},
     transaction_recovery: TransactionRecoveryConfig = .{},
     runtime_hooks: RuntimeHooksConfig = .{},

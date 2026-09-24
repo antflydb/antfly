@@ -284,6 +284,10 @@ pub const ProvisionedKernelOwnerSource = struct {
         table_storage: ?@import("../common/table_storage.zig").Settings = null,
         restore: ?@import("../storage/restore_identity.zig").Identity = null,
         owner: client.Owner,
+        /// A Raft entry's pinned descriptor did not authorize current-catalog
+        /// reconciliation. The next ordinary acquisition must reopen against
+        /// the catalog, even when the descriptor bytes happen to match.
+        opened_for_historical_apply: bool = false,
         // Exact descriptor/target proof, owned by this physical generation.
         // Shared repair steps may reuse it until a structural follow-up is due.
         repair_target: ?[]u8 = null,
@@ -1359,7 +1363,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         // checkpoint. Yield admission conflicts to it immediately: waiting for
         // another owner lease here stalls unrelated groups and can deadlock a
         // maintenance callback waiting for this same progress driver.
-        var lease = self.acquireDescriptorOnce(group_id, table_name, path, descriptor, .shared, .resident, .{}) catch |err| switch (err) {
+        var lease = self.acquireDescriptorOnce(group_id, table_name, path, descriptor, .shared, .resident, .{ .historical_raft_apply = true }) catch |err| switch (err) {
             error.StorageKernelOwnerTransitionRequired => return error.StorageBusy,
             else => return err,
         };
@@ -2477,6 +2481,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         execution_deadline_ns: ?u64 = null,
         execution_io: ?@import("../runtime_io_abi.zig").Borrow = null,
         cancellation: ?db_types.CancellationToken = null,
+        historical_raft_apply: bool = false,
 
         fn from(req: anytype) ReadControls {
             return .{ .execution_deadline_ns = req.execution_deadline_ns, .execution_io = if (@hasField(@TypeOf(req), "execution_io")) req.execution_io else null, .cancellation = req.cancellation };
@@ -3359,7 +3364,8 @@ pub const ProvisionedKernelOwnerSource = struct {
                     std.meta.eql(@as(?@import("../common/table_storage.zig").Settings, record.settings), descriptor.table_storage))
                     entry.table_storage = descriptor.table_storage;
             }
-            if (!std.mem.eql(u8, entry.schema_json, descriptor.schema_json) or
+            if ((!controls.historical_raft_apply and entry.opened_for_historical_apply) or
+                !std.mem.eql(u8, entry.schema_json, descriptor.schema_json) or
                 !std.mem.eql(u8, entry.indexes_json, descriptor.indexes_json) or
                 !std.mem.eql(u8, entry.restore_bootstrap_json, descriptor.restore_bootstrap_json) or
                 !restoreIdentitiesEqual(entry.restore, descriptor.restore) or
@@ -3461,6 +3467,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .restore_cancel_recovery = @intFromBool(descriptor.restore_cancel_recovery),
             .restore_ha_replay = @intFromBool(descriptor.restore_ha_replay),
             .online_source_authority = @intFromEnum(self.online_source_authority),
+            .historical_raft_apply = @intFromBool(controls.historical_raft_apply),
             .dense_embedding_storage = if (descriptor.table_storage) |settings| switch (settings.dense_embeddings) {
                 .primary_lsm => .primary_lsm,
                 .vector_store => .vector_store,
@@ -3505,6 +3512,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .table_storage = descriptor.table_storage,
             .restore = owned_restore,
             .owner = owner,
+            .opened_for_historical_apply = controls.historical_raft_apply,
             .active_users = 1,
             .resident = residency == .resident,
             .exclusive_pending = false,
@@ -5982,6 +5990,166 @@ test "committed owner apply yields admission conflicts and retries the exact ent
         defer value.deinit();
         try std.testing.expect(std.mem.indexOf(u8, value.bytes(), "\"count\":1") != null);
     }
+}
+
+test "committed catch-up retains newer durable schema across an older pinned descriptor" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(root);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-1/table-db", .{root});
+    defer alloc.free(path);
+    var source = ProvisionedKernelOwnerSource.init(alloc, root, table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+    defer source.deinit();
+    const old: descriptor_contract.Descriptor = .{
+        .lsm_root_generation = table_reads.backend_current_root_generation,
+        .identity = .{ .table_id = 1, .shard_id = 1, .range_id = 1 },
+        .schema_json = "{\"version\":0}",
+    };
+    const current: descriptor_contract.Descriptor = .{
+        .lsm_root_generation = old.lsm_root_generation,
+        .identity = old.identity,
+        .schema_json = "{\"version\":1}",
+    };
+    try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", old, .{
+        .writes = &.{.{ .key = "doc:first", .value = "{\"title\":\"first\"}" }},
+    }, 1, 1);
+    {
+        var lease = try source.acquireDescriptor(1, "docs", path, current);
+        lease.deinit();
+    }
+    // An old Raft entry can be retried after the metadata schema advances.
+    // Its already-applied marker must win without reopening a downgraded DB.
+    for (0..4) |_| {
+        source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", old, .{
+            .writes = &.{.{ .key = "doc:first", .value = "{\"title\":\"duplicate\"}" }},
+        }, 1, 1) catch |err| switch (err) {
+            error.StorageBusy => continue,
+            else => return err,
+        };
+        break;
+    } else return error.TestOwnerAdmissionDidNotRecover;
+    try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", old, .{
+        .writes = &.{.{ .key = "doc:second", .value = "{\"title\":\"second\"}" }},
+    }, 1, 2);
+    var lease = try source.acquireDescriptor(1, "docs", path, current);
+    defer lease.deinit();
+    var first = try lease.owner().lookupJson("docs", "{\"key\":\"doc:first\"}");
+    defer first.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, first.bytes(), "duplicate") == null);
+    var second = try lease.owner().lookupJson("docs", "{\"key\":\"doc:second\"}");
+    defer second.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, second.bytes(), "second") != null);
+}
+
+test "committed catch-up does not reconcile an older index-only descriptor" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(root);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-1/table-db", .{root});
+    defer alloc.free(path);
+    var source = ProvisionedKernelOwnerSource.init(alloc, root, table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+    defer source.deinit();
+    const old: descriptor_contract.Descriptor = .{
+        .lsm_root_generation = table_reads.backend_current_root_generation,
+        .identity = .{ .table_id = 1, .shard_id = 1, .range_id = 1 },
+        .schema_json = "{\"version\":0}",
+        .indexes_json = "{}",
+    };
+    const current: descriptor_contract.Descriptor = .{
+        .lsm_root_generation = old.lsm_root_generation,
+        .identity = old.identity,
+        .schema_json = old.schema_json,
+        .indexes_json = "{\"new_idx\":{\"type\":\"full_text\"}}",
+    };
+    try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", old, .{
+        .writes = &.{.{ .key = "doc:first", .value = "{\"title\":\"first\"}" }},
+    }, 1, 1);
+    {
+        var lease = try source.acquireDescriptor(1, "docs", path, current);
+        lease.deinit();
+    }
+    for (0..4) |_| {
+        source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", old, .{
+            .writes = &.{.{ .key = "doc:second", .value = "{\"title\":\"second\"}" }},
+        }, 1, 2) catch |err| switch (err) {
+            error.StorageBusy => continue,
+            else => return err,
+        };
+        break;
+    } else return error.TestOwnerAdmissionDidNotRecover;
+    var lease = try source.acquireDescriptorOnce(1, "docs", path, old, .shared, .resident, .{ .historical_raft_apply = true });
+    defer lease.deinit();
+    // Reconciliation would have to add this index again if historical open
+    // retired it. Querying the existing owner avoids an intervening reopen.
+    const reconciled = try lease.owner().reconcile("docs", current.schema_json, current.indexes_json, null, false);
+    try std.testing.expectEqual(@as(u64, 0), reconciled.indexes_added);
+    try std.testing.expectEqual(@as(u64, 0), reconciled.indexes_removed);
+    var second = try lease.owner().lookupJson("docs", "{\"key\":\"doc:second\"}");
+    defer second.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, second.bytes(), "second") != null);
+}
+
+test "current catalog acquisition replaces a replay-only owner with the same descriptor" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(root);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-1/table-db", .{root});
+    defer alloc.free(path);
+    const descriptor: descriptor_contract.Descriptor = .{
+        .lsm_root_generation = table_reads.backend_current_root_generation,
+        .identity = .{ .table_id = 1, .shard_id = 1, .range_id = 1 },
+        .schema_json = "{\"version\":0}",
+        .indexes_json =
+        \\{"search":{"type":"full_text","artifact_name":"chunks","enrichments":[{"name":"assets","kind":"asset","field":"url","content_type":"application/json","producer_json":"{\"type\":\"document_extraction\",\"config\":{}}"},{"name":"chunks","kind":"chunk","source_artifact_name":"assets","field":"text","chunk_size":128}]}}
+        ,
+    };
+    {
+        var initial = ProvisionedKernelOwnerSource.init(alloc, root, table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+        defer initial.deinit();
+        try initial.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", descriptor, .{
+            .writes = &.{.{ .key = "doc:first", .value = "{\"title\":\"first\"}" }},
+        }, 1, 1);
+    }
+    var source = ProvisionedKernelOwnerSource.init(alloc, root, table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+    defer source.deinit();
+    try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", descriptor, .{
+        .writes = &.{.{ .key = "doc:second", .value = "{\"title\":\"second\"}" }},
+    }, 1, 2);
+    try std.testing.expectEqual(@as(u64, 1), source.cacheStats().miss_count);
+    {
+        var replay = try source.acquireDescriptorOnce(1, "docs", path, descriptor, .shared, .resident, .{ .historical_raft_apply = true });
+        defer replay.deinit();
+        const deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+        while (true) {
+            var status = replay.owner().runtimeStatusJson("docs") catch |err| switch (err) {
+                error.StorageBusy => {
+                    if (platform_time.monotonicNs() >= deadline) return error.TestEnrichmentRuntimeNotObservable;
+                    try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                    continue;
+                },
+                else => return err,
+            };
+            defer status.deinit();
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, status.bytes(), .{});
+            defer parsed.deinit();
+            const enrichment = parsed.value.object.get("stats").?.object.get("enrichment").?.object;
+            if (enrichment.get("enabled").?.bool and enrichment.get("worker_started").?.bool) break;
+            if (platform_time.monotonicNs() >= deadline) return error.TestEnrichmentRuntimeNotStarted;
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+    }
+    var current = try source.acquireDescriptor(1, "docs", path, descriptor);
+    defer current.deinit();
+    try std.testing.expectEqual(@as(u64, 2), source.cacheStats().miss_count);
+    var second = try current.owner().lookupJson("docs", "{\"key\":\"doc:second\"}");
+    defer second.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, second.bytes(), "second") != null);
 }
 
 test "pending exclusive storage owner lease blocks new readers until drain" {

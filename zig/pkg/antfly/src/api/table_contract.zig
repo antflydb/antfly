@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const ant_json = @import("antfly-json");
+const matcher = @import("antfly_matcher");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const tables_api = @import("tables.zig");
 const indexes_api = @import("indexes.zig");
@@ -491,6 +492,14 @@ fn normalizeIndexConfigJson(
                 try appendNormalizedInlineEnrichmentsField(alloc, &out, entry.value_ptr.*, &first);
                 continue;
             }
+            if (index_type == .graph and std.mem.eql(u8, entry.key_ptr.*, "artifact")) {
+                try appendNormalizedGraphArtifactField(alloc, &out, entry.value_ptr.*, &first);
+                continue;
+            }
+            if (index_type == .graph and std.mem.eql(u8, entry.key_ptr.*, "resolvers")) {
+                try appendNormalizedGraphResolversField(alloc, &out, entry.value_ptr.*, &first);
+                continue;
+            }
             try appendField(alloc, &out, entry.key_ptr.*, entry.value_ptr.*, &first);
         }
     } else {
@@ -502,11 +511,82 @@ fn normalizeIndexConfigJson(
                 try appendNormalizedInlineEnrichmentsField(alloc, &out, entry.value_ptr.*, &first);
                 continue;
             }
+            if (index_type == .graph and std.mem.eql(u8, entry.key_ptr.*, "artifact")) {
+                try appendNormalizedGraphArtifactField(alloc, &out, entry.value_ptr.*, &first);
+                continue;
+            }
+            if (index_type == .graph and std.mem.eql(u8, entry.key_ptr.*, "resolvers")) {
+                try appendNormalizedGraphResolversField(alloc, &out, entry.value_ptr.*, &first);
+                continue;
+            }
             try appendField(alloc, &out, entry.key_ptr.*, entry.value_ptr.*, &first);
         }
     }
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+fn appendNormalizedGraphArtifactField(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: std.json.Value, first: *bool) !void {
+    if (value != .object) return appendField(alloc, out, "artifact", value, first);
+    const producer = value.object.get("producer");
+    if (producer == null or producer.? == .null) return appendField(alloc, out, "artifact", value, first);
+    if (value.object.get("producer_json")) |legacy| if (legacy != .null) return error.InvalidCreateIndexRequest;
+    var normalized = std.json.ObjectMap{};
+    defer normalized.deinit(alloc);
+    var it = value.object.iterator();
+    while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, "producer")) continue;
+        try normalized.put(alloc, entry.key_ptr.*, entry.value_ptr.*);
+    }
+    try normalized.put(alloc, "producer_json", producer.?);
+    try appendField(alloc, out, "artifact", .{ .object = normalized }, first);
+}
+
+fn appendNormalizedGraphResolversField(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: std.json.Value, first: *bool) !void {
+    if (value != .array) return appendField(alloc, out, "resolvers", value, first);
+    if (!first.*) try out.append(alloc, ',');
+    first.* = false;
+    try out.appendSlice(alloc, "\"resolvers\":[");
+    for (value.array.items, 0..) |item, i| {
+        if (i != 0) try out.append(alloc, ',');
+        if (item != .object) return error.InvalidCreateIndexRequest;
+        const scorer = item.object.get("scorer");
+        if (scorer == null or scorer.? == .null) {
+            if (item.object.get("scorer_json")) |legacy| {
+                if (legacy != .null) {
+                    if (legacy != .string) return error.InvalidCreateIndexRequest;
+                    // Empty is the legacy spelling for a deterministic
+                    // resolver without a matcher scorer.
+                    if (legacy.string.len > 0) try validateGraphScorerJson(alloc, legacy.string);
+                }
+            }
+            try appendCanonicalPublicValue(alloc, out, item, null);
+            continue;
+        }
+        if (item.object.get("scorer_json")) |legacy| if (legacy != .null) return error.InvalidCreateIndexRequest;
+        try validatePublicCreatedShape(scorer.?, .graph_scorer);
+        const scorer_json = try stringifyJsonAlloc(alloc, scorer.?);
+        defer alloc.free(scorer_json);
+        try validateGraphScorerJson(alloc, scorer_json);
+        var normalized = std.json.ObjectMap{};
+        defer normalized.deinit(alloc);
+        var it = item.object.iterator();
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.key_ptr.*, "scorer")) continue;
+            try normalized.put(alloc, entry.key_ptr.*, entry.value_ptr.*);
+        }
+        try normalized.put(alloc, "scorer_json", .{ .string = scorer_json });
+        try appendCanonicalPublicValue(alloc, out, .{ .object = normalized }, null);
+    }
+    try out.append(alloc, ']');
+}
+
+fn validateGraphScorerJson(alloc: std.mem.Allocator, raw: []const u8) !void {
+    var scorer = matcher.Scorer.parse(alloc, raw) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidCreateIndexRequest,
+    };
+    scorer.deinit();
 }
 
 fn appendNormalizedInlineEnrichmentsField(
@@ -743,7 +823,7 @@ fn validatePublicGraphArtifact(value: std.json.Value) !void {
         if (!public_index_contract.isAllowedGraphArtifactRequestField(entry.key_ptr.*))
             return error.InvalidCreateIndexRequest;
         if (entry.value_ptr.* == .null) continue;
-        if (std.mem.eql(u8, entry.key_ptr.*, "producer_json")) {
+        if (std.mem.eql(u8, entry.key_ptr.*, "producer_json") or std.mem.eql(u8, entry.key_ptr.*, "producer")) {
             if (entry.value_ptr.* != .object) return error.InvalidCreateIndexRequest;
         } else if (!public_index_contract.createdFieldValueMatches(.graph_artifact, entry.key_ptr.*, entry.value_ptr.*)) {
             return error.InvalidCreateIndexRequest;
@@ -811,8 +891,17 @@ fn normalizeArtifactEnrichmentConfigJson(
     // carries the same write-only `producer_json` a hand-written request
     // would, and every reader downstream sees one enrichment shape.
     const transcriber = if (@hasField(Object, "map")) object.map.get("transcriber") else object.get("transcriber");
-    const has_producer_json = if (@hasField(Object, "map")) object.map.contains("producer_json") else object.contains("producer_json");
+    const has_producer_json = if (if (@hasField(Object, "map")) object.map.get("producer_json") else object.get("producer_json")) |legacy| legacy != .null else false;
+    const producer = if (@hasField(Object, "map")) object.map.get("producer") else object.get("producer");
     const has_content_type = if (@hasField(Object, "map")) object.map.contains("content_type") else object.contains("content_type");
+    if (producer) |typed| {
+        if (typed != .null) {
+            if (has_producer_json or (transcriber != null and transcriber.? != .null)) return error.InvalidArtifactEnrichmentRequest;
+            const producer_json = try stringifyJsonAlloc(alloc, typed);
+            defer alloc.free(producer_json);
+            try appendField(alloc, &out, "producer_json", .{ .string = producer_json }, &first);
+        }
+    }
     if (transcriber) |shorthand| {
         if (shorthand != .null) {
             const kind = if (@hasField(Object, "map")) object.map.get("kind") else object.get("kind");
@@ -831,7 +920,7 @@ fn normalizeArtifactEnrichmentConfigJson(
     if (@hasField(Object, "map")) {
         var it = object.map.iterator();
         while (it.next()) |entry| {
-            if (std.mem.eql(u8, entry.key_ptr.*, "transcriber")) continue;
+            if (std.mem.eql(u8, entry.key_ptr.*, "transcriber") or std.mem.eql(u8, entry.key_ptr.*, "producer")) continue;
             if (std.mem.eql(u8, entry.key_ptr.*, "producer_json") and entry.value_ptr.* == .object) {
                 const producer_json = try stringifyJsonAlloc(alloc, entry.value_ptr.*);
                 defer alloc.free(producer_json);
@@ -843,7 +932,7 @@ fn normalizeArtifactEnrichmentConfigJson(
     } else {
         var it = object.iterator();
         while (it.next()) |entry| {
-            if (std.mem.eql(u8, entry.key_ptr.*, "transcriber")) continue;
+            if (std.mem.eql(u8, entry.key_ptr.*, "transcriber") or std.mem.eql(u8, entry.key_ptr.*, "producer")) continue;
             if (std.mem.eql(u8, entry.key_ptr.*, "producer_json") and entry.value_ptr.* == .object) {
                 const producer_json = try stringifyJsonAlloc(alloc, entry.value_ptr.*);
                 defer alloc.free(producer_json);
@@ -875,6 +964,10 @@ fn validatePublicArtifactEnrichmentObject(object: anytype) !void {
 fn validatePublicArtifactEnrichmentField(field: []const u8, value: std.json.Value) !void {
     if (!public_index_contract.isAllowedEnrichmentRequestField(field)) return error.InvalidArtifactEnrichmentRequest;
     if (value == .null) return;
+    if (std.mem.eql(u8, field, "producer")) {
+        if (value != .object) return error.InvalidArtifactEnrichmentRequest;
+        return;
+    }
     if (std.mem.eql(u8, field, "producer_json")) {
         if (value != .string and value != .object) return error.InvalidArtifactEnrichmentRequest;
         return;
@@ -887,6 +980,72 @@ fn validatePublicArtifactEnrichmentField(field: []const u8, value: std.json.Valu
     if (std.mem.eql(u8, field, "neighbor_context")) {
         validatePublicCreatedShape(value, .enrichment_neighbor_context) catch return error.InvalidArtifactEnrichmentRequest;
     }
+}
+
+test "typed enrichment producer and graph scorer normalize to legacy storage fields" {
+    const alloc = std.testing.allocator;
+    const enrichment = try parseArtifactEnrichmentRequest(alloc, "units",
+        \\{"name":"units","kind":"asset","field":"url","producer":{"type":"document_extraction","config":{"api_key":"private"}}}
+    );
+    defer alloc.free(enrichment);
+    try std.testing.expect(std.mem.indexOf(u8, enrichment, "\"producer_json\":\"{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, enrichment, "\"producer\":") == null);
+    const nullable_legacy = try parseArtifactEnrichmentRequest(alloc, "units",
+        \\{"name":"units","kind":"asset","field":"url","producer":{"type":"document_extraction","config":{}},"producer_json":null}
+    );
+    defer alloc.free(nullable_legacy);
+    try std.testing.expect(std.mem.indexOf(u8, nullable_legacy, "\"producer_json\":\"{") != null);
+    try std.testing.expectError(error.InvalidArtifactEnrichmentRequest, parseArtifactEnrichmentRequest(alloc, "units",
+        \\{"name":"units","kind":"asset","producer":{"type":"document_extraction"},"producer_json":"{}"}
+    ));
+
+    const graph = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"type":"graph","artifact":{"name":"mentions","kind":"asset","source":{"type":"field","value":"body"},"producer":{"type":"document_extraction","config":{"api_key":"private-graph-key"}}},"resolvers":[{"name":"r","table":"entities","source_artifact":"mentions","resolution_artifact":"resolved","key_template":"{{text}}","scorer":{"comparisons":[],"combine":{"bias":1}}}]}
+    , .{});
+    defer graph.deinit();
+    const normalized = try normalizeIndexConfigJson(alloc, graph.value.object, "g", .{ .include_name = true, .default_type = true });
+    defer alloc.free(normalized);
+    try std.testing.expect(std.mem.indexOf(u8, normalized, "\"scorer_json\":\"{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, normalized, "\"scorer\":") == null);
+    try std.testing.expect(std.mem.indexOf(u8, normalized, "\"producer_json\":{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, normalized, "private-graph-key") != null);
+    const public = try indexes_api.encodeCreatedIndexConfig(alloc, "g", normalized);
+    defer alloc.free(public);
+    try std.testing.expect(std.mem.indexOf(u8, public, "\"scorer\":{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, public, "\"comparisons\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, public, "scorer_json") == null);
+    try std.testing.expect(std.mem.indexOf(u8, public, "private-graph-key") == null);
+    try std.testing.expect(std.mem.indexOf(u8, public, "producer_json") == null);
+    const legacy_scorer = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"type":"graph","resolvers":[{"name":"r","table":"entities","source_artifact":"mentions","resolution_artifact":"resolved","key_template":"{{text}}","scorer_json":"{\"comparisons\":[],\"opaque_secret\":\"hidden-scorer\"}"}]}
+    , .{});
+    defer legacy_scorer.deinit();
+    const legacy_normalized = try normalizeIndexConfigJson(alloc, legacy_scorer.value.object, "g", .{ .include_name = true, .default_type = true });
+    defer alloc.free(legacy_normalized);
+    const legacy_public = try indexes_api.encodeCreatedIndexConfig(alloc, "g", legacy_normalized);
+    defer alloc.free(legacy_public);
+    try std.testing.expect(std.mem.indexOf(u8, legacy_public, "\"comparisons\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, legacy_public, "hidden-scorer") == null);
+    const invalid_scorer = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"type":"graph","resolvers":[{"name":"r","table":"entities","source_artifact":"mentions","resolution_artifact":"resolved","key_template":"{{text}}","scorer":{"comparisons":[{"name":"bad","left":"text","right":"name","levels":[{"when":"unknown > 0.5","weight":1}]}]}}]}
+    , .{});
+    defer invalid_scorer.deinit();
+    try std.testing.expectError(error.InvalidCreateIndexRequest, normalizeIndexConfigJson(alloc, invalid_scorer.value.object, "g", .{ .include_name = true, .default_type = true }));
+}
+
+test "empty legacy graph scorer remains a deterministic resolver" {
+    const alloc = std.testing.allocator;
+    const graph = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"type":"graph","resolvers":[{"name":"r","table":"entities","source_artifact":"mentions","resolution_artifact":"resolved","key_template":"{{text}}","scorer_json":""}]}
+    , .{});
+    defer graph.deinit();
+    const normalized = try normalizeIndexConfigJson(alloc, graph.value.object, "g", .{ .include_name = true, .default_type = true });
+    defer alloc.free(normalized);
+    try std.testing.expect(std.mem.indexOf(u8, normalized, "\"scorer_json\":\"\"") != null);
+    const public = try indexes_api.encodeCreatedIndexConfig(alloc, "g", normalized);
+    defer alloc.free(public);
+    try std.testing.expect(std.mem.indexOf(u8, public, "scorer_json") == null);
+    try std.testing.expect(std.mem.indexOf(u8, public, "\"scorer\":") == null);
 }
 
 fn extractPublicIndexType(object: anytype) ?[]const u8 {
