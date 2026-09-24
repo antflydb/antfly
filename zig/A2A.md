@@ -2,10 +2,11 @@
 
 ## Context
 
-Antfly now has two native bounded-agent APIs in the Zig implementation:
+Antfly now has three native bounded-agent APIs in the Zig implementation:
 
 - `POST /agents/query-builder`
 - `POST /agents/retrieval`
+- `POST /agents/research` (plus durable `/agents/research/jobs`)
 
 The A2A surface is an adapter over those native agents:
 
@@ -56,9 +57,19 @@ Native agent API and execution:
   - query-builder coordinator, specialists, metadata context, and runtime preflight.
 - `zig/pkg/antfly/src/api/retrieval_agent.zig`
   - retrieval pipeline, bounded agentic selection, tool policy, SSE events, generation, follow-up, confidence, and eval.
+  - `ExecuteOptions` lets a composite agent run retrieval with a lent `agent_tools.Budget`.
+- `zig/pkg/antfly/src/api/agent_tools.zig`
+  - shared conversation history, `Budget` (tool-call and history ceilings), and the token estimator.
+- `zig/pkg/antfly/src/api/web_fetch.zig`
+  - `fetch` tool policy, URL admission, and readable-text extraction.
+- `zig/pkg/antfly/src/api/research_agent.zig`
+  - research state machine (plan, research, reflect, write, verify), evidence registry, and citation checks.
+- `zig/pkg/antfly/src/api/research_jobs.zig`
+  - durable research jobs: owner-scoped records, attempt leases, checkpoints, and restart recovery.
 - `zig/pkg/antfly/src/api/http_routes.zig`
   - `/agents/query-builder`
   - `/agents/retrieval`
+  - `/agents/research`, `/agents/research/jobs`
 - `zig/pkg/antfly/src/api/httpx_handler.zig`
   - HTTPX route plumbing for the native agent endpoints.
 - `zig/pkg/antfly/src/cmd/cli/agents.zig`
@@ -150,6 +161,40 @@ Outputs:
 Pipeline mode executes the declared queries directly. Agentic mode lets the retrieval agent select, refine, evaluate,
 or ask for clarification from the declared capabilities within the configured iteration and tool limits.
 
+### Research
+
+`POST /agents/research` runs a bounded research state machine over retrieval and writes a cited report. It exists as
+a separate agent because both its state machine (plan, research rounds, reflect, write, verify) and its artifact (a
+sectioned report with an evidence registry) differ from retrieval. See `DEEP_RESEARCH.md` for the design.
+
+Inputs:
+
+- `query`, `queries` (authorized table scopes, as for retrieval), `accumulated_filters`, `agent_knowledge`,
+  `messages`, `tools`.
+- `generator`/`chain`: default for every role. `steps.plan`, `steps.research`, `steps.reflect`, `steps.write`, and
+  `steps.verify` may each override the generator and add instructions.
+- `budget`: `max_rounds`, `max_sub_questions`, `max_parallel`, `researcher_iterations`, `researcher_tool_calls`,
+  `max_llm_calls`, `max_tool_calls`, `max_evidence`, `max_report_tokens`, `deadline_ms`. Budgets are cumulative over
+  `research_state.usage`, so a resumed run cannot exceed the declared worst case.
+- `research_state`: client-carried continuation. Sending it back resumes at its `phase`.
+- bounded-agent fields: `session_id`, `decisions`, `interactive` (planner clarification, default false).
+
+Outputs:
+
+- `plan`, `findings`, `evidence`, `reflections`, `report`, `citations`, `verification`, `usage`.
+- `research_state` for continuation, plus the shared envelope (`status`, `steps`, `questions`).
+
+Every researcher is an ordinary retrieval-agent run over the same `queries`, so authorization, mandatory predicates,
+and tool policy are exactly those of `/agents/retrieval`. Researchers return compressed findings (summary, claims with
+evidence IDs, open questions); reflect and write never see raw tool transcripts. The server resolves every `[E#]`
+marker in the report against the evidence registry and removes markers that do not resolve.
+
+`/agents/research/jobs` persists a research request and advances it one bounded phase per pass. Each pass
+checkpoints `research_state` into the stored request, so a restart resumes from the last completed phase. Jobs are
+owned by the authenticated principal (other principals see 404), advances are fenced by an attempt counter and a
+lease (a concurrent advance gets 409), and stored requests must not carry inline API keys. Local standalone mode
+persists jobs in a dedicated storage root; Lite keeps them in memory.
+
 ### Deprecated Answer Agent
 
 The answer-agent schema is deprecated compatibility only. New code should use `RetrievalAgentRequest` with
@@ -179,7 +224,8 @@ Status semantics:
 - `incomplete`: the agent stopped because a limit or unavailable capability prevented completion. `incomplete_details`
   explains why for retrieval.
 - `failed`: execution failed.
-- `in_progress`: reserved for future async or durable task execution.
+- `in_progress`: the run stopped at a phase boundary and can continue. Research returns it when a request or durable
+  job advance is limited to a number of phases.
 
 Continuation is client-carried. To continue, the client sends the same core request plus:
 
@@ -213,9 +259,14 @@ Rules:
 4. `max_tool_iterations` is bounded by the same production limits as `max_internal_iterations`.
 5. Web access requires explicit `web_search_connection` or `web_search_config` and should be constrained by production
    security controls.
-6. Aggregations are a separate capability from filters: aggregation requests require `aggregate`, filter fields require
+6. `fetch` requires an explicit opt-in (`fetch` in `enabled_tools` or a `fetch_config`). It admits only URLs returned
+   by `web_search` in the same run or under `fetch_config.allowed_hosts`, so injected document text cannot make the
+   model send retrieved data to an arbitrary URL. Downloads always block private addresses, re-validate every
+   redirect hop, and are bounded in size, time, and extracted characters. Requests cannot disable private-address
+   blocking or supply object-store credentials.
+7. Aggregations are a separate capability from filters: aggregation requests require `aggregate`, filter fields require
    `add_filter`, and filtered aggregations require both tools.
-6. Use `web_search`, not `websearch` or `search`.
+8. Use `web_search`, not `websearch` or `search`.
 
 The Zig retrieval implementation currently enforces the narrowing policy through `ToolPolicy` in
 `retrieval_agent.zig`. As more steps gain native tool use, the same pattern should move into a shared helper so each
@@ -244,6 +295,10 @@ Current event names:
 Clients should treat all events before `done` as progressive UI data. They may render hits, reasoning, and step traces
 incrementally, but should reconcile final state from `done`.
 
+Research streaming reuses these event names. `step_progress` events carry `name: "research"` and a `phase` of `plan`,
+`sub_question_started`, `finding`, `reflection`, `section`, or `verification`; the report streams as `generation`
+chunks; `done` carries the `ResearchAgentResult`.
+
 A2A `message/stream` wraps A2A task events as SSE `message` frames, plus a terminal SSE `done` frame. The A2A event
 payloads are task `status-update` and `artifact-update` objects, not the raw native retrieval SSE events.
 
@@ -253,6 +308,7 @@ A2A exposes Antfly native agents as skills. The current agent card lists:
 
 - `query-builder`
 - `retrieval`
+- `research`
 
 The adapter rules are:
 
@@ -268,6 +324,9 @@ The adapter rules are:
   should forward the rest of the bounded-agent fields generically instead of adding per-field special cases.
 - Query-builder results are emitted as a `query` artifact.
 - Retrieval progress and results are emitted as task status/artifact events.
+- The research adapter maps text to `query` and forwards `queries` (or `table`), `generator`, `chain`, `steps`,
+  `budget`, `tools`, `agent_knowledge`, and `research_state` from the data part. Runs are non-interactive and use the
+  budget's `deadline_ms`. Research progress events become task artifacts, and `done` becomes the `result` artifact.
 
 The adapter should stay thin:
 
