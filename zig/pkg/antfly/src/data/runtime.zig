@@ -11066,6 +11066,29 @@ pub const DataServer = struct {
         return null;
     }
 
+    /// Route Raft/recovery metadata refresh through its own protected HTTP
+    /// task graph. Ordinary cache users continue to share the API executor;
+    /// the borrowed override covers only this call.
+    fn fetchDataRaftMetadataSnapshot(
+        self: *DataServer,
+        source: *RemoteMetadataSource,
+        budget: antfly.metadata_http_client.RequestBudget,
+    ) !antfly.metadata_api.AdminSnapshot {
+        const runtime = self.backend_runtime orelse return error.BackendRuntimeUnavailable;
+        var lane = runtime.acquireMetadataHttpLane() catch |err| switch (err) {
+            error.MetadataHttpCapacityUnavailable => return error.LeaderUnavailable,
+            else => return err,
+        };
+        defer lane.release();
+        var executor = antfly.common.http.IoHttpExecutor.init(self.alloc, lane.io(), .{
+            .max_response_bytes = @import("../metadata/restore_staging.zig").max_encoded_bytes * 2 + 4096,
+        });
+        defer executor.deinit();
+        var protected_budget = budget;
+        protected_budget.request_executor = executor.executor();
+        return source.fetchSnapshotWithBudget(protected_budget);
+    }
+
     fn acquireDataRaftForwardLane(self: *DataServer) !backend_runtime_mod.BackendRuntime.RequestForwardLaneLease {
         const runtime = self.backend_runtime orelse return error.BackendRuntimeUnavailable;
         return runtime.acquireRaftRequestForwardLane() catch |err| switch (err) {
@@ -12100,7 +12123,7 @@ pub const DataServer = struct {
     ) !DataRaftApiRoute {
         const remote_metadata = self.remote_metadata orelse return .target_missing;
         var snapshot = if (route.discovery.mayRefreshCatalog())
-            try remote_metadata.fetchSnapshotWithBudget(.{
+            try self.fetchDataRaftMetadataSnapshot(remote_metadata, .{
                 .deadline_ns = deadline_ns,
                 .cancellation = route.cancellation,
                 .io = self.dataRaftIo(),
@@ -12184,7 +12207,7 @@ pub const DataServer = struct {
         const remote_metadata = self.remote_metadata orelse return false;
         _ = self.data_raft orelse return false;
         var snapshot = if (route.discovery.mayRefreshCatalog())
-            try remote_metadata.fetchSnapshotWithBudget(.{
+            try self.fetchDataRaftMetadataSnapshot(remote_metadata, .{
                 .deadline_ns = deadline_ns,
                 .cancellation = route.cancellation,
                 .io = self.dataRaftIo(),
@@ -17567,7 +17590,7 @@ pub const DataServer = struct {
     ) !void {
         if (self.data_raft == null) return;
         const remote_metadata = self.remote_metadata orelse return;
-        var snapshot = try remote_metadata.fetchSnapshotWithBudget(.{
+        var snapshot = try self.fetchDataRaftMetadataSnapshot(remote_metadata, .{
             .deadline_ns = deadline_ns,
             .cancellation = cancellation,
             .io = self.dataRaftIo(),
@@ -23187,6 +23210,17 @@ const RemoteMetadataSource = struct {
         return client;
     }
 
+    fn metadataClientWithBudget(
+        self: *RemoteMetadataSource,
+        alloc: std.mem.Allocator,
+        budget: ?antfly.metadata_http_client.RequestBudget,
+    ) antfly.metadata_http_client.MetadataHttpClient {
+        const executor = if (budget) |value| value.request_executor orelse self.httpExecutor() else self.httpExecutor();
+        var client = antfly.metadata_http_client.MetadataHttpClient.init(alloc, executor);
+        _ = client.withInternalServiceAuth(self.internal_service_secret, self.internal_service_issuer);
+        return client;
+    }
+
     fn httpExecutor(self: *RemoteMetadataSource) antfly.common.http.RequestExecutor {
         const sequence = self.next_http_executor.fetchAdd(1, .monotonic);
         if (self.request_executors.len > 0)
@@ -23679,11 +23713,12 @@ const RemoteMetadataSource = struct {
     }
 
     fn fetchSnapshotForHeadResult(self: *RemoteMetadataSource, comptime kind: SnapshotResultKind, head: antfly.metadata_api.MetadataHead, budget: ?antfly.metadata_http_client.RequestBudget) !SnapshotResult(kind) {
-        // Coalesce concurrent control-plane cache misses. Waiting callers keep
-        // their own deadline/cancellation and recheck the published generation;
-        // authoritative reads retain their separate fencing semantics.
-        try self.lockWithBudget(&self.snapshot_refresh_mutex, budget);
-        defer self.snapshot_refresh_mutex.unlock();
+        // Coalesce ordinary cache misses, but never queue a protected Raft
+        // refresh behind an API request stalled in its public HTTP executor.
+        // Publication still fences concurrent snapshots under cache_mutex.
+        const coalesce = if (budget) |value| value.request_executor == null else true;
+        if (coalesce) try self.lockWithBudget(&self.snapshot_refresh_mutex, budget);
+        defer if (coalesce) self.snapshot_refresh_mutex.unlock();
         const now_ms = self.awakeMs();
         try self.lockWithBudget(&self.cache_mutex, budget);
         if (self.cached_head) |current_head| {
@@ -24256,7 +24291,7 @@ const RemoteMetadataSource = struct {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const scratch = arena.allocator();
-            var metadata_client = self.metadataClient(scratch);
+            var metadata_client = self.metadataClientWithBudget(scratch, budget);
             const head = metadata_client.fetchHeadWithBudget(self.base_uris[index], budget) catch |err| {
                 if (err == error.Cancelled or err == error.Timeout) return err;
                 last_err = err;
@@ -24331,7 +24366,7 @@ const RemoteMetadataSource = struct {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const scratch = arena.allocator();
-            var metadata_client = self.metadataClient(scratch);
+            var metadata_client = self.metadataClientWithBudget(scratch, budget);
             var parsed = metadata_client.fetchPagedSnapshot(self.base_uris[index], true, false, budget) catch |err| {
                 if (err == error.Cancelled or err == error.Timeout) return err;
                 last_err = err;
@@ -33025,6 +33060,7 @@ fn consumerTests() type {
             try std.testing.expectEqualStrings("{\"inserted\":1}", response.body);
             try serving.await(std.testing.io);
             try std.testing.expectEqual(@as(usize, 1), peer.route_hits[0]);
+            forward_lane.release();
 
             // Strong reads (including FK preflight) await peer lookups from
             // API workers. Fill that lane completely and prove the peer HTTP
@@ -33071,15 +33107,79 @@ fn consumerTests() type {
             try read_serving.await(std.testing.io);
             try std.testing.expectEqual(@as(usize, 1), read_peer.route_hits[0]);
 
+            // The ordinary metadata client also uses API workers. A Raft
+            // refresh must select its borrowed protected transport while all
+            // public API workers are occupied, before a metadata request is
+            // sent or cached.
+            var metadata_peer = try httpx.TestServer.start(alloc, std.testing.io, &.{.{
+                .method = .GET,
+                .path = "/metadata/v1/head",
+                .respond = .{ .status = 200, .body = "{\"metadata_group_id\":7,\"metadata_incarnation\":\"11111111111111111111111111111111\",\"metadata_epoch\":1}" },
+                .max_uses = 1,
+            }});
+            defer metadata_peer.deinit();
+            var metadata_serving = try std.testing.io.concurrent(httpx.TestServer.handleOne, .{&metadata_peer});
+            defer metadata_serving.cancel(std.testing.io) catch {};
+            var metadata_source = try RemoteMetadataSource.init(alloc, &.{metadata_peer.baseUrl()}, backend_runtime.ptr().apiIoImpl().?);
+            defer metadata_source.deinit();
+            const deadline_ns: u64 = @intCast(@max(0, std.Io.Clock.now(.awake, std.testing.io).nanoseconds + 5 * std.time.ns_per_s));
+            try std.testing.expectEqual(@as(usize, 0), metadata_peer.route_hits[0]);
+            {
+                var metadata_lane = try backend_runtime.ptr().acquireMetadataHttpLane();
+                defer metadata_lane.release();
+                var concurrent_raft_lane = try server.acquireDataRaftForwardLane();
+                defer concurrent_raft_lane.release();
+                try std.testing.expect(metadata_lane.io().userdata != concurrent_raft_lane.io().userdata);
+                var protected_metadata_executor = antfly.common.http.IoHttpExecutor.init(alloc, metadata_lane.io(), .{});
+                defer protected_metadata_executor.deinit();
+                const metadata_head = try metadata_source.fetchHeadWithBudget(.{
+                    .deadline_ns = deadline_ns,
+                    .io = std.testing.io,
+                    .request_executor = protected_metadata_executor.executor(),
+                });
+                try std.testing.expectEqual(@as(u64, 7), metadata_head.metadata_group_id);
+                const cached_snapshot: antfly.metadata_api.AdminSnapshot = .{
+                    .status = .{ .metadata_group_id = 7, .metadata_incarnation = metadata_head.metadata_incarnation, .metadata_epoch = 1, .metrics = .{} },
+                    .tables = &.{},
+                    .ranges = &.{},
+                    .stores = &.{},
+                    .placement_intents = &.{},
+                    .split_transitions = &.{},
+                    .merge_transitions = &.{},
+                };
+                metadata_source.cached_snapshot = try cloneAdminSnapshotOwned(alloc, cached_snapshot);
+                metadata_source.cached_head = metadata_head;
+                metadata_source.cached_snapshot_at_ms = metadata_source.awakeMs();
+                lockAtomic(&metadata_source.snapshot_refresh_mutex);
+                defer metadata_source.snapshot_refresh_mutex.unlock();
+                var protected_snapshot = try metadata_source.fetchSnapshotForHeadWithBudget(metadata_head, .{
+                    .deadline_ns = deadline_ns,
+                    .io = std.testing.io,
+                    .request_executor = protected_metadata_executor.executor(),
+                });
+                defer freeAdminSnapshotOwned(alloc, &protected_snapshot);
+                try std.testing.expectEqual(@as(u64, 7), protected_snapshot.status.metadata_group_id);
+            }
+            try metadata_serving.await(std.testing.io);
+            try std.testing.expectEqual(@as(usize, 1), metadata_peer.route_hits[0]);
+            var recovered_snapshot = try server.fetchDataRaftMetadataSnapshot(&metadata_source, .{
+                .deadline_ns = deadline_ns,
+                .io = std.testing.io,
+            });
+            defer freeAdminSnapshotOwned(alloc, &recovered_snapshot);
+            try std.testing.expectEqual(@as(u64, 7), recovered_snapshot.status.metadata_group_id);
+
             raft_release.set(raft_io);
             for (raft_tasks[0..raft_started]) |*task| task.await(raft_io);
             raft_started = 0;
 
             // The inverse dependency must also hold: long-running forwarded requests
             // cannot consume the capacity needed to replicate and confirm their work.
-            const forward_io = forward_lane.io();
+            var saturating_read_lane = try backend_runtime.ptr().acquireRequestForwardLane();
+            defer saturating_read_lane.release();
+            const forward_io = saturating_read_lane.io();
             var forward_release: std.Io.Event = .unset;
-            var forward_tasks: [@import("../common/threaded_io_limits.zig").backend_runtime_request_forward]std.Io.Future(void) = undefined;
+            var forward_tasks: [@import("../common/threaded_io_limits.zig").backend_runtime_request_forward - @import("../common/threaded_io_limits.zig").request_forward_workers_per_request]std.Io.Future(void) = undefined;
             var forward_started: usize = 0;
             defer {
                 forward_release.set(forward_io);

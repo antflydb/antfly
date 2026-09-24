@@ -62,6 +62,9 @@ pub const RequestBudget = struct {
     /// supply the same borrowed `std.Io` that created `deadline_ns`; native
     /// callers retain the platform-clock fallback for compatibility.
     io: ?std.Io = null,
+    /// Optional borrowed transport for a protected synchronous metadata read.
+    /// The caller keeps its executor and admission lease alive through return.
+    request_executor: ?http_common.RequestExecutor = null,
 
     pub fn nowNs(self: RequestBudget) u64 {
         const io = self.io orelse return platform_time.monotonicNs();

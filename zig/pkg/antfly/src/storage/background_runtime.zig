@@ -478,6 +478,7 @@ pub const Config = struct {
 pub const BorrowedIo = struct {
     general: Io,
     request_forward: ?Io = null,
+    metadata_http: ?Io = null,
     raft_inbound: ?Io = null,
     raft_outbound: ?Io = null,
     api: ?Io = null,
@@ -980,6 +981,8 @@ pub const BackendRuntime = struct {
     request_forward_lane_gate: LaneLeaseGate = .{},
     raft_request_forward_io_impl: std.atomic.Value(?*IoImpl) = .init(null),
     raft_request_forward_lane_gate: LaneLeaseGate = .{},
+    metadata_http_io_impl: std.atomic.Value(?*IoImpl) = .init(null),
+    metadata_http_lane_gate: LaneLeaseGate = .{},
     api_io_impl: std.atomic.Value(?*IoImpl) = .init(null),
     inference_io_impl: std.atomic.Value(?*IoImpl) = .init(null),
     pdf_render_executor: std.atomic.Value(?*bounded_worker_lane.Executor) = .init(null),
@@ -1110,6 +1113,7 @@ pub const BackendRuntime = struct {
         self.worker_lane_gate.close();
         self.request_forward_lane_gate.close();
         self.raft_request_forward_lane_gate.close();
+        self.metadata_http_lane_gate.close();
         self.api_lane_gate.close();
         self.inference_lane_gate.close();
         self.pdf_render_lane_gate.close();
@@ -1117,6 +1121,7 @@ pub const BackendRuntime = struct {
         self.worker_lane_gate.waitDrained(coordinator_io);
         self.request_forward_lane_gate.waitDrained(coordinator_io);
         self.raft_request_forward_lane_gate.waitDrained(coordinator_io);
+        self.metadata_http_lane_gate.waitDrained(coordinator_io);
         self.api_lane_gate.waitDrained(coordinator_io);
         self.inference_lane_gate.waitDrained(coordinator_io);
         self.pdf_render_lane_gate.waitDrained(coordinator_io);
@@ -1154,6 +1159,9 @@ pub const BackendRuntime = struct {
             deinitIoLane(self.alloc, io_impl);
         }
         if (self.raft_request_forward_io_impl.swap(null, .acq_rel)) |io_impl| {
+            deinitIoLane(self.alloc, io_impl);
+        }
+        if (self.metadata_http_io_impl.swap(null, .acq_rel)) |io_impl| {
             deinitIoLane(self.alloc, io_impl);
         }
         if (self.raft_inbound_io_impl.swap(null, .acq_rel)) |io_impl| {
@@ -1344,7 +1352,7 @@ pub const BackendRuntime = struct {
     pub const RequestForwardLaneLease = struct {
         runtime: *BackendRuntime,
         borrowed_io: Io,
-        raft: bool,
+        gate: *LaneLeaseGate,
         released: bool = false,
 
         pub fn io(self: *const @This()) Io {
@@ -1355,8 +1363,7 @@ pub const BackendRuntime = struct {
         pub fn release(self: *@This()) void {
             if (self.released) return;
             self.released = true;
-            const gate = if (self.raft) &self.runtime.raft_request_forward_lane_gate else &self.runtime.request_forward_lane_gate;
-            gate.release(self.runtime.io());
+            self.gate.release(self.runtime.io());
         }
     };
 
@@ -1406,7 +1413,37 @@ pub const BackendRuntime = struct {
             if (reserved > remaining) return error.RequestForwardCapacityUnavailable;
             break :blk self.threadedNetworkIo(impl);
         };
-        return .{ .runtime = self, .borrowed_io = forward_io, .raft = raft };
+        return .{ .runtime = self, .borrowed_io = forward_io, .gate = gate };
+    }
+
+    /// Complete metadata HTTP task graphs for Raft routing and recovery. The
+    /// default profile reserves one. This executor is separate from public API
+    /// work and Raft leader forwarding, and stays within the configured
+    /// BackendRuntime aggregate. Borrowed schedulers own physical isolation.
+    pub fn acquireMetadataHttpLane(self: *BackendRuntime) !RequestForwardLaneLease {
+        const gate = &self.metadata_http_lane_gate;
+        const capacity = self.lane_limits.metadata_http / threaded_io_limits.request_forward_workers_per_request;
+        _ = gate.tryAcquireBounded(capacity) orelse return error.MetadataHttpCapacityUnavailable;
+        errdefer gate.release(self.io());
+        const metadata_io = if (self.borrowed_io) |borrowed|
+            borrowed.metadata_http orelse borrowed.api orelse borrowed.general
+        else if (comptime builtin.os.tag == .freestanding)
+            return error.BackendRuntimeUnavailable
+        else if (self.backend == .manual)
+            if (self.io_impl) |impl| self.threadedNetworkIo(impl) else return error.BackendRuntimeUnavailable
+        else blk: {
+            const impl = self.ensureSpecializedIoLane(&self.metadata_http_io_impl, self.lane_limits.metadata_http) orelse
+                return error.BackendRuntimeUnavailable;
+            const sync_io = Io.Threaded.global_single_threaded.io();
+            impl.mutex.lockUncancelable(sync_io);
+            const remaining = @intFromEnum(impl.concurrent_limit) -| impl.busy_count;
+            const reserved = gate.active() * threaded_io_limits.request_forward_workers_per_request;
+            impl.mutex.unlock(sync_io);
+            if (reserved > remaining)
+                return error.MetadataHttpCapacityUnavailable;
+            break :blk self.threadedNetworkIo(impl);
+        };
+        return .{ .runtime = self, .borrowed_io = metadata_io, .gate = gate };
     }
 
     pub fn raftOutboundIoImpl(self: *BackendRuntime) ?*IoImpl {
@@ -3133,6 +3170,7 @@ test "backend runtime borrows backend-agnostic std.Io lanes" {
             .api = api,
             .control = control,
             .request_forward = forward,
+            .metadata_http = forward,
         },
     });
     defer handle.deinit();
@@ -3156,6 +3194,10 @@ test "backend runtime borrows backend-agnostic std.Io lanes" {
     try std.testing.expectEqual(@intFromPtr(&forward_token), @intFromPtr(raft_forwarding.io().userdata.?));
     raft_forwarding.release();
     try std.testing.expect(handle.ptr().raft_request_forward_io_impl.load(.acquire) == null);
+    var metadata_http = try handle.ptr().acquireMetadataHttpLane();
+    try std.testing.expectEqual(@intFromPtr(&forward_token), @intFromPtr(metadata_http.io().userdata.?));
+    metadata_http.release();
+    try std.testing.expect(handle.ptr().metadata_http_io_impl.load(.acquire) == null);
 
     var lease = try handle.ptr().acquireApiLane();
     try std.testing.expectEqual(@intFromPtr(&api_token), @intFromPtr(lease.io().userdata.?));
@@ -3190,6 +3232,7 @@ test "backend runtime deinit closes admission and waits for active lane leases" 
     var lease = try runtime.acquireApiLane();
     var forwarding = try runtime.acquireRequestForwardLane();
     var raft_forwarding = try runtime.acquireRaftRequestForwardLane();
+    var metadata_http = try runtime.acquireMetadataHttpLane();
     var deinitialized = std.atomic.Value(bool).init(false);
     var deinit_thread = try std.testing.io.concurrent(struct {
         fn run(h: *BackendRuntimeHandle, done: *std.atomic.Value(bool)) void {
@@ -3202,6 +3245,7 @@ test "backend runtime deinit closes admission and waits for active lane leases" 
         lease.release();
         forwarding.release();
         raft_forwarding.release();
+        metadata_http.release();
         deinit_thread.await(std.testing.io);
     };
 
@@ -3209,6 +3253,7 @@ test "backend runtime deinit closes admission and waits for active lane leases" 
     try std.testing.expectError(error.BackendRuntimeShuttingDown, runtime.acquireApiLane());
     try std.testing.expectError(error.RequestForwardCapacityUnavailable, runtime.acquireRequestForwardLane());
     try std.testing.expectError(error.RequestForwardCapacityUnavailable, runtime.acquireRaftRequestForwardLane());
+    try std.testing.expectError(error.MetadataHttpCapacityUnavailable, runtime.acquireMetadataHttpLane());
     try std.testing.expect(runtime.inferenceIo() == null);
     try std.testing.expect(runtime.inference_io_impl.load(.acquire) == null);
     try std.testing.expect(!deinitialized.load(.acquire));
@@ -3217,6 +3262,8 @@ test "backend runtime deinit closes admission and waits for active lane leases" 
     forwarding.release();
     try std.testing.expect(!deinitialized.load(.acquire));
     raft_forwarding.release();
+    try std.testing.expect(!deinitialized.load(.acquire));
+    metadata_http.release();
     deinit_thread.await(std.testing.io);
     deinit_thread_awaited = true;
     try std.testing.expect(deinitialized.load(.acquire));
@@ -3600,6 +3647,10 @@ test "backend runtime honors reduced per-lane limits under the aggregate ceiling
     defer raft_forward_lease.release();
     try std.testing.expectEqual(std.Io.Limit.limited(threaded_io_limits.request_forward_workers_per_request), runtime.raft_request_forward_io_impl.load(.acquire).?.concurrent_limit);
     try std.testing.expectError(error.RequestForwardCapacityUnavailable, runtime.acquireRaftRequestForwardLane());
+    var metadata_http_lease = try runtime.acquireMetadataHttpLane();
+    defer metadata_http_lease.release();
+    try std.testing.expectEqual(std.Io.Limit.limited(limits.metadata_http), runtime.metadata_http_io_impl.load(.acquire).?.concurrent_limit);
+    try std.testing.expectError(error.MetadataHttpCapacityUnavailable, runtime.acquireMetadataHttpLane());
     var api_lease = try runtime.acquireApiLane();
     defer api_lease.release();
     var inference_lease = try runtime.acquireInferenceLane();

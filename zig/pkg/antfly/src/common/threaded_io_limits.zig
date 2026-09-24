@@ -39,7 +39,10 @@ pub const backend_runtime_durable_background: u32 = 40;
 /// each other. Both have independent worker reservations.
 pub const backend_runtime_durable_commit: u32 = 4;
 pub const backend_runtime_durable_cleanup: u32 = 4;
-pub const backend_runtime_api: u32 = 16;
+/// Six former API workers are isolated for bounded Data Raft/recovery metadata
+/// HTTP. Foreground API admission uses the remaining ten workers by default.
+pub const backend_runtime_api: u32 = 10;
+pub const backend_runtime_metadata_http: u32 = request_forward_workers_per_request;
 /// Shared forwarding budget: one six-worker executor is reserved for Data
 /// Raft leader forwarding, and the remainder serves distributed reads.
 pub const backend_runtime_request_forward: u32 = 32;
@@ -70,6 +73,7 @@ pub const BackendRuntimeLaneLimits = struct {
     durable_commit: u32 = backend_runtime_durable_commit,
     durable_cleanup: u32 = backend_runtime_durable_cleanup,
     api: u32 = backend_runtime_api,
+    metadata_http: u32 = backend_runtime_metadata_http,
     request_forward: u32 = backend_runtime_request_forward,
     raft_inbound: u32 = backend_runtime_raft_inbound,
     raft_outbound: u32 = backend_runtime_raft_outbound,
@@ -87,6 +91,7 @@ pub const BackendRuntimeLaneLimits = struct {
             @as(u64, self.durable_commit) +
             @as(u64, self.durable_cleanup) +
             @as(u64, self.api) +
+            @as(u64, self.metadata_http) +
             @as(u64, self.request_forward) +
             @as(u64, self.raft_inbound) +
             @as(u64, self.raft_outbound) +
@@ -101,6 +106,7 @@ pub const BackendRuntimeLaneLimits = struct {
             self.durable_commit == 0 or self.durable_commit > backend_runtime_aggregate or
             self.durable_cleanup == 0 or self.durable_cleanup > backend_runtime_aggregate or
             self.api == 0 or self.api > backend_runtime_aggregate or
+            self.metadata_http < request_forward_workers_per_request or self.metadata_http > backend_runtime_aggregate or
             // One full graph for reads and one protected for Data Raft.
             self.request_forward < 2 * request_forward_workers_per_request or self.request_forward > backend_runtime_aggregate or
             self.raft_inbound == 0 or self.raft_inbound > backend_runtime_aggregate or
@@ -166,7 +172,7 @@ test "threaded io production limits are finite" {
     try runtime_limits.validate();
     const expected_runtime_total = @as(u64, backend_runtime_durable_background) +
         backend_runtime_durable_commit + backend_runtime_durable_cleanup +
-        backend_runtime_api + backend_runtime_request_forward + backend_runtime_raft_inbound +
+        backend_runtime_api + backend_runtime_metadata_http + backend_runtime_request_forward + backend_runtime_raft_inbound +
         backend_runtime_raft_outbound + backend_runtime_inference +
         backend_runtime_control + pdf_render + backend_runtime_workers;
     try std.testing.expectEqual(@as(u64, 252), expected_runtime_total);
@@ -176,11 +182,15 @@ test "threaded io production limits are finite" {
         error.InvalidBackendRuntimeLaneLimits,
         (BackendRuntimeLaneLimits{ .request_forward = request_forward_workers_per_request }).validate(),
     );
+    try std.testing.expectError(
+        error.InvalidBackendRuntimeLaneLimits,
+        (BackendRuntimeLaneLimits{ .metadata_http = request_forward_workers_per_request - 1 }).validate(),
+    );
     try std.testing.expect(backend_runtime_control < backend_runtime_api);
     try std.testing.expect(backend_runtime_control < backend_runtime_durable_background);
     try (BackendRuntimeLaneLimits{
         .durable_background = 8,
-        .api = 96,
+        .api = 94,
         .raft_inbound = 16,
         .raft_outbound = 16,
         .worker_capacity = 16,
