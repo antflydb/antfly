@@ -30,10 +30,9 @@ All notable changes to Antfly will be documented in this file.
   `ResearchReport`), evalaf, and as the A2A `research` skill.
 - **Retrieval agent `fetch` tool** — agents can read full web pages. Fetch is
   opt-in and admits only URLs returned by `web_search` in the same run or on
-  `fetch_config.allowed_hosts`; private addresses are always blocked. Independent
-  web searches and fetches in one model turn now run concurrently, tool results
-  are budgeted in estimated tokens instead of bytes, and every model round
-  checks the request deadline and cancellation.
+  `fetch_config.allowed_hosts`; private addresses are always blocked. Tool
+  results are budgeted in estimated tokens instead of bytes, and every model
+  round checks the request deadline and cancellation.
 
 - **One rerank endpoint for text and images** — `POST /ai/v1/rerank` takes
   `documents`, where each entry is a string or an array of text and image

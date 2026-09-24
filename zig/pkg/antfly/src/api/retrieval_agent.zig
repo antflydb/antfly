@@ -239,8 +239,9 @@ const TestStepProgressEvent = struct {
 pub const QueryRunner = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
-    /// Server-owned runtime for bounded concurrent external tool calls. Null
-    /// (embedded and test callers) executes the same calls sequentially.
+    /// Server-owned runtime for bounded concurrent agent work (research
+    /// fan-out). Null (embedded and test callers) runs the same work
+    /// sequentially.
     io: ?std.Io = null,
 
     pub const KeyPage = struct {
@@ -2047,10 +2048,9 @@ fn executeModelTools(
             }
             return outcome;
         }
-        // Independent external reads in one assistant turn run concurrently
-        // on the server runtime. Results are consumed in call order below, so
-        // history, steps and hit order stay deterministic.
-        const prefetched = try prefetchExternalCalls(arena, ctx, calls, max_calls - outcome.calls, &known_urls);
+        // Calls run in order: whether the next result fits the shared context
+        // budget depends on the size of earlier ones, and a call the budget
+        // stops must never reach the provider.
         for (calls, 0..) |call, call_index| {
             // Check again at execution time: a preceding delegated planner can
             // consume calls after this assistant batch was accepted.
@@ -2072,7 +2072,7 @@ fn executeModelTools(
                     try rejectModelToolCall(arena, steps, live, &history, call, "Use a nonempty query of at most 8192 bytes.");
                     continue;
                 }
-                const found = (if (prefetched[call_index]) |ready| ready.web else runner.vtable.web_search.?(runner.ptr, arena, config, args.value.query)) catch |err| switch (err) {
+                const found = runner.vtable.web_search.?(runner.ptr, arena, config, args.value.query) catch |err| switch (err) {
                     error.OutOfMemory, error.Canceled, error.Cancelled => return err,
                     else => {
                         // Never forward provider response bodies or request config.
@@ -2127,7 +2127,7 @@ fn executeModelTools(
                         continue;
                     },
                 };
-                const page_hit = (if (prefetched[call_index]) |ready| ready.fetch else fetchPage(arena, runner, config, admitted.url)) catch |err| switch (err) {
+                const page_hit = fetchPage(arena, runner, config, admitted.url) catch |err| switch (err) {
                     error.OutOfMemory, error.Canceled, error.Cancelled => return err,
                     else => {
                         // Never forward remote response bodies.
@@ -2400,89 +2400,6 @@ fn fetchPage(arena: std.mem.Allocator, runner: QueryRunner, config: web_fetch.Co
     const download = try runner.vtable.fetch_url.?(runner.ptr, arena, config, url);
     const page = try web_fetch.extract(arena, download, config.max_content_chars);
     return web_fetch.toHit(arena, url, download.content_type, page);
-}
-
-const PrefetchedCall = union(enum) {
-    web: anyerror![]const QueryHit,
-    fetch: anyerror!QueryHit,
-};
-
-/// Run a turn's independent web_search and fetch calls concurrently. Only
-/// batches without delegated planning (which consumes budget mid-batch) and
-/// within the remaining call budget are prefetched; everything else keeps the
-/// sequential path. Each job owns a thread-safe arena; results are copied into
-/// the request arena on this thread after the group joins.
-fn prefetchExternalCalls(
-    arena: std.mem.Allocator,
-    ctx: ModelToolContext,
-    calls: []const generating.ToolCall,
-    remaining_calls: i64,
-    known_urls: *const std.StringHashMapUnmanaged(void),
-) ![]?PrefetchedCall {
-    const results = try arena.alloc(?PrefetchedCall, calls.len);
-    @memset(results, null);
-    const io = ctx.runner.io orelse return results;
-    if (@as(i64, @intCast(calls.len)) > remaining_calls) return results;
-    for (calls) |call| if (std.mem.eql(u8, call.name, "build_query")) return results;
-
-    const Job = struct {
-        runner: QueryRunner,
-        web: ?web_search.Config,
-        fetch: ?web_fetch.Config,
-        argument: []const u8,
-        arena_impl: std.heap.ArenaAllocator,
-        web_result: ?anyerror![]const QueryHit = null,
-        fetch_result: ?anyerror!QueryHit = null,
-
-        fn run(job: *@This()) void {
-            const job_arena = job.arena_impl.allocator();
-            if (job.web) |config| {
-                job.web_result = job.runner.vtable.web_search.?(job.runner.ptr, job_arena, config, job.argument);
-            } else if (job.fetch) |config| {
-                job.fetch_result = fetchPage(job_arena, job.runner, config, job.argument);
-            }
-        }
-    };
-    var jobs = std.ArrayListUnmanaged(struct { index: usize, job: *Job }).empty;
-    defer for (jobs.items) |item| item.job.arena_impl.deinit();
-    for (calls, 0..) |call, index| {
-        if (std.mem.eql(u8, call.name, "web_search")) {
-            const config = ctx.web_config orelse continue;
-            const args = std.json.parseFromSlice(struct { query: []const u8 }, arena, call.arguments, .{}) catch continue;
-            if (std.mem.trim(u8, args.value.query, " \t\r\n").len == 0 or args.value.query.len > 8192) continue;
-            const job = try arena.create(Job);
-            job.* = .{ .runner = ctx.runner, .web = config, .fetch = null, .argument = args.value.query, .arena_impl = std.heap.ArenaAllocator.init(std.heap.smp_allocator) };
-            try jobs.append(arena, .{ .index = index, .job = job });
-        } else if (std.mem.eql(u8, call.name, "fetch")) {
-            const config = ctx.fetch_config orelse continue;
-            const args = std.json.parseFromSlice(struct { url: []const u8 }, arena, call.arguments, .{}) catch continue;
-            // Admission is re-checked on the sequential path; URLs that are not
-            // admissible now are never downloaded.
-            const admitted = web_fetch.admitUrl(arena, config, args.value.url, known_urls) catch continue;
-            const job = try arena.create(Job);
-            job.* = .{ .runner = ctx.runner, .web = null, .fetch = config, .argument = admitted.url, .arena_impl = std.heap.ArenaAllocator.init(std.heap.smp_allocator) };
-            try jobs.append(arena, .{ .index = index, .job = job });
-        }
-    }
-    if (jobs.items.len < 2) return results;
-    var group: std.Io.Group = .init;
-    for (jobs.items) |item| {
-        group.concurrent(io, Job.run, .{item.job}) catch item.job.run();
-    }
-    group.await(io) catch {};
-    for (jobs.items) |item| {
-        if (item.job.web_result) |outcome| {
-            results[item.index] = .{ .web = if (outcome) |found| try cloneHits(arena, found) else |err| err };
-        } else if (item.job.fetch_result) |outcome| {
-            results[item.index] = .{ .fetch = if (outcome) |hit| (try cloneHits(arena, &.{hit}))[0] else |err| err };
-        }
-    }
-    return results;
-}
-
-fn cloneHits(arena: std.mem.Allocator, found: []const QueryHit) ![]const QueryHit {
-    const encoded = try std.json.Stringify.valueAlloc(arena, found, .{});
-    return try std.json.parseFromSliceLeaky([]const QueryHit, arena, encoded, .{ .allocate = .alloc_always });
 }
 
 // Pruning document bodies does not discard independently useful query results.
@@ -12462,57 +12379,6 @@ test "retrieval agent fetch admits only search-result URLs and returns readable 
         \\{"query":"q","queries":[],"stream":false,"max_internal_iterations":2,"generator":{"provider":"antfly","model":"test"},"tools":{"fetch_config":{"allowed_hosts":["example.com"],"block_private_ips":false}}}
     ;
     try std.testing.expectError(error.Forbidden, executeJson(std.testing.allocator, .{ .ptr = &fake, .vtable = &.{ .run_query = Fake.query, .fetch_url = Fake.fetchUrl } }, .{ .ptr = &fake, .vtable = &.{ .execute_chain = Fake.generate } }, unsafe));
-}
-
-test "retrieval agent runs independent web searches concurrently and keeps call order" {
-    const Fake = struct {
-        searches: std.atomic.Value(usize) = .init(0),
-        turn: usize = 0,
-        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) !query_api.QueryResponse {
-            return error.UnexpectedDatabaseSearch;
-        }
-        fn prepare(_: *anyopaque, arena: std.mem.Allocator, options: web_search.Options) !web_search.Config {
-            return web_search.resolve(arena, null, options);
-        }
-        fn search(ptr: *anyopaque, arena: std.mem.Allocator, _: web_search.Config, text: []const u8) ![]const QueryHit {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            _ = self.searches.fetchAdd(1, .monotonic);
-            const body = try std.fmt.allocPrint(arena, "{{\"results\":[{{\"url\":\"https://example.com/{s}\"}}]}}", .{text});
-            return web_search.parseResults(arena, .{}, body);
-        }
-        fn generate(ptr: *anyopaque, a: std.mem.Allocator, _: []const generating.ChainLink, messages: []const generating.ChatMessage) !generating.GenerateResult {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.turn += 1;
-            if (self.turn == 1) {
-                const calls = try a.alloc(generating.ToolCall, 3);
-                for (calls, [_][]const u8{ "alpha", "beta", "gamma" }) |*call, topic| call.* = .{
-                    .id = try a.dupe(u8, topic),
-                    .name = try a.dupe(u8, "web_search"),
-                    .arguments = try std.fmt.allocPrint(a, "{{\"query\":\"{s}\"}}", .{topic}),
-                };
-                return .{ .allocator = a, .content = try a.dupe(u8, ""), .tool_calls = calls };
-            }
-            // Tool results are appended in the assistant's call order.
-            const results = messages[messages.len - 3 ..];
-            for (results, [_][]const u8{ "alpha", "beta", "gamma" }) |message, topic| {
-                try std.testing.expectEqualStrings(topic, message.tool_call_id.?);
-                try std.testing.expect(std.mem.indexOf(u8, message.content.?.text, topic) != null);
-            }
-            return .{ .allocator = a, .content = try a.dupe(u8, "done") };
-        }
-    };
-    var fake = Fake{};
-    const body =
-        \\{"query":"q","queries":[],"stream":false,"max_internal_iterations":3,"generator":{"provider":"antfly","model":"test"},"steps":{"generation":{}},"tools":{"web_search_config":{"provider":"exa","api_key":"k"}}}
-    ;
-    const encoded = try executeJson(std.testing.allocator, .{ .ptr = &fake, .vtable = &.{ .run_query = Fake.query, .prepare_web_search = Fake.prepare, .web_search = Fake.search }, .io = std.testing.io }, .{ .ptr = &fake, .vtable = &.{ .execute_chain = Fake.generate } }, body);
-    defer std.testing.allocator.free(encoded);
-    const parsed = try std.json.parseFromSlice(RetrievalAgentResult, std.testing.allocator, encoded, .{});
-    defer parsed.deinit();
-    try std.testing.expectEqual(@as(usize, 3), fake.searches.load(.monotonic));
-    try std.testing.expectEqual(AgentStatus.completed, parsed.value.status);
-    try std.testing.expectEqualStrings("web:https://example.com/alpha", parsed.value.hits[0]._id);
-    try std.testing.expectEqualStrings("web:https://example.com/gamma", parsed.value.hits[2]._id);
 }
 
 test "retrieval agent honors a lent tool-call budget" {

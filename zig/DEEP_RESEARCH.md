@@ -121,8 +121,9 @@ Deep web research needs full pages, so the retrieval agent's `fetch` tool (`web_
 - `agent_tools.Budget` replaces the literal 20-call caps in the model-directed loop; `Conversation.limit_bytes` lets
   a nested run lend a smaller history ceiling.
 - `executeModelTools` takes a `ModelToolContext` and a `ModelToolState` instead of sixteen positional parameters.
-- Independent `web_search` and `fetch` calls in one assistant turn run concurrently; results are consumed in call
-  order, so history and hit order are unchanged.
+- Tool calls within one assistant turn stay sequential on purpose. Whether a result fits the shared context
+  budget depends on earlier results, and a call the budget stops must never reach the provider. Concurrency comes
+  from running researchers in parallel, each with its own budget.
 - Tool-result context is budgeted in estimated tokens (`agent_tools.estimateTokens`: about four ASCII bytes per
   token, one token per non-ASCII code point). For ASCII payloads the limit is the same as the former byte budget.
 - The HTTP generation runner checks cancellation and the deadline before every model round, and agent handlers can
