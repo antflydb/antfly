@@ -1627,7 +1627,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "api http client requires explicit not-proposed marker and tracks delivery phase",
         "workload admission coordinator late terminal",
         "workload admission coordinator rejects mismatched live attempt rows",
-        "stable distributed transaction retry resumes a durable commit decision",
+        "stable distributed transaction retry requires matching begin identity before claiming commit",
         "distributed txn preserves original deadline across participant waves and cleanup",
         "transaction first decision distinguishes rejected admission from accepted and resumed recovery",
         "transaction recovery endpoint requires budget and translates the ingress clock",
@@ -1783,6 +1783,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-api-relational-index-http-test", "Run unified relational index CRUD and document index compatibility").dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, relational_index_http_tests, &.{ "api http server unified relational index CRUD", "api http server serves table index metadata routes", "index maintenance actions require table admin permission" }).step);
     const api_ingress_adapter_filters = [_][]const u8{
         "workload admission authenticated recovery control survives full ingress and foreground drain",
+        "protected recovery registrar excludes public routes and refuses legacy service auth",
         "opaque HTTP adapter reserves recovery body ingress from kernel policy",
     };
     const api_ingress_adapter_tests = b.addTest(.{

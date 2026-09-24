@@ -1484,7 +1484,10 @@ fn executeMultiTableCommitOnce(
 
     var begun_count: usize = 0;
     var abort_on_error = true;
-    var resume_committed = false;
+    // The current status protocol carries only the decision enum. Keep
+    // commit-only resume disabled until a status reply can prove that its
+    // BEGIN identity matches this request's timestamp and participant set.
+    const resume_committed = false;
     errdefer {
         if (abort_on_error) {
             if (trace_writer) |tw| {
@@ -1502,7 +1505,7 @@ fn executeMultiTableCommitOnce(
         }
     }
 
-    if (participants.items.len > 0) coordinator_begin: {
+    if (participants.items.len > 0) {
         const participant = participants.items[0];
         worker.beginGroup(alloc, participant.group_id, participant.table_name, .{
             .txn_id = txn_id,
@@ -1520,8 +1523,8 @@ fn executeMultiTableCommitOnce(
                 // even a failed/not-proposed BEGIN says nothing about an older
                 // execution of this ID. Probe the authoritative decision before
                 // attempting abort or reporting a terminal conflict.
-                // Resume commit-only propagation instead of treating that
-                // terminal record as a failed fresh begin.
+                // A committed status without BEGIN identity keeps recovery
+                // pending; it cannot authorize this request's phase two.
                 worker = worker.startRecovery();
                 const status = worker.statusGroupWithRequest(
                     alloc,
@@ -1535,18 +1538,13 @@ fn executeMultiTableCommitOnce(
                 };
                 if (status) |observed| switch (observed) {
                     .committed => {
-                        if (err == error.DecisionConflict) {
-                            // Status carries no begin timestamp or participant
-                            // identity. A committed record after an explicit
-                            // BEGIN conflict may belong to another use of this
-                            // ID, so it cannot authorize this request's
-                            // follower propagation or a committed response.
-                            abort_on_error = false;
-                            return error.CommitDecisionUnknown;
-                        }
-                        resume_committed = true;
+                        // A lost BEGIN reply and an ID collision are
+                        // indistinguishable with status-only evidence. Leave
+                        // the durable record for explicit recovery; reporting
+                        // success or propagating this request's decision could
+                        // commit a different operation.
                         abort_on_error = false;
-                        break :coordinator_begin;
+                        return error.CommitDecisionUnknown;
                     },
                     .aborted => {
                         abort_on_error = false;
@@ -5893,7 +5891,7 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 1), recorder.activation_prepares);
         }
 
-        test "stable distributed transaction retry resumes a durable commit decision" {
+        test "stable distributed transaction retry requires matching begin identity before claiming commit" {
             const FakeCatalog = struct {
                 fn iface() table_catalog.CatalogSource {
                     return .{
@@ -6010,7 +6008,7 @@ fn consumerTests() type {
             const txn_id = try parseTxnIdHex("0123456789abcdeffedcba9876543210");
             for ([_]anyerror{ error.RaftBatchWriteOutcomeUnknown, error.UnexpectedHttpStatus, error.Timeout, error.UnknownGroup, error.PreDecisionNotProposed }) |begin_error| {
                 recorder = .{ .begin_error = begin_error };
-                const outcome = try executeMultiTableCommitWithOptions(
+                try std.testing.expectError(error.CommitDecisionUnknown, executeMultiTableCommitWithOptions(
                     std.testing.allocator,
                     FakeCatalog.iface(),
                     recorder.worker(),
@@ -6024,12 +6022,12 @@ fn consumerTests() type {
                     .write,
                     null,
                     .{ .retain_terminal = true },
-                );
-                try std.testing.expect(outcome == .committed);
+                ));
                 try std.testing.expectEqual(@as(usize, 1), recorder.begin_calls);
                 try std.testing.expectEqual(@as(usize, 1), recorder.status_calls);
                 try std.testing.expectEqual(@as(usize, 0), recorder.prepare_calls);
-                try std.testing.expectEqual(@as(usize, 2), recorder.resolve_calls);
+                try std.testing.expectEqual(@as(usize, 0), recorder.resolve_calls);
+                try std.testing.expectEqual(@as(usize, 0), recorder.abort_calls);
             }
             // A committed status alone cannot prove that an explicit BEGIN
             // conflict belongs to this request rather than an ID collision.
@@ -6053,13 +6051,12 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 0), recorder.prepare_calls);
             try std.testing.expectEqual(@as(usize, 0), recorder.resolve_calls);
             try std.testing.expectEqual(@as(usize, 0), recorder.abort_calls);
-            // A committed status was already observed. Even a subsequent
-            // conflicting/missing/corrupt coordinator response cannot authorize
-            // abort or dispatch follower decisions with unconfirmed metadata.
+            // Even if a later phase-two callback could answer, status-only
+            // evidence cannot authorize it after an ambiguous BEGIN reply.
             for ([_]anyerror{ error.DecisionConflict, error.TxnNotFound, error.InvalidTxnRecord, error.ConnectionResetByPeer }) |retry_error| {
                 for ([_]bool{ true, false }) |report_failure| {
                     recorder = .{ .begin_error = error.RaftBatchWriteOutcomeUnknown, .resolve_error = retry_error };
-                    const resumed = executeMultiTableCommitWithOptions(
+                    try std.testing.expectError(error.CommitDecisionUnknown, executeMultiTableCommitWithOptions(
                         std.testing.allocator,
                         FakeCatalog.iface(),
                         recorder.worker(),
@@ -6073,20 +6070,11 @@ fn consumerTests() type {
                         .write,
                         null,
                         .{ .retain_terminal = true, .report_post_commit_failure = report_failure },
-                    );
-                    if (report_failure) {
-                        try std.testing.expectError(error.CommitPropagationIncomplete, resumed);
-                    } else {
-                        const committed = try resumed;
-                        try std.testing.expect(committed == .committed);
-                        try std.testing.expect(committed.committed.propagation_pending);
-                        try std.testing.expectEqual(@as(usize, 2), committed.committed.participant_count);
-                        try std.testing.expectEqual(@as(?u64, 7001), committed.committed.coordinator_group_id);
-                    }
+                    ));
                     try std.testing.expectEqual(@as(usize, 1), recorder.begin_calls);
-                    try std.testing.expectEqual(@as(usize, if (retry_error == error.ConnectionResetByPeer) 2 else 1), recorder.status_calls);
+                    try std.testing.expectEqual(@as(usize, 1), recorder.status_calls);
                     try std.testing.expectEqual(@as(usize, 0), recorder.prepare_calls);
-                    try std.testing.expectEqual(@as(usize, 1), recorder.resolve_calls);
+                    try std.testing.expectEqual(@as(usize, 0), recorder.resolve_calls);
                     try std.testing.expectEqual(@as(usize, 0), recorder.abort_calls);
                 }
             }
