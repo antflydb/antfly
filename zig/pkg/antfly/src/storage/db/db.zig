@@ -143284,6 +143284,47 @@ test "workload admission physical completion staged control BEGIN retains a pool
             try std.testing.expectEqualDeep(guard_before.guard.record, guard_after.guard.record);
         }
         try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try db.getTransactionStatus(id));
+        var readers: [3]?@import("../backend_erased.zig").ReadTxn = @splat(null);
+        defer for (&readers) |*reader| if (reader.*) |*held_reader| held_reader.abort();
+        readers[0] = try db.core.store.runtime_store.beginRead();
+        for (1..4) |ordinal| {
+            const next_id: transactions_mod.TxnId = @splat(@intCast(211 + ordinal));
+            const next_request: types.BatchRequest = .{ .transaction = .{ .begin = .{
+                .txn_id = next_id,
+                .begin_timestamp = 100 + ordinal,
+                .created_at_ns = 90 + ordinal,
+                .topology_epoch = 1,
+                .retain_terminal = true,
+                .participants = &.{ local_participant, participant },
+            } } };
+            const previous: u64 = @intCast(ordinal);
+            const next_wire = try local.compileStorageKernelReplicatedCompletion(alloc, &db, "docs", 2, next_request, .{ .term = 1, .index = previous });
+            defer alloc.free(next_wire);
+            const next_payloads = [_]abi.Bytes{.{ .ptr = next_wire.ptr, .len = next_wire.len }};
+            const next_proposal: abi.Check = .{ .kind = .proposal, .new_work_allowed = 1, .state = .{
+                .term = 1,
+                .applied_term = 1,
+                .applied_term_known = 1,
+                .applied_index = previous,
+                .last_index = previous,
+            }, .proposals = .{ .ptr = &next_payloads, .len = 1 } };
+            try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.check(lease.context, &next_proposal, &result));
+            const accepted_index = previous + 1;
+            lease.vtable.proposal_result(lease.context, &.{ .state = next_proposal.state, .first_index = accepted_index, .last_index = accepted_index, .payloads = next_proposal.proposals });
+            try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.apply_accepted.?(lease.context, 1, accepted_index, next_payloads[0]));
+            try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try db.getTransactionStatus(next_id));
+            try std.testing.expect(pool.control_owners[ordinal] != null);
+            try std.testing.expect(pool.control_owners[ordinal].?.output_pin.path != null);
+            if (ordinal < 3) {
+                readers[ordinal] = try db.core.store.runtime_store.beginRead();
+                const backend_runtime = @import("../lsm_backend/runtime.zig");
+                const locked = backend_runtime.lockBackend(lsm_backend_mod.Backend, backend);
+                defer backend_runtime.unlockBackend(lsm_backend_mod.Backend, backend, locked);
+                try pool.maintainLocked(backend);
+                try pool.qualifyFresh(backend);
+            }
+        }
+        for (pool.control_owners) |owner| try std.testing.expect(owner != null);
     }
     try std.testing.expectError(error.CompletionRecoveryCapacityRequired, DB.open(alloc, std.mem.span(tmp.path().ptr), options));
 }
@@ -143371,6 +143412,114 @@ test "workload admission physical completion rejected staged BEGIN retires nativ
     var db = try DB.open(alloc, path, reopen);
     defer db.close();
     try db.installCompletionBinding(binding, "", "", "{}", settings);
+}
+
+test "workload admission physical completion staged BEGIN rejects unbacked 69th run input before acceptance" {
+    const alloc = std.testing.allocator;
+    const abi = @import("kernel_owner_abi").completion_pool;
+    const local = @import("../local_write.zig");
+    const control_guard = @import("../lsm_backend/completion_control_guard.zig");
+    var tmp = try TestDirectory.init("completion-control-run-frontier");
+    defer tmp.cleanup();
+    const path = std.mem.span(tmp.path().ptr);
+    var resources = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer resources.deinit(alloc);
+    try resources.configureTransactionCompletion(1024 * 1024);
+    const settings: table_storage_mod.Settings = .{ .transaction_recovery = .{
+        .protocol_version = 1,
+        .max_count = 4,
+        .max_bytes = 1024 * 1024,
+        .max_transaction_bytes = 64 * 1024,
+        .completion_protocol_version = 1,
+        .profile_version = 1,
+    } };
+    const options: OpenOptions = .{
+        .resource_manager = &resources,
+        .durable_completion_enabled = true,
+        .durable_completion_authority = .standalone_local,
+        .table_storage = settings,
+        .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 },
+        .primary_backend = .{ .lsm = .{ .flush_threshold = 1024 * 1024, .compact_threshold_runs = 100, .foreground_soft_compaction = false } },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    };
+    const binding: abi.InstallBinding = .{
+        .identity = .{ .group_id = 2, .node_id = 7, .capacity = 4, .generation = 1, .incarnation = @splat(27), .policy_digest = @import("../../metadata/completion_activation.zig").policyDigest(settings.transaction_recovery.?) },
+        .table_id = 1,
+        .range_id = 3,
+        .schema_catalog_digest = try @import("../../common/completion_catalog_digest.zig").digest(alloc, "", "", "{}"),
+    };
+    {
+        var db = try DB.open(alloc, path, options);
+        defer db.close();
+        try db.configureTableStorage(settings);
+        const backend = db.core.primary_store_owner.lsmBackend().?;
+        var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+        defer runtime.deinit();
+        var i: usize = 0;
+        // Installation flushes its reconciled completion ledger into one more
+        // run. Leave exactly 63 inputs so the installed pool sees 64.
+        while (backend.runs.count() < 63) : (i += 1) {
+            var key: [32]u8 = undefined;
+            const name = try std.fmt.bufPrint(&key, "frontier-{d:0>3}", .{i});
+            var write = try runtime.beginWrite();
+            errdefer write.abort();
+            try write.put(name, "{}");
+            try write.commit();
+            const backend_runtime = @import("../lsm_backend/runtime.zig");
+            const locked = backend_runtime.lockBackend(lsm_backend_mod.Backend, backend);
+            defer backend_runtime.unlockBackend(lsm_backend_mod.Backend, backend, locked);
+            try backend.flushMutable();
+        }
+        try std.testing.expectEqual(@as(usize, 63), backend.runs.count());
+        try db.installCompletionBinding(binding, "", "", "{}", settings);
+        try std.testing.expectEqual(@as(usize, 64), backend.runs.count());
+        const lease = try db.acquireCompletionLease(2, 7);
+        defer lease.vtable.release(lease.context);
+        const startup: abi.DurableLog = .{ .mode = .startup_complete };
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.reconcile_durable.?(lease.context, &startup));
+        {
+            const backend_runtime = @import("../lsm_backend/runtime.zig");
+            const locked = backend_runtime.lockBackend(lsm_backend_mod.Backend, backend);
+            defer backend_runtime.unlockBackend(lsm_backend_mod.Backend, backend, locked);
+            try backend.completion_pool.?.enableControlOwnerStaging(backend);
+        }
+        const local_participant = try @import("../../api/distributed_txn.zig").participantIdForGroup(alloc, "docs", 2);
+        defer alloc.free(local_participant);
+        const peer = try @import("../../api/distributed_txn.zig").participantIdForGroup(alloc, "docs", 3);
+        defer alloc.free(peer);
+        const id: transactions_mod.TxnId = @splat(214);
+        const request: types.BatchRequest = .{ .transaction = .{ .begin = .{
+            .txn_id = id,
+            .begin_timestamp = 100,
+            .created_at_ns = 90,
+            .topology_epoch = 1,
+            .retain_terminal = true,
+            .participants = &.{ local_participant, peer },
+        } } };
+        const wire = try local.compileStorageKernelReplicatedCompletion(alloc, &db, "docs", 2, request, .{ .term = 0, .index = 0 });
+        defer alloc.free(wire);
+        {
+            const backend_runtime = @import("../lsm_backend/runtime.zig");
+            const locked = backend_runtime.lockBackend(lsm_backend_mod.Backend, backend);
+            defer backend_runtime.unlockBackend(lsm_backend_mod.Backend, backend, locked);
+            const pool = backend.completion_pool.?;
+            // 64 current inputs plus four document outputs and one retained
+            // control output require 69. The installed native path plan has 68.
+            try std.testing.expectError(error.UnsupportedCompletionProfile, pool.accept(backend, 1, 1, 0, 0, wire));
+            try std.testing.expect(pool.control_owners[0] == null);
+            try std.testing.expectError(error.FileNotFound, pool.io.storage().fileSize(pool.accepted_paths[0]));
+            try std.testing.expect(!try control_guard.hasAny(backend.storage.?, alloc, backend.root_dir.?));
+        }
+        try std.testing.expectError(error.TxnNotFound, db.getTransactionStatus(id));
+    }
+    const config = (try DB.completionInstallationPreflight(alloc, std.Options.debug_io, path, binding, "", "", "{}")).?;
+    var reopen = options;
+    reopen.durable_completion_authority = .raft_apply;
+    reopen.completion_pool_config = config;
+    var reopened = try DB.open(alloc, path, reopen);
+    defer reopened.close();
 }
 
 test "workload admission physical completion single-phase restart after WAL and manifest publication" {

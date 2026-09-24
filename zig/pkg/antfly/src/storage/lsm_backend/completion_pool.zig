@@ -775,7 +775,10 @@ pub fn Pool(comptime Backend: type) type {
             }, inputs[0 .. count + 1], .{
                 .format = .{ .metadata_bytes = self.config.shape.max_metadata_bytes },
                 .max_record_bytes = self.config.shape.max_record_bytes,
-                .max_inputs = self.config.shape.max_runs + control_record.max_owners,
+                // The installed pool has at most shape.max_runs prepaid input
+                // paths/cursors. A certificate for 69–72 inputs cannot be
+                // spent until those extra native handles are installed.
+                .max_inputs = self.config.shape.max_runs,
                 .max_path_bytes = 544,
                 .single_drain_metadata_bytes = self.config.shape.max_metadata_bytes,
                 .max_retained_wal_bytes = completion.limits.wal_bytes,
