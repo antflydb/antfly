@@ -806,6 +806,9 @@ const CliConfig = struct {
     bind_host: ?[]const u8 = null,
     bind_port: ?u16 = null,
     api_advertise_url: ?[]const u8 = null,
+    protected_api_bind_host: ?[]const u8 = null,
+    protected_api_bind_port: ?u16 = null,
+    protected_api_advertise_url: ?[]const u8 = null,
     health_enabled: ?bool = null,
     health_port: ?u16 = null,
     raft_bind_host: ?[]const u8 = null,
@@ -1079,6 +1082,110 @@ const DataPublicHttpRuntime = struct {
 
     fn healthy(self: *const DataPublicHttpRuntime) bool {
         return self.server.httpRuntimeStats().healthy;
+    }
+};
+
+/// Owns a separate socket, connection, and handler executor reservation.
+/// Public API clients cannot consume these workers or connection permits.
+/// The bind address must be restricted to a trusted operator network: HTTP
+/// credentials are checked after an internal socket has been accepted.
+const DataProtectedHttpRuntime = struct {
+    alloc: std.mem.Allocator,
+    handler: antfly.public_api.kernel_bridge.HttpxHandler,
+    http_runtime: httpx.HttpRuntime,
+    server: httpx.Server,
+    listener_task: httpx.ListenerTask,
+    listener_workers: backend_runtime_mod.BackendRuntime.WorkerLease,
+    connection_workers: backend_runtime_mod.BackendRuntime.WorkerLease,
+    request_workers: backend_runtime_mod.BackendRuntime.WorkerLease,
+
+    fn start(
+        alloc: std.mem.Allocator,
+        backend_runtime: *backend_runtime_mod.BackendRuntime,
+        cfg: ProtectedHttpConfig,
+        api_server: *antfly.public_api.kernel_bridge.ApiHttpServer,
+    ) !*DataProtectedHttpRuntime {
+        if (backend_runtime.usesBorrowedIo()) return error.ProtectedHttpRequiresNativeExecutor;
+        if (cfg.bind_host.len == 0 or std.mem.eql(u8, cfg.bind_host, "0.0.0.0") or
+            std.mem.eql(u8, cfg.bind_host, "::") or cfg.advertise_url.len == 0)
+            return error.UntrustedProtectedHttpBind;
+        const uri = std.Uri.parse(cfg.advertise_url) catch return error.InvalidProtectedHttpEndpoint;
+        const path = switch (uri.path) {
+            .raw => |value| value,
+            .percent_encoded => |value| value,
+        };
+        if (!std.mem.eql(u8, uri.scheme, "http") or
+            uri.host == null or uri.user != null or uri.password != null or uri.query != null or
+            uri.fragment != null or (path.len != 0 and !std.mem.eql(u8, path, "/")) or
+            (cfg.bind_port != 0 and (uri.port orelse 80) != cfg.bind_port))
+            return error.InvalidProtectedHttpEndpoint;
+        var listener_workers = try backend_runtime.acquireWorkers(.{ .capacity = 1 });
+        errdefer listener_workers.release();
+        var connection_workers = try backend_runtime.acquireWorkers(.{ .capacity = 2 });
+        errdefer connection_workers.release();
+        var request_workers = try backend_runtime.acquireWorkers(.{ .capacity = 2 });
+        errdefer request_workers.release();
+        const runtime = try alloc.create(DataProtectedHttpRuntime);
+        errdefer alloc.destroy(runtime);
+        runtime.* = .{
+            .alloc = alloc,
+            .handler = try antfly.public_api.kernel_bridge.createHandler(api_server),
+            .http_runtime = httpx.HttpRuntime.init(alloc, .{
+                .max_active_h1_requests = 0,
+                .max_active_connections = 2,
+                .max_active_requests = 2,
+                .max_listeners = 1,
+                .borrowed_io = .{
+                    .listener = listener_workers.io(),
+                    .connection = connection_workers.io(),
+                    .request = request_workers.io(),
+                },
+            }),
+            .server = undefined,
+            .listener_task = undefined,
+            .listener_workers = listener_workers,
+            .connection_workers = connection_workers,
+            .request_workers = request_workers,
+        };
+        errdefer antfly.public_api.kernel_bridge.deinitHandler(&runtime.handler);
+        errdefer runtime.http_runtime.deinit();
+        try runtime.handler.initRuntime(alloc);
+        runtime.server = httpx.Server.initWithConfig(alloc, request_workers.io(), .{
+            .host = cfg.bind_host,
+            .port = cfg.bind_port,
+            .max_body_size = 8192,
+            .max_connections = 2,
+            .max_request_tasks = 2,
+            .max_h1_inflight_bodies = 1,
+            .request_body_buffer_budget_bytes = 2 * 8192,
+            .header_read_timeout_ms = 5_000,
+            .body_read_timeout_ms = 5_000,
+            .response_write_timeout_ms = 5_000,
+            .h1_disconnect_cancellation = .disabled,
+            .http_runtime = &runtime.http_runtime,
+        });
+        errdefer runtime.server.deinit();
+        try runtime.handler.registerProtectedRecoveryRoutes(&runtime.server);
+        runtime.listener_task = httpx.ListenerTask.init(&runtime.server);
+        try runtime.listener_task.start();
+        return runtime;
+    }
+
+    fn requestStop(self: *DataProtectedHttpRuntime) void {
+        self.listener_task.requestStop();
+    }
+
+    fn deinitWithDeadline(self: *DataProtectedHttpRuntime, deadline: antfly.common.runtime_lifecycle.ShutdownDeadline) void {
+        const alloc = self.alloc;
+        self.listener_task.shutdown(deadline.remainingMilliseconds());
+        self.listener_task.join() catch |err| std.log.err("data protected listener failed during shutdown err={s}", .{@errorName(err)});
+        self.server.deinit();
+        antfly.public_api.kernel_bridge.deinitHandler(&self.handler);
+        self.http_runtime.deinit();
+        self.request_workers.release();
+        self.connection_workers.release();
+        self.listener_workers.release();
+        alloc.destroy(self);
     }
 };
 
@@ -4236,6 +4343,7 @@ pub const DataServerWorkCostPort = struct {
 pub const DataServerConfig = struct {
     bind_host: []const u8 = "127.0.0.1",
     bind_port: u16 = 0,
+    protected_http: ?ProtectedHttpConfig = null,
     raft_bind_host: []const u8 = "127.0.0.1",
     raft_bind_port: u16 = 0,
     enable_data_raft: bool = true,
@@ -4297,6 +4405,16 @@ pub const DataServerConfig = struct {
     data_request_lifecycle_hook: ?DataRequestLifecycleHook = null,
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig = .{},
     ha: DataServerHAConfig = .{},
+};
+
+/// A separate, operator-restricted network endpoint for authenticated
+/// recovery/control requests. The advertised URL must use HTTP and the bound
+/// port; a separately configured proxy/port translation is not supported.
+/// No endpoint is published when this is absent.
+pub const ProtectedHttpConfig = struct {
+    bind_host: []const u8,
+    bind_port: u16,
+    advertise_url: []const u8,
 };
 
 pub const DataServerHAConfig = struct {
@@ -5726,6 +5844,8 @@ pub const DataServer = struct {
     owned_http_runtime: ?*httpx.HttpRuntime = null,
     listener_cfg: antfly.raft.transport.std_http_listener.StdHttpListenerConfig,
     listener: ?*DataPublicHttpRuntime = null,
+    protected_http_cfg: ?ProtectedHttpConfig = null,
+    protected_listener: ?*DataProtectedHttpRuntime = null,
     query_io_impl: ?std.Io.Threaded = null,
     distributed_read_http_executor: ?*antfly.common.http.IoHttpExecutor = null,
     lsm_maintenance_mutex: std.atomic.Mutex = .unlocked,
@@ -6041,6 +6161,7 @@ pub const DataServer = struct {
             .backend_runtime = cfg.backend_runtime,
             .borrowed_storage_kernel_context = cfg.storage_kernel_context_handle,
             .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port, cfg.api_server_cfg.ingress_admission),
+            .protected_http_cfg = cfg.protected_http,
         };
     }
 
@@ -6085,6 +6206,7 @@ pub const DataServer = struct {
             .work_cost_port = cfg.work_cost_port,
             .backend_runtime = cfg.backend_runtime,
             .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port, cfg.api_server_cfg.ingress_admission),
+            .protected_http_cfg = cfg.protected_http,
         };
     }
 
@@ -6129,6 +6251,7 @@ pub const DataServer = struct {
             .work_cost_port = cfg.work_cost_port,
             .backend_runtime = cfg.backend_runtime,
             .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port, cfg.api_server_cfg.ingress_admission),
+            .protected_http_cfg = cfg.protected_http,
         };
     }
 
@@ -8432,6 +8555,12 @@ pub const DataServer = struct {
                 self.h1_disconnect_probe,
             );
         }
+        if (self.protected_listener == null) {
+            if (self.protected_http_cfg) |cfg| {
+                const runtime = self.backend_runtime orelse return error.BackendRuntimeUnavailable;
+                self.protected_listener = try DataProtectedHttpRuntime.start(self.alloc, runtime, cfg, &self.http_server.?);
+            }
+        }
     }
 
     fn metadataBootstrapRetryDue(self: *DataServer, now_ms: u64) bool {
@@ -8775,6 +8904,7 @@ pub const DataServer = struct {
         self.write_source.beginTeardown();
         if (self.data_raft_apply) |apply_sm| apply_sm.write_source.beginTeardown();
         if (self.listener) |listener| listener.requestStop();
+        if (self.protected_listener) |listener| listener.requestStop();
         if (self.data_raft) |raft| {
             raft.beginTransportShutdown();
             raft.stop();
@@ -8803,6 +8933,8 @@ pub const DataServer = struct {
         self.clearProvisionedStartupCatchUpTarget();
         if (self.listener) |listener| listener.deinitWithDeadline(deadline);
         self.listener = null;
+        if (self.protected_listener) |listener| listener.deinitWithDeadline(deadline);
+        self.protected_listener = null;
         // Native resolver/promoter workers borrow the API coordinator port.
         // Listener/request drain alone does not join those autonomous users.
         // Keep both the port owner and HTTP executor alive through this barrier.
@@ -10640,7 +10772,10 @@ pub const DataServer = struct {
         deadline_ns: u64,
     ) !?struct { node_id: u64, base_uri: []u8 } {
         const remote_metadata = self.remote_metadata orelse return null;
-        var snapshot = try remote_metadata.fetchSnapshotWithBudget(.{ .deadline_ns = deadline_ns });
+        var snapshot = try self.fetchDataRaftMetadataSnapshot(remote_metadata, .{
+            .deadline_ns = deadline_ns,
+            .io = self.dataRaftIo(),
+        });
         defer freeAdminSnapshotOwned(self.alloc, &snapshot);
         var preferred = preferred_node_id;
         if (preferred == null) {
@@ -10660,10 +10795,10 @@ pub const DataServer = struct {
             previous_target_node_id,
         ) orelse return null;
         const target_store = findSnapshotStoreByNodeId(snapshot.stores, target_node_id) orelse return null;
-        if (target_store.api_url.len == 0) return null;
+        const endpoint = recoveryStatusEndpoint(target_store) orelse return null;
         return .{
             .node_id = target_node_id,
-            .base_uri = try alloc.dupe(u8, target_store.api_url),
+            .base_uri = try alloc.dupe(u8, endpoint),
         };
     }
 
@@ -16502,6 +16637,7 @@ pub const DataServer = struct {
             .relational_topology_protocol_version = if (self.data_raft != null) antfly.metadata.table_manager.relational_topology_protocol_version else 0,
             .dense_native_storage_protocol_version = dense_native_capability,
             .api_url = api_url,
+            .internal_api_url = if (self.protected_listener != null) self.protected_http_cfg.?.advertise_url else "",
             .raft_url = raft_url,
             .role = registration.role,
             .health_class = "healthy",
@@ -22329,6 +22465,7 @@ pub const DataServer = struct {
             .backend_runtime = backend_runtime,
             .owned_backend_runtime = owned_backend_runtime,
             .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port, cfg.api_server_cfg.ingress_admission),
+            .protected_http_cfg = cfg.protected_http,
         };
         owned_backend_runtime = null;
         storage_kernel_context = null;
@@ -26749,6 +26886,7 @@ fn storeRegistrationVisible(
         if (store.node_id != record.node_id) continue;
         if (!std.mem.eql(u8, store.role, record.role)) continue;
         if (!std.mem.eql(u8, store.api_url, record.api_url)) continue;
+        if (!std.mem.eql(u8, store.internal_api_url, record.internal_api_url)) continue;
         if (!std.mem.eql(u8, store.raft_url, record.raft_url)) continue;
         // A zero committed incarnation is a legacy rolling-upgrade record.
         // Once the v15 safety profile is active, registration visibility requires the exact
@@ -27472,6 +27610,14 @@ fn findSnapshotStoreByNodeId(
     for (stores) |store| {
         if (store.node_id == node_id) return store;
     }
+    return null;
+}
+
+/// Only recovery-status RPCs use this endpoint. General group routing still
+/// needs the public URL because the protected listener has a narrow route set.
+fn recoveryStatusEndpoint(store: antfly.metadata.StoreRecord) ?[]const u8 {
+    if (store.internal_api_url.len != 0) return store.internal_api_url;
+    if (store.api_url.len != 0) return store.api_url;
     return null;
 }
 
@@ -28527,9 +28673,19 @@ pub fn runFromIterator(
         }
     }
 
+    const protected_http: ?ProtectedHttpConfig = if (cli.protected_api_bind_host != null or
+        cli.protected_api_bind_port != null or cli.protected_api_advertise_url != null)
+    blk: {
+        const host = cli.protected_api_bind_host orelse return error.InvalidArguments;
+        const port = cli.protected_api_bind_port orelse return error.InvalidArguments;
+        const url = cli.protected_api_advertise_url orelse return error.InvalidArguments;
+        if (port == 0) return error.InvalidArguments;
+        break :blk .{ .bind_host = host, .bind_port = port, .advertise_url = url };
+    } else null;
     var data_server = try DataServer.initFromMetadataApiUrls(alloc, .{
         .bind_host = cli.bind_host orelse "127.0.0.1",
         .bind_port = cli.bind_port orelse 0,
+        .protected_http = protected_http,
         .raft_bind_host = cli.raft_bind_host orelse "127.0.0.1",
         .raft_bind_port = cli.raft_bind_port orelse 0,
         .replica_root_dir = resolved.replica_root_dir,
@@ -28714,6 +28870,18 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
         }
         if (std.mem.eql(u8, arg, "--api-advertise-url")) {
             cfg.api_advertise_url = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--protected-api-host")) {
+            cfg.protected_api_bind_host = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--protected-api-port")) {
+            cfg.protected_api_bind_port = try std.fmt.parseInt(u16, args.next() orelse return error.InvalidArguments, 10);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--protected-api-advertise-url")) {
+            cfg.protected_api_advertise_url = args.next() orelse return error.InvalidArguments;
             continue;
         }
         if (std.mem.eql(u8, arg, "--raft-host")) {
@@ -29090,6 +29258,9 @@ fn printUsage(argv0: []const u8) void {
         \\  --api-host <host>              Data API bind host (default: 127.0.0.1)
         \\  --api-port <port>              Data API bind port (default: 0)
         \\  --api-advertise-url <url>      Data API URL registered with metadata (default: listener URL)
+        \\  --protected-api-host <host>    Trusted internal HTTP bind host (requires port and URL)
+        \\  --protected-api-port <port>    Trusted internal HTTP bind port (nonzero)
+        \\  --protected-api-advertise-url <url>  Internal HTTP URL registered with metadata
         \\  --raft-host <host>             Data raft bind host (default: 127.0.0.1)
         \\  --raft-port <port>             Data raft bind port (default: 0 when registered)
         \\  --raft-advertise-url <url>     Data raft URL registered with metadata (default: listener URL)
@@ -42113,7 +42284,7 @@ fn consumerTests() type {
             defer source.deinit();
             var stores = [_]antfly.metadata.StoreRecord{
                 .{ .store_id = 10, .node_id = 1, .api_url = "http://old", .role = "data", .health_class = "healthy", .live = true },
-                .{ .store_id = 20, .node_id = 2, .api_url = "http://new", .role = "data", .health_class = "healthy", .live = true },
+                .{ .store_id = 20, .node_id = 2, .api_url = "http://new", .internal_api_url = "http://new-internal", .role = "data", .health_class = "healthy", .live = true },
                 .{ .store_id = 30, .node_id = 3, .api_url = "http://dead", .role = "data", .health_class = "healthy", .live = false },
             };
             var intents = [_]antfly.raft.PlacementIntent{
@@ -42167,6 +42338,9 @@ fn consumerTests() type {
             defer route.deinit(alloc);
             try std.testing.expectEqualStrings("http://new", route.remote.base_uri);
             try std.testing.expectEqual(@as(u64, 2), route.remote.node_id);
+            try std.testing.expectEqualStrings("http://new-internal", recoveryStatusEndpoint(stores[1]).?);
+            try std.testing.expectEqualStrings("http://old", recoveryStatusEndpoint(stores[0]).?);
+            try std.testing.expect(recoveryStatusEndpoint(.{ .store_id = 40, .node_id = 4 }) == null);
 
             statuses[0].leader_store_id = 30;
             const failed_leader = try ControlReadGeneration.create(alloc, snapshot);
@@ -42208,6 +42382,111 @@ fn consumerTests() type {
             try std.testing.expectError(error.Timeout, source.statusSource().acquireJoinPlanning(.{ .clock = .{ .deadline_ns = 0 } }));
             var cancelled = std.atomic.Value(bool).init(true);
             try std.testing.expectError(error.Cancelled, source.statusSource().acquireJoinPlanning(.{ .cancellation = .fromAtomic(&cancelled) }));
+        }
+
+        test "protected data listener authenticates recovery status while public socket is saturated" {
+            if (@import("builtin").os.tag == .windows or @import("builtin").os.tag == .freestanding) return;
+            const alloc = std.testing.allocator;
+            const secret = "protected-data-listener-test-secret-0123456789";
+            const issuer = "protected-data-listener-test";
+            const Metadata = struct {
+                fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+                    return .{ .metadata_group_id = 1, .metrics = .{} };
+                }
+            };
+            var api_server = antfly.public_api.http_server.ApiHttpServer.init(alloc, .{
+                .internal_service_secret = secret,
+                .internal_service_issuer = issuer,
+            }, .{ .ptr = undefined, .vtable = &.{ .status = Metadata.status } }, null, null);
+            defer api_server.deinit();
+            var backend = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
+            defer backend.deinit();
+            try std.testing.expectError(error.InvalidProtectedHttpEndpoint, DataProtectedHttpRuntime.start(alloc, backend.ptr(), .{
+                .bind_host = "127.0.0.1",
+                .bind_port = 7411,
+                .advertise_url = "https://data.internal:7411",
+            }, &api_server));
+            try std.testing.expectError(error.InvalidProtectedHttpEndpoint, DataProtectedHttpRuntime.start(alloc, backend.ptr(), .{
+                .bind_host = "127.0.0.1",
+                .bind_port = 7411,
+                .advertise_url = "http://data.internal:7412",
+            }, &api_server));
+            const protected = try DataProtectedHttpRuntime.start(alloc, backend.ptr(), .{
+                .bind_host = "127.0.0.1",
+                .bind_port = 0,
+                .advertise_url = "http://127.0.0.1:1",
+            }, &api_server);
+            defer protected.deinitWithDeadline(antfly.common.runtime_lifecycle.ShutdownDeadline.afterMilliseconds(5_000));
+
+            var public_io = std.Io.Threaded.init(alloc, .{});
+            defer public_io.deinit();
+            var client_io = std.Io.Threaded.init(alloc, .{});
+            defer client_io.deinit();
+            var public_server = httpx.Server.initWithConfig(alloc, public_io.io(), .{
+                .host = "127.0.0.1",
+                .port = 0,
+                .max_connections = 1,
+                .max_request_tasks = 1,
+                .header_read_timeout_ms = 5_000,
+                .h1_disconnect_cancellation = .disabled,
+            });
+            defer public_server.deinit();
+            var public_task = httpx.ListenerTask.init(&public_server);
+            try public_task.start();
+            defer {
+                public_task.requestStop();
+                public_task.join() catch {};
+            }
+            const io = client_io.io();
+            var stalled = try httpx.Socket.connect(public_server.boundAddress().?, io);
+            defer stalled.close();
+            try stalled.sendAll("GET /slow HTTP/1.1\r\nHost: test\r\n");
+            for (0..5_000) |_| {
+                if (public_server.runtimeStats().active_connections == 1) break;
+                io.sleep(.fromMilliseconds(1), .awake) catch {};
+            }
+            try std.testing.expectEqual(@as(usize, 1), public_server.runtimeStats().active_connections);
+            try std.testing.expect(public_server.waiting_for_connection_permit.load(.acquire));
+
+            const address = protected.server.boundAddress() orelse return error.TestUnexpectedResult;
+            const path = "/internal/v1/groups/1/tables/docs/txn-status";
+            var denied = try httpx.Socket.connect(address, io);
+            defer denied.close();
+            try denied.setRecvTimeout(5_000);
+            try denied.sendAll("POST " ++ path ++ " HTTP/1.1\r\nHost: test\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+            var response: [2048]u8 = undefined;
+            const denied_len = try denied.recv(&response);
+            try std.testing.expect(std.mem.indexOf(u8, response[0..denied_len], " 401 ") != null);
+
+            const token = try @import("../api/internal_service_auth.zig").tokenAlloc(alloc, .{
+                .secret = secret,
+                .issuer = issuer,
+                .subject = "node:7",
+            }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+            defer alloc.free(token);
+            const request = try std.fmt.allocPrint(
+                alloc,
+                "POST {s} HTTP/1.1\r\nHost: test\r\nX-Antfly-Trusted-Principal: {s}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}",
+                .{ path, token },
+            );
+            defer alloc.free(request);
+            var admitted = try httpx.Socket.connect(address, io);
+            defer admitted.close();
+            try admitted.setRecvTimeout(5_000);
+            try admitted.sendAll(request);
+            const admitted_len = try admitted.recv(&response);
+            // Malformed status body reaches the recovery handler only after
+            // service authentication; no DATA group is needed for this proof.
+            try std.testing.expect(std.mem.indexOf(u8, response[0..admitted_len], " 400 ") != null);
+
+            public_task.shutdown(1_000);
+            try public_task.join();
+            var after_public_shutdown = try httpx.Socket.connect(address, io);
+            defer after_public_shutdown.close();
+            try after_public_shutdown.setRecvTimeout(5_000);
+            try after_public_shutdown.sendAll(request);
+            const after_len = try after_public_shutdown.recv(&response);
+            try std.testing.expect(std.mem.indexOf(u8, response[0..after_len], " 400 ") != null);
         }
 
         const SnapshotDeadlineTest = struct {

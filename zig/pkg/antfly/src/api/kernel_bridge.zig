@@ -30,6 +30,19 @@ const backend_erased = @import("../storage/backend_erased.zig");
 const ha_http_operation = @import("../storage/hot_standby/http_operation.zig");
 const httpx = @import("httpx");
 const internal_routes = @import("../internal/routes.zig");
+const api_routes = @import("http_routes.zig").Routes;
+
+fn protectedRecoveryRoute(method: anytype, path: []const u8) bool {
+    if (method != .post) return false;
+    const table_prefix = api_routes.internal_groups_prefix ++ ":group_id/tables/:table_name";
+    return std.mem.eql(u8, path, api_routes.workload_attempt_control) or
+        std.mem.eql(u8, path, table_prefix ++ api_routes.txn_resolve_suffix) or
+        std.mem.eql(u8, path, table_prefix ++ api_routes.txn_decide_suffix) or
+        std.mem.eql(u8, path, table_prefix ++ api_routes.txn_resolve_recovery_suffix) or
+        std.mem.eql(u8, path, table_prefix ++ api_routes.txn_acknowledge_recovery_suffix) or
+        std.mem.eql(u8, path, table_prefix ++ api_routes.txn_status_suffix) or
+        std.mem.eql(u8, path, table_prefix ++ api_routes.txn_acknowledge_suffix);
+}
 
 const CreateContext = abi.CreateContext;
 const CallContext = abi.CallContext;
@@ -378,6 +391,7 @@ const OpaqueHttpxHandler = struct {
         all,
         all_without_probes,
         generated_with_probes,
+        protected_recovery,
     };
 
     handle: *anyopaque,
@@ -385,6 +399,7 @@ const OpaqueHttpxHandler = struct {
     alloc: ?std.mem.Allocator = null,
     runtime_routes: std.ArrayListUnmanaged(*RuntimeRoute) = .empty,
     boundary_allocator: ?*BoundaryAllocator = null,
+    protected_recovery_auth_configured: bool = false,
 
     pub fn initRuntime(self: *OpaqueHttpxHandler, alloc: std.mem.Allocator) !void {
         try callFallible(void, void, self.functions.handler_init, self.handle, null, null);
@@ -405,6 +420,12 @@ const OpaqueHttpxHandler = struct {
 
     pub fn registerGeneratedRoutesWithProbes(self: *OpaqueHttpxHandler, server: *httpx.Server) !void {
         return self.registerRoutesWithOptions(server, .generated_with_probes);
+    }
+
+    pub fn registerProtectedRecoveryRoutes(self: *OpaqueHttpxHandler, server: *httpx.Server) !void {
+        if (!self.protected_recovery_auth_configured) return error.InternalServiceAuthenticationRequired;
+        try self.installHostInternalServiceAuth(server);
+        return self.registerRoutesWithOptions(server, .protected_recovery);
     }
 
     fn installHostInternalServiceAuth(self: *OpaqueHttpxHandler, server: *httpx.Server) !void {
@@ -495,7 +516,7 @@ const OpaqueHttpxHandler = struct {
         if (!abi.validFunctionTable(self.functions, abi.Capability.route_manifest)) return error.UnsupportedVersion;
         if (self.runtime_routes.items.len != 0) return error.RoutesAlreadyRegistered;
         const alloc = self.alloc orelse return error.ApiKernelNotInitialized;
-        try self.configureTransportIngress(server);
+        if (selection != .protected_recovery) try self.configureTransportIngress(server);
         var entries_ptr: ?[*]const abi.RouteManifestEntry = null;
         var entries_len: usize = 0;
         try callError(self.functions.handler_route_manifest(&.{
@@ -516,6 +537,7 @@ const OpaqueHttpxHandler = struct {
                 .all => {},
                 .all_without_probes => if (is_probe) continue,
                 .generated_with_probes => if (!is_generated and !is_probe) continue,
+                .protected_recovery => if (!protectedRecoveryRoute(entry.method, path)) continue,
             }
             const route = try alloc.create(RuntimeRoute);
             errdefer alloc.destroy(route);
@@ -699,6 +721,11 @@ pub fn createHandler(server: *ApiHttpServer) !HttpxHandler {
         .handle = owned_handle,
         .functions = server.functions,
         .boundary_allocator = server.boundary_allocator,
+        .protected_recovery_auth_configured = blk: {
+            const secret = server.cfg.internal_service_secret orelse break :blk false;
+            const issuer = server.cfg.internal_service_issuer orelse break :blk false;
+            break :blk secret.len != 0 and issuer.len != 0 and !server.cfg.internal_service_accept_legacy_unauthenticated;
+        },
     };
 }
 

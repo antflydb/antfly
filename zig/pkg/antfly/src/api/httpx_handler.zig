@@ -688,6 +688,26 @@ pub const AntflyApiHandler = struct {
         return self.registerRoutesWithOptions(server, true, false);
     }
 
+    /// A separately bound, trusted transport may expose only the bounded
+    /// recovery/control surface. It must never inherit the public route tree
+    /// or the rolling-upgrade unauthenticated service-credential exception.
+    pub fn registerProtectedRecoveryRoutes(self: *AntflyApiHandler, server: *httpx.Server) !void {
+        const secret = self.api_server.cfg.internal_service_secret orelse return error.InternalServiceAuthenticationRequired;
+        const issuer = self.api_server.cfg.internal_service_issuer orelse return error.InternalServiceAuthenticationRequired;
+        if (secret.len == 0 or issuer.len == 0 or self.api_server.cfg.internal_service_accept_legacy_unauthenticated)
+            return error.InternalServiceAuthenticationRequired;
+        try self.installCommonMiddleware(server);
+        const group_prefix = routes.internal_groups_prefix ++ ":group_id";
+        const table_prefix = group_prefix ++ "/tables/:table_name";
+        try server.post(routes.workload_attempt_control, httpx.Handler.bind(self, internalWorkloadControl));
+        try server.post(table_prefix ++ routes.txn_resolve_suffix, httpx.Handler.bind(self, internalTxnResolve));
+        try server.post(table_prefix ++ routes.txn_decide_suffix, httpx.Handler.bind(self, internalTxnDecide));
+        try server.post(table_prefix ++ routes.txn_resolve_recovery_suffix, httpx.Handler.bind(self, internalTxnResolveRecovery));
+        try server.post(table_prefix ++ routes.txn_acknowledge_recovery_suffix, httpx.Handler.bind(self, internalTxnAcknowledgeRecovery));
+        try server.post(table_prefix ++ routes.txn_status_suffix, httpx.Handler.bind(self, internalTxnStatus));
+        try server.post(table_prefix ++ routes.txn_acknowledge_suffix, httpx.Handler.bind(self, internalTxnAcknowledge));
+    }
+
     /// Metadata owns a distinct administration surface and must not expose
     /// data-node protocol or internal-group routes on its admin listener.
     pub fn registerGeneratedRoutesWithProbes(self: *AntflyApiHandler, server: *httpx.Server) !void {
@@ -910,6 +930,10 @@ pub const AntflyApiHandler = struct {
 
     fn installMiddleware(self: *AntflyApiHandler, server: *httpx.Server) !void {
         try self.configureTransportIngress(server);
+        try self.installCommonMiddleware(server);
+    }
+
+    fn installCommonMiddleware(self: *AntflyApiHandler, server: *httpx.Server) !void {
         try server.useFirst(httpx.Middleware.bind("antfly-workload-ingress", self, enforceIngress));
         try server.use(httpx.Middleware.bind("antfly-request-stats", self, recordRequest));
         try server.use(httpx.Middleware.bind("antfly-internal-service-auth", self, enforceInternalServiceAuth));
@@ -8968,6 +8992,32 @@ const AuthStatusSource = struct {
         };
     }
 };
+
+test "protected recovery registrar excludes public routes and refuses legacy service auth" {
+    const alloc = std.testing.allocator;
+    var status: AuthStatusSource = .{};
+    var api_server = ApiHttpServer.init(alloc, .{
+        .internal_service_secret = "p" ** 32,
+        .internal_service_issuer = "cluster",
+    }, status.iface(), null, null);
+    defer api_server.deinit();
+    var handler: AntflyApiHandler = .{ .api_server = &api_server };
+    var transport = httpx.Server.initWithConfig(alloc, std.testing.io, .{ .max_connections = 2, .max_request_tasks = 2 });
+    defer transport.deinit();
+    try handler.registerProtectedRecoveryRoutes(&transport);
+
+    var params: [16]httpx.RouteParam = undefined;
+    try std.testing.expect(transport.router.find(.POST, routes.workload_attempt_control, &params) != null);
+    try std.testing.expect(transport.router.find(.POST, "/internal/v1/groups/7/tables/docs/txn-resolve-v2", &params) != null);
+    try std.testing.expect(transport.router.find(.GET, routes.healthz, &params) == null);
+    try std.testing.expect(transport.router.find(.GET, "/db/v1/tables", &params) == null);
+    try std.testing.expect(transport.router.find(.POST, "/internal/v1/groups/7/tables/docs/batch", &params) == null);
+
+    api_server.cfg.internal_service_accept_legacy_unauthenticated = true;
+    var legacy_transport = httpx.Server.initWithConfig(alloc, std.testing.io, .{ .max_connections = 2 });
+    defer legacy_transport.deinit();
+    try std.testing.expectError(error.InternalServiceAuthenticationRequired, handler.registerProtectedRecoveryRoutes(&legacy_transport));
+}
 
 test "workload admission authenticated service identity reaches internal context and opt in fails closed" {
     const alloc = std.testing.allocator;
