@@ -265,13 +265,17 @@ pub const ParticipantWorker = struct {
 
     pub fn statusGroupWithRequest(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnStatusRequest, deadline_ns: ?u64) !db_mod.types.TxnStatus {
         try validateRestorePlan(req.restore_staging_scope, req.restore_staging_plan_id);
-        if (deadline_ns) |deadline| try ensureDecisionRecoveryDeadline(deadline);
+        const effective_deadline_ns: ?u64 = if (self.recovery_deadline_ns) |recovery_deadline|
+            if (deadline_ns) |request_deadline| @min(recovery_deadline, request_deadline) else recovery_deadline
+        else
+            deadline_ns;
+        if (effective_deadline_ns) |deadline| try ensureDecisionRecoveryDeadline(deadline);
         if (req.restore_staging_scope != null) {
             if (req.restore_staging_plan_id == null) return error.InvalidTxnRequest;
             const callback = self.vtable.status_group_scoped orelse return error.CommitDecisionUnknown;
-            return callback(self.ptr, alloc, group_id, table_name, req, deadline_ns);
+            return callback(self.ptr, alloc, group_id, table_name, req, effective_deadline_ns);
         }
-        return if (deadline_ns) |deadline| self.statusGroupUntil(alloc, group_id, table_name, req.txn_id, deadline) else self.statusGroup(alloc, group_id, table_name, req.txn_id);
+        return if (effective_deadline_ns) |deadline| self.statusGroupUntil(alloc, group_id, table_name, req.txn_id, deadline) else self.statusGroup(alloc, group_id, table_name, req.txn_id);
     }
 
     pub fn resolveGroupUntil(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest, deadline_ns: u64) !void {
@@ -2416,6 +2420,8 @@ pub fn resolveParticipant(
 ) !void {
     const ref = parseParticipantRef(participant) orelse return error.InvalidParticipant;
     try worker.startRecovery().resolveGroup(alloc, ref.group_id, ref.table_name, .{
+        .restore_staging_scope = ref.restore_staging_scope,
+        .restore_staging_plan_id = ref.restore_staging_plan_id,
         .txn_id = txn_id,
         .status = status,
         .commit_version = commit_version,
@@ -5539,6 +5545,63 @@ fn consumerTests() type {
             try std.testing.expect(second.propagation_pending);
             try std.testing.expectEqual(@as(usize, 1), committed.resolves);
             try std.testing.expectEqual(@as(usize, 1), committed.acks);
+        }
+
+        test "distributed txn recovery status requests keep the worker deadline" {
+            const Recorder = struct {
+                bounded_calls: usize = 0,
+                scoped_calls: usize = 0,
+                last_deadline_ns: ?u64 = null,
+
+                fn begin(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnBeginRequest) !void {}
+                fn prepare(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest) !void {}
+                fn resolve(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnResolveRequest) !void {}
+                fn legacy(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
+                    return error.UnexpectedLegacyCall;
+                }
+                fn bounded(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, deadline_ns: u64) !db_mod.types.TxnStatus {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.bounded_calls += 1;
+                    self.last_deadline_ns = deadline_ns;
+                    return .pending;
+                }
+                fn scoped(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnStatusRequest, deadline_ns: ?u64) !db_mod.types.TxnStatus {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.scoped_calls += 1;
+                    self.last_deadline_ns = deadline_ns;
+                    return .pending;
+                }
+            };
+            var recorder: Recorder = .{};
+            const id = try parseTxnIdHex("abcdefabcdefabcdefabcdefabcdefab");
+            const worker: ParticipantWorker = .{ .ptr = &recorder, .recovery_timeout_ns = std.time.ns_per_s, .vtable = &.{
+                .begin_group = Recorder.begin,
+                .prepare_group = Recorder.prepare,
+                .resolve_group = Recorder.resolve,
+                .status_group = Recorder.legacy,
+                .status_group_until = Recorder.bounded,
+                .status_group_scoped = Recorder.scoped,
+            } };
+            const recovery = worker.startRecovery();
+            const recovery_deadline = recovery.recovery_deadline_ns.?;
+            try std.testing.expectEqual(db_mod.types.TxnStatus.pending, try recovery.statusGroupWithRequest(std.testing.allocator, 1, "docs", .{ .txn_id = id }, null));
+            try std.testing.expectEqual(recovery_deadline, recorder.last_deadline_ns.?);
+            try std.testing.expectEqual(@as(usize, 1), recorder.bounded_calls);
+
+            const shorter_deadline = recovery_deadline - std.time.ns_per_ms;
+            try std.testing.expectEqual(db_mod.types.TxnStatus.pending, try recovery.statusGroupWithRequest(std.testing.allocator, 1, "docs", .{ .txn_id = id }, shorter_deadline));
+            try std.testing.expectEqual(shorter_deadline, recorder.last_deadline_ns.?);
+            const scoped_req: TxnStatusRequest = .{ .txn_id = id, .restore_staging_scope = [_]u8{1} ** 32, .restore_staging_plan_id = [_]u8{1} ** 16 };
+            try std.testing.expectEqual(db_mod.types.TxnStatus.pending, try recovery.statusGroupWithRequest(std.testing.allocator, 1, "docs", scoped_req, null));
+            try std.testing.expectEqual(recovery_deadline, recorder.last_deadline_ns.?);
+            try std.testing.expectEqual(@as(usize, 1), recorder.scoped_calls);
+
+            var expired = recovery;
+            expired.recovery_deadline_ns = 0;
+            try std.testing.expectError(error.CommitDecisionUnknown, expired.statusGroupWithRequest(std.testing.allocator, 1, "docs", .{ .txn_id = id }, null));
+            try std.testing.expectError(error.CommitDecisionUnknown, expired.statusGroupWithRequest(std.testing.allocator, 1, "docs", scoped_req, null));
+            try std.testing.expectEqual(@as(usize, 2), recorder.bounded_calls);
+            try std.testing.expectEqual(@as(usize, 1), recorder.scoped_calls);
         }
 
         test "transaction recovery retains shutdown cancellation and rejects unbounded fallback" {

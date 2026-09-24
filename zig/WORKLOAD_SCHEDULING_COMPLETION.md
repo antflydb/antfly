@@ -20,6 +20,30 @@ this requested implementation/correctness scope.
 
 ## Current work
 
+- Native restart now fails closed on any published or interrupted transaction
+  control guard before ordinary WAL replay, including when a completion pool is
+  configured. BEGIN guard validation binds the accepted index and term to the
+  canonical envelope. The owning durable-completion gate passed 42/42 tests,
+  including an actual native reopen with corrupt and pending control guards.
+  This is a restoration fence, not restoration of control obligations; items
+  1–3 remain open.
+- Commit completion and required cleanup now have separate fixed executor
+  reservations within the previous eight protected workers. The focused
+  background-runtime tests passed 2/2, including cleanup saturation while a
+  commit job completes. Nested I/O, memory, storage, connections, and combined
+  process pressure remain open for item 6.
+- Python synchronous and TypeScript streamed query responses now retain the
+  original deadline during body consumption; late chunks are rejected and the
+  underlying stream is closed or canceled. Python SDK passed 258 tests and the
+  TypeScript SDK passed 382 tests with one existing skip. A synchronous Python
+  transport read remains noninterruptible until that read returns.
+- Distributed recovery status requests use the earlier of the worker recovery
+  deadline and an explicit request deadline, including scoped restore probes.
+  Replayed scoped participants also carry their parsed restore scope and plan
+  into the resolution request. The new bounded-status test and existing scoped
+  LSM-reopen test passed. The broader API transaction step passed 89/92 tests;
+  unrelated metadata retirement, native read-index absence, and stable retry
+  tests failed and require separate triage. Item 8 remains open.
 - Item 6: durable maintenance and mandatory commit/cleanup jobs now use
   separate `BackendRuntime` executors. The fixed default budget allocates
   40 maintenance workers and 8 protected workers within the existing 252-worker
