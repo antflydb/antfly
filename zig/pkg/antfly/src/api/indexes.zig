@@ -397,14 +397,21 @@ pub fn encodeArtifactEnrichmentList(
     const parsed = try std.json.parseFromSlice(std.json.Value, scratch, encoded, .{});
     const artifacts = parsed.value.object.getPtr("artifacts").?;
     for (artifacts.array.items) |*artifact| {
-        const legacy = artifact.object.get("chunker_json") orelse continue;
-        if (legacy != .string or legacy.string.len == 0) continue;
-        const chunker = std.json.parseFromSlice(std.json.Value, scratch, legacy.string, .{}) catch continue;
-        if (chunker.value != .object) continue;
-        var filtered = std.ArrayListUnmanaged(u8).empty;
-        try appendPublicConfigValue(scratch, &filtered, chunker.value, null, .chunker);
-        const public_chunker = try std.json.parseFromSlice(std.json.Value, scratch, filtered.items, .{});
-        try artifact.object.put(scratch, "chunker", public_chunker.value);
+        if (artifact.object.get("chunker_json")) |legacy| {
+            if (legacy == .string and legacy.string.len > 0) {
+                const chunker = std.json.parseFromSlice(std.json.Value, scratch, legacy.string, .{}) catch null;
+                if (chunker) |parsed_chunker| {
+                    if (parsed_chunker.value == .object) try artifact.object.put(scratch, "chunker", parsed_chunker.value);
+                }
+            }
+        }
+        // Internal configs carry opaque write-only producer documents. Project
+        // every list item through the same positive contract as index reads.
+        var public = std.ArrayListUnmanaged(u8).empty;
+        try appendPublicConfigValue(scratch, &public, artifact.*, null, .enrichment);
+        var projected = try std.json.parseFromSlice(std.json.Value, scratch, public.items, .{});
+        _ = projected.value.object.orderedRemove("chunker_json");
+        artifact.* = projected.value;
     }
     return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
 }
@@ -750,9 +757,17 @@ pub fn collectArtifactEnrichmentsFromValueWithOptions(
                     var owned = try db_mod.types.EnrichmentConfig.clone(alloc, parsed.value);
                     errdefer owned.deinit(alloc);
                     if (item.object.get("chunker")) |chunker| {
-                        if (owned.kind != .chunk or chunker != .object or item.object.get("chunker_json") != null)
+                        const legacy_chunker = item.object.get("chunker_json");
+                        if (owned.kind != .chunk or chunker != .object or (legacy_chunker != null and legacy_chunker.? != .null))
                             return error.InvalidEnrichmentConfig;
                         owned.chunker_json = try document_content_hash.canonicalJsonValueAlloc(alloc, chunker);
+                    }
+                    if (item.object.get("producer")) |producer| {
+                        const legacy_producer = item.object.get("producer_json");
+                        const transcriber = item.object.get("transcriber");
+                        if (producer != .object or (legacy_producer != null and legacy_producer.? != .null) or (transcriber != null and transcriber.? != .null))
+                            return error.InvalidEnrichmentConfig;
+                        owned.producer_json = try document_content_hash.canonicalJsonValueAlloc(alloc, producer);
                     }
                     if (item.object.get("transcriber")) |transcriber| {
                         // The typed shorthand replaces producer_json rather
@@ -1512,6 +1527,19 @@ fn appendPublicConfigValue(
             var first = true;
             var it = object.iterator();
             while (it.next()) |entry| {
+                if (object_shape == .graph_resolver and std.mem.eql(u8, entry.key_ptr.*, "scorer_json")) {
+                    if (object.get("scorer") != null) continue;
+                    if (entry.value_ptr.* != .string or entry.value_ptr.string.len == 0) continue;
+                    var scorer = std.json.parseFromSlice(std.json.Value, alloc, entry.value_ptr.string, .{}) catch continue;
+                    defer scorer.deinit();
+                    if (!public_index_contract.createdValueMatchesShape(.graph_scorer, scorer.value)) continue;
+                    if (!first) try out.append(alloc, ',');
+                    first = false;
+                    try appendJsonString(alloc, out, "scorer");
+                    try out.append(alloc, ':');
+                    try appendPublicConfigValue(alloc, out, scorer.value, null, .graph_scorer);
+                    continue;
+                }
                 if (!public_index_contract.isAllowedCreatedObjectField(object_shape, entry.key_ptr.*)) continue;
                 // Asset producers are intentionally opaque and may gain new
                 // provider-specific credential fields at any time. A
@@ -7779,6 +7807,9 @@ fn consumerTests() type {
             try expectCreatedObjectAllowlistCovers(indexes_openapi.GraphBoundedTraversalConfig, .graph_bounded_traversal);
             try expectCreatedObjectAllowlistCovers(indexes_openapi.EdgeTypeConfig, .edge_type);
             try expectCreatedObjectAllowlistCovers(indexes_openapi.GraphResolverConfig, .graph_resolver);
+            try expectCreatedObjectAllowlistCovers(indexes_openapi.GraphResolverScorerConfig, .graph_scorer);
+            try expectCreatedObjectAllowlistCovers(indexes_openapi.GraphResolverScorerComparison, .graph_scorer_comparison);
+            try expectCreatedObjectAllowlistCovers(indexes_openapi.GraphResolverScorerLevel, .graph_scorer_level);
             try expectCreatedObjectAllowlistCovers(chunking_openapi.ChunkerConfig, .chunker);
             try expectCreatedObjectAllowlistCovers(chunking_api_openapi.TextChunkOptions, .chunker_text);
             try expectCreatedObjectAllowlistCovers(chunking_api_openapi.AudioChunkOptions, .chunker_audio);
@@ -11013,4 +11044,17 @@ test "artifact enrichment accepts typed chunker and rejects ambiguous legacy con
         \\{"enrichments":[{"name":"chunks","kind":"chunk","field":"body","chunker":{"provider":"antfly"},"chunker_json":"{}"}]}
     ;
     try std.testing.expectError(error.InvalidEnrichmentConfig, validateArtifactEnrichmentsForTableIndexesJson(alloc, both));
+}
+
+test "artifact enrichment list does not expose internal JSON or producer credentials" {
+    const alloc = std.testing.allocator;
+    const indexes_json =
+        \\{"enrichments":[{"name":"asset","kind":"asset","field":"url","producer_json":"{\"type\":\"document_extraction\",\"config\":{\"api_key\":\"private-token\"}}"},{"name":"chunks","kind":"chunk","field":"body","chunker_json":"{\"provider\":\"antfly\",\"model\":\"fixed\"}"}]}
+    ;
+    const listed = try encodeArtifactEnrichmentList(alloc, "docs", indexes_json);
+    defer alloc.free(listed);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "private-token") == null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "producer_json") == null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "chunker_json") == null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "\"chunker\":{") != null);
 }

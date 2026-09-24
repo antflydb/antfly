@@ -23475,10 +23475,17 @@ components:
           x-go-type-skip-optional-pointer: true
           type: string
           description: Produced asset content type for asset enrichments.
+        producer:
+          type: object
+          additionalProperties: true
+          writeOnly: true
+          description: Write-only producer configuration. Cannot be combined with producer_json or transcriber.
         producer_json:
           x-go-type-skip-optional-pointer: true
           type: string
           writeOnly: true
+          deprecated: true
+          x-deprecated-reason: Use the producer field.
           description: Write-only serialized producer configuration. For managed embedding enrichments
             Antfly stores a canonical semantic producer identity here; credentials and execution policy
             are excluded.
@@ -24289,10 +24296,17 @@ components:
           type: string
         execution:
           $ref: '#/components/schemas/ExecutionPolicy'
+        producer:
+          type: object
+          additionalProperties: true
+          writeOnly: true
+          description: Write-only producer configuration. Cannot be combined with producer_json.
         producer_json:
           type: object
           additionalProperties: true
           writeOnly: true
+          deprecated: true
+          x-deprecated-reason: Use the producer field.
           description: Write-only producer configuration; it may contain credentials and is never returned.
     GraphBoundedTraversalConfig:
       type: object
@@ -24312,6 +24326,67 @@ components:
       properties:
         bounded_traversal:
           $ref: '#/components/schemas/GraphBoundedTraversalConfig'
+    GraphResolverScorerLevel:
+      type: object
+      required:
+        - weight
+      additionalProperties: false
+      properties:
+        when:
+          type: string
+          description: Matcher condition, such as 'exact' or 'jaro_winkler >= 0.9'.
+        else:
+          type: boolean
+          description: Catch-all level when no previous condition matched.
+        weight:
+          type: number
+          format: double
+    GraphResolverScorerComparison:
+      type: object
+      required:
+        - name
+        - left
+        - right
+        - levels
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+        left:
+          type: string
+        right:
+          type: string
+        levels:
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphResolverScorerLevel'
+    GraphResolverScorerConfig:
+      type: object
+      required:
+        - comparisons
+      additionalProperties: false
+      properties:
+        comparisons:
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphResolverScorerComparison'
+        combine:
+          type: object
+          additionalProperties: false
+          properties:
+            bias:
+              type: number
+              format: double
+        decision:
+          type: object
+          additionalProperties: false
+          properties:
+            match:
+              type: number
+              format: double
+            review:
+              type: number
+              format: double
     GraphResolverConfig:
       type: object
       additionalProperties: false
@@ -24352,8 +24427,13 @@ components:
         type_must_match:
           type: boolean
           default: true
+        scorer:
+          $ref: '#/components/schemas/GraphResolverScorerConfig'
+          description: Typed matcher scorer. Cannot be combined with scorer_json.
         scorer_json:
           type: string
+          deprecated: true
+          x-deprecated-reason: Use the scorer field.
         candidate_search:
           type: string
           enum:

@@ -11664,7 +11664,14 @@ export interface components {
             full_text_index?: boolean;
             /** @description Produced asset content type for asset enrichments. */
             content_type?: string;
-            /** @description Write-only serialized producer configuration. For managed embedding enrichments Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded. */
+            /** @description Write-only producer configuration. Cannot be combined with producer_json or transcriber. */
+            producer?: {
+                [key: string]: unknown;
+            };
+            /**
+             * @deprecated
+             * @description Write-only serialized producer configuration. For managed embedding enrichments Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded.
+             */
             producer_json?: string;
             /** @description Optional bounded sample of the document's graph neighbors appended to the producer input. Only valid on asset enrichments whose producer consumes rendered prompt text (generator or extractor); producers that treat the source as a media locator (copy, reader, transcriber, document_extraction) reject it. Only same-shard graph state is sampled; a graph index without local state for a document yields empty neighbors at runtime while the graph index reference itself is validated at admission. */
             neighbor_context?: components["schemas"]["EnrichmentNeighborContextConfig"];
@@ -12129,7 +12136,14 @@ export interface components {
             source: components["schemas"]["GraphArtifactProducerSourceConfig"];
             content_type?: string;
             execution?: components["schemas"]["ExecutionPolicy"];
-            /** @description Write-only producer configuration; it may contain credentials and is never returned. */
+            /** @description Write-only producer configuration. Cannot be combined with producer_json. */
+            producer?: {
+                [key: string]: unknown;
+            };
+            /**
+             * @deprecated
+             * @description Write-only producer configuration; it may contain credentials and is never returned.
+             */
             producer_json?: {
                 [key: string]: unknown;
             };
@@ -12142,6 +12156,33 @@ export interface components {
         /** @description Optional algebraic planning features for graph traversal. */
         GraphAlgebraicPlanningConfig: {
             bounded_traversal?: components["schemas"]["GraphBoundedTraversalConfig"];
+        };
+        GraphResolverScorerLevel: {
+            /** @description Matcher condition, such as 'exact' or 'jaro_winkler >= 0.9'. */
+            when?: string;
+            /** @description Catch-all level when no previous condition matched. */
+            else?: boolean;
+            /** Format: double */
+            weight: number;
+        };
+        GraphResolverScorerComparison: {
+            name: string;
+            left: string;
+            right: string;
+            levels: components["schemas"]["GraphResolverScorerLevel"][];
+        };
+        GraphResolverScorerConfig: {
+            comparisons: components["schemas"]["GraphResolverScorerComparison"][];
+            combine?: {
+                /** Format: double */
+                bias?: number;
+            };
+            decision?: {
+                /** Format: double */
+                match?: number;
+                /** Format: double */
+                review?: number;
+            };
         };
         /** @description Versioned entity resolver attached to an artifact-backed graph index. */
         GraphResolverConfig: {
@@ -12159,6 +12200,9 @@ export interface components {
             labels?: string[];
             /** @default true */
             type_must_match?: boolean;
+            /** @description Typed matcher scorer. Cannot be combined with scorer_json. */
+            scorer?: components["schemas"]["GraphResolverScorerConfig"];
+            /** @deprecated */
             scorer_json?: string;
             /** @enum {string} */
             candidate_search?: "" | "exact_key" | "prefix" | "ann";

@@ -11,6 +11,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.chunker_config import ChunkerConfig
+    from ..models.enrichment_config_producer import EnrichmentConfigProducer
     from ..models.enrichment_neighbor_context_config import EnrichmentNeighborContextConfig
     from ..models.execution_policy import ExecutionPolicy
     from ..models.transcriber_enrichment_config import TranscriberEnrichmentConfig
@@ -47,6 +48,8 @@ class EnrichmentConfig:
             full_text_index (bool | Unset): When true on a chunk or asset enrichment, route generated text into the table's
                 default full-text index. Default: False.
             content_type (str | Unset): Produced asset content type for asset enrichments.
+            producer (EnrichmentConfigProducer | Unset): Write-only producer configuration. Cannot be combined with
+                producer_json or transcriber.
             producer_json (str | Unset): Write-only serialized producer configuration. For managed embedding enrichments
                 Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded.
             neighbor_context (EnrichmentNeighborContextConfig | Unset): Bounded sample of the document's same-shard graph
@@ -91,6 +94,7 @@ class EnrichmentConfig:
     chunker_json: str | Unset = UNSET
     full_text_index: bool | Unset = False
     content_type: str | Unset = UNSET
+    producer: EnrichmentConfigProducer | Unset = UNSET
     producer_json: str | Unset = UNSET
     neighbor_context: EnrichmentNeighborContextConfig | Unset = UNSET
     execution: ExecutionPolicy | Unset = UNSET
@@ -125,6 +129,10 @@ class EnrichmentConfig:
         full_text_index = self.full_text_index
 
         content_type = self.content_type
+
+        producer: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.producer, Unset):
+            producer = self.producer.to_dict()
 
         producer_json = self.producer_json
 
@@ -170,6 +178,8 @@ class EnrichmentConfig:
             field_dict["full_text_index"] = full_text_index
         if content_type is not UNSET:
             field_dict["content_type"] = content_type
+        if producer is not UNSET:
+            field_dict["producer"] = producer
         if producer_json is not UNSET:
             field_dict["producer_json"] = producer_json
         if neighbor_context is not UNSET:
@@ -184,6 +194,7 @@ class EnrichmentConfig:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.chunker_config import ChunkerConfig
+        from ..models.enrichment_config_producer import EnrichmentConfigProducer
         from ..models.enrichment_neighbor_context_config import EnrichmentNeighborContextConfig
         from ..models.execution_policy import ExecutionPolicy
         from ..models.transcriber_enrichment_config import TranscriberEnrichmentConfig
@@ -219,6 +230,13 @@ class EnrichmentConfig:
         full_text_index = d.pop("full_text_index", UNSET)
 
         content_type = d.pop("content_type", UNSET)
+
+        _producer = d.pop("producer", UNSET)
+        producer: EnrichmentConfigProducer | Unset
+        if isinstance(_producer, Unset):
+            producer = UNSET
+        else:
+            producer = EnrichmentConfigProducer.from_dict(_producer)
 
         producer_json = d.pop("producer_json", UNSET)
 
@@ -257,6 +275,7 @@ class EnrichmentConfig:
             chunker_json=chunker_json,
             full_text_index=full_text_index,
             content_type=content_type,
+            producer=producer,
             producer_json=producer_json,
             neighbor_context=neighbor_context,
             execution=execution,

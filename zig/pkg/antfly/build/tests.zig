@@ -1509,6 +1509,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const api_http_runtime_default_filters = [_][]const u8{
         "artifact enrichment accepts typed chunker and rejects ambiguous legacy config",
+        "artifact enrichment list does not expose internal JSON or producer credentials",
+        "typed enrichment producer and graph scorer normalize to legacy storage fields",
         "created nested response allowlists cover generated schemas",
         "staged restore published metadata wins cancellation only after every owner opens",
         "staged restore worker publishes a dependency complete mixed native cohort",
