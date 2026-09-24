@@ -685,11 +685,12 @@ export function RuntimeClient({
         <ScrollyChapter id="http" number={1} title="A request arrives">
           <Scene id="doors" graphic={<HttpDoorsFigure />}>
             <p>
-              Four doors into one hall. <code>generateEmbeddings</code>, <code>rerankDocuments</code>,{" "}
-              <code>generateContent</code>, and <code>chatCompletions</code> are four handlers on
-              the same inference server. Extraction also has its own handler. Request parsing, model
-              resolution, and resource admission precede task-specific pipelines; a common server
-              does not imply an identical execution path.
+              Four doors into one hall. <code>generateEmbeddings</code>,{" "}
+              <code>rerankDocuments</code>, <code>generateContent</code>, and{" "}
+              <code>chatCompletions</code> are four handlers on the same inference server.
+              Extraction also has its own handler. Request parsing, model resolution, and resource
+              admission precede task-specific pipelines; a common server does not imply an identical
+              execution path.
             </p>
             <p>
               <CodeLink link={L("server-embeddings")} /> · <CodeLink link={L("server-rerank")} /> ·{" "}
