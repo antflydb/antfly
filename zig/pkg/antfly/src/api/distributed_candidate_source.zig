@@ -93,7 +93,7 @@ pub const DistributedCandidateSource = struct {
         }
         fn getMany(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, keys: []const []const u8, ctx: *anyopaque, consume: CandidateSource.Consume) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            return getManyFn(&self.raw, alloc, (try self.resolve(table)) orelse return error.TableNotFound, keys, ctx, consume);
+            return getManyFn(&self.raw, alloc, (try boundTable(ptr, table)) orelse return error.TableNotFound, keys, ctx, consume);
         }
         fn scan(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, prefix: []const u8, opts: CandidateSource.ScanOptions, ctx: *anyopaque, consume: CandidateSource.Consume) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -590,6 +590,12 @@ test "DistributedCandidateSource pins a curated endpoint outside the candidate t
     defer alloc.free(doc);
     try @import("antfly-json").testing.expectSubsetJsonText(alloc, "{\"canonical_name\":\"One\"}", doc);
     binding.external = "table:new";
+    var collected = CollectCtx{ .alloc = alloc };
+    defer collected.deinit();
+    try batch.source.vtable.get_many.?(batch.source.ptr, alloc, "events", &.{"event:one"}, &collected, CollectCtx.consume);
+    try testing.expectEqual(@as(usize, 1), fake.point_query_calls);
+    try testing.expectEqual(@as(usize, 1), collected.keys.items.len);
+    try @import("antfly-json").testing.expectSubsetJsonText(alloc, "{\"canonical_name\":\"One\"}", collected.values.items[0]);
     try testing.expectEqualStrings("table:old", (try batch.source.boundTable("events")).?);
     try testing.expectEqual(@as(usize, 1), binding.calls);
 }

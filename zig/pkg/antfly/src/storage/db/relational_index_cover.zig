@@ -117,7 +117,7 @@ pub const Plan = struct {
         return self.appendSource(alloc, out, row, null);
     }
 
-    fn appendSource(self: *const Plan, alloc: Allocator, out: *std.ArrayList(u8), row: codec.OrdinalRowView, source: ?*const Source) !void {
+    pub fn appendSource(self: *const Plan, alloc: Allocator, out: *std.ArrayList(u8), row: codec.OrdinalRowView, source: ?*const Source) !void {
         if (row.layout != (if (source) |bound| bound.layout else self.source_layout)) return error.RelationalRowSchemaMismatch;
         if (source) |bound| if (bound.ordinals.len != self.columns.len or !std.mem.eql(u8, &bound.fingerprint, &self.fingerprint)) return error.RelationalRowSchemaMismatch;
         var cells: [288]codec.Cell = undefined;

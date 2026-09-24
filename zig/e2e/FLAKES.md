@@ -1,5 +1,33 @@
 # Zig E2E flakes
 
+## 2026-09-24: recovery shard quorum stalls in run 36028793026
+
+[The recovery-1 job](https://github.com/antflydb/antfly/actions/runs/36028793026/job/107754773721)
+failed `online_fk_merge_preserves_shadow_claims_and_retained_references[snapshot-child_owner]`
+during corpus setup and `schema_rewrite_recovers_dependency_cohort[publication-coordinator]`
+during source preparation. Both retained data logs show a proposed entry one
+index above the committed/applied index at the write timeout. One leader had
+zero recorded send failures; the other had 2,335 send failures and 648 exhausted
+retries across its served groups. Metadata repeatedly reported
+`GroupLeaderUnavailable` for the data group, while one metadata node still
+served the running restore job. Its Raft WAL also recorded individual syncs
+lasting 0.3–4 seconds. These facts do not yet distinguish a follower WAL stall
+from a backed-up peer sender or a separate group route problem.
+
+The unchanged cases passed 8/8 on two local workers and two repetitions;
+the first case took 4.6–5 minutes per worker in the first repetition, so it
+does exercise a heavy path without reproducing the CI timeout.
+Raft leader-wait diagnostics now include voter match/activity counts and the
+async HTTP sender's pending/failure/queue-full counters. A recurrence can use
+those bounded snapshots to decide whether to change transport scheduling or
+persistence. The sender also coalesces obsolete queued context-free heartbeats
+for the same peer and group set, so they cannot indefinitely fill a per-peer
+FIFO ahead of append traffic while a slow request is in flight. Heartbeats
+carrying read-index context, heartbeat responses, votes, append, and snapshots
+are retained. This addresses a bounded-queue pressure mechanism but does not
+prove it caused either CI stall; slow physical WAL sync remains a separate
+possible cause. A timeout increase is not accepted as a fix.
+
 ## 2026-09-22: #846 restore staging and #856 standby failures
 
 [Issue #846](https://github.com/antflydb/antfly/issues/846) recurred in

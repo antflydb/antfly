@@ -249,6 +249,7 @@ from .embeddings_index_stats_index_type import EmbeddingsIndexStatsIndexType
 from .embeddings_index_stats_promotion import EmbeddingsIndexStatsPromotion
 from .embeddings_index_stats_resolution import EmbeddingsIndexStatsResolution
 from .enrichment_config import EnrichmentConfig
+from .enrichment_config_producer import EnrichmentConfigProducer
 from .enrichment_kind import EnrichmentKind
 from .enrichment_neighbor_context_config import EnrichmentNeighborContextConfig
 from .enrichment_neighbor_context_config_direction import EnrichmentNeighborContextConfigDirection
@@ -487,6 +488,7 @@ from .graph_artifact_node_mapping_config import GraphArtifactNodeMappingConfig
 from .graph_artifact_node_mapping_config_model import GraphArtifactNodeMappingConfigModel
 from .graph_artifact_producer_config import GraphArtifactProducerConfig
 from .graph_artifact_producer_config_kind import GraphArtifactProducerConfigKind
+from .graph_artifact_producer_config_producer import GraphArtifactProducerConfigProducer
 from .graph_artifact_producer_config_producer_json import GraphArtifactProducerConfigProducerJson
 from .graph_artifact_producer_source_config import GraphArtifactProducerSourceConfig
 from .graph_artifact_producer_source_config_type import GraphArtifactProducerSourceConfigType
@@ -614,6 +616,11 @@ from .graph_resolver_config import GraphResolverConfig
 from .graph_resolver_config_candidate_search import GraphResolverConfigCandidateSearch
 from .graph_resolver_config_fusion_combine import GraphResolverConfigFusionCombine
 from .graph_resolver_config_source_artifact_kind import GraphResolverConfigSourceArtifactKind
+from .graph_resolver_scorer_comparison import GraphResolverScorerComparison
+from .graph_resolver_scorer_config import GraphResolverScorerConfig
+from .graph_resolver_scorer_config_combine import GraphResolverScorerConfigCombine
+from .graph_resolver_scorer_config_decision import GraphResolverScorerConfigDecision
+from .graph_resolver_scorer_level import GraphResolverScorerLevel
 from .graph_result_node import GraphResultNode
 from .graph_result_node_document import GraphResultNodeDocument
 from .graph_result_node_evidence import GraphResultNodeEvidence
@@ -1533,6 +1540,7 @@ __all__ = (
     "EmbeddingType1",
     "EmbeddingType3",
     "EnrichmentConfig",
+    "EnrichmentConfigProducer",
     "EnrichmentKind",
     "EnrichmentNeighborContextConfig",
     "EnrichmentNeighborContextConfigDirection",
@@ -1765,6 +1773,7 @@ __all__ = (
     "GraphArtifactNodeMappingConfigModel",
     "GraphArtifactProducerConfig",
     "GraphArtifactProducerConfigKind",
+    "GraphArtifactProducerConfigProducer",
     "GraphArtifactProducerConfigProducerJson",
     "GraphArtifactProducerSourceConfig",
     "GraphArtifactProducerSourceConfigType",
@@ -1892,6 +1901,11 @@ __all__ = (
     "GraphResolverConfigCandidateSearch",
     "GraphResolverConfigFusionCombine",
     "GraphResolverConfigSourceArtifactKind",
+    "GraphResolverScorerComparison",
+    "GraphResolverScorerConfig",
+    "GraphResolverScorerConfigCombine",
+    "GraphResolverScorerConfigDecision",
+    "GraphResolverScorerLevel",
     "GraphResultNode",
     "GraphResultNodeDocument",
     "GraphResultNodeEvidence",

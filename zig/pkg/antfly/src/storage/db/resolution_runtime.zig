@@ -867,6 +867,11 @@ const SourceCandidateProvider = struct {
         }
     };
 
+    const RedirectBatch = struct {
+        requested: std.StringArrayHashMapUnmanaged(void) = .empty,
+        found: BatchDocuments,
+    };
+
     fn collectKeys(self: *SourceCandidateProvider, collected: *BatchDocuments, keys: []const []const u8) !void {
         if (keys.len == 0) return;
         if (self.source.vtable.get_many) |get_many| {
@@ -916,18 +921,37 @@ const SourceCandidateProvider = struct {
         // An absent destination stays absent for this work unit, including when
         // many mentions or aliases point at it.
         var redirects = std.StringArrayHashMapUnmanaged(void).empty;
+        var external_redirects = std.StringArrayHashMapUnmanaged(RedirectBatch).empty;
         var documents = collected.docs.valueIterator();
         while (documents.next()) |raw| {
             if (try jsonStringFieldAlloc(a, raw.*, "merged_into")) |key| {
                 const target_table = try jsonStringFieldAlloc(a, raw.*, "merged_into_table");
                 if ((target_table == null or std.mem.eql(u8, target_table.?, self.table)) and !collected.docs.contains(key)) {
                     try redirects.put(a, key, {});
+                } else if (target_table) |table| {
+                    if (!std.mem.eql(u8, table, self.table)) {
+                        const batch = try external_redirects.getOrPut(a, table);
+                        if (!batch.found_existing) batch.value_ptr.* = .{ .found = .{ .alloc = a } };
+                        try batch.value_ptr.requested.put(a, key, {});
+                    }
                 }
             }
         }
         collected.limit = 0;
         collected.keys = .empty;
         try self.collectKeys(&collected, redirects.keys());
+        // Fetch each external survivor once per work unit. Grouping by table
+        // keeps cross-table redirects on the bounded bulk read path too.
+        for (external_redirects.keys(), external_redirects.values()) |table, *batch| {
+            if (self.source.vtable.get_many) |get_many| {
+                try get_many(self.source.ptr, a, table, batch.requested.keys(), &batch.found, BatchDocuments.consume);
+            } else {
+                for (batch.requested.keys()) |key| {
+                    if (try self.source.get(a, table, key)) |raw|
+                        try BatchDocuments.consume(&batch.found, key, raw);
+                }
+            }
+        }
         var prepared = std.StringHashMapUnmanaged([]const resolver_lib.Candidate).empty;
         for (unique.keys()) |key| {
             var candidates = std.ArrayListUnmanaged(resolver_lib.Candidate).empty;
@@ -938,7 +962,7 @@ const SourceCandidateProvider = struct {
                     const target_table = try jsonStringFieldAlloc(a, raw, "merged_into_table");
                     const resolved_raw = if (resolved_key) |rk|
                         if (target_table) |target|
-                            if (!std.mem.eql(u8, target, self.table)) try self.source.get(a, target, rk) else collected.docs.get(rk)
+                            if (!std.mem.eql(u8, target, self.table)) external_redirects.get(target).?.found.docs.get(rk) else collected.docs.get(rk)
                         else
                             collected.docs.get(rk)
                     else
@@ -4035,18 +4059,24 @@ test "SourceCandidateProvider bulk exact keys retain duplicates missing candidat
 test "SourceCandidateProvider follows a redirect into another logical table" {
     const alloc = testing.allocator;
     const Source = struct {
-        gets: usize = 0,
-        fn get(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, key: []const u8) anyerror!?[]u8 {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.gets += 1;
-            try testing.expectEqualStrings("curated", table);
-            try testing.expectEqualStrings("person/ada", key);
-            return try a.dupe(u8, "{\"canonical_name\":\"Ada\",\"entity_type\":\"person\"}");
+        people_reads: usize = 0,
+        curated_reads: usize = 0,
+        fn get(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) anyerror!?[]u8 {
+            return error.UnexpectedSingleCandidateRead;
         }
-        fn getMany(_: *anyopaque, _: std.mem.Allocator, table: []const u8, keys: []const []const u8, ctx: *anyopaque, consume: CandidateSource.Consume) anyerror!void {
-            try testing.expectEqualStrings("people", table);
-            try testing.expectEqual(@as(usize, 1), keys.len);
-            try consume(ctx, keys[0], "{\"canonical_name\":\"Ada\",\"entity_type\":\"person\",\"merged_into\":\"person/ada\",\"merged_into_table\":\"curated\"}");
+        fn getMany(ptr: *anyopaque, _: std.mem.Allocator, table: []const u8, keys: []const []const u8, ctx: *anyopaque, consume: CandidateSource.Consume) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (std.mem.eql(u8, table, "people")) {
+                self.people_reads += 1;
+                try testing.expectEqual(@as(usize, 2), keys.len);
+                for (keys) |key| try consume(ctx, key, "{\"canonical_name\":\"Ada\",\"entity_type\":\"person\",\"merged_into\":\"person/ada\",\"merged_into_table\":\"curated\"}");
+            } else {
+                try testing.expectEqualStrings("curated", table);
+                self.curated_reads += 1;
+                try testing.expectEqual(@as(usize, 1), keys.len);
+                try testing.expectEqualStrings("person/ada", keys[0]);
+                try consume(ctx, keys[0], "{\"canonical_name\":\"Ada\",\"entity_type\":\"person\"}");
+            }
         }
     };
     var source: Source = .{};
@@ -4062,14 +4092,20 @@ test "SourceCandidateProvider follows a redirect into another logical table" {
     };
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
-    const entities = [_]resolver_lib.ExtractedEntity{.{ .local_id = "e0", .label = "person", .text = "Ada" }};
-    var lists: [1][]const resolver_lib.Candidate = undefined;
+    const entities = [_]resolver_lib.ExtractedEntity{
+        .{ .local_id = "e0", .label = "person", .text = "Ada" },
+        .{ .local_id = "e1", .label = "person", .text = "Ada Lovelace" },
+    };
+    var lists: [2][]const resolver_lib.Candidate = undefined;
     try provider.provider().candidatesForBatch(arena.allocator(), &entities, &lists);
-    try testing.expectEqual(@as(usize, 1), source.gets);
-    try testing.expectEqual(@as(usize, 1), lists[0].len);
-    try testing.expectEqualStrings("curated", lists[0][0].resolved_doc_ref.?.table);
-    try testing.expectEqualStrings("person/ada", lists[0][0].resolved_doc_ref.?.key);
-    try testing.expect(lists[0][0].resolved_record != null);
+    try testing.expectEqual(@as(usize, 1), source.people_reads);
+    try testing.expectEqual(@as(usize, 1), source.curated_reads);
+    for (lists) |list| {
+        try testing.expectEqual(@as(usize, 1), list.len);
+        try testing.expectEqualStrings("curated", list[0].resolved_doc_ref.?.table);
+        try testing.expectEqualStrings("person/ada", list[0].resolved_doc_ref.?.key);
+        try testing.expect(list[0].resolved_record != null);
+    }
 }
 
 test "SourceCandidateProvider links via an injected cross-shard exact_key source" {

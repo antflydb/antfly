@@ -6243,6 +6243,7 @@ pub const CreatedEnrichmentConfig = struct {
     vector_space: ?[]const u8 = null,
     chunk_size: ?i64 = null,
     chunk_overlap: ?i64 = null,
+    chunker: ?ChunkerConfig = null,
     chunker_json: ?[]const u8 = null,
     full_text_index: ?bool = null,
     content_type: ?[]const u8 = null,
@@ -6260,6 +6261,7 @@ pub const CreatedEnrichmentConfig = struct {
         .{ "vector_space", "vector_space", true },
         .{ "chunk_size", "chunk_size", true },
         .{ "chunk_overlap", "chunk_overlap", true },
+        .{ "chunker", "chunker", true },
         .{ "chunker_json", "chunker_json", true },
         .{ "full_text_index", "full_text_index", true },
         .{ "content_type", "content_type", true },
@@ -6307,6 +6309,10 @@ pub const CreatedEnrichmentConfig = struct {
         }
         if (self.chunk_overlap) |value| {
             try jw.objectField("chunk_overlap");
+            try jw.write(value);
+        }
+        if (self.chunker) |value| {
+            try jw.objectField("chunker");
             try jw.write(value);
         }
         if (self.chunker_json) |value| {
@@ -9962,12 +9968,16 @@ pub const EnrichmentConfig = struct {
     chunk_size: ?i64 = null,
     /// Chunk overlap for chunk enrichments.
     chunk_overlap: ?i64 = null,
-    /// Serialized chunker configuration for chunk enrichments.
+    /// Chunker configuration for chunk enrichments. Cannot be combined with chunker_json.
+    chunker: ?ChunkerConfig = null,
+    /// Legacy serialized chunker configuration for chunk enrichments. Cannot be combined with chunker.
     chunker_json: ?[]const u8 = null,
     /// When true on a chunk or asset enrichment, route generated text into the table's default full-text index.
     full_text_index: ?bool = null,
     /// Produced asset content type for asset enrichments.
     content_type: ?[]const u8 = null,
+    /// Write-only producer configuration. Cannot be combined with producer_json or transcriber.
+    producer: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Write-only serialized producer configuration. For managed embedding enrichments Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded.
     producer_json: ?[]const u8 = null,
     /// Optional bounded sample of the document's graph neighbors appended to the producer input. Only valid on asset enrichments whose producer consumes rendered prompt text (generator or extractor); producers that treat the source as a media locator (copy, reader, transcriber, document_extraction) reject it. Only same-shard graph state is sampled; a graph index without local state for a document yields empty neighbors at runtime while the graph index reference itself is validated at admission.
@@ -9988,9 +9998,11 @@ pub const EnrichmentConfig = struct {
         .{ "vector_space", "vector_space", true },
         .{ "chunk_size", "chunk_size", true },
         .{ "chunk_overlap", "chunk_overlap", true },
+        .{ "chunker", "chunker", true },
         .{ "chunker_json", "chunker_json", true },
         .{ "full_text_index", "full_text_index", true },
         .{ "content_type", "content_type", true },
+        .{ "producer", "producer", true },
         .{ "producer_json", "producer_json", true },
         .{ "neighbor_context", "neighbor_context", true },
         .{ "execution", "execution", true },
@@ -10039,6 +10051,10 @@ pub const EnrichmentConfig = struct {
             try jw.objectField("chunk_overlap");
             try jw.write(value);
         }
+        if (self.chunker) |value| {
+            try jw.objectField("chunker");
+            try jw.write(value);
+        }
         if (self.chunker_json) |value| {
             try jw.objectField("chunker_json");
             try jw.write(value);
@@ -10049,6 +10065,10 @@ pub const EnrichmentConfig = struct {
         }
         if (self.content_type) |value| {
             try jw.objectField("content_type");
+            try jw.write(value);
+        }
+        if (self.producer) |value| {
+            try jw.objectField("producer");
             try jw.write(value);
         }
         if (self.producer_json) |value| {
@@ -15514,6 +15534,8 @@ pub const GraphArtifactProducerConfig = struct {
     source: GraphArtifactProducerSourceConfig,
     content_type: ?[]const u8 = null,
     execution: ?ExecutionPolicy = null,
+    /// Write-only producer configuration. Cannot be combined with producer_json.
+    producer: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Write-only producer configuration; it may contain credentials and is never returned.
     producer_json: ?std.json.ArrayHashMap(std.json.Value) = null,
 
@@ -15524,6 +15546,7 @@ pub const GraphArtifactProducerConfig = struct {
         .{ "source", "source", false },
         .{ "content_type", "content_type", true },
         .{ "execution", "execution", true },
+        .{ "producer", "producer", true },
         .{ "producer_json", "producer_json", true },
     };
 
@@ -15549,6 +15572,10 @@ pub const GraphArtifactProducerConfig = struct {
         }
         if (self.execution) |value| {
             try jw.objectField("execution");
+            try jw.write(value);
+        }
+        if (self.producer) |value| {
+            try jw.objectField("producer");
             try jw.write(value);
         }
         if (self.producer_json) |value| {
@@ -18776,6 +18803,8 @@ pub const GraphResolverConfig = struct {
     /// Mention labels this resolver consumes; empty consumes every label (catch-all). Labeled resolvers sharing a source artifact must claim disjoint label sets, and every catch-all on that artifact skips the labels claimed by labeled siblings, so extraction labels stay open-vocabulary while each mention routes to exactly one labeled resolver (label-routed tables, e.g. event mentions to an events table).
     labels: ?[]const []const u8 = null,
     type_must_match: ?bool = null,
+    /// Typed matcher scorer. Cannot be combined with scorer_json.
+    scorer: ?GraphResolverScorerConfig = null,
     scorer_json: ?[]const u8 = null,
     candidate_search: ?[]const u8 = null,
     candidate_ann_index: ?[]const u8 = null,
@@ -18800,6 +18829,7 @@ pub const GraphResolverConfig = struct {
         .{ "key_template", "key_template", false },
         .{ "labels", "labels", true },
         .{ "type_must_match", "type_must_match", true },
+        .{ "scorer", "scorer", true },
         .{ "scorer_json", "scorer_json", true },
         .{ "candidate_search", "candidate_search", true },
         .{ "candidate_ann_index", "candidate_ann_index", true },
@@ -18844,6 +18874,10 @@ pub const GraphResolverConfig = struct {
         }
         if (self.type_must_match) |value| {
             try jw.objectField("type_must_match");
+            try jw.write(value);
+        }
+        if (self.scorer) |value| {
+            try jw.objectField("scorer");
             try jw.write(value);
         }
         if (self.scorer_json) |value| {
@@ -18894,6 +18928,87 @@ pub const GraphResolverConfig = struct {
             try jw.objectField("config_generation");
             try jw.write(value);
         }
+        try jw.endObject();
+    }
+};
+
+pub const GraphResolverScorerComparison = struct {
+    name: []const u8,
+    left: []const u8,
+    right: []const u8,
+    levels: []const GraphResolverScorerLevel,
+};
+
+pub const GraphResolverScorerConfig = struct {
+    comparisons: []const GraphResolverScorerComparison,
+    combine: ?std.json.Value = null,
+    decision: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "comparisons", "comparisons", false },
+        .{ "combine", "combine", true },
+        .{ "decision", "decision", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("comparisons");
+        try jw.write(self.comparisons);
+        if (self.combine) |value| {
+            try jw.objectField("combine");
+            try jw.write(value);
+        }
+        if (self.decision) |value| {
+            try jw.objectField("decision");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const GraphResolverScorerLevel = struct {
+    /// Matcher condition, such as 'exact' or 'jaro_winkler >= 0.9'.
+    when: ?[]const u8 = null,
+    /// Catch-all level when no previous condition matched.
+    @"else": ?bool = null,
+    weight: f64,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "when", "when", true },
+        .{ "else", "else", true },
+        .{ "weight", "weight", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.when) |value| {
+            try jw.objectField("when");
+            try jw.write(value);
+        }
+        if (self.@"else") |value| {
+            try jw.objectField("else");
+            try jw.write(value);
+        }
+        try jw.objectField("weight");
+        try jw.write(self.weight);
         try jw.endObject();
     }
 };

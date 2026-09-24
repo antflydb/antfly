@@ -11420,176 +11420,6 @@ export interface components {
          * @enum {string}
          */
         EnrichmentKind: "chunk" | "asset" | "embedding";
-        /** @description Bounded sample of the document's same-shard graph neighbors appended to an asset producer's rendered input as a compact JSON block ({"neighbors":[{"edge_type":...,"direction":...,"target":...,"weight":...}]}), ordered by edge type then target key. A conceptualizer enrichment on an entities table can thereby ground its abstractions in adjacent facts ("started_by -> John Andrew Rice"). The sampled block participates in the producer's skip state, so a changed adjacency re-runs the producer. */
-        EnrichmentNeighborContextConfig: {
-            /** @description Name of a graph index on the same table whose local state is sampled. Validated at admission; cross-shard neighbors are not sampled. */
-            graph_index: string;
-            /** @description Edge types to sample. Empty admits every edge type. */
-            edge_types?: string[];
-            /**
-             * @description Adjacency orientation to sample relative to the document.
-             * @default both
-             * @enum {string}
-             */
-            direction?: "out" | "in" | "both";
-            /**
-             * Format: uint32
-             * @description Maximum neighbors rendered into the producer input, applied after deterministic ordering.
-             * @default 8
-             */
-            limit?: number;
-        };
-        /** @description Non-semantic execution policy for one producer or index maintenance operation. These fields tune how work is batched and do not change generated artifact identity. */
-        ExecutionPolicy: {
-            /** @description Maximum items to process in one batch for this operation. */
-            batch_items?: number;
-            /**
-             * Format: uint64
-             * @description Approximate maximum source bytes to process in one batch for this operation.
-             */
-            batch_bytes?: number;
-            /**
-             * Format: uint32
-             * @description Maximum PDF pages admitted for one request-atomic document operation.
-             */
-            max_document_pages?: number;
-        };
-        /**
-         * @description The STT provider to use.
-         * @enum {string}
-         */
-        STTProvider: "openai" | "vertex" | "antfly";
-        /**
-         * @description Speech-to-text provider for the `transcriber` enrichment shorthand.
-         *
-         *     Carries the provider's STT configuration (`provider`, `model`, `api_url`, `api_key`, ...) plus the transcription options below. The fields are declared inline rather than composed from `STTConfig` so that a generated client can leave an option out: a composed schema makes a typed client serialize every field, and a `max_download_bytes` of zero would reject every recording.
-         *
-         *     **Example:**
-         *     ```yaml
-         *     name: call_transcripts
-         *     kind: asset
-         *     field: recording_url
-         *     transcriber:
-         *       provider: antfly
-         *       model: openai/whisper-base
-         *       language_code: en
-         *       timestamps: true
-         *     ```
-         */
-        TranscriberEnrichmentConfig: {
-            provider: components["schemas"]["STTProvider"];
-            /** @description Model name, as the provider names it (e.g. 'openai/whisper-base' for antfly, 'whisper-1' for openai). */
-            model?: string;
-            /**
-             * Format: uri
-             * @description Antfly inference API URL. Falls back to ANTFLY_INFERENCE_URL.
-             */
-            api_url?: string;
-            /**
-             * Format: uri
-             * @description OpenAI API base URL. Falls back to OPENAI_BASE_URL.
-             */
-            base_url?: string;
-            /** @description Provider API key. Falls back to the provider's environment variable. */
-            api_key?: string;
-            /** @description Google Cloud project ID for the vertex provider. Falls back to GOOGLE_CLOUD_PROJECT. */
-            project_id?: string;
-            /** @description Google Cloud location for the vertex provider. */
-            location?: string;
-            /** @description Path to an ADC credential JSON file for the vertex provider. Falls back to the default ADC chain. */
-            credentials_path?: string;
-            /** @description Spoken language hint (ISO 639-1, e.g. 'en'). Omit for automatic detection where the provider supports it. */
-            language_code?: string;
-            /**
-             * @description Request timestamped transcript segments so chunks carry recording offsets. Providers without segment timing return plain text.
-             * @default true
-             */
-            timestamps?: boolean;
-            /**
-             * @description Request speaker labels on transcript segments where the provider supports them.
-             * @default false
-             */
-            diarization?: boolean;
-            /** @description Largest recording fetched from a URL, in bytes. Defaults to 128 MiB, which covers a one hour voice memo or podcast. */
-            max_download_bytes?: number;
-        };
-        /** @description Inline managed enrichment definition. Enrichments materialize generated artifacts before indexing and may target source rows or previously generated artifact streams. */
-        EnrichmentConfig: {
-            /** @description Stable generated artifact name. */
-            name: string;
-            kind: components["schemas"]["EnrichmentKind"];
-            /** @description Source field to read from the source document or source artifact payload. */
-            field?: string;
-            /** @description Optional template for generated text input. */
-            template?: string;
-            /** @description Existing artifact stream this enrichment consumes. Chunk enrichments may consume asset artifacts; embedding enrichments may consume chunk artifacts; asset enrichments may consume other asset artifacts (the upstream asset's produced bytes become this producer's source, so field and template must be omitted and the producer must consume text: copy, generator, or extractor). */
-            source_artifact_name?: string;
-            /** @description Expected embedding dimension for embedding enrichments. */
-            expected_dims?: number;
-            /** @description Optional stable model/token-space identifier for embedding artifacts. When omitted on every source, Antfly requires the effective producers to be semantically equivalent. To combine intentionally compatible but distinct producers, set the same identifier on every source. Explicit and implicit modes cannot be mixed; dimensions are always validated independently. */
-            vector_space?: string;
-            /** @description Chunk size for chunk enrichments. */
-            chunk_size?: number;
-            /** @description Chunk overlap for chunk enrichments. */
-            chunk_overlap?: number;
-            /** @description Serialized chunker configuration for chunk enrichments. */
-            chunker_json?: string;
-            /**
-             * @description When true on a chunk or asset enrichment, route generated text into the table's default full-text index.
-             * @default false
-             */
-            full_text_index?: boolean;
-            /** @description Produced asset content type for asset enrichments. */
-            content_type?: string;
-            /** @description Write-only serialized producer configuration. For managed embedding enrichments Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded. */
-            producer_json?: string;
-            /** @description Optional bounded sample of the document's graph neighbors appended to the producer input. Only valid on asset enrichments whose producer consumes rendered prompt text (generator or extractor); producers that treat the source as a media locator (copy, reader, transcriber, document_extraction) reject it. Only same-shard graph state is sampled; a graph index without local state for a document yields empty neighbors at runtime while the graph index reference itself is validated at admission. */
-            neighbor_context?: components["schemas"]["EnrichmentNeighborContextConfig"];
-            /** @description Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity. */
-            execution?: components["schemas"]["ExecutionPolicy"];
-            /** @description Typed shorthand for a transcription asset enrichment. Only valid with kind=asset and without producer_json; Antfly expands it into a document_extraction producer whose audio route transcribes each recording with this speech-to-text provider. The produced units carry the transcript text, provider confidence, and per-phrase time offsets, and chunk enrichments that consume them emit _start_time_ms/_end_time_ms on every chunk. With diarization: true the phrases also carry who spoke them, and a chunk that does not straddle a turn emits _speaker. content_type defaults to application/json. */
-            transcriber?: components["schemas"]["TranscriberEnrichmentConfig"];
-        };
-        /** @description Textual artifact stream consumed by a full-text index, with an optional source-local projection. */
-        FullTextArtifactIndexSource: {
-            /** @description Stable name of a chunk or textual asset artifact stream. Artifact names must be unique within the index. */
-            artifact: string;
-            /** @description Optional field selected from this artifact's records. When omitted, the index-level field is inherited; when both are omitted, Antfly indexes the default text projection. */
-            field?: string;
-        };
-        FullTextIndexConfig: {
-            /** @description Chunk or textual asset streams indexed together; every artifact record is an independent full-text member. A source-local field overrides the shared index-level field for that stream. Artifact names must be unique. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
-            sources?: components["schemas"]["FullTextArtifactIndexSource"][];
-            /** @description Whether to use memory-only storage */
-            mem_only?: boolean;
-            /** @description Content field indexed as text. With an artifact source, this selects the field within each artifact record; without one, it selects a document field. String values and arrays of strings are indexed; missing, null, and non-text values produce no posting. Omit to index the default text projection. */
-            field?: string;
-            /** @description Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
-            artifact_name?: string;
-        };
-        /**
-         * @description Publication behavior for a managed embeddings index. `progressive` makes a safely checkpointed active generation queryable before initial source coverage is complete. `atomic` keeps a new generation unavailable until complete validation and activation.
-         * @default progressive
-         * @enum {string}
-         */
-        IndexPublicationPolicy: "progressive" | "atomic";
-        /**
-         * @description How generation-scoped source outcomes determine derived-index completeness.
-         * @default strict
-         * @enum {string}
-         */
-        DerivedCoveragePolicy: "strict" | "partial" | "best_effort";
-        /** @description Named generated artifact stream consumed by an index. Producer inputs belong on the matching enrichment. */
-        ArtifactIndexSource: {
-            /** @description Stable name of a generated artifact stream. */
-            artifact: string;
-        };
-        /**
-         * @description Distance metric for the vector index (dense only). Use "cosine" for models trained with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot product similarity. Use "l2_squared" for models trained with Euclidean distance. The default is "l2_squared".
-         * @default l2_squared
-         * @enum {string}
-         */
-        DistanceMetric: "l2_squared" | "inner_product" | "cosine";
         /** @description Options specific to text chunking. */
         TextChunkOptions: {
             /** @description Target number of tokens per chunk. */
@@ -11708,6 +11538,188 @@ export interface components {
             text?: components["schemas"]["TextChunkOptions"];
             audio?: components["schemas"]["AudioChunkOptions"];
         };
+        /** @description Bounded sample of the document's same-shard graph neighbors appended to an asset producer's rendered input as a compact JSON block ({"neighbors":[{"edge_type":...,"direction":...,"target":...,"weight":...}]}), ordered by edge type then target key. A conceptualizer enrichment on an entities table can thereby ground its abstractions in adjacent facts ("started_by -> John Andrew Rice"). The sampled block participates in the producer's skip state, so a changed adjacency re-runs the producer. */
+        EnrichmentNeighborContextConfig: {
+            /** @description Name of a graph index on the same table whose local state is sampled. Validated at admission; cross-shard neighbors are not sampled. */
+            graph_index: string;
+            /** @description Edge types to sample. Empty admits every edge type. */
+            edge_types?: string[];
+            /**
+             * @description Adjacency orientation to sample relative to the document.
+             * @default both
+             * @enum {string}
+             */
+            direction?: "out" | "in" | "both";
+            /**
+             * Format: uint32
+             * @description Maximum neighbors rendered into the producer input, applied after deterministic ordering.
+             * @default 8
+             */
+            limit?: number;
+        };
+        /** @description Non-semantic execution policy for one producer or index maintenance operation. These fields tune how work is batched and do not change generated artifact identity. */
+        ExecutionPolicy: {
+            /** @description Maximum items to process in one batch for this operation. */
+            batch_items?: number;
+            /**
+             * Format: uint64
+             * @description Approximate maximum source bytes to process in one batch for this operation.
+             */
+            batch_bytes?: number;
+            /**
+             * Format: uint32
+             * @description Maximum PDF pages admitted for one request-atomic document operation.
+             */
+            max_document_pages?: number;
+        };
+        /**
+         * @description The STT provider to use.
+         * @enum {string}
+         */
+        STTProvider: "openai" | "vertex" | "antfly";
+        /**
+         * @description Speech-to-text provider for the `transcriber` enrichment shorthand.
+         *
+         *     Carries the provider's STT configuration (`provider`, `model`, `api_url`, `api_key`, ...) plus the transcription options below. The fields are declared inline rather than composed from `STTConfig` so that a generated client can leave an option out: a composed schema makes a typed client serialize every field, and a `max_download_bytes` of zero would reject every recording.
+         *
+         *     **Example:**
+         *     ```yaml
+         *     name: call_transcripts
+         *     kind: asset
+         *     field: recording_url
+         *     transcriber:
+         *       provider: antfly
+         *       model: openai/whisper-base
+         *       language_code: en
+         *       timestamps: true
+         *     ```
+         */
+        TranscriberEnrichmentConfig: {
+            provider: components["schemas"]["STTProvider"];
+            /** @description Model name, as the provider names it (e.g. 'openai/whisper-base' for antfly, 'whisper-1' for openai). */
+            model?: string;
+            /**
+             * Format: uri
+             * @description Antfly inference API URL. Falls back to ANTFLY_INFERENCE_URL.
+             */
+            api_url?: string;
+            /**
+             * Format: uri
+             * @description OpenAI API base URL. Falls back to OPENAI_BASE_URL.
+             */
+            base_url?: string;
+            /** @description Provider API key. Falls back to the provider's environment variable. */
+            api_key?: string;
+            /** @description Google Cloud project ID for the vertex provider. Falls back to GOOGLE_CLOUD_PROJECT. */
+            project_id?: string;
+            /** @description Google Cloud location for the vertex provider. */
+            location?: string;
+            /** @description Path to an ADC credential JSON file for the vertex provider. Falls back to the default ADC chain. */
+            credentials_path?: string;
+            /** @description Spoken language hint (ISO 639-1, e.g. 'en'). Omit for automatic detection where the provider supports it. */
+            language_code?: string;
+            /**
+             * @description Request timestamped transcript segments so chunks carry recording offsets. Providers without segment timing return plain text.
+             * @default true
+             */
+            timestamps?: boolean;
+            /**
+             * @description Request speaker labels on transcript segments where the provider supports them.
+             * @default false
+             */
+            diarization?: boolean;
+            /** @description Largest recording fetched from a URL, in bytes. Defaults to 128 MiB, which covers a one hour voice memo or podcast. */
+            max_download_bytes?: number;
+        };
+        /** @description Inline managed enrichment definition. Enrichments materialize generated artifacts before indexing and may target source rows or previously generated artifact streams. */
+        EnrichmentConfig: {
+            /** @description Stable generated artifact name. */
+            name: string;
+            kind: components["schemas"]["EnrichmentKind"];
+            /** @description Source field to read from the source document or source artifact payload. */
+            field?: string;
+            /** @description Optional template for generated text input. */
+            template?: string;
+            /** @description Existing artifact stream this enrichment consumes. Chunk enrichments may consume asset artifacts; embedding enrichments may consume chunk artifacts; asset enrichments may consume other asset artifacts (the upstream asset's produced bytes become this producer's source, so field and template must be omitted and the producer must consume text: copy, generator, or extractor). */
+            source_artifact_name?: string;
+            /** @description Expected embedding dimension for embedding enrichments. */
+            expected_dims?: number;
+            /** @description Optional stable model/token-space identifier for embedding artifacts. When omitted on every source, Antfly requires the effective producers to be semantically equivalent. To combine intentionally compatible but distinct producers, set the same identifier on every source. Explicit and implicit modes cannot be mixed; dimensions are always validated independently. */
+            vector_space?: string;
+            /** @description Chunk size for chunk enrichments. */
+            chunk_size?: number;
+            /** @description Chunk overlap for chunk enrichments. */
+            chunk_overlap?: number;
+            /** @description Chunker configuration for chunk enrichments. Cannot be combined with chunker_json. */
+            chunker?: components["schemas"]["ChunkerConfig"];
+            /**
+             * @deprecated
+             * @description Legacy serialized chunker configuration for chunk enrichments. Cannot be combined with chunker.
+             */
+            chunker_json?: string;
+            /**
+             * @description When true on a chunk or asset enrichment, route generated text into the table's default full-text index.
+             * @default false
+             */
+            full_text_index?: boolean;
+            /** @description Produced asset content type for asset enrichments. */
+            content_type?: string;
+            /** @description Write-only producer configuration. Cannot be combined with producer_json or transcriber. */
+            producer?: {
+                [key: string]: unknown;
+            };
+            /**
+             * @deprecated
+             * @description Write-only serialized producer configuration. For managed embedding enrichments Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded.
+             */
+            producer_json?: string;
+            /** @description Optional bounded sample of the document's graph neighbors appended to the producer input. Only valid on asset enrichments whose producer consumes rendered prompt text (generator or extractor); producers that treat the source as a media locator (copy, reader, transcriber, document_extraction) reject it. Only same-shard graph state is sampled; a graph index without local state for a document yields empty neighbors at runtime while the graph index reference itself is validated at admission. */
+            neighbor_context?: components["schemas"]["EnrichmentNeighborContextConfig"];
+            /** @description Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity. */
+            execution?: components["schemas"]["ExecutionPolicy"];
+            /** @description Typed shorthand for a transcription asset enrichment. Only valid with kind=asset and without producer_json; Antfly expands it into a document_extraction producer whose audio route transcribes each recording with this speech-to-text provider. The produced units carry the transcript text, provider confidence, and per-phrase time offsets, and chunk enrichments that consume them emit _start_time_ms/_end_time_ms on every chunk. With diarization: true the phrases also carry who spoke them, and a chunk that does not straddle a turn emits _speaker. content_type defaults to application/json. */
+            transcriber?: components["schemas"]["TranscriberEnrichmentConfig"];
+        };
+        /** @description Textual artifact stream consumed by a full-text index, with an optional source-local projection. */
+        FullTextArtifactIndexSource: {
+            /** @description Stable name of a chunk or textual asset artifact stream. Artifact names must be unique within the index. */
+            artifact: string;
+            /** @description Optional field selected from this artifact's records. When omitted, the index-level field is inherited; when both are omitted, Antfly indexes the default text projection. */
+            field?: string;
+        };
+        FullTextIndexConfig: {
+            /** @description Chunk or textual asset streams indexed together; every artifact record is an independent full-text member. A source-local field overrides the shared index-level field for that stream. Artifact names must be unique. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
+            sources?: components["schemas"]["FullTextArtifactIndexSource"][];
+            /** @description Whether to use memory-only storage */
+            mem_only?: boolean;
+            /** @description Content field indexed as text. With an artifact source, this selects the field within each artifact record; without one, it selects a document field. String values and arrays of strings are indexed; missing, null, and non-text values produce no posting. Omit to index the default text projection. */
+            field?: string;
+            /** @description Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
+            artifact_name?: string;
+        };
+        /**
+         * @description Publication behavior for a managed embeddings index. `progressive` makes a safely checkpointed active generation queryable before initial source coverage is complete. `atomic` keeps a new generation unavailable until complete validation and activation.
+         * @default progressive
+         * @enum {string}
+         */
+        IndexPublicationPolicy: "progressive" | "atomic";
+        /**
+         * @description How generation-scoped source outcomes determine derived-index completeness.
+         * @default strict
+         * @enum {string}
+         */
+        DerivedCoveragePolicy: "strict" | "partial" | "best_effort";
+        /** @description Named generated artifact stream consumed by an index. Producer inputs belong on the matching enrichment. */
+        ArtifactIndexSource: {
+            /** @description Stable name of a generated artifact stream. */
+            artifact: string;
+        };
+        /**
+         * @description Distance metric for the vector index (dense only). Use "cosine" for models trained with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot product similarity. Use "l2_squared" for models trained with Euclidean distance. The default is "l2_squared".
+         * @default l2_squared
+         * @enum {string}
+         */
+        DistanceMetric: "l2_squared" | "inner_product" | "cosine";
         /** @description Namespaced execution policy for managed index shorthand. Only namespaces with runtime effects are accepted. */
         IndexExecutionConfig: {
             /** @description Chunk producer batching for shorthand-created chunk enrichments. */
@@ -12124,7 +12136,14 @@ export interface components {
             source: components["schemas"]["GraphArtifactProducerSourceConfig"];
             content_type?: string;
             execution?: components["schemas"]["ExecutionPolicy"];
-            /** @description Write-only producer configuration; it may contain credentials and is never returned. */
+            /** @description Write-only producer configuration. Cannot be combined with producer_json. */
+            producer?: {
+                [key: string]: unknown;
+            };
+            /**
+             * @deprecated
+             * @description Write-only producer configuration; it may contain credentials and is never returned.
+             */
             producer_json?: {
                 [key: string]: unknown;
             };
@@ -12137,6 +12156,33 @@ export interface components {
         /** @description Optional algebraic planning features for graph traversal. */
         GraphAlgebraicPlanningConfig: {
             bounded_traversal?: components["schemas"]["GraphBoundedTraversalConfig"];
+        };
+        GraphResolverScorerLevel: {
+            /** @description Matcher condition, such as 'exact' or 'jaro_winkler >= 0.9'. */
+            when?: string;
+            /** @description Catch-all level when no previous condition matched. */
+            else?: boolean;
+            /** Format: double */
+            weight: number;
+        };
+        GraphResolverScorerComparison: {
+            name: string;
+            left: string;
+            right: string;
+            levels: components["schemas"]["GraphResolverScorerLevel"][];
+        };
+        GraphResolverScorerConfig: {
+            comparisons: components["schemas"]["GraphResolverScorerComparison"][];
+            combine?: {
+                /** Format: double */
+                bias?: number;
+            };
+            decision?: {
+                /** Format: double */
+                match?: number;
+                /** Format: double */
+                review?: number;
+            };
         };
         /** @description Versioned entity resolver attached to an artifact-backed graph index. */
         GraphResolverConfig: {
@@ -12154,6 +12200,9 @@ export interface components {
             labels?: string[];
             /** @default true */
             type_must_match?: boolean;
+            /** @description Typed matcher scorer. Cannot be combined with scorer_json. */
+            scorer?: components["schemas"]["GraphResolverScorerConfig"];
+            /** @deprecated */
             scorer_json?: string;
             /** @enum {string} */
             candidate_search?: "" | "exact_key" | "prefix" | "ann";
@@ -12797,6 +12846,8 @@ export interface components {
             vector_space?: string;
             chunk_size?: number;
             chunk_overlap?: number;
+            chunker?: components["schemas"]["ChunkerConfig"];
+            /** @deprecated */
             chunker_json?: string;
             /** @default false */
             full_text_index?: boolean;

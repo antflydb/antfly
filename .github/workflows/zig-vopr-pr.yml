@@ -1,0 +1,48 @@
+name: Approved PR VOPR qualification
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        type: string
+        default: ''
+      head_sha:
+        type: string
+        default: ''
+      base_sha:
+        type: string
+        default: ''
+      check_id:
+        type: string
+        default: ''
+      comment_id:
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  actions: read
+  checks: read
+  pull-requests: read
+
+jobs:
+  admission:
+    uses: ./.github/workflows/pr-ci-admission.yml
+    with:
+      pr_number: ${{ inputs.pr_number }}
+      head_sha: ${{ inputs.head_sha }}
+      base_sha: ${{ inputs.base_sha }}
+      check_id: ${{ inputs.check_id }}
+      comment_id: ${{ inputs.comment_id }}
+      suite: vopr
+
+  qualification:
+    needs: admission
+    if: >-
+      ${{ !cancelled() && success() &&
+      needs.admission.result == 'success' &&
+      github.run_attempt == 1 }}
+    uses: ./.github/workflows/zig-vopr-soak.yml
+    with:
+      qualification_only: true
+      head_sha: ${{ inputs.head_sha }}

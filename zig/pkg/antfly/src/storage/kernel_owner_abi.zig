@@ -1049,7 +1049,10 @@ pub const OpenRequest = extern struct {
     /// Immutable native ownership domain; not inferred from the first row or
     /// from a caller-supplied source control request. 1 = Raft, 2 = native.
     online_source_authority: u8 = 1,
-    _restore_reserved: [5]u8 = @splat(0),
+    /// This owner is being opened to apply an entry whose catalog descriptor
+    /// may predate the configuration already persisted by this replica.
+    historical_raft_apply: u8 = 0,
+    _restore_reserved: [4]u8 = @splat(0),
     target_observer: TargetObserver = .{},
     transaction_recovery: TransactionRecoveryConfig = .{},
     runtime_hooks: RuntimeHooksConfig = .{},
@@ -1075,14 +1078,6 @@ pub const ReplicatedBatchAtRaftEntryRequest = extern struct {
     _reserved0: u32 = 0,
     table_name: BorrowedBytes = .{},
     request_json: BorrowedBytes = .{},
-    raft_term: u64 = 0,
-    raft_index: u64 = 0,
-};
-
-pub const RaftEntryAppliedRequest = extern struct {
-    version: u32 = abi_version,
-    _reserved0: u32 = 0,
-    table_name: BorrowedBytes = .{},
     raft_term: u64 = 0,
     raft_index: u64 = 0,
 };
@@ -1874,12 +1869,6 @@ pub extern fn antfly_storage_owner_replicated_batch_at_raft_entry_json(
     owner: ?*anyopaque,
     request: *const ReplicatedBatchAtRaftEntryRequest,
     out_response: *OwnedBytes,
-) callconv(.c) Status;
-
-pub extern fn antfly_storage_owner_raft_entry_already_applied(
-    owner: ?*anyopaque,
-    request: *const RaftEntryAppliedRequest,
-    out_applied: *u8,
 ) callconv(.c) Status;
 
 pub extern fn antfly_storage_owner_transaction_status(
