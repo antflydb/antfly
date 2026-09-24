@@ -369,23 +369,29 @@ fn catchUpWindowMaybeSink(
     max_records: usize,
     catalog: ?*IndexManager,
 ) !CatchUpWindowResult {
-    const resolver_configs: ?[]ResolverConfig = if (catalog) |manager| try manager.listResolvers(gpa) else null;
-    defer if (resolver_configs) |configs| {
-        for (configs) |*cfg| cfg.deinit(gpa);
-        gpa.free(configs);
-    };
-
     const Ctx = struct {
         gpa: Allocator,
         store: resolver_lib.ArtifactStore,
         sink: ?EntitySink,
-        resolver_configs: ?[]const ResolverConfig,
+        catalog: ?*IndexManager,
+        resolver_configs: ?[]ResolverConfig = null,
         max_seen: u64,
 
         fn consume(ptr: *anyopaque, sequence: u64, payload: []const u8) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             var decoded = try change_journal_mod.decodeRecord(self.gpa, payload);
             defer decoded.deinit();
+            // The catalog is needed only if this record can reach the sink.
+            // Keep one snapshot for all matching artifacts in this window.
+            if (self.sink != null and self.resolver_configs == null) {
+                if (self.catalog) |manager| {
+                    for (decoded.record.changed_artifact_keys) |key| {
+                        if (!internal_keys.isResolutionArtifactKey(key)) continue;
+                        self.resolver_configs = try manager.listResolvers(self.gpa);
+                        break;
+                    }
+                }
+            }
             try processRecordKeysMaybeSink(self.gpa, self.store, decoded.record.changed_artifact_keys, self.sink, self.resolver_configs);
             if (sequence > self.max_seen) self.max_seen = sequence;
         }
@@ -395,8 +401,12 @@ fn catchUpWindowMaybeSink(
         .gpa = gpa,
         .store = store,
         .sink = sink,
-        .resolver_configs = resolver_configs,
+        .catalog = catalog,
         .max_seen = from_sequence,
+    };
+    defer if (ctx.resolver_configs) |configs| {
+        for (configs) |*cfg| cfg.deinit(gpa);
+        gpa.free(configs);
     };
     _ = replay_source.forEachMatchingRecord(gpa, from_sequence, .promotion, max_records, &ctx, Ctx.consume) catch |err| switch (err) {
         error.PromotionSinkUnavailable => return .{

@@ -3079,7 +3079,6 @@ pub const ProvisionedKernelOwnerSource = struct {
         var stale_index: ?usize = null;
         for (self.entries.items, 0..) |entry, index| {
             if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
-            if (entry.closing) return error.StorageKernelOwnerTransitionRequired;
             // A cached owner opened before restore intent must drain as well.
             // Compare the admitted binding in memory; warm hits need no marker I/O.
             const restore_matches = if (descriptor.restore) |expected|
@@ -3096,6 +3095,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             {
                 return error.StorageKernelOwnerStaleDescriptor;
             }
+            if (entry.closing) return error.StorageKernelOwnerTransitionRequired;
             if (entry.retired or entry.generation != descriptor.lsm_root_generation or !entry.identity.eql(descriptor.identity) or !restore_matches) {
                 entry.retired = true;
                 if (entry.active_users == 0) {
@@ -5525,6 +5525,9 @@ test "owner descriptor changes do not retire a live owner for an older schema ve
     stale_descriptor.lsm_root_generation -= 1;
     try std.testing.expectError(error.StorageKernelOwnerStaleDescriptor, source.acquireDescriptorOnce(1, "docs", "/unused", stale_descriptor, .shared, .resident, .{}));
     try std.testing.expect(!entry.retired);
+    entry.closing = true;
+    try std.testing.expectError(error.StorageKernelOwnerStaleDescriptor, source.acquireDescriptorOnce(1, "docs", "/unused", stale_descriptor, .shared, .resident, .{}));
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, source.acquireDescriptorWithMode(1, "docs", "/unused", stale_descriptor, false, .resident, .{}));
 }
 
 test "scheduled repair admission yields to readers and reuses exact configured generation" {
