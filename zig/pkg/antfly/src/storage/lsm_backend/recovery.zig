@@ -153,6 +153,13 @@ fn openIntoPolicy(comptime BackendType: type, backend: *BackendType, allocator: 
         try @import("completion_pool.zig").hasAcceptedGuards(backend.storage.?, allocator, root_dir)
     else
         false;
+    if (comptime @hasField(BackendType, "completion_pool")) {
+        // Control ownership outlives the ordinary accepted cell. Until its
+        // capacity and durable-log reconciliation are installed, an orphaned
+        // full or pending guard must fence startup even with pool configuration.
+        if (try @import("completion_control_guard.zig").hasAny(backend.storage.?, allocator, root_dir))
+            return error.CompletionRecoveryCapacityRequired;
+    }
     if (accepted_pool_guarded) {
         if (!stable_address) return error.UnsupportedCompletionBackend;
         if (backend.options.completion_pool_config == null) return error.CompletionRecoveryCapacityRequired;

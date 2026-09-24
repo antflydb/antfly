@@ -21,6 +21,22 @@ pub const pending_filenames = [_][]const u8{
     "completion-control-pending-2.guard", "completion-control-pending-3.guard",
 };
 
+/// Any published or interrupted control sidecar is a restoration obligation.
+/// A missing installation must not replay its WAL through ordinary admission,
+/// and a pending publication must not be interpreted as an empty owner slot.
+pub fn hasAny(storage: anytype, alloc: std.mem.Allocator, root: []const u8) !bool {
+    inline for (.{ filenames, pending_filenames }) |names| {
+        for (names) |filename| {
+            const path = try std.fs.path.join(alloc, &.{ root, filename });
+            defer alloc.free(path);
+            if (storage.fileSize(path)) |_| return true else |err| {
+                if (err != error.FileNotFound) return err;
+            }
+        }
+    }
+    return false;
+}
+
 pub const Guard = struct {
     record: record_codec.Record,
     envelope: []const u8,
@@ -68,7 +84,10 @@ pub const Guard = struct {
         if (entry.kind != .mutation or entry.group_id != self.record.authority.group_id or
             !std.mem.eql(u8, &entry.group_incarnation, &self.record.authority.incarnation) or
             !std.mem.eql(u8, &entry.policy_digest, &self.record.authority.policy_digest) or
-            !std.mem.eql(u8, &entry.schema_catalog_digest, &self.record.authority.schema_catalog_digest))
+            !std.mem.eql(u8, &entry.schema_catalog_digest, &self.record.authority.schema_catalog_digest) or
+            entry.previous_index != self.record.begin.index - 1 or
+            (entry.previous_index != 0 and entry.previous_term == 0) or
+            entry.previous_term > self.record.begin.term)
             return error.InvalidCompletionSlot;
         // The envelope's txn_id is a derived physical mutation ID. The
         // logical transaction ID is carried by the BEGIN record operation.
@@ -95,6 +114,11 @@ pub const Owned = struct {
 /// slot and must leave the database unavailable until reconciled.
 pub fn load(alloc: std.mem.Allocator, storage: anytype, root: []const u8, index: usize, authority: record_codec.Authority) !?Owned {
     if (index >= max_owners) return error.InvalidCompletionSlot;
+    const pending_path = try std.fs.path.join(alloc, &.{ root, pending_filenames[index] });
+    defer alloc.free(pending_path);
+    if (storage.fileSize(pending_path)) |_| return error.CompletionRecoveryCapacityRequired else |err| {
+        if (err != error.FileNotFound) return err;
+    }
     const path = try std.fs.path.join(alloc, &.{ root, filenames[index] });
     defer alloc.free(path);
     const size = storage.fileSize(path) catch |err| switch (err) {

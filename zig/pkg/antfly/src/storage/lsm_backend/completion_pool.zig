@@ -1482,6 +1482,57 @@ pub fn Pool(comptime Backend: type) type {
     };
 }
 
+test "workload admission physical completion control guards fence native restart before ordinary replay" {
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const control_guard = @import("completion_control_guard.zig");
+    const alloc = std.testing.allocator;
+    const config: Config = .{ .identity = .{ .capacity = 4, .group_id = 23, .node_id = 7, .incarnation = @splat(11), .policy_digest = @splat(12), .generation = 19 }, .schema_catalog_digest = @splat(13), .namespace = .root };
+    for ([_][]const u8{ control_guard.filenames[0], control_guard.pending_filenames[3] }) |filename| {
+        var fd_pool = storage_io.NativeStoragePool.initWithCapacityForTest(alloc, 32);
+        defer fd_pool.deinit();
+        var manager = resources.ResourceManager.init(.{ .identity_allocator = alloc, .memory_budget = .{ .hard_limit_bytes = 256 * 1024 * 1024 } });
+        defer manager.deinit(alloc);
+        var path_buffer: [256]u8 = undefined;
+        const root = repository.tmpPath(&path_buffer, "native-control-guard-restart");
+        defer repository.cleanupTmp(root);
+        const options: @import("../lsm_backend.zig").Options = .{ .resource_manager = &manager, .native_storage_pool = &fd_pool };
+        const guard_path = try std.fs.path.join(alloc, &.{ std.mem.span(root), filename });
+        defer alloc.free(guard_path);
+        {
+            var backend: Backend = undefined;
+            try backend.openInto(alloc, std.mem.span(root), options);
+            defer backend.abandonAfterCrash();
+            try backend.persistManifest();
+            try std.testing.expect(!try control_guard.hasAny(backend.storage.?, alloc, std.mem.span(root)));
+            try manifest_set.replace(alloc, backend.storage.?, guard_path, "interrupted-control-owner");
+            try std.testing.expect(try control_guard.hasAny(backend.storage.?, alloc, std.mem.span(root)));
+            const authority: @import("completion_control_record.zig").Authority = .{
+                .group_id = config.identity.group_id,
+                .incarnation = config.identity.incarnation,
+                .policy_digest = config.identity.policy_digest,
+                .schema_catalog_digest = config.schema_catalog_digest,
+                .generation = config.identity.generation,
+            };
+            if (std.mem.eql(u8, filename, control_guard.pending_filenames[3])) {
+                try std.testing.expectError(error.CompletionRecoveryCapacityRequired, control_guard.load(alloc, backend.storage.?, std.mem.span(root), 3, authority));
+            } else {
+                try std.testing.expectError(error.InvalidCompletionSlot, control_guard.load(alloc, backend.storage.?, std.mem.span(root), 0, authority));
+            }
+        }
+        {
+            var missing: Backend = undefined;
+            try std.testing.expectError(error.CompletionRecoveryCapacityRequired, missing.openInto(alloc, std.mem.span(root), options));
+        }
+        {
+            var configured: Backend = undefined;
+            var restoring = options;
+            restoring.completion_pool_config = config;
+            try std.testing.expectError(error.CompletionRecoveryCapacityRequired, configured.openInto(alloc, std.mem.span(root), restoring));
+        }
+        try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+    }
+}
+
 test "workload admission completion accepted guard binds durable owner and rejects corrupt framing" {
     const identity: abi.Identity = .{ .capacity = 4, .group_id = 23, .node_id = 7, .incarnation = @splat(11), .policy_digest = @splat(12), .generation = 19 };
     const input: Accepted = .{ .cell = 2, .term = 7, .index = 91, .identity = identity, .cohort = .{ .index = 2, .base_run_id = 99, .initial_runs = 64, .cohort_id = @splat(42) }, .envelope = "binary\x00envelope" };
