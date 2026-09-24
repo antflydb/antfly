@@ -42504,6 +42504,205 @@ fn consumerTests() type {
             try std.testing.expect(std.mem.indexOf(u8, response[0..after_len], " 400 ") != null);
         }
 
+        test "protected data listener progresses under combined public ingress and journal pressure" {
+            if (@import("builtin").os.tag == .windows or @import("builtin").os.tag == .freestanding) return;
+            const alloc = std.testing.allocator;
+            const secret = "combined-protected-listener-test-secret-012345";
+            const issuer = "combined-protected-listener-test";
+            const protocol = @import("../api/workload_attempt_protocol.zig");
+            const auth = @import("../api/internal_service_auth.zig");
+            const Metadata = struct {
+                fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+                    return .{ .metadata_group_id = 1, .metrics = .{} };
+                }
+            };
+            const Blocking = struct {
+                entered: std.atomic.Value(bool) = .init(false),
+                release: std.atomic.Value(bool) = .init(false),
+
+                fn handle(self: *@This(), ctx: *httpx.Context) !httpx.Response {
+                    self.entered.store(true, .release);
+                    while (!self.release.load(.acquire)) std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+                    return ctx.text("released");
+                }
+            };
+            const StatusProbe = struct {
+                fn run(allocator: std.mem.Allocator, address: std.Io.net.IpAddress, io: std.Io, token: []const u8, frame: []const u8, expected: protocol.AttemptId, key: []const u8, audience: []const u8) !void {
+                    const body = "{\"workload_attempt_control\":\"status\"}";
+                    const wire = try std.fmt.allocPrint(allocator, "POST /internal/v1/workload/control HTTP/1.1\r\nHost: test\r\n{s}: {s}\r\n{s}: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{
+                        auth.header_name, token, protocol.request_header, frame, body.len, body,
+                    });
+                    defer allocator.free(wire);
+                    var socket = try httpx.Socket.connect(address, io);
+                    defer socket.close();
+                    try socket.setRecvTimeout(5_000);
+                    try socket.sendAll(wire);
+                    var response: [8192]u8 = undefined;
+                    var used: usize = 0;
+                    while (std.mem.indexOf(u8, response[0..used], "\r\n\r\n") == null) {
+                        if (used == response.len) return error.TestUnexpectedResult;
+                        const received = try socket.recv(response[used..]);
+                        if (received == 0) return error.TestUnexpectedResult;
+                        used += received;
+                    }
+                    const header_end = std.mem.indexOf(u8, response[0..used], "\r\n\r\n").?;
+                    const headers = response[0..header_end];
+                    try std.testing.expect(std.mem.indexOf(u8, headers, " 200 ") != null);
+                    const marker = protocol.evidence_header ++ ": ";
+                    const start = (std.mem.indexOf(u8, headers, marker) orelse return error.TestUnexpectedResult) + marker.len;
+                    const end = std.mem.indexOfPos(u8, headers, start, "\r\n") orelse header_end;
+                    _ = try protocol.verifyTerminal(allocator, .{ .primary = key, .issuer = audience }, headers[start..end], expected, 200, "{}");
+                }
+            };
+
+            var storage_backend = @import("../storage/mem_backend.zig").Backend.init(alloc, .{});
+            defer storage_backend.close();
+            var storage = try storage_backend.runtimeStore(alloc, .{ .name = "system/combined-protected-status" });
+            defer storage.deinit();
+            var durable = antfly.public_api.transactions.DurableSessionStore.initRuntime(alloc, &storage);
+            var api_server = try antfly.public_api.http_server.ApiHttpServer.initWithConfig(alloc, .{
+                .session_store = &durable,
+                .remote_attempt_worker = .{ .max_attempts = 1, .max_bytes = 8192 },
+                .remote_attempt_node_id = 8,
+                .internal_service_secret = secret,
+                .internal_service_issuer = issuer,
+            }, .{ .ptr = undefined, .vtable = &.{ .status = Metadata.status } }, null, null);
+            defer api_server.deinit();
+            const worker = api_server.remote_attempt_worker.?;
+            try std.testing.expect((try worker.closeGeneration(7, 1, worker.incarnation)) != null);
+            const body = "{\"workload_attempt_control\":\"status\"}";
+            const attempt: protocol.Request = .{
+                .version = 3,
+                .attempt = .{ .coordinator = 7, .generation = 2, .sequence = 1, .operation = 1, .destination = 8, .worker_namespace = worker.namespace, .worker_incarnation = worker.incarnation },
+                .remaining_ns = 5 * std.time.ns_per_s,
+                .request_digest = protocol.requestDigest("POST", "/internal/v1/workload/control", body),
+            };
+            var lease = (try worker.begin(attempt)).started;
+            try lease.finish();
+            try std.testing.expectEqual(@as(usize, 1), (try worker.usage()).attempts);
+            try std.testing.expect(try worker.terminalStatus(attempt.attempt));
+
+            var backend = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
+            defer backend.deinit();
+            const protected = try DataProtectedHttpRuntime.start(alloc, backend.ptr(), .{
+                .bind_host = "127.0.0.1",
+                .bind_port = 0,
+                .advertise_url = "http://127.0.0.1:1",
+            }, &api_server);
+            defer protected.deinitWithDeadline(antfly.common.runtime_lifecycle.ShutdownDeadline.afterMilliseconds(5_000));
+
+            var public_io = std.Io.Threaded.init(alloc, .{});
+            defer public_io.deinit();
+            var client_io = std.Io.Threaded.init(alloc, .{});
+            defer client_io.deinit();
+            const io = client_io.io();
+            var public_server = httpx.Server.initWithConfig(alloc, public_io.io(), .{
+                .host = "127.0.0.1",
+                .port = 0,
+                .max_connections = 3,
+                .max_request_tasks = 1,
+                .max_h1_inflight_bodies = 1,
+                .max_body_size = 4096,
+                .request_body_buffer_budget_bytes = 4096,
+                .header_read_timeout_ms = 10_000,
+                .body_read_timeout_ms = 10_000,
+                .h1_disconnect_cancellation = .disabled,
+            });
+            defer public_server.deinit();
+            var blocking: Blocking = .{};
+            try public_server.get("/slow", httpx.Handler.bind(&blocking, Blocking.handle));
+            var public_task = httpx.ListenerTask.init(&public_server);
+            try public_task.start();
+            defer {
+                blocking.release.store(true, .release);
+                public_task.requestStop();
+                public_task.join() catch {};
+            }
+            const public_address = public_server.boundAddress() orelse return error.TestUnexpectedResult;
+            var slow = try httpx.Socket.connect(public_address, io);
+            var slow_open = true;
+            defer if (slow_open) slow.close();
+            try slow.setRecvTimeout(5_000);
+            try slow.sendAll("GET /slow HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
+            for (0..5_000) |_| {
+                if (blocking.entered.load(.acquire)) break;
+                io.sleep(.fromMilliseconds(1), .awake) catch {};
+            }
+            try std.testing.expect(blocking.entered.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 1), public_server.runtimeStats().active_requests);
+
+            var rejected = try httpx.Socket.connect(public_address, io);
+            var rejected_open = true;
+            defer if (rejected_open) rejected.close();
+            try rejected.setRecvTimeout(5_000);
+            try rejected.sendAll("GET /slow HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
+            var rejected_response: [1024]u8 = undefined;
+            const rejected_len = try rejected.recv(&rejected_response);
+            try std.testing.expect(std.mem.indexOf(u8, rejected_response[0..rejected_len], " 503 ") != null);
+            rejected.close();
+            rejected_open = false;
+
+            var upload = try httpx.Socket.connect(public_address, io);
+            var upload_open = true;
+            defer if (upload_open) upload.close();
+            try upload.sendAll("POST /upload HTTP/1.1\r\nHost: test\r\nContent-Length: 4096\r\n\r\n");
+            try upload.sendAll("x" ** 3072);
+            for (0..5_000) |_| {
+                const stats = public_server.runtimeStats();
+                if (stats.body_buffer_in_use_bytes >= 3072 and public_server.h1_body_budget.stats().in_use == 1) break;
+                io.sleep(.fromMilliseconds(1), .awake) catch {};
+            }
+            const occupied = public_server.runtimeStats();
+            try std.testing.expect(occupied.body_buffer_in_use_bytes >= 3072);
+            try std.testing.expect(occupied.body_buffer_in_use_bytes <= occupied.body_buffer_capacity_bytes);
+            try std.testing.expectEqual(@as(usize, 1), public_server.h1_body_budget.stats().in_use);
+            try std.testing.expect(!public_server.body_budget.tryReserve(2048));
+
+            var headerless = try httpx.Socket.connect(public_address, io);
+            var headerless_open = true;
+            defer if (headerless_open) headerless.close();
+            for (0..5_000) |_| {
+                if (public_server.runtimeStats().active_connections == 3 and public_server.waiting_for_connection_permit.load(.acquire)) break;
+                io.sleep(.fromMilliseconds(1), .awake) catch {};
+            }
+            try std.testing.expectEqual(@as(usize, 3), public_server.runtimeStats().active_connections);
+            try std.testing.expect(public_server.waiting_for_connection_permit.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 1), public_server.runtimeStats().active_requests);
+            try std.testing.expectEqual(@as(usize, 1), (try worker.usage()).attempts);
+
+            const token = try auth.tokenAlloc(alloc, .{ .secret = secret, .issuer = issuer, .node_id = 7 }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+            defer alloc.free(token);
+            const frame = try protocol.signRequest(alloc, .{ .primary = secret, .issuer = issuer }, attempt);
+            defer alloc.free(frame);
+            const protected_address = protected.server.boundAddress() orelse return error.TestUnexpectedResult;
+            try StatusProbe.run(alloc, protected_address, io, token, frame, attempt.attempt, secret, issuer);
+            try std.testing.expectEqual(@as(usize, 3), public_server.runtimeStats().active_connections);
+            try std.testing.expectEqual(@as(usize, 1), (try worker.usage()).attempts);
+
+            blocking.release.store(true, .release);
+            slow.close();
+            slow_open = false;
+            upload.close();
+            upload_open = false;
+            headerless.close();
+            headerless_open = false;
+            for (0..5_000) |_| {
+                const stats = public_server.runtimeStats();
+                if (stats.active_connections == 0 and stats.active_requests == 0 and stats.body_buffer_in_use_bytes == 0 and public_server.h1_body_budget.stats().in_use == 0) break;
+                io.sleep(.fromMilliseconds(1), .awake) catch {};
+            }
+            const drained = public_server.runtimeStats();
+            try std.testing.expectEqual(@as(usize, 0), drained.active_connections);
+            try std.testing.expectEqual(@as(usize, 0), drained.active_requests);
+            try std.testing.expectEqual(@as(usize, 0), drained.body_buffer_in_use_bytes);
+            try std.testing.expectEqual(@as(usize, 1), drained.peak_active_requests);
+            try std.testing.expectEqual(@as(usize, 1), public_server.h1_body_budget.stats().capacity);
+            try std.testing.expectEqual(@as(usize, 0), public_server.h1_body_budget.stats().in_use);
+            public_task.shutdown(1_000);
+            try public_task.join();
+            try StatusProbe.run(alloc, protected_address, io, token, frame, attempt.attempt, secret, issuer);
+        }
+
         const SnapshotDeadlineTest = struct {
             const VoprIo = @import("vopr").vopr_io.VoprIo;
             const RequestContext = antfly.public_api.operation.RequestContext;
