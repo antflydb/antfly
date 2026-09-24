@@ -11,7 +11,9 @@ const errors = @import("runtime_error_abi.zig");
 const memory = @import("runtime_memory_abi");
 const common = @import("common/http/http_common.zig");
 
-pub const Request = extern struct {
+/// Exact version-1 prefix. A version-1 producer must never dereference the
+/// version-2 control endpoint trailer.
+pub const RequestV1 = extern struct {
     destination: u64,
     base_uri: http.Bytes,
     method: http.HttpMethod,
@@ -24,6 +26,31 @@ pub const Request = extern struct {
     cancellation: http.CancellationView = .{},
 };
 
+pub const Request = extern struct {
+    destination: u64,
+    base_uri: http.Bytes,
+    method: http.HttpMethod,
+    uri: http.Bytes,
+    headers: http.HeaderList = .{},
+    authorization: http.OptionalBytes = .{},
+    content_type: http.OptionalBytes = .{},
+    body: http.Bytes,
+    deadline_ns: u64,
+    cancellation: http.CancellationView = .{},
+    /// Only the coordinator's authenticated discovery/fence/status requests
+    /// use this URL. Empty means the version-1 public endpoint fallback.
+    control_base_uri: http.OptionalBytes = .{},
+};
+
+comptime {
+    if (@offsetOf(Request, "control_base_uri") != @sizeOf(RequestV1))
+        @compileError("workload coordinator v2 request must preserve the complete v1 prefix");
+    for (.{ "destination", "base_uri", "method", "uri", "headers", "authorization", "content_type", "body", "deadline_ns", "cancellation" }) |field| {
+        if (@offsetOf(Request, field) != @offsetOf(RequestV1, field))
+            @compileError("workload coordinator v2 changed a v1 request field offset");
+    }
+}
+
 pub const ResponseSink = extern struct {
     context: *anyopaque,
     receive: *const fn (*anyopaque, u16, http.OptionalBytes, http.HeaderList, http.Bytes) callconv(.c) errors.Status,
@@ -35,13 +62,17 @@ pub const OptionalCoordinatorPort = extern struct {
 };
 
 pub const CoordinatorPort = extern struct {
-    version: u32 = 1,
+    version: u32 = 2,
     struct_size: u32 = @sizeOf(@This()),
     context: *anyopaque,
-    dispatch: *const fn (*anyopaque, *const memory.Allocator, *const Request, *const ResponseSink) callconv(.c) errors.Status,
+    dispatch: *const fn (*anyopaque, *const memory.Allocator, *const RequestV1, *const ResponseSink) callconv(.c) errors.Status,
 
     pub fn execute(self: CoordinatorPort, alloc: std.mem.Allocator, destination: u64, base_uri: []const u8, request: common.HttpRequest, deadline_ns: u64) !common.HttpResponse {
-        if (self.version != 1 or self.struct_size != @sizeOf(CoordinatorPort)) return error.UnsupportedVersion;
+        return self.executeWithControlUri(alloc, destination, base_uri, null, request, deadline_ns);
+    }
+
+    pub fn executeWithControlUri(self: CoordinatorPort, alloc: std.mem.Allocator, destination: u64, base_uri: []const u8, control_base_uri: ?[]const u8, request: common.HttpRequest, deadline_ns: u64) !common.HttpResponse {
+        if ((self.version != 1 and self.version != 2) or self.struct_size != @sizeOf(CoordinatorPort)) return error.UnsupportedVersion;
         const Capture = struct {
             alloc: std.mem.Allocator,
             result: ?common.HttpResponse = null,
@@ -81,7 +112,7 @@ pub const CoordinatorPort = extern struct {
         if (request.delivery_tracker) |tracker| tracker.markUnknown();
         const now = @import("antfly_platform").time.monotonicNs();
         const effective_deadline = if (request.timeout_ms) |timeout| @min(deadline_ns, now +| @as(u64, timeout) * std.time.ns_per_ms) else deadline_ns;
-        const wire: Request = .{
+        const wire_v1: RequestV1 = .{
             .destination = destination,
             .base_uri = .init(base_uri),
             .method = switch (request.method) {
@@ -103,7 +134,25 @@ pub const CoordinatorPort = extern struct {
                 }
             }.check } else .{},
         };
-        const result = self.dispatch(self.context, &allocator, &wire, &.{ .context = &capture, .receive = Capture.receive });
+        const sink: ResponseSink = .{ .context = &capture, .receive = Capture.receive };
+        const result = if (self.version == 1)
+            self.dispatch(self.context, &allocator, &wire_v1, &sink)
+        else blk: {
+            const wire_v2: Request = .{
+                .destination = wire_v1.destination,
+                .base_uri = wire_v1.base_uri,
+                .method = wire_v1.method,
+                .uri = wire_v1.uri,
+                .headers = wire_v1.headers,
+                .authorization = wire_v1.authorization,
+                .content_type = wire_v1.content_type,
+                .body = wire_v1.body,
+                .deadline_ns = wire_v1.deadline_ns,
+                .cancellation = wire_v1.cancellation,
+                .control_base_uri = .init(control_base_uri),
+            };
+            break :blk self.dispatch(self.context, &allocator, @ptrCast(&wire_v2), &sink);
+        };
         if (!result.isOk()) return errors.errorFromStatus(result);
         return capture.result orelse error.InvalidArgument;
     }
@@ -112,10 +161,16 @@ pub const CoordinatorPort = extern struct {
 test "workload admission coordinator ABI copies producer response and retains request cancellation" {
     const Producer = struct {
         calls: usize = 0,
-        fn dispatch(raw: *anyopaque, allocator: *const memory.Allocator, request: *const Request, sink: *const ResponseSink) callconv(.c) errors.Status {
+        expected_control: ?[]const u8 = null,
+        fn dispatch(raw: *anyopaque, allocator: *const memory.Allocator, request: *const RequestV1, sink: *const ResponseSink) callconv(.c) errors.Status {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
             if (!allocator.valid() or request.destination != 8) return errors.statusFromError(error.InvalidArgument);
+            if (!std.mem.eql(u8, request.base_uri.slice(), "http://worker")) return errors.statusFromError(error.InvalidArgument);
+            if (self.expected_control) |expected| {
+                const extended: *const Request = @ptrCast(request);
+                if (!std.mem.eql(u8, extended.control_base_uri.slice() orelse "", expected)) return errors.statusFromError(error.InvalidArgument);
+            }
             if (request.cancellation.is_cancelled.?(request.cancellation.context) != 0) return errors.statusFromError(error.Canceled);
             const alloc = allocator.asStd();
             const body = alloc.dupe(u8, "owned response") catch |err| return errors.statusFromError(err);
@@ -135,6 +190,17 @@ test "workload admission coordinator ABI copies producer response and retains re
     cancellation.cancel();
     try std.testing.expectError(error.Canceled, port.execute(std.testing.allocator, 8, "http://worker", request, 1234));
     try std.testing.expectEqual(@as(usize, 2), producer.calls);
+    cancellation = .{};
+    producer.expected_control = "http://worker-control";
+    var controlled = try port.executeWithControlUri(std.testing.allocator, 8, "http://worker", "http://worker-control", request, 1234);
+    controlled.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 3), producer.calls);
+    producer.expected_control = null;
+    var legacy = port;
+    legacy.version = 1;
+    var old_response = try legacy.executeWithControlUri(std.testing.allocator, 8, "http://worker", "http://ignored-control", request, 1234);
+    old_response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 4), producer.calls);
     var invalid = port;
     invalid.version += 1;
     try std.testing.expectError(error.UnsupportedVersion, invalid.execute(std.testing.allocator, 8, "http://worker", request, 1234));

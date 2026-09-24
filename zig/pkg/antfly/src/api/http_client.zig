@@ -417,6 +417,8 @@ test "workload admission coordinator dispatch durably owns sends and recovers lo
         worker: *worker_module.Store,
         drop_terminal: bool = false,
         status_available: bool = false,
+        control_on_protected: bool = false,
+        protected_controls: usize = 0,
         executed: usize = 0,
         fn respond(allocator: std.mem.Allocator, frame: ?[]u8) !http_common.HttpResponse {
             errdefer if (frame) |owned| allocator.free(owned);
@@ -435,6 +437,12 @@ test "workload admission coordinator dispatch durably owns sends and recovers lo
             try std.testing.expect(request.header(internal_service_auth.header_name) != null);
             const keys: protocol.Keys = .{ .primary = "s" ** 32, .issuer = "cluster" };
             const target = try protocol.requestTarget(request.uri);
+            if (std.mem.endsWith(u8, target, "/workload/control")) {
+                try std.testing.expect(std.mem.startsWith(u8, request.uri, if (self.control_on_protected) "http://worker-control/internal/" else "http://worker/internal/"));
+                if (self.control_on_protected) self.protected_controls += 1;
+            } else {
+                try std.testing.expect(std.mem.startsWith(u8, request.uri, "http://worker/internal/"));
+            }
             if (std.mem.endsWith(u8, target, "/workload/control") and request.header(protocol.request_header) == null) {
                 var parsed = try std.json.parseFromSlice(struct { nonce: u128 }, allocator, request.body, .{ .ignore_unknown_fields = true });
                 defer parsed.deinit();
@@ -464,10 +472,16 @@ test "workload admission coordinator dispatch durably owns sends and recovers lo
     var client = ApiHttpClient.init(alloc, .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } });
     _ = try client.withInternalServiceNodeAuth("s" ** 32, "cluster", 7);
     const request: http_common.HttpRequest = .{ .method = .POST, .uri = "http://worker/internal/v1/groups/1/tables/docs/_query", .body = "{}" };
-    for (0..6) |_| {
-        var response = try client.executeCoordinatedRead(&coordinator, 8, "http://worker", request, platform_time.monotonicNs() + 5 * std.time.ns_per_s, null);
+    for (0..6) |i| {
+        fake.control_on_protected = i == 0;
+        var response = if (i == 0)
+            try client.executeCoordinatedReadWithControlUri(&coordinator, 8, "http://worker", "http://worker-control", request, platform_time.monotonicNs() + 5 * std.time.ns_per_s, null)
+        else
+            try client.executeCoordinatedRead(&coordinator, 8, "http://worker", request, platform_time.monotonicNs() + 5 * std.time.ns_per_s, null);
         response.deinit(alloc);
     }
+    try std.testing.expectEqual(@as(usize, 2), fake.protected_controls); // Discovery and generation close.
+    fake.control_on_protected = false;
     try std.testing.expectEqual(@as(usize, 6), fake.executed);
     try std.testing.expectEqual(@as(usize, 1), (try worker.usage()).attempts);
     fake.drop_terminal = true;
@@ -477,8 +491,11 @@ test "workload admission coordinator dispatch durably owns sends and recovers lo
     try std.testing.expectEqual(@as(usize, 7), fake.executed);
     fake.status_available = true;
     fake.drop_terminal = false;
-    var reconciled = try client.executeCoordinatedRead(&coordinator, 8, "http://worker", request, platform_time.monotonicNs() + 5 * std.time.ns_per_s, null);
+    fake.control_on_protected = true;
+    var reconciled = try client.executeCoordinatedReadWithControlUri(&coordinator, 8, "http://worker", "http://worker-control", request, platform_time.monotonicNs() + 5 * std.time.ns_per_s, null);
     reconciled.deinit(alloc);
+    try std.testing.expect(fake.protected_controls >= 5); // Status, discovery, and generation close.
+    fake.control_on_protected = false;
     try std.testing.expectEqual(@as(u32, 0), (try coordinator.usage()).attempts);
     fake.drop_terminal = true;
     try std.testing.expectError(error.AttemptOutcomeUncertain, client.executeCoordinatedRead(&coordinator, 8, "http://worker", request, platform_time.monotonicNs() + 5 * std.time.ns_per_s, null));
@@ -613,12 +630,19 @@ pub const ApiHttpClient = struct {
     /// never from a response body or a public request. Every send is preceded
     /// by durable ownership. Missing evidence leaves that record charged.
     pub fn executeCoordinatedRead(self: *ApiHttpClient, coordinator: *@import("workload_attempt_coordinator.zig").Store, destination: u64, base_uri: []const u8, request: http_common.HttpRequest, deadline_ns: u64, verification_secret: ?[]const u8) !http_common.HttpResponse {
+        return self.executeCoordinatedReadWithControlUri(coordinator, destination, base_uri, base_uri, request, deadline_ns, verification_secret);
+    }
+
+    /// The original read keeps its public URI. Only authenticated discovery,
+    /// fencing, and reconciliation use the separately advertised control URI.
+    pub fn executeCoordinatedReadWithControlUri(self: *ApiHttpClient, coordinator: *@import("workload_attempt_coordinator.zig").Store, destination: u64, base_uri: []const u8, control_base_uri: []const u8, request: http_common.HttpRequest, deadline_ns: u64, verification_secret: ?[]const u8) !http_common.HttpResponse {
+        _ = base_uri;
         const protocol = @import("workload_attempt_protocol.zig");
         if (request.cancellation) |cancellation| if (cancellation.isCancelled()) return error.Canceled;
         const signing = self.internal_service orelse return error.AttemptAuthenticationUnavailable;
         if (signing.node_id != coordinator.node_id) return error.AttemptIdentityMismatch;
         const keys: protocol.Keys = .{ .primary = signing.secret, .verification = verification_secret, .issuer = signing.issuer };
-        const incarnation = try coordinator.readyIncarnation(destination) orelse try self.refreshCoordinatedDestination(coordinator, destination, base_uri, deadline_ns, verification_secret, request.cancellation);
+        const incarnation = try coordinator.readyIncarnation(destination) orelse try self.refreshCoordinatedDestination(coordinator, destination, control_base_uri, deadline_ns, verification_secret, request.cancellation);
         _ = try attemptRemainingMs(deadline_ns);
         if (request.cancellation) |cancellation| if (cancellation.isCancelled()) return error.Canceled;
         // The durable sequence provides uniqueness; the digest also separates
@@ -627,8 +651,8 @@ pub const ApiHttpClient = struct {
         const operation = std.mem.readInt(u128, digest[0..16], .big) | 1;
         const id = coordinator.begin(destination, incarnation, operation) catch |err| retry: {
             if (err != error.AttemptCapacityExhausted) return err;
-            const retired = try self.reconcileCoordinatedReads(coordinator, destination, base_uri, deadline_ns, verification_secret, request.cancellation);
-            const current_incarnation = if (retired) try self.refreshCoordinatedDestination(coordinator, destination, base_uri, deadline_ns, verification_secret, request.cancellation) else incarnation;
+            const retired = try self.reconcileCoordinatedReads(coordinator, destination, control_base_uri, deadline_ns, verification_secret, request.cancellation);
+            const current_incarnation = if (retired) try self.refreshCoordinatedDestination(coordinator, destination, control_base_uri, deadline_ns, verification_secret, request.cancellation) else incarnation;
             break :retry try coordinator.begin(destination, current_incarnation, operation);
         };
         const acknowledged = @min(coordinator.acknowledgedThrough(destination) catch |err| {

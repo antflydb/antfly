@@ -54,9 +54,12 @@ pub const Runtime = struct {
         return .{ .context = self, .dispatch = dispatch };
     }
 
-    fn dispatch(raw: *anyopaque, allocator: *const memory.Allocator, request: *const wire.Request, sink: *const wire.ResponseSink) callconv(.c) errors.Status {
+    fn dispatch(raw: *anyopaque, allocator: *const memory.Allocator, request: *const wire.RequestV1, sink: *const wire.ResponseSink) callconv(.c) errors.Status {
         const self: *Runtime = @ptrCast(@alignCast(raw));
-        self.execute(allocator, request, sink) catch |err| return errors.statusFromError(normalize(err));
+        // Runtime.port advertises version 2. Its caller supplies the extended
+        // request after checking that version; version-1 ports use a separate
+        // legacy producer and never enter this callback.
+        self.execute(allocator, @ptrCast(request), sink) catch |err| return errors.statusFromError(normalize(err));
         return .ok;
     }
 
@@ -87,7 +90,8 @@ pub const Runtime = struct {
         for (request.headers.slice(), headers) |header, *target| target.* = .{ .name = header.name.slice(), .value = header.value.slice() };
         var api = client.ApiHttpClient.init(alloc, self.borrowed_executor orelse self.owned_executor.?.executor());
         _ = try api.withInternalServiceNodeAuth(self.secret, self.issuer, self.store.node_id);
-        var response = try api.executeCoordinatedRead(&self.store, request.destination, request.base_uri.slice(), .{
+        const control_base_uri = request.control_base_uri.slice() orelse request.base_uri.slice();
+        var response = try api.executeCoordinatedReadWithControlUri(&self.store, request.destination, request.base_uri.slice(), control_base_uri, .{
             .method = switch (request.method) {
                 .get => .GET,
                 .post => .POST,

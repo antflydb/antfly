@@ -5821,7 +5821,16 @@ pub const HostedProvisionedTableReadSource = struct {
             const group_id = internalGroupIdFromUri(request.uri) orelse return error.DistributedQueryUnavailable;
             const destination = try self.attemptDestination(alloc, group_id, request.uri, attempt_deadline);
             defer alloc.free(destination.base_uri);
-            break :owned port.execute(alloc, destination.node_id, destination.base_uri, routed_request, attempt_deadline);
+            // The original query URI is resolved against the public catalog
+            // endpoint. Only the coordinator's authenticated control exchange
+            // may use the separately advertised protected listener. Version-1
+            // ports retain their exact request layout and public fallback.
+            const control_base_uri = if (port.version >= 2 and self.internal_service_secret != null and self.internal_service_issuer != null)
+                try self.router.withBudget(.{ .clock = .{ .deadline_ns = attempt_deadline } }).nodeControlBaseUriForGroup(alloc, group_id, destination.node_id)
+            else
+                null;
+            defer if (control_base_uri) |value| alloc.free(value);
+            break :owned port.executeWithControlUri(alloc, destination.node_id, destination.base_uri, control_base_uri, routed_request, attempt_deadline);
         } else client.executeRequest(routed_request)) catch |err|
             return normalizeDistributedReadTransportError(err);
         errdefer response.deinit(alloc);
@@ -25450,6 +25459,91 @@ fn consumerTests() type {
                 try std.testing.expectEqualStrings("{}", worker_response.json);
                 try std.testing.expectEqual(before_calls + 2, route_calls);
             }
+        }
+
+        test "workload admission hosted read keeps query public and routes only control to protected endpoint" {
+            const wire = @import("../runtime_workload_abi.zig");
+            const http_wire = @import("../runtime_http_abi.zig");
+            const memory = @import("runtime_memory_abi");
+            const errors = @import("../runtime_error_abi.zig");
+            const Catalog = struct {
+                fn fence(_: *anyopaque, group_id: u64) !?metadata_api.CatalogRouteFence {
+                    return .{
+                        .metadata_group_id = 1,
+                        .catalog_revision = 2,
+                        .table_id = 7,
+                        .topology_epoch = 3,
+                        .route = .{ .group_id = group_id, .range_id = 71, .identity_namespace = .{ .table_id = 7, .shard_id = group_id, .range_id = 71 } },
+                    };
+                }
+                fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+                    return error.UnexpectedAdminSnapshot;
+                }
+                fn freeSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+            };
+            const State = struct {
+                control_resolutions: usize = 0,
+                v2: bool = true,
+                calls: usize = 0,
+                fn localId(_: *anyopaque) u64 {
+                    return 7;
+                }
+                fn localStatus(_: *anyopaque, _: u64) raft_mod.HostedReplicaStatus {
+                    return .absent;
+                }
+                fn nodeUri(_: *anyopaque, alloc: std.mem.Allocator, _: u64) !?[]u8 {
+                    return try alloc.dupe(u8, "http://peer.test");
+                }
+                fn nodes(_: *anyopaque, alloc: std.mem.Allocator, group_id: u64, _: table_router.RouteBudget) ![]u64 {
+                    try std.testing.expectEqual(@as(u64, 7001), group_id);
+                    return try alloc.dupe(u64, &.{8});
+                }
+                fn control(raw: *anyopaque, alloc: std.mem.Allocator, group_id: u64, node_id: u64, _: table_router.RouteBudget) !?[]u8 {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.control_resolutions += 1;
+                    try std.testing.expectEqual(@as(u64, 7001), group_id);
+                    try std.testing.expectEqual(@as(u64, 8), node_id);
+                    return try alloc.dupe(u8, "http://peer-control.test");
+                }
+                fn dispatch(raw: *anyopaque, _: *const memory.Allocator, request: *const wire.RequestV1, sink: *const wire.ResponseSink) callconv(.c) errors.Status {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.calls += 1;
+                    if (request.destination != 8 or !std.mem.eql(u8, request.base_uri.slice(), "http://peer.test") or
+                        !std.mem.eql(u8, request.uri.slice(), "http://peer.test/internal/v1/groups/7001/tables/docs/documents/doc:a"))
+                        return errors.statusFromError(error.InvalidArgument);
+                    if (self.v2) {
+                        const extended: *const wire.Request = @ptrCast(request);
+                        if (!std.mem.eql(u8, extended.control_base_uri.slice() orelse "", "http://peer-control.test"))
+                            return errors.statusFromError(error.InvalidArgument);
+                    }
+                    const ack = [_]http_wire.HeaderView{.{ .name = .init(metadata_api.catalog_route_fence_ack_header), .value = .init(metadata_api.catalog_route_fence_ack_value) }};
+                    return sink.receive(sink.context, 200, .init("application/json"), .{ .ptr = &ack, .len = ack.len }, .init("{}"));
+                }
+            };
+            var state: State = .{};
+            var hosted: HostedProvisionedTableReadSource = .{
+                .replica_root_dir = "",
+                .catalog = .{ .ptr = &state, .vtable = &.{ .admin_snapshot = Catalog.snapshot, .free_admin_snapshot = Catalog.freeSnapshot, .route_fence = Catalog.fence } },
+                .read_safety_barrier = undefined,
+                .router = .{ .ptr = &state, .vtable = &.{ .local_node_id = State.localId, .local_status = State.localStatus, .node_base_uri = State.nodeUri, .group_node_ids = State.nodes, .node_control_base_uri_for_group = State.control } },
+                .executor = undefined,
+                .internal_service_secret = "s" ** 32,
+                .internal_service_issuer = "cluster",
+                .remote_attempt_coordinator = .{ .context = &state, .dispatch = State.dispatch },
+            };
+            const request: http_common.HttpRequest = .{ .method = .GET, .uri = "http://peer.test/internal/v1/groups/7001/tables/docs/documents/doc:a" };
+            var response = try HostedProvisionedTableReadSource.executeInternalRequest(&hosted, std.testing.allocator, request);
+            response.deinit(std.testing.allocator);
+            try std.testing.expectEqual(@as(usize, 1), state.control_resolutions);
+            try std.testing.expectEqual(@as(usize, 1), state.calls);
+            state.v2 = false;
+            var legacy_port = hosted.remote_attempt_coordinator.?;
+            legacy_port.version = 1;
+            hosted.remote_attempt_coordinator = legacy_port;
+            var legacy = try HostedProvisionedTableReadSource.executeInternalRequest(&hosted, std.testing.allocator, request);
+            legacy.deinit(std.testing.allocator);
+            try std.testing.expectEqual(@as(usize, 1), state.control_resolutions);
+            try std.testing.expectEqual(@as(usize, 2), state.calls);
         }
 
         test "join job-state polling bypasses storage route fencing without weakening storage reads" {
