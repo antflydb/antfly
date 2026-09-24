@@ -4084,6 +4084,7 @@ fn parseStoreRecord(alloc: std.mem.Allocator, body: []const u8) !metadata_table_
         dense_native_storage_protocol_version: ?u16 = null,
         relational_topology_protocol_version: ?u16 = null,
         api_url: ?[]const u8 = null,
+        internal_api_url: ?[]const u8 = null,
         raft_url: ?[]const u8 = null,
         role: ?[]const u8 = null,
         health_class: ?[]const u8 = null,
@@ -4132,6 +4133,7 @@ fn parseStoreRecord(alloc: std.mem.Allocator, body: []const u8) !metadata_table_
         .dense_native_storage_protocol_version = parsed.value.dense_native_storage_protocol_version orelse 0,
         .relational_topology_protocol_version = parsed.value.relational_topology_protocol_version orelse 0,
         .api_url = try alloc.dupe(u8, parsed.value.api_url orelse ""),
+        .internal_api_url = try alloc.dupe(u8, parsed.value.internal_api_url orelse ""),
         .raft_url = try alloc.dupe(u8, parsed.value.raft_url orelse ""),
         .role = try alloc.dupe(u8, parsed.value.role orelse "data"),
         .health_class = try alloc.dupe(u8, parsed.value.health_class orelse "healthy"),
@@ -4541,6 +4543,19 @@ test "relational topology admission JSON preserves capability in registrations a
     try std.testing.expectEqual(@as(u16, 1), heartbeat.relational_topology_protocol_version);
     try std.testing.expectError(error.InvalidStoreReporterFence, parseStoreRecord(alloc, "{\"store_id\":20,\"node_id\":20,\"relational_topology_protocol_version\":1}"));
     try std.testing.expectError(error.InvalidStoreReporterFence, parseStoreStatusReport(alloc, "{\"store_id\":20,\"reporter_incarnation\":77,\"relational_topology_protocol_version\":2}"));
+}
+
+test "store registration JSON preserves separate internal endpoint and accepts older records" {
+    const alloc = std.testing.allocator;
+    const current = try parseStoreRecord(alloc, "{\"store_id\":20,\"node_id\":30,\"api_url\":\"https://public.example\",\"internal_api_url\":\"http://data.internal:9443\"}");
+    defer metadata_table_manager.freeStore(alloc, current);
+    try std.testing.expectEqualStrings("https://public.example", current.api_url);
+    try std.testing.expectEqualStrings("http://data.internal:9443", current.internal_api_url);
+
+    const legacy = try parseStoreRecord(alloc, "{\"store_id\":20,\"node_id\":30,\"api_url\":\"https://public.example\"}");
+    defer metadata_table_manager.freeStore(alloc, legacy);
+    try std.testing.expectEqualStrings(current.api_url, legacy.api_url);
+    try std.testing.expectEqualStrings("", legacy.internal_api_url);
 }
 
 fn parseU64Field(value: std.json.Value) !u64 {

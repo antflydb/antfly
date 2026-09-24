@@ -1233,6 +1233,35 @@ test "relational integrity metadata topology admission persists rollout floor an
     try @import("../relational_topology_admission.zig").requireStores(&.{capable});
 }
 
+test "store record keeps public URL and optional internal endpoint across legacy and extended encodings" {
+    const alloc = std.testing.allocator;
+    const legacy: metadata.StoreRecord = .{
+        .store_id = 17,
+        .node_id = 23,
+        .api_url = "https://public.example:8443",
+        .raft_url = "http://raft.example:9000",
+    };
+    const legacy_encoded = try encodeStoreRecord(alloc, legacy);
+    defer alloc.free(legacy_encoded);
+    const legacy_decoded = try decodeStoreRecord(alloc, legacy_encoded);
+    defer metadata_table_manager.freeStore(alloc, legacy_decoded);
+    try std.testing.expectEqualStrings(legacy.api_url, legacy_decoded.api_url);
+    try std.testing.expectEqualStrings("", legacy_decoded.internal_api_url);
+
+    var advertised = legacy;
+    advertised.internal_api_url = "http://data.internal:9443";
+    const encoded = try encodeStoreRecord(alloc, advertised);
+    defer alloc.free(encoded);
+    const decoded = try decodeStoreRecord(alloc, encoded);
+    defer metadata_table_manager.freeStore(alloc, decoded);
+    try std.testing.expectEqualStrings(legacy.api_url, decoded.api_url);
+    try std.testing.expectEqualStrings(advertised.internal_api_url, decoded.internal_api_url);
+    const cloned = try metadata_table_manager.cloneStore(alloc, decoded);
+    defer metadata_table_manager.freeStore(alloc, cloned);
+    try std.testing.expectEqualStrings(advertised.internal_api_url, cloned.internal_api_url);
+    try std.testing.expectError(error.InvalidMetadataTransitionEncoding, decodeStoreRecord(alloc, encoded[0 .. encoded.len - 1]));
+}
+
 test "table topology recreate is fenced by the durable transition generation" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -13009,6 +13038,7 @@ const store_record_extension_native_restore_version: u16 = 3;
 const store_record_extension_artifact_sources_version: u16 = 4;
 const store_record_extension_version: u16 = 5;
 const store_record_extension_relational_topology_version: u16 = 6;
+const store_record_extension_internal_api_version: u16 = 7;
 const reallocation_request_extension_magic = "afrr1";
 const reallocation_request_extension_version: u16 = 1;
 
@@ -14660,11 +14690,15 @@ fn appendStoreRecordExtensions(
     const has_native_restore_capability = record.native_generation_restore_version != 0;
     const has_dense_native_protocol = record.dense_native_storage_protocol_version != 0;
     const has_relational_topology = record.relational_topology_protocol_version != 0;
+    const has_internal_api = record.internal_api_url.len != 0;
     if (observation_count == 0 and !has_reporter_fence and !has_artifact_protocol and
-        !has_native_restore_capability and !has_dense_native_protocol and !has_relational_topology) return;
+        !has_native_restore_capability and !has_dense_native_protocol and !has_relational_topology and
+        !has_internal_api) return;
 
     try out.appendSlice(alloc, store_record_extension_magic);
-    const version: u16 = if (has_relational_topology)
+    const version: u16 = if (has_internal_api)
+        store_record_extension_internal_api_version
+    else if (has_relational_topology)
         store_record_extension_relational_topology_version
     else if (has_dense_native_protocol)
         store_record_extension_version
@@ -14690,6 +14724,10 @@ fn appendStoreRecordExtensions(
         try appendInt(alloc, out, u16, record.dense_native_storage_protocol_version);
     if (version >= store_record_extension_relational_topology_version)
         try appendInt(alloc, out, u16, record.relational_topology_protocol_version);
+    if (version >= store_record_extension_internal_api_version) {
+        try appendInt(alloc, out, u32, @intCast(record.internal_api_url.len));
+        try out.appendSlice(alloc, record.internal_api_url);
+    }
     try appendInt(alloc, out, u32, observation_count);
     for (record.group_statuses, 0..) |status, status_index| {
         if (status.observed_reallocation_request_id == 0) continue;
@@ -14766,6 +14804,8 @@ fn readStoreRecord(alloc: std.mem.Allocator, encoded: []const u8, pos: *usize) !
         break :blk value;
     } else false;
     const extensions = try readStoreRecordExtensions(encoded, pos, group_statuses);
+    const internal_api_url = try alloc.dupe(u8, extensions.internal_api_url);
+    errdefer alloc.free(internal_api_url);
     return .{
         .store_id = store_id,
         .node_id = node_id,
@@ -14776,6 +14816,7 @@ fn readStoreRecord(alloc: std.mem.Allocator, encoded: []const u8, pos: *usize) !
         .dense_native_storage_protocol_version = extensions.dense_native_storage_protocol_version,
         .relational_topology_protocol_version = extensions.relational_topology_protocol_version,
         .api_url = api_url,
+        .internal_api_url = internal_api_url,
         .raft_url = raft_url,
         .role = role,
         .health_class = health_class,
@@ -14798,7 +14839,7 @@ fn readStoreRecordExtensions(
     encoded: []const u8,
     pos: *usize,
     group_statuses: []metadata.GroupStatusReport,
-) !struct { reporter_incarnation: u64 = 0, status_generation: u64 = 0, native_generation_restore_version: u16 = 0, artifact_sources_protocol_version: u16 = 0, dense_native_storage_protocol_version: u16 = 0, relational_topology_protocol_version: u16 = 0 } {
+) !struct { reporter_incarnation: u64 = 0, status_generation: u64 = 0, native_generation_restore_version: u16 = 0, artifact_sources_protocol_version: u16 = 0, dense_native_storage_protocol_version: u16 = 0, relational_topology_protocol_version: u16 = 0, internal_api_url: []const u8 = "" } {
     if (pos.* == encoded.len) return .{};
     if (pos.* + store_record_extension_magic.len > encoded.len or
         !std.mem.eql(
@@ -14817,7 +14858,8 @@ fn readStoreRecordExtensions(
         version != store_record_extension_native_restore_version and
         version != store_record_extension_artifact_sources_version and
         version != store_record_extension_version and
-        version != store_record_extension_relational_topology_version) return error.InvalidMetadataTransitionEncoding;
+        version != store_record_extension_relational_topology_version and
+        version != store_record_extension_internal_api_version) return error.InvalidMetadataTransitionEncoding;
     const reporter_incarnation = if (version >= store_record_extension_reporter_version)
         try readInt(encoded, pos, u64)
     else
@@ -14843,6 +14885,13 @@ fn readStoreRecordExtensions(
         try readInt(encoded, pos, u16)
     else
         0;
+    const internal_api_url = if (version >= store_record_extension_internal_api_version) blk: {
+        const len = try readInt(encoded, pos, u32);
+        if (len == 0 or pos.* + len > encoded.len) return error.InvalidMetadataTransitionEncoding;
+        const value = encoded[pos.* .. pos.* + len];
+        pos.* += len;
+        break :blk value;
+    } else "";
     if (relational_topology_protocol_version > metadata_table_manager.relational_topology_protocol_version or
         (relational_topology_protocol_version != 0 and reporter_incarnation == 0)) return error.InvalidMetadataTransitionEncoding;
     if (!metadata_table_manager.artifactSourcesProtocolValid(
@@ -14871,6 +14920,7 @@ fn readStoreRecordExtensions(
         .native_generation_restore_version = native_generation_restore_version,
         .dense_native_storage_protocol_version = dense_native_storage_protocol_version,
         .relational_topology_protocol_version = relational_topology_protocol_version,
+        .internal_api_url = internal_api_url,
     };
 }
 

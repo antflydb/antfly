@@ -2854,7 +2854,7 @@ pub fn transitionRequiresCoordinatedDecoder(command: metadata_storage.Transition
             for (delta.upsert_tables) |table| if (table.relational_retirement_json.len != 0 or table.requiresStorageMetadataExtension()) break :blk true;
             break :blk false;
         },
-        .register_store, .upsert_store => |record| record.relational_topology_protocol_version != 0,
+        .register_store, .upsert_store => |record| record.relational_topology_protocol_version != 0 or record.internal_api_url.len != 0,
         .admit_split_transition => |admission| admission.record.table_contract.integrity_protocol != .none or admission.record.table_contract.read_schema_json.len != 0,
         .upsert_split_transition => |record| record.table_contract.integrity_protocol != .none or record.table_contract.read_schema_json.len != 0,
         .admit_online_merge => true,
@@ -2869,7 +2869,11 @@ pub fn ensureCoordinatedDecoderWithContext(service: anytype, command: metadata_s
     if (!transitionRequiresCoordinatedDecoder(command)) return;
     if (comptime !@hasDecl(@TypeOf(service.*), "ensureTableTopologyProtocolReadyWithContext"))
         return error.TableTopologyProtocolUpgradeRequired;
-    _ = try service.ensureTableTopologyProtocolReadyWithContext(request, metadata_topology_protocol.coordinated_lifecycle_version);
+    const required_version = switch (command) {
+        .register_store, .upsert_store => |record| @max(metadata_topology_protocol.coordinated_lifecycle_version, storeRecordDecoderProtocol(record)),
+        else => metadata_topology_protocol.coordinated_lifecycle_version,
+    };
+    _ = try service.ensureTableTopologyProtocolReadyWithContext(request, required_version);
 }
 
 fn prepareCoordinatedDecoderAdmission(service: anytype, commands: []const metadata_storage.TransitionCommand) !?TableTopologyProtocolReadiness {
@@ -2961,11 +2965,18 @@ fn tableRecordStorageProtocol(table: metadata_table_manager.TableRecord) u16 {
     return if (table.storage_migration != null) @max(storage, metadata_topology_protocol.table_storage_metadata_version) else storage;
 }
 
+fn storeRecordDecoderProtocol(record: metadata_table_manager.StoreRecord) u16 {
+    if (record.internal_api_url.len != 0) return metadata_topology_protocol.internal_endpoint_version;
+    if (record.relational_topology_protocol_version != 0) return metadata_topology_protocol.relational_integrity_topology_version;
+    return 0;
+}
+
 /// Return the exact required decoder for extended table records and secret
 /// publications, including nested JSON/CAS records and removals of an old
 /// policy. Older voters must not silently lose durable projections.
 fn commandTableStorageProtocol(alloc: std.mem.Allocator, command: metadata_storage.TransitionCommand) !u16 {
     return switch (command) {
+        .register_store, .upsert_store => |record| storeRecordDecoderProtocol(record),
         .apply_completion_activation => metadata_topology_protocol.completion_storage_version,
         .publish_secret_collection => metadata_topology_protocol.secret_snapshot_version,
         .upsert_table => |table| tableRecordStorageProtocol(table),
@@ -4253,7 +4264,7 @@ const ProjectedCoreSnapshot = struct {
         for (self.stores) |record| {
             out.store_group_statuses += record.group_statuses.len;
             out.store_runtime_statuses += record.runtime_statuses.len;
-            out.estimated_bytes += record.api_url.len + record.raft_url.len + record.role.len +
+            out.estimated_bytes += record.api_url.len + record.internal_api_url.len + record.raft_url.len + record.role.len +
                 record.health_class.len + record.failure_domain.len +
                 @sizeOf(metadata_table_manager.GroupStatusReport) * record.group_statuses.len +
                 @sizeOf(metadata_table_manager.RuntimeGroupStatusReport) * record.runtime_statuses.len;
@@ -6046,7 +6057,8 @@ pub const MetadataService = struct {
     }
 
     pub fn upsertStore(self: *MetadataService, record: metadata_table_manager.StoreRecord) !void {
-        const readiness = if (record.relational_topology_protocol_version != 0) try self.ensureTableTopologyProtocolReadyWithContext(.{}, metadata_topology_protocol.relational_integrity_topology_version) else null;
+        const required_version = storeRecordDecoderProtocol(record);
+        const readiness = if (required_version != 0) try self.ensureTableTopologyProtocolReadyWithContext(.{}, required_version) else null;
         self.lockCatalogMutation();
         defer self.unlockCatalogMutation();
         if (readiness) |token| try self.validateTableTopologyProtocolReadinessWithContext(.{}, token);
@@ -6087,7 +6099,8 @@ pub const MetadataService = struct {
     }
 
     pub fn registerStore(self: *MetadataService, record: metadata_table_manager.StoreRecord) !void {
-        const readiness = if (record.relational_topology_protocol_version != 0) try self.ensureTableTopologyProtocolReadyWithContext(.{}, metadata_topology_protocol.relational_integrity_topology_version) else null;
+        const required_version = storeRecordDecoderProtocol(record);
+        const readiness = if (required_version != 0) try self.ensureTableTopologyProtocolReadyWithContext(.{}, required_version) else null;
         self.lockCatalogMutation();
         defer self.unlockCatalogMutation();
         if (readiness) |token| try self.validateTableTopologyProtocolReadinessWithContext(.{}, token);
@@ -8528,7 +8541,8 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn upsertStore(self: *MetadataHttpService, record: metadata_table_manager.StoreRecord) !void {
-        const readiness = if (record.relational_topology_protocol_version != 0) try self.ensureTableTopologyProtocolReadyWithContext(.{}, metadata_topology_protocol.relational_integrity_topology_version) else null;
+        const required_version = storeRecordDecoderProtocol(record);
+        const readiness = if (required_version != 0) try self.ensureTableTopologyProtocolReadyWithContext(.{}, required_version) else null;
         self.lockCatalogMutation();
         defer self.unlockCatalogMutation();
         if (readiness) |token| try self.validateTableTopologyProtocolReadinessWithContext(.{}, token);
@@ -8902,7 +8916,8 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn registerStore(self: *MetadataHttpService, record: metadata_table_manager.StoreRecord) !void {
-        const readiness = if (record.relational_topology_protocol_version != 0) try self.ensureTableTopologyProtocolReadyWithContext(.{}, metadata_topology_protocol.relational_integrity_topology_version) else null;
+        const required_version = storeRecordDecoderProtocol(record);
+        const readiness = if (required_version != 0) try self.ensureTableTopologyProtocolReadyWithContext(.{}, required_version) else null;
         self.lockCatalogMutation();
         defer self.unlockCatalogMutation();
         if (readiness) |token| try self.validateTableTopologyProtocolReadinessWithContext(.{}, token);
@@ -12677,6 +12692,37 @@ test "relational topology admission rejects lifecycle proposals before encoding 
     try std.testing.expect(!transitionRequiresCoordinatedDecoder(.{ .upsert_restore_job = .{ .key = "1", .value = "{}" } }));
     try std.testing.expect(!transitionRequiresCoordinatedDecoder(.{ .create_restore_job = .{ .key = "1", .value = "{}" } }));
     try std.testing.expect(!transitionRequiresCoordinatedDecoder(.{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{plain} } }));
+}
+
+test "internal store endpoint requires version 14 on every metadata replica before admission" {
+    const Fake = struct {
+        member_versions: []const u16,
+        requested_version: u16 = 0,
+
+        fn ensureTableTopologyProtocolReadyWithContext(self: *@This(), _: api_operation.RequestContext, required: u16) !TableTopologyProtocolReadiness {
+            self.requested_version = required;
+            for (self.member_versions) |version| if (version < required) return error.TableTopologyProtocolUpgradeRequired;
+            return tableTopologyProtocolReadiness(3, required, "0123456789abcdef0123456789abcdef".*, &.{ 1, 2, 3 });
+        }
+    };
+    const record: metadata_table_manager.StoreRecord = .{
+        .store_id = 1,
+        .node_id = 1,
+        .api_url = "https://data.example",
+        .internal_api_url = "http://data.internal:9443",
+    };
+    const command: metadata_storage.TransitionCommand = .{ .register_store = record };
+    try std.testing.expectEqual(metadata_topology_protocol.internal_endpoint_version, try commandTableStorageProtocol(std.testing.allocator, command));
+    var peer = Fake{ .member_versions = &.{ 14, 14, 13 } };
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, ensureCoordinatedDecoderWithContext(&peer, command, .{}));
+    try std.testing.expectEqual(metadata_topology_protocol.internal_endpoint_version, peer.requested_version);
+    peer.member_versions = &.{ 14, 14, 14 };
+    try ensureCoordinatedDecoderWithContext(&peer, command, .{});
+
+    var legacy = record;
+    legacy.internal_api_url = "";
+    try std.testing.expectEqual(@as(u16, 0), try commandTableStorageProtocol(std.testing.allocator, .{ .register_store = legacy }));
+    try std.testing.expect(!transitionRequiresCoordinatedDecoder(.{ .register_store = legacy }));
 }
 
 test "relational topology admission requires metadata decoder capability beyond framed status" {

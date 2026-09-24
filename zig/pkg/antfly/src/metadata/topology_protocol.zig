@@ -31,7 +31,9 @@ const std = @import("std");
 /// Version 11 preserves nondefault table storage policy in binary records.
 /// Version 12 preserves physical completion policy and profile versions.
 /// Version 13 decodes ATS1 table metadata and snapshots secret collections.
-pub const current_version: u16 = 13;
+/// Version 14 decodes the optional internal HTTP endpoint in store records.
+pub const current_version: u16 = 14;
+pub const internal_endpoint_version: u16 = 14;
 pub const completion_storage_version: u16 = 12;
 pub const table_storage_version: u16 = 11;
 pub const table_storage_metadata_version: u16 = 13;

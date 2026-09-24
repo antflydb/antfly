@@ -483,6 +483,9 @@ pub const StoreRecord = struct {
     dense_native_storage_protocol_version: u16 = 0,
     relational_topology_protocol_version: u16 = 0,
     api_url: []const u8 = "",
+    /// Optional node-to-node HTTP endpoint. Empty on older registrations;
+    /// public clients and existing peer routes continue to use api_url.
+    internal_api_url: []const u8 = "",
     raft_url: []const u8 = "",
     role: []const u8 = "data",
     health_class: []const u8 = "healthy",
@@ -2568,6 +2571,8 @@ pub fn freeNode(alloc: std.mem.Allocator, record: NodeRecord) void {
 pub fn cloneStore(alloc: std.mem.Allocator, record: StoreRecord) !StoreRecord {
     const api_url = try alloc.dupe(u8, record.api_url);
     errdefer alloc.free(api_url);
+    const internal_api_url = try alloc.dupe(u8, record.internal_api_url);
+    errdefer alloc.free(internal_api_url);
     const raft_url = try alloc.dupe(u8, record.raft_url);
     errdefer alloc.free(raft_url);
     const role = try alloc.dupe(u8, record.role);
@@ -2590,6 +2595,7 @@ pub fn cloneStore(alloc: std.mem.Allocator, record: StoreRecord) !StoreRecord {
         .dense_native_storage_protocol_version = record.dense_native_storage_protocol_version,
         .relational_topology_protocol_version = record.relational_topology_protocol_version,
         .api_url = api_url,
+        .internal_api_url = internal_api_url,
         .raft_url = raft_url,
         .role = role,
         .health_class = health_class,
@@ -2610,6 +2616,7 @@ pub fn cloneStore(alloc: std.mem.Allocator, record: StoreRecord) !StoreRecord {
 
 pub fn freeStore(alloc: std.mem.Allocator, record: StoreRecord) void {
     alloc.free(record.api_url);
+    alloc.free(record.internal_api_url);
     alloc.free(record.raft_url);
     alloc.free(record.role);
     alloc.free(record.health_class);
