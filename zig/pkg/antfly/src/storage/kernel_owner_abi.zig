@@ -1079,6 +1079,14 @@ pub const ReplicatedBatchAtRaftEntryRequest = extern struct {
     raft_index: u64 = 0,
 };
 
+pub const RaftEntryAppliedRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    table_name: BorrowedBytes = .{},
+    raft_term: u64 = 0,
+    raft_index: u64 = 0,
+};
+
 /// Complete offline HA-seed operations that must remain beside physical DB
 /// restore/validation code. Values are append-only because they are recorded
 /// in `FailureIdentity.operation` for cross-unit diagnostics.
@@ -1866,6 +1874,12 @@ pub extern fn antfly_storage_owner_replicated_batch_at_raft_entry_json(
     owner: ?*anyopaque,
     request: *const ReplicatedBatchAtRaftEntryRequest,
     out_response: *OwnedBytes,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_owner_raft_entry_already_applied(
+    owner: ?*anyopaque,
+    request: *const RaftEntryAppliedRequest,
+    out_applied: *u8,
 ) callconv(.c) Status;
 
 pub extern fn antfly_storage_owner_transaction_status(

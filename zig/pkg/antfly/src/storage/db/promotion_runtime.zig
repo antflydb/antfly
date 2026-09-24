@@ -283,7 +283,7 @@ fn processResolutionArtifactWithCatalog(
                     // upsert.
                     try entries.append(a, .{
                         .table = previous.table,
-                        .storage_table = e.doc_ref.storage_table,
+                        .storage_table = previous.storage_table,
                         .key = previous.key,
                         .doc_json = try buildMergedTombstoneDocAlloc(a, e),
                     });
@@ -1046,6 +1046,41 @@ test "processResolutionArtifact tombstones the prior key when a mention re-keys"
     // the state row proves both already committed.
     try testing.expectEqual(@as(usize, 0), try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
     try testing.expectEqual(@as(usize, 3), capture.keys.items.len);
+}
+
+test "processResolutionArtifact tombstones the prior physical destination after re-key" {
+    const alloc = testing.allocator;
+    var map = MapStore{ .alloc = alloc };
+    defer map.deinit();
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "events_resolution_v1");
+    defer alloc.free(resolution_key);
+    var capture = CaptureSink{ .alloc = alloc };
+    defer capture.deinit();
+
+    try map.put(resolution_key,
+        \\{"config_generation":1,"entities":[{"local_id":"v0","doc_ref":{"table":"events","storage_table":"table:old","key":"event/provisional"},"confidence":1,"decision":"new","label":"event","canonical_name":"Ada spoke.","surface_form":"Ada spoke."}]}
+    );
+    try testing.expectEqual(@as(usize, 1), try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
+
+    try map.put(resolution_key,
+        \\{"config_generation":1,"entities":[{"local_id":"v0","doc_ref":{"table":"events","storage_table":"table:new","key":"event/canonical"},"confidence":1,"decision":"new","label":"event","canonical_name":"Ada spoke.","surface_form":"Ada spoke."}]}
+    );
+    try testing.expectEqual(@as(usize, 2), try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
+    try testing.expectEqual(@as(usize, 2), capture.batch_calls);
+    try testing.expectEqualStrings("event/provisional", capture.keys.items[1]);
+    try testing.expectEqualStrings("table:old", capture.storage_tables.items[1].?);
+    try @import("antfly-json").testing.expectSubsetJsonText(
+        alloc,
+        "{\"merged_into\":\"event/canonical\"}",
+        capture.docs.items[1],
+    );
+    try testing.expectEqualStrings("event/canonical", capture.keys.items[2]);
+    try testing.expectEqualStrings("table:new", capture.storage_tables.items[2].?);
+    try @import("antfly-json").testing.expectSubsetJsonText(
+        alloc,
+        "{\"canonical_name\":\"Ada spoke.\"}",
+        capture.docs.items[2],
+    );
 }
 
 test "processResolutionArtifact skips a byte-stable replay of an already-promoted decision" {

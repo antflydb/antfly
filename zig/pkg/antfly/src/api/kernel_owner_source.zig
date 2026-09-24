@@ -1323,8 +1323,14 @@ pub const ProvisionedKernelOwnerSource = struct {
             current.entry.restore_ha_replay != descriptor.restore_ha_replay or
             !descriptor_contract.initialRangesEqual(current.entry.initial_range, descriptor.initial_range) or
             !std.meta.eql(current.entry.table_storage, descriptor.table_storage)) return error.StorageBusy;
-        // The DB replay path checks its atomic entry marker before mutations,
-        // and still repairs any lifecycle HA/outbox work for applied entries.
+        // The current owner may have different validation, relational indexes,
+        // or generated-column semantics. Only an entry whose mutation already
+        // committed under its original schema can be replayed through it. Use
+        // the full replay path for that case to repair lifecycle HA/outbox work.
+        // An unapplied entry must remain pending; reporting its schema mismatch
+        // as a deterministic command failure would permanently skip it.
+        if (!try current.owner().raftEntryAlreadyApplied(table_name, raft_term, raft_index))
+            return error.StorageBusy;
         const request_json = try table_writes.encodeStorageKernelBatchRequest(alloc, req);
         defer alloc.free(request_json);
         var response = try current.owner().replicatedBatchAtRaftEntryJson(table_name, request_json, raft_term, raft_index);
@@ -5321,11 +5327,11 @@ test "committed owner apply yields admission conflicts and retries the exact ent
         defer reader.deinit();
         var value = try reader.owner().lookupJson("docs", "{\"key\":\"doc:counter\",\"include_all_fields\":true}");
         defer value.deinit();
-        try std.testing.expect(std.mem.indexOf(u8, value.bytes(), "\"count\":1") != null);
+        try @import("antfly-json").testing.expectSubsetJsonText(alloc, "{\"count\":1}", value.bytes());
     }
 }
 
-test "stale committed owner replay applies exactly once under the current schema" {
+test "stale committed owner replay accepts only an already applied entry" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5363,13 +5369,15 @@ test "stale committed owner replay applies exactly once under the current schema
     } else return error.TestOwnerAdmissionDidNotRecover;
 
     try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", stale, increment, 1, 2);
-    try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", stale, increment, 1, 3);
-    try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", stale, increment, 1, 3);
+    try std.testing.expectError(error.StorageBusy, source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", stale, increment, 1, 3));
+    var old_relational = increment;
+    old_relational.relational_schema_version = 1;
+    try std.testing.expectError(error.StorageBusy, source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", stale, old_relational, 1, 3));
     var reader = try source.acquireDescriptor(1, "docs", path, current);
     defer reader.deinit();
     var value = try reader.owner().lookupJson("docs", "{\"key\":\"doc:counter\",\"include_all_fields\":true}");
     defer value.deinit();
-    try std.testing.expect(std.mem.indexOf(u8, value.bytes(), "\"count\":2") != null);
+    try @import("antfly-json").testing.expectSubsetJsonText(alloc, "{\"count\":1}", value.bytes());
 }
 
 test "stale committed owner replay reopens the current schema after restart" {
@@ -5436,12 +5444,12 @@ test "stale committed owner replay reopens the current schema after restart" {
     } }, read_gate.alreadyReadSafeBarrier());
     defer restarted.deinit();
     try restarted.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", stale, increment, 1, 2);
-    try restarted.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", stale, increment, 1, 3);
+    try std.testing.expectError(error.StorageBusy, restarted.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", stale, increment, 1, 3));
     var reader = try restarted.acquireDescriptor(1, "docs", path, current);
     defer reader.deinit();
     var value = try reader.owner().lookupJson("docs", "{\"key\":\"doc:counter\",\"include_all_fields\":true}");
     defer value.deinit();
-    try std.testing.expect(std.mem.indexOf(u8, value.bytes(), "\"count\":2") != null);
+    try @import("antfly-json").testing.expectSubsetJsonText(alloc, "{\"count\":1}", value.bytes());
 }
 
 test "pending exclusive storage owner lease blocks new readers until drain" {

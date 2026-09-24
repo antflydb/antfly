@@ -516,6 +516,21 @@ pub const Owner = struct {
         return response;
     }
 
+    pub fn raftEntryAlreadyApplied(self: *Owner, table_name: []const u8, raft_term: u64, raft_index: u64) !bool {
+        if (raft_term == 0 or raft_index == 0) return error.InvalidArgument;
+        var applied: u8 = 0;
+        try statusToError(abi.antfly_storage_owner_raft_entry_already_applied(
+            self.handle,
+            &.{
+                .table_name = .fromSlice(table_name),
+                .raft_term = raft_term,
+                .raft_index = raft_index,
+            },
+            &applied,
+        ));
+        return applied != 0;
+    }
+
     pub fn transactionStatus(
         self: *Owner,
         table_name: []const u8,

@@ -83,32 +83,33 @@ pub const DistributedEntitySink = struct {
         // Preserve the resolution work unit's immutable destination through
         // deferred promotion. Older artifacts bind all missing destinations in
         // one metadata read; pinned artifacts never resolve a logical name again.
+        // Resolve unpinned logical names once, then group by physical table.
+        // A re-key can redirect an old key in its original physical table and
+        // upsert the survivor in a new one in the same atomic batch.
+        var unpinned = std.StringArrayHashMapUnmanaged([]const u8).empty;
+        for (entries) |e| {
+            if (e.storage_table == null) try unpinned.put(a, e.table, e.table);
+        }
+        if (unpinned.count() > 0 and self.catalog_binding != null) {
+            const physical = try self.catalog_binding.?.bind(a, unpinned.keys());
+            if (physical.len != unpinned.count()) return error.InvalidCatalogRecord;
+            for (unpinned.values(), physical) |*destination, target| destination.* = target;
+        }
         const TableBatch = struct {
-            physical: ?[]const u8 = null,
             transforms: std.ArrayListUnmanaged(db_mod.types.DocumentTransform) = .empty,
         };
         var tables = std.StringArrayHashMapUnmanaged(TableBatch).empty;
         for (entries) |e| {
             const ops = try buildMergeOps(a, e.doc_json);
             if (ops.len == 0) continue;
-            const entry = try tables.getOrPut(a, e.table);
-            if (!entry.found_existing) entry.value_ptr.* = .{ .physical = e.storage_table } else {
-                const previous = entry.value_ptr.physical;
-                if ((previous == null) != (e.storage_table == null) or
-                    (previous != null and !std.mem.eql(u8, previous.?, e.storage_table.?))) return error.EntityPromotionConflict;
-            }
+            const physical = e.storage_table orelse unpinned.get(e.table).?;
+            const entry = try tables.getOrPut(a, physical);
+            if (!entry.found_existing) entry.value_ptr.* = .{};
             try entry.value_ptr.transforms.append(a, .{ .key = e.key, .operations = ops, .upsert = true });
         }
         if (tables.count() == 0) return;
-        var missing = std.ArrayListUnmanaged([]const u8).empty;
-        for (tables.keys(), tables.values()) |name, batch| if (batch.physical == null) try missing.append(a, name);
-        if (missing.items.len > 0) {
-            const physical: []const []const u8 = if (self.catalog_binding) |binding| try binding.bind(a, missing.items) else missing.items;
-            if (physical.len != missing.items.len) return error.InvalidCatalogRecord;
-            for (missing.items, physical) |name, target| tables.getPtr(name).?.physical = target;
-        }
         var reqs = std.ArrayListUnmanaged(distributed_txn.TableCommitRequest).empty;
-        for (tables.values()) |batch| try reqs.append(a, .{ .table_name = batch.physical.?, .transforms = batch.transforms.items });
+        for (tables.keys(), tables.values()) |physical, batch| try reqs.append(a, .{ .table_name = physical, .transforms = batch.transforms.items });
 
         // Promotion is a stateless, idempotent batch. Use the batch commit
         // contract so first-party sources can safely retry topology races and
@@ -230,6 +231,8 @@ const testing = std.testing;
 const FakeTableWriteSource = struct {
     alloc: std.mem.Allocator,
     table: []const u8,
+    other_table: ?[]const u8 = null,
+    table_names: std.ArrayListUnmanaged([]u8) = .empty,
     keys: std.ArrayListUnmanaged([]u8) = .empty,
     transforms_json: std.ArrayListUnmanaged([]u8) = .empty,
     /// Set so the source advertises the transaction vtable method.
@@ -240,9 +243,11 @@ const FakeTableWriteSource = struct {
     commit_batch_calls: usize = 0,
 
     fn deinit(self: *FakeTableWriteSource) void {
+        for (self.table_names.items) |name| self.alloc.free(name);
         for (self.keys.items) |k| self.alloc.free(k);
         for (self.transforms_json.items) |t| self.alloc.free(t);
         self.keys.deinit(self.alloc);
+        self.table_names.deinit(self.alloc);
         self.transforms_json.deinit(self.alloc);
     }
 
@@ -273,7 +278,8 @@ const FakeTableWriteSource = struct {
         const self: *FakeTableWriteSource = @ptrCast(@alignCast(ptr));
         self.commit_calls += 1;
         for (tables) |t| {
-            if (!std.mem.eql(u8, t.table_name, self.table)) return null;
+            if (!self.serves(t.table_name)) return null;
+            try self.table_names.append(self.alloc, try self.alloc.dupe(u8, t.table_name));
             try recordTransforms(self, alloc, t.transforms);
         }
         return .{ .committed = .{ .participant_count = tables.len } };
@@ -289,10 +295,16 @@ const FakeTableWriteSource = struct {
         const self: *FakeTableWriteSource = @ptrCast(@alignCast(ptr));
         self.commit_batch_calls += 1;
         for (tables) |t| {
-            if (!std.mem.eql(u8, t.table_name, self.table)) return null;
+            if (!self.serves(t.table_name)) return null;
+            try self.table_names.append(self.alloc, try self.alloc.dupe(u8, t.table_name));
             try recordTransforms(self, alloc, t.transforms);
         }
         return .{ .committed = .{ .participant_count = tables.len } };
+    }
+
+    fn serves(self: *const FakeTableWriteSource, name: []const u8) bool {
+        return std.mem.eql(u8, name, self.table) or
+            (self.other_table != null and std.mem.eql(u8, name, self.other_table.?));
     }
 
     fn recordTransforms(self: *FakeTableWriteSource, alloc: std.mem.Allocator, transforms: []const db_mod.types.DocumentTransform) anyerror!void {
@@ -470,6 +482,41 @@ test "DistributedEntitySink atomic promotion batch prefers stateless batch commi
     try testing.expectEqualStrings("person/ada_lovelace", fake.keys.items[0]);
     try testing.expectEqualStrings("org/antfly", fake.keys.items[1]);
     try testing.expect(std.mem.indexOf(u8, fake.transforms_json.items[0], "add_to_set aliases=\"Ada Lovelace\"") != null);
+}
+
+test "DistributedEntitySink commits a re-key across pinned physical tables atomically" {
+    const alloc = testing.allocator;
+    var fake = FakeTableWriteSource{
+        .alloc = alloc,
+        .table = "table:old",
+        .other_table = "table:new",
+        .support_commit_batch = true,
+    };
+    defer fake.deinit();
+    var sink_impl = DistributedEntitySink{ .writes = fake.source(), .atomic_batch_required = true };
+    const sink = sink_impl.entitySink();
+
+    try sink.upsertBatch(alloc, &.{
+        .{
+            .table = "events",
+            .storage_table = "table:old",
+            .key = "event/provisional",
+            .doc_json = "{\"entity_type\":\"event\",\"merged_into\":\"event/canonical\"}",
+        },
+        .{
+            .table = "events",
+            .storage_table = "table:new",
+            .key = "event/canonical",
+            .doc_json = "{\"entity_type\":\"event\",\"canonical_name\":\"Ada spoke.\"}",
+        },
+    });
+
+    try testing.expectEqual(@as(usize, 1), fake.commit_batch_calls);
+    try testing.expectEqual(@as(usize, 2), fake.table_names.items.len);
+    try testing.expectEqualStrings("table:old", fake.table_names.items[0]);
+    try testing.expectEqualStrings("table:new", fake.table_names.items[1]);
+    try testing.expectEqualStrings("event/provisional", fake.keys.items[0]);
+    try testing.expectEqualStrings("event/canonical", fake.keys.items[1]);
 }
 
 test "DistributedEntitySink batch commit remains compatible with transaction-only sources" {

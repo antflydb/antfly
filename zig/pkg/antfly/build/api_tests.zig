@@ -932,6 +932,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "hosted participant rediscovery retries only pre-decision leader unavailability",
             "distributed txn coordinator aborts only participants that may have begun",
             "DistributedEntitySink atomic promotion batch prefers stateless batch commit",
+            "DistributedEntitySink commits a re-key across pinned physical tables atomically",
             "DistributedEntitySink batch commit remains compatible with transaction-only sources",
             "DistributedEntitySink atomic mode fails closed when unsupported",
             "api http client preserves retryable group transaction unavailability",
