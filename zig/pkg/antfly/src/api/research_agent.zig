@@ -228,9 +228,7 @@ fn appendUnique(arena: std.mem.Allocator, list: []const []const u8, value: []con
 }
 
 fn boundedUtf8(text: []const u8, max: usize) []const u8 {
-    var end = @min(text.len, max);
-    while (end > 0 and end < text.len and (text[end] & 0xc0) == 0x80) end -= 1;
-    return text[0..end];
+    return agent_tools.truncateUtf8(text, max);
 }
 
 fn sourceString(source: ?JsonObject, field: []const u8) ?[]const u8 {
@@ -709,9 +707,13 @@ const Run = struct {
             // scope gets a full-text match on the sub-question, but only when
             // both tool policies allow full-text search.
             const full_text = toolAllowed(global_tools, "full_text_search") and toolAllowed(local_tools, "full_text_search");
+            const navigated = navigationTarget(raw_research);
             var direct = std.json.Array.init(self.arena);
-            for (raw_queries.array.items) |query| {
-                if (query != .object or hasPlanFields(query.object) or !full_text) {
+            for (raw_queries.array.items, 0..) |query, index| {
+                // A navigation target is a tree or graph walk, not a table
+                // scope: never replace it with a full-text search.
+                const is_navigated = if (navigated) |target| target == index else false;
+                if (query != .object or hasPlanFields(query.object) or !full_text or is_navigated) {
                     try direct.append(query);
                     continue;
                 }
@@ -753,8 +755,12 @@ const Run = struct {
         }
         var retrieval = std.json.ObjectMap.empty;
         if (local_tools) |tools| try retrieval.put(self.arena, "tools", tools);
-        // Agentic navigation needs the model loop; the pipeline retry omits it.
-        if (raw_research) |r| if (!pipeline) if (r.get("navigation")) |navigation| try retrieval.put(self.arena, "navigation", navigation);
+        // Agentic navigation needs the model loop, so the pipeline retry keeps
+        // only ranked navigation, which pipeline mode executes directly.
+        if (raw_research) |r| if (r.get("navigation")) |navigation| {
+            const agentic = navigation == .object and if (navigation.object.get("selection")) |selection| selection == .string and std.mem.eql(u8, selection.string, "agentic") else false;
+            if (!pipeline or !agentic) try retrieval.put(self.arena, "navigation", navigation);
+        };
         var generation = std.json.ObjectMap.empty;
         const instructions = if (self.request.steps) |steps| if (steps.research) |r| r.instructions else null else null;
         try generation.put(self.arena, "system_prompt", .{ .string = if (instructions) |extra| try std.fmt.allocPrint(self.arena, "{s}\nAdditional instructions: {s}", .{ researcher_prompt, extra }) else researcher_prompt });
@@ -847,7 +853,21 @@ const Run = struct {
                 try self.appendStep(.{ .kind = .tool_call, .name = "research", .action = try std.fmt.allocPrint(self.arena, "retried {s} without tools after a model tool-call failure", .{self.sub_questions.items[funded[slot]].id}), .status = if (outcome.body) |_| .success else |_| .@"error" });
             }
         }
-        for (funded, outcomes) |i, outcome| try self.absorbResearcher(i, outcome);
+        // A researcher stopped by the deadline or cancellation did not fail:
+        // keep its sub-question pending, record what finished, and end the
+        // pass without completing the round so a resume reruns only the
+        // interrupted sub-questions.
+        var interrupted = false;
+        for (funded, outcomes) |i, outcome| {
+            if (outcome.body) |_| {} else |err| if (interruption(err)) {
+                interrupted = true;
+                self.llm_calls += outcome.llm_calls;
+                self.tool_calls += outcome.tool_calls;
+                continue;
+            }
+            try self.absorbResearcher(i, outcome);
+        }
+        if (interrupted) return error.ResearchDeadlineExceeded;
         self.round += 1;
         self.phase = if (self.reflectEnabled()) .reflect else .write;
         try self.appendStep(.{
@@ -1010,7 +1030,9 @@ const Run = struct {
 
     fn runWrite(self: *Run) !void {
         if (self.registry.items.items.len == 0) {
-            self.incomplete = .{ .reason = "no_evidence", .message = "researchers found no evidence to write from" };
+            // A budget stop that starved the researchers is the root cause;
+            // keep it rather than reporting no_evidence.
+            if (self.incomplete == null) self.incomplete = .{ .reason = "no_evidence", .message = "researchers found no evidence to write from" };
             self.phase = .done;
             try self.appendStep(.{ .kind = .generation, .name = "write", .action = "skipped report: no evidence", .status = .skipped });
             return;
@@ -1261,6 +1283,15 @@ fn isRequestError(err: anyerror) bool {
     };
 }
 
+/// The run's deadline or the client's cancellation stopped the work; the
+/// same work can succeed when resumed.
+fn interruption(err: anyerror) bool {
+    return switch (err) {
+        error.DeadlineExceeded, error.Timeout, error.Canceled, error.Cancelled, error.ResearchDeadlineExceeded => true,
+        else => false,
+    };
+}
+
 /// Failures of the model call itself, as opposed to the request or data.
 fn modelLevelFailure(err: anyerror) bool {
     return switch (err) {
@@ -1270,6 +1301,14 @@ fn modelLevelFailure(err: anyerror) bool {
 }
 
 const web_tool_names = [_][]const u8{ "web_search", "fetch" };
+
+fn navigationTarget(research: ?std.json.ObjectMap) ?usize {
+    const step = research orelse return null;
+    const navigation = step.get("navigation") orelse return null;
+    if (navigation != .object) return null;
+    const index = navigation.object.get("query_index") orelse return null;
+    return if (index == .integer and index.integer >= 0) @intCast(index.integer) else null;
+}
 
 /// A tool policy with web access removed, for the pipeline-mode retry, which
 /// cannot use web tools. Removing entries only narrows the policy; a list
@@ -1310,9 +1349,14 @@ fn toolAllowed(tools: ?std.json.Value, name: []const u8) bool {
 }
 
 /// Caller-supplied search plan fields; a query without them is a table scope.
+/// Shares retrieval's definition of an executable plan.
 fn hasPlanFields(query: std.json.ObjectMap) bool {
-    inline for (.{ "full_text_search", "semantic_search", "query", "embeddings", "graph_queries", "aggregations", "count" }) |field| {
-        if (query.get(field) != null) return true;
+    for (retrieval_agent.plan_field_names) |field| {
+        if (query.get(field)) |value| {
+            // `count: false` is not a plan.
+            if (value == .bool and !value.bool) continue;
+            return true;
+        }
     }
     return false;
 }
@@ -2040,4 +2084,82 @@ test "research job advance checkpoints each phase before running the next" {
     try std.testing.expect(Probe.checked.load(.monotonic));
     try std.testing.expectEqual(research_jobs.JobState.succeeded, record.state);
     try std.testing.expectEqual(@as(u64, 5), record.advances);
+}
+
+test "research leaves deadline-interrupted sub-questions pending and resumes them" {
+    const Interrupt = struct {
+        var armed = std.atomic.Value(bool).init(true);
+        fn query(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, body: []const u8) !query_api.QueryResponse {
+            return TestFake.query(ptr, alloc, table, body);
+        }
+        fn generate(ptr: *anyopaque, a: std.mem.Allocator, chain: []const generating.ChainLink, messages: []const generating.ChatMessage) !generating.GenerateResult {
+            // The second sub-question's researcher hits the deadline once.
+            if (armed.load(.monotonic)) for (messages) |message| if (message.content) |content| {
+                if (std.mem.indexOf(u8, content.text, "\"question\":\"When does reranking help?\"") != null) {
+                    armed.store(false, .monotonic);
+                    return error.DeadlineExceeded;
+                }
+            };
+            return TestFake.generate(ptr, a, chain, messages);
+        }
+    };
+    var fake = TestFake{};
+    const first_body =
+        \\{"query":"How do hybrid search and reranking interact?","queries":[{"table":"docs","full_text_search":{"match":"hybrid"},"filter_query":{"term":"tenant-a","field":"tenant"}}],"generator":{"provider":"antfly","model":"test"},"stream":false,"budget":{"max_rounds":1}}
+    ;
+    const encoded = try execute(std.testing.allocator, .{ .ptr = &fake, .vtable = &.{ .run_query = Interrupt.query } }, .{ .ptr = &fake, .vtable = &.{ .execute_chain = Interrupt.generate } }, first_body, null, .{});
+    defer std.testing.allocator.free(encoded.body);
+    const first = try std.json.parseFromSlice(Result, std.testing.allocator, encoded.body, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+    defer first.deinit();
+    try std.testing.expectEqual(AgentStatus.incomplete, first.value.status);
+    try std.testing.expectEqualStrings("deadline", first.value.incomplete_details.?.reason);
+    try std.testing.expectEqual(Phase.research, first.value.research_state.phase);
+    const subs = first.value.plan.?.sub_questions;
+    try std.testing.expectEqualStrings("researched", subs[0].status.?);
+    try std.testing.expectEqualStrings("pending", subs[1].status.?);
+    try std.testing.expectEqual(@as(usize, 1), first.value.findings.?.len);
+
+    // Resuming reruns only the interrupted sub-question and completes.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var body = (try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), first_body, .{})).object;
+    try body.put(arena.allocator(), "research_state", try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), try std.json.Stringify.valueAlloc(arena.allocator(), first.value.research_state, .{ .emit_null_optional_fields = false }), .{}));
+    const second = try runJson(&fake, null, try std.json.Stringify.valueAlloc(arena.allocator(), std.json.Value{ .object = body }, .{}), .{});
+    defer second.deinit();
+    try std.testing.expectEqual(AgentStatus.completed, second.value.status);
+    try std.testing.expectEqual(@as(usize, 2), second.value.findings.?.len);
+    try std.testing.expect(second.value.report != null);
+}
+
+test "research keeps the budget reason when no evidence was gathered" {
+    var fake = TestFake{};
+    const body =
+        \\{"query":"q","queries":[{"table":"docs","filter_query":{"term":"tenant-a","field":"tenant"}}],"generator":{"provider":"antfly","model":"test"},"stream":false,"budget":{"max_rounds":1,"max_llm_calls":3}}
+    ;
+    const parsed = try runJson(&fake, null, body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("max_llm_calls", parsed.value.incomplete_details.?.reason);
+}
+
+test "research retry never replaces a navigation target with a full-text search" {
+    const Capture = struct {
+        var saw_sub_question = std.atomic.Value(bool).init(false);
+        fn query(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, body: []const u8) !query_api.QueryResponse {
+            if (std.mem.indexOf(u8, body, "When does reranking help?") != null) saw_sub_question.store(true, .monotonic);
+            return TestFake.query(ptr, alloc, table, body);
+        }
+    };
+    var fake = TestFake{ .fail_tool_calls = true };
+    const body =
+        \\{"query":"q","queries":[{"table":"docs","filter_query":{"term":"tenant-a","field":"tenant"}}],"generator":{"provider":"antfly","model":"test"},"stream":false,"budget":{"max_rounds":1},"steps":{"research":{"navigation":{"query_index":0,"index":"links","strategy":"graph","selection":"agentic","start_key":"doc:rrf"}}}}
+    ;
+    const encoded = try execute(std.testing.allocator, .{ .ptr = &fake, .vtable = &.{ .run_query = Capture.query } }, .{ .ptr = &fake, .vtable = &.{ .execute_chain = TestFake.generate } }, body, null, .{});
+    defer std.testing.allocator.free(encoded.body);
+    try std.testing.expect(!Capture.saw_sub_question.load(.monotonic));
+    var map = std.json.ObjectMap.empty;
+    defer map.deinit(std.testing.allocator);
+    try map.put(std.testing.allocator, "count", .{ .bool = false });
+    try std.testing.expect(!hasPlanFields(map));
+    try map.put(std.testing.allocator, "count", .{ .bool = true });
+    try std.testing.expect(hasPlanFields(map));
 }

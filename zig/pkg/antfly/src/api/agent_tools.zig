@@ -83,6 +83,16 @@ pub const Budget = struct {
     }
 };
 
+/// Longest prefix of `text` of at most `max_bytes` that does not split a
+/// UTF-8 sequence. Use it for every byte-bounded cut of user or model text
+/// that is later serialized as JSON.
+pub fn truncateUtf8(text: []const u8, max_bytes: usize) []const u8 {
+    if (text.len <= max_bytes) return text;
+    var end = max_bytes;
+    while (end > 0 and (text[end] & 0xc0) == 0x80) end -= 1;
+    return text[0..end];
+}
+
 /// Conservative token estimate for budgeting text whose generator tokenizer
 /// is not available locally. ASCII averages about four bytes per token for
 /// BPE vocabularies; every non-ASCII code point (CJK, emoji, most non-Latin
@@ -127,6 +137,15 @@ test "token estimate charges non-ASCII code points individually" {
     try std.testing.expectEqual(@as(usize, 3), estimateTokens("\u{4e2d}\u{6587}\u{5b57}"));
     // Truncated sequences never read past the slice.
     try std.testing.expectEqual(@as(usize, 1), estimateTokens("\xe4"));
+}
+
+test "UTF-8 truncation never splits a code point" {
+    const text = "ab\u{4e2d}\u{6587}";
+    try std.testing.expectEqualStrings("ab", truncateUtf8(text, 3));
+    try std.testing.expectEqualStrings("ab", truncateUtf8(text, 4));
+    try std.testing.expectEqualStrings("ab\u{4e2d}", truncateUtf8(text, 5));
+    try std.testing.expectEqualStrings(text, truncateUtf8(text, 64));
+    try std.testing.expect(std.unicode.utf8ValidateSlice(truncateUtf8("\u{1f600}\u{1f600}", 6)));
 }
 
 test "agent conversation honors a lent history ceiling" {

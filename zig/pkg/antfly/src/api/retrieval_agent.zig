@@ -1930,6 +1930,16 @@ const AgentGenerationBudget = struct {
     }
 };
 
+/// Request fields that make a query an executable plan rather than a table
+/// scope. Keep in sync with hasExecutablePlan (checked by a test).
+pub const plan_field_names = [_][]const u8{ "query", "full_text_search", "semantic_search", "embeddings", "graph_queries", "tree_search", "aggregations", "count" };
+
+test "plan field names match executable-plan fields" {
+    inline for (plan_field_names) |name| {
+        try std.testing.expect(@hasField(RetrievalQueryRequest, name));
+    }
+}
+
 fn hasExecutablePlan(query: RetrievalQueryRequest) bool {
     return query.query != null or query.full_text_search != null or query.semantic_search != null or query.embeddings != null or query.graph_queries != null or query.tree_search != null or query.aggregations != null or (query.count orelse false);
 }
@@ -2162,7 +2172,9 @@ fn executeModelTools(
                 const title: ?[]const u8 = if (source.get("title")) |value| value.string else null;
                 var payload: []const u8 = try std.json.Stringify.valueAlloc(arena, .{ .url = admitted.url, .title = title, .text = text, .truncated = truncated }, .{ .emit_null_optional_fields = false });
                 while (agent_tools.estimateTokens(payload) > context_limit and text.len > 256) {
-                    text = web_fetch.bound(null, text, text.len / 2).text;
+                    // Halve by bytes on a UTF-8 boundary: strictly shorter
+                    // every pass, whatever the script.
+                    text = agent_tools.truncateUtf8(text, text.len / 2);
                     truncated = true;
                     payload = try std.json.Stringify.valueAlloc(arena, .{ .url = admitted.url, .title = title, .text = text, .truncated = truncated }, .{ .emit_null_optional_fields = false });
                 }
@@ -12399,6 +12411,37 @@ test "retrieval agent fetch admits only search-result URLs and returns readable 
         \\{"query":"q","queries":[],"stream":false,"max_internal_iterations":2,"generator":{"provider":"antfly","model":"test"},"tools":{"fetch_config":{"allowed_hosts":["example.com"],"block_private_ips":false}}}
     ;
     try std.testing.expectError(error.Forbidden, executeJson(std.testing.allocator, .{ .ptr = &fake, .vtable = &.{ .run_query = Fake.query, .fetch_url = Fake.fetchUrl } }, .{ .ptr = &fake, .vtable = &.{ .execute_chain = Fake.generate } }, unsafe));
+}
+
+test "retrieval agent fetch shrinks non-ASCII pages to the context budget" {
+    const Fake = struct {
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) !query_api.QueryResponse {
+            return error.UnexpectedDatabaseSearch;
+        }
+        fn fetchUrl(_: *anyopaque, arena: std.mem.Allocator, _: web_fetch.Config, _: []const u8) !web_fetch.Download {
+            // Every code point is three bytes: a byte-halving loop that
+            // counted code points would never shrink this page.
+            return .{ .content_type = "text/plain", .data = try arena.dupe(u8, "\u{4e2d}" ** 4000) };
+        }
+        fn generate(_: *anyopaque, a: std.mem.Allocator, _: []const generating.ChainLink, messages: []const generating.ChatMessage) !generating.GenerateResult {
+            if (messages[messages.len - 1].role != .tool) {
+                const calls = try a.alloc(generating.ToolCall, 1);
+                calls[0] = .{ .id = try a.dupe(u8, "f"), .name = try a.dupe(u8, "fetch"), .arguments = try a.dupe(u8, "{\"url\":\"https://docs.example.com/zh\"}") };
+                return .{ .allocator = a, .content = try a.dupe(u8, ""), .tool_calls = calls };
+            }
+            try std.testing.expect(std.unicode.utf8ValidateSlice(messages[messages.len - 1].content.?.text));
+            return .{ .allocator = a, .content = try a.dupe(u8, "done") };
+        }
+    };
+    var fake: u8 = 0;
+    const body =
+        \\{"query":"q","queries":[],"stream":false,"max_internal_iterations":3,"max_context_tokens":600,"reserve_tokens":0,"generator":{"provider":"antfly","model":"test"},"steps":{"generation":{}},"tools":{"fetch_config":{"allowed_hosts":["example.com"]}}}
+    ;
+    const encoded = try executeJson(std.testing.allocator, .{ .ptr = &fake, .vtable = &.{ .run_query = Fake.query, .fetch_url = Fake.fetchUrl } }, .{ .ptr = &fake, .vtable = &.{ .execute_chain = Fake.generate } }, body);
+    defer std.testing.allocator.free(encoded);
+    const parsed = try std.json.parseFromSlice(RetrievalAgentResult, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(AgentStatus.completed, parsed.value.status);
 }
 
 test "retrieval agent honors a lent tool-call budget" {

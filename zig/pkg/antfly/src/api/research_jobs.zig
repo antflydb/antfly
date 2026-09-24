@@ -30,6 +30,8 @@ const docstore_mod = @import("../storage/docstore.zig");
 const backend_erased = @import("../storage/backend_erased.zig");
 const platform_time = @import("antfly_platform").time;
 const research_agent = @import("research_agent.zig");
+const agent_tools = @import("agent_tools.zig");
+const platform_sync = @import("antfly_platform").sync;
 
 pub const StoreConfig = struct {
     path: ?[]const u8 = null,
@@ -118,12 +120,20 @@ pub const Store = struct {
     mutex: std.atomic.Mutex = .unlocked,
     /// job_id -> encoded Record, owned by `alloc`.
     jobs: std.StringHashMapUnmanaged([]u8) = .empty,
+    /// job_id -> owner and activity, kept beside `jobs` so quota checks do
+    /// not re-parse every record. Keys are borrowed from `jobs`.
+    meta: std.StringHashMapUnmanaged(Meta) = .empty,
+
+    const Meta = struct { owner: []u8, active: bool };
 
     pub fn init(alloc: std.mem.Allocator, cfg: StoreConfig) Store {
         return .{ .alloc = alloc, .cfg = cfg };
     }
 
     pub fn deinit(self: *Store) void {
+        var meta_it = self.meta.valueIterator();
+        while (meta_it.next()) |meta| self.alloc.free(meta.owner);
+        self.meta.deinit(self.alloc);
         var it = self.jobs.iterator();
         while (it.next()) |entry| {
             self.alloc.free(entry.key_ptr.*);
@@ -208,11 +218,9 @@ pub const Store = struct {
         lock(&self.mutex);
         defer self.mutex.unlock();
         var active: usize = 0;
-        var it = self.jobs.valueIterator();
-        while (it.next()) |encoded| {
-            var parsed = std.json.parseFromSlice(Record, self.alloc, encoded.*, .{ .ignore_unknown_fields = true }) catch continue;
-            defer parsed.deinit();
-            if (!parsed.value.terminal() and std.mem.eql(u8, parsed.value.owner, owner)) active += 1;
+        var it = self.meta.valueIterator();
+        while (it.next()) |meta| {
+            if (meta.active and std.mem.eql(u8, meta.owner, owner)) active += 1;
         }
         if (active >= self.cfg.max_active_per_owner) return error.TooManyActiveJobs;
         if (self.jobs.contains(job_id)) return error.JobExists;
@@ -220,7 +228,7 @@ pub const Store = struct {
             .job_id = job_id,
             .owner = owner,
             .state = .queued,
-            .query = query[0..@min(query.len, 4096)],
+            .query = agent_tools.truncateUtf8(query, 4096),
             .request = request,
             .created_at_ms = now,
             .updated_at_ms = now,
@@ -339,7 +347,12 @@ pub const Store = struct {
         defer expired.deinit(self.alloc);
         var it = self.jobs.iterator();
         while (it.next()) |entry| {
-            var parsed = std.json.parseFromSlice(Record, self.alloc, entry.value_ptr.*, .{ .ignore_unknown_fields = true }) catch continue;
+            // A record that no longer parses can never be served, counted or
+            // expired normally; remove it rather than keep it forever.
+            var parsed = std.json.parseFromSlice(Record, self.alloc, entry.value_ptr.*, .{ .ignore_unknown_fields = true }) catch {
+                expired.append(self.alloc, entry.key_ptr.*) catch {};
+                continue;
+            };
             defer parsed.deinit();
             if (parsed.value.expires_at_ms > now) continue;
             if (parsed.value.state == .running and now < parsed.value.lease_until_ms) continue;
@@ -350,6 +363,7 @@ pub const Store = struct {
             defer self.alloc.free(key);
             if (self.opened_store) |opened| opened.docstore.putBatch(&.{}, &.{key}) catch {};
             if (self.runtime) |runtime| deleteRuntime(runtime, key) catch {};
+            if (self.meta.fetchRemove(job_id)) |removed| self.alloc.free(removed.value.owner);
             if (self.jobs.fetchRemove(job_id)) |removed| {
                 self.alloc.free(removed.value);
                 self.alloc.free(removed.key);
@@ -371,6 +385,9 @@ pub const Store = struct {
                 try txn.commit();
             }
         }
+        const owner = try self.alloc.dupe(u8, record.owner);
+        errdefer self.alloc.free(owner);
+        try self.meta.ensureUnusedCapacity(self.alloc, 1);
         if (self.jobs.getEntry(record.job_id)) |entry| {
             self.alloc.free(entry.value_ptr.*);
             entry.value_ptr.* = encoded;
@@ -379,6 +396,10 @@ pub const Store = struct {
             errdefer self.alloc.free(key);
             try self.jobs.put(self.alloc, key, encoded);
         }
+        const key = self.jobs.getKey(record.job_id).?;
+        const slot = self.meta.getOrPutAssumeCapacity(key);
+        if (slot.found_existing) self.alloc.free(slot.value_ptr.owner);
+        slot.value_ptr.* = .{ .owner = owner, .active = !record.terminal() };
     }
 };
 
@@ -559,8 +580,10 @@ pub fn nowMillis() u64 {
     return @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms);
 }
 
+/// Waiters yield the CPU after a brief spin instead of busy-spinning while
+/// another operation writes a record to disk.
 fn lock(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) std.atomic.spinLoopHint();
+    platform_sync.lockYielding(mutex);
 }
 
 test "research job store scopes jobs to their owner and fences attempts" {
@@ -649,4 +672,35 @@ test "research job store survives reopen and recovers interrupted attempts" {
     try std.testing.expectEqual(JobState.queued, recovered.state);
     try std.testing.expectEqualStrings("recovered_interrupted_attempt", recovered.last_error.?);
     try std.testing.expectEqual(@as(u64, 1), recovered.attempt);
+}
+
+test "research job queries are stored on a UTF-8 boundary and quotas use cached metadata" {
+    const alloc = std.testing.allocator;
+    var store = Store.init(alloc, .{ .max_active_per_owner = 1 });
+    defer store.deinit();
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    // 4095 ASCII bytes then a multibyte code point across the 4096 limit.
+    const query = try std.mem.concat(arena, u8, &.{ "q" ** 4095, "\u{1f600}" });
+    alloc.free(try store.create(alloc, "rsj_u", "alice", query, "{}"));
+    const record = (try store.load(arena, "rsj_u", "alice")).?;
+    try std.testing.expect(std.unicode.utf8ValidateSlice(record.query));
+    try std.testing.expectError(error.TooManyActiveJobs, store.create(alloc, "rsj_v", "alice", "q", "{}"));
+    // A terminal job no longer counts against the quota.
+    _ = (try store.requestCancel(arena, "rsj_u", "alice")).?;
+    alloc.free(try store.create(alloc, "rsj_v", "alice", "q", "{}"));
+}
+
+test "research job cleanup removes records that no longer parse" {
+    const alloc = std.testing.allocator;
+    var store = Store.init(alloc, .{});
+    defer store.deinit();
+    alloc.free(try store.create(alloc, "rsj_bad", "alice", "q", "{}"));
+    const slot = store.jobs.getPtr("rsj_bad").?;
+    alloc.free(slot.*);
+    slot.* = try alloc.dupe(u8, "{\"job_id\":\"rsj_bad\",\"owner\":\"\xe4\"");
+    store.cleanupExpiredJobs();
+    try std.testing.expect(!store.jobs.contains("rsj_bad"));
+    try std.testing.expect(!store.meta.contains("rsj_bad"));
 }

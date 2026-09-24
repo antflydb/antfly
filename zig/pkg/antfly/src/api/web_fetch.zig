@@ -27,6 +27,7 @@ const std = @import("std");
 const generating_api = @import("antfly_generating_api_openapi");
 const websearch_api = @import("antfly_websearch_openapi");
 const metadata = @import("antfly_metadata_openapi");
+const agent_tools = @import("agent_tools.zig");
 
 /// Characters of readable text returned to the model per fetched page.
 pub const default_max_content_chars: usize = 12000;
@@ -325,7 +326,7 @@ fn decodeEntity(text: []const u8) Entity {
 pub fn toHit(arena: std.mem.Allocator, url: []const u8, content_type: []const u8, page: Page) !metadata.QueryHit {
     var source = std.json.ArrayHashMap(std.json.Value){};
     try source.map.put(arena, "url", .{ .string = url });
-    if (page.title) |title| try source.map.put(arena, "title", .{ .string = page.title.?[0..@min(title.len, 1024)] });
+    if (page.title) |title| try source.map.put(arena, "title", .{ .string = agent_tools.truncateUtf8(title, 1024) });
     try source.map.put(arena, "text", .{ .string = page.text });
     try source.map.put(arena, "content_type", .{ .string = content_type });
     try source.map.put(arena, "truncated", .{ .bool = page.truncated });
@@ -385,4 +386,16 @@ test "html extraction keeps visible text and drops scripts" {
     try std.testing.expectEqualStrings("\u{4e2d}\u{6587}a", bounded.text);
     try std.testing.expect(bounded.truncated);
     try std.testing.expectError(error.UnsupportedFetchContent, extract(arena.allocator(), .{ .content_type = "image/png", .data = "\x89PNG" }, 10));
+}
+
+test "fetched page titles are truncated on a UTF-8 boundary" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // 1023 ASCII bytes then a 3-byte code point straddles the 1024 limit.
+    const title = try std.mem.concat(a, u8, &.{ "x" ** 1023, "\u{4e2d}\u{6587}" });
+    const hit = try toHit(a, "https://example.com", "text/html", .{ .title = title, .text = "t", .truncated = false });
+    const stored = hit._source.?.map.get("title").?.string;
+    try std.testing.expect(std.unicode.utf8ValidateSlice(stored));
+    try std.testing.expectEqual(@as(usize, 1023), stored.len);
 }

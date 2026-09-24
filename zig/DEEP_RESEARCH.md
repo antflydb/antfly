@@ -84,7 +84,9 @@ and renders a Sources list of the cited evidence. Ordinary brackets such as `[li
 over `research_state.usage`, so resuming a run, or advancing a job, cannot exceed the declared worst case.
 `deadline_ms` bounds one synchronous call or one job advance; the handler sets it as the request context deadline, so
 every model call, query, web search, and fetch checks it. A run that hits its deadline returns `incomplete` with
-reason `deadline` and a resumable `research_state`.
+reason `deadline` and a resumable `research_state`. A researcher interrupted by the deadline or by cancellation is not
+a failure: its sub-question stays `pending`, the round is not completed, and a resume reruns only the interrupted
+sub-questions. When a budget stop leaves no evidence, the budget reason is reported rather than `no_evidence`.
 
 ## Execution modes
 
