@@ -1268,7 +1268,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         // another owner lease here stalls unrelated groups and can deadlock a
         // maintenance callback waiting for this same progress driver.
         var lease = self.acquireDescriptorOnce(group_id, table_name, path, descriptor, .shared, .resident, .{}) catch |err| switch (err) {
-            error.StorageKernelOwnerTransitionRequired => return error.StorageBusy,
+            error.StorageKernelOwnerTransitionRequired, error.StorageKernelOwnerStaleDescriptor => return error.StorageBusy,
             else => return err,
         };
         defer lease.deinit();
@@ -2964,7 +2964,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         // retains the inspection debt and retries. Explicit structural changes
         // and admitted repair work keep their writer-preference contract.
         return self.acquireDescriptorOnce(group_id, table_name, path, descriptor, .exclusive_if_idle, residency, .{}) catch |err| switch (err) {
-            error.StorageKernelOwnerTransitionRequired => null,
+            error.StorageKernelOwnerTransitionRequired, error.StorageKernelOwnerStaleDescriptor => null,
             else => return err,
         };
     }
@@ -2981,6 +2981,9 @@ pub const ProvisionedKernelOwnerSource = struct {
     ) !Lease {
         try controls.check();
         var lease = self.acquireDescriptorOnce(group_id, table_name, path, descriptor, if (exclusive) .exclusive else .shared, residency, controls) catch |err| switch (err) {
+            // A caller with a pre-publication descriptor must go back through
+            // routing/catalog lookup. Retrying these same bytes cannot succeed.
+            error.StorageKernelOwnerStaleDescriptor => return error.StorageReadTemporarilyUnavailable,
             error.StorageKernelOwnerTransitionRequired => try self.acquireDescriptorAfterTransition(
                 group_id,
                 table_name,
@@ -3017,6 +3020,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             try wait_io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
             try controls.check();
             return self.acquireDescriptorOnce(group_id, table_name, path, descriptor, if (exclusive) .exclusive else .shared, residency, controls) catch |err| switch (err) {
+                error.StorageKernelOwnerStaleDescriptor => return error.StorageReadTemporarilyUnavailable,
                 error.StorageKernelOwnerTransitionRequired => {
                     try controls.check();
                     if (platform_time.monotonicNs() >= deadline_ns) return error.StorageBusy;
@@ -3082,6 +3086,16 @@ pub const ProvisionedKernelOwnerSource = struct {
                 if (entry.restore) |admitted| admitted.eql(expected) else false
             else
                 true;
+            // A lower durable schema cannot replace the admitted owner. Make
+            // this decision before either the live-reader or idle retirement
+            // path, and use a distinct error so the waiter does not retry the
+            // same stale descriptor for its entire five-second budget.
+            if (entry.identity.eql(descriptor.identity) and restore_matches and
+                !std.mem.eql(u8, entry.schema_json, descriptor.schema_json) and
+                schemaVersionRegresses(entry.schema_json, descriptor.schema_json))
+            {
+                return error.StorageKernelOwnerStaleDescriptor;
+            }
             if (entry.retired or entry.generation != descriptor.lsm_root_generation or !entry.identity.eql(descriptor.identity) or !restore_matches) {
                 entry.retired = true;
                 if (entry.active_users == 0) {
@@ -3108,15 +3122,8 @@ pub const ProvisionedKernelOwnerSource = struct {
                 if (entry.active_users != 0) {
                     // An admitted descriptor change must close admission before
                     // waiting, or overlapping readers can starve its drain.
-                    // Periodic inspection still yields without retiring readers,
-                    // and neither does a caller whose schema is older than the
-                    // live owner's: a descriptor captured before publication
-                    // (a replicated envelope, a stale routing snapshot) must
-                    // not force the current owner through a close and reopen
-                    // only to fail its own open with a schema regression.
-                    if (admission != .exclusive_if_idle and !schemaVersionRegresses(entry.schema_json, descriptor.schema_json)) {
-                        entry.retired = true;
-                    }
+                    // Periodic inspection still yields without retiring readers.
+                    if (admission != .exclusive_if_idle) entry.retired = true;
                     return error.StorageKernelOwnerTransitionRequired;
                 }
                 entry.retired = true;
@@ -5474,7 +5481,11 @@ test "owner descriptor changes do not retire a live owner for an older schema ve
         };
         // A stale caller (schema captured before the current publication)
         // is turned away without closing admission for current readers.
-        try std.testing.expectError(error.StorageKernelOwnerTransitionRequired, source.acquireDescriptorOnce(1, "docs", "/unused", descriptor, admission, .resident, .{}));
+        try std.testing.expectError(error.StorageKernelOwnerStaleDescriptor, source.acquireDescriptorOnce(1, "docs", "/unused", descriptor, admission, .resident, .{}));
+        try std.testing.expect(!entry.retired);
+        // The public path returns immediately, leaving the caller to refresh
+        // its descriptor rather than sleeping with the same stale bytes.
+        try std.testing.expectError(error.StorageReadTemporarilyUnavailable, source.acquireDescriptorWithMode(1, "docs", "/unused", descriptor, admission == .exclusive, .resident, .{}));
         try std.testing.expect(!entry.retired);
         // A newer schema still closes admission so the drain can complete.
         descriptor.schema_json = "{\"version\":8,\"default_type\":\"_default\"}";
@@ -5482,6 +5493,38 @@ test "owner descriptor changes do not retire a live owner for an older schema ve
         try std.testing.expect(entry.retired);
         try std.testing.expectEqual(@as(usize, 1), entry.active_users);
     }
+
+    // An idle owner must be protected too; retiring it would close the
+    // current owner before an attempted lower-version reopen fails.
+    var source = Source.init(std.testing.allocator, "/unused", table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+    defer source.entries.deinit(std.testing.allocator);
+    var entry: Source.Entry = .{
+        .group_id = 1,
+        .table_name = @constCast("docs"),
+        .generation = 7,
+        .identity = .{ .table_id = 1, .shard_id = 2, .range_id = 3 },
+        .schema_json = @constCast("{\"version\":7}"),
+        .indexes_json = @constCast("{}"),
+        .restore_bootstrap_json = @constCast(""),
+        .owner = undefined,
+        .active_users = 0,
+        .resident = true,
+    };
+    try source.entries.append(std.testing.allocator, &entry);
+    var stale_descriptor: descriptor_contract.Descriptor = .{
+        .lsm_root_generation = entry.generation,
+        .identity = entry.identity,
+        .schema_json = "{\"version\":6}",
+        .indexes_json = entry.indexes_json,
+    };
+    try std.testing.expectError(error.StorageKernelOwnerStaleDescriptor, source.acquireDescriptorOnce(1, "docs", "/unused", stale_descriptor, .shared, .resident, .{}));
+    try std.testing.expect(!entry.retired);
+    try std.testing.expectEqual(@as(usize, 1), source.entries.items.len);
+    // A stale physical root generation cannot be allowed to retire the newer
+    // owner when the table identity and durable schema version prove staleness.
+    stale_descriptor.lsm_root_generation -= 1;
+    try std.testing.expectError(error.StorageKernelOwnerStaleDescriptor, source.acquireDescriptorOnce(1, "docs", "/unused", stale_descriptor, .shared, .resident, .{}));
+    try std.testing.expect(!entry.retired);
 }
 
 test "scheduled repair admission yields to readers and reuses exact configured generation" {
