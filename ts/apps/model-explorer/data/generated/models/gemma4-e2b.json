@@ -35,9 +35,7 @@
    "spine": "graph",
    "summary": "Scaled per-layer token embeddings combine with a normalized projection of the initial hidden state, then each layer gates and projects its own slice.",
    "source": {
-    "path": "zig/pkg/inference/src/architectures/gpt.zig",
-    "anchor": "pub fn computePleVectors(",
-    "line": 11455
+    "path": "zig/pkg/inference/src/architectures/gpt.zig"
    }
   },
   {
@@ -47,9 +45,7 @@
    "spine": "graph",
    "summary": "4 sliding-window layers for each global layer; final 20 layers reuse same-type donor K/V.",
    "source": {
-    "path": "zig/pkg/inference/src/models/gpt.zig",
-    "anchor": "return ((layer_index + 1) % self.sliding_window_pattern) != 0;",
-    "line": 360
+    "path": "zig/pkg/inference/src/models/gpt.zig"
    },
    "repeat": {
     "count": 35,
@@ -125,9 +121,7 @@
    "spine": "kv",
    "summary": "General pools use 16-token pages, possibly packing many layers. Eligible Metal routes split sliding-ring and full-history global retention; shared layers reuse donor K/V.",
    "source": {
-    "path": "zig/pkg/inference/src/runtime/kv/pool.zig",
-    "anchor": "pub const KvPoolConfig = struct {",
-    "line": 202
+    "path": "zig/pkg/inference/src/runtime/kv/pool.zig"
    },
    "pageSize": 16
   },
@@ -216,9 +210,7 @@
      },
      "attrs": {},
      "source": {
-      "path": "zig/pkg/inference/src/architectures/gpt.zig",
-      "anchor": "pub fn computePleVectors(",
-      "line": 11455
+      "path": "zig/pkg/inference/src/architectures/gpt.zig"
      },
      "kernelRouteIds": [],
      "kernels": [
@@ -414,9 +406,7 @@
       "note": "Q and K are separate fused calls when eligible. Q has 8 heads; K has the model-specific KV head count. V is not a RoPE input."
      },
      "source": {
-      "path": "zig/pkg/inference/src/architectures/gpt.zig",
-      "anchor": "pub fn maybeApplyQKHeadNormRope(",
-      "line": 7178
+      "path": "zig/pkg/inference/src/architectures/gpt.zig"
      },
      "kernelRouteIds": [],
      "kernels": [
@@ -753,9 +743,7 @@
       "note": "Grouped conceptual subgraph: GELU(hidden·gate) multiplies this layer's PLE slice; project to H, RMSNorm, residual add, optional layer output scale."
      },
      "source": {
-      "path": "zig/pkg/inference/src/architectures/gpt.zig",
-      "anchor": "pub fn applyPle(",
-      "line": 11664
+      "path": "zig/pkg/inference/src/architectures/gpt.zig"
      },
      "kernelRouteIds": [],
      "kernels": [],
@@ -795,9 +783,7 @@
       "note": "Conceptual storage side effect of attention, not scatter-add arithmetic. Appends projected V and normalized/rotated K for owners; tail layers read donor storage."
      },
      "source": {
-      "path": "zig/pkg/inference/src/runtime/kv/manager.zig",
-      "anchor": "pub const KvManager = struct {",
-      "line": 39
+      "path": "zig/pkg/inference/src/runtime/kv/manager.zig"
      },
      "kernelRouteIds": [],
      "kernels": [
@@ -910,9 +896,7 @@
       "note": "Greedy argmax and temperature/Gumbel paths are alternatives, not one serial chain. Applies configured softcap/constraints where required; unsupported requests fall back to host sampling."
      },
      "source": {
-      "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-      "anchor": "kernel void termite_sample_gumbel_partials(",
-      "line": 8800
+      "path": "zig/pkg/inference/src/backends/metal_kernels.m"
      },
      "kernelRouteIds": [],
      "kernels": [
@@ -1145,9 +1129,5 @@
     "value": 86
    }
   ]
- },
- "sources": {
-  "gitCommit": "5d07db9a96364060ee859a6ce3e165814d45e50c",
-  "generatedAt": "2026-09-24T15:36:10.462Z"
  }
 }

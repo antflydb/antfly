@@ -1,8 +1,6 @@
 {
  "schemaVersion": 1,
- "gitCommit": "5d07db9a96364060ee859a6ce3e165814d45e50c",
- "generatedAt": "2026-09-24T15:36:10.462Z",
- "permalinkBase": "https://github.com/antflydb/antfly/blob",
+ "permalinkBase": "https://github.com/antflydb/antfly/blob/main",
  "models": [
   "gemma4-e2b",
   "gemma4-e4b",
@@ -14,7 +12,6 @@
  "counts": {
   "opKinds": 73,
   "kernels": 456,
-  "routes": 25,
-  "snippets": 209
+  "routes": 25
  }
 }

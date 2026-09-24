@@ -1,21 +1,12 @@
-import { execFileSync } from "node:child_process";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { ModelSpec, SourceLink } from "../lib/schema/index.ts";
 import { extractOpKinds, parseSchedules } from "./extract.ts";
 import { validateFrame } from "./frames.ts";
-import {
-  gitCommit,
-  readRepoFile,
-  repoRoot,
-  verifyAnchor,
-  verifySourceLink,
-  verifySourceRevision,
-} from "./lib.ts";
+import { verifySourcePath } from "./lib.ts";
 import { buildMergeContext, validateSpec } from "./merge.ts";
 
-const context = () =>
-  buildMergeContext([{ name: "linear" }], [], [], [], "a".repeat(40), "2026-09-09T00:00:00.000Z");
+const context = () => buildMergeContext([{ name: "linear" }], [], [], []);
 function model() {
   return ModelSpec.parse({
     schemaVersion: 1,
@@ -33,7 +24,6 @@ function model() {
         edges: [{ id: "a-b", from: "a", to: "b" }],
       },
     },
-    sources: { gitCommit: "a".repeat(40), generatedAt: "2026-09-09T00:00:00.000Z" },
     sankey: {
       nodes: [
         { id: "a", label: "A" },
@@ -111,42 +101,25 @@ test("frame validation rejects stale kernels and invalid barrier positions", () 
   assert.throws(() => validateFrame({ ...base, mode: "captured" }, []), /machine and source/);
 });
 
-test("source links reject traversal and invalid line ranges", () => {
+test("source links reject traversal, line pins and anchors", () => {
   for (const path of ["../private", "/etc/passwd", "zig/../private", "zig\\private"]) {
     assert.equal(SourceLink.safeParse({ path }).success, false);
   }
-  assert.equal(SourceLink.safeParse({ path: "zig/file.zig", line: 10, endLine: 9 }).success, false);
-  assert.throws(
-    () => verifySourceLink({ path: "zig/lib/ml/src/graph/node.zig", line: 1000000 }),
-    /outside/
-  );
+  // The explorer links by path only; stale line/anchor metadata must not
+  // creep back into curated data where it would silently rot.
+  assert.equal(SourceLink.safeParse({ path: "zig/file.zig", line: 10 }).success, false);
+  assert.equal(SourceLink.safeParse({ path: "zig/file.zig", anchor: "fn main(" }).success, false);
+  assert.equal(SourceLink.safeParse({ path: "zig/lib/ml/src/graph/node.zig" }).success, true);
+  assert.throws(() => verifySourcePath({ path: "zig/lib/ml/src/graph/missing.zig" }), /not found/);
+  assert.doesNotThrow(() => verifySourcePath({ path: "zig/lib/ml/src/graph/node.zig" }));
 });
 
-test("extracted enum links point at their actual declaration lines", () => {
+test("extracted op kinds link to the enum declaration file", () => {
   const ops = extractOpKinds();
+  assert.ok(ops.length > 50);
   for (const op of ops) {
-    assert.ok(op.source.line);
-    assert.ok(op.source.anchor);
-    assert.ok(
-      readRepoFile(op.source.path).split("\n")[op.source.line - 1].includes(op.source.anchor)
-    );
-  }
-  assert.throws(
-    () => verifyAnchor("zig/lib/ml/src/graph/node.zig", undefined, "concat,"),
-    /ambiguous/
-  );
-  // verifySourceRevision must stay hermetic as a unit test: local zig edits
-  // are a normal development state, not an app regression. `pnpm generate`
-  // still enforces the clean-revision contract.
-  const dirty = execFileSync("git", ["status", "--porcelain", "--", "zig"], { cwd: repoRoot })
-    .toString()
-    .trim();
-  if (dirty) {
-    console.warn(
-      "  skipping verifySourceRevision assertion: scanned zig sources are locally modified"
-    );
-  } else {
-    verifySourceRevision(gitCommit());
+    assert.equal(op.source.path, "zig/lib/ml/src/graph/node.zig");
+    assert.doesNotThrow(() => verifySourcePath(op.source));
   }
 });
 
