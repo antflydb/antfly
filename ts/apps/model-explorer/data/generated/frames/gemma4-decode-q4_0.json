@@ -5,9 +5,7 @@
  "title": "Recorded Q4_0 frame counts · schematic operations",
  "description": "Historical E-series Q4_0 counters from the performance plan: 1 serial compute encoder, 143 planned scopes, zero explicit planned barriers under suppression. This E4B teaching diagram draws representative operations; it is not a captured frame or a current benchmark. Bar widths are illustrative, not measured durations.",
  "source": {
-  "path": "work-log/completed/inference/gemma4/metal-perf-plan.md",
-  "anchor": "3. **Barrier work reframed by measurement**:",
-  "line": 22
+  "path": "work-log/completed/inference/gemma4/metal-perf-plan.md"
  },
  "mode": "planned",
  "stats": {

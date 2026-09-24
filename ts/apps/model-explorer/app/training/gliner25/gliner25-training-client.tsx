@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useId, useState } from "react";
 import { CodeLink } from "@/components/code/code-link";
-import { type ClientSnippet, SnippetProvider } from "@/components/code/snippet-context";
+import { SourceLinkProvider } from "@/components/code/source-link-context";
 import { Scene, ScrollyChapter } from "@/components/scrollytelling/scrolly";
 import { Figure } from "@/components/viz/glyphs";
 import { L } from "@/lib/links";
@@ -1609,17 +1609,9 @@ function PhilosophyCompareFigure() {
 /* Page                                                                */
 /* ------------------------------------------------------------------ */
 
-export function Gliner25TrainingClient({
-  snippets,
-  gitCommit,
-  permalinkBase,
-}: {
-  snippets: Record<string, ClientSnippet>;
-  gitCommit: string;
-  permalinkBase?: string;
-}) {
+export function Gliner25TrainingClient({ permalinkBase }: { permalinkBase?: string }) {
   return (
-    <SnippetProvider snippets={snippets} gitCommit={gitCommit} permalinkBase={permalinkBase}>
+    <SourceLinkProvider permalinkBase={permalinkBase}>
       <div className="py-8">
         <header className="mx-auto max-w-7xl px-4">
           <p className="font-mono text-xs uppercase tracking-wider text-muted-foreground">
@@ -1969,6 +1961,6 @@ export function Gliner25TrainingClient({
           </Scene>
         </ScrollyChapter>
       </div>
-    </SnippetProvider>
+    </SourceLinkProvider>
   );
 }

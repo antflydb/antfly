@@ -29,9 +29,7 @@
    "spine": "vision",
    "summary": "Temporal-split Conv3D patch embed, learned-position interpolation, two-axis vision RoPE, 24 bidirectional attention blocks — with DeepStack feature taps exiting at blocks 5, 11, and 17. Antfly accepts still images and rejects video; frame duplication fills the temporal patch.",
    "source": {
-    "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig",
-    "anchor": "pub fn encodeProjectedImages(",
-    "line": 604
+    "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig"
    },
    "repeat": {
     "count": 24,
@@ -56,9 +54,7 @@
    "spine": "graph",
    "summary": "Text ids gather embedding rows; merged visual tokens are spliced in at the <|image_pad|> markers. From here on the decoder sees one interleaved sequence.",
    "source": {
-    "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig",
-    "anchor": "pub fn prepareExpandedPromptEmbeddings(",
-    "line": 792
+    "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig"
    }
   },
   {
@@ -68,9 +64,7 @@
    "spine": "graph",
    "summary": "Shared GPT execution with Qwen3-VL contracts: Q/K head norm, interleaved M-RoPE and prefill-only DeepStack additions after decoder layers 0/1/2. The diagram expands one representative layer.",
    "source": {
-    "path": "zig/pkg/inference/src/models/gpt.zig",
-    "anchor": "return self.family == .qwen3_vl;",
-    "line": 296
+    "path": "zig/pkg/inference/src/models/gpt.zig"
    },
    "repeat": {
     "count": 28
@@ -333,9 +327,7 @@
       "note": "interleaved m-RoPE: head-dim sections rotate on text-time, image-height, and image-width position streams (θ = 5e6)"
      },
      "source": {
-      "path": "zig/pkg/inference/src/architectures/qwen3vl_plan.zig",
-      "anchor": "pub fn buildRequestPlan(",
-      "line": 97
+      "path": "zig/pkg/inference/src/architectures/qwen3vl_plan.zig"
      },
      "kernelRouteIds": [],
      "kernels": [
@@ -709,9 +701,7 @@
       "note": "decode positions continue at tokenCount + mrope_position_delta — all three m-RoPE axes tick together in text"
      },
      "source": {
-      "path": "zig/pkg/inference/src/architectures/qwen3vl_plan.zig",
-      "anchor": "pub fn nextDecodePosition(self: RequestPlan) !u32 {",
-      "line": 82
+      "path": "zig/pkg/inference/src/architectures/qwen3vl_plan.zig"
      },
      "kernelRouteIds": [],
      "kernels": [],
@@ -950,9 +940,7 @@
       "note": "still images duplicate their frame to fill the 2-frame temporal patch"
      },
      "source": {
-      "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig",
-      "anchor": "fn extractPatchesMergeMajor(",
-      "line": 1394
+      "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig"
      },
      "kernelRouteIds": [],
      "kernels": [],
@@ -991,9 +979,7 @@
       "grid": "48×48 learned table (2,304 positions), bilinearly interpolated to the actual patch grid"
      },
      "source": {
-      "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig",
-      "anchor": "fn addInterpolatedPositions(",
-      "line": 1471
+      "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig"
      },
      "kernelRouteIds": [],
      "kernels": [],
@@ -1107,9 +1093,7 @@
       "note": "Four neighboring 1024-wide patch vectors are grouped into 4096 channels. The following node includes the merger normalization/MLP, not a second token merge."
      },
      "source": {
-      "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig",
-      "anchor": "fn mergeProjected(",
-      "line": 1273
+      "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig"
      },
      "kernelRouteIds": [],
      "kernels": [],
@@ -1183,9 +1167,7 @@
       "note": "Zero-based vision taps 5/11/17 each merge to V×2048. Their outputs add after complete decoder layers 0/1/2 at visual positions during prefill only."
      },
      "source": {
-      "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig",
-      "anchor": "if (next_tap < cfg.deepstack_len and cfg.deepstack_layers[next_tap] == layer) {",
-      "line": 1057
+      "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig"
      },
      "kernelRouteIds": [],
      "kernels": [],
@@ -1266,9 +1248,7 @@
       "note": "T_exp includes expanded visual placeholder rows already. Replace those V rows with visual embeddings; do not append V a second time."
      },
      "source": {
-      "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig",
-      "anchor": "pub fn prepareExpandedPromptEmbeddings(",
-      "line": 792
+      "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig"
      },
      "kernelRouteIds": [],
      "kernels": [],
@@ -1470,9 +1450,7 @@
       "note": "interleaved m-RoPE: head-dim sections rotate on text-time, image-height, and image-width position streams (θ = 5e6)"
      },
      "source": {
-      "path": "zig/pkg/inference/src/architectures/qwen3vl_plan.zig",
-      "anchor": "pub fn buildRequestPlan(",
-      "line": 97
+      "path": "zig/pkg/inference/src/architectures/qwen3vl_plan.zig"
      },
      "kernelRouteIds": [],
      "kernels": [
@@ -2149,9 +2127,5 @@
     }
    ]
   }
- },
- "sources": {
-  "gitCommit": "8e648048840d064fd6d322f131aac99db728142a",
-  "generatedAt": "2026-09-23T04:21:06.380Z"
  }
 }

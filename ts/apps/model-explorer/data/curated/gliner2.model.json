@@ -32,8 +32,7 @@
       "attention": "disentangled_relative",
       "summary": "Bidirectional encoder: no causal mask, no KV cache, no sampling. Attention scores decompose into content-to-content, content-to-position, and position-to-content terms.",
       "source": {
-        "path": "zig/pkg/inference/src/architectures/deberta_graph.zig",
-        "anchor": "pub fn buildForwardGraph("
+        "path": "zig/pkg/inference/src/architectures/deberta_graph.zig"
       },
       "repeat": {
         "count": 12,
@@ -48,8 +47,7 @@
       "headType": "span",
       "summary": "First-subtoken word features and entity-marker label features feed span and label heads. Sigmoid scores are thresholded, then flat NER filters overlapping spans.",
       "source": {
-        "path": "zig/pkg/inference/src/architectures/gliner_head.zig",
-        "anchor": "fn extractWordEmbeddings("
+        "path": "zig/pkg/inference/src/architectures/gliner_head.zig"
       }
     }
   ],
@@ -134,8 +132,7 @@
             "note": "Schematic graph formulation: normalize the 512-row shared table, then gather by signed distance; position_buckets=256 is the index offset."
           },
           "source": {
-            "path": "zig/pkg/inference/src/models/deberta.zig",
-            "anchor": "pub fn relativePositionBucket("
+            "path": "zig/pkg/inference/src/models/deberta.zig"
           },
           "backend": "metal"
         },
@@ -206,8 +203,7 @@
             "note": "Schematic fused graph node: packed Q/K/V, packed relative Q/K and additive padding mask. Scores combine all three terms; no causal mask."
           },
           "source": {
-            "path": "zig/pkg/inference/src/architectures/deberta_graph.zig",
-            "anchor": "pub fn fusedDisentangledAttentionEnabledForProduction("
+            "path": "zig/pkg/inference/src/architectures/deberta_graph.zig"
           },
           "backend": "metal"
         },
@@ -355,8 +351,7 @@
           },
           "backend": "metal",
           "source": {
-            "path": "zig/pkg/inference/src/architectures/gliner_head.zig",
-            "anchor": "fn extractWordEmbeddings("
+            "path": "zig/pkg/inference/src/architectures/gliner_head.zig"
           }
         },
         {
@@ -379,8 +374,7 @@
             ]
           },
           "source": {
-            "path": "zig/pkg/inference/src/architectures/gliner_head_graph.zig",
-            "anchor": "pub fn gatherLabelEmbeddings("
+            "path": "zig/pkg/inference/src/architectures/gliner_head_graph.zig"
           },
           "attrs": {
             "note": "positions where input_ids match the entity marker (and, for other tasks, classification/relation marker ids) — the schema's label names, encoded in the same pass as the text"
@@ -412,8 +406,7 @@
           },
           "envFlagNames": ["TERMITE_METAL_DISABLE_GLINER_HEAD_CUSTOM_MLP2"],
           "source": {
-            "path": "zig/pkg/inference/src/architectures/gliner_head_graph.zig",
-            "anchor": "pub fn spanMarkerForward("
+            "path": "zig/pkg/inference/src/architectures/gliner_head_graph.zig"
           },
           "backend": "metal"
         },
@@ -489,8 +482,7 @@
           },
           "kernels": ["termite_gliner_gru_combine_f32"],
           "source": {
-            "path": "zig/pkg/inference/src/architectures/gliner_head_graph.zig",
-            "anchor": "pub fn downscaledTransformer("
+            "path": "zig/pkg/inference/src/architectures/gliner_head_graph.zig"
           },
           "backend": "metal",
           "attrs": {
@@ -521,8 +513,7 @@
             ]
           },
           "source": {
-            "path": "zig/pkg/inference/src/architectures/gliner_head_graph.zig",
-            "anchor": "pub fn scoreSpansAgainstLabels("
+            "path": "zig/pkg/inference/src/architectures/gliner_head_graph.zig"
           },
           "backend": "metal"
         },

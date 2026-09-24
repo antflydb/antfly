@@ -6020,6 +6020,12 @@ pub fn storageOwnerOpen(
     handle.* = .{
         .alloc = alloc,
         .db = db_mod.DB.open(alloc, path, open_options) catch |err| {
+            // A descriptor captured before structural reconciliation can outlive
+            // the owner that installed a newer durable schema. Reject the stale
+            // open without making Raft apply fatal; its next attempt reloads the
+            // catalog descriptor. Keep exact restore bootstrap failures strict.
+            if (err == error.SchemaVersionRegression and restore_bootstrap == null)
+                return storageOwnerStatusFromError(error.StorageBusy);
             std.log.err("storage owner open failed table={s} group_id={} err={s}", .{
                 table_name, request.group_id, @errorName(err),
             });
