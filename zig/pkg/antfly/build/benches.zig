@@ -503,6 +503,8 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
             "v25 norm table uses one byte per document and reads legacy packed norms",
             "v22 term dictionary block values compact one-hit terms and delta postings offsets",
             "v23 term dictionary stores front-coded blocks indexed by block ceiling",
+            "top-k limits results",
+            "scorer executes into external top-k collector",
             "WAND pivot bound remains conservative across later high-impact blocks",
             "single-term block scan preserves a later higher-impact chunk",
             "single-term equality pruning retains earliest cutoff ties",

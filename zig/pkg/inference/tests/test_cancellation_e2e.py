@@ -50,6 +50,17 @@ class CancellationE2E(unittest.TestCase):
         (model / "model.safetensors").write_bytes(
             len(header).to_bytes(8, "little") + header + b"\0" * 4
         )
+        if mode == "bounded_rerank":
+            (model / "model_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "type": "reranker",
+                        "tasks": ["rerank"],
+                        "inputs": ["text"],
+                        "capabilities": ["cross_encoder"],
+                    }
+                )
+            )
         with socket.socket() as reservation:
             reservation.bind(("127.0.0.1", 0))
             self.port = reservation.getsockname()[1]
@@ -123,6 +134,15 @@ class CancellationE2E(unittest.TestCase):
         self.assertEqual(status, 200, result)
         return result
 
+    def rerank(self):
+        status, result = self.request(
+            "POST",
+            "/ai/v1/rerank",
+            {"model": self.model, "query": "ab", "prompts": ["ab"]},
+        )
+        self.assertEqual(status, 200, result)
+        return result
+
     def exercise(self, mode):
         initial = self.start(mode)
         expected = self.embed()
@@ -189,6 +209,73 @@ class CancellationE2E(unittest.TestCase):
 
     def test_disconnect_replaces_uninterruptible_worker(self):
         self.exercise("hard")
+
+    def exercise_bounded_call(self, mode, path):
+        initial = self.start(mode)
+        if path == "/ai/v1/rerank":
+            expected = self.rerank()
+        elif path == "/ai/v1/embed":
+            expected = self.embed()
+        else:
+            status, expected = self.request("POST", path, {})
+            self.assertEqual(status, 200, expected)
+        baseline = self.wait_state(
+            lambda s: s["requests"] == 0 and s["units"] == 0 and s["active"] == 0
+        )
+        self.assertEqual(self.request("POST", "/_fixture/arm")[0], 200)
+
+        client = socket.create_connection(("127.0.0.1", self.port), timeout=2)
+        self.addCleanup(client.close)
+        body = json.dumps(
+            {"model": self.model, "query": "ab", "prompts": ["ab"] * 30}
+            if path == "/ai/v1/rerank"
+            else (
+                {"model": self.model, "input": ["ab"]} if path == "/ai/v1/embed" else {}
+            )
+        ).encode()
+        client.sendall(
+            f"POST {path} HTTP/1.1\r\nHost: localhost\r\n".encode()
+            + b"Content-Type: application/json\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+        )
+        running = self.wait_state(lambda s: s["active"] == 1)
+        self.assertEqual(running["pid"], initial["pid"])
+        # A TCP reset proves the client abandoned the response. An orderly
+        # HTTP/1 half-close can still leave the client reading it.
+        client.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        client.close()
+        time.sleep(0.1)
+        during = self.wait_state(lambda s: s["active"] == 1)
+        self.assertEqual(during["pid"], initial["pid"])
+        self.assertEqual(self.request("POST", "/_fixture/release")[0], 200)
+
+        completed = self.wait_state(
+            lambda s: (
+                s["cancelled"] == 1
+                and s["active"] == 0
+                and s["requests"] == 0
+                and s["units"] == 0
+                and s["scratch"] == baseline["scratch"]
+            )
+        )
+        self.assertEqual(completed["pid"], initial["pid"])
+        if path == "/ai/v1/rerank":
+            self.assertEqual(self.rerank(), expected)
+        elif path == "/ai/v1/embed":
+            self.assertEqual(self.embed(), expected)
+        else:
+            self.assertEqual(self.request("POST", path, {}), (200, expected))
+
+    def test_rerank_disconnect_stops_at_batch_boundary_without_worker_restart(self):
+        self.exercise_bounded_call("bounded_rerank", "/ai/v1/rerank")
+
+    def test_linked_rerank_disconnect_stops_at_batch_boundary_without_worker_restart(
+        self,
+    ):
+        self.exercise_bounded_call("bounded_rerank", "/_fixture/rerank_direct")
+
+    def test_embedding_disconnect_finishes_native_call_without_worker_restart(self):
+        self.exercise_bounded_call("bounded_embed", "/ai/v1/embed")
 
 
 if __name__ == "__main__":
