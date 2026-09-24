@@ -360,6 +360,15 @@ replica progress'`. Evidence: `/tmp/workload-invalid-participant-data1.log`.
   reduced 12-worker configuration. Borrowed schedulers enforce logical quotas
   but own their physical isolation; aggregate mixed-resource qualification
   and the throughput effect of reserving this grant remain open.
+- Data Raft/recovery snapshot HTTP now uses a separate six-worker executor,
+  independent of general API work and Data Raft leader forwarding. The default
+  252-worker aggregate moves six workers from API (16 to 10) into this lane;
+  custom limits account for it explicitly. A real metadata head fetch and a
+  nonexpired DataServer snapshot call progressed with general API workers and
+  Raft forwarding saturated; focused DATA 1/1 and runtime 3/3 tests passed.
+  Borrowed schedulers must provide physical isolation themselves. The reduced
+  API capacity and combined connection/memory/storage pressure still need
+  throughput and overload qualification before policy activation.
 - The merged metadata codec now preserves relational retirement metadata,
   accepts both historical and current table-storage extensions on restore,
   and encodes current dense-storage migration admissions behind topology
@@ -384,3 +393,24 @@ replica progress'`. Evidence: `/tmp/workload-invalid-participant-data1.log`.
   the focused DATA runtime gate passed 2/2 with those version checks. The
   owner tests also allow background index repair to complete before the
   backup assertion, while still requiring quiescent final backup.
+- An explicitly enabled internal pool path now stages a fresh BEGIN owner
+  before accepted-sidecar acknowledgment: it certifies aggregate control
+  obligations, retains separate publication and WAL resources, and publishes
+  the immutable guard. The real DB fixture accepts/applies BEGIN, finds the
+  retained resources and durable guard, then verifies restart fails closed
+  until runnable owner restoration exists. The durable-completion gate passed
+  43/43 with no failures or leaks. The default path and its successful BEGIN
+  restart remain unchanged; production activation is still disabled. Decision
+  and ACK routing, guard retirement, preowned output descriptors, and runnable
+  restoration remain open.
+- Rust SDK query retries now rewrite bounded top-level JSON/NDJSON `timeout_ms`
+  values to the original operation's remaining budget while preserving other
+  bytes and rejecting ambiguous duplicate keys from retry qualification.
+  The four focused Rust retry tests passed, including a delayed HTTP retry.
+- The post-merge owner-source gate passed 34/34 with no failures or leaks.
+  Scoped BEGIN validates the scoped local participant; resident owner reuse
+  compares the catalog restore identity; scoped status waits for read safety
+  and resolves the exact restore descriptor under the request context. A
+  blocked read-safety barrier itself does not accept a deadline or cancellation
+  token, although the callback rejects late status after it returns. Bounded
+  barrier occupancy remains open for item 8.
