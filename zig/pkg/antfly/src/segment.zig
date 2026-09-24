@@ -28,7 +28,7 @@
 //!   [section index]
 //!   [footer]
 //!
-//! Compatible with zapx v16/v17 section-based architecture.
+//! The section-based layout was originally inspired by Bleve's zapx.
 
 const std = @import("std");
 const Crc32 = @import("antfly_hash").Crc32;

@@ -39,7 +39,7 @@ __all__ = [
     "THREADING_SERIALIZED",
     "AntflySlice",
     "AntflyBuffer",
-    "LiteOpenOptions",
+    "AntflyOpenOptions",
     "AntflyWriteIntent",
     "AntflyVersionPredicate",
     "OPEN_FLAG_NO_SYNC",
@@ -47,6 +47,8 @@ __all__ = [
     "OPEN_FLAG_REMOTE_PROVIDER_CONFIGURED",
     "OPEN_FLAG_LOCAL_RUNTIME_CONFIGURED",
     "OPEN_FLAG_GENERATED_ENRICHMENT_REPLAY",
+    "STORAGE_KIND_DIRECTORY",
+    "STORAGE_KIND_LITE",
     "load_library",
     "get_lib",
     "validate_abi",
@@ -62,26 +64,30 @@ class ABIVersionError(RuntimeError):
 
 # The Antfly C ABI version this binding was written against
 # (antfly_abi_version() in antfly.h).
-SUPPORTED_ABI_VERSION = 1
+SUPPORTED_ABI_VERSION = 2
 
 # The only threading contract libantfly implements (ANTFLY_THREADING_SERIALIZED).
 THREADING_SERIALIZED = 1
 
-# antfly_open_options / antfly_lite_open_options flag bits.
+# antfly_open_options flag bits.
 OPEN_FLAG_NO_SYNC = 1 << 0
 OPEN_FLAG_TTL_CLEANUP = 1 << 1
 OPEN_FLAG_REMOTE_PROVIDER_CONFIGURED = 1 << 2
 OPEN_FLAG_LOCAL_RUNTIME_CONFIGURED = 1 << 3
 OPEN_FLAG_GENERATED_ENRICHMENT_REPLAY = 1 << 4
 
-# ANTFLY_LITE_OPEN_MODE_* / ANTFLY_LITE_PROFILE_*
+# ANTFLY_OPEN_MODE_* / ANTFLY_PROFILE_*
 OPEN_MODE_WRITER = 0
 OPEN_MODE_READONLY = 1
 OPEN_MODE_STATUS_ONLY = 2
 PROFILE_NATIVE = 0
 PROFILE_HOSTED = 1
 
-# ANTFLY_LITE_INFERENCE_MODE_* string constants.
+# ANTFLY_STORAGE_KIND_* values for antfly_open_options.storage_kind.
+STORAGE_KIND_DIRECTORY = 0
+STORAGE_KIND_LITE = 1
+
+# ANTFLY_INFERENCE_MODE_* string constants.
 INFERENCE_MODE_CALLER_SUPPLIED_OR_DISABLED = "caller_supplied_or_disabled"
 INFERENCE_MODE_CALLER_SUPPLIED_ARTIFACTS = "caller_supplied_artifacts"
 INFERENCE_MODE_REMOTE_PROVIDER = "remote_provider"
@@ -110,16 +116,20 @@ class AntflyBuffer(ctypes.Structure):
     ]
 
 
-class LiteOpenOptions(ctypes.Structure):
-    """antfly_lite_open_options. Must be initialized with
-    antfly_lite_open_options_init before fields are set (see ABI Contract in
-    zig/CAPI.md)."""
+class AntflyOpenOptions(ctypes.Structure):
+    """antfly_open_options. Must be initialized with
+    antfly_open_options_init before fields are set (see ABI Contract in
+    zig/CAPI.md). Storage-neutral: `storage_kind` selects a .aflite file
+    (ANTFLY_STORAGE_KIND_LITE) or a normal Antfly directory
+    (ANTFLY_STORAGE_KIND_DIRECTORY)."""
 
     _fields_ = [
         ("abi_size", ctypes.c_uint32),
+        ("storage_kind", ctypes.c_uint32),
         ("open_mode", ctypes.c_uint32),
         ("profile", ctypes.c_uint32),
         ("flags", ctypes.c_uint32),
+        ("reserved0", ctypes.c_uint32),
         ("map_size", ctypes.c_uint64),
         ("ttl_cleanup_enabled", ctypes.c_bool),
         ("ttl_cleanup_lease_owned", ctypes.c_bool),
@@ -135,7 +145,7 @@ class LiteOpenOptions(ctypes.Structure):
         ("inference_kv_budget_mb", ctypes.c_uint32),
         ("inference_scratch_budget_mb", ctypes.c_uint32),
         ("busy_timeout_ms", ctypes.c_uint64),
-        ("reserved", ctypes.c_uint64 * 7),
+        ("reserved", ctypes.c_uint64 * 8),
     ]
 
 
@@ -159,36 +169,41 @@ TxnIDArray = ctypes.c_uint8 * 16
 
 _VOID_P = ctypes.c_void_p
 _BUF_P = ctypes.POINTER(AntflyBuffer)
-_OPTS_P = ctypes.POINTER(LiteOpenOptions)
+_OPTS_P = ctypes.POINTER(AntflyOpenOptions)
 _TXN_P = ctypes.POINTER(TxnIDArray)
 _ERR = ctypes.c_int  # antfly_error_code (C enum, backed by `int`)
 
 # (name, argtypes, restype) for every function this binding calls. This is a
 # deliberate subset of antfly.h: it mirrors exactly what go/pkg/lite calls,
 # which is itself a considered subset of the full C ABI.
+#
+# Naming (see antfly.h): antfly_* is library-level (no handle); antfly_db_*
+# takes a handle of any storage kind; antfly_lite_* is .aflite file-format
+# operations plus open shortcuts.
 _FUNCTIONS: list[tuple[str, list[object], object]] = [
     ("antfly_abi_version", [], ctypes.c_uint32),
-    ("antfly_lite_open_options_size", [], ctypes.c_uint32),
+    ("antfly_open_options_size", [], ctypes.c_uint32),
     ("antfly_error_code_name", [_ERR], ctypes.c_char_p),
     ("antfly_error_code_description", [_ERR], ctypes.c_char_p),
-    ("antfly_lite_open_options_init", [_OPTS_P], _ERR),
+    ("antfly_open_options_init", [_OPTS_P], _ERR),
     ("antfly_threading_mode", [], ctypes.c_uint32),
-    ("antfly_lite_open_with_options", [ctypes.c_char_p, _OPTS_P, ctypes.POINTER(_VOID_P)], _ERR),
-    ("antfly_lite_create_with_options", [ctypes.c_char_p, _OPTS_P, ctypes.POINTER(_VOID_P)], _ERR),
+    ("antfly_db_open_with_options", [ctypes.c_char_p, _OPTS_P, ctypes.POINTER(_VOID_P)], _ERR),
+    ("antfly_db_create_with_options", [ctypes.c_char_p, _OPTS_P, ctypes.POINTER(_VOID_P)], _ERR),
     ("antfly_lite_open_hosted", [ctypes.c_char_p, ctypes.POINTER(_VOID_P)], _ERR),
     ("antfly_lite_create_hosted", [ctypes.c_char_p, ctypes.POINTER(_VOID_P)], _ERR),
-    ("antfly_lite_status_json", [_VOID_P, _BUF_P], _ERR),
-    ("antfly_lite_capabilities_json", [_VOID_P, _BUF_P], _ERR),
-    ("antfly_lite_replay_generated_enrichments_json", [_VOID_P, _BUF_P], _ERR),
-    ("antfly_lite_backup", [_VOID_P, _BUF_P], _ERR),
-    ("antfly_lite_export", [_VOID_P, _BUF_P], _ERR),
-    ("antfly_lite_import_backup", [_VOID_P, AntflySlice], _ERR),
-    ("antfly_lite_import", [_VOID_P, AntflySlice], _ERR),
-    ("antfly_lite_restore_backup_json", [ctypes.c_char_p, AntflySlice, ctypes.c_bool, _BUF_P], _ERR),
-    ("antfly_lite_restore_json", [ctypes.c_char_p, AntflySlice, ctypes.c_bool, _BUF_P], _ERR),
+    ("antfly_db_status_json", [_VOID_P, _BUF_P], _ERR),
+    ("antfly_db_capabilities_json", [_VOID_P, _BUF_P], _ERR),
+    ("antfly_db_replay_generated_enrichments_json", [_VOID_P, _BUF_P], _ERR),
+    ("antfly_db_backup", [_VOID_P, _BUF_P], _ERR),
+    ("antfly_db_import_backup", [_VOID_P, AntflySlice], _ERR),
     (
-        "antfly_lite_restore_backup_file_json",
-        [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_bool, _BUF_P],
+        "antfly_restore_backup_json",
+        [ctypes.c_char_p, _OPTS_P, AntflySlice, ctypes.c_bool, _BUF_P],
+        _ERR,
+    ),
+    (
+        "antfly_restore_backup_file_json",
+        [ctypes.c_char_p, _OPTS_P, ctypes.c_char_p, ctypes.c_bool, _BUF_P],
         _ERR,
     ),
     ("antfly_lite_check_json", [_VOID_P, _BUF_P], _ERR),
@@ -201,9 +216,9 @@ _FUNCTIONS: list[tuple[str, list[object], object]] = [
     ),
     ("antfly_lite_compact_json", [_VOID_P, _BUF_P], _ERR),
     ("antfly_lite_vacuum_json", [_VOID_P, _BUF_P], _ERR),
-    ("antfly_lite_run_until_idle", [_VOID_P], _ERR),
-    ("antfly_lite_run_until_idle_json", [_VOID_P, _BUF_P], _ERR),
-    ("antfly_lite_pending_work_stats_json", [_VOID_P, _BUF_P], _ERR),
+    ("antfly_db_run_until_idle", [_VOID_P], _ERR),
+    ("antfly_db_run_until_idle_json", [_VOID_P, _BUF_P], _ERR),
+    ("antfly_db_pending_work_stats_json", [_VOID_P, _BUF_P], _ERR),
     ("antfly_db_close", [_VOID_P], None),
     ("antfly_buffer_free", [_BUF_P], None),
     (
@@ -263,7 +278,7 @@ _FUNCTIONS: list[tuple[str, list[object], object]] = [
     ("antfly_db_search_text_match_phrase_wire", [_VOID_P, AntflySlice, _BUF_P], _ERR),
     ("antfly_db_aggregate_hits_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
     ("antfly_db_lookup_artifact_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
-    ("antfly_db_decode_artifact_id_json", [AntflySlice, _BUF_P], _ERR),
+    ("antfly_decode_artifact_id_json", [AntflySlice, _BUF_P], _ERR),
     ("antfly_db_extract_enrichments_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
     ("antfly_db_compute_enrichments_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
     (
@@ -332,8 +347,8 @@ def validate_abi() -> None:
     got = lib.antfly_abi_version()
     if got != SUPPORTED_ABI_VERSION:
         raise ABIVersionError(f"lite: unsupported C ABI version {got}, want {SUPPORTED_ABI_VERSION}")
-    got_size = lib.antfly_lite_open_options_size()
-    want_size = ctypes.sizeof(LiteOpenOptions)
+    got_size = lib.antfly_open_options_size()
+    want_size = ctypes.sizeof(AntflyOpenOptions)
     if got_size != want_size:
         raise ABIVersionError(f"lite: C ABI open options size {got_size}, compiled struct size {want_size}")
 

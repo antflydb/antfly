@@ -27,8 +27,8 @@ capacity must not be treated as permission to allocate memory.
 
 | Deployment | Physical owner | Model owner | Execution owner | Required connection |
 | --- | --- | --- | --- | --- |
-| `antfly inference run` | local inference admission controller | process-local `ModelManager` | command-owned `std.Io` executor | local ownership is declared at `Node` creation |
-| full standalone Antfly | the data node's `ResourceManager` | embedded `ModelManager` | node `BackendRuntime`; inference borrows its isolated inference lane | external resource owner and inference lane are required before preload or serve |
+| `antfly inference run` | local inference admission controller | process-local `ModelManager` | command-owned `std.Io` executor (the server runs in a supervised, auto-restarted child) | local ownership is declared at `Node` creation |
+| full standalone Antfly | the data node's `ResourceManager` | embedded `ModelManager` | node `BackendRuntime`; inference borrows its isolated inference lane, and execution is delegated to `antfly inference _worker` when a process-isolated backend is compiled in | external resource owner and inference lane are required before preload or serve |
 | distributed data process | that process's `ResourceManager` | none unless inference is embedded | process `BackendRuntime` with data, Raft, API, and control lanes | no cross-process memory or executor ledger |
 | distributed inference process | local inference admission controller | process-local `ModelManager` | role-local executor | cluster scheduling routes work; process admission protects memory |
 | offline conversion/inspection | command-scoped budgets | command-scoped loaders | command-owned executor | no serving residency contract |

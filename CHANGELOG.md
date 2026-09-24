@@ -32,6 +32,28 @@ All notable changes to Antfly will be documented in this file.
   `match_all` contributes its text domain to hybrid aggregations, while
   filter-only vector requests no longer add a match-all retrieval lane to the
   ranked page.
+- **TOON document rendering in retrieval agents** — the generation prompt now
+  encodes each retrieved document's fields as TOON instead of raw JSON, and
+  `document_renderer` on a retrieval agent request is accepted again: a
+  Handlebars template rendered per hit against `{id, score, fields}` with an
+  `encodeToon` helper (`indent`, `delimiter`). Invalid templates are rejected
+  with `400`. Queries still reject `document_renderer`.
+- **`antfly inference run` reads the rest of its config file** — `keep_alive`
+  (duration) or `keep_alive_ms` (integer; `0` never unloads idle models),
+  `prompt_cache`, and `kernel_jit` are now honored, nested under `inference` or
+  flat. CLI flags and `ANTFLY_INFERENCE_KERNEL_JIT_MODE` still win. Operator
+  InferencePool keep-alive settings now take effect.
+- **Operator: standalone keeps embedded inference** — standalone clusters no
+  longer default `inference.api_url` to `http://0.0.0.0:11433`, which disabled
+  embedded inference; `api_url` is written only when set explicitly, and a
+  user-provided value is never overwritten. Standalone and InferencePool pods
+  with a memory limit get `ANTFLY_PROCESS_MEMORY_BUDGET_MB` at 90% of it.
+- **Operator: InferencePool model `priority` orders preloads** — eager preloads
+  warm high, then medium, then low priority models; priority does not affect
+  eviction.
+- **Retrieval agent `auto_seed` stays agent-side** — the flag is cleared before
+  the internal query hop now that the generated rerank type carries it.
+
 - **`antfly standby` replaces `antfly ha`** — the hot-standby command is
   renamed; `antfly ha` remains a hidden alias for one minor release. It gains
   `--data-dir` (opens the node's standby state under `<dir>/ha/` and reads the

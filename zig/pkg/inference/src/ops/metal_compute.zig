@@ -22990,6 +22990,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.unaryLikeInput(input_buf, output);
     }
 
+    /// Preparation has copied the projection into its model-owned native slot.
+    /// Release temporary host mirrors before preparing the next projection.
+    pub fn releaseLayaPreparationWeightCaches(self: *MetalCompute) void {
+        std.debug.assert(!metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime));
+        var it = self.weight_handles.valueIterator();
+        while (it.next()) |value| std.debug.assert(toBuf(value.*).weight_handle_refs == 0);
+        self.deinitWeightCaches();
+    }
+
     fn deinitWeightCaches(self: *MetalCompute) void {
         var it = self.weight_handles.iterator();
         while (it.next()) |entry| {
@@ -30762,6 +30771,10 @@ pub fn deinitSharedNativeProvider(data: *WeightStore) void {
     }
     defer data.shared_metal_native_provider_lock.unlock(std.Io.failing);
     const provider = data.shared_metal_native_provider orelse return;
+    if (data.laya_resident) |owner| {
+        owner.destroy();
+        data.laya_resident = null;
+    }
     provider.deinitOwned();
     std.heap.c_allocator.destroy(provider);
     data.shared_metal_native_provider = null;

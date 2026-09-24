@@ -54,7 +54,7 @@ func (db *DB) BeginTransaction(txnID TxnID, timestampNS uint64, participants []s
 	defer cleanup()
 
 	return check(C.antfly_db_begin_transaction_with_id(
-		handle,
+		(*C.antfly_db)(handle),
 		cTxnIDPtr(txnID),
 		C.uint64_t(timestampNS),
 		cParticipants,
@@ -77,7 +77,7 @@ func (db *DB) WriteTransaction(txnID TxnID, writes []WriteIntent) error {
 	defer cleanup()
 
 	return check(C.antfly_db_write_transaction(
-		handle,
+		(*C.antfly_db)(handle),
 		cTxnIDPtr(txnID),
 		cWrites,
 		C.size_t(len(writes)),
@@ -95,7 +95,7 @@ func (db *DB) ResolveTransaction(txnID TxnID, status TxnStatus, commitVersion ui
 	defer release()
 	defer runtime.KeepAlive(db)
 	return check(C.antfly_db_resolve_intents(
-		handle,
+		(*C.antfly_db)(handle),
 		cTxnIDPtr(txnID),
 		C.uint8_t(status),
 		C.uint64_t(commitVersion),
@@ -111,7 +111,7 @@ func (db *DB) TransactionStatus(txnID TxnID) (TxnStatus, error) {
 	defer release()
 	defer runtime.KeepAlive(db)
 	var status C.uint8_t
-	if err := check(C.antfly_db_get_transaction_status(handle, cTxnIDPtr(txnID), &status)); err != nil {
+	if err := check(C.antfly_db_get_transaction_status((*C.antfly_db)(handle), cTxnIDPtr(txnID), &status)); err != nil {
 		return 0, err
 	}
 	return TxnStatus(status), nil
@@ -126,7 +126,7 @@ func (db *DB) CommitVersion(txnID TxnID) (uint64, error) {
 	defer release()
 	defer runtime.KeepAlive(db)
 	var version C.uint64_t
-	if err := check(C.antfly_db_get_commit_version(handle, cTxnIDPtr(txnID), &version)); err != nil {
+	if err := check(C.antfly_db_get_commit_version((*C.antfly_db)(handle), cTxnIDPtr(txnID), &version)); err != nil {
 		return 0, err
 	}
 	return uint64(version), nil

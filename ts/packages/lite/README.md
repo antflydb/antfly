@@ -154,11 +154,30 @@ section for the full resolution order and rationale, and
 
 ## ABI validation
 
-`validateAbi()` checks that the loaded library's `antfly_abi_version()` and
-`antfly_lite_open_options` struct size match what this binding was compiled
-against, throwing `AbiMismatchError` otherwise. It runs automatically before
-every open/create call and before `checkFile()`; call it yourself at startup
-to fail fast.
+`validateAbi()` checks that the loaded library's `antfly_abi_version()`
+(expected: 2) and `antfly_open_options` struct size match what this binding
+was compiled against, throwing `AbiMismatchError` otherwise. It runs
+automatically before every open/create call and before `checkFile()`; call
+it yourself at startup to fail fast.
+
+## Storage kinds
+
+Every open/create call accepts `storage` (`Storage.Lite`, the default, or
+`Storage.Directory`) via `OpenOptions.storage`:
+
+- `Storage.Lite` -- a single-file `.aflite` database (this package's usual
+  use case).
+- `Storage.Directory` -- a normal single-node Antfly directory. Directory
+  storage is created by opening a missing path with `open`/`openWithOptions`;
+  `create`/`createWithOptions` only create `.aflite` files.
+
+A portable `.afb` backup (`backup()`) round-trips across storage kinds: it
+restores into either kind with the module-level `restore`/`restoreFile`, and
+imports into an *empty* database of either kind with `importBackup()`.
+`restore(path, backup, { storage, replace })` and
+`restoreFile(path, backupPath, { storage, replace })` select the destination
+kind with `storage` (default `Storage.Lite`); the `.aflite` suffix is only
+required client-side when the destination is `Storage.Lite`.
 
 ## JSON conventions
 
@@ -212,8 +231,8 @@ Mirrors `go/pkg/lite`'s surface idiomatically:
 
 - **Open/create**: `create`, `open`, `openReadonly`, `openStatusOnly`,
   `openHosted`, `createHosted`, `openWithOptions`, `createWithOptions`, plus
-  `OpenOptions`, `OpenMode`, `Profile`, `TxnStatus`, `GraphDirection`,
-  `InferenceMode`, `THREADING_SERIALIZED`.
+  `OpenOptions` (including `storage`), `Storage`, `OpenMode`, `Profile`,
+  `TxnStatus`, `GraphDirection`, `InferenceMode`, `THREADING_SERIALIZED`.
 - **`Database`**: `close()`, `[Symbol.asyncDispose]`; `batch`/`batchJson`;
   `lookup`/`lookupRaw`/`getRaw`; `scan`/`search`/`stats`; `status`,
   `capabilities`, `check`, `pendingWorkStats`, `runUntilIdle` /
@@ -227,11 +246,11 @@ Mirrors `go/pkg/lite`'s surface idiomatically:
   `computeEnrichments`; transactions (`beginTransaction`/`writeTransaction`/
   `resolveTransaction`/`transactionStatus`/`commitVersion` -- 16-byte
   transaction ids accepted as a `Uint8Array(16)` or a 32-char hex string);
-  `backup`/`export`/`importBackup`/`import`, `backupToFile`/`exportToFile`;
-  `compact`/`vacuum`/`copyStableSnapshot`.
-- **Module-level**: `checkFile`, `restore`/`restoreBackup`/`restoreFile`/
-  `restoreBackupFile`, `copyStableSnapshotFile`, `decodeArtifactId`,
-  `abiVersion`, `threadingMode`, `validateAbi`.
+  `backup`/`importBackup`, `backupToFile`; `compact`/`vacuum`/
+  `copyStableSnapshot`.
+- **Module-level**: `checkFile`, `restore`/`restoreFile` (both take
+  `RestoreOptions` -- `{ storage, replace }`), `copyStableSnapshotFile`,
+  `decodeArtifactId`, `abiVersion`, `threadingMode`, `validateAbi`.
 
 See `src/index.ts` for the full export list and `src/types.ts` for typed
 `Status` / `Capabilities` / report interfaces.
@@ -249,7 +268,10 @@ ANTFLY_LIBRARY=/nonexistent pnpm run test         # exercises the clean-skip pat
 
 `test/conformance.test.ts` runs every case under
 `zig/pkg/antfly/capi-conformance/cases/*.json` through this public API,
-mirroring `go/pkg/lite/conformance_cgo_test.go`'s semantics. `test/
+mirroring `go/pkg/lite/conformance_cgo_test.go`'s semantics, including the
+`storage`-typed opens and the `import_backup`/`restore_open` cross-storage
+cases. `test/storage.test.ts` adds coverage beyond conformance: restoring a
+`.aflite` backup into directory storage and reopening it. `test/
 concurrency.test.ts` covers mixed concurrent operations, `close()` racing
 in-flight calls, `busyTimeoutMs` behavior, and that concurrent searches
 overlap instead of serializing on the event loop. `test/errors.test.ts` and

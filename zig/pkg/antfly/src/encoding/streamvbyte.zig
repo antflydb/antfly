@@ -14,8 +14,8 @@
 
 //! StreamVByte: SIMD-accelerated variable-length uint32 encoding.
 //!
-//! Port of go-highway/hwy/contrib/varint StreamVByte implementation.
-//! Wire-compatible with the Go version used in zapx.
+//! Port of go-highway/hwy/contrib/varint StreamVByte implementation, and
+//! wire-compatible with it.
 //!
 //! Format: each group of 4 values has a 1-byte control header where each
 //! 2-bit field encodes (byte_length - 1) for that value. Data bytes follow

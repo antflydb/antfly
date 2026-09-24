@@ -65,6 +65,15 @@ const (
 	defaultLibTPUSHA256                    = "1bb180fcc38ca309e8b7fbe04e7c47d5fdf8c5157a4f5dcb67fc05710652c4f5"
 	pjrtPluginMountPath                    = "/pjrt"
 	pjrtPluginPath                         = pjrtPluginMountPath + "/libtpu.so"
+
+	// antflyProcessMemoryBudgetEnvVar tells the Antfly inference runtime its
+	// process memory envelope in MiB. It matters for Burstable pods: a
+	// container with only a Requests value (no Limits) gets an unbounded
+	// ("max") cgroup, and even with a finite Limits the runtime benefits from
+	// throttling itself below the hard limit rather than relying solely on
+	// the kernel OOM killer. See zig/MANAGERS.md "Budget derivation". Set
+	// only when the pool has an explicit memory limit.
+	antflyProcessMemoryBudgetEnvVar = "ANTFLY_PROCESS_MEMORY_BUDGET_MB" // #nosec G101 -- environment variable name, not a credential
 )
 
 var (
@@ -353,7 +362,17 @@ func (r *InferencePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.
 	// serving; lazy and bounded models remain available for request-time loading.
 	// Accelerator selection is configured independently through
 	// ANTFLY_INFERENCE_PREFERRED_BACKEND.
-	preload := make([]map[string]any, 0, len(pool.Spec.Models.Preload))
+	//
+	// The runtime warms config.preload sequentially, in list order (see
+	// server.Node.warmConfiguredModels in zig/pkg/inference/src/server/server.zig).
+	// Entries are therefore emitted ordered by ModelSpec.Priority (high before
+	// medium before low) so higher-priority models finish loading, and become
+	// servable, first. Ties keep the spec.models.preload declaration order.
+	type prioritizedPreloadEntry struct {
+		priority antflyaiv1alpha1.ModelPriority
+		entry    map[string]any
+	}
+	entries := make([]prioritizedPreloadEntry, 0, len(pool.Spec.Models.Preload))
 	_, preloadOverridden := config["preload"]
 	for i, model := range pool.Spec.Models.Preload {
 		if preloadOverridden {
@@ -378,7 +397,14 @@ func (r *InferencePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.
 				entry["quantization"] = quantization
 			}
 		}
-		preload = append(preload, entry)
+		entries = append(entries, prioritizedPreloadEntry{priority: model.Priority, entry: entry})
+	}
+	slices.SortStableFunc(entries, func(a, b prioritizedPreloadEntry) int {
+		return modelPriorityRank(a.priority) - modelPriorityRank(b.priority)
+	})
+	preload := make([]map[string]any, 0, len(entries))
+	for _, e := range entries {
+		preload = append(preload, e.entry)
 	}
 
 	// Set auto-generated config (don't override if user specified)
@@ -597,6 +623,56 @@ func isTPUAccelerator(accelerator string) bool {
 	return antflyaiv1alpha1.IsTPUAccelerator(accelerator)
 }
 
+// modelPriorityRank orders ModelSpec.Priority for preload emission: lower
+// ranks are warmed first. Unset/unrecognized values rank as medium, matching
+// the field's CRD default.
+func modelPriorityRank(priority antflyaiv1alpha1.ModelPriority) int {
+	switch priority {
+	case antflyaiv1alpha1.ModelPriorityHigh:
+		return 0
+	case antflyaiv1alpha1.ModelPriorityLow:
+		return 2
+	default:
+		return 1
+	}
+}
+
+// processMemoryBudgetMB derives the ANTFLY_PROCESS_MEMORY_BUDGET_MB value
+// from a container's memory limit, leaving 10% headroom below the cgroup hard
+// limit. It returns ok=false when no memory limit is set.
+func processMemoryBudgetMB(limits corev1.ResourceList) (int64, bool) {
+	if limits == nil {
+		return 0, false
+	}
+	qty, ok := limits[corev1.ResourceMemory]
+	if !ok {
+		return 0, false
+	}
+	limitBytes := qty.Value()
+	if limitBytes <= 0 {
+		return 0, false
+	}
+	const mib = 1024 * 1024
+	budget := (limitBytes * 9 / 10) / mib
+	if budget < 1 {
+		budget = 1
+	}
+	return budget, true
+}
+
+// processMemoryBudgetEnvVar builds the ANTFLY_PROCESS_MEMORY_BUDGET_MB
+// EnvVar for a container's resource limits, or nil when no budget applies.
+func processMemoryBudgetEnvVar(limits corev1.ResourceList) *corev1.EnvVar {
+	budgetMB, ok := processMemoryBudgetMB(limits)
+	if !ok {
+		return nil
+	}
+	return &corev1.EnvVar{
+		Name:  antflyProcessMemoryBudgetEnvVar,
+		Value: strconv.FormatInt(budgetMB, 10),
+	}
+}
+
 func zigWarmModelKind(tasks []string) string {
 	// Match the Zig registry's task-to-kind precedence. Model task hints are
 	// written into the pulled manifest by the init container.
@@ -779,6 +855,12 @@ func (r *InferencePoolReconciler) reconcileStatefulSet(ctx context.Context, pool
 		})
 	}
 
+	inferenceResources := r.buildResources(pool)
+	var inferenceEnv []corev1.EnvVar
+	if budgetEnv := processMemoryBudgetEnvVar(inferenceResources.Limits); budgetEnv != nil {
+		inferenceEnv = append(inferenceEnv, *budgetEnv)
+	}
+
 	sts := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      pool.Name,
@@ -807,12 +889,13 @@ func (r *InferencePoolReconciler) reconcileStatefulSet(ctx context.Context, pool
 								{Name: "http", ContainerPort: InferenceAPIPort, Protocol: corev1.ProtocolTCP},
 							},
 							VolumeMounts: inferenceVolumeMounts,
+							Env:          inferenceEnv,
 							EnvFrom: []corev1.EnvFromSource{
 								{ConfigMapRef: &corev1.ConfigMapEnvSource{
 									LocalObjectReference: corev1.LocalObjectReference{Name: pool.Name + "-config"},
 								}},
 							},
-							Resources: r.buildResources(pool),
+							Resources: inferenceResources,
 						},
 					},
 					Volumes:          volumes,

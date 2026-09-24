@@ -82,7 +82,7 @@ pub const Scenario = struct {
 
         fn backup(handle: *anyopaque) !CApi.Buffer {
             var out: CApi.Buffer = .{};
-            if (capi_db.antfly_lite_backup(handle, &out) != .ok) return error.CapiBackupFailed;
+            if (capi_db.antfly_db_backup(handle, &out) != .ok) return error.CapiBackupFailed;
             return out;
         }
 

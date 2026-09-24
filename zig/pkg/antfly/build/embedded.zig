@@ -38,7 +38,7 @@ pub fn configureModule(
     vector_mod: *std.Build.Module,
     vectorindex_mod: *std.Build.Module,
     hash_mod: *std.Build.Module,
-    vellum_mod: *std.Build.Module,
+    fst_mod: *std.Build.Module,
     regex_mod: *std.Build.Module,
     image_mod: *std.Build.Module,
     font_mod: *std.Build.Module,
@@ -68,7 +68,7 @@ pub fn configureModule(
     mod.addImport("antfly_vector", vector_mod);
     mod.addImport("antfly_vectorindex", vectorindex_mod);
     mod.addImport("antfly_hash", hash_mod);
-    mod.addImport("antfly_vellum", vellum_mod);
+    mod.addImport("antfly_fst", fst_mod);
     mod.addImport("antfly_regex", regex_mod);
     mod.addImport("antfly_image", image_mod);
     mod.addImport("antfly_font", font_mod);
@@ -139,7 +139,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     const vector_mod = options.antfly_imports.vector;
     const hash_mod = options.antfly_imports.hash;
     const vectorindex_mod = options.antfly_imports.vectorindex;
-    const vellum_mod = options.antfly_imports.vellum;
+    const fst_mod = options.antfly_imports.fst;
     const regex_mod = options.antfly_imports.regex;
     const json_mod = options.antfly_imports.json;
     const matcher_mod = options.antfly_imports.matcher;
@@ -174,7 +174,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         vector_mod,
         vectorindex_mod,
         hash_mod,
-        vellum_mod,
+        fst_mod,
         regex_mod,
         image_mod,
         font_mod,
@@ -505,6 +505,8 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi system write cursor",
         "capi lite exposes hosted and status-only profiles",
         "capi lite open options validate and configure ttl cleanup",
+        "capi directory restore coordinates with open handles and publishes atomically",
+        "capi directory restore publishes with derived work drained",
         "capi handle ids are safe to use after close and across slot reuse",
         "capi handle registry retires a slot instead of wrapping its generation",
         "capi concurrent calls and closes on one handle never touch freed memory",

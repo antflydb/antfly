@@ -49,6 +49,12 @@ _PROFILE_NAMES = {
     "native": antfly_lite.Profile.NATIVE,
     "hosted": antfly_lite.Profile.HOSTED,
 }
+_STORAGE_NAMES = {
+    None: antfly_lite.Storage.LITE,
+    "": antfly_lite.Storage.LITE,
+    "lite": antfly_lite.Storage.LITE,
+    "directory": antfly_lite.Storage.DIRECTORY,
+}
 _STATUS_NAMES = {
     antfly_lite.TxnStatus.PENDING: "pending",
     antfly_lite.TxnStatus.COMMITTED: "committed",
@@ -63,8 +69,12 @@ def _build_open_options(spec: dict) -> antfly_lite.OpenOptions:
     profile = spec.get("profile")
     if profile not in _PROFILE_NAMES:
         raise ValueError(f"unknown profile {profile!r}")
+    storage = spec.get("storage")
+    if storage not in _STORAGE_NAMES:
+        raise ValueError(f"unknown storage {storage!r}")
     busy_timeout_ms = spec.get("busy_timeout_ms") or 0
     return antfly_lite.OpenOptions(
+        storage=_STORAGE_NAMES[storage],
         mode=_MODE_NAMES[mode],
         profile=_PROFILE_NAMES[profile],
         no_sync=bool(spec.get("no_sync", False)),
@@ -195,9 +205,15 @@ def _execute(runner: ConformanceRunner, step: dict) -> Any:
     if op == "backup":
         runner.backup = db.backup()
         return None
+    if op == "import_backup":
+        db.import_backup(runner.backup or b"")
+        return None
     if op == "restore_open":
         path = runner.resolve_path(step.get("path"))
-        antfly_lite.restore_backup(str(path), runner.backup or b"", False)
+        storage = step.get("storage")
+        if storage not in _STORAGE_NAMES:
+            raise ValueError(f"unknown storage {storage!r}")
+        antfly_lite.restore(str(path), runner.backup or b"", storage=_STORAGE_NAMES[storage], replace=False)
         runner.close_current()
         runner.open_current(step)
         return None
@@ -305,3 +321,26 @@ def test_conformance_case(case_file: Path, tmp_path: Path) -> None:
 
 def test_conformance_cases_found() -> None:
     assert CASE_FILES, f"no conformance cases found in {CASES_DIR}"
+
+
+def test_restore_backup_into_directory_storage_and_reopen(tmp_path: Path) -> None:
+    """A .aflite backup restores into directory storage (not just another
+    .aflite file), and the resulting directory can be reopened and read
+    independently of the conformance case runner above."""
+    src_path = tmp_path / "source.aflite"
+    with antfly_lite.create(src_path, no_sync=True) as db:
+        db.batch(
+            [antfly_lite.WriteIntent(key="doc:portable", value=b'{"title":"restored into a directory"}')],
+            timestamp=1,
+        )
+        db.run_until_idle()
+        backup = db.backup()
+
+    dest_path = tmp_path / "restored-dir"
+    antfly_lite.restore(str(dest_path), backup, storage=antfly_lite.Storage.DIRECTORY)
+
+    opts = antfly_lite.OpenOptions(storage=antfly_lite.Storage.DIRECTORY, mode=antfly_lite.OpenMode.READONLY)
+    with antfly_lite.open_with_options(dest_path, opts) as restored:
+        assert restored.lookup("doc:portable") == {"title": "restored into a directory"}
+        status = restored.status()
+        assert status["storage"]["format"] == "directory"

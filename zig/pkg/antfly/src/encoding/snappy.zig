@@ -15,8 +15,8 @@
 //! Snappy block compression/decompression.
 //!
 //! Wire-compatible with Go's `github.com/golang/snappy` block format.
-//! This is the raw block format (no framing), used by zapx for stored fields
-//! and doc values compression.
+//! This is the raw block format (no framing), used for stored fields and doc
+//! values compression.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

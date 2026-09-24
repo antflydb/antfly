@@ -61,7 +61,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const structlog_mod = options.antfly_imports.structlog;
     const hash_mod = options.antfly_imports.hash;
     const vectorindex_mod = options.antfly_imports.vectorindex;
-    const vellum_mod = options.antfly_imports.vellum;
+    const fst_mod = options.antfly_imports.fst;
     const antfly_imports = options.antfly_imports;
     const antfly_mod = options.antfly_mod;
     const antfly_test_mod = options.antfly_test_mod;
@@ -265,7 +265,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
         .optimize = optimize,
     });
     text_segment_bench_root_mod.addImport("bloom", bloom_mod);
-    text_segment_bench_root_mod.addImport("antfly_vellum", vellum_mod);
+    text_segment_bench_root_mod.addImport("antfly_fst", fst_mod);
     text_segment_bench_root_mod.addImport("antfly_platform", platform_mod);
     text_segment_bench_root_mod.addImport("antfly_hash", hash_mod);
     text_segment_write_bench_mod.addImport("antfly_text_bench", text_segment_bench_root_mod);
@@ -378,7 +378,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
         .target = target,
         .optimize = optimize,
     });
-    quickstart_bench_root_mod.addImport("antfly_vellum", vellum_mod);
+    quickstart_bench_root_mod.addImport("antfly_fst", fst_mod);
     quickstart_bench_root_mod.addImport("bloom", bloom_mod);
     quickstart_bench_root_mod.addImport("antfly_platform", platform_mod);
     quickstart_bench_root_mod.addImport("antfly_hash", hash_mod);

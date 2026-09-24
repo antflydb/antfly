@@ -198,9 +198,9 @@ def test_aggregation_full_result_budget(monkeypatch, request):
             api.query_table(name, query)
         response = failure.value.response
         assert response.status_code == 422, response.text
-        assert (
-            response.json()["error"] == "query_candidate_budget_exceeded"
-        ), response.text
+        assert response.json()["error"] == "query_candidate_budget_exceeded", (
+            response.text
+        )
 
 
 # Hybrid aggregation domain.

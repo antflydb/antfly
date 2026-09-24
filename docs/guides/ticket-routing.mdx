@@ -39,7 +39,6 @@ curl -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
     "stream": false,
     "steps": {
       "generation": {
-        "enabled": true,
         "system_prompt": "You route support tickets. Given a new ticket and similar resolved tickets, respond with only the team name that should own it, chosen from the teams in the retrieved tickets."
       }
     }
