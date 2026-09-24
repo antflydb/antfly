@@ -55,7 +55,10 @@ pub fn encodeManagedEmbeddingsIndexRequest(
     index_name: []const u8,
     field_name: []const u8,
     dimension: i64,
-    embedder: embeddings_openapi.IndexEmbedderConfig,
+    /// Any JSON-serializable embedder config: an `IndexEmbedderConfig`
+    /// variant, or the flat `EmbedderConfig` when a shared field such as
+    /// `multimodal` must reach the wire.
+    embedder: anytype,
     chunker: ?chunking_openapi.ChunkerConfig,
 ) ![]u8 {
     const embedder_json = try stringifyJsonAlloc(alloc, embedder);
@@ -94,7 +97,10 @@ pub fn encodeManagedEmbeddingsIndexTemplateRequest(
     index_name: []const u8,
     template_source: []const u8,
     dimension: i64,
-    embedder: embeddings_openapi.IndexEmbedderConfig,
+    /// Any JSON-serializable embedder config: an `IndexEmbedderConfig`
+    /// variant, or the flat `EmbedderConfig` when a shared field such as
+    /// `multimodal` must reach the wire.
+    embedder: anytype,
 ) ![]u8 {
     const embedder_json = try stringifyJsonAlloc(alloc, embedder);
     defer alloc.free(embedder_json);
@@ -116,7 +122,10 @@ pub fn encodeManagedEmbeddingsIndexTemplateWithChunkerRequest(
     index_name: []const u8,
     template_source: []const u8,
     dimension: i64,
-    embedder: embeddings_openapi.IndexEmbedderConfig,
+    /// Any JSON-serializable embedder config: an `IndexEmbedderConfig`
+    /// variant, or the flat `EmbedderConfig` when a shared field such as
+    /// `multimodal` must reach the wire.
+    embedder: anytype,
     chunker: chunking_openapi.ChunkerConfig,
 ) ![]u8 {
     const embedder_json = try stringifyJsonAlloc(alloc, embedder);
@@ -145,13 +154,15 @@ pub fn openAIIndexEmbedder(model: []const u8, url: []const u8) embeddings_openap
     } };
 }
 
-pub fn antflyIndexEmbedder(model: []const u8, api_url: []const u8, multimodal: bool) embeddings_openapi.IndexEmbedderConfig {
-    return .{ .antfly_embedder_config = .{
+/// `multimodal` is a field shared by every provider, so it exists only on the
+/// flat `EmbedderConfig`; the provider-tagged union variants cannot carry it.
+pub fn antflyIndexEmbedder(model: []const u8, api_url: []const u8, multimodal: bool) embeddings_openapi.EmbedderConfig {
+    return .{
         .provider = "antfly",
         .model = model,
         .api_url = api_url,
-        .multimodal = multimodal,
-    } };
+        .multimodal = if (multimodal) true else null,
+    };
 }
 
 pub fn encodeManagedSparseEmbeddingsIndexRequest(

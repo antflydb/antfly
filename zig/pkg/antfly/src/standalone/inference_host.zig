@@ -2896,6 +2896,7 @@ fn localModelCapabilitiesInScope(
         modalities.image,
         modalities.audio,
         modalities.document,
+        inference.server.resolvedExecutorKind(@tagName(task), &manifest),
     );
     modalities = .{
         .text = executor_modalities.text,

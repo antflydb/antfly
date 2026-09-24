@@ -155,7 +155,11 @@ Query-time rerankers reach this path through their `template`: the `media` and `
 
 - Requests without images are reranked through the native text reranker path, whatever the model.
 - Image-bearing requests are parsed, validated, resized, normalized, and grid-prepared natively in Zig.
-- Models that do not advertise `colqwen` or `multimodal_late_interaction` are rejected for image-bearing requests.
+- Image support is resolved from the model manifest into an executor kind (`resolvedExecutorKind("rerank", ...)`), the same way image embedding is:
+  - a manifest whose `inputs` are declared without `image` stays text-only;
+  - a Qwen3-VL reranker GGUF bundle with its projector resolves to `native_projector_reranking` (pointwise);
+  - a manifest declaring the `colqwen` or `multimodal_late_interaction` capability resolves to `native_late_interaction_reranking` (MaxSim).
+- That executor kind is the single answer for the model catalog's `input_modalities`, the executor contract, and the handler. Image-bearing requests to a model without an image executor are rejected with `400 MODEL_NOT_SUPPORTED` before media is fetched or the model loads.
 - Image-bearing requests execute end to end when the model has a native GPT/Qwen text session plus either a `visual_model` export or native Qwen2-VL vision config.
   - If a `visual_model` export is present, Antfly inference uses it.
   - Otherwise it falls back to the native Qwen2-VL-style vision tower path.

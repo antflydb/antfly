@@ -10878,17 +10878,16 @@ pub const Node = struct {
         const executor_contract = resolvedInferenceExecutorContract(self, "rerank", &admission_manifest) catch |err|
             return inferenceExecutorContractFailureResponse(ctx, err);
 
-        // Reject a text-only model from its lightweight manifest before
-        // fetching request media or loading weights and accelerator sessions.
-        if (media_shape.image_count > 0) {
-            const supports_qwen3vl_pointwise = admission_manifest.isQwen3VlRerankerGgufBundle() and
-                admission_manifest.gguf_projector_path != null;
-            if (!(supports_qwen3vl_pointwise or admission_manifest.hasCapability("colqwen") or admission_manifest.hasCapability("multimodal_late_interaction"))) {
-                return ctx.status(400).json(.{
-                    .@"error" = "MODEL_NOT_SUPPORTED",
-                    .message = "model does not advertise a supported multimodal reranking capability",
-                });
-            }
+        // Reject a model without a resolved image executor from its
+        // lightweight manifest, before fetching request media or loading
+        // weights and accelerator sessions. This is the same answer the model
+        // catalog publishes as the reranker's image input modality.
+        const image_executor = resolvedExecutorKind("rerank", &admission_manifest);
+        if (media_shape.image_count > 0 and !executor_contract.accepts_image) {
+            return ctx.status(400).json(.{
+                .@"error" = "MODEL_NOT_SUPPORTED",
+                .message = "model does not accept images for reranking",
+            });
         }
 
         var parsed_docs = std.ArrayListUnmanaged(ParsedMultimodalRerankDocument).empty;
@@ -10988,13 +10987,7 @@ pub const Node = struct {
             return writeRerankScoresResponse(ctx, requested_model, scores, prepared.prompt_tokens);
         }
 
-        if (model.manifest.isQwen3VlReranker()) {
-            if (!model.manifest.isQwen3VlRerankerGgufBundle()) {
-                return ctx.status(400).json(.{
-                    .@"error" = "MODEL_NOT_SUPPORTED",
-                    .message = "Qwen3-VL safetensors rerankers are text-only; multimodal reranking requires a qualified GGUF projector bundle",
-                });
-            }
+        if (image_executor == .native_projector_reranking) {
             const projector_path = model.manifest.gguf_projector_path orelse
                 return ctx.status(400).json(.{ .@"error" = "MODEL_NOT_SUPPORTED", .message = "Qwen3-VL reranker bundle is missing its GGUF projector" });
             const gpt_cfg = session_factory.getGptConfig(model.session) orelse
@@ -11118,12 +11111,7 @@ pub const Node = struct {
             return writeRerankScoresResponse(ctx, requested_model, scores, prompt_tokens);
         }
 
-        if (!(model.manifest.hasCapability("colqwen") or model.manifest.hasCapability("multimodal_late_interaction"))) {
-            return ctx.status(400).json(.{
-                .@"error" = "MODEL_NOT_SUPPORTED",
-                .message = "model does not advertise multimodal late-interaction reranking capability",
-            });
-        }
+        std.debug.assert(image_executor == .native_late_interaction_reranking);
 
         model.ensureVisionSessionWithControl(execution_control) catch |err|
             return inferenceFailureResponse(ctx, err);
@@ -21808,6 +21796,7 @@ fn appendModelInfo(
             manifest_accepts_image,
             manifest_accepts_audio,
             manifest_accepts_document,
+            executor_kind,
         )
     else
         ResolvedInferenceModalities{};
@@ -21902,6 +21891,7 @@ pub fn resolvedExecutorModalities(
     manifest_image: bool,
     manifest_audio: bool,
     manifest_document: bool,
+    executor_kind: ResolvedExecutorKind,
 ) ResolvedInferenceModalities {
     _ = manifest_document;
     if (std.mem.eql(u8, resolved_task, "read")) return .{ .image = manifest_image };
@@ -21910,9 +21900,11 @@ pub fn resolvedExecutorModalities(
         .image = manifest_image,
         .audio = manifest_audio,
     };
+    // A reranker scores images only through a resolved image executor; the
+    // executor kind already honors a manifest that declares text-only inputs.
     if (std.mem.eql(u8, resolved_task, "rerank")) return .{
         .text = manifest_text,
-        .image = manifest_image,
+        .image = executor_kind.scoresRerankImages(),
     };
     if (std.mem.eql(u8, resolved_task, "extract")) return .{
         .text = manifest_text,
@@ -21948,14 +21940,14 @@ pub fn resolvedTaskPromptPolicy(resolved_task: []const u8) []const u8 {
 
 test "executor capability resolution never advertises raw documents" {
     for ([_][]const u8{ "read", "generate", "embed", "rerank", "chunk", "extract", "rewrite", "transcribe" }) |task| {
-        const modalities = resolvedExecutorModalities(task, true, true, true, true);
+        const modalities = resolvedExecutorModalities(task, true, true, true, true, .compatibility);
         try std.testing.expect(!modalities.document);
     }
-    const extract = resolvedExecutorModalities("extract", true, true, true, true);
+    const extract = resolvedExecutorModalities("extract", true, true, true, true, .compatibility);
     try std.testing.expect(extract.text and extract.image and !extract.audio);
-    const transcribe = resolvedExecutorModalities("transcribe", true, true, true, true);
+    const transcribe = resolvedExecutorModalities("transcribe", true, true, true, true, .compatibility);
     try std.testing.expect(transcribe.audio and !transcribe.text and !transcribe.image);
-    const chunk = resolvedExecutorModalities("chunk", true, true, true, true);
+    const chunk = resolvedExecutorModalities("chunk", true, true, true, true, .compatibility);
     try std.testing.expect(chunk.text and chunk.image and chunk.audio and !chunk.document);
 }
 
@@ -22325,6 +22317,44 @@ pub fn resolvedImageTransform(
     };
 }
 
+test "reranker image support is resolved from manifest declarations" {
+    // Manifests here own no allocations, so they are not deinitialized.
+    var late_interaction_caps = [_][]const u8{"multimodal_late_interaction"};
+    var late_interaction = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .model_type = .reranker,
+        .capabilities = &late_interaction_caps,
+    };
+    try std.testing.expectEqual(ResolvedExecutorKind.native_late_interaction_reranking, resolvedExecutorKind("rerank", &late_interaction));
+    try std.testing.expect(resolvedExecutorModalities("rerank", true, false, false, false, resolvedExecutorKind("rerank", &late_interaction)).image);
+
+    var projector = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .model_type = .reranker,
+        .inference_bundle_family = manifest_mod.qwen3_vl_reranker_gguf_bundle_family,
+        .gguf_projector_path = "mmproj.gguf",
+    };
+    try std.testing.expectEqual(ResolvedExecutorKind.native_projector_reranking, resolvedExecutorKind("rerank", &projector));
+    // The same bundle without its projector has no image executor.
+    projector.gguf_projector_path = null;
+    try std.testing.expectEqual(ResolvedExecutorKind.compatibility, resolvedExecutorKind("rerank", &projector));
+
+    // Declared text-only inputs keep an image-capable executor text-only.
+    var text_inputs = [_][]const u8{"text"};
+    late_interaction.inputs = &text_inputs;
+    try std.testing.expectEqual(ResolvedExecutorKind.compatibility, resolvedExecutorKind("rerank", &late_interaction));
+    var image_inputs = [_][]const u8{ "text", "image" };
+    late_interaction.inputs = &image_inputs;
+    try std.testing.expectEqual(ResolvedExecutorKind.native_late_interaction_reranking, resolvedExecutorKind("rerank", &late_interaction));
+
+    // Declaring image input alone is not an executor.
+    var plain = manifest_mod.ModelManifest{ .allocator = std.testing.allocator, .model_type = .reranker, .inputs = &image_inputs };
+    try std.testing.expectEqual(ResolvedExecutorKind.compatibility, resolvedExecutorKind("rerank", &plain));
+    try std.testing.expect(!resolvedExecutorModalities("rerank", true, true, false, false, .compatibility).image);
+    // The executor kind is task-scoped.
+    try std.testing.expectEqual(ResolvedExecutorKind.compatibility, resolvedExecutorKind("embed", &late_interaction));
+}
+
 test "resolved image transforms are executor-owned" {
     var florence = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
     defer florence.deinit();
@@ -22378,6 +22408,17 @@ pub const ResolvedExecutorKind = enum {
     native_sparse_embedding,
     native_florence_reader,
     native_gliner_extraction,
+    /// Pointwise reranking that projects each document's images into a
+    /// vision-language decoder (Qwen3-VL GGUF bundle with its projector).
+    native_projector_reranking,
+    /// Late-interaction (MaxSim) reranking over text and image token
+    /// embeddings, declared by the `colqwen` or `multimodal_late_interaction`
+    /// manifest capability.
+    native_late_interaction_reranking,
+
+    pub fn scoresRerankImages(self: ResolvedExecutorKind) bool {
+        return self == .native_projector_reranking or self == .native_late_interaction_reranking;
+    }
 };
 
 test "microbatch registration qualifies concrete GLiNER bundles and Qwen embedding profiles" {
@@ -22444,6 +22485,26 @@ pub fn resolvedExecutorKind(
     if (std.mem.eql(u8, resolved_task, "extract") and
         (manifest.isSplitGlinerBundle() or manifest.gliner_architecture == .boundary))
         return .native_gliner_extraction;
+    if (std.mem.eql(u8, resolved_task, "rerank")) return resolvedRerankExecutorKind(manifest);
+    return .compatibility;
+}
+
+/// Image reranking is resolved from what the manifest declares, like image
+/// embedding: explicit `inputs` without `image` keep the model text-only,
+/// and otherwise the declared bundle family or capability selects the image
+/// executor. Anything else is served by the text scorer.
+fn resolvedRerankExecutorKind(manifest: *const manifest_mod.ModelManifest) ResolvedExecutorKind {
+    if (manifest.inputs.len > 0) {
+        var declares_image = false;
+        for (manifest.inputs) |input| {
+            if (std.mem.eql(u8, input, "image")) declares_image = true;
+        }
+        if (!declares_image) return .compatibility;
+    }
+    if (manifest.isQwen3VlRerankerGgufBundle() and manifest.gguf_projector_path != null)
+        return .native_projector_reranking;
+    if (manifest.hasCapability("colqwen") or manifest.hasCapability("multimodal_late_interaction"))
+        return .native_late_interaction_reranking;
     return .compatibility;
 }
 
@@ -22630,12 +22691,14 @@ fn resolvedInferenceExecutorContract(
     const manifest_audio = model_caps.modelAcceptsInput(manifest, "audio");
     const manifest_document = model_caps.modelAcceptsInput(manifest, "document") or
         model_caps.modelAcceptsInput(manifest, "pdf");
+    const executor_kind = resolvedExecutorKind(resolved_task, manifest);
     const modalities = resolvedExecutorModalities(
         resolved_task,
         manifest_text,
         manifest_image,
         manifest_audio,
         manifest_document,
+        executor_kind,
     );
     for (manifest.capabilities) |capability| {
         const prefix = "inference.mime_type=";
@@ -22654,10 +22717,7 @@ fn resolvedInferenceExecutorContract(
         .batch = try resolveInferenceBatchCapabilities(
             resolved_task,
             manifest.capabilities,
-            resolvedExecutorBatchImplementation(
-                resolved_task,
-                resolvedExecutorKind(resolved_task, manifest),
-            ),
+            resolvedExecutorBatchImplementation(resolved_task, executor_kind),
             requestMediaMaxBytes(node),
             if (max_images > 0) requestMediaMaxDecodedPixels(node, max_images) else 0,
             modalities.image,
