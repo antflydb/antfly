@@ -21,6 +21,47 @@ const wal_client = @import("kernel_wal_client.zig");
 const data_apply_client = @import("data_raft_apply_client.zig");
 const metadata_apply_client = @import("metadata_raft_apply_client.zig");
 
+test "opaque owner retries a stale schema descriptor without regressing durable state" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const path = try std.fmt.allocPrint(alloc, "{s}/stale-schema", .{root});
+    defer alloc.free(path);
+    var options: abi.OpenRequest = .{
+        .path = .fromSlice(path),
+        .table_name = .fromSlice("docs"),
+        .group_id = 7001,
+        .schema_json = .fromSlice("{\"version\":1}"),
+    };
+    {
+        var owner = try client.Owner.open(options);
+        defer owner.deinit();
+        var response = try owner.batchJson("docs", "{\"inserts\":{\"a\":{\"n\":1}},\"sync_level\":\"write\"}");
+        response.deinit();
+    }
+    options.schema_json = .fromSlice("{\"version\":2}");
+    {
+        var owner = try client.Owner.open(options);
+        owner.deinit();
+    }
+    // Reconciliation advanced the durable schema after this caller captured
+    // version one. The failure must cross the archive boundary as retryable.
+    var stale = options;
+    stale.schema_json = .fromSlice("{\"version\":1}");
+    try std.testing.expectError(error.StorageBusy, client.Owner.open(stale));
+    {
+        var owner = try client.Owner.open(options);
+        defer owner.deinit();
+        var row = try owner.lookupJson("docs", "{\"key\":\"a\"}");
+        defer row.deinit();
+        try std.testing.expect(std.mem.indexOf(u8, row.bytes(), "\"n\":1") != null);
+    }
+    // A successful fresh reopen must not make the old descriptor admissible.
+    try std.testing.expectError(error.StorageBusy, client.Owner.open(stale));
+}
+
 test "opaque owner standalone rewrite authority is durable and cannot be selected by a request" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

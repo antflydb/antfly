@@ -137,7 +137,6 @@
     }
   ],
   "source": {
-    "path": "work-log/completed/inference/metal/status-history.md",
-    "anchor": "`10979 236888 2088 740`, reports `planned_scopes=36`,"
+    "path": "work-log/completed/inference/metal/status-history.md"
   }
 }
