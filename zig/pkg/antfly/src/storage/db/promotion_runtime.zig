@@ -262,11 +262,19 @@ fn processResolutionArtifactWithCatalog(
             .doc_json = doc_json,
         });
     }
-    if (entries.items.len == 0) return 0;
+    const state_value = try std.json.Stringify.valueAlloc(a, std.json.Value{ .object = next_state }, .{});
+    if (entries.items.len == 0) {
+        // Every remaining mention was a byte-stable replay, but the artifact
+        // itself may have shrunk (a mention dropped or fell into the review
+        // band). Keep the state row equal to the last artifact so it never
+        // carries a vanished mention indefinitely.
+        const unchanged = if (prior_raw) |prior_state| std.mem.eql(u8, prior_state, state_value) else next_state.count() == 0;
+        if (!unchanged) try store.put(state_key, state_value);
+        return 0;
+    }
     try sink.upsertBatch(gpa, entries.items);
     // State follows the successful batch: a crash between the two re-emits
     // the same idempotent tombstones on the next replay.
-    const state_value = try std.json.Stringify.valueAlloc(a, std.json.Value{ .object = next_state }, .{});
     try store.put(state_key, state_value);
     return entries.items.len;
 }

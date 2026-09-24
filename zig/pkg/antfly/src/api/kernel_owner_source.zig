@@ -876,6 +876,46 @@ pub const ProvisionedKernelOwnerSource = struct {
         return count;
     }
 
+    /// True when `incoming` carries a lower durable schema version than
+    /// `current`. Table schemas persist a monotonic `version`; the storage
+    /// kernel rejects opening a lower one as `SchemaVersionRegression`, so a
+    /// caller presenting it can only be stale. Unversioned or unparseable
+    /// schemas compare as "not older" and keep the conservative drain.
+    fn schemaVersionRegresses(current: []const u8, incoming: []const u8) bool {
+        const current_version = schemaVersionFromJson(current) orelse return false;
+        const incoming_version = schemaVersionFromJson(incoming) orelse return false;
+        return incoming_version < current_version;
+    }
+
+    fn schemaVersionFromJson(schema_json: []const u8) ?u32 {
+        var scanner = std.json.Scanner.initCompleteInput(std.heap.page_allocator, schema_json);
+        defer scanner.deinit();
+        if ((scanner.next() catch return null) != .object_begin) return null;
+        var depth: usize = 0;
+        while (true) {
+            const token = scanner.next() catch return null;
+            switch (token) {
+                .object_begin, .array_begin => depth += 1,
+                .object_end, .array_end => {
+                    if (depth == 0) return null;
+                    depth -= 1;
+                },
+                .end_of_document => return null,
+                .string => |key| if (depth == 0 and std.mem.eql(u8, key, "version")) {
+                    const value = scanner.next() catch return null;
+                    return switch (value) {
+                        .number => |digits| std.fmt.parseInt(u32, digits, 10) catch null,
+                        else => null,
+                    };
+                } else {
+                    // Skip the value that follows this key or array element.
+                    if (depth == 0) scanner.skipValue() catch return null;
+                },
+                else => {},
+            }
+        }
+    }
+
     fn publicationPendingLocked(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8) bool {
         for (self.publications.items) |publication| {
             if (publication.group_id == group_id and std.mem.eql(u8, publication.table_name, table_name)) return true;
@@ -3068,8 +3108,15 @@ pub const ProvisionedKernelOwnerSource = struct {
                 if (entry.active_users != 0) {
                     // An admitted descriptor change must close admission before
                     // waiting, or overlapping readers can starve its drain.
-                    // Periodic inspection still yields without retiring readers.
-                    if (admission != .exclusive_if_idle) entry.retired = true;
+                    // Periodic inspection still yields without retiring readers,
+                    // and neither does a caller whose schema is older than the
+                    // live owner's: a descriptor captured before publication
+                    // (a replicated envelope, a stale routing snapshot) must
+                    // not force the current owner through a close and reopen
+                    // only to fail its own open with a schema regression.
+                    if (admission != .exclusive_if_idle and !schemaVersionRegresses(entry.schema_json, descriptor.schema_json)) {
+                        entry.retired = true;
+                    }
                     return error.StorageKernelOwnerTransitionRequired;
                 }
                 entry.retired = true;
@@ -5390,6 +5437,49 @@ test "owner descriptor changes close admission before draining existing readers"
             old_descriptor.schema_json = entry.schema_json;
             try std.testing.expectError(error.StorageKernelOwnerTransitionRequired, source.acquireDescriptorOnce(1, "docs", "/unused", old_descriptor, .shared, .resident, .{}));
         }
+        try std.testing.expectEqual(@as(usize, 1), entry.active_users);
+    }
+}
+
+test "owner descriptor changes do not retire a live owner for an older schema version" {
+    const Source = ProvisionedKernelOwnerSource;
+    try std.testing.expectEqual(@as(?u32, 7), Source.schemaVersionFromJson("{\"default_type\":\"_default\",\"types\":{\"a\":{\"version\":1}},\"version\":7}"));
+    try std.testing.expectEqual(@as(?u32, null), Source.schemaVersionFromJson("old schema"));
+    try std.testing.expect(Source.schemaVersionRegresses("{\"version\":7}", "{\"version\":6}"));
+    try std.testing.expect(!Source.schemaVersionRegresses("{\"version\":7}", "{\"version\":8}"));
+    try std.testing.expect(!Source.schemaVersionRegresses("{\"version\":7}", "{\"version\":7}"));
+    try std.testing.expect(!Source.schemaVersionRegresses("old schema", "{\"version\":1}"));
+
+    for ([_]Source.LeaseAdmission{ .shared, .exclusive }) |admission| {
+        var source = Source.init(std.testing.allocator, "/unused", table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+        defer source.entries.deinit(std.testing.allocator);
+        var entry: Source.Entry = .{
+            .group_id = 1,
+            .table_name = @constCast("docs"),
+            .generation = 7,
+            .identity = .{ .table_id = 1, .shard_id = 2, .range_id = 3 },
+            .schema_json = @constCast("{\"version\":7,\"default_type\":\"_default\"}"),
+            .indexes_json = @constCast("{}"),
+            .restore_bootstrap_json = @constCast(""),
+            .owner = undefined,
+            .active_users = 1,
+            .resident = true,
+        };
+        try source.entries.append(std.testing.allocator, &entry);
+        var descriptor: descriptor_contract.Descriptor = .{
+            .lsm_root_generation = entry.generation,
+            .identity = entry.identity,
+            .schema_json = "{\"version\":6,\"default_type\":\"_default\"}",
+            .indexes_json = entry.indexes_json,
+        };
+        // A stale caller (schema captured before the current publication)
+        // is turned away without closing admission for current readers.
+        try std.testing.expectError(error.StorageKernelOwnerTransitionRequired, source.acquireDescriptorOnce(1, "docs", "/unused", descriptor, admission, .resident, .{}));
+        try std.testing.expect(!entry.retired);
+        // A newer schema still closes admission so the drain can complete.
+        descriptor.schema_json = "{\"version\":8,\"default_type\":\"_default\"}";
+        try std.testing.expectError(error.StorageKernelOwnerTransitionRequired, source.acquireDescriptorOnce(1, "docs", "/unused", descriptor, admission, .resident, .{}));
+        try std.testing.expect(entry.retired);
         try std.testing.expectEqual(@as(usize, 1), entry.active_users);
     }
 }

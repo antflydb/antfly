@@ -104,6 +104,9 @@ pub const GemmaAutodiffCtx = struct {
     graph_config: gemma_graph.Config,
     graph_options: gemma_graph.BuildOptions = .{},
     loss_target_encoding: LossTargetEncoding = .dense_distribution,
+    /// Gather block size for the sparse token loss; tests shrink it to cover
+    /// the multi-block slice/concat path with tiny graphs.
+    sparse_token_loss_block_rows: usize = default_sparse_token_loss_block_rows,
     built: ?gemma_graph.GemmaGraph = null,
     lm_logits: ?NodeId = null,
 
@@ -160,13 +163,17 @@ pub const GemmaAutodiffCtx = struct {
         };
     }
 
+    /// Rows per gather block for the sparse token loss. The diagonal gather
+    /// index must stay an exact f32 integer (< 2^24) for the CUDA graph ABI,
+    /// and the [block, block] candidate matrix is the only quadratic term.
+    pub const default_sparse_token_loss_block_rows: usize = 1024;
+
     fn buildSparseTokenLoss(
         self: *GemmaAutodiffCtx,
         bld: *Builder,
         logits: NodeId,
         targets: NodeId,
     ) !NodeId {
-        _ = self;
         const logits_shape = bld.graph.node(logits).output_shape;
         const targets_shape = bld.graph.node(targets).output_shape;
         if (logits_shape.rank() != 2 or targets_shape.rank() != 2) return error.ShapeMismatch;
@@ -183,32 +190,43 @@ pub const GemmaAutodiffCtx = struct {
         const log_probs = try bld.logSoftmax(logits);
         const transposed = try bld.transpose(log_probs, &.{ 1, 0 });
         const token_ids_matrix = try bld.sliceLastDim(targets, 0, 1);
-        const token_ids = try bld.reshape(token_ids_matrix, Shape.init(.f32, &.{rows}));
-        const candidates = try bld.gather(
-            transposed,
-            token_ids,
-            Shape.init(.f32, &.{ rows, rows }),
-        );
+        const token_ids_row = try bld.reshape(token_ids_matrix, Shape.init(.f32, &.{ 1, rows }));
 
-        // candidates[token_slot, causal_row] contains the log-probability
-        // of token_ids[token_slot] at causal_row. A second axis-0 gather of
-        // its diagonal selects one exact token per row. Keeping this second
-        // index below 2^24 preserves exact f32 integer representation used
-        // by the CUDA graph ABI.
+        // Select one exact token per causal row in bounded blocks. Within a
+        // block, candidates[token_slot, causal_row] holds the log-probability
+        // of token_ids[token_slot] at causal_row and a second axis-0 gather of
+        // its diagonal picks the matching pair. Blocking keeps the candidate
+        // matrix at O(rows * block) instead of O(rows^2) and removes the
+        // sequence-length ceiling the single-block form imposed.
         const row_count: usize = @intCast(rows);
-        const candidate_count = std.math.mul(usize, row_count, row_count) catch
-            return error.SparseTargetSequenceTooLong;
-        if (candidate_count == 0 or candidate_count - 1 > (1 << 24)) {
-            return error.SparseTargetSequenceTooLong;
+        const block_rows: usize = @min(row_count, @max(self.sparse_token_loss_block_rows, 1));
+        var selected: ?NodeId = null;
+        var start: usize = 0;
+        while (start < row_count) : (start += block_rows) {
+            const end = @min(row_count, start + block_rows);
+            const block_len = end - start;
+            const block_i64: i64 = @intCast(block_len);
+            const whole = block_len == row_count;
+            const block_log_probs = if (whole) transposed else try bld.sliceLastDim(transposed, @intCast(start), @intCast(end));
+            const block_ids_row = if (whole) token_ids_row else try bld.sliceLastDim(token_ids_row, @intCast(start), @intCast(end));
+            const block_ids = try bld.reshape(block_ids_row, Shape.init(.f32, &.{block_i64}));
+            const candidates = try bld.gather(
+                block_log_probs,
+                block_ids,
+                Shape.init(.f32, &.{ block_i64, block_i64 }),
+            );
+            const candidate_count = block_len * block_len;
+            std.debug.assert(candidate_count - 1 < (1 << 24));
+            const candidate_flat = try bld.reshape(candidates, Shape.init(.f32, &.{ @as(i64, @intCast(candidate_count)), 1 }));
+            const diagonal_data = try bld.graph.allocator.alloc(f32, block_len);
+            defer bld.graph.allocator.free(diagonal_data);
+            for (diagonal_data, 0..) |*index, row| index.* = @floatFromInt(row * block_len + row);
+            const diagonal_indices = try bld.tensorConst(diagonal_data, Shape.init(.f32, &.{block_i64}));
+            const block_selected = try bld.gather(candidate_flat, diagonal_indices, Shape.init(.f32, &.{ block_i64, 1 }));
+            selected = if (selected) |previous| try bld.concat(previous, block_selected, 0) else block_selected;
         }
-        const candidate_flat = try bld.reshape(candidates, Shape.init(.f32, &.{ @as(i64, @intCast(candidate_count)), 1 }));
-        const diagonal_data = try bld.graph.allocator.alloc(f32, row_count);
-        defer bld.graph.allocator.free(diagonal_data);
-        for (diagonal_data, 0..) |*index, row| index.* = @floatFromInt(row * row_count + row);
-        const diagonal_indices = try bld.tensorConst(diagonal_data, Shape.init(.f32, &.{rows}));
-        const selected = try bld.gather(candidate_flat, diagonal_indices, Shape.init(.f32, &.{ rows, 1 }));
         const scales = try bld.sliceLastDim(targets, 1, 2);
-        const weighted = try bld.mul(scales, selected);
+        const weighted = try bld.mul(scales, selected.?);
         return bld.neg(try bld.reduceMean(weighted, &.{ 0, 1 }));
     }
 
@@ -401,7 +419,7 @@ pub const FrozenBaseScorer = struct {
         );
     }
 
-    pub fn sequenceLogprobForExample(
+    pub fn referenceSequenceLogprobForExample(
         self: *FrozenBaseScorer,
         example: *const gemma4.PreparedExampleInput,
     ) !f32 {
@@ -2023,6 +2041,79 @@ test "sparse preference loss log-softmax gradient matches finite differences" {
         1e-3,
     );
     try std.testing.expect(max_relative_error < 5e-3);
+}
+
+test "sparse preference loss blocks match the single-gather form and a host reference" {
+    const allocator = std.testing.allocator;
+    const logits_values = [_]f32{
+        0.2,  -0.4, 0.7,  1.1,  -0.1,
+        -0.3, 0.6,  0.1,  -0.8, 0.9,
+        1.2,  0.0,  -0.5, 0.4,  0.3,
+        -0.6, 0.8,  0.2,  0.5,  -1.0,
+        0.9,  -0.2, 0.3,  -0.7, 0.1,
+    };
+    // One exact token ID and one signed log-probability coefficient per row.
+    const target_values = [_]f32{ 3, 0.7, 1, -0.4, 4, 1.1, 0, 0.5, 2, -0.9 };
+    const rows: usize = 5;
+    const vocab: usize = 5;
+
+    // Host reference: -mean_r(scale_r * log_softmax(logits)[r, id_r]).
+    var expected: f64 = 0.0;
+    for (0..rows) |row| {
+        const logits_row = logits_values[row * vocab ..][0..vocab];
+        var max: f64 = -std.math.inf(f64);
+        for (logits_row) |value| max = @max(max, @as(f64, value));
+        var sum: f64 = 0.0;
+        for (logits_row) |value| sum += @exp(@as(f64, value) - max);
+        const token: usize = @intFromFloat(target_values[row * 2]);
+        const log_prob = @as(f64, logits_row[token]) - max - @log(sum);
+        expected -= @as(f64, target_values[row * 2 + 1]) * log_prob;
+    }
+    expected /= @as(f64, @floatFromInt(rows));
+
+    // Block sizes: single block (the pre-blocking graph), an uneven split
+    // (2 + 2 + 1), and one row per block.
+    for ([_]usize{ GemmaAutodiffCtx.default_sparse_token_loss_block_rows, 2, 1 }) |block_rows| {
+        var ctx = GemmaAutodiffCtx.initPreference(.{
+            .family = .gemma,
+            .hidden_size = 4,
+            .num_hidden_layers = 1,
+            .num_attention_heads = 1,
+            .num_key_value_heads = 1,
+            .attention_head_dim = 4,
+            .intermediate_size = 8,
+            .vocab_size = 5,
+            .position_encoding = .rope,
+            .norm_type = .rms_norm,
+            .activation = .gelu_new,
+            .norm_eps = 1e-6,
+            .norm_weight_offset = 1.0,
+        });
+        ctx.sparse_token_loss_block_rows = block_rows;
+        var graph = Graph.init(allocator);
+        defer graph.deinit();
+        var bld = Builder.init(&graph);
+        const logits = try bld.parameter("logits", Shape.init(.f32, &.{ rows, vocab }));
+        const targets = try bld.parameter("targets", Shape.init(.f32, &.{ rows, 2 }));
+        const loss = try ctx.buildSparseTokenLoss(&bld, logits, targets);
+        try graph.markOutput(loss);
+
+        var evaluated = try ml.graph.grad_check.evaluateOutputs(allocator, &graph, &.{ &logits_values, &target_values });
+        defer evaluated.deinit();
+        try std.testing.expectEqual(@as(usize, 1), evaluated.values.len);
+        try std.testing.expectEqual(@as(usize, 1), evaluated.values[0].len);
+        try std.testing.expectApproxEqAbs(@as(f32, @floatCast(expected)), evaluated.values[0][0], 1e-5);
+
+        const max_relative_error = try ml.graph.grad_check.checkGradients(
+            allocator,
+            &graph,
+            loss,
+            &.{logits},
+            &.{ &logits_values, &target_values },
+            1e-3,
+        );
+        try std.testing.expect(max_relative_error < 5e-3);
+    }
 }
 
 test "makeTrainerInputForExample builds sparse teacher soft targets" {

@@ -179,6 +179,9 @@ fn appendBackwardPass(
     // propagation actionable without dumping the full graph.
     var produced_gradient = false;
     for (wrt) |wrt_node| {
+        // Lowering maps a parameter unreachable from the outputs to
+        // null_node; it has no adjoint slot.
+        if (wrt_node == null_node) continue;
         if (adjoints[wrt_node] != null_node) {
             produced_gradient = true;
             break;
@@ -212,7 +215,8 @@ fn appendBackwardPass(
     // Collect parameter gradients.
     const param_grads = try allocator.alloc(NodeId, wrt.len);
     for (wrt, 0..) |wrt_node, idx| {
-        param_grads[idx] = adjoints[wrt_node]; // null_node if no gradient flows
+        // null_node if no gradient flows (or the target was never lowered).
+        param_grads[idx] = if (wrt_node == null_node) null_node else adjoints[wrt_node];
     }
     return param_grads;
 }

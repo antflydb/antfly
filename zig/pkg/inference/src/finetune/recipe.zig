@@ -3802,6 +3802,12 @@ fn tokenizeSftTextRow(
     return buildGemmaPreparedExampleFromTokens(allocator, prompt_tokens, completion_tokens, max_seq_len);
 }
 
+/// Preference recipes alternate between a batch-one scoring graph
+/// (`sequenceLogprobForExample`, `sampleCompletion`) and the batched update
+/// graph every unit. Retaining both keeps each preference pair or group from
+/// rebuilding (and on CUDA recompiling) the graph twice.
+const preference_graph_cache_capacity: u8 = 2;
+
 fn runOptimizerBackedGemmaDpo(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -3913,6 +3919,7 @@ fn runOptimizerBackedGemmaDpo(
         .execution_engine = if (backend_kind == .cuda) .compiled_device else .interpreter,
         .compiled_required = backend_kind == .cuda,
         .strict_cuda_execution = backend_kind == .cuda,
+        .graph_cache_capacity = preference_graph_cache_capacity,
     });
     defer trainer.deinit();
 
@@ -3941,8 +3948,8 @@ fn runOptimizerBackedGemmaDpo(
     defer allocator.free(reference_rejected_logps);
     for (chosen_prepared.examples, rejected_prepared.examples, samples.samples, 0..) |*chosen_ex, *rejected_ex, sample, sample_idx| {
         if (shared_base_reference) |*scorer| {
-            reference_chosen_logps[sample_idx] = try scorer.sequenceLogprobForExample(chosen_ex);
-            reference_rejected_logps[sample_idx] = try scorer.sequenceLogprobForExample(rejected_ex);
+            reference_chosen_logps[sample_idx] = try scorer.referenceSequenceLogprobForExample(chosen_ex);
+            reference_rejected_logps[sample_idx] = try scorer.referenceSequenceLogprobForExample(rejected_ex);
         } else {
             try DecoderLogprobScorer.modelForward(
                 @ptrCast(&ref_scorer),
@@ -4445,6 +4452,7 @@ fn runOptimizerBackedGemmaGrpo(
         .execution_engine = if (backend_kind == .cuda) .compiled_device else .interpreter,
         .compiled_required = backend_kind == .cuda,
         .strict_cuda_execution = backend_kind == .cuda,
+        .graph_cache_capacity = preference_graph_cache_capacity,
     });
     defer trainer.deinit();
 

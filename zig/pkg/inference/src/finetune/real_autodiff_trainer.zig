@@ -1360,20 +1360,38 @@ pub const RealAutodiffTrainer = struct {
         const use_device_optimizer = self.deviceOptimizerRequested();
         try self.reduceAccumulatedGradients(use_device_optimizer);
 
+        // Each micro-batch gradient was accumulated at 1/grad_accum_steps.
+        // A partial window (fewer micro-batches than configured) must be
+        // rescaled to the mean over the micro-batches that actually ran, or
+        // the final optimizer step of an epoch is silently under-weighted.
+        const accum_steps: u32 = @max(self.config.grad_accum_steps, 1);
+        const window_rescale: f32 = if (micro_batches < accum_steps)
+            @as(f32, @floatFromInt(accum_steps)) / @as(f32, @floatFromInt(micro_batches))
+        else
+            1.0;
+
         self.optimizer_state.step_count = @intCast(self.optimizer_step_count + 1);
         const learning_rate = self.config.lr_schedule.lr(@intCast(self.optimizer_step_count));
         var grad_norm: f32 = undefined;
         if (use_device_optimizer) {
             const accumulated_norm = try self.deviceGlobalGradNorm();
-            grad_norm = accumulated_norm;
+            grad_norm = accumulated_norm * window_rescale;
             const clip_scale = if (self.config.max_grad_norm > 0.0 and grad_norm > self.config.max_grad_norm)
                 self.config.max_grad_norm / (grad_norm + 1e-6)
             else
                 1.0;
-            try self.stepDeviceAdamW(learning_rate, clip_scale);
+            try self.stepDeviceAdamW(learning_rate, clip_scale * window_rescale);
             for (self.lora_params.items) |*slot| @memset(slot.grad_accum, 0);
             for (self.regular_params.items) |*slot| @memset(slot.grad_accum, 0);
         } else {
+            if (window_rescale != 1.0) {
+                for (self.lora_params.items) |*slot| {
+                    for (slot.grad_accum) |*value| value.* *= window_rescale;
+                }
+                for (self.regular_params.items) |*slot| {
+                    for (slot.grad_accum) |*value| value.* *= window_rescale;
+                }
+            }
             grad_norm = self.globalGradNorm();
             if (self.config.max_grad_norm > 0.0 and grad_norm > self.config.max_grad_norm) {
                 const clip_scale = self.config.max_grad_norm / (grad_norm + 1e-6);
@@ -3716,7 +3734,7 @@ test "RealAutodiffTrainer: reduce_device_grads hook type wiring" {
     try testing.expect(trainer.config.reduce_device_grads != null);
 }
 
-test "RealAutodiffTrainer: partial accumulation flush keeps upstream configured divisor" {
+test "RealAutodiffTrainer: partial accumulation flush rescales to the executed micro-batch mean" {
     const allocator = testing.allocator;
     const dummy_cb: *const ComputeBackend = @ptrFromInt(@alignOf(ComputeBackend));
 
@@ -3733,7 +3751,8 @@ test "RealAutodiffTrainer: partial accumulation flush keeps upstream configured 
     weights[0] = 0.0;
     const grad_accum = try allocator.alloc(f32, 1);
     // Two micro-batch gradients summing to 8 were accumulated with the
-    // configured 1/4 scale. Upstream flushes the stored value as-is.
+    // configured 1/4 scale. Flushing the partial window rescales the stored
+    // value to the mean over the two micro-batches that ran: 8 / 2 = 4.
     grad_accum[0] = 2.0;
     const dims = try allocator.dupe(i32, &.{1});
     const name = try allocator.dupe(u8, "x.lora_A");
@@ -3755,9 +3774,9 @@ test "RealAutodiffTrainer: partial accumulation flush keeps upstream configured 
     const result = (try trainer.flushAccumulatedGradients()).?;
     try testing.expectEqual(@as(u32, 2), result.micro_batches);
     try testing.expectEqual(@as(u64, 1), result.optimizer_step);
-    try testing.expectApproxEqAbs(@as(f32, 2.0), result.grad_norm, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 4.0), result.grad_norm, 1e-6);
     // AdamW with beta1=beta2=0 and eps=1 updates by g/(|g|+1).
-    try testing.expectApproxEqAbs(@as(f32, -2.0 / 3.0), weights[0], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, -4.0 / 5.0), weights[0], 1e-6);
     try testing.expectEqual(@as(f32, 0.0), grad_accum[0]);
     try testing.expect((try trainer.flushAccumulatedGradients()) == null);
 }

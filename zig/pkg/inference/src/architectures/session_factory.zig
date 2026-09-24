@@ -4689,12 +4689,36 @@ fn resolveCudaA4bGptInferenceConfig(
     request: ?backend_contracts.A4bInferenceRequest,
     artifact_qualified: bool,
 ) !?backend_contracts.A4bInferenceConfig {
+    // Apply the CUDA defaults (16 GiB envelope, resident placement) before
+    // the geometry pre-pass. Validating the raw request first rejects an
+    // explicit `residency_mode: resident` without `memory_budget_mb` against
+    // the streamed floor, so the documented default could never apply.
+    const effective = backend_contracts.effectiveCudaA4bRequest(request);
     const detected = (try resolveA4bGptInferenceConfig(
         gpt_config,
-        request,
+        if (request != null) effective else null,
         artifact_qualified,
     )) orelse return null;
     return try backend_contracts.buildCudaA4bInferenceConfig(request, detected.geometry);
+}
+
+test "CUDA A4B resolver applies the resident envelope default before validating residency" {
+    const gpt_config = gpt_mod.Config{
+        .family = .gemma,
+        .hidden_size = 2816,
+        .num_hidden_layers = 30,
+        .num_local_experts = 128,
+        .num_experts_per_tok = 8,
+        .num_shared_experts = 1,
+        .expert_intermediate_size = 704,
+    };
+    const request = backend_contracts.A4bInferenceRequest{ .residency_mode = .resident };
+    const resolved = (try resolveCudaA4bGptInferenceConfig(gpt_config, request, true)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(backend_contracts.A4bResidencyMode.resident, resolved.residency_mode);
+    try std.testing.expectEqual(
+        @as(u64, backend_contracts.qualified_cuda_a4b_memory_budget_mb) * 1024 * 1024,
+        resolved.memory_budget_bytes,
+    );
 }
 
 fn shouldRetainTensorStore(store_kind: tensor_store_mod.StoreKind, lazy_weight_count: usize) bool {

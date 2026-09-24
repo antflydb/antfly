@@ -217,6 +217,7 @@ exact protocol below:
 ```json
 {
   "schema_version": "antfly_gemma4_unsloth_preference_benchmark/v1",
+  "status": "passed",
   "protocol": {
     "process_scope": "fresh-process-per-objective-repetition",
     "duration_scope": "process-wall-including-model-load-and-adapter-publication",
@@ -226,7 +227,20 @@ exact protocol below:
     "rank": 16,
     "alpha": 32.0,
     "learning_rate": 0.0001,
+    "optimizer_family": "adamw",
+    "weight_decay": 0.01,
+    "adam_beta1": 0.9,
+    "adam_beta2": 0.999,
+    "adam_epsilon": 1e-08,
+    "lr_scheduler": "constant",
+    "max_grad_norm": 1.0,
     "gradient_accumulation_steps": 1,
+    "lora_target_modules": [
+      "q_proj",
+      "v_proj"
+    ],
+    "lora_dropout": 0.0,
+    "dpo_beta": 0.1,
     "dpo_fixture": {
       "prompt": "Answer briefly: what is the capital of France?",
       "chosen": "The capital is Paris.",
@@ -237,7 +251,14 @@ exact protocol below:
       "target": "qualification-sequence-hash-v1"
     },
     "grpo_reward_mode": "sequence-hash",
-    "grpo_max_completion_tokens": 4
+    "grpo_group_size": 4,
+    "grpo_max_completion_tokens": 4,
+    "grpo_clip_epsilon": 0.2,
+    "grpo_kl_coef": 0.04,
+    "grpo_advantage_epsilon": 0.0001,
+    "grpo_advantage_standard_deviation_correction": 1,
+    "grpo_reward_scaling": "group-sample-std",
+    "grpo_loss_normalization": "per-completion-token-mean"
   },
   "cases": [
     {

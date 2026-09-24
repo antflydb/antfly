@@ -11600,8 +11600,11 @@ fn primDotGeneralOp(
     // Training keeps the original dense buffers and expresses each layout
     // through SGEMM flags. Copying a transpose can select a different FP32
     // reduction order as well as adding allocation and device traffic.
+    // BF16 frozen weights take the dedicated routes below; SGEMM must only
+    // ever read f32 operands.
     if (self.training_blas) |*blas| {
-        if (lhs.shape.len == 2 and rhs.shape.len == 2) {
+        if (lhs.shape.len == 2 and rhs.shape.len == 2 and !rhs_bf16) {
+            try ensureF32(rhs);
             const lc = lhs_contracting[0];
             const rc = rhs_contracting[0];
             if (lc > 1 or rc > 1) return error.UnsupportedShape;
@@ -11751,6 +11754,9 @@ fn selectedTokenLogprobsOp(
     vocab_size: usize,
 ) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    // The vtable contract returns null when no fused kernel exists so the
+    // caller can take its host fallback instead of failing the run.
+    if (self.kernels.selected_token_logprobs_f32 == null) return null;
     const logits = tensorFromCt(logits_ct);
     try ensureF32(logits);
     if (row_indices.len == 0 or row_indices.len != token_ids.len or rows == 0 or vocab_size == 0) return error.InvalidShape;

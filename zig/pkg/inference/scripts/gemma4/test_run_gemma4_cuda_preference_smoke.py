@@ -554,5 +554,21 @@ pathlib.Path(artifacts["report_path"]).write_text(json.dumps(report), encoding="
         self.assertEqual(["inference", "finetune", "run"], command[1:4])
 
 
+class DocumentedBaselineContractTest(unittest.TestCase):
+    """FINETUNING.md publishes the baseline JSON the loader accepts verbatim."""
+
+    def test_documented_baseline_example_matches_loader_contract(self) -> None:
+        doc = (
+            pathlib.Path(__file__).resolve().parents[2] / "finetuning" / "FINETUNING.md"
+        ).read_text(encoding="utf-8")
+        marker = '```json\n{\n  "schema_version": "' + smoke.BASELINE_SCHEMA + '"'
+        start = doc.index(marker) + len("```json\n")
+        end = doc.index("```", start)
+        payload = json.loads(doc[start:end])
+        self.assertEqual("passed", payload["status"])
+        self.assertEqual(smoke.benchmark_protocol(128, 16, 32.0), payload["protocol"])
+        self.assertTrue(payload["cases"])
+
+
 if __name__ == "__main__":
     unittest.main()

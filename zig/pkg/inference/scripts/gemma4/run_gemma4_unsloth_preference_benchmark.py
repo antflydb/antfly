@@ -199,7 +199,13 @@ def parse_models(values: Iterable[str]) -> list[ModelSpec]:
             raise BenchmarkError(
                 f"cannot read model config {config_path}: {error}"
             ) from error
-        if not isinstance(config, dict) or config.get("model_type") != "gemma4":
+        model_type = config.get("model_type") if isinstance(config, dict) else None
+        normalized = (
+            model_type.lower().replace("_", "") if isinstance(model_type, str) else ""
+        )
+        # Match the Zig runner's acceptance (`gemma4`, `gemma4_text`, ...) so a
+        # checkpoint the Zig gate admits can always get a matched baseline.
+        if not normalized.startswith("gemma4") or "assistant" in normalized:
             raise BenchmarkError(f"model is not a Gemma4 checkpoint: {path}")
         result.append(ModelSpec(label, path, sha256_file(config_path)))
     if not result:

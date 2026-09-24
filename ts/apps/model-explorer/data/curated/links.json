@@ -541,7 +541,6 @@
   },
   "gemma4-train-seq-logprob": {
     "path": "zig/pkg/inference/src/finetune/gemma4_real_autodiff.zig",
-    "line": 1233,
     "anchor": "pub fn sequenceLogprobForExample("
   },
   "gemma4-train-grpo-adv": {

@@ -22,6 +22,7 @@ import shutil
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import asdict, dataclass
 from typing import Any, Iterable
@@ -529,7 +530,6 @@ def run_command(
 ) -> ProcessMetrics:
     environment = os.environ.copy()
     environment["TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR"] = "1"
-    environment["TERMITE_REQUIRE_TRAINING_GRAPH_EXECUTOR"] = "1"
     environment.update(DETERMINISTIC_CUDA_ENVIRONMENT)
     for name in (
         "TERMITE_DISABLE_TRAINING_GRAPH_EXECUTOR",
@@ -1148,7 +1148,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         out_dir = (
             args.out
-            or pathlib.Path("/tmp")
+            or pathlib.Path(tempfile.gettempdir())
             / f"antfly-gemma4-cuda-preference-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"
         ).resolve()
         if out_dir.exists():
