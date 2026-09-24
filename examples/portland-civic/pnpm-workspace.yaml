@@ -1,0 +1,5 @@
+packages:
+  - .
+  - ../../ts/packages/sdk
+allowBuilds:
+  esbuild: true

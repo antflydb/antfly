@@ -1,0 +1,49 @@
+{
+  "name": "portland-civic",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch --env-file-if-exists=.env server/index.ts",
+    "build": "tsc --noEmit && vite build",
+    "start": "NODE_ENV=production tsx --env-file-if-exists=.env server/index.ts",
+    "snapshot": "tsx --env-file-if-exists=.env scripts/snapshot.ts",
+    "ingest": "tsx --env-file-if-exists=.env scripts/ingest.ts",
+    "governance:snapshot": "tsx scripts/governance-snapshot.ts",
+    "governance:curate": "tsx scripts/governance-curate.ts",
+    "governance:ingest": "tsx --env-file-if-exists=.env scripts/governance-ingest.ts",
+    "governance:extract": "tsx --env-file-if-exists=.env scripts/governance-extract.ts",
+    "governance:gliner-model": "tsx scripts/governance-gliner-model.ts",
+    "governance:eval": "tsx --env-file-if-exists=.env scripts/governance-eval.ts",
+    "test": "tsx --test tests/*.test.ts",
+    "test:e2e": "playwright test"
+  },
+  "dependencies": {
+    "@antfly/components": "0.0.14",
+    "@antfly/sdk": "workspace:*",
+    "cheerio": "^1.2.0",
+    "diff": "^9.0.0",
+    "express": "^5.1.0",
+    "leaflet": "^1.9.4",
+    "lucide-react": "^0.468.0",
+    "pdfjs-dist": "^6.3.289",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.55.0",
+    "@types/express": "^5.0.0",
+    "@types/leaflet": "^1.9.16",
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.7.0",
+    "tsx": "^4.20.0",
+    "typescript": "~5.9.3",
+    "vite": "^6.4.0"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "packageManager": "pnpm@11.1.3"
+}

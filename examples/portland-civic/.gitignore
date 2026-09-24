@@ -1,0 +1,9 @@
+node_modules/
+.env
+data/*.json
+!data/sample.json
+dist/
+test-results/
+playwright-report/
+.antfly/
+data/governance/cache/
