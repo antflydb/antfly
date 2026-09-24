@@ -59,16 +59,17 @@ pub const Interruption = enum {
 pub const MonitorControl = struct {
     deadline_ns: ?u64 = null,
     cancellation: ?Cancellation = null,
+    cancellation_grace_ns: ?u64 = null,
     ptr: ?*anyopaque = null,
     check_fn: ?*const fn (?*anyopaque) anyerror!void = null,
 
     pub fn check(self: MonitorControl) !void {
+        if (self.deadline_ns) |deadline_ns| {
+            if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        }
         if (self.check_fn) |check_fn| try check_fn(self.ptr);
         if (self.cancellation) |token| {
             if (token.isCancelled()) return error.Cancelled;
-        }
-        if (self.deadline_ns) |deadline_ns| {
-            if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
         }
     }
 };
@@ -133,6 +134,9 @@ pub const InferenceExecutionControl = struct {
     /// cannot notice that one particular request was cancelled while blocked
     /// in a driver.
     hard_cancellation: ?HardCancellationBoundary = null,
+    /// A cancelled request may finish an in-flight native call before the
+    /// watchdog replaces the worker. Checks outside native calls stay immediate.
+    cancellation_grace_ns: ?u64 = null,
 
     /// Borrow this control for structured image work. The caller must retain
     /// it until all preprocessing workers have joined.
@@ -211,6 +215,7 @@ pub const InferenceExecutionControl = struct {
             .token = try boundary.arm(.{
                 .deadline_ns = self.deadline_ns,
                 .cancellation = self.cancellation,
+                .cancellation_grace_ns = self.cancellation_grace_ns,
                 .ptr = self.ptr,
                 .check_fn = self.check_fn,
             }),

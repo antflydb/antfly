@@ -10,7 +10,7 @@ admission, execution control, the hard-cancellation watchdog, and the process
 supervisor. Only the model session is synthetic. Its control routes exist only
 in this test executable, which is not installed or linked into the server.
 
-Each test first verifies a successful embedding, arms a blocking model call,
+The embedding cases first verify a successful embedding, arm a blocking model call,
 waits until the real HTTP request owns admission and scratch memory, and then
 aborts its TCP client with a reset (RST):
 
@@ -23,9 +23,20 @@ Both paths must return to baseline resource accounting and serve the same
 embedding successfully afterward. All network waits are bounded, and cleanup
 terminates the fixture process group even on failure.
 
-An orderly TCP half-close (FIN) is not cancellation: an HTTP/1 client may still
-be waiting to read the response. The tests deliberately use RST to establish
-response abandonment, matching the production transport contract.
+By default, an orderly TCP half-close (FIN) is not cancellation: an HTTP/1
+client may still be waiting to read the response. The embedding tests use RST
+to establish response abandonment, matching the default transport contract.
+
+The HTTP reranker and linked reranker cases abort their requests with a TCP
+reset. Their synthetic GPU batch returns only
+after the test releases it. The worker must remain alive while the batch is
+in progress, then observe cancellation and release admission before the next
+rerank request.
+
+The embedding case exercises the same safe native-call grace through the
+shared inference control. A cancelled request releases at the end of its
+current call without replacing the worker; a genuinely stuck call still
+restarts the worker after the bounded grace.
 
 This covers transport-abort propagation through model execution. It does not
 exercise real GPU drivers, cold model loading, or application-deadline wiring;
