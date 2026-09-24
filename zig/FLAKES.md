@@ -1,5 +1,125 @@
 # Zig runtime flakes
 
+## 2026-09-23: executable chunk embeddings and transient rewrite owner routing
+
+[PR #868 CI run 35937420037](https://github.com/antflydb/antfly/actions/runs/35937420037)
+failed both executable embedding artifact restart cases before the restart:
+the worker reported zero completed batches and skipped coverage. The planner
+classified an embedding that names a directly generated chunk artifact as
+inline chunk input. The embedding's `source_field` was `text`, which exists on
+the stored chunk but not the parent document. The planner now marks every
+named chunk source as materialized input, and the worker routes by that
+explicit input kind. The planner regression and focused database suite pass
+(309/309); both E2E variants passed four invocations each across two concurrent
+soak workers.
+
+The same run's schema rewrite recovery case exhausted its terminal wait at
+attempt 9 with `RestoreValidationPending` in the snapshot phase and intermittent
+owner/metadata 503 responses. A temporary unavailable owner is readiness for
+the already durable rewrite cursor, not a repository failure. The rewrite
+driver now maps that condition to a short same-attempt wait; scope-change and
+other errors keep their existing handling. The focused rewrite case passed four
+two-worker soak invocations. The run also included a seed-write
+timeout during slow metadata persistence; this is a separate availability
+signature and the rewrite change does not resolve it.
+
+[Origin/main job 107446985962](https://github.com/antflydb/antfly/actions/runs/35936641093/job/107446985962)
+failed a constraint-status poll on the endpoint's documented transient 409
+(`refresh and retry`). The lifecycle test now retries only that exact response
+while polling. That job also had catalog and foreground traffic failures with
+while polling. The corrected retirement case passed four clean two-worker
+soak invocations. That job also had catalog and foreground traffic failures with
+metadata WAL commits taking up to 12.2 seconds, including time spent in the
+physical WAL commit. The E2E base lanes now schedule only one Antfly cluster
+workload per runner, preventing another test cluster from contending for the
+same disk during bounded-latency assertions. This is CI workload isolation,
+not a guarantee of availability when a production disk takes 12 seconds to
+commit a WAL record. The CI result after this change is still needed to
+validate that contention was the cause on that runner.
+
+## 2026-09-23: older Raft owner descriptor regressed a migrated schema
+
+[CI job 107389740209](https://github.com/antflydb/antfly/actions/runs/35916384702/job/107389740209)
+failed `test_concurrent_tenant_schema_migrations_preserve_documents`. During
+startup catch-up, an older committed entry (index 3) carried its original
+storage-owner descriptor. The physical DB had already durably installed a
+newer schema. Opening the owner tried to commit the older schema and returned
+`SchemaVersionRegression`; the C ABI mapped it to an internal storage failure,
+which stopped data nodes 102 and 103 and left the migration poll to time out.
+
+The owner open and configuration paths now retain a newer durable schema and
+its index definitions when an older descriptor is replayed. A committed Raft
+batch no longer revalidates against the replica's current metadata schema:
+admission happened before the entry was committed, and the native applied
+marker still performs idempotent replay. This keeps metadata arrival order
+from changing the outcome of an older committed entry. The exact descriptor
+transition has a deterministic compiled-owner test; a DB reopen test checks
+that the newer public and runtime schema remain persisted. Both pass. One
+unchanged-binary focused E2E invocation passed, so the timing-sensitive CI
+failure was not reproduced by that single local run. The rebuilt server passed
+four focused E2E invocations across two concurrent regression-loop workers;
+those passes validate recovery under local load but do not prove the CI race
+cannot recur.
+
+```sh
+SKIP_BUILD=1 ANTFLY_BIN=/absolute/path/to/antfly \
+  ANTFLY_E2E_REGRESSION_WORKERS=2 ANTFLY_E2E_REGRESSION_REPEATS=2 \
+  scripts/ci/zig-e2e-regression-loop.sh \
+  e2e/antfly/test_catalog_resilience.py::test_concurrent_tenant_schema_migrations_preserve_documents
+```
+
+## 2026-09-23: restore staging contention and partial vector publication after restart
+
+[CI job 107069241819](https://github.com/antflydb/antfly/actions/runs/35823581381/job/107069241819)
+and [job 107085992226](https://github.com/antflydb/antfly/actions/runs/35826961268/job/107085992226)
+each failed the same two standalone E2E tests. In
+`test_cluster_restore_modes_with_concurrent_observers`, restore attempt 15
+reached neither publication nor a terminal error within 120 seconds. Both
+server logs identify `StorageBusy` during `authority_or_owner` staging.
+This is the remaining [#846](https://github.com/antflydb/antfly/issues/846)
+signature: the generic error mapping treated transient owner contention as
+`RestoreValidationPending`, requeued a fresh durable attempt, and applied
+repository-failure backoff. `StorageBusy` now takes the short cooperative
+same-attempt yield; ordinary repository errors still use their durable
+retry policy. The translator also preserves longer readiness waits raised directly
+by cutover fencing. The mapping regression checks all three classifications.
+
+In `test_progressive_publication_remains_queryable_across_process_restart`,
+the same index incarnation had 160 searchable vectors before restart and 32
+afterward, while source coverage stayed at 80 of 100 documents. The generated
+replay and target counters advanced to reflect the reduction, so the failure
+is not just a stale status field. Two paths could withdraw old embeddings
+before replacement: the chunk producer deleted derived embedding artifacts
+while reconciling stale chunk rows, and the chunked dense worker could enqueue
+stale embedding deletions before its provider call succeeded. The chunk
+producer now cleans its own stored rows and targets only full-text deletions;
+the embedding consumer retires its artifacts after successful replacement,
+including the materialized chunk path's terminal-outcome check. Synchronous
+precomputation likewise retires stale embeddings only after replacement
+generation succeeds in the same commit. The restart
+regression keeps the provider blocked after a source change, checks that all
+previously published vectors survive retry and reopen, and then checks that
+the obsolete vectors retire after the provider recovers. This is tracked in
+[#867](https://github.com/antflydb/antfly/issues/867).
+With only the embedding-worker change, that deterministic test failed on
+reopen (`expected 3, found 1`); fixing the chunk producer made it pass.
+
+The unchanged `origin/main` binary passed 80 focused invocations across ten
+four-worker regression-loop repetitions, so neither CI timing failure was
+reproduced by that local soak. The deterministic regressions target the
+identified transitions. The fixed server passed eight focused E2E invocations
+across two two-worker repetitions, plus the targeted database tests for dense,
+sparse, full-text, and synchronous replacement. These passes do not prove the
+CI failures had no additional contributing cause.
+
+```sh
+SKIP_BUILD=1 ANTFLY_E2E_ENV_LOADED=1 \
+  ANTFLY_E2E_REGRESSION_WORKERS=4 ANTFLY_E2E_REGRESSION_REPEATS=10 \
+  scripts/ci/zig-e2e-regression-loop.sh \
+  e2e/antfly/test_backup_restore.py::test_cluster_restore_modes_with_concurrent_observers \
+  e2e/antfly/test_quickstart.py::test_progressive_publication_remains_queryable_across_process_restart
+```
+
 ## 2026-09-22: schema rewrite cutover readiness after coordinator crash
 
 [CI run 35813900420, job 107039234761](https://github.com/antflydb/antfly/actions/runs/35813900420/job/107039234761)

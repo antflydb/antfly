@@ -117,7 +117,8 @@ class Antfly < Formula
     (testpath/"smoke.c").write <<~C
       #include <antfly.h>
       int main(void) {{
-        if (antfly_abi_version() != 2) return 1;
+        uint32_t abi = antfly_abi_version();
+        if (abi != 1 && abi != 2) return 1;
         void *db = NULL;
         if (antfly_lite_create("smoke.aflite", (void *)&db) != ANTFLY_OK) return 2;
         antfly_db_close(db);

@@ -23,6 +23,9 @@ pub const SendFrameRequest = struct {
     frame: codec_iface.EncodedFrame,
     group_ids: []const u64 = &.{},
     attempt: u32 = 1,
+    /// Only context-free Raft heartbeats qualify. A newer heartbeat for the
+    /// same groups supersedes this frame while it is still queued.
+    replaceable_heartbeat: bool = false,
 };
 
 /// Failed asynchronous delivery transfers ownership back to the transport.
@@ -33,6 +36,7 @@ pub const FailedFrame = struct {
     peer_id: u64,
     frame: codec_iface.EncodedFrame,
     attempt: u32,
+    replaceable_heartbeat: bool = false,
 
     pub fn deinit(self: *FailedFrame) void {
         self.alloc.free(self.frame.bytes);

@@ -44,6 +44,7 @@ pub const AsyncSendMetricsSnapshot = struct {
     pending: usize = 0,
     retained_bytes: usize = 0,
     retained_frames: usize = 0,
+    heartbeats_coalesced: u64 = 0,
 };
 
 const AsyncSendMetrics = struct {
@@ -53,6 +54,7 @@ const AsyncSendMetrics = struct {
     dropped: std.atomic.Value(u64) = .init(0),
     queue_full: std.atomic.Value(u64) = .init(0),
     peer_queue_full: std.atomic.Value(u64) = .init(0),
+    heartbeats_coalesced: std.atomic.Value(u64) = .init(0),
 };
 
 pub const SendBatch = struct {
@@ -83,6 +85,7 @@ pub const HttpFrameDriver = struct {
         content_type: []u8,
         attempt: u32 = 1,
         group_ids: []u64,
+        replaceable_heartbeat: bool = false,
 
         fn deinit(self: *QueuedFrame, alloc: std.mem.Allocator) void {
             alloc.free(self.base_uri);
@@ -175,6 +178,7 @@ pub const HttpFrameDriver = struct {
             .pending = pending,
             .retained_bytes = retained.bytes,
             .retained_frames = retained.frames,
+            .heartbeats_coalesced = self.metrics.heartbeats_coalesced.load(.monotonic),
         };
     }
 
@@ -343,7 +347,7 @@ pub const HttpFrameDriver = struct {
         self.releaseRetentionLocked(frame);
         self.alloc.free(frame.base_uri);
         self.alloc.free(frame.group_ids);
-        return .{ .alloc = self.alloc, .source_id = frame.source_id, .peer_id = frame.peer_id, .frame = .{ .bytes = frame.body, .media_type = frame.content_type }, .attempt = frame.attempt };
+        return .{ .alloc = self.alloc, .source_id = frame.source_id, .peer_id = frame.peer_id, .frame = .{ .bytes = frame.body, .media_type = frame.content_type }, .attempt = frame.attempt, .replaceable_heartbeat = frame.replaceable_heartbeat };
     }
 
     fn invalidateRoute(ptr: *anyopaque, group_id: u64, peer_id: u64) void {
@@ -397,6 +401,7 @@ pub const HttpFrameDriver = struct {
         const size = std.math.add(usize, req.frame.bytes.len, req.endpoint.address.len) catch return error.BatchTooLarge;
         const metadata_size = std.math.add(usize, req.frame.media_type.len, std.math.mul(usize, req.group_ids.len, @sizeOf(u64)) catch return error.BatchTooLarge) catch return error.BatchTooLarge;
         const bytes = std.math.add(usize, size, metadata_size) catch return error.BatchTooLarge;
+        if (req.replaceable_heartbeat) self.coalesceQueuedHeartbeatsLocked(req.peer_id, req.group_ids);
         const peer = self.peers.get(req.peer_id) orelse PeerState{};
         if (self.retained.frames >= self.cfg.async_send_queue_max or bytes > self.cfg.async_send_retained_bytes_max -| self.retained.bytes) {
             _ = self.metrics.queue_full.fetchAdd(1, .monotonic);
@@ -439,12 +444,40 @@ pub const HttpFrameDriver = struct {
             queue.items.len = remaining;
             entry.value_ptr.head = 0;
         }
-        try queue.append(self.alloc, .{ .source_id = req.source_id, .peer_id = req.peer_id, .base_uri = address, .body = body, .content_type = content_type, .group_ids = group_ids, .attempt = req.attempt });
+        try queue.append(self.alloc, .{ .source_id = req.source_id, .peer_id = req.peer_id, .base_uri = address, .body = body, .content_type = content_type, .group_ids = group_ids, .attempt = req.attempt, .replaceable_heartbeat = req.replaceable_heartbeat });
         self.pending += 1;
         self.makeReadyLocked(req.peer_id);
         _ = self.metrics.enqueued.fetchAdd(1, .monotonic);
         if (req.attempt > 1) _ = self.metrics.retried.fetchAdd(1, .monotonic);
         self.cond.signal(self.io);
+    }
+
+    fn coalesceQueuedHeartbeatsLocked(self: *HttpFrameDriver, peer_id: u64, group_ids: []const u64) void {
+        const peer = self.peers.getPtr(peer_id) orelse return;
+        var kept: usize = 0;
+        self.removeReadyLocked(peer_id);
+        for (peer.queue.items[peer.head..]) |frame| {
+            if (frame.replaceable_heartbeat and std.mem.eql(u64, frame.group_ids, group_ids)) {
+                const bytes = frame.body.len + frame.base_uri.len + frame.content_type.len + frame.group_ids.len * @sizeOf(u64);
+                peer.bytes -= bytes;
+                peer.frames -= 1;
+                self.retained.bytes -= bytes;
+                self.retained.frames -= 1;
+                self.pending -= 1;
+                var obsolete = frame;
+                obsolete.deinit(self.alloc);
+                _ = self.metrics.heartbeats_coalesced.fetchAdd(1, .monotonic);
+            } else {
+                peer.queue.items[kept] = frame;
+                kept += 1;
+            }
+        }
+        peer.queue.items.len = kept;
+        peer.head = 0;
+        if (peer.frames == 0) {
+            peer.queue.deinit(self.alloc);
+            _ = self.peers.remove(peer_id);
+        } else self.makeReadyLocked(peer_id);
     }
 
     fn popQueuedFrame(self: *HttpFrameDriver) ?QueuedFrame {
@@ -909,6 +942,84 @@ test "http frame driver budgets in flight and failed frames and invalidates queu
     driver.cfg.async_send_retained_bytes_max = size - 1;
     try std.testing.expectError(error.AsyncSendQueueFull, driver.frameDriver().sendFrame(req));
     try std.testing.expectEqual(@as(u64, 1), driver.metricsSnapshot().queue_full);
+}
+
+test "queued context-free heartbeats coalesce behind a slow peer without dropping append or read-index work" {
+    const Blocking = struct {
+        io: std.Io,
+        mutex: std.Io.Mutex = .init,
+        cond: std.Io.Condition = .init,
+        allow: bool = false,
+        entered: std.atomic.Value(bool) = .init(false),
+        fn release(self: *@This()) void {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            self.allow = true;
+            self.cond.broadcast(self.io);
+        }
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, _: common.HttpRequest) !common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            self.entered.store(true, .release);
+            while (!self.allow) self.cond.waitUncancelable(self.io, &self.mutex);
+            return error.ConnectionRefused;
+        }
+    };
+    const io = std.testing.io;
+    var executor = Blocking{ .io = io };
+    var driver: HttpFrameDriver = undefined;
+    try driver.initAsyncInPlace(std.testing.allocator, .{ .async_send_worker_count = 1, .async_send_queue_max_per_peer = 3 }, .{ .ptr = &executor, .vtable = &.{ .execute = Blocking.execute } }, io);
+    defer driver.deinit();
+    defer executor.release();
+    var inflight = "inflight".*;
+    var old_body = "old-heartbeat".*;
+    var append_body = "append".*;
+    var new_body = "new-heartbeat".*;
+    var read_index_body = "read-index-context".*;
+    const base: raft_engine.runtime.frame_driver_iface.SendFrameRequest = .{
+        .peer_id = 2,
+        .source_id = 1,
+        .endpoint = .{ .protocol = .http1, .address = "http://slow" },
+        .frame = .{ .bytes = &inflight, .media_type = "raft" },
+        .group_ids = &.{41},
+    };
+    try driver.frameDriver().sendFrame(base);
+    const deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (!executor.entered.load(.acquire) and platform_time.monotonicNs() < deadline) try io.sleep(.fromMilliseconds(1), .awake);
+    try std.testing.expect(executor.entered.load(.acquire));
+    var old_heartbeat = base;
+    old_heartbeat.frame.bytes = &old_body;
+    old_heartbeat.replaceable_heartbeat = true;
+    try driver.frameDriver().sendFrame(old_heartbeat);
+    var append = base;
+    append.frame.bytes = &append_body;
+    try driver.frameDriver().sendFrame(append);
+    var new_heartbeat = old_heartbeat;
+    new_heartbeat.frame.bytes = &new_body;
+    for (0..32) |_| try driver.frameDriver().sendFrame(new_heartbeat);
+    try std.testing.expectEqual(@as(u64, 32), driver.metricsSnapshot().heartbeats_coalesced);
+    try std.testing.expectEqual(@as(usize, 2), driver.metricsSnapshot().pending);
+    driver.mutex.lockUncancelable(io);
+    {
+        defer driver.mutex.unlock(io);
+        const peer = driver.peers.get(2).?;
+        try std.testing.expectEqualStrings("append", peer.queue.items[peer.head].body);
+        try std.testing.expectEqualStrings("new-heartbeat", peer.queue.items[peer.head + 1].body);
+    }
+    var read_index_heartbeat = base;
+    read_index_heartbeat.frame.bytes = &read_index_body;
+    driver.cfg.async_send_queue_max_per_peer = 4;
+    try driver.frameDriver().sendFrame(read_index_heartbeat);
+    try driver.frameDriver().sendFrame(new_heartbeat);
+    try std.testing.expectEqual(@as(usize, 3), driver.metricsSnapshot().pending);
+    try std.testing.expectEqual(@as(u64, 33), driver.metricsSnapshot().heartbeats_coalesced);
+    driver.mutex.lockUncancelable(io);
+    {
+        defer driver.mutex.unlock(io);
+        const peer = driver.peers.get(2).?;
+        try std.testing.expectEqualStrings("read-index-context", peer.queue.items[peer.head + 1].body);
+    }
 }
 
 test "http frame driver ready peers drain fairly and retain FIFO across backlog" {
