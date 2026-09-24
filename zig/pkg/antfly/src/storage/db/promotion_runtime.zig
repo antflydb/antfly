@@ -94,12 +94,12 @@ fn buildEntityDocAlloc(alloc: std.mem.Allocator, e: resolver_lib.ResolvedEntity)
 /// Companion state row: the entity keys and canonical fields this
 /// resolution artifact's canonical mentions last promoted, keyed by mention
 /// local id. Compositional event identity makes re-keying a designed
-/// convergence path (a participant merge re-keys the events it touches), and
-/// promotion is upsert-only — without this diff every re-key would strand the
-/// previously promoted document as a dead node. The diff writes a merged_into
-/// tombstone instead, the same redirect the matcher-scorer machinery already
-/// follows. The recorded fields also make a replay of the same decision a
-/// no-op instead of a repeat live promotion.
+/// convergence path (a participant merge re-keys the events it touches).
+/// Without this diff every re-key would strand the previously promoted
+/// document as a dead node. The diff writes a merged_into tombstone for a
+/// logical re-key and deletes the old copy for a pinned physical move. The
+/// recorded fields also make a replay of the same decision a no-op instead
+/// of a repeat live promotion.
 fn promotedKeysStateKeyAlloc(alloc: Allocator, resolution_key: []const u8) ![]u8 {
     var key = std.ArrayListUnmanaged(u8).empty;
     defer key.deinit(alloc);
@@ -264,7 +264,12 @@ fn processResolutionArtifactWithCatalog(
         if (e.canonical_name.len == 0) continue;
         promotable_count += 1;
         if (prior.get(e.local_id)) |previous| {
-            if (std.mem.eql(u8, previous.table, e.doc_ref.table) and std.mem.eql(u8, previous.key, e.doc_ref.key)) {
+            const same_logical_key = std.mem.eql(u8, previous.table, e.doc_ref.table) and std.mem.eql(u8, previous.key, e.doc_ref.key);
+            const same_storage_table = if (previous.storage_table) |old|
+                if (e.doc_ref.storage_table) |current| std.mem.eql(u8, old, current) else false
+            else
+                e.doc_ref.storage_table == null;
+            if (same_logical_key and same_storage_table) {
                 // The same key with the same canonical document is a
                 // byte-stable replay (a retried resolution window
                 // re-emits its artifact when the handoff marker did not
@@ -274,7 +279,17 @@ fn processResolutionArtifactWithCatalog(
                 // so a repeat would silently undo a curator redirect
                 // that landed on this key between the two replays.
                 if (promotedRefMatches(previous, e)) continue;
-            } else {
+            } else if (same_logical_key and previous.storage_table != null and e.doc_ref.storage_table != null) {
+                // A physical table move with the same logical key cannot use
+                // a redirect: that would point back to the old document.
+                // Delete the old pinned copy in the same commit as the new one.
+                try entries.append(a, .{
+                    .table = previous.table,
+                    .storage_table = previous.storage_table,
+                    .key = previous.key,
+                    .delete = true,
+                });
+            } else if (!same_logical_key) {
                 // A mention that previously promoted a DIFFERENT key in
                 // the same table has re-keyed (compositional identity
                 // following a merge): tombstone the old document with a
@@ -878,6 +893,7 @@ const CaptureSink = struct {
     tables: std.ArrayListUnmanaged([]u8) = .empty,
     storage_tables: std.ArrayListUnmanaged(?[]u8) = .empty,
     docs: std.ArrayListUnmanaged([]u8) = .empty,
+    deletes: std.ArrayListUnmanaged(bool) = .empty,
     batch_calls: usize = 0,
 
     fn deinit(self: *CaptureSink) void {
@@ -889,6 +905,7 @@ const CaptureSink = struct {
         self.tables.deinit(self.alloc);
         self.storage_tables.deinit(self.alloc);
         self.docs.deinit(self.alloc);
+        self.deletes.deinit(self.alloc);
     }
 
     fn sink(self: *CaptureSink) EntitySink {
@@ -897,24 +914,25 @@ const CaptureSink = struct {
 
     const vtable = EntitySink.VTable{ .upsert = upsert, .upsert_batch = upsertBatch };
 
-    fn record(self: *CaptureSink, table: []const u8, storage_table: ?[]const u8, key: []const u8, doc_json: []const u8) anyerror!void {
+    fn record(self: *CaptureSink, table: []const u8, storage_table: ?[]const u8, key: []const u8, doc_json: []const u8, delete: bool) anyerror!void {
         try self.tables.append(self.alloc, try self.alloc.dupe(u8, table));
         try self.storage_tables.append(self.alloc, if (storage_table) |physical| try self.alloc.dupe(u8, physical) else null);
         try self.keys.append(self.alloc, try self.alloc.dupe(u8, key));
         try self.docs.append(self.alloc, try self.alloc.dupe(u8, doc_json));
+        try self.deletes.append(self.alloc, delete);
     }
 
     fn upsert(ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, key: []const u8, doc_json: []const u8) anyerror!void {
         _ = allocator;
         const self: *CaptureSink = @ptrCast(@alignCast(ptr));
-        try self.record(table, null, key, doc_json);
+        try self.record(table, null, key, doc_json, false);
     }
 
     fn upsertBatch(ptr: *anyopaque, allocator: std.mem.Allocator, entries: []const EntityUpsert) anyerror!void {
         _ = allocator;
         const self: *CaptureSink = @ptrCast(@alignCast(ptr));
         self.batch_calls += 1;
-        for (entries) |e| try self.record(e.table, e.storage_table, e.key, e.doc_json);
+        for (entries) |e| try self.record(e.table, e.storage_table, e.key, e.doc_json, e.delete);
     }
 };
 
@@ -986,7 +1004,7 @@ test "processResolutionArtifact upserts a canonical entity per resolved mention"
     try testing.expectEqual(@as(usize, 0), try processResolutionArtifact(alloc, map.store(), "no-such-key", capture.sink()));
 }
 
-test "processResolutionArtifact re-promotes when the pinned physical destination changes" {
+test "processResolutionArtifact atomically moves a pinned physical destination" {
     const alloc = testing.allocator;
     var map = MapStore{ .alloc = alloc };
     defer map.deinit();
@@ -1003,10 +1021,22 @@ test "processResolutionArtifact re-promotes when the pinned physical destination
     try map.put(resolution_key,
         \\{"config_generation":1,"entities":[{"local_id":"e0","doc_ref":{"table":"entities","storage_table":"table:new","key":"person/ada"},"confidence":1,"decision":"new","label":"person","canonical_name":"Ada","surface_form":"Ada"}]}
     );
-    try testing.expectEqual(@as(usize, 1), try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
-    try testing.expectEqualStrings("table:new", capture.storage_tables.items[1].?);
+    try testing.expectEqual(@as(usize, 2), try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
+    try testing.expectEqualStrings("table:old", capture.storage_tables.items[1].?);
+    try testing.expect(capture.deletes.items[1]);
+    try testing.expectEqualStrings("person/ada", capture.keys.items[1]);
+    try testing.expectEqualStrings("table:new", capture.storage_tables.items[2].?);
+    try testing.expect(!capture.deletes.items[2]);
     try testing.expectEqual(@as(usize, 0), try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
-    try testing.expectEqual(@as(usize, 2), capture.keys.items.len);
+    try testing.expectEqual(@as(usize, 3), capture.keys.items.len);
+
+    // Without a pinned new physical table, the old destination may still be
+    // the live one. Re-upsert the logical key without issuing a blind delete.
+    try map.put(resolution_key,
+        \\{"config_generation":1,"entities":[{"local_id":"e0","doc_ref":{"table":"entities","key":"person/ada"},"confidence":1,"decision":"new","label":"person","canonical_name":"Ada","surface_form":"Ada"}]}
+    );
+    try testing.expectEqual(@as(usize, 1), try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
+    try testing.expect(!capture.deletes.items[3]);
 }
 
 test "processResolutionArtifact tombstones the prior key when a mention re-keys" {

@@ -97,19 +97,27 @@ pub const DistributedEntitySink = struct {
         }
         const TableBatch = struct {
             transforms: std.ArrayListUnmanaged(db_mod.types.DocumentTransform) = .empty,
+            deletes: std.ArrayListUnmanaged([]const u8) = .empty,
         };
         var tables = std.StringArrayHashMapUnmanaged(TableBatch).empty;
         for (entries) |e| {
-            const ops = try buildMergeOps(a, e.doc_json);
-            if (ops.len == 0) continue;
             const physical = e.storage_table orelse unpinned.get(e.table).?;
             const entry = try tables.getOrPut(a, physical);
             if (!entry.found_existing) entry.value_ptr.* = .{};
-            try entry.value_ptr.transforms.append(a, .{ .key = e.key, .operations = ops, .upsert = true });
+            if (e.delete) {
+                try entry.value_ptr.deletes.append(a, e.key);
+            } else {
+                const ops = try buildMergeOps(a, e.doc_json);
+                if (ops.len != 0) try entry.value_ptr.transforms.append(a, .{ .key = e.key, .operations = ops, .upsert = true });
+            }
         }
         if (tables.count() == 0) return;
         var reqs = std.ArrayListUnmanaged(distributed_txn.TableCommitRequest).empty;
-        for (tables.keys(), tables.values()) |physical, batch| try reqs.append(a, .{ .table_name = physical, .transforms = batch.transforms.items });
+        for (tables.keys(), tables.values()) |physical, batch| {
+            if (batch.transforms.items.len == 0 and batch.deletes.items.len == 0) continue;
+            try reqs.append(a, .{ .table_name = physical, .transforms = batch.transforms.items, .deletes = batch.deletes.items });
+        }
+        if (reqs.items.len == 0) return;
 
         // Promotion is a stateless, idempotent batch. Use the batch commit
         // contract so first-party sources can safely retry topology races and
@@ -239,6 +247,7 @@ const FakeTableWriteSource = struct {
     other_table: ?[]const u8 = null,
     table_names: std.ArrayListUnmanaged([]u8) = .empty,
     keys: std.ArrayListUnmanaged([]u8) = .empty,
+    deletes: std.ArrayListUnmanaged([]u8) = .empty,
     transforms_json: std.ArrayListUnmanaged([]u8) = .empty,
     /// Set so the source advertises the transaction vtable method.
     support_transactions: bool = false,
@@ -250,8 +259,10 @@ const FakeTableWriteSource = struct {
     fn deinit(self: *FakeTableWriteSource) void {
         for (self.table_names.items) |name| self.alloc.free(name);
         for (self.keys.items) |k| self.alloc.free(k);
+        for (self.deletes.items) |key| self.alloc.free(key);
         for (self.transforms_json.items) |t| self.alloc.free(t);
         self.keys.deinit(self.alloc);
+        self.deletes.deinit(self.alloc);
         self.table_names.deinit(self.alloc);
         self.transforms_json.deinit(self.alloc);
     }
@@ -286,6 +297,7 @@ const FakeTableWriteSource = struct {
             if (!self.serves(t.table_name)) return null;
             try self.table_names.append(self.alloc, try self.alloc.dupe(u8, t.table_name));
             try recordTransforms(self, alloc, t.transforms);
+            for (t.deletes) |key| try self.deletes.append(self.alloc, try self.alloc.dupe(u8, key));
         }
         return .{ .committed = .{ .participant_count = tables.len } };
     }
@@ -303,6 +315,7 @@ const FakeTableWriteSource = struct {
             if (!self.serves(t.table_name)) return null;
             try self.table_names.append(self.alloc, try self.alloc.dupe(u8, t.table_name));
             try recordTransforms(self, alloc, t.transforms);
+            for (t.deletes) |key| try self.deletes.append(self.alloc, try self.alloc.dupe(u8, key));
         }
         return .{ .committed = .{ .participant_count = tables.len } };
     }
@@ -535,6 +548,29 @@ test "DistributedEntitySink commits a re-key across pinned physical tables atomi
     try testing.expectEqualStrings("table:new", fake.table_names.items[1]);
     try testing.expectEqualStrings("event/provisional", fake.keys.items[0]);
     try testing.expectEqualStrings("event/canonical", fake.keys.items[1]);
+}
+
+test "DistributedEntitySink deletes an old pinned copy while moving a key" {
+    const alloc = testing.allocator;
+    var fake = FakeTableWriteSource{
+        .alloc = alloc,
+        .table = "table:old",
+        .other_table = "table:new",
+        .support_commit_batch = true,
+    };
+    defer fake.deinit();
+    var sink_impl = DistributedEntitySink{ .writes = fake.source(), .atomic_batch_required = true };
+    try sink_impl.entitySink().upsertBatch(alloc, &.{
+        .{ .table = "entities", .storage_table = "table:old", .key = "person/ada", .delete = true },
+        .{ .table = "entities", .storage_table = "table:new", .key = "person/ada", .doc_json = "{\"canonical_name\":\"Ada\"}" },
+    });
+    try testing.expectEqual(@as(usize, 1), fake.commit_batch_calls);
+    try testing.expectEqual(@as(usize, 2), fake.table_names.items.len);
+    try testing.expectEqualStrings("table:old", fake.table_names.items[0]);
+    try testing.expectEqualStrings("table:new", fake.table_names.items[1]);
+    try testing.expectEqualStrings("person/ada", fake.deletes.items[0]);
+    try testing.expectEqual(@as(usize, 1), fake.keys.items.len);
+    try testing.expectEqualStrings("person/ada", fake.keys.items[0]);
 }
 
 test "DistributedEntitySink batch commit remains compatible with transaction-only sources" {

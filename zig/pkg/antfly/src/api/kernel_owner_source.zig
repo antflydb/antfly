@@ -2545,8 +2545,10 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer self.alloc.free(entries);
         for (encoded, entries) |source, *destination| destination.* = .{
             .table = source.table.slice(),
+            .storage_table = if (source.storage_table.slice().len == 0) null else source.storage_table.slice(),
             .key = source.key.slice(),
             .doc_json = source.doc_json.slice(),
+            .delete = source.delete != 0,
         };
         sink.upsertBatch(self.alloc, entries) catch |err|
             return kernel_error_identity.statusFromError(err);
@@ -2986,7 +2988,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     ) !Lease {
         try controls.check();
         var lease = self.acquireDescriptorOnce(group_id, table_name, path, descriptor, if (exclusive) .exclusive else .shared, residency, controls) catch |err| switch (err) {
-            error.StorageKernelOwnerStaleDescriptor => return error.StorageReadTemporarilyUnavailable,
+            error.StorageKernelOwnerStaleDescriptor => return err,
             error.StorageKernelOwnerTransitionRequired => try self.acquireDescriptorAfterTransition(
                 group_id,
                 table_name,
@@ -3023,7 +3025,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             try wait_io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
             try controls.check();
             return self.acquireDescriptorOnce(group_id, table_name, path, descriptor, if (exclusive) .exclusive else .shared, residency, controls) catch |err| switch (err) {
-                error.StorageKernelOwnerStaleDescriptor => return error.StorageReadTemporarilyUnavailable,
+                error.StorageKernelOwnerStaleDescriptor => return err,
                 error.StorageKernelOwnerTransitionRequired => {
                     try controls.check();
                     if (platform_time.monotonicNs() >= deadline_ns) return error.StorageBusy;
@@ -5699,7 +5701,7 @@ test "owner descriptor changes do not retire a live owner for an older schema ve
         // is turned away without closing admission for current readers.
         try std.testing.expectError(error.StorageKernelOwnerStaleDescriptor, source.acquireDescriptorOnce(1, "docs", "/unused", descriptor, admission, .resident, .{}));
         try std.testing.expect(!entry.retired);
-        try std.testing.expectError(error.StorageReadTemporarilyUnavailable, source.acquireDescriptorWithMode(1, "docs", "/unused", descriptor, admission == .exclusive, .resident, .{}));
+        try std.testing.expectError(error.StorageKernelOwnerStaleDescriptor, source.acquireDescriptorWithMode(1, "docs", "/unused", descriptor, admission == .exclusive, .resident, .{}));
         try std.testing.expect(!entry.retired);
         // A newer schema still closes admission so the drain can complete.
         descriptor.schema_json = "{\"version\":8,\"default_type\":\"_default\"}";
@@ -5730,6 +5732,7 @@ test "owner descriptor changes do not retire a live owner for an older schema ve
         .indexes_json = entry.indexes_json,
     };
     try std.testing.expectError(error.StorageKernelOwnerStaleDescriptor, source.acquireDescriptorOnce(1, "docs", "/unused", stale, .shared, .resident, .{}));
+    try std.testing.expectError(error.StorageKernelOwnerStaleDescriptor, source.acquireDescriptor(1, "docs", "/unused", stale));
     try std.testing.expect(!entry.retired);
     try std.testing.expectEqual(@as(usize, 0), entry.active_users);
 }
