@@ -5307,7 +5307,7 @@ test "distributed txn sessions durably seal exact binary integrity plans before 
         .address = try @import("../storage/db/relational_integrity_contract.zig").Address.init(@splat(2), "\x00\xfftuple"),
         .operation = .{ .check_owner = .{ .parent_table = "docs", .parent_key = "\x00\xffa" } },
     }};
-    const tables = [_]distributed_txn.TableCommitRequest{.{ .table_name = "docs", .relational_schema_version = 3, .relational_integrity_generation_set = @splat(0xff), .predicates = &.{.{ .key = "a", .expected_version = 7 }}, .integrity_commands = &commands }};
+    const tables = [_]distributed_txn.TableCommitRequest{.{ .table_name = "docs", .relational_schema_version = 3, .relational_integrity_generation_set = @splat(0xff), .predicates = &.{.{ .key = "a", .expected_version = 7 }}, .integrity_commands = &commands, .row_policy_principal_proof = "signed-owner-admission", .row_policy_database = "default", .row_policy_admitted_at_seconds = 1_800_000_000 }};
     durable.fail_writes_for_test = true;
     try std.testing.expectError(error.InjectedSessionStoreFailure, writer.sealExecutionPlan(alloc, session.txn_id, &tables));
     try std.testing.expect((try writer.getExecutionPlan(alloc, session.txn_id)) == null);
@@ -5327,6 +5327,9 @@ test "distributed txn sessions durably seal exact binary integrity plans before 
     var decoded = try parseExecutionPlan(alloc, recovery.commit.execution_plan.?);
     defer decoded.deinit();
     try std.testing.expectEqual(@as(?u32, 3), decoded.value[0].relational_schema_version);
+    try std.testing.expectEqualStrings("signed-owner-admission", decoded.value[0].row_policy_principal_proof);
+    try std.testing.expectEqualStrings("default", decoded.value[0].row_policy_database);
+    try std.testing.expectEqual(@as(i64, 1_800_000_000), decoded.value[0].row_policy_admitted_at_seconds);
     try std.testing.expectEqual(@as(u64, 7), decoded.value[0].predicates[0].expected_version);
     try std.testing.expectEqualStrings("\x00\xffa", decoded.value[0].integrity_commands[0].operation.check_owner.parent_key);
     try std.testing.expectEqualSlices(u8, &commands[0].address.routing, &decoded.value[0].integrity_commands[0].address.routing);

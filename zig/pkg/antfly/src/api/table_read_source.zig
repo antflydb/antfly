@@ -183,6 +183,10 @@ pub const RelationalStatementSnapshot = struct {
         const callback = self.vtable.open_guarded orelse return error.SqlRangeTrackingRequired;
         const result = try Abi.call("open_guarded", self.boundary_dispatch, callback, .{ self.ptr, alloc, scan });
         errdefer result.view.deinit();
+        errdefer {
+            for (result.owner_proofs) |owner| alloc.free(owner.proofs);
+            alloc.free(result.owner_proofs);
+        }
         try @import("range_read_guards.zig").validate(result.owner_proofs);
         return result;
     }
@@ -237,7 +241,8 @@ pub const TableReadSource = struct {
     pub const VTable = struct {
         /// Optional owner-local dynamic read set. A distributed router must
         /// not implement this with independently captured shard snapshots.
-        open_relational_statement_snapshot: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, read_gate.ReadConsistency, ?CancellationToken, ?u64) anyerror!RelationalStatementSnapshot = null,
+        open_relational_statement_snapshot: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, u32, read_gate.ReadConsistency, ?CancellationToken, ?u64) anyerror!RelationalStatementSnapshot = null,
+        open_relational_statement_snapshot_group_local_routed: ?*const fn (*anyopaque, std.mem.Allocator, metadata_api.CatalogRouteFence, u64, []const u8, read_gate.ReadConsistency, ?CancellationToken, ?u64) anyerror!RelationalStatementSnapshot = null,
         open_relational_statement: ?*const fn (*anyopaque, std.mem.Allocator, []const RelationalStatementScan, read_gate.ReadConsistency) anyerror!RelationalStatementRead = null,
         open_relational_read: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8, []const u8, db_types.ScanOptions, read_gate.ReadConsistency) anyerror!?RelationalReadView = null,
         open_relational_read_group_local_routed: ?*const fn (*anyopaque, std.mem.Allocator, metadata_api.CatalogRouteFence, u64, []const u8, []const u8, []const u8, db_types.ScanOptions, read_gate.ReadConsistency) anyerror!?RelationalReadView = null,
@@ -587,10 +592,16 @@ pub const TableReadSource = struct {
         return BoundaryAbi.call("open_relational_statement", self.boundary_dispatch, callback, .{ self.ptr, alloc, scans, consistency });
     }
 
-    pub fn openRelationalStatementSnapshot(self: TableReadSource, alloc: std.mem.Allocator, table: []const u8, consistency: read_gate.ReadConsistency, cancellation: ?CancellationToken, deadline_ns: ?u64) !RelationalStatementSnapshot {
+    pub fn openRelationalStatementSnapshot(self: TableReadSource, alloc: std.mem.Allocator, table: []const u8, schema_version: u32, consistency: read_gate.ReadConsistency, cancellation: ?CancellationToken, deadline_ns: ?u64) !RelationalStatementSnapshot {
         if (self.route_fence != null) return error.SqlStatementSnapshotRequired;
         const callback = self.vtable.open_relational_statement_snapshot orelse return error.SqlStatementSnapshotRequired;
-        return BoundaryAbi.call("open_relational_statement_snapshot", self.boundary_dispatch, callback, .{ self.ptr, alloc, table, consistency, cancellation, deadline_ns });
+        return BoundaryAbi.call("open_relational_statement_snapshot", self.boundary_dispatch, callback, .{ self.ptr, alloc, table, schema_version, consistency, cancellation, deadline_ns });
+    }
+
+    pub fn openRelationalStatementSnapshotGroupLocal(self: TableReadSource, alloc: std.mem.Allocator, group: u64, table: []const u8, consistency: read_gate.ReadConsistency, cancellation: ?CancellationToken, deadline_ns: ?u64) !RelationalStatementSnapshot {
+        const fence = self.route_fence orelse return error.CatalogRouteFenceRequired;
+        const callback = self.vtable.open_relational_statement_snapshot_group_local_routed orelse return error.SqlStatementSnapshotRequired;
+        return BoundaryAbi.call("open_relational_statement_snapshot_group_local_routed", self.boundary_dispatch, callback, .{ self.ptr, alloc, fence, group, table, consistency, cancellation, deadline_ns });
     }
 
     pub fn openRelationalReadGroupLocal(self: TableReadSource, alloc: std.mem.Allocator, group: u64, table: []const u8, from: []const u8, to: []const u8, opts: db_types.ScanOptions, consistency: read_gate.ReadConsistency) !?RelationalReadView {

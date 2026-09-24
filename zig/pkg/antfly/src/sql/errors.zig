@@ -65,6 +65,10 @@ pub fn describe(err: anyerror) Diagnostic {
         error.InvalidSavepointName, error.SqlSavepointNotFound => .{ .code = "3B001", .message = "The requested savepoint does not exist or its name is invalid.", .retryable = false },
         error.SavepointLimitExceeded => .{ .code = "54000", .message = "The transaction savepoint limit was exceeded.", .hint = "Release earlier savepoints before creating more.", .retryable = false },
         error.UnsupportedSqlExecution, error.UnsupportedSqlShape => .{ .code = "0A000", .message = "This SQL statement or expression is not supported.", .hint = "Use a supported relational SELECT, INSERT, UPDATE, or DELETE statement." },
+        error.RowPolicyUnsupported, error.RowPolicyTopologyUnsupported => .{ .code = "0A000", .message = "Row policy publication is not supported for this table shape.", .hint = "Remove unsupported indexes or topology features before enabling the policy; no publication was started.", .retryable = false },
+        error.ForeignKeyGenerationPublicationRequired => .{ .code = "0A000", .message = "This foreign-key definition requires parent-owner generation publication.", .hint = "Use a deployment with coordinated foreign-key publication; no schema change was admitted.", .retryable = false },
+        error.ForeignKeyPartialSupportIndexRequired => .{ .code = "0A000", .message = "Initial MATCH PARTIAL foreign keys require atomic parent support-index publication.", .hint = "Create the table without that constraint, then add it with ALTER TABLE. No table publication was admitted.", .retryable = false },
+        error.ForeignKeyInitialSelfReferenceUnsupported => .{ .code = "0A000", .message = "An initial self-referential foreign key requires a child-owner publication fence.", .hint = "Create the table without that constraint, then add it with ALTER TABLE. No table publication was admitted.", .retryable = false },
         error.SqlRowIdentityRequired => .{ .code = "0A000", .message = "This mutation requires an explicit row identity.", .hint = "Provide a non-null _id for each inserted row." },
         error.SqlStatementSnapshotRequired => .{ .code = "0A000", .message = "This query requires a consistent statement snapshot that is not available.", .hint = "Narrow the query to one bounded page or use a runtime with statement snapshots." },
         error.SqlRangeTrackingRequired => .{ .code = "0A000", .message = "This transaction requires activated, owner-fenced range protection.", .hint = "Use a runtime that supports the requested isolation level; isolation was not downgraded.", .retryable = false },
@@ -125,6 +129,7 @@ test "SQL diagnostics retain definite constraints conflicts and unknown outcomes
         .{ .err = error.PreparedReadSetChanged, .code = "40001", .retryable = true },
         .{ .err = error.SqlMutationOutcomeUnknown, .code = "40003", .retryable = false },
         .{ .err = error.QueryCanceled, .code = "57014", .retryable = null },
+        .{ .err = error.RowPolicyUnsupported, .code = "0A000", .retryable = false },
     }) |case| {
         const value = describe(case.err);
         try std.testing.expectEqualStrings(case.code, value.code);

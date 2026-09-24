@@ -36,6 +36,8 @@ pub const BatchResult = struct {
     /// the stable status vocabulary so older strict-enum SDKs can still parse
     /// the committed response and safely avoid replaying the mutation.
     failure: ?BatchFailure = null,
+    /// Private data-Raft control response; never populated for user rows.
+    row_policy_receipt: ?@import("../storage/db/row_policy_bundle.zig").Receipt = null,
 };
 
 test "SQL document epoch fence survives internal batch codec and rejects public injection" {
@@ -49,6 +51,44 @@ test "SQL document epoch fence survives internal batch codec and rejects public 
         try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, body));
     }
     try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(alloc, "{\"_schema_version\":4294967296}"));
+}
+
+test "row policy publication Raft codec carries immutable owner-fetched bytes privately" {
+    const alloc = std.testing.allocator;
+    const request: db_mod.types.BatchRequest = .{ .row_policy_publication = .{
+        .table_id = 7,
+        .expected_generation = 11,
+        .expected_catalog_epoch = 13,
+        .expected_phase = .pending_install,
+        .owner_group_id = 17,
+        .expected_descriptor_digest = @splat(0xab),
+    }, .row_policy_install_bundle = "{\"table_id\":7}" };
+    const encoded = try encodeBatchRequest(alloc, request);
+    defer alloc.free(encoded);
+    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, encoded));
+    var parsed = try parseInternalBatchRequest(alloc, encoded);
+    defer parsed.deinit(alloc);
+    try std.testing.expectEqualDeep(request.row_policy_publication.?, parsed.req.row_policy_publication.?);
+    try std.testing.expectEqualStrings(request.row_policy_install_bundle, parsed.req.row_policy_install_bundle);
+    try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(alloc, "{\"inserts\":{},\"deletes\":[],\"_row_policy_publication\":{\"table_id\":7,\"expected_generation\":11,\"expected_catalog_epoch\":13,\"expected_phase\":\"pending_install\"},\"sync_level\":\"write\",\"_schema_version\":1}"));
+}
+
+test "signed write admission is internal-only and survives the replicated batch codec" {
+    const alloc = std.testing.allocator;
+    const req: db_mod.types.BatchRequest = .{
+        .writes = &.{.{ .key = "row", .value = "{}" }},
+        .row_policy_principal_proof = "v1:opaque:signature",
+        .row_policy_database = "main",
+        .row_policy_admitted_at_seconds = 123,
+    };
+    const encoded = try encodeBatchRequest(alloc, req);
+    defer alloc.free(encoded);
+    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, encoded));
+    var parsed = try parseInternalBatchRequest(alloc, encoded);
+    defer parsed.deinit(alloc);
+    try std.testing.expectEqualStrings(req.row_policy_principal_proof, parsed.req.row_policy_principal_proof);
+    try std.testing.expectEqualStrings(req.row_policy_database, parsed.req.row_policy_database);
+    try std.testing.expectEqual(req.row_policy_admitted_at_seconds, parsed.req.row_policy_admitted_at_seconds);
 }
 
 test "index maintenance internal batch codec owns binary proof and rejects public bypass" {
@@ -322,6 +362,9 @@ pub const OwnedBatchRequest = struct {
     relational_retirement: ?std.json.Parsed(@import("../storage/db/relational_integrity_retirement_contract.zig").Command) = null,
     relational_index_maintenance: ?std.json.Parsed(@import("../storage/db/relational_index_maintenance_contract.zig").Command) = null,
     relational_topology: ?std.json.Parsed(@import("../storage/db/relational_integrity_topology_contract.zig").Command) = null,
+    relational_generation_gc: ?std.json.Parsed(@import("../storage/db/relational_integrity_generation_retirement.zig").GcCommand) = null,
+    row_policy_publication: ?std.json.Parsed(@import("../system_catalog/policies.zig").InstallRequest) = null,
+    row_policy_install_bundle: ?[]u8 = null,
     restore_staging: ?std.json.Parsed(@import("../storage/db/restore_staging_contract.zig").Control) = null,
     online_source: ?std.json.Parsed(@import("../storage/db/online_source_contract.zig").Command) = null,
     transaction_participants: [][]const u8 = &.{},
@@ -345,6 +388,9 @@ pub const OwnedBatchRequest = struct {
         if (self.relational_retirement) |*retirement| retirement.deinit();
         if (self.relational_index_maintenance) |*retirement| retirement.deinit();
         if (self.relational_topology) |*topology| topology.deinit();
+        if (self.relational_generation_gc) |*page| page.deinit();
+        if (self.row_policy_publication) |*publication| publication.deinit();
+        if (self.row_policy_install_bundle) |bundle| alloc.free(bundle);
         if (self.restore_staging) |*control| control.deinit();
         if (self.online_source) |*control| control.deinit();
         if (self.merge_page_effects) |*effects| {
@@ -540,6 +586,53 @@ fn parseBatchRequestWithOptions(
         break :topology @as(?std.json.Parsed(@import("../storage/db/relational_integrity_topology_contract.zig").Command), try std.json.parseFromValue(@import("../storage/db/relational_integrity_topology_contract.zig").Command, alloc, value, .{ .allocate = .alloc_always }));
     } else null;
     errdefer if (relational_topology) |*topology| topology.deinit();
+    var relational_generation_gc = if (root.get("_relational_generation_gc")) |value| gc: {
+        if (!allow_internal) return error.InvalidBatchRequest;
+        var gc_page = try std.json.parseFromValue(@import("../storage/db/relational_integrity_generation_retirement.zig").GcCommand, alloc, value, .{ .allocate = .alloc_always });
+        errdefer gc_page.deinit();
+        try gc_page.value.validate();
+        break :gc gc_page;
+    } else null;
+    errdefer if (relational_generation_gc) |*page| page.deinit();
+    var row_policy_publication = if (root.get("_row_policy_publication")) |value| publication: {
+        if (!allow_internal) return error.InvalidBatchRequest;
+        break :publication @as(?std.json.Parsed(@import("../system_catalog/policies.zig").InstallRequest), try std.json.parseFromValue(@import("../system_catalog/policies.zig").InstallRequest, alloc, value, .{ .allocate = .alloc_always }));
+    } else null;
+    errdefer if (row_policy_publication) |*publication| publication.deinit();
+    const row_policy_install_bundle: ?[]u8 = if (root.get("_row_policy_install_bundle")) |value| bundle: {
+        if (!allow_internal or value != .string or value.string.len == 0 or
+            value.string.len > @import("../system_catalog/policies.zig").max_install_snapshot_bytes)
+            return error.InvalidBatchRequest;
+        break :bundle try alloc.dupe(u8, value.string);
+    } else null;
+    errdefer if (row_policy_install_bundle) |bundle| alloc.free(bundle);
+    const row_policy_proof: []const u8 = if (root.get("_row_policy_principal_proof")) |value| blk: {
+        if (!allow_internal or value != .string or value.string.len == 0 or
+            value.string.len > @import("../usermgr/row_policy_authority.zig").maximum_token_bytes)
+            return error.InvalidBatchRequest;
+        break :blk value.string;
+    } else "";
+    const row_policy_database: []const u8 = if (root.get("_row_policy_database")) |value| blk: {
+        if (!allow_internal or value != .string or value.string.len == 0 or value.string.len > 256)
+            return error.InvalidBatchRequest;
+        break :blk value.string;
+    } else "";
+    const row_policy_admitted_at_seconds: i64 = if (root.get("_row_policy_admitted_at_seconds")) |value| blk: {
+        if (!allow_internal) return error.InvalidBatchRequest;
+        const admitted = try parseInternalU64(value);
+        if (admitted == 0 or admitted > std.math.maxInt(i64)) return error.InvalidBatchRequest;
+        break :blk @intCast(admitted);
+    } else 0;
+    if ((row_policy_proof.len == 0) != (row_policy_database.len == 0) or
+        (row_policy_proof.len == 0) != (row_policy_admitted_at_seconds == 0))
+        return error.InvalidBatchRequest;
+    if (row_policy_publication) |publication| {
+        // Internal batch encoding always emits empty inserts/deletes. Nothing
+        // else may share this control entry, even an otherwise inert field.
+        if (publication.value.table_id == 0 or publication.value.expected_generation == 0 or publication.value.expected_catalog_epoch == 0 or publication.value.owner_group_id == 0 or root.count() != 5 or row_policy_install_bundle == null or
+            root.get("inserts") == null or root.get("deletes") == null or root.get("sync_level") == null or writes.len != 0 or deletes.len != 0)
+            return error.InvalidBatchRequest;
+    } else if (row_policy_install_bundle != null) return error.InvalidBatchRequest;
     var restore_staging = if (root.get("_restore_staging")) |value| control: {
         if (!allow_internal) return error.InvalidBatchRequest;
         const marker = root.get("_merge_checkpoint") orelse return error.InvalidBatchRequest;
@@ -1082,6 +1175,7 @@ fn parseBatchRequestWithOptions(
         if (transaction == null or transaction.? != .prepare or writes.len != 0 or deletes.len != 0 or transforms.len != 0 or predicates.len != 0 or integrity.len != 0 or integrity_commands != null or relational_activation != null or relational_retirement != null or relational_repair or restore_staging_scope != null) return error.InvalidBatchRequest;
     }
     if (relational_topology != null and (transaction != null or writes.len != 0 or deletes.len != 0 or transforms.len != 0 or predicates.len != 0 or integrity.len != 0 or integrity_commands != null or relational_activation != null or relational_retirement != null or relational_index_maintenance != null or split_checkpoint != null or split_replication != null or split_transition != null or merge_checkpoint != null or merge_replication != null or merge_source_transition != null)) return error.InvalidBatchRequest;
+    if (relational_generation_gc != null and (transaction != null or relational_topology != null or row_policy_publication != null or writes.len != 0 or deletes.len != 0 or transforms.len != 0 or predicates.len != 0 or integrity.len != 0 or integrity_commands != null or relational_activation != null or relational_retirement != null or relational_index_maintenance != null or split_checkpoint != null or split_replication != null or split_transition != null or merge_checkpoint != null or merge_replication != null or merge_source_transition != null)) return error.InvalidBatchRequest;
     if (relational_topology != null and (relational_schema_version != null or relational_integrity_generation_set != null or relational_repair)) return error.InvalidBatchRequest;
     if (transaction) |mutation| switch (mutation) {
         .begin, .resolve, .acknowledge, .cleanup => if (writes.len != 0 or deletes.len != 0 or transforms.len != 0 or predicates.len != 0)
@@ -1132,6 +1226,9 @@ fn parseBatchRequestWithOptions(
         .relational_retirement = relational_retirement,
         .relational_index_maintenance = relational_index_maintenance,
         .relational_topology = relational_topology,
+        .relational_generation_gc = relational_generation_gc,
+        .row_policy_publication = row_policy_publication,
+        .row_policy_install_bundle = row_policy_install_bundle,
         .restore_staging = restore_staging,
         .online_source = online_source,
         .transaction_participants = transaction_participants,
@@ -1146,6 +1243,9 @@ fn parseBatchRequestWithOptions(
         .merge_page = merge_page,
         .merge_page_effects = page_effects,
         .req = .{
+            .row_policy_principal_proof = row_policy_proof,
+            .row_policy_database = row_policy_database,
+            .row_policy_admitted_at_seconds = row_policy_admitted_at_seconds,
             .integrity = integrity,
             .integrity_commands = if (integrity_commands) |commands| commands.value else &.{},
             .range_guards = if (range_guards) |guards| guards.value else &.{},
@@ -1153,6 +1253,9 @@ fn parseBatchRequestWithOptions(
             .relational_retirement = if (relational_retirement) |retirement| retirement.value else null,
             .relational_index_maintenance = if (relational_index_maintenance) |maintenance| maintenance.value else null,
             .relational_topology = if (relational_topology) |topology| topology.value else null,
+            .relational_generation_gc = if (relational_generation_gc) |page| page.value else null,
+            .row_policy_publication = if (row_policy_publication) |publication| publication.value else null,
+            .row_policy_install_bundle = row_policy_install_bundle orelse "",
             .restore_staging = if (restore_staging) |control| control.value else null,
             .online_source = if (online_source) |control| control.value else null,
             .relational_schema_version = relational_schema_version,
@@ -1201,6 +1304,16 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
 }
 
 fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequest) ![]u8 {
+    if (req.row_policy_publication) |publication| {
+        if (publication.table_id == 0 or publication.expected_generation == 0 or publication.expected_catalog_epoch == 0 or publication.owner_group_id == 0 or
+            req.row_policy_install_bundle.len == 0 or req.row_policy_install_bundle.len > @import("../system_catalog/policies.zig").max_install_snapshot_bytes or
+            req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
+            req.graph_writes.len != 0 or req.graph_deletes.len != 0 or req.predicates.len != 0 or
+            req.transaction != null or req.relational_topology != null or req.relational_generation_gc != null or
+            req.relational_activation != null or req.relational_retirement != null or req.relational_index_maintenance != null or
+            req.split_checkpoint != null or req.merge_checkpoint != null or req.online_source != null or req.restore_staging != null)
+            return error.InvalidBatchRequest;
+    } else if (req.row_policy_install_bundle.len != 0) return error.InvalidBatchRequest;
     if (req.range_guards.len != 0 and (req.range_guards.len > @import("range_read_guards.zig").max_proofs or req.transaction == null or req.transaction.? != .prepare)) return error.InvalidBatchRequest;
     try @import("../storage/range_protection.zig").validateRequest(req);
     try @import("../storage/db/online_source_contract.zig").validateRequest(req);
@@ -1210,6 +1323,8 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
         if (checkpoint.page_source) |source| try source.validate();
     }
     if (req.relational_topology != null and (req.transaction != null or req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or req.predicates.len != 0 or req.integrity.len != 0 or req.integrity_commands.len != 0 or req.relational_activation != null or req.relational_retirement != null or req.relational_index_maintenance != null or req.split_checkpoint != null or req.split_replication != null or req.split_transition != null or req.merge_checkpoint != null or req.merge_replication != null or req.merge_source_transition != null)) return error.InvalidBatchRequest;
+    if (req.relational_generation_gc != null and (req.transaction != null or req.relational_topology != null or req.row_policy_publication != null or req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or req.predicates.len != 0 or req.integrity.len != 0 or req.integrity_commands.len != 0 or req.relational_activation != null or req.relational_retirement != null or req.relational_index_maintenance != null or req.split_checkpoint != null or req.split_replication != null or req.split_transition != null or req.merge_checkpoint != null or req.merge_replication != null or req.merge_source_transition != null)) return error.InvalidBatchRequest;
+    if (req.relational_generation_gc) |gc| try gc.validate();
     if (req.relational_topology != null and (req.relational_schema_version != null or req.relational_integrity_generation_set != null or req.relational_repair)) return error.InvalidBatchRequest;
     if (req.integrity.len != 0 and (req.transaction == null or req.transaction.? != .prepare)) return error.InvalidBatchRequest;
     if (req.integrity_commands.len != 0 and (req.transaction == null or req.transaction.? != .prepare or req.integrity.len != 0)) return error.InvalidBatchRequest;
@@ -1369,6 +1484,27 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
         defer alloc.free(encoded);
         try writer.writeAll(encoded);
     }
+    if (req.relational_generation_gc) |page| {
+        try writer.writeAll(",\"_relational_generation_gc\":");
+        const encoded = try std.json.Stringify.valueAlloc(alloc, page, .{});
+        defer alloc.free(encoded);
+        try writer.writeAll(encoded);
+    }
+    if (req.row_policy_publication) |publication| {
+        try writer.writeAll(",\"_row_policy_publication\":");
+        try writer.print("{f}", .{std.json.fmt(publication, .{})});
+        try writer.writeAll(",\"_row_policy_install_bundle\":");
+        try writer.print("{f}", .{std.json.fmt(req.row_policy_install_bundle, .{})});
+    }
+    if (req.row_policy_principal_proof.len != 0) {
+        if (req.row_policy_database.len == 0 or req.row_policy_admitted_at_seconds <= 0)
+            return error.InvalidBatchRequest;
+        try writer.writeAll(",\"_row_policy_principal_proof\":");
+        try writer.print("{f}", .{std.json.fmt(req.row_policy_principal_proof, .{})});
+        try writer.writeAll(",\"_row_policy_database\":");
+        try writer.print("{f}", .{std.json.fmt(req.row_policy_database, .{})});
+        try writer.print(",\"_row_policy_admitted_at_seconds\":{d}", .{req.row_policy_admitted_at_seconds});
+    } else if (req.row_policy_database.len != 0 or req.row_policy_admitted_at_seconds != 0) return error.InvalidBatchRequest;
     if (req.restore_staging) |control| {
         if (req.online_source != null or req.merge_checkpoint != null or req.merge_page != null) return error.InvalidBatchRequest;
         try writer.writeAll(",\"_merge_checkpoint\":{\"kind\":\"restore_v3\"},\"_restore_staging\":");
@@ -1976,6 +2112,19 @@ fn consumerTests() type {
                 .relational_topology = .{ .fence = fence, .action = .release },
                 .deletes = &.{"user-row"},
             }));
+            const retirement = @import("../storage/db/relational_integrity_generation_retirement.zig");
+            const gc_before = try (retirement.GcProgress{ .revision = 1 }).encode(alloc);
+            defer alloc.free(gc_before);
+            const gc_after = try (retirement.GcProgress{ .revision = 1, .tombstones = true }).encode(alloc);
+            defer alloc.free(gc_after);
+            const gc = try encodeBatchRequest(alloc, .{ .relational_generation_gc = .{ .owner_group_id = 301, .namespace = .{ .table_id = 7, .shard_id = 8, .range_id = 9 }, .expected = gc_before, .next = gc_after, .deletions = &.{}, .inspected = 0 } });
+            defer alloc.free(gc);
+            try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, gc));
+            var parsed_gc = try parseInternalBatchRequest(alloc, gc);
+            defer parsed_gc.deinit(alloc);
+            try std.testing.expectEqual(@as(u64, 301), parsed_gc.req.relational_generation_gc.?.owner_group_id);
+            try std.testing.expectEqualSlices(u8, gc_after, parsed_gc.req.relational_generation_gc.?.next);
+            try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, .{ .relational_generation_gc = parsed_gc.req.relational_generation_gc, .deletes = &.{"user-row"} }));
         }
 
         test "distributed txn public batch rejects isolated coordinator generation evidence spoof" {

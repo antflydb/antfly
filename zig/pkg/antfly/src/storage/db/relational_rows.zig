@@ -112,6 +112,7 @@ pub const Page = struct {
 };
 
 pub const Reader = struct {
+    row_policy_lease: ?@import("row_policy_gate.zig").Gate.Lease = null,
     alloc: Allocator,
     arena: std.heap.ArenaAllocator,
     read: docstore.DocStore.Txn,
@@ -482,6 +483,7 @@ pub const Reader = struct {
     }
 
     pub fn deinit(self: *Reader) void {
+        if (self.row_policy_lease) |*lease| lease.release();
         if (self.failed_row) |row| self.alloc.free(row.key);
         if (self.covering_projection) |*plan| plan.deinit();
         for (self.covering_conditions) |*condition| condition.deinit();
@@ -620,11 +622,19 @@ pub const Reader = struct {
     /// Page continuation advances only after successful preparation. An OOM,
     /// cancellation, or corrupt row cannot silently consume part of the result.
     pub fn nextPage(self: *Reader, alloc: Allocator, io: ?std.Io, budget: Budget) !Page {
-        return self.nextPageFormat(alloc, io, budget, false);
+        if (self.row_policy_lease) |*lease| try lease.checkAt(@intCast(@divFloor(time.realtimeNs(), std.time.ns_per_s)));
+        var page = try self.nextPageFormat(alloc, io, budget, false);
+        errdefer page.deinit();
+        if (self.row_policy_lease) |*lease| try lease.checkAt(@intCast(@divFloor(time.realtimeNs(), std.time.ns_per_s)));
+        return page;
     }
 
     pub fn nextTypedPage(self: *Reader, alloc: Allocator, io: ?std.Io, budget: Budget) !Page {
-        return self.nextPageFormat(alloc, io, budget, true);
+        if (self.row_policy_lease) |*lease| try lease.checkAt(@intCast(@divFloor(time.realtimeNs(), std.time.ns_per_s)));
+        var page = try self.nextPageFormat(alloc, io, budget, true);
+        errdefer page.deinit();
+        if (self.row_policy_lease) |*lease| try lease.checkAt(@intCast(@divFloor(time.realtimeNs(), std.time.ns_per_s)));
+        return page;
     }
 
     fn nextPageFormat(self: *Reader, alloc: Allocator, io: ?std.Io, budget: Budget, typed_output: bool) !Page {

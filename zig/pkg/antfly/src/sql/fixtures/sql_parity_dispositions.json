@@ -72,8 +72,8 @@
       "cwd": "zig",
       "timeout_seconds": 600
     },
-    "sql-mounted-conflict-capture": {
-      "command": ["zig", "build", "public-api-parity-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "--", "--test-filter", "SQL original sql-1411 uses active native unique claim and one guarded commit"],
+    "sql-mounted-conflict-apply": {
+      "command": ["zig", "build", "public-api-parity-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "--", "--test-filter", "SQL direct conflict scalar uses one guarded native cut through owner and commit"],
       "cwd": "zig",
       "timeout_seconds": 600
     }
@@ -7829,8 +7829,8 @@
     {
       "id": "sql-1411",
       "status": "implemented",
-      "reason": "The exact original INSERT conflict scalar subquery runs through mounted SQL with an active native unique arbiter and typed owner claim. It captures the pre-conflict source value before the owner point read, commits once with range and native claim guards, and returns the matched id.",
-      "evidence": [{ "path": "zig/pkg/antfly/src/api/sql_execution.zig", "test": "SQL original sql-1411 uses active native unique claim and one guarded commit", "gate": "sql-mounted-conflict-capture" }, { "path": "zig/pkg/antfly/src/sql/conflict_test.zig", "test": "SQL original sql-1411 conflict scalar source captures before one guarded commit", "gate": "sql-compiler-rejections" }]
+      "reason": "The original direct scalar conflict assignment executes only after native owner arbitration on a single-owner primary-path cut. Its demanded read and owner/absence range proofs join the same atomic commit; nonconflicting inserts and WHERE-false updates skip the scalar entirely.",
+      "evidence": [{ "path": "zig/pkg/antfly/src/api/sql_execution.zig", "test": "SQL direct conflict scalar uses one guarded native cut through owner and commit", "gate": "sql-mounted-conflict-apply" }, { "path": "zig/pkg/antfly/src/sql/conflict_test.zig", "test": "SQL direct conflict scalar Apply reads only owner-selected updates", "gate": "sql-compiler-rejections" }]
     },
     {
       "id": "sql-1412",
@@ -7976,8 +7976,8 @@
     {
       "id": "sql-1440",
       "status": "implemented",
-      "reason": "The exact same-table INSERT SELECT conflict subquery runs through mounted SQL with an active native unique arbiter. Source rows and the scalar assignment are captured together before the owner point read, then one guarded commit publishes the returned status.",
-      "evidence": [{ "path": "zig/pkg/antfly/src/api/sql_execution.zig", "test": "SQL original sql-1411 uses active native unique claim and one guarded commit", "gate": "sql-mounted-conflict-capture" }, { "path": "zig/pkg/antfly/src/sql/conflict_test.zig", "test": "SQL original sql-1411 conflict scalar source captures before one guarded commit", "gate": "sql-compiler-rejections" }]
+      "reason": "The original same-table INSERT SELECT conflict assignment uses a delayed direct scalar read on the owner-bound native statement cut and one guarded commit; untaken assignments do not execute.",
+      "evidence": [{ "path": "zig/pkg/antfly/src/api/sql_execution.zig", "test": "SQL direct conflict scalar uses one guarded native cut through owner and commit", "gate": "sql-mounted-conflict-apply" }, { "path": "zig/pkg/antfly/src/sql/conflict_test.zig", "test": "SQL original conflict scalar cases require a deferred owner-side read", "gate": "sql-compiler-rejections" }]
     },
     {
       "id": "sql-1441",

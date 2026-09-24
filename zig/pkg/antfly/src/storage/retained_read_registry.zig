@@ -17,7 +17,7 @@ pub const Scope = struct {
     schema_version: u32,
 };
 pub const Token = struct { incarnation: u128, sequence: u64, slot: u32 };
-pub const Kind = enum { capture, cursor };
+pub const Kind = enum { capture, snapshot, cursor };
 pub const Resource = struct {
     ptr: *anyopaque,
     close: *const fn (*anyopaque) void,

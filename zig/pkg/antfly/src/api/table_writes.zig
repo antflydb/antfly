@@ -2349,7 +2349,10 @@ pub const ProvisionedTableWriteCache = struct {
         }
     };
 
-    fn applyRuntimeHooksToDb(self: *ProvisionedTableWriteCache, db: *db_mod.DB, group_id: u64, owner_state: ?*PromotionOwnerState) void {
+    fn applyRuntimeHooksToDb(self: *ProvisionedTableWriteCache, db: *db_mod.DB, table_name: []const u8, group_id: u64, owner_state: ?*PromotionOwnerState) void {
+        // Every managed owner, including adopted startup/restore owners, must
+        // bind signed policy proofs to its stable cache-entry table identity.
+        db.row_policy_table_name = table_name;
         db.setCoordinatedTtl(self.coordinated_ttl, group_id);
         db.setResolutionCandidateSource(self.resolution_candidate_source);
         db.setEntitySink(self.entity_sink);
@@ -2420,7 +2423,7 @@ pub const ProvisionedTableWriteCache = struct {
             return;
         }
         for (self.entries.items) |entry| {
-            self.applyRuntimeHooksToDb(&entry.db, entry.group_id, &entry.promotion_owner_state);
+            self.applyRuntimeHooksToDb(&entry.db, entry.table_name, entry.group_id, &entry.promotion_owner_state);
         }
     }
 
@@ -2980,6 +2983,7 @@ pub const ProvisionedTableWriteCache = struct {
                 ha_write_gate: ?db_mod.HAWriteGate,
                 ha_async_mirror: ?db_mod.HAAsyncEffectMirror,
                 inference_api_url: ?[]const u8,
+                policy_table_name: []const u8,
             ) !OpenedDb {
                 const effective_ha_mirror = haMirrorForManagedDbOpenMode(open_mode, ha_async_mirror);
                 var db = if (indexes_json) |managed_indexes_json|
@@ -3035,6 +3039,9 @@ pub const ProvisionedTableWriteCache = struct {
                     });
                 errdefer db.close();
                 try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &db);
+                const owned_policy_table_name = try allocator.dupe(u8, policy_table_name);
+                db.owned_row_policy_table_name = owned_policy_table_name;
+                db.row_policy_table_name = owned_policy_table_name;
                 return .{
                     .db = db,
                     .start_bulk_session = switch (open_mode) {
@@ -3078,6 +3085,7 @@ pub const ProvisionedTableWriteCache = struct {
                 self.ha_write_gate,
                 self.ha_async_mirror,
                 self.inference_api_url,
+                table_name,
             );
             const owned_db = try self.alloc.create(db_mod.DB);
             errdefer self.alloc.destroy(owned_db);
@@ -3133,6 +3141,7 @@ pub const ProvisionedTableWriteCache = struct {
             self.ha_write_gate,
             self.ha_async_mirror,
             self.inference_api_url,
+            table_name,
         );
         errdefer opened.db.close();
         const start_bulk_session = opened.start_bulk_session and self.bulkIngestSessionReadyForTable(table_name);
@@ -3154,7 +3163,7 @@ pub const ProvisionedTableWriteCache = struct {
             .active_leases = 1,
             .bulk_ingest_session_open = start_bulk_session,
         };
-        self.applyRuntimeHooksToDb(&owned_entry.db, group_id, &owned_entry.promotion_owner_state);
+        self.applyRuntimeHooksToDb(&owned_entry.db, owned_entry.table_name, group_id, &owned_entry.promotion_owner_state);
         try owned_entry.db.activateResolverReplayRuntimes();
         try self.entries.append(self.alloc, owned_entry);
         // Artifact-issue mutations invalidate their compact status summary in
@@ -3525,7 +3534,7 @@ pub const ProvisionedTableWriteCache = struct {
             .active_leases = 1,
             .bulk_ingest_session_open = start_bulk_session,
         };
-        self.applyRuntimeHooksToDb(&owned_entry.db, group_id, &owned_entry.promotion_owner_state);
+        self.applyRuntimeHooksToDb(&owned_entry.db, owned_entry.table_name, group_id, &owned_entry.promotion_owner_state);
         try owned_entry.db.activateResolverReplayRuntimes();
         prepared.schema_json = null;
         errdefer owned_entry.deinit(self.alloc, self.backend_runtime);
@@ -3584,7 +3593,7 @@ pub const ProvisionedTableWriteCache = struct {
             .allow_generation_adoption = true,
             .allow_active_generation_adoption = true,
         };
-        self.applyRuntimeHooksToDb(&owned_entry.db, group_id, &owned_entry.promotion_owner_state);
+        self.applyRuntimeHooksToDb(&owned_entry.db, owned_entry.table_name, group_id, &owned_entry.promotion_owner_state);
         try owned_entry.db.activateResolverReplayRuntimes();
         errdefer owned_entry.deinit(self.alloc, self.backend_runtime);
 
@@ -20929,7 +20938,7 @@ pub const ProvisionedTableWriteSource = struct {
     pub fn source(self: *ProvisionedTableWriteSource) TableWriteSource {
         return .{
             .ptr = self,
-            .supports_sql_range_guards = self.raft_batcher != null,
+            .supports_sql_range_guards = if (self.raft_batcher) |batcher| batcher.vtable.batch_group_routed_with_cancellation != null else false,
             .vtable = &.{
                 .activate_range_tracking = activateRangeTracking,
                 .create_table = createTable,
@@ -20959,6 +20968,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .finish_bulk_ingest = finishBulkIngest,
                 .abort_bulk_ingest = abortBulkIngest,
                 .batch_group_local = batchGroupLocal,
+                .replicated_batch_group_local = replicatedPolicyControlGroupLocal,
                 .txn_begin_group_local = txnBeginGroupLocal,
                 .txn_begin_group_local_with_pre_decision_context = txnBeginGroupLocalWithPreDecisionContext,
                 .txn_prepare_group_local = txnPrepareGroupLocal,
@@ -22329,6 +22339,7 @@ pub const ProvisionedTableWriteSource = struct {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try context.ensureActive();
         const batcher = self.raft_batcher orelse return error.SqlRangeTrackingRequired;
+        if (batcher.vtable.batch_group_routed_with_cancellation == null) return error.SqlRangeTrackingRequired;
         try enforceHAWriteGateOptional(self.ha_write_gate);
         var routing = (try table_catalog.tableRoutingSnapshotForWrite(alloc, self.catalog, table, self.catalog.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io }))) orelse return error.TableNotFound;
         defer routing.deinit(alloc);
@@ -22355,7 +22366,7 @@ pub const ProvisionedTableWriteSource = struct {
         // empty ordinary batch whose grouping could silently discard it.
         if (req.activate_range_tracking) return error.SqlRangeTrackingRequired;
         try @import("../storage/db/online_source_contract.zig").validateRequest(req);
-        const control_group: ?u64 = if (req.online_source) |command| command.scope().fence.owner_group_id else if (req.relational_topology) |command| command.fence.owner_group_id else null;
+        const control_group: ?u64 = if (req.online_source) |command| command.scope().fence.owner_group_id else if (req.relational_topology) |command| command.fence.owner_group_id else if (req.relational_generation_gc) |page| page.owner_group_id else null;
         if (control_group) |group_id| {
             try enforceHAWriteGateOptional(self.ha_write_gate);
             if (self.raft_batcher) |batcher| {
@@ -23247,6 +23258,57 @@ pub const ProvisionedTableWriteSource = struct {
         return try self.applyReplicatedBatchGroupLocal(alloc, group_id, table_name, req);
     }
 
+    /// The monolithic standalone owner has no data-Raft or compiled kernel
+    /// source. Its private policy coordinator still needs the exact immutable
+    /// metadata bundle committed with an owner-local entry identity. Do not
+    /// turn this into a general client-controlled replicated batch adapter.
+    fn replicatedPolicyControlGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.BatchRequest,
+        metadata_prepared: bool,
+        entry: ?db_mod.types.RaftAppliedEntryIdentity,
+    ) !?void {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (comptime control_only_storage_sources) {
+            const owner = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+            return try owner.replicatedBatchGroupLocal(alloc, group_id, table_name, req, metadata_prepared, entry);
+        } else {
+            if (metadata_prepared or self.raft_batcher != null or self.ha_write_gate != null or
+                req.row_policy_publication == null or req.row_policy_install_bundle.len == 0 or
+                req.row_policy_principal_proof.len != 0 or req.row_policy_database.len != 0 or
+                req.row_policy_admitted_at_seconds != 0 or req.range_guards.len != 0 or
+                req.activate_range_tracking or req.schema_version != null or req.online_source != null or
+                req.restore_staging != null or req.restore_staging_scope != null or
+                req.restore_staging_plan_id != null or req.relational_topology != null or
+                req.relational_generation_gc != null or req.relational_schema_version != null or
+                req.relational_integrity_generation_set != null or req.relational_repair or
+                req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
+                req.graph_writes.len != 0 or req.graph_deletes.len != 0 or req.predicates.len != 0 or
+                req.integrity.len != 0 or req.integrity_commands.len != 0 or
+                req.relational_activation != null or req.relational_retirement != null or
+                req.relational_index_maintenance != null or req.timestamp_ns != 0 or
+                req.sync_level != .write or req.reject_graph_transform_projections or
+                req.split_checkpoint != null or req.split_replication != null or
+                req.split_transition != null or req.merge_source_transition != null or
+                req.merge_checkpoint != null or req.merge_replication != null or
+                req.merge_page != null or req.merge_artifacts.len != 0 or req.transaction != null)
+                return error.RowPolicyUnsupported;
+            const applied = entry orelse return error.InvalidBatchRequest;
+            const cache = self.write_cache orelse return error.RowPolicyUnsupported;
+            const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+            defer alloc.free(path);
+            self.beginGroupOperation(table_name, group_id);
+            defer self.endGroupOperation(table_name, group_id);
+            var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default_async, null, null);
+            defer cached.deinit(alloc);
+            _ = try cached.db.applyReplicatedRowPolicyPublication(req.row_policy_install_bundle, req.row_policy_publication.?, applied);
+            return {};
+        }
+    }
+
     pub fn applyReplicatedBatchGroupLocal(
         self: *ProvisionedTableWriteSource,
         alloc: std.mem.Allocator,
@@ -24111,6 +24173,9 @@ pub const ProvisionedTableWriteSource = struct {
         if (req.restore_staging_scope != null) {
             if (req.relational_index_maintenance != null) return error.InvalidBatchRequest;
             try self.applyRestoreStagingBatch(alloc, table_name, group_id, .{
+                .row_policy_principal_proof = req.row_policy_principal_proof,
+                .row_policy_database = req.row_policy_database,
+                .row_policy_admitted_at_seconds = req.row_policy_admitted_at_seconds,
                 .writes = transactionWritesAsBatchWrites(req.writes),
                 .deletes = req.deletes,
                 .transforms = req.transforms,
@@ -24135,6 +24200,9 @@ pub const ProvisionedTableWriteSource = struct {
         try ensurePreDecisionContextActive(context);
         if (self.raft_batcher) |batcher| {
             try batcher.batchGroupLocalWithPreDecisionContext(alloc, group_id, table_name, .{
+                .row_policy_principal_proof = req.row_policy_principal_proof,
+                .row_policy_database = req.row_policy_database,
+                .row_policy_admitted_at_seconds = req.row_policy_admitted_at_seconds,
                 .writes = transactionWritesAsBatchWrites(req.writes),
                 .deletes = req.deletes,
                 .transforms = req.transforms,
@@ -26718,7 +26786,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (req.activate_range_tracking) return error.SqlRangeTrackingRequired;
         try @import("../storage/db/online_source_contract.zig").validateRequest(req);
-        const control_group: ?u64 = if (req.online_source) |command| command.scope().fence.owner_group_id else if (req.relational_topology) |command| command.fence.owner_group_id else null;
+        const control_group: ?u64 = if (req.online_source) |command| command.scope().fence.owner_group_id else if (req.relational_topology) |command| command.fence.owner_group_id else if (req.relational_generation_gc) |page| page.owner_group_id else null;
         if (control_group) |group_id| {
             var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse return error.GroupLeaderUnavailable;
             defer route.deinit(alloc);
@@ -27435,6 +27503,9 @@ pub const HostedProvisionedTableWriteSource = struct {
         context: distributed_txn.PreDecisionContext,
     ) !?void {
         return try batchGroupLocalFencedWithPreDecisionContext(ptr, alloc, group_id, table_name, .{
+            .row_policy_principal_proof = req.row_policy_principal_proof,
+            .row_policy_database = req.row_policy_database,
+            .row_policy_admitted_at_seconds = req.row_policy_admitted_at_seconds,
             .writes = transactionWritesAsBatchWrites(req.writes),
             .deletes = req.deletes,
             .transforms = req.transforms,
@@ -40734,6 +40805,47 @@ pub const implementation_tests = implementationTests();
 fn implementationTests() type {
     if (!(@import("builtin").is_test and !control_only_storage_sources)) return struct {};
     const Suite = struct {
+        test "range tracking activation uses a fenced owner-routed Raft command" {
+            const Capture = struct {
+                calls: usize = 0,
+                group_id: u64 = 0,
+
+                fn unexpected(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.BatchRequest) !void {
+                    return error.TestUnexpectedResult;
+                }
+
+                fn routed(ptr: *anyopaque, _: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table: []const u8, req: db_mod.types.BatchRequest, _: db_mod.types.CancellationToken) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqualStrings("docs", table);
+                    try std.testing.expect(req.activate_range_tracking);
+                    try @import("../storage/range_protection.zig").validateRequest(req);
+                    self.calls += 1;
+                    self.group_id = fence.route.group_id;
+                }
+            };
+
+            var capture: Capture = .{};
+            var source = ProvisionedTableWriteSource.init("unused", ProvisionedWriteCoalesceTestCatalog.iface());
+            defer source.deinit();
+            try std.testing.expect(!source.source().supports_sql_range_guards);
+            try std.testing.expectError(error.SqlRangeTrackingRequired, source.source().activateRangeTracking(std.testing.allocator, "docs", .{}));
+            _ = source.withRaftBatcher(.{ .ptr = &capture, .vtable = &.{
+                .batch_group = Capture.unexpected,
+                .batch_group_local = Capture.unexpected,
+            } });
+            try std.testing.expect(!source.source().supports_sql_range_guards);
+            try std.testing.expectError(error.SqlRangeTrackingRequired, source.source().activateRangeTracking(std.testing.allocator, "docs", .{}));
+            _ = source.withRaftBatcher(.{ .ptr = &capture, .vtable = &.{
+                .batch_group = Capture.unexpected,
+                .batch_group_routed_with_cancellation = Capture.routed,
+                .batch_group_local = Capture.unexpected,
+            } });
+            try std.testing.expect(source.source().supports_sql_range_guards);
+            try source.source().activateRangeTracking(std.testing.allocator, "docs", .{});
+            try std.testing.expectEqual(@as(usize, 1), capture.calls);
+            try std.testing.expectEqual(@as(u64, 7001), capture.group_id);
+        }
+
         test "restore staging private provisioning primes hidden owner without public catalog admission" {
             const alloc = std.testing.allocator;
             var tmp = std.testing.tmpDir(.{});

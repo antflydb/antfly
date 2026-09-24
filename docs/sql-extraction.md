@@ -79,23 +79,21 @@ aggregates and ROWS/numeric RANGE frames preserve typed null/numeric semantics.
 Internal aggregate nodes use wider numeric state; only requested SQL results are
 range-checked. Omitted INSERT identities use the shared native secure row-ID
 generator. Primary-identity ON CONFLICT actions use exact observed row fences.
-Conflict-assignment scalar subqueries now lower hidden typed outputs into the
-same INSERT source capture, then combine those outputs with the observed old
-row and `excluded` image before one guarded commit. This covers direct and
-mixed eager scalar expressions, including the original `sql-1411` and
-`sql-1440` cases. Multi-row captures retain each proposed row's result, and
-NULL/cardinality failures abort before mutation. A guaranteed-demand first
-CASE condition or COALESCE argument can share that guarded capture; later
-lazy branches, including nested short-circuit sites, still reject before any
-read or write. Eager source lowering could evaluate an untaken branch and
-change its error semantics. Full masked Apply and owner-dependent correlation
-need a transaction-scoped snapshot/read-set handle that allows scans opened
-after owner binding and atomically commits their point/range/absence proofs.
-An owner-local LSM snapshot can now fork delayed primary scans from one pinned
-visibility cut, with bounded lifetime and raw range proofs. It is read-only
-for SQL: the local source has no authenticated route fence, so guarded reads
-and lazy conflict Apply remain disabled. Multi-owner captures also need a
-coordinated immutable cut before this capability can be advertised.
+Conflict-assignment scalar subqueries use a post-owner masked Apply: a direct,
+uncorrelated scalar SELECT is evaluated only for rows that actually conflict
+and satisfy DO UPDATE WHERE. Its point/range/absence reads use the same pinned
+statement cut and commit read set as the owner arbitration. The earlier eager
+INSERT-source capture was unsound because an untaken assignment could raise a
+scalar error on a nonconflicting insert or a WHERE-false conflict. Conditional
+or nested scalar subqueries, owner-correlated reads, and secondary-index
+probes remain rejected until their demand masks and index membership proofs
+can be preserved. Owner-local LSM snapshots fork delayed primary scans from
+a bounded, route-fenced visibility cut. The distributed single-table primary
+path now acquires every owner's write/replay fence, rejects unresolved
+prepared intents, forks independent retained cursors while all fences are
+held, and releases the fences before paging. It binds the schema version and
+every owner/absence proof to the same guarded commit; unsupported multi-table
+or non-primary delayed shapes remain closed.
 Existing conflict-owner point reads now use reclaimed cursor and page scratch
 per owner, resetting page scratch after empty progress pages. A 32-owner batch
 with three 64 KiB native continuation pages per owner fits a 512 KiB SQL
@@ -353,13 +351,18 @@ does not grant SQL SET authority to mutate the durable registry. Pgwire now
 holds typed, identity-fenced dotted-name overlays with SET/SET LOCAL/SHOW/RESET,
 transaction/savepoint rollback, RESET ALL/DISCARD ALL, and prepared-plan epoch
 checks. Those overlays belong to one connection; they are not restart-durable
-or available to HTTP durable sessions. Native row policies, remote propagation,
-durable-session overlays, and failover/security workload gates remain open. A
-durable setting registry alone is not policy parity.
-Inert, schema-bound policy definitions now survive catalog Raft replay,
-snapshot/import, and table retirement. Their typed programs and setting
-dependencies are validated at capture, but no route enables RLS and no data
-owner evaluates them; policy records do not grant access or alter visibility.
+or available to HTTP durable sessions. Durable-session overlays and
+failover/security workload gates remain open. A durable setting registry alone
+is not policy parity. Schema-bound policy definitions survive catalog Raft
+replay, snapshot/import, and table retirement. SQL CREATE/ALTER/DROP POLICY
+edits drafts only; ENABLE/DISABLE requests a separate durable owner
+publication. Owner-native reads and writes have signed principal/generation
+proofs and fail-closed gates, but unsupported search, restore, and mutation
+routes cannot bypass policy enforcement or make the feature generally ready.
+The native standalone owner now exercises publication, proofless-read denial,
+signed reads and restart recovery. Owners configured for hot standby reject
+protected policy state until catalog/bundle/receipt commits gain an ordered
+outbox, replay, seed and promotion proof; this is a deliberate safety gate.
 
 The native policy boundary must be catalog-versioned authority, not a SQL
 projection filter. A policy record needs the bound table ID/schema epoch,
@@ -373,8 +376,8 @@ API, pgwire, Lite, remote reads, and non-SQL mutation routes must not be able to
 select an unprotected backend. A missing/stale policy view or unsupported owner
 must deny the operation. Policy DDL must publish durably before it can authorize
 new traffic, and prepared statements must revalidate policy and setting
-generations. Until those paths and revocation/failover tests are complete,
-CREATE/ALTER/DROP POLICY and RLS-enabled tables remain unsupported.
+generations. Until every public route and revocation/failover/restore test is
+complete, active policy publication remains guarded by capability checks.
 
 ### MERGE mutation lowering: partial
 
@@ -602,24 +605,24 @@ generation-level path without copying parent data requires a shared lifecycle:
    retain explicit work/cancellation budgets and cannot silently truncate a
    live-reference search.
 
-The owner-local pending record for step 2 is now encoded with a checksum and
-an exact topology fence, plan digest, child table, and FK generation. Restore
-plans pin untouched external parents, reserve their groups, and require parent
-fence receipts before child cutover. A private replicated control command stages
-pending retirement idempotently across restart; changed replays fail,
-cancellation removes it, and fence release and portable backup reject a
-retained pending record. Pending state has no read-side effect. Final-owner
-activation now has an irreversible metadata decision after old/parent fencing
-and topology/dependency recheck. A direct leader-linearizable authority response
-can be validated against the exact parent fence and child FK generations, but
-the final data-group leader does not yet fetch it or persist an activated
-generation registry. The owner-local registry and bounded resumable GC contract
-now exist: immutable generation tombstones reject stale attachments, and native
-reference reads skip retired generations. Portable backup and range handoff
-reject active authority until they can transfer it correctly. The activation
-command, authenticated leader proof fetch, replicated GC worker and tombstone
-handoff remain missing, so both SQL admission and metadata publication remain
-guarded; no coordinator-supplied receipt is trusted as activation evidence.
+The owner-local pending record for step 2 is checksummed and binds an exact
+topology fence, plan digest, child table, and old/successor FK generations.
+Restore plans pin untouched external parents and require durable parent fence
+receipts before child cutover. The owner re-fetches an irreversible metadata
+activation decision before committing a replicated accepted-generation scope;
+range handoff carries that scope, and bounded resumable GC skips retired
+references. The SQL child-only external-parent TRUNCATE route remains guarded.
+The parent activation step now retains its owner fence across restart, and
+generic release/cancel cannot lift it; only a metadata-authorized ACK after
+child publication releases admission. This closes the pre-publication orphan
+window but does not replace end-to-end coordinator crash/lost-ACK evidence.
+Ordinary FK schema edits now have a metadata-owned parent/source publication
+and ACK protocol, while FK-bearing initial CREATE uses hidden child owners and
+publishes the table only after parent and child receipts. Standalone initial FK
+CREATE, self-referential initial FK declarations, and initial MATCH PARTIAL
+declarations remain guarded until their owner or atomic support-index paths
+exist. Hidden-owner standby replay has a Raft-bound batch envelope, but
+seed/promotion fault coverage remains a release gate.
 
 Acceptance needs crash/lost-ack tests at each fence, publication and activation
 boundary, cancellation on both sides of publication, parent mutations and new
@@ -1061,7 +1064,12 @@ probe and no counter writes. Active batches update each touched bucket once.
 The initial 257-bucket layout is conservative: common-prefix keys share a bucket,
 so it is not an adaptive low-contention interval index. TTL-enabled reads reject
 guarded snapshots because clock-driven visibility needs an explicit transaction
-time contract. Hosted activation and guarded Lite sessions remain unsupported.
+time contract. Hosted owners route the idempotent activation command through
+each catalog-fenced data-Raft group; a failed partial activation is safe to
+retry, but it is not an atomic table-wide epoch switch. Guarded Lite sessions
+remain unsupported: the local source does not advertise the capability until
+session invalidation across in-place restore and the local owner/commit path
+have end-to-end fault coverage.
 The acceptance checklist below remains the release gate for the broader shape,
 not a claim that every deployment or fault workload has been completed.
 

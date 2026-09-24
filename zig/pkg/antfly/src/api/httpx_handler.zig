@@ -359,6 +359,7 @@ fn witnessDDLError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
         error.ReservedForeignKeySupportIndex => jsonErrorResponse(ctx, 400, "__fk_partial_ indexes are server-owned foreign-key support; edit or retire the foreign key instead"),
         error.ForeignKeyPartialSupportIndexConflict => jsonErrorResponse(ctx, 409, "foreign-key support index name conflicts with an existing definition"),
         error.ForeignKeyPartialSupportIndexRequired, error.RelationalIndexNotReady => jsonErrorResponse(ctx, 409, "foreign-key support changed or is still building; refresh the schema and retry"),
+        error.ForeignKeyInitialSelfReferenceUnsupported => jsonErrorResponse(ctx, 409, "initial self-referential foreign keys need child-owner publication; create the table first, then add the constraint"),
         error.ForeignKeyTargetNotUnique, error.ForeignKeyTypeMismatch, error.ForeignKeyParentTableNotFound => jsonErrorResponse(ctx, 400, "foreign key requires an existing parent with a matching ordered unique key and compatible scalar column types"),
         error.TableGenerationChanged, error.SchemaVersionChanged, error.TableTransitionActive, error.ConstraintRetirementInProgress => jsonErrorResponse(ctx, 409, "parent schema changed or has active maintenance; refresh and retry"),
         error.MetadataUnavailable, error.NotLeader, error.ProposalDropped => jsonErrorResponse(ctx, 503, "foreign-key support metadata is unavailable; retry"),
@@ -1161,6 +1162,11 @@ pub const AntflyApiHandler = struct {
         try server.post(table_prefix ++ routes.batch_suffix, httpx.Handler.bind(self, internalGroupBatch));
         try server.post(table_prefix ++ routes.backup_shard_suffix, httpx.Handler.bind(self, internalGroupBackupShard));
         try server.post(table_prefix ++ routes.restore_owner_suffix, httpx.Handler.bind(self, internalGroupRestoreOwner));
+        try server.post(table_prefix ++ routes.restore_parent_activation_suffix, httpx.Handler.bind(self, internalGroupRestoreParentActivation));
+        try server.post(table_prefix ++ routes.fk_generation_parent_suffix, httpx.Handler.bind(self, internalGroupFkGenerationParent));
+        try server.post(table_prefix ++ routes.fk_generation_source_suffix, httpx.Handler.bind(self, internalGroupFkGenerationSource));
+        try server.post(table_prefix ++ routes.fk_initial_child_suffix, httpx.Handler.bind(self, internalGroupFkInitialChild));
+        try server.post(table_prefix ++ routes.row_policy_install_suffix, httpx.Handler.bind(self, internalGroupRowPolicyInstall));
         try server.post(table_prefix ++ routes.online_merge_io_suffix, httpx.Handler.bind(self, internalGroupOnlineMergeIo));
         try server.postResponseStreaming(table_prefix ++ routes.documents_suffix, httpx.Handler.bind(self, internalGroupScan));
         try server.post(table_prefix ++ "/retained-read", httpx.Handler.bind(self, internalRetainedRead));
@@ -1659,6 +1665,7 @@ pub const AntflyApiHandler = struct {
 
     fn tableMutationContext(ctx: *httpx.Context, identity: *const ?AuthenticatedIdentity) operation_contract.RequestContext {
         var request = operationContext(ctx, identity.*);
+        request.row_policy_credential = identity;
         request.table_write_authorization = .{
             .ptr = identity,
             .allows = struct {
@@ -2146,6 +2153,94 @@ pub const AntflyApiHandler = struct {
             };
         };
         return ctx.json(result);
+    }
+
+    fn internalGroupRestoreParentActivation(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "parent activation request required");
+        if (body.len > 4096) return textResponse(ctx, 413, "parent activation request too large");
+        var parsed = std.json.parseFromSlice(@import("restore_parent_activation.zig").Request, ctx.allocator, body, .{}) catch return textResponse(ctx, 400, "invalid parent activation request");
+        defer parsed.deinit();
+        parsed.value.validate(params.group_id) catch return textResponse(ctx, 400, "invalid parent activation scope");
+        const port = self.api_server.cfg.restore_parent_activation orelse return textResponse(ctx, 503, "parent activation unavailable");
+        const result = port.execute(ctx.allocator, params.table_name, params.group_id, parsed.value, operationContext(ctx, null)) catch |err| return switch (err) {
+            error.RestoreStagingScopeChanged, error.RestoreActivationDecisionMissing, error.IntegrityTopologyChanged, error.GenerationRetirementChanged => textResponse(ctx, 409, "parent activation proof changed"),
+            error.Canceled, error.Cancelled => textResponse(ctx, 408, "parent activation canceled"),
+            else => textResponse(ctx, 503, "parent activation must be retried"),
+        };
+        return ctx.json(result);
+    }
+
+    fn internalGroupFkGenerationParent(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "FK generation parent request required");
+        if (body.len > 4096) return textResponse(ctx, 413, "FK generation parent request too large");
+        const publication = @import("relational_fk_generation_publication.zig");
+        var parsed = std.json.parseFromSlice(publication.Request, ctx.allocator, body, .{}) catch return textResponse(ctx, 400, "invalid FK generation parent request");
+        defer parsed.deinit();
+        parsed.value.validate(params.group_id) catch return textResponse(ctx, 400, "invalid FK generation parent scope");
+        const port = self.api_server.cfg.fk_generation_parent orelse return textResponse(ctx, 503, "FK generation parent unavailable");
+        const receipt = port.execute(ctx.allocator, params.table_name, params.group_id, parsed.value, operationContext(ctx, null)) catch |err| return switch (err) {
+            error.GenerationAdmissionChanged, error.IntegrityTopologyChanged, error.IdentityNamespaceMismatch, error.InvalidGenerationPublication => textResponse(ctx, 409, "FK generation parent plan or owner changed"),
+            error.Canceled, error.Cancelled => textResponse(ctx, 408, "FK generation parent canceled"),
+            else => textResponse(ctx, 503, "FK generation parent must be retried"),
+        };
+        return ctx.json(receipt);
+    }
+
+    fn internalGroupFkGenerationSource(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "FK generation source request required");
+        if (body.len > 4096) return textResponse(ctx, 413, "FK generation source request too large");
+        const publication = @import("relational_fk_generation_publication.zig");
+        var parsed = std.json.parseFromSlice(publication.SourceRequest, ctx.allocator, body, .{}) catch return textResponse(ctx, 400, "invalid FK generation source request");
+        defer parsed.deinit();
+        parsed.value.validate(params.group_id) catch return textResponse(ctx, 400, "invalid FK generation source scope");
+        const port = self.api_server.cfg.fk_generation_source orelse return textResponse(ctx, 503, "FK generation source unavailable");
+        const receipt = port.execute(ctx.allocator, params.table_name, params.group_id, parsed.value, operationContext(ctx, null)) catch |err| return switch (err) {
+            error.GenerationAdmissionChanged, error.IntegrityTopologyChanged, error.IdentityNamespaceMismatch, error.InvalidGenerationPublication => textResponse(ctx, 409, "FK generation source plan or owner changed"),
+            error.Canceled, error.Cancelled => textResponse(ctx, 408, "FK generation source canceled"),
+            else => textResponse(ctx, 503, "FK generation source must be retried"),
+        };
+        return ctx.json(receipt);
+    }
+
+    fn internalGroupFkInitialChild(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "initial FK child request required");
+        if (body.len > 4096) return textResponse(ctx, 413, "initial FK child request too large");
+        const publication = @import("relational_fk_generation_publication.zig");
+        var parsed = std.json.parseFromSlice(publication.InitialChildRequest, ctx.allocator, body, .{}) catch return textResponse(ctx, 400, "invalid initial FK child request");
+        defer parsed.deinit();
+        parsed.value.validate(params.group_id) catch return textResponse(ctx, 400, "invalid initial FK child scope");
+        const port = self.api_server.cfg.fk_initial_child orelse return textResponse(ctx, 503, "initial FK child unavailable");
+        const receipt = port.execute(ctx.allocator, params.table_name, params.group_id, parsed.value, operationContext(ctx, null)) catch |err| return switch (err) {
+            error.InitialChildPublicationChanged, error.GenerationAdmissionChanged, error.IntegrityCatalogChanged, error.IdentityNamespaceMismatch => textResponse(ctx, 409, "initial FK child plan or owner changed"),
+            error.Canceled, error.Cancelled => textResponse(ctx, 408, "initial FK child canceled"),
+            else => textResponse(ctx, 503, "initial FK child must be retried"),
+        };
+        return ctx.json(receipt);
+    }
+
+    fn internalGroupRowPolicyInstall(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "row policy install request required");
+        if (body.len > 4096) return textResponse(ctx, 413, "row policy install request too large");
+        var parsed = std.json.parseFromSlice(@import("row_policy_install.zig").Request, ctx.allocator, body, .{}) catch return textResponse(ctx, 400, "invalid row policy install request");
+        defer parsed.deinit();
+        @import("row_policy_install.zig").validate(parsed.value, params.group_id) catch return textResponse(ctx, 400, "invalid row policy install scope");
+        const port = self.api_server.cfg.row_policy_install orelse return textResponse(ctx, 503, "row policy install unavailable");
+        const receipt = port.execute(ctx.allocator, params.table_name, params.group_id, parsed.value, operationContext(ctx, null)) catch |err| return switch (err) {
+            error.RowPolicyCatalogChanged, error.InvalidRowPolicyBundle, error.IntegrityTopologyChanged, error.IdentityNamespaceMismatch => textResponse(ctx, 409, "row policy publication or owner changed"),
+            error.Canceled, error.Cancelled => textResponse(ctx, 408, "row policy install canceled"),
+            else => textResponse(ctx, 503, "row policy installation must be retried"),
+        };
+        return ctx.json(receipt);
     }
 
     fn internalGroupBackupShard(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -2766,6 +2861,8 @@ pub const AntflyApiHandler = struct {
             else => textResponse(ctx, 500, "internal server error"),
         };
         defer input.deinit(ctx.allocator);
+        if (input.req.relational_topology) |command| if (command.action == .activate_parent_retirement or command.action == .acknowledge_parent_retirement)
+            return textResponse(ctx, 403, "parent activation requires owner-local metadata proof");
         const result = self.internalGroupOperations().batch(
             ctx.allocator,
             operationContext(ctx, null),
@@ -3185,6 +3282,8 @@ pub const AntflyApiHandler = struct {
             else => textResponse(ctx, 500, "internal server error"),
         };
         defer input.deinit(ctx.allocator);
+        if (input.req.relational_topology) |command| if (command.action == .activate_parent_retirement or command.action == .acknowledge_parent_retirement)
+            return textResponse(ctx, 403, "parent activation requires owner-local metadata proof");
         const result = self.internalGroupOperations().routedBatch(
             ctx.allocator,
             operationContext(ctx, null),
@@ -5106,7 +5205,7 @@ pub const AntflyApiHandler = struct {
             }
             self.is_write = switch (compiled.statement) {
                 .select, .explain => false,
-                .insert, .update, .delete, .merge, .create_table, .drop_table, .catalog_ddl, .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints => true,
+                .insert, .update, .delete, .merge, .create_table, .drop_table, .catalog_ddl, .policy_ddl, .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints => true,
             };
             var execution = self.adapter.server.acquireSqlExecution(self.is_write) catch |err| {
                 self.failure = err;
@@ -5215,7 +5314,7 @@ pub const AntflyApiHandler = struct {
             };
             defer compiled.deinit();
             return switch (compiled.statement) {
-                .select, .insert, .update, .delete, .merge, .create_table, .drop_table, .catalog_ddl => ctx.status(503).json(sql_wire.SQLDiagnostic{ .code = "53300", .message = "SQL execution capacity unavailable" }),
+                .select, .insert, .update, .delete, .merge, .create_table, .drop_table, .catalog_ddl, .policy_ddl => ctx.status(503).json(sql_wire.SQLDiagnostic{ .code = "53300", .message = "SQL execution capacity unavailable" }),
                 else => ctx.status(501).json(sql_wire.SQLDiagnostic{ .code = "0A000", .message = "SQL statement is not supported by this endpoint" }),
             };
         };
@@ -5859,7 +5958,14 @@ pub const AntflyApiHandler = struct {
         const alloc = ctx.allocator;
         const route = try system_catalog_routes.parseAlloc(alloc, http_server_mod.stripApiPrefix(ctx.request.uri.path));
         defer if (route) |value| value.deinit(alloc);
-        if (route == null and self.api_server.source.vtable.system_catalog == null) return self.api_server.source.createTable(alloc, physical_name, req);
+        if (route == null and self.api_server.source.vtable.system_catalog == null) {
+            // The local no-catalog backend cannot publish an initial child FK
+            // generation with its parent owners. Reject before persisting an
+            // inert or unenforced table through this fallback.
+            if (try @import("../metadata/fk_generation_publication.zig").schemaHasForeignKeys(alloc, tables_api.effectiveSchemaJson(req.schema_json)))
+                return error.ForeignKeyGenerationPublicationRequired;
+            return self.api_server.source.createTable(alloc, physical_name, req);
+        }
         const target: system_catalog.Target = if (route) |value| try value.target() else try system_catalog.Target.literal(logical_name);
         if (req.tablespace_name) |tablespace| if (identity) |value| {
             if (!http_server_mod.permissionsAllow(value.permissions, .tablespace, tablespace, .read)) return error.Forbidden;
@@ -6360,9 +6466,67 @@ pub const AntflyApiHandler = struct {
         if (create_req.indexes_json) |old| alloc.free(old);
         create_req.indexes_json = sealed_indexes_json;
         @import("relational_witness_ddl.zig").validateArtifactNames(alloc, sealed_indexes_json) catch |err| return witnessDDLError(ctx, err);
-        const supported_schema = self.api_server.preparePartialWitnessSchema(alloc, decoded_table_name, tables_api.effectiveSchemaJson(create_req.schema_json), "", operationContext(ctx, authenticated_identity)) catch |err| return witnessDDLError(ctx, err);
+        const fk_schema = tables_api.effectiveSchemaJson(create_req.schema_json);
+        const has_initial_fk = try @import("../metadata/fk_generation_publication.zig").schemaHasForeignKeys(alloc, fk_schema);
+        if (has_initial_fk and try @import("relational_witness_ddl.zig").needed(alloc, fk_schema, ""))
+            return jsonErrorResponse(ctx, 422, "initial MATCH PARTIAL foreign keys require atomic parent support-index publication; create the table without that constraint, then add it with ALTER TABLE");
+        const supported_schema = self.api_server.preparePartialWitnessSchema(alloc, decoded_table_name, fk_schema, "", operationContext(ctx, authenticated_identity)) catch |err| return witnessDDLError(ctx, err);
         if (create_req.schema_json) |old| alloc.free(old);
         create_req.schema_json = supported_schema;
+        if (has_initial_fk) {
+            const request_context = operationContext(ctx, authenticated_identity);
+            var plan_arena = std.heap.ArenaAllocator.init(alloc);
+            defer plan_arena.deinit();
+            const plan_alloc = plan_arena.allocator();
+            const plan = @import("fk_initial_create_plan_builder.zig").build(self.api_server, plan_alloc, request_context, authenticated_identity, create_scope, create_req) catch |err| switch (err) {
+                error.Forbidden => return jsonErrorResponse(ctx, 403, "initial foreign key publication requires admin permission on every affected parent"),
+                error.CatalogAlreadyExists,
+                error.TableAlreadyExists,
+                error.GenerationPublicationChanged,
+                error.CatalogGenerationChanged,
+                error.TableGenerationChanged,
+                => return jsonErrorResponse(ctx, 409, "table name or owner generation changed; refresh and retry"),
+                error.MetadataCapabilityUnavailable, error.UnsupportedOperation => return jsonErrorResponse(ctx, 409, "coordinated initial foreign key publication is unavailable on this deployment"),
+                else => return witnessDDLError(ctx, err),
+            };
+            // Build both responses before the durable begin. An allocator
+            // failure after commit must not erase the caller's recovery handle.
+            const id_hex = std.fmt.bytesToHex(plan.id, .lower);
+            const catalog_id_text = try std.fmt.allocPrint(alloc, "{d}", .{plan.catalog_id});
+            defer alloc.free(catalog_id_text);
+            const table_id_text = try std.fmt.allocPrint(alloc, "{d}", .{plan.child.table_id});
+            defer alloc.free(table_id_text);
+            const pending_response = try std.json.Stringify.valueAlloc(alloc, .{
+                .code = "fk_initial_create_publication",
+                .publication_id = id_hex[0..],
+                .catalog_id = catalog_id_text,
+                .table_id = table_id_text,
+                .state = "pending",
+                .message = "Initial foreign key table publication is running. Poll for the table; do not replay an uncertain submission.",
+            }, .{});
+            defer alloc.free(pending_response);
+            const unknown_response = try std.json.Stringify.valueAlloc(alloc, .{
+                .code = "fk_initial_create_publication",
+                .publication_id = id_hex[0..],
+                .catalog_id = catalog_id_text,
+                .table_id = table_id_text,
+                .state = "admission_unknown",
+                .message = "Initial foreign key table admission is unresolved. Retain this publication ID, refresh table status, and do not replay CREATE.",
+            }, .{});
+            defer alloc.free(unknown_response);
+            const accepted = self.api_server.submitFkInitialCreatePlan(plan_alloc, request_context, plan) catch |err| switch (err) {
+                error.Forbidden => return jsonErrorResponse(ctx, 403, "initial foreign key publication requires admin permission on every affected parent"),
+                error.CatalogAlreadyExists,
+                error.TableAlreadyExists,
+                error.GenerationPublicationChanged,
+                error.CatalogGenerationChanged,
+                error.TableGenerationChanged,
+                => return jsonErrorResponse(ctx, 409, "table name or owner generation changed; refresh and retry"),
+                error.MetadataCapabilityUnavailable, error.UnsupportedOperation => return jsonErrorResponse(ctx, 409, "coordinated initial foreign key publication is unavailable on this deployment"),
+                else => return witnessDDLError(ctx, err),
+            };
+            return jsonResponse(ctx, 202, if (accepted.state == .admission_unknown) unknown_response else pending_response);
+        }
         std.log.info("public create table begin table={s}", .{decoded_table_name});
         const metadata_create_start_ns = platform_time.monotonicNs();
         var metadata_create_attempts: usize = 0;
@@ -6383,6 +6547,10 @@ pub const AntflyApiHandler = struct {
                 error.ForeignKeyTargetNotUnique, error.ForeignKeyTypeMismatch, error.ForeignKeyParentTableNotFound => {
                     _ = ctx.status(400);
                     return ctx.text("foreign key requires an existing parent with a matching ordered unique key and compatible scalar column types");
+                },
+                error.ForeignKeyGenerationPublicationRequired => {
+                    _ = ctx.status(409);
+                    return ctx.text("initial foreign key generations require coordinated parent-owner publication; create the table without foreign keys, then add them through a schema update");
                 },
                 error.InvalidTableStorageSettings, error.VectorStoreRequiresLocalSingleShardTable => {
                     _ = ctx.status(400);
@@ -6838,6 +7006,8 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid schema update request");
         };
         var expected_version: ?u32 = null;
+        var expected_table_id: u64 = 0;
+        var expected_schema_digest: [32]u8 = undefined;
         // Validate the raw query as well as the generated parameter shape:
         // duplicate rewrite flags must not be silently collapsed by routing.
         const rewrite_requested = @import("relational_rewrite_admission.zig").requested(ctx.request.uri.query orelse "") catch return jsonErrorResponse(ctx, 400, "schema query accepts only rewrite=true or rewrite=false");
@@ -6877,6 +7047,8 @@ pub const AntflyApiHandler = struct {
             };
             defer alloc.free(bound);
             const version = try tables_api.schemaVersion(current.schema_json);
+            expected_table_id = current.table_id;
+            std.crypto.hash.Blake3.hash(current.schema_json, &expected_schema_digest, .{});
             if (expected_version) |expected| if (version != expected) return jsonErrorResponse(ctx, 409, "schema version changed; refresh and retry");
             expected_version = version;
             if (rewrite_requested) {
@@ -6913,6 +7085,33 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(409);
                 return ctx.text("coordinated constraint retirement is required before changing or removing these declarations");
             },
+            error.ForeignKeyGenerationPublicationRequired => {
+                var current_snapshot = (try self.api_server.source.adminSnapshot()) orelse return jsonErrorResponse(ctx, 503, "schema catalog unavailable");
+                defer self.api_server.source.freeAdminSnapshot(&current_snapshot);
+                const before = tables_api.findTableByName(&current_snapshot, decoded_table_name) orelse return jsonErrorResponse(ctx, 404, "not found");
+                var observed_schema_digest: [32]u8 = undefined;
+                std.crypto.hash.Blake3.hash(before.schema_json, &observed_schema_digest, .{});
+                if (before.table_id != expected_table_id or try tables_api.schemaVersion(before.schema_json) != expected_version.? or
+                    !std.mem.eql(u8, &observed_schema_digest, &expected_schema_digest))
+                    return jsonErrorResponse(ctx, 409, "table identity or schema version changed; refresh and retry");
+                const accepted = self.api_server.beginFkGenerationPublication(alloc, operationContext(ctx, authenticated_identity), authenticated_identity, before.*, supported_schema.?) catch |begin_err| switch (begin_err) {
+                    error.Forbidden => return jsonErrorResponse(ctx, 403, "foreign key publication requires admin permission on every affected parent"),
+                    error.CatalogGenerationChanged, error.TableGenerationChanged, error.SchemaVersionChanged, error.GenerationPublicationChanged => return jsonErrorResponse(ctx, 409, "schema or owner generation changed; refresh and retry"),
+                    error.MetadataCapabilityUnavailable, error.UnsupportedOperation => return jsonErrorResponse(ctx, 503, "coordinated foreign key publication is unavailable"),
+                    else => return witnessDDLError(ctx, begin_err),
+                };
+                const id_hex = std.fmt.bytesToHex(accepted.plan_id, .lower);
+                const response = try std.json.Stringify.valueAlloc(alloc, .{
+                    .code = "fk_generation_publication",
+                    .publication_id = id_hex[0..],
+                    .table_id = accepted.child_table_id,
+                    .schema_version = accepted.schema_version,
+                    .state = @tagName(accepted.state),
+                    .message = "Foreign key generation publication is running. Poll the table schema version; do not replay an uncertain submission.",
+                }, .{});
+                defer alloc.free(response);
+                return jsonResponse(ctx, 202, response);
+            },
             error.MetadataMutationOutcomeUnknown => {
                 return metadataMutationOutcomeUnknownResponse(ctx);
             },
@@ -6947,6 +7146,10 @@ pub const AntflyApiHandler = struct {
                     error.ConstraintRetirementRequired => {
                         _ = ctx.status(409);
                         return ctx.text("coordinated constraint retirement is required before changing or removing these declarations");
+                    },
+                    error.ForeignKeyGenerationPublicationRequired => {
+                        _ = ctx.status(409);
+                        return ctx.text("foreign key changes require coordinated parent-owner publication; unrelated schema changes remain supported");
                     },
                     else => return write_err,
                 };
@@ -7014,8 +7217,25 @@ pub const AntflyApiHandler = struct {
         defer if (identity) |*value| value.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &identity)) |response| return response;
         const alloc = ctx.allocator;
-        const name = (try self.resolvePublicTableName(ctx, table_name, &identity)) orelse return ctx.response.build();
-        defer alloc.free(name);
+        const binding = (try self.resolvePublicTableBinding(ctx, table_name, &identity)) orelse return ctx.response.build();
+        defer binding.deinit(alloc);
+        const name = binding.physical;
+        // Constraint diagnostics contain per-range row counts and failure
+        // detail. The internal FK coordinator may inspect those under its
+        // service authority; the public route must not expose them through a
+        // row-policy-protected table without a policy-aware diagnostic model.
+        if (binding.logical) |logical| {
+            const target = try system_catalog.Target.parse(logical);
+            const principal: ?*const AuthenticatedIdentity = if (identity) |*value| value else null;
+            const proof = self.api_server.rowPolicyReadProof(alloc, principal, operationContext(ctx, identity), binding.table_id orelse return error.RowPolicyCatalogChanged, binding.physical, target.database, null) catch |err| return switch (err) {
+                error.RowPolicyAuthenticationRequired, error.RowPolicyDenied => jsonErrorResponse(ctx, 403, "row policy authentication required"),
+                error.RowPolicyCatalogChanged, error.RowPolicyUnsupported => jsonErrorResponse(ctx, 409, "row policy publication changed"),
+                error.RowPolicyAuthorityUnavailable => jsonErrorResponse(ctx, 503, "row policy authority unavailable"),
+                else => err,
+            };
+            defer if (proof) |token| alloc.free(token);
+            if (proof != null) return jsonErrorResponse(ctx, 409, "constraint diagnostics are unavailable while row policies are active");
+        }
         if (try self.acquirePublicOperation(ctx, "getRelationalConstraintStatus")) |response| return response;
         defer self.releasePublicOperation("getRelationalConstraintStatus");
         const reads = self.api_server.table_reads orelse return jsonErrorResponse(ctx, 503, "constraint owners unavailable");
@@ -7036,8 +7256,9 @@ pub const AntflyApiHandler = struct {
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
-        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
-        defer alloc.free(decoded_table_name);
+        const binding = (try self.resolvePublicTableBinding(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
+        defer binding.deinit(alloc);
+        const decoded_table_name = binding.physical;
         // The OpenAPI request body is optional; an absent body is the default
         // unbounded-range scan, just like an explicitly empty legacy request.
         const body_data = (try ctx.body()) orelse "";
@@ -7056,6 +7277,28 @@ pub const AntflyApiHandler = struct {
         scan_req.opts.execution_deadline_ns = request.deadline_ns;
         if (request.cancellation.ptr != null and request.cancellation.is_cancelled_fn != null)
             scan_req.opts.cancellation = request.cancellation;
+        var row_policy_proof: ?[]u8 = null;
+        defer if (row_policy_proof) |proof| alloc.free(proof);
+        if (binding.logical) |logical| {
+            const target = try system_catalog.Target.parse(logical);
+            const identity: ?*const AuthenticatedIdentity = if (authenticated_identity) |*value| value else null;
+            row_policy_proof = self.api_server.rowPolicyReadProof(
+                alloc,
+                identity,
+                request,
+                binding.table_id orelse return error.RowPolicyCatalogChanged,
+                binding.physical,
+                target.database,
+                null,
+            ) catch |err| return switch (err) {
+                error.RowPolicyAuthenticationRequired, error.RowPolicyDenied => jsonErrorResponse(ctx, 403, "row policy authentication required"),
+                error.RowPolicyCatalogChanged, error.RowPolicyUnsupported => jsonErrorResponse(ctx, 409, "row policy publication changed"),
+                error.RowPolicyAuthorityUnavailable => jsonErrorResponse(ctx, 503, "row policy authority unavailable"),
+                else => err,
+            };
+            scan_req.opts.row_policy_principal_proof = row_policy_proof orelse "";
+            scan_req.opts.row_policy_database = target.database;
+        }
 
         const row_filter_json = try http_server_mod.resolveEffectiveRowFilterJson(alloc, authenticated_identity, decoded_table_name);
         defer if (row_filter_json) |value| alloc.free(value);
@@ -7079,6 +7322,10 @@ pub const AntflyApiHandler = struct {
                     return jsonErrorResponse(ctx, response.status, response.message);
                 }
                 return switch (err) {
+                    error.RowPolicyAuthenticationRequired, error.RowPolicyDenied => jsonErrorResponse(ctx, 403, "row policy authentication required"),
+                    error.RowPolicyCatalogChanged, error.RowPolicyReadersActive => jsonErrorResponse(ctx, 409, "row policy publication changed"),
+                    error.RowPolicyUnsupported => jsonErrorResponse(ctx, 409, "row policy does not support this read"),
+                    error.RowPolicyAuthorityUnavailable => jsonErrorResponse(ctx, 503, "row policy authority unavailable"),
                     error.TableNotFound => jsonErrorResponse(ctx, 404, "not found"),
                     error.TopologyChanged, error.IdentityReadGenerationChanged, error.DocIdentityNamespaceMismatch => jsonErrorResponse(ctx, 409, "read topology changed"),
                     error.Canceled, error.Cancelled => error.Canceled,
@@ -7135,6 +7382,18 @@ pub const AntflyApiHandler = struct {
                 return ctx.text(response.message);
             }
             return switch (err) {
+                error.RowPolicyAuthenticationRequired, error.RowPolicyDenied => {
+                    _ = ctx.status(403);
+                    return ctx.text("row policy authentication required");
+                },
+                error.RowPolicyCatalogChanged, error.RowPolicyReadersActive, error.RowPolicyUnsupported => {
+                    _ = ctx.status(409);
+                    return ctx.text("row policy publication changed");
+                },
+                error.RowPolicyAuthorityUnavailable => {
+                    _ = ctx.status(503);
+                    return ctx.text("row policy authority unavailable");
+                },
                 error.TableNotFound => {
                     _ = ctx.status(404);
                     return ctx.text("not found");
@@ -7190,6 +7449,12 @@ pub const AntflyApiHandler = struct {
 
     pub fn lookupKey(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: metadata_openapi.server.LookupKeyParams) !httpx.Response {
         return self.lookupKeyImpl(ctx, table_name, key, params) catch |err| {
+            switch (err) {
+                error.RowPolicyAuthenticationRequired, error.RowPolicyDenied => return textResponse(ctx, 403, "row policy authentication required"),
+                error.RowPolicyCatalogChanged, error.RowPolicyReadersActive, error.RowPolicyTopologyUnsupported, error.RowPolicyUnsupported => return textResponse(ctx, 409, "row policy publication changed"),
+                error.RowPolicyAuthorityUnavailable => return textResponse(ctx, 503, "row policy authority unavailable"),
+                else => {},
+            }
             std.log.warn("public document lookup failed table={s} err={s}", .{ table_name, @errorName(err) });
             return err;
         };
@@ -7213,6 +7478,23 @@ pub const AntflyApiHandler = struct {
 
         var lookup_opts = try http_route_helpers.parseLookupOptions(alloc, ctx.request.uri.query orelse "");
         defer lookup_opts.deinit(alloc);
+        var row_policy_proof: ?[]u8 = null;
+        defer if (row_policy_proof) |proof| alloc.free(proof);
+        if (binding.logical) |logical| {
+            const target = try system_catalog.Target.parse(logical);
+            const identity: ?*const AuthenticatedIdentity = if (authenticated_identity) |*value| value else null;
+            row_policy_proof = try self.api_server.rowPolicyReadProof(
+                alloc,
+                identity,
+                operationContext(ctx, authenticated_identity),
+                binding.table_id orelse return error.RowPolicyCatalogChanged,
+                binding.physical,
+                target.database,
+                null,
+            );
+            lookup_opts.opts.row_policy_principal_proof = row_policy_proof orelse "";
+            lookup_opts.opts.row_policy_database = target.database;
+        }
         const consistency = http_server_mod.parseLookupReadConsistency(ctx.request.uri.query orelse "") catch {
             _ = ctx.status(400);
             return ctx.text("invalid read consistency");

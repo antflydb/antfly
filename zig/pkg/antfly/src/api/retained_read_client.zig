@@ -70,7 +70,7 @@ pub const Client = struct {
             return null;
         }
         self.token = parsed.value.token orelse return error.InvalidRetainedReadResponse;
-        return .{ .ptr = self, .vtable = &.{ .validate = validate, .open = open, .release = close } };
+        return .{ .ptr = self, .vtable = &.{ .validate = validate, .open = open, .capture_snapshot = captureSnapshot, .release = close } };
     }
 
     fn call(self: *Client, request: rpc.Request) !http.HttpResponse {
@@ -114,8 +114,38 @@ pub const Client = struct {
         defer response.deinit(self.alloc);
     }
 
+    fn captureSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator) !@import("../storage/statement_read_fence.zig").Snapshot {
+        const self: *Client = @ptrCast(@alignCast(ptr));
+        var response = try self.call(.{ .operation = .snapshot, .schema_version = self.schema_version, .token = self.token, .connection = self.connection, .lease_ms = rpc.max_lease_ms });
+        defer response.deinit(self.alloc);
+        var parsed = try std.json.parseFromSlice(rpc.Response, alloc, response.body, .{});
+        defer parsed.deinit();
+        const token = parsed.value.token orelse return error.InvalidRetainedReadResponse;
+        errdefer {
+            var cleanup: ?http.HttpResponse = self.call(.{ .operation = .close, .schema_version = self.schema_version, .token = token }) catch null;
+            if (cleanup) |*value| value.deinit(self.alloc);
+        }
+        const snapshot = try alloc.create(Client);
+        errdefer alloc.destroy(snapshot);
+        const uri = try alloc.dupe(u8, self.uri);
+        errdefer alloc.free(uri);
+        const route = try alloc.dupe(u8, self.route);
+        errdefer alloc.free(route);
+        snapshot.* = .{ .alloc = alloc, .executor = self.executor, .uri = uri, .route = route, .schema_version = self.schema_version, .deadline_ns = self.deadline_ns, .token = token, .connection = self.connection };
+        return .{ .ptr = snapshot, .vtable = &.{ .open = openSnapshot, .release = close } };
+    }
+
     fn open(ptr: *anyopaque, alloc: std.mem.Allocator, from: []const u8, to: []const u8, opts: types.ScanOptions) !reads.RelationalReadView {
         const self: *Client = @ptrCast(@alignCast(ptr));
+        return self.openKind(alloc, from, to, opts, false);
+    }
+
+    fn openSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, from: []const u8, to: []const u8, opts: types.ScanOptions) !reads.RelationalReadView {
+        const self: *Client = @ptrCast(@alignCast(ptr));
+        return self.openKind(alloc, from, to, opts, true);
+    }
+
+    fn openKind(self: *Client, alloc: std.mem.Allocator, from: []const u8, to: []const u8, opts: types.ScanOptions, delayed: bool) !reads.RelationalReadView {
         var parsed_query: ?std.json.Parsed(types.RelationalRowQuery) = null;
         defer if (parsed_query) |*parsed| parsed.deinit();
         const query = opts.relational_query orelse blk: {
@@ -130,7 +160,7 @@ pub const Client = struct {
         const route = try alloc.dupe(u8, self.route);
         errdefer alloc.free(route);
         errdefer self.cancelUnknown();
-        var response = try self.call(.{ .operation = .open, .schema_version = self.schema_version, .token = self.token, .connection = self.connection, .lease_ms = rpc.max_lease_ms, .from = from, .to = to, .query = query, .filter_query_json = opts.filter_query_json, .inclusive_from = opts.inclusive_from, .exclusive_to = opts.exclusive_to, .sql_document_preimage = opts.sql_document_preimage, .include_content_hashes = opts.include_content_hashes, .include_range_proofs = opts.include_range_proofs });
+        var response = try self.call(.{ .operation = if (delayed) .open_snapshot else .open, .schema_version = self.schema_version, .token = self.token, .connection = self.connection, .lease_ms = rpc.max_lease_ms, .from = from, .to = to, .query = query, .filter_query_json = opts.filter_query_json, .inclusive_from = opts.inclusive_from, .exclusive_to = opts.exclusive_to, .sql_document_preimage = opts.sql_document_preimage, .include_content_hashes = opts.include_content_hashes, .include_range_proofs = opts.include_range_proofs, .row_policy_principal_proof = opts.row_policy_principal_proof, .row_policy_database = opts.row_policy_database });
         defer response.deinit(self.alloc);
         var parsed = try std.json.parseFromSlice(rpc.Response, alloc, response.body, .{});
         defer parsed.deinit();

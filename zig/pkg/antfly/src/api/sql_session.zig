@@ -42,7 +42,10 @@ pub const Coordinator = struct {
         const source = server.table_writes orelse return error.UnsupportedSqlExecution;
         var prepared = try server.preparePublicCommitWithIntegrity(alloc, tables, self.context);
         defer prepared.deinit();
-        var plan = (try server.txn_sessions.sealExecutionPlan(alloc, id, prepared.tables)) orelse return error.SqlTransactionNotActive;
+        var proof_arena = std.heap.ArenaAllocator.init(alloc);
+        defer proof_arena.deinit();
+        const signed = try server.signCurrentRowPolicyMutationParticipants(proof_arena.allocator(), prepared.tables, self.context);
+        var plan = (try server.txn_sessions.sealExecutionPlan(alloc, id, signed)) orelse return error.SqlTransactionNotActive;
         defer plan.deinit();
         // Once the durable plan is sealed, no error is safe to turn into a
         // replay invitation. Maintenance owns completion under this same id.

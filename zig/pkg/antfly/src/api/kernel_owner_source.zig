@@ -169,9 +169,11 @@ test "source owner routed admission preserves the fence clock" {
     };
     try std.testing.expectError(error.TopologyChanged, source.validateRoutedRead(std.testing.allocator, fence, 2, "rows"));
     try std.testing.expectEqual(@as(usize, 1), catalog.calls);
+    try std.testing.expectError(error.TopologyChanged, ProvisionedKernelOwnerSource.openStatementSnapshotRouted(&source, std.testing.allocator, fence, 2, "rows", .read_index, null, fence.admission_deadline_ns));
+    try std.testing.expectEqual(@as(usize, 2), catalog.calls);
     request.now = fence.admission_deadline_ns.?;
     try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, source.validateRoutedRead(std.testing.allocator, fence, 2, "rows"));
-    try std.testing.expectEqual(@as(usize, 1), catalog.calls);
+    try std.testing.expectEqual(@as(usize, 2), catalog.calls);
 }
 
 pub const ProvisionedKernelOwnerSource = struct {
@@ -181,6 +183,8 @@ pub const ProvisionedKernelOwnerSource = struct {
     read_safety_barrier: read_gate.ReadSafetyBarrier,
     /// Selected once by the hosting runtime before any owner is opened.
     online_source_authority: @import("../storage/db/online_source_contract.zig").Authority = .raft,
+    row_policy_authority_secret: ?[]const u8 = null,
+    row_policy_authority_issuer: ?[]const u8 = null,
     group_visible_root_generation: ?table_reads.GroupVisibleRootGenerationSource = null,
     transaction_recovery_source: ?transaction_recovery_source.Source = null,
     restore_descriptor_recovery: ?RestoreDescriptorRecovery = null,
@@ -259,6 +263,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         schema_json: []u8,
         indexes_json: []u8,
         restore_bootstrap_json: []u8,
+        initial_child_bootstrap_json: []u8,
         initial_range: ?db_types.ByteRange = null,
         restore_cancel_recovery: bool = false,
         restore_ha_replay: bool = false,
@@ -507,6 +512,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .scan = unsupportedTopLevelScan,
                 .open_relational_read_group_local_routed = openRelationalReadRouted,
                 .try_statement_read_fence_group_local_routed = tryStatementReadFenceRouted,
+                .open_relational_statement_snapshot_group_local_routed = openStatementSnapshotRouted,
                 .query = unsupportedTopLevelQuery,
                 .preflight_query_group_local = preflightQueryGroupLocal,
                 .preflight_query_group_local_routed = preflightQueryGroupLocalRouted,
@@ -1379,6 +1385,18 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer abi.antfly_storage_owner_buffer_destroy(&output);
     }
 
+    /// Hidden initial FK owners are already resident from the authenticated
+    /// private placement projection. Public catalog lookup must not be used
+    /// before the final metadata publication CAS.
+    pub fn captureHASeedInitialChildReplicaSnapshot(self: *ProvisionedKernelOwnerSource, table_name: []const u8, group_id: u64, snapshot_token: []const u8, destination_root: []const u8) !void {
+        var lease = try self.acquirePreparedOwner(group_id, table_name);
+        defer lease.deinit();
+        if (lease.entry.initial_child_bootstrap_json.len == 0) return error.InvalidInitialChildPublication;
+        var output: abi.OwnedBytes = .{};
+        try kernel_error_identity.statusToError(abi.antfly_storage_owner_hidden_restore_json(lease.owner().handle, &.{ .operation = .capture_public_snapshot, .table_name = .fromSlice(table_name), .table_id = lease.entry.identity.table_id, .snapshot_token = .fromSlice(snapshot_token), .destination_root = .fromSlice(destination_root) }, &output));
+        defer abi.antfly_storage_owner_buffer_destroy(&output);
+    }
+
     pub fn applyHAHiddenOwnerRecord(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, scope: [32]u8, record: ha_replication_record.RecordView) !void {
         var descriptor = (try self.cachedRestoreDescriptor(alloc, group_id, table_name, scope)) orelse return error.RestoreStagingScopeChanged;
         defer descriptor.deinit(alloc);
@@ -1386,6 +1404,27 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer alloc.free(path);
         var lease = try self.acquireDescriptor(group_id, table_name, path, descriptor.view());
         defer lease.deinit();
+        try lease.owner().applyHAReplicationRecord(table_name, .{
+            .record_kind = @intFromEnum(record.kind),
+            .payload_codec = @intFromEnum(record.payload_codec),
+            .flags = record.flags,
+            .cluster_id = record.cluster_id,
+            .shard_id = record.shard_id,
+            .table_id = record.table_id,
+            .timeline_id = record.timeline_id,
+            .epoch = record.epoch,
+            .lsn = record.lsn,
+            .previous_lsn = record.previous_lsn,
+            .commit_timestamp_ns = record.commit_timestamp_ns,
+            .payload = record.payload,
+        });
+    }
+
+    pub fn applyHAInitialChildOwnerRecord(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8, record: ha_replication_record.RecordView) !void {
+        var lease = try self.acquirePreparedOwner(group_id, table_name);
+        defer lease.deinit();
+        if (lease.entry.initial_child_bootstrap_json.len == 0 or lease.entry.identity.table_id != record.table_id or
+            lease.entry.identity.shard_id != record.shard_id) return error.InitialChildPublicationChanged;
         try lease.owner().applyHAReplicationRecord(table_name, .{
             .record_kind = @intFromEnum(record.kind),
             .payload_codec = @intFromEnum(record.payload_codec),
@@ -2008,6 +2047,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         self.alloc.free(entry.schema_json);
         self.alloc.free(entry.indexes_json);
         self.alloc.free(entry.restore_bootstrap_json);
+        self.alloc.free(entry.initial_child_bootstrap_json);
         descriptor_contract.freeInitialRange(self.alloc, entry.initial_range);
         if (entry.restore) |*identity| identity.deinit(self.alloc);
         if (entry.repair_target) |target| self.alloc.free(target);
@@ -2815,6 +2855,15 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer lease.deinit();
     }
 
+    pub fn primeInitialChildOwner(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8, descriptor: descriptor_contract.Descriptor) !void {
+        if (descriptor.initial_child_bootstrap_json.len == 0 or descriptor.restore_bootstrap_json.len != 0 or
+            descriptor.lsm_root_generation != self.visibleRootGeneration(group_id)) return error.InvalidInitialChildPublication;
+        const path = try std.fmt.allocPrint(self.alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
+        defer self.alloc.free(path);
+        var lease = try self.acquireDescriptor(group_id, table_name, path, descriptor);
+        defer lease.deinit();
+    }
+
     pub fn restoreOwnerControl(
         self: *ProvisionedKernelOwnerSource,
         alloc: std.mem.Allocator,
@@ -3087,6 +3136,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             if (!std.mem.eql(u8, entry.schema_json, descriptor.schema_json) or
                 !std.mem.eql(u8, entry.indexes_json, descriptor.indexes_json) or
                 !std.mem.eql(u8, entry.restore_bootstrap_json, descriptor.restore_bootstrap_json) or
+                !std.mem.eql(u8, entry.initial_child_bootstrap_json, descriptor.initial_child_bootstrap_json) or
                 !descriptor_contract.initialRangesEqual(entry.initial_range, descriptor.initial_range) or
                 entry.restore_cancel_recovery != descriptor.restore_cancel_recovery or
                 entry.restore_ha_replay != descriptor.restore_ha_replay or
@@ -3128,6 +3178,8 @@ pub const ProvisionedKernelOwnerSource = struct {
         errdefer self.alloc.free(owned_indexes_json);
         const owned_restore_bootstrap_json = try self.alloc.dupe(u8, descriptor.restore_bootstrap_json);
         errdefer self.alloc.free(owned_restore_bootstrap_json);
+        const owned_initial_child_bootstrap_json = try self.alloc.dupe(u8, descriptor.initial_child_bootstrap_json);
+        errdefer self.alloc.free(owned_initial_child_bootstrap_json);
         const owned_initial_range = try descriptor_contract.cloneInitialRange(self.alloc, descriptor.initial_range);
         errdefer descriptor_contract.freeInitialRange(self.alloc, owned_initial_range);
         var owned_restore = if (descriptor.restore) |identity| try identity.clone(self.alloc) else null;
@@ -3154,9 +3206,12 @@ pub const ProvisionedKernelOwnerSource = struct {
             .schema_json = .fromSlice(descriptor.schema_json),
             .indexes_json = .fromSlice(descriptor.indexes_json),
             .restore_bootstrap_json = .fromSlice(descriptor.restore_bootstrap_json),
+            .initial_child_bootstrap_json = .fromSlice(descriptor.initial_child_bootstrap_json),
             .restore_cancel_recovery = @intFromBool(descriptor.restore_cancel_recovery),
             .restore_ha_replay = @intFromBool(descriptor.restore_ha_replay),
             .online_source_authority = @intFromEnum(self.online_source_authority),
+            .row_policy_authority_secret = .fromSlice(self.row_policy_authority_secret orelse ""),
+            .row_policy_authority_issuer = .fromSlice(self.row_policy_authority_issuer orelse ""),
             .dense_embedding_storage = if (descriptor.table_storage) |settings| switch (settings.dense_embeddings) {
                 .primary_lsm => .primary_lsm,
                 .vector_store => .vector_store,
@@ -3195,6 +3250,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .schema_json = owned_schema_json,
             .indexes_json = owned_indexes_json,
             .restore_bootstrap_json = owned_restore_bootstrap_json,
+            .initial_child_bootstrap_json = owned_initial_child_bootstrap_json,
             .initial_range = owned_initial_range,
             .restore_cancel_recovery = descriptor.restore_cancel_recovery,
             .restore_ha_replay = descriptor.restore_ha_replay,
@@ -3454,7 +3510,112 @@ pub const ProvisionedKernelOwnerSource = struct {
             retained.* = .{ .alloc = alloc, .lease = owner, .view = view };
             return .{ .ptr = retained, .vtable = &.{ .next = RetainedRelationalRead.next, .close = RetainedRelationalRead.close, .normalize = RetainedRelationalRead.normalize, .range_proofs = RetainedRelationalRead.rangeProofs } };
         }
+
+        fn captureSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator) !@import("../storage/statement_read_fence.zig").Snapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const frozen_proof = self.frozen_proof orelse return error.SqlStatementSnapshotRequired;
+            try validate(self);
+            const native = try self.native.captureSnapshot(alloc);
+            errdefer native.deinit();
+            try validate(self);
+            var owner = self.owner.cloneRead();
+            errdefer owner.deinit();
+            const name = try alloc.dupe(u8, self.table);
+            errdefer alloc.free(name);
+            // The short capture's cancellation/deadline borrows die when the
+            // mutation fence is released. The immutable snapshot retains only
+            // owner identity; each delayed cursor brings its own controls.
+            var retained_route = self.route;
+            retained_route.admission_cancellation = .none;
+            retained_route.admission_deadline_ns = null;
+            retained_route.admission_deadline_io = null;
+            const snapshot = try alloc.create(RoutedStatementSnapshot);
+            snapshot.* = .{ .alloc = alloc, .source = self.source, .owner = owner, .native = native, .route = retained_route, .group = self.group, .table = name, .cancellation = null, .deadline_ns = null, .frozen_proof = frozen_proof };
+            return .{ .ptr = snapshot, .vtable = &.{ .open = RoutedStatementSnapshot.openNative, .release = RoutedStatementSnapshot.close } };
+        }
     };
+
+    const RoutedStatementSnapshot = struct {
+        alloc: std.mem.Allocator,
+        source: *ProvisionedKernelOwnerSource,
+        owner: Lease,
+        native: @import("../storage/statement_read_fence.zig").Snapshot,
+        route: metadata_api.CatalogRouteFence,
+        group: u64,
+        table: []u8,
+        cancellation: ?@import("../common/cancellation.zig").CancellationToken,
+        deadline_ns: ?u64,
+        frozen_proof: read_gate.ReadSafetyBarrier.FrozenProof,
+
+        fn check(self: *@This()) !void {
+            if (self.cancellation) |token| try token.check();
+            if (self.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+            try self.source.validateRoutedRead(self.alloc, self.route, self.group, self.table);
+            const validate = self.source.read_safety_barrier.vtable.validate_frozen orelse return error.SqlStatementSnapshotRequired;
+            try validate(self.source.read_safety_barrier.ptr, self.group, self.frozen_proof, self.deadline_ns, self.cancellation orelse .none);
+        }
+        fn open(ptr: *anyopaque, alloc: std.mem.Allocator, input: table_read_source.RelationalStatementScan) !table_read_source.RelationalReadView {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.check();
+            if (!std.mem.eql(u8, input.table, self.table)) return error.SqlStatementSnapshotRequired;
+            if (!input.opts.include_range_proofs) return error.SqlRangeTrackingRequired;
+            var opts = input.opts;
+            if (self.cancellation) |token| opts.cancellation = token;
+            if (self.deadline_ns) |deadline| opts.execution_deadline_ns = if (opts.execution_deadline_ns) |prior| @min(prior, deadline) else deadline;
+            var lease = self.owner.cloneRead();
+            errdefer lease.deinit();
+            const view = try self.native.open(alloc, input.from, input.to, opts);
+            errdefer view.deinit();
+            try self.check();
+            const retained = try alloc.create(RetainedRelationalRead);
+            retained.* = .{ .alloc = alloc, .lease = lease, .view = view };
+            return .{ .ptr = retained, .vtable = &.{ .next = RetainedRelationalRead.next, .close = RetainedRelationalRead.close, .normalize = RetainedRelationalRead.normalize, .range_proofs = RetainedRelationalRead.rangeProofs } };
+        }
+        fn openNative(ptr: *anyopaque, alloc: std.mem.Allocator, from: []const u8, to: []const u8, opts: db_types.ScanOptions) !table_read_source.RelationalReadView {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return open(ptr, alloc, .{ .table = self.table, .from = from, .to = to, .opts = opts });
+        }
+        fn openGuarded(ptr: *anyopaque, alloc: std.mem.Allocator, input: table_read_source.RelationalStatementScan) !table_read_source.RelationalStatementSnapshot.GuardedRead {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const view = try open(ptr, alloc, input);
+            errdefer view.deinit();
+            const proofs = try view.rangeProofs(alloc);
+            errdefer alloc.free(proofs);
+            if (proofs.len == 0) return error.SqlRangeTrackingRequired;
+            const owners = try alloc.alloc(@import("range_read_guards.zig").OwnerRangeProof, 1);
+            owners[0] = .{ .fence = self.route, .proofs = proofs };
+            return .{ .view = view, .owner_proofs = owners };
+        }
+        fn close(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.native.deinit();
+            self.owner.deinit();
+            self.alloc.free(self.table);
+            self.alloc.destroy(self);
+        }
+    };
+
+    fn openStatementSnapshotRouted(ptr: *anyopaque, alloc: std.mem.Allocator, route: metadata_api.CatalogRouteFence, group: u64, table: []const u8, consistency: read_gate.ReadConsistency, cancellation: ?@import("../common/cancellation.zig").CancellationToken, deadline_ns: ?u64) !table_read_source.RelationalStatementSnapshot {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        var scoped = route;
+        if (cancellation) |token| scoped.admission_cancellation = token;
+        if (deadline_ns) |deadline| scoped.admission_deadline_ns = if (scoped.admission_deadline_ns) |prior| @min(prior, deadline) else deadline;
+        const opts: db_types.ScanOptions = .{ .cancellation = cancellation, .execution_deadline_ns = scoped.admission_deadline_ns };
+        const fence = (try tryStatementReadFenceRouted(ptr, alloc, scoped, group, table, opts, consistency)) orelse return error.Backpressured;
+        defer fence.deinit();
+        const held: *RetainedStatementFence = @ptrCast(@alignCast(fence.ptr));
+        const frozen_proof = held.frozen_proof orelse return error.SqlStatementSnapshotRequired;
+        const native = try held.native.captureSnapshot(alloc);
+        errdefer native.deinit();
+        try RetainedStatementFence.validate(held);
+        var owner = held.owner.cloneRead();
+        errdefer owner.deinit();
+        const name = try alloc.dupe(u8, table);
+        errdefer alloc.free(name);
+        const snapshot = try alloc.create(RoutedStatementSnapshot);
+        snapshot.* = .{ .alloc = alloc, .source = self, .owner = owner, .native = native, .route = scoped, .group = group, .table = name, .cancellation = cancellation, .deadline_ns = scoped.admission_deadline_ns, .frozen_proof = frozen_proof };
+        return .{ .ptr = snapshot, .vtable = &.{ .open = RoutedStatementSnapshot.open, .open_guarded = RoutedStatementSnapshot.openGuarded, .close = RoutedStatementSnapshot.close } };
+    }
 
     fn tryStatementReadFenceRouted(ptr: *anyopaque, alloc: std.mem.Allocator, route: metadata_api.CatalogRouteFence, group: u64, table: []const u8, opts: db_types.ScanOptions, consistency: read_gate.ReadConsistency) !?table_read_source.StatementReadFence {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
@@ -3475,7 +3636,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (self.read_safety_barrier.vtable.capture_frozen) |capture_proof|
             retained.frozen_proof = try capture_proof(self.read_safety_barrier.ptr, group);
         try RetainedStatementFence.validateLocal(retained);
-        return .{ .ptr = retained, .vtable = &.{ .validate = RetainedStatementFence.validate, .open = RetainedStatementFence.open, .release = RetainedStatementFence.release } };
+        return .{ .ptr = retained, .vtable = &.{ .validate = RetainedStatementFence.validate, .open = RetainedStatementFence.open, .capture_snapshot = RetainedStatementFence.captureSnapshot, .release = RetainedStatementFence.release } };
     }
 
     fn prepareRetainedScanRead(self: *ProvisionedKernelOwnerSource, group: u64, from: []const u8, to: []const u8, opts: db_types.ScanOptions, consistency: read_gate.ReadConsistency) !void {
@@ -3688,7 +3849,11 @@ pub const ProvisionedKernelOwnerSource = struct {
         try self.prepareLookupRead(group_id, key, opts, consistency);
         const request_json = try table_reads.encodeStorageKernelLookupRequest(alloc, key, opts);
         defer alloc.free(request_json);
-        var lease = try self.acquire(group_id, table_name);
+        var lease = if (std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"initial_child_preflight\"}") or
+            std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"initial_child_publication\"}"))
+            try self.acquirePreparedOwner(group_id, table_name)
+        else
+            try self.acquire(group_id, table_name);
         defer lease.deinit();
         var response = lease.owner().lookupJson(table_name, request_json) catch |err| switch (err) {
             error.NotFound => return null,

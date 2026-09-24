@@ -1751,20 +1751,31 @@ pub fn applySchemaUpdateRecord(
     table: *const metadata_table_manager.TableRecord,
     schema_json: []const u8,
 ) !metadata_table_manager.TableRecord {
-    return applySchemaRecord(alloc, table, schema_json, false);
+    return applySchemaRecord(alloc, table, schema_json, false, false);
 }
 
 /// Only the fresh-generation rewrite reservation may use this constructor.
 /// It does not publish the schema or permit changing existing stored rows.
 pub fn prepareSchemaRewriteRecord(alloc: std.mem.Allocator, table: *const metadata_table_manager.TableRecord, schema_json: []const u8) !metadata_table_manager.TableRecord {
-    return applySchemaRecord(alloc, table, schema_json, true);
+    return applySchemaRecord(alloc, table, schema_json, true, false);
 }
 
-fn applySchemaRecord(alloc: std.mem.Allocator, table: *const metadata_table_manager.TableRecord, schema_json: []const u8, rewrite: bool) !metadata_table_manager.TableRecord {
+/// Construct the immutable candidate for a coordinated FK generation plan.
+/// This does not publish the table: metadata's dedicated fenced state machine
+/// is the only consumer allowed to commit the returned record.
+pub fn prepareForeignKeyPublicationRecord(alloc: std.mem.Allocator, table: *const metadata_table_manager.TableRecord, schema_json: []const u8) !metadata_table_manager.TableRecord {
+    return applySchemaRecord(alloc, table, schema_json, false, true);
+}
+
+fn applySchemaRecord(alloc: std.mem.Allocator, table: *const metadata_table_manager.TableRecord, schema_json: []const u8, rewrite: bool, fk_publication: bool) !metadata_table_manager.TableRecord {
     try @import("../schema/relational_index_namespace.zig").validate(alloc, schema_json, table.indexes_json);
     const current_version = try schemaVersion(table.schema_json);
     const schema_changed = !try schemasSemanticallyEqual(alloc, table.schema_json, schema_json);
-    if (schema_changed and !rewrite) try @import("../schema/relational_expression.zig").validateSchemaUpdate(alloc, table.schema_json, schema_json);
+    if (schema_changed and !rewrite) {
+        try @import("../schema/relational_expression.zig").validateSchemaUpdate(alloc, table.schema_json, schema_json);
+        if (!fk_publication and !try foreignKeyDefinitionsUnchanged(alloc, table.schema_json, schema_json))
+            return error.ForeignKeyGenerationPublicationRequired;
+    }
     const next_version = if (schema_changed)
         std.math.add(u32, current_version, 1) catch return error.SchemaVersionExhausted
     else
@@ -1807,6 +1818,70 @@ fn applySchemaRecord(alloc: std.mem.Allocator, table: *const metadata_table_mana
     alloc.free(updated.indexes_json);
     updated.indexes_json = next_indexes_json;
     return updated;
+}
+
+/// A regular schema update cannot publish a new child FK identity before its
+/// parent owners have durably accepted that generation. Compare the same
+/// canonical fingerprints as the owner catalog, so JSON spelling/order and
+/// unrelated layout changes do not turn a safe update into a false conflict.
+pub fn foreignKeyDefinitionsUnchanged(alloc: std.mem.Allocator, previous_json: []const u8, next_json: []const u8) !bool {
+    const schema_api = @import("../schema/mod.zig");
+    const native = @import("../storage/schema.zig");
+    const declarations = @import("../schema/relational_declarations.zig");
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var previous = try schema_api.parseValidatedTableSchema(a, if (previous_json.len == 0) "{}" else previous_json);
+    defer previous.deinit(a);
+    var next = try schema_api.parseValidatedTableSchema(a, if (next_json.len == 0) "{}" else next_json);
+    defer next.deinit(a);
+    const previous_fk_count = if (previous.foreign_keys) |list| list.value.len else 0;
+    const next_fk_count = if (next.foreign_keys) |list| list.value.len else 0;
+    if (previous_fk_count == 0 and next_fk_count == 0) return true;
+    const previous_runtime = try schema_api.deriveRuntimeTableSchema(a, previous);
+    defer native.freeSchema(a, previous_runtime);
+    const next_runtime = try schema_api.deriveRuntimeTableSchema(a, next);
+    defer native.freeSchema(a, next_runtime);
+    const prior = try declarations.definitionFingerprints(a, previous, previous_runtime);
+    defer declarations.freeDefinitions(a, prior);
+    const candidate = try declarations.definitionFingerprints(a, next, next_runtime);
+    defer declarations.freeDefinitions(a, candidate);
+    var prior_count: usize = 0;
+    var next_count: usize = 0;
+    for (prior) |definition| {
+        if (definition.kind != .foreign_key) continue;
+        prior_count += 1;
+        const matching = for (candidate) |other| {
+            if (other.kind == .foreign_key and std.mem.eql(u8, definition.name, other.name)) break other;
+        } else return false;
+        if (!std.mem.eql(u8, &definition.fingerprint, &matching.fingerprint)) return false;
+    }
+    for (candidate) |definition| if (definition.kind == .foreign_key) {
+        next_count += 1;
+    };
+    return prior_count == next_count;
+}
+
+test "ordinary schema update rejects unacknowledged FK generation but permits unrelated columns" {
+    const alloc = std.testing.allocator;
+    const previous =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"fk","child_columns":["id"],"parent_table":"parents","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const changed_fk =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"fk","child_columns":["id"],"parent_table":"parents","parent_columns":["id"],"on_delete":"cascade"}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const added_column =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"fk","child_columns":["id"],"parent_table":"parents","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"note":{"type":"string"}},"additionalProperties":false}}}}
+    ;
+    const table: metadata_table_manager.TableRecord = .{ .table_id = 11, .name = "children", .schema_json = previous };
+    try std.testing.expectError(error.ForeignKeyGenerationPublicationRequired, applySchemaUpdateRecord(alloc, &table, changed_fk));
+    const candidate = try prepareForeignKeyPublicationRecord(alloc, &table, changed_fk);
+    defer metadata_table_manager.freeTable(alloc, candidate);
+    try std.testing.expectEqual(@as(u32, 2), try schemaVersion(candidate.schema_json));
+    try std.testing.expect(std.mem.indexOf(u8, candidate.schema_json, "cascade") != null);
+    const updated = try applySchemaUpdateRecord(alloc, &table, added_column);
+    defer metadata_table_manager.freeTable(alloc, updated);
+    try std.testing.expectEqual(@as(u32, 2), try schemaVersion(updated.schema_json));
 }
 
 fn validateRuntimeDerivableSchemaJson(alloc: std.mem.Allocator, schema_json: []const u8) !void {

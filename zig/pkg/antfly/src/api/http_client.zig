@@ -769,6 +769,106 @@ pub const ApiHttpClient = struct {
         return parsed.value;
     }
 
+    pub fn fetchRestoreParentActivation(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("restore_parent_activation.zig").Request, input_context: @import("operation.zig").RequestContext) !@import("restore_parent_activation.zig").Response {
+        const context = try input_context.platformDeadline();
+        try context.ensureActive();
+        try request.validate(group_id);
+        const encoded_name = try percentEncodePathComponent(self.alloc, table_name);
+        defer self.alloc.free(encoded_name);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}{s}", .{ routes.Routes.internal_groups_prefix, group_id, routes.Routes.tables_prefix, encoded_name, routes.Routes.restore_parent_activation_suffix });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+        const body = try std.json.Stringify.valueAlloc(self.alloc, request, .{});
+        defer self.alloc.free(body);
+        if (body.len > 4096) return error.InvalidRestoreStaging;
+        const control: backup_contract.BackupOperationControl = .{ .deadline_ns = context.deadline_ns orelse (platform_time.monotonicNs() + 30 * std.time.ns_per_s), .cancellation = context.cancellation };
+        var cancellation = http_common.RequestCancellation{ .borrowed_context = context.cancellation.ptr, .borrowed_is_cancelled = context.cancellation.is_cancelled_fn };
+        var response = try self.executeRequest(.{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = try control.remainingTimeoutMs(), .cancellation = &cancellation });
+        defer response.deinit(self.alloc);
+        switch (response.status) {
+            200 => {},
+            400, 409 => return error.RestoreStagingScopeChanged,
+            408, 504 => return error.Timeout,
+            404, 503 => return error.RestoreValidationPending,
+            else => return error.UnexpectedHttpStatus,
+        }
+        const parsed = try std.json.parseFromSlice(@import("restore_parent_activation.zig").Response, self.alloc, response.body, .{});
+        defer parsed.deinit();
+        return parsed.value;
+    }
+
+    fn fetchFkGenerationControl(self: *ApiHttpClient, comptime Response: type, suffix: []const u8, base_uri: []const u8, group_id: u64, table_name: []const u8, request: anytype, input_context: @import("operation.zig").RequestContext) !Response {
+        const context = try input_context.platformDeadline();
+        try context.ensureActive();
+        try request.validate(group_id);
+        const encoded_name = try percentEncodePathComponent(self.alloc, table_name);
+        defer self.alloc.free(encoded_name);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}{s}", .{ routes.Routes.internal_groups_prefix, group_id, routes.Routes.tables_prefix, encoded_name, suffix });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+        const body = try std.json.Stringify.valueAlloc(self.alloc, request, .{});
+        defer self.alloc.free(body);
+        if (body.len > 4096) return error.InvalidGenerationPublication;
+        const control: backup_contract.BackupOperationControl = .{ .deadline_ns = context.deadline_ns orelse (platform_time.monotonicNs() + 30 * std.time.ns_per_s), .cancellation = context.cancellation };
+        var cancellation = http_common.RequestCancellation{ .borrowed_context = context.cancellation.ptr, .borrowed_is_cancelled = context.cancellation.is_cancelled_fn };
+        var response = try self.executeRequest(.{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = try control.remainingTimeoutMs(), .cancellation = &cancellation });
+        defer response.deinit(self.alloc);
+        switch (response.status) {
+            200 => {},
+            400, 409 => return error.GenerationAdmissionChanged,
+            408, 504 => return error.Timeout,
+            404, 503 => return error.GenerationAdmissionPending,
+            else => return error.UnexpectedHttpStatus,
+        }
+        const parsed = try std.json.parseFromSlice(Response, self.alloc, response.body, .{});
+        defer parsed.deinit();
+        try parsed.value.validate(request);
+        return parsed.value;
+    }
+
+    pub fn fetchFkGenerationParent(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("relational_fk_generation_publication.zig").Request, context: @import("operation.zig").RequestContext) !@import("relational_fk_generation_publication.zig").Receipt {
+        return self.fetchFkGenerationControl(@import("relational_fk_generation_publication.zig").Receipt, routes.Routes.fk_generation_parent_suffix, base_uri, group_id, table_name, request, context);
+    }
+
+    pub fn fetchFkGenerationSource(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("relational_fk_generation_publication.zig").SourceRequest, context: @import("operation.zig").RequestContext) !@import("relational_fk_generation_publication.zig").SourceReceipt {
+        return self.fetchFkGenerationControl(@import("relational_fk_generation_publication.zig").SourceReceipt, routes.Routes.fk_generation_source_suffix, base_uri, group_id, table_name, request, context);
+    }
+
+    pub fn fetchFkInitialChild(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("relational_fk_generation_publication.zig").InitialChildRequest, context: @import("operation.zig").RequestContext) !@import("relational_fk_generation_publication.zig").InitialChildReceipt {
+        return self.fetchFkGenerationControl(@import("relational_fk_generation_publication.zig").InitialChildReceipt, routes.Routes.fk_initial_child_suffix, base_uri, group_id, table_name, request, context);
+    }
+
+    pub fn fetchRowPolicyInstall(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("row_policy_install.zig").Request, input_context: @import("operation.zig").RequestContext) !@import("row_policy_install.zig").Response {
+        const context = try input_context.platformDeadline();
+        try context.ensureActive();
+        try @import("row_policy_install.zig").validate(request, group_id);
+        const encoded_name = try percentEncodePathComponent(self.alloc, table_name);
+        defer self.alloc.free(encoded_name);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}{s}", .{ routes.Routes.internal_groups_prefix, group_id, routes.Routes.tables_prefix, encoded_name, routes.Routes.row_policy_install_suffix });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+        const body = try std.json.Stringify.valueAlloc(self.alloc, request, .{});
+        defer self.alloc.free(body);
+        if (body.len > 4096) return error.InvalidRowPolicyPublication;
+        const control: backup_contract.BackupOperationControl = .{ .deadline_ns = context.deadline_ns orelse (platform_time.monotonicNs() + 30 * std.time.ns_per_s), .cancellation = context.cancellation };
+        var cancellation = http_common.RequestCancellation{ .borrowed_context = context.cancellation.ptr, .borrowed_is_cancelled = context.cancellation.is_cancelled_fn };
+        var response = try self.executeRequest(.{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = try control.remainingTimeoutMs(), .cancellation = &cancellation });
+        defer response.deinit(self.alloc);
+        switch (response.status) {
+            200 => {},
+            400, 409 => return error.RowPolicyCatalogChanged,
+            408, 504 => return error.Timeout,
+            404, 503 => return error.RowPolicyInstallationPending,
+            else => return error.UnexpectedHttpStatus,
+        }
+        const parsed = try std.json.parseFromSlice(@import("row_policy_install.zig").Response, self.alloc, response.body, .{});
+        defer parsed.deinit();
+        return parsed.value;
+    }
+
     pub fn fetchBackupShardCohort(
         self: *ApiHttpClient,
         base_uri: []const u8,

@@ -12,6 +12,144 @@ const metadata = @import("../metadata/table_manager.zig");
 const stages = @import("../metadata/restore_staging.zig");
 const jobs = @import("restore_jobs.zig");
 const operation = @import("operation.zig");
+const integrity_catalog = @import("../storage/db/relational_integrity_catalog.zig");
+
+/// Predict the fresh child identities with the exact owner compiler, before
+/// the hidden generation exists. This is not a hash of a policy name: the
+/// generation allocation order, typed declaration fingerprint, and table
+/// incarnation must match the owner-side catalog byte-for-byte.
+fn plannedIntegrityCatalog(alloc: std.mem.Allocator, table_id: u64, schema_json: []const u8) !integrity_catalog.Update {
+    const schema_api = @import("../schema/mod.zig");
+    const native_schema = @import("../storage/schema.zig");
+    const declarations = @import("../schema/relational_declarations.zig");
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    if (parsed.storage_mode != .relational) return error.RelationalTableRequired;
+    const runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer native_schema.freeSchema(alloc, runtime);
+    const bytes = try native_schema.serializeSchema(alloc, runtime);
+    defer alloc.free(bytes);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(bytes, &digest, .{});
+    const definitions = try declarations.definitionFingerprints(alloc, parsed, runtime);
+    defer declarations.freeDefinitions(alloc, definitions);
+    return integrity_catalog.prepare(alloc, null, try integrity_catalog.incarnationFromTableId(table_id), runtime.version, digest, definitions);
+}
+
+fn currentIntegrityCatalog(alloc: std.mem.Allocator, source: @import("table_read_source.zig").TableReadSource, table: records.TableRecord) !integrity_catalog.Catalog {
+    var response = (try source.integrityCatalog(alloc, table.name)) orelse return error.IntegrityCatalogUnavailable;
+    defer response.deinit(alloc);
+    const Envelope = struct { catalog: []const u8, schema_version: u32, table_id: []const u8 };
+    var envelope = try std.json.parseFromSlice(Envelope, alloc, response.json, .{});
+    defer envelope.deinit();
+    if ((std.fmt.parseInt(u64, envelope.value.table_id, 10) catch return error.InvalidIntegrityCatalog) != table.table_id) return error.CatalogGenerationChanged;
+    const length = std.base64.standard.Decoder.calcSizeForSlice(envelope.value.catalog) catch return error.InvalidIntegrityCatalog;
+    if (length > integrity_catalog.max_catalog_bytes) return error.InvalidIntegrityCatalog;
+    const bytes = try alloc.alloc(u8, length);
+    defer alloc.free(bytes);
+    std.base64.standard.Decoder.decode(bytes, envelope.value.catalog) catch return error.InvalidIntegrityCatalog;
+    var loaded_catalog = try integrity_catalog.decode(alloc, bytes);
+    errdefer loaded_catalog.deinit();
+    if (loaded_catalog.schema_version != envelope.value.schema_version or
+        !std.mem.eql(u8, &loaded_catalog.incarnation, &(try integrity_catalog.incarnationFromTableId(table.table_id)))) return error.CatalogGenerationChanged;
+    var expected = try plannedIntegrityCatalog(alloc, table.table_id, @import("tables.zig").effectiveSchemaJson(table.schema_json));
+    defer expected.deinit();
+    if (loaded_catalog.schema_version != expected.catalog.schema_version or !std.mem.eql(u8, &loaded_catalog.schema_digest, &expected.catalog.schema_digest)) return error.CatalogGenerationChanged;
+    for (expected.catalog.bindings) |binding| {
+        const actual = loaded_catalog.find(binding.definition.kind, binding.definition.name) orelse return error.CatalogGenerationChanged;
+        if (!std.mem.eql(u8, &actual.definition.fingerprint, &binding.definition.fingerprint)) return error.CatalogGenerationChanged;
+    }
+    return loaded_catalog;
+}
+
+const ExternalForeign = std.meta.Child(@FieldType(stages.ExternalFkParent, "foreign_keys"));
+const ExternalParentDraft = struct {
+    table: records.TableRecord,
+    foreign_keys: std.ArrayList(ExternalForeign) = .empty,
+};
+
+fn buildExternalParents(
+    server: *server_mod.ApiHttpServer,
+    identity: ?server_mod.AuthenticatedIdentity,
+    context: operation.RequestContext,
+    alloc: std.mem.Allocator,
+    snapshot: @import("../metadata/api.zig").AdminSnapshot,
+    selected: []const records.TableRecord,
+    planned: []const stages.Target,
+    id: stages.Id,
+) ![]stages.ExternalFkParent {
+    const reads = server.table_reads orelse return error.UnsupportedSqlExecution;
+    var drafts: std.ArrayList(ExternalParentDraft) = .empty;
+    for (selected, planned) |child, replacement| {
+        var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, @import("tables.zig").effectiveSchemaJson(child.schema_json));
+        defer parsed.deinit(alloc);
+        if (parsed.storage_mode != .relational) continue;
+        const definitions = try parsed.relationalForeignKeyDefinitions(alloc);
+        if (definitions.len == 0) continue;
+        const has_external = for (definitions) |fk| {
+            const parent_selected = for (selected) |other| {
+                if (std.mem.eql(u8, other.name, fk.parent_table)) break true;
+            } else false;
+            if (!parent_selected) break true;
+        } else false;
+        if (!has_external) continue;
+        var old_catalog = try currentIntegrityCatalog(alloc, reads, child);
+        defer old_catalog.deinit();
+        var new_catalog = try plannedIntegrityCatalog(alloc, replacement.table.table_id, replacement.table.schema_json);
+        defer new_catalog.deinit();
+        for (definitions) |fk| {
+            var parent_selected = false;
+            for (selected) |other| if (std.mem.eql(u8, other.name, fk.parent_table)) {
+                parent_selected = true;
+                break;
+            };
+            if (parent_selected) continue;
+            const parent = for (snapshot.tables) |candidate| {
+                if (std.mem.eql(u8, candidate.name, fk.parent_table)) break candidate;
+            } else return error.ForeignKeyParentTableNotFound;
+            if (parent.storage_migration != null or parent.relational_retirement_json.len != 0 or parent.restore_backup_id.len != 0) return error.TableTransitionActive;
+            const before = old_catalog.find(.foreign_key, fk.name) orelse return error.CatalogGenerationChanged;
+            const after = new_catalog.catalog.find(.foreign_key, fk.name) orelse return error.CatalogGenerationChanged;
+            var draft: ?*ExternalParentDraft = null;
+            for (drafts.items) |*existing| if (existing.table.table_id == parent.table_id) {
+                draft = existing;
+                break;
+            };
+            if (draft == null) {
+                if (drafts.items.len >= 128) return error.SqlProgramLimitExceeded;
+                try drafts.append(alloc, .{ .table = parent });
+                draft = &drafts.items[drafts.items.len - 1];
+            }
+            if (draft.?.foreign_keys.items.len >= 128) return error.SqlProgramLimitExceeded;
+            try draft.?.foreign_keys.append(alloc, .{ .child_table_id = child.table_id, .child_table_name = child.name, .constraint_name = try alloc.dupe(u8, fk.name), .generation = before.generation, .next_generation = after.generation });
+        }
+    }
+    const results = try alloc.alloc(stages.ExternalFkParent, drafts.items.len);
+    var total_ranges: usize = 0;
+    for (drafts.items, results) |draft, *result| {
+        const names = try server.logicalTableNamesInArena(alloc, context, &.{draft.table.name});
+        if (names.len != 1 or !try server_mod.tablePermissionCurrentlyAllowed(identity, names[0], .admin) or
+            try server_mod.resolveEffectiveRowFilterJson(alloc, identity, names[0]) != null) return error.Forbidden;
+        var ranges_list: std.ArrayList(records.RangeRecord) = .empty;
+        for (snapshot.ranges) |range| if (range.table_id == draft.table.table_id) try ranges_list.append(alloc, range);
+        total_ranges += ranges_list.items.len;
+        if (ranges_list.items.len == 0 or total_ranges > 4096) return error.SqlProgramLimitExceeded;
+        metadata.sortKeyspaceRanges(records.RangeRecord, ranges_list.items);
+        const ranges = try ranges_list.toOwnedSlice(alloc);
+        const fences = try alloc.alloc(@import("../storage/db/relational_integrity_topology_contract.zig").Fence, ranges.len);
+        for (ranges, fences) |range, *fence| {
+            try context.ensureActive();
+            var response = (try reads.lookup(alloc, draft.table.name, range.start_key, .{ .relational_topology_json = "{\"mode\":\"identity\"}", .execution_deadline_ns = (try context.platformDeadline()).deadline_ns, .cancellation = context.cancellation }, .read_index)) orelse return error.TableNotFound;
+            defer response.deinit(alloc);
+            const Native = struct { namespace: @import("../storage/db/doc_identity.zig").Namespace, catalog_digest: [32]u8, next_epoch: u64 };
+            const native = try std.json.parseFromSliceLeaky(Native, alloc, response.json, .{ .ignore_unknown_fields = true });
+            if (native.namespace.table_id != draft.table.table_id or native.namespace.shard_id != metadata.rangeDocIdentityShardId(range) or native.namespace.range_id != metadata.rangeDocIdentityRangeId(range)) return error.TableGenerationChanged;
+            fence.* = .{ .transition_id = std.mem.readInt(u64, id[0..8], .little), .attempt = 1, .admission_epoch = native.next_epoch, .owner_group_id = range.group_id, .peer_group_id = range.group_id, .role = .truncate_parent, .namespace = native.namespace, .catalog_digest = native.catalog_digest };
+        }
+        result.* = .{ .table = draft.table, .ranges = ranges, .fences = fences, .foreign_keys = draft.foreign_keys.items };
+    }
+    return results;
+}
 
 test {
     _ = @import("sql_truncate_test.zig");
@@ -20,6 +158,10 @@ test {
 /// Dependency adjacency is built once; closure is O(tables + FK edges).
 /// CASCADE follows incoming references only, never silently empties parents.
 pub fn select(alloc: std.mem.Allocator, tables: []const records.TableRecord, requested: []const []const u8, cascade: bool) ![]records.TableRecord {
+    return selectInternal(alloc, tables, requested, cascade, false);
+}
+
+fn selectInternal(alloc: std.mem.Allocator, tables: []const records.TableRecord, requested: []const []const u8, cascade: bool, allow_external_parents: bool) ![]records.TableRecord {
     var names: std.StringHashMapUnmanaged(usize) = .empty;
     for (tables, 0..) |table, i| try names.put(alloc, table.name, i);
     const included = try alloc.alloc(bool, tables.len);
@@ -62,7 +204,7 @@ pub fn select(alloc: std.mem.Allocator, tables: []const records.TableRecord, req
     // Until old-child inverse witness generations can be retired on untouched
     // parents, reject this boundary before admission. Never delete a parent
     // merely to make a cohort complete.
-    for (edges.items) |edge| if (included[edge.child] and !included[edge.parent]) return error.SqlTruncateExternalForeignKey;
+    if (!allow_external_parents) for (edges.items) |edge| if (included[edge.child] and !included[edge.parent]) return error.SqlTruncateExternalForeignKey;
     const result = try alloc.alloc(records.TableRecord, queue.items.len);
     for (queue.items, result) |index, *table| {
         table.* = tables[index];
@@ -82,6 +224,22 @@ pub fn select(alloc: std.mem.Allocator, tables: []const records.TableRecord, req
         }
     }.less);
     return result;
+}
+
+test "SQL TRUNCATE planned child FK generation is table-incarnation bound" {
+    const alloc = std.testing.allocator;
+    const child =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"fk","child_columns":["id"],"parent_table":"parents","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    var first = try plannedIntegrityCatalog(alloc, 700, child);
+    defer first.deinit();
+    var replay = try plannedIntegrityCatalog(alloc, 700, child);
+    defer replay.deinit();
+    var replacement = try plannedIntegrityCatalog(alloc, 701, child);
+    defer replacement.deinit();
+    const first_generation = first.catalog.find(.foreign_key, "fk").?.generation;
+    try std.testing.expectEqualDeep(first_generation, replay.catalog.find(.foreign_key, "fk").?.generation);
+    try std.testing.expect(!std.mem.eql(u8, &first_generation, &replacement.catalog.find(.foreign_key, "fk").?.generation));
 }
 
 fn generation(id: stages.Id, original: u64, ordinal: u64, label: []const u8) u64 {
@@ -157,6 +315,9 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
             if (std.mem.eql(u8, bound.name, table.name) and bound.table_id == table.table_id) break;
         } else return error.CatalogGenerationChanged;
     }
+    // Parent retirement is staged and ACKed for this TRUNCATE cohort, but
+    // the publication/release boundary is still guarded until the complete
+    // external-parent crash/replay and concurrent visibility proof passes.
     const selected = try select(a, snapshot.tables, requested, ddl.cascade);
     const names = try a.alloc([]const u8, selected.len);
     for (selected, names) |table, *name| {
@@ -204,9 +365,16 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
         binding.id = table.table_id;
         target.* = .{ .source_table_id = before.table_id, .table = table, .catalog_binding = binding, .ranges = ranges, .empty_generation = true, .replace = .{ .table = before, .ranges = old_ranges.items, .fences = fences } };
     }
+    const external_parents = try buildExternalParents(server, identity, context, a, snapshot, selected, planned, id);
+    if (external_parents.len != 0) {
+        const parent_names = try a.alloc([]const u8, external_parents.len);
+        for (external_parents, parent_names) |parent, *name| name.* = parent.table.name;
+        try server.requireEmptyGenerationAuthority(principal, parent_names);
+    }
     var digest: [32]u8 = undefined;
-    std.crypto.hash.Blake3.hash(try std.json.Stringify.valueAlloc(a, planned, .{}), &digest, .{});
-    const plan: stages.Plan = .{ .id = id, .cohort_digest = digest, .targets = planned };
+    const cohort_manifest = try std.json.Stringify.valueAlloc(a, .{ .targets = planned, .external_fk_parents = external_parents }, .{});
+    std.crypto.hash.Blake3.hash(cohort_manifest, &digest, .{});
+    const plan: stages.Plan = .{ .id = id, .cohort_digest = digest, .targets = planned, .external_fk_parents = external_parents };
     try plan.validate(a);
     const primary_target = for (planned) |target| {
         if (target.source_table_id == resolved.tables[0].?.table_id) break target.table;
@@ -246,6 +414,9 @@ test "SQL TRUNCATE closure follows incoming FKs without emptying an untouched pa
     };
     try std.testing.expectError(error.SqlTruncateReferenced, select(a, &tables, &.{"parents"}, false));
     try std.testing.expectError(error.SqlTruncateExternalForeignKey, select(a, &tables, &.{"children"}, true));
+    const staged_child = try selectInternal(a, &tables, &.{"children"}, true, true);
+    try std.testing.expectEqual(@as(usize, 1), staged_child.len);
+    try std.testing.expectEqualStrings("children", staged_child[0].name);
     const cascade = try select(a, &tables, &.{"parents"}, true);
     try std.testing.expectEqual(@as(usize, 2), cascade.len);
     try std.testing.expectEqualStrings("children", cascade[0].name);

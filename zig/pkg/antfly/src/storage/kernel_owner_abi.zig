@@ -18,7 +18,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 64;
+pub const abi_version: u32 = 67;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -1044,6 +1044,7 @@ pub const OpenRequest = extern struct {
     /// Exact private metadata-authorized hidden owner bootstrap. Never set by
     /// ordinary public catalog opens; durable scope is checked before adoption.
     restore_bootstrap_json: BorrowedBytes = .{},
+    initial_child_bootstrap_json: BorrowedBytes = .{},
     restore_cancel_recovery: u8 = 0,
     restore_ha_replay: u8 = 0,
     /// Immutable native ownership domain; not inferred from the first row or
@@ -1058,6 +1059,11 @@ pub const OpenRequest = extern struct {
     initial_range_end: BorrowedBytes = .{},
     initial_range_control: ControlledJsonOperationRequest = .{},
     restore: RestoreAdmission = .{},
+    /// Immutable owner-local verifier for authenticated, statement-scoped
+    /// row-policy principal proofs. Absent for Lite and legacy runtimes, which
+    /// must reject active-policy reads and writes rather than assume a role.
+    row_policy_authority_secret: BorrowedBytes = .{},
+    row_policy_authority_issuer: BorrowedBytes = .{},
 };
 
 pub const JsonOperationRequest = extern struct {

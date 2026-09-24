@@ -9,7 +9,7 @@ pub const Output = struct { command_tag: []const u8, mutation_outcome: ?catalog.
 
 pub fn accepts(statement: ast.Statement) bool {
     return switch (statement) {
-        .create_table, .drop_table, .catalog_ddl => true,
+        .create_table, .drop_table, .catalog_ddl, .policy_ddl => true,
         else => false,
     };
 }
@@ -21,12 +21,20 @@ pub fn execute(alloc: std.mem.Allocator, backend: catalog.Backend, statement: as
         .create_table => |create| .{ .create_table = .{ .name = create.table, .schema_json = try createSchemaAlloc(alloc, create), .if_not_exists = create.if_not_exists, .tablespace = create.tablespace } },
         .drop_table => |drop| .{ .drop_table = drop },
         .catalog_ddl => |ddl| .{ .catalog_ddl = ddl },
+        .policy_ddl => |ddl| .{ .policy_ddl = ddl },
         else => return error.UnsupportedSqlExecution,
     };
     const outcome = try dispatch(backend.ptr, alloc, request);
-    return .{ .command_tag = if (outcome.receipt != null and outcome.receipt.?.state != .ready) "DDL PENDING" else switch (request) {
+    return .{ .command_tag = if (outcome.mutation_outcome == .committed_pending or (outcome.receipt != null and outcome.receipt.?.state != .ready)) "DDL PENDING" else switch (request) {
         .create_table => "CREATE TABLE",
         .drop_table => "DROP TABLE",
+        .policy_ddl => |ddl| switch (ddl.action) {
+            .create => "CREATE POLICY",
+            .alter => "ALTER POLICY",
+            .drop => "DROP POLICY",
+            .enable => "ALTER TABLE ENABLE ROW LEVEL SECURITY",
+            .disable => "ALTER TABLE DISABLE ROW LEVEL SECURITY",
+        },
         .catalog_ddl => |ddl| switch (ddl.action) {
             .truncate => "TRUNCATE TABLE",
             .alter_schema => switch (ddl.schema_change orelse return error.InvalidSqlSyntax) {

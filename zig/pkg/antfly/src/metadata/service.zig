@@ -482,6 +482,18 @@ fn replaceTableDefinitionStampedWithReceipt(
         !std.mem.eql(u8, replacement.name, expected.name))
         return error.InvalidTableDefinitionReplacement;
     const store = service.projectedStore() orelse return error.MissingMetadataStore;
+    if (!std.mem.eql(u8, expected.schema_json, replacement.schema_json) or
+        !std.mem.eql(u8, expected.read_schema_json, replacement.read_schema_json) or
+        !std.mem.eql(u8, expected.indexes_json, replacement.indexes_json))
+    {
+        // Policy bytecode binds the typed-row layout. Reject uncoupled
+        // relational index/schema DDL before proposing a metadata mutation;
+        // apply repeats the guard at its authoritative table-record writer.
+        if (comptime @TypeOf(service.*) == MetadataService or @TypeOf(service.*) == MetadataHttpService) {
+            try service.ensureLinearizableRead();
+            try store.requirePolicyIndexMutationAllowed(service.metadata_group_id, expected.table_id);
+        }
+    }
     const baseline_fence = try store.getTableTransitionFence(
         service.metadata_group_id,
         expected.table_id,
@@ -2825,6 +2837,33 @@ pub fn transitionRequiresCoordinatedDecoder(command: metadata_storage.Transition
     };
 }
 
+fn preflightRowPolicyTopologyCommand(service: anytype, command: metadata_storage.TransitionCommand) !void {
+    const table_id: ?u64 = switch (command) {
+        .upsert_range => |range| range.table_id,
+        .admit_split_transition => |admission| admission.record.table_contract.table_id,
+        .upsert_split_transition => |record| record.table_contract.table_id,
+        .upsert_merge_transition => |record| record.table_contract.table_id,
+        .admit_online_merge => |admission| admission.next.scope.fence.namespace.table_id,
+        .compare_and_set_online_merge => |update| update.expected.scope.fence.namespace.table_id,
+        else => null,
+    };
+    if (table_id) |id| {
+        const store = service.projectedStore() orelse return error.MissingMetadataStore;
+        try store.requirePolicyTopologyMutationAllowed(service.metadata_group_id, id);
+    }
+    if (command == .remove_range or command == .complete_restore_range) {
+        const store = service.projectedStore() orelse return error.MissingMetadataStore;
+        const range_group_id = switch (command) {
+            .remove_range => |record| record.group_id,
+            .complete_restore_range => |record| record.group_id,
+            else => unreachable,
+        };
+        const range = try store.getRange(service.alloc, service.metadata_group_id, range_group_id);
+        defer if (range) |value| metadata_table_manager.freeRange(service.alloc, value);
+        if (range) |value| try store.requirePolicyTopologyMutationAllowed(service.metadata_group_id, value.table_id);
+    }
+}
+
 /// Call before acquiring a catalog lock. Remote membership probes belong at
 /// workflow admission; the final proposal path below only consumes a proof.
 pub fn ensureCoordinatedDecoderWithContext(service: anytype, command: metadata_storage.TransitionCommand, request: api_operation.RequestContext) !void {
@@ -2835,6 +2874,9 @@ pub fn ensureCoordinatedDecoderWithContext(service: anytype, command: metadata_s
 }
 
 fn prepareCoordinatedDecoderAdmission(service: anytype, commands: []const metadata_storage.TransitionCommand) !?TableTopologyProtocolReadiness {
+    if (comptime @TypeOf(service.*) == MetadataService or @TypeOf(service.*) == MetadataHttpService) {
+        for (commands) |command| try preflightRowPolicyTopologyCommand(service, command);
+    }
     for (commands) |command| if (transitionRequiresCoordinatedDecoder(command)) {
         if (comptime !@hasDecl(@TypeOf(service.*), "cachedCoordinatedDecoderReadiness"))
             return error.TableTopologyProtocolUpgradeRequired;
@@ -3781,7 +3823,7 @@ test "catalog projection capability counts cover every enum tag and last-owner r
 
 test "catalog projection store lease includes relational rollout capability" {
     const alloc = std.testing.allocator;
-    const record = try metadata_table_manager.cloneStore(alloc, .{ .store_id = 1, .node_id = 1, .relational_topology_protocol_version = 1 });
+    const record = try metadata_table_manager.cloneStore(alloc, .{ .store_id = 1, .node_id = 1, .relational_topology_protocol_version = metadata_table_manager.relational_topology_protocol_version });
     const lease = StoreProjectionLease.create(alloc, record, null, false, false) catch |err| {
         metadata_table_manager.freeStore(alloc, record);
         return err;

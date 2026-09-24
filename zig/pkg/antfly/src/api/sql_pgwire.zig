@@ -675,7 +675,7 @@ const Job = struct {
         const compiled = lease.compiled();
         const write = self.kind == .execute and switch (compiled.statement) {
             .select, .explain => false,
-            .insert, .update, .delete, .merge, .create_table, .drop_table, .catalog_ddl, .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints => true,
+            .insert, .update, .delete, .merge, .create_table, .drop_table, .catalog_ddl, .policy_ddl, .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints => true,
         };
         const server = self.adapter.server;
         var admission = try server.acquireSqlExecution(write);
@@ -865,6 +865,10 @@ const Authority = struct {
             .cancellation = operation.CancellationToken.fromAtomic(self.request.cancel_requested),
             .principal = .{ .kind = .user, .subject = self.identity.*.?.username },
             .destination_authorization_principal = self.credential.principal,
+            // The authenticated, credential-fenced identity is borrowed for
+            // this statement only; owner write proofs are minted before the
+            // durable transaction plan is sealed.
+            .row_policy_credential = self.identity,
             .table_write_authorization = .{ .ptr = self, .allows = allowsWrite },
         };
     }

@@ -184,6 +184,7 @@ pub const Ddl = union(enum) {
     create_table: struct { name: ast.Name, schema_json: []const u8, if_not_exists: bool, tablespace: ?[]const u8 = null },
     drop_table: ast.DropTable,
     catalog_ddl: ast.CatalogDdl,
+    policy_ddl: ast.PolicyDdl,
 };
 pub const DdlReceipt = struct {
     database: []const u8,
@@ -194,6 +195,7 @@ pub const DdlReceipt = struct {
     state: enum { ready, pending, invalid, admission_unknown },
     diagnostic: ?[]const u8 = null,
     restore_job_id: ?[]const u8 = null,
+    fk_generation_publication_id: ?[]const u8 = null,
 };
 pub const DdlOutcome = struct { mutation_outcome: ?MutationOutcome = .committed, receipt: ?DdlReceipt = null };
 
@@ -225,6 +227,9 @@ pub const Backend = struct {
     /// Exact secondary-index probes also share that read set, and cannot be
     /// selected while a staged-session overlay requires primary ordering.
     coordinated_index_reads: bool = false,
+    /// Every later scan can fork the same owner-issued cut and retain its
+    /// route/range proof in the mutation's atomic commit read set.
+    dynamic_statement_read_set: bool = false,
 
     pub const VTable = struct {
         /// Native opaque identity, generated once before mutation admission.

@@ -30,6 +30,12 @@ comptime {
     _ = @import("db/relational_index_maintenance_sweep.zig");
     _ = @import("rewrite_program_cache.zig");
     _ = @import("rewrite_tail_spool.zig");
+    _ = @import("relational_read_set.zig");
+    _ = @import("statement_read_fence.zig");
+    _ = @import("range_protection.zig");
+    _ = @import("retained_read_registry.zig");
+    _ = @import("row_identity.zig");
+    _ = @import("typed_json.zig");
     _ = @import("db/relational_constraint_jobs.zig");
     _ = @import("db/relational_integrity.zig");
     _ = @import("db/relational_integrity_contract.zig");
@@ -40,7 +46,13 @@ comptime {
     _ = @import("db/relational_integrity_activation.zig");
     _ = @import("db/relational_integrity_retirement.zig");
     _ = @import("db/relational_integrity_topology.zig");
+    _ = @import("db/relational_integrity_generation_retirement.zig");
+    _ = @import("db/relational_integrity_generation_admission.zig");
+    _ = @import("db/relational_initial_child_publication.zig");
+    _ = @import("db/row_policy_gate.zig");
+    _ = @import("db/row_policy_bundle.zig");
     _ = @import("db/restore_staging.zig");
+    _ = @import("db/restore_staging_contract.zig");
     _ = @import("db/relational_index_gc.zig");
     _ = @import("db/relational_row_cursor.zig");
     _ = @import("db/relational_predicate.zig");

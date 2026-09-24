@@ -1121,112 +1121,21 @@ const Parser = struct {
     }
 
     fn conflictCaptures(self: *Parser, clause: *ast.Conflict) Error![]const *const ast.Scalar {
-        var captures: std.ArrayList(*const ast.Scalar) = .empty;
         const assignments = try self.alloc.dupe(ast.Assignment, clause.assignments);
         for (assignments) |*assignment| {
             const expression = assignment.expression orelse continue;
-            if (!hasScalarSubquery(expression)) continue;
-            if (@import("subquery_lowering.zig").hasConditional(expression)) return self.fail(error.UnsupportedSqlShape, "lazy conflict expression requires conditional subquery Apply");
-            // A conflict-row reference outside the subquery must be evaluated
-            // after owner arbitration. It cannot be moved into the INSERT
-            // source without changing which row the reference denotes.
-            assignment.capture_ordinal = captures.items.len;
-            if (hasOuterColumn(expression)) {
-                assignment.capture_expression = try self.rewriteConflictHoles(expression, &captures);
-                assignment.capture_span = captures.items.len - assignment.capture_ordinal.?;
-            } else {
-                try captures.append(self.alloc, expression);
-                assignment.capture_span = 1;
-            }
+            if (!@import("subquery_lowering.zig").has(expression)) continue;
+            // Direct scalar expressions are demand-masked by conflict owner
+            // and DO UPDATE WHERE. Nested CASE/COALESCE branches need their
+            // own row mask and remain unsupported until that vector operator
+            // is bound. Never hoist either shape into the INSERT source.
+            if (expression.* != .call or expression.call.subquery == null or !std.mem.eql(u8, expression.call.name, "$scalar") or expression.call.args.len != 0)
+                return self.fail(error.UnsupportedSqlShape, "conflict assignment subquery requires post-owner masked Apply");
+            assignment.deferred_scalar = true;
+            clause.deferred_count += 1;
         }
         clause.assignments = assignments;
-        clause.capture_count = captures.items.len;
-        return captures.toOwnedSlice(self.alloc);
-    }
-
-    fn rewriteConflictHoles(self: *Parser, expression: *const ast.Scalar, captures: *std.ArrayList(*const ast.Scalar)) Error!*const ast.Scalar {
-        if (expression.* == .call and expression.call.subquery != null) {
-            if (!std.mem.eql(u8, expression.call.name, "$scalar")) return self.fail(error.UnsupportedSqlShape, "conflict assignment subquery must be scalar");
-            const ordinal = captures.items.len;
-            try captures.append(self.alloc, expression);
-            const hole = try self.alloc.create(ast.Scalar);
-            hole.* = .{ .column = try std.fmt.allocPrint(self.alloc, "$conflict_capture_{d}", .{ordinal}) };
-            return hole;
-        }
-        const rewritten = try self.alloc.create(ast.Scalar);
-        rewritten.* = switch (expression.*) {
-            .literal, .column => expression.*,
-            .unary => |part| .{ .unary = .{ .op = part.op, .operand = try self.rewriteConflictHoles(part.operand, captures) } },
-            .binary => |part| .{ .binary = .{ .op = part.op, .left = try self.rewriteConflictHoles(part.left, captures), .right = try self.rewriteConflictHoles(part.right, captures) } },
-            .cast => |part| .{ .cast = .{ .operand = try self.rewriteConflictHoles(part.operand, captures), .type = part.type } },
-            .in_list => |part| blk: {
-                const values = try self.alloc.alloc(*const ast.Scalar, part.values.len);
-                for (part.values, values) |value_, *out| out.* = try self.rewriteConflictHoles(value_, captures);
-                break :blk .{ .in_list = .{ .operand = try self.rewriteConflictHoles(part.operand, captures), .values = values, .negated = part.negated } };
-            },
-            .call => |part| blk: {
-                const args = try self.alloc.alloc(*const ast.Scalar, part.args.len);
-                for (part.args, args) |arg, *out| out.* = try self.rewriteConflictHoles(arg, captures);
-                var copy = part;
-                copy.args = args;
-                copy.filter = if (part.filter) |filter| try self.rewriteConflictHoles(filter, captures) else null;
-                break :blk .{ .call = copy };
-            },
-            .case_when => |part| blk: {
-                const branches = try self.alloc.alloc(ast.Scalar.Branch, part.branches.len);
-                for (part.branches, branches) |branch, *out| out.* = .{ .condition = try self.rewriteConflictHoles(branch.condition, captures), .value = try self.rewriteConflictHoles(branch.value, captures) };
-                break :blk .{ .case_when = .{ .branches = branches, .otherwise = if (part.otherwise) |otherwise| try self.rewriteConflictHoles(otherwise, captures) else null } };
-            },
-        };
-        return rewritten;
-    }
-
-    fn hasScalarSubquery(expression: *const ast.Scalar) bool {
-        return switch (expression.*) {
-            .literal, .column => false,
-            .unary => |item| hasScalarSubquery(item.operand),
-            .binary => |item| hasScalarSubquery(item.left) or hasScalarSubquery(item.right),
-            .cast => |item| hasScalarSubquery(item.operand),
-            .case_when => |item| blk: {
-                for (item.branches) |branch| if (hasScalarSubquery(branch.condition) or hasScalarSubquery(branch.value)) break :blk true;
-                break :blk if (item.otherwise) |otherwise| hasScalarSubquery(otherwise) else false;
-            },
-            .in_list => |item| blk: {
-                if (hasScalarSubquery(item.operand)) break :blk true;
-                for (item.values) |candidate| if (hasScalarSubquery(candidate)) break :blk true;
-                break :blk false;
-            },
-            .call => |item| blk: {
-                if (item.subquery != null and std.mem.eql(u8, item.name, "$scalar")) break :blk true;
-                for (item.args) |argument| if (hasScalarSubquery(argument)) break :blk true;
-                break :blk if (item.filter) |filter| hasScalarSubquery(filter) else false;
-            },
-        };
-    }
-
-    fn hasOuterColumn(expression: *const ast.Scalar) bool {
-        return switch (expression.*) {
-            .literal => false,
-            .column => true,
-            .unary => |item| hasOuterColumn(item.operand),
-            .binary => |item| hasOuterColumn(item.left) or hasOuterColumn(item.right),
-            .cast => |item| hasOuterColumn(item.operand),
-            .case_when => |item| blk: {
-                for (item.branches) |branch| if (hasOuterColumn(branch.condition) or hasOuterColumn(branch.value)) break :blk true;
-                break :blk if (item.otherwise) |otherwise| hasOuterColumn(otherwise) else false;
-            },
-            .in_list => |item| blk: {
-                if (hasOuterColumn(item.operand)) break :blk true;
-                for (item.values) |candidate| if (hasOuterColumn(candidate)) break :blk true;
-                break :blk false;
-            },
-            .call => |item| blk: {
-                // A scalar subquery has its own column scope.
-                if (item.subquery != null and std.mem.eql(u8, item.name, "$scalar")) break :blk false;
-                for (item.args) |argument| if (hasOuterColumn(argument)) break :blk true;
-                break :blk if (item.filter) |filter| hasOuterColumn(filter) else false;
-            },
-        };
+        return &.{};
     }
 
     fn conflict(self: *Parser) Error!?ast.Conflict {
@@ -1617,6 +1526,57 @@ const Parser = struct {
         return ddl;
     }
 
+    fn policyDdl(self: *Parser, action: @FieldType(ast.PolicyDdl, "action")) Error!ast.PolicyDdl {
+        var conditional = false;
+        if (action == .drop) {
+            conditional = self.keyword(.@"if");
+            if (conditional) try self.expectKeyword(.exists);
+        }
+        var ddl: ast.PolicyDdl = .{ .action = action, .name = try self.identifier(), .table = undefined, .if_exists = conditional };
+        try self.expectKeyword(.on);
+        ddl.table = try self.name();
+        if (action == .drop) return ddl;
+        if (action == .create and self.keyword(.as)) {
+            ddl.permissive = if (self.ddlWord("PERMISSIVE")) true else if (self.ddlWord("RESTRICTIVE")) false else return self.fail(error.InvalidSqlSyntax, "policy AS requires PERMISSIVE or RESTRICTIVE");
+        }
+        if (action == .create and self.ddlWord("FOR")) {
+            ddl.command = if (self.keyword(.all)) .all else if (self.keyword(.select)) .select else if (self.keyword(.insert)) .insert else if (self.keyword(.update)) .update else if (self.keyword(.delete)) .delete else return self.fail(error.InvalidSqlSyntax, "policy FOR requires a supported command");
+        }
+        if (self.keyword(.to)) {
+            ddl.roles_specified = true;
+            var roles: std.ArrayList([]const u8) = .empty;
+            while (true) {
+                if (roles.items.len >= 256) return self.fail(error.SqlLimitExceeded, "too many policy roles");
+                try roles.append(self.alloc, if (self.ddlWord("PUBLIC")) "PUBLIC" else try self.identifier());
+                if (!self.take(.comma)) break;
+            }
+            ddl.roles = try roles.toOwnedSlice(self.alloc);
+        }
+        if (self.ddlWord("USING")) {
+            ddl.using_specified = true;
+            try self.expect(.lparen);
+            ddl.using = try self.scalar(0, 0);
+            try self.expect(.rparen);
+        }
+        if (self.keyword(.with)) {
+            if (!self.keyword(.check)) return self.fail(error.InvalidSqlSyntax, "policy WITH requires CHECK");
+            ddl.check_specified = true;
+            try self.expect(.lparen);
+            ddl.with_check = try self.scalar(0, 0);
+            try self.expect(.rparen);
+        }
+        if (action == .create) {
+            if (ddl.command == .insert and ddl.using_specified) return self.fail(error.InvalidSqlSyntax, "INSERT policy cannot have USING");
+            if ((ddl.command == .select or ddl.command == .delete) and ddl.check_specified) return self.fail(error.InvalidSqlSyntax, "SELECT and DELETE policies cannot have WITH CHECK");
+            const truth = try self.alloc.create(ast.Scalar);
+            truth.* = .{ .literal = .{ .boolean = true } };
+            if (ddl.command != .insert and !ddl.using_specified) ddl.using = truth;
+            if ((ddl.command == .all or ddl.command == .insert or ddl.command == .update) and !ddl.check_specified)
+                ddl.with_check = ddl.using orelse truth;
+        }
+        return ddl;
+    }
+
     fn indexDdl(self: *Parser, create: bool, unique: bool) Error!ast.CatalogDdl {
         const conditional = self.keyword(.@"if");
         if (conditional) {
@@ -1919,6 +1879,7 @@ const Parser = struct {
         }
         if (self.keyword(.merge)) return .{ .merge = try self.merge() };
         if (self.keyword(.create)) {
+            if (self.ddlWord("POLICY")) return .{ .policy_ddl = try self.policyDdl(.create) };
             if (self.keyword(.table)) return .{ .create_table = try self.createTable() };
             const unique = self.keyword(.unique);
             if (self.keyword(.index)) return .{ .catalog_ddl = try self.indexDdl(true, unique) };
@@ -1926,13 +1887,29 @@ const Parser = struct {
             return .{ .catalog_ddl = try self.catalogDdl(.create) };
         }
         if (self.keyword(.drop)) {
+            if (self.ddlWord("POLICY")) return .{ .policy_ddl = try self.policyDdl(.drop) };
             if (self.keyword(.index)) return .{ .catalog_ddl = try self.indexDdl(false, false) };
             if (!self.keyword(.table)) return .{ .catalog_ddl = try self.catalogDdl(.drop) };
             const if_exists = self.keyword(.@"if");
             if (if_exists) try self.expectKeyword(.exists);
             return .{ .drop_table = .{ .table = try self.name(), .if_exists = if_exists } };
         }
-        if (self.keyword(.alter)) return .{ .catalog_ddl = try self.catalogDdl(.rename) };
+        if (self.keyword(.alter)) {
+            if (self.ddlWord("POLICY")) return .{ .policy_ddl = try self.policyDdl(.alter) };
+            const before_table = self.pos;
+            if (self.keyword(.table)) {
+                _ = self.keyword(.only);
+                const target = try self.name();
+                const change: ?@FieldType(ast.PolicyDdl, "action") = if (self.ddlWord("ENABLE")) .enable else if (self.ddlWord("DISABLE")) .disable else null;
+                if (change) |action| {
+                    if (!self.ddlWord("ROW") or !self.ddlWord("LEVEL") or !self.ddlWord("SECURITY"))
+                        return self.fail(error.InvalidSqlSyntax, "policy publication requires ROW LEVEL SECURITY");
+                    return .{ .policy_ddl = .{ .action = action, .name = "", .table = target } };
+                }
+                self.pos = before_table;
+            }
+            return .{ .catalog_ddl = try self.catalogDdl(.rename) };
+        }
         if (self.keyword(.set)) {
             if (!self.ddlWord("CONSTRAINTS")) return self.fail(error.UnsupportedSqlShape, "SET requires CONSTRAINTS");
             var names: std.ArrayList([]const u8) = .empty;
@@ -2023,24 +2000,56 @@ test "compiler deferred uniqueness and constraint timing are explicit" {
     try std.testing.expectEqualStrings("Other", named.statement.set_constraints.names[1]);
 }
 
+test "policy DDL parses draft definitions and never accepts publication commands" {
+    var created = try compile(std.testing.allocator, "CREATE POLICY tenant_filter ON public.accounts AS RESTRICTIVE FOR UPDATE TO tenant_admin USING (tenant_id = 7) WITH CHECK (tenant_id = 7)", .{});
+    defer created.deinit();
+    const policy = created.statement.policy_ddl;
+    try std.testing.expectEqual(.create, policy.action);
+    try std.testing.expectEqualStrings("tenant_filter", policy.name);
+    try std.testing.expectEqualStrings("accounts", policy.table.table);
+    try std.testing.expectEqual(.update, policy.command);
+    try std.testing.expect(!policy.permissive);
+    try std.testing.expectEqualStrings("tenant_admin", policy.roles[0]);
+    try std.testing.expect(policy.using != null and policy.with_check != null);
+
+    var altered = try compile(std.testing.allocator, "ALTER POLICY tenant_filter ON public.accounts TO tenant_admin, auditor USING (tenant_id = 8)", .{});
+    defer altered.deinit();
+    try std.testing.expectEqual(.alter, altered.statement.policy_ddl.action);
+    try std.testing.expect(altered.statement.policy_ddl.using_specified);
+    try std.testing.expect(!altered.statement.policy_ddl.check_specified);
+    try std.testing.expectEqual(@as(usize, 2), altered.statement.policy_ddl.roles.len);
+
+    var dropped = try compile(std.testing.allocator, "DROP POLICY IF EXISTS tenant_filter ON public.accounts", .{});
+    defer dropped.deinit();
+    try std.testing.expect(dropped.statement.policy_ddl.if_exists);
+    var enabled = try compile(std.testing.allocator, "ALTER TABLE public.accounts ENABLE ROW LEVEL SECURITY", .{});
+    defer enabled.deinit();
+    try std.testing.expectEqual(.enable, enabled.statement.policy_ddl.action);
+    var disabled = try compile(std.testing.allocator, "ALTER TABLE public.accounts DISABLE ROW LEVEL SECURITY", .{});
+    defer disabled.deinit();
+    try std.testing.expectEqual(.disable, disabled.statement.policy_ddl.action);
+    try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "CREATE POLICY bad ON accounts FOR INSERT USING (true)", .{}));
+    try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "CREATE POLICY bad ON accounts FOR SELECT WITH CHECK (true)", .{}));
+}
+
 test "compiler ONLY scopes exact table references across read and write statements" {
     for ([_][]const u8{
-        "SELECT id FROM ONLY public.rows",
-        "INSERT INTO ONLY public.rows (id) VALUES ('a') RETURNING id",
-        "UPDATE ONLY public.rows SET id='a' FROM ONLY public.source AS s WHERE rows.id=s.id",
-        "DELETE FROM ONLY public.rows USING ONLY public.source AS s WHERE rows.id=s.id",
-        "MERGE INTO ONLY public.rows AS r USING ONLY public.source AS s ON r.id=s.id WHEN MATCHED THEN DELETE",
-        "TRUNCATE ONLY public.rows",
-        "ALTER TABLE ONLY public.rows VALIDATE CONSTRAINT c",
-        "CREATE INDEX idx ON ONLY public.rows (id)",
+        "SELECT id FROM ONLY public.records",
+        "INSERT INTO ONLY public.records (id) VALUES ('a') RETURNING id",
+        "UPDATE ONLY public.records SET id='a' FROM ONLY public.refs AS s WHERE records.id=s.id",
+        "DELETE FROM ONLY public.records USING ONLY public.refs AS s WHERE records.id=s.id",
+        "MERGE INTO ONLY public.records AS r USING ONLY public.refs AS s ON r.id=s.id WHEN MATCHED THEN DELETE",
+        "TRUNCATE ONLY public.records",
+        "ALTER TABLE ONLY public.records VALIDATE CONSTRAINT c",
+        "CREATE INDEX idx ON ONLY public.records (id)",
     }) |sql| {
         var compiled = try compile(std.testing.allocator, sql, .{});
         defer compiled.deinit();
     }
-    var inserted = try compile(std.testing.allocator, "INSERT INTO ONLY public.rows (id) VALUES ('a')", .{});
+    var inserted = try compile(std.testing.allocator, "INSERT INTO ONLY public.records (id) VALUES ('a')", .{});
     defer inserted.deinit();
     try std.testing.expectEqualStrings("public", inserted.statement.insert.table.namespace.?);
-    try std.testing.expectEqualStrings("rows", inserted.statement.insert.table.table);
+    try std.testing.expectEqualStrings("records", inserted.statement.insert.table.table);
     var quoted = try compile(std.testing.allocator, "SELECT id FROM \"only\"", .{});
     defer quoted.deinit();
     try std.testing.expectEqualStrings("only", quoted.statement.select.table.?.table);

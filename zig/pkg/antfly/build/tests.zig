@@ -197,7 +197,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const system_catalog_store_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[8],
-        .filters = &.{ "metadata raft apply store", "metadata replay", "system catalog", "metadata.table storage extension", "relational integrity restore staging" },
+        .filters = &.{ "metadata raft apply store", "metadata replay", "system catalog", "row-policy publication", "metadata.table storage extension", "relational integrity restore staging", "FK generation publication", "policy definition command serializes" },
     });
     const system_catalog_store_step = b.step("antfly-system-catalog-store-test", "Run catalog report persistence, snapshot, drain, and migration regressions");
     system_catalog_store_step.dependOn(&b.addRunArtifact(system_catalog_store_tests).step);
@@ -1521,6 +1521,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "api.sql_pgwire",
         "SQL schema cache",
         "SQL catalog",
+        "SQL policy DDL",
+        "api.row_policy_publication_coordinator.",
+        "api.row_policy_install.",
+        "api.relational_fk_generation_publication.",
+        "api http row policy signer",
         "SQL native session",
         "SQL session metadata",
         "SQL session overlay",
@@ -4292,6 +4297,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "standalone catalog remote apply outage preserves committed creation and retry authority",
             "standalone metadata replay refreshes colliding revisions and only publishes complete effects",
             "standalone metadata advertises a linearizable owned snapshot",
+            "standalone catalog journal preserves imported policy publication as fail closed",
+            "native standalone policy publication installs exact owner phases and resumes after restart",
             "standalone schema mutation supports atomic merge patch and version CAS",
             "standalone routing watch does not report absence after one probe",
             "standalone routing watch confirms absence before deadline and retries after expiry",
@@ -4313,11 +4320,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             .mode = .simple,
         },
         // This root intentionally links the complete standalone runtime and
-        // embedded inference ABI. With catalog and relational integration,
-        // macOS Debug codegen peaked at 13.17 GB; reserve scheduling headroom.
+        // embedded inference ABI. With native policy coordinator/owner paths,
+        // macOS Debug codegen peaked at 16.42 GB; reserve scheduling headroom.
         // This is a compile-memory scheduling claim, not a service limit.
         // Linux retains the measured aggregate default.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 18 else 7) * 1024 * 1024 * 1024,
     });
     const lib_standalone_runtime_test_step = b.step("antfly-standalone-runtime-test", "Run focused standalone runtime tests");
     const run_lib_standalone_runtime_tests = addFilteredTestRunArtifact(b, lib_standalone_runtime_tests);
@@ -5488,7 +5495,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.relational_integrity_range.",
             "storage.db.relational_integrity_activation.",
             "storage.db.relational_integrity_retirement.",
+            "storage.db.relational_integrity_generation_retirement.",
+            "storage.db.relational_integrity_generation_admission.",
+            "storage.db.relational_initial_child_publication.",
+            "storage.db.row_policy_gate.",
+            "storage.db.row_policy_bundle.",
             "storage.db.restore_staging.",
+            "storage.db.restore_staging_contract.",
             "storage.db.relational_integrity_topology.",
             "storage.db.relational_index_gc.",
             "storage.db.relational_row_cursor.",
@@ -5525,6 +5538,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.maintenance_signal.",
             "storage.projection_page_cache.",
             "storage.projection_read_trace.",
+            "storage.range_protection.",
+            "storage.relational_read_set.",
+            "storage.retained_read_registry.",
+            "storage.row_identity.",
+            "storage.statement_read_fence.",
+            "storage.typed_json.",
             "storage.vector_payload_store.",
             "storage.vector_wal_view.",
             "storage.backend_conformance_test.",

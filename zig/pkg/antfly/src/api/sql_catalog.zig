@@ -39,6 +39,39 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     const proposed = try std.json.Stringify.valueAlloc(a, schema, .{});
     const updated = try server.bindForeignKeySchema(a, target, table.name, proposed, definition.schema_json, identity, context);
     try context.ensureActive();
+    if (!try tables.foreignKeyDefinitionsUnchanged(a, definition.schema_json, updated)) {
+        var current = (try server.source.adminSnapshot()) orelse return error.UnsupportedSqlExecution;
+        defer server.source.freeAdminSnapshot(&current);
+        const before = tables.findTableByName(&current, table.name) orelse return error.TableNotFound;
+        if (before.table_id != table.table_id or try tables.schemaVersion(before.schema_json) != native.version or
+            !std.mem.eql(u8, before.schema_json, definition.schema_json))
+            return error.SchemaVersionChanged;
+        // Own the public receipt before admission. Allocation failure after an
+        // uncertain durable begin must never erase the caller's handle.
+        var receipt = try newReceipt(alloc, target, table.table_id, std.math.add(u32, native.version, 1) catch return error.SqlLimitExceeded);
+        errdefer {
+            alloc.free(receipt.database);
+            alloc.free(receipt.namespace);
+            alloc.free(receipt.table);
+            alloc.free(receipt.table_id);
+        }
+        const publication_id = try alloc.alloc(u8, 32);
+        errdefer alloc.free(publication_id);
+        const publication = server.beginFkGenerationPublication(alloc, context, identity, before.*, updated) catch |err| switch (err) {
+            error.MetadataMutationOutcomeUnknown => return error.SqlMutationOutcomeUnknown,
+            else => return err,
+        };
+        const hex = std.fmt.bytesToHex(publication.plan_id, .lower);
+        @memcpy(publication_id, &hex);
+        receipt.fk_generation_publication_id = publication_id;
+        receipt.schema_version = publication.schema_version;
+        receipt.state = if (publication.state == .admission_unknown) .admission_unknown else .pending;
+        receipt.diagnostic = if (publication.state == .admission_unknown)
+            "FK generation admission is unresolved. Retain the publication ID, refresh table schema and constraint status, and do not replay the DDL."
+        else
+            "FK generation publication was admitted. Poll the table schema and constraint status; do not replay the DDL.";
+        return .{ .mutation_outcome = if (publication.state == .admission_unknown) null else .committed_pending, .receipt = receipt };
+    }
     if (ddl.schema_change) |change| if (change == .add_column and (!change.add_column.nullable or change.add_column.default_value != null))
         return rewriteSchema(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated);
     const retirement = try requiresRetirement(a, definition.schema_json, schema);
@@ -155,10 +188,12 @@ fn submitSchema(server: *server_mod.ApiHttpServer, context: operation.RequestCon
 
 pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, alloc: std.mem.Allocator, input: catalog.Ddl) !catalog.DdlOutcome {
     try context.ensureActive();
+    if (input == .policy_ddl) return @import("sql_policy_ddl.zig").execute(server, identity, context, database, namespace, alloc, input.policy_ddl);
     const name = switch (input) {
         .create_table => |v| v.name,
         .drop_table => |v| v.table,
         .catalog_ddl => |v| v.name,
+        .policy_ddl => unreachable,
     };
     const target: domain.Target = .{ .database = name.database orelse database, .namespace = name.namespace orelse namespace, .table = name.table };
     try target.validate();
@@ -166,6 +201,7 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
         .catalog_ddl => |ddl| switch (ddl.kind) {
             inline else => |tag| @field(domain.Kind, @tagName(tag)),
         },
+        .policy_ddl => unreachable,
         else => .table,
     };
     const route: @import("../system_catalog/routes.zig").Route = .{ .kind = kind, .database = target.database, .namespace = target.namespace, .name = target.table };
@@ -187,6 +223,7 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
             .alter_schema, .truncate => unreachable,
             inline else => |tag| @field(domain.Action, @tagName(tag)),
         },
+        .policy_ddl => unreachable,
     }, .kind = kind, .database = target.database, .namespace = target.namespace, .name = target.table } };
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -206,17 +243,43 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
             // Explicit empty search indexes avoids building a full-text index
             // on every SQL table. SQL indexes are added through native DDL.
             const bound_schema = try server.bindForeignKeySchema(a, target, request.physical_name.?, create.schema_json, "", identity, context);
+            if (try @import("../metadata/fk_generation_publication.zig").schemaHasForeignKeys(a, bound_schema) and
+                try @import("relational_witness_ddl.zig").needed(a, bound_schema, ""))
+                return error.ForeignKeyPartialSupportIndexRequired;
             const schema_value = try std.json.parseFromSliceLeaky(std.json.Value, a, bound_schema, .{ .parse_numbers = false });
-            for ([_][]const u8{ "unique_constraints", "checks", "foreign_keys" }) |key| {
+            const body = try std.json.Stringify.valueAlloc(a, .{ .schema = schema_value, .indexes = std.json.Value{ .object = .empty } }, .{});
+            var parsed = try tables.parseCreateTableRequest(alloc, body);
+            defer parsed.deinit(alloc);
+            if (create.tablespace) |tablespace| parsed.tablespace_name = try alloc.dupe(u8, tablespace);
+            if (try @import("../metadata/fk_generation_publication.zig").schemaHasForeignKeys(a, bound_schema)) {
+                const plan = @import("fk_initial_create_plan_builder.zig").build(server, a, context, identity, target, parsed) catch |err| switch (err) {
+                    error.CatalogAlreadyExists, error.TableAlreadyExists => if (create.if_not_exists) return .{} else return err,
+                    else => return err,
+                };
+                var receipt = try newReceipt(alloc, target, plan.child.table_id, 0);
+                errdefer {
+                    alloc.free(receipt.database);
+                    alloc.free(receipt.namespace);
+                    alloc.free(receipt.table);
+                    alloc.free(receipt.table_id);
+                    if (receipt.fk_generation_publication_id) |id| alloc.free(id);
+                }
+                const hex = std.fmt.bytesToHex(plan.id, .lower);
+                receipt.fk_generation_publication_id = try alloc.dupe(u8, &hex);
+                const accepted = try server.submitFkInitialCreatePlan(a, context, plan);
+                receipt.state = if (accepted.state == .admission_unknown) .admission_unknown else .pending;
+                receipt.diagnostic = if (accepted.state == .admission_unknown)
+                    "Initial FK table admission is unresolved. Retain the publication ID, refresh table status, and do not replay CREATE."
+                else
+                    "Initial FK table publication was admitted. Poll for the table; do not replay CREATE.";
+                return .{ .mutation_outcome = if (accepted.state == .admission_unknown) null else .committed_pending, .receipt = receipt };
+            }
+            for ([_][]const u8{ "unique_constraints", "checks" }) |key| {
                 if (schema_value.object.get(key)) |constraints| if (constraints == .array and constraints.array.items.len != 0) {
                     creation_receipt = try newReceipt(alloc, target, 0, 0);
                     break;
                 };
             }
-            const body = try std.json.Stringify.valueAlloc(a, .{ .schema = schema_value, .indexes = std.json.Value{ .object = .empty } }, .{});
-            var parsed = try tables.parseCreateTableRequest(alloc, body);
-            defer parsed.deinit(alloc);
-            if (create.tablespace) |tablespace| parsed.tablespace_name = try alloc.dupe(u8, tablespace);
             request.create_table_json = try tables.encodeStoredCreateTableRequestAlloc(a, parsed);
         },
         .drop_table => {},
@@ -231,6 +294,7 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
                 if (identity) |authenticated| if (!server_mod.permissionsAllow(authenticated.permissions, permission_kind, destination_resource, .admin)) return error.Forbidden;
             }
         },
+        .policy_ddl => unreachable,
     }
     if (request.mutation.tablespace) |tablespace| if (identity) |authenticated| {
         if (!server_mod.permissionsAllow(authenticated.permissions, .tablespace, tablespace, .read)) return error.Forbidden;
@@ -242,6 +306,7 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
             .create_table => |create| if (create.if_not_exists and (err == error.CatalogAlreadyExists or err == error.TableAlreadyExists)) return .{},
             .drop_table => |drop| if (drop.if_exists and (err == error.CatalogNotFound or err == error.TableNotFound)) return .{},
             .catalog_ddl => |ddl| if (ddl.conditional and ((ddl.action == .create and err == error.CatalogAlreadyExists) or (ddl.action == .drop and err == error.CatalogNotFound))) return .{},
+            .policy_ddl => unreachable,
         }
         if (err == error.MetadataMutationOutcomeUnknown) return error.SqlMutationOutcomeUnknown;
         return err;

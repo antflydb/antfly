@@ -18,7 +18,7 @@ pub const artifact_sources_protocol_version: u16 = 1;
 /// The store understands native HBC authority markers, WAL recovery, and the
 /// fail-closed placement contract used during rolling upgrades.
 pub const dense_native_storage_protocol_version: u16 = 1;
-pub const relational_topology_protocol_version: u16 = 1;
+pub const relational_topology_protocol_version: u16 = 2;
 pub const embedding_activity_protocol_version: u16 = 2;
 const group_ids = @import("../common/group_ids.zig");
 const topology_records = @import("../common/topology_records.zig");

@@ -286,6 +286,8 @@ pub const MetadataServer = struct {
                     catalog,
                     raft.read_gate.alreadyReadSafeBarrier(),
                 );
+                owner_source.row_policy_authority_secret = cfg.api_server_cfg.trusted_principal_secret;
+                owner_source.row_policy_authority_issuer = cfg.api_server_cfg.trusted_principal_issuer;
                 _ = owner_source.withRemoteContent(cfg.api_server_cfg.remote_content);
                 owned_kernel_owner_source = owner_source;
                 _ = public_read_source.withLocalReadSource(owner_source.readSource());

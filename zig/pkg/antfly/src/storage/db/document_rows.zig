@@ -17,6 +17,7 @@ const scalar = @import("../../sql/scalar.zig");
 const View = @import("../relational_read_view.zig").View;
 
 pub const Session = struct {
+    row_policy_lease: ?@import("row_policy_gate.zig").Gate.Lease = null,
     range_proofs: ?[]const @import("../range_protection.zig").Proof = null,
     alloc: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
@@ -120,6 +121,7 @@ pub const Session = struct {
     }
 
     pub fn deinit(self: *Session) void {
+        if (self.row_policy_lease) |*lease| lease.release();
         self.txn.abort();
         if (self.schema) |*schema| schema.release();
         if (self.filter) |*filter| filter.deinit();
@@ -129,6 +131,7 @@ pub const Session = struct {
     }
 
     pub fn rangeProofs(self: *Session, alloc: std.mem.Allocator) ![]@import("../range_protection.zig").Proof {
+        try self.checkpoint();
         return alloc.dupe(@import("../range_protection.zig").Proof, self.range_proofs orelse return error.SqlRangeTrackingRequired);
     }
 
@@ -136,6 +139,7 @@ pub const Session = struct {
         if (self.failed) return error.InvalidSqlBackendResponse;
         if (self.cancellation) |token| try token.check();
         if (self.deadline_ns) |deadline| if (time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+        if (self.row_policy_lease) |*lease| try lease.checkAt(@intCast(@divFloor(time.realtimeNs(), std.time.ns_per_s)));
     }
 
     /// Uses the same pinned public validator as native schema admission. SQL

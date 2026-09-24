@@ -50,6 +50,7 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
         try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(a, req.indexes_json.?);
         try managed_embedder.validateEmbeddingProducerOwnershipJson(a, req.indexes_json.?);
         var table = tables_api.deriveTableRecord(storage_name, req);
+        if (try fk_publication.schemaHasForeignKeys(a, table.schema_json)) return error.ForeignKeyGenerationPublicationRequired;
         const policy = admission.placement_policy;
         try policy.validate();
         if (policy.placement_role) |role| table.placement_role = role;
@@ -109,6 +110,235 @@ pub fn settingSnapshotJson(svc: anytype, alloc: std.mem.Allocator, context: oper
     try svc.ensureLinearizableReadWithContext(context);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
     return store.sqlSettingSnapshotJson(alloc, svc.metadata_group_id, scope);
+}
+
+pub fn policySnapshotJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("policies.zig").SnapshotRequest) ![]u8 {
+    try context.ensureActive();
+    if (request.table_id == 0 or request.principal.len == 0 or request.database.len == 0) return error.InvalidRowPolicyRecord;
+    // This principal-independent catalog read cannot assert roles. The API
+    // separately mints a short-lived authenticated role proof, which the
+    // owner verifies against this immutable serving generation.
+    if (request.roles.len != 0) return error.RowPolicyAuthenticationRequired;
+    if (context.principal != null) {
+        const admitted = context.setting_read_principal orelse return error.Forbidden;
+        if (!std.mem.eql(u8, admitted, request.principal)) return error.Forbidden;
+    }
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    return store.sqlPolicySnapshotJson(alloc, svc.metadata_group_id, request.table_id, request.principal, request.database, request.roles);
+}
+
+pub fn policyInstallSnapshotJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("policies.zig").InstallRequest) ![]u8 {
+    try context.ensureActive();
+    if (!context.row_policy_install_authority or request.table_id == 0 or
+        request.expected_generation == 0 or request.expected_catalog_epoch == 0)
+        return error.Forbidden;
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    return store.sqlPolicyInstallSnapshotJson(alloc, svc.metadata_group_id, request);
+}
+
+pub fn policyPublicationStatusJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, table_id: u64) ![]u8 {
+    try context.ensureActive();
+    if (!context.row_policy_install_authority or table_id == 0) return error.Forbidden;
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    return store.sqlPolicyPublicationStatusJson(alloc, svc.metadata_group_id, table_id);
+}
+
+pub fn policyPublicationWorkJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, after_table_id: u64) ![]u8 {
+    try context.ensureActive();
+    if (!context.row_policy_install_authority) return error.Forbidden;
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    return store.sqlPolicyPublicationWorkJson(alloc, svc.metadata_group_id, after_table_id);
+}
+
+pub fn beginPolicyPublication(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("policies.zig").BeginRequest) ![]u8 {
+    if (!context.setting_admin or !context.row_policy_install_authority or request.table_id == 0) return error.Forbidden;
+    try context.ensureActive();
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    const bytes = try store.sqlPolicyBeginCommandJson(alloc, svc.metadata_group_id, request);
+    defer alloc.free(bytes);
+    var command = try std.json.parseFromSlice(@import("policies.zig").PublicationCommand, alloc, bytes, .{});
+    defer command.deinit();
+    return mutatePolicyPublication(svc, alloc, context, command.value);
+}
+
+/// The reconciler supplies a precomputed owner cut and durable owner receipt;
+/// metadata apply repeats the topology/ACK checks before committing. An
+/// ambiguous proposal is reconciled by reading publication status, not by
+/// blindly resubmitting a transition.
+pub fn mutatePolicyPublication(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, command: @import("policies.zig").PublicationCommand) ![]u8 {
+    if (!context.setting_admin or !context.row_policy_install_authority) return error.Forbidden;
+    try context.ensureActive();
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_row_policy_publication_version);
+    svc.lockCatalogMutation();
+    defer svc.unlockCatalogMutation();
+    try svc.ensureLinearizableReadWithContext(context);
+    try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    const current = try store.systemCatalogMeta(alloc, svc.metadata_group_id);
+    if (current.revision != command.expected_revision) return error.RowPolicyCatalogChanged;
+    const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
+    defer alloc.free(bytes);
+    if (bytes.len > domain.max_command_bytes) return error.CatalogCommandTooLarge;
+    try context.ensureActive();
+    const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_sql_policy_publication = bytes });
+    svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
+    const observed = store.systemCatalogMeta(alloc, svc.metadata_group_id) catch return error.MetadataMutationOutcomeUnknown;
+    var expected_hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &expected_hash, .{});
+    if (observed.revision != command.expected_revision + 1 or !std.mem.eql(u8, &observed.last_command, &expected_hash))
+        return error.MetadataMutationOutcomeUnknown;
+    return std.json.Stringify.valueAlloc(alloc, observed, .{});
+}
+
+fn serializePolicyDefinitionCommand(alloc: std.mem.Allocator, command: @import("policies.zig").Command) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(alloc);
+    defer output.deinit();
+    var stream: std.json.Stringify = .{ .writer = &output.writer, .options = .{} };
+    try @import("../storage/db/relational_integrity_json.zig").write(command, &stream);
+    return output.toOwnedSlice();
+}
+
+test "policy definition command serializes logical JSON literals without map pointers" {
+    const alloc = std.testing.allocator;
+    var literal = try std.json.parseFromSlice(std.json.Value, alloc, "{\"roles\":[\"reader\"],\"enabled\":true}", .{});
+    defer literal.deinit();
+    const command: @import("policies.zig").Command = .{
+        .expected_revision = 1,
+        .change = .{ .put = .{
+            .id = 1,
+            .generation = 1,
+            .table_id = 2,
+            .schema_version = 1,
+            .schema_digest = @splat(1),
+            .name = "p",
+            .commands = .{ .select = true },
+            .roles = &.{"reader"},
+            .using = .{ .instructions = &.{.{ .type = .{ .kind = .boolean }, .operation = .{ .literal = literal.value } }}, .root = 0 },
+        } },
+    };
+    const bytes = try serializePolicyDefinitionCommand(alloc, command);
+    defer alloc.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"enabled\":true") != null);
+    var decoded = try std.json.parseFromSlice(@import("policies.zig").Command, alloc, bytes, .{});
+    defer decoded.deinit();
+    try std.testing.expect(decoded.value.change.put.using.?.instructions[0].operation.literal.object.get("enabled").?.bool);
+}
+
+const fk_publication = @import("../metadata/fk_generation_publication.zig");
+
+pub fn fkGenerationPublicationStatusJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, child_table_id: u64) ![]u8 {
+    if (!context.fk_generation_publication_authority) return error.Forbidden;
+    try context.ensureActive();
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    return store.fkGenerationPublicationStatusJson(alloc, svc.metadata_group_id, child_table_id);
+}
+
+pub fn fkGenerationPublicationWorkJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, after_child_table_id: u64) ![]u8 {
+    if (!context.fk_generation_publication_authority) return error.Forbidden;
+    try context.ensureActive();
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    return store.fkGenerationPublicationWorkJson(alloc, svc.metadata_group_id, after_child_table_id);
+}
+
+pub fn fkGenerationPublicationDecisionJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: fk_publication.DecisionRequest) ![]u8 {
+    if (!context.fk_generation_publication_authority) return error.Forbidden;
+    try context.ensureActive();
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    return store.fkGenerationPublicationDecisionJson(alloc, svc.metadata_group_id, request);
+}
+
+pub fn fkGenerationPublicationSourceDecisionJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: fk_publication.SourceDecisionRequest) ![]u8 {
+    if (!context.fk_generation_publication_authority) return error.Forbidden;
+    try context.ensureActive();
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    return store.fkGenerationPublicationSourceDecisionJson(alloc, svc.metadata_group_id, request);
+}
+
+pub fn mutateFkGenerationPublication(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, command: fk_publication.Command) ![]u8 {
+    if (!context.fk_generation_publication_authority) return error.Forbidden;
+    try command.validateShape();
+    try context.ensureActive();
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.fk_generation_publication_version);
+    svc.lockCatalogMutation();
+    defer svc.unlockCatalogMutation();
+    try svc.ensureLinearizableReadWithContext(context);
+    try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
+    defer alloc.free(bytes);
+    if (bytes.len > fk_publication.max_bytes) return error.CatalogCommandTooLarge;
+    try context.ensureActive();
+    const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_fk_generation_publication = bytes });
+    svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
+    const observed = store.fkGenerationPublicationStatusJson(alloc, svc.metadata_group_id, command.child_table_id) catch return error.MetadataMutationOutcomeUnknown;
+    errdefer alloc.free(observed);
+    var parsed = std.json.parseFromSlice(fk_publication.Publication, alloc, observed, .{}) catch return error.MetadataMutationOutcomeUnknown;
+    defer parsed.deinit();
+    if (!std.mem.eql(u8, &parsed.value.plan.id, &command.plan_id) or parsed.value.revision != command.expected_revision + 1)
+        return error.MetadataMutationOutcomeUnknown;
+    return observed;
+}
+
+pub fn mutateFkInitialCreate(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, command: fk_publication.InitialCommand) ![]u8 {
+    if (!context.fk_generation_publication_authority) return error.Forbidden;
+    try command.validateShape();
+    try context.ensureActive();
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.fk_initial_create_version);
+    svc.lockCatalogMutation();
+    defer svc.unlockCatalogMutation();
+    try svc.ensureLinearizableReadWithContext(context);
+    try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
+    defer alloc.free(bytes);
+    if (bytes.len > fk_publication.max_bytes) return error.CatalogCommandTooLarge;
+    try context.ensureActive();
+    const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_fk_initial_create = bytes });
+    svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
+    const observed = store.fkInitialCreateStatusJson(alloc, svc.metadata_group_id, command.child_table_id) catch return error.MetadataMutationOutcomeUnknown;
+    errdefer alloc.free(observed);
+    var parsed = std.json.parseFromSlice(fk_publication.InitialPublication, alloc, observed, .{}) catch return error.MetadataMutationOutcomeUnknown;
+    defer parsed.deinit();
+    if (!std.mem.eql(u8, &parsed.value.plan.id, &command.plan_id) or parsed.value.revision != command.expected_revision + 1)
+        return error.MetadataMutationOutcomeUnknown;
+    return observed;
+}
+
+/// Durable draft-only policy mutation. The authorization is a body-bound
+/// administrator service grant; this transition never installs an owner
+/// bundle or flips the serving publication. Ambiguous outcomes require a
+/// status read rather than replaying an uncertain command.
+pub fn mutatePolicyDefinition(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, command: @import("policies.zig").Command) ![]u8 {
+    if (!context.setting_admin) return error.Forbidden;
+    try context.ensureActive();
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_row_policy_publication_version);
+    svc.lockCatalogMutation();
+    defer svc.unlockCatalogMutation();
+    try svc.ensureLinearizableReadWithContext(context);
+    try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    const current = try store.systemCatalogMeta(alloc, svc.metadata_group_id);
+    if (current.revision != command.expected_revision) return error.RowPolicyCatalogChanged;
+    const bytes = try serializePolicyDefinitionCommand(alloc, command);
+    defer alloc.free(bytes);
+    if (bytes.len > domain.max_command_bytes) return error.CatalogCommandTooLarge;
+    const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_sql_policies = bytes });
+    svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
+    const observed = store.systemCatalogMeta(alloc, svc.metadata_group_id) catch return error.MetadataMutationOutcomeUnknown;
+    var expected_hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &expected_hash, .{});
+    if (observed.revision != command.expected_revision + 1 or !std.mem.eql(u8, &observed.last_command, &expected_hash))
+        return error.MetadataMutationOutcomeUnknown;
+    return std.json.Stringify.valueAlloc(alloc, observed, .{});
 }
 
 pub fn mutateSetting(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: settings.Request) ![]u8 {
@@ -177,6 +407,51 @@ fn listTablesJson(svc: anytype, alloc: std.mem.Allocator, context: operation.Req
 pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, input: domain.Call) ![]u8 {
     return switch (input) {
         .setting_snapshot => |scope| settingSnapshotJson(svc, alloc, context, scope),
+        .policy_snapshot => |request| policySnapshotJson(svc, alloc, context, request),
+        .policy_install_snapshot => |request| policyInstallSnapshotJson(svc, alloc, context, request),
+        .policy_publication_status => |table_id| policyPublicationStatusJson(svc, alloc, context, table_id),
+        .policy_publication_work => |after_table_id| policyPublicationWorkJson(svc, alloc, context, after_table_id),
+        .policy_publication_begin => |request| beginPolicyPublication(svc, alloc, context, request),
+        .policy_definition_mutate => |command| mutatePolicyDefinition(svc, alloc, context, command),
+        .policy_publication_mutate => |command| mutatePolicyPublication(svc, alloc, context, command),
+        .fk_generation_publication_begin => |plan| mutateFkGenerationPublication(svc, alloc, context, .{ .plan_id = plan.id, .child_table_id = plan.child_before.table_id, .expected_revision = 0, .action = .begin, .plan = plan }),
+        .fk_generation_publication_mutate => |command| mutateFkGenerationPublication(svc, alloc, context, command),
+        .fk_generation_publication_status => |child_table_id| fkGenerationPublicationStatusJson(svc, alloc, context, child_table_id),
+        .fk_generation_publication_work => |after_child_table_id| fkGenerationPublicationWorkJson(svc, alloc, context, after_child_table_id),
+        .fk_generation_publication_decision => |request| fkGenerationPublicationDecisionJson(svc, alloc, context, request),
+        .fk_generation_publication_source_decision => |request| fkGenerationPublicationSourceDecisionJson(svc, alloc, context, request),
+        .fk_initial_create_prepare => |request| blk: {
+            if (!context.fk_generation_publication_authority) return error.Forbidden;
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk store.fkInitialCreatePrepareJson(alloc, svc.metadata_group_id, request);
+        },
+        .fk_initial_child_decision => |request| blk: {
+            if (!context.fk_generation_publication_authority) return error.Forbidden;
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk store.fkInitialChildDecisionJson(alloc, svc.metadata_group_id, request);
+        },
+        .fk_initial_create_begin => |plan| mutateFkInitialCreate(svc, alloc, context, .{ .plan_id = plan.id, .child_table_id = plan.child.table_id, .expected_revision = 0, .action = .begin, .plan = plan }),
+        .fk_initial_create_mutate => |command| mutateFkInitialCreate(svc, alloc, context, command),
+        .fk_initial_create_status => |child_table_id| blk: {
+            if (!context.fk_generation_publication_authority) return error.Forbidden;
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk store.fkInitialCreateStatusJson(alloc, svc.metadata_group_id, child_table_id);
+        },
+        .fk_initial_create_work => |after_child_table_id| blk: {
+            if (!context.fk_generation_publication_authority) return error.Forbidden;
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk store.fkInitialCreateWorkJson(alloc, svc.metadata_group_id, after_child_table_id);
+        },
+        .fk_initial_parent_decision => |request| blk: {
+            if (!context.fk_generation_publication_authority) return error.Forbidden;
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk store.fkInitialParentDecisionJson(alloc, svc.metadata_group_id, request);
+        },
         .setting_mutate => |request| mutateSetting(svc, alloc, context, request),
         .write_validation_revision => blk: {
             try svc.ensureLinearizableReadWithContext(context);

@@ -741,7 +741,7 @@ test "relational integrity shared parent guards and fenced bounded action recove
         const fence: topology.Fence = .{ .role = .truncate_parent, .transition_id = 11, .attempt = 1, .peer_group_id = 21, .owner_group_id = 31, .namespace = .{ .table_id = 41, .shard_id = 31, .range_id = 31 }, .catalog_digest = @splat(4) };
         const encoded_fence = try fence.encode();
         try store.put(topology.fence_key, &encoded_fence);
-        const pending = try retirement.encodePending(alloc, fence, @splat(5), &.{.{ .child_table_id = 51, .child_table_name = first.child_table, .constraint_name = first.constraint_name, .generation = first.constraint_generation }});
+        const pending = try retirement.encodePending(alloc, fence, @splat(5), &.{.{ .child_table_id = 51, .child_table_name = first.child_table, .constraint_name = first.constraint_name, .generation = first.constraint_generation, .next_generation = @splat(8) }});
         defer alloc.free(pending);
         try store.put(retirement.key, pending);
         var pending_read = try store.beginReadTxn();

@@ -17,6 +17,436 @@ const integrity = @import("relational_integrity.zig");
 const catalog = @import("relational_integrity_catalog.zig");
 const tuples = @import("relational_index_keys.zig");
 
+test "child FK generation schema install commits catalog and source release with Raft marker" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/fk-generation-child", .{tmp.sub_path});
+    defer alloc.free(path);
+    const namespace: @import("doc_identity.zig").Namespace = .{ .table_id = 51, .shard_id = 41, .range_id = 41 };
+    var db = try db_mod.DB.open(alloc, path, .{ .identity_namespace = namespace, .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    const before_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const after_json =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"name":{"type":"string"}},"additionalProperties":false}}}}
+    ;
+    try db.setSchemaJson(alloc, before_json);
+    const old_catalog = try db.core.store.get(alloc, catalog.key);
+    defer alloc.free(old_catalog);
+    var before_digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(old_catalog, &before_digest, .{});
+    const public_schema = @import("../../schema/mod.zig");
+    var parsed = try public_schema.parseValidatedTableSchema(alloc, after_json);
+    defer parsed.deinit(alloc);
+    const runtime_schema = try public_schema.deriveRuntimeTableSchema(alloc, parsed);
+    defer @import("../schema.zig").freeSchema(alloc, runtime_schema);
+    var prepared = try db.core.prepareSchemaMetadataPublishedChild(runtime_schema, &.{.{ .key = "\x00\x00__metadata__:schema_json", .value = after_json }});
+    defer prepared.deinit();
+    var after_digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(prepared.integrity_catalog.?.value, &after_digest, .{});
+    var schema_json_digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(after_json, &schema_json_digest, .{});
+    var before_schema_json_digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(before_json, &before_schema_json_digest, .{});
+    const topology = @import("relational_integrity_topology.zig");
+    const initial_fence: topology.Fence = .{ .role = .child_generation_source, .transition_id = 11, .attempt = 1, .admission_epoch = 1, .peer_group_id = 41, .owner_group_id = 41, .namespace = namespace, .catalog_digest = before_digest };
+    try db.applyRelationalTopologyControl(.{ .action = .begin, .fence = initial_fence }, null);
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.setSchemaJson(alloc, after_json));
+    try std.testing.expectError(error.GenerationAdmissionActivationRequired, db.applyRelationalTopologyControl(.{ .action = .release, .fence = initial_fence }, null));
+    try std.testing.expectError(error.GenerationAdmissionActivationRequired, db.applyRelationalTopologyControl(.{ .action = .cancel, .fence = initial_fence }, null));
+    try db.applyRelationalTopologyControl(.{ .action = .cancel_child_generation_source, .fence = initial_fence }, null);
+    var fence = initial_fence;
+    fence.transition_id = 12;
+    fence.admission_epoch = 2;
+    try db.applyRelationalTopologyControl(.{ .action = .begin, .fence = fence }, null);
+    const publication: db_mod.DB.PublishedChildSchema = .{ .fence = fence, .before_schema_json_digest = before_schema_json_digest, .schema_json_digest = schema_json_digest, .before_catalog_digest = before_digest, .after_catalog_digest = after_digest, .raft_entry = .{ .term = 1, .index = 1 } };
+    var changed = publication;
+    changed.after_catalog_digest = @splat(9);
+    try std.testing.expectError(error.IntegrityCatalogChanged, db.installPublishedChildSchema(alloc, after_json, changed));
+    changed = publication;
+    changed.before_schema_json_digest = @splat(9);
+    try std.testing.expectError(error.IntegrityCatalogChanged, db.installPublishedChildSchema(alloc, after_json, changed));
+    const command: topology.Command = .{ .action = .install_child_schema, .fence = fence, .child_schema_install = .{ .schema_json = after_json, .before_schema_json_digest = before_schema_json_digest, .schema_json_digest = schema_json_digest, .before_catalog_digest = before_digest, .after_catalog_digest = after_digest } };
+    try db.batchRaftReplicatedApply(.{ .relational_topology = command }, publication.raft_entry);
+    try db.batchRaftReplicatedApply(.{ .relational_topology = command }, publication.raft_entry);
+    const installed = (try db.getSchemaJson(alloc)).?;
+    defer alloc.free(installed);
+    try std.testing.expectEqualStrings(after_json, installed);
+    const new_catalog = try db.core.store.get(alloc, catalog.key);
+    defer alloc.free(new_catalog);
+    var actual_digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(new_catalog, &actual_digest, .{});
+    try std.testing.expectEqualSlices(u8, &after_digest, &actual_digest);
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expect(try topology.current(&read) == null);
+    try std.testing.expect((try topology.completed(&read)).?.eql(fence));
+
+    // A hot standby replays the dedicated schema-cut event after the source
+    // begin batch. A generic metadata event would reject the FK generation
+    // change or lose the source release on promotion.
+    const standby_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/fk-generation-child-standby", .{tmp.sub_path});
+    defer alloc.free(standby_path);
+    var standby = try db_mod.DB.open(alloc, standby_path, .{ .identity_namespace = namespace, .start_optional_runtimes = false, .start_index_workers = false });
+    var standby_open = true;
+    defer if (standby_open) standby.close();
+    try standby.setSchemaJson(alloc, before_json);
+    try standby.applyRelationalTopologyControl(.{ .action = .begin, .fence = fence }, null);
+    const effects = @import("../hot_standby/effects.zig");
+    const bad_payload = try effects.encodePublishedChildSchemaMetadataMutationAlloc(alloc, runtime_schema, after_json, .{
+        .fence = fence,
+        .before_schema_json_digest = before_schema_json_digest,
+        .schema_json_digest = schema_json_digest,
+        .before_catalog_digest = before_digest,
+        .after_catalog_digest = @splat(9),
+        .applied_term = publication.raft_entry.term,
+        .applied_index = publication.raft_entry.index,
+    });
+    defer alloc.free(bad_payload);
+    const bad_record: @import("../hot_standby/replication_record.zig").Record = .{
+        .kind = .metadata_mutation,
+        .payload_codec = .json,
+        .cluster_id = 1,
+        .timeline_id = 1,
+        .epoch = 1,
+        .lsn = 1,
+        .previous_lsn = 0,
+        .payload = bad_payload,
+    };
+    try std.testing.expectError(error.IntegrityCatalogChanged, standby.applyHAReplicationRecord(bad_record));
+    const payload = try effects.encodePublishedChildSchemaMetadataMutationAlloc(alloc, runtime_schema, after_json, .{
+        .fence = fence,
+        .before_schema_json_digest = before_schema_json_digest,
+        .schema_json_digest = schema_json_digest,
+        .before_catalog_digest = before_digest,
+        .after_catalog_digest = after_digest,
+        .applied_term = publication.raft_entry.term,
+        .applied_index = publication.raft_entry.index,
+    });
+    defer alloc.free(payload);
+    const record: @import("../hot_standby/replication_record.zig").Record = .{
+        .kind = .metadata_mutation,
+        .payload_codec = .json,
+        .cluster_id = 1,
+        .timeline_id = 1,
+        .epoch = 1,
+        .lsn = 1,
+        .previous_lsn = 0,
+        .payload = payload,
+    };
+    try standby.applyHAReplicationRecord(record);
+    try standby.applyHAReplicationRecord(record);
+    const standby_schema = (try standby.getSchemaJson(alloc)).?;
+    defer alloc.free(standby_schema);
+    try std.testing.expectEqualStrings(after_json, standby_schema);
+    const standby_catalog = try standby.core.store.get(alloc, catalog.key);
+    defer alloc.free(standby_catalog);
+    try std.testing.expectEqualSlices(u8, new_catalog, standby_catalog);
+    var standby_read = try standby.core.store.beginReadTxn();
+    try std.testing.expect(try topology.current(&standby_read) == null);
+    try std.testing.expect((try topology.completed(&standby_read)).?.eql(fence));
+    standby_read.abort();
+    const receipt_key = @import("relational_integrity_generation_admission.zig").source_install_receipt_key;
+    const primary_receipt = try db.core.store.get(alloc, receipt_key);
+    defer alloc.free(primary_receipt);
+    const standby_receipt = try standby.core.store.get(alloc, receipt_key);
+    defer alloc.free(standby_receipt);
+    try std.testing.expectEqualSlices(u8, primary_receipt, standby_receipt);
+    standby.close();
+    standby_open = false;
+    // Promotion/restart must load the same durable schema and receipt without
+    // consulting the old metadata decision or replaying the journal event.
+    var promoted = try db_mod.DB.open(alloc, standby_path, .{ .identity_namespace = namespace, .start_optional_runtimes = false, .start_index_workers = false });
+    defer promoted.close();
+    const promoted_schema = (try promoted.getSchemaJson(alloc)).?;
+    defer alloc.free(promoted_schema);
+    try std.testing.expectEqualStrings(after_json, promoted_schema);
+    const promoted_catalog = try promoted.core.store.get(alloc, catalog.key);
+    defer alloc.free(promoted_catalog);
+    try std.testing.expectEqualSlices(u8, new_catalog, promoted_catalog);
+    const promoted_receipt = try promoted.core.store.get(alloc, receipt_key);
+    defer alloc.free(promoted_receipt);
+    try std.testing.expectEqualSlices(u8, primary_receipt, promoted_receipt);
+    var promoted_read = try promoted.core.store.beginReadTxn();
+    defer promoted_read.abort();
+    try std.testing.expect(try topology.current(&promoted_read) == null);
+    try std.testing.expect((try topology.completed(&promoted_read)).?.eql(fence));
+}
+
+test "initial FK child owner stays hidden across restart until replicated release" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/fk-initial-child", .{tmp.sub_path});
+    defer alloc.free(path);
+    const standby_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/fk-initial-child-standby", .{tmp.sub_path});
+    defer alloc.free(standby_path);
+    const namespace: @import("doc_identity.zig").Namespace = .{ .table_id = 51, .shard_id = 41, .range_id = 41 };
+    const options: db_mod.OpenOptions = .{ .identity_namespace = namespace, .start_optional_runtimes = false, .start_index_workers = false };
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"parent_fk","child_columns":["parent_id"],"parent_table":"parents","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent_id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const schema = @import("../../schema/mod.zig");
+    var parsed = try schema.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const runtime = try schema.deriveRuntimeTableSchema(alloc, parsed);
+    defer @import("../schema.zig").freeSchema(alloc, runtime);
+    const hidden = @import("relational_initial_child_publication.zig");
+    const topology = @import("relational_integrity_topology.zig");
+    const plan_id: [16]u8 = @splat(7);
+    const plan_digest: [32]u8 = @splat(8);
+    var catalog_digest: [32]u8 = undefined;
+    var schema_digest: [32]u8 = undefined;
+    var public_digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(schema_json, &public_digest, .{});
+    {
+        var db = try db_mod.DB.open(alloc, path, options);
+        defer db.close();
+        var candidate = try db.core.prepareSchemaMetadataPublishedChild(runtime, &.{.{ .key = "\x00\x00__metadata__:schema_json", .value = schema_json }});
+        defer candidate.deinit();
+        std.crypto.hash.Blake3.hash(candidate.integrity_catalog.?.value, &catalog_digest, .{});
+        schema_digest = candidate.integrity_catalog.?.catalog.schema_digest;
+        const fence: topology.Fence = .{ .role = .child_generation_source, .transition_id = 11, .attempt = 1, .admission_epoch = 1, .peer_group_id = 41, .owner_group_id = 41, .namespace = namespace, .catalog_digest = catalog_digest };
+        const provision: topology.Command = .{ .action = .provision_initial_child, .fence = fence, .initial_child_provision = .{
+            .schema_json = schema_json,
+            .plan_id = plan_id,
+            .plan_digest = plan_digest,
+            .schema_digest = schema_digest,
+            .public_schema_json_digest = public_digest,
+            .catalog_digest = catalog_digest,
+        } };
+        try db.batchRaftReplicatedApply(.{ .relational_topology = provision }, .{ .term = 2, .index = 1 });
+        try db.batchRaftReplicatedApply(.{ .relational_topology = provision }, .{ .term = 2, .index = 1 });
+        try std.testing.expectError(error.InitialChildNotPublished, db.batch(.{ .writes = &.{.{ .key = "leak", .value = "{}" }} }));
+        try std.testing.expectError(error.InitialChildNotPublished, db.lookup(alloc, "leak", .{}));
+        const stored = try db.core.store.get(alloc, hidden.key);
+        defer alloc.free(stored);
+        try std.testing.expectEqual(hidden.Phase.hidden, (try hidden.Record.decode(stored)).phase);
+        const bootstrap: hidden.Bootstrap = .{
+            .plan_id = plan_id,
+            .plan_digest = plan_digest,
+            .namespace = namespace,
+            .schema_version = 1,
+            .schema_digest = schema_digest,
+            .public_schema_json_digest = public_digest,
+            .catalog_digest = catalog_digest,
+        };
+        var standby_options = options;
+        standby_options.initial_child_bootstrap = bootstrap;
+        var standby = try db_mod.DB.open(alloc, standby_path, standby_options);
+        defer standby.close();
+        const payload = try @import("../hot_standby/effects.zig").encodeInitialChildMutationRequestAlloc(alloc, .{ .relational_topology = provision }, .{ .term = 2, .index = 1 });
+        defer alloc.free(payload);
+        const ha_record: @import("../hot_standby/replication_record.zig").RecordView = .{
+            .kind = .batch_mutation,
+            .payload_codec = .json,
+            .cluster_id = 1,
+            .timeline_id = 1,
+            .epoch = 1,
+            .lsn = 1,
+            .previous_lsn = 0,
+            .payload = payload,
+        };
+        try standby.applyHAReplicationRecord(ha_record);
+        try standby.applyHAReplicationRecord(ha_record);
+        try std.testing.expectError(error.InitialChildNotPublished, standby.lookup(alloc, "leak", .{}));
+        const replayed = try standby.core.store.get(alloc, hidden.key);
+        defer alloc.free(replayed);
+        try std.testing.expectEqualSlices(u8, stored, replayed);
+    }
+    {
+        var db = try db_mod.DB.open(alloc, path, options);
+        defer db.close();
+        try std.testing.expectError(error.InitialChildNotPublished, db.batch(.{ .writes = &.{.{ .key = "leak", .value = "{}" }} }));
+        const fence: topology.Fence = .{ .role = .child_generation_source, .transition_id = 11, .attempt = 1, .admission_epoch = 1, .peer_group_id = 41, .owner_group_id = 41, .namespace = namespace, .catalog_digest = catalog_digest };
+        const release: topology.Command = .{ .action = .release_initial_child, .fence = fence, .initial_child_control = .{
+            .plan_id = plan_id,
+            .plan_digest = plan_digest,
+            .schema_version = 1,
+            .schema_digest = schema_digest,
+            .public_schema_json_digest = public_digest,
+            .catalog_digest = catalog_digest,
+        } };
+        var wrong = release;
+        wrong.initial_child_control.?.plan_digest = @splat(9);
+        try std.testing.expectError(error.InitialChildPublicationChanged, db.batchRaftReplicatedApply(.{ .relational_topology = wrong }, .{ .term = 2, .index = 2 }));
+        try db.batchRaftReplicatedApply(.{ .relational_topology = release }, .{ .term = 2, .index = 2 });
+        try db.batchRaftReplicatedApply(.{ .relational_topology = release }, .{ .term = 2, .index = 2 });
+        const stored = try db.core.store.get(alloc, hidden.key);
+        defer alloc.free(stored);
+        try std.testing.expectEqual(hidden.Phase.released, (try hidden.Record.decode(stored)).phase);
+        try std.testing.expect((try db.lookup(alloc, "leak", .{})) == null);
+        try std.testing.expectError(error.InvalidIntegrityOperation, db.batch(.{ .writes = &.{.{ .key = hidden.key, .value = "forged" }} }));
+        var standby_options = options;
+        standby_options.initial_child_bootstrap = .{
+            .plan_id = plan_id,
+            .plan_digest = plan_digest,
+            .namespace = namespace,
+            .schema_version = 1,
+            .schema_digest = schema_digest,
+            .public_schema_json_digest = public_digest,
+            .catalog_digest = catalog_digest,
+        };
+        var standby = try db_mod.DB.open(alloc, standby_path, standby_options);
+        defer standby.close();
+        const payload = try @import("../hot_standby/effects.zig").encodeInitialChildMutationRequestAlloc(alloc, .{ .relational_topology = release }, .{ .term = 2, .index = 2 });
+        defer alloc.free(payload);
+        const record: @import("../hot_standby/replication_record.zig").RecordView = .{
+            .kind = .batch_mutation,
+            .payload_codec = .json,
+            .cluster_id = 1,
+            .timeline_id = 1,
+            .epoch = 1,
+            .lsn = 2,
+            .previous_lsn = 1,
+            .payload = payload,
+        };
+        try standby.applyHAReplicationRecord(record);
+        try standby.applyHAReplicationRecord(record);
+        const replayed = try standby.core.store.get(alloc, hidden.key);
+        defer alloc.free(replayed);
+        try std.testing.expectEqualSlices(u8, stored, replayed);
+        try std.testing.expect((try standby.lookup(alloc, "leak", .{})) == null);
+    }
+}
+
+test "initial FK bootstrap denies direct writes before first Raft provision and survives reopen" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/fk-bootstrap", .{tmp.sub_path});
+    defer alloc.free(path);
+    const namespace: @import("doc_identity.zig").Namespace = .{ .table_id = 51, .shard_id = 41, .range_id = 41 };
+    const bootstrap: @import("relational_initial_child_publication.zig").Bootstrap = .{
+        .plan_id = @splat(1),
+        .plan_digest = @splat(2),
+        .namespace = namespace,
+        .schema_version = 0,
+        .schema_digest = @splat(3),
+        .public_schema_json_digest = @splat(4),
+        .catalog_digest = @splat(5),
+    };
+    const options: db_mod.OpenOptions = .{
+        .identity_namespace = namespace,
+        .initial_child_bootstrap = bootstrap,
+        .start_optional_runtimes = false,
+        .start_index_workers = false,
+    };
+    {
+        var db = try db_mod.DB.open(alloc, path, options);
+        defer db.close();
+        try std.testing.expectError(error.InitialChildNotPublished, db.batch(.{ .writes = &.{.{ .key = "leak", .value = "{}" }} }));
+        try std.testing.expectError(error.InitialChildNotPublished, db.lookup(alloc, "leak", .{}));
+        try std.testing.expectError(error.InitialChildNotPublished, db.scan(alloc, "", "", .{}));
+    }
+    {
+        var db = try db_mod.DB.open(alloc, path, options);
+        defer db.close();
+        try std.testing.expectError(error.InitialChildNotPublished, db.batch(.{ .writes = &.{.{ .key = "leak", .value = "{}" }} }));
+    }
+}
+
+test "parent FK generation owner stages default-deny, activates atomically, and fences until metadata ACK" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/fk-generation-parent", .{tmp.sub_path});
+    defer alloc.free(path);
+    const namespace: @import("doc_identity.zig").Namespace = .{ .table_id = 41, .shard_id = 31, .range_id = 31 };
+    var db = try db_mod.DB.open(alloc, path, .{ .identity_namespace = namespace, .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.setSchemaJson(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    );
+    const raw = try db.core.store.get(alloc, catalog.key);
+    defer alloc.free(raw);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(raw, &digest, .{});
+    const topology = @import("relational_integrity_topology.zig");
+    const admission = @import("relational_integrity_generation_admission.zig");
+    const transition: admission.Transition = .{ .child_table_id = 51, .child_table_name = "children", .constraint_name = "fk", .expected_generation = null, .next_generation = @splat(5), .plan_id = @splat(4), .decision_digest = @splat(6) };
+    var second_constraint = transition;
+    second_constraint.constraint_name = "fk2";
+    second_constraint.next_generation = @splat(7);
+    const transitions = [_]admission.Transition{ transition, second_constraint };
+    const first: topology.Fence = .{ .role = .child_generation_parent, .transition_id = 11, .attempt = 1, .admission_epoch = 1, .peer_group_id = 51, .owner_group_id = 31, .namespace = namespace, .catalog_digest = digest };
+    try db.applyRelationalTopologyControl(.{ .action = .begin, .fence = first }, null);
+    try db.applyRelationalTopologyControl(.{ .action = .stage_child_generation, .fence = first, .child_generations = &transitions }, null);
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        const scope = (try admission.load(&read, transition.child_table_name, transition.constraint_name)).?;
+        try std.testing.expectEqual(admission.Phase.staged, scope.phase);
+        try std.testing.expect(scope.active_generation == null);
+        const second_scope = (try admission.load(&read, second_constraint.child_table_name, second_constraint.constraint_name)).?;
+        try std.testing.expectEqual(admission.Phase.staged, second_scope.phase);
+    }
+    try std.testing.expectError(error.GenerationAdmissionActivationRequired, db.applyRelationalTopologyControl(.{ .action = .release, .fence = first }, null));
+    try db.applyRelationalTopologyControl(.{ .action = .cancel, .fence = first, .child_generations = &transitions }, null);
+    var second = first;
+    second.transition_id = 12;
+    second.admission_epoch = 2;
+    try db.applyRelationalTopologyControl(.{ .action = .begin, .fence = second }, null);
+    try db.applyRelationalTopologyControl(.{ .action = .stage_child_generation, .fence = second, .child_generations = &transitions }, null);
+    try db.applyRelationalTopologyControl(.{ .action = .activate_child_generation, .fence = second, .child_generations = &transitions }, null);
+    try db.applyRelationalTopologyControl(.{ .action = .activate_child_generation, .fence = second, .child_generations = &transitions }, null);
+    try std.testing.expectError(error.GenerationAdmissionChanged, db.applyRelationalTopologyControl(.{ .action = .cancel, .fence = second, .child_generations = &transitions }, null));
+    var third = second;
+    third.transition_id = 13;
+    third.admission_epoch = 3;
+    try std.testing.expectError(error.GenerationAdmissionAcknowledgementPending, db.applyRelationalTopologyControl(.{ .action = .begin, .fence = third }, null));
+    try db.applyRelationalTopologyControl(.{ .action = .acknowledge_child_generation, .fence = second, .child_generations = &transitions }, null);
+    try db.applyRelationalTopologyControl(.{ .action = .acknowledge_child_generation, .fence = second, .child_generations = &transitions }, null);
+    try db.applyRelationalTopologyControl(.{ .action = .begin, .fence = third }, null);
+    var next_transition = transition;
+    next_transition.expected_generation = transition.next_generation;
+    next_transition.next_generation = @splat(7);
+    next_transition.plan_id = @splat(8);
+    next_transition.decision_digest = @splat(9);
+    try db.applyRelationalTopologyControl(.{ .action = .cancel, .fence = third, .child_generations = &.{next_transition} }, null);
+    const retirement = @import("relational_integrity_generation_retirement.zig");
+    var fourth = third;
+    fourth.transition_id = 14;
+    fourth.admission_epoch = 4;
+    try db.applyRelationalTopologyControl(.{ .action = .begin, .fence = fourth }, null);
+    next_transition.next_generation = null; // DROP CONSTRAINT
+    try db.applyRelationalTopologyControl(.{ .action = .stage_child_generation, .fence = fourth, .child_generations = &.{next_transition} }, null);
+    try db.applyRelationalTopologyControl(.{ .action = .activate_child_generation, .fence = fourth, .child_generations = &.{next_transition} }, null);
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        const scope = (try admission.load(&read, transition.child_table_name, transition.constraint_name)).?;
+        try std.testing.expect(scope.active_generation == null);
+        const active = try read.get(&retirement.activeKey(@splat(5)));
+        _ = try retirement.Active.decode(active, @splat(5));
+        const progress = try read.get(retirement.gc_progress_key);
+        try std.testing.expect(!(try retirement.GcProgress.decode(progress)).complete);
+    }
+    try db.applyRelationalTopologyControl(.{ .action = .acknowledge_child_generation, .fence = fourth, .child_generations = &.{next_transition} }, null);
+    const scope_key = try admission.scopeKey("children", "fk");
+    try std.testing.expectError(error.InvalidIntegrityOperation, db.batch(.{ .writes = &.{.{ .key = &scope_key, .value = "forged" }} }));
+    try std.testing.expectError(error.InvalidIntegrityOperation, db.batch(.{ .deletes = &.{admission.source_install_receipt_key} }));
+    var fifth = fourth;
+    fifth.transition_id = 15;
+    fifth.admission_epoch = 5;
+    try db.applyRelationalTopologyControl(.{ .action = .begin, .fence = fifth }, null);
+    var reparent = second_constraint;
+    reparent.expected_generation = second_constraint.next_generation;
+    reparent.next_generation = @splat(8);
+    reparent.plan_id = @splat(10);
+    reparent.decision_digest = @splat(11);
+    try db.applyRelationalTopologyControl(.{ .action = .stage_child_generation, .fence = fifth, .child_generations = &.{reparent} }, null);
+    try db.applyRelationalTopologyControl(.{ .action = .activate_child_generation, .fence = fifth, .child_generations = &.{reparent} }, null);
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        const active = try read.get(&retirement.activeKey(@splat(7)));
+        _ = try retirement.Active.decode(active, @splat(7));
+    }
+}
+
 test "relational integrity TRUNCATE parent pending generations survive restart and reject changed replay" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -30,7 +460,7 @@ test "relational integrity TRUNCATE parent pending generations survive restart a
     ;
     const topology = @import("relational_integrity_topology.zig");
     const retirement = @import("relational_integrity_generation_retirement.zig");
-    const entry: @import("relational_integrity_topology_contract.zig").ParentRetirementEntry = .{ .child_table_id = 51, .child_table_name = "children", .constraint_name = "fk", .generation = @splat(3) };
+    const entry: @import("relational_integrity_topology_contract.zig").ParentRetirementEntry = .{ .child_table_id = 51, .child_table_name = "children", .constraint_name = "fk", .generation = @splat(3), .next_generation = @splat(4) };
     var fence: topology.Fence = .{ .role = .truncate_parent, .transition_id = 11, .attempt = 1, .peer_group_id = 21, .owner_group_id = 31, .namespace = namespace, .catalog_digest = undefined };
     const stage: @import("relational_integrity_topology_contract.zig").ParentRetirementStage = .{ .plan_digest = @splat(5), .entries = &.{entry} };
     {
@@ -44,13 +474,13 @@ test "relational integrity TRUNCATE parent pending generations survive restart a
         try db.applyRelationalTopologyControl(.{ .fence = fence, .action = .stage_parent_retirement, .parent_retirement = stage }, null);
         try db.applyRelationalTopologyControl(.{ .fence = fence, .action = .stage_parent_retirement, .parent_retirement = stage }, null);
         try std.testing.expectError(error.GenerationRetirementChanged, db.applyRelationalTopologyControl(.{ .fence = fence, .action = .stage_parent_retirement, .parent_retirement = .{ .plan_digest = @splat(6), .entries = stage.entries } }, null));
-        try std.testing.expectError(error.IntegrityTopologyCutoverRequired, db.applyRelationalTopologyControl(.{ .fence = fence, .action = .release }, null));
+        try std.testing.expectError(error.GenerationAdmissionActivationRequired, db.applyRelationalTopologyControl(.{ .fence = fence, .action = .release }, null));
     }
     {
         var db = try db_mod.DB.open(alloc, path, options);
         defer db.close();
         try db.applyRelationalTopologyControl(.{ .fence = fence, .action = .stage_parent_retirement, .parent_retirement = stage }, null);
-        const changed: @import("relational_integrity_topology_contract.zig").ParentRetirementEntry = .{ .child_table_id = entry.child_table_id, .child_table_name = entry.child_table_name, .constraint_name = entry.constraint_name, .generation = @splat(4) };
+        const changed: @import("relational_integrity_topology_contract.zig").ParentRetirementEntry = .{ .child_table_id = entry.child_table_id, .child_table_name = entry.child_table_name, .constraint_name = entry.constraint_name, .generation = @splat(5), .next_generation = entry.next_generation };
         try std.testing.expectError(error.GenerationRetirementChanged, db.applyRelationalTopologyControl(.{ .fence = fence, .action = .stage_parent_retirement, .parent_retirement = .{ .plan_digest = stage.plan_digest, .entries = &.{changed} } }, null));
         var renamed = entry;
         renamed.child_table_name = "renamed_children";
@@ -58,10 +488,10 @@ test "relational integrity TRUNCATE parent pending generations survive restart a
         renamed = entry;
         renamed.constraint_name = "renamed_fk";
         try std.testing.expectError(error.GenerationRetirementChanged, db.applyRelationalTopologyControl(.{ .fence = fence, .action = .stage_parent_retirement, .parent_retirement = .{ .plan_digest = stage.plan_digest, .entries = &.{renamed} } }, null));
-        try std.testing.expectError(error.IntegrityTopologyCutoverRequired, db.applyRelationalTopologyControl(.{ .fence = fence, .action = .release }, null));
+        try std.testing.expectError(error.GenerationAdmissionActivationRequired, db.applyRelationalTopologyControl(.{ .fence = fence, .action = .release }, null));
         const pending = try db.core.store.get(alloc, retirement.key);
         defer alloc.free(pending);
-        try std.testing.expect((try retirement.Pending.decode(pending)).contains(entry.child_table_id, entry.generation));
+        try std.testing.expect((try retirement.Pending.decode(pending)).containsTransition(entry.child_table_id, entry.generation, entry.next_generation));
         try db.applyRelationalTopologyControl(.{ .fence = fence, .action = .cancel }, null);
     }
     {
@@ -77,7 +507,7 @@ test "relational integrity TRUNCATE parent pending generations survive restart a
     }
 }
 
-test "relational integrity verified generation tombstone survives restart and bounded GC never resurrects references" {
+test "relational integrity accepted generation survives restart and bounded two-phase GC never resurrects references" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -114,14 +544,19 @@ test "relational integrity verified generation tombstone survives restart and bo
         try db.core.store.put(&old_key, old_bytes);
         try db.core.store.put(&live_key, live_bytes);
         try db.applyRelationalTopologyControl(.{ .fence = fence, .action = .begin }, null);
-        try db.applyRelationalTopologyControl(.{ .fence = fence, .action = .stage_parent_retirement, .parent_retirement = .{ .plan_digest = @splat(5), .entries = &.{.{ .child_table_id = 51, .child_table_name = "children", .constraint_name = "fk", .generation = old.constraint_generation }} } }, null);
-        // Model only the trusted owner-local effect of a verified metadata
-        // publication; the public control path still rejects unproven release.
-        var txn = try db.core.store.beginWriteTxn();
-        errdefer txn.abort();
-        try retirement.stageVerifiedActivation(alloc, &txn, fence, @splat(5), @splat(6));
-        try topology.stageRelease(&txn, fence);
-        try txn.commit();
+        try db.applyRelationalTopologyControl(.{ .fence = fence, .action = .stage_parent_retirement, .parent_retirement = .{ .plan_digest = @splat(5), .entries = &.{.{ .child_table_id = 51, .child_table_name = "children", .constraint_name = "fk", .generation = old.constraint_generation, .next_generation = @splat(5) }} } }, null);
+        const plan_id: [16]u8 = @splat(4);
+        const publication_digest = retirement.publicationDigest(plan_id, @splat(5));
+        const activate: topology.Command = .{ .fence = fence, .action = .activate_parent_retirement, .parent_activation = .{ .plan_id = plan_id, .plan_digest = @splat(5), .publication_digest = publication_digest } };
+        try db.applyRelationalTopologyControl(activate, null);
+        try db.applyRelationalTopologyControl(activate, null);
+        {
+            var probe = try db.core.store.beginProbeTxn();
+            defer probe.abort();
+            try std.testing.expect((try topology.current(&probe)).?.eql(fence));
+            try std.testing.expectError(error.IntegrityTopologyBusy, topology.requireUnfenced(&probe));
+        }
+        try std.testing.expectError(error.GenerationRetirementChanged, db.applyRelationalTopologyControl(.{ .fence = fence, .action = .activate_parent_retirement, .parent_activation = .{ .plan_id = @splat(6), .plan_digest = @splat(5), .publication_digest = retirement.publicationDigest(@splat(6), @splat(5)) } }, null));
     }
     {
         var db = try db_mod.DB.open(alloc, path, options);
@@ -130,36 +565,107 @@ test "relational integrity verified generation tombstone survives restart and bo
         split.role = .split_source;
         split.transition_id += 1;
         split.admission_epoch += 1;
-        try std.testing.expectError(error.GenerationRetirementHandoffRequired, db.applyRelationalTopologyControl(.{ .fence = split, .action = .begin }, null));
+        try std.testing.expectError(error.IntegrityTopologyBusy, db.applyRelationalTopologyControl(.{ .fence = split, .action = .begin }, null));
+        try std.testing.expectError(error.GenerationAdmissionActivationRequired, db.applyRelationalTopologyControl(.{ .fence = fence, .action = .release }, null));
+        try std.testing.expectError(error.GenerationAdmissionActivationRequired, db.applyRelationalTopologyControl(.{ .fence = fence, .action = .cancel }, null));
+        const gc_before_ack = try db.core.store.get(alloc, retirement.gc_progress_key);
+        defer alloc.free(gc_before_ack);
+        const previous_gc = try retirement.GcProgress.decode(gc_before_ack);
+        const tombstone_phase = try (retirement.GcProgress{ .revision = previous_gc.revision, .tombstones = true }).encode(alloc);
+        defer alloc.free(tombstone_phase);
+        try db.core.store.put(retirement.gc_progress_key, tombstone_phase);
+        {
+            var probe = try db.core.store.beginProbeTxn();
+            defer probe.abort();
+            try std.testing.expect((try retirement.prepareGcPage(alloc, &probe, 1, 1024 * 1024)) == null);
+        }
+        try db.core.store.put(retirement.gc_progress_key, gc_before_ack);
+        const plan_id: [16]u8 = @splat(4);
+        const acknowledge: topology.Command = .{ .fence = fence, .action = .acknowledge_parent_retirement, .parent_activation = .{ .plan_id = plan_id, .plan_digest = @splat(5), .publication_digest = retirement.publicationDigest(plan_id, @splat(5)) } };
+        try std.testing.expectError(error.GenerationRetirementChanged, db.applyRelationalTopologyControl(.{ .fence = fence, .action = .acknowledge_parent_retirement, .parent_activation = .{ .plan_id = @splat(6), .plan_digest = @splat(5), .publication_digest = retirement.publicationDigest(@splat(6), @splat(5)) } }, null));
+        try db.applyRelationalTopologyControl(acknowledge, null);
+        try db.applyRelationalTopologyControl(acknowledge, null);
+        {
+            var probe = try db.core.store.beginProbeTxn();
+            defer probe.abort();
+            try std.testing.expect((try topology.current(&probe)) == null);
+            try topology.requireUnfenced(&probe);
+        }
+        try db.applyRelationalTopologyControl(.{ .fence = split, .action = .begin }, null);
+        try db.applyRelationalTopologyControl(acknowledge, null);
+        try db.applyRelationalTopologyControl(.{ .fence = split, .action = .cancel }, null);
         var read = try integrity.CurrentView.init(db.core.store);
-        defer read.deinit();
+        var read_open = true;
+        defer if (read_open) read.deinit();
         try std.testing.expect(try retirement.isRetired(&read, old));
         try std.testing.expect(!(try retirement.isRetired(&read, live)));
+        const accepted = (try @import("relational_integrity_generation_admission.zig").load(&read, old.child_table, old.constraint_name)).?;
+        try std.testing.expectEqual(@as(integrity.Generation, @splat(5)), accepted.active_generation.?);
+        var unknown_generation = old;
+        unknown_generation.constraint_generation = @splat(9);
+        try std.testing.expect(try retirement.isRetired(&read, unknown_generation));
+        var successor = old;
+        successor.constraint_generation = @splat(5);
+        try std.testing.expect(!(try retirement.isRetired(&read, successor)));
         try std.testing.expectError(error.GenerationRetired, integrity.prepare(alloc, &read, &.{.{ .address = address, .operation = .{ .attach = old } }}));
         try std.testing.expectError(error.ForeignKeyReferenced, integrity.prepare(alloc, &read, &.{.{ .address = address, .operation = .{ .release = .{ .parent_table = "parents", .parent_key = "p" } } }}));
         // Exactly one reference is examined per page, including live rows;
         // each committed progress record survives an owner reopen.
         var pages: usize = 0;
-        while (pages < 3) : (pages += 1) {
+        while (pages < 6) : (pages += 1) {
             var page = (try retirement.prepareGcPage(alloc, &read, 1, 1024 * 1024)) orelse break;
             defer page.deinit();
-            var write = try db.core.store.beginWriteTxn();
-            errdefer write.abort();
-            try retirement.applyGcPage(&write, page);
-            try write.commit();
-            // A duplicate page is rejected after its progress commit.
-            var duplicate = try db.core.store.beginWriteTxn();
-            defer duplicate.abort();
-            try std.testing.expectError(error.GenerationRetirementChanged, retirement.applyGcPage(&duplicate, page));
+            const command = page.command(namespace.shard_id, namespace);
             read.deinit();
+            read_open = false;
+            try db.batchRaftReplicatedApply(.{ .relational_generation_gc = command }, .{ .term = 1, .index = @intCast(pages * 2 + 1) });
+            // Raft replay is idempotent, whereas a fresh stale proposal must
+            // not silently advance the progress CAS or delete a new value.
+            try db.batchRaftReplicatedApply(.{ .relational_generation_gc = command }, .{ .term = 1, .index = @intCast(pages * 2 + 1) });
+            const progress_before_stale = try db.core.store.get(alloc, retirement.gc_progress_key);
+            defer alloc.free(progress_before_stale);
+            try db.batchRaftReplicatedApply(.{ .relational_generation_gc = command }, .{ .term = 1, .index = @intCast(pages * 2 + 2) });
+            const progress_after_stale = try db.core.store.get(alloc, retirement.gc_progress_key);
+            defer alloc.free(progress_after_stale);
+            try std.testing.expectEqualSlices(u8, progress_before_stale, progress_after_stale);
             read = try integrity.CurrentView.init(db.core.store);
+            read_open = true;
             if ((try retirement.GcProgress.decode(try read.get(retirement.gc_progress_key))).complete) break;
         }
-        try std.testing.expect(pages < 3);
+        try std.testing.expect(pages < 6);
+        try std.testing.expect((try retirement.GcProgress.decode(try read.get(retirement.gc_progress_key))).complete);
         try std.testing.expectError(error.NotFound, read.get(&old_key));
+        try std.testing.expectError(error.NotFound, read.get(&retirement.activeKey(old.constraint_generation)));
         _ = try integrity.Reference.decode(&live_key, try read.get(&live_key));
         try std.testing.expect(try retirement.isRetired(&read, old));
         try std.testing.expectError(error.GenerationRetired, integrity.prepare(alloc, &read, &.{.{ .address = address, .operation = .{ .attach = old } }}));
+        read.deinit();
+        read_open = false;
+        // A coherent native seed carries both the durable retired-generation
+        // authority and the exact metadata-acknowledged owner fence. A normal
+        // historical restore remains prohibited for coordinated constraints.
+        _ = try db.snapshot("retired-generation");
+        const snapshot_path = try std.fmt.allocPrint(alloc, "{s}.snapshots/retired-generation", .{path});
+        defer alloc.free(snapshot_path);
+        const target_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/retired-parent-seed", .{tmp.sub_path});
+        defer alloc.free(target_path);
+        var transition = try @import("generation_lifecycle.zig").beginProcessExclusiveWithRuntime(target_path, null);
+        defer transition.deinit();
+        var staged = try transition.beginStaging();
+        defer staged.deinit();
+        try std.testing.expectError(error.CoordinatedConstraintRestoreRequired, db_mod.DB.restoreSnapshotToStagedGeneration(&staged, alloc, snapshot_path, staged.path(), options));
+        try db_mod.DB.restoreCoherentHASeedReplicaToStagedGeneration(&staged, alloc, snapshot_path, staged.path(), options, namespace);
+        var staged_options = options;
+        staged_options.staged_generation = &staged;
+        var seeded = try db_mod.DB.open(alloc, staged.path(), staged_options);
+        defer seeded.close();
+        var seeded_read = try integrity.CurrentView.init(seeded.core.store);
+        defer seeded_read.deinit();
+        try std.testing.expect(try retirement.isRetired(&seeded_read, old));
+        const seeded_scope = (try @import("relational_integrity_generation_admission.zig").load(&seeded_read, old.child_table, old.constraint_name)).?;
+        try std.testing.expectEqual(@as(integrity.Generation, @splat(5)), seeded_scope.active_generation.?);
+        try retirement.requireActivationAcknowledged(&seeded_read);
+        try std.testing.expectError(error.GenerationRetired, integrity.prepare(alloc, &seeded_read, &.{.{ .address = address, .operation = .{ .attach = old } }}));
     }
 }
 
@@ -933,6 +1439,7 @@ test "relational integrity topology handoff transfers routed companions with res
     const alloc = std.testing.allocator;
     const topology = @import("relational_integrity_topology.zig");
     const handoff = @import("relational_integrity_handoff.zig");
+    const retirement = @import("relational_integrity_generation_retirement.zig");
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const owned = arena.allocator();
@@ -977,8 +1484,16 @@ test "relational integrity topology handoff transfers routed companions with res
     }
     const source_owner = try source.relationalTopologyIdentity();
     const destination_owner = try destination.relationalTopologyIdentity();
-    const source_fence: topology.Fence = .{ .transition_id = 800, .attempt = 1, .owner_group_id = 601, .peer_group_id = 602, .role = .split_source, .namespace = source_owner.namespace, .catalog_digest = source_owner.catalog_digest };
+    const retired: integrity.Reference = .{ .child_table = "children", .child_key = "old", .constraint_name = "fk", .constraint_generation = @splat(9) };
+    const parent_fence: topology.Fence = .{ .transition_id = 799, .attempt = 1, .owner_group_id = 601, .peer_group_id = 700, .role = .truncate_parent, .namespace = source_owner.namespace, .catalog_digest = source_owner.catalog_digest, .admission_epoch = source_owner.next_epoch };
+    try source.applyRelationalTopologyControl(.{ .action = .begin, .fence = parent_fence }, null);
+    try source.applyRelationalTopologyControl(.{ .action = .stage_parent_retirement, .fence = parent_fence, .parent_retirement = .{ .plan_digest = @splat(5), .entries = &.{.{ .child_table_id = 700, .child_table_name = "children", .constraint_name = "fk", .generation = retired.constraint_generation, .next_generation = @splat(6) }} } }, null);
+    try source.applyRelationalTopologyControl(.{ .action = .activate_parent_retirement, .fence = parent_fence, .parent_activation = .{ .plan_id = @splat(4), .plan_digest = @splat(5), .publication_digest = retirement.publicationDigest(@splat(4), @splat(5)) } }, null);
+    const parent_acknowledge: topology.Command = .{ .action = .acknowledge_parent_retirement, .fence = parent_fence, .parent_activation = .{ .plan_id = @splat(4), .plan_digest = @splat(5), .publication_digest = retirement.publicationDigest(@splat(4), @splat(5)) } };
+    const source_fence: topology.Fence = .{ .transition_id = 800, .attempt = 1, .owner_group_id = 601, .peer_group_id = 602, .role = .split_source, .namespace = source_owner.namespace, .catalog_digest = source_owner.catalog_digest, .admission_epoch = source_owner.next_epoch + 1 };
     const destination_fence: topology.Fence = .{ .transition_id = 800, .attempt = 1, .owner_group_id = 602, .peer_group_id = 601, .role = .split_destination, .namespace = destination_owner.namespace, .catalog_digest = destination_owner.catalog_digest };
+    try std.testing.expectError(error.GenerationRetirementAcknowledgementPending, source.applyRelationalTopologyControl(.{ .action = .begin, .fence = source_fence }, null));
+    try source.applyRelationalTopologyControl(parent_acknowledge, null);
     try source.applyRelationalTopologyControl(.{ .action = .begin, .fence = source_fence }, null);
     try destination.applyRelationalTopologyControl(.{ .action = .begin, .fence = destination_fence }, null);
     const manifest = try source.relationalHandoffManifest(owned, source_fence, destination_fence, "m", "", 10);
@@ -1004,6 +1519,12 @@ test "relational integrity topology handoff transfers routed companions with res
     }
     var read = try destination.core.store.beginProbeTxn();
     defer read.abort();
+    try std.testing.expect(try retirement.isRetired(&read, retired));
+    const accepted = (try @import("relational_integrity_generation_admission.zig").load(&read, retired.child_table, retired.constraint_name)).?;
+    try std.testing.expectEqual(@as(integrity.Generation, @splat(6)), accepted.active_generation.?);
+    const transferred_gc = try retirement.GcProgress.decode(try read.get(retirement.gc_progress_key));
+    try std.testing.expect(!transferred_gc.complete);
+    try std.testing.expectEqualStrings("", transferred_gc.cursor);
     const address = kept_address orelse return error.TestUnexpectedResult;
     try integrity.validateTransferredCompanions(&read, &address.claimKey(), try read.get(&address.claimKey()));
     // Metadata completion alone never releases the destination write fence.

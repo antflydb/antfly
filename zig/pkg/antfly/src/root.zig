@@ -318,6 +318,10 @@ test {
 
     // Public API
     _ = public_api;
+    _ = public_api.row_policy_install;
+    _ = public_api.relational_fk_generation_publication;
+    _ = public_api.row_policy_publication_coordinator;
+    _ = public_api.fk_generation_publication_coordinator;
     _ = public_api.http_server;
     _ = public_api.internal_query_operations;
     _ = public_api.tables;

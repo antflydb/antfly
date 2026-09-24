@@ -8,16 +8,19 @@ const catalog = @import("catalog.zig");
 const scalar = @import("scalar.zig");
 
 pub const Bound = struct {
+    pub const Deferred = struct { query: *const ast.Select, binding: *const @import("describe.zig").BoundStatement };
     columns: []const scalar.Column,
     row_width: usize,
     assignments: []const ?scalar.Program,
+    deferred: []const ?Deferred = &.{},
     predicate: ?scalar.Program,
     arbiter_conditions: []const catalog.Condition = &.{},
     arbiter_expressions: []const catalog.ConflictExpression = &.{},
 };
 
 pub fn bind(alloc: std.mem.Allocator, backend: catalog.Backend, table: catalog.Table, name: ast.Name, clause: ast.Conflict, parameters: []?ast.ColumnType, capture_types: []const ast.ColumnType) !Bound {
-    if (clause.capture_count != 0 and (!backend.atomic_statement_read_set or backend.vtable.open_statement == null)) return error.SqlRangeTrackingRequired;
+    if ((clause.capture_count != 0 or clause.deferred_count != 0) and (!backend.atomic_statement_read_set or backend.vtable.open_statement == null)) return error.SqlRangeTrackingRequired;
+    if (clause.deferred_count != 0 and !backend.dynamic_statement_read_set) return error.SqlStatementSnapshotRequired;
     if (capture_types.len != clause.capture_count) return error.InvalidSqlBackendResponse;
     // Secondary unique arbiters require a native unique-key reservation, not
     // a scan of a possibly partial index. Refuse them until that authority is
@@ -55,6 +58,7 @@ pub fn bind(alloc: std.mem.Allocator, backend: catalog.Backend, table: catalog.T
             const column = try table.column(assignment.field);
             if (column.generated or std.mem.eql(u8, column.name, "_id")) return error.UnsupportedSqlShape;
             const expression = assignment.expression orelse return error.InvalidSqlBackendResponse;
+            if (assignment.deferred_scalar) continue;
             if (assignment.capture_ordinal) |ordinal| {
                 if (ordinal + assignment.capture_span > clause.capture_count) return error.InvalidSqlBackendResponse;
                 if (assignment.capture_expression == null) continue;
@@ -65,8 +69,26 @@ pub fn bind(alloc: std.mem.Allocator, backend: catalog.Backend, table: catalog.T
         if (!changed) break;
     }
     const assignments = try alloc.alloc(?scalar.Program, clause.assignments.len);
-    for (clause.assignments, assignments) |assignment, *program| program.* = if (assignment.capture_ordinal != null and assignment.capture_expression == null) null else try scalar.bindExpectedWithSettings(alloc, assignment.capture_expression orelse assignment.expression.?, columns, parameters, (try table.column(assignment.field)).type, .{}, backend.settings_view);
-    return .{ .columns = columns, .row_width = count, .assignments = assignments, .predicate = if (clause.predicate) |expression| try scalar.bindExpectedWithSettings(alloc, expression, columns, parameters, .boolean, .{}, backend.settings_view) else null, .arbiter_conditions = arbiter_conditions, .arbiter_expressions = arbiter_expressions };
+    const deferred = try alloc.alloc(?Bound.Deferred, clause.assignments.len);
+    for (clause.assignments, assignments, deferred) |assignment, *program, *later| {
+        later.* = null;
+        if (assignment.deferred_scalar) {
+            program.* = null;
+            const expression = assignment.expression orelse return error.InvalidSqlBackendResponse;
+            if (expression.* != .call or expression.call.subquery == null or !std.mem.eql(u8, expression.call.name, "$scalar")) return error.InvalidSqlBackendResponse;
+            const query = expression.call.subquery.?;
+            const compiled: @import("compiler.zig").Compiled = .{ .arena = undefined, .statement = .{ .select = query.* }, .parameter_count = @intCast(parameters.len) };
+            const binding = try alloc.create(@import("describe.zig").BoundStatement);
+            binding.* = try @import("describe.zig").bind(alloc, backend, &compiled, parameters);
+            if (binding.columns.len != 1) return error.InvalidSqlParameters;
+            const target = try table.column(assignment.field);
+            if (binding.columns[0].type != target.type and !(binding.columns[0].type == .integer and target.type == .number)) return error.SqlTypeMismatch;
+            later.* = .{ .query = query, .binding = binding };
+            continue;
+        }
+        program.* = if (assignment.capture_ordinal != null and assignment.capture_expression == null) null else try scalar.bindExpectedWithSettings(alloc, assignment.capture_expression orelse assignment.expression.?, columns, parameters, (try table.column(assignment.field)).type, .{}, backend.settings_view);
+    }
+    return .{ .columns = columns, .row_width = count, .assignments = assignments, .deferred = deferred, .predicate = if (clause.predicate) |expression| try scalar.bindExpectedWithSettings(alloc, expression, columns, parameters, .boolean, .{}, backend.settings_view) else null, .arbiter_conditions = arbiter_conditions, .arbiter_expressions = arbiter_expressions };
 }
 
 fn bindArbiterPredicate(alloc: std.mem.Allocator, table: catalog.Table, expression: *const ast.Scalar) ![]const catalog.Condition {
@@ -160,8 +182,11 @@ pub fn resolve(context: anytype, table: catalog.Table, clause: ast.Conflict, bin
 }
 
 fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict, binding: Bound, proposed: []const catalog.Mutation, normalized: []const catalog.Mutation, owners: ?[]const catalog.ConflictOwner, captured: []const []const scalar.Datum) ![]const catalog.Mutation {
+    if (binding.deferred.len != 0 and binding.deferred.len != clause.assignments.len) return error.InvalidSqlBackendResponse;
     const buffer = try context.arena.alloc(catalog.Mutation, normalized.len);
     const captured_buffer = try context.arena.alloc([]const scalar.Datum, normalized.len);
+    const deferred_cache = try context.arena.alloc(?scalar.Datum, clause.assignments.len);
+    @memset(deferred_cache, null);
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     var owner_by_key: std.StringHashMapUnmanaged(catalog.ConflictOwner) = .empty;
     var count: usize = 0;
@@ -291,11 +316,15 @@ fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict,
                 const old = try previous.cell(column.name);
                 break :blk .{ .value = old.value, .sql_null = old.sql_null };
             };
-            for (clause.assignments, binding.assignments) |assignment, program| if (std.mem.eql(u8, assignment.field, column.name)) {
+            for (clause.assignments, binding.assignments, 0..) |assignment, program, assignment_index| if (std.mem.eql(u8, assignment.field, column.name)) {
                 datum = if (assignment.capture_ordinal != null and assignment.capture_expression == null) blk: {
                     const ordinal = assignment.capture_ordinal.?;
                     if (ordinal >= captured_row.len) return error.InvalidSqlBackendResponse;
                     break :blk captured_row[ordinal];
+                } else if (assignment.deferred_scalar) blk: {
+                    const deferred = binding.deferred[assignment_index] orelse return error.InvalidSqlBackendResponse;
+                    if (deferred_cache[assignment_index] == null) deferred_cache[assignment_index] = try context.deferredScalar(deferred.query, deferred.binding);
+                    break :blk deferred_cache[assignment_index].?;
                 } else try (program orelse return error.InvalidSqlBackendResponse).evaluate(page_alloc, cells, context.parameters, .{});
                 break;
             };

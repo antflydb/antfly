@@ -1043,7 +1043,7 @@ pub const MetadataHttpClient = struct {
     /// Read-only retries are safe. The response proves the metadata identity;
     /// callers need no preceding status/discovery round trip on the happy path.
     pub fn readSystemCatalog(self: *MetadataHttpClient, base_uri: []const u8, input: system_catalog.Call, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !CatalogRead {
-        if (input == .mutate or input == .setting_mutate) return error.InvalidCatalogMutation;
+        if (input == .mutate or input == .setting_mutate or input == .policy_definition_mutate or input == .policy_publication_mutate or input == .policy_publication_begin or input == .fk_generation_publication_begin or input == .fk_generation_publication_mutate or input == .fk_initial_create_begin or input == .fk_initial_create_mutate) return error.InvalidCatalogMutation;
         if (remaining_ms == 0) return error.Timeout;
         if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
         const body = try std.json.Stringify.valueAlloc(self.alloc, input, .{});
@@ -1053,7 +1053,7 @@ pub const MetadataHttpClient = struct {
         defer self.alloc.free(uri);
         var remaining_buf: [10]u8 = undefined;
         const authority = @import("../system_catalog/setting_authority.zig");
-        const grant = if (input == .setting_snapshot) try authority.sign(self.alloc, self.setting_authority_secret orelse return error.SettingAuthorityUnavailable, self.setting_authority_issuer orelse return error.SettingAuthorityUnavailable, .read, body, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s))) else null;
+        const grant = if (input == .setting_snapshot or input == .policy_snapshot or input == .policy_install_snapshot or input == .policy_publication_status or input == .policy_publication_work or input == .fk_generation_publication_status or input == .fk_generation_publication_work or input == .fk_generation_publication_decision or input == .fk_generation_publication_source_decision or input == .fk_initial_create_prepare or input == .fk_initial_child_decision or input == .fk_initial_create_status or input == .fk_initial_create_work or input == .fk_initial_parent_decision) try authority.sign(self.alloc, self.setting_authority_secret orelse return error.SettingAuthorityUnavailable, self.setting_authority_issuer orelse return error.SettingAuthorityUnavailable, .read, body, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s))) else null;
         defer if (grant) |value| self.alloc.free(value);
         const headers = [_]http_common.RequestHeader{
             .{ .name = routes.Routes.raft_mutation_remaining_ms_header, .value = try std.fmt.bufPrint(&remaining_buf, "{d}", .{remaining_ms}) },
@@ -1085,7 +1085,7 @@ pub const MetadataHttpClient = struct {
     }
 
     pub fn forwardSystemCatalog(self: *MetadataHttpClient, base_uri: []const u8, input: system_catalog.Call, forwarding: raft_mutation_forwarding.Context, setting_admin: bool) ![]u8 {
-        if ((input == .setting_mutate) != setting_admin) return error.Forbidden;
+        if ((input == .setting_mutate or input == .policy_definition_mutate or input == .policy_publication_mutate or input == .policy_publication_begin or input == .fk_generation_publication_begin or input == .fk_generation_publication_mutate or input == .fk_initial_create_begin or input == .fk_initial_create_mutate) != setting_admin) return error.Forbidden;
         const body = try std.json.Stringify.valueAlloc(self.alloc, input, .{});
         defer self.alloc.free(body);
         if (body.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;

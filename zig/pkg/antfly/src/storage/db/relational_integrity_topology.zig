@@ -96,9 +96,12 @@ pub fn stageBegin(txn: anytype, fence: Fence) !void {
         return;
     }
     try @import("relational_integrity_generation_retirement.zig").requireClear(txn);
-    if (fence.role == .split_source or fence.role == .split_destination or
-        fence.role == .merge_source or fence.role == .merge_destination or
-        fence.role == .rewrite_source)
+    try @import("relational_integrity_generation_retirement.zig").requireActivationAcknowledged(txn);
+    try @import("relational_integrity_generation_admission.zig").requireAcknowledged(txn);
+    // Split/merge transfer the durable generation tombstones through the
+    // integrity handoff stream. Rewrite has a different copy protocol and
+    // remains fenced until it transfers the same authority.
+    if (fence.role == .rewrite_source)
         try @import("relational_integrity_generation_retirement.zig").requireNoActive(txn);
     if (try optional(txn, receipt_key)) |bytes| {
         const previous = try Fence.decode(bytes);
@@ -244,7 +247,7 @@ test "relational integrity topology pending inverse generation is owner bound an
     const retirement = @import("relational_integrity_generation_retirement.zig");
     const alloc = std.testing.allocator;
     const fence: Fence = .{ .role = .truncate_parent, .transition_id = 11, .attempt = 1, .peer_group_id = 21, .owner_group_id = 31, .namespace = .{ .table_id = 41, .shard_id = 31, .range_id = 31 }, .catalog_digest = @splat(2) };
-    const entries = [_]retirement.Entry{ .{ .child_table_id = 51, .child_table_name = "children", .constraint_name = "fk1", .generation = @splat(3) }, .{ .child_table_id = 52, .child_table_name = "other_children", .constraint_name = "fk2", .generation = @splat(4) } };
+    const entries = [_]retirement.Entry{ .{ .child_table_id = 51, .child_table_name = "children", .constraint_name = "fk1", .generation = @splat(3), .next_generation = @splat(5) }, .{ .child_table_id = 52, .child_table_name = "other_children", .constraint_name = "fk2", .generation = @splat(4), .next_generation = @splat(6) } };
     const bytes = try retirement.encodePending(alloc, fence, @splat(5), &entries);
     defer alloc.free(bytes);
     const pending = try retirement.Pending.decode(bytes);
@@ -289,7 +292,7 @@ test "relational integrity topology cancels exact pending parent generation befo
     };
     const fence: Fence = .{ .role = .truncate_parent, .transition_id = 11, .attempt = 1, .peer_group_id = 21, .owner_group_id = 31, .namespace = .{ .table_id = 41, .shard_id = 31, .range_id = 31 }, .catalog_digest = @splat(2) };
     const encoded_fence = try fence.encode();
-    var txn: Mock = .{ .alloc = alloc, .fence = &encoded_fence, .pending = try retirement.encodePending(alloc, fence, @splat(5), &.{.{ .child_table_id = 51, .child_table_name = "children", .constraint_name = "fk", .generation = @splat(3) }}) };
+    var txn: Mock = .{ .alloc = alloc, .fence = &encoded_fence, .pending = try retirement.encodePending(alloc, fence, @splat(5), &.{.{ .child_table_id = 51, .child_table_name = "children", .constraint_name = "fk", .generation = @splat(3), .next_generation = @splat(4) }}) };
     try std.testing.expectError(error.GenerationRetirementPending, stageRelease(&txn, fence));
     var other = fence;
     other.transition_id += 1;

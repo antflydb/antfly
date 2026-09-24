@@ -25,6 +25,11 @@ pub const storage_maintenance_operations = @import("storage_maintenance_operatio
 pub const batch = @import("batch.zig");
 pub const backups = @import("backups.zig");
 pub const restore_owner = @import("restore_owner.zig");
+pub const restore_parent_activation = @import("restore_parent_activation.zig");
+pub const relational_fk_generation_publication = @import("relational_fk_generation_publication.zig");
+pub const row_policy_install = @import("row_policy_install.zig");
+pub const row_policy_publication_coordinator = @import("row_policy_publication_coordinator.zig");
+pub const fk_generation_publication_coordinator = @import("fk_generation_publication_coordinator.zig");
 pub const linear_merge = @import("linear_merge.zig");
 pub const query = @import("query.zig");
 pub const query_contract = @import("query_contract.zig");
@@ -232,6 +237,7 @@ test "join inequality: incomparable types return 0" {
 
 test "api module compiles" {
     _ = @import("sql_truncate.zig");
+    _ = @import("sql_policy_ddl.zig");
     _ = sql_execution;
     _ = @import("sql_schema_cache.zig");
     _ = sql_pgwire;

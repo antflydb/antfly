@@ -665,6 +665,16 @@ const mappings = [_]Mapping{
     .{ .status = .vector_store_requires_empty_table, .err = error.VectorStoreRequiresEmptyTable },
     .{ .status = .vector_store_requires_local_single_shard_table, .err = error.VectorStoreRequiresLocalSingleShardTable },
     .{ .status = .vector_store_requires_offline_command, .err = error.VectorStoreRequiresOfflineCommand },
+    .{ .status = .row_policy_authentication_required, .err = error.RowPolicyAuthenticationRequired },
+    .{ .status = .row_policy_authority_unavailable, .err = error.RowPolicyAuthorityUnavailable },
+    .{ .status = .row_policy_catalog_changed, .err = error.RowPolicyCatalogChanged },
+    .{ .status = .row_policy_readers_active, .err = error.RowPolicyReadersActive },
+    .{ .status = .row_policy_topology_unsupported, .err = error.RowPolicyTopologyUnsupported },
+    .{ .status = .row_policy_mutation_unsupported, .err = error.RowPolicyMutationUnsupported },
+    .{ .status = .row_policy_denied, .err = error.RowPolicyDenied },
+    .{ .status = .invalid_row_policy_receipt, .err = error.InvalidRowPolicyReceipt },
+    .{ .status = .invalid_row_policy_bundle, .err = error.InvalidRowPolicyBundle },
+    .{ .status = .row_policy_unsupported, .err = error.RowPolicyUnsupported },
 };
 
 pub fn statusFromError(err: anyerror) abi.Status {

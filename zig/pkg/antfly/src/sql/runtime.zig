@@ -179,6 +179,26 @@ pub const Context = struct {
         try self.backend.vtable.checkpoint(self.backend.ptr);
     }
 
+    /// Evaluate one owner-demanded scalar on the active statement cut. The
+    /// native backend owns the cut and accumulates every point/range proof in
+    /// the same transaction as the eventual mutation. Bound output is typed;
+    /// the public bigint string representation must not enter row arithmetic.
+    pub fn deferredScalar(self: Context, query: *const ast.Select, bound: *const describe.BoundStatement) !@import("scalar.zig").Datum {
+        var nested = self;
+        nested.binding = bound.*;
+        nested.typed_output = true;
+        nested.limits.result_rows = @min(nested.limits.result_rows, 2);
+        if (nested.limits.result_rows < 2) return error.SqlProgramLimitExceeded;
+        const output = nested.select(query.*) catch |err| switch (err) {
+            error.SqlResultTooLarge => return error.SqlCardinalityViolation,
+            else => return err,
+        };
+        if (output.rows.len > 1) return error.SqlCardinalityViolation;
+        if (output.rows.len == 0) return .{ .value = .null, .sql_null = true };
+        if (output.rows[0].len != 1 or output.sql_nulls == null or output.sql_nulls.?.len != 1 or output.sql_nulls.?[0].len != 1) return error.InvalidSqlBackendResponse;
+        return .{ .value = output.rows[0][0], .sql_null = output.sql_nulls.?[0][0] };
+    }
+
     pub fn outputValue(self: Context, value_: Json) !Json {
         if (!self.typed_output and value_ == .integer) return .{ .string = try std.fmt.allocPrint(self.arena, "{d}", .{value_.integer}) };
         return clone(self.arena, value_);

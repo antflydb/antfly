@@ -136,6 +136,10 @@ pub const TableApi = struct {
     };
 
     pub const ExecuteQueryError = error{
+        RowPolicyAuthenticationRequired,
+        RowPolicyCatalogChanged,
+        RowPolicyUnsupported,
+        RowPolicyAuthorityUnavailable,
         InvalidQueryRequest,
         InvalidFilterQueryRequest,
         InvalidExclusionQueryRequest,
@@ -1817,6 +1821,10 @@ pub fn handleTableQueryRequest(
     };
     const response_body = api.executeTableQueryRequest(alloc, table_name, body, row_filter_json) catch |err| {
         switch (err) {
+            error.RowPolicyAuthenticationRequired => return .{ .status = 403, .body = try alloc.dupe(u8, "row policy authentication required") },
+            error.RowPolicyCatalogChanged => return .{ .status = 409, .body = try alloc.dupe(u8, "row policy publication changed") },
+            error.RowPolicyUnsupported => return .{ .status = 409, .body = try alloc.dupe(u8, "row policy does not support this query") },
+            error.RowPolicyAuthorityUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "row policy authority unavailable") },
             error.InvalidQueryRequest => {
                 if (db_mod.peekLastSortRejectionDiagnostic() != null) {
                     std.log.warn("public table query invalid exact sort table={s} err={}", .{ table_name, err });

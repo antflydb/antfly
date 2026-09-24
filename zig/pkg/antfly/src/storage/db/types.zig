@@ -322,6 +322,17 @@ pub const TransactionMutation = union(enum) {
 };
 
 pub const BatchRequest = struct {
+    /// Trusted ingress attaches a signed write principal and the admission
+    /// instant after authenticating the live request. Replicas verify against
+    /// that committed instant so delayed Raft replay is deterministic.
+    /// Public batch JSON never accepts these fields.
+    row_policy_principal_proof: []const u8 = "",
+    row_policy_database: []const u8 = "",
+    row_policy_admitted_at_seconds: i64 = 0,
+    /// Exact metadata read-index snapshot fetched and validated by the owner
+    /// leader before proposal. Followers consume these committed bytes locally;
+    /// they must never perform metadata IO from deterministic Raft apply.
+    row_policy_install_bundle: []const u8 = "",
     range_guards: []const @import("../range_protection.zig").Proof = &.{},
     /// Internal replicated capability activation. Never accepted by public JSON.
     activate_range_tracking: bool = false,
@@ -337,6 +348,12 @@ pub const BatchRequest = struct {
     restore_staging_plan_id: ?[16]u8 = null,
     /// Authenticated owner lifecycle control; never populated by public JSON.
     relational_topology: ?@import("relational_integrity_topology_contract.zig").Command = null,
+    /// Bounded, exact-CAS inverse-reference cleanup after generation retirement.
+    /// Only the current owner leader may propose this private Raft command.
+    relational_generation_gc: ?@import("relational_integrity_generation_retirement.zig").GcCommand = null,
+    /// Metadata-authorized policy generation identifier. The Raft payload
+    /// never contains caller-supplied policy expressions or role claims.
+    row_policy_publication: ?@import("../../system_catalog/policies.zig").InstallRequest = null,
     relational_schema_version: ?u32 = null,
     /// Internal coordinator evidence; never populated from public request JSON.
     relational_integrity_generation_set: ?[32]u8 = null,
@@ -1341,6 +1358,14 @@ pub const Query = union(enum) {
 };
 
 pub const LookupOptions = struct {
+    row_policy_principal_proof: []const u8 = "",
+    row_policy_database: []const u8 = "",
+    /// Private metadata-coordinator probe. Public HTTP lookup parsing must
+    /// never populate this field; it exposes no row data.
+    row_policy_receipt: ?struct {
+        generation: u64,
+        phase: @import("../../system_catalog/policies.zig").Publication.Phase,
+    } = null,
     /// Private optimistic observation: captures version and SHA256 of the
     /// exact primary bytes from one snapshot, regardless of JSON projection.
     include_primary_digest: bool = false,
@@ -1453,6 +1478,10 @@ pub const ScanOptions = struct {
     /// Schema-bound typed row query carried by the routed scan transport. It
     /// is never interpreted as a search DSL or permitted to replace RLS filters.
     relational_query_json: []const u8 = "",
+    /// Opaque authenticated principal proof for one policy epoch. External
+    /// callers cannot assert roles directly; the native owner verifies it.
+    row_policy_principal_proof: []const u8 = "",
+    row_policy_database: []const u8 = "",
     /// Internal differential-testing and benchmark baseline; never serialized.
     disable_columnar_scan: bool = false,
     /// Internal request-local decoded payload reuse budget. Includes retained
@@ -1633,6 +1662,9 @@ pub const TransactionVersionPredicate = struct {
 pub const TransactionIntegrityOperation = @import("relational_integrity_contract.zig").Operation;
 
 pub const TransactionIntentRequest = struct {
+    row_policy_principal_proof: []const u8 = "",
+    row_policy_database: []const u8 = "",
+    row_policy_admitted_at_seconds: i64 = 0,
     range_guards: []const @import("../range_protection.zig").Proof = &.{},
     schema_version: ?u32 = null,
     relational_index_maintenance: ?@import("relational_index_maintenance_contract.zig").Command = null,

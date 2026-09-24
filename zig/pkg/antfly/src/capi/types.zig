@@ -347,8 +347,20 @@ pub fn mapError(err: anyerror) ErrorCode {
         error.PortableImportPublicationInProgress,
         error.PortableRuntimeActivationPending,
         error.GenerationTransitionActive,
+        error.RowPolicyCatalogChanged,
+        error.RowPolicyReadersActive,
+        error.InvalidRowPolicyReceipt,
+        error.InvalidRowPolicyBundle,
         => .busy,
-        error.FileLocksUnsupported, error.GenerationFileLocksUnsupported => .unsupported,
+        error.FileLocksUnsupported,
+        error.GenerationFileLocksUnsupported,
+        error.RowPolicyAuthenticationRequired,
+        error.RowPolicyAuthorityUnavailable,
+        error.RowPolicyDenied,
+        error.RowPolicyTopologyUnsupported,
+        error.RowPolicyMutationUnsupported,
+        error.RowPolicyUnsupported,
+        => .unsupported,
         error.DurabilityOutcomeUnknown => .outcome_unknown,
         error.RunUntilIdleNoProgress => .stalled,
         // A dimension probe against a live embedder hit an operational
@@ -375,4 +387,13 @@ test "run until idle no-progress error maps to a dedicated stalled ABI code, not
         "ANTFLY_INTERNAL",
         std.mem.span(errorCodeName(@intFromEnum(ErrorCode.internal))),
     );
+}
+
+test "unauthenticated Lite access to an RLS table is a nonretryable capability error" {
+    try std.testing.expectEqual(ErrorCode.unsupported, mapError(error.RowPolicyAuthenticationRequired));
+    try std.testing.expectEqual(ErrorCode.busy, mapError(error.RowPolicyCatalogChanged));
+    try std.testing.expectEqual(ErrorCode.busy, mapError(error.RowPolicyReadersActive));
+    try std.testing.expectEqual(ErrorCode.unsupported, mapError(error.RowPolicyDenied));
+    try std.testing.expectEqual(ErrorCode.unsupported, mapError(error.RowPolicyTopologyUnsupported));
+    try std.testing.expectEqual(ErrorCode.busy, mapError(error.InvalidRowPolicyReceipt));
 }

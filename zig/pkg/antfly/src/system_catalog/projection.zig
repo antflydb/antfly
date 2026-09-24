@@ -55,11 +55,46 @@ pub const Export = struct {
     tables: []metadata.TableRecord,
     ranges: []metadata.RangeRecord,
     system_catalog: domain.State = .{},
+    /// Immutable programs for active row-policy generations. Draft policy
+    /// definitions may already differ, so they cannot reconstruct these
+    /// programs during restore. An in-flight publication is not exportable.
+    policy_install_snapshots: []const @import("policies.zig").InstallSnapshot = &.{},
     extension_packages: []extensions.PackageManifest = &.{},
     installed_extensions: []extensions.InstalledExtension = &.{},
     extension_members: []extensions.ExtensionMember = &.{},
     extension_dependencies: []extensions.ExtensionDependency = &.{},
 };
+
+/// Validate the portable policy manifest before staging any owner. Draft
+/// records are intentionally not used here: an active generation is defined
+/// by its immutable compiled install snapshot, not the current draft.
+pub fn validatePolicyPrograms(alloc: std.mem.Allocator, publications: []const @import("policies.zig").Publication, programs: []const @import("policies.zig").InstallSnapshot) !void {
+    const policies = @import("policies.zig");
+    if (programs.len > publications.len) return error.RowPolicyCatalogChanged;
+    var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer seen.deinit(alloc);
+    var active: std.AutoHashMapUnmanaged(u64, *const policies.Publication) = .empty;
+    defer active.deinit(alloc);
+    for (publications) |*publication| {
+        try publication.validateShape();
+        const entry = try seen.getOrPut(alloc, publication.table_id);
+        if (entry.found_existing) return error.RowPolicyCatalogChanged;
+        switch (publication.phase) {
+            .active => try active.put(alloc, publication.table_id, publication),
+            .disabled => if (publication.disabled_acknowledged_owners.len != publication.required_owners.len) return error.RowPolicyCatalogChanged,
+            else => return error.RowPolicyPublicationInProgress,
+        }
+    }
+    for (programs) |program| {
+        try program.validateShape();
+        const publication = active.get(program.table_id) orelse return error.RowPolicyCatalogChanged;
+        if (program.phase != .active or program.policy_generation != publication.generation or
+            program.catalog_epoch != publication.catalog_epoch or program.schema_version != publication.schema_version or
+            !std.mem.eql(u8, &program.schema_digest, &publication.schema_digest)) return error.RowPolicyCatalogChanged;
+        _ = active.remove(program.table_id);
+    }
+    if (active.count() != 0) return error.RowPolicyCatalogChanged;
+}
 
 /// Keyset pagination concerns logical membership, not changing runtime counters.
 pub fn selectPage(entries: []TableEntry, request: domain.TableList, revision: u64) !struct { entries: []TableEntry, next: ?[]const u8 } {

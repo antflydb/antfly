@@ -230,6 +230,25 @@ test "SQL TRUNCATE original CASCADE case closes incoming FK cohort" {
     try std.testing.expectEqualStrings("archived_records", plan.value.targets[1].catalog_binding.?.name);
 }
 
+test "SQL TRUNCATE child-only external parent remains guarded before admission" {
+    var fixture: Fixture = .{ .logical_name = "parent", .second_logical_name = "child" };
+    defer fixture.deinit();
+    fixture.tables[0].schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    fixture.tables[1].schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"fk","child_columns":["parent_id"],"parent_table":"physical","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"parent_id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    var parsed = try compiler.compile(alloc, "TRUNCATE child", .{});
+    defer parsed.deinit();
+    var server = try fixture.server();
+    defer server.deinit();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    try std.testing.expectError(error.SqlTruncateExternalForeignKey, truncate.execute(&server, null, .{}, "default", "public", arena.allocator(), parsed.statement.catalog_ddl));
+    try std.testing.expectEqual(@as(usize, 0), fixture.admissions);
+}
+
 test "SQL TRUNCATE native admission persists fresh plan and reconciles unknown reply" {
     for ([_]struct { unknown: bool, restart_identity: bool }{
         .{ .unknown = false, .restart_identity = false },

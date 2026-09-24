@@ -1117,6 +1117,9 @@ pub fn executeCrossGroup(
     if (req.range_guards.len != 0) return error.InvalidTxnRequest;
     const tables = [_]TableCommitRequest{.{
         .table_name = table_name,
+        .row_policy_principal_proof = req.row_policy_principal_proof,
+        .row_policy_database = req.row_policy_database,
+        .row_policy_admitted_at_seconds = req.row_policy_admitted_at_seconds,
         .writes = req.writes,
         .deletes = req.deletes,
         .transforms = req.transforms,
@@ -1284,6 +1287,14 @@ fn executeMultiTableCommitOnce(
         }
         for (participants.items) |*participant| {
             if (!std.mem.eql(u8, participant.table_name, table.table_name)) continue;
+            if (participant.row_policy_principal_proof.len != 0 and
+                (!std.mem.eql(u8, participant.row_policy_principal_proof, table.row_policy_principal_proof) or
+                    !std.mem.eql(u8, participant.row_policy_database, table.row_policy_database) or
+                    participant.row_policy_admitted_at_seconds != table.row_policy_admitted_at_seconds))
+                return error.InvalidTxnRequest;
+            participant.row_policy_principal_proof = table.row_policy_principal_proof;
+            participant.row_policy_database = table.row_policy_database;
+            participant.row_policy_admitted_at_seconds = table.row_policy_admitted_at_seconds;
             if (participant.relational_schema_version) |existing| {
                 if (table.relational_schema_version) |requested| {
                     if (existing != requested) return error.InvalidTxnRequest;
@@ -1840,6 +1851,9 @@ fn resolveCoordinatorDecisionAfterFailureUntil(
 }
 
 const ParticipantTxn = struct {
+    row_policy_principal_proof: []const u8 = "",
+    row_policy_database: []const u8 = "",
+    row_policy_admitted_at_seconds: i64 = 0,
     route_fence: ?@import("../metadata/api.zig").CatalogRouteFence = null,
     range_guards: std.ArrayListUnmanaged(@import("../storage/range_protection.zig").Proof) = .empty,
     schema_version: ?u32 = null,
@@ -1973,6 +1987,9 @@ const PrepareFanoutTask = struct {
             .txn_id = txn_id,
             .topology_epoch = participant.topology_epoch,
             .req = .{
+                .row_policy_principal_proof = participant.row_policy_principal_proof,
+                .row_policy_database = participant.row_policy_database,
+                .row_policy_admitted_at_seconds = participant.row_policy_admitted_at_seconds,
                 .writes = participant.writes.items,
                 .deletes = participant.deletes.items,
                 .transforms = participant.transforms.items,

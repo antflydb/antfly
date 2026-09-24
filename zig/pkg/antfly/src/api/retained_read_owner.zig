@@ -59,6 +59,17 @@ pub const Owner = struct {
             self.alloc.destroy(self);
         }
     };
+    const Snapshot = struct {
+        alloc: std.mem.Allocator,
+        cancelled: std.atomic.Value(bool) = .init(false),
+        snapshot: @import("../storage/statement_read_fence.zig").Snapshot,
+
+        fn close(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.snapshot.deinit();
+            self.alloc.destroy(self);
+        }
+    };
     const Cursor = struct {
         alloc: std.mem.Allocator,
         cancelled: std.atomic.Value(bool) = .init(false),
@@ -107,6 +118,23 @@ pub const Owner = struct {
         try borrow.validate(time.monotonicNs());
     }
 
+    /// Convert a short mutation fence into an independently leased immutable
+    /// owner cut. The coordinator captures every owner while all fences are
+    /// held, validates the cohort, then releases the fences before row work.
+    pub fn captureSnapshot(self: Owner, scope: registry_mod.Scope, capture_token: registry_mod.Token, connection: u128, deadline_ns: u64) !registry_mod.Token {
+        var borrow = try self.registry.borrow(capture_token, scope, .capture, time.monotonicNs());
+        defer borrow.deinit();
+        const capture_value: *Capture = @ptrCast(@alignCast(borrow.resource.ptr));
+        const alloc = self.registry.alloc;
+        const owned = try alloc.create(Snapshot);
+        errdefer alloc.destroy(owned);
+        owned.* = .{ .alloc = alloc, .snapshot = try capture_value.fence.captureSnapshot(alloc) };
+        errdefer owned.snapshot.deinit();
+        try capture_value.fence.validate();
+        try borrow.validate(time.monotonicNs());
+        return try self.registry.insert(scope, connection, time.monotonicNs(), deadline_ns, .{ .ptr = owned, .kind = .snapshot, .close = Snapshot.close, .cancellation = &owned.cancelled });
+    }
+
     /// Snapshot gets a separate owned cancellation capsule: releasing the
     /// short mutation capture must not cancel its long-lived paging cursors.
     pub fn open(self: Owner, scope: registry_mod.Scope, capture_token: registry_mod.Token, connection: u128, from: []const u8, to: []const u8, input: types.ScanOptions, deadline_ns: u64) !registry_mod.Token {
@@ -135,6 +163,34 @@ pub const Owner = struct {
         // open() validates local ownership while pinning; the coordinator does
         // one final quorum validation per capture after ALL aliases are open.
         // Repeating quorum rounds per alias would inflate the apply-lock hold.
+        try borrow.validate(time.monotonicNs());
+        return try self.registry.insert(scope, connection, time.monotonicNs(), deadline_ns, .{ .ptr = owned, .kind = .cursor, .close = Cursor.close, .cancellation = &owned.cancelled });
+    }
+
+    pub fn openSnapshot(self: Owner, scope: registry_mod.Scope, snapshot_token: registry_mod.Token, connection: u128, from: []const u8, to: []const u8, input: types.ScanOptions, deadline_ns: u64) !registry_mod.Token {
+        var borrow = try self.registry.borrow(snapshot_token, scope, .snapshot, time.monotonicNs());
+        defer borrow.deinit();
+        const retained: *Snapshot = @ptrCast(@alignCast(borrow.resource.ptr));
+        const alloc = self.registry.alloc;
+        const owned = try alloc.create(Cursor);
+        errdefer alloc.destroy(owned);
+        owned.* = .{ .alloc = alloc, .view = undefined };
+        var opts = input;
+        var parsed: ?std.json.Parsed(types.RelationalRowQuery) = null;
+        defer if (parsed) |*value| value.deinit();
+        var query = input.relational_query orelse blk: {
+            parsed = try std.json.parseFromSlice(types.RelationalRowQuery, alloc, input.relational_query_json, .{ .allocate = .alloc_always, .parse_numbers = false });
+            break :blk parsed.?.value;
+        };
+        if (query.schema_version) |version| if (version != scope.schema_version) return error.RetainedReadScopeChanged;
+        if (query.index != null or query.auto_index) return error.SqlStatementSnapshotRequired;
+        query.schema_version = scope.schema_version;
+        opts.relational_query = query;
+        opts.columnar_stats = null;
+        opts.cancellation = CancellationToken.fromAtomic(&owned.cancelled);
+        opts.execution_deadline_ns = deadline_ns;
+        owned.view = try retained.snapshot.open(alloc, from, to, opts);
+        errdefer owned.view.deinit();
         try borrow.validate(time.monotonicNs());
         return try self.registry.insert(scope, connection, time.monotonicNs(), deadline_ns, .{ .ptr = owned, .kind = .cursor, .close = Cursor.close, .cancellation = &owned.cancelled });
     }
@@ -203,13 +259,23 @@ fn consumerTests() type {
                 capture_token: CancellationToken = .none,
                 cursor_token: CancellationToken = .none,
                 captures_closed: usize = 0,
+                snapshots_closed: usize = 0,
                 cursors_closed: usize = 0,
 
                 fn capture(ptr: *anyopaque, _: std.mem.Allocator, route: metadata.CatalogRouteFence, _: u64, _: []const u8, opts: types.ScanOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.StatementReadFence {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.capture_token = opts.cancellation.?;
                     try std.testing.expectEqual(self.capture_token.ptr, route.admission_cancellation.ptr);
-                    return .{ .ptr = self, .vtable = &.{ .validate = validate, .open = open, .release = release } };
+                    return .{ .ptr = self, .vtable = &.{ .validate = validate, .open = open, .capture_snapshot = captureSnapshot, .release = release } };
+                }
+                fn captureSnapshot(ptr: *anyopaque, _: std.mem.Allocator) !@import("../storage/statement_read_fence.zig").Snapshot {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try self.capture_token.check();
+                    return .{ .ptr = self, .vtable = &.{ .open = open, .release = releaseSnapshot } };
+                }
+                fn releaseSnapshot(ptr: *anyopaque) void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.snapshots_closed += 1;
                 }
                 fn validate(ptr: *anyopaque) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -245,15 +311,24 @@ fn consumerTests() type {
             const deadline = time.monotonicNs() + 5 * std.time.ns_per_s;
             const capture = (try owner.capture(scope, 1, route, "rows", deadline)).?;
             try owner.validateCapture(scope, capture);
+            const snapshot = try owner.captureSnapshot(scope, capture, 1, deadline);
             const cursor = try owner.open(scope, capture, 1, "", "", .{ .relational_query = .{ .fields = &.{} } }, deadline);
             try registry.close(capture, scope);
             try std.testing.expectEqual(1, fixture.captures_closed);
+            var wrong_scope = scope;
+            wrong_scope.group_id += 1;
+            try std.testing.expectError(error.RetainedReadScopeChanged, owner.openSnapshot(wrong_scope, snapshot, 1, "", "", .{ .relational_query = .{ .fields = &.{} } }, deadline));
+            const delayed = try owner.openSnapshot(scope, snapshot, 1, "", "", .{ .relational_query = .{ .fields = &.{} } }, deadline);
+            try registry.close(snapshot, scope);
+            try std.testing.expectEqual(1, fixture.snapshots_closed);
+            var delayed_page = try owner.next(std.testing.allocator, scope, delayed, 0, 10);
+            delayed_page.deinit();
             var page = try owner.next(std.testing.allocator, scope, cursor, 0, 10);
             page.deinit();
             try std.testing.expectError(error.RetainedReadSequenceMismatch, owner.next(std.testing.allocator, scope, cursor, 0, 10));
             try std.testing.expectEqual(0, fixture.cursors_closed);
             registry.expire(deadline, 8);
-            try std.testing.expectEqual(1, fixture.cursors_closed);
+            try std.testing.expectEqual(2, fixture.cursors_closed);
             try std.testing.expectError(error.RetainedReadNotFound, owner.next(std.testing.allocator, scope, cursor, 1, 10));
         }
 

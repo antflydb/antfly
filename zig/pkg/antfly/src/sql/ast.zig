@@ -142,8 +142,10 @@ pub const Conflict = struct {
     /// Hidden INSERT-source outputs for scalar assignment subqueries. Each
     /// output is captured before conflict-owner reads and aligned by input row.
     capture_count: usize = 0,
+    /// A direct scalar subquery evaluated only for an owner-selected update.
+    deferred_count: usize = 0,
 };
-pub const Assignment = struct { field: []const u8, value: Value = .null, expression: ?*const Scalar = null, use_default: bool = false, capture_ordinal: ?usize = null, capture_span: usize = 0, capture_expression: ?*const Scalar = null };
+pub const Assignment = struct { field: []const u8, value: Value = .null, expression: ?*const Scalar = null, use_default: bool = false, capture_ordinal: ?usize = null, capture_span: usize = 0, capture_expression: ?*const Scalar = null, deferred_scalar: bool = false };
 pub const Update = struct { table: Name, alias: ?[]const u8 = null, source: ?*const Relation = null, ctes: []const Cte = &.{}, assignments: []const Assignment, predicate: ?*const Predicate = null, returning: ?[]const Projection = null };
 pub const Delete = struct { table: Name, alias: ?[]const u8 = null, source: ?*const Relation = null, ctes: []const Cte = &.{}, predicate: ?*const Predicate = null, returning: ?[]const Projection = null };
 pub const Merge = struct {
@@ -206,6 +208,20 @@ pub const SchemaChange = union(enum) {
     set_default: struct { column: []const u8, value: Value },
     drop_default: []const u8,
 };
+pub const PolicyDdl = struct {
+    action: enum { create, alter, drop, enable, disable },
+    name: []const u8,
+    table: Name,
+    if_exists: bool = false,
+    command: enum { all, select, insert, update, delete } = .all,
+    roles: []const []const u8 = &.{},
+    roles_specified: bool = false,
+    permissive: bool = true,
+    using: ?*const Scalar = null,
+    using_specified: bool = false,
+    with_check: ?*const Scalar = null,
+    check_specified: bool = false,
+};
 pub const Statement = union(enum) {
     explain: struct { statement: *const Statement, format: enum { text, json } = .text, verbose: bool = false },
     select: Select,
@@ -216,6 +232,7 @@ pub const Statement = union(enum) {
     create_table: CreateTable,
     drop_table: DropTable,
     catalog_ddl: CatalogDdl,
+    policy_ddl: PolicyDdl,
     begin: @import("session.zig").Begin,
     commit,
     rollback,

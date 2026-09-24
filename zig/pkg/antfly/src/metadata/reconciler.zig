@@ -4297,7 +4297,7 @@ test "relational topology admission leaves unavailable transitions pending witho
     defer pending.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), pending.split_admissions.len);
     try std.testing.expectEqual(@as(usize, 1), pending.table_upserts.len);
-    const capable: table_manager.StoreRecord = .{ .store_id = 1, .node_id = 1, .reporter_incarnation = 8, .relational_topology_protocol_version = 1 };
+    const capable: table_manager.StoreRecord = .{ .store_id = 1, .node_id = 1, .reporter_incarnation = 8, .relational_topology_protocol_version = table_manager.relational_topology_protocol_version };
     var ready = try reconciler.computePlan(&manager, &.{}, &.{}, .{ .tables = &.{constrained}, .ranges = &.{range}, .stores = &.{capable} });
     defer ready.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), ready.split_admissions.len);

@@ -3447,6 +3447,12 @@ pub fn encodeStorageKernelQueryRequest(alloc: std.mem.Allocator, req: db_mod.typ
 
 pub const StorageKernelLookupWireRequest = struct {
     key: []const u8,
+    row_policy_principal_proof: []const u8 = "",
+    row_policy_database: []const u8 = "",
+    row_policy_receipt: ?struct {
+        generation: u64,
+        phase: @import("../system_catalog/policies.zig").Publication.Phase,
+    } = null,
     fields: []const []const u8 = &.{},
     include_all_fields: bool = true,
     include_primary_digest: bool = false,
@@ -3461,6 +3467,9 @@ pub const StorageKernelLookupWireRequest = struct {
 
     pub fn options(self: StorageKernelLookupWireRequest) db_mod.types.LookupOptions {
         return .{
+            .row_policy_principal_proof = self.row_policy_principal_proof,
+            .row_policy_database = self.row_policy_database,
+            .row_policy_receipt = if (self.row_policy_receipt) |receipt| .{ .generation = receipt.generation, .phase = receipt.phase } else null,
             .fields = self.fields,
             .include_all_fields = self.include_all_fields,
             .include_primary_digest = self.include_primary_digest,
@@ -3488,7 +3497,7 @@ pub const StorageKernelLookupWireRequest = struct {
 };
 
 pub fn integrityLookupMode(opts: db_mod.types.LookupOptions) bool {
-    return opts.relational_integrity_catalog or opts.relational_integrity_action or opts.relational_integrity_jobs_json.len != 0 or opts.relational_index_status_json.len != 0 or opts.relational_activation_json.len != 0 or opts.relational_topology_json.len != 0;
+    return opts.row_policy_receipt != null or opts.relational_integrity_catalog or opts.relational_integrity_action or opts.relational_integrity_jobs_json.len != 0 or opts.relational_index_status_json.len != 0 or opts.relational_activation_json.len != 0 or opts.relational_topology_json.len != 0;
 }
 
 test "compiled lookup wire preserves binary scope and every integrity control" {
@@ -3506,6 +3515,7 @@ test "compiled lookup wire preserves binary scope and every integrity control" {
         .relational_activation_json = "{\"mode\":\"status\"}",
         .relational_index_status_json = "{\"name\":\"by_id\",\"schema_version\":2}",
         .relational_topology_json = "{\"mode\":\"identity\"}",
+        .row_policy_receipt = .{ .generation = 9, .phase = .pending_install },
         .execution_deadline_ns = 1234,
     };
     const encoded = try encodeStorageKernelLookupRequest(alloc, "\xff\x00\x80", options);
@@ -3522,6 +3532,8 @@ test "compiled lookup wire preserves binary scope and every integrity control" {
     try std.testing.expectEqualStrings(options.relational_activation_json, actual.relational_activation_json);
     try std.testing.expectEqualStrings(options.relational_index_status_json, actual.relational_index_status_json);
     try std.testing.expectEqualStrings(options.relational_topology_json, actual.relational_topology_json);
+    try std.testing.expectEqual(@as(u64, 9), actual.row_policy_receipt.?.generation);
+    try std.testing.expectEqual(@as(@import("../system_catalog/policies.zig").Publication.Phase, .pending_install), actual.row_policy_receipt.?.phase);
     try std.testing.expectEqualStrings("id", actual.fields[0]);
     try std.testing.expect(actual.execution_deadline_ns == null and actual.execution_io == null and actual.cancellation == null);
 }
@@ -3533,6 +3545,9 @@ pub fn encodeStorageKernelLookupRequest(
 ) ![]u8 {
     return try std.json.Stringify.valueAlloc(alloc, StorageKernelLookupWireRequest{
         .key = key,
+        .row_policy_principal_proof = opts.row_policy_principal_proof,
+        .row_policy_database = opts.row_policy_database,
+        .row_policy_receipt = if (opts.row_policy_receipt) |receipt| .{ .generation = receipt.generation, .phase = receipt.phase } else null,
         .fields = opts.fields,
         .include_all_fields = opts.include_all_fields,
         .include_primary_digest = opts.include_primary_digest,
@@ -3602,6 +3617,8 @@ pub const StorageKernelScanWireRequest = struct {
     filter_query_json: []const u8 = "",
     include_content_hashes: bool = false,
     relational_query_json: []const u8 = "",
+    row_policy_principal_proof: []const u8 = "",
+    row_policy_database: []const u8 = "",
     relational_query: ?db_mod.types.RelationalRowQuery = null,
 
     pub fn options(self: StorageKernelScanWireRequest) db_mod.types.ScanOptions {
@@ -3615,6 +3632,8 @@ pub const StorageKernelScanWireRequest = struct {
             .filter_query_json = self.filter_query_json,
             .include_content_hashes = self.include_content_hashes,
             .relational_query_json = self.relational_query_json,
+            .row_policy_principal_proof = self.row_policy_principal_proof,
+            .row_policy_database = self.row_policy_database,
             .relational_query = self.relational_query,
         };
     }
@@ -3649,6 +3668,8 @@ pub fn encodeStorageKernelScanRequest(
         .filter_query_json = opts.filter_query_json,
         .include_content_hashes = opts.include_content_hashes,
         .relational_query_json = opts.relational_query_json,
+        .row_policy_principal_proof = opts.row_policy_principal_proof,
+        .row_policy_database = opts.row_policy_database,
         .relational_query = opts.relational_query,
     }, .{});
 }

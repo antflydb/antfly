@@ -38,6 +38,7 @@ pub const metadata_restore_staging = @import("metadata/restore_staging.zig");
 pub const metadata_storage_raft_apply_store = @import("metadata/storage/raft_apply_store.zig");
 pub const metadata_storage_raft_apply_contract = @import("metadata/storage/raft_apply_contract.zig");
 pub const storage_db_restore_staging_contract = @import("storage/db/restore_staging_contract.zig");
+pub const storage_db_relational_initial_child_publication = @import("storage/db/relational_initial_child_publication.zig");
 pub const storage_source_authority = @import("storage/source_authority.zig");
 pub const api_bounded_diagnostic_gate = @import("api/bounded_diagnostic_gate.zig");
 pub const storage_db_online_merge_io_contract = @import("storage/db/online_merge_io_contract.zig");

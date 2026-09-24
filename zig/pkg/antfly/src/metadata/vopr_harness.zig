@@ -6707,6 +6707,7 @@ pub const MetadataAdminVoprSource = struct {
         const group_id = target.cluster.metadata_group_id;
         const result = switch (input) {
             .setting_snapshot => |scope| try store.sqlSettingSnapshotJson(alloc, group_id, scope),
+            .policy_snapshot => |request| try store.sqlPolicySnapshotJson(alloc, group_id, request.table_id, request.principal, request.database, request.roles),
             .setting_mutate => return error.Forbidden,
             .write_validation_revision => try std.json.Stringify.valueAlloc(alloc, metadata_api.MetadataHead{
                 .metadata_group_id = group_id,

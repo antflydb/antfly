@@ -752,7 +752,7 @@ pub const AdminSource = struct {
         return captureProvisioningSnapshot(service.MetadataHttpService, svc, alloc, request, node_id);
     }
 
-    fn captureRestoreStagingAuthority(comptime Service: type, svc: *Service, alloc: std.mem.Allocator, request: operation.RequestContext, input: @import("restore_staging.zig").AuthorityRequest) !@import("restore_staging.zig").AuthorityResponse {
+    pub fn captureRestoreStagingAuthority(comptime Service: type, svc: *Service, alloc: std.mem.Allocator, request: operation.RequestContext, input: @import("restore_staging.zig").AuthorityRequest) !@import("restore_staging.zig").AuthorityResponse {
         try input.validate();
         const store = svc.projectedStore() orelse return error.MissingMetadataStore;
         for (0..3) |_| {
@@ -1962,8 +1962,9 @@ pub const MetadataHttpServer = struct {
         // This transport authenticates the calling service, not a setting
         // administrator. Never infer an admin grant from request JSON.
         const authority = @import("../system_catalog/setting_authority.zig");
-        const admin_grant = parsed.value == .setting_mutate;
-        if (admin_grant or parsed.value == .setting_snapshot) {
+        const admin_grant = parsed.value == .setting_mutate or parsed.value == .policy_definition_mutate or parsed.value == .policy_publication_mutate or parsed.value == .policy_publication_begin or parsed.value == .fk_generation_publication_begin or parsed.value == .fk_generation_publication_mutate or parsed.value == .fk_initial_create_begin or parsed.value == .fk_initial_create_mutate;
+        const fk_publication_read = parsed.value == .fk_generation_publication_status or parsed.value == .fk_generation_publication_work or parsed.value == .fk_generation_publication_decision or parsed.value == .fk_generation_publication_source_decision or parsed.value == .fk_initial_create_prepare or parsed.value == .fk_initial_child_decision or parsed.value == .fk_initial_create_status or parsed.value == .fk_initial_create_work or parsed.value == .fk_initial_parent_decision;
+        if (admin_grant or fk_publication_read or parsed.value == .setting_snapshot or parsed.value == .policy_snapshot or parsed.value == .policy_install_snapshot or parsed.value == .policy_publication_status or parsed.value == .policy_publication_work) {
             if (ctx.header(@import("../api/internal_service_auth.zig").header_name) == null) return ctx.status(403).text("setting authority requires an authenticated service");
             authority.verify(
                 self.setting_authority_secret orelse return ctx.status(403).text("setting authority unavailable"),
@@ -1982,8 +1983,10 @@ pub const MetadataHttpServer = struct {
         ) catch return ctx.status(400).text("invalid forwarding context")) orelse return ctx.status(400).text("missing forwarding context");
         var context = systemCatalogRequestContext(ctx, forwarding.remaining_ms);
         context.setting_admin = admin_grant;
+        context.row_policy_install_authority = parsed.value == .policy_install_snapshot or parsed.value == .policy_publication_status or parsed.value == .policy_publication_work or parsed.value == .policy_publication_mutate or parsed.value == .policy_publication_begin;
+        context.fk_generation_publication_authority = fk_publication_read or parsed.value == .fk_generation_publication_begin or parsed.value == .fk_generation_publication_mutate or parsed.value == .fk_initial_create_begin or parsed.value == .fk_initial_create_mutate;
         const callback = self.source.vtable.system_catalog orelse return ctx.status(426).text("catalog upgrade required");
-        const identity_reader = if (parsed.value != .mutate and parsed.value != .setting_mutate)
+        const identity_reader = if (parsed.value != .mutate and parsed.value != .setting_mutate and parsed.value != .policy_definition_mutate and parsed.value != .policy_publication_mutate and parsed.value != .policy_publication_begin and parsed.value != .fk_generation_publication_begin and parsed.value != .fk_generation_publication_mutate and parsed.value != .fk_initial_create_begin and parsed.value != .fk_initial_create_mutate)
             self.source.vtable.catalog_identity orelse return ctx.status(426).text("catalog identity upgrade required")
         else
             null;
@@ -4487,15 +4490,15 @@ test "metadata status JSON preserves compact managed index admission state" {
 
 test "relational topology admission JSON preserves capability in registrations and heartbeats" {
     const alloc = std.testing.allocator;
-    const json = "{\"store_id\":20,\"node_id\":20,\"reporter_incarnation\":77,\"relational_topology_protocol_version\":1}";
+    const json = "{\"store_id\":20,\"node_id\":20,\"reporter_incarnation\":77,\"relational_topology_protocol_version\":2}";
     const registration = try parseStoreRecord(alloc, json);
     defer metadata_table_manager.freeStore(alloc, registration);
-    try std.testing.expectEqual(@as(u16, 1), registration.relational_topology_protocol_version);
+    try std.testing.expectEqual(metadata_table_manager.relational_topology_protocol_version, registration.relational_topology_protocol_version);
     const heartbeat = try parseStoreStatusReport(alloc, json);
     defer freeStoreStatusReport(alloc, heartbeat);
-    try std.testing.expectEqual(@as(u16, 1), heartbeat.relational_topology_protocol_version);
-    try std.testing.expectError(error.InvalidStoreReporterFence, parseStoreRecord(alloc, "{\"store_id\":20,\"node_id\":20,\"relational_topology_protocol_version\":1}"));
-    try std.testing.expectError(error.InvalidStoreReporterFence, parseStoreStatusReport(alloc, "{\"store_id\":20,\"reporter_incarnation\":77,\"relational_topology_protocol_version\":2}"));
+    try std.testing.expectEqual(metadata_table_manager.relational_topology_protocol_version, heartbeat.relational_topology_protocol_version);
+    try std.testing.expectError(error.InvalidStoreReporterFence, parseStoreRecord(alloc, "{\"store_id\":20,\"node_id\":20,\"relational_topology_protocol_version\":2}"));
+    try std.testing.expectError(error.InvalidStoreReporterFence, parseStoreStatusReport(alloc, "{\"store_id\":20,\"reporter_incarnation\":77,\"relational_topology_protocol_version\":3}"));
 }
 
 fn parseU64Field(value: std.json.Value) !u64 {

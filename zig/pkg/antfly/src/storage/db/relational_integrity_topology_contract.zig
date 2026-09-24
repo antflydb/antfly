@@ -33,18 +33,85 @@ pub const receipt_key = "\x00\x00__metadata__:relational_integrity_topology_rece
 
 pub const abort_prefix = "\x00\x00__metadata__:relational_integrity_topology_aborted:";
 
-pub const Role = enum(u8) { split_source = 1, split_destination = 2, merge_source = 3, merge_destination = 4, backup_snapshot = 5, rewrite_source = 6, truncate_parent = 7 };
+pub const Role = enum(u8) { split_source = 1, split_destination = 2, merge_source = 3, merge_destination = 4, backup_snapshot = 5, rewrite_source = 6, truncate_parent = 7, child_generation_parent = 8, child_generation_source = 9 };
 
 pub const ParentRetirementEntry = struct {
     child_table_id: u64,
     child_table_name: []const u8,
     constraint_name: []const u8,
     generation: integrity.Generation,
+    next_generation: integrity.Generation,
 };
 
 pub const ParentRetirementStage = struct {
     plan_digest: integrity.Digest,
     entries: []const ParentRetirementEntry,
+};
+
+pub const ParentActivation = struct {
+    plan_id: [16]u8,
+    plan_digest: integrity.Digest,
+    publication_digest: integrity.Digest,
+};
+
+pub const ChildSchemaInstall = struct {
+    schema_json: []const u8,
+    before_schema_json_digest: integrity.Digest,
+    schema_json_digest: integrity.Digest,
+    before_catalog_digest: integrity.Digest,
+    after_catalog_digest: integrity.Digest,
+
+    pub fn nativeJsonProjection(self: ChildSchemaInstall) struct {
+        schema_json: std.json.Value,
+        before_schema_json_digest: integrity.Digest,
+        schema_json_digest: integrity.Digest,
+        before_catalog_digest: integrity.Digest,
+        after_catalog_digest: integrity.Digest,
+    } {
+        return .{
+            .schema_json = .{ .string = self.schema_json },
+            .before_schema_json_digest = self.before_schema_json_digest,
+            .schema_json_digest = self.schema_json_digest,
+            .before_catalog_digest = self.before_catalog_digest,
+            .after_catalog_digest = self.after_catalog_digest,
+        };
+    }
+};
+
+pub const InitialChildProvision = struct {
+    schema_json: []const u8,
+    plan_id: [16]u8,
+    plan_digest: integrity.Digest,
+    schema_digest: integrity.Digest,
+    public_schema_json_digest: integrity.Digest,
+    catalog_digest: integrity.Digest,
+
+    pub fn nativeJsonProjection(self: InitialChildProvision) struct {
+        schema_json: std.json.Value,
+        plan_id: [16]u8,
+        plan_digest: integrity.Digest,
+        schema_digest: integrity.Digest,
+        public_schema_json_digest: integrity.Digest,
+        catalog_digest: integrity.Digest,
+    } {
+        return .{
+            .schema_json = .{ .string = self.schema_json },
+            .plan_id = self.plan_id,
+            .plan_digest = self.plan_digest,
+            .schema_digest = self.schema_digest,
+            .public_schema_json_digest = self.public_schema_json_digest,
+            .catalog_digest = self.catalog_digest,
+        };
+    }
+};
+
+pub const InitialChildControl = struct {
+    plan_id: [16]u8,
+    plan_digest: integrity.Digest,
+    schema_version: u32,
+    schema_digest: integrity.Digest,
+    public_schema_json_digest: integrity.Digest,
+    catalog_digest: integrity.Digest,
 };
 
 pub const Fence = struct {
@@ -109,9 +176,14 @@ pub const Fence = struct {
 
 pub const Command = struct {
     fence: Fence,
-    action: enum { begin, release, cancel, abort_transition, transfer, prune, stage_parent_retirement },
+    action: enum { begin, release, cancel, abort_transition, transfer, prune, stage_parent_retirement, activate_parent_retirement, acknowledge_parent_retirement, stage_child_generation, activate_child_generation, acknowledge_child_generation, cancel_child_generation_source, install_child_schema, provision_initial_child, release_initial_child, cancel_initial_child },
     transfer: ?@import("relational_integrity_handoff_contract.zig").Command = null,
     parent_retirement: ?ParentRetirementStage = null,
+    parent_activation: ?ParentActivation = null,
+    child_generations: ?[]const @import("relational_integrity_generation_admission.zig").Transition = null,
+    child_schema_install: ?ChildSchemaInstall = null,
+    initial_child_provision: ?InitialChildProvision = null,
+    initial_child_control: ?InitialChildControl = null,
     pub fn jsonStringify(self: Command, jw: anytype) @TypeOf(jw.*).Error!void {
         try @import("relational_integrity_json.zig").write(self, jw);
     }

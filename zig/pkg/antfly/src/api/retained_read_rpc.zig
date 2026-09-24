@@ -16,7 +16,7 @@ pub const max_request_bytes = 4 << 20;
 pub const max_response_bytes = 32 << 20;
 pub const max_lease_ms: u32 = 30_000;
 pub const Request = struct {
-    operation: enum { admit, capture, validate, open, next, normalize, range_proofs, close, cancel },
+    operation: enum { admit, capture, validate, snapshot, open, open_snapshot, next, normalize, range_proofs, close, cancel },
     schema_version: u32,
     token: ?registry.Token = null,
     connection: u128 = 0,
@@ -32,6 +32,8 @@ pub const Request = struct {
     sql_document_preimage: bool = false,
     include_content_hashes: bool = false,
     include_range_proofs: bool = false,
+    row_policy_principal_proof: []const u8 = "",
+    row_policy_database: []const u8 = "",
     writes: []const types.BatchWrite = &.{},
 };
 
@@ -80,6 +82,11 @@ pub fn execute(alloc: std.mem.Allocator, owner: owner_mod.Owner, scope: registry
             try owner.validateCapture(scope, input.token orelse return error.InvalidRetainedReadToken);
             return encode(alloc, .{});
         },
+        .snapshot => {
+            const token = try owner.captureSnapshot(scope, input.token orelse return error.InvalidRetainedReadToken, input.connection, deadline);
+            errdefer owner.registry.close(token, scope) catch {};
+            return encode(alloc, .{ .token = token });
+        },
         .open => {
             const token = try owner.open(scope, input.token orelse return error.InvalidRetainedReadToken, input.connection, input.from, input.to, .{
                 .relational_query = input.query orelse return error.InvalidRetainedReadQuery,
@@ -89,6 +96,23 @@ pub fn execute(alloc: std.mem.Allocator, owner: owner_mod.Owner, scope: registry
                 .sql_document_preimage = input.sql_document_preimage,
                 .include_content_hashes = input.include_content_hashes,
                 .include_range_proofs = input.include_range_proofs,
+                .row_policy_principal_proof = input.row_policy_principal_proof,
+                .row_policy_database = input.row_policy_database,
+            }, deadline);
+            errdefer owner.registry.close(token, scope) catch {};
+            return encode(alloc, .{ .token = token });
+        },
+        .open_snapshot => {
+            const token = try owner.openSnapshot(scope, input.token orelse return error.InvalidRetainedReadToken, input.connection, input.from, input.to, .{
+                .relational_query = input.query orelse return error.InvalidRetainedReadQuery,
+                .filter_query_json = input.filter_query_json,
+                .inclusive_from = input.inclusive_from,
+                .exclusive_to = input.exclusive_to,
+                .sql_document_preimage = input.sql_document_preimage,
+                .include_content_hashes = input.include_content_hashes,
+                .include_range_proofs = input.include_range_proofs,
+                .row_policy_principal_proof = input.row_policy_principal_proof,
+                .row_policy_database = input.row_policy_database,
             }, deadline);
             errdefer owner.registry.close(token, scope) catch {};
             return encode(alloc, .{ .token = token });

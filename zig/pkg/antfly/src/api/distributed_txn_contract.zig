@@ -48,6 +48,9 @@ pub const TxnStatusRequest = struct {
 };
 
 pub const TableCommitRequest = struct {
+    row_policy_principal_proof: []const u8 = "",
+    row_policy_database: []const u8 = "",
+    row_policy_admitted_at_seconds: i64 = 0,
     range_guards: []const @import("range_read_guards.zig").OwnerRangeProof = &.{},
     schema_version: ?u32 = null,
     table_name: []const u8,

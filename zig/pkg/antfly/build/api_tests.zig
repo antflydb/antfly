@@ -1088,6 +1088,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "retained read client",
             "relational row query response budget",
             "relational row query full-key index proof requires every routed owner",
+            "partially applied two-owner decision cannot enter retained SQL cut",
             "relational row query executes typed projection",
             "owner-local delayed statement scans",
             "relational row query retained owner holds admission and releases failed opens",
@@ -1570,7 +1571,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-api-public-table-http-test", "Run public table HTTP response contracts").dependOn(&run_api_public_table_http_docid_tests.step);
     const api_relational_row_contract_tests = b.addTest(.{
         .root_module = api_public_table_http_docid_test_mod,
-        .filters = &.{ "relational mutation", "relational row query", "relational declarations" },
+        .filters = &.{ "relational mutation", "relational row query", "relational declarations", "ordinary schema update rejects unacknowledged FK generation", "FK generation publication coordinator", "FK initial create coordinator", "SQL TRUNCATE" },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-relational-rows-test", "Run generated relational row and schema boundary contracts").dependOn(&addFilteredTestRunArtifact(b, api_relational_row_contract_tests).step);
@@ -1850,7 +1851,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const hosted_batch_tests = @import("linked_tests.zig").addPair(b, .{
         .name = "api-hosted-batch-tests",
         .root_module = api_table_writes_docid_test_mod,
-        .filters = &.{"hosted remote batch prefers routed Raft protocol with safe legacy fallback"},
+        .filters = &.{
+            "hosted remote batch prefers routed Raft protocol with safe legacy fallback",
+            "range tracking activation uses a fenced owner-routed Raft command",
+        },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     }, write_implementation_tests);
     b.step("antfly-api-hosted-batch-test", "Run hosted batch forwarding authority and canonical wire regressions").dependOn(&hosted_batch_tests.run(b).step);

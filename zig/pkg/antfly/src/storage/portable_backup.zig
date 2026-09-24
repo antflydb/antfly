@@ -586,13 +586,24 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
         else => return err,
     };
     if (gc_progress != null) return error.CoordinatedConstraintPortableBackupUnsupported;
-    // A completed GC may leave only permanent old-generation tombstones.
-    // Portable backup does not carry their global authority, so an image
-    // without the live catalog still must not silently discard them.
+    inline for (.{ generation_gc.activation_receipt_key, generation_gc.completed_pending_key, generation_gc.acknowledged_receipt_key }) |authority_key| {
+        const authority = scan.get(authority_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (authority != null) return error.CoordinatedConstraintPortableBackupUnsupported;
+    }
+    // Replicated GC may remove physical tombstones, but the permanent
+    // accepted-generation scope still denies delayed old-generation attaches.
+    // Portable backup cannot silently discard either authority.
     var retired_cursor = try scan.openCursor();
     defer retired_cursor.close();
     if (try retired_cursor.seekAtOrAfter(generation_gc.active_prefix)) |entry| {
         if (std.mem.startsWith(u8, entry.key, generation_gc.active_prefix)) return error.CoordinatedConstraintPortableBackupUnsupported;
+    }
+    const admitted_prefix = @import("db/relational_integrity_generation_admission.zig").prefix;
+    if (try retired_cursor.seekAtOrAfter(admitted_prefix)) |entry| {
+        if (std.mem.startsWith(u8, entry.key, admitted_prefix)) return error.CoordinatedConstraintPortableBackupUnsupported;
     }
     const topology_fence = scan.get(@import("db/relational_integrity_topology.zig").fence_key) catch |err| switch (err) {
         error.NotFound => null,
@@ -4846,6 +4857,11 @@ test "portable backup refuses retained retirement and topology authority without
     }
     const active_key = @import("db/relational_integrity_generation_retirement.zig").activeKey(@splat(7));
     try store.put(&active_key, "retained authority");
+    try std.testing.expectError(error.CoordinatedConstraintPortableBackupUnsupported, exportPortable(alloc, &store, &output));
+    try std.testing.expectEqual(@as(usize, 0), output.items.len);
+    try store.delete(&active_key);
+    const admission_key = try @import("db/relational_integrity_generation_admission.zig").scopeKey("children", "fk");
+    try store.put(&admission_key, "retained authority");
     try std.testing.expectError(error.CoordinatedConstraintPortableBackupUnsupported, exportPortable(alloc, &store, &output));
     try std.testing.expectEqual(@as(usize, 0), output.items.len);
 }

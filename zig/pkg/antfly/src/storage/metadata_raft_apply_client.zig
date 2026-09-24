@@ -29,6 +29,9 @@ const raft_state_machine = @import("../raft/state_machine/mod.zig");
 const extension_domain = @import("../extensions/mod.zig");
 const restore_staging = @import("../metadata/restore_staging.zig");
 const physical_metadata = @import("../metadata/storage/raft_apply_store.zig");
+const sql_settings = @import("../system_catalog/settings.zig");
+const sql_policies = @import("../system_catalog/policies.zig");
+const fk_generation_publication = @import("../metadata/fk_generation_publication.zig");
 
 pub const RaftApplyStoreConfig = struct {
     root_dir: []const u8,
@@ -413,6 +416,59 @@ pub const RaftApplyStore = struct {
         errdefer arena.deinit();
         const value = try self.catalogProjection(struct { meta: system_catalog.Meta, value: system_catalog.State }, arena.allocator(), group_id, .{ .catalog_snapshot = {} });
         return .{ .arena = arena, .meta = value.meta, .value = value.value };
+    }
+    pub fn sqlSettingSnapshotJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, scope: sql_settings.Scope) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .sql_setting_snapshot = scope });
+    }
+    pub fn sqlPolicySnapshotJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, table_id: u64, principal: []const u8, database: []const u8, roles: []const []const u8) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .sql_policy_snapshot = .{ .table_id = table_id, .principal = principal, .database = database, .roles = roles } });
+    }
+    pub fn sqlPolicyInstallSnapshotJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: sql_policies.InstallRequest) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .sql_policy_install_snapshot = request });
+    }
+    pub fn sqlPolicyPublicationStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, table_id: u64) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .sql_policy_publication_status = table_id });
+    }
+    pub fn sqlPolicyPublicationWorkJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, after_table_id: u64) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .sql_policy_publication_work = after_table_id });
+    }
+    pub fn sqlPolicyBeginCommandJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: sql_policies.BeginRequest) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .sql_policy_begin_command = request });
+    }
+    pub fn requirePolicyIndexMutationAllowed(self: *RaftApplyStore, group_id: u64, table_id: u64) !void {
+        const value = try self.catalogProjection(bool, self.alloc, group_id, .{ .require_policy_index_mutation_allowed = table_id });
+        if (!value) return error.RowPolicyUnsupported;
+    }
+    pub fn requirePolicyTopologyMutationAllowed(self: *RaftApplyStore, group_id: u64, table_id: u64) !void {
+        const value = try self.catalogProjection(bool, self.alloc, group_id, .{ .require_policy_topology_mutation_allowed = table_id });
+        if (!value) return error.RowPolicyUnsupported;
+    }
+    pub fn fkGenerationPublicationStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, child_table_id: u64) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .fk_generation_publication_status = child_table_id });
+    }
+    pub fn fkGenerationPublicationWorkJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, after_child_table_id: u64) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .fk_generation_publication_work = after_child_table_id });
+    }
+    pub fn fkGenerationPublicationDecisionJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: fk_generation_publication.DecisionRequest) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .fk_generation_publication_decision = request });
+    }
+    pub fn fkGenerationPublicationSourceDecisionJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: fk_generation_publication.SourceDecisionRequest) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .fk_generation_publication_source_decision = request });
+    }
+    pub fn fkInitialCreatePrepareJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: fk_generation_publication.InitialCreatePrepareRequest) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .fk_initial_create_prepare = request });
+    }
+    pub fn fkInitialChildDecisionJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: fk_generation_publication.InitialChildDecisionRequest) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .fk_initial_child_decision = request });
+    }
+    pub fn fkInitialCreateStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, child_table_id: u64) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .fk_initial_create_status = child_table_id });
+    }
+    pub fn fkInitialCreateWorkJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, after_child_table_id: u64) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .fk_initial_create_work = after_child_table_id });
+    }
+    pub fn fkInitialParentDecisionJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: fk_generation_publication.DecisionRequest) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .fk_initial_parent_decision = request });
     }
     fn catalogProjection(self: *RaftApplyStore, comptime T: type, alloc: std.mem.Allocator, group_id: u64, request: contract.CatalogProjectionRequest) !T {
         const bytes = try std.json.Stringify.valueAlloc(alloc, request, .{});

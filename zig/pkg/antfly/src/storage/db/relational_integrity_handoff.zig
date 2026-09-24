@@ -20,6 +20,8 @@ const topology = @import("relational_integrity_topology.zig");
 const integrity = @import("relational_integrity.zig");
 const catalog = @import("relational_integrity_catalog.zig");
 const activation = @import("relational_integrity_activation.zig");
+const generation_retirement = @import("relational_integrity_generation_retirement.zig");
+const generation_admission = @import("relational_integrity_generation_admission.zig");
 const docstore = @import("../docstore.zig");
 const Allocator = std.mem.Allocator;
 pub const manifest_key = @import("relational_integrity_handoff_contract.zig").manifest_key;
@@ -78,8 +80,11 @@ pub fn readPage(alloc: Allocator, store: *docstore.DocStore, manifest: Manifest,
     var next_buf: [integrity.key_len + 32]u8 = undefined;
     var next: []const u8 = progress.cursor;
     var exhausted = true;
-    const initial_kind = if (progress.cursor.len != 0) (try integrity.parseKey(progress.cursor)).kind else integrity.Kind.claim;
+    const resuming_retirements = std.mem.startsWith(u8, progress.cursor, generation_retirement.active_prefix);
+    const resuming_admissions = std.mem.startsWith(u8, progress.cursor, generation_admission.prefix);
+    const initial_kind = if (progress.cursor.len != 0 and !resuming_retirements and !resuming_admissions) (try integrity.parseKey(progress.cursor)).kind else integrity.Kind.claim;
     outer: for ([_]integrity.Kind{ .claim, .reference, .job }) |kind| {
+        if (resuming_retirements or resuming_admissions) break;
         if (@intFromEnum(kind) < @intFromEnum(initial_kind)) continue;
         var prefix: [integrity.namespace.len + 1]u8 = undefined;
         @memcpy(prefix[0..integrity.namespace.len], integrity.namespace);
@@ -104,6 +109,54 @@ pub fn readPage(alloc: Allocator, store: *docstore.DocStore, manifest: Manifest,
             }
             bytes += size;
             _ = try integrity.validateTransferRecord(entry.key, entry.value);
+            try records.append(alloc, .{ .key = try alloc.dupe(u8, entry.key), .value = try alloc.dupe(u8, entry.value) });
+            @memcpy(next_buf[0..entry.key.len], entry.key);
+            next = next_buf[0..entry.key.len];
+        }
+    }
+    if (exhausted and !resuming_retirements) {
+        // Accepted-generation scopes are table-wide, permanent denial
+        // authority. Transfer them before tombstones in physical key order.
+        var item = try cursor.seekAtOrAfter(if (resuming_admissions) progress.cursor else generation_admission.prefix);
+        if (item) |entry| {
+            if (resuming_admissions and std.mem.eql(u8, entry.key, progress.cursor)) item = try cursor.next();
+        }
+        while (item) |entry| : (item = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, generation_admission.prefix)) break;
+            const scope = try generation_admission.Scope.decode(entry.value);
+            const expected = try generation_admission.scopeKey(scope.child_table_name, scope.constraint_name);
+            if (!std.mem.eql(u8, &expected, entry.key)) return error.InvalidGenerationAdmission;
+            const size = std.math.add(usize, entry.key.len, entry.value.len) catch return error.IntegrityRecordTooLarge;
+            if (records.items.len == max_records or size > max_bytes - bytes) {
+                if (records.items.len == 0) return error.IntegrityRecordTooLarge;
+                exhausted = false;
+                break;
+            }
+            bytes += size;
+            try records.append(alloc, .{ .key = try alloc.dupe(u8, entry.key), .value = try alloc.dupe(u8, entry.value) });
+            @memcpy(next_buf[0..entry.key.len], entry.key);
+            next = next_buf[0..entry.key.len];
+        }
+    }
+    if (exhausted) {
+        // Generation tombstones are table-wide authority. Every new owner
+        // needs the full immutable set, even when its row range is tiny.
+        // They sort after integrity keys and share the same bounded page CAS.
+        var item = try cursor.seekAtOrAfter(if (resuming_retirements) progress.cursor else generation_retirement.active_prefix);
+        if (item) |entry| if (resuming_retirements and std.mem.eql(u8, entry.key, progress.cursor)) {
+            item = try cursor.next();
+        };
+        while (item) |entry| : (item = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, generation_retirement.active_prefix)) break;
+            if (entry.key.len != generation_retirement.active_prefix.len + 16) return error.InvalidGenerationRetirement;
+            _ = try generation_retirement.Active.decode(entry.value, entry.key[generation_retirement.active_prefix.len..][0..16].*);
+            const size = std.math.add(usize, entry.key.len, entry.value.len) catch return error.IntegrityRecordTooLarge;
+            if (records.items.len == max_records or size > max_bytes - bytes) {
+                if (records.items.len == 0) return error.IntegrityRecordTooLarge;
+                exhausted = false;
+                break;
+            }
+            bytes += size;
             try records.append(alloc, .{ .key = try alloc.dupe(u8, entry.key), .value = try alloc.dupe(u8, entry.value) });
             @memcpy(next_buf[0..entry.key.len], entry.key);
             next = next_buf[0..entry.key.len];
@@ -200,11 +253,17 @@ pub fn apply(alloc: Allocator, txn: anytype, fence: topology.Fence, command: Com
             for (page.records) |record| {
                 bytes = std.math.add(usize, bytes, record.key.len + record.value.len) catch return error.IntegrityRecordTooLarge;
                 if (bytes > max_bytes or std.mem.order(u8, record.key, previous) != .gt or std.mem.order(u8, record.key, page.next_cursor) == .gt) return error.InvalidIntegrityKey;
-                const address = try integrity.validateTransferRecord(record.key, record.value);
-                if (compiled.findGeneration(address.generation) == null) return error.IntegrityCatalogChanged;
-                if (!contains(manifest.value, &address.routing)) return error.KeyOutOfRange;
-                if (try optional(txn, record.key)) |existing| if (!std.mem.eql(u8, existing, record.value)) return error.IntegrityHandoffCollision;
-                try txn.put(record.key, record.value);
+                if (std.mem.startsWith(u8, record.key, generation_admission.prefix)) {
+                    try generation_admission.stageTransferred(txn, record.key, record.value);
+                } else if (std.mem.startsWith(u8, record.key, generation_retirement.active_prefix)) {
+                    try generation_retirement.stageTransferredActive(alloc, txn, record.key, record.value);
+                } else {
+                    const address = try integrity.validateTransferRecord(record.key, record.value);
+                    if (compiled.findGeneration(address.generation) == null) return error.IntegrityCatalogChanged;
+                    if (!contains(manifest.value, &address.routing)) return error.KeyOutOfRange;
+                    if (try optional(txn, record.key)) |existing| if (!std.mem.eql(u8, existing, record.value)) return error.IntegrityHandoffCollision;
+                    try txn.put(record.key, record.value);
+                }
                 previous = record.key;
             }
             state.value.sequence = page.sequence;

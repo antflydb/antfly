@@ -14,6 +14,7 @@
 
 const user_manager = @import("user_manager.zig");
 const storage_adapter = @import("storage_adapter.zig");
+pub const row_policy_authority = @import("row_policy_authority.zig");
 
 pub const MemoryStore = user_manager.MemoryStore;
 pub const verifyPassword = user_manager.verifyPassword;
@@ -44,4 +45,5 @@ pub const portable_seed_format_version = storage_adapter.portable_seed_format_ve
 
 test {
     _ = storage_adapter;
+    _ = row_policy_authority;
 }
