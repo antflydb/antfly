@@ -435,15 +435,18 @@ class RuntimeCacheTest(unittest.TestCase):
                 self.assert_archives(self.build("cache-probe"))
 
     def test_lite_capability_options(self):
-        baseline = self.build("cache-probe")
-        self.assert_archives(self.build("cache-probe"))
-        settings = ("-Dlite-local-inference-runtime=true",)
-        changed = self.build("cache-probe", settings=settings)
+        # Set both values explicitly so this cache contract remains valid if
+        # the production default changes.
+        enabled = ("-Dlite-local-inference-runtime=true",)
+        disabled = ("-Dlite-local-inference-runtime=false",)
+        baseline = self.build("cache-probe", settings=enabled)
+        self.assert_archives(self.build("cache-probe", settings=enabled))
+        changed = self.build("cache-probe", settings=disabled)
         self.assert_archives(changed, rebuilt=("distributed", "storage_kernel"))
         # The actual capability implementation must still report the new value.
         self.assertNotEqual(self.probe(baseline), self.probe(changed))
-        self.assert_archives(self.build("cache-probe", settings=settings))
-        restored = self.build("cache-probe")
+        self.assert_archives(self.build("cache-probe", settings=disabled))
+        restored = self.build("cache-probe", settings=enabled)
         self.assert_archives(restored)
         self.assertEqual(self.probe(baseline), self.probe(restored))
 
