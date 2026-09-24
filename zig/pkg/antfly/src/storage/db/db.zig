@@ -143069,6 +143069,28 @@ test "workload admission physical completion begin captures real coordinator and
         defer entry.deinit();
         try std.testing.expect(transactions_mod.isBeginCompletionMutation(entry.entry.prepare_operations));
         try std.testing.expect(!std.mem.eql(u8, &id, &entry.entry.txn_id));
+        // A truncated fresh BEGIN would create a transaction record without
+        // its participant and lifetime-credit rows. Reject it before the
+        // accepted sidecar is published or a cell is spent.
+        const record_prefix = @import("../completion_control_budget.zig").records_prefix;
+        const record_op = for (entry.entry.prepare_operations) |op| {
+            if (std.mem.startsWith(u8, op.key, record_prefix)) break op;
+        } else return error.TestUnexpectedResult;
+        var malformed_entry = entry.entry;
+        const truncated_operations = [_]@import("../lsm_backend/completion_slot.zig").Operation{record_op};
+        malformed_entry.prepare_operations = &truncated_operations;
+        const malformed = try codec.encode(alloc, malformed_entry);
+        defer alloc.free(malformed);
+        {
+            const backend = db.core.primary_store_owner.lsmBackend().?;
+            const backend_runtime = @import("../lsm_backend/runtime.zig");
+            const locked = backend_runtime.lockBackend(lsm_backend_mod.Backend, backend);
+            defer backend_runtime.unlockBackend(lsm_backend_mod.Backend, backend, locked);
+            const pool = backend.completion_pool.?;
+            try std.testing.expectError(error.UnsupportedCompletionProfile, pool.accept(backend, 1, 1, 0, 0, malformed));
+            try std.testing.expectEqual(@import("../lsm_backend/completion_pool.zig").Pool(lsm_backend_mod.Backend).Phase.free, pool.cells[0].phase);
+            try std.testing.expectError(error.FileNotFound, pool.io.storage().fileSize(pool.accepted_paths[0]));
+        }
         // Independent legacy begin must produce exactly the candidate delta,
         // including coordinator selection, participants and completion credit.
         try local.applyReplicatedTransactionMutationInternal(alloc, &reference, "docs", 2, request, .{}, null);

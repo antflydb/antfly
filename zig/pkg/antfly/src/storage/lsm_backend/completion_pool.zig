@@ -21,6 +21,8 @@ const Allocator = std.mem.Allocator;
 pub const maintenance = @import("completion_maintenance.zig");
 const capacity = @import("completion_capacity.zig");
 const generations_mod = @import("completion_generations.zig");
+const control_begin = @import("completion_control_begin.zig");
+const control_shape = @import("../completion_control_budget.zig");
 comptime {
     if (completion.scratch_bytes != maintenance.compiler_workspace_bytes)
         @compileError("completion maintenance certificate must match installed compiler backing");
@@ -656,6 +658,24 @@ pub fn Pool(comptime Backend: type) type {
             return .{};
         }
 
+        /// A new transaction record is a future decision/ACK obligation. Even
+        /// while full control capacity is disabled, its accepted physical
+        /// mutation must be the exact fresh BEGIN understood by the native
+        /// owner codec. Existing records may be rewritten by later controls.
+        fn validateNewTransactionRecord(self: *Self, backend: *Backend, alloc: Allocator, entry: *const entry_codec.OwnedEntry) !void {
+            if (entry.entry.kind != .mutation) return;
+            const namespace = entry.decoded_descriptor.descriptor.namespace;
+            for (entry.entry.prepare_operations) |op| {
+                if (op.kind != .put or !std.mem.startsWith(u8, op.key, control_shape.records_prefix)) continue;
+                const existing = try self.point(backend, alloc, namespace, op.key);
+                defer existing.deinit(alloc);
+                if (existing.value == null) {
+                    _ = try control_begin.inspect(entry.entry.prepare_operations);
+                    return;
+                }
+            }
+        }
+
         pub fn validateBaseline(self: *Self, backend: *Backend, alloc: Allocator, entry: *const entry_codec.OwnedEntry) !void {
             var hash = entry_codec.BaselineHasher.init();
             for (entry.entry.baseline_keys) |key| {
@@ -851,6 +871,7 @@ pub fn Pool(comptime Backend: type) type {
             try Slot.validateFootprint(backend, checked.decoded_descriptor.descriptor);
             if (checked.entry.kind == .mutation)
                 try Slot.validateCanonicalFootprint(backend, checked.decoded_descriptor.descriptor.namespace, checked.entry.prepare_operations);
+            try self.validateNewTransactionRecord(backend, scratch, &checked);
             try self.validateBaseline(backend, scratch, &checked);
             const growth = try entryCapacity(&checked);
             try self.checkCapacity(growth);
