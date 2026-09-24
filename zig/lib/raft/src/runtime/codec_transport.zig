@@ -297,11 +297,15 @@ pub const CodecTransportHost = struct {
             .peer_id = batch.peer_id,
             .endpoint = endpoint,
             .frame = frame,
+            .replaceable_heartbeat = isReplaceableHeartbeatBatch(batch),
         }) catch {
             self.metrics.send_failures += 1;
             // Failure ownership is per group. A later route change/removal
             // cannot send another group's pending messages to the wrong node.
             for (batch.groups) |group| {
+                // Raft emits another context-free heartbeat on the next tick.
+                // Retrying this one later can replace a newer queued heartbeat.
+                if (isReplaceableHeartbeatGroup(group)) continue;
                 const isolated = try self.codec.encodePeerBatch(self.alloc, .{ .peer_id = batch.peer_id, .groups = &.{group} });
                 defer self.codec.freeFrame(self.alloc, isolated);
                 try self.scheduleRetry(group.group_id, if (group.messages.len > 0) group.messages[0].from else null, batch.peer_id, isolated, 1);
@@ -414,6 +418,9 @@ pub const CodecTransportHost = struct {
             var completion = failed;
             defer completion.deinit();
             self.metrics.send_failures += 1;
+            // An asynchronously failed heartbeat is just as stale as one
+            // rejected at enqueue time. Keep read-index and data retries.
+            if (completion.replaceable_heartbeat) continue;
             if (completion.attempt >= self.retry_policy.max_attempts) {
                 self.metrics.retries_exhausted += 1;
                 continue;
@@ -423,6 +430,9 @@ pub const CodecTransportHost = struct {
             switch (decoded) {
                 .raft_peer_batch => |batch| for (batch.groups) |group| {
                     if (!self.peer_routes.contains(.{ .group_id = group.group_id, .node_id = completion.peer_id })) continue;
+                    // Mixed bundles can contain both retryable work and an
+                    // obsolete context-free heartbeat.
+                    if (isReplaceableHeartbeatGroup(group)) continue;
                     const frame = try self.codec.encodePeerBatch(self.alloc, .{ .peer_id = completion.peer_id, .groups = &.{group} });
                     defer self.codec.freeFrame(self.alloc, frame);
                     try self.scheduleRetry(group.group_id, completion.source_id, completion.peer_id, frame, completion.attempt);
@@ -479,6 +489,33 @@ pub const CodecTransportHost = struct {
         self.pending_retries.items.len = kept;
     }
 };
+
+fn isReplaceableHeartbeatGroup(group: transport_iface.GroupMessageBatch) bool {
+    if (group.messages.len == 0) return false;
+    for (group.messages) |message| {
+        if (message.msg_type != .heartbeat or message.context.len != 0 or
+            message.entries.len != 0 or message.snapshot != null or message.responses.len != 0) return false;
+    }
+    return true;
+}
+
+fn isReplaceableHeartbeatBatch(batch: transport_iface.PeerBatch) bool {
+    if (batch.groups.len == 0) return false;
+    for (batch.groups) |group| if (!isReplaceableHeartbeatGroup(group)) return false;
+    return true;
+}
+
+test "only context-free outbound heartbeat batches are replaceable" {
+    var context = "read-index".*;
+    const heartbeat = core.Message{ .msg_type = .heartbeat, .from = 1, .to = 2 };
+    const read_index = core.Message{ .msg_type = .heartbeat, .from = 1, .to = 2, .context = &context };
+    const response = core.Message{ .msg_type = .heartbeat_response, .from = 1, .to = 2 };
+    const append = core.Message{ .msg_type = .append_entries, .from = 1, .to = 2 };
+    try std.testing.expect(isReplaceableHeartbeatBatch(.{ .peer_id = 2, .groups = &.{.{ .group_id = 7, .messages = &.{heartbeat} }} }));
+    for ([_]core.Message{ read_index, response, append }) |message| {
+        try std.testing.expect(!isReplaceableHeartbeatBatch(.{ .peer_id = 2, .groups = &.{.{ .group_id = 7, .messages = &.{message} }} }));
+    }
+}
 
 fn firstSourceNodeId(batch: transport_iface.PeerBatch) ?core.types.NodeId {
     for (batch.groups) |group| {

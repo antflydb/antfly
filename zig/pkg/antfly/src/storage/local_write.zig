@@ -292,6 +292,21 @@ pub fn reclaimStaleNativeSnapshotAttempts(
 }
 
 pub const local_schema_json_key = "\x00\x00__metadata__:schema_json";
+const owner_catalog_initialized_key = "\x00\x00__metadata__:owner_catalog_initialized";
+
+fn loadOwnerCatalogContract(alloc: std.mem.Allocator, db: *db_mod.DB) !?[]u8 {
+    return db.core.store.get(alloc, owner_catalog_initialized_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+}
+
+fn persistOwnerCatalogContract(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const u8) !void {
+    const stored = try loadOwnerCatalogContract(alloc, db);
+    defer if (stored) |value| alloc.free(value);
+    if (stored) |value| if (std.mem.eql(u8, value, indexes_json)) return;
+    try db.core.store.put(owner_catalog_initialized_key, indexes_json);
+}
 
 pub fn applyStorageKernelReplicatedBatch(
     alloc: std.mem.Allocator,
@@ -316,7 +331,11 @@ pub fn applyStorageKernelReplicatedBatchAtRaftEntry(
     req: db_mod.types.BatchRequest,
     raft_entry: db_mod.RaftAppliedEntryIdentity,
 ) !void {
-    try validateTableBatchAgainstLocalSchema(alloc, db, req.writes, req.deletes, req.transforms);
+    // The leader admitted this immutable command under the descriptor pinned
+    // in its Raft entry. A follower may already have a newer durable schema
+    // when it catches up; validating against that schema would make apply
+    // order depend on metadata delivery and can even reject an already
+    // applied entry before the native marker gets a chance to short-circuit.
     runTestBeforeBatchExecutionHook();
     if (req.transaction != null)
         try applyReplicatedTransactionMutationAtRaftEntry(alloc, db, table_name, group_id, req, raft_entry)
@@ -1745,9 +1764,63 @@ pub fn configureStorageKernelOwnerDb(
     remote_content: ?*const scraping.RemoteContentConfig,
     installed: ?*OwnerManagedConfig,
 ) !void {
+    return configureStorageKernelOwnerDbAtOpen(alloc, db, table_name, schema_json, indexes_json, backend_runtime, antfly_provider, secret_store, remote_content, installed, false);
+}
+
+/// A pinned Raft descriptor is write-admission history, not current catalog
+/// authority. Once a physical owner has been configured, replay must leave
+/// its index catalog alone; the current metadata reconciler owns later DDL.
+pub fn configureStorageKernelOwnerDbAtOpen(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    table_name: []const u8,
+    schema_json: []const u8,
+    indexes_json: []const u8,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    antfly_provider: ?managed_embedder.AntflyProvider,
+    secret_store: ?*common_secrets.FileStore,
+    remote_content: ?*const scraping.RemoteContentConfig,
+    installed: ?*OwnerManagedConfig,
+    historical_raft_apply: bool,
+) !void {
+    if (historical_raft_apply) {
+        const stored = try loadOwnerCatalogContract(alloc, db);
+        defer if (stored) |value| alloc.free(value);
+        if (stored) |value| {
+            // Reconstruct the producer runtime from the durable desired
+            // contract, without reconciling the old Raft descriptor against
+            // the physical index catalog. "1" is the prior marker format;
+            // the next current-catalog acquisition upgrades it to JSON.
+            if (!std.mem.eql(u8, value, "1") and backend_runtime != null) {
+                try reconfigureManagedDbEnrichmentRuntimePaused(alloc, db, value, backend_runtime, antfly_provider, null, null, table_name, secret_store, remote_content);
+                try db.resumeEnrichmentRuntimeAfterReconfigure("historical owner reopen", "*");
+                if (installed) |state| state.publish(value);
+            }
+            return;
+        }
+        if (try db.raftAppliedEntry() != null) return;
+        // Older physical roots predate the marker. Existing index definitions
+        // still prove that replay must not replace their current catalog.
+        const indexes = try db.listIndexes(alloc);
+        defer db_mod.types.freeIndexConfigs(alloc, indexes);
+        if (indexes.len != 0) return;
+    }
+    // Catch-up may request an owner using an older Raft entry's pinned
+    // descriptor after this physical generation has a newer durable schema.
+    // Never roll back its schema, managed runtimes, or index definitions.
+    if (db.core.schema) |durable_schema| {
+        var descriptor_schema = if (schema_json.len > 0)
+            try tables_api.parseValidatedTableSchema(alloc, schema_json)
+        else
+            null;
+        defer if (descriptor_schema) |*parsed| parsed.deinit(alloc);
+        const descriptor_version: u32 = if (descriptor_schema) |parsed| parsed.version else 0;
+        if (descriptor_version < durable_schema.version) return;
+    }
     if (schema_json.len > 0) try applyLocalTableSchemaJson(alloc, db, schema_json);
     if (indexes_json.len > 0) {
-        const replace = backend_runtime != null and !(if (installed) |state| state.matches(indexes_json) else false);
+        const installed_matches = if (installed) |state| state.matches(indexes_json) else false;
+        const replace = backend_runtime != null and !installed_matches;
         if (replace) try reconfigureManagedDbEnrichmentRuntimePaused(
             alloc,
             db,
@@ -1764,6 +1837,7 @@ pub fn configureStorageKernelOwnerDb(
             .drain_resolver_backfill = false,
         });
         if (replace) try db.resumeEnrichmentRuntimeAfterReconfigure("owner configuration", "*");
+        if (!installed_matches) try persistOwnerCatalogContract(alloc, db, indexes_json);
         if (installed) |state| state.publish(indexes_json);
     }
 }
@@ -1862,7 +1936,8 @@ pub fn reconcileStorageKernelOwnerDb(
     installed: ?*OwnerManagedConfig,
 ) !StorageKernelReconcileResult {
     if (target_index_name == null and schema_json.len > 0) try applyLocalTableSchemaJson(alloc, db, schema_json);
-    const replace = indexes_json.len > 0 and backend_runtime != null and !(if (installed) |state| state.matches(indexes_json) else false);
+    const installed_matches = if (installed) |state| state.matches(indexes_json) else false;
+    const replace = indexes_json.len > 0 and backend_runtime != null and !installed_matches;
     if (replace) try reconfigureManagedDbEnrichmentRuntimePaused(
         alloc,
         db,
@@ -1883,6 +1958,7 @@ pub fn reconcileStorageKernelOwnerDb(
             try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, db, indexes_json, options);
     } else metadata_table_provisioner.ProvisionSummary{};
     if (replace) try db.resumeEnrichmentRuntimeAfterReconfigure("owner reconciliation", target_index_name orelse "*");
+    if (indexes_json.len > 0 and !installed_matches) try persistOwnerCatalogContract(alloc, db, indexes_json);
     if (indexes_json.len > 0) if (installed) |state| state.publish(indexes_json);
 
     var result = StorageKernelReconcileResult{
