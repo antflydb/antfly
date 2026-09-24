@@ -1,8 +1,16 @@
 import type {
+  AgentStep,
   ClassificationTransformationResult,
   EvalResult,
   GenerationConfidence,
   QueryHit,
+  ResearchAgentStreamCallbacks,
+  ResearchFinding,
+  ResearchPlanProgress,
+  ResearchReflection,
+  ResearchSectionProgress,
+  ResearchSubQuestionStartedProgress,
+  ResearchVerification,
   RetrievalAgentStreamCallbacks,
   SSEStepStarted,
   SSEToolMode,
@@ -11,6 +19,8 @@ import {
   AntflyClient,
   type GlobalQueryRequest,
   type QueryResponses,
+  type ResearchAgentRequest,
+  type ResearchAgentResult,
   type RetrievalAgentRequest,
   type RetrievalAgentResult,
 } from "@antfly/sdk";
@@ -265,6 +275,111 @@ export async function streamAnswer(
       }
     } else if (callbacks.onError) {
       callbacks.onError(new Error("Unknown error occurred during retrieval agent streaming"));
+    }
+    return new AbortController();
+  }
+}
+
+// Research Agent streaming types and functions
+export interface ResearchCallbacks {
+  onStepStarted?: (step: SSEStepStarted) => void;
+  onPlan?: (plan: ResearchPlanProgress) => void;
+  onSubQuestionStarted?: (event: ResearchSubQuestionStartedProgress) => void;
+  onFinding?: (finding: ResearchFinding) => void;
+  onReflection?: (reflection: ResearchReflection) => void;
+  onSection?: (section: ResearchSectionProgress) => void;
+  onVerification?: (verification: ResearchVerification) => void;
+  onGeneration?: (chunk: string) => void;
+  onStepCompleted?: (step: AgentStep) => void;
+  onComplete?: () => void;
+  onError?: (error: Error | string) => void;
+  onResearchAgentResult?: (result: ResearchAgentResult) => void;
+}
+
+/**
+ * Stream Research Agent results from the Antfly /agents/research endpoint using Server-Sent Events or JSON
+ * @param url - Base URL of the Antfly server (e.g., http://localhost:8080/db/v1)
+ * @param request - Research agent request with query, queries, budget and step configs
+ * @param headers - Optional HTTP headers for authentication
+ * @param callbacks - Structured callbacks for research events (plan, sub-questions, findings, reflections, sections, verification, report text, complete, error)
+ * @returns AbortController to cancel the stream
+ */
+export async function streamResearch(
+  url: string,
+  request: ResearchAgentRequest,
+  headers: Record<string, string> = {},
+  callbacks: ResearchCallbacks
+): Promise<AbortController> {
+  try {
+    // Always create a fresh client with the base URL
+    const client = new AntflyClient({
+      baseUrl: url,
+      headers,
+    });
+
+    // Determine if we should stream based on presence of streaming callbacks
+    const shouldStream = !!(
+      callbacks.onStepStarted ||
+      callbacks.onPlan ||
+      callbacks.onSubQuestionStarted ||
+      callbacks.onFinding ||
+      callbacks.onReflection ||
+      callbacks.onSection ||
+      callbacks.onVerification ||
+      callbacks.onGeneration ||
+      callbacks.onStepCompleted
+    );
+
+    // Build the request with streaming flag
+    const researchRequest: ResearchAgentRequest = {
+      ...request,
+      stream: shouldStream,
+    };
+
+    // Build SDK callbacks if streaming
+    const sdkCallbacks: ResearchAgentStreamCallbacks | undefined = shouldStream
+      ? {
+          onStepStarted: callbacks.onStepStarted,
+          onPlan: callbacks.onPlan,
+          onSubQuestionStarted: callbacks.onSubQuestionStarted,
+          onFinding: callbacks.onFinding,
+          onReflection: callbacks.onReflection,
+          onSection: callbacks.onSection,
+          onVerification: callbacks.onVerification,
+          onGeneration: callbacks.onGeneration,
+          onStepCompleted: callbacks.onStepCompleted,
+          onDone: (result) => {
+            callbacks.onResearchAgentResult?.(result);
+            if (callbacks.onComplete) {
+              callbacks.onComplete();
+            }
+          },
+          onError: (error: string) => {
+            if (callbacks.onError) {
+              callbacks.onError(error);
+            }
+          },
+        }
+      : undefined;
+
+    // Call the research agent endpoint
+    if (sdkCallbacks) {
+      return await client.streamResearchAgent(researchRequest, sdkCallbacks);
+    }
+
+    const result: ResearchAgentResult = await client.researchAgent(researchRequest);
+    callbacks.onResearchAgentResult?.(result);
+    callbacks.onComplete?.();
+    return new AbortController();
+  } catch (error) {
+    if (error instanceof Error) {
+      if (error.name === "AbortError") {
+        // Stream was aborted - this is expected behavior
+      } else if (callbacks.onError) {
+        callbacks.onError(error);
+      }
+    } else if (callbacks.onError) {
+      callbacks.onError(new Error("Unknown error occurred during research agent streaming"));
     }
     return new AbortController();
   }
