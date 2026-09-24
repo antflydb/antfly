@@ -165,6 +165,61 @@ describe("query read retries", () => {
 });
 
 describe("query retry transport cancellation", () => {
+  it("keeps the original deadline while a successful response is streaming", async () => {
+    let closed = 0;
+    const base = vi.fn<typeof fetch>().mockImplementation(
+      async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode("first"));
+            },
+            cancel() {
+              closed++;
+            },
+          }),
+          { status: 200 }
+        )
+    );
+    const result = await readRetryFetch(base, { ...policy, maxElapsedMs: 30 })(url, {
+      method: "POST",
+      body: "{}",
+    });
+    if (!result.body) throw new Error("missing response body");
+    const reader = result.body.getReader();
+    expect(new TextDecoder().decode((await reader.read()).value)).toBe("first");
+    await expect(reader.read()).rejects.toMatchObject({ name: "TimeoutError" });
+    expect(closed).toBe(1);
+    expect(base).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancels a returned response when its caller aborts", async () => {
+    let closed = 0;
+    const controller = new AbortController();
+    const base = vi.fn<typeof fetch>().mockImplementation(
+      async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            cancel() {
+              closed++;
+            },
+          }),
+          { status: 200 }
+        )
+    );
+    const result = await readRetryFetch(base, policy)(url, {
+      method: "POST",
+      body: "{}",
+      signal: controller.signal,
+    });
+    if (!result.body) throw new Error("missing response body");
+    const pending = result.body.getReader().read();
+    controller.abort(new DOMException("cancelled", "AbortError"));
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(closed).toBe(1);
+    expect(base).toHaveBeenCalledTimes(1);
+  });
+
   it("rejects late successful headers and closes the underlying response", async () => {
     let closed = 0;
     const base = vi.fn<typeof fetch>().mockImplementation(async () => {

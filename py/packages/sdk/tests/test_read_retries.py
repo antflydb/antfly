@@ -134,6 +134,61 @@ def test_attempt_limit_and_original_deadline():
         assert len(calls) == 1
 
 
+def test_sync_stream_rejects_chunk_returned_after_original_deadline():
+    class DelayedBody(httpx.SyncByteStream):
+        def __init__(self):
+            self.closed = 0
+
+        def __iter__(self):
+            yield b"first"
+            time.sleep(0.05)
+            yield b"late"
+
+        def close(self):
+            self.closed += 1
+
+    body = DelayedBody()
+    pool = AdmissionPool(ClientAdmission(1))
+    with ReadRetryHTTPClient(
+        POLICY, pool, transport=httpx.MockTransport(lambda _: httpx.Response(200, stream=body))
+    ) as client:
+        response = client.send(client.build_request("POST", URL, content=b'{"timeout_ms":30}'), stream=True)
+        iterator = response.iter_raw()
+        assert next(iterator) == b"first"
+        assert pool.stats["active"] == 1
+        with pytest.raises(TimeoutError, match="deadline expired"):
+            next(iterator)
+        response.close()
+    assert body.closed == 1
+    assert pool.stats == {"active": 0, "queued": 0}
+
+
+def test_sync_stream_consumer_pause_does_not_restart_deadline():
+    class ReadyBody(httpx.SyncByteStream):
+        def __init__(self):
+            self.closed = 0
+
+        def __iter__(self):
+            yield b"first"
+            yield b"late"
+
+        def close(self):
+            self.closed += 1
+
+    body = ReadyBody()
+    with ReadRetryHTTPClient(
+        POLICY, transport=httpx.MockTransport(lambda _: httpx.Response(200, stream=body))
+    ) as client:
+        response = client.send(client.build_request("POST", URL, content=b'{"timeout_ms":30}'), stream=True)
+        iterator = response.iter_raw()
+        assert next(iterator) == b"first"
+        time.sleep(0.04)
+        with pytest.raises(TimeoutError, match="deadline expired"):
+            next(iterator)
+        response.close()
+    assert body.closed == 1
+
+
 @pytest.mark.asyncio
 async def test_async_cancellation_during_backoff():
     called = asyncio.Event()

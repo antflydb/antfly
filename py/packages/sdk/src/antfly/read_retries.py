@@ -27,8 +27,9 @@ class ReadRetryPolicy:
     Async streamed response reads retain that absolute deadline after headers.
     Query timeout_ms also bounds the original operation; subsequent dispatches
     forward only the remaining body budget without reencoding other fields.
-    Synchronous httpx I/O timeouts are capped by the remaining budget; as with
-    httpx itself they bound individual I/O waits, not total stream consumption.
+    Synchronous httpx I/O timeouts are capped by the remaining budget. Stream
+    reads also reject chunks returned after the original deadline. A blocking
+    synchronous transport read cannot be interrupted before it returns.
     """
 
     max_attempts: int
@@ -190,6 +191,36 @@ class _ReplaySync(httpx.SyncByteStream):
         self.original.close()
 
 
+class _DeadlineSync(httpx.SyncByteStream):
+    """Reject late chunks, including after a pause in synchronous consumption."""
+
+    def __init__(self, original: httpx.SyncByteStream, deadline: float):
+        self.original, self.deadline = original, deadline
+        self.closed = False
+
+    def __iter__(self) -> Iterator[bytes]:
+        iterator = iter(self.original)
+        try:
+            while True:
+                if time.monotonic() >= self.deadline:
+                    raise TimeoutError("Antfly query response deadline expired")
+                try:
+                    chunk = next(iterator)
+                except StopIteration:
+                    return
+                if time.monotonic() >= self.deadline:
+                    raise TimeoutError("Antfly query response deadline expired")
+                yield chunk
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        self.original.close()
+
+
 class _ReplayAsync(httpx.AsyncByteStream):
     def __init__(self, chunks: list[bytes], tail: AsyncIterator[bytes], original: httpx.AsyncByteStream):
         self.chunks, self.tail, self.original = chunks, tail, original
@@ -292,6 +323,9 @@ class ReadRetryHTTPClient(AdmissionHTTPClient):
                         body = b"".join(chunks) if size <= 16384 else b"x" * 16385
                     delay = _delay(policy, response, body, attempt, deadline)
                 if delay is None:
+                    if not response.is_closed:
+                        assert isinstance(response.stream, httpx.SyncByteStream)
+                        response.stream = _DeadlineSync(response.stream, deadline)
                     if not stream:
                         response.read()
                         response.close()

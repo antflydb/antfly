@@ -139,6 +139,68 @@ async function wait(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
+function deadlineResponse(response: Response, signal: AbortSignal): Response {
+  if (!response.body) return response;
+  const reader = response.body.getReader();
+  let finished = false;
+  let closing: Promise<void> | undefined;
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    signal.removeEventListener("abort", abort);
+    reader.releaseLock();
+  };
+  const cancel = (reason?: unknown): Promise<void> => {
+    closing ??= (async () => {
+      try {
+        await reader.cancel(reason);
+      } finally {
+        finish();
+      }
+    })();
+    return closing;
+  };
+  const abort = () => {
+    void cancel(signal.reason).catch(() => {});
+  };
+  signal.addEventListener("abort", abort, { once: true });
+  if (signal.aborted) abort();
+  const body = new ReadableStream<Uint8Array>(
+    {
+      async pull(controller) {
+        try {
+          signal.throwIfAborted();
+          const chunk = await reader.read();
+          signal.throwIfAborted();
+          if (chunk.done) {
+            if (closing) await closing;
+            controller.close();
+            finish();
+          } else controller.enqueue(chunk.value);
+        } catch (error) {
+          controller.error(error);
+          try {
+            await cancel(error);
+          } catch {
+            // Preserve the deadline or transport read error.
+          }
+        }
+      },
+      cancel,
+    },
+    { highWaterMark: 0 }
+  );
+  const wrapped = new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+  for (const key of ["url", "redirected", "type"] as const) {
+    Object.defineProperty(wrapped, key, { value: response[key] });
+  }
+  return wrapped;
+}
+
 /** Place outside admission so rejected attempts return slots before backoff.
  * Query input is buffered at most 1 MiB; larger/streaming inputs bypass retries.
  * Query results may observe newer data when eventually admitted.
@@ -230,14 +292,16 @@ export function readRetryFetch(
         void response.body?.cancel(signal.reason).catch(() => {});
         signal.throwIfAborted();
       }
-      if (attempt >= config.maxAttempts || response.status !== 429) return response;
+      if (attempt >= config.maxAttempts || response.status !== 429)
+        return deadlineResponse(response, signal);
       const length = response.headers.get("Content-Length");
-      if (length === null || !/^\d+$/.test(length) || Number(length) > 16_384) return response;
+      if (length === null || !/^\d+$/.test(length) || Number(length) > 16_384)
+        return deadlineResponse(response, signal);
       // The declared error bound is verified before parsing. Unknown/chunked
       // responses remain visible to callers without speculative retries.
       const copy = response.clone();
       const errorReader = copy.body?.getReader();
-      if (!errorReader) return response;
+      if (!errorReader) return deadlineResponse(response, signal);
       let errorSize = 0;
       const errors: Uint8Array[] = [];
       const cancelError = (reason: unknown) => {
@@ -257,7 +321,7 @@ export function readRetryFetch(
           errorSize += next.value.byteLength;
           if (errorSize > 16_384) {
             void errorReader.cancel().catch(() => {});
-            return response;
+            return deadlineResponse(response, signal);
           }
           errors.push(next.value);
         }
@@ -278,21 +342,22 @@ export function readRetryFetch(
       try {
         detail = JSON.parse(new TextDecoder().decode(encoded));
       } catch {
-        return response;
+        return deadlineResponse(response, signal);
       }
       if (
         detail?.reason !== "instance_busy" ||
         detail.stage !== "admission" ||
         detail.execution_started !== false
       )
-        return response;
+        return deadlineResponse(response, signal);
       let delay = Math.min(config.initialBackoffMs * 2 ** (attempt - 1), config.maxBackoffMs);
       const after = response.headers.get("Retry-After");
       if (after !== null) {
-        if (!/^\d+$/.test(after) || Number(after) * 1_000 > config.maxBackoffMs) return response;
+        if (!/^\d+$/.test(after) || Number(after) * 1_000 > config.maxBackoffMs)
+          return deadlineResponse(response, signal);
         delay = Math.max(delay, Number(after) * 1_000);
       }
-      if (performance.now() + delay >= deadline) return response;
+      if (performance.now() + delay >= deadline) return deadlineResponse(response, signal);
       await response.body?.cancel();
       await wait(delay, signal);
     }
