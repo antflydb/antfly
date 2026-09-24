@@ -87,6 +87,37 @@ test "relational index system range activation rejects pending writers and captu
     try db.batch(.{ .activate_range_tracking = true });
 }
 
+test "relational index system range activation and counters survive owner reopen" {
+    const protection = @import("../range_protection.zig");
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("sql-range-activation-reopen");
+    defer directory.cleanup();
+    {
+        var original = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
+        defer original.close();
+        try original.batch(.{ .activate_range_tracking = true });
+        try original.batch(.{ .writes = &.{.{ .key = "alpha", .value = "{}" }} });
+    }
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect(try protection.isActive(&read));
+        try std.testing.expectEqual(@as(?u64, 1), try protection.generation(&read, protection.bucket("alpha")));
+    }
+    const options: db_mod.types.ScanOptions = .{ .include_range_proofs = true, .relational_query = .{ .fields = &.{"_id"} } };
+    const snapshot = try db.openDocumentReadSession(alloc, "a", "az", options);
+    defer snapshot.deinit();
+    const proofs = try snapshot.rangeProofs(alloc);
+    defer alloc.free(proofs);
+    try std.testing.expectEqual(@as(usize, 1), proofs.len);
+    try std.testing.expectEqual(@as(?u64, 1), proofs[0].generation);
+    try db.batch(.{ .writes = &.{.{ .key = "another", .value = "{}" }} });
+    const guarded = try db.beginTransaction(3);
+    try std.testing.expectError(error.VersionConflict, db.writeTransaction(guarded, .{ .range_guards = proofs }));
+    try db.abortTransaction(guarded, 4);
+}
+
 test "relational index system ordinary tuple replacement respects a prepared index span reader" {
     const protection = @import("../range_protection.zig");
     var directory = try @import("../../common/test_directory.zig").TestDirectory.init("index-span-ordinary-conflict");

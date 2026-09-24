@@ -90,7 +90,12 @@ deallocation, with SQLSTATE 26000 after each removed plan is executed.
 supersessions of catalog/admin session mutations. Their exact public-namespace
 and one-millisecond timeout commands run through the pgwire session state
 machine; the test checks effective SHOW rows, transaction-local rollback, and
-RESET. The two-namespace and custom `app.*` cases are still unresolved.
+RESET. The exact two-namespace `SET SESSION`/`SET LOCAL` commands now use a
+bounded ordered lookup path: pgwire tests cover authorization and transaction
+scope, and a native resolver test proves that only a missing table advances to
+the next namespace. Exact `app.tenant_id` SET/RESET/RESET ALL/DISCARD commands
+also use typed connection-owned overlays. Broader custom-setting semantics
+remain case-by-case work.
 The remaining unresolved dispositions describe missing case-by-case evidence,
 not a claim that every current implementation is missing.
 The exact `sql-1410` self-read INSERT now passes through mounted SQL against
@@ -120,6 +125,10 @@ The exact `sql-1494` INSERT DEFAULT VALUES executes against a native schema
 with defaults for all three returned logical columns. The shared prepared-row
 pipeline also has component evidence for per-cell DEFAULT across direct and
 captured VALUES sources, explicit SQL NULL, generated columns and row IDs.
+The exact `sql-1481` two-row INSERT executes through mounted SQL and checks
+both affected rows and ordered RETURNING values. The duplicate-key rejection
+case `sql-1484` remains unresolved until it has a mounted table with an active
+coordinated UNIQUE constraint and a no-partial-write assertion.
 The exact `sql-1496` TIMESTAMPTZ literal executes through mounted SQL against
 a native datetime column; RETURNING shows the validated `+01:30` source offset
 normalized to UTC. `sql-1495` still needs an active unique arbiter and the

@@ -49,13 +49,15 @@ the client-requested timeout but never the operator's hard statement deadline.
 control characters. Startup `application_name` obeys the same bound. Local and
 session changes follow the transaction and savepoint rules above.
 `SET [SESSION|LOCAL] search_path`, `SHOW search_path`, and `RESET search_path`
-support one existing namespace (at most 128 bytes), using the same transaction
-and savepoint restoration rules. SET rechecks namespace-read permission before
-the native existence lookup. Table operations still authorize their own scoped
-resources. Lookup scope is separate from the immutable durable transaction-owner
-scope. Existing SQL prepared statements, Parse/Bind portals and cursors retain
-their original namespace. Lists and `$user` expansion fail explicitly until
-multi-namespace resolution is implemented. Other session settings are not
+support up to eight ordered existing namespaces (at most 128 bytes each), using
+the same transaction and savepoint restoration rules. SET checks every
+namespace's read permission and existence before installing the entire path.
+An unqualified relation binds to the first matching table; authorization,
+catalog-generation, and other failures never trigger fallback. Table operations
+still authorize their own scoped resources. Lookup scope is separate from the
+immutable durable transaction-owner scope. Existing SQL prepared statements,
+Parse/Bind portals and cursors retain their original complete path. `$user`
+expansion remains unsupported. Other session settings are not
 acknowledged as no-ops. `SET CONSTRAINTS` is a native durable transaction command,
 not a connection setting.
 

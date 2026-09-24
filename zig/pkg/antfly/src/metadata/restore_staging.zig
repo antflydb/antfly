@@ -31,6 +31,23 @@ pub fn idForAttempt(job_id: u64, attempt_id: u64) !Id {
 pub const Digest = [32]u8;
 pub const max_encoded_bytes = 32 * 1024 * 1024;
 pub const max_active_attempts = 8;
+
+/// Graph indexes own asynchronous edge and metric artifacts outside the row
+/// generation. A fresh empty owner cannot claim their retirement until the
+/// graph publication protocol participates in the same cutover barrier.
+/// Keep this check at the durable-plan boundary as well as the SQL ingress.
+pub fn hasGraphIndex(alloc: std.mem.Allocator, indexes_json: []const u8) !bool {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidRestoreStaging;
+    for (parsed.value.object.values()) |declaration| {
+        if (declaration != .object) return error.InvalidRestoreStaging;
+        const kind = declaration.object.get("type") orelse return error.InvalidRestoreStaging;
+        if (kind != .string) return error.InvalidRestoreStaging;
+        if (std.mem.eql(u8, kind.string, "graph")) return true;
+    }
+    return false;
+}
 pub const ProvisioningProjection = @import("restore_provisioning_contract.zig").ProvisioningProjection;
 pub const ProvisioningRequest = struct { node_id: u64 };
 
@@ -305,6 +322,7 @@ pub const Plan = struct {
                 const old = target.replace orelse return error.InvalidRestoreStaging;
                 if (self.preparing_sources or target.rewrite != null or target.rewrite_sources.len != 0 or target.source_artifacts.len != 0 or old.table.table_id != target.source_table_id or old.fences.len != old.ranges.len or old.ranges.len != target.ranges.len) return error.InvalidRestoreStaging;
                 if (!std.mem.eql(u8, old.table.schema_json, table.schema_json) or !std.mem.eql(u8, old.table.read_schema_json, table.read_schema_json) or !std.mem.eql(u8, old.table.indexes_json, table.indexes_json)) return error.InvalidRestoreStaging;
+                if (try hasGraphIndex(alloc, table.indexes_json)) return error.InvalidRestoreStaging;
                 for (old.ranges, target.ranges) |source, destination| {
                     if (!std.mem.eql(u8, source.start_key, destination.start_key) or !std.mem.eql(u8, source.end_key orelse "", destination.end_key orelse "")) return error.InvalidRestoreStaging;
                     const fence = for (old.fences) |item| {
@@ -813,6 +831,18 @@ test "relational integrity restore staging empty generation binds old fences wit
     targets[0].replace.?.fences = &.{fence};
     targets[0].table.schema_json = "{\"version\":2}";
     try std.testing.expectError(error.InvalidRestoreStaging, plan.validate(alloc));
+    targets[0].table.schema_json = "{}";
+    targets[0].table.indexes_json = "{\"graph_idx\":{\"type\":\"graph\"}}";
+    targets[0].replace.?.table.indexes_json = targets[0].table.indexes_json;
+    try std.testing.expectError(error.InvalidRestoreStaging, plan.validate(alloc));
+}
+
+test "relational integrity restore staging empty-generation graph declaration guard is independent of index position" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(!try hasGraphIndex(alloc, "{}"));
+    try std.testing.expect(!try hasGraphIndex(alloc, "{\"ordered\":{\"type\":\"relational\"}}"));
+    try std.testing.expect(try hasGraphIndex(alloc, "{\"ordered\":{\"type\":\"relational\"},\"links\":{\"type\":\"graph\"}}"));
+    try std.testing.expectError(error.InvalidRestoreStaging, hasGraphIndex(alloc, "{\"links\":{}}"));
 }
 
 test "relational integrity restore staging pins an untouched FK parent and exact child generation" {

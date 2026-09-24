@@ -210,13 +210,7 @@ fn selectInternal(alloc: std.mem.Allocator, tables: []const records.TableRecord,
         table.* = tables[index];
         // A graph artifact on another table cannot block this cohort. Parse
         // index declarations only for actual participants after FK closure.
-        const indexes = try std.json.parseFromSliceLeaky(std.json.Value, alloc, table.indexes_json, .{});
-        if (indexes != .object) return error.InvalidRestoreStaging;
-        for (indexes.object.values()) |decl| if (decl == .object) {
-            if (decl.object.get("type")) |kind| {
-                if (kind == .string and std.mem.eql(u8, kind.string, "graph")) return error.SqlTruncateGraphDependency;
-            }
-        };
+        if (try stages.hasGraphIndex(alloc, table.indexes_json)) return error.SqlTruncateGraphDependency;
     }
     std.mem.sort(records.TableRecord, result, {}, struct {
         fn less(_: void, a: records.TableRecord, b: records.TableRecord) bool {

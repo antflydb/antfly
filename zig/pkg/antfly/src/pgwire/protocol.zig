@@ -51,6 +51,7 @@ const Prepared = struct {
     parameter_oids: []const u32,
     description: backend.Description,
     namespace: []const u8,
+    search_path: ?commands.SearchPath = null,
 };
 
 const Portal = struct {
@@ -61,6 +62,7 @@ const Portal = struct {
     formats: []const u16,
     description: backend.Description,
     namespace: ?[]const u8 = null,
+    search_path: ?commands.SearchPath = null,
     result: ?backend.Result = null,
     stream: ?backend.ReadStream = null,
     stream_opened: bool = false,
@@ -83,6 +85,7 @@ const SqlCursor = struct {
     committed: bool = false,
     database: ?[]const u8 = null,
     namespace: ?[]const u8 = null,
+    search_path: ?commands.SearchPath = null,
     creation_epoch: u64 = 0,
 };
 
@@ -106,12 +109,13 @@ pub const Session = struct {
     cursor_epoch: u64 = 0,
     statement_timeout: ?u32 = null,
     application_name: commands.ApplicationName = .{},
-    namespace_setting: ?commands.Namespace = null,
+    namespace_setting: ?commands.SearchPath = null,
     catalog_settings: ?settings_catalog.OverlayState = null,
     request_namespace: ?[]const u8 = null,
+    request_search_path: ?commands.SearchPath = null,
     transaction_namespace: ?commands.Namespace = null,
-    timeout_transaction: ?struct { before: ?u32, committed: ?u32, namespace_before: ?commands.Namespace, namespace_committed: ?commands.Namespace, application_before: commands.ApplicationName, application_committed: commands.ApplicationName } = null,
-    savepoints: std.ArrayList(struct { name: []const u8, epoch: u64, timeout: ?u32, committed_timeout: ?u32, namespace: ?commands.Namespace, committed_namespace: ?commands.Namespace, application: commands.ApplicationName, committed_application: commands.ApplicationName, catalog: ?settings_catalog.OverlayState.Savepoint = null }) = .empty,
+    timeout_transaction: ?struct { before: ?u32, committed: ?u32, namespace_before: ?commands.SearchPath, namespace_committed: ?commands.SearchPath, application_before: commands.ApplicationName, application_committed: commands.ApplicationName } = null,
+    savepoints: std.ArrayList(struct { name: []const u8, epoch: u64, timeout: ?u32, committed_timeout: ?u32, namespace: ?commands.SearchPath, committed_namespace: ?commands.SearchPath, application: commands.ApplicationName, committed_application: commands.ApplicationName, catalog: ?settings_catalog.OverlayState.Savepoint = null }) = .empty,
     skip_until_sync: bool = false,
     backend_pid: i32 = 0,
     cancel_key: i32 = 0,
@@ -306,7 +310,13 @@ pub const Session = struct {
     }
 
     fn effectiveNamespace(self: *const Session) []const u8 {
-        return if (self.namespace_setting) |*value| value.slice() else self.namespace orelse "public";
+        return if (self.namespace_setting) |*value| value.first() else self.namespace orelse "public";
+    }
+
+    fn effectiveSearchPath(self: *const Session) ?commands.SearchPath {
+        // An explicit Parse/DECLARE scope pins even the absence of an
+        // override. Null must not fall through to a later session SET.
+        return if (self.request_namespace != null) self.request_search_path else self.namespace_setting;
     }
 
     fn request(self: *Session, statement: []const u8, parameters: []const std.json.Value, types: []const backend.Type) backend.Request {
@@ -316,6 +326,7 @@ pub const Session = struct {
             .parameter_types = types,
             .database = self.database,
             .namespace = self.request_namespace orelse self.effectiveNamespace(),
+            .search_path = self.effectiveSearchPath(),
             .session_namespace = if (self.transaction_namespace) |*value| value.slice() else null,
             .session_id = self.session_id,
             .setting_overlay = if (self.catalog_settings) |*state| state.values() else &.{},
@@ -454,25 +465,31 @@ pub const Session = struct {
         if (setting == .show) {
             result.columns = &.{.{ .name = "search_path", .type = .string }};
             const row = try alloc.alloc(std.json.Value, 1);
-            row[0] = .{ .string = try alloc.dupe(u8, self.effectiveNamespace()) };
+            row[0] = .{ .string = if (self.namespace_setting) |*path| try path.display(alloc) else try alloc.dupe(u8, self.namespace orelse "public") };
             const rows = try alloc.alloc([]const std.json.Value, 1);
             rows[0] = row;
             result.rows = rows;
             return result;
         }
-        const update = if (setting == .reset) (commands.SearchPathSetting{ .set = .{ .local = false, .namespace = null } }).set else setting.set;
+        const update = if (setting == .reset) (commands.SearchPathSetting{ .set = .{ .local = false, .path = null } }).set else setting.set;
         if (update.local and self.status != .in_transaction) return error.NoActiveSqlTransaction;
         const validate = self.source.vtable.validate_namespace orelse return error.UnsupportedSqlExecution;
         var request_value = self.request(statement, &.{}, &.{});
-        request_value.namespace = if (update.namespace) |*value| value.slice() else self.namespace orelse "public";
+        request_value.namespace = if (update.path) |*value| value.first() else self.namespace orelse "public";
+        request_value.search_path = update.path;
         self.cancel_requested.store(false, .release);
         self.executing.store(true, .release);
         defer self.executing.store(false, .release);
         try request_value.check();
-        try validate(self.source.context, alloc, self.identity orelse return error.AuthenticationFailed, request_value);
-        self.namespace_setting = update.namespace;
+        if (update.path) |path| {
+            for (path.entries[0..path.len]) |*entry| {
+                request_value.namespace = entry.slice();
+                try validate(self.source.context, alloc, self.identity orelse return error.AuthenticationFailed, request_value);
+            }
+        } else try validate(self.source.context, alloc, self.identity orelse return error.AuthenticationFailed, request_value);
+        self.namespace_setting = update.path;
         if (!update.local) if (self.timeout_transaction) |*settings| {
-            settings.namespace_committed = update.namespace;
+            settings.namespace_committed = update.path;
         };
         return result;
     }
@@ -689,7 +706,7 @@ pub const Session = struct {
                 self.removePrepared(name);
                 if (name.len == 0) self.removePortal("");
                 const namespace = try a.dupe(u8, self.request_namespace orelse self.effectiveNamespace());
-                try self.prepared.put(self.alloc, owned_name, .{ .arena = arena, .statement = owned_statement, .parameter_oids = oids, .description = description, .namespace = namespace });
+                try self.prepared.put(self.alloc, owned_name, .{ .arena = arena, .statement = owned_statement, .parameter_oids = oids, .description = description, .namespace = namespace, .search_path = self.effectiveSearchPath() });
                 transferred = true;
                 try self.message('1', "");
             },
@@ -743,7 +760,7 @@ pub const Session = struct {
                 errdefer if (!transferred) self.alloc.free(owned_name);
                 self.removePortal(name);
                 const namespace = try a.dupe(u8, statement.namespace);
-                try self.portals.put(self.alloc, owned_name, .{ .arena = arena, .statement = text, .parameters = parameters, .types = types, .formats = result_formats, .description = description, .namespace = namespace });
+                try self.portals.put(self.alloc, owned_name, .{ .arena = arena, .statement = text, .parameters = parameters, .types = types, .formats = result_formats, .description = description, .namespace = namespace, .search_path = statement.search_path });
                 transferred = true;
                 try self.message('2', "");
             },
@@ -775,8 +792,11 @@ pub const Session = struct {
                 try cursor.finish();
                 const portal = self.portals.getPtr(name) orelse return error.InvalidPortalName;
                 const previous_namespace = self.request_namespace;
+                const previous_search_path = self.request_search_path;
                 self.request_namespace = portal.namespace;
                 defer self.request_namespace = previous_namespace;
+                self.request_search_path = portal.search_path;
+                defer self.request_search_path = previous_search_path;
                 if (portal.failed) return error.PortalExecutionFailed;
                 portal.failed = true;
                 errdefer if (portal.stream) |stream| {
@@ -865,7 +885,7 @@ pub const Session = struct {
                 const name = try self.alloc.dupe(u8, prepare.name);
                 errdefer self.alloc.free(name);
                 const namespace = try a.dupe(u8, self.request_namespace orelse self.effectiveNamespace());
-                try self.prepared.put(self.alloc, name, .{ .arena = arena, .statement = sql, .parameter_oids = oids, .description = description, .namespace = namespace });
+                try self.prepared.put(self.alloc, name, .{ .arena = arena, .statement = sql, .parameter_oids = oids, .description = description, .namespace = namespace, .search_path = self.effectiveSearchPath() });
                 // Map ownership has transferred before writing an acknowledgement.
                 // A failed socket is handled by connection cleanup, never replay.
             },
@@ -885,8 +905,11 @@ pub const Session = struct {
             .execute => |execute_command| {
                 const prepared = self.prepared.get(execute_command.name) orelse return error.InvalidStatementName;
                 const previous_namespace = self.request_namespace;
+                const previous_search_path = self.request_search_path;
                 self.request_namespace = prepared.namespace;
                 defer self.request_namespace = previous_namespace;
+                self.request_search_path = prepared.search_path;
+                defer self.request_search_path = previous_search_path;
                 if (execute_command.expressions.len != prepared.description.parameter_types.len) return error.InvalidParameter;
                 const evaluator = self.source.vtable.evaluate_parameters orelse return error.UnsupportedSqlExecution;
                 self.cancel_requested.store(false, .release);
@@ -992,7 +1015,7 @@ pub const Session = struct {
         const database = if (self.database) |value| try arena.allocator().dupe(u8, value) else null;
         const namespace = try arena.allocator().dupe(u8, self.request_namespace orelse self.effectiveNamespace());
         self.cursor_epoch = std.math.add(u64, self.cursor_epoch, 1) catch return error.ProgramLimitExceeded;
-        try self.sql_cursors.put(self.alloc, key, .{ .arena = arena, .statement = owned_statement, .description = description, .stream = stream, .session_id = session_id, .scroll = scroll, .hold = hold, .committed = hold and self.status == .idle, .spool = spool, .exhausted = stream == null, .database = database, .namespace = namespace, .creation_epoch = self.cursor_epoch });
+        try self.sql_cursors.put(self.alloc, key, .{ .arena = arena, .statement = owned_statement, .description = description, .stream = stream, .session_id = session_id, .scroll = scroll, .hold = hold, .committed = hold and self.status == .idle, .spool = spool, .exhausted = stream == null, .database = database, .namespace = namespace, .search_path = self.effectiveSearchPath(), .creation_epoch = self.cursor_epoch });
         key_moved = true;
         arena_moved = true;
         stream_moved = true;
@@ -1014,6 +1037,7 @@ pub const Session = struct {
         req.setting_epoch = cursor.description.setting_epoch;
         req.database = cursor.database;
         req.namespace = cursor.namespace;
+        req.search_path = cursor.search_path;
         try req.check();
         if (cursor.spool != null) {
             self.fetchSpooled(cursor, fetch, req) catch |err| {
@@ -1076,6 +1100,7 @@ pub const Session = struct {
         var req = self.request(cursor.statement, &.{}, &.{});
         req.database = cursor.database;
         req.namespace = cursor.namespace;
+        req.search_path = cursor.search_path;
         req.session_id = if (cursor.committed or cursor.session_id.len == 0) null else cursor.session_id;
         req.binding_guard = cursor.description.binding_guard;
         req.setting_epoch = cursor.description.setting_epoch;

@@ -11576,9 +11576,12 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         }
         fn catalog(ptr: *anyopaque, a: std.mem.Allocator, context: operation_contract.RequestContext, input: system_catalog.Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            try context.ensureActive();
+            // This fixture has no row-policy publication. The production
+            // admission path treats that absence as an unprotected table.
+            if (input == .policy_publication_status) return error.RowPolicyCatalogChanged;
             self.calls += 1;
             if (self.replace_after_open and self.calls == 3) return error.CatalogGenerationChanged;
-            try context.ensureActive();
             if (input == .write_validation) return std.json.Stringify.valueAlloc(a, .{ .schema_json = self.schema }, .{});
             if (input != .resolve_many) return error.UnexpectedCatalogCall;
             if (input.resolve_many.expected_revision) |revision| if (revision != 7) return error.CatalogGenerationChanged;
@@ -12391,6 +12394,31 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             try std.testing.expectEqualStrings("u_schema_default", result.value.rows[0][0].string);
             try std.testing.expectEqualStrings("reset", result.value.rows[0][1].string);
             try std.testing.expectEqualStrings("9", result.value.rows[0][2].string);
+        }
+        {
+            // sql-1481: two source images enter one native mutation and
+            // RETURNING preserves their source order.
+            const exact_sql = for (corpus.value.object.get("entries").?.array.items) |entry| {
+                if (std.mem.eql(u8, entry.object.get("id").?.string, "sql-1481")) break entry.object.get("sql").?.string;
+            } else return error.TestMissingCorpusCase;
+            const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = exact_sql }, .{});
+            defer alloc.free(body);
+            var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+            defer request.deinit();
+            request.body = body;
+            var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+            defer ctx.deinit();
+            var response = try text_handler.executeSQL(&ctx);
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, 200), response.status.code);
+            const result = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, response.body.?, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(i64, 2), result.value.rows_affected);
+            try std.testing.expectEqual(@as(usize, 2), result.value.rows.len);
+            try std.testing.expectEqualStrings("u_multi_1", result.value.rows[0][0].string);
+            try std.testing.expectEqualStrings("open", result.value.rows[0][1].string);
+            try std.testing.expectEqualStrings("u_multi_2", result.value.rows[1][0].string);
+            try std.testing.expectEqualStrings("closed", result.value.rows[1][1].string);
         }
         {
             // sql-1496: typed TIMESTAMPTZ literals normalize the source offset

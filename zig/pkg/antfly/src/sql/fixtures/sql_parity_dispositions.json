@@ -27,6 +27,16 @@
       "cwd": "zig",
       "timeout_seconds": 600
     },
+    "pgwire-ordered-search-path": {
+      "command": ["zig", "build", "pgwire-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "--", "--test-filter", "pgwire ordered search path follows SET SESSION and SET LOCAL savepoint scope"],
+      "cwd": "zig",
+      "timeout_seconds": 600
+    },
+    "sql-native-path-resolution": {
+      "command": ["zig", "build", "antfly-api-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "--", "--test-filter", "SQL pgwire ordered native resolver falls back only on exact table absence"],
+      "cwd": "zig",
+      "timeout_seconds": 600
+    },
     "pgwire-original-cursor": {
       "command": ["zig", "build", "pgwire-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "--", "--test-filter", "pgwire original cursor declaration and fetch retain one bounded result", "--test-filter", "pgwire original forward fetch forms and cursor close commands", "--test-filter", "pgwire original directional fetch forms preserve scroll position", "--test-filter", "pgwire materialized cursor enforces quota and reauthorizes held fetch"],
       "cwd": "zig",
@@ -291,9 +301,12 @@
     },
     {
       "id": "sql-0038",
-      "status": "unresolved",
-      "reason": "A multi-namespace search path needs ordered, authorization-aware binding across all table references and transaction snapshots. The exact command currently fails closed with SQLSTATE 0A000 without changing the active lookup scope.",
-      "evidence": [{"path": "zig/pkg/antfly/src/pgwire/protocol_test.zig", "test": "pgwire multi namespace search path fails closed without changing the lookup scope", "gate": "pgwire-original-session-commands"}]
+      "status": "superseded",
+      "reason": "The exact SET SESSION list installs an ordered, bounded connection-owned search path. Every namespace is authorized before installation, native unqualified lookup advances only on an exact table miss, and prepared statements pin the complete path; no shared catalog mutation occurs.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/pgwire/protocol_test.zig", "test": "pgwire ordered search path follows SET SESSION and SET LOCAL savepoint scope", "gate": "pgwire-ordered-search-path"},
+        {"path": "zig/pkg/antfly/src/api/sql_pgwire.zig", "test": "SQL pgwire ordered native resolver falls back only on exact table absence", "gate": "sql-native-path-resolution"}
+      ]
     },
     {
       "id": "sql-0039",
@@ -303,9 +316,12 @@
     },
     {
       "id": "sql-0040",
-      "status": "unresolved",
-      "reason": "Transaction-local ordered namespace lookup is not yet implemented. The exact SET LOCAL list fails closed with SQLSTATE 0A000 and does not mutate the connection namespace.",
-      "evidence": [{"path": "zig/pkg/antfly/src/pgwire/protocol_test.zig", "test": "pgwire multi namespace search path fails closed without changing the lookup scope", "gate": "pgwire-original-session-commands"}]
+      "status": "superseded",
+      "reason": "The exact SET LOCAL list installs the ordered path for the current transaction only. Savepoint rollback and COMMIT restore prior scope, while native lookup preserves authorization and catalog-revision failures instead of falling through.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/pgwire/protocol_test.zig", "test": "pgwire ordered search path follows SET SESSION and SET LOCAL savepoint scope", "gate": "pgwire-ordered-search-path"},
+        {"path": "zig/pkg/antfly/src/api/sql_pgwire.zig", "test": "SQL pgwire ordered native resolver falls back only on exact table absence", "gate": "sql-native-path-resolution"}
+      ]
     },
     {
       "id": "sql-0041",
@@ -8187,8 +8203,9 @@
     },
     {
       "id": "sql-1481",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact two-row INSERT executes through mounted SQL against native relational storage. One atomic mutation returns both ordered identities and statuses with two affected rows.",
+      "evidence": [{ "path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL executes one relational page with exact integer parameters", "gate": "sql-mounted-read-shapes" }]
     },
     {
       "id": "sql-1482",
@@ -8203,7 +8220,7 @@
     {
       "id": "sql-1484",
       "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "reason": "The original duplicate-identity rejection needs a mounted table with an active coordinated UNIQUE(id) constraint; an unconstrained text-id fixture cannot prove SQLSTATE 23505 or atomic no-partial-write behavior."
     },
     {
       "id": "sql-1485",

@@ -32,6 +32,9 @@ pub const Request = struct {
     parameter_types: []const Type = &.{},
     database: ?[]const u8 = null,
     namespace: ?[]const u8 = null,
+    /// Ordered lookup candidates for unqualified SQL relations. The first
+    /// entry remains `namespace` for statement/transaction ownership.
+    search_path: ?@import("search_path.zig").Path = null,
     /// Immutable owner scope of an already active transaction; namespace above
     /// is the mutable lookup scope. Never supplied by a remote session id.
     session_namespace: ?[]const u8 = null,

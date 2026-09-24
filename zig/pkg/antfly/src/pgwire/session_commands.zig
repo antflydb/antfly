@@ -35,21 +35,9 @@ test "pgwire held-cursor precommit recognition requires the complete command" {
 
 pub const Control = union(enum) { savepoint: []const u8, rollback_to: []const u8, release: []const u8 };
 pub const TimeoutSetting = union(enum) { show, set: struct { local: bool, milliseconds: ?u32 }, reset };
-pub const Namespace = struct {
-    bytes: [128]u8 = @splat(0),
-    len: u8 = 0,
-    pub fn init(text: []const u8) !Namespace {
-        if (text.len == 0 or text.len > 128 or (!std.ascii.isAlphabetic(text[0]) and text[0] != '_')) return error.InvalidParameter;
-        for (text[1..]) |ch| if (!std.ascii.isAlphanumeric(ch) and ch != '_' and ch != '-') return error.UnsupportedSqlShape;
-        var value: Namespace = .{ .len = @intCast(text.len) };
-        @memcpy(value.bytes[0..text.len], text);
-        return value;
-    }
-    pub fn slice(self: *const Namespace) []const u8 {
-        return self.bytes[0..self.len];
-    }
-};
-pub const SearchPathSetting = union(enum) { show, set: struct { local: bool, namespace: ?Namespace }, reset };
+pub const Namespace = @import("search_path.zig").Namespace;
+pub const SearchPath = @import("search_path.zig").Path;
+pub const SearchPathSetting = union(enum) { show, set: struct { local: bool, path: ?SearchPath }, reset };
 pub const ApplicationName = struct {
     bytes: [128]u8 = @splat(0),
     len: u8 = 0,
@@ -282,22 +270,36 @@ pub fn searchPathSetting(alloc: std.mem.Allocator, input: []const u8) !?SearchPa
     }
     if (!try p.take('=')) if (!std.ascii.eqlIgnoreCase(try p.word(), "to")) return error.InvalidSqlSyntax;
     try p.space();
-    const quoted = p.pos < input.len and (input[p.pos] == '\'' or input[p.pos] == '"');
-    const value = if (quoted) try p.quoted(input[p.pos]) else try p.name();
-    if (try p.take(',')) return error.UnsupportedSqlShape;
+    var path: SearchPath = .{};
+    while (true) {
+        const quoted = p.pos < input.len and (input[p.pos] == '\'' or input[p.pos] == '"');
+        const value = if (quoted) try p.quoted(input[p.pos]) else try p.name();
+        if (!quoted and std.ascii.eqlIgnoreCase(value, "default")) {
+            if (path.len != 0 or try p.take(',')) return error.InvalidSqlSyntax;
+            try p.finish();
+            return .{ .set = .{ .local = local, .path = null } };
+        }
+        try path.append(try Namespace.init(value));
+        if (!try p.take(',')) break;
+    }
     try p.finish();
-    return .{ .set = .{ .local = local, .namespace = if (!quoted and std.ascii.eqlIgnoreCase(value, "default")) null else try Namespace.init(value) } };
+    return .{ .set = .{ .local = local, .path = path } };
 }
 
-test "pgwire search path accepts one scoped namespace and explicitly rejects lookup lists" {
+test "pgwire search path accepts bounded ordered lookup lists" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
     const value = (try searchPathSetting(alloc, "SET LOCAL search_path TO 'tenant-west'")).?.set;
     try std.testing.expect(value.local);
-    try std.testing.expectEqualStrings("tenant-west", value.namespace.?.slice());
-    try std.testing.expect((try searchPathSetting(alloc, "SET search_path = DEFAULT")).?.set.namespace == null);
-    try std.testing.expectError(error.UnsupportedSqlShape, searchPathSetting(alloc, "SET search_path = public, tenant"));
+    try std.testing.expectEqualStrings("tenant-west", value.path.?.first());
+    try std.testing.expect((try searchPathSetting(alloc, "SET search_path = DEFAULT")).?.set.path == null);
+    const path = (try searchPathSetting(alloc, "SET SESSION search_path TO tenant_schema, public;")).?.set.path.?;
+    try std.testing.expectEqual(@as(u8, 2), path.len);
+    try std.testing.expectEqualStrings("tenant_schema", path.entries[0].slice());
+    try std.testing.expectEqualStrings("public", path.entries[1].slice());
+    const duplicate = (try searchPathSetting(alloc, "SET search_path TO public, tenant_schema, public")).?.set.path.?;
+    try std.testing.expectEqualStrings("public, tenant_schema, public", try duplicate.display(alloc));
     try std.testing.expectError(error.UnsupportedSqlShape, searchPathSetting(alloc, "SET search_path = 'public,tenant'"));
     try std.testing.expectError(error.InvalidParameter, searchPathSetting(alloc, "SET search_path = '$user'"));
     try std.testing.expectError(error.InvalidSqlSyntax, searchPathSetting(alloc, "RESET search_path; DROP TABLE t"));

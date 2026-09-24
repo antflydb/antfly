@@ -54,6 +54,7 @@ const Mock = struct {
     failed_transactions: usize = 0,
     canceled: std.atomic.Value(bool) = .init(false),
     namespace_log: [16]@import("session_commands.zig").Namespace = undefined,
+    path_log: [16]?@import("session_commands.zig").SearchPath = @splat(null),
     namespace_count: usize = 0,
     namespace_checks: usize = 0,
     saw_distinct_owner_namespace: bool = false,
@@ -81,7 +82,7 @@ const Mock = struct {
         try request.check();
         self.namespace_checks += 1;
         const name = request.namespace orelse "public";
-        if (!std.mem.eql(u8, name, "public") and !std.mem.eql(u8, name, "analytics") and !std.mem.eql(u8, name, "tenant")) return error.Forbidden;
+        if (!std.mem.eql(u8, name, "public") and !std.mem.eql(u8, name, "analytics") and !std.mem.eql(u8, name, "tenant") and !std.mem.eql(u8, name, "tenant_schema")) return error.Forbidden;
     }
     fn failTransaction(raw: *anyopaque, _: backend.Identity, _: backend.Request) anyerror!void {
         const self: *Mock = @ptrCast(@alignCast(raw));
@@ -197,6 +198,7 @@ const Mock = struct {
         self.saw_statement_unchanged = std.mem.eql(u8, request.statement, "SELECT $1");
         if (self.namespace_count < self.namespace_log.len) {
             self.namespace_log[self.namespace_count] = try @import("session_commands.zig").Namespace.init(request.namespace orelse "public");
+            self.path_log[self.namespace_count] = request.search_path;
             self.namespace_count += 1;
         }
         if (request.session_namespace) |owner| if (std.mem.eql(u8, owner, "public") and !std.mem.eql(u8, owner, request.namespace orelse "public")) {
@@ -1236,18 +1238,28 @@ test "pgwire scoped search path pins prepared namespaces and restores transactio
     try std.testing.expectEqual(@as(usize, 6), mock.namespace_checks);
 }
 
-test "pgwire multi namespace search path fails closed without changing the lookup scope" {
-    // sql-0038, sql-0040: ordered namespace binding is not yet implemented;
-    // neither exact public command may silently use only its first entry.
+test "pgwire ordered search path follows SET SESSION and SET LOCAL savepoint scope" {
+    // sql-0038, sql-0040: the exact public commands must retain both entries,
+    // and local scope must be restored by savepoint rollback and COMMIT.
     var input = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer input.deinit();
     try startup(&input.writer);
     for ([_][]const u8{
-        "SET search_path = analytics\x00",
         "SET SESSION search_path TO tenant_schema, public;\x00",
-        "SET LOCAL search_path TO tenant_schema, public;\x00",
-        "SHOW search_path\x00",
         "SELECT n FROM t\x00",
+        "BEGIN\x00",
+        "SET LOCAL search_path TO public;\x00",
+        "SELECT n FROM t\x00",
+        "SAVEPOINT sp\x00",
+        "SET LOCAL search_path TO tenant_schema, public;\x00",
+        "SELECT n FROM t\x00",
+        "ROLLBACK TO sp\x00",
+        "SELECT n FROM t\x00",
+        "COMMIT\x00",
+        "SELECT n FROM t\x00",
+        "SET search_path TO forbidden, public\x00",
+        "SELECT n FROM t\x00",
+        "SHOW search_path\x00",
     }) |statement| try frame(&input.writer, 'Q', statement);
     try frame(&input.writer, 'X', "");
     var mock: Mock = .{};
@@ -1255,11 +1267,42 @@ test "pgwire multi namespace search path fails closed without changing the looku
     defer output.deinit();
     const observed = try tags(std.testing.allocator, output.written());
     defer std.testing.allocator.free(observed);
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, observed, "E"));
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, output.written(), "0A000"));
-    try std.testing.expectEqual(@as(usize, 1), mock.namespace_count);
-    try std.testing.expectEqualStrings("analytics", mock.namespace_log[0].slice());
-    try std.testing.expectEqual(@as(usize, 1), mock.namespace_checks);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, observed, "E"));
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "42501") != null);
+    const expected = [_][]const u8{ "tenant_schema", "public", "tenant_schema", "public", "tenant_schema", "tenant_schema" };
+    try std.testing.expectEqual(expected.len, mock.namespace_count);
+    for (expected, 0..) |value, index| try std.testing.expectEqualStrings(value, mock.namespace_log[index].slice());
+    try std.testing.expectEqual(@as(u8, 2), mock.path_log[0].?.len);
+    try std.testing.expectEqualStrings("public", mock.path_log[0].?.entries[1].slice());
+    try std.testing.expectEqual(@as(u8, 1), mock.path_log[1].?.len);
+    try std.testing.expectEqual(@as(u8, 2), mock.path_log[2].?.len);
+    try std.testing.expectEqual(@as(usize, 6), mock.namespace_checks);
+}
+
+test "pgwire prepared and portal execution pin the complete ordered search path" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    try frame(&input.writer, 'Q', "SET SESSION search_path TO tenant_schema, public\x00");
+    try frame(&input.writer, 'Q', "PREPARE pinned AS SELECT n FROM t\x00");
+    try parse(&input.writer, "wire_pinned", "SELECT n FROM t", false);
+    try frame(&input.writer, 'Q', "SET search_path TO public\x00");
+    try frame(&input.writer, 'Q', "EXECUTE pinned\x00");
+    try bind(&input.writer, "portal", "wire_pinned", null);
+    try execute(&input.writer, "portal", 0);
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{};
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    const observed = try tags(std.testing.allocator, output.written());
+    defer std.testing.allocator.free(observed);
+    try std.testing.expect(std.mem.indexOfScalar(u8, observed, 'E') == null);
+    try std.testing.expectEqual(@as(usize, 2), mock.namespace_count);
+    for (mock.path_log[0..mock.namespace_count]) |path| {
+        try std.testing.expectEqual(@as(u8, 2), path.?.len);
+        try std.testing.expectEqualStrings("tenant_schema", path.?.entries[0].slice());
+        try std.testing.expectEqualStrings("public", path.?.entries[1].slice());
+    }
 }
 
 test "pgwire held cursor keeps declaration namespace after mutable search path changes" {

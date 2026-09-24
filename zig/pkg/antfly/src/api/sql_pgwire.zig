@@ -64,6 +64,64 @@ pub const Listener = struct {
     }
 };
 
+fn resolveOnPath(native_backend: catalog.Backend, alloc: std.mem.Allocator, name: ast.Name, action: catalog.Action, path: ?*const @import("../pgwire/search_path.zig").Path) !catalog.Table {
+    if (name.namespace != null or name.database != null or path == null) return native_backend.vtable.resolve(native_backend.ptr, alloc, name, action);
+    // All candidates use the same native catalog-revision fence. A missing
+    // relation may advance; auth, schema churn, and runtime failures may not.
+    const selected = path.?;
+    for (selected.entries[0..selected.len]) |*entry| {
+        var scoped = name;
+        scoped.namespace = entry.slice();
+        const table = native_backend.vtable.resolve(native_backend.ptr, alloc, scoped, action) catch |err| switch (err) {
+            error.TableNotFound => continue,
+            else => return err,
+        };
+        return table;
+    }
+    return error.TableNotFound;
+}
+
+test "SQL pgwire ordered native resolver falls back only on exact table absence" {
+    // sql-0038 / sql-0040: SET SESSION and SET LOCAL share this ordered,
+    // authorization-fenced native binding path after pgwire scope selection.
+    const search_path = @import("../pgwire/search_path.zig");
+    const Fixture = struct {
+        calls: usize = 0,
+        seen: [4]search_path.Namespace = undefined,
+        first_error: ?anyerror = null,
+
+        fn resolve(raw: *anyopaque, _: std.mem.Allocator, name: ast.Name, _: catalog.Action) !catalog.Table {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.seen[self.calls] = try search_path.Namespace.init(name.namespace orelse "public");
+            self.calls += 1;
+            if (self.calls == 1) if (self.first_error) |err| return err;
+            return .{ .id = 7, .physical_name = "second_table", .schema_version = 1, .columns = &.{} };
+        }
+        fn backend(self: *@This()) catalog.Backend {
+            return .{ .ptr = self, .vtable = &.{ .resolve = resolve, .scan = undefined, .mutate = undefined, .checkpoint = undefined } };
+        }
+    };
+    var path: search_path.Path = .{};
+    try path.append(try search_path.Namespace.init("tenant_schema"));
+    try path.append(try search_path.Namespace.init("public"));
+    var fixture: Fixture = .{ .first_error = error.TableNotFound };
+    const table = try resolveOnPath(fixture.backend(), std.testing.allocator, .{ .table = "t" }, .read, &path);
+    try std.testing.expectEqual(@as(u64, 7), table.id);
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+    try std.testing.expectEqualStrings("tenant_schema", fixture.seen[0].slice());
+    try std.testing.expectEqualStrings("public", fixture.seen[1].slice());
+
+    for ([_]anyerror{ error.Forbidden, error.CatalogGenerationChanged, error.QueryCanceled }) |failure| {
+        fixture = .{ .first_error = failure };
+        try std.testing.expectError(failure, resolveOnPath(fixture.backend(), std.testing.allocator, .{ .table = "t" }, .read, &path));
+        try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    }
+    fixture = .{ .first_error = error.TableNotFound };
+    try std.testing.expectError(error.TableNotFound, resolveOnPath(fixture.backend(), std.testing.allocator, .{ .namespace = "explicit", .table = "t" }, .read, &path));
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    try std.testing.expectEqualStrings("explicit", fixture.seen[0].slice());
+}
+
 test "SQL pgwire owner rejects unauthenticated and runtime-less startup" {
     var api: http.ApiHttpServer = undefined;
     api.cfg = .{};
@@ -368,6 +426,7 @@ const OwnedRead = struct {
         defer if (admission) |*lease| lease.release();
         const original = self.authority.request;
         if (!std.mem.eql(u8, original.database.?, request.database orelse "default") or !std.mem.eql(u8, original.namespace.?, request.namespace orelse "public") or
+            !std.meta.eql(original.search_path, request.search_path) or
             !std.mem.eql(u8, original.binding_guard orelse "", request.binding_guard orelse "")) return error.CatalogGenerationChanged;
         // Detached rows retain immutable source identity, not permission to
         // follow a renamed/replaced logical resource into a different table.
@@ -913,7 +972,7 @@ const GuardedCatalog = struct {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
         try checkpoint(raw);
         try self.authority.credential.validate();
-        const table = try self.native.vtable.resolve(self.native.ptr, alloc, name, action);
+        const table = try resolveOnPath(self.native, alloc, name, action, if (self.authority.request.search_path) |*path| path else null);
         if (self.expected_guard) |guard| try verifyBindingGuard(guard, self.revision.* orelse return error.InvalidSqlBackendResponse, table);
         return table;
     }
