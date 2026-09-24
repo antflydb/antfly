@@ -14,6 +14,7 @@ const Fixture = struct {
     conflicted: bool = false,
     seen_n: i64 = 0,
     generated: usize = 0,
+    generated_collision: bool = false,
     identity_failure: bool = false,
     guards: usize = 0,
     page_token_bytes: usize = 0,
@@ -52,6 +53,7 @@ const Fixture = struct {
         const self: *Fixture = @ptrCast(@alignCast(ptr));
         if (self.identity_failure) return error.EntropyUnavailable;
         self.generated += 1;
+        if (self.generated_collision) return alloc.dupe(u8, "existing");
         return std.fmt.allocPrint(alloc, "generated-{d}", .{self.generated});
     }
     fn scan(_: *anyopaque, _: Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
@@ -113,6 +115,7 @@ const Fixture = struct {
             var object: std.json.ObjectMap = .empty;
             const original = mutation.row.?.object;
             for (original.keys(), original.values()) |key, value| try object.put(alloc, key, value);
+            if (object.get("n") == null) try object.put(alloc, "n", .{ .integer = 3 });
             try object.put(alloc, "g", .{ .integer = object.get("n").?.integer * 2 });
             mutation.row = .{ .object = object };
         }
@@ -204,6 +207,25 @@ test "SQL conflict primary arbiter compiles old and excluded shape with RETURNIN
     try std.testing.expectEqual(@as(i64, 9), fixture.seen_n);
     try std.testing.expectEqualStrings("9", result.output.rows[0][0].string);
     try std.testing.expectEqualStrings("18", result.output.rows[0][1].string);
+}
+
+test "SQL DEFAULT VALUES conflict uses prepared defaults and generated identity" {
+    var fixture: Fixture = .{ .generated_collision = true };
+    var backend = fixture.backend();
+    var vtable = backend.vtable.*;
+    vtable.generate_row_id = Fixture.generate;
+    backend.vtable = &vtable;
+    var compiled = try compiler.compile(std.testing.allocator, "INSERT INTO items DEFAULT VALUES ON CONFLICT (_id) DO UPDATE SET n=excluded.n RETURNING _id,n,g", .{});
+    defer compiled.deinit();
+    var result = try runtime.execute(std.testing.allocator, backend, &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), fixture.generated);
+    try std.testing.expectEqual(@as(usize, 1), fixture.commits);
+    try std.testing.expectEqual(@as(usize, 1), fixture.affected);
+    try std.testing.expectEqual(@as(i64, 3), fixture.seen_n);
+    try std.testing.expectEqualStrings("existing", result.output.rows[0][0].string);
+    try std.testing.expectEqualStrings("3", result.output.rows[0][1].string);
+    try std.testing.expectEqualStrings("6", result.output.rows[0][2].string);
 }
 
 test "SQL conflict assignment subqueries fail closed before owner-side masked Apply" {

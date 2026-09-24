@@ -126,13 +126,16 @@ with defaults for all three returned logical columns. The shared prepared-row
 pipeline also has component evidence for per-cell DEFAULT across direct and
 captured VALUES sources, explicit SQL NULL, generated columns and row IDs.
 The exact `sql-1481` two-row INSERT executes through mounted SQL and checks
-both affected rows and ordered RETURNING values. The duplicate-key rejection
-case `sql-1484` remains unresolved until it has a mounted table with an active
-coordinated UNIQUE constraint and a no-partial-write assertion.
+both affected rows and ordered RETURNING values. The exact `sql-1484` batch
+uses a mounted table with an enforced coordinated UNIQUE(id) owner. Distinct
+physical row IDs with the same logical ID reject as SQLSTATE `23505` before
+either primary row is applied; a native scan verifies no partial write.
 The exact `sql-1496` TIMESTAMPTZ literal executes through mounted SQL against
 a native datetime column; RETURNING shows the validated `+01:30` source offset
-normalized to UTC. `sql-1495` still needs an active unique arbiter and the
-coordinated constraint-write path, so it is not counted as implemented.
+normalized to UTC. The exact `sql-1495` DEFAULT VALUES conflict statement
+uses a seeded native row and active coordinated UNIQUE(id) claim. The owner
+selects the existing row, the guarded update commits, and RETURNING plus a
+physical read verify the schema-derived default values.
 The 14 ordinary MERGE cases have exact-text compiler/binder coverage, and
 `sql-0579` additionally has component execution plus a mounted, authorized
 two-table commit test that checks distinct owner-route range proofs, denies a

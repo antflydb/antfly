@@ -12,6 +12,25 @@ const topology = @import("../storage/db/relational_integrity_topology_contract.z
 const tables = @import("tables.zig");
 const existing = @import("fk_generation_plan_builder.zig");
 
+/// Resolve only the self edge after metadata has reserved the candidate's
+/// physical identity. External edges have already been bound at DDL ingress.
+fn bindReservedSelf(alloc: std.mem.Allocator, schema_json: []const u8, logical_name: []const u8, physical_name: []const u8) ![]const u8 {
+    var value = try std.json.parseFromSliceLeaky(std.json.Value, alloc, schema_json, .{ .allocate = .alloc_always, .parse_numbers = false });
+    if (value != .object) return error.InvalidGenerationPublication;
+    const fks = value.object.getPtr("foreign_keys") orelse return schema_json;
+    if (fks.* != .array) return error.InvalidGenerationPublication;
+    var changed = false;
+    for (fks.array.items) |*fk| {
+        if (fk.* != .object) return error.InvalidGenerationPublication;
+        const parent = fk.object.getPtr("parent_table") orelse return error.InvalidGenerationPublication;
+        if (parent.* != .string) return error.InvalidGenerationPublication;
+        if (!std.mem.eql(u8, parent.string, logical_name)) continue;
+        parent.* = .{ .string = physical_name };
+        changed = true;
+    }
+    return if (changed) try std.json.Stringify.valueAlloc(alloc, value, .{}) else schema_json;
+}
+
 fn namespaceId(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, context: operation.RequestContext, target: domain.Target) !u64 {
     if (std.mem.eql(u8, target.database, domain.default_database_name) and
         std.mem.eql(u8, target.namespace, domain.default_namespace_name))
@@ -59,9 +78,11 @@ pub fn build(
         .candidate = candidate,
     } });
     const prepared = try std.json.parseFromSliceLeaky(publication.InitialCreatePrepare, alloc, prepare_bytes, .{ .allocate = .alloc_always });
+    var child = prepared.child;
+    child.schema_json = try bindReservedSelf(alloc, child.schema_json, target.table, child.name);
     var snapshot = (try server.source.linearizableSnapshot(context)) orelse return error.MetadataCapabilityUnavailable;
     defer server.source.freeAdminSnapshot(&snapshot);
-    const derived = try publication.deriveInitialTransitions(alloc, prepared.child.table_id, prepared.child.name, prepared.child.schema_json);
+    const derived = try publication.deriveInitialTransitions(alloc, child.table_id, child.name, child.schema_json);
     if (derived.len == 0) return error.InvalidGenerationPublication;
     var id: publication.Id = undefined;
     const io = server.restore_job_store.io orelse return error.AsyncRestoreUnavailable;
@@ -70,11 +91,17 @@ pub fn build(
         if (std.mem.readInt(u64, id[0..8], .little) != 0 and std.mem.readInt(u64, id[8..16], .little) != 0) break;
     }
     var parents: std.ArrayList(publication.Parent) = .empty;
+    var self_transitions: std.ArrayList(publication.Transition) = .empty;
+    var self_target_checked = false;
     for (derived) |item| {
-        // A self-reference needs the hidden child to act as both sides of the
-        // publication fence. It cannot be resolved from the public snapshot.
-        if (std.mem.eql(u8, item.parent_table_name, prepared.child.name))
-            return error.ForeignKeyInitialSelfReferenceUnsupported;
+        if (std.mem.eql(u8, item.parent_table_name, child.name)) {
+            if (!self_target_checked) {
+                try @import("../schema/relational_foreign_key_target.zig").validate(alloc, child.schema_json, child.name, child.schema_json);
+                self_target_checked = true;
+            }
+            try self_transitions.append(alloc, item.transition);
+            continue;
+        }
         const parent_table: records.TableRecord = for (snapshot.tables) |table| {
             if (std.mem.eql(u8, table.name, item.parent_table_name)) break table;
         } else return error.ForeignKeyParentTableNotFound;
@@ -120,15 +147,21 @@ pub fn build(
         }.less);
         parent.transitions = sorted;
     }
+    std.mem.sort(publication.Transition, self_transitions.items, {}, struct {
+        fn less(_: void, lhs: publication.Transition, rhs: publication.Transition) bool {
+            return std.mem.lessThan(u8, lhs.constraint_name, rhs.constraint_name);
+        }
+    }.less);
     const plan: publication.InitialCreatePlan = .{
         .id = id,
         .catalog_id = prepared.catalog_id,
         .expected_catalog_revision = prepared.expected_catalog_revision,
         .tablespace_id = prepared.tablespace_id,
         .min_ranges_explicit = prepared.min_ranges_explicit,
-        .child = prepared.child,
+        .child = child,
         .child_ranges = prepared.child_ranges,
         .parents = try parents.toOwnedSlice(alloc),
+        .self_transitions = try self_transitions.toOwnedSlice(alloc),
         .logical_name = target.table,
         .namespace_id = namespace_id,
     };

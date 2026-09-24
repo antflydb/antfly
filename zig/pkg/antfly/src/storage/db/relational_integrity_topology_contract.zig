@@ -80,6 +80,7 @@ pub const ChildSchemaInstall = struct {
 
 pub const InitialChildProvision = struct {
     schema_json: []const u8,
+    child_table_name: []const u8,
     plan_id: [16]u8,
     plan_digest: integrity.Digest,
     schema_digest: integrity.Digest,
@@ -88,6 +89,7 @@ pub const InitialChildProvision = struct {
 
     pub fn nativeJsonProjection(self: InitialChildProvision) struct {
         schema_json: std.json.Value,
+        child_table_name: []const u8,
         plan_id: [16]u8,
         plan_digest: integrity.Digest,
         schema_digest: integrity.Digest,
@@ -96,6 +98,7 @@ pub const InitialChildProvision = struct {
     } {
         return .{
             .schema_json = .{ .string = self.schema_json },
+            .child_table_name = self.child_table_name,
             .plan_id = self.plan_id,
             .plan_digest = self.plan_digest,
             .schema_digest = self.schema_digest,

@@ -208,9 +208,9 @@ fn selectInternal(alloc: std.mem.Allocator, tables: []const records.TableRecord,
     const result = try alloc.alloc(records.TableRecord, queue.items.len);
     for (queue.items, result) |index, *table| {
         table.* = tables[index];
-        // A graph artifact on another table cannot block this cohort. Parse
-        // index declarations only for actual participants after FK closure.
-        if (try stages.hasGraphIndex(alloc, table.indexes_json)) return error.SqlTruncateGraphDependency;
+        // Graph artifacts are owner-scoped and their exact declaration is
+        // bound into the staged replacement below. Untouched graph tables do
+        // not join this FK cohort merely because they have graph indexes.
     }
     std.mem.sort(records.TableRecord, result, {}, struct {
         fn less(_: void, a: records.TableRecord, b: records.TableRecord) bool {
@@ -357,7 +357,7 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
         var binding = logical_index.byId(.table, before.table_id) orelse return error.CatalogGenerationChanged;
         if (!std.mem.eql(u8, binding.storage_name, before.name)) return error.CatalogGenerationChanged;
         binding.id = table.table_id;
-        target.* = .{ .source_table_id = before.table_id, .table = table, .catalog_binding = binding, .ranges = ranges, .empty_generation = true, .replace = .{ .table = before, .ranges = old_ranges.items, .fences = fences } };
+        target.* = .{ .source_table_id = before.table_id, .table = table, .catalog_binding = binding, .ranges = ranges, .empty_generation = true, .graph_retirement_digest = if (try stages.hasGraphIndex(a, table.indexes_json)) stages.graphRetirementDigest(before.table_id, table.table_id, table.indexes_json) else null, .replace = .{ .table = before, .ranges = old_ranges.items, .fences = fences } };
     }
     const external_parents = try buildExternalParents(server, identity, context, a, snapshot, selected, planned, id);
     if (external_parents.len != 0) {
@@ -420,7 +420,7 @@ test "SQL TRUNCATE closure follows incoming FKs without emptying an untouched pa
     try std.testing.expectEqual(@as(usize, 1), document.len);
 }
 
-test "SQL TRUNCATE graph guard applies only to the selected FK cohort" {
+test "SQL TRUNCATE graph declarations stay scoped to the selected FK cohort" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -431,7 +431,9 @@ test "SQL TRUNCATE graph guard applies only to the selected FK cohort" {
     const plain = try select(a, &tables, &.{"plain"}, false);
     try std.testing.expectEqual(@as(usize, 1), plain.len);
     try std.testing.expectEqualStrings("plain", plain[0].name);
-    try std.testing.expectError(error.SqlTruncateGraphDependency, select(a, &tables, &.{"graph"}, false));
+    const graph = try select(a, &tables, &.{"graph"}, false);
+    try std.testing.expectEqual(@as(usize, 1), graph.len);
+    try std.testing.expectEqualStrings("graph", graph[0].name);
 
     const relational = [_]records.TableRecord{
         .{ .table_id = 20, .name = "parent" },
@@ -439,7 +441,8 @@ test "SQL TRUNCATE graph guard applies only to the selected FK cohort" {
         \\{"version":1,"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"fk","child_columns":["id"],"parent_table":"parent","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
         },
     };
-    try std.testing.expectError(error.SqlTruncateGraphDependency, select(a, &relational, &.{"parent"}, true));
+    const cascade = try select(a, &relational, &.{"parent"}, true);
+    try std.testing.expectEqual(@as(usize, 2), cascade.len);
 }
 
 test "SQL TRUNCATE unknown target fails before unrelated schema parsing" {

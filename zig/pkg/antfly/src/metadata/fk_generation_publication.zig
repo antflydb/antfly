@@ -327,6 +327,9 @@ pub const InitialCreatePlan = struct {
     child: records.TableRecord,
     child_ranges: []const records.RangeRecord,
     parents: []const Parent,
+    /// Parent generations hosted by the hidden child itself. Every child
+    /// range installs these scopes atomically with its initial schema/AIC.
+    self_transitions: []const Transition = &.{},
     logical_name: []const u8,
     namespace_id: u64,
 
@@ -335,7 +338,8 @@ pub const InitialCreatePlan = struct {
             self.logical_name.len == 0 or self.logical_name.len > 256 or
             self.child.table_id == 0 or self.child.name.len == 0 or
             self.child_ranges.len == 0 or self.child_ranges.len > max_owners or
-            self.parents.len == 0 or self.parents.len > max_constraints) return error.InvalidGenerationPublication;
+            (self.parents.len == 0 and self.self_transitions.len == 0) or
+            self.parents.len > max_constraints or self.self_transitions.len > max_constraints) return error.InvalidGenerationPublication;
         const expected_physical_name = try std.fmt.allocPrint(alloc, "table:{d}", .{self.catalog_id});
         defer alloc.free(expected_physical_name);
         const expected_physical_id = std.hash.Wyhash.hash(0x54424c45, expected_physical_name);
@@ -354,7 +358,20 @@ pub const InitialCreatePlan = struct {
         for (self.child_ranges) |range| if (range.table_id != self.child.table_id) return error.InvalidGenerationPublication;
         if (self.child_ranges.len != @as(usize, self.child.min_ranges)) return error.InvalidGenerationPublication;
         var owners = self.child_ranges.len;
-        var transitions: usize = 0;
+        var transitions: usize = self.self_transitions.len;
+        if (transitions > max_constraints) return error.InvalidGenerationPublication;
+        if (self.self_transitions.len != 0)
+            try @import("../schema/relational_foreign_key_target.zig").validate(alloc, self.child.schema_json, self.child.name, self.child.schema_json);
+        for (self.self_transitions, 0..) |transition, ti| {
+            try transition.validate(self.child);
+            if (transition.expected_generation != null or transition.next_generation == null or
+                (ti != 0 and std.mem.order(u8, self.self_transitions[ti - 1].constraint_name, transition.constraint_name) != .lt))
+                return error.InvalidGenerationPublication;
+            const fk = compiled.catalog.find(.foreign_key, transition.constraint_name) orelse return error.InvalidGenerationPublication;
+            if (!std.mem.eql(u8, &fk.generation, &transition.next_generation.?)) return error.InvalidGenerationPublication;
+            const parent_name = foreignParent(fks, transition.constraint_name) orelse return error.InvalidGenerationPublication;
+            if (!std.mem.eql(u8, self.child.name, parent_name)) return error.InvalidGenerationPublication;
+        }
         for (self.parents, 0..) |parent, index| {
             if (parent.table.table_id == 0 or parent.table.table_id == self.child.table_id or
                 parent.ranges.len == 0 or parent.ranges.len > max_owners or
@@ -363,6 +380,11 @@ pub const InitialCreatePlan = struct {
             for (self.parents[0..index]) |prior| if (prior.table.table_id == parent.table.table_id) return error.InvalidGenerationPublication;
             try table_manager.validateCompleteKeyspaceRanges(parent.ranges);
             try validateOwnerFences(self.id, parent.table, parent.ranges, parent.fences, .child_generation_parent);
+            // The ingress may have prepared an owned witness index, but a
+            // submitted plan is not trusted authority. Pin the support to
+            // this exact parent descriptor before metadata locks the owner;
+            // begin also compares that descriptor inside its Raft txn.
+            try validateInitialPartialParent(alloc, self.child.schema_json, fks, parent.table);
             owners = std.math.add(usize, owners, parent.ranges.len) catch return error.InvalidGenerationPublication;
             transitions = std.math.add(usize, transitions, parent.transitions.len) catch return error.InvalidGenerationPublication;
             if (owners > max_owners or transitions > max_constraints) return error.InvalidGenerationPublication;
@@ -395,6 +417,9 @@ pub const InitialCreatePlan = struct {
         }
         for (fks) |fk| {
             var count: usize = 0;
+            for (self.self_transitions) |transition| {
+                if (std.mem.eql(u8, transition.constraint_name, fk.name)) count += 1;
+            }
             for (self.parents) |parent| for (parent.transitions) |transition| {
                 if (std.mem.eql(u8, transition.constraint_name, fk.name)) count += 1;
             };
@@ -477,6 +502,48 @@ pub const InitialCreatePlan = struct {
     }
 };
 
+fn validateInitialPartialParent(alloc: std.mem.Allocator, child_json: []const u8, fks: anytype, parent: records.TableRecord) !void {
+    for (fks) |fk| {
+        if (fk.match == .partial and std.mem.eql(u8, fk.parent_table, parent.name)) {
+            try @import("../schema/relational_foreign_key_target.zig").validate(alloc, child_json, parent.name, parent.schema_json);
+            return;
+        }
+    }
+}
+
+/// Derived from the committed immutable plan, never a supervisor-supplied
+/// index name. A parent owner must prove each selected witness is ready before
+/// it can durably stage the new child generation.
+pub fn initialPartialSupportNames(alloc: std.mem.Allocator, child_json: []const u8, parent: records.TableRecord) ![]const []const u8 {
+    var child = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, child_json);
+    defer child.deinit(alloc);
+    const fks = try child.relationalForeignKeyDefinitions(alloc);
+    defer if (fks.len != 0) alloc.free(fks);
+    var needs_support = false;
+    for (fks) |fk| if (fk.match == .partial and std.mem.eql(u8, fk.parent_table, parent.name)) {
+        needs_support = true;
+        break;
+    };
+    if (!needs_support) return &.{};
+    var parent_schema = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, parent.schema_json);
+    defer parent_schema.deinit(alloc);
+    var names: std.ArrayList([]const u8) = .empty;
+    for (fks) |fk| {
+        if (fk.match != .partial or !std.mem.eql(u8, fk.parent_table, parent.name)) continue;
+        const selected = try @import("../schema/relational_witness_indexes.zig").supportNames(alloc, parent_schema, fk.parent_columns);
+        defer alloc.free(selected);
+        for (selected) |name| {
+            var seen = false;
+            for (names.items) |existing| if (std.mem.eql(u8, existing, name)) {
+                seen = true;
+                break;
+            };
+            if (!seen) try names.append(alloc, try alloc.dupe(u8, name));
+        }
+    }
+    return names.toOwnedSlice(alloc);
+}
+
 /// The private owner receives only this identity request. Metadata derives
 /// the candidate and exact owner descriptor from a committed read-index cut;
 /// neither the worker nor the caller may supply schema bytes or a route.
@@ -544,6 +611,7 @@ pub const InitialParentDecision = struct {
     transitions: []const Transition,
     parent_table: records.TableRecord,
     parent_range: records.RangeRecord,
+    partial_support_indexes: []const []const u8,
 };
 
 pub const InitialPhase = enum {
@@ -617,7 +685,8 @@ pub const InitialPublication = struct {
                     .child_provisioned => {
                         if (self.phase != .provisioning_child) return error.GenerationPublicationChanged;
                         next.child_provisioned = try appendReceipt(alloc, self.child_provisioned, compact);
-                        if (next.child_provisioned.len == self.plan.child_ranges.len) next.phase = .staging_parents;
+                        if (next.child_provisioned.len == self.plan.child_ranges.len)
+                            next.phase = if (self.plan.parents.len == 0) .published_hidden else .staging_parents;
                     },
                     .child_released => {
                         if (self.phase != .published_hidden) return error.GenerationPublicationChanged;
@@ -707,7 +776,7 @@ pub const InitialPublication = struct {
                 return lhs.group_id < rhs.group_id;
             }
         }.less);
-        for (parent_groups.items[1..], 1..) |range, index| if (parent_groups.items[index - 1].group_id == range.group_id) return error.InvalidGenerationPublication;
+        for (parent_groups.items[@min(parent_groups.items.len, 1)..], 1..) |range, index| if (parent_groups.items[index - 1].group_id == range.group_id) return error.InvalidGenerationPublication;
         try validateReceipts(parent_groups.items, self.parent_staged);
         try validateReceipts(parent_groups.items, self.parent_activated);
         try validateReceipts(parent_groups.items, self.parent_acknowledged);
@@ -1012,7 +1081,7 @@ pub const Publication = struct {
                 return a.group_id < b.group_id;
             }
         }.less);
-        for (parent_groups.items[1..], 1..) |range, i| if (parent_groups.items[i - 1].group_id == range.group_id) return error.InvalidGenerationPublication;
+        for (parent_groups.items[@min(parent_groups.items.len, 1)..], 1..) |range, i| if (parent_groups.items[i - 1].group_id == range.group_id) return error.InvalidGenerationPublication;
         try validateReceipts(parent_groups.items, self.parent_staged);
         try validateReceipts(parent_groups.items, self.parent_activated);
         try validateReceipts(parent_groups.items, self.parent_acknowledged);
@@ -1196,6 +1265,31 @@ test "FK generation publication rejects an unbound or empty plan" {
     try std.testing.expectError(error.InvalidGenerationPublication, plan.validate(std.testing.allocator));
 }
 
+test "initial MATCH PARTIAL publication pins parent witness support" {
+    const alloc = std.testing.allocator;
+    const child_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"fk","child_columns":["a","b"],"parent_table":"parent","parent_columns":["a","b"],"match":"partial"}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"a":{"type":"integer","nullable":true},"b":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
+    ;
+    const parent_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["a","b"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"a":{"type":"integer","nullable":true},"b":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
+    ;
+    var child = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, child_json);
+    defer child.deinit(alloc);
+    const fks = try child.relationalForeignKeyDefinitions(alloc);
+    defer alloc.free(fks);
+    try std.testing.expectError(error.ForeignKeyPartialSupportIndexRequired, validateInitialPartialParent(alloc, child_json, fks, .{ .table_id = 201, .name = "parent", .schema_json = parent_json }));
+    const supported = (try @import("../schema/relational_witness_indexes.zig").ensureCoverage(alloc, parent_json, &.{ "a", "b" })).?;
+    defer alloc.free(supported);
+    try validateInitialPartialParent(alloc, child_json, fks, .{ .table_id = 201, .name = "parent", .schema_json = supported });
+    var names_arena = std.heap.ArenaAllocator.init(alloc);
+    defer names_arena.deinit();
+    const names = try initialPartialSupportNames(names_arena.allocator(), child_json, .{ .table_id = 201, .name = "parent", .schema_json = supported });
+    try std.testing.expectEqual(@as(usize, 2), names.len);
+    try std.testing.expectEqualStrings(&@import("../schema/relational_witness_indexes.zig").supportName("a"), names[0]);
+    try std.testing.expectEqualStrings(&@import("../schema/relational_witness_indexes.zig").supportName("b"), names[1]);
+    try std.testing.expectError(error.ForeignKeyTargetNotUnique, validateInitialPartialParent(alloc, child_json, fks, .{ .table_id = 201, .name = "parent", .schema_json = child_json }));
+}
+
 test "FK generation publication derives history-bound replacement and reparenting" {
     const alloc = std.testing.allocator;
     const before_json =
@@ -1207,6 +1301,7 @@ test "FK generation publication derives history-bound replacement and reparentin
     const reparent_json =
         \\{"version":2,"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"fk","child_columns":["id"],"parent_table":"parent_b","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
     ;
+    try std.testing.expectEqual(@as(usize, 0), (try initialPartialSupportNames(alloc, before_json, .{ .table_id = 202, .name = "parent_a" })).len);
     var before = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, before_json);
     defer before.deinit(alloc);
     var compiled = try compileCatalog(alloc, before, 101, null);

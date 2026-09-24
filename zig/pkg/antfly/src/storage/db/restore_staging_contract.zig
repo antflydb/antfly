@@ -111,7 +111,8 @@ pub const Control = union(enum) {
 
 pub const Scope = struct {
     pub fn nativeJsonSkipField(self: @This(), comptime name: []const u8) bool {
-        return std.mem.eql(u8, name, "empty_generation") and !self.empty_generation;
+        return (std.mem.eql(u8, name, "empty_generation") and !self.empty_generation) or
+            (std.mem.eql(u8, name, "graph_retirement_digest") and self.graph_retirement_digest == null);
     }
     plan_id: [16]u8,
     plan_digest: Digest,
@@ -123,10 +124,14 @@ pub const Scope = struct {
     preserve_artifacts: bool = false,
     /// A fresh, proven-pristine owner; never accepts source rows or artifacts.
     empty_generation: bool = false,
+    /// Exact graph declaration/old-new incarnation proof from the immutable
+    /// metadata plan. Only an empty owner may carry this retirement barrier.
+    graph_retirement_digest: ?Digest = null,
     rewrite: ?@import("relational_rewrite_contract.zig").Binding = null,
 
     pub fn validateReservation(self: Scope) !void {
         if (self.empty_generation and (self.preserve_artifacts or self.rewrite != null)) return error.InvalidRestoreStagingCommand;
+        if (!self.empty_generation and self.graph_retirement_digest != null) return error.InvalidRestoreStagingCommand;
         if (self.rewrite) |rewrite| {
             try rewrite.validate();
             if (rewrite.source_scope) |source| if (!source.receiver_namespace.eql(self.target_namespace) or
@@ -139,6 +144,7 @@ pub const Scope = struct {
 
     pub fn validate(self: Scope) !void {
         if (self.empty_generation and (self.preserve_artifacts or self.rewrite != null or !std.mem.allEqual(u8, &self.source_artifact_digest, 0) or !std.mem.allEqual(u8, &self.source_descriptor_digest, 0))) return error.InvalidRestoreStagingCommand;
+        if (!self.empty_generation and self.graph_retirement_digest != null) return error.InvalidRestoreStagingCommand;
         if (self.preserve_artifacts and self.rewrite != null) return error.InvalidRestoreStagingCommand;
         if (self.rewrite) |rewrite| {
             try rewrite.validate();
@@ -167,6 +173,10 @@ pub const Scope = struct {
         hash.update(&self.target_schema_digest);
         if (self.preserve_artifacts) hash.update("native-artifact-preservation-v1");
         if (self.empty_generation) hash.update("empty-generation-v1");
+        if (self.graph_retirement_digest) |retirement| {
+            hash.update("graph-retirement-v1");
+            hash.update(&retirement);
+        }
         if (self.rewrite) |rewrite| {
             hash.update("relational-rewrite-v1");
             hash.update(&rewrite.program_digest);

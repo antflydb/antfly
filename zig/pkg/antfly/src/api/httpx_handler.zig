@@ -12572,6 +12572,217 @@ test "httpx SQL executes one relational page with exact integer parameters" {
     }
 }
 
+test "httpx SQL coordinated UNIQUE owner rejects duplicate batch and updates default collision" {
+    const alloc = std.testing.allocator;
+    const integrity = @import("relational_integrity_commit.zig");
+    const owner = @import("../storage/db/relational_integrity.zig");
+    const activation = @import("../storage/db/relational_integrity_activation_contract.zig");
+    const native_catalog = @import("../storage/db/relational_integrity_catalog.zig");
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"id_unique","columns":["id"]}],"column_defaults":[{"column":"id","expression":{"op":"literal","type":"string","value":"u_default"}},{"column":"status","expression":{"op":"literal","type":"string","value":"reset"}},{"column":"amount","expression":{"op":"literal","type":"integer","value":9}}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const Fixture = struct {
+        const Self = @This();
+        const EmptyOwner = struct {
+            const Cursor = struct {
+                const Entry = struct { key: []const u8, value: []const u8 };
+                pub fn close(_: *@This()) void {}
+                pub fn seekAtOrAfter(_: *@This(), _: []const u8) !?Entry {
+                    return null;
+                }
+                pub fn next(_: *@This()) !?Entry {
+                    return null;
+                }
+            };
+            pub fn get(_: *@This(), _: []const u8) ![]const u8 {
+                return error.NotFound;
+            }
+            pub fn openCursor(_: *@This()) !Cursor {
+                return .{};
+            }
+        };
+        db: *db_mod.DB,
+        envelope: []const u8,
+        digest: [32]u8,
+        generation_set: [32]u8,
+        records: [1]@import("../common/topology_records.zig").TableRecord = .{.{ .table_id = 7, .name = "usage_records", .schema_json = schema_json }},
+        ranges: [1]@import("../common/topology_records.zig").RangeRecord = .{.{ .group_id = 8, .table_id = 7, .start_key = "" }},
+        owner_attempts: usize = 0,
+        primary_apply_attempts: usize = 0,
+        seeded_claim: ?@import("../storage/db/relational_integrity_contract.zig").Claim = null,
+        seeded_address: ?@import("../storage/db/relational_integrity_contract.zig").Address = null,
+        default_conflict: bool = false,
+        native_reads: ?@import("table_read_source.zig").TableReadSource = null,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn catalog(_: *anyopaque, a: std.mem.Allocator, context: operation_contract.RequestContext, input: system_catalog.Call) ![]u8 {
+            try context.ensureActive();
+            if (input == .policy_publication_status) return error.RowPolicyCatalogChanged;
+            if (input == .write_validation) return std.json.Stringify.valueAlloc(a, .{ .schema_json = schema_json }, .{});
+            if (input != .resolve_many) return error.UnexpectedCatalogCall;
+            if (input.resolve_many.targets.len != 1 or !std.mem.eql(u8, input.resolve_many.targets[0].table, "usage_records")) return error.UnexpectedCatalogCall;
+            const tables = [_]?system_catalog.ResolvedTable{.{ .table_id = 7, .name = "usage_records", .query_definition = if (input.resolve_many.include_query_definitions) .{ .table_id = 7, .schema_json = schema_json, .read_schema_json = "", .indexes_json = "{}" } else null }};
+            return std.json.Stringify.valueAlloc(a, system_catalog.ResolvedMany{ .revision = 7, .tables = &tables }, .{});
+        }
+        fn snapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            return .{ .status = try status(ptr), .tables = &self.records, .ranges = &self.ranges, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+        }
+        fn freeSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn lookup(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, key: []const u8, opts: db_mod.types.LookupOptions, consistency: raft_mod.read_gate.ReadConsistency) !?table_reads.LookupResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            if (opts.relational_integrity_catalog) return .{ .json = try a.dupe(u8, self.envelope), .version = 0 };
+            if (opts.relational_activation_json.len != 0) {
+                const coverage = .{ .schema_version = @as(u32, 1), .schema_digest = self.digest, .generation_set = self.generation_set, .owner = [_]u8{1} ** 32, .range_start = @as([]const u8, ""), .range_end = @as([]const u8, ""), .unique_covered = true, .state = activation.State.enforced, .phase = activation.Phase.unique, .rows_scanned = @as(u64, 0), .failure = @as([]const u8, "") };
+                return .{ .json = try std.json.Stringify.valueAlloc(a, coverage, .{}), .version = 0 };
+            }
+            if (opts.relational_integrity_jobs_json.len != 0) {
+                const claim = self.seeded_claim orelse return null;
+                const address = self.seeded_address orelse return error.InvalidIntegrityRecord;
+                const query = try std.json.parseFromSlice(struct { address: @TypeOf(address) }, a, opts.relational_integrity_jobs_json, .{ .ignore_unknown_fields = true });
+                defer query.deinit();
+                if (!std.meta.eql(address, query.value.address)) return null;
+                return .{ .json = try std.json.Stringify.valueAlloc(a, .{ .address = address, .claim = claim }, .{}), .version = 0 };
+            }
+            if (self.native_reads) |source| return source.lookup(a, table, key, opts, consistency);
+            return null;
+        }
+        fn openRead(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.read_gate.ReadConsistency) !?@import("table_read_source.zig").RelationalReadView {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            return (self.native_reads orelse return null).openRelationalRead(a, table, from, to, opts, consistency);
+        }
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+            return error.UnexpectedCall;
+        }
+        fn commit(ptr: *anyopaque, a: std.mem.Allocator, tables: []const distributed_txn_contract.TableCommitRequest, _: db_mod.types.SyncLevel) !?distributed_txn_contract.CommitOutcome {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(usize, 1), tables.len);
+            try std.testing.expectEqualStrings("usage_records", tables[0].table_name);
+            if (self.default_conflict) {
+                try std.testing.expectEqual(@as(usize, 1), tables[0].writes.len);
+                try std.testing.expectEqualStrings("seed-primary", tables[0].writes[0].key);
+                try std.testing.expect(tables[0].integrity_commands.len != 0);
+                var guarded = false;
+                for (tables[0].integrity_commands) |command| if (command.operation == .compare_claim and command.operation.compare_claim != null) {
+                    guarded = true;
+                    try std.testing.expectEqualStrings("seed-primary", command.operation.compare_claim.?.parent_key);
+                };
+                try std.testing.expect(guarded);
+            } else {
+                try std.testing.expectEqual(@as(usize, 2), tables[0].writes.len);
+                try std.testing.expect(!std.mem.eql(u8, tables[0].writes[0].key, tables[0].writes[1].key));
+                try std.testing.expectEqual(@as(usize, 2), tables[0].integrity_commands.len);
+            }
+            self.owner_attempts += 1;
+            if (!self.default_conflict) {
+                var empty: EmptyOwner = .{};
+                var effects = try owner.prepare(a, &empty, tables[0].integrity_commands);
+                defer effects.deinit();
+            }
+            self.primary_apply_attempts += 1;
+            const transaction_writes: []const db_mod.types.TransactionWrite = @ptrCast(tables[0].writes);
+            const txn = try self.db.beginTransactionWithId(@splat(47), 47);
+            try self.db.writeTransaction(txn, .{ .writes = transaction_writes, .relational_schema_version = tables[0].relational_schema_version, .relational_integrity_generation_set = tables[0].relational_integrity_generation_set, .integrity_commands = tables[0].integrity_commands });
+            try self.db.commitTransaction(txn, 48);
+            return .{ .committed = .{ .participant_count = 1 } };
+        }
+    };
+    var directory = try @import("../common/test_directory.zig").TestDirectory.init("antfly-httpx-sql-unique-batch");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .identity_namespace = .{ .table_id = 7, .shard_id = 8, .range_id = 9 }, .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.setSchemaJson(alloc, schema_json);
+    const envelope = try integrity.testCatalogEnvelope(alloc, 7, schema_json);
+    defer alloc.free(envelope);
+    const parsed_envelope = try std.json.parseFromSlice(struct { catalog: []const u8 }, alloc, envelope, .{ .ignore_unknown_fields = true });
+    defer parsed_envelope.deinit();
+    const decoded = try alloc.alloc(u8, try std.base64.standard.Decoder.calcSizeForSlice(parsed_envelope.value.catalog));
+    defer alloc.free(decoded);
+    try std.base64.standard.Decoder.decode(decoded, parsed_envelope.value.catalog);
+    var published_catalog = try native_catalog.decode(alloc, decoded);
+    defer published_catalog.deinit();
+    var fixture: Fixture = .{ .db = &db, .envelope = envelope, .digest = published_catalog.schema_digest, .generation_set = activation.generationSet(published_catalog) };
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+    var native_reads = table_reads.BoundTableReadSource.init("usage_records", 8, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
+    var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &fixture, .vtable = &.{ .status = Fixture.status, .system_catalog = Fixture.catalog, .admin_snapshot = Fixture.snapshot, .free_admin_snapshot = Fixture.freeSnapshot, .supports_query_definitions = true } }, .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.lookup, .open_relational_read = Fixture.openRead, .scan = undefined, .query = undefined } }, .{ .ptr = &fixture, .vtable = &.{ .batch = Fixture.batch, .commit_batch = Fixture.commit } });
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @embedFile("../sql/fixtures/sql_parity_inventory.json"), .{});
+    defer corpus.deinit();
+    const exact_sql = for (corpus.value.object.get("entries").?.array.items) |entry| {
+        if (std.mem.eql(u8, entry.object.get("id").?.string, "sql-1484")) break entry.object.get("sql").?.string;
+    } else return error.TestMissingCorpusCase;
+    const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = exact_sql }, .{});
+    defer alloc.free(body);
+    var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+    defer request.deinit();
+    request.body = body;
+    var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try handler.executeSQL(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 400), response.status.code);
+    const diagnostic = try std.json.parseFromSlice(sql_wire.SQLDiagnostic, alloc, response.body.?, .{});
+    defer diagnostic.deinit();
+    try std.testing.expectEqualStrings("23505", diagnostic.value.code);
+    try std.testing.expectEqual(@as(usize, 1), fixture.owner_attempts);
+    try std.testing.expectEqual(@as(usize, 0), fixture.primary_apply_attempts);
+    var remaining = try db.scan(alloc, "", "", .{});
+    defer remaining.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), remaining.hashes.len);
+    fixture.native_reads = native_reads.source();
+    // sql-1495: a native UNIQUE claim, not a primary-key coincidence,
+    // resolves the generated DEFAULT VALUES proposal to the seeded owner.
+    const seed_txn = try db.beginTransactionWithId(@splat(45), 45);
+    try db.writeTransaction(seed_txn, .{ .writes = &.{.{ .key = "seed-primary", .value = "{\"id\":\"u_default\",\"status\":\"before\",\"amount\":1}" }}, .relational_schema_version = 1, .relational_integrity_generation_set = fixture.generation_set });
+    try db.commitTransaction(seed_txn, 46);
+    var seed = (try db.lookup(alloc, "seed-primary", .{ .include_primary_digest = true })).?;
+    defer seed.deinit(alloc);
+    const records = [_]@import("../common/topology_records.zig").TableRecord{fixture.records[0]};
+    var backfill = try integrity.prepareBackfill(alloc, .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.lookup, .open_relational_read = Fixture.openRead, .scan = undefined, .query = undefined } }, &records, "usage_records", &.{.{ .key = "seed-primary", .json = seed.json, .version = seed.version.?, .expected_content_digest = seed.expected_content_digest }}, .unique);
+    defer backfill.deinit();
+    try std.testing.expectEqual(@as(usize, 1), backfill.tables[0].integrity_commands.len);
+    const establish = backfill.tables[0].integrity_commands[0];
+    try std.testing.expect(establish.operation == .establish);
+    fixture.seeded_claim = establish.operation.establish;
+    fixture.seeded_address = establish.address;
+    const claim_txn = try db.beginTransactionWithId(@splat(46), 46);
+    try db.writeTransaction(claim_txn, .{ .integrity_commands = &.{establish}, .relational_schema_version = 1, .relational_integrity_generation_set = fixture.generation_set });
+    try db.commitTransaction(claim_txn, 47);
+    fixture.default_conflict = true;
+    const conflict_sql = for (corpus.value.object.get("entries").?.array.items) |entry| {
+        if (std.mem.eql(u8, entry.object.get("id").?.string, "sql-1495")) break entry.object.get("sql").?.string;
+    } else return error.TestMissingCorpusCase;
+    const conflict_body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = conflict_sql }, .{});
+    defer alloc.free(conflict_body);
+    var conflict_request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+    defer conflict_request.deinit();
+    conflict_request.body = conflict_body;
+    var conflict_ctx = httpx.Context.init(alloc, std.testing.io, &conflict_request);
+    defer conflict_ctx.deinit();
+    var conflict_response = try handler.executeSQL(&conflict_ctx);
+    defer conflict_response.deinit();
+    if (conflict_response.status.code != 200) std.debug.print("sql-1495: {s}\n", .{conflict_response.body orelse ""});
+    try std.testing.expectEqual(@as(u16, 200), conflict_response.status.code);
+    const result = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, conflict_response.body.?, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(i64, 1), result.value.rows_affected);
+    try std.testing.expectEqual(@as(usize, 1), result.value.rows.len);
+    try std.testing.expectEqualStrings("u_default", result.value.rows[0][0].string);
+    try std.testing.expectEqualStrings("reset", result.value.rows[0][1].string);
+    try std.testing.expectEqualStrings("9", result.value.rows[0][2].string);
+    try std.testing.expectEqual(@as(usize, 2), fixture.owner_attempts);
+    try std.testing.expectEqual(@as(usize, 1), fixture.primary_apply_attempts);
+    var committed = (try db.lookup(alloc, "seed-primary", .{})).?;
+    defer committed.deinit(alloc);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, committed.json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("reset", parsed.value.object.get("status").?.string);
+    try std.testing.expectEqual(@as(i64, 9), parsed.value.object.get("amount").?.integer);
+}
+
 test "httpx relational row query mutation endpoints enforce exact versions and schema epochs" {
     const alloc = std.testing.allocator;
     var directory = try @import("../common/test_directory.zig").TestDirectory.init("antfly-httpx-relational-rows");

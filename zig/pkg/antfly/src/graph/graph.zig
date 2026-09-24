@@ -6686,6 +6686,61 @@ pub const GraphIndex = struct {
         };
     }
 
+    /// Empty-generation cutover never imports a predecessor's graph stores.
+    /// Check physical edge records, not counters: a replayed or corrupted
+    /// counter must not make a nonempty hidden owner publishable. Metadata
+    /// (including an empty metric build) is private to this owner incarnation.
+    pub fn requirePristineEmptyGeneration(self: *GraphIndex) !void {
+        for ([_]bool{ false, true }) |incoming| {
+            var txn = if (incoming) try self.beginReadReverseTxn() else try self.beginReadOutgoingTxn();
+            defer txn.abort();
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var first_edge = try cursor.first();
+            if (first_edge) |entry| if (std.mem.startsWith(u8, entry.key, graph_meta_prefix)) {
+                first_edge = try cursor.seekAtOrAfter("meta;");
+            };
+            if (first_edge != null) return error.RestoreStagingTargetNotEmpty;
+        }
+        // Metric control may legitimately exist for an empty asynchronous
+        // build, but no score or rank row may predate this owner reservation.
+        var reverse = try self.beginReadReverseTxn();
+        defer reverse.abort();
+        var cursor = try reverse.openCursor();
+        defer cursor.close();
+        for (self.metric_configs) |metric| for ([_][]const u8{ "score", "rank" }) |lane| {
+            const prefix = try self.graphMetricKeyAlloc(&.{ metric.name, lane });
+            defer self.alloc.free(prefix);
+            if (try cursor.seekAtOrAfter(prefix)) |entry| if (std.mem.startsWith(u8, entry.key, prefix)) return error.RestoreStagingTargetNotEmpty;
+        };
+    }
+
+    test "graph empty-generation proof checks physical edges rather than counters" {
+        const alloc = std.testing.allocator;
+        var graph = try GraphIndex.openWithPrivateStores(alloc, "unused-out", "unused-in", "links", .{ .reverse_backend = .mem });
+        defer graph.close();
+        try graph.requirePristineEmptyGeneration();
+        try graph.batchApply(&.{.{ .source = "a", .target = "b", .edge_type = "link" }}, &.{});
+        // In-memory counters are advisory during repair; the physical proof
+        // must still reject an owner whose artifacts survived a bad replay.
+        graph.edge_count = 0;
+        graph.node_count = 0;
+        try std.testing.expectError(error.RestoreStagingTargetNotEmpty, graph.requirePristineEmptyGeneration());
+
+        var metric_graph = try GraphIndex.openWithPrivateStores(alloc, "unused-metric-out", "unused-metric-in", "metric-links", .{ .reverse_backend = .mem, .metric_configs = &.{.{ .name = "degree", .kind = .degree }} });
+        defer metric_graph.close();
+        try metric_graph.requirePristineEmptyGeneration();
+        const score_key = try metric_graph.graphMetricScoreKeyAlloc("degree", 1, "orphan");
+        defer alloc.free(score_key);
+        {
+            var batch = try metric_graph.beginWriteReverseBatch();
+            errdefer batch.abort();
+            try batch.put(score_key, "stale");
+            try batch.commit();
+        }
+        try std.testing.expectError(error.RestoreStagingTargetNotEmpty, metric_graph.requirePristineEmptyGeneration());
+    }
+
     pub fn graphMetricStorageFootprint(self: *GraphIndex, metric_name: []const u8) !GraphMetricStorageFootprint {
         var txn = try self.beginReadReverseTxn();
         defer txn.abort();

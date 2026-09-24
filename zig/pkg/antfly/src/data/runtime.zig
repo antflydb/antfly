@@ -9974,6 +9974,36 @@ pub const DataServer = struct {
         return .{ .receipt = receipt };
     }
 
+    fn requireInitialPartialSupportReady(
+        scratch: std.mem.Allocator,
+        read_source: antfly.public_api.TableReadSource,
+        group_id: u64,
+        table_name: []const u8,
+        table: @import("../metadata/table_manager.zig").TableRecord,
+        range: @import("../metadata/table_manager.zig").RangeRecord,
+        names: []const []const u8,
+        context: antfly.public_api.operation.RequestContext,
+        consistency: @import("../raft/read_gate.zig").ReadConsistency,
+    ) !void {
+        if (names.len == 0) return;
+        var parent_schema = try @import("../schema/mod.zig").parseValidatedTableSchema(scratch, table.schema_json);
+        defer parent_schema.deinit(scratch);
+        const index_status = @import("../storage/db/relational_index_status_contract.zig");
+        for (names) |name| {
+            try context.ensureActive();
+            const expected_comparison = try @import("../api/relational_index_status.zig").expectedComparison(scratch, parent_schema, name);
+            const request_json = try std.json.Stringify.valueAlloc(scratch, index_status.Request{ .name = name, .schema_version = parent_schema.version }, .{});
+            var response = (read_source.lookupGroupLocal(scratch, group_id, table_name, range.start_key, .{ .relational_index_status_json = request_json, .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io, .cancellation = context.cancellation }, consistency) catch |err| switch (err) {
+                error.IndexNotFound, error.PreparedGenerationChanged, error.RelationalTableRequired, error.TableNotFound => return error.GenerationAdmissionPending,
+                else => return err,
+            }) orelse return error.GenerationAdmissionPending;
+            defer response.deinit(scratch);
+            if (response.json.len > index_status.max_response_bytes) return error.GenerationAdmissionPending;
+            const status = try std.json.parseFromSliceLeaky(index_status.Status, scratch, response.json, .{});
+            try @import("../api/relational_index_status.zig").requireInitialFkSupportReady(status, table.table_id, parent_schema.version, range.start_key, range.end_key orelse "", expected_comparison);
+        }
+    }
+
     fn fkGenerationParentControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: antfly.public_api.relational_fk_generation_publication.Request, context: antfly.public_api.operation.RequestContext) !antfly.public_api.relational_fk_generation_publication.Receipt {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         const publication = @import("../metadata/fk_generation_publication.zig");
@@ -10015,6 +10045,7 @@ pub const DataServer = struct {
             transitions: []const publication.Transition,
             parent_table: @import("../metadata/table_manager.zig").TableRecord,
             parent_range: @import("../metadata/table_manager.zig").RangeRecord,
+            partial_support_indexes: []const []const u8 = &.{},
         };
         const decision = try std.json.parseFromSliceLeaky(ParentDecision, scratch, decision_bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
         if (decision.parent_table.table_id != request.parent_table_id or
@@ -10040,6 +10071,12 @@ pub const DataServer = struct {
         const owner_identity = try std.json.parseFromSliceLeaky(@import("../storage/db/relational_integrity_topology_contract.zig").Identity, scratch, identity_response.json, .{ .allocate = .alloc_always });
         if (!owner_identity.namespace.eql(decision.fence.namespace) or
             !std.mem.eql(u8, &owner_identity.catalog_digest, &decision.fence.catalog_digest)) return error.IntegrityTopologyChanged;
+        // Initial MATCH PARTIAL CREATE may publish an owned parent index
+        // definition before asynchronous backfill completes. The exact
+        // metadata plan derives these names, and the durable owner stage
+        // receipt is withheld until every required index is ready.
+        if (request.action == .stage)
+            try requireInitialPartialSupportReady(scratch, read_source, group_id, table_name, decision.parent_table, decision.parent_range, decision.partial_support_indexes, context, .read_index);
         const expected = switch (request.action) {
             .stage => try admission.stageReceipt(decision.fence, transitions),
             .activate, .acknowledge => try admission.completionReceipt(decision.fence, transitions),
@@ -10255,15 +10292,26 @@ pub const DataServer = struct {
         const schema = @import("../schema/mod.zig");
         try context.ensureActive();
         try request.validate(group_id);
-        const leader_term = blk: {
+        const leader_term: ?u64 = blk: {
             lockAtomic(&self.data_raft_mutex);
             defer self.data_raft_mutex.unlock();
-            const raft = self.data_raft orelse return error.GroupLeaderUnavailable;
+            const raft = self.data_raft orelse break :blk null;
             if (!raft.host.http_host.host.isLocalLeader(group_id)) return error.GroupLeaderUnavailable;
             const status = raft.host.http_host.host.raftStatus(group_id) orelse return error.UnknownGroup;
             break :blk status.hard.current_term;
         };
-        try self.waitDataReadSafeWithCancellation(group_id, "FK-initial-child", 30_000, context.cancellation);
+        if (leader_term != null) {
+            try self.waitDataReadSafeWithCancellation(group_id, "FK-initial-child", 30_000, context.cancellation);
+        } else {
+            if (comptime !control_only_storage_sources) return error.GroupLeaderUnavailable;
+            if (self.api_server_cfg.deployment_mode != .standalone or
+                self.ha_cfg.internal_primary != null or self.ha_cfg.standby_owner != null or
+                self.ha_cfg.standby_replication != null or self.ha_promoted_primary != null)
+                return error.GroupLeaderUnavailable;
+            // The local metadata journal supplies the hidden owner descriptor.
+            // Prime it before preflight; public routing must still not see it.
+            if (!try self.status_source.runRound()) return error.GroupLeaderUnavailable;
+        }
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const scratch = arena.allocator();
@@ -10315,7 +10363,11 @@ pub const DataServer = struct {
             .catalog_digest = catalog_digest,
         };
         const read_source = self.read_source.source();
-        var preflight_response = (try read_source.lookupGroupLocal(scratch, group_id, table_name, "", .{ .relational_topology_json = "{\"mode\":\"initial_child_preflight\"}" }, .read_index)) orelse return error.GenerationAdmissionPending;
+        // A hidden standalone group has no public topology route or data
+        // Raft read index. Its one local compiled owner is authoritative for
+        // this private control read after metadata's exact decision check.
+        const owner_consistency: @import("../raft/read_gate.zig").ReadConsistency = if (leader_term == null) .stale else .read_index;
+        var preflight_response = (try read_source.lookupGroupLocal(scratch, group_id, table_name, "", .{ .relational_topology_json = "{\"mode\":\"initial_child_preflight\"}" }, owner_consistency)) orelse return error.GenerationAdmissionPending;
         defer preflight_response.deinit(scratch);
         const preflight = try std.json.parseFromSliceLeaky(struct {
             namespace: @import("../storage/db/doc_identity_namespace.zig").Namespace,
@@ -10339,23 +10391,32 @@ pub const DataServer = struct {
             .release => stored.phase == .released,
             .cancel => stored.phase == .canceled,
         } else false;
+        if (request.action == .release and !already_completed) {
+            const self_support = try publication.initialPartialSupportNames(scratch, decision.child.schema_json, decision.child);
+            try requireInitialPartialSupportReady(scratch, read_source, group_id, table_name, decision.child, decision.range, self_support, context, owner_consistency);
+        }
         if (!already_completed) {
             switch (request.action) {
                 .provision => {
                     if (prior != null or preflight.has_schema or preflight.has_catalog) return error.InitialChildPublicationChanged;
-                    try self.proposeRaftBatchGroup(alloc, group_id, table_name, .{ .relational_topology = .{ .action = .provision_initial_child, .fence = fence, .initial_child_provision = .{
+                    const batch: antfly.db.types.BatchRequest = .{ .relational_topology = .{ .action = .provision_initial_child, .fence = fence, .initial_child_provision = .{
                         .schema_json = decision.child.schema_json,
+                        .child_table_name = decision.child.name,
                         .plan_id = request.plan_id,
                         .plan_digest = decision.plan_digest,
                         .schema_digest = decision.schema_digest,
                         .public_schema_json_digest = public_digest,
                         .catalog_digest = catalog_digest,
-                    } } }, .{ .discovery = .cached, .required_local_term = leader_term });
+                    } } };
+                    if (leader_term) |term|
+                        try self.proposeRaftBatchGroup(alloc, group_id, table_name, batch, .{ .discovery = .cached, .required_local_term = term })
+                    else
+                        _ = (try self.write_source.source().replicatedBatchGroupLocal(alloc, group_id, table_name, batch, true, .{ .term = 1, .index = 1 })) orelse return error.GroupLeaderUnavailable;
                 },
                 .release, .cancel => {
                     if (request.action == .release and (prior == null or prior.?.phase != .hidden or !preflight.has_schema or !preflight.has_catalog)) return error.InitialChildPublicationChanged;
                     if (request.action == .cancel and prior != null and prior.?.phase != .hidden) return error.InitialChildPublicationChanged;
-                    try self.proposeRaftBatchGroup(alloc, group_id, table_name, .{ .relational_topology = .{
+                    const batch: antfly.db.types.BatchRequest = .{ .relational_topology = .{
                         .action = if (request.action == .release) .release_initial_child else .cancel_initial_child,
                         .fence = fence,
                         .initial_child_control = .{
@@ -10366,11 +10427,15 @@ pub const DataServer = struct {
                             .public_schema_json_digest = public_digest,
                             .catalog_digest = catalog_digest,
                         },
-                    } }, .{ .discovery = .cached, .required_local_term = leader_term });
+                    } };
+                    if (leader_term) |term|
+                        try self.proposeRaftBatchGroup(alloc, group_id, table_name, batch, .{ .discovery = .cached, .required_local_term = term })
+                    else
+                        _ = (try self.write_source.source().replicatedBatchGroupLocal(alloc, group_id, table_name, batch, true, .{ .term = 1, .index = if (request.action == .release) 2 else 3 })) orelse return error.GroupLeaderUnavailable;
                 },
             }
         }
-        var status_response = (try read_source.lookupGroupLocal(scratch, group_id, table_name, "", .{ .relational_topology_json = "{\"mode\":\"initial_child_publication\"}" }, .read_index)) orelse return error.GenerationAdmissionPending;
+        var status_response = (try read_source.lookupGroupLocal(scratch, group_id, table_name, "", .{ .relational_topology_json = "{\"mode\":\"initial_child_publication\"}" }, owner_consistency)) orelse return error.GenerationAdmissionPending;
         defer status_response.deinit(scratch);
         const status = (try std.json.parseFromSliceLeaky(?hidden.Record, scratch, status_response.json, .{ .allocate = .alloc_always })) orelse return error.GenerationAdmissionPending;
         if (!std.mem.eql(u8, &status.plan_id, &request.plan_id) or
@@ -18684,6 +18749,13 @@ pub const DataServer = struct {
             .initial_child_bootstrap_json = encoded,
             .table_storage = owner.table.storage,
         });
+    }
+
+    /// Local metadata owns the durable hidden projection in standalone. It
+    /// validates the entire private cut before handing this exact descriptor
+    /// to the same compiled owner used by clustered provisioning.
+    pub fn primeInitialChildOwnerDescriptor(self: *DataServer, owner: @import("private_provisioning.zig").InitialOwner) !void {
+        return self.primePrivateInitialChildOwner(owner);
     }
 
     pub fn primeRestoreOwnerDescriptor(self: *DataServer, group_id: u64, table_name: []const u8, descriptor: @import("../storage/kernel_owner_descriptor.zig").Descriptor) !void {

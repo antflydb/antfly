@@ -23919,7 +23919,8 @@ pub const DB = struct {
         }
         try self.maybeFinalizePendingRowPolicyPublication();
         if (self.initial_child_hidden.load(.acquire) and
-            opts.relational_topology_json.len == 0 and !opts.relational_integrity_catalog)
+            opts.relational_topology_json.len == 0 and opts.relational_index_status_json.len == 0 and
+            !opts.relational_integrity_catalog)
             return error.InitialChildNotPublished;
         if (self.restore_staging_required.load(.acquire) or opts.restore_staging_scope != null) {
             var staging_read = try self.core.store.beginProbeTxn();
@@ -27631,6 +27632,7 @@ pub const DB = struct {
 
     pub const InitialHiddenChild = struct {
         fence: @import("relational_integrity_topology_contract.zig").Fence,
+        child_table_name: []const u8,
         plan_id: [16]u8,
         plan_digest: [32]u8,
         schema_digest: [32]u8,
@@ -27655,6 +27657,8 @@ pub const DB = struct {
         }
         if (input.fence.role != .child_generation_source or
             !input.fence.namespace.eql(self.core.identity_namespace) or
+            input.child_table_name.len == 0 or input.child_table_name.len > 256 or
+            !std.unicode.utf8ValidateSlice(input.child_table_name) or
             std.mem.allEqual(u8, &input.plan_id, 0) or std.mem.allEqual(u8, &input.plan_digest, 0) or
             (ha_lsn != null and ha_payload != null))
             return error.InvalidInitialChildPublication;
@@ -27710,12 +27714,41 @@ pub const DB = struct {
         const encoded_record = try record.encode();
         var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
         const marker = raftAppliedEntryWrite(input.raft_entry, &marker_buf);
-        var writes: [6]docstore_mod.KVPair = undefined;
+        // Self-referential parents share these hidden child owners. Install
+        // their accepted generation scopes in the same durable transaction as
+        // the initial schema and hidden gate, before any release can route a
+        // row. External-parent scopes use the separate parent protocol.
+        const admission = @import("relational_integrity_generation_admission.zig");
+        const fks = try parsed.relationalForeignKeyDefinitions(self.alloc);
+        defer if (fks.len > 0) self.alloc.free(fks);
+        var self_arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer self_arena.deinit();
+        const self_alloc = self_arena.allocator();
+        var writes = try self.alloc.alloc(docstore_mod.KVPair, 6 + fks.len);
+        defer self.alloc.free(writes);
         var write_count: usize = 4;
         writes[0] = schema_writes[0];
         writes[1] = schema_writes[1];
         writes[2] = .{ .key = hidden.key, .value = &encoded_record };
         writes[3] = marker;
+        for (fks) |fk| {
+            if (!std.mem.eql(u8, fk.parent_table, input.child_table_name)) continue;
+            const binding = aic.catalog.find(.foreign_key, fk.name) orelse return error.IntegrityCatalogChanged;
+            const scope_key = try admission.scopeKey(input.child_table_name, fk.name);
+            const key = try self_alloc.dupe(u8, &scope_key);
+            const scope: admission.Scope = .{
+                .child_table_id = input.fence.namespace.table_id,
+                .child_table_name = input.child_table_name,
+                .constraint_name = fk.name,
+                .revision = 1,
+                .phase = .active,
+                .active_generation = binding.generation,
+                .plan_id = input.plan_id,
+                .decision_digest = input.plan_digest,
+            };
+            writes[write_count] = .{ .key = key, .value = try scope.encode(self_alloc) };
+            write_count += 1;
+        }
         var ha_lsn_buffer: [ha_applied_lsn_value_len]u8 = undefined;
         if (ha_lsn) |lsn| {
             writes[write_count] = haAppliedReplicationLsnWrite(lsn, &ha_lsn_buffer);
@@ -27871,6 +27904,29 @@ pub const DB = struct {
         var schema_digest: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(stored_schema, &schema_digest, .{});
         if (!std.mem.eql(u8, &schema_digest, &current.public_schema_json_digest)) return error.IntegrityCatalogChanged;
+        if (phase == .released) {
+            var parsed_schema = try public_table_schema.parseValidatedTableSchema(self.alloc, stored_schema);
+            defer parsed_schema.deinit(self.alloc);
+            var parsed_catalog = try @import("relational_integrity_catalog.zig").decode(self.alloc, stored_catalog);
+            defer parsed_catalog.deinit();
+            const fks = try parsed_schema.relationalForeignKeyDefinitions(self.alloc);
+            defer if (fks.len > 0) self.alloc.free(fks);
+            for (fks) |fk| {
+                // Physical table identity is hash-derived by metadata. Match
+                // the hidden child without relying on a public route, then
+                // require its own accepted parent generation to be durable.
+                if (!std.mem.startsWith(u8, fk.parent_table, "table:")) continue;
+                const physical_id = std.hash.Wyhash.hash(0x54424c45, fk.parent_table);
+                if ((if (physical_id == 0) @as(u64, 1) else physical_id) != current.namespace.table_id) continue;
+                const scope = (try @import("relational_integrity_generation_admission.zig").load(&txn, fk.parent_table, fk.name)) orelse return error.InitialChildPublicationChanged;
+                const binding = parsed_catalog.find(.foreign_key, fk.name) orelse return error.IntegrityCatalogChanged;
+                if (scope.phase != .active or scope.active_generation == null or
+                    !std.mem.eql(u8, &scope.active_generation.?, &binding.generation) or
+                    !std.mem.eql(u8, &scope.plan_id, &current.plan_id) or
+                    !std.mem.eql(u8, &scope.decision_digest, &current.plan_digest))
+                    return error.InitialChildPublicationChanged;
+            }
+        }
         const table_raw = txn.get(@import("table_catalog.zig").key) catch return error.InitialChildPublicationChanged;
         if ((try @import("table_catalog.zig").Catalog.decode(table_raw)).row_count != 0) return error.InitialChildPublicationChanged;
         _ = try hidden.stagePhase(&txn, current, phase, entry.term, entry.index);
@@ -29757,6 +29813,7 @@ pub const DB = struct {
             defer if (payload) |bytes| self.alloc.free(bytes);
             try self.provisionInitialHiddenChild(provision.schema_json, .{
                 .fence = command.fence,
+                .child_table_name = provision.child_table_name,
                 .plan_id = provision.plan_id,
                 .plan_digest = provision.plan_digest,
                 .schema_digest = provision.schema_digest,
@@ -39402,6 +39459,30 @@ pub const DB = struct {
         }
         if (self.core.table_catalog.row_count != 0) return error.RestoreStagingTargetNotEmpty;
         if (scope.empty_generation) {
+            if ((scope.graph_retirement_digest != null) != self.core.index_manager.hasGraphIndexes()) return error.RestoreStagingScopeChanged;
+            if (scope.graph_retirement_digest != null) for (self.core.index_manager.graph_indexes.items) |*entry| {
+                try entry.index.requirePristineEmptyGeneration();
+            };
+            if (scope.graph_retirement_digest != null) {
+                // Source-owned graph edge/state/contender rows live in the
+                // primary store, outside the graph index's private stores.
+                // An empty row count cannot prove these orphan artifacts
+                // absent. The new owner normally has no user-key band, so
+                // this is one bounded early-exit cursor walk at admission.
+                var graph_cursor = try txn.openPhysicalCursorAdapter();
+                defer graph_cursor.close();
+                var entry = try graph_cursor.seekAtOrAfter(&.{internal_keys.replay_namespace});
+                while (entry) |record| {
+                    if (record.key.len == 0 or record.key[0] != internal_keys.replay_namespace or
+                        (record.key.len > 1 and record.key[1] == 0xff)) break;
+                    if (internal_keys.isGraphEdgeArtifactKey(record.key) or
+                        internal_keys.isGraphAssetStateKey(record.key) or
+                        internal_keys.isGraphEdgeContenderKey(record.key)) return error.RestoreStagingTargetNotEmpty;
+                    entry = try graph_cursor.next();
+                }
+                const global_prefix = [_]u8{ internal_keys.replay_namespace, 0xff, internal_keys.graph_global_edge_contender_kind };
+                if (try graph_cursor.seekAtOrAfter(&global_prefix)) |record| if (std.mem.startsWith(u8, record.key, &global_prefix)) return error.RestoreStagingTargetNotEmpty;
+            }
             // These global secondary records lie outside document identity's
             // user-key proof. A fresh generation must not inherit claims or
             // ordered-index entries even if a corrupt counter says zero.

@@ -32,10 +32,8 @@ pub const Digest = [32]u8;
 pub const max_encoded_bytes = 32 * 1024 * 1024;
 pub const max_active_attempts = 8;
 
-/// Graph indexes own asynchronous edge and metric artifacts outside the row
-/// generation. A fresh empty owner cannot claim their retirement until the
-/// graph publication protocol participates in the same cutover barrier.
-/// Keep this check at the durable-plan boundary as well as the SQL ingress.
+/// Graph declarations must be recognized at the durable-plan boundary, not
+/// inferred from the first index or from the old owner's mutable runtime.
 pub fn hasGraphIndex(alloc: std.mem.Allocator, indexes_json: []const u8) !bool {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
     defer parsed.deinit();
@@ -47,6 +45,19 @@ pub fn hasGraphIndex(alloc: std.mem.Allocator, indexes_json: []const u8) !bool {
         if (std.mem.eql(u8, kind.string, "graph")) return true;
     }
     return false;
+}
+
+pub fn graphRetirementDigest(source_table_id: u64, target_table_id: u64, indexes_json: []const u8) Digest {
+    var hash = std.crypto.hash.Blake3.init(.{});
+    hash.update("antfly-empty-generation-graph-retirement-v1");
+    var ids: [16]u8 = undefined;
+    std.mem.writeInt(u64, ids[0..8], source_table_id, .little);
+    std.mem.writeInt(u64, ids[8..16], target_table_id, .little);
+    hash.update(&ids);
+    hash.update(indexes_json);
+    var digest: Digest = undefined;
+    hash.final(&digest);
+    return digest;
 }
 pub const ProvisioningProjection = @import("restore_provisioning_contract.zig").ProvisioningProjection;
 pub const ProvisioningRequest = struct { node_id: u64 };
@@ -148,10 +159,16 @@ pub const State = enum { importing, validating, cutover, activating, published, 
 pub const SourceArtifact = @import("restore_provisioning_contract.zig").SourceArtifact;
 pub const Target = struct {
     pub fn nativeJsonSkipField(self: @This(), comptime name: []const u8) bool {
-        return std.mem.eql(u8, name, "empty_generation") and !self.empty_generation;
+        return (std.mem.eql(u8, name, "empty_generation") and !self.empty_generation) or
+            (std.mem.eql(u8, name, "graph_retirement_digest") and self.graph_retirement_digest == null);
     }
     source_table_id: u64,
     empty_generation: bool = false,
+    /// Binds graph artifact retirement to the exact old/new physical table
+    /// incarnations and unchanged index declarations. Old edge/metric stores
+    /// remain with the fenced old groups; fresh groups must prove pristine
+    /// graph stores before acknowledging the hidden owner reservation.
+    graph_retirement_digest: ?Digest = null,
     table: records.TableRecord,
     /// Logical publication is part of the same transaction as the new owner
     /// generation. The namespace ID is pinned, not reinterpreted by name.
@@ -322,7 +339,9 @@ pub const Plan = struct {
                 const old = target.replace orelse return error.InvalidRestoreStaging;
                 if (self.preparing_sources or target.rewrite != null or target.rewrite_sources.len != 0 or target.source_artifacts.len != 0 or old.table.table_id != target.source_table_id or old.fences.len != old.ranges.len or old.ranges.len != target.ranges.len) return error.InvalidRestoreStaging;
                 if (!std.mem.eql(u8, old.table.schema_json, table.schema_json) or !std.mem.eql(u8, old.table.read_schema_json, table.read_schema_json) or !std.mem.eql(u8, old.table.indexes_json, table.indexes_json)) return error.InvalidRestoreStaging;
-                if (try hasGraphIndex(alloc, table.indexes_json)) return error.InvalidRestoreStaging;
+                const graph_index = try hasGraphIndex(alloc, table.indexes_json);
+                if (graph_index != (target.graph_retirement_digest != null)) return error.InvalidRestoreStaging;
+                if (target.graph_retirement_digest) |retirement_digest| if (!std.mem.eql(u8, &retirement_digest, &graphRetirementDigest(old.table.table_id, table.table_id, table.indexes_json))) return error.InvalidRestoreStaging;
                 for (old.ranges, target.ranges) |source, destination| {
                     if (!std.mem.eql(u8, source.start_key, destination.start_key) or !std.mem.eql(u8, source.end_key orelse "", destination.end_key orelse "")) return error.InvalidRestoreStaging;
                     const fence = for (old.fences) |item| {
@@ -331,6 +350,7 @@ pub const Plan = struct {
                     if (fence.role != .rewrite_source or fence.peer_group_id != destination.group_id or fence.transition_id != std.mem.readInt(u64, self.id[0..8], .little) or fence.attempt != std.mem.readInt(u64, self.id[8..16], .little)) return error.InvalidRestoreStaging;
                 }
             }
+            if (!target.empty_generation and target.graph_retirement_digest != null) return error.InvalidRestoreStaging;
             if (target.catalog_binding) |binding| {
                 if (binding.kind != .table or binding.id != table.table_id or binding.parent_id == 0 or
                     !std.mem.eql(u8, binding.storage_name, table.name)) return error.InvalidRestoreStaging;
@@ -539,6 +559,7 @@ pub fn ownerScope(alloc: std.mem.Allocator, plan: Plan, plan_digest: Digest, tar
             .target_namespace = .{ .table_id = target.table.table_id, .shard_id = tables.rangeDocIdentityShardId(range), .range_id = tables.rangeDocIdentityRangeId(range) },
             .target_schema_digest = @import("../storage/db/restore_staging_contract.zig").digest(encoded),
             .empty_generation = true,
+            .graph_retirement_digest = target.graph_retirement_digest,
         };
     }
     const artifact = for (target.source_artifacts) |source| {
@@ -834,6 +855,12 @@ test "relational integrity restore staging empty generation binds old fences wit
     targets[0].table.schema_json = "{}";
     targets[0].table.indexes_json = "{\"graph_idx\":{\"type\":\"graph\"}}";
     targets[0].replace.?.table.indexes_json = targets[0].table.indexes_json;
+    try std.testing.expectError(error.InvalidRestoreStaging, plan.validate(alloc));
+    targets[0].graph_retirement_digest = graphRetirementDigest(9, 10, targets[0].table.indexes_json);
+    try plan.validate(alloc);
+    const graph_scope = try ownerScope(alloc, plan, try plan.digest(alloc), targets[0], targets[0].ranges[0]);
+    try std.testing.expectEqualDeep(targets[0].graph_retirement_digest, graph_scope.graph_retirement_digest);
+    targets[0].graph_retirement_digest = graphRetirementDigest(9, 11, targets[0].table.indexes_json);
     try std.testing.expectError(error.InvalidRestoreStaging, plan.validate(alloc));
 }
 

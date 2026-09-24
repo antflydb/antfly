@@ -1928,6 +1928,20 @@ const LocalStandaloneMetadata = struct {
             server.ha_cfg.standby_replication == null and server.ha_promoted_primary == null;
     }
 
+    /// Initial FK creation is a metadata decision followed by durable data
+    /// owner receipts. The local lifecycle store provides the same decision
+    /// journal as clustered metadata. The native owner supports the hidden
+    /// self-referential case; external parent actions and HA need their own
+    /// receipt/outbox protocols before admission.
+    fn localFkPublicationSupported(self: *const LocalStandaloneMetadata) bool {
+        const server = self.data_server orelse return false;
+        return self.lifecycle_store != null and self.ha_catalog_server == null and
+            control_only_storage_sources and server.data_raft == null and
+            server.api_server_cfg.deployment_mode == .standalone and
+            server.ha_cfg.internal_primary == null and server.ha_cfg.standby_owner == null and
+            server.ha_cfg.standby_replication == null and server.ha_promoted_primary == null;
+    }
+
     const CatalogReader = struct {
         owner: *LocalStandaloneMetadata,
         alloc: std.mem.Allocator,
@@ -2129,7 +2143,8 @@ const LocalStandaloneMetadata = struct {
         const result = try systemCatalogAdmitted(ptr, alloc, admitted, call);
         errdefer alloc.free(result);
         if (call != .mutate and call != .setting_mutate and call != .policy_definition_mutate and
-            call != .policy_publication_begin and call != .policy_publication_mutate) try context.ensureActive();
+            call != .policy_publication_begin and call != .policy_publication_mutate and
+            call != .fk_initial_create_begin and call != .fk_initial_create_mutate) try context.ensureActive();
         return result;
     }
 
@@ -2137,15 +2152,18 @@ const LocalStandaloneMetadata = struct {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         try context.ensureActive();
         if (call == .mutate or call == .setting_mutate or call == .policy_definition_mutate or
-            call == .policy_publication_begin or call == .policy_publication_mutate) if (self.ha_catalog_server) |server|
+            call == .policy_publication_begin or call == .policy_publication_mutate or
+            call == .fk_initial_create_begin or call == .fk_initial_create_mutate) if (self.ha_catalog_server) |server|
         {
             try server.ha_public_gate_state.checkWrite(server.ha_public_gate_state.currentGeneration());
         };
         var lease = if (call == .mutate or call == .setting_mutate or call == .policy_definition_mutate or
-            call == .policy_publication_begin or call == .policy_publication_mutate) (if (self.ha_catalog_server) |server| server.ha_mutation_barrier.acquireShared() else null) else null;
+            call == .policy_publication_begin or call == .policy_publication_mutate or
+            call == .fk_initial_create_begin or call == .fk_initial_create_mutate) (if (self.ha_catalog_server) |server| server.ha_mutation_barrier.acquireShared() else null) else null;
         defer if (lease) |*value| value.release();
         if (call == .mutate or call == .setting_mutate or call == .policy_definition_mutate or
-            call == .policy_publication_begin or call == .policy_publication_mutate) if (self.ha_catalog_server) |server|
+            call == .policy_publication_begin or call == .policy_publication_mutate or
+            call == .fk_initial_create_begin or call == .fk_initial_create_mutate) if (self.ha_catalog_server) |server|
         {
             try server.ha_public_gate_state.checkWrite(server.ha_public_gate_state.currentGeneration());
         };
@@ -2173,14 +2191,65 @@ const LocalStandaloneMetadata = struct {
             .fk_generation_publication_work,
             .fk_generation_publication_decision,
             .fk_generation_publication_source_decision,
-            .fk_initial_create_prepare,
-            .fk_initial_child_decision,
-            .fk_initial_create_begin,
-            .fk_initial_create_mutate,
-            .fk_initial_create_status,
-            .fk_initial_create_work,
-            .fk_initial_parent_decision,
             => return error.UnsupportedOperation,
+            .fk_initial_create_prepare => |request| {
+                if (!context.fk_generation_publication_authority or !self.localFkPublicationSupported()) return error.UnsupportedOperation;
+                const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+                return store.fkInitialCreatePrepareJson(alloc, group_ids.main_metadata_group_id, request);
+            },
+            .fk_initial_child_decision => |request| {
+                if (!context.fk_generation_publication_authority or !self.localFkPublicationSupported()) return error.UnsupportedOperation;
+                const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+                return store.fkInitialChildDecisionJson(alloc, group_ids.main_metadata_group_id, request);
+            },
+            .fk_initial_parent_decision => |request| {
+                if (!context.fk_generation_publication_authority or !self.localFkPublicationSupported()) return error.UnsupportedOperation;
+                const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+                return store.fkInitialParentDecisionJson(alloc, group_ids.main_metadata_group_id, request);
+            },
+            .fk_initial_create_status => |child_table_id| {
+                if (!context.fk_generation_publication_authority or !self.localFkPublicationSupported()) return error.UnsupportedOperation;
+                const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+                return store.fkInitialCreateStatusJson(alloc, group_ids.main_metadata_group_id, child_table_id);
+            },
+            .fk_initial_create_work => |after_child_table_id| {
+                if (!context.fk_generation_publication_authority or !self.localFkPublicationSupported()) return error.UnsupportedOperation;
+                const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+                return store.fkInitialCreateWorkJson(alloc, group_ids.main_metadata_group_id, after_child_table_id);
+            },
+            .fk_initial_create_begin, .fk_initial_create_mutate => {
+                if (!context.setting_admin or !context.fk_generation_publication_authority) return error.Forbidden;
+                if (!self.localFkPublicationSupported()) return error.UnsupportedOperation;
+                const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+                const publication = @import("../metadata/fk_generation_publication.zig");
+                const command: publication.InitialCommand = switch (call) {
+                    .fk_initial_create_begin => |plan| blk: {
+                        if (plan.parents.len != 0) return error.UnsupportedOperation;
+                        break :blk .{
+                            .plan_id = plan.id,
+                            .child_table_id = plan.child.table_id,
+                            .expected_revision = 0,
+                            .action = .begin,
+                            .plan = plan,
+                        };
+                    },
+                    .fk_initial_create_mutate => |value| value,
+                    else => unreachable,
+                };
+                try command.validateShape();
+                const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
+                defer alloc.free(bytes);
+                if (bytes.len > publication.max_bytes) return error.CatalogCommandTooLarge;
+                try context.ensureActive();
+                try store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .apply_fk_initial_create = bytes });
+                self.reloadLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
+                const observed = store.fkInitialCreateStatusJson(alloc, group_ids.main_metadata_group_id, command.child_table_id) catch return error.MetadataMutationOutcomeUnknown;
+                errdefer alloc.free(observed);
+                const parsed = std.json.parseFromSliceLeaky(publication.InitialPublication, alloc, observed, .{ .allocate = .alloc_always }) catch return error.MetadataMutationOutcomeUnknown;
+                if (!std.mem.eql(u8, &parsed.plan.id, &command.plan_id) or parsed.revision != command.expected_revision + 1)
+                    return error.MetadataMutationOutcomeUnknown;
+                return observed;
+            },
             // Native standalone metadata uses the same durable policy catalog
             // and exact immutable phase snapshots as clustered metadata.
             // The no-HA local owner commits an exact install receipt before a
@@ -2948,13 +3017,32 @@ const LocalStandaloneMetadata = struct {
         const store = self.lifecycle_store orelse return;
         // Borrow a coherent private projection only for provisioning. It never
         // enters the public table manager or named-query routing cache.
-        lockAtomic(&self.mutex);
-        var projection = store.captureProvisioningCatalog(self.alloc, group_ids.main_metadata_group_id) catch |err| {
-            self.mutex.unlock();
-            return err;
+        var projection = blk: {
+            lockAtomic(&self.mutex);
+            defer self.mutex.unlock();
+            var cut = try store.captureProvisioningCatalog(self.alloc, group_ids.main_metadata_group_id);
+            errdefer cut.deinit(self.alloc);
+            // Verify the private/public separation against this same local
+            // catalog cut with indexed lookups. Never clone and scan every
+            // public table on the 100 ms provisioning round.
+            if (self.localFkPublicationSupported()) {
+                for (cut.initial_fk_owners) |descriptor| {
+                    if (self.manager.tables.contains(descriptor.child_table_id) or
+                        self.manager.ranges.contains(descriptor.child_group_id))
+                        return error.InvalidGenerationPublication;
+                }
+            }
+            break :blk cut;
         };
-        self.mutex.unlock();
         defer projection.deinit(self.alloc);
+        if (projection.initial_fk_owners.len != 0 and self.localFkPublicationSupported()) {
+            // Metadata's private descriptor is the only source of hidden
+            // identity. Validate against one coherent public cut before any
+            // owner is opened; canceled/published descriptors vanish from it.
+            const owners = try @import("../data/private_provisioning.zig").validateInitial(self.alloc, &.{}, &.{}, projection);
+            defer self.alloc.free(owners);
+            for (owners) |owner| try server.primeInitialChildOwnerDescriptor(owner);
+        }
         for (projection.jobs_json) |bytes| {
             var job = try std.json.parseFromSlice(Staging.Job, self.alloc, bytes, .{});
             defer job.deinit();
@@ -4355,6 +4443,17 @@ pub fn runFromIterator(
     // Reject persisted experimental tables before HA can snapshot or mirror
     // primary roots whose references need a separate source-store lifecycle.
     if (ha_role_requested) {
+        if (local_metadata.lifecycle_store) |store| {
+            const pending_json = try store.fkInitialCreateWorkJson(alloc, group_ids.main_metadata_group_id, 0);
+            defer alloc.free(pending_json);
+            var pending = try std.json.parseFromSlice(?@import("../metadata/fk_generation_publication.zig").InitialWork, alloc, pending_json, .{});
+            defer pending.deinit();
+            if (pending.value) |work| {
+                const id = std.fmt.bytesToHex(work.plan_id, .lower);
+                std.log.err("hot-standby startup refused: initial foreign-key table publication {s} is still pending for {s}; restart without hot standby and wait for the table to publish or cancel the publication first", .{ id[0..], work.child_table_name });
+                return error.PendingInitialFkPublication;
+            }
+        }
         var tables = local_metadata.manager.tables.valueIterator();
         while (tables.next()) |table| {
             if (table.storage.dense_embeddings == .vector_store)

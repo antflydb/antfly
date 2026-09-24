@@ -4664,6 +4664,7 @@ pub const ApiHttpServer = struct {
             else => std.log.warn("row policy publication deferred err={s}", .{@errorName(err)}),
         };
         self.advanceFkGenerationPublicationOnce() catch |err| switch (err) {
+            error.UnsupportedOperation,
             error.GenerationPublicationChanged,
             error.InvalidGenerationPublication,
             error.MetadataMutationOutcomeUnknown,
@@ -4675,6 +4676,10 @@ pub const ApiHttpServer = struct {
             else => std.log.warn("FK generation publication deferred err={s}", .{@errorName(err)}),
         };
         self.advanceFkInitialCreateOnce() catch |err| switch (err) {
+            error.UnsupportedOperation,
+            error.GenerationAdmissionPending,
+            error.TopologyChanged,
+            error.InitialChildPublicationChanged,
             error.GenerationPublicationChanged,
             error.InvalidGenerationPublication,
             error.MetadataMutationOutcomeUnknown,
@@ -15438,14 +15443,11 @@ pub const ApiHttpServer = struct {
             const logical = try target.resourceNameAlloc(a);
             if (!try tablePermissionCurrentlyAllowed(identity, logical, .admin)) return error.Forbidden;
             if (std.mem.eql(u8, target.table, scope.table)) {
-                // On CREATE, `child` is only a provisional storage name. The
-                // initial-publication protocol assigns a different hidden
-                // identity in metadata, so binding to this name would turn a
-                // self-reference into a misleading missing-parent error (or
-                // worse, accidentally resolve an unrelated physical table).
-                // Existing-table schema changes retain their own admission
-                // path and are deliberately unaffected.
-                if (before.len == 0) return error.ForeignKeyInitialSelfReferenceUnsupported;
+                // Initial CREATE has no physical identity until metadata
+                // reserves the hidden owner. Preserve the logical self name
+                // only in the unpublished candidate; the initial-plan
+                // builder replaces it with that exact reserved identity.
+                if (before.len == 0) continue;
                 parent.* = .{ .string = child };
                 continue;
             }
@@ -17254,8 +17256,13 @@ pub const ApiHttpServer = struct {
 
     pub fn executeFkInitialChild(self: *ApiHttpServer, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: @import("relational_fk_generation_publication.zig").InitialChildRequest, context: api_operation.RequestContext) !@import("relational_fk_generation_publication.zig").InitialChildReceipt {
         try context.ensureActive();
-        if (self.cfg.deployment_mode == .standalone) return error.UnsupportedOperation;
         try request.validate(group_id);
+        // A standalone initial child is not publicly routable until the
+        // release receipt and metadata CAS complete. Route only to this
+        // process's private owner port; it re-reads the durable decision and
+        // exact hidden descriptor before applying a control entry.
+        if (self.cfg.deployment_mode == .standalone)
+            return (self.cfg.fk_initial_child orelse return error.GenerationAdmissionPending).execute(alloc, table_name, group_id, request, context);
         var fallback = table_router.CatalogBackedGroupRouter.init(self.catalogSource(), self.localSessionNodeId());
         const router = self.cfg.session_router orelse fallback.router();
         var route = (try table_router.resolveGroupRoute(alloc, self.catalogSource(), router, group_id, .prefer_leader)) orelse return error.GenerationAdmissionPending;
@@ -53356,7 +53363,10 @@ test "system catalog binds foreign keys once and authorizes cascades by current 
     const scope: system_catalog.Target = .{ .database = "analytics", .table = "children" };
     const schema = "{\"foreign_keys\":[{\"name\":\"fk\",\"parent_table\":\"parents\"}]}";
     const self_schema = "{\"foreign_keys\":[{\"name\":\"fk_self\",\"parent_table\":\"children\"}]}";
-    try std.testing.expectError(error.ForeignKeyInitialSelfReferenceUnsupported, server.bindForeignKeySchema(alloc, scope, "table:provisional", self_schema, "", null, .{}));
+    const unbound_self = try server.bindForeignKeySchema(alloc, scope, "table:provisional", self_schema, "", null, .{});
+    defer alloc.free(unbound_self);
+    try std.testing.expect(std.mem.indexOf(u8, unbound_self, "children") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unbound_self, "table:provisional") == null);
     const self_updated = try server.bindForeignKeySchema(alloc, scope, "table:child", self_schema, "{\"version\":1}", null, .{});
     defer alloc.free(self_updated);
     try std.testing.expect(std.mem.indexOf(u8, self_updated, "table:child") != null);

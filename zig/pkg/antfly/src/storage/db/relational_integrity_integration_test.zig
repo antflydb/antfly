@@ -17,6 +17,68 @@ const integrity = @import("relational_integrity.zig");
 const catalog = @import("relational_integrity_catalog.zig");
 const tuples = @import("relational_index_keys.zig");
 
+test "initial partial FK parent support remains unready until every owner index survives restart" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/initial-partial-parent", .{tmp.sub_path});
+    defer alloc.free(path);
+    const namespace: @import("doc_identity.zig").Namespace = .{ .table_id = 201, .shard_id = 401, .range_id = 401 };
+    const options: db_mod.OpenOptions = .{ .identity_namespace = namespace, .start_optional_runtimes = false, .start_index_workers = false };
+    const original =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["a","b"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"a":{"type":"integer","nullable":true},"b":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
+    ;
+    const support = @import("../../schema/relational_witness_indexes.zig");
+    const patched = (try support.ensureCoverage(alloc, original, &.{ "a", "b" })).?;
+    defer alloc.free(patched);
+    const next = try std.mem.replaceOwned(u8, alloc, patched, "\"version\":1", "\"version\":2");
+    defer alloc.free(next);
+    var parsed = try @import("../../schema/mod.zig").parseValidatedTableSchema(alloc, next);
+    defer parsed.deinit(alloc);
+    const readiness = @import("../../api/relational_index_status.zig");
+    const status_contract = @import("relational_index_status_contract.zig");
+    const a_name = support.supportName("a");
+    const b_name = support.supportName("b");
+    const names = [_][]const u8{ &a_name, &b_name };
+    {
+        var db = try db_mod.DB.open(alloc, path, options);
+        defer db.close();
+        try db.setSchemaJson(alloc, original);
+        try db.setSchemaJson(alloc, next);
+        for (names) |name| {
+            const request = try std.json.Stringify.valueAlloc(alloc, status_contract.Request{ .name = name, .schema_version = 2 }, .{});
+            defer alloc.free(request);
+            var response = (try db.lookup(alloc, "", .{ .relational_index_status_json = request })).?;
+            defer response.deinit(alloc);
+            var status = try std.json.parseFromSlice(status_contract.Status, alloc, response.json, .{});
+            defer status.deinit();
+            const comparison = try readiness.expectedComparison(alloc, parsed, name);
+            try std.testing.expectError(error.GenerationAdmissionPending, readiness.requireInitialFkSupportReady(status.value, 201, 2, "", "", comparison));
+        }
+        for (names) |name| {
+            for (0..2048) |_| {
+                if ((try db.relationalIndexBuildStatus(name)).state == .ready) break;
+                try db.buildRelationalIndexStep(name, .{});
+            }
+            try std.testing.expectEqual(@import("relational_index_jobs.zig").State.ready, (try db.relationalIndexBuildStatus(name)).state);
+        }
+    }
+    {
+        var db = try db_mod.DB.open(alloc, path, options);
+        defer db.close();
+        for (names) |name| {
+            const request = try std.json.Stringify.valueAlloc(alloc, status_contract.Request{ .name = name, .schema_version = 2 }, .{});
+            defer alloc.free(request);
+            var response = (try db.lookup(alloc, "", .{ .relational_index_status_json = request })).?;
+            defer response.deinit(alloc);
+            var status = try std.json.parseFromSlice(status_contract.Status, alloc, response.json, .{});
+            defer status.deinit();
+            const comparison = try readiness.expectedComparison(alloc, parsed, name);
+            try readiness.requireInitialFkSupportReady(status.value, 201, 2, "", "", comparison);
+        }
+    }
+}
+
 test "child FK generation schema install commits catalog and source release with Raft marker" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -183,10 +245,10 @@ test "initial FK child owner stays hidden across restart until replicated releas
     defer alloc.free(path);
     const standby_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/fk-initial-child-standby", .{tmp.sub_path});
     defer alloc.free(standby_path);
-    const namespace: @import("doc_identity.zig").Namespace = .{ .table_id = 51, .shard_id = 41, .range_id = 41 };
+    const namespace: @import("doc_identity.zig").Namespace = .{ .table_id = std.hash.Wyhash.hash(0x54424c45, "table:11"), .shard_id = 41, .range_id = 41 };
     const options: db_mod.OpenOptions = .{ .identity_namespace = namespace, .start_optional_runtimes = false, .start_index_workers = false };
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"parent_fk","child_columns":["parent_id"],"parent_table":"parents","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent_id":{"type":"integer"}},"additionalProperties":false}}}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"parent_fk","child_columns":["parent_id"],"parent_table":"parents","parent_columns":["id"]},{"name":"self_fk","child_columns":["parent_id"],"parent_table":"table:11","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent_id":{"type":"integer"}},"additionalProperties":false}}}}
     ;
     const schema = @import("../../schema/mod.zig");
     var parsed = try schema.parseValidatedTableSchema(alloc, schema_json);
@@ -211,6 +273,7 @@ test "initial FK child owner stays hidden across restart until replicated releas
         const fence: topology.Fence = .{ .role = .child_generation_source, .transition_id = 11, .attempt = 1, .admission_epoch = 1, .peer_group_id = 41, .owner_group_id = 41, .namespace = namespace, .catalog_digest = catalog_digest };
         const provision: topology.Command = .{ .action = .provision_initial_child, .fence = fence, .initial_child_provision = .{
             .schema_json = schema_json,
+            .child_table_name = "table:11",
             .plan_id = plan_id,
             .plan_digest = plan_digest,
             .schema_digest = schema_digest,
@@ -221,9 +284,20 @@ test "initial FK child owner stays hidden across restart until replicated releas
         try db.batchRaftReplicatedApply(.{ .relational_topology = provision }, .{ .term = 2, .index = 1 });
         try std.testing.expectError(error.InitialChildNotPublished, db.batch(.{ .writes = &.{.{ .key = "leak", .value = "{}" }} }));
         try std.testing.expectError(error.InitialChildNotPublished, db.lookup(alloc, "leak", .{}));
+        // The release controller must be able to probe self-parent witness
+        // readiness while ordinary point reads remain hidden. This fixture
+        // has no secondary index, so it reaches IndexNotFound past the gate.
+        try std.testing.expectError(error.IndexNotFound, db.lookup(alloc, "", .{ .relational_index_status_json = "{\"name\":\"self_witness\",\"schema_version\":1}" }));
         const stored = try db.core.store.get(alloc, hidden.key);
         defer alloc.free(stored);
         try std.testing.expectEqual(hidden.Phase.hidden, (try hidden.Record.decode(stored)).phase);
+        var owner_read = try db.core.store.beginReadTxn();
+        defer owner_read.abort();
+        const self_scope = (try @import("relational_integrity_generation_admission.zig").load(&owner_read, "table:11", "self_fk")).?;
+        try std.testing.expectEqual(@import("relational_integrity_generation_admission.zig").Phase.active, self_scope.phase);
+        try std.testing.expectEqual(namespace.table_id, self_scope.child_table_id);
+        try std.testing.expectEqualSlices(u8, &plan_id, &self_scope.plan_id);
+        try std.testing.expectEqualSlices(u8, &plan_digest, &self_scope.decision_digest);
         const bootstrap: hidden.Bootstrap = .{
             .plan_id = plan_id,
             .plan_digest = plan_digest,
@@ -255,11 +329,18 @@ test "initial FK child owner stays hidden across restart until replicated releas
         const replayed = try standby.core.store.get(alloc, hidden.key);
         defer alloc.free(replayed);
         try std.testing.expectEqualSlices(u8, stored, replayed);
+        var standby_read = try standby.core.store.beginReadTxn();
+        defer standby_read.abort();
+        const replayed_scope = (try @import("relational_integrity_generation_admission.zig").load(&standby_read, "table:11", "self_fk")).?;
+        try std.testing.expectEqualSlices(u8, &self_scope.active_generation.?, &replayed_scope.active_generation.?);
     }
     {
         var db = try db_mod.DB.open(alloc, path, options);
         defer db.close();
         try std.testing.expectError(error.InitialChildNotPublished, db.batch(.{ .writes = &.{.{ .key = "leak", .value = "{}" }} }));
+        var restart_read = try db.core.store.beginReadTxn();
+        defer restart_read.abort();
+        try std.testing.expect((try @import("relational_integrity_generation_admission.zig").load(&restart_read, "table:11", "self_fk")) != null);
         const fence: topology.Fence = .{ .role = .child_generation_source, .transition_id = 11, .attempt = 1, .admission_epoch = 1, .peer_group_id = 41, .owner_group_id = 41, .namespace = namespace, .catalog_digest = catalog_digest };
         const release: topology.Command = .{ .action = .release_initial_child, .fence = fence, .initial_child_control = .{
             .plan_id = plan_id,
@@ -272,6 +353,16 @@ test "initial FK child owner stays hidden across restart until replicated releas
         var wrong = release;
         wrong.initial_child_control.?.plan_digest = @splat(9);
         try std.testing.expectError(error.InitialChildPublicationChanged, db.batchRaftReplicatedApply(.{ .relational_topology = wrong }, .{ .term = 2, .index = 2 }));
+        const self_key = try @import("relational_integrity_generation_admission.zig").scopeKey("table:11", "self_fk");
+        const self_scope_bytes = try db.core.store.get(alloc, &self_key);
+        defer alloc.free(self_scope_bytes);
+        var corrupted = try db.core.store.beginWriteTxn();
+        try corrupted.delete(&self_key);
+        try corrupted.commit();
+        try std.testing.expectError(error.InitialChildPublicationChanged, db.batchRaftReplicatedApply(.{ .relational_topology = release }, .{ .term = 2, .index = 2 }));
+        var repaired = try db.core.store.beginWriteTxn();
+        try repaired.put(&self_key, self_scope_bytes);
+        try repaired.commit();
         try db.batchRaftReplicatedApply(.{ .relational_topology = release }, .{ .term = 2, .index = 2 });
         try db.batchRaftReplicatedApply(.{ .relational_topology = release }, .{ .term = 2, .index = 2 });
         const stored = try db.core.store.get(alloc, hidden.key);

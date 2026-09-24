@@ -225,6 +225,23 @@ test "SQL TRUNCATE original multi-table case admits one atomic empty cohort" {
     }
 }
 
+test "SQL TRUNCATE graph index admission binds retirement to the exact incarnations" {
+    var fixture: Fixture = .{};
+    defer fixture.deinit();
+    fixture.tables[0].indexes_json = "{\"links\":{\"type\":\"graph\"}}";
+    var server = try fixture.server();
+    defer server.deinit();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const outcome = try truncate.execute(&server, null, .{}, "default", "public", arena.allocator(), ddl);
+    try std.testing.expectEqual(.pending, outcome.receipt.?.state);
+    var plan = try std.json.parseFromSlice(stages.Plan, alloc, fixture.plan.?, .{});
+    defer plan.deinit();
+    const target = plan.value.targets[0];
+    try std.testing.expectEqualDeep(stages.graphRetirementDigest(100, target.table.table_id, fixture.tables[0].indexes_json), target.graph_retirement_digest.?);
+    try std.testing.expectEqualDeep(target.graph_retirement_digest, (try stages.ownerScope(alloc, plan.value, try plan.value.digest(alloc), target, target.ranges[0])).graph_retirement_digest);
+}
+
 test "SQL TRUNCATE original CASCADE case closes incoming FK cohort" {
     // sql-0165: CASCADE adds the referencing child, never an outgoing parent.
     var parsed = try compiler.compile(alloc, "TRUNCATE TABLE usage_records CASCADE;", .{});

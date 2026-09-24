@@ -52,6 +52,11 @@
       "cwd": "zig",
       "timeout_seconds": 600
     },
+    "sql-mounted-default-conflict": {
+      "command": ["zig", "build", "public-api-parity-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "--", "--test-filter", "httpx SQL coordinated UNIQUE owner rejects duplicate batch and updates default collision"],
+      "cwd": "zig",
+      "timeout_seconds": 600
+    },
     "sql-explain-runtime": {
       "command": ["zig", "build", "sql-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "--", "--test-filter", "SQL EXPLAIN binds authorized plans without reading or writing rows"],
       "cwd": "zig",
@@ -8219,8 +8224,9 @@
     },
     {
       "id": "sql-1484",
-      "status": "unresolved",
-      "reason": "The original duplicate-identity rejection needs a mounted table with an active coordinated UNIQUE(id) constraint; an unconstrained text-id fixture cannot prove SQLSTATE 23505 or atomic no-partial-write behavior."
+      "status": "rejected",
+      "reason": "The exact statement runs through mounted SQL with an enforced coordinated UNIQUE(id) owner; its duplicate logical-key claim rejects with SQLSTATE 23505 before either primary row is applied, and a native scan verifies no partial write.",
+      "evidence": [{ "path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL coordinated UNIQUE owner rejects duplicate batch and updates default collision", "gate": "sql-mounted-default-conflict" }]
     },
     {
       "id": "sql-1485",
@@ -8276,8 +8282,9 @@
     },
     {
       "id": "sql-1495",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact DEFAULT VALUES ON CONFLICT(id) DO UPDATE statement executes through mounted SQL with a seeded schema-derived id collision and coordinated UNIQUE owner claim. Owner resolution selects the stored physical row, native transaction preparation fences the claim, RETURNING reports the default-derived update image, and a subsequent physical lookup confirms one committed update.",
+      "evidence": [{ "path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL coordinated UNIQUE owner rejects duplicate batch and updates default collision", "gate": "sql-mounted-default-conflict" }]
     },
     {
       "id": "sql-1496",

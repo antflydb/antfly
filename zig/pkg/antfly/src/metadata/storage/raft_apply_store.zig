@@ -164,6 +164,252 @@ test "FK generation publication begins durably and rejects stale CAS and topolog
     try std.testing.expectError(error.GenerationPublicationChanged, store.fkGenerationPublicationSourceDecisionJson(alloc, group_id, .{ .plan_id = id, .child_table_id = child.table_id, .child_table_name = child.name, .child_group_id = child_range.group_id, .action = .fence }));
 }
 
+test "initial self FK reserves one hidden child owner and no duplicate parent route" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/initial-self-fk", .{tmp.sub_path});
+    defer alloc.free(root);
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer store.deinit();
+    const group_id = group_ids.main_metadata_group_id;
+    try store.applyStandaloneCommand(group_id, .{ .initialize_metadata_incarnation = "11111111111111111111111111111111".* });
+    const logical_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"self_fk","child_columns":["parent_id"],"parent_table":"nodes","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent_id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const prepared_json = try store.fkInitialCreatePrepareJson(alloc, group_id, .{
+        .namespace_id = system_catalog.default_namespace_id,
+        .logical_name = "nodes",
+        .candidate = .{ .table_id = 0, .name = "", .schema_json = logical_schema },
+    });
+    defer alloc.free(prepared_json);
+    var prepared = try std.json.parseFromSlice(fk_generation_publication.InitialCreatePrepare, alloc, prepared_json, .{});
+    defer prepared.deinit();
+    const child = prepared.value.child;
+    const replacement = try std.fmt.allocPrint(alloc, "\"parent_table\":\"{s}\"", .{child.name});
+    defer alloc.free(replacement);
+    const bound_schema = try std.mem.replaceOwned(u8, alloc, logical_schema, "\"parent_table\":\"nodes\"", replacement);
+    defer alloc.free(bound_schema);
+    var bound_child = child;
+    bound_child.schema_json = bound_schema;
+    const derived = try fk_generation_publication.deriveInitialTransitions(alloc, child.table_id, child.name, bound_schema);
+    defer fk_generation_publication.freeDerivedTransitions(alloc, derived);
+    try std.testing.expectEqual(@as(usize, 1), derived.len);
+    var id: fk_generation_publication.Id = @splat(0);
+    std.mem.writeInt(u64, id[0..8], 91, .little);
+    std.mem.writeInt(u64, id[8..16], 2, .little);
+    const plan: fk_generation_publication.InitialCreatePlan = .{
+        .id = id,
+        .catalog_id = prepared.value.catalog_id,
+        .expected_catalog_revision = prepared.value.expected_catalog_revision,
+        .child = bound_child,
+        .child_ranges = prepared.value.child_ranges,
+        .parents = &.{},
+        .self_transitions = &.{derived[0].transition},
+        .logical_name = "nodes",
+        .namespace_id = system_catalog.default_namespace_id,
+    };
+    try plan.validate(alloc);
+    const begin = try std.json.Stringify.valueAlloc(alloc, fk_generation_publication.InitialCommand{ .plan_id = id, .child_table_id = child.table_id, .expected_revision = 0, .action = .begin, .plan = plan }, .{});
+    defer alloc.free(begin);
+    try store.applyStandaloneCommand(group_id, .{ .apply_fk_initial_create = begin });
+    const decision_json = try store.fkInitialChildDecisionJson(alloc, group_id, .{ .plan_id = id, .child_table_id = child.table_id, .child_group_id = prepared.value.child_ranges[0].group_id, .action = .provision });
+    defer alloc.free(decision_json);
+    var decision = try std.json.parseFromSlice(fk_generation_publication.InitialChildDecision, alloc, decision_json, .{});
+    defer decision.deinit();
+    try std.testing.expectEqualStrings(bound_schema, decision.value.child.schema_json);
+    const candidate = try plan.candidateIdentity(alloc);
+    const namespace: @import("../../storage/db/doc_identity_namespace.zig").Namespace = .{
+        .table_id = child.table_id,
+        .shard_id = metadata_table_manager.rangeDocIdentityShardId(prepared.value.child_ranges[0]),
+        .range_id = metadata_table_manager.rangeDocIdentityRangeId(prepared.value.child_ranges[0]),
+    };
+    const db_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/initial-self-owner", .{tmp.sub_path});
+    defer alloc.free(db_path);
+    const bootstrap: @import("../../storage/db/relational_initial_child_publication.zig").Bootstrap = .{
+        .plan_id = id,
+        .plan_digest = try plan.digest(alloc),
+        .namespace = namespace,
+        .schema_version = candidate.schema_version,
+        .schema_digest = candidate.schema_digest,
+        .public_schema_json_digest = candidate.public_schema_json_digest,
+        .catalog_digest = candidate.catalog_digest,
+    };
+    const db_options: @import("../../storage/db/db.zig").OpenOptions = .{ .identity_namespace = namespace, .initial_child_bootstrap = bootstrap, .start_optional_runtimes = false, .start_index_workers = false };
+    const child_fence: @import("../../storage/db/relational_integrity_topology_contract.zig").Fence = .{
+        .role = .child_generation_source,
+        .transition_id = child.table_id,
+        .attempt = 1,
+        .admission_epoch = 1,
+        .peer_group_id = prepared.value.child_ranges[0].group_id,
+        .owner_group_id = prepared.value.child_ranges[0].group_id,
+        .namespace = namespace,
+        .catalog_digest = candidate.catalog_digest,
+    };
+    {
+        var db = try @import("../../storage/db/db.zig").DB.open(alloc, db_path, db_options);
+        defer db.close();
+        try std.testing.expectError(error.InitialChildNotPublished, db.lookup(alloc, "unpublished", .{}));
+        try db.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .provision_initial_child, .fence = child_fence, .initial_child_provision = .{
+            .schema_json = bound_schema,
+            .child_table_name = child.name,
+            .plan_id = id,
+            .plan_digest = bootstrap.plan_digest,
+            .schema_digest = candidate.schema_digest,
+            .public_schema_json_digest = candidate.public_schema_json_digest,
+            .catalog_digest = candidate.catalog_digest,
+        } } }, .{ .term = 2, .index = 1 });
+        try std.testing.expectError(error.InitialChildNotPublished, db.lookup(alloc, "unpublished", .{}));
+    }
+    const receipt: @import("../../api/relational_fk_generation_publication.zig").InitialChildReceipt = .{
+        .plan_id = id,
+        .child_table_id = child.table_id,
+        .child_group_id = prepared.value.child_ranges[0].group_id,
+        .action = .provision,
+        .namespace = namespace,
+        .plan_digest = try plan.digest(alloc),
+        .schema_version = candidate.schema_version,
+        .schema_digest = candidate.schema_digest,
+        .public_schema_json_digest = candidate.public_schema_json_digest,
+        .catalog_digest = candidate.catalog_digest,
+        .row_count = 0,
+        .applied_term = 2,
+        .applied_index = 1,
+    };
+    const provisioned = try std.json.Stringify.valueAlloc(alloc, fk_generation_publication.InitialCommand{ .plan_id = id, .child_table_id = child.table_id, .expected_revision = 1, .action = .child_provisioned, .child_receipt = receipt }, .{});
+    defer alloc.free(provisioned);
+    try store.applyStandaloneCommand(group_id, .{ .apply_fk_initial_create = provisioned });
+    const work_json = try store.fkInitialCreateWorkJson(alloc, group_id, 0);
+    defer alloc.free(work_json);
+    var work = try std.json.parseFromSlice(?fk_generation_publication.InitialWork, alloc, work_json, .{});
+    defer work.deinit();
+    try std.testing.expectEqual(fk_generation_publication.InitialPhase.published_hidden, work.value.?.phase);
+    try std.testing.expectEqual(@import("../../api/relational_fk_generation_publication.zig").InitialChildAction.release, work.value.?.target.child.action);
+    const public_tables = try store.listTables(alloc, group_id);
+    defer store.freeTables(alloc, public_tables);
+    try std.testing.expectEqual(@as(usize, 0), public_tables.len);
+    {
+        var db = try @import("../../storage/db/db.zig").DB.open(alloc, db_path, db_options);
+        defer db.close();
+        try std.testing.expectError(error.InitialChildNotPublished, db.lookup(alloc, "unpublished", .{}));
+        try db.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .release_initial_child, .fence = child_fence, .initial_child_control = .{
+            .plan_id = id,
+            .plan_digest = bootstrap.plan_digest,
+            .schema_version = candidate.schema_version,
+            .schema_digest = candidate.schema_digest,
+            .public_schema_json_digest = candidate.public_schema_json_digest,
+            .catalog_digest = candidate.catalog_digest,
+        } } }, .{ .term = 2, .index = 2 });
+        try std.testing.expect((try db.lookup(alloc, "unpublished", .{})) == null);
+    }
+    var released_receipt = receipt;
+    released_receipt.action = .release;
+    released_receipt.applied_index = 2;
+    const released = try std.json.Stringify.valueAlloc(alloc, fk_generation_publication.InitialCommand{ .plan_id = id, .child_table_id = child.table_id, .expected_revision = 2, .action = .child_released, .child_receipt = released_receipt }, .{});
+    defer alloc.free(released);
+    try store.applyStandaloneCommand(group_id, .{ .apply_fk_initial_create = released });
+    const published = try std.json.Stringify.valueAlloc(alloc, fk_generation_publication.InitialCommand{ .plan_id = id, .child_table_id = child.table_id, .expected_revision = 3, .action = .publish_child }, .{});
+    defer alloc.free(published);
+    try store.applyStandaloneCommand(group_id, .{ .apply_fk_initial_create = published });
+    const visible = try store.listTables(alloc, group_id);
+    defer store.freeTables(alloc, visible);
+    try std.testing.expectEqual(@as(usize, 1), visible.len);
+    try std.testing.expectEqualStrings(bound_schema, visible[0].schema_json);
+}
+
+test "initial self FK resumes the second hidden range after a durable owner receipt" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/initial-self-multi", .{tmp.sub_path});
+    defer alloc.free(root);
+    const group_id = group_ids.main_metadata_group_id;
+    const logical_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"self_fk","child_columns":["parent_id"],"parent_table":"nodes","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent_id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    var store_open = true;
+    defer if (store_open) store.deinit();
+    try store.applyStandaloneCommand(group_id, .{ .initialize_metadata_incarnation = "22222222222222222222222222222222".* });
+    const prepared_json = try store.fkInitialCreatePrepareJson(alloc, group_id, .{
+        .namespace_id = system_catalog.default_namespace_id,
+        .logical_name = "nodes",
+        .min_ranges_explicit = true,
+        .candidate = .{ .table_id = 0, .name = "", .schema_json = logical_schema, .min_ranges = 2 },
+    });
+    defer alloc.free(prepared_json);
+    var prepared = try std.json.parseFromSlice(fk_generation_publication.InitialCreatePrepare, alloc, prepared_json, .{});
+    defer prepared.deinit();
+    try std.testing.expectEqual(@as(usize, 2), prepared.value.child_ranges.len);
+    const child = prepared.value.child;
+    const replacement = try std.fmt.allocPrint(alloc, "\"parent_table\":\"{s}\"", .{child.name});
+    defer alloc.free(replacement);
+    const bound_schema = try std.mem.replaceOwned(u8, alloc, logical_schema, "\"parent_table\":\"nodes\"", replacement);
+    defer alloc.free(bound_schema);
+    var bound_child = child;
+    bound_child.schema_json = bound_schema;
+    const derived = try fk_generation_publication.deriveInitialTransitions(alloc, child.table_id, child.name, bound_schema);
+    defer fk_generation_publication.freeDerivedTransitions(alloc, derived);
+    var id: fk_generation_publication.Id = @splat(0);
+    std.mem.writeInt(u64, id[0..8], 92, .little);
+    std.mem.writeInt(u64, id[8..16], 2, .little);
+    const plan: fk_generation_publication.InitialCreatePlan = .{
+        .id = id,
+        .catalog_id = prepared.value.catalog_id,
+        .expected_catalog_revision = prepared.value.expected_catalog_revision,
+        .min_ranges_explicit = true,
+        .child = bound_child,
+        .child_ranges = prepared.value.child_ranges,
+        .parents = &.{},
+        .self_transitions = &.{derived[0].transition},
+        .logical_name = "nodes",
+        .namespace_id = system_catalog.default_namespace_id,
+    };
+    try plan.validate(alloc);
+    const begin = try std.json.Stringify.valueAlloc(alloc, fk_generation_publication.InitialCommand{ .plan_id = id, .child_table_id = child.table_id, .expected_revision = 0, .action = .begin, .plan = plan }, .{});
+    defer alloc.free(begin);
+    try store.applyStandaloneCommand(group_id, .{ .apply_fk_initial_create = begin });
+    const first_work_json = try store.fkInitialCreateWorkJson(alloc, group_id, 0);
+    defer alloc.free(first_work_json);
+    var first_work = try std.json.parseFromSlice(?fk_generation_publication.InitialWork, alloc, first_work_json, .{});
+    defer first_work.deinit();
+    const first_group = first_work.value.?.target.child.group_id;
+    const first_range = for (plan.child_ranges) |range| {
+        if (range.group_id == first_group) break range;
+    } else return error.InvalidGenerationPublication;
+    const candidate = try plan.candidateIdentity(alloc);
+    const first_receipt: @import("../../api/relational_fk_generation_publication.zig").InitialChildReceipt = .{
+        .plan_id = id,
+        .child_table_id = child.table_id,
+        .child_group_id = first_group,
+        .action = .provision,
+        .namespace = .{ .table_id = child.table_id, .shard_id = metadata_table_manager.rangeDocIdentityShardId(first_range), .range_id = metadata_table_manager.rangeDocIdentityRangeId(first_range) },
+        .plan_digest = try plan.digest(alloc),
+        .schema_version = candidate.schema_version,
+        .schema_digest = candidate.schema_digest,
+        .public_schema_json_digest = candidate.public_schema_json_digest,
+        .catalog_digest = candidate.catalog_digest,
+        .row_count = 0,
+        .applied_term = 1,
+        .applied_index = 1,
+    };
+    const first_command = try std.json.Stringify.valueAlloc(alloc, fk_generation_publication.InitialCommand{ .plan_id = id, .child_table_id = child.table_id, .expected_revision = 1, .action = .child_provisioned, .child_receipt = first_receipt }, .{});
+    defer alloc.free(first_command);
+    try store.applyStandaloneCommand(group_id, .{ .apply_fk_initial_create = first_command });
+    try std.testing.expectError(error.GenerationPublicationChanged, store.applyStandaloneCommand(group_id, .{ .apply_fk_initial_create = first_command }));
+    store.deinit();
+    store_open = false;
+    var recovered = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer recovered.deinit();
+    const next_work_json = try recovered.fkInitialCreateWorkJson(alloc, group_id, 0);
+    defer alloc.free(next_work_json);
+    var next_work = try std.json.parseFromSlice(?fk_generation_publication.InitialWork, alloc, next_work_json, .{});
+    defer next_work.deinit();
+    try std.testing.expectEqual(fk_generation_publication.InitialPhase.provisioning_child, next_work.value.?.phase);
+    try std.testing.expectEqual(@as(u64, 2), next_work.value.?.revision);
+    try std.testing.expect(next_work.value.?.target.child.group_id != first_group);
+}
+
 test "FK generation publication initial create reserves hidden identity before any public route" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2844,6 +3090,76 @@ test "relational integrity restore staging overwrite keeps old generation until 
     try txn.commit();
     txn_open = false;
     try std.testing.expectEqual(@as(u64, 11), try store.resolveTableCreateIdentity(group_id, 1));
+}
+
+test "relational integrity restore staging graph empty-generation cutover replays old tombstone and fresh owner atomically" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/graph-empty-cutover", .{tmp.sub_path});
+    defer alloc.free(root);
+    const group_id = group_ids.main_metadata_group_id;
+    const indexes = "{\"links\":{\"type\":\"graph\"}}";
+    const old: metadata.TableRecord = .{ .table_id = 1, .name = "documents", .schema_json = "{}", .indexes_json = indexes };
+    const old_range: metadata.RangeRecord = .{ .table_id = 1, .group_id = 601, .range_id = 601, .start_key = "" };
+    const fence: @import("../../storage/db/relational_integrity_topology_contract.zig").Fence = .{ .role = .rewrite_source, .transition_id = 7, .attempt = 1, .owner_group_id = 601, .peer_group_id = 701, .namespace = .{ .table_id = 1, .shard_id = 601, .range_id = 601 }, .catalog_digest = @splat(4) };
+    var replacement = old;
+    replacement.table_id = 11;
+    const target: restore_staging.Target = .{
+        .source_table_id = 1,
+        .empty_generation = true,
+        .graph_retirement_digest = restore_staging.graphRetirementDigest(1, 11, indexes),
+        .table = replacement,
+        .ranges = &.{.{ .table_id = 11, .group_id = 701, .range_id = 701, .doc_identity_shard_id = 701, .doc_identity_range_id = 701, .start_key = "" }},
+        .replace = .{ .table = old, .ranges = &.{old_range}, .fences = &.{fence} },
+    };
+    const plan: restore_staging.Plan = .{ .id = try restore_staging.idForAttempt(7, 1), .cohort_digest = @splat(9), .targets = &.{target} };
+    try plan.validate(alloc);
+    const digest = try plan.digest(alloc);
+    {
+        var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+        defer store.deinit();
+        var txn = try store.store.beginWriteTxn();
+        var txn_open = true;
+        defer if (txn_open) txn.abort();
+        try store.applyTransitionCommandTxn(&txn, group_id, .{ .upsert_table = old });
+        try store.applyTransitionCommandTxn(&txn, group_id, .{ .upsert_range = old_range });
+        try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = plan.id, .action = .reserve, .plan = plan });
+        try txn.commit();
+        txn_open = false;
+    }
+    {
+        var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+        defer store.deinit();
+        var txn = try store.store.beginWriteTxn();
+        var txn_open = true;
+        defer if (txn_open) txn.abort();
+        var key_buf: [catalog_name_key_buffer_bytes]u8 = undefined;
+        _ = try txn.get(try tableKeyForGroup(&key_buf, group_id, 1));
+        try std.testing.expectError(error.NotFound, txn.get(try tableKeyForGroup(&key_buf, group_id, 11)));
+        for ([_]restore_staging.Command{
+            .{ .id = plan.id, .action = .imported, .expected_revision = 1, .receipt = .{ .group_id = 701, .range_id = 701, .plan_digest = digest, .completion_digest = @splat(1) } },
+            .{ .id = plan.id, .action = .validated, .expected_revision = 2, .receipt = .{ .group_id = 701, .range_id = 701, .plan_digest = digest, .completion_digest = @splat(2) } },
+            .{ .id = plan.id, .action = .begin_cutover, .expected_revision = 2 },
+            .{ .id = plan.id, .action = .old_fenced, .expected_revision = 3, .receipt = .{ .group_id = 601, .range_id = 601, .plan_digest = digest, .completion_digest = @splat(3) } },
+            .{ .id = plan.id, .action = .publish, .expected_revision = 3 },
+        }) |command| try applyRestoreStagingForTest(&store, &txn, group_id, command);
+        try std.testing.expectError(error.NotFound, txn.get(try tableKeyForGroup(&key_buf, group_id, 1)));
+        _ = try txn.get(try tableKeyForGroup(&key_buf, group_id, 11));
+        try txn.commit();
+        txn_open = false;
+    }
+    {
+        var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+        defer store.deinit();
+        var txn = try store.store.beginWriteTxn();
+        defer txn.abort();
+        var key_buf: [catalog_name_key_buffer_bytes]u8 = undefined;
+        try std.testing.expectError(error.NotFound, txn.get(try tableKeyForGroup(&key_buf, group_id, 1)));
+        _ = try txn.get(try tableKeyForGroup(&key_buf, group_id, 11));
+        try store.applyTransitionCommandTxn(&txn, group_id, .{ .upsert_table = old });
+        try std.testing.expectError(error.NotFound, txn.get(try tableKeyForGroup(&key_buf, group_id, 1)));
+    }
 }
 
 test "relational integrity restore staging cancellation drains both old and new owners" {
@@ -6569,6 +6885,7 @@ pub const RaftApplyStore = struct {
             .transitions = parent.transitions,
             .parent_table = parent.table,
             .parent_range = parent.ranges[index],
+            .partial_support_indexes = try fk_generation_publication.initialPartialSupportNames(a, publication.plan.child.schema_json, parent.table),
         };
         return std.json.Stringify.valueAlloc(alloc, decision, .{});
     }

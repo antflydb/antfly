@@ -90,6 +90,45 @@ test "restore empty generation proves pristine owner and rejects source import" 
     }
 }
 
+test "restore graph empty generation rejects physical artifacts before staging" {
+    const db = @import("db.zig");
+    const alloc = std.testing.allocator;
+    for ([_]enum { clean, edge, primary_artifact }{ .clean, .edge, .primary_artifact }) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/graph-empty-owner", .{tmp.sub_path});
+        defer alloc.free(path);
+        const namespace: identity.Namespace = .{ .table_id = 10, .shard_id = 11, .range_id = 11 };
+        var target = try db.DB.open(alloc, path, .{ .identity_namespace = namespace, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
+        defer target.close();
+        try target.setSchemaJson(alloc, "{}");
+        try target.addIndex(.{ .name = "links", .kind = .graph, .config_json = "{}" });
+        const schema = try @import("../schema.zig").serializeSchema(alloc, target.core.schema orelse .{});
+        defer alloc.free(schema);
+        const scope: Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(0), .source_namespace = .{ .table_id = 4, .shard_id = 5, .range_id = 5 }, .target_namespace = namespace, .target_schema_digest = digest(schema), .empty_generation = true, .graph_retirement_digest = @splat(7) };
+        try target.reserveRestoreStagingScoped(alloc, scope);
+        if (case == .edge) try target.core.index_manager.graphIndex("links").?.index.batchApply(&.{.{ .source = "a", .target = "b", .edge_type = "link" }}, &.{});
+        if (case == .primary_artifact) {
+            const keys = @import("../internal_keys.zig");
+            var state = std.ArrayListUnmanaged(u8).empty;
+            defer state.deinit(alloc);
+            try keys.appendDocumentPrefix(&state, alloc, "orphan");
+            try state.append(alloc, keys.graph_asset_state_kind);
+            try keys.appendEncodedComponent(&state, alloc, "links");
+            try keys.appendEncodedComponent(&state, alloc, "source");
+            try target.core.store.putBatch(&.{.{ .key = state.items, .value = "orphan" }}, &.{});
+        }
+        if (case != .clean) {
+            try std.testing.expectError(error.RestoreStagingTargetNotEmpty, target.beginRestoreStaging(alloc, scope));
+        } else {
+            try target.beginRestoreStaging(alloc, scope);
+            var state = (try target.restoreStagingStatus(alloc)).?;
+            defer state.deinit();
+            try std.testing.expectEqual(Phase.imported, state.value.phase);
+        }
+    }
+}
+
 pub fn optional(txn: anytype) !?[]const u8 {
     return txn.get(key) catch |err| switch (err) {
         error.NotFound => null,
