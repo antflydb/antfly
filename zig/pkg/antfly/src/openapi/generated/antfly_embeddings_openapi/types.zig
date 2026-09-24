@@ -231,8 +231,8 @@ pub const EmbedderConfig = struct {
     /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
     api_url: ?[]const u8 = null,
     rate_limit: ?antfly_provider_openapi.RateLimitConfig = null,
-    /// Declare that this model supports non-text content (images, audio, video, PDFs), even if the model isn't in Antfly's built-in model registry yet. When `true`, Antfly treats the model as multimodal and sends binary content (images, audio, etc.) through an embedding adapter that supports content parts. Antfly currently provides that contract for local Antfly inference and Bedrock; text-only provider adapters reject media rather than silently discarding it. Not needed for models already in the local registry (e.g., `clip-*`, `clipclap`). **Example:** ```json { "provider": "antfly", "model": "some-future-multimodal-model", "multimodal": true } ```
-    multimodal: ?bool = null,
+    /// Input types the model accepts. Normally omitted: Antfly learns them from the model's capabilities, which Antfly inference publishes for every model it serves. Set it only to use a model whose capabilities Antfly cannot discover yet, such as a newly released model. When set, it replaces the discovered input types. Only providers whose adapters can send media accept media inputs: `antfly` (`image`, `audio`) and `bedrock` (`image`). Other providers reject `image` and `audio` here rather than silently discarding media. **Example:** ```json { "provider": "antfly", "model": "some-future-multimodal-model", "inputs": ["text", "image"] } ```
+    inputs: ?[]const []const u8 = null,
     /// Deprecated compatibility form of `retrieval.query_input_type`. New configurations should use the nested `retrieval` object.
     query_input_type: ?[]const u8 = null,
     /// Deprecated compatibility form of `retrieval.document_input_type`. New configurations should use the nested `retrieval` object.
@@ -260,7 +260,7 @@ pub const EmbedderConfig = struct {
         .{ "batch_size", "batch_size", true },
         .{ "api_url", "api_url", true },
         .{ "rate_limit", "rate_limit", false },
-        .{ "multimodal", "multimodal", true },
+        .{ "inputs", "inputs", true },
         .{ "query_input_type", "query_input_type", true },
         .{ "document_input_type", "document_input_type", true },
         .{ "query_instruction", "query_instruction", true },
@@ -351,8 +351,8 @@ pub const EmbedderConfig = struct {
             try jw.objectField("rate_limit");
             try jw.write(@as(?u8, null));
         }
-        if (self.multimodal) |value| {
-            try jw.objectField("multimodal");
+        if (self.inputs) |value| {
+            try jw.objectField("inputs");
             try jw.write(value);
         }
         if (self.query_input_type) |value| {

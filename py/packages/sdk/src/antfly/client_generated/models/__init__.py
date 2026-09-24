@@ -232,6 +232,7 @@ from .edge_type_config import EdgeTypeConfig
 from .edge_type_config_topology import EdgeTypeConfigTopology
 from .edges_response import EdgesResponse
 from .embedder_config import EmbedderConfig
+from .embedder_config_inputs_item import EmbedderConfigInputsItem
 from .embedder_provider import EmbedderProvider
 from .embedding_index_activity import EmbeddingIndexActivity
 from .embedding_index_activity_phase import EmbeddingIndexActivityPhase
@@ -812,8 +813,6 @@ from .inference_read_response_object import InferenceReadResponseObject
 from .inference_read_result import InferenceReadResult
 from .inference_read_result_fields import InferenceReadResultFields
 from .inference_request_admission_config import InferenceRequestAdmissionConfig
-from .inference_rerank_multimodal_document import InferenceRerankMultimodalDocument
-from .inference_rerank_multimodal_request import InferenceRerankMultimodalRequest
 from .inference_rerank_object import InferenceRerankObject
 from .inference_rerank_object_object import InferenceRerankObjectObject
 from .inference_rerank_request import InferenceRerankRequest
@@ -1517,6 +1516,7 @@ __all__ = (
     "EdgeTypeConfig",
     "EdgeTypeConfigTopology",
     "EmbedderConfig",
+    "EmbedderConfigInputsItem",
     "EmbedderProvider",
     "EmbeddingIndexActivity",
     "EmbeddingIndexActivityPhase",
@@ -2091,8 +2091,6 @@ __all__ = (
     "InferenceReadResult",
     "InferenceReadResultFields",
     "InferenceRequestAdmissionConfig",
-    "InferenceRerankMultimodalDocument",
-    "InferenceRerankMultimodalRequest",
     "InferenceRerankObject",
     "InferenceRerankObjectObject",
     "InferenceRerankRequest",

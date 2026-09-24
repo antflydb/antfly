@@ -45,7 +45,6 @@ pub const Operation = enum {
     embed,
     embeddings,
     rerank,
-    rerank_multimodal,
     chunk,
     extract,
     rewrite,
@@ -56,7 +55,7 @@ pub const Operation = enum {
             .read => .read,
             .generate, .generate_batch, .chat_completions => .generate,
             .embed, .embeddings => .embed,
-            .rerank, .rerank_multimodal => .rerank,
+            .rerank => .rerank,
             .chunk => .chunk,
             .extract => .extract,
             .rewrite => .rewrite,
@@ -68,7 +67,6 @@ pub const Operation = enum {
         return switch (self) {
             .generate_batch => "generate.batch",
             .chat_completions => "chat.completions",
-            .rerank_multimodal => "rerank_multimodal",
             else => @tagName(self),
         };
     }
@@ -900,6 +898,9 @@ pub const InferenceCapabilities = struct {
     /// The HTTP route guarantees AFN1 dense/score responses when requested
     /// exclusively. Version 1 has a fixed 4-MiB frame ceiling.
     numeric_responses_v1: bool = false,
+    /// The `/rerank` route accepts `documents` (strings or content parts)
+    /// instead of only the deprecated text `prompts`.
+    rerank_documents_v1: bool = false,
     /// Linked-process executor has a concrete borrowed raw-raster entrypoint.
     /// This is never inferred from image modality or encoded attachment support.
     borrowed_rasters: bool = false,

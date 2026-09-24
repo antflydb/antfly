@@ -28,6 +28,7 @@ import type {
   InferenceError,
   ModelsResponse,
   RequestOptions,
+  RerankDocument,
   RerankResponse,
   RewriteResponse,
   TranscribeResponse,
@@ -360,12 +361,16 @@ export class InferenceClient {
   }
 
   /**
-   * Rerank prompts by relevance to a query
+   * Rerank documents by relevance to a query
+   *
+   * Each document is a string or an array of text and image content parts.
+   * Documents with images need a multimodal reranker (ColQwen or Qwen3-VL);
+   * other models reject them.
    *
    * @param model - Name of the reranker model (e.g., "bge-reranker-v2-m3")
    * @param query - Search query for relevance scoring
-   * @param prompts - Pre-rendered text prompts to rerank
-   * @returns RerankResponse with relevance scores for each prompt
+   * @param documents - Documents to rerank, rendered to text or content parts
+   * @returns RerankResponse with one relevance score per document
    *
    * @example
    * ```typescript
@@ -378,16 +383,15 @@ export class InferenceClient {
    *     "Cooking recipes for beginners"
    *   ]
    * );
-   * // result.scores might be [0.85, 0.92, 0.12]
-   * // Higher scores indicate more relevance to the query
+   * // result.data[i].score is the relevance of documents[result.data[i].index]
    * ```
    */
-  async rerank(model: string, query: string, prompts: string[]): Promise<RerankResponse> {
+  async rerank(model: string, query: string, documents: RerankDocument[]): Promise<RerankResponse> {
     const { data, error, response } = await this.client.POST("/ai/v1/rerank", {
       body: {
         model,
         query,
-        prompts,
+        documents,
       },
     });
     if (!response.ok) throw inferenceAPIError(response.status, error);

@@ -98,6 +98,9 @@ export interface InferenceConfig {
 // Helper type for embedding input - supports all three formats
 export type EmbedInput = string | string[] | ContentPart[];
 
+// A document to rerank: text, or text and image content parts
+export type RerankDocument = string | ContentPart[];
+
 // Log level values for convenience
 export const logLevels: Level[] = ["debug", "info", "warn", "error"];
 
