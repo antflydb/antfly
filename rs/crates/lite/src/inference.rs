@@ -623,21 +623,20 @@ impl Inference {
         let raw = self.with_handle(|handle| {
             let mut out = antfly_buffer::default();
 
-            let (progress_fn, progress_ctx, mut callback_ctx): (
-                sys::antfly_inference_pull_progress_fn,
-                *mut c_void,
-                Option<CallbackCtx>,
-            ) = match progress {
-                Some(f) => {
-                    let mut ctx = CallbackCtx {
-                        progress: f,
-                        panic: None,
-                    };
-                    let ctx_ptr = std::ptr::addr_of_mut!(ctx).cast::<c_void>();
-                    (Some(trampoline as _), ctx_ptr, Some(ctx))
-                }
-                None => (None, std::ptr::null_mut(), None),
-            };
+            // The context must stay at one address for the whole call: build
+            // it in its final place, then take the pointer the callback uses.
+            let mut callback_ctx = progress.map(|f| CallbackCtx {
+                progress: f,
+                panic: None,
+            });
+            let (progress_fn, progress_ctx): (sys::antfly_inference_pull_progress_fn, *mut c_void) =
+                match callback_ctx.as_mut() {
+                    Some(ctx) => (
+                        Some(trampoline as _),
+                        std::ptr::from_mut(ctx).cast::<c_void>(),
+                    ),
+                    None => (None, std::ptr::null_mut()),
+                };
 
             let code = unsafe {
                 sys::antfly_inference_pull_json(
