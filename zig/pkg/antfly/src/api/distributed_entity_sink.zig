@@ -214,6 +214,11 @@ fn buildMergeOps(a: std.mem.Allocator, doc_json: []const u8) ![]db_mod.types.Tra
     } else {
         try ops.append(a, .{ .op = .unset, .path = "merged_into", .value_json = null });
     }
+    if (obj.get("merged_into_table")) |v| {
+        if (v == .string) try ops.append(a, .{ .op = .set, .path = "merged_into_table", .value_json = try jsonStringAlloc(a, v.string) }) else try ops.append(a, .{ .op = .unset, .path = "merged_into_table", .value_json = null });
+    } else {
+        try ops.append(a, .{ .op = .unset, .path = "merged_into_table", .value_json = null });
+    }
     return try ops.toOwnedSlice(a);
 }
 
@@ -373,7 +378,8 @@ test "DistributedEntitySink upserts a merge transform per entity" {
     try testing.expect(std.mem.indexOf(u8, ops, "add_to_set aliases=\"Ada Lovelace\"") != null);
     // A live promotion clears any stale redirect: the key is a current
     // canonical target.
-    try testing.expect(std.mem.indexOf(u8, ops, "unset merged_into") != null);
+    try testing.expect(std.mem.indexOf(u8, ops, "unset merged_into=;") != null);
+    try testing.expect(std.mem.indexOf(u8, ops, "unset merged_into_table=;") != null);
 }
 
 test "DistributedEntitySink overwrites the redirect for a merged tombstone" {
@@ -392,7 +398,19 @@ test "DistributedEntitySink overwrites the redirect for a merged tombstone" {
     );
     const ops = fake.transforms_json.items[0];
     try testing.expect(std.mem.indexOf(u8, ops, "set merged_into=\"event/canonical\"") != null);
-    try testing.expect(std.mem.indexOf(u8, ops, "unset merged_into") == null);
+    try testing.expect(std.mem.indexOf(u8, ops, "unset merged_into=;") == null);
+}
+
+test "DistributedEntitySink records a cross-table redirect" {
+    const alloc = testing.allocator;
+    var fake = FakeTableWriteSource{ .alloc = alloc, .table = "people" };
+    defer fake.deinit();
+    var sink_impl = DistributedEntitySink{ .writes = fake.source() };
+    try sink_impl.entitySink().upsert(alloc, "people", "person/ada",
+        \\{"entity_type":"person","merged_into":"person/ada","merged_into_table":"curated"}
+    );
+    const ops = fake.transforms_json.items[0];
+    try testing.expect(std.mem.indexOf(u8, ops, "set merged_into_table=\"curated\"") != null);
 }
 
 test "DistributedEntitySink fails closed on an unknown table" {

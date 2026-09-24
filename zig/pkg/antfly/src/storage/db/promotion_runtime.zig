@@ -181,11 +181,12 @@ fn stringifyPromotedKeysState(a: Allocator, entities: []const resolver_lib.Resol
     return std.json.Stringify.valueAlloc(a, std.json.Value{ .object = state }, .{});
 }
 
-fn buildMergedTombstoneDocAlloc(alloc: Allocator, e: resolver_lib.ResolvedEntity) ![]u8 {
+fn buildMergedTombstoneDocAlloc(alloc: Allocator, previous_table: []const u8, e: resolver_lib.ResolvedEntity) ![]u8 {
     return try std.json.Stringify.valueAlloc(alloc, .{
         .entity_type = e.label,
         .canonical_name = e.canonical_name,
         .merged_into = e.doc_ref.key,
+        .merged_into_table = if (std.mem.eql(u8, previous_table, e.doc_ref.table)) @as(?[]const u8, null) else e.doc_ref.table,
     }, .{});
 }
 
@@ -263,31 +264,29 @@ fn processResolutionArtifactWithCatalog(
         if (e.canonical_name.len == 0) continue;
         promotable_count += 1;
         if (prior.get(e.local_id)) |previous| {
-            if (std.mem.eql(u8, previous.table, e.doc_ref.table)) {
-                if (std.mem.eql(u8, previous.key, e.doc_ref.key)) {
-                    // The same key with the same canonical document is a
-                    // byte-stable replay (a retried resolution window
-                    // re-emits its artifact when the handoff marker did not
-                    // land). The state row proves the earlier batch
-                    // committed, so re-upserting adds nothing -- and the
-                    // sink's live-promotion transform clears `merged_into`,
-                    // so a repeat would silently undo a curator redirect
-                    // that landed on this key between the two replays.
-                    if (promotedRefMatches(previous, e)) continue;
-                } else {
-                    // A mention that previously promoted a DIFFERENT key in
-                    // the same table has re-keyed (compositional identity
-                    // following a merge): tombstone the old document with a
-                    // merged_into redirect so it never lingers as a dead
-                    // node, in the same atomic batch as the survivor's
-                    // upsert.
-                    try entries.append(a, .{
-                        .table = previous.table,
-                        .storage_table = previous.storage_table,
-                        .key = previous.key,
-                        .doc_json = try buildMergedTombstoneDocAlloc(a, e),
-                    });
-                }
+            if (std.mem.eql(u8, previous.table, e.doc_ref.table) and std.mem.eql(u8, previous.key, e.doc_ref.key)) {
+                // The same key with the same canonical document is a
+                // byte-stable replay (a retried resolution window
+                // re-emits its artifact when the handoff marker did not
+                // land). The state row proves the earlier batch
+                // committed, so re-upserting adds nothing -- and the
+                // sink's live-promotion transform clears `merged_into`,
+                // so a repeat would silently undo a curator redirect
+                // that landed on this key between the two replays.
+                if (promotedRefMatches(previous, e)) continue;
+            } else {
+                // A mention that previously promoted a DIFFERENT key in
+                // the same table has re-keyed (compositional identity
+                // following a merge): tombstone the old document with a
+                // merged_into redirect so it never lingers as a dead
+                // node, in the same atomic batch as the survivor's
+                // upsert.
+                try entries.append(a, .{
+                    .table = previous.table,
+                    .storage_table = previous.storage_table,
+                    .key = previous.key,
+                    .doc_json = try buildMergedTombstoneDocAlloc(a, previous.table, e),
+                });
             }
         }
         try entries.append(a, .{
@@ -1081,6 +1080,30 @@ test "processResolutionArtifact tombstones the prior physical destination after 
         "{\"canonical_name\":\"Ada spoke.\"}",
         capture.docs.items[2],
     );
+}
+
+test "processResolutionArtifact redirects a curated move to another logical table" {
+    const alloc = testing.allocator;
+    var map = MapStore{ .alloc = alloc };
+    defer map.deinit();
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    var capture = CaptureSink{ .alloc = alloc };
+    defer capture.deinit();
+
+    try map.put(resolution_key,
+        \\{"config_generation":1,"entities":[{"local_id":"e0","doc_ref":{"table":"people","storage_table":"table:people","key":"person/ada"},"confidence":1,"decision":"new","label":"person","canonical_name":"Ada"}]}
+    );
+    try testing.expectEqual(@as(usize, 1), try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
+    try map.put(resolution_key,
+        \\{"config_generation":1,"entities":[{"local_id":"e0","doc_ref":{"table":"curated","storage_table":"table:curated","key":"person/ada"},"confidence":1,"decision":"match","label":"person","canonical_name":"Ada"}]}
+    );
+    try testing.expectEqual(@as(usize, 2), try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
+    try testing.expectEqualStrings("people", capture.tables.items[1]);
+    try testing.expectEqualStrings("table:people", capture.storage_tables.items[1].?);
+    try @import("antfly-json").testing.expectSubsetJsonText(alloc, "{\"merged_into\":\"person/ada\",\"merged_into_table\":\"curated\"}", capture.docs.items[1]);
+    try testing.expectEqualStrings("curated", capture.tables.items[2]);
+    try testing.expectEqualStrings("table:curated", capture.storage_tables.items[2].?);
 }
 
 test "processResolutionArtifact skips a byte-stable replay of an already-promoted decision" {

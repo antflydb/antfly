@@ -806,7 +806,13 @@ fn appendEntityCandidateWithResolved(
         .doc_ref = .{ .table = try allocator.dupe(u8, table), .key = try allocator.dupe(u8, entity_key) },
         .label = label,
         .record = .{ .fields = try fields.toOwnedSlice(allocator) },
-        .resolved_doc_ref = if (resolved_key) |rk| .{ .table = try allocator.dupe(u8, table), .key = try allocator.dupe(u8, rk) } else null,
+        .resolved_doc_ref = if (resolved_key) |rk| .{
+            .table = try allocator.dupe(u8, if (parsed.value.object.get("merged_into_table")) |target|
+                if (target == .string and target.string.len != 0) target.string else table
+            else
+                table),
+            .key = try allocator.dupe(u8, rk),
+        } else null,
         .resolved_record = resolved_record,
     });
 }
@@ -912,10 +918,12 @@ const SourceCandidateProvider = struct {
         var redirects = std.StringArrayHashMapUnmanaged(void).empty;
         var documents = collected.docs.valueIterator();
         while (documents.next()) |raw| {
-            if (try jsonStringFieldAlloc(a, raw.*, "merged_into")) |key|
-                if (!collected.docs.contains(key)) {
+            if (try jsonStringFieldAlloc(a, raw.*, "merged_into")) |key| {
+                const target_table = try jsonStringFieldAlloc(a, raw.*, "merged_into_table");
+                if ((target_table == null or std.mem.eql(u8, target_table.?, self.table)) and !collected.docs.contains(key)) {
                     try redirects.put(a, key, {});
-                };
+                }
+            }
         }
         collected.limit = 0;
         collected.keys = .empty;
@@ -927,7 +935,14 @@ const SourceCandidateProvider = struct {
             for (selected) |candidate_key| {
                 if (collected.docs.get(candidate_key)) |raw| {
                     const resolved_key = try jsonStringFieldAlloc(a, raw, "merged_into");
-                    const resolved_raw = if (resolved_key) |rk| collected.docs.get(rk) else null;
+                    const target_table = try jsonStringFieldAlloc(a, raw, "merged_into_table");
+                    const resolved_raw = if (resolved_key) |rk|
+                        if (target_table) |target|
+                            if (!std.mem.eql(u8, target, self.table)) try self.source.get(a, target, rk) else collected.docs.get(rk)
+                        else
+                            collected.docs.get(rk)
+                    else
+                        null;
                     try appendEntityCandidateWithResolved(alloc, self.table, candidate_key, raw, resolved_key, resolved_raw, &candidates);
                 }
             }
@@ -950,7 +965,9 @@ const SourceCandidateProvider = struct {
             if (self.limit > 0 and self.seen >= self.limit) return error.CandidateLimitReached;
             const resolved_key = try jsonStringFieldAlloc(self.allocator, value, "merged_into");
             defer if (resolved_key) |rk| self.allocator.free(rk);
-            const resolved_raw = if (resolved_key) |rk| try self.source.get(self.allocator, self.table, rk) else null;
+            const target_table = try jsonStringFieldAlloc(self.allocator, value, "merged_into_table");
+            defer if (target_table) |name| self.allocator.free(name);
+            const resolved_raw = if (resolved_key) |rk| try self.source.get(self.allocator, target_table orelse self.table, rk) else null;
             defer if (resolved_raw) |raw| self.allocator.free(raw);
             try appendEntityCandidateWithResolved(self.allocator, self.table, entity_key, value, resolved_key, resolved_raw, self.out);
             self.seen += 1;
@@ -972,7 +989,9 @@ const SourceCandidateProvider = struct {
                 defer allocator.free(raw);
                 const resolved_key = try jsonStringFieldAlloc(allocator, raw, "merged_into");
                 defer if (resolved_key) |rk| allocator.free(rk);
-                const resolved_raw = if (resolved_key) |rk| try self.source.get(allocator, self.table, rk) else null;
+                const target_table = try jsonStringFieldAlloc(allocator, raw, "merged_into_table");
+                defer if (target_table) |name| allocator.free(name);
+                const resolved_raw = if (resolved_key) |rk| try self.source.get(allocator, target_table orelse self.table, rk) else null;
                 defer if (resolved_raw) |rv| allocator.free(rv);
                 try appendEntityCandidateWithResolved(allocator, self.table, key, raw, resolved_key, resolved_raw, out);
             },
@@ -1038,7 +1057,12 @@ const ExactKeyCandidateProvider = struct {
         defer allocator.free(raw);
         const resolved_key = try jsonStringFieldAlloc(allocator, raw, "merged_into");
         defer if (resolved_key) |rk| allocator.free(rk);
-        const resolved_raw = if (resolved_key) |rk| try entityRawFromStore(allocator, self.store, rk) else null;
+        const target_table = try jsonStringFieldAlloc(allocator, raw, "merged_into_table");
+        defer if (target_table) |name| allocator.free(name);
+        const resolved_raw = if (resolved_key) |rk|
+            if (target_table == null or std.mem.eql(u8, target_table.?, self.table)) try entityRawFromStore(allocator, self.store, rk) else null
+        else
+            null;
         defer if (resolved_raw) |rv| allocator.free(rv);
         try appendEntityCandidateWithResolved(allocator, self.table, key, raw, resolved_key, resolved_raw, out);
     }
@@ -1076,7 +1100,12 @@ const PrefixCandidateProvider = struct {
             defer self.allocator.free(logical_value);
             const resolved_key = try jsonStringFieldAlloc(self.allocator, logical_value, "merged_into");
             defer if (resolved_key) |rk| self.allocator.free(rk);
-            const resolved_raw = if (resolved_key) |rk| try entityRawFromStore(self.allocator, self.store, rk) else null;
+            const target_table = try jsonStringFieldAlloc(self.allocator, logical_value, "merged_into_table");
+            defer if (target_table) |name| self.allocator.free(name);
+            const resolved_raw = if (resolved_key) |rk|
+                if (target_table == null or std.mem.eql(u8, target_table.?, self.table)) try entityRawFromStore(self.allocator, self.store, rk) else null
+            else
+                null;
             defer if (resolved_raw) |rv| self.allocator.free(rv);
             try appendEntityCandidateWithResolved(self.allocator, self.table, entity_key, logical_value, resolved_key, resolved_raw, self.out);
             self.seen += 1;
@@ -4001,6 +4030,46 @@ test "SourceCandidateProvider bulk exact keys retain duplicates missing candidat
         try testing.expectEqualStrings("person/ada", lists[i][0].doc_ref.key);
         try testing.expectEqualStrings("person/canonical", lists[i][0].resolved_doc_ref.?.key);
     }
+}
+
+test "SourceCandidateProvider follows a redirect into another logical table" {
+    const alloc = testing.allocator;
+    const Source = struct {
+        gets: usize = 0,
+        fn get(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, key: []const u8) anyerror!?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.gets += 1;
+            try testing.expectEqualStrings("curated", table);
+            try testing.expectEqualStrings("person/ada", key);
+            return try a.dupe(u8, "{\"canonical_name\":\"Ada\",\"entity_type\":\"person\"}");
+        }
+        fn getMany(_: *anyopaque, _: std.mem.Allocator, table: []const u8, keys: []const []const u8, ctx: *anyopaque, consume: CandidateSource.Consume) anyerror!void {
+            try testing.expectEqualStrings("people", table);
+            try testing.expectEqual(@as(usize, 1), keys.len);
+            try consume(ctx, keys[0], "{\"canonical_name\":\"Ada\",\"entity_type\":\"person\",\"merged_into\":\"person/ada\",\"merged_into_table\":\"curated\"}");
+        }
+    };
+    var source: Source = .{};
+    var resolver = try resolver_lib.Resolver.initFromParts(alloc, "people", "{{ lower _entity.label }}/{{ slug _entity.text }}", .{}, false, "");
+    defer resolver.deinit();
+    var provider = SourceCandidateProvider{
+        .source = .{ .ptr = &source, .vtable = &.{ .get = Source.get, .get_many = Source.getMany } },
+        .resolver = &resolver,
+        .table = "people",
+        .mode = .exact_key,
+        .ann_index_name = "",
+        .candidate_limit = 25,
+    };
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const entities = [_]resolver_lib.ExtractedEntity{.{ .local_id = "e0", .label = "person", .text = "Ada" }};
+    var lists: [1][]const resolver_lib.Candidate = undefined;
+    try provider.provider().candidatesForBatch(arena.allocator(), &entities, &lists);
+    try testing.expectEqual(@as(usize, 1), source.gets);
+    try testing.expectEqual(@as(usize, 1), lists[0].len);
+    try testing.expectEqualStrings("curated", lists[0][0].resolved_doc_ref.?.table);
+    try testing.expectEqualStrings("person/ada", lists[0][0].resolved_doc_ref.?.key);
+    try testing.expect(lists[0][0].resolved_record != null);
 }
 
 test "SourceCandidateProvider links via an injected cross-shard exact_key source" {
