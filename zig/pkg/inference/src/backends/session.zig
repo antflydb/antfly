@@ -1225,8 +1225,10 @@ fn deinitTensorSlice(tensors: []Tensor, allocator: std.mem.Allocator) void {
 test "session vtable layout" {
     // Ensure the vtable has all required function pointers.
     const info = @typeInfo(Session.VTable);
-    try std.testing.expectEqual(@as(usize, 15), info.@"struct".fields.len);
+    try std.testing.expectEqual(@as(usize, 17), info.@"struct".fields.len);
     try std.testing.expect(@hasField(Session.VTable, "independentBatchRows"));
+    try std.testing.expect(@hasField(Session.VTable, "hasLayaDecisions"));
+    try std.testing.expect(@hasField(Session.VTable, "runLayaDecisions"));
 }
 
 const AdmissionProbeSession = struct {
