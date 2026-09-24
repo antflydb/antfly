@@ -513,7 +513,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi inference calls reject null, closed, and database handles",
         "capi inference lists models and reports route errors with the runtime's JSON",
         "capi inference embeds text with a local model",
-        "capi inference reranks prompts with a local model",
+        "capi inference reranks documents with a local model",
         "capi inference chunks text without a model",
         "capi inference generates text with a local model and rejects streaming",
         "capi inference pull rejects invalid requests with a JSON error",
