@@ -401,12 +401,18 @@ pub fn rerankContentWithOptions(
                         );
                         if (!capabilities.input_modalities.image) return error.RerankerMediaUnsupported;
                     }
-                    const scores = try managed_embedder.AntflyProviderBoundary.call(
+                    const scores = managed_embedder.AntflyProviderBoundary.call(
                         "rerank_documents_with_context",
                         local.boundary_dispatch,
                         rerank_parts,
                         .{ local.ptr, alloc, cfg.model, query, content.parts.?, request_context },
-                    );
+                    ) catch |err| return switch (err) {
+                        // The linked host reports the rerank core's 400/413 as
+                        // InvalidArguments: this model cannot score these
+                        // documents, a query error like the remote path's 400.
+                        error.InvalidArguments => error.RerankerMediaUnsupported,
+                        else => err,
+                    };
                     errdefer alloc.free(scores);
                     try validateScores(scores, documents.len);
                     try request_context.check();
@@ -1313,6 +1319,7 @@ test "reranking runtime sends image documents to linked rerankers that accept im
 
     const State = struct {
         accepts_images: bool,
+        reject: bool = false,
         document_calls: usize = 0,
 
         fn dense(_: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![][]f32 {
@@ -1326,6 +1333,7 @@ test "reranking runtime sends image documents to linked rerankers that accept im
         }
         fn rerankDocuments(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const u8, documents: []const []const ContentPart, _: inference_request_context.RequestContext) anyerror![]f32 {
             const state: *@This() = @ptrCast(@alignCast(ptr));
+            if (state.reject) return error.InvalidArguments;
             state.document_calls += 1;
             try std.testing.expectEqual(@as(usize, 2), documents.len);
             try std.testing.expect(documents[0][1] == .binary);
@@ -1365,7 +1373,12 @@ test "reranking runtime sends image documents to linked rerankers that accept im
     try std.testing.expectError(error.RerankerMediaUnsupported, rerankContentWithOptions(alloc, &client, cfg, .{ .antfly_provider = local }, "invoice total", content));
     try std.testing.expectEqual(@as(usize, 1), state.document_calls);
 
-    local.rerank_documents_with_context = null;
+    // A document the linked core rejects is a query error, not an outage.
     state.accepts_images = true;
+    state.reject = true;
+    try std.testing.expectError(error.RerankerMediaUnsupported, rerankContentWithOptions(alloc, &client, cfg, .{ .antfly_provider = local }, "invoice total", content));
+    state.reject = false;
+
+    local.rerank_documents_with_context = null;
     try std.testing.expectError(error.RerankerMediaUnsupported, rerankContentWithOptions(alloc, &client, cfg, .{ .antfly_provider = local }, "invoice total", content));
 }

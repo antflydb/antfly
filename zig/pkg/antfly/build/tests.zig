@@ -1302,6 +1302,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "reranker component paging includes the post-rerank offset",
         "reranker paging preserves the underlying retrieval total",
         "reranker templates render media into image documents",
+        "reranker rendering parses only helper directives",
         "query dependency errors expose a stable JSON retry contract",
         "wildcard matching distinguishes operators from escaped literals",
         "wildcard literal escaping round trips metacharacters",

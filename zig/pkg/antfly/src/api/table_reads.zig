@@ -14443,6 +14443,16 @@ fn rerankerRenderConfig(
     return config;
 }
 
+/// Only the directives the template helpers emit select part parsing. Plain
+/// text that merely contains `<<<`, such as indexed logs, must reach the
+/// scorer unchanged rather than be trimmed or stripped by the part parser.
+fn hasRenderedDirective(rendered: []const u8) bool {
+    for ([_][]const u8{ "<<<dotprompt:media:url ", "<<<error:status=", "<<<error:message=" }) |prefix| {
+        if (std.mem.indexOf(u8, rendered, prefix) != null) return true;
+    }
+    return false;
+}
+
 fn isFatalRerankerRenderError(err: anyerror) bool {
     return err == error.OutOfMemory or err == error.Timeout or err == error.Canceled or err == error.Cancelled;
 }
@@ -14505,7 +14515,7 @@ const RerankerDocuments = struct {
             self.initialized += 1;
             return;
         };
-        if (std.mem.indexOf(u8, rendered, "<<<") == null) {
+        if (!hasRenderedDirective(rendered)) {
             self.texts[index] = rendered;
             self.initialized += 1;
             return;
@@ -19459,6 +19469,13 @@ fn consumerTests() type {
                 .{ .reranker_runtime = &runtime },
             ));
             try std.testing.expectEqual(@as(usize, 1), runtime.admission.stats().in_flight);
+        }
+
+        test "reranker rendering parses only helper directives" {
+            try std.testing.expect(hasRenderedDirective("page <<<dotprompt:media:url data:image/png;base64,AA==>>>"));
+            try std.testing.expect(hasRenderedDirective("<<<error:message=fetch failed>>>"));
+            try std.testing.expect(!hasRenderedDirective("  build log <<< merge conflict >>>  "));
+            try std.testing.expect(!hasRenderedDirective("<<<error without a directive shape"));
         }
 
         test "reranker templates render media into image documents" {
