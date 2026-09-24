@@ -40,6 +40,8 @@ pub const backend_runtime_durable_background: u32 = 40;
 pub const backend_runtime_durable_commit: u32 = 4;
 pub const backend_runtime_durable_cleanup: u32 = 4;
 pub const backend_runtime_api: u32 = 16;
+/// Shared forwarding budget: one six-worker executor is reserved for Data
+/// Raft leader forwarding, and the remainder serves distributed reads.
 pub const backend_runtime_request_forward: u32 = 32;
 /// Request/deadline, nested connect/deadline, and socket operation/deadline.
 /// Admission reserves the complete HTTP/1 task graph before sending a byte.
@@ -99,7 +101,8 @@ pub const BackendRuntimeLaneLimits = struct {
             self.durable_commit == 0 or self.durable_commit > backend_runtime_aggregate or
             self.durable_cleanup == 0 or self.durable_cleanup > backend_runtime_aggregate or
             self.api == 0 or self.api > backend_runtime_aggregate or
-            self.request_forward < request_forward_workers_per_request or self.request_forward > backend_runtime_aggregate or
+            // One full graph for reads and one protected for Data Raft.
+            self.request_forward < 2 * request_forward_workers_per_request or self.request_forward > backend_runtime_aggregate or
             self.raft_inbound == 0 or self.raft_inbound > backend_runtime_aggregate or
             self.raft_outbound == 0 or self.raft_outbound > backend_runtime_aggregate or
             self.inference == 0 or self.inference > backend_runtime_aggregate or
@@ -169,6 +172,10 @@ test "threaded io production limits are finite" {
     try std.testing.expectEqual(@as(u64, 252), expected_runtime_total);
     try std.testing.expectEqual(expected_runtime_total, runtime_limits.total());
     try std.testing.expect(runtime_limits.total() <= backend_runtime_aggregate);
+    try std.testing.expectError(
+        error.InvalidBackendRuntimeLaneLimits,
+        (BackendRuntimeLaneLimits{ .request_forward = request_forward_workers_per_request }).validate(),
+    );
     try std.testing.expect(backend_runtime_control < backend_runtime_api);
     try std.testing.expect(backend_runtime_control < backend_runtime_durable_background);
     try (BackendRuntimeLaneLimits{

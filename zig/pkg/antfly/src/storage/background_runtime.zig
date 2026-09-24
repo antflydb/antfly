@@ -978,6 +978,8 @@ pub const BackendRuntime = struct {
     raft_outbound_io_impl: std.atomic.Value(?*IoImpl) = .init(null),
     request_forward_io_impl: std.atomic.Value(?*IoImpl) = .init(null),
     request_forward_lane_gate: LaneLeaseGate = .{},
+    raft_request_forward_io_impl: std.atomic.Value(?*IoImpl) = .init(null),
+    raft_request_forward_lane_gate: LaneLeaseGate = .{},
     api_io_impl: std.atomic.Value(?*IoImpl) = .init(null),
     inference_io_impl: std.atomic.Value(?*IoImpl) = .init(null),
     pdf_render_executor: std.atomic.Value(?*bounded_worker_lane.Executor) = .init(null),
@@ -1107,12 +1109,14 @@ pub const BackendRuntime = struct {
         const coordinator_io = self.io();
         self.worker_lane_gate.close();
         self.request_forward_lane_gate.close();
+        self.raft_request_forward_lane_gate.close();
         self.api_lane_gate.close();
         self.inference_lane_gate.close();
         self.pdf_render_lane_gate.close();
         self.control_lane_gate.close();
         self.worker_lane_gate.waitDrained(coordinator_io);
         self.request_forward_lane_gate.waitDrained(coordinator_io);
+        self.raft_request_forward_lane_gate.waitDrained(coordinator_io);
         self.api_lane_gate.waitDrained(coordinator_io);
         self.inference_lane_gate.waitDrained(coordinator_io);
         self.pdf_render_lane_gate.waitDrained(coordinator_io);
@@ -1147,6 +1151,9 @@ pub const BackendRuntime = struct {
             deinitIoLane(self.alloc, io_impl);
         }
         if (self.request_forward_io_impl.swap(null, .acq_rel)) |io_impl| {
+            deinitIoLane(self.alloc, io_impl);
+        }
+        if (self.raft_request_forward_io_impl.swap(null, .acq_rel)) |io_impl| {
             deinitIoLane(self.alloc, io_impl);
         }
         if (self.raft_inbound_io_impl.swap(null, .acq_rel)) |io_impl| {
@@ -1337,6 +1344,7 @@ pub const BackendRuntime = struct {
     pub const RequestForwardLaneLease = struct {
         runtime: *BackendRuntime,
         borrowed_io: Io,
+        raft: bool,
         released: bool = false,
 
         pub fn io(self: *const @This()) Io {
@@ -1347,15 +1355,33 @@ pub const BackendRuntime = struct {
         pub fn release(self: *@This()) void {
             if (self.released) return;
             self.released = true;
-            self.runtime.request_forward_lane_gate.release(self.runtime.io());
+            const gate = if (self.raft) &self.runtime.raft_request_forward_lane_gate else &self.runtime.request_forward_lane_gate;
+            gate.release(self.runtime.io());
         }
     };
 
     pub fn acquireRequestForwardLane(self: *BackendRuntime) !RequestForwardLaneLease {
-        const capacity = self.lane_limits.request_forward / threaded_io_limits.request_forward_workers_per_request;
-        _ = self.request_forward_lane_gate.tryAcquireBounded(capacity) orelse
+        return self.acquireRequestForwardLaneWithPriority(false);
+    }
+
+    /// In the native backend, Data Raft leader forwarding owns one complete
+    /// six-worker HTTP task graph on a separate executor. General distributed
+    /// reads cannot occupy its workers, including while completed tasks retire.
+    /// The two executors stay within the configured forwarding worker ceiling.
+    /// Borrowed schedulers preserve their injected I/O and enforce only the
+    /// logical lease quotas; their physical isolation is the caller's choice.
+    pub fn acquireRaftRequestForwardLane(self: *BackendRuntime) !RequestForwardLaneLease {
+        return self.acquireRequestForwardLaneWithPriority(true);
+    }
+
+    fn acquireRequestForwardLaneWithPriority(self: *BackendRuntime, raft: bool) !RequestForwardLaneLease {
+        const raft_workers = threaded_io_limits.request_forward_workers_per_request;
+        const lane_workers = if (raft) raft_workers else self.lane_limits.request_forward - raft_workers;
+        const capacity = lane_workers / raft_workers;
+        const gate = if (raft) &self.raft_request_forward_lane_gate else &self.request_forward_lane_gate;
+        _ = gate.tryAcquireBounded(capacity) orelse
             return error.RequestForwardCapacityUnavailable;
-        errdefer self.request_forward_lane_gate.release(self.io());
+        errdefer gate.release(self.io());
         const forward_io = if (self.borrowed_io) |borrowed|
             borrowed.request_forward orelse borrowed.general
         else if (comptime builtin.os.tag == .freestanding)
@@ -1363,7 +1389,8 @@ pub const BackendRuntime = struct {
         else if (self.backend == .manual)
             if (self.io_impl) |impl| self.threadedNetworkIo(impl) else return error.BackendRuntimeUnavailable
         else blk: {
-            const impl = self.ensureSpecializedIoLane(&self.request_forward_io_impl, self.lane_limits.request_forward) orelse
+            const slot = if (raft) &self.raft_request_forward_io_impl else &self.request_forward_io_impl;
+            const impl = self.ensureSpecializedIoLane(slot, lane_workers) orelse
                 return error.BackendRuntimeUnavailable;
             // Group/Future completion precedes Threaded's busy-count release.
             // Count every still-busy task, including those whose request lease
@@ -1374,12 +1401,12 @@ pub const BackendRuntime = struct {
             const sync_io = Io.Threaded.global_single_threaded.io();
             impl.mutex.lockUncancelable(sync_io);
             const remaining = @intFromEnum(impl.concurrent_limit) -| impl.busy_count;
-            const reserved = self.request_forward_lane_gate.active() * threaded_io_limits.request_forward_workers_per_request;
+            const reserved = gate.active() * raft_workers;
             impl.mutex.unlock(sync_io);
             if (reserved > remaining) return error.RequestForwardCapacityUnavailable;
             break :blk self.threadedNetworkIo(impl);
         };
-        return .{ .runtime = self, .borrowed_io = forward_io };
+        return .{ .runtime = self, .borrowed_io = forward_io, .raft = raft };
     }
 
     pub fn raftOutboundIoImpl(self: *BackendRuntime) ?*IoImpl {
@@ -3125,6 +3152,10 @@ test "backend runtime borrows backend-agnostic std.Io lanes" {
     try std.testing.expectEqual(@intFromPtr(&forward_token), @intFromPtr(forwarding.io().userdata.?));
     forwarding.release();
     try std.testing.expect(handle.ptr().request_forward_io_impl.load(.acquire) == null);
+    var raft_forwarding = try handle.ptr().acquireRaftRequestForwardLane();
+    try std.testing.expectEqual(@intFromPtr(&forward_token), @intFromPtr(raft_forwarding.io().userdata.?));
+    raft_forwarding.release();
+    try std.testing.expect(handle.ptr().raft_request_forward_io_impl.load(.acquire) == null);
 
     var lease = try handle.ptr().acquireApiLane();
     try std.testing.expectEqual(@intFromPtr(&api_token), @intFromPtr(lease.io().userdata.?));
@@ -3158,6 +3189,7 @@ test "backend runtime deinit closes admission and waits for active lane leases" 
     const runtime = handle.ptr();
     var lease = try runtime.acquireApiLane();
     var forwarding = try runtime.acquireRequestForwardLane();
+    var raft_forwarding = try runtime.acquireRaftRequestForwardLane();
     var deinitialized = std.atomic.Value(bool).init(false);
     var deinit_thread = try std.testing.io.concurrent(struct {
         fn run(h: *BackendRuntimeHandle, done: *std.atomic.Value(bool)) void {
@@ -3169,18 +3201,22 @@ test "backend runtime deinit closes admission and waits for active lane leases" 
     defer if (!deinit_thread_awaited) {
         lease.release();
         forwarding.release();
+        raft_forwarding.release();
         deinit_thread.await(std.testing.io);
     };
 
     while (!runtime.api_lane_gate.isClosed()) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expectError(error.BackendRuntimeShuttingDown, runtime.acquireApiLane());
     try std.testing.expectError(error.RequestForwardCapacityUnavailable, runtime.acquireRequestForwardLane());
+    try std.testing.expectError(error.RequestForwardCapacityUnavailable, runtime.acquireRaftRequestForwardLane());
     try std.testing.expect(runtime.inferenceIo() == null);
     try std.testing.expect(runtime.inference_io_impl.load(.acquire) == null);
     try std.testing.expect(!deinitialized.load(.acquire));
     lease.release();
     try std.testing.expect(!deinitialized.load(.acquire));
     forwarding.release();
+    try std.testing.expect(!deinitialized.load(.acquire));
+    raft_forwarding.release();
     deinit_thread.await(std.testing.io);
     deinit_thread_awaited = true;
     try std.testing.expect(deinitialized.load(.acquire));
@@ -3385,6 +3421,54 @@ test "backend runtime async lane limit is CPU aware" {
     try std.testing.expectEqual(expected, boundedIoAsyncLimit(8));
 }
 
+test "backend runtime Data Raft forwarding progresses under saturated distributed reads" {
+    if (builtin.os.tag == .freestanding or builtin.single_threaded) return error.SkipZigTest;
+
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{
+        .lane_limits = .{ .request_forward = 12 },
+    });
+    defer handle.deinit();
+    const runtime = handle.ptr();
+    var general = try runtime.acquireRequestForwardLane();
+    defer general.release();
+    const general_io = general.io();
+    var release: Io.Event = .unset;
+    var all_started: Io.Event = .unset;
+    var started: std.atomic.Value(usize) = .init(0);
+    var reads: Io.Group = .init;
+    defer {
+        release.set(general_io);
+        reads.cancel(general_io);
+    }
+    const BlockedRead = struct {
+        fn run(task_io: Io, started_count: *std.atomic.Value(usize), ready: *Io.Event, unblock: *Io.Event) void {
+            if (started_count.fetchAdd(1, .acq_rel) + 1 == 6) ready.set(task_io);
+            unblock.waitUncancelable(task_io);
+        }
+    };
+    for (0..6) |_| try reads.concurrent(general_io, BlockedRead.run, .{ general_io, &started, &all_started, &release });
+    try all_started.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    try std.testing.expectError(error.RequestForwardCapacityUnavailable, runtime.acquireRequestForwardLane());
+
+    var raft = try runtime.acquireRaftRequestForwardLane();
+    defer raft.release();
+    var progressed: Io.Event = .unset;
+    var raft_tasks: Io.Group = .init;
+    defer raft_tasks.cancel(raft.io());
+    const SignalProgress = struct {
+        fn run(task_io: Io, done: *Io.Event) void {
+            done.set(task_io);
+        }
+    };
+    try raft_tasks.concurrent(raft.io(), SignalProgress.run, .{ raft.io(), &progressed });
+    try progressed.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    try raft_tasks.await(raft.io());
+    try std.testing.expectEqual(@as(usize, 1), runtime.request_forward_lane_gate.active());
+    try std.testing.expectEqual(@as(usize, 1), runtime.raft_request_forward_lane_gate.active());
+    release.set(general_io);
+    try reads.await(general_io);
+}
+
 test "backend runtime forwarding admission includes retiring executor tasks" {
     if (builtin.os.tag == .freestanding or builtin.single_threaded) return error.SkipZigTest;
     const PausedAllocator = struct {
@@ -3407,7 +3491,7 @@ test "backend runtime forwarding admission includes retiring executor tasks" {
         fn free(ptr: *anyopaque, buf: []u8, align_: std.mem.Alignment, ra: usize) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.hold.load(.acquire)) {
-                if (self.retiring.fetchAdd(1, .release) + 1 == 6) self.all_retiring.set(std.testing.io);
+                if (self.retiring.fetchAdd(1, .release) + 1 == 12) self.all_retiring.set(std.testing.io);
                 self.release.waitUncancelable(std.testing.io);
             }
             std.heap.page_allocator.rawFree(buf, align_, ra);
@@ -3416,12 +3500,14 @@ test "backend runtime forwarding admission includes retiring executor tasks" {
 
     var allocator: PausedAllocator = .{};
     var handle = try BackendRuntimeHandle.init(allocator.allocator(), .{
-        .lane_limits = .{ .request_forward = 6 },
+        .lane_limits = .{ .request_forward = 12 },
     });
     defer handle.deinit();
     const runtime = handle.ptr();
     var lease = try runtime.acquireRequestForwardLane();
     defer lease.release();
+    var raft_lease = try runtime.acquireRaftRequestForwardLane();
+    defer raft_lease.release();
     const io = lease.io();
     var release: Io.Event = .unset;
     var tasks: Io.Group = .init;
@@ -3437,6 +3523,7 @@ test "backend runtime forwarding admission includes retiring executor tasks" {
         }
     };
     for (0..6) |_| try tasks.concurrent(io, Task.run, .{ io, &release });
+    for (0..6) |_| try tasks.concurrent(raft_lease.io(), Task.run, .{ raft_lease.io(), &release });
     allocator.hold.store(true, .release);
     defer allocator.hold.store(false, .release);
     release.set(io);
@@ -3445,13 +3532,21 @@ test "backend runtime forwarding admission includes retiring executor tasks" {
     // The request has finished and releases its lease, but its slots are busy.
     try allocator.all_retiring.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
     lease.release();
+    raft_lease.release();
     const admission = runtime.acquireRequestForwardLane();
     if (admission) |value| {
         var unexpected = value;
         unexpected.release();
         return error.TestUnexpectedResult;
     } else |err| try std.testing.expectEqual(error.RequestForwardCapacityUnavailable, err);
+    const raft_admission = runtime.acquireRaftRequestForwardLane();
+    if (raft_admission) |value| {
+        var unexpected = value;
+        unexpected.release();
+        return error.TestUnexpectedResult;
+    } else |err| try std.testing.expectEqual(error.RequestForwardCapacityUnavailable, err);
     try std.testing.expectEqual(@as(usize, 0), runtime.request_forward_lane_gate.active());
+    try std.testing.expectEqual(@as(usize, 0), runtime.raft_request_forward_lane_gate.active());
     allocator.hold.store(false, .release);
     allocator.release.set(std.testing.io);
     // Only this test waits for the deliberately paused retirement. Production
@@ -3476,7 +3571,7 @@ test "backend runtime honors reduced per-lane limits under the aggregate ceiling
         .api = 5,
         .raft_inbound = 2,
         .raft_outbound = 2,
-        .request_forward = 6,
+        .request_forward = 12,
         .inference = 4,
         .control = 1,
         .pdf_render = 1,
@@ -3499,8 +3594,12 @@ test "backend runtime honors reduced per-lane limits under the aggregate ceiling
     try std.testing.expectEqual(std.Io.Limit.limited(limits.raft_outbound), runtime.raftOutboundIoImpl().?.concurrent_limit);
     var forward_lease = try runtime.acquireRequestForwardLane();
     defer forward_lease.release();
-    try std.testing.expectEqual(std.Io.Limit.limited(limits.request_forward), runtime.request_forward_io_impl.load(.acquire).?.concurrent_limit);
+    try std.testing.expectEqual(std.Io.Limit.limited(limits.request_forward - threaded_io_limits.request_forward_workers_per_request), runtime.request_forward_io_impl.load(.acquire).?.concurrent_limit);
     try std.testing.expectError(error.RequestForwardCapacityUnavailable, runtime.acquireRequestForwardLane());
+    var raft_forward_lease = try runtime.acquireRaftRequestForwardLane();
+    defer raft_forward_lease.release();
+    try std.testing.expectEqual(std.Io.Limit.limited(threaded_io_limits.request_forward_workers_per_request), runtime.raft_request_forward_io_impl.load(.acquire).?.concurrent_limit);
+    try std.testing.expectError(error.RequestForwardCapacityUnavailable, runtime.acquireRaftRequestForwardLane());
     var api_lease = try runtime.acquireApiLane();
     defer api_lease.release();
     var inference_lease = try runtime.acquireInferenceLane();

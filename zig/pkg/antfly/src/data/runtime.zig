@@ -11068,7 +11068,7 @@ pub const DataServer = struct {
 
     fn acquireDataRaftForwardLane(self: *DataServer) !backend_runtime_mod.BackendRuntime.RequestForwardLaneLease {
         const runtime = self.backend_runtime orelse return error.BackendRuntimeUnavailable;
-        return runtime.acquireRequestForwardLane() catch |err| switch (err) {
+        return runtime.acquireRaftRequestForwardLane() catch |err| switch (err) {
             // This request has not entered transport. Report safe admission
             // failure through the existing leader-unavailable classification.
             error.RequestForwardCapacityUnavailable => error.LeaderUnavailable,
