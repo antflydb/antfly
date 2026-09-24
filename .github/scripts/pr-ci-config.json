@@ -47,6 +47,11 @@
       "label": "ci:gpu"
     },
     {
+      "id": "vopr",
+      "workflow": "zig-vopr-pr.yml",
+      "label": "ci:vopr"
+    },
+    {
       "id": "darwin",
       "workflow": "diagnose-zig-arm64-bad-alloc.yml",
       "label": "ci:darwin-release"

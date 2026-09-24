@@ -127,6 +127,16 @@ jobs:
       base_sha: ${{ needs.approve.outputs.base_sha }}
       check_id: ${{ inputs.check_id }}
       comment_id: ${{ inputs.comment_id }}
+  vopr:
+    needs: approve
+    if: contains(fromJSON(needs.approve.outputs.suites), 'vopr')
+    uses: ./.github/workflows/zig-vopr-pr.yml
+    with:
+      pr_number: ${{ inputs.pr_number }}
+      head_sha: ${{ needs.approve.outputs.head_sha }}
+      base_sha: ${{ needs.approve.outputs.base_sha }}
+      check_id: ${{ inputs.check_id }}
+      comment_id: ${{ inputs.comment_id }}
   darwin:
     needs: approve
     if: contains(fromJSON(needs.approve.outputs.suites), 'darwin')
@@ -139,7 +149,7 @@ jobs:
       comment_id: ${{ inputs.comment_id }}
   result:
     name: PR CI result
-    needs: [approve, policy, zig, sdks, proxy, operator, scale, gpu, darwin]
+    needs: [approve, policy, zig, sdks, proxy, operator, scale, gpu, vopr, darwin]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
