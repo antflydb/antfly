@@ -123,6 +123,7 @@ test {
     _ = @import("finetune/laya/job.zig");
     _ = @import("pipelines/laya.zig");
     _ = @import("pipelines/laya_tree.zig");
+    _ = @import("architectures/laya_trunk_cache.zig");
     _ = @import("pipelines/laya_packed_test.zig");
     _ = @import("pipelines/laya_packed_parity_test.zig");
     _ = @import("pipelines/laya_parity_test.zig");

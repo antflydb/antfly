@@ -154,33 +154,77 @@ fn scoreHost(cb: *const CB, a: std.mem.Allocator, cfg: Config, host: []const f32
 /// mask. Trunk tokens (`kinds` = -1) receive no question-type embedding.
 /// Returns logits `[questions, width]` and action logits `[questions, n_act]`.
 pub fn forwardPacked(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder: CT, head_bias: CT, kinds: []const i64, markers: []const i64, anchors: []const i64, width: usize, dim: usize) ![]Tensor {
-    const seq = kinds.len;
+    return packedHead(cb, a, cfg, encoder, head_bias, kinds, markers, anchors, width, dim, null);
+}
+
+/// `forwardPacked` for the branch rows of a row whose trunk keys and values
+/// are cached (`prefix`). `encoder` and `kinds` cover the branch rows only;
+/// `markers` and `anchors` stay row-global. `head_bias` covers the whole row.
+pub fn forwardPackedBranches(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder: CT, head_bias: CT, kinds: []const i64, markers: []const i64, anchors: []const i64, width: usize, dim: usize, prefix: Prefix) ![]Tensor {
+    const local_markers = try a.alloc(i64, markers.len);
+    defer a.free(local_markers);
+    for (markers, local_markers) |marker, *local| {
+        if (marker >= 0 and marker < prefix.rows) return error.InvalidLayaInputs;
+        local.* = if (marker < 0) -1 else marker - @as(i64, @intCast(prefix.rows));
+    }
+    const local_anchors = try a.alloc(i64, anchors.len);
+    defer a.free(local_anchors);
+    for (anchors, local_anchors) |anchor, *local| {
+        if (anchor < prefix.rows) return error.InvalidLayaInputs;
+        local.* = anchor - @as(i64, @intCast(prefix.rows));
+    }
+    return packedHead(cb, a, cfg, encoder, head_bias, kinds, local_markers, local_anchors, width, dim, prefix);
+}
+
+/// Run the head layers over trunk-only encoder rows (`[rows, dim]`, no type
+/// embedding, full visibility) and copy each layer's keys and values.
+pub fn captureTrunk(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder: CT, rows: usize, dim: usize, capture: Capture) !void {
+    if (capture.keys.len != cfg.head_layers or capture.values.len != cfg.head_layers) return error.InvalidLayaInputs;
+    const zeros = try a.alloc(f32, rows * dim);
+    defer a.free(zeros);
+    @memset(zeros, 0);
+    const zero_ct = try cb.fromFloat32Shape(zeros, &.{ @intCast(rows), @intCast(dim) });
+    defer cb.free(zero_ct);
+    const mask = try a.alloc(i64, rows);
+    defer a.free(mask);
+    @memset(mask, 1);
+    const hidden = try layers(cb, a, cfg, try cb.add(encoder, zero_ct), mask, null, 1, rows, dim, null, capture);
+    cb.free(hidden);
+}
+
+fn packedHead(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder: CT, head_bias: CT, kinds: []const i64, markers: []const i64, anchors: []const i64, width: usize, dim: usize, prefix: ?Prefix) ![]Tensor {
+    const rows = kinds.len;
+    const seq = rows + if (prefix) |p| p.rows else 0;
     const questions = anchors.len;
-    if (seq == 0 or questions == 0 or width < 2 or width > cfg.maxOptions() or markers.len != questions * width or dim < 64 or dim % 64 != 0) return error.InvalidLayaInputs;
+    if (rows == 0 or questions == 0 or width < 2 or width > cfg.maxOptions() or markers.len != questions * width or dim < 64 or dim % 64 != 0) return error.InvalidLayaInputs;
     const type_weight = try cb.getWeight("model.type_emb.weight");
     defer cb.free(type_weight);
     const table = try cb.toFloat32(type_weight, a);
     defer a.free(table);
     if (table.len != 3 * dim) return error.InvalidLayaWeights;
-    const types = try a.alloc(f32, seq * dim);
+    const types = try a.alloc(f32, rows * dim);
     defer a.free(types);
     for (kinds, 0..) |kind, i| {
         const dst = types[i * dim ..][0..dim];
         if (kind < 0) @memset(dst, 0) else @memcpy(dst, table[@as(usize, @intCast(kind)) * dim ..][0..dim]);
     }
-    const type_ct = try cb.fromFloat32Shape(types, &.{ @intCast(seq), @intCast(dim) });
+    const type_ct = try cb.fromFloat32Shape(types, &.{ @intCast(rows), @intCast(dim) });
     defer cb.free(type_ct);
     const mask = try a.alloc(i64, seq);
     defer a.free(mask);
     @memset(mask, 1);
-    const hidden = try layers(cb, a, cfg, try cb.add(encoder, type_ct), mask, head_bias, 1, seq, dim);
+    const hidden = try layers(cb, a, cfg, try cb.add(encoder, type_ct), mask, head_bias, 1, seq, dim, prefix, null);
     defer cb.free(hidden);
     const host = try cb.toFloat32(hidden, a);
     defer a.free(host);
-    if (host.len != seq * dim) return error.UnexpectedOutputShape;
+    if (host.len != rows * dim) return error.UnexpectedOutputShape;
     const offsets = try a.alloc(usize, questions);
     defer a.free(offsets);
-    for (anchors, offsets) |anchor, *offset| offset.* = @intCast(anchor);
+    for (anchors, offsets) |anchor, *offset| {
+        if (anchor < 0 or anchor >= rows) return error.InvalidLayaInputs;
+        offset.* = @intCast(anchor);
+    }
+    for (markers) |marker| if (marker >= rows) return error.InvalidLayaInputs;
     return scoreHost(cb, a, cfg, host, markers, offsets, width, dim);
 }
 
@@ -233,12 +277,20 @@ pub fn transform(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder: CT, 
     defer cb.free(type_weight);
     const types = try cb.embeddingLookup(type_weight, repeated, batch * seq, dim);
     defer cb.free(types);
-    return layers(cb, a, cfg, try cb.add(encoder, types), mask, null, batch, seq, dim);
+    return layers(cb, a, cfg, try cb.add(encoder, types), mask, null, batch, seq, dim, null, null);
 }
 
-/// Pre-norm TransformerEncoder layers. Takes ownership of `input`.
-fn layers(cb: *const CB, a: std.mem.Allocator, cfg: Config, input: CT, mask: []const i64, bias: ?CT, batch: usize, seq: usize, dim: usize) !CT {
-    _ = a;
+/// Cached trunk keys and values per head layer, `[rows, dim]` each, and a
+/// `[rows, dim]` zero block standing in for trunk queries.
+pub const Prefix = struct { rows: usize, keys: []const CT, values: []const CT, zeros: CT };
+/// Host destinations for each head layer's keys and values.
+pub const Capture = struct { keys: []const []f32, values: []const []f32 };
+
+/// Pre-norm TransformerEncoder layers. Takes ownership of `input`. With a
+/// prefix, `input` holds only the rows after it and attention spans both.
+fn layers(cb: *const CB, a: std.mem.Allocator, cfg: Config, input: CT, mask: []const i64, bias: ?CT, batch: usize, seq: usize, dim: usize, trunk: ?Prefix, capture: ?Capture) !CT {
+    const prefix_rows: usize = if (trunk) |p| p.rows else 0;
+    const rows = batch * seq - prefix_rows;
     var hidden = input;
     errdefer cb.free(hidden);
     for (0..cfg.head_layers) |layer| {
@@ -252,7 +304,7 @@ fn layers(cb: *const CB, a: std.mem.Allocator, cfg: Config, input: CT, mask: []c
         defer cb.free(qw);
         const qb = try weight(cb, prefix, "self_attn.in_proj_bias");
         defer cb.free(qb);
-        const qkv = try cb.linear(n1, qw, qb, batch * seq, dim, dim * 3);
+        const qkv = try cb.linear(n1, qw, qb, rows, dim, dim * 3);
         defer cb.free(qkv);
         const q = try cb.sliceLastDim(qkv, 0, dim);
         defer cb.free(q);
@@ -260,19 +312,41 @@ fn layers(cb: *const CB, a: std.mem.Allocator, cfg: Config, input: CT, mask: []c
         defer cb.free(k);
         const v = try cb.sliceLastDim(qkv, dim * 2, dim * 3);
         defer cb.free(v);
-        const attn = try cb.scaledDotProductAttention(q, k, v, mask, bias, batch, seq, dim / 64, 64);
-        defer cb.free(attn);
-        const proj = try linear(cb, attn, try std.fmt.bufPrint(&buf, "{s}.self_attn.out_proj", .{prefix}), batch * seq, dim, dim);
+        if (capture) |c| {
+            for ([_]CT{ k, v }, [_][]f32{ c.keys[layer], c.values[layer] }) |tensor, dst| {
+                const host = try cb.toFloat32(tensor, a);
+                defer a.free(host);
+                if (host.len != dst.len) return error.InvalidLayaInputs;
+                @memcpy(dst, host);
+            }
+        }
+        var joined: [3]?CT = .{ null, null, null };
+        defer for (joined) |tensor| if (tensor) |t| cb.free(t);
+        if (trunk) |p| {
+            const prefix_shape = [_]i64{ @intCast(p.rows), @intCast(dim) };
+            const rows_shape = [_]i64{ @intCast(rows), @intCast(dim) };
+            joined[0] = try cb.primConcatPrim(p.zeros, q, 0, &prefix_shape, &rows_shape);
+            joined[1] = try cb.primConcatPrim(p.keys[layer], k, 0, &prefix_shape, &rows_shape);
+            joined[2] = try cb.primConcatPrim(p.values[layer], v, 0, &prefix_shape, &rows_shape);
+        }
+        const attn_full = try cb.scaledDotProductAttention(joined[0] orelse q, joined[1] orelse k, joined[2] orelse v, mask, bias, batch, seq, dim / 64, 64);
+        defer cb.free(attn_full);
+        const attn = if (trunk != null)
+            try @import("modern_bert.zig").branchRows(cb, a, attn_full, prefix_rows, seq, dim)
+        else
+            attn_full;
+        defer if (trunk != null) cb.free(attn);
+        const proj = try linear(cb, attn, try std.fmt.bufPrint(&buf, "{s}.self_attn.out_proj", .{prefix}), rows, dim, dim);
         defer cb.free(proj);
         const residual = try cb.add(hidden, proj);
         defer cb.free(residual);
         const n2 = try norm(cb, residual, try std.fmt.bufPrint(&buf, "{s}.norm2", .{prefix}), dim);
         defer cb.free(n2);
-        const up = try linear(cb, n2, try std.fmt.bufPrint(&buf, "{s}.linear1", .{prefix}), batch * seq, dim, dim * 4);
+        const up = try linear(cb, n2, try std.fmt.bufPrint(&buf, "{s}.linear1", .{prefix}), rows, dim, dim * 4);
         defer cb.free(up);
         const relu = try cb.relu(up);
         defer cb.free(relu);
-        const down = try linear(cb, relu, try std.fmt.bufPrint(&buf, "{s}.linear2", .{prefix}), batch * seq, dim * 4, dim);
+        const down = try linear(cb, relu, try std.fmt.bufPrint(&buf, "{s}.linear2", .{prefix}), rows, dim * 4, dim);
         defer cb.free(down);
         const next = try cb.add(residual, down);
         cb.free(hidden);

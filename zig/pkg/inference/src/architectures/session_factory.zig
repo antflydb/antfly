@@ -6525,7 +6525,39 @@ const ArchSession = struct {
     /// when this is set; other architectures fall through to their
     /// existing eager path.
     graph_runtime_strategy: ?graph_runtime.Strategy = null,
+    /// Tree-packed Laya trunk keys and values, created on first packed run.
+    laya_trunk_cache: ?*@import("laya_trunk_cache.zig").Cache = null,
+    laya_trunk_cache_lock: std.atomic.Mutex = .unlocked,
 };
+
+fn layaTrunkCache(self: *ArchSession) ?*@import("laya_trunk_cache.zig").Cache {
+    platform.sync.lockYielding(&self.laya_trunk_cache_lock);
+    defer self.laya_trunk_cache_lock.unlock();
+    if (self.laya_trunk_cache == null) {
+        const cache = self.allocator.create(@import("laya_trunk_cache.zig").Cache) catch return null;
+        cache.* = @import("laya_trunk_cache.zig").Cache.fromEnvironment(self.allocator);
+        self.laya_trunk_cache = cache;
+    }
+    return self.laya_trunk_cache;
+}
+
+/// Hit/miss counters of a packed Laya session's trunk cache.
+pub fn layaTrunkCacheStats(session: Session) ?@import("laya_trunk_cache.zig").Stats {
+    if (session.vtable != &arch_vtable) return null;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    const cache = layaTrunkCache(self) orelse return null;
+    return cache.snapshot();
+}
+
+/// Replace a session's trunk cache budget; 0 disables it.
+pub fn setLayaTrunkCacheLimit(session: Session, limit_bytes: usize) void {
+    if (session.vtable != &arch_vtable) return;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    const cache = layaTrunkCache(self) orelse return;
+    platform.sync.lockYielding(&cache.mutex);
+    defer cache.mutex.unlock();
+    cache.limit_bytes = limit_bytes;
+}
 
 /// Attach a runtime Io to a Session created by this factory so its
 /// compute backend dispatches matmul work through the caller's thread
@@ -8167,7 +8199,7 @@ fn archRunImpl(
         },
         .modern_bert => |cfg| {
             if (cfg.laya) |laya| {
-                if (laya.packing.enabled()) return @import("laya_packed.zig").run(&cb, allocator, cfg, inputs);
+                if (laya.packing.enabled()) return @import("laya_packed.zig").run(&cb, allocator, cfg, inputs, layaTrunkCache(self));
                 if (inputs.len != 4) return error.InvalidLayaInputs;
                 const bi = try parseBertRunInputs(inputs[0..2]);
                 const kinds = try validateI64Matrix(inputs[2], .{ bi.batch, 1 });
@@ -9378,6 +9410,11 @@ fn archBackend(ptr: *anyopaque) BackendType {
 
 fn archClose(ptr: *anyopaque) void {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    if (self.laya_trunk_cache) |cache| {
+        cache.deinit();
+        self.allocator.destroy(cache);
+        self.laya_trunk_cache = null;
+    }
     switch (self.backend_type) {
         .native => self.backend_data.native.deinitOwned(),
         .metal => {

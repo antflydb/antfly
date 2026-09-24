@@ -23,6 +23,7 @@ const ops = @import("../ops/ops.zig");
 const modern = @import("modern_bert.zig");
 const head = @import("laya_head.zig");
 const tree = @import("../pipelines/laya_tree.zig");
+const trunk_cache = @import("laya_trunk_cache.zig");
 const Tensor = @import("../backends/tensor.zig").Tensor;
 const TensorInfo = @import("../backends/tensor.zig").TensorInfo;
 
@@ -80,15 +81,110 @@ pub fn view(a: std.mem.Allocator, cfg: modern.Config, inputs: []const Tensor) !t
     return tree.own(a, row);
 }
 
-pub fn run(cb: *const ops.ComputeBackend, a: std.mem.Allocator, cfg: modern.Config, inputs: []const Tensor) ![]Tensor {
+pub fn run(cb: *const ops.ComputeBackend, a: std.mem.Allocator, cfg: modern.Config, inputs: []const Tensor, cache: ?*trunk_cache.Cache) ![]Tensor {
     const laya = cfg.laya orelse return error.InvalidLayaConfig;
     const row = try view(a, cfg, inputs);
     defer row.deinit(a);
-    return forwardRow(cb, a, cfg, laya, row);
+    return forwardRow(cb, a, cfg, laya, row, cache);
 }
 
-/// Encoder and decision head for one validated row.
-pub fn forwardRow(cb: *const ops.ComputeBackend, a: std.mem.Allocator, cfg: modern.Config, laya: @import("../models/laya.zig").Config, row: tree.Row) ![]Tensor {
+const Laya = @import("../models/laya.zig").Config;
+
+/// Encoder and decision head for one validated row. With a cache on the CPU
+/// backend, the trunk's per-layer keys and values are reused across rows and
+/// requests, and only the branch tokens are encoded (laya_trunk_cache.zig).
+pub fn forwardRow(cb: *const ops.ComputeBackend, a: std.mem.Allocator, cfg: modern.Config, laya: Laya, row: tree.Row, cache: ?*trunk_cache.Cache) ![]Tensor {
+    const store = cache orelse return forwardFull(cb, a, cfg, laya, row);
+    // CPU only for now. On Metal, device row concat/gather is not ordered with
+    // pending session work (wrong decisions), and per-request uploads of the
+    // host cache cost what skipping the trunk saves (models/laya/LAYA.md).
+    if (cb.kind() != .native) return forwardFull(cb, a, cfg, laya, row);
+    const trunk = trunkRows(row) orelse return forwardFull(cb, a, cfg, laya, row);
+    if (store.limit_bytes == 0 or trunk == row.ids.len) return forwardFull(cb, a, cfg, laya, row);
+    const layers = cfg.num_hidden_layers + laya.head_layers;
+    const key = trunk_cache.Cache.key(row.ids[0..trunk], layers, cfg.hidden_size);
+    const entry = store.acquire(key) orelse blk: {
+        const created = try store.create(key, trunk, layers, cfg.hidden_size);
+        errdefer store.release(created);
+        try fillTrunk(cb, a, cfg, laya, row.ids[0..trunk], created);
+        store.publish(created);
+        break :blk created;
+    };
+    defer store.release(entry);
+    return forwardCached(cb, a, cfg, laya, row, entry);
+}
+
+/// Trunk length when the trunk is exactly rows `0..T` at positions `0..T-1`.
+fn trunkRows(row: tree.Row) ?usize {
+    var trunk: usize = 0;
+    while (trunk < row.ids.len and row.segments[trunk] == 0) : (trunk += 1) {
+        if (row.positions[trunk] != trunk) return null;
+    }
+    for (row.segments[trunk..]) |segment| if (segment == 0) return null;
+    return if (trunk == 0) null else trunk;
+}
+
+/// Encode the trunk alone (it never attends to a branch) and copy every
+/// encoder and head layer's keys and values into `entry`.
+fn fillTrunk(cb: *const ops.ComputeBackend, a: std.mem.Allocator, cfg: modern.Config, laya: Laya, ids: []const i64, entry: *trunk_cache.Entry) !void {
+    const n = cfg.num_hidden_layers;
+    const keys = try a.alloc([]f32, entry.layers);
+    defer a.free(keys);
+    const values = try a.alloc([]f32, entry.layers);
+    defer a.free(values);
+    for (keys, values, 0..) |*k, *v, layer| {
+        k.* = entry.slot(layer, .keys);
+        v.* = entry.slot(layer, .values);
+    }
+    const encoded = try modern.forwardCapturingCT(cb, a, cfg, ids, .{ .keys = keys[0..n], .values = values[0..n] });
+    defer cb.free(encoded);
+    try head.captureTrunk(cb, a, laya, encoded, ids.len, cfg.hidden_size, .{ .keys = keys[n..], .values = values[n..] });
+}
+
+fn forwardCached(cb: *const ops.ComputeBackend, a: std.mem.Allocator, cfg: modern.Config, laya: Laya, row: tree.Row, entry: *const trunk_cache.Entry) ![]Tensor {
+    const n = row.ids.len;
+    const trunk = entry.tokens;
+    const hidden = cfg.hidden_size;
+    const shape = [_]i32{ @intCast(n), @intCast(n) };
+    const global_values = try tree.bias(a, row, null);
+    defer a.free(global_values);
+    const global = try cb.fromFloat32Shape(global_values, &shape);
+    defer cb.free(global);
+    const local_values = try tree.bias(a, row, cfg.local_attention_window / 2);
+    defer a.free(local_values);
+    const local = try cb.fromFloat32Shape(local_values, &shape);
+    defer cb.free(local);
+    const block = [_]i32{ @intCast(trunk), @intCast(hidden) };
+    const zero_values = try a.alloc(f32, trunk * hidden);
+    defer a.free(zero_values);
+    @memset(zero_values, 0);
+    const zeros = try cb.fromFloat32Shape(zero_values, &block);
+    defer cb.free(zeros);
+    const keys = try a.alloc(ops.CT, entry.layers);
+    defer a.free(keys);
+    const values = try a.alloc(ops.CT, entry.layers);
+    defer a.free(values);
+    var uploaded: usize = 0;
+    defer for (keys[0..uploaded], values[0..uploaded]) |k, v| {
+        cb.free(k);
+        cb.free(v);
+    };
+    for (keys, values, 0..) |*k, *v, layer| {
+        k.* = try cb.fromFloat32Shape(entry.keys(layer), &block);
+        v.* = cb.fromFloat32Shape(entry.vals(layer), &block) catch |err| {
+            cb.free(k.*);
+            return err;
+        };
+        uploaded += 1;
+    }
+    const layers = cfg.num_hidden_layers;
+    const encoded = try modern.forwardBranchesCT(cb, a, cfg, row.ids[trunk..], .{ .positions = row.positions[trunk..], .global_bias = global, .local_bias = local }, .{ .prefix_rows = trunk, .keys = keys[0..layers], .values = values[0..layers], .zeros = zeros });
+    defer cb.free(encoded);
+    return head.forwardPackedBranches(cb, a, laya, encoded, global, row.kinds[trunk..], row.markers, row.anchors, row.width, hidden, .{ .rows = trunk, .keys = keys[layers..], .values = values[layers..], .zeros = zeros });
+}
+
+/// Encoder and decision head over every token of one validated row.
+pub fn forwardFull(cb: *const ops.ComputeBackend, a: std.mem.Allocator, cfg: modern.Config, laya: Laya, row: tree.Row) ![]Tensor {
     const n = row.ids.len;
     const shape = [_]i32{ @intCast(n), @intCast(n) };
     const global_values = try tree.bias(a, row, null);

@@ -192,7 +192,7 @@ test "laya packed encoder on a one-segment tree reproduces the unpacked encoder"
 fn runRow(a: std.mem.Allocator, fixture: *const Fixture, row: tree.Row) ![2][]f32 {
     const cb = try factory.getComputeBackend(fixture.session, a);
     defer cb.deinit();
-    const outputs = try packed_arch.forwardRow(&cb, a, fixture.encoder, fixture.cfg, row);
+    const outputs = try packed_arch.forwardRow(&cb, a, fixture.encoder, fixture.cfg, row, null);
     defer {
         for (outputs) |*output| output.deinit();
         a.free(outputs);
@@ -250,6 +250,62 @@ test "laya packed questions are isolated and share one exact trunk encoding" {
         const moved = try runRow(a, &fixture, other);
         try std.testing.expect(try maxError(together[0], moved[0]) > 1e-4);
     }
+}
+
+test "laya packed trunk cache reuses the state exactly across rows and requests" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var words = synthetic.WordTokenizer{};
+    const tok = words.tokenizer();
+    const trunk_cache = @import("../architectures/laya_trunk_cache.zig");
+    for ([_][]const u8{ "{\"mode\":\"question\"}", "{\"mode\":\"candidate\"}" }) |packing| {
+        var fixture = try Fixture.init(std.testing.allocator, packing);
+        defer fixture.deinit(std.testing.allocator);
+        var cache = trunk_cache.Cache.init(std.testing.allocator, 64 * 1024 * 1024);
+        defer cache.deinit();
+        var worst: f32 = 0;
+        // Miss (fills the cache), then hits with different question sets.
+        for ([_][]const pipeline.Question{ &questions, questions[1..], questions[0..1] }) |subset| {
+            const row = (try tree.build(a, tok, fixture.cfg, state_text, subset))[0];
+            const full = try runRow(a, &fixture, row);
+            // One compute backend at a time: Metal sessions share one provider.
+            const cb = try factory.getComputeBackend(fixture.session, std.testing.allocator);
+            defer cb.deinit();
+            const cached = try packed_arch.forwardRow(&cb, a, fixture.encoder, fixture.cfg, row, &cache);
+            worst = @max(worst, try maxError(full[0], cached[0].asFloat32()));
+            worst = @max(worst, try maxError(full[1], cached[1].asFloat32()));
+        }
+        const stats = cache.snapshot();
+        std.debug.print("Laya packed {s}: cached vs full max error={d}, hits={d} misses={d} bytes={d}\n", .{ packing, worst, stats.hits, stats.misses, stats.bytes });
+        try std.testing.expect(worst < 1e-5);
+        // The cache is CPU-only; other backends always run the full row.
+        const cached_backend = fixture.session.backend() == .native;
+        try std.testing.expectEqual(@as(u64, if (cached_backend) 2 else 0), stats.hits);
+        try std.testing.expectEqual(@as(u64, if (cached_backend) 1 else 0), stats.misses);
+    }
+}
+
+test "laya packed session caches the trunk across pipeline requests" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var words = synthetic.WordTokenizer{};
+    const tok = words.tokenizer();
+    var fixture = try Fixture.init(std.testing.allocator, "{\"mode\":\"question\"}");
+    defer fixture.deinit(std.testing.allocator);
+    const first = try pipeline.execute(a, fixture.session, tok, fixture.cfg, &.{.{ .text = state_text, .question = questions[0] }}, null);
+    const second = try pipeline.execute(a, fixture.session, tok, fixture.cfg, &.{ .{ .text = state_text, .question = questions[1] }, .{ .text = state_text, .question = questions[0] } }, null);
+    const stats = factory.layaTrunkCacheStats(fixture.session).?;
+    const cached_backend = fixture.session.backend() == .native;
+    try std.testing.expectEqual(@as(u64, @intFromBool(cached_backend)), stats.misses);
+    try std.testing.expectEqual(@as(u64, @intFromBool(cached_backend)), stats.hits);
+    try std.testing.expect(try maxError(first.decisions[0].probabilities, second.decisions[1].probabilities) < 1e-5);
+    // A disabled cache recomputes the trunk and returns the same decisions.
+    factory.setLayaTrunkCacheLimit(fixture.session, 0);
+    const uncached = try pipeline.execute(a, fixture.session, tok, fixture.cfg, &.{.{ .text = state_text, .question = questions[0] }}, null);
+    try std.testing.expectEqual(stats.hits, factory.layaTrunkCacheStats(fixture.session).?.hits);
+    try std.testing.expect(try maxError(first.decisions[0].probabilities, uncached.decisions[0].probabilities) < 1e-5);
 }
 
 test "laya packed pipeline groups shared states and preserves request order" {
@@ -379,10 +435,23 @@ test "laya packed benchmark shared-state cost against unpacked" {
                 std.mem.sort(u64, times[1..], {}, std.sort.asc(u64));
                 medians[which] = times[1 + samples / 2];
             }
-            std.debug.print("LAYA_PACKED_BENCH {{\"backend\":\"{s}\",\"state_sentences\":{d},\"questions\":{d},\"unpacked_ms\":{d:.1},\"packed_ms\":{d:.1},\"unpacked_tokens\":{d},\"packed_tokens\":{d}}}\n", .{
-                @tagName(unpacked.backend()),              sentences,                                 count,
-                @as(f64, @floatFromInt(medians[0])) / 1e6, @as(f64, @floatFromInt(medians[1])) / 1e6, tokens[0],
-                tokens[1],
+            // The packed timings above hit the trunk cache after the first
+            // request. Measure the uncached packed cost separately.
+            factory.setLayaTrunkCacheLimit(packed_session, 0);
+            var uncached: [samples + 1]u64 = undefined;
+            for (&uncached) |*t| {
+                var request = std.heap.ArenaAllocator.init(a);
+                defer request.deinit();
+                const began = platform.time.monotonicNs();
+                _ = try pipeline.executeWithScratch(request.allocator(), a, packed_session, tok, packed_cfg, tasks, null, null);
+                t.* = platform.time.monotonicNs() - began;
+            }
+            factory.setLayaTrunkCacheLimit(packed_session, 1024 * 1024 * 1024);
+            std.mem.sort(u64, uncached[1..], {}, std.sort.asc(u64));
+            std.debug.print("LAYA_PACKED_BENCH {{\"backend\":\"{s}\",\"state_sentences\":{d},\"questions\":{d},\"unpacked_ms\":{d:.1},\"packed_ms\":{d:.1},\"packed_cached_ms\":{d:.1},\"unpacked_tokens\":{d},\"packed_tokens\":{d}}}\n", .{
+                @tagName(unpacked.backend()),              sentences,                                                count,
+                @as(f64, @floatFromInt(medians[0])) / 1e6, @as(f64, @floatFromInt(uncached[1 + samples / 2])) / 1e6, @as(f64, @floatFromInt(medians[1])) / 1e6,
+                tokens[0],                                 tokens[1],
             });
         }
     }

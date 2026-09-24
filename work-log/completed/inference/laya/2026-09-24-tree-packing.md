@@ -120,3 +120,52 @@ Laya intermediates encoder_max_error=0.0000005 head_max_error=0.0000014
 $ uv run --script laya_packed_reference.py --fixture <ref> --common common.py
 {"one_segment_vs_upstream_max_error": 0.0}
 ```
+
+## State cache (added later on 2026-09-24)
+
+CPU, ReleaseFast. `packed_ms` is packed with the cache disabled, and
+`packed_cached_ms` is packed with the cache on. Every repeated request after
+the first hits the cache.
+
+```
+{"backend":"native","state_sentences":1,"questions":1,"unpacked_ms":307.0,"packed_ms":307.2,"packed_cached_ms":310.8,"unpacked_tokens":55,"packed_tokens":56}
+{"backend":"native","state_sentences":1,"questions":2,"unpacked_ms":436.9,"packed_ms":381.3,"packed_cached_ms":327.9,"unpacked_tokens":119,"packed_tokens":86}
+{"backend":"native","state_sentences":1,"questions":4,"unpacked_ms":568.9,"packed_ms":450.5,"packed_cached_ms":425.0,"unpacked_tokens":235,"packed_tokens":134}
+{"backend":"native","state_sentences":1,"questions":8,"unpacked_ms":919.0,"packed_ms":675.7,"packed_cached_ms":659.5,"unpacked_tokens":479,"packed_tokens":242}
+{"backend":"native","state_sentences":1,"questions":16,"unpacked_ms":1630.0,"packed_ms":1247.4,"packed_cached_ms":1208.5,"unpacked_tokens":955,"packed_tokens":446}
+{"backend":"native","state_sentences":4,"questions":1,"unpacked_ms":477.9,"packed_ms":473.5,"packed_cached_ms":364.9,"unpacked_tokens":151,"packed_tokens":152}
+{"backend":"native","state_sentences":4,"questions":2,"unpacked_ms":731.5,"packed_ms":546.3,"packed_cached_ms":395.0,"unpacked_tokens":311,"packed_tokens":182}
+{"backend":"native","state_sentences":4,"questions":4,"unpacked_ms":1238.3,"packed_ms":634.9,"packed_cached_ms":515.8,"unpacked_tokens":619,"packed_tokens":230}
+{"backend":"native","state_sentences":4,"questions":8,"unpacked_ms":2241.4,"packed_ms":907.8,"packed_cached_ms":779.8,"unpacked_tokens":1247,"packed_tokens":338}
+{"backend":"native","state_sentences":4,"questions":16,"unpacked_ms":4182.5,"packed_ms":1582.7,"packed_cached_ms":1454.9,"unpacked_tokens":2491,"packed_tokens":542}
+{"backend":"native","state_sentences":12,"questions":1,"unpacked_ms":1126.9,"packed_ms":1113.2,"packed_cached_ms":721.1,"unpacked_tokens":407,"packed_tokens":408}
+{"backend":"native","state_sentences":12,"questions":2,"unpacked_ms":2051.9,"packed_ms":1207.0,"packed_cached_ms":785.8,"unpacked_tokens":823,"packed_tokens":438}
+{"backend":"native","state_sentences":12,"questions":4,"unpacked_ms":3835.5,"packed_ms":1375.2,"packed_cached_ms":972.9,"unpacked_tokens":1643,"packed_tokens":486}
+{"backend":"native","state_sentences":12,"questions":8,"unpacked_ms":7487.0,"packed_ms":1813.0,"packed_cached_ms":1393.9,"unpacked_tokens":3295,"packed_tokens":594}
+{"backend":"native","state_sentences":12,"questions":16,"unpacked_ms":14696.1,"packed_ms":2703.6,"packed_cached_ms":2287.8,"unpacked_tokens":6587,"packed_tokens":798}
+```
+
+Metal: the same benchmark with the cache enabled on Metal, before it was
+restricted to CPU. The cache gave no speedup, because the host keys and values
+are re-uploaded on every request. A second finding followed: decisions through
+a session were wrong (max probability error 0.034 against the oracle), because
+the device row concat/gather is not ordered with pending batched command work.
+In this output `packed_ms` is uncached and `packed_cached_ms` is cached.
+
+```
+{"backend":"metal","state_sentences":1,"questions":1,"unpacked_ms":57.5,"packed_ms":56.3,"packed_cached_ms":68.3,"unpacked_tokens":55,"packed_tokens":56}
+{"backend":"metal","state_sentences":1,"questions":2,"unpacked_ms":66.8,"packed_ms":61.2,"packed_cached_ms":68.2,"unpacked_tokens":119,"packed_tokens":86}
+{"backend":"metal","state_sentences":1,"questions":4,"unpacked_ms":80.2,"packed_ms":70.4,"packed_cached_ms":79.6,"unpacked_tokens":235,"packed_tokens":134}
+{"backend":"metal","state_sentences":1,"questions":8,"unpacked_ms":110.5,"packed_ms":89.2,"packed_cached_ms":99.4,"unpacked_tokens":479,"packed_tokens":242}
+{"backend":"metal","state_sentences":1,"questions":16,"unpacked_ms":169.1,"packed_ms":153.0,"packed_cached_ms":162.3,"unpacked_tokens":955,"packed_tokens":446}
+{"backend":"metal","state_sentences":4,"questions":1,"unpacked_ms":79.9,"packed_ms":73.3,"packed_cached_ms":78.3,"unpacked_tokens":151,"packed_tokens":152}
+{"backend":"metal","state_sentences":4,"questions":2,"unpacked_ms":104.5,"packed_ms":79.2,"packed_cached_ms":83.6,"unpacked_tokens":311,"packed_tokens":182}
+{"backend":"metal","state_sentences":4,"questions":4,"unpacked_ms":151.1,"packed_ms":87.7,"packed_cached_ms":93.8,"unpacked_tokens":619,"packed_tokens":230}
+{"backend":"metal","state_sentences":4,"questions":8,"unpacked_ms":242.7,"packed_ms":118.2,"packed_cached_ms":125.0,"unpacked_tokens":1247,"packed_tokens":338}
+{"backend":"metal","state_sentences":4,"questions":16,"unpacked_ms":441.6,"packed_ms":192.1,"packed_cached_ms":204.9,"unpacked_tokens":2491,"packed_tokens":542}
+{"backend":"metal","state_sentences":12,"questions":1,"unpacked_ms":197.8,"packed_ms":138.8,"packed_cached_ms":130.3,"unpacked_tokens":407,"packed_tokens":408}
+{"backend":"metal","state_sentences":12,"questions":2,"unpacked_ms":292.6,"packed_ms":148.4,"packed_cached_ms":142.9,"unpacked_tokens":823,"packed_tokens":438}
+{"backend":"metal","state_sentences":12,"questions":4,"unpacked_ms":481.3,"packed_ms":169.1,"packed_cached_ms":167.0,"unpacked_tokens":1643,"packed_tokens":486}
+{"backend":"metal","state_sentences":12,"questions":8,"unpacked_ms":826.3,"packed_ms":228.5,"packed_cached_ms":217.0,"unpacked_tokens":3295,"packed_tokens":594}
+{"backend":"metal","state_sentences":12,"questions":16,"unpacked_ms":1512.8,"packed_ms":347.5,"packed_cached_ms":361.0,"unpacked_tokens":6587,"packed_tokens":798}
+```

@@ -106,7 +106,7 @@ test "laya packed training graph matches packed serving logits, alone and in a p
             const l = try train.layout(batch);
             var decision: usize = 0;
             for (batch) |e| {
-                const outputs = try packed_arch.forwardRow(&cb, a, config, laya, e.packed_row.?.row);
+                const outputs = try packed_arch.forwardRow(&cb, a, config, laya, e.packed_row.?.row, null);
                 defer {
                     for (outputs) |*output| output.deinit();
                     a.free(outputs);
