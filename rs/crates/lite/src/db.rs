@@ -15,12 +15,11 @@
 //! The embedded Antfly Lite database handle and its core operations.
 
 use std::path::Path;
-use std::sync::{Condvar, Mutex, PoisonError};
 
 use antfly_lite_sys::{self as sys, antfly_buffer, antfly_db, antfly_error_code, antfly_slice};
 
 use crate::error::{Error, Result};
-use crate::ffi::{borrow_slice, check, path_has_suffix, path_to_cstring, take_buffer};
+use crate::ffi::{HandleGate, borrow_slice, check, path_has_suffix, path_to_cstring, take_buffer};
 use crate::options::{GraphDirection, OpenOptions, WriteIntent};
 
 /// The Antfly C ABI version this binding expects.
@@ -71,129 +70,6 @@ pub fn validate_abi() -> Result<()> {
     Ok(())
 }
 
-/// Shared mutable state behind [`HandleGate`]: the handle itself (`None`
-/// once closed) plus the bookkeeping needed for a writer-preferring
-/// reader/writer gate.
-struct GateState {
-    handle: Option<*mut antfly_db>,
-    readers: u32,
-    /// Set while at least one thread is waiting to close. Blocks *new*
-    /// reader acquisitions so that a sustained stream of reads cannot starve
-    /// `close` -- see the doc comment on [`HandleGate`].
-    closer_waiting: bool,
-    /// Set while the (single, at a time) close is actually running.
-    closer_active: bool,
-}
-
-/// A small hand-rolled reader/writer gate, used instead of
-/// `std::sync::RwLock` because `std`'s `RwLock` explicitly makes no
-/// fairness guarantees -- on at least macOS's `pthread_rwlock`, a steady
-/// stream of readers can starve a writer indefinitely. The Go binding's
-/// `sync.RWMutex` does not have that problem (new `RLock` calls block once a
-/// `Lock` is pending), and libantfly's own contract says `antfly_db_close`
-/// "waits for every call that has already entered ... and then frees the
-/// handle" -- a bounded wait, not a potentially-unbounded one. This gate
-/// gives the same guarantee: once a close is requested, new calls block
-/// until it completes (or observe the database as already closed), while
-/// already in-flight calls are allowed to finish normally.
-struct HandleGate {
-    state: Mutex<GateState>,
-    cond: Condvar,
-}
-
-impl HandleGate {
-    fn new(handle: *mut antfly_db) -> HandleGate {
-        HandleGate {
-            state: Mutex::new(GateState {
-                handle: Some(handle),
-                readers: 0,
-                closer_waiting: false,
-                closer_active: false,
-            }),
-            cond: Condvar::new(),
-        }
-    }
-
-    /// Runs `f` with the live handle, or returns [`Error::InvalidArgument`]
-    /// if the database has already been closed or a close is in progress.
-    fn with_handle<T>(&self, f: impl FnOnce(*mut antfly_db) -> Result<T>) -> Result<T> {
-        let handle = {
-            let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            loop {
-                if guard.closer_waiting || guard.closer_active {
-                    guard = self
-                        .cond
-                        .wait(guard)
-                        .unwrap_or_else(PoisonError::into_inner);
-                    continue;
-                }
-                break;
-            }
-            match guard.handle {
-                Some(handle) => {
-                    guard.readers += 1;
-                    handle
-                }
-                None => return Err(Error::InvalidArgument),
-            }
-        };
-
-        // Release the reader slot even if `f` panics; otherwise a later
-        // close (or Drop) would wait forever for a reader that never leaves.
-        struct ReaderSlot<'a>(&'a HandleGate);
-        impl Drop for ReaderSlot<'_> {
-            fn drop(&mut self) {
-                let mut guard = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
-                guard.readers -= 1;
-                if guard.readers == 0 {
-                    self.0.cond.notify_all();
-                }
-            }
-        }
-        let _slot = ReaderSlot(self);
-        f(handle)
-    }
-
-    /// Waits for every call already in flight to finish, then closes the
-    /// handle (a no-op if it is already closed, whether by this call or a
-    /// concurrent one). Safe to call concurrently and more than once.
-    fn close(&self, close_fn: impl FnOnce(*mut antfly_db)) {
-        let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if guard.handle.is_none() {
-            return;
-        }
-        guard.closer_waiting = true;
-        while guard.readers > 0 || guard.closer_active {
-            guard = self
-                .cond
-                .wait(guard)
-                .unwrap_or_else(PoisonError::into_inner);
-        }
-        guard.closer_waiting = false;
-
-        let Some(handle) = guard.handle.take() else {
-            // Another concurrent close already took it while we waited.
-            self.cond.notify_all();
-            return;
-        };
-        guard.closer_active = true;
-        drop(guard);
-
-        close_fn(handle);
-
-        let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        guard.closer_active = false;
-        self.cond.notify_all();
-    }
-
-    fn is_open(&self) -> bool {
-        self.state
-            .lock()
-            .map(|guard| guard.handle.is_some())
-            .unwrap_or(false)
-    }
-}
-
 /// An embedded Antfly Lite database handle.
 ///
 /// `Database` is safe for concurrent use from multiple threads, like
@@ -208,7 +84,7 @@ pub struct Database {
     // `std::sync::RwLock`, so a steady stream of reads cannot starve
     // `close`. The actual write-vs-write serialization for concurrent
     // mutations happens inside libantfly itself, not in this gate.
-    gate: HandleGate,
+    gate: HandleGate<antfly_db>,
 }
 
 // SAFETY: libantfly's only threading mode is "serialized" (see

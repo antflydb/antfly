@@ -20,7 +20,8 @@ const kernel_jit_mod = @import("../graph/kernel_jit.zig");
 const backend_contracts = @import("../graph/backend_contracts.zig");
 const graph_runtime_mod = @import("../graph/runtime.zig");
 const backend_runtime_mod = @import("backend_runtime.zig");
-const Interruption = @import("../execution_control.zig").Interruption;
+const execution_control = @import("../execution_control.zig");
+const Interruption = execution_control.Interruption;
 
 pub const Session = @import("session.zig").Session;
 pub const Tensor = @import("tensor.zig").Tensor;
@@ -252,6 +253,13 @@ pub const SessionManager = struct {
     /// backend whose driver requires process-level recovery.
     process_isolation_available: bool = true,
 
+    /// Backends whose execution can only be stopped by killing the process run
+    /// in a supervised worker, or in-process when the host accepted that they
+    /// cannot be interrupted (see `execution_control.allowUninterruptibleInProcess`).
+    pub fn processRequiredBackendsAllowed(self: *const SessionManager) bool {
+        return self.process_isolation_available or execution_control.uninterruptibleInProcessAllowed();
+    }
+
     pub fn init(allocator: std.mem.Allocator) SessionManager {
         const required = requiredBackendFromEnv();
         return .{
@@ -295,7 +303,7 @@ pub const SessionManager = struct {
         if (!backend.available() or !backend.supportsDirectSessionLoad())
             return error.RequiredBackendUnavailable;
         const backend_runtime = try self.resolveBackendRuntime(backend);
-        if (!self.process_isolation_available and backend_runtime.executionInterruption() == .process_required)
+        if (!self.processRequiredBackendsAllowed() and backend_runtime.executionInterruption() == .process_required)
             return error.ProcessIsolationRequired;
     }
 
@@ -384,7 +392,7 @@ pub const SessionManager = struct {
                 first_err = first_err orelse err;
                 continue;
             };
-            if (!self.process_isolation_available and backend_runtime.executionInterruption() == .process_required) {
+            if (!self.processRequiredBackendsAllowed() and backend_runtime.executionInterruption() == .process_required) {
                 first_err = first_err orelse error.ProcessIsolationRequired;
                 continue;
             }

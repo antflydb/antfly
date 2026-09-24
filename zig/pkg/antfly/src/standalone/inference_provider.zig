@@ -9,9 +9,9 @@ const builtin = @import("builtin");
 const platform = @import("antfly_platform");
 const platform_time = platform.time;
 const process_memory_budget = @import("../common/process_memory_budget.zig");
-const inference_bridge = @import("inference_bridge.zig");
+pub const inference_bridge = @import("inference_bridge.zig");
 const inference_connection_abi = @import("../inference_connection_abi.zig");
-const runtime_http_abi = @import("../runtime_http_abi.zig");
+pub const runtime_http_abi = @import("../runtime_http_abi.zig");
 const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 const inline_inference_codegen = builtin.is_test and !@import("standalone_runtime_options").linked_inference;
 const inference_host = if (inline_inference_codegen) @import("inference_host.zig") else struct {};
@@ -143,6 +143,10 @@ pub const EmbeddedInferenceNodeOptions = struct {
     kv_budget_mb: u32 = 0,
     scratch_budget_mb: u32 = 0,
     process_memory_budget_mb: u32 = 0,
+    /// Directory models are resolved from. Null uses the
+    /// default: `$ANTFLY_INFERENCE_MODELS_DIR`, else
+    /// `~/.antfly/inference/models`.
+    models_dir: ?[]const u8 = null,
 };
 
 // Default embedded per-lane generation budgets (MiB), used whenever the
@@ -172,6 +176,9 @@ const default_scratch_budget_mb: u32 = 16384;
 pub const EmbeddedInferenceNode = struct {
     handle: *anyopaque,
     resource_owner: ?*LiteInferenceResourceOwner,
+    /// Why `resource_owner` is null: the runtime started but cannot serve
+    /// calls, for example because its worker process failed to start.
+    configure_error: ?anyerror = null,
     // The process-memory envelope this node actually resolved -- either the
     // caller's explicit `process_memory_budget_mb` override or, when that is
     // 0 (the default), the same host/cgroup-detected policy
@@ -270,7 +277,7 @@ pub fn createEmbeddedInferenceNode(
         .abi_version = inference_bridge.abi_version,
         .data_dir_ptr = data_dir.ptr,
         .data_dir_len = data_dir.len,
-        .models_dir = .{},
+        .models_dir = .init(options.models_dir),
         .ml_dir = .{},
         .host_limit_bytes = try process_memory_budget.mibToBytes(@as(usize, effective_host_budget_mb)),
         .backend_limit_bytes = try process_memory_budget.mibToBytes(@as(usize, effective_backend_budget_mb)),
@@ -295,7 +302,10 @@ pub fn createEmbeddedInferenceNode(
         .has_max_loaded_models = 1,
         .content_security_json = .{},
         .s3_credentials_json = .{},
-        .runtime_config_json = inference_bridge.String.init("{}"),
+        // libantfly runs inside the caller's program, which it cannot kill
+        // and restart like a worker, so every backend runs in-process; see
+        // execution_control.allowUninterruptibleInProcess.
+        .runtime_config_json = inference_bridge.String.init("{\"process_isolation\":false}"),
         .executor = .init(&borrowed_io),
         .out_handle = &out_handle,
     };
@@ -329,16 +339,19 @@ pub fn createEmbeddedInferenceNode(
     // a multi-tenant server, so unconditional admission is the correct
     // policy, matching "antfly inference run"'s own local/host-owned default
     // when no external resource policy is configured.
+    var configure_error: ?anyerror = null;
     const resource_owner = configureLiteInferenceResourceBudget(handle) catch |err| blk: {
         std.log.warn(
             "lite embedded inference resource budget configuration failed, provider calls will fail: {s}",
             .{@errorName(err)},
         );
+        configure_error = err;
         break :blk null;
     };
     return .{
         .handle = handle,
         .resource_owner = resource_owner,
+        .configure_error = configure_error,
         .process_memory_limit_bytes = process_memory_resolution.limit_bytes,
         .process_memory_limit_source = process_memory_resolution.effective_source,
         .host_budget_mb = effective_host_budget_mb,
@@ -347,6 +360,34 @@ pub fn createEmbeddedInferenceNode(
         .kv_budget_mb = effective_kv_budget_mb,
         .scratch_budget_mb = effective_scratch_budget_mb,
     };
+}
+
+/// Downloads models into `models_dir` (null for the default); see
+/// `inference_bridge.PullModelContext` for the callbacks. Needs no node.
+pub fn pullEmbeddedInferenceModels(
+    io: std.Io,
+    models_dir: ?[]const u8,
+    request_json: []const u8,
+    progress_context: ?*anyopaque,
+    on_progress: ?*const fn (?*anyopaque, *const inference_bridge.PullProgress) callconv(.c) u8,
+    result_context: ?*anyopaque,
+    on_result: *const fn (?*anyopaque, inference_bridge.String) callconv(.c) void,
+) !void {
+    var borrowed_io = io;
+    const context = inference_bridge.PullModelContext{
+        .abi_version = inference_bridge.abi_version,
+        .executor = .init(&borrowed_io),
+        .models_dir = .init(models_dir),
+        .request_json = .init(request_json),
+        .progress_context = progress_context,
+        .on_progress = on_progress,
+        .result_context = result_context,
+        .on_result = on_result,
+    };
+    if (comptime inline_inference_codegen) return inference_host.linkedInferencePullModel(&context);
+    const table = try linkedInferenceApi(inference_bridge.Capability.model_pull);
+    const status = table.pull_model(&context);
+    if (!status.isOk()) return inference_bridge.errorFromStatus(status);
 }
 
 /// Counterpart to `createEmbeddedInferenceNode`. Callers must quiesce any
@@ -726,6 +767,15 @@ pub fn optionalOwnedInferenceConnectionBytes(
 }
 
 pub fn invokeLocalInferenceConnectionFallible(context: *const inference_connection_abi.InvokeContext) !void {
+    return invokeLocalInferenceRoute(context, .post);
+}
+
+/// Dispatches `<method> /ai/v1/<operation>` to the runtime's HTTP handlers
+/// in memory. POST sends `context.body` as JSON; GET sends no body.
+fn invokeLocalInferenceRoute(
+    context: *const inference_connection_abi.InvokeContext,
+    method: runtime_http_abi.HttpMethod,
+) !void {
     if (!inference_connection_abi.validInvokeContext(context)) return error.UnsupportedVersion;
     const local_context: *LocalInferenceConnectionContext = @ptrCast(@alignCast(context.target_context));
     const alloc = context.allocator.asStd();
@@ -767,7 +817,7 @@ pub fn invokeLocalInferenceConnectionFallible(context: *const inference_connecti
     }
     const entries = if (entries_ptr) |ptr| ptr[0..entries_len] else &.{};
     const route_handle = for (entries) |entry| {
-        if (entry.method == .post and std.mem.eql(u8, entry.path.slice(), path))
+        if (entry.method == method and std.mem.eql(u8, entry.path.slice(), path))
             break entry.route_handle;
     } else return error.UnsupportedInferenceOperation;
 
@@ -775,13 +825,14 @@ pub fn invokeLocalInferenceConnectionFallible(context: *const inference_connecti
         .name = runtime_http_abi.Bytes.init("Content-Type"),
         .value = runtime_http_abi.Bytes.init("application/json"),
     }};
+    const has_body = method != .get;
     const request = runtime_http_abi.HttpRequestView{
-        .method = .post,
+        .method = method,
         .path = runtime_http_abi.Bytes.init(path),
-        .headers_ptr = &headers,
-        .headers_len = headers.len,
-        .body = runtime_http_abi.OptionalBytes.init(body),
-        .content_type = runtime_http_abi.OptionalBytes.init("application/json"),
+        .headers_ptr = if (has_body) &headers else null,
+        .headers_len = if (has_body) headers.len else 0,
+        .body = if (has_body) runtime_http_abi.OptionalBytes.init(body) else .{},
+        .content_type = if (has_body) runtime_http_abi.OptionalBytes.init("application/json") else .{},
     };
     var response_handle: ?*anyopaque = null;
     var response_view: runtime_http_abi.HttpResponseView = undefined;
@@ -830,6 +881,49 @@ pub fn invokeLocalInferenceConnectionFallible(context: *const inference_connecti
     errdefer if (response.retry_after.present != 0) alloc.free(response.retry_after.bytes.slice());
     response.content_type = try optionalOwnedInferenceConnectionBytes(alloc, response_view.content_type.slice());
     context.out_response.* = response;
+}
+
+/// Response of `invokeEmbeddedInferenceRoute`: the handler's HTTP status and
+/// body, owned by the caller's allocator.
+pub const EmbeddedInferenceRouteResponse = struct {
+    status: u16,
+    body: []u8,
+};
+
+/// Calls one public inference API route (`<method> /ai/v1/<operation>`) on an
+/// embedded node, with the same request and response JSON as the HTTP API.
+/// `deadline_ns` is an absolute monotonic deadline; 0 means none.
+/// `cancellation` may be empty.
+pub fn invokeEmbeddedInferenceRoute(
+    lifetime: *EmbeddedInferenceProviderLifetime,
+    alloc: std.mem.Allocator,
+    method: runtime_http_abi.HttpMethod,
+    operation: []const u8,
+    body: []const u8,
+    deadline_ns: u64,
+    cancellation: runtime_http_abi.CancellationView,
+    /// Receives a streaming response instead of `body`; empty for buffered.
+    stream: runtime_http_abi.StreamSink,
+) !EmbeddedInferenceRouteResponse {
+    var guard = try lifetime.acquire();
+    defer guard.deinit();
+    var target = LocalInferenceConnectionContext{ .handle = lifetime.handle };
+    var abi_alloc = inference_connection_abi.Allocator.fromStd(&alloc);
+    var response: inference_connection_abi.InvokeResponse = .{};
+    defer response.deinit(&abi_alloc);
+    try invokeLocalInferenceRoute(&.{
+        .abi_version = inference_connection_abi.abi_version,
+        .target_context = &target,
+        .allocator = &abi_alloc,
+        .operation = .init(operation),
+        .body = .init(body),
+        .deadline_ns = deadline_ns,
+        .cancellation = cancellation,
+        .stream = stream,
+        .out_response = &response,
+    }, method);
+    if (!response.valid()) return error.RuntimeBoundaryFailure;
+    return .{ .status = response.status, .body = try alloc.dupe(u8, response.body.slice()) };
 }
 
 pub fn inferenceProviderEmbedDenseTexts(

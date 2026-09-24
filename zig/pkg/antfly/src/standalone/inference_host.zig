@@ -101,6 +101,10 @@ const LinkedResourceBudgetContext = struct {
 
 const InferenceRuntimeConfig = struct {
     embedded_enabled: bool = true,
+    /// False runs every backend in this process, even those whose calls can
+    /// only be stopped by killing the process. For library hosts (libantfly),
+    /// whose process is the caller's program and cannot be restarted.
+    process_isolation: bool = true,
     worker_environment: []const worker_runtime.EnvironmentEntry = &.{},
     max_concurrent_requests: ?usize = null,
     kernel_jit: inference.graph.kernel_jit.Config = .{},
@@ -726,8 +730,10 @@ pub fn linkedInferenceCreateLocal(context: *const inference_bridge.CreateContext
     errdefer runtime_config.deinit();
     try runtime_config.value.kernel_jit.validate();
     try runtime_config.value.prompt_cache.validate();
+    if (!runtime_config.value.process_isolation) inference.execution_control.allowUninterruptibleInProcess();
     const use_worker = !supervised and !@import("builtin").is_test and
         runtime_config.value.embedded_enabled and
+        runtime_config.value.process_isolation and
         inference.backends.BackendRuntime.availableRequiresProcessIsolation();
 
     const state = try alloc.create(LinkedInferenceState);
@@ -3348,3 +3354,114 @@ test "linked generator validates concrete MIME and decoded pixels" {
 }
 
 // ---------------------------------------------------------------
+
+/// Body of `antfly_inference_pull_json`; see `inference_bridge.PullModelContext`.
+const PullModelRequest = struct {
+    model: []const u8,
+    /// Pulls `model:variant` for each; empty pulls `model` as given.
+    variants: []const []const u8 = &.{},
+    /// Hub token for private or gated models; defaults to `$HF_TOKEN`.
+    token: ?[]const u8 = null,
+    tasks: []const []const u8 = &.{},
+    capabilities: []const []const u8 = &.{},
+    /// "auto" (default), "none", or "match".
+    projector: ?[]const u8 = null,
+    max_artifact_bytes: ?u64 = null,
+    max_model_bytes: ?u64 = null,
+};
+
+pub fn linkedInferencePullModel(context: *const inference_bridge.PullModelContext) !void {
+    const alloc = std.heap.c_allocator;
+    var executor = try context.executor.receive();
+    const io = executor.io();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const result = pullModels(arena, io, context) catch |err| {
+        const failure = std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(.{
+            .@"error" = @errorName(err),
+            .message = pullErrorMessage(err),
+        }, .{})}) catch "{\"error\":\"OutOfMemory\"}";
+        context.on_result(context.result_context, .init(failure));
+        return err;
+    };
+    context.on_result(context.result_context, .init(result));
+}
+
+fn pullErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.HubModelNotFound => "the model was not found on the hub",
+        error.HubAccessDenied => "the hub denied access; the model may be private or gated, so set token or HF_TOKEN",
+        error.InvalidModelRef, error.InvalidModelVariant => "invalid model reference; use owner/name or owner/name:variant",
+        error.NoModelFilesFound => "the model has no files in a supported format",
+        error.DownloadSizeLimitExceeded, error.ModelSizeLimitExceeded => "the model exceeds max_artifact_bytes or max_model_bytes",
+        error.UnknownField, error.MissingField, error.SyntaxError, error.UnexpectedToken, error.InvalidArgument => "invalid pull request",
+        else => "model pull failed",
+    };
+}
+
+fn pullModels(arena: std.mem.Allocator, io: std.Io, context: *const inference_bridge.PullModelContext) ![]const u8 {
+    const request = try std.json.parseFromSliceLeaky(PullModelRequest, arena, context.request_json.slice(), .{});
+    if (request.model.len == 0) return error.InvalidArgument;
+    const download = inference.registry.download;
+    const projector: download.ProjectorSelection = if (request.projector) |value|
+        download.parseProjectorSelection(value) orelse return error.InvalidArgument
+    else
+        .auto;
+    const models_dir = context.models_dir.slice() orelse
+        try antfly.inference_runtime.defaultModelsDirForDataDirAlloc(arena, ".");
+    const hub_config = download.HubConfig{
+        .token = request.token orelse @import("antfly_platform").env.getenv("HF_TOKEN"),
+        .max_artifact_bytes = request.max_artifact_bytes orelse download.default_max_artifact_bytes,
+        .max_model_bytes = request.max_model_bytes orelse download.default_max_model_bytes,
+    };
+    const tasks_csv = if (request.tasks.len == 0) null else try std.mem.join(arena, ",", request.tasks);
+    const capabilities_csv = if (request.capabilities.len == 0) null else try std.mem.join(arena, ",", request.capabilities);
+
+    var refs: std.ArrayListUnmanaged([]const u8) = .empty;
+    if (request.variants.len == 0) {
+        try refs.append(arena, request.model);
+    } else for (request.variants) |variant| {
+        if (variant.len == 0) return error.InvalidArgument;
+        try refs.append(arena, try std.fmt.allocPrint(arena, "{s}:{s}", .{ request.model, variant }));
+    }
+
+    var registry = inference.registry.ModelRegistry.init(arena, models_dir);
+    defer registry.deinit();
+    for (refs.items) |ref| {
+        var reporter = PullProgressReporter{ .context = context, .model = ref };
+        try registry.pullWithProgress(io, ref, hub_config, tasks_csv, capabilities_csv, projector, .{
+            .callback = PullProgressReporter.report,
+            .context = &reporter,
+            .cancelled = &reporter.cancelled,
+        });
+    }
+    return std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(.{
+        .models = refs.items,
+        .models_dir = models_dir,
+    }, .{})});
+}
+
+const PullProgressReporter = struct {
+    context: *const inference_bridge.PullModelContext,
+    model: []const u8,
+    cancelled: std.atomic.Value(bool) = .init(false),
+
+    fn report(progress: inference.registry.download.DownloadProgress, raw: ?*anyopaque) void {
+        const self: *PullProgressReporter = @ptrCast(@alignCast(raw.?));
+        const callback = self.context.on_progress orelse return;
+        const view = inference_bridge.PullProgress{
+            // The registry names the model each report belongs to, which
+            // differs from the request for a companion model.
+            .model = .init(if (progress.model.len > 0) progress.model else self.model),
+            .file = .init(progress.file),
+            .bytes_downloaded = progress.bytes_downloaded,
+            .total_bytes = progress.total_bytes orelse 0,
+            .files_done = progress.files_done,
+            .files_total = progress.files_total,
+            .cached = @intFromBool(progress.cached),
+        };
+        if (callback(self.context.progress_context, &view) == 0) self.cancelled.store(true, .release);
+    }
+};
