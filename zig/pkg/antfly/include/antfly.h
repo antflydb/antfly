@@ -639,7 +639,10 @@ antfly_error_code antfly_inference_list_models_json(antfly_inference *inference,
 typedef struct antfly_inference_pull_progress {
     uint32_t abi_size;
     uint32_t reserved0;
-    /* The model reference being pulled (one per requested variant). */
+    /* The model reference this report is for: one per requested variant, or
+     * a companion model the requested one needs (such as the speculative
+     * decoding assistant of a Gemma 4 QAT checkpoint), whose files are
+     * counted separately. */
     antfly_slice model;
     antfly_slice file;
     uint64_t bytes_downloaded;

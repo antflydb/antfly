@@ -3449,7 +3449,9 @@ const PullProgressReporter = struct {
         const self: *PullProgressReporter = @ptrCast(@alignCast(raw.?));
         const callback = self.context.on_progress orelse return;
         const view = inference_bridge.PullProgress{
-            .model = .init(self.model),
+            // The registry names the model each report belongs to, which
+            // differs from the request for a companion model.
+            .model = .init(if (progress.model.len > 0) progress.model else self.model),
             .file = .init(progress.file),
             .bytes_downloaded = progress.bytes_downloaded,
             .total_bytes = progress.total_bytes orelse 0,

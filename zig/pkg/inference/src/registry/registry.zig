@@ -521,8 +521,11 @@ pub const ModelRegistry = struct {
         tasks_csv: ?[]const u8,
         capabilities_csv: ?[]const u8,
         projector_selection: download.ProjectorSelection,
-        progress_sink: download.ProgressSink,
+        caller_sink: download.ProgressSink,
     ) !void {
+        // Label every report with the model it belongs to.
+        var labeler = ProgressLabeler{ .inner = caller_sink, .model = ref_str };
+        const progress_sink = labeler.sink();
         const ref = try parsePullModelRef(ref_str);
         const resolved_models_dir = try resolveModelsDirForWriteAlloc(self.allocator, io, self.models_dir);
         defer self.allocator.free(resolved_models_dir);
@@ -638,7 +641,7 @@ pub const ModelRegistry = struct {
                 break :blk isModelDir(io, companion_dest);
             };
             if (!companion_installed) {
-                self.pullWithProgress(io, companion_ref, hub_config, null, null, projector_selection, progress_sink) catch |err| {
+                self.pullWithProgress(io, companion_ref, hub_config, null, null, projector_selection, caller_sink) catch |err| {
                     std.log.warn(
                         "optional Gemma4 MTP assistant pull failed for {s}: {s}",
                         .{ companion_ref, @errorName(err) },
@@ -791,6 +794,27 @@ pub const ModelRegistry = struct {
             else => 0,
         };
     }
+
+    /// Forwards reports to `inner` with `model` set.
+    const ProgressLabeler = struct {
+        inner: download.ProgressSink,
+        model: []const u8,
+
+        fn sink(self: *ProgressLabeler) download.ProgressSink {
+            return .{
+                .callback = if (self.inner.callback != null) forward else null,
+                .context = self,
+                .cancelled = self.inner.cancelled,
+            };
+        }
+
+        fn forward(progress: download.DownloadProgress, raw: ?*anyopaque) void {
+            const self: *ProgressLabeler = @ptrCast(@alignCast(raw.?));
+            var labeled = progress;
+            labeled.model = self.model;
+            self.inner.callback.?(labeled, self.inner.context);
+        }
+    };
 
     const ProgressPrinter = struct {
         active_file: ?[]const u8 = null,
@@ -2323,4 +2347,30 @@ test "model refs accept independent formats and revisions" {
     }
     try std.testing.expectError(error.InvalidModelRef, ModelRef.parse("BAAI/bge-m3:onnx@../../main"));
     try std.testing.expectError(error.InvalidModelRef, ModelRef.parse("BAAI/bge-m3:onnx@main?x=1"));
+}
+
+test "pull progress reports carry the model they belong to" {
+    const Capture = struct {
+        model: []const u8 = "",
+        file: []const u8 = "",
+        fn report(progress: download.DownloadProgress, raw: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.model = progress.model;
+            self.file = progress.file;
+        }
+    };
+    var capture = Capture{};
+    var cancelled = std.atomic.Value(bool).init(false);
+    const caller: download.ProgressSink = .{ .callback = Capture.report, .context = &capture, .cancelled = &cancelled };
+    var labeler = ModelRegistry.ProgressLabeler{ .inner = caller, .model = "owner/companion" };
+    const sink = labeler.sink();
+    sink.callback.?(.{ .file = "model.gguf", .bytes_downloaded = 0, .total_bytes = null, .files_done = 0, .files_total = 1 }, sink.context);
+    try std.testing.expectEqualStrings("owner/companion", capture.model);
+    try std.testing.expectEqualStrings("model.gguf", capture.file);
+    // Cancellation still reaches the download through the labeled sink.
+    cancelled.store(true, .release);
+    try std.testing.expectError(error.Canceled, sink.checkCancelled());
+    // A caller without a callback gets none.
+    var bare = ModelRegistry.ProgressLabeler{ .inner = .{}, .model = "owner/model" };
+    try std.testing.expect(bare.sink().callback == null);
 }

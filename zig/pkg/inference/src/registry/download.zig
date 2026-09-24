@@ -1098,6 +1098,9 @@ fn writeSyntheticMetadata(
 }
 
 pub const DownloadProgress = struct {
+    /// The model reference being pulled; set by `ModelRegistry.pullWithProgress`
+    /// (a pull can include a companion model with its own reports).
+    model: []const u8 = "",
     file: []const u8,
     bytes_downloaded: u64,
     total_bytes: ?u64,
