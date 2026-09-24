@@ -137,8 +137,17 @@ def _delay(
 ) -> float | None:
     if len(body) > 16384:
         return None
+
+    def unique_fields(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        fields: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in fields:
+                raise ValueError("duplicate retry evidence field")
+            fields[key] = value
+        return fields
+
     try:
-        detail = json.loads(body)
+        detail = json.loads(body, object_pairs_hook=unique_fields)
     except (ValueError, UnicodeError):
         return None
     if (

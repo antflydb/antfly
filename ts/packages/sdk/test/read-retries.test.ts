@@ -131,11 +131,73 @@ describe("query read retries", () => {
     [url, 429, rejected.replace("false", "true"), undefined],
     [url, 503, rejected, undefined],
     [url, 429, rejected, "1"],
+    [
+      url,
+      429,
+      '{"reason":"instance_busy","stage":"admission","execution_started":true,"execution_started":false}',
+      undefined,
+    ],
+    [
+      url,
+      429,
+      '{"reason":"instance_busy","stage":"worker","stage":"admission","execution_started":false}',
+      undefined,
+    ],
+    [
+      url,
+      429,
+      '{"reason":"instance_busy","stage":"admission","execution_started":true,"execution_\\u0073tarted":false}',
+      undefined,
+    ],
+    [url, 429, '{"reason":"instance_busy","stage":"admission","protocol_version":2}', undefined],
+    [
+      url,
+      429,
+      '{"reason":"instance_busy","stage":"admission","execution_started":false,"protocol_version":1,"protocol_version":2}',
+      undefined,
+    ],
+    [url, 429, '{"reason":"instance_busy","stage":"worker","execution_started":false}', undefined],
+    [
+      url,
+      429,
+      '{"Reason":"instance_busy","Stage":"admission","Execution_Started":false}',
+      undefined,
+    ],
   ])("does not retry writes or ambiguous/long-delay errors (%s %s)", async (path, status, body, after) => {
     const base = vi.fn<typeof fetch>().mockResolvedValue(response(status, body, after));
     const result = await readRetryFetch(base, policy)(path, { method: "POST", body: "{}" });
     expect(await result.text()).toBe(body);
     expect(base).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not retry malformed UTF-8 in otherwise explicit evidence", async () => {
+    const body = new Uint8Array([
+      ...new TextEncoder().encode(
+        '{"reason":"instance_busy","stage":"admission","execution_started":false,"trace":"'
+      ),
+      0xff,
+      ...new TextEncoder().encode('"}'),
+    ]);
+    const base = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(body, {
+        status: 429,
+        headers: { "Content-Length": String(body.length) },
+      })
+    );
+    const result = await readRetryFetch(base, policy)(url, { method: "POST", body: "{}" });
+    expect(new Uint8Array(await result.arrayBuffer())).toEqual(body);
+    expect(base).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries explicit pre-execution evidence with future extension fields", async () => {
+    const extended = JSON.stringify({ ...JSON.parse(rejected), protocol_version: 2 });
+    const base = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(response(429, extended))
+      .mockResolvedValueOnce(response(200, "ok"));
+    const result = await readRetryFetch(base, policy)(url, { method: "POST", body: "{}" });
+    expect(result.status).toBe(200);
+    expect(base).toHaveBeenCalledTimes(2);
   });
 
   it("cancels backoff without another dispatch", async () => {

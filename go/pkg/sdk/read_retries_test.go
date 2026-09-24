@@ -61,6 +61,14 @@ func TestReadRetriesDoNotRetryWritesAmbiguousErrorsOrLongGuidance(t *testing.T) 
 		{"write", "/db/v1/tables/docs/batch", rejectedQuery, "", 429, false},
 		{"unknown", "/db/v1/query", `{"reason":"instance_busy"}`, "", 429, false},
 		{"executed", "/db/v1/query", `{"reason":"instance_busy","stage":"admission","execution_started":true}`, "", 429, false},
+		{"duplicate-started", "/db/v1/query", `{"reason":"instance_busy","stage":"admission","execution_started":true,"execution_started":false}`, "", 429, false},
+		{"duplicate-stage", "/db/v1/query", `{"reason":"instance_busy","stage":"worker","stage":"admission","execution_started":false}`, "", 429, false},
+		{"escaped-duplicate", "/db/v1/query", `{"reason":"instance_busy","stage":"admission","execution_started":true,"execution_\u0073tarted":false}`, "", 429, false},
+		{"duplicate-future-field", "/db/v1/query", `{"reason":"instance_busy","stage":"admission","execution_started":false,"protocol_version":1,"protocol_version":2}`, "", 429, false},
+		{"invalid-utf8", "/db/v1/query", "{\"reason\":\"instance_busy\",\"stage\":\"admission\",\"execution_started\":false,\"trace\":\"\xff\"}", "", 429, false},
+		{"rolling-missing-proof", "/db/v1/query", `{"reason":"instance_busy","stage":"admission","protocol_version":2}`, "", 429, false},
+		{"rolling-worker-stage", "/db/v1/query", `{"reason":"instance_busy","stage":"worker","execution_started":false}`, "", 429, false},
+		{"rolling-case-changed-proof", "/db/v1/query", `{"Reason":"instance_busy","Stage":"admission","Execution_Started":false}`, "", 429, false},
 		{"capacity", "/db/v1/query", rejectedQuery, "", 503, false},
 		{"long-delay", "/db/v1/query", rejectedQuery, "1", 429, false},
 		{"network", "/db/v1/query", "", "", 0, true},
@@ -90,6 +98,26 @@ func TestReadRetriesDoNotRetryWritesAmbiguousErrorsOrLongGuidance(t *testing.T) 
 				t.Fatalf("calls=%d", calls)
 			}
 		})
+	}
+}
+
+func TestReadRetriesAcceptFutureFieldsWithExplicitNonAdmission(t *testing.T) {
+	calls := 0
+	transport, _ := NewReadRetryTransport(admissionRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		_ = req.Body.Close()
+		if calls == 1 {
+			return retryResponse(429, `{"reason":"instance_busy","stage":"admission","execution_started":false,"protocol_version":2}`), nil
+		}
+		return retryResponse(200, "ok"), nil
+	}), retryPolicy())
+	response, err := transport.RoundTrip(admissionRequest(t, context.Background()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if calls != 2 || response.StatusCode != 200 {
+		t.Fatalf("calls=%d status=%d", calls, response.StatusCode)
 	}
 }
 

@@ -44,6 +44,45 @@ def test_retries_replay_and_release_admission():
     assert pool.stats == {"active": 0, "queued": 0}
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"reason":"instance_busy","stage":"admission","execution_started":true,"execution_started":false}',
+        b'{"reason":"instance_busy","stage":"worker","stage":"admission","execution_started":false}',
+        b'{"reason":"instance_busy","stage":"admission","execution_started":true,"execution_\\u0073tarted":false}',
+        b'{"reason":"instance_busy","stage":"admission","execution_started":false,"protocol_version":1,"protocol_version":2}',
+        b'{"reason":"instance_busy","stage":"admission","execution_started":false,"trace":"\xff"}',
+        b'{"reason":"instance_busy","stage":"admission","protocol_version":2}',
+        b'{"reason":"instance_busy","stage":"worker","execution_started":false}',
+        b'{"Reason":"instance_busy","Stage":"admission","Execution_Started":false}',
+    ],
+)
+def test_malformed_or_rolling_rejection_proof_is_not_retried(body):
+    calls = []
+
+    def handle(request):
+        calls.append(request)
+        return httpx.Response(429, content=body)
+
+    with ReadRetryHTTPClient(POLICY, transport=httpx.MockTransport(handle)) as client:
+        assert client.post(URL, content=b"{}").content == body
+    assert len(calls) == 1
+
+
+def test_future_rejection_fields_preserve_explicit_non_admission_retry():
+    calls = []
+
+    def handle(request):
+        calls.append(request)
+        return (
+            httpx.Response(429, json={**REJECTION, "protocol_version": 2}) if len(calls) == 1 else httpx.Response(200)
+        )
+
+    with ReadRetryHTTPClient(POLICY, transport=httpx.MockTransport(handle)) as client:
+        assert client.post(URL, content=b"{}").status_code == 200
+    assert len(calls) == 2
+
+
 def test_retry_forwards_remaining_body_timeout_without_reencoding_other_values():
     requests = []
     original = b'{ "large": 12345678901234567890123456789, "decimal": 1.0000000000000000001, "timeout_ms": 150 }'

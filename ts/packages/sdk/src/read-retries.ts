@@ -59,6 +59,24 @@ function valueEnd(text: string, position: number): number {
   return position;
 }
 
+function hasDuplicateTopLevelFields(text: string): boolean {
+  let position = skipWhitespace(text, 0) + 1;
+  const keys = new Set<string>();
+  while (true) {
+    position = skipWhitespace(text, position);
+    if (text[position] === "}") return false;
+    const end = stringEnd(text, position);
+    const key = JSON.parse(text.slice(position, end)) as string;
+    if (keys.has(key)) return true;
+    keys.add(key);
+    position = skipWhitespace(text, end) + 1;
+    position = skipWhitespace(text, position);
+    position = skipWhitespace(text, valueEnd(text, position));
+    if (text[position] === "}") return false;
+    position++;
+  }
+}
+
 function bodyBudget(
   body: Uint8Array,
   contentType: string | null,
@@ -340,7 +358,15 @@ export function readRetryFetch(
       }
       let detail: Record<string, unknown>;
       try {
-        detail = JSON.parse(new TextDecoder().decode(encoded));
+        const text = new TextDecoder("utf-8", { fatal: true }).decode(encoded);
+        detail = JSON.parse(text);
+        if (
+          !detail ||
+          typeof detail !== "object" ||
+          Array.isArray(detail) ||
+          hasDuplicateTopLevelFields(text)
+        )
+          return deadlineResponse(response, signal);
       } catch {
         return deadlineResponse(response, signal);
       }

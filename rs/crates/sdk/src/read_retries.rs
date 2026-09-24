@@ -246,6 +246,57 @@ fn remaining_query_body(plan: &QueryPlan, end: Instant) -> Vec<u8> {
     body
 }
 
+// Reject duplicate fields, including future extension fields, before treating
+// the body as proof. serde_json::Value would silently keep the last value.
+struct RejectedBeforeExecution {
+    reason: String,
+    stage: String,
+    execution_started: bool,
+}
+
+impl<'de> serde::Deserialize<'de> for RejectedBeforeExecution {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct EvidenceVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for EvidenceVisitor {
+            type Value = RejectedBeforeExecution;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("an unambiguous query admission rejection")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut keys = HashSet::new();
+                let (mut reason, mut stage, mut execution_started) = (None, None, None);
+                while let Some(key) = map.next_key::<String>()? {
+                    if !keys.insert(key.clone()) {
+                        return Err(serde::de::Error::custom("duplicate retry evidence field"));
+                    }
+                    match key.as_str() {
+                        "reason" => reason = Some(map.next_value::<String>()?),
+                        "stage" => stage = Some(map.next_value::<String>()?),
+                        "execution_started" => execution_started = Some(map.next_value::<bool>()?),
+                        _ => {
+                            let _: serde::de::IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+                Ok(RejectedBeforeExecution {
+                    reason: reason.ok_or_else(|| serde::de::Error::missing_field("reason"))?,
+                    stage: stage.ok_or_else(|| serde::de::Error::missing_field("stage"))?,
+                    execution_started: execution_started
+                        .ok_or_else(|| serde::de::Error::missing_field("execution_started"))?,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(EvidenceVisitor)
+    }
+}
+
 fn retry_delay(
     policy: ReadRetryPolicy,
     attempt: u8,
@@ -256,11 +307,11 @@ fn retry_delay(
     if status != 429 {
         return None;
     }
-    let detail: serde_json::Value = serde_json::from_slice(body).ok()?;
-    if detail["reason"] != "instance_busy"
-        || detail["stage"] != "admission"
-        || detail["execution_started"] != false
-    {
+    // Unknown fields are skipped by the typed decoder, so validate the whole
+    // body before accepting proof from its known fields.
+    std::str::from_utf8(body).ok()?;
+    let detail: RejectedBeforeExecution = serde_json::from_slice(body).ok()?;
+    if detail.reason != "instance_busy" || detail.stage != "admission" || detail.execution_started {
         return None;
     }
     let mut delay = (policy.initial_backoff * (1 << attempt)).min(policy.max_backoff);
@@ -578,6 +629,7 @@ mod tests {
                         Err(error) => panic!("{error}"),
                     }
                 };
+                socket.set_nonblocking(false).unwrap();
                 socket
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
@@ -689,12 +741,38 @@ mod tests {
         for unknown in [
             br#"{"reason":"instance_busy"}"#.as_slice(),
             br#"{"reason":"instance_busy","stage":"admission","execution_started":true}"#,
+            br#"{"reason":"instance_busy","stage":"admission","execution_started":true,"execution_started":false}"#,
+            br#"{"reason":"instance_busy","stage":"worker","stage":"admission","execution_started":false}"#,
+            br#"{"reason":"instance_busy","stage":"admission","execution_started":true,"execution_\u0073tarted":false}"#,
+            br#"{"reason":"instance_busy","stage":"admission","protocol_version":2}"#,
+            br#"{"reason":"instance_busy","stage":"admission","execution_started":false,"protocol_version":1,"protocol_version":2}"#,
+            br#"{"reason":"instance_busy","stage":"worker","execution_started":false}"#,
+            br#"{"Reason":"instance_busy","Stage":"admission","Execution_Started":false}"#,
         ] {
             assert_eq!(
                 retry_delay(policy, 0, 429, &HeaderMap::new(), unknown),
                 None
             );
         }
+        let mut malformed =
+            br#"{"reason":"instance_busy","stage":"admission","execution_started":false,"trace":""#
+                .to_vec();
+        malformed.push(0xff);
+        malformed.extend_from_slice(b"\"}");
+        assert_eq!(
+            retry_delay(policy, 0, 429, &HeaderMap::new(), &malformed),
+            None
+        );
+        assert_eq!(
+            retry_delay(
+                policy,
+                0,
+                429,
+                &HeaderMap::new(),
+                br#"{"reason":"instance_busy","stage":"admission","execution_started":false,"protocol_version":2}"#,
+            ),
+            Some(Duration::from_millis(10))
+        );
         let mut headers = HeaderMap::new();
         headers.insert("retry-after", "2".parse().unwrap());
         assert_eq!(retry_delay(policy, 0, 429, &headers, body), None);

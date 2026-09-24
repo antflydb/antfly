@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // ReadRetryPolicy is opt-in. MaxAttempts includes the original attempt. One
@@ -208,6 +209,52 @@ func remainingQueryBody(body []byte, spans []timeoutSpan, deadline time.Time) []
 	return append(result, body[position:]...)
 }
 
+// A rejected-before-execution proof must be unambiguous. encoding/json accepts
+// duplicate keys and repairs malformed UTF-8, either of which could otherwise
+// turn conflicting rolling-version evidence into a retryable rejection.
+func explicitReadNonAdmission(body []byte) bool {
+	if !utf8.Valid(body) {
+		return false
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	start, err := decoder.Token()
+	if err != nil || start != json.Delim('{') {
+		return false
+	}
+	fields := make(map[string]json.RawMessage)
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return false
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return false
+		}
+		if _, duplicate := fields[key]; duplicate {
+			return false
+		}
+		var value json.RawMessage
+		if decoder.Decode(&value) != nil {
+			return false
+		}
+		fields[key] = value
+	}
+	end, err := decoder.Token()
+	if err != nil || end != json.Delim('}') {
+		return false
+	}
+	var trailing any
+	if decoder.Decode(&trailing) != io.EOF {
+		return false
+	}
+	var reason, stage string
+	if json.Unmarshal(fields["reason"], &reason) != nil || json.Unmarshal(fields["stage"], &stage) != nil {
+		return false
+	}
+	return reason == "instance_busy" && stage == "admission" && bytes.Equal(bytes.TrimSpace(fields["execution_started"]), []byte("false"))
+}
+
 func (t *readRetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.Method != http.MethodPost || !retryQueryPath.MatchString(req.URL.EscapedPath()) || (req.Body != nil && req.GetBody == nil) {
 		return t.base.RoundTrip(req)
@@ -258,12 +305,7 @@ func (t *readRetryTransport) RoundTrip(req *http.Request) (*http.Response, error
 		}
 		body, readErr := io.ReadAll(io.LimitReader(response.Body, 16385))
 		response.Body = &replayedErrorBody{Reader: io.MultiReader(bytes.NewReader(body), response.Body), Closer: response.Body}
-		var detail struct {
-			Reason  string `json:"reason"`
-			Stage   string `json:"stage"`
-			Started *bool  `json:"execution_started"`
-		}
-		if readErr != nil || len(body) > 16384 || json.Unmarshal(body, &detail) != nil || detail.Reason != "instance_busy" || detail.Stage != "admission" || detail.Started == nil || *detail.Started {
+		if readErr != nil || len(body) > 16384 || !explicitReadNonAdmission(body) {
 			return finish()
 		}
 		delay := t.policy.InitialBackoff
