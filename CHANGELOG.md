@@ -51,6 +51,22 @@ All notable changes to Antfly will be documented in this file.
   text to an Antfly reranker whose model accepts images, whether it runs in
   process or on a remote inference server. Other rerankers reject such queries
   with `400`.
+- **Aggregations on hybrid and semantic queries** — queries that combine
+  `aggregations` with `semantic_search` or `embeddings` no longer fail with
+  `query_candidate_budget_exceeded`. Aggregations now count every full-text
+  match plus each embedding index's top results at the requested limit and
+  `search_effort`, merged across shards. Previously the internal collection
+  widened each vector search to the full-result budget, which approximate
+  search could never prove complete. The ranked page is unchanged, the
+  full-result budget still bounds full-text matches, and a filter with no
+  full-text query contributes no extra rows. Separately, a vector search that
+  exhausts its traversal with a truncated top-k window now reports its total as
+  a lower bound instead of exact.
+- **Aggregation and semantic paging corrections** — full-text facets with fewer
+  matches than the collection budget now complete on larger tables. Explicit
+  `match_all` contributes its text domain to hybrid aggregations, while
+  filter-only vector requests no longer add a match-all retrieval lane to the
+  ranked page.
 - **TOON document rendering in retrieval agents** — the generation prompt now
   encodes each retrieved document's fields as TOON instead of raw JSON, and
   `document_renderer` on a retrieval agent request is accepted again: a
