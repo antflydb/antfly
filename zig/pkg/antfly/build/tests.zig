@@ -1511,6 +1511,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "artifact enrichment accepts typed chunker and rejects ambiguous legacy config",
         "artifact enrichment list does not expose internal JSON or producer credentials",
         "typed enrichment producer and graph scorer normalize to legacy storage fields",
+        "empty legacy graph scorer remains a deterministic resolver",
         "created nested response allowlists cover generated schemas",
         "staged restore published metadata wins cancellation only after every owner opens",
         "staged restore worker publishes a dependency complete mixed native cohort",

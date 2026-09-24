@@ -555,7 +555,9 @@ fn appendNormalizedGraphResolversField(alloc: std.mem.Allocator, out: *std.Array
             if (item.object.get("scorer_json")) |legacy| {
                 if (legacy != .null) {
                     if (legacy != .string) return error.InvalidCreateIndexRequest;
-                    try validateGraphScorerJson(alloc, legacy.string);
+                    // Empty is the legacy spelling for a deterministic
+                    // resolver without a matcher scorer.
+                    if (legacy.string.len > 0) try validateGraphScorerJson(alloc, legacy.string);
                 }
             }
             try appendCanonicalPublicValue(alloc, out, item, null);
@@ -1029,6 +1031,21 @@ test "typed enrichment producer and graph scorer normalize to legacy storage fie
     , .{});
     defer invalid_scorer.deinit();
     try std.testing.expectError(error.InvalidCreateIndexRequest, normalizeIndexConfigJson(alloc, invalid_scorer.value.object, "g", .{ .include_name = true, .default_type = true }));
+}
+
+test "empty legacy graph scorer remains a deterministic resolver" {
+    const alloc = std.testing.allocator;
+    const graph = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"type":"graph","resolvers":[{"name":"r","table":"entities","source_artifact":"mentions","resolution_artifact":"resolved","key_template":"{{text}}","scorer_json":""}]}
+    , .{});
+    defer graph.deinit();
+    const normalized = try normalizeIndexConfigJson(alloc, graph.value.object, "g", .{ .include_name = true, .default_type = true });
+    defer alloc.free(normalized);
+    try std.testing.expect(std.mem.indexOf(u8, normalized, "\"scorer_json\":\"\"") != null);
+    const public = try indexes_api.encodeCreatedIndexConfig(alloc, "g", normalized);
+    defer alloc.free(public);
+    try std.testing.expect(std.mem.indexOf(u8, public, "scorer_json") == null);
+    try std.testing.expect(std.mem.indexOf(u8, public, "\"scorer\":") == null);
 }
 
 fn extractPublicIndexType(object: anytype) ?[]const u8 {
