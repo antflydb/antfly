@@ -74,18 +74,24 @@ test "laya packed rows and decisions match the independent PyTorch oracle" {
             try std.testing.expectEqualSlices(i64, case.row.anchors, row.anchors);
             try std.testing.expectEqual(case.row.width, row.width);
             for (case.row.markers, 0..) |expected, qi| try std.testing.expectEqualSlices(i64, expected, row.markers[qi * row.width ..][0..row.width]);
-            const result = try pipeline.execute(s, session, tok, cfg, &.{
-                .{ .text = case.state, .question = questions[0] },
-                .{ .text = case.state, .question = questions[1] },
-                .{ .text = case.state, .question = questions[2] },
-            }, null);
-            try std.testing.expectEqual(@as(usize, 1), result.execution_chunks);
-            for (result.decisions, case.logits, case.action_logits, questions) |decision, logits, actions, q| {
-                // The oracle emits raw logits; compare calibrated probabilities.
-                const expected = try pipeline.decode(s, cfg, q, logits[0..q.labels.len], actions);
-                for (expected.probabilities, decision.probabilities) |want, got| worst = @max(worst, @abs(want - got));
-                worst = @max(worst, @abs(expected.act_probability - decision.act_probability));
+            // Full rows, then the state cache: a miss followed by a hit.
+            for ([_]usize{ @import("../architectures/laya_trunk_cache.zig").default_min_tokens, 1, 1 }) |min_tokens| {
+                factory.setLayaTrunkCacheLimit(session, 64 * 1024 * 1024, min_tokens);
+                const result = try pipeline.execute(s, session, tok, cfg, &.{
+                    .{ .text = case.state, .question = questions[0] },
+                    .{ .text = case.state, .question = questions[1] },
+                    .{ .text = case.state, .question = questions[2] },
+                }, null);
+                try std.testing.expectEqual(@as(usize, 1), result.execution_chunks);
+                for (result.decisions, case.logits, case.action_logits, questions) |decision, logits, actions, q| {
+                    // The oracle emits raw logits; compare calibrated probabilities.
+                    const expected = try pipeline.decode(s, cfg, q, logits[0..q.labels.len], actions);
+                    for (expected.probabilities, decision.probabilities) |want, got| worst = @max(worst, @abs(want - got));
+                    worst = @max(worst, @abs(expected.act_probability - decision.act_probability));
+                }
             }
+            const stats = factory.layaTrunkCacheStats(session).?;
+            try std.testing.expect(stats.hits >= 1);
         }
     }
     std.debug.print("Laya packed oracle backend max probability error={d}\n", .{worst});

@@ -179,7 +179,7 @@ pub fn forwardPackedBranches(cb: *const CB, a: std.mem.Allocator, cfg: Config, e
 /// Run the head layers over trunk-only encoder rows (`[rows, dim]`, no type
 /// embedding, full visibility) and copy each layer's keys and values.
 pub fn captureTrunk(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder: CT, rows: usize, dim: usize, capture: Capture) !void {
-    if (capture.keys.len != cfg.head_layers or capture.values.len != cfg.head_layers) return error.InvalidLayaInputs;
+    if (@max(capture.keys.len, capture.key_tensors.len) != cfg.head_layers or @max(capture.values.len, capture.value_tensors.len) != cfg.head_layers) return error.InvalidLayaInputs;
     const zeros = try a.alloc(f32, rows * dim);
     defer a.free(zeros);
     @memset(zeros, 0);
@@ -283,8 +283,14 @@ pub fn transform(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder: CT, 
 /// Cached trunk keys and values per head layer, `[rows, dim]` each, and a
 /// `[rows, dim]` zero block standing in for trunk queries.
 pub const Prefix = struct { rows: usize, keys: []const CT, values: []const CT, zeros: CT };
-/// Host destinations for each head layer's keys and values.
-pub const Capture = struct { keys: []const []f32, values: []const []f32 };
+/// Each head layer's keys and values, as host copies or dense tensors owned
+/// by the caller (see `modern_bert.Capture`).
+pub const Capture = struct {
+    keys: []const []f32 = &.{},
+    values: []const []f32 = &.{},
+    key_tensors: []?CT = &.{},
+    value_tensors: []?CT = &.{},
+};
 
 /// Pre-norm TransformerEncoder layers. Takes ownership of `input`. With a
 /// prefix, `input` holds only the rows after it and attention spans both.
@@ -312,22 +318,14 @@ fn layers(cb: *const CB, a: std.mem.Allocator, cfg: Config, input: CT, mask: []c
         defer cb.free(k);
         const v = try cb.sliceLastDim(qkv, dim * 2, dim * 3);
         defer cb.free(v);
-        if (capture) |c| {
-            for ([_]CT{ k, v }, [_][]f32{ c.keys[layer], c.values[layer] }) |tensor, dst| {
-                const host = try cb.toFloat32(tensor, a);
-                defer a.free(host);
-                if (host.len != dst.len) return error.InvalidLayaInputs;
-                @memcpy(dst, host);
-            }
-        }
+        if (capture) |c| try @import("modern_bert.zig").captureLayer(cb, a, c.keys, c.values, c.key_tensors, c.value_tensors, layer, k, v, rows, dim);
         var joined: [3]?CT = .{ null, null, null };
         defer for (joined) |tensor| if (tensor) |t| cb.free(t);
         if (trunk) |p| {
-            const prefix_shape = [_]i64{ @intCast(p.rows), @intCast(dim) };
-            const rows_shape = [_]i64{ @intCast(rows), @intCast(dim) };
-            joined[0] = try cb.primConcatPrim(p.zeros, q, 0, &prefix_shape, &rows_shape);
-            joined[1] = try cb.primConcatPrim(p.keys[layer], k, 0, &prefix_shape, &rows_shape);
-            joined[2] = try cb.primConcatPrim(p.values[layer], v, 0, &prefix_shape, &rows_shape);
+            const modern = @import("modern_bert.zig");
+            joined[0] = try modern.joinRows(cb, a, p.zeros, p.rows, q, rows, dim);
+            joined[1] = try modern.joinRows(cb, a, p.keys[layer], p.rows, k, rows, dim);
+            joined[2] = try modern.joinRows(cb, a, p.values[layer], p.rows, v, rows, dim);
         }
         const attn_full = try cb.scaledDotProductAttention(joined[0] orelse q, joined[1] orelse k, joined[2] orelse v, mask, bias, batch, seq, dim / 64, 64);
         defer cb.free(attn_full);

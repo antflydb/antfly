@@ -17,22 +17,31 @@
 //! so its per-layer keys and values depend only on its tokens and the model.
 //! A later request about the same state encodes only its question branches.
 //!
-//! Entries are host f32, bounded by `limit_bytes`, and evicted least recently
-//! used. Entries in use are pinned and never evicted. The bound defaults to
-//! ANTFLY_LAYA_TRUNK_CACHE_MB (256 MiB); 0 disables caching.
+//! Entries are host f32 on CPU and retained device tensors on Metal. They are
+//! bounded by `limit_bytes` and evicted least recently used; entries in use
+//! are pinned and never evicted. The bound defaults to
+//! ANTFLY_LAYA_TRUNK_CACHE_MB (256 MiB); 0 disables caching. Trunks shorter
+//! than `min_tokens` are not cached.
 const std = @import("std");
 const platform = @import("antfly_platform");
 
 pub const default_limit_mb = 256;
+/// Shorter trunks cost less to re-encode than the cached path's fixed
+/// overhead (measured on Metal and CPU with the released checkpoint).
+pub const default_min_tokens = 96;
 
 /// Per-layer trunk keys (after RoPE for the encoder) and values, `[T, H]`
 /// each, for every encoder layer followed by every decision-head layer.
+/// Host entries fill `values`; device entries leave it empty and own
+/// backend tensors through `device` (released by `device_deinit`).
 pub const Entry = struct {
     key: [32]u8,
     tokens: usize,
     hidden: usize,
     layers: usize,
     values: []f32,
+    device: ?*anyopaque = null,
+    device_deinit: ?*const fn (?*anyopaque, std.mem.Allocator) void = null,
     pins: usize = 0,
     last_used: u64 = 0,
 
@@ -47,7 +56,7 @@ pub const Entry = struct {
         return self.values[index * self.tokens * self.hidden ..][0 .. self.tokens * self.hidden];
     }
     pub fn bytes(self: *const Entry) usize {
-        return self.values.len * @sizeOf(f32);
+        return 2 * self.layers * self.tokens * self.hidden * @sizeOf(f32);
     }
 };
 
@@ -56,6 +65,7 @@ pub const Stats = struct { hits: u64 = 0, misses: u64 = 0, entries: usize = 0, b
 pub const Cache = struct {
     allocator: std.mem.Allocator,
     limit_bytes: usize,
+    min_tokens: usize = default_min_tokens,
     mutex: std.atomic.Mutex = .unlocked,
     entries: std.ArrayListUnmanaged(*Entry) = .empty,
     clock: u64 = 0,
@@ -76,6 +86,7 @@ pub const Cache = struct {
     }
 
     fn destroy(self: *Cache, entry: *Entry) void {
+        if (entry.device_deinit) |free_device| free_device(entry.device, self.allocator);
         self.allocator.free(entry.values);
         self.allocator.destroy(entry);
     }
@@ -111,9 +122,10 @@ pub const Cache = struct {
         if (entry.pins == 0 and std.mem.indexOfScalar(*Entry, self.entries.items, entry) == null) self.destroy(entry);
     }
 
-    /// Allocate an unpublished, pinned entry for the caller to fill.
-    pub fn create(self: *Cache, k: [32]u8, tokens: usize, layers: usize, hidden: usize) !*Entry {
-        const count = try std.math.mul(usize, try std.math.mul(usize, 2 * layers, tokens), hidden);
+    /// Allocate an unpublished, pinned entry for the caller to fill. Device
+    /// entries (`host = false`) get no host storage.
+    pub fn create(self: *Cache, k: [32]u8, tokens: usize, layers: usize, hidden: usize, host: bool) !*Entry {
+        const count = if (host) try std.math.mul(usize, try std.math.mul(usize, 2 * layers, tokens), hidden) else 0;
         const entry = try self.allocator.create(Entry);
         errdefer self.allocator.destroy(entry);
         entry.* = .{ .key = k, .tokens = tokens, .hidden = hidden, .layers = layers, .values = try self.allocator.alloc(f32, count), .pins = 1 };
@@ -166,7 +178,7 @@ test "laya trunk cache pins, evicts least recently used, and frees unpublished e
     try std.testing.expect(!std.mem.eql(u8, &k1, &k2));
     try std.testing.expect(cache.acquire(k1) == null);
     for ([_][32]u8{ k1, k2 }) |k| {
-        const entry = try cache.create(k, 4, 1, 8);
+        const entry = try cache.create(k, 4, 1, 8, true);
         @memset(entry.values, 1);
         cache.publish(entry);
         cache.release(entry);
@@ -174,14 +186,14 @@ test "laya trunk cache pins, evicts least recently used, and frees unpublished e
     try std.testing.expectEqual(@as(usize, 2), cache.snapshot().entries);
     // k1 is pinned, so publishing k3 must evict k2 even though k1 is older.
     const pinned = cache.acquire(k1).?;
-    const third = try cache.create(k3, 4, 1, 8);
+    const third = try cache.create(k3, 4, 1, 8, true);
     cache.publish(third);
     cache.release(third);
     try std.testing.expect(cache.acquire(k2) == null);
     try std.testing.expectEqual(@as(u64, 1), cache.snapshot().evictions);
     cache.release(pinned);
     // An entry larger than the whole budget is never published but still freed.
-    const huge = try cache.create(Cache.key(&.{7}, 3, 64), 4, 3, 64);
+    const huge = try cache.create(Cache.key(&.{7}, 3, 64), 4, 3, 64, false);
     cache.publish(huge);
     cache.release(huge);
     try std.testing.expectEqual(@as(usize, 2), cache.snapshot().entries);

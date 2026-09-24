@@ -121,7 +121,7 @@ $ uv run --script laya_packed_reference.py --fixture <ref> --common common.py
 {"one_segment_vs_upstream_max_error": 0.0}
 ```
 
-## State cache (added later on 2026-09-24)
+## State cache, CPU only (superseded later on 2026-09-24)
 
 CPU, ReleaseFast. `packed_ms` is packed with the cache disabled, and
 `packed_cached_ms` is packed with the cache on. Every repeated request after
@@ -168,4 +168,74 @@ In this output `packed_ms` is uncached and `packed_cached_ms` is cached.
 {"backend":"metal","state_sentences":12,"questions":4,"unpacked_ms":481.3,"packed_ms":169.1,"packed_cached_ms":167.0,"unpacked_tokens":1643,"packed_tokens":486}
 {"backend":"metal","state_sentences":12,"questions":8,"unpacked_ms":826.3,"packed_ms":228.5,"packed_cached_ms":217.0,"unpacked_tokens":3295,"packed_tokens":594}
 {"backend":"metal","state_sentences":12,"questions":16,"unpacked_ms":1512.8,"packed_ms":347.5,"packed_cached_ms":361.0,"unpacked_tokens":6587,"packed_tokens":798}
+```
+
+## State cache on the GPU (final)
+
+After the row-join fix (in-stream flat concat/slice on Metal) and
+device-resident entries, the cache is enabled on Metal and CPU. Trunks under
+96 tokens are not cached. `packed_ms` is uncached and `packed_cached_ms` is
+cached. Metal:
+
+```
+{"backend":"metal","state_sentences":1,"questions":1,"unpacked_ms":58.2,"packed_ms":56.3,"packed_cached_ms":56.5,"unpacked_tokens":55,"packed_tokens":56}
+{"backend":"metal","state_sentences":1,"questions":2,"unpacked_ms":66.5,"packed_ms":61.2,"packed_cached_ms":60.9,"unpacked_tokens":119,"packed_tokens":86}
+{"backend":"metal","state_sentences":1,"questions":4,"unpacked_ms":79.8,"packed_ms":69.9,"packed_cached_ms":69.9,"unpacked_tokens":235,"packed_tokens":134}
+{"backend":"metal","state_sentences":1,"questions":8,"unpacked_ms":109.1,"packed_ms":88.8,"packed_cached_ms":88.7,"unpacked_tokens":479,"packed_tokens":242}
+{"backend":"metal","state_sentences":1,"questions":16,"unpacked_ms":166.3,"packed_ms":148.6,"packed_cached_ms":148.7,"unpacked_tokens":955,"packed_tokens":446}
+{"backend":"metal","state_sentences":4,"questions":1,"unpacked_ms":79.6,"packed_ms":72.0,"packed_cached_ms":66.8,"unpacked_tokens":151,"packed_tokens":152}
+{"backend":"metal","state_sentences":4,"questions":2,"unpacked_ms":103.4,"packed_ms":78.2,"packed_cached_ms":72.2,"unpacked_tokens":311,"packed_tokens":182}
+{"backend":"metal","state_sentences":4,"questions":4,"unpacked_ms":149.0,"packed_ms":87.3,"packed_cached_ms":82.2,"unpacked_tokens":619,"packed_tokens":230}
+{"backend":"metal","state_sentences":4,"questions":8,"unpacked_ms":234.3,"packed_ms":115.7,"packed_cached_ms":109.4,"unpacked_tokens":1247,"packed_tokens":338}
+{"backend":"metal","state_sentences":4,"questions":16,"unpacked_ms":411.4,"packed_ms":194.0,"packed_cached_ms":191.4,"unpacked_tokens":2491,"packed_tokens":542}
+{"backend":"metal","state_sentences":12,"questions":1,"unpacked_ms":193.5,"packed_ms":137.2,"packed_cached_ms":108.5,"unpacked_tokens":407,"packed_tokens":408}
+{"backend":"metal","state_sentences":12,"questions":2,"unpacked_ms":280.1,"packed_ms":147.5,"packed_cached_ms":118.3,"unpacked_tokens":823,"packed_tokens":438}
+{"backend":"metal","state_sentences":12,"questions":4,"unpacked_ms":452.0,"packed_ms":168.0,"packed_cached_ms":139.4,"unpacked_tokens":1643,"packed_tokens":486}
+{"backend":"metal","state_sentences":12,"questions":8,"unpacked_ms":788.1,"packed_ms":222.4,"packed_cached_ms":192.9,"unpacked_tokens":3295,"packed_tokens":594}
+{"backend":"metal","state_sentences":12,"questions":16,"unpacked_ms":1499.9,"packed_ms":972.6,"packed_cached_ms":473.1,"unpacked_tokens":6587,"packed_tokens":798}
+```
+
+The uncached 16-question, 12-sentence Metal value (972.6 ms) is an outlier;
+three earlier runs measured 340–347 ms.
+
+Intermediate Metal run: device-resident entries, but the branch forward was
+still unframed. The cached path was slower than uncached, which showed the
+remaining cost was per-op submission rather than uploads.
+
+```
+{"backend":"metal","state_sentences":1,"questions":1,"unpacked_ms":58.9,"packed_ms":51.8,"packed_cached_ms":119.4,"unpacked_tokens":55,"packed_tokens":56}
+{"backend":"metal","state_sentences":1,"questions":2,"unpacked_ms":65.0,"packed_ms":61.7,"packed_cached_ms":175.8,"unpacked_tokens":119,"packed_tokens":86}
+{"backend":"metal","state_sentences":1,"questions":4,"unpacked_ms":81.6,"packed_ms":72.1,"packed_cached_ms":210.8,"unpacked_tokens":235,"packed_tokens":134}
+{"backend":"metal","state_sentences":1,"questions":8,"unpacked_ms":111.8,"packed_ms":90.9,"packed_cached_ms":313.4,"unpacked_tokens":479,"packed_tokens":242}
+{"backend":"metal","state_sentences":1,"questions":16,"unpacked_ms":167.7,"packed_ms":153.1,"packed_cached_ms":392.0,"unpacked_tokens":955,"packed_tokens":446}
+{"backend":"metal","state_sentences":4,"questions":1,"unpacked_ms":82.1,"packed_ms":74.0,"packed_cached_ms":188.2,"unpacked_tokens":151,"packed_tokens":152}
+{"backend":"metal","state_sentences":4,"questions":2,"unpacked_ms":105.2,"packed_ms":77.9,"packed_cached_ms":157.3,"unpacked_tokens":311,"packed_tokens":182}
+{"backend":"metal","state_sentences":4,"questions":4,"unpacked_ms":150.0,"packed_ms":88.4,"packed_cached_ms":186.6,"unpacked_tokens":619,"packed_tokens":230}
+{"backend":"metal","state_sentences":4,"questions":8,"unpacked_ms":236.8,"packed_ms":116.6,"packed_cached_ms":312.6,"unpacked_tokens":1247,"packed_tokens":338}
+{"backend":"metal","state_sentences":4,"questions":16,"unpacked_ms":416.6,"packed_ms":199.0,"packed_cached_ms":373.2,"unpacked_tokens":2491,"packed_tokens":542}
+{"backend":"metal","state_sentences":12,"questions":1,"unpacked_ms":192.9,"packed_ms":137.8,"packed_cached_ms":292.6,"unpacked_tokens":407,"packed_tokens":408}
+{"backend":"metal","state_sentences":12,"questions":2,"unpacked_ms":287.9,"packed_ms":148.2,"packed_cached_ms":266.7,"unpacked_tokens":823,"packed_tokens":438}
+{"backend":"metal","state_sentences":12,"questions":4,"unpacked_ms":456.9,"packed_ms":169.0,"packed_cached_ms":332.3,"unpacked_tokens":1643,"packed_tokens":486}
+{"backend":"metal","state_sentences":12,"questions":8,"unpacked_ms":797.7,"packed_ms":229.6,"packed_cached_ms":402.5,"unpacked_tokens":3295,"packed_tokens":594}
+{"backend":"metal","state_sentences":12,"questions":16,"unpacked_ms":1530.0,"packed_ms":342.2,"packed_cached_ms":448.9,"unpacked_tokens":6587,"packed_tokens":798}
+```
+
+CPU:
+
+```
+{"backend":"native","state_sentences":1,"questions":1,"unpacked_ms":383.5,"packed_ms":403.1,"packed_cached_ms":401.2,"unpacked_tokens":55,"packed_tokens":56}
+{"backend":"native","state_sentences":1,"questions":2,"unpacked_ms":588.3,"packed_ms":497.2,"packed_cached_ms":507.5,"unpacked_tokens":119,"packed_tokens":86}
+{"backend":"native","state_sentences":1,"questions":4,"unpacked_ms":824.0,"packed_ms":661.1,"packed_cached_ms":635.9,"unpacked_tokens":235,"packed_tokens":134}
+{"backend":"native","state_sentences":1,"questions":8,"unpacked_ms":1341.4,"packed_ms":954.1,"packed_cached_ms":956.9,"unpacked_tokens":479,"packed_tokens":242}
+{"backend":"native","state_sentences":1,"questions":16,"unpacked_ms":2218.5,"packed_ms":1218.5,"packed_cached_ms":1218.9,"unpacked_tokens":955,"packed_tokens":446}
+{"backend":"native","state_sentences":4,"questions":1,"unpacked_ms":476.0,"packed_ms":471.7,"packed_cached_ms":345.8,"unpacked_tokens":151,"packed_tokens":152}
+{"backend":"native","state_sentences":4,"questions":2,"unpacked_ms":725.4,"packed_ms":535.0,"packed_cached_ms":382.0,"unpacked_tokens":311,"packed_tokens":182}
+{"backend":"native","state_sentences":4,"questions":4,"unpacked_ms":1204.0,"packed_ms":618.5,"packed_cached_ms":497.9,"unpacked_tokens":619,"packed_tokens":230}
+{"backend":"native","state_sentences":4,"questions":8,"unpacked_ms":2250.2,"packed_ms":902.2,"packed_cached_ms":777.3,"unpacked_tokens":1247,"packed_tokens":338}
+{"backend":"native","state_sentences":4,"questions":16,"unpacked_ms":4106.4,"packed_ms":1611.1,"packed_cached_ms":1443.4,"unpacked_tokens":2491,"packed_tokens":542}
+{"backend":"native","state_sentences":12,"questions":1,"unpacked_ms":1174.7,"packed_ms":1181.9,"packed_cached_ms":740.3,"unpacked_tokens":407,"packed_tokens":408}
+{"backend":"native","state_sentences":12,"questions":2,"unpacked_ms":2255.2,"packed_ms":1327.0,"packed_cached_ms":834.1,"unpacked_tokens":823,"packed_tokens":438}
+{"backend":"native","state_sentences":12,"questions":4,"unpacked_ms":4157.8,"packed_ms":1675.3,"packed_cached_ms":1034.0,"unpacked_tokens":1643,"packed_tokens":486}
+{"backend":"native","state_sentences":12,"questions":8,"unpacked_ms":7401.4,"packed_ms":1824.4,"packed_cached_ms":1408.4,"unpacked_tokens":3295,"packed_tokens":594}
+{"backend":"native","state_sentences":12,"questions":16,"unpacked_ms":14821.7,"packed_ms":2756.9,"packed_cached_ms":2324.4,"unpacked_tokens":6587,"packed_tokens":798}
 ```

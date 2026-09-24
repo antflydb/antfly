@@ -1809,6 +1809,25 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     /// Non-owning CT view over a pooled buffer CT, shaped `dims`. Freeing the
     /// returned view decrements only the borrowed wrapper (release_on_drop=false),
     /// leaving the pooled MTLBuffer alive for reuse.
+    /// A retained reference to the dense device tensor behind `ct`, for
+    /// caches that outlive request-local compute wrappers (the packed Laya
+    /// trunk cache). Null for host-backed tensors, views, and quantized data.
+    pub fn retainDenseDeviceTensor(ct: CT) !?MetalTensor {
+        const buf = toBuf(ct);
+        if (buf.integer_storage or buf.quantized_storage != null or buf.runtime_quantized_storage != null or
+            buf.owned_quantized_storage != null or buf.lazy_multiply != null or buf.view_strides != null or
+            buf.logical_view_strides != null or buf.view_index_map != null or buf.view_base_offset != 0) return null;
+        const tensor = buf.metal_tensor orelse return null;
+        if (!tensor.isDevice()) return null;
+        return try tensor.retainedCopy();
+    }
+
+    /// A request-local tensor over a retained device tensor; the caller keeps
+    /// its own reference and frees the result with the compute backend.
+    pub fn ctFromRetainedDeviceTensor(self: *MetalCompute, tensor: *const MetalTensor) !CT {
+        return self.ctFromOwnedMetalTensor(try tensor.retainedCopy());
+    }
+
     pub fn ctFromPoolCtView(cb: *const ops.ComputeBackend, pool_ct: CT, dims: []const i32) !CT {
         if (cb.kind() != .metal) return error.UnsupportedTensorType;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));

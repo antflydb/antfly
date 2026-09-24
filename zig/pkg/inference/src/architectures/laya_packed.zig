@@ -24,6 +24,9 @@ const modern = @import("modern_bert.zig");
 const head = @import("laya_head.zig");
 const tree = @import("../pipelines/laya_tree.zig");
 const trunk_cache = @import("laya_trunk_cache.zig");
+const build_options = @import("build_options");
+const metal_compute = if (build_options.enable_metal) @import("../ops/metal_compute.zig") else struct {};
+const MetalTensor = if (build_options.enable_metal) @import("../backends/metal_tensor.zig").MetalTensor else void;
 const Tensor = @import("../backends/tensor.zig").Tensor;
 const TensorInfo = @import("../backends/tensor.zig").TensorInfo;
 
@@ -95,18 +98,14 @@ const Laya = @import("../models/laya.zig").Config;
 /// requests, and only the branch tokens are encoded (laya_trunk_cache.zig).
 pub fn forwardRow(cb: *const ops.ComputeBackend, a: std.mem.Allocator, cfg: modern.Config, laya: Laya, row: tree.Row, cache: ?*trunk_cache.Cache) ![]Tensor {
     const store = cache orelse return forwardFull(cb, a, cfg, laya, row);
-    // CPU only for now. On Metal, device row concat/gather is not ordered with
-    // pending session work (wrong decisions), and per-request uploads of the
-    // host cache cost what skipping the trunk saves (models/laya/LAYA.md).
-    if (cb.kind() != .native) return forwardFull(cb, a, cfg, laya, row);
     const trunk = trunkRows(row) orelse return forwardFull(cb, a, cfg, laya, row);
-    if (store.limit_bytes == 0 or trunk == row.ids.len) return forwardFull(cb, a, cfg, laya, row);
+    if (store.limit_bytes == 0 or trunk < store.min_tokens or trunk == row.ids.len) return forwardFull(cb, a, cfg, laya, row);
     const layers = cfg.num_hidden_layers + laya.head_layers;
     const key = trunk_cache.Cache.key(row.ids[0..trunk], layers, cfg.hidden_size);
     const entry = store.acquire(key) orelse blk: {
-        const created = try store.create(key, trunk, layers, cfg.hidden_size);
+        const created = try store.create(key, trunk, layers, cfg.hidden_size, !deviceCache(cb));
         errdefer store.release(created);
-        try fillTrunk(cb, a, cfg, laya, row.ids[0..trunk], created);
+        try fillTrunk(cb, a, cfg, laya, row.ids[0..trunk], created, store.allocator);
         store.publish(created);
         break :blk created;
     };
@@ -124,10 +123,54 @@ fn trunkRows(row: tree.Row) ?usize {
     return if (trunk == 0) null else trunk;
 }
 
-/// Encode the trunk alone (it never attends to a branch) and copy every
-/// encoder and head layer's keys and values into `entry`.
-fn fillTrunk(cb: *const ops.ComputeBackend, a: std.mem.Allocator, cfg: modern.Config, laya: Laya, ids: []const i64, entry: *trunk_cache.Entry) !void {
+/// Trunk tensors stay on Metal devices across requests; elsewhere they are
+/// host f32 and re-uploaded per request (cheap on CPU).
+fn deviceCache(cb: *const ops.ComputeBackend) bool {
+    return build_options.enable_metal and cb.kind() == .metal;
+}
+
+const DeviceTrunk = if (build_options.enable_metal) struct {
+    tensors: []MetalTensor,
+
+    fn destroy(raw: ?*anyopaque, allocator: std.mem.Allocator) void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        for (self.tensors) |*tensor| tensor.deinit();
+        allocator.free(self.tensors);
+        allocator.destroy(self);
+    }
+} else struct {};
+
+/// Encode the trunk alone (it never attends to a branch) and keep every
+/// encoder and head layer's keys and values in `entry`.
+fn fillTrunk(cb: *const ops.ComputeBackend, a: std.mem.Allocator, cfg: modern.Config, laya: Laya, ids: []const i64, entry: *trunk_cache.Entry, cache_allocator: std.mem.Allocator) !void {
     const n = cfg.num_hidden_layers;
+    if (comptime build_options.enable_metal) if (deviceCache(cb)) {
+        const tensors = try a.alloc(?ops.CT, 2 * entry.layers);
+        defer a.free(tensors);
+        @memset(tensors, null);
+        defer for (tensors) |tensor| if (tensor) |t| cb.free(t);
+        const keys = tensors[0..entry.layers];
+        const values = tensors[entry.layers..];
+        const encoded = try modern.forwardCapturingCT(cb, a, cfg, ids, .{ .key_tensors = keys[0..n], .value_tensors = values[0..n] });
+        defer cb.free(encoded);
+        try head.captureTrunk(cb, a, laya, encoded, ids.len, cfg.hidden_size, .{ .key_tensors = keys[n..], .value_tensors = values[n..] });
+        const trunk = try cache_allocator.create(DeviceTrunk);
+        errdefer cache_allocator.destroy(trunk);
+        trunk.tensors = try cache_allocator.alloc(MetalTensor, 2 * entry.layers);
+        var retained: usize = 0;
+        errdefer {
+            for (trunk.tensors[0..retained]) |*tensor| tensor.deinit();
+            cache_allocator.free(trunk.tensors);
+        }
+        // Interleave as [layer][keys, values].
+        for (0..entry.layers) |layer| for ([_]?ops.CT{ keys[layer], values[layer] }) |tensor| {
+            trunk.tensors[retained] = (try metal_compute.MetalCompute.retainDenseDeviceTensor(tensor.?)) orelse return error.UnsupportedLayaDeviceCache;
+            retained += 1;
+        };
+        entry.device = trunk;
+        entry.device_deinit = DeviceTrunk.destroy;
+        return;
+    };
     const keys = try a.alloc([]f32, entry.layers);
     defer a.free(keys);
     const values = try a.alloc([]f32, entry.layers);
@@ -139,6 +182,17 @@ fn fillTrunk(cb: *const ops.ComputeBackend, a: std.mem.Allocator, cfg: modern.Co
     const encoded = try modern.forwardCapturingCT(cb, a, cfg, ids, .{ .keys = keys[0..n], .values = values[0..n] });
     defer cb.free(encoded);
     try head.captureTrunk(cb, a, laya, encoded, ids.len, cfg.hidden_size, .{ .keys = keys[n..], .values = values[n..] });
+}
+
+/// A request-local tensor for one cached trunk layer (`which` 0 = keys).
+fn trunkTensor(cb: *const ops.ComputeBackend, entry: *const trunk_cache.Entry, layer: usize, which: usize) !ops.CT {
+    if (comptime build_options.enable_metal) if (entry.device) |raw| {
+        const trunk: *const DeviceTrunk = @ptrCast(@alignCast(raw));
+        const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        return compute.ctFromRetainedDeviceTensor(&trunk.tensors[2 * layer + which]);
+    };
+    const block = [_]i32{ @intCast(entry.tokens), @intCast(entry.hidden) };
+    return cb.fromFloat32Shape(if (which == 0) entry.keys(layer) else entry.vals(layer), &block);
 }
 
 fn forwardCached(cb: *const ops.ComputeBackend, a: std.mem.Allocator, cfg: modern.Config, laya: Laya, row: tree.Row, entry: *const trunk_cache.Entry) ![]Tensor {
@@ -154,11 +208,12 @@ fn forwardCached(cb: *const ops.ComputeBackend, a: std.mem.Allocator, cfg: moder
     defer a.free(local_values);
     const local = try cb.fromFloat32Shape(local_values, &shape);
     defer cb.free(local);
-    const block = [_]i32{ @intCast(trunk), @intCast(hidden) };
-    const zero_values = try a.alloc(f32, trunk * hidden);
-    defer a.free(zero_values);
-    @memset(zero_values, 0);
-    const zeros = try cb.fromFloat32Shape(zero_values, &block);
+    const zeros = (try cb.zeroTensor(trunk, hidden)) orelse blk: {
+        const zero_values = try a.alloc(f32, trunk * hidden);
+        defer a.free(zero_values);
+        @memset(zero_values, 0);
+        break :blk try cb.fromFloat32Shape(zero_values, &.{ @intCast(trunk), @intCast(hidden) });
+    };
     defer cb.free(zeros);
     const keys = try a.alloc(ops.CT, entry.layers);
     defer a.free(keys);
@@ -170,8 +225,8 @@ fn forwardCached(cb: *const ops.ComputeBackend, a: std.mem.Allocator, cfg: moder
         cb.free(v);
     };
     for (keys, values, 0..) |*k, *v, layer| {
-        k.* = try cb.fromFloat32Shape(entry.keys(layer), &block);
-        v.* = cb.fromFloat32Shape(entry.vals(layer), &block) catch |err| {
+        k.* = try trunkTensor(cb, entry, layer, 0);
+        v.* = trunkTensor(cb, entry, layer, 1) catch |err| {
             cb.free(k.*);
             return err;
         };

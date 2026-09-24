@@ -331,11 +331,18 @@ pub const Branches = struct {
     zeros: CT,
 };
 
-/// Host destinations for every encoder layer's keys (after RoPE) and values,
-/// `[tokens * hidden]` each.
+/// Per encoder layer keys (after RoPE) and values. Either host copies,
+/// `[tokens * hidden]` each, or dense `[tokens, hidden]` backend tensors
+/// that the caller owns (`key_tensors`/`value_tensors`, one slot per layer).
 pub const Capture = struct {
-    keys: []const []f32,
-    values: []const []f32,
+    keys: []const []f32 = &.{},
+    values: []const []f32 = &.{},
+    key_tensors: []?CT = &.{},
+    value_tensors: []?CT = &.{},
+
+    fn layers(self: Capture) usize {
+        return @max(self.keys.len, self.key_tensors.len);
+    }
 };
 
 /// Encode only the branch tokens of a packed row whose trunk occupies rows
@@ -369,7 +376,7 @@ pub fn forwardCapturingCT(
     input_ids: []const i64,
     capture: Capture,
 ) !CT {
-    if (capture.keys.len != config.num_hidden_layers or capture.values.len != config.num_hidden_layers) return error.InvalidInputShape;
+    if (capture.layers() != config.num_hidden_layers or @max(capture.values.len, capture.value_tensors.len) != config.num_hidden_layers) return error.InvalidInputShape;
     const n = input_ids.len;
     const mask = try allocator.alloc(i64, n);
     defer allocator.free(mask);
@@ -425,10 +432,9 @@ fn forwardImpl(
     // does not submit and wait after every projection.  The frame is owned
     // only here; callers that already compose a frame retain control.
     var encoder_frame_active = false;
-    // Interleaved packed RoPE and trunk capture read back to the host, and
-    // the device row concat/gather of a branch-only forward is not ordered
-    // with pending frame work (it read stale queries), so those run unframed.
-    if ((packed_row == null or !config.rope_interleaved) and capture == null and branches == null and cb.kind() == .metal and metalEncoderFrameEnabled() and !cb.decoderRuntimeHasActiveFrame()) {
+    // Interleaved packed RoPE and trunk capture read back to the host, so
+    // those forwards run unframed.
+    if ((packed_row == null or !config.rope_interleaved) and capture == null and cb.kind() == .metal and metalEncoderFrameEnabled() and !cb.decoderRuntimeHasActiveFrame()) {
         encoder_frame_active = try cb.decoderRuntimeBeginFrame();
     }
     errdefer if (encoder_frame_active) cb.decoderRuntimeCancelFrame() catch {};
@@ -596,22 +602,13 @@ fn encoderLayer(
         try cb.rope(qkv.k, seq_len, head_dim, head_dim, rope_theta, 1.0, 0, config.rope_interleaved);
     defer cb.free(K);
 
-    if (capture) |c| {
-        for ([_]CT{ K, qkv.v }, [_][]f32{ c.keys[layer_idx], c.values[layer_idx] }) |tensor, dst| {
-            const host = try cb.toFloat32(tensor, allocator);
-            defer allocator.free(host);
-            if (host.len != dst.len) return error.InvalidInputShape;
-            @memcpy(dst, host);
-        }
-    }
+    if (capture) |c| try captureLayer(cb, allocator, c.keys, c.values, c.key_tensors, c.value_tensors, layer_idx, K, qkv.v, total, H);
     var joined: [3]?CT = .{ null, null, null };
     defer for (joined) |tensor| if (tensor) |t| cb.free(t);
     if (branches) |b| {
-        const prefix_shape = [_]i64{ @intCast(prefix_rows), @intCast(H) };
-        const rows_shape = [_]i64{ @intCast(total), @intCast(H) };
-        joined[0] = try cb.primConcatPrim(b.zeros, Q, 0, &prefix_shape, &rows_shape);
-        joined[1] = try cb.primConcatPrim(b.keys[layer_idx], K, 0, &prefix_shape, &rows_shape);
-        joined[2] = try cb.primConcatPrim(b.values[layer_idx], qkv.v, 0, &prefix_shape, &rows_shape);
+        joined[0] = try joinRows(cb, allocator, b.zeros, prefix_rows, Q, total, H);
+        joined[1] = try joinRows(cb, allocator, b.keys[layer_idx], prefix_rows, K, total, H);
+        joined[2] = try joinRows(cb, allocator, b.values[layer_idx], prefix_rows, qkv.v, total, H);
     }
     const q_all = joined[0] orelse Q;
     const k_all = joined[1] orelse K;
@@ -896,13 +893,65 @@ fn geGluFfn(
     );
 }
 
-/// Rows `prefix..seq` of a `[seq, width]` activation. A row gather is
-/// independent of the head-major or token-major layout attention returns.
+/// Rows `prefix..seq` of a token-major `[seq, width]` activation.
+///
+/// On Metal, row joins and slices are last-dimension ops on a flattened
+/// `[1, rows * width]` view, which run in the ordered decode stream. Metal's
+/// axis-0 concat blits outside that stream and read stale inputs while
+/// earlier work was still queued. Other backends execute eagerly and use the
+/// row gather and axis-0 concat directly.
 pub fn branchRows(cb: *const ComputeBackend, allocator: std.mem.Allocator, input: CT, prefix: usize, seq: usize, width: usize) !CT {
-    const ids = try allocator.alloc(i64, seq - prefix);
-    defer allocator.free(ids);
-    for (ids, prefix..) |*id, row| id.* = @intCast(row);
-    return cb.embeddingLookup(input, ids, ids.len, width);
+    if (cb.kind() != .metal) {
+        const ids = try allocator.alloc(i64, seq - prefix);
+        defer allocator.free(ids);
+        for (ids, prefix..) |*id, row| id.* = @intCast(row);
+        return cb.embeddingLookup(input, ids, ids.len, width);
+    }
+    const flat = try reshape(cb, allocator, input, &.{ 1, @intCast(seq * width) });
+    defer cb.free(flat);
+    const tail = try cb.sliceLastDim(flat, prefix * width, seq * width);
+    defer cb.free(tail);
+    return reshape(cb, allocator, tail, &.{ @intCast(seq - prefix), @intCast(width) });
+}
+
+/// `[a_rows + b_rows, width]` from `[a_rows, width]` and `[b_rows, width]`.
+pub fn joinRows(cb: *const ComputeBackend, allocator: std.mem.Allocator, a: CT, a_rows: usize, b: CT, b_rows: usize, width: usize) !CT {
+    if (cb.kind() != .metal) {
+        return cb.primConcatPrim(a, b, 0, &.{ @intCast(a_rows), @intCast(width) }, &.{ @intCast(b_rows), @intCast(width) });
+    }
+    const left = try reshape(cb, allocator, a, &.{ 1, @intCast(a_rows * width) });
+    defer cb.free(left);
+    const right = try reshape(cb, allocator, b, &.{ 1, @intCast(b_rows * width) });
+    defer cb.free(right);
+    const joined = try cb.concat(left, right, 1, a_rows * width, b_rows * width);
+    defer cb.free(joined);
+    return reshape(cb, allocator, joined, &.{ @intCast(a_rows + b_rows), @intCast(width) });
+}
+
+/// Store one layer's keys and values as host copies or as dense tensors.
+pub fn captureLayer(cb: *const ComputeBackend, allocator: std.mem.Allocator, host_keys: []const []f32, host_values: []const []f32, key_tensors: []?CT, value_tensors: []?CT, layer: usize, keys: CT, values: CT, rows: usize, width: usize) !void {
+    if (key_tensors.len > 0) {
+        const shape = [_]i32{ @intCast(rows), @intCast(width) };
+        key_tensors[layer] = try reshape(cb, allocator, keys, &shape);
+        value_tensors[layer] = try reshape(cb, allocator, values, &shape);
+        return;
+    }
+    for ([_]CT{ keys, values }, [_][]f32{ host_keys[layer], host_values[layer] }) |tensor, dst| {
+        const host = try cb.toFloat32(tensor, allocator);
+        defer allocator.free(host);
+        if (host.len != dst.len) return error.InvalidInputShape;
+        @memcpy(dst, host);
+    }
+}
+
+/// A new handle with a different logical shape over the same elements.
+/// Tensors a backend cannot alias (host-backed or strided views) are
+/// materialized through the host, which is ordered but synchronizes.
+pub fn reshape(cb: *const ComputeBackend, allocator: std.mem.Allocator, input: CT, shape: []const i32) !CT {
+    if (try cb.cloneTensorShape(input, shape)) |view| return view;
+    const values = try cb.toFloat32(input, allocator);
+    defer allocator.free(values);
+    return cb.fromFloat32Shape(values, shape);
 }
 
 /// RoPE at explicit per-token positions for a token-major `[tokens, heads *

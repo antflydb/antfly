@@ -6549,14 +6549,16 @@ pub fn layaTrunkCacheStats(session: Session) ?@import("laya_trunk_cache.zig").St
     return cache.snapshot();
 }
 
-/// Replace a session's trunk cache budget; 0 disables it.
-pub fn setLayaTrunkCacheLimit(session: Session, limit_bytes: usize) void {
+/// Replace a session's trunk cache budget (0 disables it) and minimum
+/// cached trunk length.
+pub fn setLayaTrunkCacheLimit(session: Session, limit_bytes: usize, min_tokens: usize) void {
     if (session.vtable != &arch_vtable) return;
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
     const cache = layaTrunkCache(self) orelse return;
     platform.sync.lockYielding(&cache.mutex);
     defer cache.mutex.unlock();
     cache.limit_bytes = limit_bytes;
+    cache.min_tokens = min_tokens;
 }
 
 /// Attach a runtime Io to a Session created by this factory so its

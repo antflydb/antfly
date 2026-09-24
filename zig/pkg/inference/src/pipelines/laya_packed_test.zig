@@ -264,6 +264,8 @@ test "laya packed trunk cache reuses the state exactly across rows and requests"
         defer fixture.deinit(std.testing.allocator);
         var cache = trunk_cache.Cache.init(std.testing.allocator, 64 * 1024 * 1024);
         defer cache.deinit();
+        // The synthetic state is short; cache it anyway.
+        cache.min_tokens = 1;
         var worst: f32 = 0;
         // Miss (fills the cache), then hits with different question sets.
         for ([_][]const pipeline.Question{ &questions, questions[1..], questions[0..1] }) |subset| {
@@ -279,10 +281,8 @@ test "laya packed trunk cache reuses the state exactly across rows and requests"
         const stats = cache.snapshot();
         std.debug.print("Laya packed {s}: cached vs full max error={d}, hits={d} misses={d} bytes={d}\n", .{ packing, worst, stats.hits, stats.misses, stats.bytes });
         try std.testing.expect(worst < 1e-5);
-        // The cache is CPU-only; other backends always run the full row.
-        const cached_backend = fixture.session.backend() == .native;
-        try std.testing.expectEqual(@as(u64, if (cached_backend) 2 else 0), stats.hits);
-        try std.testing.expectEqual(@as(u64, if (cached_backend) 1 else 0), stats.misses);
+        try std.testing.expectEqual(@as(u64, 2), stats.hits);
+        try std.testing.expectEqual(@as(u64, 1), stats.misses);
     }
 }
 
@@ -294,15 +294,15 @@ test "laya packed session caches the trunk across pipeline requests" {
     const tok = words.tokenizer();
     var fixture = try Fixture.init(std.testing.allocator, "{\"mode\":\"question\"}");
     defer fixture.deinit(std.testing.allocator);
+    factory.setLayaTrunkCacheLimit(fixture.session, 64 * 1024 * 1024, 1);
     const first = try pipeline.execute(a, fixture.session, tok, fixture.cfg, &.{.{ .text = state_text, .question = questions[0] }}, null);
     const second = try pipeline.execute(a, fixture.session, tok, fixture.cfg, &.{ .{ .text = state_text, .question = questions[1] }, .{ .text = state_text, .question = questions[0] } }, null);
     const stats = factory.layaTrunkCacheStats(fixture.session).?;
-    const cached_backend = fixture.session.backend() == .native;
-    try std.testing.expectEqual(@as(u64, @intFromBool(cached_backend)), stats.misses);
-    try std.testing.expectEqual(@as(u64, @intFromBool(cached_backend)), stats.hits);
+    try std.testing.expectEqual(@as(u64, 1), stats.misses);
+    try std.testing.expectEqual(@as(u64, 1), stats.hits);
     try std.testing.expect(try maxError(first.decisions[0].probabilities, second.decisions[1].probabilities) < 1e-5);
     // A disabled cache recomputes the trunk and returns the same decisions.
-    factory.setLayaTrunkCacheLimit(fixture.session, 0);
+    factory.setLayaTrunkCacheLimit(fixture.session, 0, 0);
     const uncached = try pipeline.execute(a, fixture.session, tok, fixture.cfg, &.{.{ .text = state_text, .question = questions[0] }}, null);
     try std.testing.expectEqual(stats.hits, factory.layaTrunkCacheStats(fixture.session).?.hits);
     try std.testing.expect(try maxError(first.decisions[0].probabilities, uncached.decisions[0].probabilities) < 1e-5);
@@ -414,6 +414,7 @@ test "laya packed benchmark shared-state cost against unpacked" {
     const unpacked_cfg = factory.getLayaConfig(unpacked).?;
     const packed_cfg = factory.getLayaConfig(packed_session).?;
     const samples: usize = 5;
+    const trunk_cache_min = @import("../architectures/laya_trunk_cache.zig").default_min_tokens;
     for ([_]usize{ 1, 4, 12 }) |sentences| {
         const text = try s.alloc(u8, sentence.len * sentences);
         for (0..sentences) |i| @memcpy(text[i * sentence.len ..][0..sentence.len], sentence);
@@ -437,7 +438,7 @@ test "laya packed benchmark shared-state cost against unpacked" {
             }
             // The packed timings above hit the trunk cache after the first
             // request. Measure the uncached packed cost separately.
-            factory.setLayaTrunkCacheLimit(packed_session, 0);
+            factory.setLayaTrunkCacheLimit(packed_session, 0, trunk_cache_min);
             var uncached: [samples + 1]u64 = undefined;
             for (&uncached) |*t| {
                 var request = std.heap.ArenaAllocator.init(a);
@@ -446,7 +447,7 @@ test "laya packed benchmark shared-state cost against unpacked" {
                 _ = try pipeline.executeWithScratch(request.allocator(), a, packed_session, tok, packed_cfg, tasks, null, null);
                 t.* = platform.time.monotonicNs() - began;
             }
-            factory.setLayaTrunkCacheLimit(packed_session, 1024 * 1024 * 1024);
+            factory.setLayaTrunkCacheLimit(packed_session, 1024 * 1024 * 1024, trunk_cache_min);
             std.mem.sort(u64, uncached[1..], {}, std.sort.asc(u64));
             std.debug.print("LAYA_PACKED_BENCH {{\"backend\":\"{s}\",\"state_sentences\":{d},\"questions\":{d},\"unpacked_ms\":{d:.1},\"packed_ms\":{d:.1},\"packed_cached_ms\":{d:.1},\"unpacked_tokens\":{d},\"packed_tokens\":{d}}}\n", .{
                 @tagName(unpacked.backend()),              sentences,                                                count,
