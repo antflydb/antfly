@@ -6338,6 +6338,107 @@ test "native completion scope drains prepared SST manifest and WAL with exhauste
     try std.testing.expectEqualStrings("durable", try recovered.get(.{}, "key"));
 }
 
+test "workload admission native protected flush progresses while foreground write waits on shared fd pool" {
+    if (!supports_posix_fd_cache or builtin.single_threaded) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const wal = @import("wal.zig");
+    const repository = @import("repository.zig");
+    var root_buffer: [256]u8 = undefined;
+    const root_z = repository.tmpPath(&root_buffer, "native-protected-flush-pressure");
+    const root = std.mem.span(root_z);
+    defer repository.cleanupTmp(root_z);
+    const sst = try std.fmt.allocPrint(alloc, "{s}/runs/protected.sst", .{root});
+    defer alloc.free(sst);
+    const foreground = try std.fmt.allocPrint(alloc, "{s}/foreground.dat", .{root});
+    defer alloc.free(foreground);
+
+    var pool = NativeStoragePool.initWithCapacityForTest(alloc, 2);
+    defer pool.deinit();
+    var native = try NativeStorage.initWithPool(alloc, .threaded, &pool);
+    defer native.deinit();
+    try native.storage().createDirPath(root);
+    var state: @import("state.zig").State = .{};
+    defer state.deinit(alloc);
+    try state.upsert(alloc, .{}, "control", "committed", false);
+    var prepared = try wal.PreparedAppend.init(alloc, root, &state, true, .{});
+    defer prepared.deinit();
+    const scope = try NativeCompletionIo.createWithFiles(alloc, &native, root, &.{.{ .path = sst, .max_bytes = 64 }});
+    var scope_open = true;
+    defer if (scope_open) scope.deinit() catch unreachable;
+    try std.testing.expectEqual(@as(usize, 2), pool.snapshotStats().fd_admitted_descriptors);
+
+    const Foreground = struct {
+        storage: Storage,
+        path: []const u8,
+        done: std.atomic.Value(bool) = .init(false),
+        failed: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            self.storage.writeFileAbsolute(self.path, "foreground") catch {
+                self.failed.store(true, .release);
+            };
+            self.done.store(true, .release);
+        }
+    };
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var worker = Foreground{ .storage = native.storage(), .path = foreground };
+    var future = std.Io.async(io, Foreground.run, .{&worker});
+    var awaited = false;
+    defer if (!awaited) {
+        if (scope_open) {
+            scope.deinit() catch unreachable;
+            scope_open = false;
+        }
+        future.await(io);
+    };
+    for (0..5_000) |_| {
+        if (pool.snapshotStats().fd_admission_waiters == 1) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    const blocked = pool.snapshotStats();
+    try std.testing.expectEqual(@as(usize, 2), blocked.fd_admitted_descriptors);
+    try std.testing.expectEqual(@as(usize, 1), blocked.fd_admission_waiters);
+    try std.testing.expect(!worker.done.load(.acquire));
+
+    // The scope owns both descriptors before the foreground waiter arrives.
+    // WAL and SST publication make real fsynced progress without reacquiring
+    // a shared permit or letting the waiting write borrow a protected slot.
+    const storage = scope.storage();
+    try storage.createDirPath(scope.files[0].parent);
+    try std.testing.expect((try prepared.execute(storage, alloc)) == .appended);
+    var writer = try storage.beginAtomicWrite(alloc, sst);
+    try writer.appendSlice("protected-sst");
+    try writer.finish();
+    try storage.syncFileContentsAbsolute(sst);
+    try storage.syncParentAbsolute(sst);
+    try std.testing.expectEqual(@as(u64, "protected-sst".len), try storage.fileSize(sst));
+    try std.testing.expectEqual(@as(usize, 1), pool.snapshotStats().fd_admission_waiters);
+    try std.testing.expect(!worker.done.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2), pool.snapshotStats().fd_admitted_descriptors);
+
+    try scope.deinit();
+    scope_open = false;
+    for (0..5_000) |_| {
+        if (worker.done.load(.acquire)) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(worker.done.load(.acquire));
+    future.await(io);
+    awaited = true;
+    try std.testing.expect(!worker.failed.load(.acquire));
+    const drained = pool.snapshotStats();
+    try std.testing.expectEqual(@as(usize, 0), drained.fd_admission_waiters);
+    try std.testing.expectEqual(@as(usize, 0), drained.fd_admitted_descriptors);
+    try std.testing.expect(drained.fd_admission_waits > 0);
+    const published = try native.storage().readFileAlloc(alloc, sst, 64);
+    defer alloc.free(published);
+    try std.testing.expectEqualStrings("protected-sst", published);
+    const resumed = try native.storage().readFileAlloc(alloc, foreground, 64);
+    defer alloc.free(resumed);
+    try std.testing.expectEqualStrings("foreground", resumed);
+}
+
 test "native completion scope prepare failures and path permissions retain no ownership" {
     if (!supports_posix_fd_cache) return error.SkipZigTest;
     const Fixture = struct {
