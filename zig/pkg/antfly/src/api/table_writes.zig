@@ -7982,6 +7982,9 @@ pub const ProvisionedTableWriteSource = struct {
     local_change_hook: ?LocalChangeHook = null,
     local_index_repair_debt_hook: ?LocalIndexRepairDebtHook = null,
     raft_batcher: ?RaftBatcher = null,
+    /// Set only after startup proves this process is the non-Raft standalone
+    /// data owner. A temporarily absent Raft callback is not that proof.
+    standalone_sql_range_guards: bool = false,
     local_write_owner: ?*ProvisionedTableWriteSource = null,
     /// Optional local physical-operation provider. Top-level routing,
     /// coalescing, admission, and lifecycle remain on this source; a compiled
@@ -8698,6 +8701,11 @@ pub const ProvisionedTableWriteSource = struct {
 
     pub fn withRaftBatcher(self: *ProvisionedTableWriteSource, batcher: ?RaftBatcher) *ProvisionedTableWriteSource {
         self.raft_batcher = batcher;
+        return self;
+    }
+
+    pub fn withStandaloneSqlRangeGuards(self: *ProvisionedTableWriteSource, enabled: bool) *ProvisionedTableWriteSource {
+        self.standalone_sql_range_guards = enabled;
         return self;
     }
 
@@ -20938,7 +20946,10 @@ pub const ProvisionedTableWriteSource = struct {
     pub fn source(self: *ProvisionedTableWriteSource) TableWriteSource {
         return .{
             .ptr = self,
-            .supports_sql_range_guards = if (self.raft_batcher) |batcher| batcher.vtable.batch_group_routed_with_cancellation != null else false,
+            .supports_sql_range_guards = if (self.raft_batcher) |batcher|
+                batcher.vtable.batch_group_routed_with_cancellation != null
+            else
+                self.standalone_sql_range_guards and (self.groupLocalWriteSource() != null or self.write_cache != null),
             .vtable = &.{
                 .activate_range_tracking = activateRangeTracking,
                 .create_table = createTable,
@@ -22338,8 +22349,10 @@ pub const ProvisionedTableWriteSource = struct {
     fn activateRangeTracking(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, context: @import("operation.zig").RequestContext) !void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try context.ensureActive();
-        const batcher = self.raft_batcher orelse return error.SqlRangeTrackingRequired;
-        if (batcher.vtable.batch_group_routed_with_cancellation == null) return error.SqlRangeTrackingRequired;
+        const batcher = self.raft_batcher;
+        if (batcher) |owner| {
+            if (owner.vtable.batch_group_routed_with_cancellation == null) return error.SqlRangeTrackingRequired;
+        } else if (!self.standalone_sql_range_guards or (self.groupLocalWriteSource() == null and self.write_cache == null)) return error.SqlRangeTrackingRequired;
         try enforceHAWriteGateOptional(self.ha_write_gate);
         var routing = (try table_catalog.tableRoutingSnapshotForWrite(alloc, self.catalog, table, self.catalog.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io }))) orelse return error.TableNotFound;
         defer routing.deinit(alloc);
@@ -22351,7 +22364,18 @@ pub const ProvisionedTableWriteSource = struct {
             fence.admission_deadline_ns = context.deadline_ns;
             fence.admission_deadline_io = context.deadline_io;
             fence.admission_cancellation = context.cancellation;
-            try batcher.batchGroupRoutedWithCancellation(alloc, fence, table, .{ .activate_range_tracking = true }, context.cancellation);
+            if (batcher) |owner| {
+                try owner.batchGroupRoutedWithCancellation(alloc, fence, table, .{ .activate_range_tracking = true }, context.cancellation);
+            } else {
+                // Standalone owns every local range directly. Hold the same
+                // table admission used by restore and split while validating
+                // this exact catalog route and committing the durable marker.
+                // The owner DB serializes activation against guarded prepares.
+                const deadline = self.catalog.routeFenceDeadline(fence) orelse std.math.maxInt(u64);
+                var admission = try self.acquireRoutedWriteAdmission(alloc, table, fence, deadline, context.cancellation);
+                defer admission.deinit();
+                _ = (try self.source().batchGroupLocal(alloc, route.group_id, table, .{ .activate_range_tracking = true })) orelse return error.StorageKernelOwnerUnavailable;
+            }
         }
     }
 
@@ -40809,6 +40833,7 @@ fn implementationTests() type {
             const Capture = struct {
                 calls: usize = 0,
                 group_id: u64 = 0,
+                local_calls: usize = 0,
 
                 fn unexpected(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.BatchRequest) !void {
                     return error.TestUnexpectedResult;
@@ -40821,6 +40846,16 @@ fn implementationTests() type {
                     try @import("../storage/range_protection.zig").validateRequest(req);
                     self.calls += 1;
                     self.group_id = fence.route.group_id;
+                }
+
+                fn local(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, table: []const u8, req: db_mod.types.BatchRequest) !?void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqualStrings("docs", table);
+                    try std.testing.expect(req.activate_range_tracking);
+                    try @import("../storage/range_protection.zig").validateRequest(req);
+                    self.local_calls += 1;
+                    self.group_id = group_id;
+                    return {};
                 }
             };
 
@@ -40843,6 +40878,18 @@ fn implementationTests() type {
             try std.testing.expect(source.source().supports_sql_range_guards);
             try source.source().activateRangeTracking(std.testing.allocator, "docs", .{});
             try std.testing.expectEqual(@as(usize, 1), capture.calls);
+            try std.testing.expectEqual(@as(u64, 7001), capture.group_id);
+
+            // Lite has no data-Raft proposal. Its direct owner can still make
+            // the same durable activation under the catalog/table cutover
+            // admission, and only that source advertises guarded SQL.
+            _ = source.withRaftBatcher(null);
+            _ = source.withLocalWriteSource(.{ .ptr = &capture, .vtable = &.{ .batch = undefined, .batch_group_local = Capture.local } });
+            try std.testing.expect(!source.source().supports_sql_range_guards);
+            _ = source.withStandaloneSqlRangeGuards(true);
+            try std.testing.expect(source.source().supports_sql_range_guards);
+            try source.source().activateRangeTracking(std.testing.allocator, "docs", .{});
+            try std.testing.expectEqual(@as(usize, 1), capture.local_calls);
             try std.testing.expectEqual(@as(u64, 7001), capture.group_id);
         }
 

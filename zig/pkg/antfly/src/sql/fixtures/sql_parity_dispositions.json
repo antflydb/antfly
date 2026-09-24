@@ -292,7 +292,8 @@
     {
       "id": "sql-0038",
       "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "reason": "A multi-namespace search path needs ordered, authorization-aware binding across all table references and transaction snapshots. The exact command currently fails closed with SQLSTATE 0A000 without changing the active lookup scope.",
+      "evidence": [{"path": "zig/pkg/antfly/src/pgwire/protocol_test.zig", "test": "pgwire multi namespace search path fails closed without changing the lookup scope", "gate": "pgwire-original-session-commands"}]
     },
     {
       "id": "sql-0039",
@@ -303,7 +304,8 @@
     {
       "id": "sql-0040",
       "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "reason": "Transaction-local ordered namespace lookup is not yet implemented. The exact SET LOCAL list fails closed with SQLSTATE 0A000 and does not mutate the connection namespace.",
+      "evidence": [{"path": "zig/pkg/antfly/src/pgwire/protocol_test.zig", "test": "pgwire multi namespace search path fails closed without changing the lookup scope", "gate": "pgwire-original-session-commands"}]
     },
     {
       "id": "sql-0041",
@@ -313,8 +315,9 @@
     },
     {
       "id": "sql-0042",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The exact SQL command sets an administrator-defined, session-writable typed app.tenant_id in a connection-owned overlay. It does not mutate shared catalog defaults, and policy-sensitive definitions reject client writes.",
+      "evidence": [{"path": "zig/pkg/antfly/src/pgwire/protocol_test.zig", "test": "pgwire original app setting reset all and discard all commands are connection scoped", "gate": "pgwire-original-session-commands"}]
     },
     {
       "id": "sql-0043",
@@ -324,13 +327,15 @@
     },
     {
       "id": "sql-0044",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The exact RESET command removes the connection override so the authorized typed catalog default is visible again; it does not mutate the shared catalog.",
+      "evidence": [{"path": "zig/pkg/antfly/src/pgwire/protocol_test.zig", "test": "pgwire original app setting reset all and discard all commands are connection scoped", "gate": "pgwire-original-session-commands"}]
     },
     {
       "id": "sql-0045",
-      "status": "unresolved",
-      "reason": "Connection-owned RESET ALL covers current pgwire settings with transaction/savepoint semantics, but the original session catalog also includes custom app.* settings; full original behavior still needs an authorized typed session-setting registry and evidence."
+      "status": "superseded",
+      "reason": "The exact RESET ALL command clears built-in and catalog-owned session overrides, including typed app.* values; subsequent SHOW resolves authorized catalog defaults. Transaction and savepoint semantics are connection-owned.",
+      "evidence": [{"path": "zig/pkg/antfly/src/pgwire/protocol_test.zig", "test": "pgwire original app setting reset all and discard all commands are connection scoped", "gate": "pgwire-original-session-commands"}]
     },
     {
       "id": "sql-0046",
@@ -340,8 +345,9 @@
     },
     {
       "id": "sql-0047",
-      "status": "unresolved",
-      "reason": "Pgwire DISCARD ALL now resets supported settings and retires connection-owned prepared statements, portals and held cursors after the reply. Original custom app.* catalog settings and broader catalog/session semantics remain unimplemented, so full parity is not yet established."
+      "status": "superseded",
+      "reason": "The exact DISCARD ALL command resets built-in and catalog-owned typed app.* connection overrides and retires prepared statements, portals, and held cursors after the reply. It is rejected inside an active transaction.",
+      "evidence": [{"path": "zig/pkg/antfly/src/pgwire/protocol_test.zig", "test": "pgwire original app setting reset all and discard all commands are connection scoped", "gate": "pgwire-original-session-commands"}]
     },
     {
       "id": "sql-0048",
@@ -978,7 +984,7 @@
     {
       "id": "sql-0165",
       "status": "superseded",
-      "reason": "CASCADE now computes the incoming-FK closure and admits parent plus referencing child in one durable empty-generation cohort. The prior row mutation source is replaced; external-parent retirement remains a separately guarded, unresolved architecture gap.",
+      "reason": "CASCADE computes the incoming-FK closure and admits parent plus referencing child in one durable empty-generation cohort. Child-only TRUNCATE retains untouched parents and includes exact inverse-witness generation retirement in the same fenced publication plan.",
       "evidence": [{"path": "zig/pkg/antfly/src/api/sql_truncate_test.zig", "test": "SQL TRUNCATE original CASCADE case closes incoming FK cohort", "gate": "truncate-native-admission"}, {"path": "zig/pkg/antfly/src/api/sql_truncate.zig", "test": "SQL TRUNCATE closure follows incoming FKs without emptying an untouched parent", "gate": "truncate-native-admission"}, {"path": "zig/pkg/antfly/src/api/http_server.zig", "test": "staged restore worker rewrites retained acknowledged writes and reopens hidden mixed owners", "gate": "truncate-owner-publication"}]
     },
     {

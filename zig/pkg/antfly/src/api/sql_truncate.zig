@@ -315,10 +315,10 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
             if (std.mem.eql(u8, bound.name, table.name) and bound.table_id == table.table_id) break;
         } else return error.CatalogGenerationChanged;
     }
-    // Parent retirement is staged and ACKed for this TRUNCATE cohort, but
-    // the publication/release boundary is still guarded until the complete
-    // external-parent crash/replay and concurrent visibility proof passes.
-    const selected = try select(a, snapshot.tables, requested, ddl.cascade);
+    // Child-only TRUNCATE retains external parents and retires the old child
+    // witness generations there. The parent fences are part of the same
+    // immutable plan and metadata publication decision as the new child.
+    const selected = try selectInternal(a, snapshot.tables, requested, ddl.cascade, true);
     const names = try a.alloc([]const u8, selected.len);
     for (selected, names) |table, *name| {
         if (table.storage_migration != null or table.relational_retirement_json.len != 0 or table.restore_backup_id.len != 0) return error.TableTransitionActive;

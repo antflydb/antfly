@@ -70,9 +70,10 @@ const Mock = struct {
     fn loadSettings(raw: *anyopaque, alloc: std.mem.Allocator, _: backend.Identity, request: backend.Request) !@import("../sql/setting_catalog.zig").RawSnapshot {
         const self: *Mock = @ptrCast(@alignCast(raw));
         self.setting_snapshots += 1;
-        const definitions = try alloc.alloc(@import("../sql/setting_catalog.zig").Definition, 2);
+        const definitions = try alloc.alloc(@import("../sql/setting_catalog.zig").Definition, 3);
         definitions[0] = .{ .identity = .{ .id = 1, .generation = self.setting_generation }, .name = "app.limit", .kind = .integer, .session_writable = true, .default = .{ .integer = 3 } };
         definitions[1] = .{ .identity = .{ .id = 2, .generation = 1 }, .name = "app.tenant", .kind = .string, .policy_sensitive = true, .default = .{ .string = "owner" } };
+        definitions[2] = .{ .identity = .{ .id = 3, .generation = 1 }, .name = "app.tenant_id", .kind = .string, .session_writable = true, .default = .{ .string = "unassigned" } };
         return .{ .scope = .{ .principal = "tester", .database = request.database orelse "db" }, .epoch = self.setting_generation, .definitions = definitions };
     }
     fn validateNamespace(raw: *anyopaque, _: std.mem.Allocator, _: backend.Identity, request: backend.Request) !void {
@@ -914,6 +915,48 @@ test "pgwire typed catalog settings honor local savepoint reset and discard over
     try std.testing.expectEqual(@as(?i64, null), mock.observed_setting);
 }
 
+test "pgwire original app setting reset all and discard all commands are connection scoped" {
+    // sql-0042, sql-0044, sql-0045, sql-0047: exact public commands use one
+    // typed, authorized connection overlay rather than shared catalog writes.
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    for ([_][]const u8{
+        "SET app.tenant_id = 'tenant-a';\x00",
+        "SHOW app.tenant_id;\x00",
+        "RESET app.tenant_id;\x00",
+        "SHOW app.tenant_id;\x00",
+        "SET app.tenant_id = 'tenant-b';\x00",
+        "RESET ALL;\x00",
+        "SHOW app.tenant_id;\x00",
+        "SET app.tenant_id = 'tenant-c';\x00",
+        "DISCARD ALL;\x00",
+        "SHOW app.tenant_id;\x00",
+    }) |statement| try frame(&input.writer, 'Q', statement);
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{};
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    const expected = [_][]const u8{ "tenant-a", "unassigned", "unassigned", "unassigned" };
+    var index: usize = 0;
+    var cursor: protocol.Cursor = .{ .bytes = output.written() };
+    while (cursor.offset < cursor.bytes.len) {
+        const tag = try cursor.int(u8);
+        const length = try cursor.int(u32);
+        var payload: protocol.Cursor = .{ .bytes = try cursor.take(length - 4) };
+        try std.testing.expect(tag != 'E');
+        if (tag == 'D') {
+            try std.testing.expectEqual(@as(u16, 1), try payload.int(u16));
+            const n = try payload.int(u32);
+            try std.testing.expect(index < expected.len);
+            try std.testing.expectEqualStrings(expected[index], try payload.take(n));
+            index += 1;
+        }
+    }
+    try std.testing.expectEqual(expected.len, index);
+    try std.testing.expectEqual(@as(usize, 0), mock.executions);
+}
+
 test "pgwire typed catalog setting writes fail closed for policy type and local scope" {
     var input = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer input.deinit();
@@ -1191,6 +1234,32 @@ test "pgwire scoped search path pins prepared namespaces and restores transactio
     for (expected, 0..) |value, index| try std.testing.expectEqualStrings(value, mock.namespace_log[index].slice());
     try std.testing.expect(mock.saw_distinct_owner_namespace);
     try std.testing.expectEqual(@as(usize, 6), mock.namespace_checks);
+}
+
+test "pgwire multi namespace search path fails closed without changing the lookup scope" {
+    // sql-0038, sql-0040: ordered namespace binding is not yet implemented;
+    // neither exact public command may silently use only its first entry.
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    for ([_][]const u8{
+        "SET search_path = analytics\x00",
+        "SET SESSION search_path TO tenant_schema, public;\x00",
+        "SET LOCAL search_path TO tenant_schema, public;\x00",
+        "SHOW search_path\x00",
+        "SELECT n FROM t\x00",
+    }) |statement| try frame(&input.writer, 'Q', statement);
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{};
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    const observed = try tags(std.testing.allocator, output.written());
+    defer std.testing.allocator.free(observed);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, observed, "E"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, output.written(), "0A000"));
+    try std.testing.expectEqual(@as(usize, 1), mock.namespace_count);
+    try std.testing.expectEqualStrings("analytics", mock.namespace_log[0].slice());
+    try std.testing.expectEqual(@as(usize, 1), mock.namespace_checks);
 }
 
 test "pgwire held cursor keeps declaration namespace after mutable search path changes" {

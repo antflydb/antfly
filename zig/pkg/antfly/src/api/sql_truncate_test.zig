@@ -20,6 +20,7 @@ const Fixture = struct {
     wrong_owner: bool = false,
     catalog_reads: usize = 0,
     owner_reads: usize = 0,
+    integrity_reads: usize = 0,
     admissions: usize = 0,
     job_key: ?[]u8 = null,
     job_value: ?[]u8 = null,
@@ -85,6 +86,29 @@ const Fixture = struct {
         const self = cast(ptr);
         const archive = std.mem.eql(u8, table, "physical_archive");
         try std.testing.expect(archive or std.mem.eql(u8, table, "physical"));
+        if (options.relational_integrity_catalog) {
+            try std.testing.expect(archive);
+            self.integrity_reads += 1;
+            const schema_api = @import("../schema/mod.zig");
+            const native_schema = @import("../storage/schema.zig");
+            const declarations = @import("../schema/relational_declarations.zig");
+            const integrity_catalog = @import("../storage/db/relational_integrity_catalog.zig");
+            var parsed = try schema_api.parseValidatedTableSchema(a, self.tables[1].schema_json);
+            defer parsed.deinit(a);
+            const runtime = try schema_api.deriveRuntimeTableSchema(a, parsed);
+            defer native_schema.freeSchema(a, runtime);
+            const bytes = try native_schema.serializeSchema(a, runtime);
+            defer a.free(bytes);
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.Blake3.hash(bytes, &digest, .{});
+            const definitions = try declarations.definitionFingerprints(a, parsed, runtime);
+            defer declarations.freeDefinitions(a, definitions);
+            var prepared = try integrity_catalog.prepare(a, null, try integrity_catalog.incarnationFromTableId(101), runtime.version, digest, definitions);
+            defer prepared.deinit();
+            const encoded = try a.alloc(u8, std.base64.standard.Encoder.calcSize(prepared.value.len));
+            _ = std.base64.standard.Encoder.encode(encoded, prepared.value);
+            return .{ .version = 0, .json = try std.json.Stringify.valueAlloc(a, .{ .catalog = encoded, .schema_version = runtime.version, .table_id = "101" }, .{}) };
+        }
         try std.testing.expectEqualStrings("{\"mode\":\"identity\"}", options.relational_topology_json);
         try std.testing.expectEqual(@as(usize, 0), self.admissions);
         self.owner_reads += 1;
@@ -230,23 +254,38 @@ test "SQL TRUNCATE original CASCADE case closes incoming FK cohort" {
     try std.testing.expectEqualStrings("archived_records", plan.value.targets[1].catalog_binding.?.name);
 }
 
-test "SQL TRUNCATE child-only external parent remains guarded before admission" {
-    var fixture: Fixture = .{ .logical_name = "parent", .second_logical_name = "child" };
-    defer fixture.deinit();
-    fixture.tables[0].schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
-    ;
-    fixture.tables[1].schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"fk","child_columns":["parent_id"],"parent_table":"physical","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"parent_id":{"type":"integer"}},"additionalProperties":false}}}}
-    ;
-    var parsed = try compiler.compile(alloc, "TRUNCATE child", .{});
-    defer parsed.deinit();
-    var server = try fixture.server();
-    defer server.deinit();
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    try std.testing.expectError(error.SqlTruncateExternalForeignKey, truncate.execute(&server, null, .{}, "default", "public", arena.allocator(), parsed.statement.catalog_ddl));
-    try std.testing.expectEqual(@as(usize, 0), fixture.admissions);
+test "SQL TRUNCATE child-only external parent admits exact retirement plan and reconciles unknown reply" {
+    for ([_]bool{ false, true }) |unknown| {
+        var fixture: Fixture = .{ .logical_name = "parent", .second_logical_name = "child", .unknown = unknown };
+        defer fixture.deinit();
+        fixture.tables[0].schema_json =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+        ;
+        fixture.tables[1].schema_json =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"fk","child_columns":["parent_id"],"parent_table":"physical","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"parent_id":{"type":"integer"}},"additionalProperties":false}}}}
+        ;
+        var parsed = try compiler.compile(alloc, "TRUNCATE child", .{});
+        defer parsed.deinit();
+        var server = try fixture.server();
+        defer server.deinit();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const outcome = try truncate.execute(&server, null, .{}, "default", "public", arena.allocator(), parsed.statement.catalog_ddl);
+        try std.testing.expectEqual(@as(usize, 1), fixture.integrity_reads);
+        try std.testing.expectEqual(@as(usize, 2), fixture.owner_reads);
+        try std.testing.expectEqual(@as(usize, 1), fixture.admissions);
+        try std.testing.expectEqual(@as(@TypeOf(outcome.receipt.?.state), if (unknown) .admission_unknown else .pending), outcome.receipt.?.state);
+        var plan = try std.json.parseFromSlice(stages.Plan, alloc, fixture.plan.?, .{});
+        defer plan.deinit();
+        try std.testing.expectEqual(@as(usize, 1), plan.value.targets.len);
+        try std.testing.expectEqual(@as(usize, 1), plan.value.external_fk_parents.len);
+        const parent = plan.value.external_fk_parents[0];
+        try std.testing.expectEqual(@as(u64, 100), parent.table.table_id);
+        try std.testing.expectEqual(@as(u64, 200), parent.fences[0].owner_group_id);
+        try std.testing.expectEqual(@as(u64, 101), parent.foreign_keys[0].child_table_id);
+        try std.testing.expectEqualStrings("fk", parent.foreign_keys[0].constraint_name);
+        try std.testing.expect(!std.mem.eql(u8, &parent.foreign_keys[0].generation, &parent.foreign_keys[0].next_generation));
+    }
 }
 
 test "SQL TRUNCATE native admission persists fresh plan and reconciles unknown reply" {

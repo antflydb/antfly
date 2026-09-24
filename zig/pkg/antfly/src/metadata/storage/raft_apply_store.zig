@@ -2995,6 +2995,11 @@ test "relational integrity restore staging reserves external parent and rejects 
     try std.testing.expectError(error.NotFound, txn.get(try restore_staging.identityKey(&buf, group_id, .group, parent_range.group_id)));
     try txn.commit();
     txn_open = false;
+    // A coordinator restart after durable reservation must retain the parent
+    // identity lock and exact parent-group authority, not silently reopen a
+    // concurrent schema or topology transition.
+    store.deinit();
+    store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
     try std.testing.expect(!try store.restoreStagingAuthorityAllowed(alloc, group_id, id, 7, 501));
     try store.applyStandaloneCommand(group_id, .{ .register_node = .{ .node_id = 7, .role = "data", .lifecycle = metadata_table_manager.node_lifecycle_active } });
     try store.applyStandaloneCommand(group_id, .{ .upsert_replica_intent = .{
@@ -3027,6 +3032,11 @@ test "relational integrity restore staging reserves external parent and rejects 
     try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .old_fenced, .expected_revision = 3, .receipt = old_receipt });
     try txn.commit();
     txn_open = false;
+    // Crash between parent/old-child cutover receipts and the irreversible
+    // activation decision: replayed metadata must still require the exact
+    // owner activation receipt before any target becomes visible.
+    store.deinit();
+    store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
     txn = try store.store.beginWriteTxn();
     txn_open = true;
     // The metadata decision is irreversible: once a parent may have made old

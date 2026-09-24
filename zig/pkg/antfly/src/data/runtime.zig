@@ -6100,6 +6100,7 @@ pub const DataServer = struct {
         self.write_source.setLocalChangeHook(self.localChangeHook());
         self.write_source.setLocalIndexRepairDebtHook(self.localIndexRepairDebtHook());
         _ = self.write_source.withRaftBatcher(if (self.data_raft != null) self.localRaftBatcher() else null);
+        _ = self.write_source.withStandaloneSqlRangeGuards(self.data_raft == null and api_server_cfg.deployment_mode == .standalone);
         if (self.data_raft_apply) |apply_sm| {
             _ = apply_sm.write_source.withRaftBatcher(if (self.data_raft != null) self.localRaftBatcher() else null);
         }
