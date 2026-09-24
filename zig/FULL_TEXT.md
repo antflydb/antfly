@@ -37,6 +37,12 @@ that the Zig implementation is still prerelease.
 
 - Exact string companions use `.keyword`.
 - `search_as_you_type` emits `._2gram`, `._3gram`, and `._index_prefix`.
+- `substring` emits `._substring`: every lowercased token and every adjacent
+  token pair (joined without a separator) is indexed under all of its suffixes
+  of 2 to 32 bytes. A `match` or `prefix` query on `._substring` lowers to a
+  prefix lookup over that suffix dictionary, so `g3we` finds `rag3-weaver`,
+  `rag3_weaver`, and `rag3weaver` without a dictionary scan. The companion is
+  several times the size of its text, so it is opt-in per field.
 - `._2gram` and `._3gram` are shingle fields for multi-token
   search-as-you-type matching.
 - Prefix/autocomplete matching should target `._index_prefix`; it is
@@ -58,6 +64,50 @@ and from the Go/Bleve naming. The benefit is that the public query surface,
 schema-derived fields, dynamic-template variants, and schema-less exact fields
 all use one familiar subfield convention before compatibility constraints make
 the layout expensive to change.
+
+## Substring Design
+
+`x-antfly-types: ["text", "substring"]` adds a `._substring` companion
+analyzed by `substring_analyzer` (`unicode_words → lowercase → shingle(1..2,
+no separator) → suffix(2..32)`). The suffix filter is the only new storage
+idea: a prefix query over a dictionary of suffixes answers "token contains X"
+with the existing `rangeTermIterator` seek, so nothing in the postings format,
+the BM25 path, or the term dictionary changed. The joined two-token shingle is
+what lets a query cross token boundaries regardless of the separator the source
+text used.
+
+Query lowering in `search_exec.zig` recognizes fields whose resolved analyzer is
+`substring_analyzer` (explicit companions, dynamic-template fields with
+`analyzer: substring`, and `analysis_config` overrides alike). `match` and
+`prefix` on such a field analyze the query with `substring_query_analyzer`
+(`unicode_words → lowercase`), join each adjacent pair of tokens, bound each
+joined string to 32 bytes, and emit one prefix lookup per pair conjoined in a
+`bool_query`. A single-byte query lowers to `match_none` because one-byte
+suffixes are never indexed; that is the guard against the "two characters match
+everything" failure mode described in Lucivy's own benchmarks. Three-or-more
+token queries are answered as "every adjacent pair occurs", a superset of the
+exact phrase.
+
+`term` queries on `._substring` are deliberately left raw: they match tokens
+that end with the given bytes, which is occasionally useful and never
+surprising once documented.
+
+## Highlighting
+
+`highlight` on a query request asks for `_highlights` on every hit that carries
+stored source: a map of source field to fragments, each a window of the stored
+value with byte-offset spans. Fragments are computed by `attachHighlights` in
+`search_exec.zig` on the node that owns the stored documents, right after the
+DB assembles the result, and a distributed coordinator only relays what shards
+produced. Nothing is stored for it: the query is lowered once more with the same
+analysis config, each positive clause becomes a `highlight.Matcher` (`term`,
+`prefix`, `wildcard`, `fuzzy`, `regexp`, or `contains`), and the stored field
+value is re-analyzed with the field's analyzer so stemmed and stop-word-filtered
+terms mark their surface form. Companion suffixes (`._substring`, `.keyword`,
+`._2gram`, ...) resolve to their root field. `contains` matchers, which come
+from `substring` companions, mark the exact contained bytes and may span two
+adjacent tokens. Negative clauses never highlight, and traversal requests
+(`hierarchy.children`) reject the option.
 
 ## Search-As-You-Type Design
 

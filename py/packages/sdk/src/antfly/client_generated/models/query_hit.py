@@ -10,6 +10,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.query_hit_hierarchy import QueryHitHierarchy
+    from ..models.query_hit_highlights import QueryHitHighlights
     from ..models.query_hit_index_scores import QueryHitIndexScores
     from ..models.query_hit_source import QueryHitSource
 
@@ -35,6 +36,11 @@ class QueryHit:
             to paginate to the next/previous page. Values preserve their JSON
             types. Present for ordered result pages, including cursor-only
             requests whose effective order is `_id` ascending.
+        field_highlights (QueryHitHighlights | Unset): Highlighted fragments keyed by source field, present when the
+            request
+            set `highlight` and the hit carried the field. Each fragment is a
+            window of the stored field value with byte-offset spans marking the
+            text the full-text query matched.
     """
 
     field_id: str
@@ -44,6 +50,7 @@ class QueryHit:
     field_source: QueryHitSource | Unset = UNSET
     hierarchy: QueryHitHierarchy | Unset = UNSET
     field_sort: list[Any] | Unset = UNSET
+    field_highlights: QueryHitHighlights | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -69,6 +76,10 @@ class QueryHit:
         if not isinstance(self.field_sort, Unset):
             field_sort = self.field_sort
 
+        field_highlights: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.field_highlights, Unset):
+            field_highlights = self.field_highlights.to_dict()
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -87,12 +98,15 @@ class QueryHit:
             field_dict["hierarchy"] = hierarchy
         if field_sort is not UNSET:
             field_dict["_sort"] = field_sort
+        if field_highlights is not UNSET:
+            field_dict["_highlights"] = field_highlights
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.query_hit_hierarchy import QueryHitHierarchy
+        from ..models.query_hit_highlights import QueryHitHighlights
         from ..models.query_hit_index_scores import QueryHitIndexScores
         from ..models.query_hit_source import QueryHitSource
 
@@ -126,6 +140,13 @@ class QueryHit:
 
         field_sort = cast(list[Any], d.pop("_sort", UNSET))
 
+        _field_highlights = d.pop("_highlights", UNSET)
+        field_highlights: QueryHitHighlights | Unset
+        if isinstance(_field_highlights, Unset):
+            field_highlights = UNSET
+        else:
+            field_highlights = QueryHitHighlights.from_dict(_field_highlights)
+
         query_hit = cls(
             field_id=field_id,
             field_score=field_score,
@@ -134,6 +155,7 @@ class QueryHit:
             field_source=field_source,
             hierarchy=hierarchy,
             field_sort=field_sort,
+            field_highlights=field_highlights,
         )
 
         query_hit.additional_properties = d

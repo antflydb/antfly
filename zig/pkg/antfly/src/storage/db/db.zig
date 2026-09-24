@@ -34494,6 +34494,7 @@ pub const DB = struct {
             var composed = try self.searchComposed(alloc, selection_req, exec_ctx, dense_profile_sink);
             errdefer composed.deinit();
             try self.populateCanonicalGroupedMatches(alloc, execution_req, exec_ctx, &composed);
+            try self.attachSearchHighlights(alloc, execution_req, &composed);
             if (externalize_artifact_ids) try externalizeSearchResultArtifactIds(alloc, &composed);
             return composed;
         }
@@ -34536,6 +34537,7 @@ pub const DB = struct {
         };
         errdefer base.deinit();
         try self.populateCanonicalGroupedMatches(alloc, execution_req, exec_ctx, &base);
+        try self.attachSearchHighlights(alloc, execution_req, &base);
 
         if (execution_req.graph_queries.len == 0) {
             if (externalize_artifact_ids) try externalizeSearchResultArtifactIds(alloc, &base);
@@ -34546,6 +34548,22 @@ pub const DB = struct {
         try self.applyGraphExpandStrategy(alloc, &base, execution_req.expand_strategy);
         if (externalize_artifact_ids) try externalizeSearchResultArtifactIds(alloc, &base);
         return base;
+    }
+
+    /// Attach `_highlights` to hits that carry stored source when the request
+    /// asked for them. This runs on the node that owns the stored documents;
+    /// a distributed coordinator only relays what its shards computed.
+    fn attachSearchHighlights(self: *DB, alloc: Allocator, req: types.SearchRequest, result: *types.SearchResult) !void {
+        const options = req.highlight orelse return;
+        // Deferred unit grouping carries a private revision envelope in
+        // `_source`, not the document.
+        if (req.defer_hierarchy_child_hydration) return;
+        const text_query = req.full_text orelse return;
+        const entry = self.core.textIndexEntry(req.primary_text_index_name orelse req.index_name) orelse
+            self.core.textIndexEntry(null) orelse return;
+        entry.lockAnalysisShared();
+        defer entry.unlockAnalysisShared();
+        try db_query_search.attachHighlights(alloc, options, text_query, result.hits, entry.text_analysis, entry.runtime_schema);
     }
 
     fn hierarchyChildrenInaccessibleParentResult(

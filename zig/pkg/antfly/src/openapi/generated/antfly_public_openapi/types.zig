@@ -4339,6 +4339,7 @@ pub const GlobalStatefulQueryRequest = struct {
     /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance. This field is required when hierarchy.group_by is present so a grouped query cannot accidentally hydrate an entire grouped document. Use an empty array for identity-only groups. This projection is also required for hierarchy.children traversal.
     fields: ?[]const []const u8 = null,
     hierarchy: ?QueryHierarchy = null,
+    highlight: ?QueryHighlight = null,
     /// Maximum number of top-level results to return. For semantic_search, this is the topk parameter. This does not limit nested matches attached through hierarchy.group_by.matches; use hierarchy.group_by.matches.limit for that. Default varies by query type (typically 10). Queries using hierarchy.group_by.matches are limited to 100 top-level groups and a groups-times-matches execution budget of 1,000.
     limit: ?i64 = null,
     /// Number of results to skip for pagination. Supported for text-backed, match_all, and filter-only requests. Approximate semantic requests do not support offset on their own. Semantic and hybrid requests support it when a reranker is configured: Antfly retrieves a bounded candidate window and applies offset after coordinator-owned reranking.
@@ -4396,6 +4397,7 @@ pub const GlobalStatefulQueryRequest = struct {
         .{ "search_effort", "search_effort", true },
         .{ "fields", "fields", true },
         .{ "hierarchy", "hierarchy", true },
+        .{ "highlight", "highlight", true },
         .{ "limit", "limit", true },
         .{ "offset", "offset", true },
         .{ "timeout_ms", "timeout_ms", true },
@@ -4484,6 +4486,10 @@ pub const GlobalStatefulQueryRequest = struct {
         }
         if (self.hierarchy) |value| {
             try jw.objectField("hierarchy");
+            try jw.write(value);
+        }
+        if (self.highlight) |value| {
+            try jw.objectField("highlight");
             try jw.write(value);
         }
         if (self.limit) |value| {
@@ -5251,6 +5257,53 @@ pub const HierarchyMatches = struct {
 pub const HierarchyProjection = struct {
     /// Fields to include from the hydrated hierarchy document. This projection is required whenever the ancestor is requested so hierarchy hydration cannot accidentally return an unbounded document. Use an empty array to return hierarchy identity without stored document fields.
     fields: []const []const u8,
+};
+
+pub const HighlightFragment = struct {
+    /// The fragment of the stored field value.
+    text: []const u8,
+    /// Byte offset of the fragment within the field value.
+    offset: i64,
+    /// Array index of the value when the field is an array of strings.
+    item: ?i64 = null,
+    spans: []const HighlightSpan,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "text", "text", false },
+        .{ "offset", "offset", false },
+        .{ "item", "item", true },
+        .{ "spans", "spans", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("text");
+        try jw.write(self.text);
+        try jw.objectField("offset");
+        try jw.write(self.offset);
+        if (self.item) |value| {
+            try jw.objectField("item");
+            try jw.write(value);
+        }
+        try jw.objectField("spans");
+        try jw.write(self.spans);
+        try jw.endObject();
+    }
+};
+
+/// Half-open byte range within the fragment text.
+pub const HighlightSpan = struct {
+    start: i64,
+    end: i64,
 };
 
 /// Explains why the agent stopped before completion. Present when status is "incomplete".
@@ -7152,6 +7205,48 @@ pub const QueryHierarchy = struct {
     }
 };
 
+/// Ask for highlighted fragments of the stored fields matched by `full_text_search`. Matches are located by re-analyzing the stored value with the field's analyzer, so stemmed and stop-word-filtered terms highlight the surface form. `prefix`, `wildcard`, `regexp`, and `fuzzy` clauses mark whole tokens; `match` or `prefix` on a `substring` companion (`field._substring`) marks the exact contained bytes, including matches that span two adjacent tokens.
+pub const QueryHighlight = struct {
+    /// Source fields to highlight. Defaults to every field the full-text query references (companion suffixes such as `._substring` and `.keyword` resolve to their root field).
+    fields: ?[]const []const u8 = null,
+    /// Fragment window size in bytes.
+    fragment_size: ?i64 = null,
+    /// Maximum fragments returned per field.
+    max_fragments: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "fields", "fields", true },
+        .{ "fragment_size", "fragment_size", true },
+        .{ "max_fragments", "max_fragments", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.fields) |value| {
+            try jw.objectField("fields");
+            try jw.write(value);
+        }
+        if (self.fragment_size) |value| {
+            try jw.objectField("fragment_size");
+            try jw.write(value);
+        }
+        if (self.max_fragments) |value| {
+            try jw.objectField("max_fragments");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// A single query result hit
 pub const QueryHit = struct {
     /// ID of the record.
@@ -7167,6 +7262,8 @@ pub const QueryHit = struct {
     hierarchy: ?QueryHitHierarchy = null,
     /// Sort key values for this hit. Pass as search_after or search_before to paginate to the next/previous page. Values preserve their JSON types. Present for ordered result pages, including cursor-only requests whose effective order is `_id` ascending.
     _sort: ?[]const std.json.Value = null,
+    /// Highlighted fragments keyed by source field, present when the request set `highlight` and the hit carried the field. Each fragment is a window of the stored field value with byte-offset spans marking the text the full-text query matched.
+    _highlights: ?std.json.ArrayHashMap([]const HighlightFragment) = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -7177,6 +7274,7 @@ pub const QueryHit = struct {
         .{ "_source", "_source", true },
         .{ "hierarchy", "hierarchy", true },
         .{ "_sort", "_sort", true },
+        .{ "_highlights", "_highlights", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -7211,6 +7309,10 @@ pub const QueryHit = struct {
         }
         if (self._sort) |value| {
             try jw.objectField("_sort");
+            try jw.write(value);
+        }
+        if (self._highlights) |value| {
+            try jw.objectField("_highlights");
             try jw.write(value);
         }
         try jw.endObject();
@@ -7513,6 +7615,7 @@ pub const QueryRequest = struct {
     /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance. This field is required when hierarchy.group_by is present so a grouped query cannot accidentally hydrate an entire grouped document. Use an empty array for identity-only groups. This projection is also required for hierarchy.children traversal.
     fields: ?[]const []const u8 = null,
     hierarchy: ?QueryHierarchy = null,
+    highlight: ?QueryHighlight = null,
     /// Maximum number of top-level results to return. For semantic_search, this is the topk parameter. This does not limit nested matches attached through hierarchy.group_by.matches; use hierarchy.group_by.matches.limit for that. Default varies by query type (typically 10). Queries using hierarchy.group_by.matches are limited to 100 top-level groups and a groups-times-matches execution budget of 1,000.
     limit: ?i64 = null,
     /// Number of results to skip for pagination. Supported for text-backed, match_all, and filter-only requests. Approximate semantic requests do not support offset on their own. Semantic and hybrid requests support it when a reranker is configured: Antfly retrieves a bounded candidate window and applies offset after coordinator-owned reranking.
@@ -7566,6 +7669,7 @@ pub const QueryRequest = struct {
         .{ "search_effort", "search_effort", true },
         .{ "fields", "fields", true },
         .{ "hierarchy", "hierarchy", true },
+        .{ "highlight", "highlight", true },
         .{ "limit", "limit", true },
         .{ "offset", "offset", true },
         .{ "timeout_ms", "timeout_ms", true },
@@ -7654,6 +7758,10 @@ pub const QueryRequest = struct {
         }
         if (self.hierarchy) |value| {
             try jw.objectField("hierarchy");
+            try jw.write(value);
+        }
+        if (self.highlight) |value| {
+            try jw.objectField("highlight");
             try jw.write(value);
         }
         if (self.limit) |value| {
@@ -9482,6 +9590,7 @@ pub const RetrievalQueryRequest = struct {
     /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance. This field is required when hierarchy.group_by is present so a grouped query cannot accidentally hydrate an entire grouped document. Use an empty array for identity-only groups. This projection is also required for hierarchy.children traversal.
     fields: ?[]const []const u8 = null,
     hierarchy: ?QueryHierarchy = null,
+    highlight: ?QueryHighlight = null,
     /// Maximum number of top-level results to return. For semantic_search, this is the topk parameter. This does not limit nested matches attached through hierarchy.group_by.matches; use hierarchy.group_by.matches.limit for that. Default varies by query type (typically 10). Queries using hierarchy.group_by.matches are limited to 100 top-level groups and a groups-times-matches execution budget of 1,000.
     limit: ?i64 = null,
     /// Number of results to skip for pagination. Supported for text-backed, match_all, and filter-only requests. Approximate semantic requests do not support offset on their own. Semantic and hybrid requests support it when a reranker is configured: Antfly retrieves a bounded candidate window and applies offset after coordinator-owned reranking.
@@ -9537,6 +9646,7 @@ pub const RetrievalQueryRequest = struct {
         .{ "search_effort", "search_effort", true },
         .{ "fields", "fields", true },
         .{ "hierarchy", "hierarchy", true },
+        .{ "highlight", "highlight", true },
         .{ "limit", "limit", true },
         .{ "offset", "offset", true },
         .{ "timeout_ms", "timeout_ms", true },
@@ -9626,6 +9736,10 @@ pub const RetrievalQueryRequest = struct {
         }
         if (self.hierarchy) |value| {
             try jw.objectField("hierarchy");
+            try jw.write(value);
+        }
+        if (self.highlight) |value| {
+            try jw.objectField("highlight");
             try jw.write(value);
         }
         if (self.limit) |value| {
@@ -10549,6 +10663,7 @@ pub const StatefulQueryRequest = struct {
     /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance. This field is required when hierarchy.group_by is present so a grouped query cannot accidentally hydrate an entire grouped document. Use an empty array for identity-only groups. This projection is also required for hierarchy.children traversal.
     fields: ?[]const []const u8 = null,
     hierarchy: ?QueryHierarchy = null,
+    highlight: ?QueryHighlight = null,
     /// Maximum number of top-level results to return. For semantic_search, this is the topk parameter. This does not limit nested matches attached through hierarchy.group_by.matches; use hierarchy.group_by.matches.limit for that. Default varies by query type (typically 10). Queries using hierarchy.group_by.matches are limited to 100 top-level groups and a groups-times-matches execution budget of 1,000.
     limit: ?i64 = null,
     /// Number of results to skip for pagination. Supported for text-backed, match_all, and filter-only requests. Approximate semantic requests do not support offset on their own. Semantic and hybrid requests support it when a reranker is configured: Antfly retrieves a bounded candidate window and applies offset after coordinator-owned reranking.
@@ -10606,6 +10721,7 @@ pub const StatefulQueryRequest = struct {
         .{ "search_effort", "search_effort", true },
         .{ "fields", "fields", true },
         .{ "hierarchy", "hierarchy", true },
+        .{ "highlight", "highlight", true },
         .{ "limit", "limit", true },
         .{ "offset", "offset", true },
         .{ "timeout_ms", "timeout_ms", true },
@@ -10696,6 +10812,10 @@ pub const StatefulQueryRequest = struct {
         }
         if (self.hierarchy) |value| {
             try jw.objectField("hierarchy");
+            try jw.write(value);
+        }
+        if (self.highlight) |value| {
+            try jw.objectField("highlight");
             try jw.write(value);
         }
         if (self.limit) |value| {

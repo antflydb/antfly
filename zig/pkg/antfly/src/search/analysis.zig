@@ -18,7 +18,7 @@
 //!   - Character filters: transform raw text before tokenization (HTML strip, ASCII fold)
 //!   - Tokenizers: split text into tokens (unicode_words, whitespace, keyword, ngram, edge_ngram, character)
 //!   - Token filters: transform tokens (lowercase, stop words, Porter2 stemmer, ngram, edge_ngram,
-//!     shingle, length, truncate, unique, reverse, camel_case, elision, apostrophe)
+//!     shingle, suffix, length, truncate, unique, reverse, camel_case, elision, apostrophe)
 //!   - Analyzer: composes char filters + tokenizer + filter chain
 //!
 //! Default analyzer: unicode_words → lowercase → English stop words → Porter2 stemmer
@@ -567,6 +567,7 @@ pub const TokenFilter = union(enum) {
     ngram: NgramConfig,
     edge_ngram: EdgeNgramConfig,
     shingle: ShingleConfig,
+    suffix: SuffixConfig,
     length: LengthConfig,
     truncate: TruncateConfig,
     unique,
@@ -577,7 +578,29 @@ pub const TokenFilter = union(enum) {
     stop_words_lang: Language,
     stemmer_lang: Language,
 
-    pub const ShingleConfig = struct { min: u8 = 2, max: u8 = 2 };
+    pub const ShingleConfig = struct {
+        min: u8 = 2,
+        max: u8 = 2,
+        /// How adjacent tokens are joined. `none` produces compound terms
+        /// such as `rag3weaver` from `rag3 weaver`, which lets substring
+        /// matching cross token boundaries regardless of the separator
+        /// that appeared in the source text.
+        separator: Separator = .space,
+
+        pub const Separator = enum { space, none };
+    };
+    /// Emit every suffix of each token so a prefix query over the resulting
+    /// dictionary answers "token contains X". Suffixes always start on a
+    /// UTF-8 boundary.
+    pub const SuffixConfig = struct {
+        /// Shortest suffix emitted, in bytes. Shorter suffixes match too
+        /// many tokens to be useful and only inflate the dictionary.
+        min: u8 = 2,
+        /// Longest suffix emitted, in bytes. Longer suffixes are truncated
+        /// so a token of n bytes costs at most n × max dictionary bytes;
+        /// substring queries longer than this cannot match.
+        max: u8 = 32,
+    };
     pub const LengthConfig = struct { min: u8 = 0, max: u8 = 255 };
     pub const TruncateConfig = struct { max_len: u8 = 255 };
 
@@ -591,6 +614,7 @@ pub const TokenFilter = union(enum) {
             .ngram => |cfg| applyNgramFilter(alloc, tokens, cfg),
             .edge_ngram => |cfg| applyEdgeNgramFilter(alloc, tokens, cfg),
             .shingle => |cfg| applyShingle(alloc, tokens, cfg),
+            .suffix => |cfg| applySuffix(alloc, tokens, cfg),
             .length => |cfg| applyLength(alloc, tokens, cfg),
             .truncate => |cfg| applyTruncate(alloc, tokens, cfg),
             .unique => applyUnique(alloc, tokens),
@@ -726,16 +750,17 @@ fn applyShingle(alloc: Allocator, tokens: []Token, cfg: TokenFilter.ShingleConfi
         if (n > count) continue;
         var i: usize = 0;
         while (i + n <= count) : (i += 1) {
-            // Build shingle: join tokens[i..i+n] with space
+            // Build shingle: join tokens[i..i+n] with the configured separator
+            const separator_len: usize = if (cfg.separator == .space) 1 else 0;
             var total_len: usize = 0;
             for (0..n) |j| {
-                if (j > 0) total_len += 1; // space
+                if (j > 0) total_len += separator_len;
                 total_len += tokens[i + j].term.len;
             }
             const term = try alloc.alloc(u8, total_len);
             var pos: usize = 0;
             for (0..n) |j| {
-                if (j > 0) {
+                if (j > 0 and separator_len > 0) {
                     term[pos] = ' ';
                     pos += 1;
                 }
@@ -824,6 +849,47 @@ fn applyReverse(alloc: Allocator, tokens: []Token) ![]Token {
         tok.term = reversed;
     }
     return tokens;
+}
+
+fn applySuffix(alloc: Allocator, tokens: []Token, cfg: TokenFilter.SuffixConfig) ![]Token {
+    var result = std.ArrayListUnmanaged(Token).empty;
+    defer result.deinit(alloc);
+    const min_len: usize = @max(cfg.min, 1);
+    const max_len: usize = @max(cfg.max, cfg.min);
+
+    for (tokens) |tok| {
+        const word = tok.term;
+        var start: usize = 0;
+        while (start < word.len) : (start += 1) {
+            if (isUtf8Continuation(word[start])) continue;
+            const suffix = word[start..];
+            // Suffixes only get shorter from here on.
+            if (suffix.len < min_len) break;
+            const end = utf8BoundaryAtOrBefore(suffix, @min(suffix.len, max_len));
+            if (end < min_len) continue;
+            try result.append(alloc, .{
+                .term = try alloc.dupe(u8, suffix[0..end]),
+                .position = tok.position,
+                .start_byte = tok.start_byte + @as(u32, @intCast(start)),
+                .end_byte = tok.end_byte,
+            });
+        }
+        alloc.free(@constCast(tok.term));
+    }
+
+    alloc.free(tokens);
+    return try result.toOwnedSlice(alloc);
+}
+
+fn isUtf8Continuation(byte: u8) bool {
+    return byte & 0xC0 == 0x80;
+}
+
+/// Largest index <= `limit` that does not split a UTF-8 sequence in `text`.
+fn utf8BoundaryAtOrBefore(text: []const u8, limit: usize) usize {
+    var end = limit;
+    while (end > 0 and end < text.len and isUtf8Continuation(text[end])) end -= 1;
+    return end;
 }
 
 fn applyCamelCase(alloc: Allocator, tokens: []Token) ![]Token {
@@ -1444,6 +1510,37 @@ pub const search_as_you_type_root_prefix_analyzer = Analyzer{
 
 pub const search_as_you_type_analyzer = search_as_you_type_index_prefix_analyzer;
 
+pub const substring_min_query_length: u8 = 2;
+pub const substring_max_query_length: u8 = 32;
+
+/// Substring subfield: unicode_words → lowercase → shingle(1..2, joined without a
+/// separator) → suffix(2..32). Every token and every adjacent token pair is
+/// indexed under all of its suffixes, so a prefix query over this field finds
+/// documents whose text contains the query bytes, including across token
+/// boundaries (`rag3-weaver`, `rag3_weaver`, and `rag3weaver` all match `g3we`).
+pub const substring_analyzer = Analyzer{
+    .tokenizer = .unicode_words,
+    .filters = &.{
+        .lowercase,
+        .{ .shingle = .{ .min = 1, .max = 2, .separator = .none } },
+        .{ .suffix = .{ .min = substring_min_query_length, .max = substring_max_query_length } },
+    },
+};
+
+/// Bound a substring lookup to the longest suffix the index stores, without
+/// splitting a UTF-8 sequence.
+pub fn substringQueryPrefix(term: []const u8) []const u8 {
+    return term[0..utf8BoundaryAtOrBefore(term, @min(term.len, substring_max_query_length))];
+}
+
+/// Query-side companion for `substring_analyzer`: the same tokenization
+/// without suffix expansion. Adjacent query tokens are joined the same way the
+/// index joins them so a prefix lookup per joined pair answers the query.
+pub const substring_query_analyzer = Analyzer{
+    .tokenizer = .unicode_words,
+    .filters = &.{.lowercase},
+};
+
 /// Language-specific analyzer: unicode_words → lowercase → language stop words → language stemmer
 pub fn languageAnalyzer(comptime lang: Language) Analyzer {
     return .{
@@ -1477,6 +1574,8 @@ pub fn builtinAnalyzerByName(name: []const u8) ?*const Analyzer {
     if (std.mem.eql(u8, name, "search_as_you_type_3gram")) return &search_as_you_type_3gram_analyzer;
     if (std.mem.eql(u8, name, "search_as_you_type_index_prefix")) return &search_as_you_type_index_prefix_analyzer;
     if (std.mem.eql(u8, name, "search_as_you_type_root_prefix")) return &search_as_you_type_root_prefix_analyzer;
+    if (std.mem.eql(u8, name, "substring")) return &substring_analyzer;
+    if (std.mem.eql(u8, name, "substring_query")) return &substring_query_analyzer;
     if (std.mem.eql(u8, name, "german")) return &german_analyzer;
     if (std.mem.eql(u8, name, "french")) return &french_analyzer;
     if (std.mem.eql(u8, name, "spanish")) return &spanish_analyzer;
@@ -1896,6 +1995,72 @@ test "camel_case filter" {
     try std.testing.expectEqual(@as(usize, 2), tokens.len);
     try std.testing.expectEqualStrings("first", tokens[0].term);
     try std.testing.expectEqualStrings("name", tokens[1].term);
+}
+
+test "suffix filter emits every suffix on UTF-8 boundaries" {
+    const alloc = std.testing.allocator;
+    var tokens = try (Tokenizer{ .whitespace = {} }).tokenize(alloc, "café ab");
+    tokens = try (TokenFilter{ .suffix = .{ .min = 2, .max = 4 } }).apply(alloc, tokens);
+    defer {
+        for (tokens) |t| alloc.free(@constCast(t.term));
+        alloc.free(tokens);
+    }
+
+    // "café" is 5 bytes; suffixes start at c, a, f, é (never inside é) and
+    // are truncated to 4 bytes without splitting the two-byte é.
+    try std.testing.expectEqual(@as(usize, 5), tokens.len);
+    try std.testing.expectEqualStrings("caf", tokens[0].term);
+    try std.testing.expectEqualStrings("afé", tokens[1].term);
+    try std.testing.expectEqualStrings("fé", tokens[2].term);
+    try std.testing.expectEqualStrings("é", tokens[3].term);
+    try std.testing.expectEqualStrings("ab", tokens[4].term);
+    try std.testing.expectEqual(@as(u32, 0), tokens[0].position);
+    try std.testing.expectEqual(@as(u32, 0), tokens[0].start_byte);
+    try std.testing.expectEqual(@as(u32, 1), tokens[1].start_byte);
+    try std.testing.expectEqual(@as(u32, 2), tokens[2].start_byte);
+    try std.testing.expectEqual(@as(u32, 5), tokens[2].end_byte);
+    try std.testing.expectEqual(@as(u32, 3), tokens[3].start_byte);
+}
+
+test "shingle filter can join tokens without a separator" {
+    const alloc = std.testing.allocator;
+    var tokens = try (Tokenizer{ .whitespace = {} }).tokenize(alloc, "rag3 weaver");
+    tokens = try (TokenFilter{ .shingle = .{ .min = 1, .max = 2, .separator = .none } }).apply(alloc, tokens);
+    defer {
+        for (tokens) |t| alloc.free(@constCast(t.term));
+        alloc.free(tokens);
+    }
+    try std.testing.expectEqual(@as(usize, 3), tokens.len);
+    try std.testing.expectEqualStrings("rag3", tokens[0].term);
+    try std.testing.expectEqualStrings("weaver", tokens[1].term);
+    try std.testing.expectEqualStrings("rag3weaver", tokens[2].term);
+}
+
+test "substring analyzer indexes suffixes across token separators" {
+    const alloc = std.testing.allocator;
+    const analyzer = builtinAnalyzerByName("substring") orelse return error.TestExpectedEqual;
+
+    for ([_][]const u8{ "Rag3-Weaver", "rag3_weaver", "RAG3WEAVER", "rag3 weaver" }) |text| {
+        const tokens = try analyzer.analyze(alloc, text);
+        defer Analyzer.freeTokens(alloc, tokens);
+        var found = false;
+        for (tokens) |tok| {
+            if (std.mem.startsWith(u8, tok.term, "g3wea")) found = true;
+        }
+        try std.testing.expect(found);
+    }
+
+    // Single-byte suffixes are never emitted.
+    const tokens = try analyzer.analyze(alloc, "ab");
+    defer Analyzer.freeTokens(alloc, tokens);
+    try std.testing.expectEqual(@as(usize, 1), tokens.len);
+    try std.testing.expectEqualStrings("ab", tokens[0].term);
+
+    const query_tokens = try substring_query_analyzer.analyze(alloc, "Rag3 Weaver");
+    defer Analyzer.freeTokens(alloc, query_tokens);
+    try std.testing.expectEqual(@as(usize, 2), query_tokens.len);
+    try std.testing.expectEqualStrings("rag3", query_tokens[0].term);
+    try std.testing.expectEqualStrings("weaver", query_tokens[1].term);
 }
 
 test "elision filter" {

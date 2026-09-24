@@ -2261,6 +2261,9 @@ fn applyCommonSearchRequestOptions(
     if (request.aggregations) |aggregations| {
         req.aggregations_json = try jsonStringifyAlloc(alloc, aggregations);
     }
+    if (comptime @hasField(@TypeOf(request), "highlight")) {
+        if (request.highlight) |highlight| req.highlight = try parseHighlightRequest(alloc, highlight);
+    }
     if (request.filter_prefix) |filter_prefix| req.filter_prefix = try alloc.dupe(u8, filter_prefix);
     if (request.distance_over) |distance_over| req.distance_over = distance_over;
     if (request.distance_under) |distance_under| req.distance_under = distance_under;
@@ -3651,6 +3654,7 @@ fn toOpenApiHit(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: 
         else
             null,
         .hierarchy = try searchHitHierarchyOpenApiValue(alloc, req, hit),
+        ._highlights = try highlightsJsonValue(alloc, hit.highlights),
     };
 }
 
@@ -7531,6 +7535,49 @@ fn buildRerankerQueryTextFromValue(alloc: std.mem.Allocator, input: anytype) ![]
     return try jsonStringifyAlloc(alloc, value);
 }
 
+fn parseHighlightRequest(alloc: std.mem.Allocator, value: anytype) !db_mod.types.HighlightRequest {
+    var out: db_mod.types.HighlightRequest = .{};
+    if (value.fields) |fields| out.fields = try cloneFields(alloc, fields);
+    errdefer freeHighlightRequest(alloc, out);
+    if (value.fragment_size) |size| {
+        if (size < 16 or size > 4096) return error.InvalidQueryRequest;
+        out.fragment_size = @intCast(size);
+    }
+    if (value.max_fragments) |count| {
+        if (count < 1 or count > 20) return error.InvalidQueryRequest;
+        out.max_fragments = @intCast(count);
+    }
+    return out;
+}
+
+fn freeHighlightRequest(alloc: std.mem.Allocator, value: db_mod.types.HighlightRequest) void {
+    for (value.fields) |field| alloc.free(field);
+    if (value.fields.len > 0) alloc.free(value.fields);
+}
+
+fn highlightsJsonValue(
+    alloc: std.mem.Allocator,
+    items: []const db_mod.types.HighlightedField,
+) !?std.json.ArrayHashMap([]const metadata_openapi.HighlightFragment) {
+    if (items.len == 0) return null;
+    var out = std.json.ArrayHashMap([]const metadata_openapi.HighlightFragment){};
+    for (items) |item| {
+        const fragments = try alloc.alloc(metadata_openapi.HighlightFragment, item.fragments.len);
+        for (item.fragments, fragments) |fragment, *dst| {
+            const spans = try alloc.alloc(metadata_openapi.HighlightSpan, fragment.spans.len);
+            for (fragment.spans, spans) |span, *span_dst| span_dst.* = .{ .start = span.start, .end = span.end };
+            dst.* = .{
+                .text = fragment.text,
+                .offset = fragment.offset,
+                .item = if (fragment.item) |index| @as(i64, index) else null,
+                .spans = spans,
+            };
+        }
+        try out.map.put(alloc, item.field, fragments);
+    }
+    return out;
+}
+
 fn cloneFields(alloc: std.mem.Allocator, value: []const []const u8) ![][]const u8 {
     const fields = try alloc.alloc([]const u8, value.len);
     var initialized: usize = 0;
@@ -10688,6 +10735,55 @@ test "graph date filters accept RFC3339 offsets and reject normalized invalid da
     try std.testing.expect((try parseRfc3339ToNs("2026-08-24")) == null);
 }
 
+test "query request highlight option parses with bounds and renders on hits" {
+    const alloc = std.testing.allocator;
+    var owned = try parseQueryRequest(alloc, null, "docs",
+        \\{"full_text_search":{"match":"hello","field":"body"},"highlight":{"fields":["body"],"fragment_size":32,"max_fragments":1}}
+    );
+    defer owned.deinit(alloc);
+    const highlight = owned.req.highlight orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 1), highlight.fields.len);
+    try std.testing.expectEqualStrings("body", highlight.fields[0]);
+    try std.testing.expectEqual(@as(u32, 32), highlight.fragment_size);
+    try std.testing.expectEqual(@as(u32, 1), highlight.max_fragments);
+
+    var defaults = try parseQueryRequest(alloc, null, "docs",
+        \\{"full_text_search":{"match":"hello","field":"body"},"highlight":{}}
+    );
+    defer defaults.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 150), defaults.req.highlight.?.fragment_size);
+    try std.testing.expectEqual(@as(u32, 3), defaults.req.highlight.?.max_fragments);
+    try std.testing.expectEqual(@as(usize, 0), defaults.req.highlight.?.fields.len);
+
+    var plain = try parseQueryRequest(alloc, null, "docs",
+        \\{"full_text_search":{"match":"hello","field":"body"}}
+    );
+    defer plain.deinit(alloc);
+    try std.testing.expect(plain.req.highlight == null);
+
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
+        \\{"full_text_search":{"match":"hello","field":"body"},"highlight":{"fragment_size":4}}
+    ));
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
+        \\{"full_text_search":{"match":"hello","field":"body"},"highlight":{"max_fragments":0}}
+    ));
+
+    // Hits render highlights under `_highlights` and omit the key otherwise.
+    var spans = [_]db_mod.types.HighlightSpan{.{ .start = 4, .end = 9 }};
+    var fragments = [_]db_mod.types.HighlightFragment{.{ .text = try alloc.dupe(u8, "say hello there"), .offset = 0, .spans = &spans }};
+    defer alloc.free(fragments[0].text);
+    var highlighted = [_]db_mod.types.HighlightedField{.{ .field = try alloc.dupe(u8, "body"), .fragments = &fragments }};
+    defer alloc.free(highlighted[0].field);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const hit = try toOpenApiHit(arena.allocator(), .{}, .{ .id = @constCast("doc:1"), .score = 1.0, .highlights = &highlighted });
+    const rendered = try std.json.Stringify.valueAlloc(arena.allocator(), hit, .{ .emit_null_optional_fields = false });
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"_highlights\":{\"body\":[{\"text\":\"say hello there\",\"offset\":0,\"spans\":[{\"start\":4,\"end\":9}]}]}") != null);
+    const bare = try toOpenApiHit(arena.allocator(), .{}, .{ .id = @constCast("doc:2"), .score = 1.0 });
+    const bare_rendered = try std.json.Stringify.valueAlloc(arena.allocator(), bare, .{ .emit_null_optional_fields = false });
+    try std.testing.expect(std.mem.indexOf(u8, bare_rendered, "_highlights") == null);
+}
+
 test "canonical graph date filters are operation keyed and require a bound" {
     const alloc = std.testing.allocator;
     var owned = try parseQueryRequest(alloc, null, "docs",
@@ -11425,6 +11521,7 @@ fn freeSearchRequest(alloc: std.mem.Allocator, req: *db_mod.types.SearchRequest)
     if (req.primary_text_index_name) |index_name| alloc.free(index_name);
     if (req.aggregations_json.len > 0) alloc.free(req.aggregations_json);
     if (req.filter_prefix.len > 0) alloc.free(req.filter_prefix);
+    if (req.highlight) |highlight| freeHighlightRequest(alloc, highlight);
     if (req.reranker) |*reranker| reranker.deinit(alloc);
     if (req.reranker_query_text.len > 0) alloc.free(req.reranker_query_text);
     if (req.merge_config) |merge_config| {

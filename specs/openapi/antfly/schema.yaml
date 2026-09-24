@@ -24,6 +24,7 @@ components:
         - blob
         - link
         - search_as_you_type
+        - substring
 
     FieldMappingType:
       type: string
@@ -53,6 +54,7 @@ components:
         - blob
         - link
         - search_as_you_type
+        - substring
 
     DocumentSchema:
       type: object

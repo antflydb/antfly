@@ -44,6 +44,11 @@ components:
         - term
     MatchQuery:
       type: object
+      description: |
+        Analyze the text with the field's analyzer and match any of the
+        resulting terms. On a `substring` companion field (`fieldName._substring`)
+        the text is lowercased and matched as a contained substring instead:
+        `{"match": "g3we", "field": "sku._substring"}` finds `RAG3-WEAVER`.
       properties:
         match:
           type: string
@@ -149,6 +154,10 @@ components:
         - term
     PrefixQuery:
       type: object
+      description: |
+        Match terms that start with the given bytes. On a `substring`
+        companion field the prefix is lowercased and matched as a contained
+        substring, exactly like `match` on that field.
       properties:
         prefix:
           type: string

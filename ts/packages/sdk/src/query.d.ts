@@ -26,6 +26,12 @@ export interface components {
             field?: string;
             boost?: components["schemas"]["Boost"];
         };
+        /**
+         * @description Analyze the text with the field's analyzer and match any of the
+         *     resulting terms. On a `substring` companion field (`fieldName._substring`)
+         *     the text is lowercased and matched as a contained substring instead:
+         *     `{"match": "g3we", "field": "sku._substring"}` finds `RAG3-WEAVER`.
+         */
         MatchQuery: {
             match: string;
             field?: string;
@@ -69,6 +75,11 @@ export interface components {
             field?: string;
             boost?: components["schemas"]["Boost"];
         };
+        /**
+         * @description Match terms that start with the given bytes. On a `substring`
+         *     companion field the prefix is lowercased and matched as a contained
+         *     substring, exactly like `match` on that field.
+         */
         PrefixQuery: {
             prefix: string;
             field?: string;

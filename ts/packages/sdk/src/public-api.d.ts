@@ -7495,6 +7495,7 @@ export interface components {
              */
             fields?: string[];
             hierarchy?: components["schemas"]["QueryHierarchy"];
+            highlight?: components["schemas"]["QueryHighlight"];
             /**
              * @description Maximum number of top-level results to return. For semantic_search, this is the topk parameter.
              *     This does not limit nested matches attached through hierarchy.group_by.matches;
@@ -8399,6 +8400,60 @@ export interface components {
              *     requests whose effective order is `_id` ascending.
              */
             _sort?: unknown[];
+            /**
+             * @description Highlighted fragments keyed by source field, present when the request
+             *     set `highlight` and the hit carried the field. Each fragment is a
+             *     window of the stored field value with byte-offset spans marking the
+             *     text the full-text query matched.
+             */
+            _highlights?: {
+                [key: string]: components["schemas"]["HighlightFragment"][];
+            };
+        };
+        /**
+         * @description Ask for highlighted fragments of the stored fields matched by
+         *     `full_text_search`. Matches are located by re-analyzing the stored
+         *     value with the field's analyzer, so stemmed and stop-word-filtered
+         *     terms highlight the surface form. `prefix`, `wildcard`, `regexp`, and
+         *     `fuzzy` clauses mark whole tokens; `match` or `prefix` on a
+         *     `substring` companion (`field._substring`) marks the exact contained
+         *     bytes, including matches that span two adjacent tokens.
+         */
+        QueryHighlight: {
+            /**
+             * @description Source fields to highlight. Defaults to every field the full-text
+             *     query references (companion suffixes such as `._substring` and
+             *     `.keyword` resolve to their root field).
+             * @example [
+             *       "title",
+             *       "body"
+             *     ]
+             */
+            fields?: string[];
+            /**
+             * @description Fragment window size in bytes.
+             * @default 150
+             */
+            fragment_size?: number;
+            /**
+             * @description Maximum fragments returned per field.
+             * @default 3
+             */
+            max_fragments?: number;
+        };
+        HighlightFragment: {
+            /** @description The fragment of the stored field value. */
+            text: string;
+            /** @description Byte offset of the fragment within the field value. */
+            offset: number;
+            /** @description Array index of the value when the field is an array of strings. */
+            item?: number;
+            spans: components["schemas"]["HighlightSpan"][];
+        };
+        /** @description Half-open byte range within the fragment text. */
+        HighlightSpan: {
+            start: number;
+            end: number;
         };
         /** @description A list of query hits. */
         QueryHits: {
@@ -9673,6 +9728,74 @@ export interface components {
             /** @description Optional field selected from this artifact's records. When omitted, the index-level field is inherited; when both are omitted, Antfly indexes the default text projection. */
             field?: string;
         };
+        /** @description One named analysis component: its type and type-specific configuration. */
+        TextAnalysisComponent: {
+            type: string;
+            config?: {
+                [key: string]: unknown;
+            };
+        };
+        /**
+         * @description Custom text analysis for a full-text index. Component maps are keyed
+         *     by the name that analyzers and `field_analyzers` reference. Built-in
+         *     analyzers (`standard`, `simple`, `keyword`, `html`, `search_as_you_type`,
+         *     `substring`, and the language analyzers such as `german`) are always
+         *     available without declaring them.
+         *
+         *     Example: split camelCase identifiers and match them as substrings.
+         *
+         *     ```json
+         *     {
+         *       "analysis_config": {
+         *         "field_analyzers": {"symbol": "code"},
+         *         "token_filters": {
+         *           "tails": {"type": "suffix", "config": {"min": 3, "max": 24}}
+         *         },
+         *         "analyzers": {
+         *           "code": {
+         *             "type": "custom",
+         *             "config": {
+         *               "tokenizer": "whitespace",
+         *               "token_filters": ["camel_case", "unique", "tails"]
+         *             }
+         *           }
+         *         }
+         *       }
+         *     }
+         *     ```
+         */
+        TextAnalysisConfig: {
+            /** @description Map of indexed field name to analyzer name. Overrides the analyzer derived from the table schema for that field. */
+            field_analyzers?: {
+                [key: string]: string;
+            };
+            /** @description Named character filters. Types: `html_strip` (alias `html`), `ascii_fold`, `zero_width_non_joiner`. */
+            char_filters?: {
+                [key: string]: components["schemas"]["TextAnalysisComponent"];
+            };
+            /** @description Named tokenizers. Types: `unicode` (alias `unicode_words`), `whitespace`, `keyword`, `character`, `ngram` (`config.min`, `config.max`), `edge_ngram` (`config.min`, `config.max`, `config.side` of `front` or `back`). */
+            tokenizers?: {
+                [key: string]: components["schemas"]["TextAnalysisComponent"];
+            };
+            /** @description Named token filters. Types: `lowercase` (alias `to_lower`), `stop_words` (alias `stop`; optional `config.language`), `stemmer` (optional `config.language`), `ngram` and `edge_ngram` (`config.min`, `config.max`), `shingle` (`config.min`, `config.max`, `config.separator` of `space` or `none`), `suffix` (`config.min`, `config.max`; emits every suffix of each token so prefix queries answer containment), `length` (`config.min`, `config.max`), `truncate` (`config.length`), `camel_case`, `unique`, `reverse`, `elision`, `apostrophe`. Languages: english, german, french, spanish, italian, portuguese, dutch, swedish, norwegian, danish, finnish. */
+            token_filters?: {
+                [key: string]: components["schemas"]["TextAnalysisComponent"];
+            };
+            /** @description Named analyzers of type `custom`. `config.tokenizer` names a built-in or declared tokenizer; `config.char_filters` and `config.token_filters` list built-in or declared component names in application order. Configuration-free filters (`lowercase`, `stop_words`, `stemmer`, `camel_case`, `unique`, `reverse`, `elision`, `apostrophe`, `suffix`) can be listed by name without declaring them. */
+            analyzers?: {
+                [key: string]: components["schemas"]["TextAnalysisComponent"];
+            };
+            /** @description Name of the date-time parser applied to datetime fields without a field-specific parser. */
+            default_datetime_parser?: string;
+            /** @description Map of field name to date-time parser name. */
+            field_date_time_parsers?: {
+                [key: string]: string;
+            };
+            /** @description Named date-time parsers. Type `sanitizedgo` accepts `config.layouts`, a list of Go reference-time layouts tried in order. */
+            date_time_parsers?: {
+                [key: string]: components["schemas"]["TextAnalysisComponent"];
+            };
+        };
         FullTextIndexConfig: {
             /** @description Chunk or textual asset streams indexed together; every artifact record is an independent full-text member. A source-local field overrides the shared index-level field for that stream. Artifact names must be unique. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
             sources?: components["schemas"]["FullTextArtifactIndexSource"][];
@@ -9682,6 +9805,7 @@ export interface components {
             field?: string;
             /** @description Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
             artifact_name?: string;
+            analysis_config?: components["schemas"]["TextAnalysisConfig"];
         };
         /**
          * @description Publication behavior for a managed embeddings index. `progressive` makes a safely checkpointed active generation queryable before initial source coverage is complete. `atomic` keeps a new generation unavailable until complete validation and activation.
@@ -10335,7 +10459,7 @@ export interface components {
          *     geoshape.
          * @enum {string}
          */
-        FieldMappingType: "text" | "html" | "keyword" | "numeric" | "number" | "integer" | "boolean" | "bool" | "datetime" | "date" | "timestamp" | "geopoint" | "geo_point" | "geoshape" | "geo_shape" | "embedding" | "blob" | "link" | "search_as_you_type";
+        FieldMappingType: "text" | "html" | "keyword" | "numeric" | "number" | "integer" | "boolean" | "bool" | "datetime" | "date" | "timestamp" | "geopoint" | "geo_point" | "geoshape" | "geo_shape" | "embedding" | "blob" | "link" | "search_as_you_type" | "substring";
         /** @description Mapping for one named multifield emitted from its parent document property. Multifields are intentionally one level deep and read the parent property's JSON value rather than a nested JSON property. */
         DocumentSubfieldMapping: {
             type?: components["schemas"]["FieldMappingType"];
@@ -10579,6 +10703,7 @@ export interface components {
             sources?: components["schemas"]["FullTextArtifactIndexSource"][];
             mem_only?: boolean;
             field?: string;
+            analysis_config?: components["schemas"]["TextAnalysisConfig"];
         };
         /** @description Normalized effective full-text index configuration returned after creation. */
         CreatedFullTextIndex: components["schemas"]["CreatedIndexCommon"] & components["schemas"]["CreatedFullTextIndexConfig"] & {
@@ -12573,6 +12698,12 @@ export interface components {
             field?: string;
             boost?: components["schemas"]["Boost"];
         };
+        /**
+         * @description Analyze the text with the field's analyzer and match any of the
+         *     resulting terms. On a `substring` companion field (`fieldName._substring`)
+         *     the text is lowercased and matched as a contained substring instead:
+         *     `{"match": "g3we", "field": "sku._substring"}` finds `RAG3-WEAVER`.
+         */
         MatchQuery: {
             match: string;
             field?: string;
@@ -12618,6 +12749,11 @@ export interface components {
             field?: string;
             boost?: components["schemas"]["Boost"];
         };
+        /**
+         * @description Match terms that start with the given bytes. On a `substring`
+         *     companion field the prefix is lowercased and matched as a contained
+         *     substring, exactly like `match` on that field.
+         */
         PrefixQuery: {
             prefix: string;
             field?: string;

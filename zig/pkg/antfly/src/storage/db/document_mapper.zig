@@ -3002,7 +3002,7 @@ fn appendMappedTextField(
     if (!mapping.do_index) return;
 
     switch (mapping.field_type) {
-        .text, .html, .keyword, .link, .search_as_you_type => try appendNamedTextField(alloc, fields, path, text, mapping.analyzer, mapping.include_in_all, text_analysis),
+        .text, .html, .keyword, .link, .search_as_you_type, .substring => try appendNamedTextField(alloc, fields, path, text, mapping.analyzer, mapping.include_in_all, text_analysis),
         else => {},
     }
 }
@@ -3458,7 +3458,7 @@ fn collectFieldValues(
 
 fn isTextFieldType(field_type: runtime_schema.AntflyType) bool {
     return switch (field_type) {
-        .text, .html, .keyword, .link, .search_as_you_type => true,
+        .text, .html, .keyword, .link, .search_as_you_type, .substring => true,
         else => false,
     };
 }
@@ -5147,6 +5147,46 @@ test "document mapper emits schema geo point typed doc values" {
     , .{});
     defer invalid_lon.deinit();
     try std.testing.expect((try typedDocValueForMappedFieldAlloc(alloc, mapping, invalid_lon.value)) == null);
+}
+
+test "document mapper indexes substring companions under every suffix" {
+    const alloc = std.testing.allocator;
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    const schema: runtime_schema.TableSchema = .{
+        .version = 0,
+        .default_type = "product",
+        .ttl_field = "_timestamp",
+        .full_text_documents = &.{
+            .{
+                .name = "product",
+                .fields = &.{
+                    .{ .path = "name", .emitted_name = "name", .analyzer = "standard" },
+                    .{ .path = "name", .emitted_name = "name._substring", .analyzer = "substring" },
+                },
+            },
+        },
+    };
+
+    const segment = (try buildTextSegmentFromDocuments(alloc, &.{
+        .{ .key = "doc:1", .value = "{\"name\":\"Rag3-Weaver Kit\"}" },
+    }, text_analysis, schema)).?;
+    defer alloc.free(segment);
+
+    var reader = try @import("../../segment.zig").SegmentReader.init(alloc, segment);
+    defer reader.deinit();
+
+    const root = (try reader.invertedIndex("name")) orelse return error.TestExpectedEqual;
+    try std.testing.expect(root.lookup("rag3") != null);
+    try std.testing.expect(root.lookup("g3weaver") == null);
+
+    const companion = (try reader.invertedIndex("name._substring")) orelse return error.TestExpectedEqual;
+    // Whole tokens, inner suffixes, and suffixes of the joined adjacent pair.
+    try std.testing.expect(companion.lookup("rag3") != null);
+    try std.testing.expect(companion.lookup("ag3") != null);
+    try std.testing.expect(companion.lookup("g3weaver") != null);
+    try std.testing.expect(companion.lookup("weaverkit") != null);
+    try std.testing.expect(companion.lookup("g3weaverkit") == null);
+    try std.testing.expect(companion.lookup("t") == null);
 }
 
 test "document mapper emits Go-style dynamic-template search_as_you_type field" {

@@ -1576,6 +1576,8 @@ pub const SearchRequest = struct {
     hierarchy_unit_fields: []const []const u8 = &.{},
     hierarchy_unit_include_all_fields: bool = true,
     fields: []const []const u8 = &.{},
+    /// Highlighting options; null leaves `_highlights` out of every hit.
+    highlight: ?HighlightRequest = null,
     order_by: []const SortField = &.{},
     search_after: []const std.json.Value = &.{},
     search_before: []const std.json.Value = &.{},
@@ -1696,6 +1698,7 @@ const hierarchy_children_rejected_fields = [_][]const u8{
     "hierarchy_unit_fields",
     "hierarchy_unit_include_all_fields",
     "search_before",
+    "highlight",
     "search_effort",
     "filter_prefix",
     "distance_over",
@@ -1942,6 +1945,83 @@ pub const MergeConfig = struct {
     weights: []const fusion_mod.NamedWeight = &.{},
 };
 
+/// Request-side highlighting options. See `QueryHighlight` in the public
+/// spec; fragments are computed on the node that owns the stored documents.
+pub const HighlightRequest = struct {
+    /// Source fields to highlight. Empty means every root field the full-text
+    /// query references.
+    fields: []const []const u8 = &.{},
+    fragment_size: u32 = 150,
+    max_fragments: u32 = 3,
+};
+
+pub const HighlightSpan = struct {
+    start: u32,
+    end: u32,
+};
+
+pub const HighlightFragment = struct {
+    text: []u8,
+    offset: u32,
+    /// Array index when the highlighted field value is an array of strings.
+    item: ?u32 = null,
+    spans: []HighlightSpan,
+};
+
+pub const HighlightedField = struct {
+    field: []u8,
+    fragments: []HighlightFragment,
+};
+
+pub fn freeHighlightFragment(alloc: Allocator, fragment: *HighlightFragment) void {
+    alloc.free(fragment.text);
+    if (fragment.spans.len > 0) alloc.free(fragment.spans);
+    fragment.* = undefined;
+}
+
+pub fn freeHighlightedField(alloc: Allocator, field: *HighlightedField) void {
+    alloc.free(field.field);
+    for (field.fragments) |*fragment| freeHighlightFragment(alloc, fragment);
+    if (field.fragments.len > 0) alloc.free(field.fragments);
+    field.* = undefined;
+}
+
+pub fn freeHighlights(alloc: Allocator, items: []HighlightedField) void {
+    for (items) |*item| freeHighlightedField(alloc, item);
+    if (items.len > 0) alloc.free(items);
+}
+
+pub fn cloneHighlights(alloc: Allocator, items: []const HighlightedField) ![]HighlightedField {
+    if (items.len == 0) return &.{};
+    const cloned = try alloc.alloc(HighlightedField, items.len);
+    var initialized: usize = 0;
+    errdefer freeHighlights(alloc, cloned[0..initialized]);
+    for (items, 0..) |item, i| {
+        const field = try alloc.dupe(u8, item.field);
+        errdefer alloc.free(field);
+        const fragments = try alloc.alloc(HighlightFragment, item.fragments.len);
+        var fragments_initialized: usize = 0;
+        errdefer {
+            for (fragments[0..fragments_initialized]) |*fragment| freeHighlightFragment(alloc, fragment);
+            alloc.free(fragments);
+        }
+        for (item.fragments, 0..) |fragment, j| {
+            const text = try alloc.dupe(u8, fragment.text);
+            errdefer alloc.free(text);
+            fragments[j] = .{
+                .text = text,
+                .offset = fragment.offset,
+                .item = fragment.item,
+                .spans = try alloc.dupe(HighlightSpan, fragment.spans),
+            };
+            fragments_initialized += 1;
+        }
+        cloned[i] = .{ .field = field, .fragments = fragments };
+        initialized += 1;
+    }
+    return cloned;
+}
+
 pub const SearchHit = struct {
     id: []u8,
     /// Internal graph-hydration namespace. Null means the query's source
@@ -1961,6 +2041,9 @@ pub const SearchHit = struct {
     ancestor_unit_data: ?[]u8 = null,
     artifact_ref: ?ArtifactRef = null,
     chunk_hits: []ChunkHit = &.{},
+    /// Highlighted fragments keyed by source field, present only when the
+    /// request asked for highlighting and the hit carried stored source.
+    highlights: []HighlightedField = &.{},
 
     pub fn clone(self: SearchHit, alloc: Allocator) !SearchHit {
         var cloned = SearchHit{ .id = try alloc.dupe(u8, self.id) };
@@ -1973,6 +2056,7 @@ pub const SearchHit = struct {
             if (cloned.ancestor_source_data) |data| alloc.free(data);
             if (cloned.ancestor_unit_data) |data| alloc.free(data);
             if (cloned.artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
+            freeHighlights(alloc, cloned.highlights);
         }
         cloned.source_table = if (self.source_table) |table| try alloc.dupe(u8, table) else null;
         cloned.doc_ordinal = self.doc_ordinal;
@@ -1985,6 +2069,7 @@ pub const SearchHit = struct {
         cloned.ancestor_source_data = if (self.ancestor_source_data) |data| try alloc.dupe(u8, data) else null;
         cloned.ancestor_unit_data = if (self.ancestor_unit_data) |data| try alloc.dupe(u8, data) else null;
         cloned.artifact_ref = if (self.artifact_ref) |artifact_ref| try artifact_ref.clone(alloc) else null;
+        cloned.highlights = try cloneHighlights(alloc, self.highlights);
 
         if (self.chunk_hits.len == 0) return cloned;
 
@@ -2013,6 +2098,7 @@ pub const SearchHit = struct {
         if (self.artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
         for (self.chunk_hits) |*chunk| chunk.deinit(alloc);
         if (self.chunk_hits.len > 0) alloc.free(self.chunk_hits);
+        freeHighlights(alloc, self.highlights);
         self.* = undefined;
     }
 };

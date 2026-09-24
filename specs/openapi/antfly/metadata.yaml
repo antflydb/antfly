@@ -180,11 +180,12 @@ tags:
       - **Single type**: `"x-antfly-types": ["text"]` - Creates standard text field
       - **Multiple types**: `"x-antfly-types": ["text", "keyword"]` - Creates `fieldName` (text) and `fieldName.keyword`
       - **With search-as-you-type**: `"x-antfly-types": ["text", "search_as_you_type"]` - Creates `fieldName` (text), `fieldName._2gram`, `fieldName._3gram`, and `fieldName._index_prefix`
+      - **With substring**: `"x-antfly-types": ["text", "substring"]` - Creates `fieldName` (text) and `fieldName._substring`, a suffix-indexed companion that answers "contains" queries without scanning the term dictionary
 
       **Type Combination Rules**:
       - `text` and `html` are mutually exclusive (choose one as primary type)
-      - Primary types (`text`, `html`) can be combined with variants (`keyword`, `search_as_you_type`)
-      - `search_as_you_type` + `keyword` allowed without primary type (auto-adds `text`)
+      - Primary types (`text`, `html`) can be combined with variants (`keyword`, `search_as_you_type`, `substring`)
+      - `search_as_you_type` or `substring` + `keyword` allowed without primary type (auto-adds `text`)
 
       `x-antfly-types` remains supported as the compact multi-mapping/search
       shorthand. Exact scalar names in that array describe how a field is
@@ -242,7 +243,7 @@ tags:
         "x-antfly-include-in-all": ["title", "body", "description"]
       }
       ```
-      Only text-based types (`text`, `html`, `keyword`, `search_as_you_type`, `link`) are included, and only the primary field (not `.keyword`, `._2gram`, `._3gram`, or `._index_prefix` variants).
+      Only text-based types (`text`, `html`, `keyword`, `search_as_you_type`, `substring`, `link`) are included, and only the primary field (not `.keyword`, `._2gram`, `._3gram`, `._index_prefix`, or `._substring` variants).
 
       ## Antfly Types
 
@@ -251,6 +252,7 @@ tags:
       - `html` - Full-text searchable with HTML tag stripping. Use for HTML content.
       - `keyword` - Exact-match strings (not analyzed). Use for IDs, tags, categories, filters.
       - `search_as_you_type` - Search-as-you-type mappings for autocomplete. Creates `fieldName._2gram`, `fieldName._3gram`, and `fieldName._index_prefix` mappings.
+      - `substring` - Infix ("contains") matching for identifiers, SKUs, paths, and code. Creates `fieldName._substring`, which indexes every suffix (2 to 32 bytes) of each lowercased token and of each adjacent token pair joined without a separator, so `rag3-weaver`, `rag3_weaver`, and `rag3weaver` all match a `match` or `prefix` query for `g3we` on `fieldName._substring`. Queries are lowercased, adjacent query tokens are joined the same way, and a query of three or more tokens requires every adjacent pair. Single-character queries never match. Expect the companion to cost several times the size of the text it indexes; opt in per field.
       - `link` - URL/link field (keyword analyzer).
 
       ### Numeric and Boolean Types
@@ -287,6 +289,7 @@ tags:
       - **Primary field** (`text` or `html`): Uses original field name
       - **Keyword variant**: `fieldName.keyword`
       - **Search-as-you-type**: `fieldName._2gram`, `fieldName._3gram`, and `fieldName._index_prefix`
+      - **Substring**: `fieldName._substring`
 
       Example: `"x-antfly-types": ["text", "keyword", "search_as_you_type"]` creates:
       - `title` (text analyzer)
@@ -7774,6 +7777,9 @@ components:
         hierarchy:
           $ref: "#/components/schemas/QueryHierarchy"
           x-go-type-skip-optional-pointer: false
+        highlight:
+          $ref: "#/components/schemas/QueryHighlight"
+          x-go-type-skip-optional-pointer: false
         limit:
           type: integer
           description: |
@@ -8859,6 +8865,76 @@ components:
             types. Present for ordered result pages, including cursor-only
             requests whose effective order is `_id` ascending.
           x-go-name: sort
+        _highlights:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              $ref: "#/components/schemas/HighlightFragment"
+          description: |
+            Highlighted fragments keyed by source field, present when the request
+            set `highlight` and the hit carried the field. Each fragment is a
+            window of the stored field value with byte-offset spans marking the
+            text the full-text query matched.
+          x-go-name: highlights
+    QueryHighlight:
+      type: object
+      description: |
+        Ask for highlighted fragments of the stored fields matched by
+        `full_text_search`. Matches are located by re-analyzing the stored
+        value with the field's analyzer, so stemmed and stop-word-filtered
+        terms highlight the surface form. `prefix`, `wildcard`, `regexp`, and
+        `fuzzy` clauses mark whole tokens; `match` or `prefix` on a
+        `substring` companion (`field._substring`) marks the exact contained
+        bytes, including matches that span two adjacent tokens.
+      properties:
+        fields:
+          type: array
+          items:
+            type: string
+          description: |
+            Source fields to highlight. Defaults to every field the full-text
+            query references (companion suffixes such as `._substring` and
+            `.keyword` resolve to their root field).
+          example: ["title", "body"]
+        fragment_size:
+          type: integer
+          minimum: 16
+          maximum: 4096
+          default: 150
+          description: Fragment window size in bytes.
+        max_fragments:
+          type: integer
+          minimum: 1
+          maximum: 20
+          default: 3
+          description: Maximum fragments returned per field.
+    HighlightFragment:
+      type: object
+      required: [text, offset, spans]
+      properties:
+        text:
+          type: string
+          description: The fragment of the stored field value.
+        offset:
+          type: integer
+          description: Byte offset of the fragment within the field value.
+        item:
+          type: integer
+          description: Array index of the value when the field is an array of strings.
+        spans:
+          type: array
+          items:
+            $ref: "#/components/schemas/HighlightSpan"
+    HighlightSpan:
+      type: object
+      required: [start, end]
+      description: Half-open byte range within the fragment text.
+      properties:
+        start:
+          type: integer
+        end:
+          type: integer
     QueryHits:
       x-omitempty: false
       x-omitzero: false

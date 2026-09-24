@@ -754,10 +754,13 @@ fn metadataFilterCapabilitySupportsMode(capability: QueryBuilderFieldCapability,
         return field_type == .geopoint or field_type == .geoshape;
     }
     if (std.mem.eql(u8, mode, "full_text")) {
-        return field_type == .text or field_type == .html or field_type == .search_as_you_type;
+        return field_type == .text or field_type == .html or field_type == .search_as_you_type or field_type == .substring;
     }
     if (std.mem.eql(u8, mode, "pattern")) {
-        return field_type == .keyword or field_type == .link or field_type == .text or field_type == .html or field_type == .search_as_you_type;
+        return field_type == .keyword or field_type == .link or field_type == .text or field_type == .html or field_type == .search_as_you_type or field_type == .substring;
+    }
+    if (std.mem.eql(u8, mode, "substring")) {
+        return field_type == .substring;
     }
     return true;
 }

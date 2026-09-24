@@ -2423,8 +2423,11 @@ pub const InvertedIndexReader = struct {
         };
     }
 
-    /// Iterate terms matching an automaton. Blocks are enumerated by prefix FST,
-    /// then the automaton is checked against full terms inside each block.
+    /// Iterate terms matching an automaton. Blocks are enumerated by the
+    /// block-ceiling FST; blocks whose shared prefix already leaves the
+    /// automaton dead are skipped by seeking past the dead prefix, and the
+    /// remaining terms are checked incrementally from their front-coded
+    /// shared prefix.
     pub fn fstSearchIterator(self: *const InvertedIndexReader, aut: vellum.Automaton) !TermIterator {
         return .{
             .alloc = self.alloc,
@@ -2689,6 +2692,16 @@ pub const TermIterator = struct {
     start: ?[]const u8 = null,
     end: ?[]const u8 = null,
     automaton: ?vellum.Automaton = null,
+    /// Automaton states aligned with `current_key`: entry `i` is the state
+    /// after consuming `current_key[0..i]`. Front-coded terms reuse the
+    /// states of their shared prefix, so each decoded term only feeds its
+    /// leaf bytes through the automaton.
+    automaton_states: std.ArrayListUnmanaged(usize) = .empty,
+    /// Scratch key used to seek the block iterator past a dead prefix.
+    seek_scratch: std.ArrayListUnmanaged(u8) = .empty,
+    /// Diagnostic: dictionary blocks skipped without decoding because their
+    /// shared prefix cannot lead to an automaton match.
+    blocks_pruned: u64 = 0,
     // We must copy the key before advancing, because block parsing reuses section slices.
     current_key: std.ArrayListUnmanaged(u8) = .empty,
 
@@ -2723,14 +2736,16 @@ pub const TermIterator = struct {
             self.current_key.shrinkRetainingCapacity(self.current_block_prefix.len + shared_len);
             try self.current_key.appendSlice(self.alloc, leaf);
 
+            // The automaton state stack must track every decoded key, so it
+            // advances before any range check can skip the term.
+            if (self.automaton) |aut| {
+                if (!try self.advanceAutomatonStates(aut, self.current_block_prefix.len + shared_len)) continue;
+            }
             if (self.start) |start| {
                 if (std.mem.order(u8, self.current_key.items, start) == .lt) continue;
             }
             if (self.end) |end| {
                 if (std.mem.order(u8, self.current_key.items, end) != .lt) return null;
-            }
-            if (self.automaton) |aut| {
-                if (!termMatchesAutomaton(aut, self.current_key.items)) continue;
             }
 
             const result: LookupResult = if (fstValIs1Hit(value))
@@ -2746,37 +2761,99 @@ pub const TermIterator = struct {
     }
 
     fn loadNextBlock(self: *TermIterator) !bool {
-        const current = self.block_iter.current() orelse return false;
-        _ = try self.block_iter.nextEntry();
-        const block_offset: usize = @intCast(current.val);
-        if (block_offset >= self.reader.dict_blocks.len) return error.InvalidData;
-        var cursor = block_offset;
-        const prefix_len = readVarintU32(self.reader.dict_blocks, &cursor) catch return error.InvalidData;
-        self.current_block_remaining = readVarintU32(self.reader.dict_blocks, &cursor) catch return error.InvalidData;
-        if (cursor + prefix_len > self.reader.dict_blocks.len) return error.InvalidData;
-        self.current_block_prefix = self.reader.dict_blocks[cursor..][0..prefix_len];
-        cursor += prefix_len;
-        self.current_block_cursor = cursor;
-        self.current_block_last_postings_offset = 0;
-        self.current_key.clearRetainingCapacity();
-        try self.current_key.appendSlice(self.alloc, self.current_block_prefix);
+        while (true) {
+            const current = self.block_iter.current() orelse return false;
+            const block_offset: usize = @intCast(current.val);
+            if (block_offset >= self.reader.dict_blocks.len) return error.InvalidData;
+            var cursor = block_offset;
+            const prefix_len = readVarintU32(self.reader.dict_blocks, &cursor) catch return error.InvalidData;
+            const block_remaining = readVarintU32(self.reader.dict_blocks, &cursor) catch return error.InvalidData;
+            if (cursor + prefix_len > self.reader.dict_blocks.len) return error.InvalidData;
+            const block_prefix = self.reader.dict_blocks[cursor..][0..prefix_len];
+            cursor += prefix_len;
+
+            if (self.automaton) |aut| {
+                if (try self.primeAutomatonStates(aut, block_prefix)) |dead_len| {
+                    // Every term in this block starts with `block_prefix`, and
+                    // the automaton is already dead after `dead_len` of its
+                    // bytes, so no term in this block (or in any later block
+                    // sharing that dead prefix) can match. Seek the block
+                    // index straight past the dead range instead of decoding
+                    // each block's terms one by one.
+                    self.blocks_pruned += 1;
+                    if (!try self.seekPastDeadPrefix(block_prefix[0..dead_len])) return false;
+                    continue;
+                }
+            }
+
+            _ = try self.block_iter.nextEntry();
+            self.current_block_remaining = block_remaining;
+            self.current_block_prefix = block_prefix;
+            self.current_block_cursor = cursor;
+            self.current_block_last_postings_offset = 0;
+            self.current_key.clearRetainingCapacity();
+            try self.current_key.appendSlice(self.alloc, self.current_block_prefix);
+            return true;
+        }
+    }
+
+    /// Feed a block's shared prefix through the automaton from its start
+    /// state, recording the state after every byte. Returns the number of
+    /// prefix bytes after which the automaton became dead, or null when the
+    /// whole prefix can still lead to a match.
+    fn primeAutomatonStates(self: *TermIterator, aut: vellum.Automaton, block_prefix: []const u8) !?usize {
+        self.automaton_states.clearRetainingCapacity();
+        try self.automaton_states.ensureTotalCapacity(self.alloc, block_prefix.len + 1);
+        var state = aut.start();
+        self.automaton_states.appendAssumeCapacity(state);
+        if (!aut.canMatch(state)) return 0;
+        for (block_prefix, 0..) |byte, index| {
+            state = aut.accept(state, byte);
+            self.automaton_states.appendAssumeCapacity(state);
+            if (!aut.canMatch(state)) return index + 1;
+        }
+        return null;
+    }
+
+    /// Extend the automaton state stack from the retained key prefix to the
+    /// end of `current_key`. Returns whether the full term is accepted.
+    fn advanceAutomatonStates(self: *TermIterator, aut: vellum.Automaton, retained_len: usize) !bool {
+        std.debug.assert(self.automaton_states.items.len > retained_len);
+        self.automaton_states.shrinkRetainingCapacity(retained_len + 1);
+        const leaf = self.current_key.items[retained_len..];
+        try self.automaton_states.ensureUnusedCapacity(self.alloc, leaf.len);
+        var state = self.automaton_states.items[retained_len];
+        for (leaf) |byte| {
+            // Dead states stay dead; keep pushing so the stack stays aligned
+            // with `current_key` for the next front-coded term.
+            if (aut.canMatch(state)) state = aut.accept(state, byte);
+            self.automaton_states.appendAssumeCapacity(state);
+        }
+        return aut.canMatch(state) and aut.isMatch(state);
+    }
+
+    /// Reposition the block iterator at the first block whose ceiling sorts
+    /// after every key starting with `dead_prefix`. Returns false when no such
+    /// key exists (the prefix is all 0xFF bytes), which ends iteration.
+    fn seekPastDeadPrefix(self: *TermIterator, dead_prefix: []const u8) !bool {
+        self.seek_scratch.clearRetainingCapacity();
+        try self.seek_scratch.appendSlice(self.alloc, dead_prefix);
+        while (self.seek_scratch.items.len > 0 and self.seek_scratch.items[self.seek_scratch.items.len - 1] == 0xFF) {
+            self.seek_scratch.items.len -= 1;
+        }
+        if (self.seek_scratch.items.len == 0) return false;
+        self.seek_scratch.items[self.seek_scratch.items.len - 1] += 1;
+        try self.block_iter.seek(self.seek_scratch.items);
         return true;
     }
 
     pub fn deinit(self: *TermIterator) void {
         self.current_key.deinit(self.alloc);
+        self.automaton_states.deinit(self.alloc);
+        self.seek_scratch.deinit(self.alloc);
         self.block_iter.deinit();
     }
 };
-
-fn termMatchesAutomaton(aut: vellum.Automaton, term: []const u8) bool {
-    var state = aut.start();
-    for (term) |b| {
-        if (!aut.canMatch(state)) return false;
-        state = aut.accept(state, b);
-    }
-    return aut.isMatch(state);
-}
 
 /// Result of looking up a term. Either a full postings list or a 1-hit value.
 pub const LookupResult = union(enum) {

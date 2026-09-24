@@ -19796,6 +19796,16 @@ fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest)
     {
         try appendJsonFieldNames(alloc, &out, &first, "fields", req.fields);
     }
+    if (req.highlight) |highlight| {
+        try appendJsonFieldName(alloc, &out, &first, "highlight");
+        const encoded = try std.json.Stringify.valueAlloc(alloc, .{
+            .fields = highlight.fields,
+            .fragment_size = highlight.fragment_size,
+            .max_fragments = highlight.max_fragments,
+        }, .{});
+        defer alloc.free(encoded);
+        try out.appendSlice(alloc, encoded);
+    }
     if (req.hierarchy_children != null or
         req.hierarchy_grouped_matches or
         req.hierarchy_group_level == .unit)
@@ -20929,6 +20939,7 @@ fn parseRemoteSearchResultInner(alloc: std.mem.Allocator, body: []const u8) !db_
         hit.ancestor_unit_data = try remoteHierarchyAncestorDocumentAlloc(alloc, item.hierarchy, .unit);
         hit.artifact_ref = try parseRemoteHierarchyArtifactRefAlloc(alloc, item.hierarchy);
         hit.chunk_hits = try parseRemoteHierarchyMatchesAlloc(alloc, item.hierarchy);
+        hit.highlights = try parseRemoteHighlightsAlloc(alloc, item._highlights);
         hits[i] = hit;
         initialized += 1;
     }
@@ -21041,6 +21052,49 @@ fn parseRemoteArtifactKind(value: []const u8) !db_mod.types.ArtifactKind {
     return error.InvalidQueryRequest;
 }
 
+fn parseRemoteHighlightsAlloc(
+    alloc: std.mem.Allocator,
+    maybe_value: ?std.json.ArrayHashMap([]const metadata_openapi.HighlightFragment),
+) ![]db_mod.types.HighlightedField {
+    const value = maybe_value orelse return &.{};
+    if (value.map.count() == 0) return &.{};
+
+    var out = std.ArrayListUnmanaged(db_mod.types.HighlightedField).empty;
+    errdefer {
+        for (out.items) |*item| db_mod.types.freeHighlightedField(alloc, item);
+        out.deinit(alloc);
+    }
+    var it = value.map.iterator();
+    while (it.next()) |entry| {
+        const field = try alloc.dupe(u8, entry.key_ptr.*);
+        errdefer alloc.free(field);
+        var fragments = std.ArrayListUnmanaged(db_mod.types.HighlightFragment).empty;
+        errdefer {
+            for (fragments.items) |*fragment| db_mod.types.freeHighlightFragment(alloc, fragment);
+            fragments.deinit(alloc);
+        }
+        for (entry.value_ptr.*) |fragment| {
+            if (fragment.offset < 0) return error.InvalidQueryRequest;
+            const text = try alloc.dupe(u8, fragment.text);
+            errdefer alloc.free(text);
+            const spans = try alloc.alloc(db_mod.types.HighlightSpan, fragment.spans.len);
+            errdefer alloc.free(spans);
+            for (fragment.spans, spans) |span, *dst| {
+                if (span.start < 0 or span.end < span.start or span.end > @as(i64, @intCast(fragment.text.len))) return error.InvalidQueryRequest;
+                dst.* = .{ .start = @intCast(span.start), .end = @intCast(span.end) };
+            }
+            try fragments.append(alloc, .{
+                .text = text,
+                .offset = std.math.cast(u32, fragment.offset) orelse return error.InvalidQueryRequest,
+                .item = if (fragment.item) |index| (std.math.cast(u32, index) orelse return error.InvalidQueryRequest) else null,
+                .spans = spans,
+            });
+        }
+        try out.append(alloc, .{ .field = field, .fragments = try fragments.toOwnedSlice(alloc) });
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
 fn parseRemoteIndexScoresAlloc(
     alloc: std.mem.Allocator,
     maybe_value: ?std.json.ArrayHashMap(f64),
@@ -21096,6 +21150,32 @@ test "parseRemoteSearchResult preserves fused index scores" {
     try std.testing.expect(std.mem.indexOf(u8, result.hits[0].ancestor_unit_data.?, "page_number") != null);
     try std.testing.expectEqualStrings("doc:a", result.hits[0].artifact_ref.?.document_id);
     try std.testing.expectEqualStrings("page:1", result.hits[0].artifact_ref.?.unit_id.?);
+}
+
+test "parseRemoteSearchResult preserves shard-computed highlights" {
+    const alloc = std.testing.allocator;
+    var result = try parseRemoteSearchResult(alloc,
+        \\{"responses":[{"hits":{"total":{"value":1,"relation":"exact"},"hits":[{"_id":"doc:1","_score":0.5,"_source":{"title":"Rag3-Weaver kit"},"_highlights":{"title":[{"text":"Rag3-Weaver kit","offset":0,"spans":[{"start":2,"end":7}]}],"tags":[{"text":"zulu wing","offset":0,"item":2,"spans":[{"start":0,"end":4}]}]}}],"max_score":0.5},"took":1,"status":200,"table":"docs"}]}
+    );
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    const highlights = result.hits[0].highlights;
+    try std.testing.expectEqual(@as(usize, 2), highlights.len);
+    try std.testing.expectEqualStrings("title", highlights[0].field);
+    try std.testing.expectEqual(@as(usize, 1), highlights[0].fragments.len);
+    try std.testing.expectEqualStrings("Rag3-Weaver kit", highlights[0].fragments[0].text);
+    try std.testing.expectEqual(@as(u32, 0), highlights[0].fragments[0].offset);
+    try std.testing.expectEqual(@as(?u32, null), highlights[0].fragments[0].item);
+    try std.testing.expectEqual(@as(u32, 2), highlights[0].fragments[0].spans[0].start);
+    try std.testing.expectEqual(@as(u32, 7), highlights[0].fragments[0].spans[0].end);
+    try std.testing.expectEqualStrings("tags", highlights[1].field);
+    try std.testing.expectEqual(@as(?u32, 2), highlights[1].fragments[0].item);
+
+    // Spans outside the fragment text are a malformed shard response.
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResult(alloc,
+        \\{"responses":[{"hits":{"total":{"value":1,"relation":"exact"},"hits":[{"_id":"doc:1","_score":0.5,"_highlights":{"title":[{"text":"abc","offset":0,"spans":[{"start":1,"end":9}]}]}}],"max_score":0.5},"took":1,"status":200,"table":"docs"}]}
+    ));
 }
 
 test "parseRemoteSearchResult preserves grouped hierarchy matches" {
@@ -25863,6 +25943,39 @@ test "encode query request round-trips composed bleve full_text queries" {
     var parsed_fuzzy = try parseJsonTestBody(std.json.Value, alloc, fuzzy);
     defer parsed_fuzzy.deinit();
     try std.testing.expectEqual(@as(i64, 1), parsed_fuzzy.value.object.get("full_text_search").?.object.get("fuzziness").?.integer);
+}
+
+test "encode query request forwards highlight options to shards" {
+    const alloc = std.testing.allocator;
+    const fields = [_][]const u8{ "title", "body" };
+    const encoded = try encodeQueryRequest(alloc, .{
+        .full_text = .{ .match = .{ .field = "body", .text = "hello" } },
+        .highlight = .{ .fields = &fields, .fragment_size = 80, .max_fragments = 2 },
+    });
+    defer alloc.free(encoded);
+
+    var parsed = try parseJsonTestBody(std.json.Value, alloc, encoded);
+    defer parsed.deinit();
+    const highlight = parsed.value.object.get("highlight").?.object;
+    try std.testing.expectEqual(@as(usize, 2), highlight.get("fields").?.array.items.len);
+    try std.testing.expectEqualStrings("body", highlight.get("fields").?.array.items[1].string);
+    try std.testing.expectEqual(@as(i64, 80), highlight.get("fragment_size").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), highlight.get("max_fragments").?.integer);
+
+    // The shard parses the forwarded option back into the same request shape.
+    var owned = try query_contract.parseQueryRequest(alloc, null, "docs", encoded);
+    defer owned.deinit(alloc);
+    const round_trip = owned.req.highlight orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 2), round_trip.fields.len);
+    try std.testing.expectEqualStrings("title", round_trip.fields[0]);
+    try std.testing.expectEqual(@as(u32, 80), round_trip.fragment_size);
+    try std.testing.expectEqual(@as(u32, 2), round_trip.max_fragments);
+
+    const without = try encodeQueryRequest(alloc, .{
+        .full_text = .{ .match = .{ .field = "body", .text = "hello" } },
+    });
+    defer alloc.free(without);
+    try std.testing.expect(std.mem.indexOf(u8, without, "highlight") == null);
 }
 
 test "encode query request round-trips all public phrase geo and ip queries" {

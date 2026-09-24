@@ -701,6 +701,7 @@ pub const MatchPhraseQuery = struct {
     }
 };
 
+/// Analyze the text with the field's analyzer and match any of the resulting terms. On a `substring` companion field (`fieldName._substring`) the text is lowercased and matched as a contained substring instead: `{"match": "g3we", "field": "sku._substring"}` finds `RAG3-WEAVER`.
 pub const MatchQuery = struct {
     match: []const u8,
     field: ?[]const u8 = null,
@@ -972,6 +973,7 @@ pub const PhraseQuery = struct {
     }
 };
 
+/// Match terms that start with the given bytes. On a `substring` companion field the prefix is lowercased and matched as a contained substring, exactly like `match` on that field.
 pub const PrefixQuery = struct {
     prefix: []const u8,
     field: ?[]const u8 = null,

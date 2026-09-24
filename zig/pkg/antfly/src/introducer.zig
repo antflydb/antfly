@@ -2212,13 +2212,27 @@ fn resolveTokenizerComponent(component: std.json.Value, component_type: []const 
     return error.InvalidArgument;
 }
 
+/// Token filters that need no configuration can be referenced directly by
+/// name from an analyzer's `token_filters` list, without declaring a named
+/// component first. Named components declared in `token_filters` shadow these.
+fn builtinTokenFilterByName(name: []const u8) ?analysis_mod.TokenFilter {
+    if (std.mem.eql(u8, name, "to_lower") or std.mem.eql(u8, name, "lowercase")) return .lowercase;
+    if (std.mem.eql(u8, name, "stop_en") or std.mem.eql(u8, name, "stop_words")) return .stop_words;
+    if (std.mem.eql(u8, name, "stemmer_en") or std.mem.eql(u8, name, "stemmer")) return .stemmer;
+    if (std.mem.eql(u8, name, "camel_case")) return .camel_case;
+    if (std.mem.eql(u8, name, "unique")) return .unique;
+    if (std.mem.eql(u8, name, "reverse")) return .reverse;
+    if (std.mem.eql(u8, name, "elision")) return .elision;
+    if (std.mem.eql(u8, name, "apostrophe")) return .apostrophe;
+    if (std.mem.eql(u8, name, "suffix")) return .{ .suffix = .{} };
+    return null;
+}
+
 fn resolveTokenFilterName(name: []const u8, named: []const NamedTokenFilter) !analysis_mod.TokenFilter {
-    if (std.mem.eql(u8, name, "to_lower")) return .lowercase;
-    if (std.mem.eql(u8, name, "stop_en")) return .stop_words;
-    if (std.mem.eql(u8, name, "stemmer_en")) return .stemmer;
     for (named) |item| {
         if (std.mem.eql(u8, item.name, name)) return item.filter;
     }
+    if (builtinTokenFilterByName(name)) |filter| return filter;
     return error.InvalidArgument;
 }
 
@@ -2237,7 +2251,57 @@ fn resolveTokenFilterComponent(component: std.json.Value, component_type: []cons
             .max = try configU8(config_val, "max", 3),
         } };
     }
+    if (std.mem.eql(u8, component_type, "shingle")) {
+        return .{ .shingle = .{
+            .min = try configU8(config_val, "min", 2),
+            .max = try configU8(config_val, "max", 2),
+            .separator = try configShingleSeparator(config_val),
+        } };
+    }
+    if (std.mem.eql(u8, component_type, "suffix")) {
+        return .{ .suffix = .{
+            .min = try configU8(config_val, "min", analysis_mod.substring_min_query_length),
+            .max = try configU8(config_val, "max", analysis_mod.substring_max_query_length),
+        } };
+    }
+    if (std.mem.eql(u8, component_type, "length")) {
+        return .{ .length = .{
+            .min = try configU8(config_val, "min", 0),
+            .max = try configU8(config_val, "max", 255),
+        } };
+    }
+    if (std.mem.eql(u8, component_type, "truncate")) {
+        return .{ .truncate = .{ .max_len = try configU8(config_val, "length", 255) } };
+    }
+    if (std.mem.eql(u8, component_type, "stop_words") or std.mem.eql(u8, component_type, "stop")) {
+        if (try configLanguage(config_val)) |lang| return .{ .stop_words_lang = lang };
+        return .stop_words;
+    }
+    if (std.mem.eql(u8, component_type, "stemmer")) {
+        if (try configLanguage(config_val)) |lang| return .{ .stemmer_lang = lang };
+        return .stemmer;
+    }
+    if (builtinTokenFilterByName(component_type)) |filter| return filter;
     return error.InvalidArgument;
+}
+
+fn configShingleSeparator(config_val: ?std.json.Value) !analysis_mod.TokenFilter.ShingleConfig.Separator {
+    const cfg = config_val orelse return .space;
+    if (cfg != .object) return .space;
+    const raw = cfg.object.get("separator") orelse return .space;
+    if (raw != .string) return error.InvalidArgument;
+    if (std.mem.eql(u8, raw.string, "none") or raw.string.len == 0) return .none;
+    if (std.mem.eql(u8, raw.string, "space") or std.mem.eql(u8, raw.string, " ")) return .space;
+    return error.InvalidArgument;
+}
+
+fn configLanguage(config_val: ?std.json.Value) !?analysis_mod.Language {
+    const cfg = config_val orelse return null;
+    if (cfg != .object) return null;
+    const raw = cfg.object.get("language") orelse cfg.object.get("lang") orelse return null;
+    if (raw != .string) return error.InvalidArgument;
+    if (std.mem.eql(u8, raw.string, "en")) return .english;
+    return std.meta.stringToEnum(analysis_mod.Language, raw.string) orelse error.InvalidArgument;
 }
 
 fn configU8(config_val: ?std.json.Value, field: []const u8, default_value: u8) !u8 {
@@ -2975,6 +3039,75 @@ test "buildSegmentFromText uses configured custom datetime parsers for typed doc
     var ts_reader = try typed_dv.TypedDocValuesReader.init(alloc, ts_section);
     try std.testing.expectEqual(typed_dv.ValueType.u64_val, ts_reader.value_type);
     try std.testing.expect((try ts_reader.getU64(0)) != null);
+}
+
+test "analysis config resolves built-in filter names and configured filter types" {
+    const alloc = std.testing.allocator;
+    const cfg_json =
+        \\{"analysis_config":{
+        \\  "field_analyzers":{"code":"code_analyzer","compound":"compound_analyzer"},
+        \\  "token_filters":{
+        \\    "pairs":{"type":"shingle","config":{"min":1,"max":2,"separator":"none"}},
+        \\    "tails":{"type":"suffix","config":{"min":3,"max":8}},
+        \\    "short":{"type":"length","config":{"min":2,"max":10}},
+        \\    "stems_de":{"type":"stemmer","config":{"language":"german"}}
+        \\  },
+        \\  "analyzers":{
+        \\    "code_analyzer":{"type":"custom","config":{"tokenizer":"whitespace","token_filters":["camel_case","unique","short"]}},
+        \\    "compound_analyzer":{"type":"custom","config":{"tokenizer":"unicode","token_filters":["lowercase","pairs","tails","stems_de"]}}
+        \\  }
+        \\}}
+    ;
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const cfg = try parseTextAnalysisConfig(arena_state.allocator(), cfg_json);
+    try std.testing.expectEqual(@as(usize, 2), cfg.analyzers.len);
+
+    const code = resolveFieldAnalyzer("code", cfg) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 3), code.filters.len);
+    try std.testing.expect(code.filters[0] == .camel_case);
+    try std.testing.expect(code.filters[1] == .unique);
+    try std.testing.expect(code.filters[2] == .length);
+    const code_tokens = try code.analyze(alloc, "parseHttpRequest parseHttpRequest");
+    defer analysis_mod.Analyzer.freeTokens(alloc, code_tokens);
+    try std.testing.expectEqual(@as(usize, 3), code_tokens.len);
+    try std.testing.expectEqualStrings("parse", code_tokens[0].term);
+    try std.testing.expectEqualStrings("http", code_tokens[1].term);
+    try std.testing.expectEqualStrings("request", code_tokens[2].term);
+
+    const compound = resolveFieldAnalyzer("compound", cfg) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 4), compound.filters.len);
+    try std.testing.expect(compound.filters[0] == .lowercase);
+    switch (compound.filters[1]) {
+        .shingle => |shingle| {
+            try std.testing.expectEqual(@as(u8, 1), shingle.min);
+            try std.testing.expectEqual(@as(u8, 2), shingle.max);
+            try std.testing.expect(shingle.separator == .none);
+        },
+        else => return error.TestExpectedEqual,
+    }
+    switch (compound.filters[2]) {
+        .suffix => |suffix| {
+            try std.testing.expectEqual(@as(u8, 3), suffix.min);
+            try std.testing.expectEqual(@as(u8, 8), suffix.max);
+        },
+        else => return error.TestExpectedEqual,
+    }
+    switch (compound.filters[3]) {
+        .stemmer_lang => |lang| try std.testing.expect(lang == .german),
+        else => return error.TestExpectedEqual,
+    }
+
+    // Unknown filter names and languages are rejected rather than ignored.
+    try std.testing.expectError(error.InvalidArgument, parseTextAnalysisConfig(
+        arena_state.allocator(),
+        "{\"analysis_config\":{\"analyzers\":{\"a\":{\"type\":\"custom\",\"config\":{\"tokenizer\":\"unicode\",\"token_filters\":[\"no_such_filter\"]}}}}}",
+    ));
+    try std.testing.expectError(error.InvalidArgument, parseTextAnalysisConfig(
+        arena_state.allocator(),
+        "{\"analysis_config\":{\"token_filters\":{\"x\":{\"type\":\"stemmer\",\"config\":{\"language\":\"klingon\"}}}}}",
+    ));
 }
 
 test "buildSegmentFromText uses configured custom field analyzer" {

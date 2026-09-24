@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from ..models.prefix_query import PrefixQuery
     from ..models.pruner import Pruner
     from ..models.query_hierarchy import QueryHierarchy
+    from ..models.query_highlight import QueryHighlight
     from ..models.query_request_aggregations import QueryRequestAggregations
     from ..models.query_request_embeddings import QueryRequestEmbeddings
     from ..models.query_request_foreign_sources import QueryRequestForeignSources
@@ -220,6 +221,13 @@ class RetrievalQueryRequest:
                 matches are returned. `ancestors` only controls projected context and never changes result
                 cardinality. Omit `hierarchy` entirely to retain the v0.2-compatible implicit
                 source-grouped result shape.
+            highlight (QueryHighlight | Unset): Ask for highlighted fragments of the stored fields matched by
+                `full_text_search`. Matches are located by re-analyzing the stored
+                value with the field's analyzer, so stemmed and stop-word-filtered
+                terms highlight the surface form. `prefix`, `wildcard`, `regexp`, and
+                `fuzzy` clauses mark whole tokens; `match` or `prefix` on a
+                `substring` companion (`field._substring`) marks the exact contained
+                bytes, including matches that span two adjacent tokens.
             limit (int | Unset): Maximum number of top-level results to return. For semantic_search, this is the topk
                 parameter.
                 This does not limit nested matches attached through hierarchy.group_by.matches;
@@ -482,6 +490,7 @@ class RetrievalQueryRequest:
     search_effort: float | Unset = 0.5
     fields: list[str] | Unset = UNSET
     hierarchy: QueryHierarchy | Unset = UNSET
+    highlight: QueryHighlight | Unset = UNSET
     limit: int | Unset = UNSET
     offset: int | Unset = UNSET
     timeout_ms: int | Unset = UNSET
@@ -734,6 +743,10 @@ class RetrievalQueryRequest:
         if not isinstance(self.hierarchy, Unset):
             hierarchy = self.hierarchy.to_dict()
 
+        highlight: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.highlight, Unset):
+            highlight = self.highlight.to_dict()
+
         limit = self.limit
 
         offset = self.offset
@@ -830,6 +843,8 @@ class RetrievalQueryRequest:
             field_dict["fields"] = fields
         if hierarchy is not UNSET:
             field_dict["hierarchy"] = hierarchy
+        if highlight is not UNSET:
+            field_dict["highlight"] = highlight
         if limit is not UNSET:
             field_dict["limit"] = limit
         if offset is not UNSET:
@@ -900,6 +915,7 @@ class RetrievalQueryRequest:
         from ..models.prefix_query import PrefixQuery
         from ..models.pruner import Pruner
         from ..models.query_hierarchy import QueryHierarchy
+        from ..models.query_highlight import QueryHighlight
         from ..models.query_request_aggregations import QueryRequestAggregations
         from ..models.query_request_embeddings import QueryRequestEmbeddings
         from ..models.query_request_foreign_sources import QueryRequestForeignSources
@@ -1681,6 +1697,13 @@ class RetrievalQueryRequest:
         else:
             hierarchy = QueryHierarchy.from_dict(_hierarchy)
 
+        _highlight = d.pop("highlight", UNSET)
+        highlight: QueryHighlight | Unset
+        if isinstance(_highlight, Unset):
+            highlight = UNSET
+        else:
+            highlight = QueryHighlight.from_dict(_highlight)
+
         limit = d.pop("limit", UNSET)
 
         offset = d.pop("offset", UNSET)
@@ -1782,6 +1805,7 @@ class RetrievalQueryRequest:
             search_effort=search_effort,
             fields=fields,
             hierarchy=hierarchy,
+            highlight=highlight,
             limit=limit,
             offset=offset,
             timeout_ms=timeout_ms,

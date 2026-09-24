@@ -5164,6 +5164,7 @@ pub const CreateFullTextIndexRequest = struct {
     field: ?[]const u8 = null,
     /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     artifact_name: ?[]const u8 = null,
+    analysis_config: ?TextAnalysisConfig = null,
     type: []const u8,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -5175,6 +5176,7 @@ pub const CreateFullTextIndexRequest = struct {
         .{ "mem_only", "mem_only", true },
         .{ "field", "field", true },
         .{ "artifact_name", "artifact_name", true },
+        .{ "analysis_config", "analysis_config", true },
         .{ "type", "type", false },
     };
 
@@ -5214,6 +5216,10 @@ pub const CreateFullTextIndexRequest = struct {
         }
         if (self.artifact_name) |value| {
             try jw.objectField("artifact_name");
+            try jw.write(value);
+        }
+        if (self.analysis_config) |value| {
+            try jw.objectField("analysis_config");
             try jw.write(value);
         }
         try jw.objectField("type");
@@ -6031,6 +6037,7 @@ pub const CreatedFullTextIndex = struct {
     sources: ?[]const FullTextArtifactIndexSource = null,
     mem_only: ?bool = null,
     field: ?[]const u8 = null,
+    analysis_config: ?TextAnalysisConfig = null,
     type: []const u8,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -6042,6 +6049,7 @@ pub const CreatedFullTextIndex = struct {
         .{ "sources", "sources", true },
         .{ "mem_only", "mem_only", true },
         .{ "field", "field", true },
+        .{ "analysis_config", "analysis_config", true },
         .{ "type", "type", false },
     };
 
@@ -6081,6 +6089,10 @@ pub const CreatedFullTextIndex = struct {
             try jw.objectField("field");
             try jw.write(value);
         }
+        if (self.analysis_config) |value| {
+            try jw.objectField("analysis_config");
+            try jw.write(value);
+        }
         try jw.objectField("type");
         try jw.write(self.type);
         try jw.endObject();
@@ -6092,12 +6104,14 @@ pub const CreatedFullTextIndexConfig = struct {
     sources: ?[]const FullTextArtifactIndexSource = null,
     mem_only: ?bool = null,
     field: ?[]const u8 = null,
+    analysis_config: ?TextAnalysisConfig = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "sources", "sources", true },
         .{ "mem_only", "mem_only", true },
         .{ "field", "field", true },
+        .{ "analysis_config", "analysis_config", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -6120,6 +6134,10 @@ pub const CreatedFullTextIndexConfig = struct {
         }
         if (self.field) |value| {
             try jw.objectField("field");
+            try jw.write(value);
+        }
+        if (self.analysis_config) |value| {
+            try jw.objectField("analysis_config");
             try jw.write(value);
         }
         try jw.endObject();
@@ -11663,6 +11681,7 @@ pub const FieldMappingType = enum {
     blob,
     link,
     search_as_you_type,
+    substring,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -11685,6 +11704,7 @@ pub const FieldMappingType = enum {
             .blob => "blob",
             .link => "link",
             .search_as_you_type => "search_as_you_type",
+            .substring => "substring",
         };
         try jw.write(s);
     }
@@ -11714,6 +11734,7 @@ pub const FieldMappingType = enum {
             .{ "blob", .blob },
             .{ "link", .link },
             .{ "search_as_you_type", .search_as_you_type },
+            .{ "substring", .substring },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -11941,6 +11962,7 @@ pub const FullTextIndexConfig = struct {
     field: ?[]const u8 = null,
     /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     artifact_name: ?[]const u8 = null,
+    analysis_config: ?TextAnalysisConfig = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -11948,6 +11970,7 @@ pub const FullTextIndexConfig = struct {
         .{ "mem_only", "mem_only", true },
         .{ "field", "field", true },
         .{ "artifact_name", "artifact_name", true },
+        .{ "analysis_config", "analysis_config", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -11974,6 +11997,10 @@ pub const FullTextIndexConfig = struct {
         }
         if (self.artifact_name) |value| {
             try jw.objectField("artifact_name");
+            try jw.write(value);
+        }
+        if (self.analysis_config) |value| {
+            try jw.objectField("analysis_config");
             try jw.write(value);
         }
         try jw.endObject();
@@ -12876,6 +12903,7 @@ pub const GlobalStatefulQueryRequest = struct {
     /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance. This field is required when hierarchy.group_by is present so a grouped query cannot accidentally hydrate an entire grouped document. Use an empty array for identity-only groups. This projection is also required for hierarchy.children traversal.
     fields: ?[]const []const u8 = null,
     hierarchy: ?QueryHierarchy = null,
+    highlight: ?QueryHighlight = null,
     /// Maximum number of top-level results to return. For semantic_search, this is the topk parameter. This does not limit nested matches attached through hierarchy.group_by.matches; use hierarchy.group_by.matches.limit for that. Default varies by query type (typically 10). Queries using hierarchy.group_by.matches are limited to 100 top-level groups and a groups-times-matches execution budget of 1,000.
     limit: ?i64 = null,
     /// Number of results to skip for pagination. Supported for text-backed, match_all, and filter-only requests. Approximate semantic requests do not support offset on their own. Semantic and hybrid requests support it when a reranker is configured: Antfly retrieves a bounded candidate window and applies offset after coordinator-owned reranking.
@@ -12933,6 +12961,7 @@ pub const GlobalStatefulQueryRequest = struct {
         .{ "search_effort", "search_effort", true },
         .{ "fields", "fields", true },
         .{ "hierarchy", "hierarchy", true },
+        .{ "highlight", "highlight", true },
         .{ "limit", "limit", true },
         .{ "offset", "offset", true },
         .{ "timeout_ms", "timeout_ms", true },
@@ -13021,6 +13050,10 @@ pub const GlobalStatefulQueryRequest = struct {
         }
         if (self.hierarchy) |value| {
             try jw.objectField("hierarchy");
+            try jw.write(value);
+        }
+        if (self.highlight) |value| {
+            try jw.objectField("highlight");
             try jw.write(value);
         }
         if (self.limit) |value| {
@@ -16788,6 +16821,53 @@ pub const HierarchyProjection = struct {
     fields: []const []const u8,
 };
 
+pub const HighlightFragment = struct {
+    /// The fragment of the stored field value.
+    text: []const u8,
+    /// Byte offset of the fragment within the field value.
+    offset: i64,
+    /// Array index of the value when the field is an array of strings.
+    item: ?i64 = null,
+    spans: []const HighlightSpan,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "text", "text", false },
+        .{ "offset", "offset", false },
+        .{ "item", "item", true },
+        .{ "spans", "spans", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("text");
+        try jw.write(self.text);
+        try jw.objectField("offset");
+        try jw.write(self.offset);
+        if (self.item) |value| {
+            try jw.objectField("item");
+            try jw.write(value);
+        }
+        try jw.objectField("spans");
+        try jw.write(self.spans);
+        try jw.endObject();
+    }
+};
+
+/// Half-open byte range within the fragment text.
+pub const HighlightSpan = struct {
+    start: i64,
+    end: i64,
+};
+
 pub const IPRangeQuery = struct {
     cidr: []const u8,
     field: ?[]const u8 = null,
@@ -16868,6 +16948,7 @@ pub const IndexConfig = struct {
     field: ?[]const u8 = null,
     /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     artifact_name: ?[]const u8 = null,
+    analysis_config: ?TextAnalysisConfig = null,
     publication_policy: ?IndexPublicationPolicy = null,
     /// Source-unit completeness policy for managed embeddings. `strict` requires one produced outcome per source document; `partial` permits intentional skips; `best_effort` also treats terminal failures as complete while reporting the index unhealthy. External indexes use `external: true` and must not set this field.
     coverage_policy: ?DerivedCoveragePolicy = null,
@@ -16922,6 +17003,7 @@ pub const IndexConfig = struct {
         .{ "mem_only", "mem_only", true },
         .{ "field", "field", true },
         .{ "artifact_name", "artifact_name", true },
+        .{ "analysis_config", "analysis_config", true },
         .{ "publication_policy", "publication_policy", true },
         .{ "coverage_policy", "coverage_policy", true },
         .{ "external", "external", true },
@@ -16987,6 +17069,10 @@ pub const IndexConfig = struct {
         }
         if (self.artifact_name) |value| {
             try jw.objectField("artifact_name");
+            try jw.write(value);
+        }
+        if (self.analysis_config) |value| {
+            try jw.objectField("analysis_config");
             try jw.write(value);
         }
         if (self.publication_policy) |value| {
@@ -23005,6 +23091,7 @@ pub const MatchPhraseQuery = struct {
     }
 };
 
+/// Analyze the text with the field's analyzer and match any of the resulting terms. On a `substring` companion field (`fieldName._substring`) the text is lowercased and matched as a contained substring instead: `{"match": "g3we", "field": "sku._substring"}` finds `RAG3-WEAVER`.
 pub const MatchQuery = struct {
     match: []const u8,
     field: ?[]const u8 = null,
@@ -24453,6 +24540,7 @@ pub const PhraseQuery = struct {
     }
 };
 
+/// Match terms that start with the given bytes. On a `substring` companion field the prefix is lowercased and matched as a contained substring, exactly like `match` on that field.
 pub const PrefixQuery = struct {
     prefix: []const u8,
     field: ?[]const u8 = null,
@@ -25220,6 +25308,48 @@ pub const QueryHierarchy = struct {
     }
 };
 
+/// Ask for highlighted fragments of the stored fields matched by `full_text_search`. Matches are located by re-analyzing the stored value with the field's analyzer, so stemmed and stop-word-filtered terms highlight the surface form. `prefix`, `wildcard`, `regexp`, and `fuzzy` clauses mark whole tokens; `match` or `prefix` on a `substring` companion (`field._substring`) marks the exact contained bytes, including matches that span two adjacent tokens.
+pub const QueryHighlight = struct {
+    /// Source fields to highlight. Defaults to every field the full-text query references (companion suffixes such as `._substring` and `.keyword` resolve to their root field).
+    fields: ?[]const []const u8 = null,
+    /// Fragment window size in bytes.
+    fragment_size: ?i64 = null,
+    /// Maximum fragments returned per field.
+    max_fragments: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "fields", "fields", true },
+        .{ "fragment_size", "fragment_size", true },
+        .{ "max_fragments", "max_fragments", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.fields) |value| {
+            try jw.objectField("fields");
+            try jw.write(value);
+        }
+        if (self.fragment_size) |value| {
+            try jw.objectField("fragment_size");
+            try jw.write(value);
+        }
+        if (self.max_fragments) |value| {
+            try jw.objectField("max_fragments");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// A single query result hit
 pub const QueryHit = struct {
     /// ID of the record.
@@ -25235,6 +25365,8 @@ pub const QueryHit = struct {
     hierarchy: ?QueryHitHierarchy = null,
     /// Sort key values for this hit. Pass as search_after or search_before to paginate to the next/previous page. Values preserve their JSON types. Present for ordered result pages, including cursor-only requests whose effective order is `_id` ascending.
     _sort: ?[]const std.json.Value = null,
+    /// Highlighted fragments keyed by source field, present when the request set `highlight` and the hit carried the field. Each fragment is a window of the stored field value with byte-offset spans marking the text the full-text query matched.
+    _highlights: ?std.json.ArrayHashMap([]const HighlightFragment) = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -25245,6 +25377,7 @@ pub const QueryHit = struct {
         .{ "_source", "_source", true },
         .{ "hierarchy", "hierarchy", true },
         .{ "_sort", "_sort", true },
+        .{ "_highlights", "_highlights", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -25279,6 +25412,10 @@ pub const QueryHit = struct {
         }
         if (self._sort) |value| {
             try jw.objectField("_sort");
+            try jw.write(value);
+        }
+        if (self._highlights) |value| {
+            try jw.objectField("_highlights");
             try jw.write(value);
         }
         try jw.endObject();
@@ -25581,6 +25718,7 @@ pub const QueryRequest = struct {
     /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance. This field is required when hierarchy.group_by is present so a grouped query cannot accidentally hydrate an entire grouped document. Use an empty array for identity-only groups. This projection is also required for hierarchy.children traversal.
     fields: ?[]const []const u8 = null,
     hierarchy: ?QueryHierarchy = null,
+    highlight: ?QueryHighlight = null,
     /// Maximum number of top-level results to return. For semantic_search, this is the topk parameter. This does not limit nested matches attached through hierarchy.group_by.matches; use hierarchy.group_by.matches.limit for that. Default varies by query type (typically 10). Queries using hierarchy.group_by.matches are limited to 100 top-level groups and a groups-times-matches execution budget of 1,000.
     limit: ?i64 = null,
     /// Number of results to skip for pagination. Supported for text-backed, match_all, and filter-only requests. Approximate semantic requests do not support offset on their own. Semantic and hybrid requests support it when a reranker is configured: Antfly retrieves a bounded candidate window and applies offset after coordinator-owned reranking.
@@ -25634,6 +25772,7 @@ pub const QueryRequest = struct {
         .{ "search_effort", "search_effort", true },
         .{ "fields", "fields", true },
         .{ "hierarchy", "hierarchy", true },
+        .{ "highlight", "highlight", true },
         .{ "limit", "limit", true },
         .{ "offset", "offset", true },
         .{ "timeout_ms", "timeout_ms", true },
@@ -25722,6 +25861,10 @@ pub const QueryRequest = struct {
         }
         if (self.hierarchy) |value| {
             try jw.objectField("hierarchy");
+            try jw.write(value);
+        }
+        if (self.highlight) |value| {
+            try jw.objectField("highlight");
             try jw.write(value);
         }
         if (self.limit) |value| {
@@ -27774,6 +27917,7 @@ pub const RetrievalQueryRequest = struct {
     /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance. This field is required when hierarchy.group_by is present so a grouped query cannot accidentally hydrate an entire grouped document. Use an empty array for identity-only groups. This projection is also required for hierarchy.children traversal.
     fields: ?[]const []const u8 = null,
     hierarchy: ?QueryHierarchy = null,
+    highlight: ?QueryHighlight = null,
     /// Maximum number of top-level results to return. For semantic_search, this is the topk parameter. This does not limit nested matches attached through hierarchy.group_by.matches; use hierarchy.group_by.matches.limit for that. Default varies by query type (typically 10). Queries using hierarchy.group_by.matches are limited to 100 top-level groups and a groups-times-matches execution budget of 1,000.
     limit: ?i64 = null,
     /// Number of results to skip for pagination. Supported for text-backed, match_all, and filter-only requests. Approximate semantic requests do not support offset on their own. Semantic and hybrid requests support it when a reranker is configured: Antfly retrieves a bounded candidate window and applies offset after coordinator-owned reranking.
@@ -27829,6 +27973,7 @@ pub const RetrievalQueryRequest = struct {
         .{ "search_effort", "search_effort", true },
         .{ "fields", "fields", true },
         .{ "hierarchy", "hierarchy", true },
+        .{ "highlight", "highlight", true },
         .{ "limit", "limit", true },
         .{ "offset", "offset", true },
         .{ "timeout_ms", "timeout_ms", true },
@@ -27918,6 +28063,10 @@ pub const RetrievalQueryRequest = struct {
         }
         if (self.hierarchy) |value| {
             try jw.objectField("hierarchy");
+            try jw.write(value);
+        }
+        if (self.highlight) |value| {
+            try jw.objectField("highlight");
             try jw.write(value);
         }
         if (self.limit) |value| {
@@ -29274,6 +29423,7 @@ pub const StatefulQueryRequest = struct {
     /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance. This field is required when hierarchy.group_by is present so a grouped query cannot accidentally hydrate an entire grouped document. Use an empty array for identity-only groups. This projection is also required for hierarchy.children traversal.
     fields: ?[]const []const u8 = null,
     hierarchy: ?QueryHierarchy = null,
+    highlight: ?QueryHighlight = null,
     /// Maximum number of top-level results to return. For semantic_search, this is the topk parameter. This does not limit nested matches attached through hierarchy.group_by.matches; use hierarchy.group_by.matches.limit for that. Default varies by query type (typically 10). Queries using hierarchy.group_by.matches are limited to 100 top-level groups and a groups-times-matches execution budget of 1,000.
     limit: ?i64 = null,
     /// Number of results to skip for pagination. Supported for text-backed, match_all, and filter-only requests. Approximate semantic requests do not support offset on their own. Semantic and hybrid requests support it when a reranker is configured: Antfly retrieves a bounded candidate window and applies offset after coordinator-owned reranking.
@@ -29331,6 +29481,7 @@ pub const StatefulQueryRequest = struct {
         .{ "search_effort", "search_effort", true },
         .{ "fields", "fields", true },
         .{ "hierarchy", "hierarchy", true },
+        .{ "highlight", "highlight", true },
         .{ "limit", "limit", true },
         .{ "offset", "offset", true },
         .{ "timeout_ms", "timeout_ms", true },
@@ -29421,6 +29572,10 @@ pub const StatefulQueryRequest = struct {
         }
         if (self.hierarchy) |value| {
             try jw.objectField("hierarchy");
+            try jw.write(value);
+        }
+        if (self.highlight) |value| {
+            try jw.objectField("highlight");
             try jw.write(value);
         }
         if (self.limit) |value| {
@@ -31138,6 +31293,114 @@ pub const TermRangeQuery = struct {
                 try jw.objectField("boost");
                 try jw.write(value);
             },
+        }
+        try jw.endObject();
+    }
+};
+
+/// One named analysis component: its type and type-specific configuration.
+pub const TextAnalysisComponent = struct {
+    type: []const u8,
+    config: ?std.json.ArrayHashMap(std.json.Value) = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "config", "config", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.config) |value| {
+            try jw.objectField("config");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Custom text analysis for a full-text index. Component maps are keyed by the name that analyzers and `field_analyzers` reference. Built-in analyzers (`standard`, `simple`, `keyword`, `html`, `search_as_you_type`, `substring`, and the language analyzers such as `german`) are always available without declaring them. Example: split camelCase identifiers and match them as substrings. ```json { "analysis_config": { "field_analyzers": {"symbol": "code"}, "token_filters": { "tails": {"type": "suffix", "config": {"min": 3, "max": 24}} }, "analyzers": { "code": { "type": "custom", "config": { "tokenizer": "whitespace", "token_filters": ["camel_case", "unique", "tails"] } } } } } ```
+pub const TextAnalysisConfig = struct {
+    /// Map of indexed field name to analyzer name. Overrides the analyzer derived from the table schema for that field.
+    field_analyzers: ?std.json.ArrayHashMap([]const u8) = null,
+    /// Named character filters. Types: `html_strip` (alias `html`), `ascii_fold`, `zero_width_non_joiner`.
+    char_filters: ?std.json.ArrayHashMap(TextAnalysisComponent) = null,
+    /// Named tokenizers. Types: `unicode` (alias `unicode_words`), `whitespace`, `keyword`, `character`, `ngram` (`config.min`, `config.max`), `edge_ngram` (`config.min`, `config.max`, `config.side` of `front` or `back`).
+    tokenizers: ?std.json.ArrayHashMap(TextAnalysisComponent) = null,
+    /// Named token filters. Types: `lowercase` (alias `to_lower`), `stop_words` (alias `stop`; optional `config.language`), `stemmer` (optional `config.language`), `ngram` and `edge_ngram` (`config.min`, `config.max`), `shingle` (`config.min`, `config.max`, `config.separator` of `space` or `none`), `suffix` (`config.min`, `config.max`; emits every suffix of each token so prefix queries answer containment), `length` (`config.min`, `config.max`), `truncate` (`config.length`), `camel_case`, `unique`, `reverse`, `elision`, `apostrophe`. Languages: english, german, french, spanish, italian, portuguese, dutch, swedish, norwegian, danish, finnish.
+    token_filters: ?std.json.ArrayHashMap(TextAnalysisComponent) = null,
+    /// Named analyzers of type `custom`. `config.tokenizer` names a built-in or declared tokenizer; `config.char_filters` and `config.token_filters` list built-in or declared component names in application order. Configuration-free filters (`lowercase`, `stop_words`, `stemmer`, `camel_case`, `unique`, `reverse`, `elision`, `apostrophe`, `suffix`) can be listed by name without declaring them.
+    analyzers: ?std.json.ArrayHashMap(TextAnalysisComponent) = null,
+    /// Name of the date-time parser applied to datetime fields without a field-specific parser.
+    default_datetime_parser: ?[]const u8 = null,
+    /// Map of field name to date-time parser name.
+    field_date_time_parsers: ?std.json.ArrayHashMap([]const u8) = null,
+    /// Named date-time parsers. Type `sanitizedgo` accepts `config.layouts`, a list of Go reference-time layouts tried in order.
+    date_time_parsers: ?std.json.ArrayHashMap(TextAnalysisComponent) = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "field_analyzers", "field_analyzers", true },
+        .{ "char_filters", "char_filters", true },
+        .{ "tokenizers", "tokenizers", true },
+        .{ "token_filters", "token_filters", true },
+        .{ "analyzers", "analyzers", true },
+        .{ "default_datetime_parser", "default_datetime_parser", true },
+        .{ "field_date_time_parsers", "field_date_time_parsers", true },
+        .{ "date_time_parsers", "date_time_parsers", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.field_analyzers) |value| {
+            try jw.objectField("field_analyzers");
+            try jw.write(value);
+        }
+        if (self.char_filters) |value| {
+            try jw.objectField("char_filters");
+            try jw.write(value);
+        }
+        if (self.tokenizers) |value| {
+            try jw.objectField("tokenizers");
+            try jw.write(value);
+        }
+        if (self.token_filters) |value| {
+            try jw.objectField("token_filters");
+            try jw.write(value);
+        }
+        if (self.analyzers) |value| {
+            try jw.objectField("analyzers");
+            try jw.write(value);
+        }
+        if (self.default_datetime_parser) |value| {
+            try jw.objectField("default_datetime_parser");
+            try jw.write(value);
+        }
+        if (self.field_date_time_parsers) |value| {
+            try jw.objectField("field_date_time_parsers");
+            try jw.write(value);
+        }
+        if (self.date_time_parsers) |value| {
+            try jw.objectField("date_time_parsers");
+            try jw.write(value);
         }
         try jw.endObject();
     }

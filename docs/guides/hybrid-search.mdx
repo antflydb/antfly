@@ -171,6 +171,40 @@ antfly query --table wikipedia \
 
 `min_score_ratio` and `max_score_gap_percent` together are the usual pair: one sets a floor relative to the best result, the other stops at the elbow where relevance falls off. Pair pruning with RSF; RRF's compressed scores give the gap detector nothing to see.
 
+### 5. Show Why a Hit Matched
+
+Add `highlight` to any query that carries `full_text_search` and every hit that
+returns stored source also carries `_highlights`: a map from field name to
+fragments of the stored value, each with byte-offset spans marking the text the
+query matched.
+
+```json
+{
+  "full_text_search": {"match": "g3we", "field": "sku._substring"},
+  "highlight": {"fields": ["sku", "title"], "fragment_size": 120, "max_fragments": 2},
+  "limit": 10
+}
+```
+
+```json
+{
+  "_id": "sku:41",
+  "_score": 3.1,
+  "_source": {"sku": "RAG3-WEAVER", "title": "Rag3 Weaver kit"},
+  "_highlights": {
+    "sku": [{"text": "RAG3-WEAVER", "offset": 0, "spans": [{"start": 2, "end": 7}]}]
+  }
+}
+```
+
+Spans are located by re-analyzing the stored value with the field's analyzer, so
+a query for `handbooks` highlights `Handbook`. Companion fields resolve to their
+root, so a `sku._substring` query highlights `sku`, and substring matches mark
+the exact contained bytes even when they cross a separator. Omit `fields` to
+highlight every field the query references. Highlights are computed on the
+node that owns the documents, so they add no coordinator round trips; the cost
+is one re-analysis of each highlighted field per returned hit.
+
 ## Tradeoffs
 
 Which stages to turn on depends on how your users ask.

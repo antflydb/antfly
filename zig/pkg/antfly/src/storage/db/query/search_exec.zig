@@ -9512,15 +9512,19 @@ fn patternFilterValueToSearchQuery(
                 null
         else
             null;
+        const analyzer = try resolveQueryAnalyzer(
+            field_value.field,
+            analyzer_name,
+            text_analysis,
+            runtime_schema,
+        );
+        if (analyzer == &analysis_mod.substring_analyzer) {
+            return try substringQueryToSearchQuery(alloc, field_value.field, field_value.value, 1.0);
+        }
         return .{ .match = .{
             .field = field_value.field,
             .text = field_value.value,
-            .analyzer = try resolveQueryAnalyzer(
-                field_value.field,
-                analyzer_name,
-                text_analysis,
-                runtime_schema,
-            ),
+            .analyzer = analyzer,
         } };
     }
     if (value.object.get("prefix")) |prefix| {
@@ -18025,12 +18029,18 @@ pub fn textQueryToSearchQuery(
             .polygons = try geoPointPolygonsToSearchPolygons(alloc, geo_shape.polygons),
             .boost = geo_shape.boost,
         } },
-        .match => |match| .{ .match = .{
-            .field = match.field,
-            .text = match.text,
-            .analyzer = try resolveQueryAnalyzer(match.field, match.analyzer, text_analysis, runtime_schema),
-            .boost = match.boost,
-        } },
+        .match => |match| blk: {
+            const analyzer = try resolveQueryAnalyzer(match.field, match.analyzer, text_analysis, runtime_schema);
+            if (analyzer == &analysis_mod.substring_analyzer) {
+                break :blk try substringQueryToSearchQuery(alloc, match.field, match.text, match.boost);
+            }
+            break :blk .{ .match = .{
+                .field = match.field,
+                .text = match.text,
+                .analyzer = analyzer,
+                .boost = match.boost,
+            } };
+        },
         .multi_match_bool_prefix => |multi_match| try multiMatchBoolPrefixToSearchQuery(alloc, multi_match, text_analysis, runtime_schema),
         .match_phrase => |phrase| .{ .phrase = .{
             .field = phrase.field,
@@ -18040,11 +18050,16 @@ pub fn textQueryToSearchQuery(
             .auto_fuzzy = phrase.auto_fuzzy,
             .boost = phrase.boost,
         } },
-        .prefix => |prefix| .{ .prefix = .{
-            .field = prefix.field,
-            .prefix = prefix.prefix,
-            .boost = prefix.boost,
-        } },
+        .prefix => |prefix| blk: {
+            if (fieldUsesSubstringAnalyzer(prefix.field, text_analysis, runtime_schema)) {
+                break :blk try substringQueryToSearchQuery(alloc, prefix.field, prefix.prefix, prefix.boost);
+            }
+            break :blk .{ .prefix = .{
+                .field = prefix.field,
+                .prefix = prefix.prefix,
+                .boost = prefix.boost,
+            } };
+        },
         .wildcard => |wildcard| .{ .wildcard = .{
             .field = wildcard.field,
             .pattern = wildcard.pattern,
@@ -18306,6 +18321,382 @@ fn isSearchAsYouTypeGeneratedField(field: []const u8) bool {
         std.mem.endsWith(u8, field, "._index_prefix");
 }
 
+const highlight_mod = @import("../../../search/highlight.zig");
+const highlight_regex_mod = @import("../../../search/regex.zig");
+
+const HighlightMatcherEntry = struct {
+    field: []const u8,
+    matcher: highlight_mod.Matcher,
+};
+
+const highlight_companion_suffixes = [_][]const u8{
+    "._substring",
+    "._2gram",
+    "._3gram",
+    "._index_prefix",
+    "._root_prefix",
+    ".keyword",
+};
+
+/// Map an indexed field name back to the stored source field it was derived
+/// from, so highlights land on the text the client actually sees.
+fn highlightRootField(field: []const u8) []const u8 {
+    for (highlight_companion_suffixes) |suffix| {
+        if (field.len > suffix.len and std.mem.endsWith(u8, field, suffix)) return field[0 .. field.len - suffix.len];
+    }
+    return field;
+}
+
+fn highlightFieldIsSurfaceMatched(field: []const u8) bool {
+    return std.mem.endsWith(u8, field, "._substring") or std.mem.endsWith(u8, field, ".keyword");
+}
+
+fn highlightAutoFuzziness(term: []const u8) u8 {
+    if (term.len <= 2) return 0;
+    if (term.len <= 5) return 1;
+    return 2;
+}
+
+/// Collect one highlight matcher per positive text clause of a lowered
+/// query. Negative clauses (`must_not`) never highlight.
+fn collectHighlightMatchers(
+    arena: Allocator,
+    query: anytype,
+    out: *std.ArrayListUnmanaged(HighlightMatcherEntry),
+) anyerror!void {
+    if (comptime @hasField(@TypeOf(query), "hybrid")) {
+        if (query == .hybrid) return collectHighlightMatchers(arena, query.hybrid.text_query, out);
+    }
+    switch (query) {
+        .match => |match| {
+            const analyzer = match.analyzer orelse &analysis_mod.default_analyzer;
+            const tokens = try analyzer.analyze(arena, match.text);
+            for (tokens) |token| try out.append(arena, .{ .field = highlightRootField(match.field), .matcher = .{ .term = token.term } });
+        },
+        .phrase => |phrase| {
+            const analyzer = phrase.analyzer orelse &analysis_mod.default_analyzer;
+            const tokens = try analyzer.analyze(arena, phrase.text);
+            for (tokens) |token| try out.append(arena, .{ .field = highlightRootField(phrase.field), .matcher = .{ .term = token.term } });
+        },
+        .term => |term| try out.append(arena, .{
+            .field = highlightRootField(term.field),
+            .matcher = if (highlightFieldIsSurfaceMatched(term.field)) .{ .contains = term.term } else .{ .term = term.term },
+        }),
+        .term_phrase => |phrase| for (phrase.terms) |term| {
+            try out.append(arena, .{ .field = highlightRootField(phrase.field), .matcher = .{ .term = term } });
+        },
+        .multi_phrase => |phrase| for (phrase.terms) |alternatives| for (alternatives) |term| {
+            try out.append(arena, .{ .field = highlightRootField(phrase.field), .matcher = .{ .term = term } });
+        },
+        .fuzzy => |fuzzy| try out.append(arena, .{
+            .field = highlightRootField(fuzzy.field),
+            .matcher = .{ .fuzzy = .{
+                .term = fuzzy.term,
+                .max_edits = if (fuzzy.auto_fuzzy) highlightAutoFuzziness(fuzzy.term) else fuzzy.max_edits,
+            } },
+        }),
+        .prefix => |prefix| try out.append(arena, .{
+            .field = highlightRootField(prefix.field),
+            .matcher = if (highlightFieldIsSurfaceMatched(prefix.field)) .{ .contains = prefix.prefix } else .{ .prefix = prefix.prefix },
+        }),
+        .wildcard => |wildcard| try out.append(arena, .{ .field = highlightRootField(wildcard.field), .matcher = .{ .wildcard = wildcard.pattern } }),
+        .regexp => |regexp| {
+            const compiled = try arena.create(highlight_regex_mod.RegexAutomaton);
+            compiled.* = highlight_regex_mod.compile(arena, regexp.pattern) catch return;
+            try out.append(arena, .{
+                .field = highlightRootField(regexp.field),
+                .matcher = .{ .regexp = .{ .pattern = regexp.pattern, .compiled = compiled } },
+            });
+        },
+        .bool_query => |bool_query| {
+            for (bool_query.must) |child| try collectHighlightMatchers(arena, child, out);
+            for (bool_query.should) |child| try collectHighlightMatchers(arena, child, out);
+        },
+        else => {},
+    }
+}
+
+fn jsonValueAtDottedPath(root: std.json.Value, path: []const u8) ?std.json.Value {
+    var current = root;
+    var remaining = path;
+    while (remaining.len > 0) {
+        if (current != .object) return null;
+        if (current.object.get(remaining)) |direct| return direct;
+        const dot = std.mem.indexOfScalar(u8, remaining, '.') orelse return null;
+        current = current.object.get(remaining[0..dot]) orelse return null;
+        remaining = remaining[dot + 1 ..];
+    }
+    return current;
+}
+
+fn appendHighlightFragments(
+    alloc: Allocator,
+    fragments: *std.ArrayListUnmanaged(types.HighlightFragment),
+    text: []const u8,
+    item: ?u32,
+    matchers: []const highlight_mod.Matcher,
+    analyzer: *const analysis_mod.Analyzer,
+    max_fragments: u32,
+    fragment_size: u32,
+) !void {
+    const found = try highlight_mod.highlightMatchers(alloc, text, matchers, analyzer, max_fragments, fragment_size);
+    defer highlight_mod.freeFragments(alloc, found);
+    for (found) |fragment| {
+        const owned_text = try alloc.dupe(u8, fragment.text);
+        errdefer alloc.free(owned_text);
+        const spans = try alloc.alloc(types.HighlightSpan, fragment.highlights.len);
+        errdefer alloc.free(spans);
+        for (fragment.highlights, spans) |span, *dst| dst.* = .{ .start = span.start, .end = span.end };
+        try fragments.append(alloc, .{
+            .text = owned_text,
+            .offset = fragment.offset,
+            .item = item,
+            .spans = spans,
+        });
+    }
+}
+
+/// Attach `_highlights` to every hit that carries stored source. Matchers are
+/// derived from the same lowering the query executed with, so stemmed,
+/// stop-word-filtered, and substring-companion clauses all highlight the
+/// surface text the client sees. Fields default to every root field the
+/// query references.
+pub fn attachHighlights(
+    alloc: Allocator,
+    options: types.HighlightRequest,
+    text_query: types.TextQuery,
+    hits: []types.SearchHit,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+    runtime_schema: ?runtime_schema_mod.TableSchema,
+) !void {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const lowered = try textQueryToSearchQuery(arena, text_query, text_analysis, runtime_schema);
+    var entries = std.ArrayListUnmanaged(HighlightMatcherEntry).empty;
+    try collectHighlightMatchers(arena, lowered, &entries);
+    if (entries.items.len == 0) return;
+
+    var fields = std.ArrayListUnmanaged([]const u8).empty;
+    if (options.fields.len > 0) {
+        for (options.fields) |field| try fields.append(arena, field);
+    } else {
+        for (entries.items) |entry| {
+            var seen = false;
+            for (fields.items) |existing| {
+                if (std.mem.eql(u8, existing, entry.field)) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) try fields.append(arena, entry.field);
+        }
+    }
+    const fragment_size = @max(options.fragment_size, 1);
+    const max_fragments = @max(options.max_fragments, 1);
+
+    for (hits) |*hit| {
+        if (hit.highlights.len > 0) continue;
+        const stored = hit.stored_data orelse continue;
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, stored, .{}) catch continue;
+
+        var highlighted = std.ArrayListUnmanaged(types.HighlightedField).empty;
+        errdefer {
+            for (highlighted.items) |*item| types.freeHighlightedField(alloc, item);
+            highlighted.deinit(alloc);
+        }
+        for (fields.items) |field| {
+            const value = jsonValueAtDottedPath(parsed, field) orelse continue;
+            var matchers = std.ArrayListUnmanaged(highlight_mod.Matcher).empty;
+            for (entries.items) |entry| {
+                if (std.mem.eql(u8, entry.field, field)) try matchers.append(arena, entry.matcher);
+            }
+            if (matchers.items.len == 0) continue;
+            const analyzer = (resolveQueryAnalyzer(field, null, text_analysis, runtime_schema) catch null) orelse &analysis_mod.default_analyzer;
+
+            var fragments = std.ArrayListUnmanaged(types.HighlightFragment).empty;
+            errdefer {
+                for (fragments.items) |*fragment| types.freeHighlightFragment(alloc, fragment);
+                fragments.deinit(alloc);
+            }
+            switch (value) {
+                .string => |text| try appendHighlightFragments(alloc, &fragments, text, null, matchers.items, analyzer, max_fragments, fragment_size),
+                .array => |items| for (items.items, 0..) |item, index| {
+                    if (item != .string) continue;
+                    try appendHighlightFragments(alloc, &fragments, item.string, @intCast(index), matchers.items, analyzer, max_fragments, fragment_size);
+                },
+                else => {},
+            }
+            if (fragments.items.len == 0) continue;
+            const owned_field = try alloc.dupe(u8, field);
+            errdefer alloc.free(owned_field);
+            try highlighted.append(alloc, .{ .field = owned_field, .fragments = try fragments.toOwnedSlice(alloc) });
+        }
+        if (highlighted.items.len == 0) {
+            highlighted.deinit(alloc);
+            continue;
+        }
+        hit.highlights = try highlighted.toOwnedSlice(alloc);
+    }
+}
+
+test "attachHighlights marks analyzed, prefix, and substring matches on stored source" {
+    const alloc = std.testing.allocator;
+    const text_analysis: introducer_mod.TextAnalysisConfig = .{
+        .field_analyzers = &.{
+            .{ .field_name = "title", .analyzer_name = "standard" },
+            .{ .field_name = "sku", .analyzer_name = "standard" },
+            .{ .field_name = "sku._substring", .analyzer_name = "substring" },
+            .{ .field_name = "tags", .analyzer_name = "simple" },
+        },
+    };
+
+    var hits = [_]types.SearchHit{
+        .{ .id = try alloc.dupe(u8, "doc:1"), .stored_data = try alloc.dupe(u8,
+            \\{"title":"The Runners Handbook","sku":"Rag3-Weaver kit","tags":["alpha wing","beta","zulu wing"],"n":3}
+        ) },
+        .{ .id = try alloc.dupe(u8, "doc:2"), .stored_data = null },
+    };
+    defer for (&hits) |*hit| hit.deinit(alloc);
+
+    const must = [_]types.TextQuery{
+        .{ .match = .{ .field = "title", .text = "handbooks" } },
+        .{ .match = .{ .field = "sku._substring", .text = "g3 we" } },
+        .{ .prefix = .{ .field = "tags", .prefix = "zu" } },
+    };
+    const query: types.TextQuery = .{ .bool_query = .{ .must = &must } };
+
+    try attachHighlights(alloc, .{ .fragment_size = 64, .max_fragments = 2 }, query, &hits, text_analysis, null);
+
+    try std.testing.expectEqual(@as(usize, 0), hits[1].highlights.len);
+    try std.testing.expectEqual(@as(usize, 3), hits[0].highlights.len);
+
+    var saw_title = false;
+    var saw_sku = false;
+    var saw_tags = false;
+    for (hits[0].highlights) |field| {
+        if (std.mem.eql(u8, field.field, "title")) {
+            saw_title = true;
+            try std.testing.expectEqual(@as(usize, 1), field.fragments.len);
+            const fragment = field.fragments[0];
+            try std.testing.expectEqual(@as(usize, 1), fragment.spans.len);
+            // The stemmed query term ("handbook") highlights the surface form.
+            try std.testing.expectEqualStrings("Handbook", fragment.text[fragment.spans[0].start..fragment.spans[0].end]);
+        } else if (std.mem.eql(u8, field.field, "sku")) {
+            saw_sku = true;
+            const fragment = field.fragments[0];
+            try std.testing.expectEqual(@as(usize, 1), fragment.spans.len);
+            try std.testing.expectEqualStrings("g3-We", fragment.text[fragment.spans[0].start..fragment.spans[0].end]);
+        } else if (std.mem.eql(u8, field.field, "tags")) {
+            saw_tags = true;
+            try std.testing.expectEqual(@as(usize, 1), field.fragments.len);
+            try std.testing.expectEqual(@as(?u32, 2), field.fragments[0].item);
+            const fragment = field.fragments[0];
+            try std.testing.expectEqualStrings("zulu", fragment.text[fragment.spans[0].start..fragment.spans[0].end]);
+        }
+    }
+    try std.testing.expect(saw_title and saw_sku and saw_tags);
+
+    // Explicit field selection narrows the output and clones survive.
+    var narrowed = [_]types.SearchHit{
+        .{ .id = try alloc.dupe(u8, "doc:1"), .stored_data = try alloc.dupe(u8, hits[0].stored_data.?) },
+    };
+    defer for (&narrowed) |*hit| hit.deinit(alloc);
+    const only_title = [_][]const u8{"title"};
+    try attachHighlights(alloc, .{ .fields = &only_title }, query, &narrowed, text_analysis, null);
+    try std.testing.expectEqual(@as(usize, 1), narrowed[0].highlights.len);
+    var cloned = try narrowed[0].clone(alloc);
+    defer cloned.deinit(alloc);
+    try std.testing.expectEqualStrings("title", cloned.highlights[0].field);
+}
+
+fn fieldUsesSubstringAnalyzer(
+    field: []const u8,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+    runtime_schema: ?runtime_schema_mod.TableSchema,
+) bool {
+    const analyzer = resolveQueryAnalyzer(field, null, text_analysis, runtime_schema) catch return false;
+    return analyzer == &analysis_mod.substring_analyzer;
+}
+
+/// Queries against a substring-analyzed field lower to containment lookups
+/// over its suffix dictionary. Each adjacent pair of query tokens (or the lone
+/// token) is joined the way the index joins shingles and becomes a prefix
+/// lookup; pairs are conjoined, so a query of three or more tokens is
+/// answered as "every adjacent pair occurs", a superset of the exact phrase.
+/// Queries shorter than the indexed minimum suffix can never match.
+fn substringQueryToSearchQuery(
+    alloc: Allocator,
+    field: []const u8,
+    text: []const u8,
+    boost: f32,
+) !search_mod.SearchQuery {
+    const tokens = try analysis_mod.substring_query_analyzer.analyze(alloc, text);
+    defer analysis_mod.Analyzer.freeTokens(alloc, tokens);
+    if (tokens.len == 0) return .{ .match_none = {} };
+
+    const lookup_count = if (tokens.len == 1) 1 else tokens.len - 1;
+    const must = try alloc.alloc(search_mod.SearchQuery, lookup_count);
+    for (must, 0..) |*query, i| {
+        const joined = if (tokens.len == 1)
+            try alloc.dupe(u8, tokens[0].term)
+        else
+            try std.mem.concat(alloc, u8, &.{ tokens[i].term, tokens[i + 1].term });
+        const prefix = analysis_mod.substringQueryPrefix(joined);
+        if (prefix.len < analysis_mod.substring_min_query_length) return .{ .match_none = {} };
+        query.* = .{ .prefix = .{ .field = field, .prefix = prefix, .boost = boost } };
+    }
+    if (must.len == 1) return must[0];
+    return .{ .bool_query = .{ .must = must } };
+}
+
+test "substring field queries lower to suffix-dictionary prefix lookups" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const text_analysis: introducer_mod.TextAnalysisConfig = .{
+        .field_analyzers = &.{
+            .{ .field_name = "name", .analyzer_name = "standard" },
+            .{ .field_name = "name._substring", .analyzer_name = "substring" },
+        },
+    };
+
+    const single = try textQueryToSearchQuery(alloc, .{ .match = .{ .field = "name._substring", .text = "Rag3" } }, text_analysis, null);
+    try std.testing.expect(single == .prefix);
+    try std.testing.expectEqualStrings("name._substring", single.prefix.field);
+    try std.testing.expectEqualStrings("rag3", single.prefix.prefix);
+
+    // Two tokens are joined without a separator, like the indexed shingles.
+    const pair = try textQueryToSearchQuery(alloc, .{ .match = .{ .field = "name._substring", .text = "rag3 Weaver" } }, text_analysis, null);
+    try std.testing.expect(pair == .prefix);
+    try std.testing.expectEqualStrings("rag3weaver", pair.prefix.prefix);
+
+    // Longer queries conjoin every adjacent pair.
+    const triple = try textQueryToSearchQuery(alloc, .{ .match = .{ .field = "name._substring", .text = "big rag3 weaver" } }, text_analysis, null);
+    try std.testing.expect(triple == .bool_query);
+    try std.testing.expectEqual(@as(usize, 2), triple.bool_query.must.len);
+    try std.testing.expectEqualStrings("bigrag3", triple.bool_query.must[0].prefix.prefix);
+    try std.testing.expectEqualStrings("rag3weaver", triple.bool_query.must[1].prefix.prefix);
+
+    // Single-byte lookups cannot exist in the suffix dictionary.
+    const short = try textQueryToSearchQuery(alloc, .{ .match = .{ .field = "name._substring", .text = "a" } }, text_analysis, null);
+    try std.testing.expect(short == .match_none);
+
+    // Prefix queries on the companion get the same normalization.
+    const prefix_query = try textQueryToSearchQuery(alloc, .{ .prefix = .{ .field = "name._substring", .prefix = "G3-We" } }, text_analysis, null);
+    try std.testing.expect(prefix_query == .prefix);
+    try std.testing.expectEqualStrings("g3we", prefix_query.prefix.prefix);
+
+    // Other fields are untouched.
+    const plain = try textQueryToSearchQuery(alloc, .{ .prefix = .{ .field = "name", .prefix = "G3" } }, text_analysis, null);
+    try std.testing.expect(plain == .prefix);
+    try std.testing.expectEqualStrings("G3", plain.prefix.prefix);
+    const plain_match = try textQueryToSearchQuery(alloc, .{ .match = .{ .field = "name", .text = "rag3 weaver" } }, text_analysis, null);
+    try std.testing.expect(plain_match == .match);
+}
+
 fn resolveQueryAnalyzer(
     field: []const u8,
     analyzer_name: ?[]const u8,
@@ -18445,7 +18836,7 @@ fn segmentMatchesPattern(segment: []const u8, pattern: ?[]const u8) bool {
 
 fn isTextFieldType(field_type: runtime_schema_mod.AntflyType) bool {
     return switch (field_type) {
-        .text, .html, .keyword, .link, .search_as_you_type => true,
+        .text, .html, .keyword, .link, .search_as_you_type, .substring => true,
         else => false,
     };
 }
