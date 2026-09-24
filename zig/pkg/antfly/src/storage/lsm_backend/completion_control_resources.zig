@@ -11,11 +11,13 @@ const std = @import("std");
 const domains = @import("completion_allocator.zig");
 const resources = @import("../resource_manager.zig");
 const protocol = @import("../../common/completion_entry_protocol.zig");
+const accepted_guard = @import("completion_control_accepted.zig");
 
 pub const Limits = struct {
     publication_bytes: usize,
     wal_bytes: u64,
     proposal_bytes: usize = protocol.max_wire_bytes,
+    accepted_bytes: usize = accepted_guard.max_bytes,
 };
 
 pub const Resources = struct {
@@ -26,15 +28,18 @@ pub const Resources = struct {
     compiler: *domains.CompilerWorkspace,
     txn_id: [16]u8,
     proposal: []u8,
+    accepted: []u8,
+    accepted_len: usize = 0,
     busy: bool = false,
     wal_credit: u64 = 0,
     wal_pin: resources.ObserverMetadataPin,
 
     pub fn create(backing: std.mem.Allocator, manager: *resources.ResourceManager, compiler: *domains.CompilerWorkspace, txn_id: [16]u8, limits: Limits) !*Resources {
-        if (limits.publication_bytes == 0 or limits.wal_bytes == 0 or limits.proposal_bytes == 0 or limits.proposal_bytes > protocol.max_wire_bytes)
+        if (limits.publication_bytes == 0 or limits.wal_bytes == 0 or limits.proposal_bytes == 0 or limits.proposal_bytes > protocol.max_wire_bytes or
+            limits.accepted_bytes == 0 or limits.accepted_bytes > accepted_guard.max_bytes)
             return error.UnsupportedCompletionProfile;
         const footprint = domains.RecyclingScratch.allocationFootprint;
-        const control_bytes = try std.math.add(usize, try footprint(@sizeOf(Resources), @alignOf(Resources)), try footprint(limits.proposal_bytes, 1));
+        const control_bytes = try std.math.add(usize, try std.math.add(usize, try footprint(@sizeOf(Resources), @alignOf(Resources)), try footprint(limits.proposal_bytes, 1)), try footprint(limits.accepted_bytes, 1));
         const control = try domains.RecyclingScratch.create(backing, manager, control_bytes);
         errdefer control.retire();
         const allocator = control.allocator();
@@ -42,6 +47,8 @@ pub const Resources = struct {
         errdefer allocator.destroy(self);
         const proposal = try allocator.alloc(u8, limits.proposal_bytes);
         errdefer allocator.free(proposal);
+        const accepted = try allocator.alloc(u8, limits.accepted_bytes);
+        errdefer allocator.free(accepted);
         const publication_domain = try domains.RecyclingScratch.create(backing, manager, try domains.PublicationReservation.backingFootprint(limits.publication_bytes));
         errdefer publication_domain.retire();
         const publication = try domains.PublicationReservation.create(publication_domain, limits.publication_bytes);
@@ -53,6 +60,7 @@ pub const Resources = struct {
             .compiler = compiler,
             .txn_id = txn_id,
             .proposal = proposal,
+            .accepted = accepted,
             .wal_pin = undefined,
         };
         self.wal_pin = try manager.pinObserverMetadata(.lsm_wal_retention, &self.wal_credit);
@@ -108,6 +116,7 @@ pub const Resources = struct {
         const control = self.control;
         const allocator = control.allocator();
         allocator.free(self.proposal);
+        allocator.free(self.accepted);
         allocator.destroy(self);
         control.retire();
     }

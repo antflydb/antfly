@@ -17,11 +17,13 @@ const table_file = @import("../lsm/table_file.zig");
 const resources = @import("../resource_manager.zig");
 const abi = @import("kernel_owner_abi").completion_pool;
 const wal = @import("wal.zig");
+const state = @import("state.zig");
 const Allocator = std.mem.Allocator;
 pub const maintenance = @import("completion_maintenance.zig");
 const capacity = @import("completion_capacity.zig");
 const generations_mod = @import("completion_generations.zig");
 const control_begin = @import("completion_control_begin.zig");
+const control_accepted = @import("completion_control_accepted.zig");
 const control_transition = @import("completion_control_transition.zig");
 const control_shape = @import("../completion_control_budget.zig");
 const control_capacity = @import("completion_control_capacity.zig");
@@ -426,8 +428,14 @@ pub fn Pool(comptime Backend: type) type {
             output_pin: Backend.CompletionRunPathPin,
             declaration: control_begin.Declaration,
             begin: completion.AcceptedIdentity,
+            pending: ?completion.AcceptedIdentity = null,
+            transition: ?control_transition.Transition = null,
         };
+        const ControlTarget = struct { slot_index: usize, transition: control_transition.Transition };
         config: Config,
+        /// Local component-test opt-in only; no installation/config ABI can
+        /// activate the incomplete decision/ACK lifecycle.
+        control_transition_staging: bool = false,
         control_owners: [control_record.max_owners]?ControlOwner = @splat(null),
         control_output_ids: [control_record.max_owners]u64 = @splat(0),
         control: *domains.RecyclingScratch,
@@ -451,6 +459,7 @@ pub fn Pool(comptime Backend: type) type {
         cohort: completion.guard.Info,
         guard_paths: [max_slots][]u8,
         accepted_paths: [max_slots][]u8,
+        control_accepted_paths: [control_record.max_owners][]u8,
         run_paths: [max_slots]?[]const u8,
         run_path_pins: [max_slots]?Backend.CompletionRunPathPin = @splat(null),
         journal_path: []u8,
@@ -514,6 +523,15 @@ pub fn Pool(comptime Backend: type) type {
             var spec_count: usize = 0;
             var guard_paths: [max_slots][]u8 = undefined;
             var accepted_paths: [max_slots][]u8 = undefined;
+            var control_accepted_paths: [control_record.max_owners][]u8 = undefined;
+            var control_path_count: usize = 0;
+            errdefer for (control_accepted_paths[0..control_path_count]) |path| alloc.free(path);
+            for (&control_accepted_paths, 0..) |*path, i| {
+                path.* = try std.fs.path.join(alloc, &.{ root, control_accepted.filenames[i] });
+                control_path_count += 1;
+                specs[spec_count] = .{ .path = path.*, .max_bytes = control_accepted.max_bytes, .allow_delete = true };
+                spec_count += 1;
+            }
             var run_paths: [max_slots]?[]const u8 = @splat(null);
             var path_count: usize = 0;
             errdefer for (0..path_count) |i| {
@@ -590,6 +608,7 @@ pub fn Pool(comptime Backend: type) type {
                 .wal_pin = wal_pin,
                 .guard_paths = guard_paths,
                 .accepted_paths = accepted_paths,
+                .control_accepted_paths = control_accepted_paths,
                 .run_paths = run_paths,
                 .run_path_pins = run_path_pins,
                 .journal_path = journal_path,
@@ -647,6 +666,14 @@ pub fn Pool(comptime Backend: type) type {
             self.config.control_owner_staging = true;
         }
 
+        pub fn enableControlTransitionStaging(self: *Self) !void {
+            if (!self.config.control_owner_staging or !self.ready or self.failed or !self.restored)
+                return error.CompletionAdmissionUnavailable;
+            for (self.cells[0..self.cell_count]) |cell| if (cell.phase == .accepted or cell.phase == .prepared)
+                return error.CompletionReservationBusy;
+            self.control_transition_staging = true;
+        }
+
         /// Native owner calls this only after attached runtime leases are gone
         /// and pooled Slots have returned their cell ownership. Published tree
         /// allocations retain the publication domain through old reader release.
@@ -668,6 +695,7 @@ pub fn Pool(comptime Backend: type) type {
                 self.control.allocator().free(self.accepted_paths[i]);
                 self.control.allocator().free(self.run_paths[i].?);
             }
+            for (self.control_accepted_paths) |path| self.control.allocator().free(path);
             self.control.allocator().free(self.journal_path);
             for (&self.retired) |*generation| generation.deinit(self.control.allocator());
             self.generations.retire();
@@ -729,15 +757,21 @@ pub fn Pool(comptime Backend: type) type {
         /// its transaction before allocating or publishing a document cell.
         /// Inspect prepared outcome templates too, so they cannot later write
         /// one of the retained owner's metadata keys through a different cell.
-        fn rejectUnownedControlTransition(self: *Self, backend: *Backend, alloc: Allocator, entry: *const entry_codec.OwnedEntry) !void {
-            if (!self.config.control_owner_staging) return;
+        fn classifyOwnedControlTransition(self: *Self, backend: *Backend, alloc: Allocator, entry: *const entry_codec.OwnedEntry) !?ControlTarget {
             const descriptor = entry.decoded_descriptor.descriptor;
             for ([_][]const slot_codec.Operation{ entry.entry.prepare_operations, descriptor.commit, descriptor.abort }) |operations| {
                 for (operations) |op| {
+                    // Native owner/progress rows are generated only by the
+                    // owner-backed apply path, never by a replicated payload.
+                    if (std.mem.startsWith(u8, op.key, control_record.owner_prefix) or
+                        std.mem.startsWith(u8, op.key, control_record.receipt_prefix) or
+                        std.mem.startsWith(u8, op.key, control_record.progress_prefix))
+                        return error.CompletionAdmissionUnavailable;
+                    if (!self.config.control_owner_staging) continue;
                     inline for (.{ control_shape.records_prefix, control_shape.participants_prefix, control_shape.resolved_participants_prefix, control_shape.completion_prefix, control_shape.intent_admission_prefix, control_shape.intent_keys_prefix, control_shape.schema_leases_prefix, "\x00\x00__txn_read_admission__:" }) |prefix| {
                         if (op.key.len == prefix.len + 16 and std.mem.startsWith(u8, op.key, prefix)) {
                             const id = op.key[prefix.len..][0..16];
-                            for (self.control_owners) |owner| if (owner) |active| {
+                            for (self.control_owners, 0..) |owner, owner_index| if (owner) |active| {
                                 if (!std.mem.eql(u8, id, &active.declaration.txn_id)) continue;
                                 // The exact physical classifier is exercised
                                 // at the real preaccept boundary, but it does
@@ -756,13 +790,160 @@ pub fn Pool(comptime Backend: type) type {
                                 defer participants.deinit(alloc);
                                 var resolved = try self.point(backend, alloc, descriptor.namespace, resolved_key);
                                 defer resolved.deinit(alloc);
-                                _ = try control_transition.inspect(entry.entry.prepare_operations, active.declaration, before.value orelse return error.UnsupportedCompletionProfile, participants.value orelse return error.UnsupportedCompletionProfile, resolved.value);
-                                return error.CompletionAdmissionUnavailable;
+                                const transition = try control_transition.inspect(entry.entry.prepare_operations, active.declaration, before.value orelse return error.UnsupportedCompletionProfile, participants.value orelse return error.UnsupportedCompletionProfile, resolved.value);
+                                return .{ .slot_index = owner_index, .transition = transition };
                             };
                         }
                     }
                 }
             }
+            return null;
+        }
+
+        fn acceptOwnedControlTransition(self: *Self, backend: *Backend, alloc: Allocator, target: ControlTarget, identity: completion.AcceptedIdentity, entry: *const entry_codec.OwnedEntry, envelope: []const u8) !usize {
+            if (self.control_owners[target.slot_index] == null) return error.InvalidCompletionSlot;
+            const active = &self.control_owners[target.slot_index].?;
+            if (active.pending != null or active.held.accepted_len != 0) return error.CompletionReservationBusy;
+            for (self.cells[0..self.cell_count]) |cell| {
+                if (cell.phase == .accepted or (cell.phase == .prepared and !cell.slot.retired)) return error.CompletionReservationBusy;
+            }
+            // This stage accepts only a first decision. ACK application and
+            // owner retirement need the same prepaid path plus checkpointing.
+            if (!self.control_transition_staging) return error.CompletionAdmissionUnavailable;
+            switch (target.transition) {
+                .decision => {},
+                else => return error.CompletionAdmissionUnavailable,
+            }
+            try self.certifyActiveControls(backend, .{});
+            try self.validateBaseline(backend, alloc, entry);
+            const accepted: control_accepted.Accepted = .{
+                .slot_index = @intCast(target.slot_index),
+                .txn_id = active.declaration.txn_id,
+                .begin = .{ .term = active.begin.term, .index = active.begin.index, .digest = active.begin.digest },
+                .transition = .{ .term = identity.term, .index = identity.index, .digest = identity.digest },
+                .envelope = envelope,
+            };
+            const bytes = try accepted.encodeInto(active.held.accepted);
+            active.held.accepted_len = bytes.len;
+            active.pending = identity;
+            active.transition = target.transition;
+            var writer = self.io.storage().beginAtomicWrite(self.scratch.allocator(), self.control_accepted_paths[target.slot_index]) catch |err| {
+                self.failed = true;
+                backend.fenceFailedBulkWal();
+                return err;
+            };
+            var live = true;
+            errdefer if (live) writer.abort();
+            writer.appendSlice(bytes) catch |err| {
+                self.failed = true;
+                backend.fenceFailedBulkWal();
+                return err;
+            };
+            live = false;
+            writer.finish() catch |err| {
+                self.failed = true;
+                backend.fenceFailedBulkWal();
+                return err;
+            };
+            return target.slot_index;
+        }
+
+        /// First metadata decision only. The accepted sidecar survives any
+        /// uncertain append; restart remains fenced until restoration is
+        /// installed. No generic Slot or additional output run is consumed.
+        pub fn applyOwnedControlTransition(self: *Self, backend: *Backend, identity: completion.AcceptedIdentity) !bool {
+            if (self.failed or !self.restored or backend.manifest_recovery_required) return error.RecoveryRequired;
+            const owner_index: usize = blk: {
+                for (self.control_owners, 0..) |owner, i| if (owner) |active| {
+                    if (active.pending) |pending| if (std.meta.eql(pending, identity)) break :blk i;
+                };
+                return false;
+            };
+            const active = &self.control_owners[owner_index].?;
+            const transition = active.transition orelse return error.InvalidCompletionSlot;
+            const decision = switch (transition) {
+                .decision => |value| value,
+                else => return error.CompletionAdmissionUnavailable,
+            };
+            var borrow = try self.compiler.tryBorrow();
+            defer borrow.release() catch unreachable;
+            const alloc = try borrow.allocator();
+            const accepted = try control_accepted.Accepted.decode(active.held.accepted[0..active.held.accepted_len]);
+            if (accepted.slot_index != owner_index or !std.mem.eql(u8, &accepted.txn_id, &active.declaration.txn_id) or
+                !std.meta.eql(accepted.transition, control_record.Receipt{ .term = identity.term, .index = identity.index, .digest = identity.digest }))
+                return error.InvalidCompletionSlot;
+            var decoded = try entry_codec.decode(alloc, accepted.envelope);
+            defer decoded.deinit();
+            if (!std.mem.eql(u8, &decoded.digest, &identity.digest)) return error.InvalidCompletionSlot;
+            const ns = @import("../backend_types.zig").Namespace{ .name = decoded.decoded_descriptor.descriptor.namespace };
+            var incoming: state.ActiveMemTable = .{};
+            defer incoming.deinit(alloc);
+            for (decoded.entry.prepare_operations) |op| {
+                if (op.bindings.len != 0) return error.InvalidCompletionSlot;
+                try incoming.upsert(alloc, ns, op.key, op.value, op.kind == .delete);
+            }
+            const authority: control_record.Authority = .{
+                .group_id = self.config.identity.group_id,
+                .incarnation = self.config.identity.incarnation,
+                .policy_digest = self.config.identity.policy_digest,
+                .schema_catalog_digest = self.config.schema_catalog_digest,
+                .generation = self.config.identity.generation,
+            };
+            const owner_record: control_record.Record = .{
+                .authority = authority,
+                .txn_id = active.declaration.txn_id,
+                .begin = accepted.begin,
+                .participants = active.declaration.participants,
+                .slot_index = @intCast(owner_index),
+                .output_run_id = self.control_output_ids[owner_index],
+            };
+            const progress: control_record.Progress = .{
+                .txn_id = active.declaration.txn_id,
+                .begin = accepted.begin,
+                .latest = accepted.transition,
+                .phase = .decision,
+                .decision = decision,
+                .acknowledged = 0,
+                .resolved_digest = @splat(0),
+            };
+            const owner_value = try owner_record.encode();
+            const progress_value = try progress.encode();
+            try incoming.upsert(alloc, ns, &control_record.ownerKey(active.declaration.txn_id), &owner_value, false);
+            try incoming.upsert(alloc, ns, &control_record.progressKey(active.declaration.txn_id), &progress_value, false);
+            const marker = identity.encode();
+            try incoming.upsert(alloc, ns, &@import("../internal_keys.zig").raft_document_applied_entry_key, marker[0..16], false);
+            const group_progress = encodeProgress(self.config.identity, identity);
+            try incoming.upsert(alloc, ns, entry_codec.group_progress_key, &group_progress, false);
+            const pub_alloc = active.held.publication.allocator();
+            var candidate = try backend.mutable.preparePublicationOwned(pub_alloc, &incoming);
+            defer candidate.deinit(pub_alloc);
+            var append = try wal.PreparedAppend.init(alloc, backend.root_dir.?, &incoming, true, .{ .segment_bytes = backend.options.wal_segment_bytes });
+            defer append.deinit();
+            var wal_lock = try backend.acquireWalOperationLock(.exclusive);
+            defer wal_lock.release();
+            self.failed = true; // Any subsequent uncertainty must never admit.
+            errdefer backend.fenceFailedBulkWal();
+            try active.held.chargeWal(&backend.tracked_wal_retention_bytes, @intCast(append.record.len));
+            const outcome = try backend.wal_retention.appendPrepared(self.io.storage(), alloc, &append, backend.writeStatsNowNs());
+            const result = switch (outcome) {
+                .appended => |value| value,
+                .uncertain => |err| return err,
+            };
+            backend.write_stats.wal_append_records += 1;
+            backend.write_stats.wal_append_entries += incoming.entryCount();
+            backend.write_stats.wal_append_bytes += result.bytes;
+            backend.noteMutableWalSegment(result.segment);
+            backend.invalidateMutableReadSnapshot();
+            backend.mutable.publishPrepared(&candidate);
+            backend.syncTrackedInMemoryStateUsageCurrentLocked();
+            self.progress = identity;
+            try self.io.storage().deleteFileAbsolute(self.control_accepted_paths[owner_index]);
+            try self.io.storage().syncParentAbsolute(self.control_accepted_paths[owner_index]);
+            active.pending = null;
+            active.transition = null;
+            active.held.accepted_len = 0;
+            self.failed = false;
+            return true;
         }
 
         /// Allocate independent control debt before publishing the accepted
@@ -899,6 +1080,12 @@ pub fn Pool(comptime Backend: type) type {
         pub fn checkOrdinary(self: *Self, backend: *Backend, incoming: anytype) !void {
             if (self.maintenance_active) return error.CompletionReservationBusy;
             if (self.failed or !self.restored) return error.RecoveryRequired;
+            for (self.control_owners) |owner| if (owner) |active| {
+                // Phase A has no certified pressure-relief output while a
+                // decision is runnable. Keep its physical envelope exclusive.
+                if (self.control_transition_staging) return error.CompletionReservationBusy;
+                if (active.pending != null or !self.capacity_certified) return error.CompletionReservationBusy;
+            };
             const reserve = try self.remainingAppendBudget();
             reserve.requireHeadroom(backend.write_stats, completion.incomingAppendCounters(incoming)) catch return error.CompletionForegroundCapacityExceeded;
             if (incoming.estimatedLogicalBytes() > completion.foreground_bytes -| backend.mutable.estimatedLogicalBytes() or
@@ -914,6 +1101,9 @@ pub fn Pool(comptime Backend: type) type {
                 const key = item.key;
                 if (std.mem.eql(u8, key, entry_codec.group_progress_key) or
                     std.mem.startsWith(u8, key, entry_codec.receipt_prefix) or
+                    std.mem.startsWith(u8, key, control_record.owner_prefix) or
+                    std.mem.startsWith(u8, key, control_record.receipt_prefix) or
+                    std.mem.startsWith(u8, key, control_record.progress_prefix) or
                     std.mem.startsWith(u8, key, completion.storage_key) or
                     std.mem.startsWith(u8, key, completion.applied_key)) return error.PreparedCompletionActive;
             }
@@ -924,6 +1114,7 @@ pub fn Pool(comptime Backend: type) type {
                     const item = incoming.entryAt(i);
                     growth = try growth.plus(try capacity.Cost.record(if (item.namespace_name) |ns| ns.len else 0, item.key.len, item.value.len));
                 }
+                try self.certifyActiveControls(backend, growth);
                 try self.checkCapacity(growth);
                 // Preflight can precede a failed write. Retain the conservative
                 // charge until maintenance rather than refund uncertain I/O.
@@ -955,6 +1146,47 @@ pub fn Pool(comptime Backend: type) type {
                 .max_metadata_bytes = self.config.shape.max_metadata_bytes,
                 .max_output_metadata_bytes = self.config.shape.max_metadata_bytes,
                 .max_record_bytes = self.config.shape.max_record_bytes,
+            });
+        }
+
+        /// Reprove all retained control obligations after any competing
+        /// foreground or document growth. A BEGIN's one-time certificate is
+        /// not permission for later work to consume its unpaid capacity.
+        fn certifyActiveControls(self: *const Self, backend: *const Backend, growth: capacity.Cost) !void {
+            var rows: [control_record.max_owners][3]control_capacity.NativeRowShape = undefined;
+            var inputs: [control_record.max_owners]control_capacity.OwnerInput = undefined;
+            var count: usize = 0;
+            for (self.control_owners) |owner| if (owner) |active| {
+                const budget = control_capacity.NumericBudget.fromMeasured(active.declaration.budget);
+                rows[count] = control_capacity.ownershipRows(budget.mutations);
+                inputs[count] = .{ .budget = budget, .rows = &rows[count] };
+                count += 1;
+            };
+            if (count == 0) return;
+            const projected = try self.capacity_cost.plus(growth);
+            const mutable = try self.capacity_growth.plus(growth);
+            const proof = try control_capacity.certifyCohort(.{
+                .cost = projected,
+                .mutable_growth = mutable,
+                .baseline_frontier_bytes = self.capacity_baseline_frontier,
+                .max_mutable_entries = try std.math.add(usize, completion.foreground_entries, std.math.cast(usize, mutable.records) orelse return error.UnsupportedCompletionProfile),
+                .current_runs = backend.runs.count(),
+                .future_document_outputs = self.cell_count,
+                .append = try (try self.remainingAppendBudget()).plus(completion.foreground_append_budget),
+            }, inputs[0..count], .{
+                .format = .{ .metadata_bytes = self.config.shape.max_metadata_bytes },
+                .max_record_bytes = self.config.shape.max_record_bytes,
+                .max_inputs = self.config.shape.max_runs,
+                .max_path_bytes = 544,
+                .single_drain_metadata_bytes = self.config.shape.max_metadata_bytes,
+                .max_retained_wal_bytes = completion.limits.wal_bytes,
+                .replay_workspace_bytes = completion.scratch_bytes,
+                .compiler_workspace_bytes = completion.scratch_bytes,
+            });
+            try proof.requireHeadroom(backend.write_stats, backend.manifest_journal.sequence orelse return error.RecoveryRequired, backend.next_run_id, if (backend.wal_retention.primary) |primary| primary.current_segment else 1, .{
+                .manifest_steps = self.cell_count,
+                .run_ids = self.cell_count,
+                .wal_segments = self.cell_count,
             });
         }
 
@@ -1014,6 +1246,7 @@ pub fn Pool(comptime Backend: type) type {
 
         pub fn hasAcceptedDebt(self: *const Self) bool {
             for (self.cells[0..self.cell_count]) |cell| if (cell.phase == .accepted) return true;
+            for (self.control_owners) |owner| if (owner) |active| if (active.pending != null) return true;
             return false;
         }
 
@@ -1033,6 +1266,7 @@ pub fn Pool(comptime Backend: type) type {
         pub fn accept(self: *Self, backend: *Backend, term: u64, index: u64, previous_term: u64, applied: u64, envelope: []const u8) !usize {
             if (!self.ready or self.failed or !self.restored) return error.RecoveryRequired;
             if (term == 0 or index == 0) return error.InvalidCompletionSlot;
+            for (self.control_owners) |owner| if (owner) |active| if (active.pending != null) return error.CompletionReservationBusy;
             var borrow = try self.compiler.tryBorrow();
             defer borrow.release() catch unreachable;
             const scratch = try borrow.allocator();
@@ -1056,11 +1290,16 @@ pub fn Pool(comptime Backend: type) type {
             try Slot.validateFootprint(backend, checked.decoded_descriptor.descriptor);
             if (checked.entry.kind == .mutation)
                 try Slot.validateCanonicalFootprint(backend, checked.decoded_descriptor.descriptor.namespace, checked.entry.prepare_operations);
-            try self.rejectUnownedControlTransition(backend, scratch, &checked);
+            if (try self.classifyOwnedControlTransition(backend, scratch, &checked)) |target|
+                return self.acceptOwnedControlTransition(backend, scratch, target, .{ .term = term, .index = index, .digest = checked.digest }, &checked, envelope);
+            if (self.control_transition_staging) {
+                for (self.control_owners) |owner| if (owner != null) return error.CompletionReservationBusy;
+            }
             const fresh_begin = try self.validateNewTransactionRecord(backend, scratch, &checked);
             try self.validateBaseline(backend, scratch, &checked);
             const growth = try entryCapacity(&checked);
             try self.checkCapacity(growth);
+            if (fresh_begin == null) try self.certifyActiveControls(backend, growth);
             const maximum_credit = try self.checkCounterHeadroom(backend, scratch, &checked);
             const free_index = for (self.cells[0..self.cell_count], 0..) |cell, i| {
                 if (cell.phase == .free) break i;
@@ -1248,6 +1487,12 @@ pub fn Pool(comptime Backend: type) type {
         /// This may release the backend lock for streaming I/O; readiness and
         /// every ordinary mutation are fenced until the handoff completes.
         pub fn maintainLocked(self: *Self, backend: *Backend) !void {
+            // The bounded document maintenance proof does not include the
+            // staged owner's future checkpoint. Defer that merge until the
+            // combined control checkpoint contract is implemented.
+            if (self.control_transition_staging) {
+                for (self.control_owners) |owner| if (owner != null) return error.CompletionReservationBusy;
+            }
             try @import("completion_maintenance_cycle.zig").run(Backend, self, backend);
         }
 
@@ -1552,6 +1797,24 @@ pub fn Pool(comptime Backend: type) type {
         /// transaction or releases the resources backing either outcome.
         pub fn cancelUnacceptedProposal(self: *Self, backend: *Backend, identity: completion.AcceptedIdentity) !void {
             if (self.failed or !self.restored) return error.RecoveryRequired;
+            for (&self.control_owners, 0..) |*owner, i| if (owner.*) |*active| {
+                if (active.pending) |pending| if (std.meta.eql(pending, identity)) {
+                    self.io.storage().deleteFileAbsolute(self.control_accepted_paths[i]) catch |err| {
+                        self.failed = true;
+                        backend.fenceFailedBulkWal();
+                        return err;
+                    };
+                    self.io.storage().syncParentAbsolute(self.control_accepted_paths[i]) catch |err| {
+                        self.failed = true;
+                        backend.fenceFailedBulkWal();
+                        return err;
+                    };
+                    active.pending = null;
+                    active.transition = null;
+                    active.held.accepted_len = 0;
+                    return;
+                };
+            };
             for (self.cells[0..self.cell_count], 0..) |*cell, i| {
                 if (cell.phase != .accepted and cell.phase != .prepared) continue;
                 if (cell.resolution) |resolution| if (std.meta.eql(identity, resolution.identity)) {
@@ -1631,6 +1894,11 @@ pub fn Pool(comptime Backend: type) type {
             if (self.failed or !self.restored) return error.RecoveryRequired;
             const digest = entry_codec.protocol.payloadDigest(payload);
             const identity: completion.AcceptedIdentity = .{ .term = term, .index = index, .digest = digest };
+            for (self.control_owners) |owner| if (owner) |active| if (active.pending) |pending| {
+                if (pending.index != index) continue;
+                if (!std.meta.eql(pending, identity)) return error.InvalidCompletionSlot;
+                return true;
+            };
             for (self.cells[0..self.cell_count]) |cell| {
                 if (cell.phase != .accepted and cell.phase != .prepared) continue;
                 if (cell.term == term and cell.index == index) {
@@ -1815,6 +2083,34 @@ test "workload admission physical completion control guards fence native restart
         }
         try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
     }
+}
+
+test "workload admission physical completion orphaned accepted control transition fences restart" {
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const alloc = std.testing.allocator;
+    var fd_pool = storage_io.NativeStoragePool.initWithCapacityForTest(alloc, 32);
+    defer fd_pool.deinit();
+    var manager = resources.ResourceManager.init(.{ .identity_allocator = alloc, .memory_budget = .{ .hard_limit_bytes = 256 * 1024 * 1024 } });
+    defer manager.deinit(alloc);
+    var path_buffer: [256]u8 = undefined;
+    const root = repository.tmpPath(&path_buffer, "native-control-accepted-restart");
+    defer repository.cleanupTmp(root);
+    const options: @import("../lsm_backend.zig").Options = .{ .resource_manager = &manager, .native_storage_pool = &fd_pool };
+    const path = try std.fs.path.join(alloc, &.{ std.mem.span(root), control_accepted.filenames[0] });
+    defer alloc.free(path);
+    {
+        var backend: Backend = undefined;
+        try backend.openInto(alloc, std.mem.span(root), options);
+        defer backend.abandonAfterCrash();
+        try backend.persistManifest();
+        // Model a crash after the accepted transition is durable but before
+        // either WAL publication or restoration of the retained BEGIN guard.
+        try manifest_set.replace(alloc, backend.storage.?, path, "interrupted-control-transition");
+        try std.testing.expect(try control_accepted.hasAny(backend.storage.?, alloc, std.mem.span(root)));
+    }
+    var reopened: Backend = undefined;
+    try std.testing.expectError(error.CompletionRecoveryCapacityRequired, reopened.openInto(alloc, std.mem.span(root), options));
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
 }
 
 test "workload admission completion accepted guard binds durable owner and rejects corrupt framing" {
@@ -2627,7 +2923,6 @@ test "workload admission completion operation workspace reserves exact remaining
 }
 
 test "workload admission completion replay workspace covers unique and replaced versions with fixed pending storage" {
-    const state = @import("state.zig");
     const alloc = std.testing.allocator;
     const bound = try replayWorkspaceRequirement();
     try std.testing.expect(bound.total <= completion.scratch_bytes);

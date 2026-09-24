@@ -143372,6 +143372,99 @@ test "workload admission physical completion staged control BEGIN retains a pool
         control_proof.document.compacted_index = 1;
         control_proof.document.compacted_term = 1;
         try std.testing.expectEqual(runtime_failure_abi.Status.recovery_required, control_lease.vtable.reconcile_durable(control_lease.context, &control_proof));
+        // Test-only transition staging uses the same retained owner after four
+        // interleaved BEGINs and reader snapshots. The decision must append
+        // through that owner without consuming a reusable document cell.
+        // The two retired path generations are deliberately pinned by the
+        // oldest readers above; release those before a fresh maintenance
+        // cycle while retaining the newest reader across the decision.
+        if (readers[0]) |*reader| reader.abort();
+        readers[0] = null;
+        if (readers[1]) |*reader| reader.abort();
+        readers[1] = null;
+        {
+            const backend_runtime = @import("../lsm_backend/runtime.zig");
+            const locked = backend_runtime.lockBackend(lsm_backend_mod.Backend, backend);
+            defer backend_runtime.unlockBackend(lsm_backend_mod.Backend, backend, locked);
+            try pool.maintainLocked(backend);
+            try pool.qualifyFresh(backend);
+            // Leave just enough append counter headroom for the ordinary
+            // foreground and every reusable document cell. The four retained
+            // control owners also need their future decision/ACK WAL, so the
+            // ordinary preflight must reject before consuming that promise.
+            for (pool.cells[0..pool.cell_count]) |cell| try std.testing.expectEqual(@import("../lsm_backend/completion_pool.zig").Pool(lsm_backend_mod.Backend).Phase.free, cell.phase);
+            var ordinary: @import("../lsm_backend/state.zig").ActiveMemTable = .{};
+            defer ordinary.deinit(alloc);
+            try ordinary.upsert(alloc, .{}, "ordinary-control-pressure", "value", false);
+            const runtime = @import("../lsm_backend/completion_runtime.zig");
+            const document_bytes = @as(u64, @intCast(pool.cell_count)) * (runtime.prepare_append_budget.bytes + runtime.outcome_append_budget.bytes);
+            const saved_bytes = backend.write_stats.wal_append_bytes;
+            const saved_start = pool.wal_bytes_start;
+            defer {
+                backend.write_stats.wal_append_bytes = saved_bytes;
+                pool.wal_bytes_start = saved_start;
+            }
+            backend.write_stats.wal_append_bytes = std.math.maxInt(u64) - document_bytes - runtime.foreground_append_budget.bytes - 4096;
+            pool.wal_bytes_start = backend.write_stats.wal_append_bytes;
+            try std.testing.expectError(error.UnsupportedCompletionProfile, pool.checkOrdinary(backend, &ordinary));
+            for (pool.control_owners) |owner| try std.testing.expect(owner != null and owner.?.pending == null);
+            backend.write_stats.wal_append_bytes = saved_bytes;
+            pool.wal_bytes_start = saved_start;
+            try pool.enableControlTransitionStaging();
+            try std.testing.expectError(error.CompletionReservationBusy, pool.checkOrdinary(backend, &ordinary));
+            try std.testing.expectError(error.CompletionReservationBusy, pool.maintainLocked(backend));
+        }
+        const owned_decision = blk: {
+            var read = try manager.store.beginRead();
+            defer read.abort();
+            break :blk try manager.compileControlMutation(alloc, &read, .{
+                .txn_id = id,
+                .action = .{ .resolve_metadata = .{ .status = .committed, .timestamp = 200 } },
+            }, .{
+                .group_id = binding.identity.group_id,
+                .incarnation = binding.identity.incarnation,
+                .policy_digest = binding.identity.policy_digest,
+                .schema_catalog_digest = binding.schema_catalog_digest,
+                .previous_term = 1,
+                .previous_index = 4,
+            }, @splat(19), "owned-control-decision-test", &.{});
+        };
+        defer alloc.free(owned_decision);
+        const decision_payloads = [_]abi.Bytes{.{ .ptr = owned_decision.ptr, .len = owned_decision.len }};
+        const decision_proposal: abi.Check = .{ .kind = .proposal, .new_work_allowed = 1, .state = .{
+            .term = 1,
+            .applied_term = 1,
+            .applied_term_known = 1,
+            .applied_index = 4,
+            .last_index = 4,
+        }, .proposals = .{ .ptr = &decision_payloads, .len = 1 } };
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.check(lease.context, &decision_proposal, &result));
+        lease.vtable.proposal_result(lease.context, &.{ .state = decision_proposal.state, .first_index = 5, .last_index = 5, .payloads = decision_proposal.proposals });
+        const accepted_path = pool.control_accepted_paths[0];
+        const accepted_size = try pool.io.storage().fileSize(accepted_path);
+        const accepted_bytes = try alloc.alloc(u8, @intCast(accepted_size));
+        defer alloc.free(accepted_bytes);
+        try pool.io.storage().readFileRangeInto(alloc, accepted_path, 0, accepted_bytes);
+        const accepted = try @import("../lsm_backend/completion_control_accepted.zig").Accepted.decode(accepted_bytes);
+        try std.testing.expectEqualDeep(id, accepted.txn_id);
+        try std.testing.expectEqual(@as(u64, 5), accepted.transition.index);
+        try std.testing.expectEqualSlices(u8, owned_decision, accepted.envelope);
+        try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try db.getTransactionStatus(id));
+        try std.testing.expectEqual(@as(u64, 4), pool.progress.?.index);
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.apply_accepted.?(lease.context, 1, 5, decision_payloads[0]));
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.apply_accepted.?(lease.context, 1, 5, decision_payloads[0]));
+        try std.testing.expectError(error.FileNotFound, pool.io.storage().fileSize(accepted_path));
+        try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try db.getTransactionStatus(id));
+        try std.testing.expect(pool.control_owners[0] != null and pool.control_owners[0].?.pending == null);
+        try std.testing.expectEqual(@as(u64, 5), pool.progress.?.index);
+        const progress_key = control_record.progressKey(id);
+        const progress_bytes = (try db.core.getStoreValue(alloc, &progress_key)).?;
+        defer alloc.free(progress_bytes);
+        const progress = try control_record.Progress.decode(progress_bytes);
+        try std.testing.expectEqual(control_record.Progress.Phase.decision, progress.phase);
+        try std.testing.expectEqual(control_record.Progress.Decision.committed, progress.decision);
+        try std.testing.expectEqual(@as(u64, 1), progress.begin.index);
+        try std.testing.expectEqual(@as(u64, 5), progress.latest.index);
     }
     try std.testing.expectError(error.CompletionRecoveryCapacityRequired, DB.open(alloc, std.mem.span(tmp.path().ptr), options));
     const path = std.mem.span(tmp.path().ptr);

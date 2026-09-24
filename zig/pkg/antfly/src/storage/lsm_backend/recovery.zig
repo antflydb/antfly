@@ -154,6 +154,11 @@ fn openIntoPolicy(comptime BackendType: type, backend: *BackendType, allocator: 
     else
         false;
     if (comptime @hasField(BackendType, "completion_pool")) {
+        // A transition sidecar may contain an accepted Raft entry whose WAL
+        // publication was interrupted. It is an independent startup debt,
+        // even if its BEGIN guard was lost or removed out of order.
+        if (try @import("completion_control_accepted.zig").hasAny(backend.storage.?, allocator, root_dir))
+            return error.CompletionRecoveryCapacityRequired;
         const control_guard = @import("completion_control_guard.zig");
         // Control ownership outlives the ordinary accepted cell. Until its
         // capacity and durable-log reconciliation are installed, an orphaned

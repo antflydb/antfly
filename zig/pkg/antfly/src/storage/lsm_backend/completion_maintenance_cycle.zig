@@ -175,6 +175,7 @@ fn runWithWorkspace(comptime Backend: type, pool: anytype, backend: *Backend, sc
     spec_count = 0;
     for (pool.guard_paths) |path| try addSpec(&specs, &spec_count, path, completion.limits.max_encoded_bytes + completion.guard.header_bytes, false, true);
     for (pool.accepted_paths) |path| try addSpec(&specs, &spec_count, path, @import("completion_pool.zig").max_accepted_bytes, false, true);
+    for (pool.control_accepted_paths) |path| try addSpec(&specs, &spec_count, path, @import("completion_control_accepted.zig").max_bytes, false, true);
     var wal_paths: [3][]u8 = undefined;
     var wal_count: usize = 0;
     defer for (wal_paths[0..wal_count]) |path| control.free(path);

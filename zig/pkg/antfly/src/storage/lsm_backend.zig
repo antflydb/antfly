@@ -4788,6 +4788,7 @@ pub const Backend = struct {
             }
             return null;
         };
+        if (try pool.applyOwnedControlTransition(self, .{ .term = term, .index = index, .digest = digest })) return null;
         const cell_index = for (pool.cells[0..pool.cell_count], 0..) |cell, i| {
             if (cell.index != index or cell.term != term or cell.entry == null) continue;
             if (!std.mem.eql(u8, &cell.entry.?.digest, &digest)) return error.InvalidCompletionSlot;
