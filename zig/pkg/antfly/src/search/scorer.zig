@@ -1018,7 +1018,8 @@ test "top-k limits results" {
     const results = try scorer.execute();
     defer alloc.free(results.hits);
     try std.testing.expectEqual(@as(usize, 5), results.hits.len);
-    try std.testing.expectEqual(TotalHitsRelation.gte, results.total_relation);
+    try std.testing.expectEqual(@as(u32, 20), results.total_count);
+    try std.testing.expectEqual(TotalHitsRelation.exact, results.total_relation);
     // Results should be sorted by score descending
     for (0..results.hits.len - 1) |i| {
         try std.testing.expect(results.hits[i].score >= results.hits[i + 1].score);
@@ -1178,7 +1179,8 @@ test "scorer executes into external top-k collector" {
     const results = try collector.finishOwned();
     defer alloc.free(results.hits);
 
-    try std.testing.expectEqual(TotalHitsRelation.gte, results.total_relation);
+    try std.testing.expectEqual(@as(u32, 8), results.total_count);
+    try std.testing.expectEqual(TotalHitsRelation.exact, results.total_relation);
     try std.testing.expectEqual(@as(usize, 3), results.hits.len);
     try std.testing.expectEqual(@as(u32, 7), results.hits[0].doc_id);
 }
