@@ -88,6 +88,8 @@ pub const metrics_mod = @import("metrics.zig");
 const inference_admission_mod = @import("inference_admission.zig");
 const execution_control_mod = @import("../execution_control.zig");
 const InferenceExecutionControl = execution_control_mod.InferenceExecutionControl;
+const cancellable_rerank_batch_size: usize = 8;
+const native_call_cancellation_grace_ns: u64 = 5 * std.time.ns_per_s;
 
 fn httpInferenceExecutionControl(node: *Node, ctx: *httpx.Context) InferenceExecutionControl {
     const Check = struct {
@@ -104,6 +106,7 @@ fn httpInferenceExecutionControl(node: *Node, ctx: *httpx.Context) InferenceExec
     return .{
         .io = ctx.io,
         .deadline_ns = ctx.application_deadline_ns,
+        .cancellation_grace_ns = native_call_cancellation_grace_ns,
         .ptr = ctx,
         .check_fn = Check.check,
         .hard_cancellation = if (node.hard_cancellation_watchdog) |watchdog|
@@ -3911,6 +3914,8 @@ pub const Node = struct {
         supplied: InferenceExecutionControl,
     ) InferenceExecutionControl {
         var control = supplied;
+        if (control.cancellation_grace_ns == null)
+            control.cancellation_grace_ns = native_call_cancellation_grace_ns;
         if (control.io == null) control.io = io orelse self.session_manager.io;
         if (control.hard_cancellation == null) {
             if (self.hard_cancellation_watchdog) |watchdog|
@@ -4287,6 +4292,7 @@ pub const Node = struct {
         var deadline_control = DeadlineControl{ .deadline_ns = deadline_ns, .upstream = upstream_control };
         const execution_control = self.bindExecutionControl(request_io, .{
             .io = if (upstream_control) |control| control.io else null,
+            .deadline_ns = deadline_ns,
             .ptr = &deadline_control,
             .check_fn = DeadlineControl.check,
             .hard_cancellation = if (upstream_control) |control| control.hard_cancellation else null,
@@ -4295,6 +4301,7 @@ pub const Node = struct {
         defer model_handle.release();
         const model = model_handle.get();
         var pipeline = model.rerankingPipeline(allocator);
+        pipeline.config.batch_size = @min(pipeline.config.batch_size, cancellable_rerank_batch_size);
         pipeline.execution_control = execution_control;
         const scores = try pipeline.rerank(query, documents);
         errdefer allocator.free(scores);
@@ -7163,6 +7170,7 @@ pub const Node = struct {
         const model = model_handle.get();
 
         var pipeline = model.rerankingPipeline(ctx.allocator);
+        pipeline.config.batch_size = @min(pipeline.config.batch_size, cancellable_rerank_batch_size);
         pipeline.execution_control = execution_control;
         const scores = pipeline.rerank(body.query, body.prompts) catch |err|
             return inferenceFailureResponse(ctx, err);

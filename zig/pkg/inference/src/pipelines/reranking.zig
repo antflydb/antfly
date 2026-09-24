@@ -263,6 +263,7 @@ pub const RerankingPipeline = struct {
 
         var offset: usize = 0;
         while (offset < documents.len) {
+            try self.checkExecution();
             const chunk_len = @min(chunk_limit, documents.len - offset);
             const encoded = try alloc.alloc([]i32, chunk_len);
             defer alloc.free(encoded);
@@ -272,6 +273,7 @@ pub const RerankingPipeline = struct {
             }
             var effective_len: usize = 1;
             for (documents[offset .. offset + chunk_len], 0..) |document, local_index| {
+                try self.checkExecution();
                 encoded[local_index] = try self.encodeGenerativeYesNoPair(query, document);
                 encoded_count += 1;
                 effective_len = @max(effective_len, encoded[local_index].len);
@@ -367,6 +369,7 @@ pub const RerankingPipeline = struct {
         const trim_padding = self.config.trim_padding_to_batch_max and !fixed_len;
         var effective_len: usize = if (trim_padding) 1 else max_len;
         for (documents, 0..) |doc, i| {
+            try self.checkExecution();
             encoded[i] = try self.tok.encodeForPair(alloc, query, doc, max_len);
             encoded_count += 1;
             if (trim_padding) {
@@ -459,6 +462,7 @@ pub const RerankingPipeline = struct {
             @memset(doc_type_ids, 0);
 
             for (documents[offset .. offset + chunk_len], 0..) |doc, local_idx| {
+                try self.checkExecution();
                 var encoded = try self.encodeSingleText(doc);
                 defer encoded.deinit();
                 @memcpy(doc_ids[local_idx * max_len .. (local_idx + 1) * max_len], encoded.ids);
@@ -824,7 +828,7 @@ test "cross encoder bounds working memory with configured batches" {
     try std.testing.expectEqual(@as(usize, documents.len * 2), tokenizer_state.encode_count.load(.acquire));
 }
 
-test "cross encoder observes cancellation between bounded batches" {
+test "cross encoder stops a 30-document pass after its first bounded batch" {
     const Control = struct {
         runs: *std.atomic.Value(usize),
 
@@ -842,10 +846,11 @@ test "cross encoder observes cancellation between bounded batches" {
         allocator,
         session_state.session(),
         tokenizer_state.tokenizer(),
-        .{ .max_length = 8, .batch_size = 2 },
+        .{ .max_length = 8, .batch_size = 8 },
     );
     pipeline.execution_control = .{ .ptr = &control, .check_fn = Control.check };
-    try std.testing.expectError(error.Cancelled, pipeline.rerank("query", &.{ "one", "two", "three" }));
+    const documents = [_][]const u8{"document"} ** 30;
+    try std.testing.expectError(error.Cancelled, pipeline.rerank("query", &documents));
     try std.testing.expectEqual(@as(usize, 1), session_state.run_count.load(.acquire));
 }
 
