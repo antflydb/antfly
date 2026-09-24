@@ -204,6 +204,58 @@ pub const DurableLog = extern struct {
     reserved: u32 = 0,
     observations: [max_durable_cells]DurableObservation = @splat(.{}),
 };
+/// Independent v2 control proof. The v1 document structs and vtable remain
+/// byte-for-byte unchanged; a missing v2 issuer cannot attest a control owner.
+pub const control_proof_abi_version: u32 = 2;
+pub const max_durable_controls = 4;
+pub const ControlDurableOwnerV2 = extern struct {
+    identity: Progress = .{},
+    slot_index: u32 = 0,
+    reserved: u32 = 0,
+};
+pub const ControlDurableOwnersV2 = extern struct {
+    version: u32 = control_proof_abi_version,
+    count: u32 = 0,
+    reserved: u64 = 0,
+    owners: [max_durable_controls]ControlDurableOwnerV2 = @splat(.{}),
+};
+pub const ControlDurableLogV2 = extern struct {
+    version: u32 = control_proof_abi_version,
+    mode: ReconcileMode,
+    compacted_index: u64 = 0,
+    compacted_term: u64 = 0,
+    last_index: u64 = 0,
+    commit_index: u64 = 0,
+    count: u32 = 0,
+    reserved: u32 = 0,
+    observations: [max_durable_controls]DurableObservation = @splat(.{}),
+    /// One atomic native reconciliation also carries the unchanged v1
+    /// document proof, closing any gap between two callback invocations.
+    document: DurableLog = .{ .mode = .startup_complete },
+};
+pub const ControlVTableV2 = extern struct {
+    release: *const fn (?*anyopaque) callconv(.c) void,
+    durable_owners: *const fn (?*anyopaque, *ControlDurableOwnersV2) callconv(.c) failure.Status,
+    reconcile_durable: *const fn (?*anyopaque, *const ControlDurableLogV2) callconv(.c) failure.Status,
+};
+pub const ControlLeaseV2 = extern struct {
+    identity: Identity,
+    context: ?*anyopaque,
+    vtable: *const ControlVTableV2,
+};
+pub const ControlProviderV2 = extern struct {
+    context: ?*anyopaque,
+    acquire: *const fn (?*anyopaque, u64, u64, *ControlLeaseV2) callconv(.c) failure.Status,
+};
+test "workload admission completion pool v1 durable ABI layout remains unchanged" {
+    const std = @import("std");
+    try std.testing.expectEqual(@as(usize, 240), @sizeOf(DurableCells));
+    try std.testing.expectEqual(@as(usize, 16), @offsetOf(DurableCells, "cells"));
+    try std.testing.expectEqual(@as(usize, 432), @sizeOf(DurableLog));
+    try std.testing.expectEqual(@as(usize, 48), @offsetOf(DurableLog, "observations"));
+    try std.testing.expectEqual(@as(usize, 64), @sizeOf(VTable));
+    try std.testing.expectEqual(@as(usize, 56), @offsetOf(VTable, "reconcile_durable"));
+}
 pub const VTable = extern struct {
     /// Inbound checks are nonmutating readiness checks. Ready may acquire
     /// accepted-entry ownership before persistence/ACK. A changed volatile

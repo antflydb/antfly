@@ -4393,6 +4393,7 @@ pub const DataServerConfig = struct {
     /// Owned native pool installation precedes DB authority binding and group
     /// admission. This callback only acquires a reference to that installation.
     data_raft_completion_native_provider: ?completion_pool_abi.Provider = null,
+    data_raft_control_proof_provider_v2: ?completion_pool_abi.ControlProviderV2 = null,
     /// Zero selects bounded synchronous peer delivery. Production defaults to
     /// asynchronous workers; deterministic composed runtimes can remove those
     /// continuously-ready actors without changing the Raft wire protocol.
@@ -22293,6 +22294,7 @@ pub const DataServer = struct {
         errdefer remote_metadata.deinit();
         remote_metadata.completion_backing_provider = cfg.data_raft_completion_provider;
         remote_metadata.completion_native_provider = cfg.data_raft_completion_native_provider;
+        remote_metadata.control_proof_provider_v2 = cfg.data_raft_control_proof_provider_v2;
         remote_metadata.completion_new_admission_enabled = cfg.api_server_cfg.durable_transaction_completion.enabled;
 
         const effective_storage_context = cfg.storage_kernel_context_handle orelse
@@ -22315,6 +22317,7 @@ pub const DataServer = struct {
                 // an external callback cannot bypass local restoration fencing.
                 remote_metadata.completion_authority_source = source;
                 if (remote_metadata.completion_native_provider == null) remote_metadata.completion_native_provider = source.completionProvider();
+                if (remote_metadata.control_proof_provider_v2 == null) remote_metadata.control_proof_provider_v2 = source.controlProofProviderV2();
             }
         }
 
@@ -23145,7 +23148,10 @@ const RemoteMetadataSource = struct {
         try kernel_owner_client.statusToError(result);
         defer lease.vtable.release(lease.context);
         try self.validateCompletionRestorationIdentity(lease.identity, group_id, node_id);
-        try completion_admission_bridge.Bridge.reconcileLease(lease, log);
+        if (self.control_proof_provider_v2) |provider_v2|
+            try completion_admission_bridge.Bridge.reconcileControlProviderV2(provider_v2, lease, group_id, node_id, log)
+        else
+            try completion_admission_bridge.Bridge.reconcileLease(lease, log);
     }
 
     fn validateCompletionRestorationIdentity(self: *RemoteMetadataSource, identity: completion_pool_abi.Identity, group_id: u64, node_id: u64) !void {
@@ -23164,6 +23170,7 @@ const RemoteMetadataSource = struct {
 
     completion_backing_provider: ?raft_engine.runtime.completion_admission_iface.Provider = null,
     completion_native_provider: ?completion_pool_abi.Provider = null,
+    control_proof_provider_v2: ?completion_pool_abi.ControlProviderV2 = null,
     completion_authority_source: ?*antfly.public_api.ProvisionedKernelOwnerSource = null,
     completion_new_admission_enabled: bool = false,
     supports_runtime_reference: std.atomic.Value(bool) = .init(false),

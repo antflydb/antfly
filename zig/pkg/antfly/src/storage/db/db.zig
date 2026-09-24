@@ -28359,6 +28359,17 @@ pub const DB = struct {
         return @import("../completion_native_guard.zig").Guard(DB).lease(stable, group_id, node_id);
     }
 
+    pub fn acquireControlCompletionLeaseV2(self: *DB, group_id: u64, node_id: u64) !@import("kernel_owner_abi").completion_pool.ControlLeaseV2 {
+        const stable = blk: {
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            const backend = self.core.primary_store_owner.lsmBackend() orelse return error.NotFound;
+            if (backend.completion_pool == null) return error.NotFound;
+            break :blk self.async_context.completion_pool_owner orelse return error.CompletionAdmissionUnavailable;
+        };
+        return @import("../completion_native_guard.zig").Guard(DB).controlLeaseV2(stable, group_id, node_id);
+    }
+
     pub fn attestCompletionBacking(self: *DB, group_id: u64, node_id: u64) !@import("kernel_owner_abi").completion_pool.NativeAttestation {
         const stable = self.async_context.completion_pool_owner orelse return error.CompletionAdmissionUnavailable;
         return @import("../completion_native_guard.zig").Guard(DB).attest(stable, group_id, node_id);
@@ -143325,6 +143336,42 @@ test "workload admission physical completion staged control BEGIN retains a pool
             }
         }
         for (pool.control_owners) |owner| try std.testing.expect(owner != null);
+        // The separate v2 channel inventories all retained BEGINs after their
+        // reusable document cells drain. Exact persisted-entry observations
+        // pass; a same-index replacement or compacted BEGIN cannot retire one.
+        const control_lease = try @import("../completion_native_guard.zig").Guard(DB).controlLeaseV2(&db, 2, 7);
+        defer control_lease.vtable.release(control_lease.context);
+        var owners: abi.ControlDurableOwnersV2 = .{};
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, control_lease.vtable.durable_owners(control_lease.context, &owners));
+        try std.testing.expectEqual(@as(u32, 4), owners.count);
+        const stale_v1: abi.DurableLog = .{ .mode = .persisted_replacement, .last_index = 4, .commit_index = 4 };
+        try std.testing.expectEqual(runtime_failure_abi.Status.completion_admission_unavailable, lease.vtable.reconcile_durable.?(lease.context, &stale_v1));
+        var control_proof: abi.ControlDurableLogV2 = .{ .mode = .persisted_replacement, .last_index = 4, .commit_index = 4, .count = owners.count, .document = stale_v1 };
+        for (owners.owners[0..owners.count], 0..) |owner, i| {
+            var guard_owner = (try control_guard.load(alloc, backend.storage.?, backend.root_dir.?, @intCast(owner.slot_index), authority)) orelse return error.TestUnexpectedResult;
+            defer guard_owner.deinit();
+            try std.testing.expectEqualDeep(guard_owner.guard.record.begin, control_record.Receipt{
+                .term = owner.identity.term,
+                .index = owner.identity.index,
+                .digest = owner.identity.payload_digest,
+            });
+            control_proof.observations[i] = .{ .expected = owner.identity, .present = 1, .observed_term = owner.identity.term, .observed_digest = @import("../../common/completion_entry_protocol.zig").payloadDigest(guard_owner.guard.envelope) };
+        }
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, control_lease.vtable.reconcile_durable(control_lease.context, &control_proof));
+        // A later v1 call cannot reuse that proof after a same-index suffix
+        // replacement; the v2 callback included both proofs atomically.
+        try std.testing.expectEqual(runtime_failure_abi.Status.completion_admission_unavailable, lease.vtable.reconcile_durable.?(lease.context, &stale_v1));
+        control_proof.document.last_index = 5;
+        try std.testing.expectEqual(runtime_failure_abi.Status.invalid_argument, control_lease.vtable.reconcile_durable(control_lease.context, &control_proof));
+        control_proof.document.last_index = 4;
+        control_proof.observations[1].observed_term += 1;
+        try std.testing.expectEqual(runtime_failure_abi.Status.recovery_required, control_lease.vtable.reconcile_durable(control_lease.context, &control_proof));
+        control_proof.observations[1].observed_term -= 1;
+        control_proof.compacted_index = 1;
+        control_proof.compacted_term = 1;
+        control_proof.document.compacted_index = 1;
+        control_proof.document.compacted_term = 1;
+        try std.testing.expectEqual(runtime_failure_abi.Status.recovery_required, control_lease.vtable.reconcile_durable(control_lease.context, &control_proof));
     }
     try std.testing.expectError(error.CompletionRecoveryCapacityRequired, DB.open(alloc, std.mem.span(tmp.path().ptr), options));
     const path = std.mem.span(tmp.path().ptr);

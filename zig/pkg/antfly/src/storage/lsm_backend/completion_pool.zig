@@ -260,6 +260,10 @@ pub const DurableCell = struct {
     identity: completion.AcceptedIdentity,
     prepared: bool,
 };
+pub const DurableControlOwner = struct {
+    identity: completion.AcceptedIdentity,
+    slot_index: usize,
+};
 pub const DurableObservation = struct {
     expected: completion.AcceptedIdentity,
     present: bool,
@@ -1427,6 +1431,47 @@ pub fn Pool(comptime Backend: type) type {
                 count += 1;
             }
             return out[0..count];
+        }
+
+        /// Retained BEGIN ownership is independent of the reusable document
+        /// cells. Enumerate the immutable identities without allocating or
+        /// deriving authority from a mutable transaction row.
+        pub fn durableControlOwners(self: *const Self, out: *[control_record.max_owners]DurableControlOwner) ![]const DurableControlOwner {
+            if (self.failed or !self.restored) return error.RecoveryRequired;
+            var count: usize = 0;
+            for (self.control_owners, 0..) |owner, slot_index| if (owner) |active| {
+                out[count] = .{ .identity = active.begin, .slot_index = slot_index };
+                count += 1;
+            };
+            return out[0..count];
+        }
+
+        /// A complete persisted suffix can attest an exact live BEGIN. This
+        /// stage never retires or restores a control owner: absent, replaced,
+        /// or compacted entries still require a separate native receipt and
+        /// owner-backed transition path before any capacity can be released.
+        pub fn reconcileControlDurableLog(self: *const Self, log: DurableLog) !void {
+            if (self.failed or !self.restored) return error.RecoveryRequired;
+            if (log.commit_index > log.last_index or log.compacted_index > log.commit_index or
+                (log.compacted_index == 0) != (log.compacted_term == 0) or
+                log.observations.len > control_record.max_owners) return error.InvalidCompletionSlot;
+            var owners: [control_record.max_owners]DurableControlOwner = undefined;
+            const active = try self.durableControlOwners(&owners);
+            if (active.len != log.observations.len) return error.InvalidCompletionSlot;
+            var seen: [control_record.max_owners]bool = @splat(false);
+            for (active) |owner| {
+                const observation = for (log.observations, 0..) |candidate, i| {
+                    if (!std.meta.eql(candidate.expected, owner.identity)) continue;
+                    if (seen[i]) return error.InvalidCompletionSlot;
+                    seen[i] = true;
+                    break candidate;
+                } else return error.InvalidCompletionSlot;
+                if (!observation.present or owner.identity.index <= log.compacted_index or
+                    owner.identity.index > log.last_index or observation.observed_term != owner.identity.term or
+                    !std.mem.eql(u8, &observation.observed_digest, &owner.identity.digest))
+                    return error.RecoveryRequired;
+            }
+            for (seen[0..log.observations.len]) |matched| if (!matched) return error.InvalidCompletionSlot;
         }
 
         /// Only accepted, never-applied ownership can be retired by durable log

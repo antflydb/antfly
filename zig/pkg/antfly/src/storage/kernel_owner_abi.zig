@@ -2295,6 +2295,7 @@ pub extern fn antfly_storage_wal_append_idempotent(
 ) Status;
 
 pub extern fn antfly_storage_owner_acquire_completion_lease(owner: ?*anyopaque, group_id: u64, node_id: u64, output: *completion_pool.Lease) Status;
+pub extern fn antfly_storage_owner_acquire_control_proof_lease_v2(owner: ?*anyopaque, group_id: u64, node_id: u64, output: *completion_pool.ControlLeaseV2) Status;
 pub extern fn antfly_storage_owner_attest_completion_backing(owner: ?*anyopaque, group_id: u64, node_id: u64, output: *completion_pool.NativeAttestation) Status;
 
 pub extern fn antfly_storage_owner_install_completion(owner: ?*anyopaque, request: *const InstallCompletionRequest) Status;
