@@ -983,7 +983,11 @@ fn beginDefinitelyCreatedNoState(err: anyerror) bool {
 }
 
 fn retainedBeginOutcomeUnknown(err: anyerror) bool {
-    return err == error.RaftBatchWriteOutcomeUnknown or
+    // A conflicting pending BEGIN can belong to an earlier execution of the
+    // stable ID with different metadata. This attempt cannot abort it merely
+    // because its own BEGIN was rejected.
+    return err == error.DecisionConflict or
+        err == error.RaftBatchWriteOutcomeUnknown or
         err == error.UnexpectedHttpStatus or
         err == error.ClientShuttingDown or
         isPreDecisionTransportUnavailable(err);
@@ -1531,6 +1535,15 @@ fn executeMultiTableCommitOnce(
                 };
                 if (status) |observed| switch (observed) {
                     .committed => {
+                        if (err == error.DecisionConflict) {
+                            // Status carries no begin timestamp or participant
+                            // identity. A committed record after an explicit
+                            // BEGIN conflict may belong to another use of this
+                            // ID, so it cannot authorize this request's
+                            // follower propagation or a committed response.
+                            abort_on_error = false;
+                            return error.CommitDecisionUnknown;
+                        }
                         resume_committed = true;
                         abort_on_error = false;
                         break :coordinator_begin;
@@ -1543,10 +1556,9 @@ fn executeMultiTableCommitOnce(
                 };
             }
             if (options.retain_terminal and retainedBeginOutcomeUnknown(err)) {
-                // BEGIN is idempotent for the same stable ID and participant
-                // set. Preserve a pending record and let the session retry;
-                // aborting here turns a slow/unknown Raft reply into a
-                // permanent 409 on the next commit attempt.
+                // A pending record may be an idempotent earlier attempt or a
+                // conflicting execution of this stable ID. Neither this
+                // failed BEGIN nor status=pending grants abort ownership.
                 abort_on_error = false;
                 return error.CommitDecisionUnknown;
             }
@@ -1592,8 +1604,9 @@ fn executeMultiTableCommitOnce(
             const participant_index = failure_offset + 1;
             const failure = fanout_slots[participant_index].err.?;
             if (options.retain_terminal and retainedBeginOutcomeUnknown(failure)) {
-                // Every contacted participant may have persisted BEGIN. A
-                // stable-ID retry can safely finish those idempotent begins.
+                // A contacted follower may retain an earlier execution of
+                // this stable ID. Do not abort it (or the coordinator) based
+                // on a failed follower BEGIN from this invocation.
                 abort_on_error = false;
                 return error.CommitDecisionUnknown;
             }
@@ -5995,7 +6008,7 @@ fn consumerTests() type {
 
             var recorder = Recorder{};
             const txn_id = try parseTxnIdHex("0123456789abcdeffedcba9876543210");
-            for ([_]anyerror{ error.DecisionConflict, error.RaftBatchWriteOutcomeUnknown, error.UnexpectedHttpStatus, error.Timeout, error.UnknownGroup, error.PreDecisionNotProposed }) |begin_error| {
+            for ([_]anyerror{ error.RaftBatchWriteOutcomeUnknown, error.UnexpectedHttpStatus, error.Timeout, error.UnknownGroup, error.PreDecisionNotProposed }) |begin_error| {
                 recorder = .{ .begin_error = begin_error };
                 const outcome = try executeMultiTableCommitWithOptions(
                     std.testing.allocator,
@@ -6018,12 +6031,34 @@ fn consumerTests() type {
                 try std.testing.expectEqual(@as(usize, 0), recorder.prepare_calls);
                 try std.testing.expectEqual(@as(usize, 2), recorder.resolve_calls);
             }
+            // A committed status alone cannot prove that an explicit BEGIN
+            // conflict belongs to this request rather than an ID collision.
+            recorder = .{ .begin_error = error.DecisionConflict, .observed_status = .committed };
+            try std.testing.expectError(error.CommitDecisionUnknown, executeMultiTableCommitWithOptions(
+                std.testing.allocator,
+                FakeCatalog.iface(),
+                recorder.worker(),
+                txn_id,
+                10_000,
+                10_001,
+                &.{.{ .table_name = "docs", .writes = &.{
+                    .{ .key = "doc:a", .value = "{}" },
+                    .{ .key = "doc:z", .value = "{}" },
+                } }},
+                .write,
+                null,
+                .{ .retain_terminal = true },
+            ));
+            try std.testing.expectEqual(@as(usize, 1), recorder.status_calls);
+            try std.testing.expectEqual(@as(usize, 0), recorder.prepare_calls);
+            try std.testing.expectEqual(@as(usize, 0), recorder.resolve_calls);
+            try std.testing.expectEqual(@as(usize, 0), recorder.abort_calls);
             // A committed status was already observed. Even a subsequent
             // conflicting/missing/corrupt coordinator response cannot authorize
             // abort or dispatch follower decisions with unconfirmed metadata.
             for ([_]anyerror{ error.DecisionConflict, error.TxnNotFound, error.InvalidTxnRecord, error.ConnectionResetByPeer }) |retry_error| {
                 for ([_]bool{ true, false }) |report_failure| {
-                    recorder = .{ .resolve_error = retry_error };
+                    recorder = .{ .begin_error = error.RaftBatchWriteOutcomeUnknown, .resolve_error = retry_error };
                     const resumed = executeMultiTableCommitWithOptions(
                         std.testing.allocator,
                         FakeCatalog.iface(),
@@ -6099,6 +6134,36 @@ fn consumerTests() type {
                         .{ .retain_terminal = true },
                     );
                     try std.testing.expect(resumed == .committed);
+                }
+                // A pending record with this stable ID may belong to an
+                // earlier execution whose BEGIN metadata conflicts with this
+                // request. The rejected coordinator or follower BEGIN cannot
+                // abort that record, even after the other BEGINs answered.
+                for ([_]u64{ 7001, 7002 }) |failed_group| {
+                    var conflicting = Recorder{
+                        .failed_begin_group = failed_group,
+                        .begin_error = error.DecisionConflict,
+                        .observed_status = .pending,
+                    };
+                    try std.testing.expectError(error.CommitDecisionUnknown, executeMultiTableCommitWithOptions(
+                        std.testing.allocator,
+                        FakeCatalog.iface(),
+                        conflicting.worker(),
+                        txn_id,
+                        10_000,
+                        10_001,
+                        &.{.{ .table_name = "docs", .writes = &.{
+                            .{ .key = "doc:a", .value = "{}" },
+                            .{ .key = "doc:z", .value = "{}" },
+                        } }},
+                        .write,
+                        null,
+                        .{ .retain_terminal = true },
+                    ));
+                    try std.testing.expectEqual(@as(usize, if (failed_group == 7001) 1 else 0), conflicting.status_calls);
+                    try std.testing.expectEqual(@as(usize, 0), conflicting.prepare_calls);
+                    try std.testing.expectEqual(@as(usize, 0), conflicting.resolve_calls);
+                    try std.testing.expectEqual(@as(usize, 0), conflicting.abort_calls);
                 }
                 // Model an earlier interrupted execution with a prepared follower.
                 // Neither coordinator BEGIN failure nor a follower's explicit
