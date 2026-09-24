@@ -4310,6 +4310,8 @@ test "opaque storage owner retained completion lease survives worker quiesce and
     defer if (owner_live) owner.deinit();
     const lease = try owner.acquireCompletionLease(2, 7);
     defer lease.vtable.release(lease.context);
+    const control_lease = try owner.acquireControlProofLeaseV2(2, 7);
+    defer control_lease.vtable.release(control_lease.context);
     try owner.quiesce();
     try owner.quiesce();
     owner.deinit();
@@ -4319,6 +4321,10 @@ test "opaque storage owner retained completion lease survives worker quiesce and
     var cells: abi.completion_pool.DurableCells = undefined;
     try std.testing.expectEqual(abi.Status.ok, lease.vtable.durable_cells.?(lease.context, &cells));
     try std.testing.expectEqual(@as(u32, 0), cells.count);
+    var controls: abi.completion_pool.ControlDurableOwnersV2 = .{};
+    try std.testing.expectEqual(abi.Status.ok, control_lease.vtable.durable_owners(control_lease.context, &controls));
+    try std.testing.expectEqual(abi.completion_pool.control_proof_abi_version, controls.version);
+    try std.testing.expectEqual(@as(u32, 0), controls.count);
     var progress: abi.completion_pool.Progress = undefined;
     try std.testing.expectEqual(abi.Status.not_found, lease.vtable.progress.?(lease.context, &progress));
 }
