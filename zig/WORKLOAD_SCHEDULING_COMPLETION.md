@@ -70,10 +70,35 @@ this requested implementation/correctness scope.
   and linked API ingress passed 3/3, and the production DATA artifact built
   33/33. Full internal client routing, storage/memory pressure, and combined
   process-wide progress remain open.
+- Hosted transaction decide/resolve/status/ack now select a placement-checked
+  internal endpoint only when the worker has service-signing credentials;
+  older or unsigned peers use the public URL. Begin/prepare and ordinary group
+  routing stay public. The transaction API gate passed 95/95, and DATA's
+  dedicated recovery-status auth fallback plus socket gate passed 2/2. The
+  workload coordinator now uses a versioned v2 ABI to route authenticated
+  discovery, fencing, and reconciliation to the internal endpoint while query
+  traffic stays public. Version 1 and older catalog records retain the public
+  fallback. The workload gate passed 305/305 owning tests and 388 broad tests
+  (one skip), with no failures or leaks. Combined resource saturation remains
+  open for item 6.
+- A separate v2 control-proof ABI now carries retained BEGIN observations and
+  the unchanged v1 document proof from one borrowed durable-log image. Native
+  reconciliation validates both under one DB/backend lock; v1 reconciliation
+  refuses a group with retained control owners. A missing v2 issuer, replaced
+  or compacted BEGIN, and mismatched identity fail closed. The connected native
+  gate passed 45/45, and the workload gate above exercised its DATA bridge.
+  This does not yet restore runnable control resources or certify decision/ACK
+  capacity and replay.
 - Distributed join now stages all fanout hits until every batch succeeds;
   late-batch and sequential failures leave caller output unchanged. The
   curated focused API regression passed 1/1. This covers atomic result
   publication, not the full distributed/client contract inventory.
+- Parallel graph expansion now charges every worker's transient response arena
+  to the request allocator through one synchronized backing object. Its
+  lifetime extends through result merge and worker join, including canceled
+  groups. A 1 MiB request quota rejects two workers' 2 MiB scratch allocations;
+  the curated graph gate passed 16/16 with no leaks. Hydrate and edge fanout
+  arenas still use page-backed memory, so the operator inventory is incomplete.
 - An explicit conflicting stable-ID BEGIN no longer uses a pending or
   committed status enum to abort or propagate an older transaction whose
   BEGIN identity has not been proved equal. Coordinator and follower conflict
