@@ -232,6 +232,7 @@ from .edge_type_config import EdgeTypeConfig
 from .edge_type_config_topology import EdgeTypeConfigTopology
 from .edges_response import EdgesResponse
 from .embedder_config import EmbedderConfig
+from .embedder_config_inputs_item import EmbedderConfigInputsItem
 from .embedder_provider import EmbedderProvider
 from .embedding_index_activity import EmbeddingIndexActivity
 from .embedding_index_activity_phase import EmbeddingIndexActivityPhase
@@ -1515,6 +1516,7 @@ __all__ = (
     "EdgeTypeConfig",
     "EdgeTypeConfigTopology",
     "EmbedderConfig",
+    "EmbedderConfigInputsItem",
     "EmbedderProvider",
     "EmbeddingIndexActivity",
     "EmbeddingIndexActivityPhase",

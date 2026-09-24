@@ -54,6 +54,24 @@ antfly inference pull antflydb/clipclap:gguf:Q4_K
 The running service discovers the newly installed model on its next model-list
 or inference request; no restart is needed.
 
+Antfly learns which inputs a model accepts from its capabilities, which Antfly
+inference publishes for every model it serves, so the index needs no extra
+setting to embed images or audio. For a model whose capabilities Antfly cannot
+discover yet, such as one a provider released after your Antfly version,
+declare them on the embedder:
+
+```json
+"embedder": {
+  "provider": "antfly",
+  "model": "some-new-multimodal-model",
+  "inputs": ["text", "image"]
+}
+```
+
+`inputs` replaces the discovered input types. Only the `antfly` (`image`,
+`audio`) and `bedrock` (`image`) providers accept media inputs; other providers
+reject them instead of silently dropping media.
+
 ### Define the Source Field
 
 Link annotations make the remote-media intent visible in the table schema and

@@ -4888,26 +4888,26 @@ export interface components {
             rate_limit?: components["schemas"]["RateLimitConfig"];
             provider: components["schemas"]["EmbedderProvider"];
             /**
-             * @description Declare that this model supports non-text content (images, audio, video, PDFs),
-             *     even if the model isn't in Antfly's built-in model registry yet.
+             * @description Input types the model accepts. Normally omitted: Antfly learns them from the
+             *     model's capabilities, which Antfly inference publishes for every model it
+             *     serves. Set it only to use a model whose capabilities Antfly cannot discover
+             *     yet, such as a newly released model. When set, it replaces the discovered
+             *     input types.
              *
-             *     When `true`, Antfly treats the model as multimodal and sends binary content
-             *     (images, audio, etc.) through an embedding adapter that supports content parts.
-             *     Antfly currently provides that contract for local Antfly inference and Bedrock;
-             *     text-only provider adapters reject media rather than silently discarding it.
-             *
-             *     Not needed for models already in the local registry (e.g., `clip-*`, `clipclap`).
+             *     Only providers whose adapters can send media accept media inputs: `antfly`
+             *     (`image`, `audio`) and `bedrock` (`image`). Other providers reject `image` and
+             *     `audio` here rather than silently discarding media.
              *
              *     **Example:**
              *     ```json
              *     {
              *       "provider": "antfly",
              *       "model": "some-future-multimodal-model",
-             *       "multimodal": true
+             *       "inputs": ["text", "image"]
              *     }
              *     ```
              */
-            multimodal?: boolean;
+            inputs?: ("text" | "image" | "audio")[];
             /**
              * @deprecated
              * @description Deprecated compatibility form of

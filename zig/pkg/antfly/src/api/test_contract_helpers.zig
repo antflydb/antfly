@@ -154,14 +154,15 @@ pub fn openAIIndexEmbedder(model: []const u8, url: []const u8) embeddings_openap
     } };
 }
 
-/// `multimodal` is a field shared by every provider, so it exists only on the
-/// flat `EmbedderConfig`; the provider-tagged union variants cannot carry it.
-pub fn antflyIndexEmbedder(model: []const u8, api_url: []const u8, multimodal: bool) embeddings_openapi.EmbedderConfig {
+/// `inputs` is a field shared by every provider, so it exists only on the flat
+/// `EmbedderConfig`; the provider-tagged union variants cannot carry it. The
+/// test providers publish no capabilities, so image support is declared.
+pub fn antflyIndexEmbedder(model: []const u8, api_url: []const u8, accepts_images: bool) embeddings_openapi.EmbedderConfig {
     return .{
         .provider = "antfly",
         .model = model,
         .api_url = api_url,
-        .multimodal = if (multimodal) true else null,
+        .inputs = if (accepts_images) &.{ "text", "image" } else null,
     };
 }
 

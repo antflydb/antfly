@@ -12765,24 +12765,33 @@ components:
               $ref: '#/components/schemas/RateLimitConfig'
             provider:
               $ref: '#/components/schemas/EmbedderProvider'
-            multimodal:
-              type: boolean
+            inputs:
+              type: array
+              minItems: 1
+              uniqueItems: true
+              items:
+                type: string
+                enum:
+                  - text
+                  - image
+                  - audio
               description: >-
-                Declare that this model supports non-text content (images, audio, video, PDFs),
+                Input types the model accepts. Normally omitted: Antfly learns them from the
 
-                even if the model isn't in Antfly's built-in model registry yet.
+                model's capabilities, which Antfly inference publishes for every model it
 
+                serves. Set it only to use a model whose capabilities Antfly cannot discover
 
-                When `true`, Antfly treats the model as multimodal and sends binary content
+                yet, such as a newly released model. When set, it replaces the discovered
 
-                (images, audio, etc.) through an embedding adapter that supports content parts.
-
-                Antfly currently provides that contract for local Antfly inference and Bedrock;
-
-                text-only provider adapters reject media rather than silently discarding it.
+                input types.
 
 
-                Not needed for models already in the local registry (e.g., `clip-*`, `clipclap`).
+                Only providers whose adapters can send media accept media inputs: `antfly`
+
+                (`image`, `audio`) and `bedrock` (`image`). Other providers reject `image` and
+
+                `audio` here rather than silently discarding media.
 
 
                 **Example:**
@@ -12792,7 +12801,7 @@ components:
                 {
                   "provider": "antfly",
                   "model": "some-future-multimodal-model",
-                  "multimodal": true
+                  "inputs": ["text", "image"]
                 }
 
                 ```

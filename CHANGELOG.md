@@ -32,6 +32,20 @@ All notable changes to Antfly will be documented in this file.
   catalog; Antfly sends `documents` only to servers that do and keeps sending
   `prompts` to older ones, so clusters and inference pools can upgrade in
   either order. `prompts` can be removed once every client sends `documents`.
+- **Embedder input types come from model capabilities** — the embedder
+  `multimodal` flag is removed. Antfly learns which inputs a model accepts from
+  its capabilities (discovered from Antfly inference, or the linked runtime).
+  For a model whose capabilities cannot be discovered yet, set `inputs`, for
+  example `["text", "image"]`, which replaces the discovered input types; only
+  the `antfly` (`image`, `audio`) and `bedrock` (`image`) providers accept media
+  inputs. Existing indexes keep working: a stored `multimodal` value is ignored,
+  and it no longer takes part in embedding producer identity.
+- **Reranker image support is resolved from the model manifest** — like image
+  embedding, a manifest declaring text-only `inputs` stays text-only, and
+  otherwise a Qwen3-VL GGUF bundle with its projector or a `colqwen` /
+  `multimodal_late_interaction` capability selects the image executor. The
+  model catalog, the executor contract, and the rerank handler share that one
+  answer.
 - **Query rerankers score images** — a reranker `template` can use the `media`
   and `remoteMedia` helpers, and each candidate's images are sent with its
   text to an Antfly reranker whose model accepts images, whether it runs in
