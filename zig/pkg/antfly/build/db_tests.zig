@@ -225,6 +225,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.db.test.materialized preserved sources dedupe pending chunk keys",
         "storage.db.db.test.db generated replay atomically promotes staged artifacts and deletes stale generation",
         "storage.db.enrichment.enrichment_runtime.test.rejected chunk embedding publication records its request for stale cleanup",
+        "storage.db.enrichment.enrichment_runtime.test.empty chunk sources retain their own document revisions",
+        "storage.db.enrichment.enrichment_runtime.test.stale embedding cleanup guards each request in a shared window",
         "storage.db.db.test.db cached chunk cleanup survives another failed shared batch request",
         "storage.db.db.test.db managed dense enrichment retries temporary model capacity without terminal coverage",
         "storage.db.db.test.db managed sparse enrichment retries temporary model capacity without terminal coverage",

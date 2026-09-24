@@ -3593,6 +3593,11 @@ const WorkerChunkCacheEntry = struct {
     source_record_digest: ?[32]u8 = null,
 };
 
+const WorkerChunkSource = struct {
+    chunks: []const chunker_mod.Chunk,
+    source_record_digest: ?[32]u8,
+};
+
 const RequestPlanCacheEntry = struct {
     doc_key: []u8,
     requests: []const enrichment_types.GeneratedEnrichmentRequest,
@@ -3931,12 +3936,150 @@ test "enrichment worker chunk cache keys preserve embedded separators" {
     try std.testing.expect(!std.mem.eql(u8, left, right));
 }
 
+test "empty chunk sources retain their own document revisions" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+    var erased_store = try backend_erased.storeFrom(alloc, store);
+    defer erased_store.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/empty-chunk-revisions", .{tmp.sub_path});
+    var index_manager = try index_manager_mod.IndexManager.init(alloc, index_path);
+    defer index_manager.deinit();
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = erased_store,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = &index_manager,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .failure_ctx = undefined,
+        .failure_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+    };
+    defer clearIndexEmbeddingActivity(&runtime);
+    var cache = std.ArrayListUnmanaged(WorkerChunkCacheEntry).empty;
+    defer {
+        freeWorkerChunkCache(alloc, &cache);
+    }
+    const first_raw = "{\"body\":\"\"}";
+    const second_raw = "{\"body\":\"\",\"revision\":2}";
+    const first_key = try documentSourceStoreKeyAlloc(&runtime, "doc:first");
+    defer alloc.free(first_key);
+    const second_key = try documentSourceStoreKeyAlloc(&runtime, "doc:second");
+    defer alloc.free(second_key);
+    try storePutWithRetry(&runtime, first_key, first_raw);
+    try storePutWithRetry(&runtime, second_key, second_raw);
+    const first_request: enrichment_types.GeneratedEnrichmentRequest = .{
+        .kind = .dense_embedding,
+        .index_name = "semantic",
+        .artifact_name = "chunks",
+        .embedding_name = "dense",
+        .input_kind = .inline_chunks,
+        .doc_key = "doc:first",
+        .source_field = "body",
+        .chunk_size = 8,
+    };
+    var first = try chunkEmbeddingSourceSetForRequest(&runtime, first_request, "chunks", &cache);
+    defer first.deinit(alloc);
+    var second_request = first_request;
+    second_request.doc_key = "doc:second";
+    var second = try chunkEmbeddingSourceSetForRequest(&runtime, second_request, "chunks", &cache);
+    defer second.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), first.sources.len);
+    try std.testing.expectEqual(@as(usize, 0), second.sources.len);
+    try std.testing.expectEqual(sourceRecordDigest(first_raw), first.source_record_digest.?);
+    try std.testing.expectEqual(sourceRecordDigest(second_raw), second.source_record_digest.?);
+}
+
+test "stale embedding cleanup guards each request in a shared window" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+    var erased_store = try backend_erased.storeFrom(alloc, store);
+    defer erased_store.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/cleanup-guards", .{tmp.sub_path});
+    var index_manager = try index_manager_mod.IndexManager.init(alloc, index_path);
+    defer index_manager.deinit();
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = erased_store,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = &index_manager,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .failure_ctx = undefined,
+        .failure_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+    };
+    var window = GeneratedReplayWindow{ .alloc = alloc };
+    defer window.deinit();
+    const first_chunk = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:first", "chunks", 0);
+    defer alloc.free(first_chunk);
+    const second_chunk = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:second", "chunks", 0);
+    defer alloc.free(second_chunk);
+    const first_embedding = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, first_chunk, "dense");
+    defer alloc.free(first_embedding);
+    const second_embedding = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, second_chunk, "dense");
+    defer alloc.free(second_embedding);
+    const first_source = try documentSourceStoreKeyAlloc(&runtime, "doc:first");
+    defer alloc.free(first_source);
+    const second_source = try documentSourceStoreKeyAlloc(&runtime, "doc:second");
+    defer alloc.free(second_source);
+    const first_request: enrichment_types.GeneratedEnrichmentRequest = .{
+        .kind = .dense_embedding,
+        .index_name = "semantic",
+        .doc_key = "doc:first",
+        .source_field = "body",
+        .sequence = 1,
+    };
+    var second_request = first_request;
+    second_request.doc_key = "doc:second";
+    second_request.sequence = 2;
+    var first_guarded = false;
+    var second_guarded = false;
+    try guardStaleEmbeddingDelete(&runtime, &window, first_source, null, first_request, first_embedding, &first_guarded);
+    try guardStaleEmbeddingDelete(&runtime, &window, first_source, null, first_request, first_embedding, &first_guarded);
+    try guardStaleEmbeddingDelete(&runtime, &window, second_source, null, second_request, second_embedding, &second_guarded);
+    var first_source_guards: usize = 0;
+    var second_source_guards: usize = 0;
+    for (window.source_guards.items) |guard| {
+        if (guard.document_key) |doc_key| {
+            if (std.mem.eql(u8, doc_key, "doc:first")) first_source_guards += 1;
+            if (std.mem.eql(u8, doc_key, "doc:second")) second_source_guards += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), first_source_guards);
+    try std.testing.expectEqual(@as(usize, 1), second_source_guards);
+}
+
 fn getOrCreateRequestChunks(
     runtime: *EnrichmentRuntime,
     request: enrichment_types.GeneratedEnrichmentRequest,
     cache: *std.ArrayListUnmanaged(WorkerChunkCacheEntry),
-) ![]const chunker_mod.Chunk {
-    if (!requestHasChunking(request)) return &.{};
+) !WorkerChunkSource {
+    if (!requestHasChunking(request)) return .{ .chunks = &.{}, .source_record_digest = null };
 
     const cache_key = try workerChunkCacheKey(runtime.alloc, request);
     errdefer runtime.alloc.free(cache_key);
@@ -3957,7 +4100,7 @@ fn getOrCreateRequestChunks(
         }
         if (raw) |value| runtime.alloc.free(value);
         runtime.alloc.free(cache_key);
-        return entry.chunks;
+        return .{ .chunks = entry.chunks, .source_record_digest = entry.source_record_digest };
     }
     if (raw == null) {
         const empty = try runtime.alloc.alloc(chunker_mod.Chunk, 0);
@@ -3966,7 +4109,7 @@ fn getOrCreateRequestChunks(
             .chunks = empty,
             .source_record_digest = source_digest,
         });
-        return cache.items[cache.items.len - 1].chunks;
+        return .{ .chunks = empty, .source_record_digest = source_digest };
     }
     defer runtime.alloc.free(raw.?);
 
@@ -3977,7 +4120,7 @@ fn getOrCreateRequestChunks(
             .chunks = empty,
             .source_record_digest = source_digest,
         });
-        return cache.items[cache.items.len - 1].chunks;
+        return .{ .chunks = empty, .source_record_digest = source_digest };
     };
     defer runtime.alloc.free(source_text);
 
@@ -3997,7 +4140,7 @@ fn getOrCreateRequestChunks(
         .chunks = chunks,
         .source_record_digest = sourceRecordDigest(raw.?),
     });
-    return cache.items[cache.items.len - 1].chunks;
+    return .{ .chunks = chunks, .source_record_digest = source_digest };
 }
 
 fn inheritProcessTelemetryUnlocked(runtime: anytype, previous: types.EnrichmentStats) void {
@@ -21854,11 +21997,14 @@ fn processMaterializedChunkDenseRequest(
     }
 
     if (rejected_requests.contains(requestFailureFingerprint(request))) return;
+    var source_guarded_in_window = false;
     for (existing_embedding_keys.items) |embedding_key| {
         if (try derivedEmbeddingBelongsToDesiredChunkSet(runtime.alloc, embedding_key, &desired_chunk_keys)) continue;
+        // Finish preceding replacement work before guarded cleanup. Later
+        // requests may share this bounded window with independent guards.
         if (window.source_guards.items.len == 0)
             try flushGeneratedReplayWindowWithIdentity(runtime, window, scope.completedFingerprint());
-        try guardStaleEmbeddingDelete(runtime, window, source_key, source_digest, request, embedding_key);
+        try guardStaleEmbeddingDelete(runtime, window, source_key, source_digest, request, embedding_key, &source_guarded_in_window);
         try appendUniqueDupeKey(runtime.alloc, &window.artifact_delete_keys, embedding_key);
         try flushGeneratedReplayWindowIfNeededWithIdentity(runtime, window, max_window_items, scope.completedFingerprint());
     }
@@ -23010,9 +23156,14 @@ fn guardStaleEmbeddingDelete(
     source_digest: ?[32]u8,
     request: enrichment_types.GeneratedEnrichmentRequest,
     embedding_key: []const u8,
+    source_guarded_in_window: *bool,
 ) !void {
-    if (window.source_guards.items.len == 0)
+    // A window may carry other requests' guards. The caller tracks whether
+    // this request has installed its own source fence in the current window.
+    if (!source_guarded_in_window.* or window.source_guards.items.len == 0) {
         try appendGeneratedSourceGuard(runtime, window, source_key, source_digest, request.doc_key, request.sequence);
+        source_guarded_in_window.* = true;
+    }
     try appendGuardForCurrentRecord(runtime, window, embedding_key);
     if (try internal_keys.derivedEmbeddingBaseKeyAlloc(runtime.alloc, embedding_key)) |base_key| {
         defer runtime.alloc.free(base_key);
@@ -23028,8 +23179,9 @@ fn mergeGuardedStaleEmbeddingDeletesIntoWindow(
     source_digest: ?[32]u8,
     request: enrichment_types.GeneratedEnrichmentRequest,
 ) !void {
+    var source_guarded_in_window = false;
     for (stale.artifact_delete_keys) |key|
-        try guardStaleEmbeddingDelete(runtime, window, source_key, source_digest, request, key);
+        try guardStaleEmbeddingDelete(runtime, window, source_key, source_digest, request, key, &source_guarded_in_window);
     try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, stale);
 }
 
@@ -23280,7 +23432,7 @@ fn processChunkText(
 ) !void {
     if (request.chunk_size == 0 and request.chunker_json.len == 0) return;
 
-    const chunks = try getOrCreateRequestChunks(runtime, request, chunk_cache);
+    const chunks = (try getOrCreateRequestChunks(runtime, request, chunk_cache)).chunks;
 
     const artifact_name = requestArtifactName(request);
     const include_default_full_text = request.full_text_index or
@@ -27198,14 +27350,9 @@ fn chunkEmbeddingSourceSetForRequest(
         return error.InvalidEnrichmentConfig;
     }
 
-    const chunks = try getOrCreateRequestChunks(runtime, request, chunk_cache);
-    const source_record_digest = blk: {
-        for (chunk_cache.items) |entry| {
-            if (entry.chunks.ptr == chunks.ptr) break :blk entry.source_record_digest;
-        }
-        if (requestHasChunking(request)) return error.MissingChunkSourceFence;
-        break :blk null;
-    };
+    const chunk_source = try getOrCreateRequestChunks(runtime, request, chunk_cache);
+    const chunks = chunk_source.chunks;
+    const source_record_digest = chunk_source.source_record_digest;
     if (chunks.len > 0) {
         var sources = std.ArrayListUnmanaged(ChunkEmbeddingSource).empty;
         errdefer {
