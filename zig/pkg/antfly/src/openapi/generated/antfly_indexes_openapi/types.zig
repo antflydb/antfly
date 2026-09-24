@@ -1582,6 +1582,7 @@ pub const CreatedEnrichmentConfig = struct {
     vector_space: ?[]const u8 = null,
     chunk_size: ?i64 = null,
     chunk_overlap: ?i64 = null,
+    chunker: ?antfly_chunking_openapi.ChunkerConfig = null,
     chunker_json: ?[]const u8 = null,
     full_text_index: ?bool = null,
     content_type: ?[]const u8 = null,
@@ -1599,6 +1600,7 @@ pub const CreatedEnrichmentConfig = struct {
         .{ "vector_space", "vector_space", true },
         .{ "chunk_size", "chunk_size", true },
         .{ "chunk_overlap", "chunk_overlap", true },
+        .{ "chunker", "chunker", false },
         .{ "chunker_json", "chunker_json", true },
         .{ "full_text_index", "full_text_index", true },
         .{ "content_type", "content_type", true },
@@ -1647,6 +1649,13 @@ pub const CreatedEnrichmentConfig = struct {
         if (self.chunk_overlap) |value| {
             try jw.objectField("chunk_overlap");
             try jw.write(value);
+        }
+        if (self.chunker) |value| {
+            try jw.objectField("chunker");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("chunker");
+            try jw.write(@as(?u8, null));
         }
         if (self.chunker_json) |value| {
             try jw.objectField("chunker_json");
@@ -3662,7 +3671,9 @@ pub const EnrichmentConfig = struct {
     chunk_size: ?i64 = null,
     /// Chunk overlap for chunk enrichments.
     chunk_overlap: ?i64 = null,
-    /// Serialized chunker configuration for chunk enrichments.
+    /// Chunker configuration for chunk enrichments. Cannot be combined with chunker_json.
+    chunker: ?antfly_chunking_openapi.ChunkerConfig = null,
+    /// Legacy serialized chunker configuration for chunk enrichments. Cannot be combined with chunker.
     chunker_json: ?[]const u8 = null,
     /// When true on a chunk or asset enrichment, route generated text into the table's default full-text index.
     full_text_index: ?bool = null,
@@ -3688,6 +3699,7 @@ pub const EnrichmentConfig = struct {
         .{ "vector_space", "vector_space", true },
         .{ "chunk_size", "chunk_size", true },
         .{ "chunk_overlap", "chunk_overlap", true },
+        .{ "chunker", "chunker", false },
         .{ "chunker_json", "chunker_json", true },
         .{ "full_text_index", "full_text_index", true },
         .{ "content_type", "content_type", true },
@@ -3738,6 +3750,13 @@ pub const EnrichmentConfig = struct {
         if (self.chunk_overlap) |value| {
             try jw.objectField("chunk_overlap");
             try jw.write(value);
+        }
+        if (self.chunker) |value| {
+            try jw.objectField("chunker");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("chunker");
+            try jw.write(@as(?u8, null));
         }
         if (self.chunker_json) |value| {
             try jw.objectField("chunker_json");

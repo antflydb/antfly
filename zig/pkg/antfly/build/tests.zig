@@ -1508,6 +1508,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lib_bedrock_test_step.dependOn(&run_lib_bedrock_tests.step);
 
     const api_http_runtime_default_filters = [_][]const u8{
+        "artifact enrichment accepts typed chunker and rejects ambiguous legacy config",
+        "created nested response allowlists cover generated schemas",
         "staged restore published metadata wins cancellation only after every owner opens",
         "staged restore worker publishes a dependency complete mixed native cohort",
         "staged restore worker rebuilds a dependency complete mixed portable cohort",

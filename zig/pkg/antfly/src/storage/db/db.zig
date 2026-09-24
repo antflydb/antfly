@@ -46486,7 +46486,11 @@ const InlineChunkEmbeddingCleanup = struct {
                         continue;
                     };
                     const desired = group.embeddings.get(embedding_name) orelse continue;
-                    if (!desired.contains(key)) try artifact_delete_keys.append(alloc, try alloc.dupe(u8, key));
+                    if (!desired.contains(key)) {
+                        const deleted_key = try alloc.dupe(u8, key);
+                        errdefer alloc.free(deleted_key);
+                        try artifact_delete_keys.append(alloc, deleted_key);
+                    }
                 }
                 const next_cursor = try alloc.dupe(u8, existing[existing.len - 1]);
                 if (cursor) |key| alloc.free(key);

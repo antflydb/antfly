@@ -492,7 +492,11 @@ components:
           description: "Optional stable model/token-space identifier asserted for this embedding artifact."
         chunk_size: { type: integer, minimum: 0 }
         chunk_overlap: { type: integer, minimum: 0 }
-        chunker_json: { type: string }
+        chunker: { $ref: "chunking.yaml#/components/schemas/ChunkerConfig" }
+        chunker_json:
+          type: string
+          deprecated: true
+          x-deprecated-reason: "Use the typed chunker field."
         full_text_index: { type: boolean, default: false }
         content_type: { type: string }
         neighbor_context: { $ref: "#/components/schemas/EnrichmentNeighborContextConfig" }
@@ -728,10 +732,15 @@ components:
           type: integer
           minimum: 0
           description: "Chunk overlap for chunk enrichments."
+        chunker:
+          $ref: "chunking.yaml#/components/schemas/ChunkerConfig"
+          description: "Chunker configuration for chunk enrichments. Cannot be combined with chunker_json."
         chunker_json:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: "Serialized chunker configuration for chunk enrichments."
+          deprecated: true
+          x-deprecated-reason: "Use the typed chunker field."
+          description: "Legacy serialized chunker configuration for chunk enrichments. Cannot be combined with chunker."
         full_text_index:
           x-go-type-skip-optional-pointer: true
           type: boolean

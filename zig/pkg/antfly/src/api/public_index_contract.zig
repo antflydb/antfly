@@ -264,6 +264,8 @@ pub fn createdObjectShapeForChild(parent: CreatedObjectShape, field: []const u8)
             .execution_policy
         else if (std.mem.eql(u8, field, "neighbor_context"))
             .enrichment_neighbor_context
+        else if (std.mem.eql(u8, field, "chunker"))
+            .chunker
         else
             .unrestricted,
         .chunker => if (std.mem.eql(u8, field, "text"))
@@ -503,7 +505,8 @@ fn enrichmentFieldValueMatches(field: []const u8, value: std.json.Value) bool {
     if (std.mem.eql(u8, field, "full_text_index")) return isBool(value);
     if (std.mem.eql(u8, field, "execution") or
         std.mem.eql(u8, field, "transcriber") or
-        std.mem.eql(u8, field, "neighbor_context")) return value == .object;
+        std.mem.eql(u8, field, "neighbor_context") or
+        std.mem.eql(u8, field, "chunker")) return value == .object;
     if (std.mem.eql(u8, field, "vector_space")) return isNonEmptyString(value);
     return isString(value);
 }
@@ -724,6 +727,7 @@ pub fn isAllowedCreatedEnrichmentField(field: []const u8) bool {
         std.mem.eql(u8, field, "vector_space") or
         std.mem.eql(u8, field, "chunk_size") or
         std.mem.eql(u8, field, "chunk_overlap") or
+        std.mem.eql(u8, field, "chunker") or
         std.mem.eql(u8, field, "chunker_json") or
         std.mem.eql(u8, field, "full_text_index") or
         std.mem.eql(u8, field, "content_type") or

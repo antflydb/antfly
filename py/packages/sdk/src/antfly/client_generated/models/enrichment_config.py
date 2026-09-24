@@ -10,6 +10,7 @@ from ..models.enrichment_kind import EnrichmentKind
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.chunker_config import ChunkerConfig
     from ..models.enrichment_neighbor_context_config import EnrichmentNeighborContextConfig
     from ..models.execution_policy import ExecutionPolicy
     from ..models.transcriber_enrichment_config import TranscriberEnrichmentConfig
@@ -39,7 +40,10 @@ class EnrichmentConfig:
                 be mixed; dimensions are always validated independently.
             chunk_size (int | Unset): Chunk size for chunk enrichments.
             chunk_overlap (int | Unset): Chunk overlap for chunk enrichments.
-            chunker_json (str | Unset): Serialized chunker configuration for chunk enrichments.
+            chunker (ChunkerConfig | Unset): A unified configuration for a chunking provider. Example: {'provider':
+                'antfly', 'model': 'fixed', 'text': {'target_tokens': 500, 'overlap_tokens': 50}}.
+            chunker_json (str | Unset): Legacy serialized chunker configuration for chunk enrichments. Cannot be combined
+                with chunker.
             full_text_index (bool | Unset): When true on a chunk or asset enrichment, route generated text into the table's
                 default full-text index. Default: False.
             content_type (str | Unset): Produced asset content type for asset enrichments.
@@ -83,6 +87,7 @@ class EnrichmentConfig:
     vector_space: str | Unset = UNSET
     chunk_size: int | Unset = UNSET
     chunk_overlap: int | Unset = UNSET
+    chunker: ChunkerConfig | Unset = UNSET
     chunker_json: str | Unset = UNSET
     full_text_index: bool | Unset = False
     content_type: str | Unset = UNSET
@@ -110,6 +115,10 @@ class EnrichmentConfig:
         chunk_size = self.chunk_size
 
         chunk_overlap = self.chunk_overlap
+
+        chunker: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.chunker, Unset):
+            chunker = self.chunker.to_dict()
 
         chunker_json = self.chunker_json
 
@@ -153,6 +162,8 @@ class EnrichmentConfig:
             field_dict["chunk_size"] = chunk_size
         if chunk_overlap is not UNSET:
             field_dict["chunk_overlap"] = chunk_overlap
+        if chunker is not UNSET:
+            field_dict["chunker"] = chunker
         if chunker_json is not UNSET:
             field_dict["chunker_json"] = chunker_json
         if full_text_index is not UNSET:
@@ -172,6 +183,7 @@ class EnrichmentConfig:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.chunker_config import ChunkerConfig
         from ..models.enrichment_neighbor_context_config import EnrichmentNeighborContextConfig
         from ..models.execution_policy import ExecutionPolicy
         from ..models.transcriber_enrichment_config import TranscriberEnrichmentConfig
@@ -194,6 +206,13 @@ class EnrichmentConfig:
         chunk_size = d.pop("chunk_size", UNSET)
 
         chunk_overlap = d.pop("chunk_overlap", UNSET)
+
+        _chunker = d.pop("chunker", UNSET)
+        chunker: ChunkerConfig | Unset
+        if isinstance(_chunker, Unset):
+            chunker = UNSET
+        else:
+            chunker = ChunkerConfig.from_dict(_chunker)
 
         chunker_json = d.pop("chunker_json", UNSET)
 
@@ -234,6 +253,7 @@ class EnrichmentConfig:
             vector_space=vector_space,
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
+            chunker=chunker,
             chunker_json=chunker_json,
             full_text_index=full_text_index,
             content_type=content_type,

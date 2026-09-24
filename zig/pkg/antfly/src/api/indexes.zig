@@ -25,6 +25,7 @@ const coverage_policy_mod = @import("coverage_policy.zig");
 const json_helpers = @import("json_helpers.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const internal_keys = @import("../storage/internal_keys.zig");
+const document_content_hash = @import("../storage/db/document_content_hash.zig");
 const indexes_openapi = @import("antfly_indexes_openapi");
 const chunking_openapi = @import("antfly_chunking_openapi");
 const chunking_api_openapi = @import("antfly_chunking_api_openapi");
@@ -388,7 +389,24 @@ pub fn encodeArtifactEnrichmentList(
         .table_name = table_name,
         .artifacts = enrichments[0..unique_len],
     };
-    return try std.json.Stringify.valueAlloc(alloc, response, .{});
+    const encoded = try std.json.Stringify.valueAlloc(alloc, response, .{});
+    defer alloc.free(encoded);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const parsed = try std.json.parseFromSlice(std.json.Value, scratch, encoded, .{});
+    const artifacts = parsed.value.object.getPtr("artifacts").?;
+    for (artifacts.array.items) |*artifact| {
+        const legacy = artifact.object.get("chunker_json") orelse continue;
+        if (legacy != .string or legacy.string.len == 0) continue;
+        const chunker = std.json.parseFromSlice(std.json.Value, scratch, legacy.string, .{}) catch continue;
+        if (chunker.value != .object) continue;
+        var filtered = std.ArrayListUnmanaged(u8).empty;
+        try appendPublicConfigValue(scratch, &filtered, chunker.value, null, .chunker);
+        const public_chunker = try std.json.parseFromSlice(std.json.Value, scratch, filtered.items, .{});
+        try artifact.object.put(scratch, "chunker", public_chunker.value);
+    }
+    return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
 }
 
 pub fn validateArtifactEnrichmentsForTableIndexesJson(
@@ -731,6 +749,11 @@ pub fn collectArtifactEnrichmentsFromValueWithOptions(
                     defer parsed.deinit();
                     var owned = try db_mod.types.EnrichmentConfig.clone(alloc, parsed.value);
                     errdefer owned.deinit(alloc);
+                    if (item.object.get("chunker")) |chunker| {
+                        if (owned.kind != .chunk or chunker != .object or item.object.get("chunker_json") != null)
+                            return error.InvalidEnrichmentConfig;
+                        owned.chunker_json = try document_content_hash.canonicalJsonValueAlloc(alloc, chunker);
+                    }
                     if (item.object.get("transcriber")) |transcriber| {
                         // The typed shorthand replaces producer_json rather
                         // than layering on it, and only an asset stream can
@@ -789,7 +812,7 @@ fn artifactEnrichmentConfigsEqual(
         std.mem.eql(u8, a.vector_space, b.vector_space) and
         a.chunk_size == b.chunk_size and
         a.chunk_overlap == b.chunk_overlap and
-        std.mem.eql(u8, a.chunker_json, b.chunker_json) and
+        try enrichment_config_validation.producerJsonValuesEqual(alloc, a.chunker_json, b.chunker_json) and
         a.full_text_index == b.full_text_index and
         std.mem.eql(u8, a.content_type, b.content_type) and
         try enrichment_config_validation.producerJsonValuesEqual(alloc, a.producer_json, b.producer_json) and
@@ -10956,4 +10979,38 @@ test "posting refresh status aggregates unknown and pending shards conservativel
     encoded.clearRetainingCapacity();
     try appendHbcPostingStatus(alloc, &encoded, .{ .refresh_pending = false });
     try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"refresh_pending\":false") != null);
+}
+
+test "artifact enrichment accepts typed chunker and rejects ambiguous legacy config" {
+    const alloc = std.testing.allocator;
+    const typed =
+        \\{"enrichments":[{"name":"chunks","kind":"chunk","field":"body","chunker":{"provider":"antfly","model":"fixed-bert-tokenizer","store_chunks":false,"text":{"target_tokens":64,"overlap_tokens":8}}}]}
+    ;
+    try validateArtifactEnrichmentsForTableIndexesJson(alloc, typed);
+    const enrichments = try collectArtifactEnrichmentsFromTableIndexesJson(alloc, typed);
+    defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
+    try std.testing.expectEqual(@as(usize, 1), enrichments.len);
+    var chunker = try std.json.parseFromSlice(std.json.Value, alloc, enrichments[0].chunker_json, .{});
+    defer chunker.deinit();
+    try std.testing.expectEqual(false, chunker.value.object.get("store_chunks").?.bool);
+    const listed = try encodeArtifactEnrichmentList(alloc, "items", typed);
+    defer alloc.free(listed);
+    var listed_json = try std.json.parseFromSlice(std.json.Value, alloc, listed, .{});
+    defer listed_json.deinit();
+    const listed_chunker = listed_json.value.object.get("artifacts").?.array.items[0].object.get("chunker").?;
+    try std.testing.expectEqual(false, listed_chunker.object.get("store_chunks").?.bool);
+
+    const legacy =
+        \\{"enrichments":[{"name":"chunks","kind":"chunk","field":"body","chunker_json":"{\"provider\":\"antfly\",\"model\":\"fixed-bert-tokenizer\",\"store_chunks\":false,\"text\":{\"target_tokens\":64}}"}]}
+    ;
+    try validateArtifactEnrichmentsForTableIndexesJson(alloc, legacy);
+    const reordered =
+        \\{"enrichments":[{"name":"chunks","kind":"chunk","field":"body","chunker":{"provider":"antfly","model":"fixed","text":{"target_tokens":64}}},{"name":"chunks","kind":"chunk","field":"body","chunker":{"text":{"target_tokens":64},"model":"fixed","provider":"antfly"}}]}
+    ;
+    try validateArtifactEnrichmentsForTableIndexesJson(alloc, reordered);
+
+    const both =
+        \\{"enrichments":[{"name":"chunks","kind":"chunk","field":"body","chunker":{"provider":"antfly"},"chunker_json":"{}"}]}
+    ;
+    try std.testing.expectError(error.InvalidEnrichmentConfig, validateArtifactEnrichmentsForTableIndexesJson(alloc, both));
 }

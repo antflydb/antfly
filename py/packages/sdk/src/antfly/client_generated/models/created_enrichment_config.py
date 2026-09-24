@@ -9,6 +9,7 @@ from ..models.enrichment_kind import EnrichmentKind
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.chunker_config import ChunkerConfig
     from ..models.enrichment_neighbor_context_config import EnrichmentNeighborContextConfig
     from ..models.execution_policy import ExecutionPolicy
 
@@ -30,6 +31,8 @@ class CreatedEnrichmentConfig:
         vector_space (str | Unset): Optional stable model/token-space identifier asserted for this embedding artifact.
         chunk_size (int | Unset):
         chunk_overlap (int | Unset):
+        chunker (ChunkerConfig | Unset): A unified configuration for a chunking provider. Example: {'provider':
+            'antfly', 'model': 'fixed', 'text': {'target_tokens': 500, 'overlap_tokens': 50}}.
         chunker_json (str | Unset):
         full_text_index (bool | Unset):  Default: False.
         content_type (str | Unset):
@@ -52,6 +55,7 @@ class CreatedEnrichmentConfig:
     vector_space: str | Unset = UNSET
     chunk_size: int | Unset = UNSET
     chunk_overlap: int | Unset = UNSET
+    chunker: ChunkerConfig | Unset = UNSET
     chunker_json: str | Unset = UNSET
     full_text_index: bool | Unset = False
     content_type: str | Unset = UNSET
@@ -76,6 +80,10 @@ class CreatedEnrichmentConfig:
         chunk_size = self.chunk_size
 
         chunk_overlap = self.chunk_overlap
+
+        chunker: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.chunker, Unset):
+            chunker = self.chunker.to_dict()
 
         chunker_json = self.chunker_json
 
@@ -113,6 +121,8 @@ class CreatedEnrichmentConfig:
             field_dict["chunk_size"] = chunk_size
         if chunk_overlap is not UNSET:
             field_dict["chunk_overlap"] = chunk_overlap
+        if chunker is not UNSET:
+            field_dict["chunker"] = chunker
         if chunker_json is not UNSET:
             field_dict["chunker_json"] = chunker_json
         if full_text_index is not UNSET:
@@ -128,6 +138,7 @@ class CreatedEnrichmentConfig:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.chunker_config import ChunkerConfig
         from ..models.enrichment_neighbor_context_config import EnrichmentNeighborContextConfig
         from ..models.execution_policy import ExecutionPolicy
 
@@ -149,6 +160,13 @@ class CreatedEnrichmentConfig:
         chunk_size = d.pop("chunk_size", UNSET)
 
         chunk_overlap = d.pop("chunk_overlap", UNSET)
+
+        _chunker = d.pop("chunker", UNSET)
+        chunker: ChunkerConfig | Unset
+        if isinstance(_chunker, Unset):
+            chunker = UNSET
+        else:
+            chunker = ChunkerConfig.from_dict(_chunker)
 
         chunker_json = d.pop("chunker_json", UNSET)
 
@@ -180,6 +198,7 @@ class CreatedEnrichmentConfig:
             vector_space=vector_space,
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
+            chunker=chunker,
             chunker_json=chunker_json,
             full_text_index=full_text_index,
             content_type=content_type,
