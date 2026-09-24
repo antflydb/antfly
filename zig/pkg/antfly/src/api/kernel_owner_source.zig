@@ -4916,7 +4916,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(raw orelse return .invalid_argument));
         var lease = self.installedCompletionOwner(group_id) catch |err| return kernel_error_identity.statusFromError(err);
         defer lease.deinit();
-        output.* = lease.owner().acquireControlCompletionLeaseV2(group_id, node_id) catch |err| return kernel_error_identity.statusFromError(err);
+        output.* = lease.owner().acquireControlProofLeaseV2(group_id, node_id) catch |err| return kernel_error_identity.statusFromError(err);
         return .ok;
     }
 
