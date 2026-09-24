@@ -569,6 +569,13 @@ fn restoreRetryDelayNs(err: anyerror, job_id: u64, attempt_id: u64) u64 {
     };
 }
 
+fn restoreRewriteStepError(err: anyerror) anyerror {
+    // A source or target owner may briefly return 503 while leadership or
+    // routing settles. The rewrite cursor is already durable: keep this
+    // attempt and retry the same step instead of backing off a new attempt.
+    return if (err == error.RestoreValidationPending) error.RestoreStagingWait else err;
+}
+
 fn waitForRestoreCutoverFence(
     alloc: std.mem.Allocator,
     reads: table_reads.TableReadSource,
@@ -603,6 +610,8 @@ test "restore cutover readiness waits without exponential retry" {
     try std.testing.expectEqual(restore_staging_wait_ns, restoreRetryDelayNs(error.RestoreStagingWait, 42, 8));
     try std.testing.expect(restoreRetryDelayNs(error.RestoreValidationPending, 42, 8) > restore_staging_wait_ns);
     try std.testing.expect(restoreJobErrorIsRetryable(error.RestoreStagingWait));
+    try std.testing.expectEqual(error.RestoreStagingWait, restoreRewriteStepError(error.RestoreValidationPending));
+    try std.testing.expectEqual(error.RestoreStagingScopeChanged, restoreRewriteStepError(error.RestoreStagingScopeChanged));
 }
 
 test "restore cutover lost begin reply waits for the same fence to drain" {
@@ -16225,7 +16234,7 @@ pub const ApiHttpServer = struct {
                 const before = worker_state.value.rewrite_progress;
                 driver.step(self, &job, &worker_state.value, context) catch |err| {
                     if (restore_staging_diagnostic_gate.admit(platform_time.monotonicNs())) std.log.warn("restore rewrite retry staging={s} phase={s} owner={d} err={s}", .{ @tagName(phase), @tagName(worker_state.value.rewrite_progress.phase), worker_state.value.rewrite_progress.owner, @errorName(err) });
-                    return @as(anyerror![]u8, err);
+                    return @as(anyerror![]u8, restoreRewriteStepError(err));
                 };
                 rewrite_diagnostic = worker_state.value.rewrite_progress;
                 // Bound CPU/IO work and yield on a pending full owner pass,

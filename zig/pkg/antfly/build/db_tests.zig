@@ -176,6 +176,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.catalog.enrichment_catalog.test.enrichment catalog round trip without source_template",
         "storage.db.catalog.index_manager.test.dense index manager accepts external embedding indexes without enrichments",
         "storage.db.catalog.index_manager.test.generated enrichment request identity includes source_template",
+        "storage.db.catalog.index_manager.test.dense index unions multiple embedding artifact sources without overwriting members",
         "storage.db.catalog.index_manager.test.graph config parses artifact source and shorthand asset enrichment",
         "storage.db.catalog.index_manager.test.remove drops generated embedding artifacts while retaining reusable chunk artifacts and shorthand enrichments",
         "storage.db.catalog.index_manager.test.shorthand chunk and embedding enrichment compatibility includes source_template",

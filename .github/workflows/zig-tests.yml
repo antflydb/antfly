@@ -1398,7 +1398,7 @@ jobs:
     name: e2e-base / ${{ matrix.suite }}
     needs: [admission, changes, e2e-base-build]
     runs-on: arc-antfly-heavy
-    timeout-minutes: 45
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -1417,6 +1417,10 @@ jobs:
       UV_CACHE_DIR: /mnt/cache/antfly/zig/uv
       HF_HOME: /mnt/cache/antfly/zig/hf
       ANTFLY_E2E_DURATION_FILE: /mnt/cache/antfly/zig/e2e-durations/antfly-v1.json
+      # Multi-node tests already create several WALs each. Keep a single
+      # cluster workload per runner so latency/availability checks are not
+      # invalidated by another test's concurrent durable commits.
+      ANTFLY_E2E_PROCESS_SLOTS: "1"
       # Permit the diagnostic debugger to attach to disposable test children.
       ANTFLY_E2E_NATIVE_STACKS: "1"
       ANTFLY_CI_TRACE: "1"

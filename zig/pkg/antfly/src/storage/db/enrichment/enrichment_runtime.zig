@@ -3654,13 +3654,8 @@ const ChunkEmbeddingSourceSet = struct {
     }
 };
 
-fn requestUsesMaterializedChunkArtifact(
-    runtime: *EnrichmentRuntime,
-    artifact_name: []const u8,
-) bool {
-    if (artifact_name.len == 0) return false;
-    const chunk_cfg = runtime.index_manager.getEnrichment(.chunk, artifact_name) orelse return false;
-    return chunk_cfg.source_artifact_name.len > 0;
+fn requestUsesMaterializedChunkArtifact(request: enrichment_types.GeneratedEnrichmentRequest) bool {
+    return request.input_kind == .materialized_chunks;
 }
 
 const StaleEmbeddingDeletes = struct {
@@ -22593,7 +22588,7 @@ fn processChunkedDenseWindow(
             scope.enter(requestFailureFingerprint(request));
 
             const chunk_artifact_name = requestArtifactName(request);
-            if (requestUsesMaterializedChunkArtifact(runtime, chunk_artifact_name)) {
+            if (requestUsesMaterializedChunkArtifact(request)) {
                 processMaterializedChunkDenseRequest(runtime, request, chunk_artifact_name, embedding_artifact_name, dense_embedder, consumer_indexes, window, scope) catch |err| {
                     if (scope.shouldYield(runtime, err)) {
                         if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
@@ -24924,7 +24919,7 @@ fn processSparseEmbedding(
 
     const chunk_artifact_name = requestArtifactName(request);
     if (requestHasChunkSource(request)) {
-        if (requestUsesMaterializedChunkArtifact(runtime, chunk_artifact_name)) {
+        if (requestUsesMaterializedChunkArtifact(request)) {
             try processMaterializedChunkSparseRequest(runtime, request, chunk_artifact_name, embedding_artifact_name, sparse_embedder, consumer_indexes, window);
             return;
         }
@@ -27346,7 +27341,7 @@ fn chunkEmbeddingSourceSetForRequest(
     artifact_name: []const u8,
     chunk_cache: *std.ArrayListUnmanaged(WorkerChunkCacheEntry),
 ) !ChunkEmbeddingSourceSet {
-    if (requestUsesMaterializedChunkArtifact(runtime, artifact_name)) {
+    if (requestUsesMaterializedChunkArtifact(request)) {
         return error.InvalidEnrichmentConfig;
     }
 
@@ -27410,7 +27405,7 @@ fn chunkEmbeddingSourceSetForRequest(
     // An inline source with no chunks is an intentional empty revision. The
     // chunk producer may be running in another lane, so stored rows still
     // describe the previous revision and must not become embedding inputs.
-    if (requestHasChunking(request)) return .{
+    if (request.input_kind == .inline_chunks) return .{
         .desired_chunk_keys = try runtime.alloc.alloc([]u8, 0),
         .source_record_digest = source_record_digest,
     };

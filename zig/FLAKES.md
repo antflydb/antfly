@@ -1,5 +1,42 @@
 # Zig runtime flakes
 
+## 2026-09-23: executable chunk embeddings and transient rewrite owner routing
+
+[PR #868 CI run 35937420037](https://github.com/antflydb/antfly/actions/runs/35937420037)
+failed both executable embedding artifact restart cases before the restart:
+the worker reported zero completed batches and skipped coverage. The planner
+classified an embedding that names a directly generated chunk artifact as
+inline chunk input. The embedding's `source_field` was `text`, which exists on
+the stored chunk but not the parent document. The planner now marks every
+named chunk source as materialized input, and the worker routes by that
+explicit input kind. The planner regression and focused database suite pass
+(309/309); both E2E variants passed four invocations each across two concurrent
+soak workers.
+
+The same run's schema rewrite recovery case exhausted its terminal wait at
+attempt 9 with `RestoreValidationPending` in the snapshot phase and intermittent
+owner/metadata 503 responses. A temporary unavailable owner is readiness for
+the already durable rewrite cursor, not a repository failure. The rewrite
+driver now maps that condition to a short same-attempt wait; scope-change and
+other errors keep their existing handling. The focused rewrite case passed four
+two-worker soak invocations. The run also included a seed-write
+timeout during slow metadata persistence; this is a separate availability
+signature and the rewrite change does not resolve it.
+
+[Origin/main job 107446985962](https://github.com/antflydb/antfly/actions/runs/35936641093/job/107446985962)
+failed a constraint-status poll on the endpoint's documented transient 409
+(`refresh and retry`). The lifecycle test now retries only that exact response
+while polling. That job also had catalog and foreground traffic failures with
+while polling. The corrected retirement case passed four clean two-worker
+soak invocations. That job also had catalog and foreground traffic failures with
+metadata WAL commits taking up to 12.2 seconds, including time spent in the
+physical WAL commit. The E2E base lanes now schedule only one Antfly cluster
+workload per runner, preventing another test cluster from contending for the
+same disk during bounded-latency assertions. This is CI workload isolation,
+not a guarantee of availability when a production disk takes 12 seconds to
+commit a WAL record. The CI result after this change is still needed to
+validate that contention was the cause on that runner.
+
 ## 2026-09-23: older Raft owner descriptor regressed a migrated schema
 
 [CI job 107389740209](https://github.com/antflydb/antfly/actions/runs/35916384702/job/107389740209)

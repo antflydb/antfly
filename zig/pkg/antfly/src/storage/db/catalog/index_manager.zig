@@ -13816,7 +13816,11 @@ pub const IndexManager = struct {
                                 .artifact_name = try alloc.dupe(u8, chunk_cfg.name),
                                 .embedding_name = try alloc.dupe(u8, embedding_name),
                                 .embedding_input = embedding_cfg.embedding_input,
-                                .input_kind = embeddingInputKindForChunkEnrichment(chunk_cfg),
+                                // A named embedding producer consumes the
+                                // chunk artifact emitted by a separate
+                                // producer, even when that chunk producer
+                                // itself reads the parent document directly.
+                                .input_kind = .materialized_chunks,
                                 .doc_key = try alloc.dupe(u8, doc_key),
                                 .source_field = try alloc.dupe(u8, embedding_cfg.source_field),
                                 .source_template = if (embedding_cfg.source_template.len > 0) try alloc.dupe(u8, embedding_cfg.source_template) else "",
@@ -13929,7 +13933,7 @@ pub const IndexManager = struct {
                                 .index_name = try alloc.dupe(u8, entry.config.name),
                                 .artifact_name = try alloc.dupe(u8, chunk_cfg.name),
                                 .embedding_name = try alloc.dupe(u8, embedding_name),
-                                .input_kind = embeddingInputKindForChunkEnrichment(chunk_cfg),
+                                .input_kind = .materialized_chunks,
                                 .doc_key = try alloc.dupe(u8, doc_key),
                                 .source_field = try alloc.dupe(u8, embedding_cfg.source_field),
                                 .source_template = if (embedding_cfg.source_template.len > 0) try alloc.dupe(u8, embedding_cfg.source_template) else "",
@@ -13965,8 +13969,9 @@ pub const IndexManager = struct {
             if (request.input_kind == .materialized_chunks and request.artifact_name.len > 0) {
                 const chunk_cfg = self.getEnrichment(.chunk, request.artifact_name) orelse
                     return error.InvalidIndexConfig;
-                if (chunk_cfg.source_artifact_name.len == 0) return error.InvalidIndexConfig;
-                request.upstream_artifact_name = try alloc.dupe(u8, chunk_cfg.source_artifact_name);
+                if (chunk_cfg.source_artifact_name.len > 0) {
+                    request.upstream_artifact_name = try alloc.dupe(u8, chunk_cfg.source_artifact_name);
+                }
             }
             request.consumer_indexes = switch (request.kind) {
                 .asset => try self.textIndexesForChunk(
@@ -35126,7 +35131,7 @@ test "dense index unions multiple embedding artifact sources without overwriting
         try std.testing.expect(try enrichment_config_validation.producerJsonValuesEqual(alloc, producer_json, request.producer_json));
         try std.testing.expectEqual(
             if (std.mem.eql(u8, request.embedding_name, "body_dense_v1"))
-                enrichment_types.EmbeddingInputKind.inline_chunks
+                enrichment_types.EmbeddingInputKind.materialized_chunks
             else
                 enrichment_types.EmbeddingInputKind.document,
             request.input_kind,
