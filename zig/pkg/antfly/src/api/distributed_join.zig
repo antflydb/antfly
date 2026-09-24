@@ -5922,7 +5922,9 @@ fn appendClonedJsonHitsToArray(
     hits: []const std.json.Value,
 ) !void {
     for (hits) |hit| {
-        try out.append(try cloneJsonValue(alloc, hit));
+        var owned = try cloneJsonValue(alloc, hit);
+        errdefer deinitJsonValue(alloc, &owned);
+        try out.append(owned);
     }
 }
 
@@ -6849,6 +6851,13 @@ const JoinReadJob = struct {
 /// publication stay on the caller, in catalog order; all launched I/O is drained
 /// before any arena or request-scoped routing lease can be released.
 fn appendJoinReadJobs(ctx: JoinContext, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table_name: []const u8, jobs: []const JoinReadJob, hits: *std.json.Array) !bool {
+    // A later worker or batch may fail. Keep every new hit private until the
+    // complete fanout succeeds, so callers never observe a partial join.
+    var staged = std.json.Array.init(alloc);
+    defer {
+        for (staged.items) |*hit| deinitJsonValue(alloc, hit);
+        staged.deinit();
+    }
     // Match ordinary query fanout: graph phases share request-wide retained
     // state budgets and need completion-aware admission before parallelizing.
     const has_graph = for (jobs) |job| {
@@ -6857,9 +6866,12 @@ fn appendJoinReadJobs(ctx: JoinContext, alloc: std.mem.Allocator, source: table_
     if (ctx.fanout_io == null or jobs.len < 2 or has_graph) {
         for (jobs) |job| {
             try ctx.ensureExecutionDeadline();
-            if (!try appendGroupLocalJoinHits(alloc, source, job.group_id, table_name, job.req, false, hits)) return false;
+            if (!try appendGroupLocalJoinHits(alloc, source, job.group_id, table_name, job.req, false, &staged)) return false;
         }
         try ctx.ensureExecutionDeadline();
+        try hits.ensureUnusedCapacity(staged.items.len);
+        for (staged.items) |hit| hits.appendAssumeCapacity(hit);
+        staged.clearRetainingCapacity();
         return true;
     }
     const Slot = struct {
@@ -6895,9 +6907,12 @@ fn appendJoinReadJobs(ctx: JoinContext, alloc: std.mem.Allocator, source: table_
         for (slots[0..batch.len]) |slot| if (!slot.supported) {
             return false;
         };
-        for (slots[0..batch.len]) |slot| try appendClonedJsonHitsToArray(alloc, hits, slot.hits.?.items);
+        for (slots[0..batch.len]) |slot| try appendClonedJsonHitsToArray(alloc, &staged, slot.hits.?.items);
     }
     try ctx.ensureExecutionDeadline();
+    try hits.ensureUnusedCapacity(staged.items.len);
+    for (staged.items) |hit| hits.appendAssumeCapacity(hit);
+    staged.clearRetainingCapacity();
     return true;
 }
 
@@ -9685,7 +9700,7 @@ test "distributed join fanout bounds concurrency drains errors and preserves gro
         active: std.atomic.Value(usize) = .init(0),
         peak: std.atomic.Value(usize) = .init(0),
         calls: std.atomic.Value(usize) = .init(0),
-        fail: bool = false,
+        fail_group: ?u64 = null,
         fn query(ptr: *anyopaque, alloc: std.mem.Allocator, group: u64, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const active = self.active.fetchAdd(1, .acq_rel) + 1;
@@ -9694,7 +9709,7 @@ test "distributed join fanout bounds concurrency drains errors and preserves gro
             _ = self.calls.fetchAdd(1, .acq_rel);
             // Complete out of order to test deterministic publication.
             try std.Io.sleep(std.Options.debug_io, .fromMilliseconds(@intCast(10 - group % 8)), .awake);
-            if (self.fail and group == 2) return error.TopologyChanged;
+            if (self.fail_group == group) return error.TopologyChanged;
             return .{ .json = try std.fmt.allocPrint(alloc, "{{\"responses\":[{{\"hits\":{{\"total\":{{\"value\":1,\"relation\":\"exact\"}},\"hits\":[{{\"_id\":\"{d}\",\"_source\":{{}}}}]}}}}]}}", .{group}) };
         }
     };
@@ -9718,18 +9733,30 @@ test "distributed join fanout bounds concurrency drains errors and preserves gro
     try std.testing.expect(fixture.peak.load(.acquire) <= 8);
     for (hits.items, 0..) |hit, i| try std.testing.expectEqual(i, try std.fmt.parseInt(usize, hit.object.get("_id").?.string, 10));
     const published = hits.items.len;
-    fixture.fail = true;
+    fixture.fail_group = 2;
     fixture.calls.store(0, .release);
     try std.testing.expectError(error.TopologyChanged, appendJoinReadJobs(ctx, alloc, source, "customers", &jobs, &hits));
     try std.testing.expectEqual(@as(usize, 0), fixture.active.load(.acquire));
     try std.testing.expectEqual(@as(usize, 8), fixture.calls.load(.acquire));
     try std.testing.expectEqual(published, hits.items.len);
+    // The first batch succeeds; a later batch must not publish those hits
+    // when one of its workers fails. The same rule applies without fanout I/O.
+    fixture.fail_group = 10;
+    fixture.calls.store(0, .release);
+    try std.testing.expectError(error.TopologyChanged, appendJoinReadJobs(ctx, alloc, source, "customers", &jobs, &hits));
+    try std.testing.expectEqual(@as(usize, 16), fixture.calls.load(.acquire));
+    try std.testing.expectEqual(published, hits.items.len);
+    ctx.fanout_io = null;
+    try std.testing.expectError(error.TopologyChanged, appendJoinReadJobs(ctx, alloc, source, "customers", &jobs, &hits));
+    try std.testing.expectEqual(published, hits.items.len);
+    ctx.fanout_io = @import("../runtime_io_abi.zig").Borrow.init(&io);
+    const calls_before_cancel = fixture.calls.load(.acquire);
     var cancelled = std.atomic.Value(bool).init(true);
     ctx.cancellation = CancellationToken.fromAtomic(&cancelled);
     try std.testing.expectError(error.Cancelled, appendJoinReadJobs(ctx, alloc, source, "customers", &jobs, &hits));
-    try std.testing.expectEqual(@as(usize, 8), fixture.calls.load(.acquire));
+    try std.testing.expectEqual(calls_before_cancel, fixture.calls.load(.acquire));
     ctx.cancellation = null;
-    fixture.fail = false;
+    fixture.fail_group = null;
     fixture.peak.store(0, .release);
     jobs[0].req.graph_query_transport = .{ .dialect = .canonical, .operations_json = "{}", .admitted_operations_ptr = &fixture, .admitted_operations_len = 0 };
     try std.testing.expect(try appendJoinReadJobs(ctx, alloc, source, "customers", jobs[0..2], &hits));

@@ -1723,6 +1723,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "api http client distinguishes invalid restore sources from retryable owners",
         "distributed join translates native and borrowed deadline boundaries",
         "distributed join context forwards one absolute deadline to every query callback",
+        "distributed join fanout bounds concurrency drains errors and preserves group order",
         "distributed graph translates native worker and catalog deadline boundaries",
         "query embedding cache translates native query deadlines",
         "typed internal HTTP errors preserve conflict semantics",
