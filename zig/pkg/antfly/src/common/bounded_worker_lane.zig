@@ -17,6 +17,7 @@ const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
+threadlocal var current_executor: ?*Executor = null;
 
 pub const Options = struct {
     worker_count: usize,
@@ -229,6 +230,9 @@ const Worker = struct {
     thread: ?std.Thread = null,
 
     fn run(self: *Worker) void {
+        std.debug.assert(current_executor == null);
+        current_executor = self.executor;
+        defer current_executor = null;
         while (self.executor.take()) |job| {
             const active = self.executor.active_jobs.fetchAdd(1, .acq_rel) + 1;
             updateAtomicMax(&self.executor.peak_active_jobs, active);
@@ -334,6 +338,10 @@ pub const Executor = struct {
     ) !BatchStats {
         if (contexts.len == 0) return .{ .peak_parallelism = 0 };
         if (max_scratch_bytes == 0) return error.InvalidBoundedWorkerLaneScratchLimit;
+        // A worker waiting for its own lane cannot make progress once all
+        // workers are occupied by nested callers. Reject before publication;
+        // even an apparently spare sibling may enter the same path concurrently.
+        if (current_executor == self) return error.BoundedWorkerLaneReentrant;
         // This limit covers new arena backing committed by this batch. Memory
         // already retained by a worker is bounded separately as explicit lane
         // overhead; higher layers still account every logical render
@@ -461,6 +469,44 @@ test "bounded worker lane reuses one thread-confined scratch arena" {
     const stats = executor.snapshotStats();
     try std.testing.expectEqual(@as(u64, 2), stats.scratch_resets);
     try std.testing.expect(stats.retained_scratch_bytes <= 64 * 1024);
+}
+
+test "bounded worker lane rejects nested work on its saturated worker" {
+    if (comptime @import("builtin").single_threaded) return;
+    var executor = try Executor.create(std.testing.allocator, .{
+        .worker_count = 1,
+        .queue_capacity = 1,
+        .max_scratch_bytes = 64 * 1024,
+        .retained_scratch_bytes_per_worker = 0,
+    });
+    defer executor.destroy();
+
+    const Context = struct {
+        executor: *Executor,
+        nested_rejected: std.atomic.Value(bool) = .init(false),
+        nested_runs: std.atomic.Value(usize) = .init(0),
+
+        fn nested(ptr: *anyopaque, _: Allocator) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.nested_runs.fetchAdd(1, .monotonic);
+        }
+
+        fn outer(ptr: *anyopaque, _: Allocator) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const contexts = [_]*anyopaque{@ptrCast(self)};
+            _ = self.executor.runBatch(&contexts, nested, 1024) catch |err| {
+                self.nested_rejected.store(err == error.BoundedWorkerLaneReentrant, .release);
+                return;
+            };
+        }
+    };
+    var context = Context{ .executor = executor };
+    _ = try executor.runBatch(&.{@ptrCast(&context)}, Context.outer, 1024);
+    try std.testing.expect(context.nested_rejected.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), context.nested_runs.load(.acquire));
+    const stats = executor.snapshotStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.submitted_jobs);
+    try std.testing.expectEqual(@as(u64, 1), stats.completed_jobs);
 }
 
 test "bounded worker lane caps aggregate scratch and handles concurrent submitters" {
