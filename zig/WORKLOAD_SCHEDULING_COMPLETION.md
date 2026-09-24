@@ -32,11 +32,28 @@ this requested implementation/correctness scope.
   background-runtime tests passed 2/2, including cleanup saturation while a
   commit job completes. Nested I/O, memory, storage, connections, and combined
   process pressure remain open for item 6.
+- HTTP/1 body ingress now has an opt-in nonborrowable recovery slot inside the
+  configured total. Its request classifier verifies the internal-service
+  credential before selecting that slot. The unfiltered lib-httpx suite passed
+  606 tests with eight skips, including held general-upload, recovery-body and
+  disconnect tests. The direct and linked Antfly ingress adapter gate passed
+  2/2. Connection-slot and aggregate body-byte pressure remain open.
 - Python synchronous and TypeScript streamed query responses now retain the
   original deadline during body consumption; late chunks are rejected and the
   underlying stream is closed or canceled. Python SDK passed 258 tests and the
   TypeScript SDK passed 382 tests with one existing skip. A synchronous Python
   transport read remains noninterruptible until that read returns.
+- The Go SDK now keeps the original query deadline through successful response
+  body consumption and rejects late headers/chunks even when a custom transport
+  ignores cancellation. Retried query bodies rewrite only bounded top-level
+  `timeout_ms` value tokens to the remaining original budget; writes and
+  ambiguous bodies are never replayed. The full Go SDK suite and race-tested
+  read-retry tests passed.
+- Fresh transaction BEGIN acceptance now validates the actual canonical
+  control shape before spending a native accepted cell. The DB fixture
+  truncates a real compiled BEGIN and verifies rejection without sidecar
+  publication, then accepts the valid candidate. The owning durable-completion
+  gate passed 42/42. This does not yet retain decision/ACK capacity.
 - Distributed recovery status requests use the earlier of the worker recovery
   deadline and an explicit request deadline, including scoped restore probes.
   Replayed scoped participants also carry their parsed restore scope and plan
