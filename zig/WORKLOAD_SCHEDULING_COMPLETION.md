@@ -20,6 +20,47 @@ this requested implementation/correctness scope.
 
 ## Current work
 
+- A direct rejection of a staged native BEGIN now retires its exact accepted
+  sidecar and control guard before refunding the retained owner. A real DB
+  reopen succeeds afterward. Generic completion cells reject metadata
+  decisions/ACKs touching a staged owner's transaction keys before acceptance,
+  including prepared outcome templates. The owning durable-completion gate
+  passed 44/44 tests. Accepted control owners still need owner-backed
+  decision/ACK apply, durable retirement, and runnable restart restoration.
+- The checksummed local completion capsule now carries the authenticated
+  first-open range hint. The two-voter DATA regression passed 1/1 after
+  offline restoration and later catalog admission; its prior failure was a
+  pinned-owner descriptor mismatch because the hint was absent. This does not
+  complete multi-process quorum fault qualification.
+- A waiter behind a blocked scheduler head now expires at its own max-wait
+  bound and releases queue ownership (focused regression 1/1). A separate
+  HTTPX listener remains available with the public listener's connection slot
+  saturated and after public-listener shutdown (full HTTPX suite 608 passed,
+  eight skipped). Production internal endpoint routing/trust and combined
+  process-pressure qualification remain open.
+- Store metadata now has an optional internal HTTP endpoint in JSON and the
+  durable record extension. Older empty registrations retain their old wire
+  encoding. A nonempty endpoint requires metadata decoder protocol 14 on every
+  applying member before admission; three focused metadata gates passed 1/1
+  each. No DATA process advertises or routes this endpoint yet, so this is a
+  rollout-safe representation, not protected production traffic.
+- Distributed join now stages all fanout hits until every batch succeeds;
+  late-batch and sequential failures leave caller output unchanged. The
+  curated focused API regression passed 1/1. This covers atomic result
+  publication, not the full distributed/client contract inventory.
+- An explicit conflicting stable-ID BEGIN no longer uses a pending or
+  committed status enum to abort or propagate an older transaction whose
+  BEGIN identity has not been proved equal. Coordinator and follower conflict
+  schedules passed the curated stable-retry regression 1/1. Ambiguous committed
+  retries still need an identity-bearing status contract before they can prove
+  equivalence; this slice fails closed for explicit conflicts.
+- Scan working-memory allocation now clears stale admission failure provenance
+  after success and reports backing resize/remap OOM accurately. Its focused
+  failing-allocator regression passed 1/1; after a stale HTTP test-call repair
+  and a corrected WAL physical-versus-completed-applied assertion, the
+  workload-admission gate passed 302/302 owning tests and 387 broad tests
+  (one skip), with no leaks. The WAL fixture now requires state-machine replay
+  before reporting a completed applied index.
 - Native restart now fails closed on any published or interrupted transaction
   control guard before ordinary WAL replay, including when a completion pool is
   configured. BEGIN guard validation binds the accepted index and term to the
