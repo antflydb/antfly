@@ -30,23 +30,27 @@ const std = @import("std");
 /// Version 10 adds resumable store inventories and atomic schema-progress batches.
 /// Version 11 preserves nondefault table storage policy in binary records.
 /// Version 12 preserves physical completion policy and profile versions.
-pub const current_version: u16 = 12;
+/// Version 13 decodes ATS1 table metadata and snapshots secret collections.
+pub const current_version: u16 = 13;
 pub const completion_storage_version: u16 = 12;
 pub const table_storage_version: u16 = 11;
+pub const table_storage_metadata_version: u16 = 13;
+pub const secret_snapshot_version: u16 = 13;
 
 pub fn tableStorageVersion(settings: @import("../common/table_storage.zig").Settings, minimum: u16) u16 {
     if (settings.transaction_recovery) |policy| {
         if (policy.completion_protocol_version != 0 or policy.profile_version != 0)
             return @max(minimum, completion_storage_version);
     }
-    return if (settings.transaction_recovery != null or settings.dense_embeddings != .primary_lsm) @max(minimum, table_storage_version) else minimum;
+    if (settings.transaction_recovery == null and settings.dense_embeddings != .primary_lsm)
+        return @max(minimum, table_storage_metadata_version);
+    return if (settings.transaction_recovery != null) @max(minimum, table_storage_version) else minimum;
 }
 pub const durable_activation_version: u16 = 9;
 pub const store_report_update_version: u16 = 8;
 // Preflight and final append require the same complete decoder capability.
 pub const relational_integrity_topology_version: u16 = coordinated_lifecycle_version;
 pub const coordinated_lifecycle_version: u16 = 11;
-pub const table_storage_metadata_version: u16 = 11;
 pub const source_scope_version: u16 = 11;
 pub const restore_job_admission_version: u16 = 5;
 pub const restore_job_expiry_version: u16 = 6;
@@ -232,5 +236,5 @@ test "workload admission storage activation requires exact membership incarnatio
     stale.member_count += 1;
     try std.testing.expect(!stale.satisfies(required));
     try std.testing.expectEqual(system_catalog_version, tableStorageVersion(.{}, system_catalog_version));
-    try std.testing.expectEqual(table_storage_version, tableStorageVersion(.{ .dense_embeddings = .vector_store }, system_catalog_version));
+    try std.testing.expectEqual(table_storage_metadata_version, tableStorageVersion(.{ .dense_embeddings = .vector_store }, system_catalog_version));
 }

@@ -2957,15 +2957,17 @@ fn runtimeStatusProtocolSafeCommand(
 }
 
 fn tableRecordStorageProtocol(table: metadata_table_manager.TableRecord) u16 {
-    return metadata_topology_protocol.tableStorageVersion(table.storage, 0);
+    const storage = metadata_topology_protocol.tableStorageVersion(table.storage, 0);
+    return if (table.storage_migration != null) @max(storage, metadata_topology_protocol.table_storage_metadata_version) else storage;
 }
 
-/// Covers every command that can persist an extended table record. Return the
-/// exact required decoder, including nested JSON/CAS records and removals of
-/// an old policy, so older voters cannot silently lose completion ownership.
+/// Return the exact required decoder for extended table records and secret
+/// publications, including nested JSON/CAS records and removals of an old
+/// policy. Older voters must not silently lose durable projections.
 fn commandTableStorageProtocol(alloc: std.mem.Allocator, command: metadata_storage.TransitionCommand) !u16 {
     return switch (command) {
         .apply_completion_activation => metadata_topology_protocol.completion_storage_version,
+        .publish_secret_collection => metadata_topology_protocol.secret_snapshot_version,
         .upsert_table => |table| tableRecordStorageProtocol(table),
         .compare_and_replace_table => |change| @max(tableRecordStorageProtocol(change.expected), tableRecordStorageProtocol(change.replacement)),
         .apply_table_topology => |change| switch (change) {
@@ -3186,6 +3188,11 @@ test "workload admission extended table writers require decoder activation" {
     var vector = legacy;
     vector.storage.dense_embeddings = .vector_store;
     try std.testing.expect(try commandNeedsTableStorageProtocol(alloc, .{ .upsert_table = vector }));
+    try std.testing.expectEqual(metadata_topology_protocol.table_storage_metadata_version, try commandTableStorageProtocol(alloc, .{ .upsert_table = vector }));
+    var migrating = legacy;
+    migrating.storage_migration = .{ .request = .{ .job_id = "move_vectors", .mode = .online } };
+    try std.testing.expectEqual(metadata_topology_protocol.table_storage_metadata_version, try commandTableStorageProtocol(alloc, .{ .upsert_table = migrating }));
+    try std.testing.expectEqual(metadata_topology_protocol.secret_snapshot_version, try commandTableStorageProtocol(alloc, .{ .publish_secret_collection = "publication" }));
     var physical = active;
     physical.storage.transaction_recovery.?.completion_protocol_version = 1;
     physical.storage.transaction_recovery.?.profile_version = 1;
@@ -3193,7 +3200,7 @@ test "workload admission extended table writers require decoder activation" {
     try std.testing.expectEqual(metadata_topology_protocol.table_storage_version, try commandTableStorageProtocol(alloc, .{ .upsert_table = active }));
     try std.testing.expectEqual(physical_version, try commandTableStorageProtocol(alloc, .{ .upsert_table = physical }));
     try std.testing.expectEqual(physical_version, try commandTableStorageProtocol(alloc, .{ .compare_and_replace_table = .{ .expected = physical, .replacement = legacy } }));
-    try std.testing.expectEqual(physical_version, try commandTableStorageProtocol(alloc, .{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{ active, physical, vector } } }));
+    try std.testing.expectEqual(metadata_topology_protocol.table_storage_metadata_version, try commandTableStorageProtocol(alloc, .{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{ active, physical, vector } } }));
     var physical_catalog = catalog;
     physical_catalog.topology.?.create.table = physical;
     const physical_bytes = try std.json.Stringify.valueAlloc(alloc, physical_catalog, .{});
@@ -12674,8 +12681,8 @@ test "relational topology admission rejects lifecycle proposals before encoding 
 
 test "relational topology admission requires metadata decoder capability beyond framed status" {
     try std.testing.expectEqual(@as(u16, 11), metadata_topology_protocol.source_scope_version);
-    try std.testing.expectEqual(metadata_topology_protocol.current_version, metadata_topology_protocol.coordinated_lifecycle_version);
-    try std.testing.expectEqual(metadata_topology_protocol.current_version, metadata_topology_protocol.relational_integrity_topology_version);
+    try std.testing.expect(metadata_topology_protocol.current_version >= metadata_topology_protocol.coordinated_lifecycle_version);
+    try std.testing.expectEqual(metadata_topology_protocol.coordinated_lifecycle_version, metadata_topology_protocol.relational_integrity_topology_version);
     const incarnation: metadata_mod.MetadataClusterIncarnation = "0123456789abcdef0123456789abcdef".*;
     var status: MetadataStatus = .{ .metadata_group_id = 42, .metadata_incarnation = incarnation, .metadata_raft_local_node_id = 7, .metrics = .{}, .table_topology_protocol_version = 6, .runtime_status_record_version = metadata_runtime_status_protocol.current_record_version };
     try std.testing.expect(runtimeStatusProtocolCompatible(status, 42, 7, incarnation, metadata_runtime_status_protocol.current_record_version));

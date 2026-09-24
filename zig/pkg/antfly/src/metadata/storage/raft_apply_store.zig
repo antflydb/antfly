@@ -8815,7 +8815,8 @@ pub const RaftApplyStore = struct {
     }
 
     const metadata_snapshot_magic = "AFMS";
-    const metadata_snapshot_version: u8 = 1;
+    const metadata_snapshot_legacy_version: u8 = 1;
+    const metadata_snapshot_secret_version: u8 = 2;
 
     const MetadataSnapshotKeyFn = *const fn ([]u8, u64) anyerror![]const u8;
     const MetadataSnapshotProjection = enum {
@@ -8863,6 +8864,7 @@ pub const RaftApplyStore = struct {
         key: MetadataSnapshotKey,
     };
     const metadata_snapshot_projections = [_]MetadataSnapshotProjectionDescriptor{
+        .{ .projection = .secret_collection, .key = .{ .prefix = secret_store.prefixForGroup } },
         .{ .projection = .completion_activation, .key = .{ .prefix = completionActivationPrefixForGroup } },
         .{ .projection = .topology_activation, .key = .{ .point = topologyActivationKeyForGroup } },
         .{ .projection = .system_catalog, .key = .{ .prefix = system_catalog_storage.prefixForGroup } },
@@ -9054,10 +9056,19 @@ pub const RaftApplyStore = struct {
         defer self.apply_mutex.unlock(io);
         try self.checkpoints.ensureUnusedCapacity(self.alloc, 1);
 
+        const include_secrets = encoded[metadata_snapshot_magic.len] == metadata_snapshot_secret_version;
         const existing = blk: {
             var read_txn = try self.store.beginReadTxn();
             defer read_txn.abort();
-            break :blk try self.collectMetadataSnapshotRowsTxn(alloc, &read_txn, group_id, null, false);
+            if (!include_secrets) {
+                // V1 does not describe the source's secret state. Keeping local
+                // rows could retain stale ciphertext or resurrect a deletion.
+                var prefix_buf: [160]u8 = undefined;
+                const secrets = try docstore.DocStore.scanPrefixTxn(alloc, &read_txn, try secret_store.prefixForGroup(&prefix_buf, group_id));
+                defer freeMetadataSnapshotRows(alloc, secrets);
+                if (secrets.len != 0) return error.MetadataSnapshotRequiresSecretProtocol;
+            }
+            break :blk try self.collectMetadataSnapshotRowsTxn(alloc, &read_txn, group_id, null, false, include_secrets);
         };
         defer freeMetadataSnapshotRows(alloc, existing);
         const derived_existing = blk: {
@@ -9096,9 +9107,28 @@ pub const RaftApplyStore = struct {
         group_id: u64,
         cancelled: ?*const std.atomic.Value(bool),
     ) ![]u8 {
-        const rows = try self.collectMetadataSnapshotRowsTxn(alloc, txn, group_id, cancelled, true);
+        var activation_key_buf: [160]u8 = undefined;
+        const activation_bytes = txn.get(try topologyActivationKeyForGroup(&activation_key_buf, group_id)) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        const include_secrets = if (activation_bytes) |bytes| blk: {
+            var parsed = try std.json.parseFromSlice(topology_protocol.Activation, alloc, bytes, .{});
+            defer parsed.deinit();
+            break :blk parsed.value.version >= topology_protocol.secret_snapshot_version;
+        } else false;
+        if (!include_secrets) {
+            // V1 has no secret projection. Do not compact away a committed
+            // publication that a cold snapshot recipient could not restore.
+            var prefix_buf: [160]u8 = undefined;
+            const secrets = try docstore.DocStore.scanPrefixTxn(alloc, txn, try secret_store.prefixForGroup(&prefix_buf, group_id));
+            defer freeMetadataSnapshotRows(alloc, secrets);
+            if (secrets.len != 0) return error.MetadataSnapshotRequiresSecretProtocol;
+        }
+        const version: u8 = if (include_secrets) metadata_snapshot_secret_version else metadata_snapshot_legacy_version;
+        const rows = try self.collectMetadataSnapshotRowsTxn(alloc, txn, group_id, cancelled, true, include_secrets);
         defer freeMetadataSnapshotRows(alloc, rows);
-        return try encodeMetadataSnapshot(alloc, rows);
+        return try encodeMetadataSnapshot(alloc, version, rows);
     }
 
     fn collectMetadataSnapshotRowsTxn(
@@ -9108,6 +9138,7 @@ pub const RaftApplyStore = struct {
         group_id: u64,
         cancelled: ?*const std.atomic.Value(bool),
         materialize_stores: bool,
+        include_secrets: bool,
     ) ![]docstore.OwnedKVPair {
         var rows = std.ArrayListUnmanaged(docstore.OwnedKVPair).empty;
         errdefer {
@@ -9119,6 +9150,7 @@ pub const RaftApplyStore = struct {
         }
         var buf: [256]u8 = undefined;
         for (metadata_snapshot_projections) |descriptor| {
+            if (descriptor.projection == .secret_collection and !include_secrets) continue;
             if (cancelled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
             const first = rows.items.len;
             if (materialize_stores and descriptor.projection == .store_report_generation) {
@@ -14422,10 +14454,8 @@ fn decodeTableProjection(alloc: std.mem.Allocator, encoded: []const u8, mode: en
     var count: usize = 0;
     while (pos < encoded.len) : (count += 1) {
         if (count == fields.len) {
-            if (!std.mem.startsWith(u8, encoded[pos..], table_storage_extension_magic)) return error.InvalidMetadataTransitionEncoding;
-            // Identity/query projections do not own storage settings, but
-            // must validate the same extension as the full record decoder.
-            _ = try readAnyTableStorageExtension(encoded, &pos);
+            // The remaining bytes are optional retirement and storage
+            // extensions. Validate them after all framed fields are known.
             break;
         }
         const length = try readInt(encoded, &pos, u32);
@@ -15879,9 +15909,33 @@ fn appendTableRecord(
         try appendInt(alloc, out, u32, @intCast(record.relational_retirement_json.len));
         try out.appendSlice(alloc, record.relational_retirement_json);
     }
-    // Inactive records keep their historical bytes. The extension is gated
-    // by the metadata storage-policy capability before replicated admission.
-    if (record.storage.dense_embeddings != .primary_lsm or record.storage.transaction_recovery != null) {
+    // Inactive records keep their historical bytes. The current extension
+    // retains physical ownership and an optional migration admission.
+    if (record.storage.transaction_recovery == null and
+        (record.storage.dense_embeddings != .primary_lsm or record.storage_migration != null))
+    {
+        try appendInt(alloc, out, u32, table_storage_metadata_magic);
+        try appendInt(alloc, out, u16, table_storage_metadata_version);
+        try out.append(alloc, switch (record.storage.dense_embeddings) {
+            .primary_lsm => 0,
+            .vector_store => 1,
+        });
+        if (record.storage_migration) |migration| {
+            try migration.request.validate();
+            try out.append(alloc, 1);
+            try appendInt(alloc, out, u16, @intCast(migration.request.job_id.len));
+            try out.appendSlice(alloc, migration.request.job_id);
+            try out.append(alloc, switch (migration.request.mode) {
+                .offline => 0,
+                .online => 1,
+            });
+            try appendInt(alloc, out, u64, migration.request.budget.batch_bytes);
+            try appendInt(alloc, out, u32, migration.request.budget.batch_rows);
+            try appendInt(alloc, out, u64, migration.request.budget.temporary_bytes);
+            try appendInt(alloc, out, u64, migration.request.budget.disk_reserve_bytes);
+        } else try out.append(alloc, 0);
+    } else if (record.storage.transaction_recovery != null) {
+        if (record.storage_migration != null) return error.UnsupportedTableStorageMigration;
         const completion_policy = if (record.storage.transaction_recovery) |policy|
             policy.completion_protocol_version != 0 or policy.profile_version != 0
         else
@@ -16432,7 +16486,7 @@ fn readTableRecordWithRestoreIntent(
         break :blk try readRequiredString(alloc, encoded, pos);
     } else try alloc.dupe(u8, "");
     errdefer alloc.free(relational_retirement_json);
-    var extension = try readTableStorageExtension(encoded, pos);
+    var extension = try readAnyTableStorageExtension(encoded, pos);
     if (extension.migration) |*migration| migration.request.job_id = try alloc.dupe(u8, migration.request.job_id);
     return .{
         .storage = extension.storage,
@@ -17314,11 +17368,11 @@ fn metadataSnapshotRowLessThan(_: void, lhs: docstore.OwnedKVPair, rhs: docstore
     return std.mem.order(u8, lhs.key, rhs.key) == .lt;
 }
 
-fn encodeMetadataSnapshot(alloc: std.mem.Allocator, rows: []const docstore.OwnedKVPair) ![]u8 {
+fn encodeMetadataSnapshot(alloc: std.mem.Allocator, version: u8, rows: []const docstore.OwnedKVPair) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
     try out.appendSlice(alloc, RaftApplyStore.metadata_snapshot_magic);
-    try out.append(alloc, RaftApplyStore.metadata_snapshot_version);
+    try out.append(alloc, version);
     try appendInt(alloc, &out, u32, std.math.cast(u32, rows.len) orelse return error.MetadataSnapshotTooLarge);
     for (rows) |row| {
         try appendInt(alloc, &out, u32, std.math.cast(u32, row.key.len) orelse return error.MetadataSnapshotTooLarge);
@@ -17332,7 +17386,8 @@ fn encodeMetadataSnapshot(alloc: std.mem.Allocator, rows: []const docstore.Owned
 fn decodeMetadataSnapshotAlloc(alloc: std.mem.Allocator, encoded: []const u8) ![]docstore.OwnedKVPair {
     if (encoded.len < RaftApplyStore.metadata_snapshot_magic.len + 1 + @sizeOf(u32) or
         !std.mem.eql(u8, encoded[0..RaftApplyStore.metadata_snapshot_magic.len], RaftApplyStore.metadata_snapshot_magic) or
-        encoded[RaftApplyStore.metadata_snapshot_magic.len] != RaftApplyStore.metadata_snapshot_version)
+        (encoded[RaftApplyStore.metadata_snapshot_magic.len] != RaftApplyStore.metadata_snapshot_legacy_version and
+            encoded[RaftApplyStore.metadata_snapshot_magic.len] != RaftApplyStore.metadata_snapshot_secret_version))
     {
         return error.InvalidMetadataSnapshot;
     }
@@ -24661,6 +24716,54 @@ test "system catalog admission header and cursor fence concurrent full repairs" 
     defer alloc.free(stale_cursor);
     try applyTestReportUpdate(&store, stale_cursor);
     try std.testing.expectEqualDeep(cursor, (try store.reportCursor(21, 20)).?);
+}
+
+test "metadata raft apply store legacy snapshots reject ambiguous secrets and activated snapshots replace them" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source_root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/secret-snapshot-source", .{tmp.sub_path});
+    defer a.free(source_root);
+    const target_root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/secret-snapshot-target", .{tmp.sub_path});
+    defer a.free(target_root);
+    const group_id = group_ids.main_metadata_group_id;
+    var secret_key_buf: [160]u8 = undefined;
+    const secret_key = try secret_store.keyForScope(&secret_key_buf, group_id, "default");
+
+    var source = try RaftApplyStore.init(a, .{ .root_dir = source_root });
+    defer source.deinit();
+    var target = try RaftApplyStore.init(a, .{ .root_dir = target_root });
+    defer target.deinit();
+    try target.store.put(secret_key, "target-ciphertext");
+
+    const legacy = try source.snapshotBuilder().buildSnapshot(a, group_id);
+    defer a.free(legacy);
+    try std.testing.expectEqual(RaftApplyStore.metadata_snapshot_legacy_version, legacy[RaftApplyStore.metadata_snapshot_magic.len]);
+    try std.testing.expectError(error.MetadataSnapshotRequiresSecretProtocol, target.snapshotBuilder().installSnapshot(a, group_id, 1, legacy));
+    const retained = try target.store.get(a, secret_key);
+    defer a.free(retained);
+    try std.testing.expectEqualStrings("target-ciphertext", retained);
+
+    try source.store.put(secret_key, "source-ciphertext");
+    try std.testing.expectError(error.MetadataSnapshotRequiresSecretProtocol, source.snapshotBuilder().buildSnapshot(a, group_id));
+
+    const proof: topology_protocol.Activation = .{
+        .version = topology_protocol.secret_snapshot_version,
+        .incarnation = "11111111111111111111111111111111".*,
+        .member_count = 1,
+        .membership_fingerprint = @splat(7),
+    };
+    const proof_bytes = try std.json.Stringify.valueAlloc(a, proof, .{});
+    defer a.free(proof_bytes);
+    var activation_key_buf: [160]u8 = undefined;
+    try source.store.put(try RaftApplyStore.topologyActivationKeyForGroup(&activation_key_buf, group_id), proof_bytes);
+    const upgraded = try source.snapshotBuilder().buildSnapshot(a, group_id);
+    defer a.free(upgraded);
+    try std.testing.expectEqual(RaftApplyStore.metadata_snapshot_secret_version, upgraded[RaftApplyStore.metadata_snapshot_magic.len]);
+    try std.testing.expect(try target.snapshotBuilder().installSnapshot(a, group_id, 2, upgraded));
+    const replaced = try target.store.get(a, secret_key);
+    defer a.free(replaced);
+    try std.testing.expectEqualStrings("source-ciphertext", replaced);
 }
 
 test "metadata raft apply store topology activation survives snapshots and fences membership" {
