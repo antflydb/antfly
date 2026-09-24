@@ -8,4 +8,5 @@ test {
     _ = @import("storage/transactions.zig");
     _ = @import("storage/completion_physical.zig");
     _ = @import("storage/completion_process_test.zig");
+    _ = @import("storage/completion_two_process_raft_test.zig");
 }
