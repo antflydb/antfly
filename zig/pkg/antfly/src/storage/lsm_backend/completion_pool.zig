@@ -1743,7 +1743,10 @@ test "workload admission physical completion control guards fence native restart
             var configured: Backend = undefined;
             var restoring = options;
             restoring.completion_pool_config = config;
-            try std.testing.expectError(error.CompletionRecoveryCapacityRequired, configured.openInto(alloc, std.mem.span(root), restoring));
+            try std.testing.expectError(
+                if (std.mem.eql(u8, filename, control_guard.pending_filenames[3])) error.CompletionRecoveryCapacityRequired else error.InvalidCompletionSlot,
+                configured.openInto(alloc, std.mem.span(root), restoring),
+            );
         }
         try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
     }

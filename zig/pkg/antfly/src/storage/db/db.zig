@@ -143327,6 +143327,26 @@ test "workload admission physical completion staged control BEGIN retains a pool
         for (pool.control_owners) |owner| try std.testing.expect(owner != null);
     }
     try std.testing.expectError(error.CompletionRecoveryCapacityRequired, DB.open(alloc, std.mem.span(tmp.path().ptr), options));
+    const path = std.mem.span(tmp.path().ptr);
+    const config = (try DB.completionInstallationPreflight(alloc, std.Options.debug_io, path, binding, "", "", "{}")).?;
+    var reopen = options;
+    reopen.durable_completion_authority = .raft_apply;
+    reopen.completion_pool_config = config;
+    // Trusted local guard decoding now runs during startup, but no control
+    // owner can become runnable without exact durable-log reconciliation.
+    try std.testing.expectError(error.CompletionRecoveryCapacityRequired, DB.open(alloc, path, reopen));
+    var storage = try @import("../lsm_backend/storage_io.zig").NativeStorage.init(alloc, .threaded);
+    defer storage.deinit();
+    const guard_path = try std.fs.path.join(alloc, &.{ path, control_guard.filenames[0] });
+    defer alloc.free(guard_path);
+    const storage_io = storage.storage();
+    const size = try storage_io.fileSize(guard_path);
+    const bytes = try alloc.alloc(u8, @intCast(size));
+    defer alloc.free(bytes);
+    try storage_io.readFileRangeInto(alloc, guard_path, 0, bytes);
+    bytes[bytes.len - 1] ^= 1;
+    try storage_io.writeFileAbsolute(guard_path, bytes);
+    try std.testing.expectError(error.CompletionSlotChecksumMismatch, DB.open(alloc, path, reopen));
 }
 
 test "workload admission physical completion rejected staged BEGIN retires native owner before reopen" {

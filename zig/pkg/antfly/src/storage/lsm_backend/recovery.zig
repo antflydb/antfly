@@ -154,11 +154,27 @@ fn openIntoPolicy(comptime BackendType: type, backend: *BackendType, allocator: 
     else
         false;
     if (comptime @hasField(BackendType, "completion_pool")) {
+        const control_guard = @import("completion_control_guard.zig");
         // Control ownership outlives the ordinary accepted cell. Until its
         // capacity and durable-log reconciliation are installed, an orphaned
         // full or pending guard must fence startup even with pool configuration.
-        if (try @import("completion_control_guard.zig").hasAny(backend.storage.?, allocator, root_dir))
+        // A trusted installation can already validate the exact local BEGIN
+        // identity and all owner slots before reporting that missing capacity.
+        if (try control_guard.hasAny(backend.storage.?, allocator, root_dir)) {
+            if (backend.options.completion_pool_config) |config| {
+                const authority: @import("completion_control_record.zig").Authority = .{
+                    .group_id = config.identity.group_id,
+                    .incarnation = config.identity.incarnation,
+                    .policy_digest = config.identity.policy_digest,
+                    .schema_catalog_digest = config.schema_catalog_digest,
+                    .generation = config.identity.generation,
+                };
+                var local = try control_guard.loadAll(allocator, backend.storage.?, root_dir, authority);
+                defer local.deinit();
+                if (local.count == 0) return error.InvalidCompletionSlot;
+            }
             return error.CompletionRecoveryCapacityRequired;
+        }
     }
     if (accepted_pool_guarded) {
         if (!stable_address) return error.UnsupportedCompletionBackend;
