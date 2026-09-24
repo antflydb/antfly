@@ -674,6 +674,9 @@ const AttemptEvaluationSummary = struct {
 pub const ExecuteOptions = struct {
     /// Ceilings for the model-directed loop. Public requests use defaults.
     budget: agent_tools.Budget = .{},
+    /// When set, receives each result hit's source table (null for web and
+    /// fetched pages), in result order, allocated with the caller allocator.
+    hit_tables: ?*std.ArrayListUnmanaged(?[]const u8) = null,
 };
 
 pub fn execute(
@@ -809,6 +812,7 @@ fn executeInternal(
 
     var hit_list = std.ArrayListUnmanaged(QueryHit).empty;
     var seen_ids = std.StringHashMapUnmanaged(void).empty;
+    var hit_tables = std.ArrayListUnmanaged(?[]const u8).empty;
     defer {
         hit_list.deinit(arena);
         seen_ids.deinit(arena);
@@ -1031,6 +1035,7 @@ fn executeInternal(
         }, .{
             .hits = &hit_list,
             .seen = &seen_ids,
+            .hit_tables = &hit_tables,
             .steps = &steps_list,
             .strategies = &strategies,
             .live = &live,
@@ -1105,7 +1110,7 @@ fn executeInternal(
         previous_query_hits = query_hits;
         tool_calls_made += 1;
         iteration_count += 1;
-        try accumulateHits(arena, &hit_list, &seen_ids, query_hits);
+        try accumulateHits(arena, &hit_list, &seen_ids, &hit_tables, table_name, query_hits);
         try live.emitHits(query_hits, retrieval_query.tree_search != null);
 
         if (shouldRunStepBackFollowup(agentic_mode, max_internal_iterations, tool_calls_made, classification_result, retrieval_query)) {
@@ -1150,7 +1155,7 @@ fn executeInternal(
                 .details = try buildToolStepDetails(arena, retrieval_query, retrieval_query_index, followup_strategy),
             });
 
-            try accumulateHits(arena, &hit_list, &seen_ids, followup_hits);
+            try accumulateHits(arena, &hit_list, &seen_ids, &hit_tables, retrieval_query.table, followup_hits);
             try live.emitHits(followup_hits, retrieval_query.tree_search != null);
         }
 
@@ -1253,7 +1258,7 @@ fn executeInternal(
                     .details = try buildToolStepDetails(arena, expanded_query, retrieval_query_index, .tree),
                 });
 
-                try accumulateHits(arena, &hit_list, &seen_ids, expanded_hits);
+                try accumulateHits(arena, &hit_list, &seen_ids, &hit_tables, retrieval_query.table, expanded_hits);
                 try live.emitHits(expanded_hits, true);
 
                 previous_attempt_summary = attempt_summary;
@@ -1337,7 +1342,7 @@ fn executeInternal(
                     .details = try buildToolStepDetails(arena, retrieval_query, retrieval_query_index, strategy),
                 });
 
-                try accumulateHits(arena, &hit_list, &seen_ids, refined_hits);
+                try accumulateHits(arena, &hit_list, &seen_ids, &hit_tables, retrieval_query.table, refined_hits);
                 try live.emitHits(refined_hits, retrieval_query.tree_search != null);
 
                 previous_attempt_summary = attempt_summary;
@@ -1580,6 +1585,9 @@ fn executeInternal(
         });
     }
 
+    if (exec_options.hit_tables) |out| {
+        for (hit_tables.items) |table| try out.append(alloc, if (table) |name| try alloc.dupe(u8, name) else null);
+    }
     const steps = try steps_list.toOwnedSlice(arena);
     const result = RetrievalAgentResult{
         .model = model_used,
@@ -1954,6 +1962,7 @@ const ModelToolContext = struct {
 const ModelToolState = struct {
     hits: *std.ArrayListUnmanaged(QueryHit),
     seen: *std.StringHashMapUnmanaged(void),
+    hit_tables: *std.ArrayListUnmanaged(?[]const u8),
     steps: *std.ArrayListUnmanaged(AgentStep),
     strategies: *std.ArrayListUnmanaged(RetrievalStrategy),
     live: *LiveEmitter,
@@ -2082,7 +2091,7 @@ fn executeModelTools(
                     },
                 };
                 successful_searches += 1;
-                try accumulateHits(arena, hits, seen, found);
+                try accumulateHits(arena, hits, seen, state_ptrs.hit_tables, null, found);
                 try rememberSearchUrls(arena, &known_urls, found);
                 var details = JsonObject{};
                 try details.map.put(arena, "provider", .{ .string = @tagName(config.provider) });
@@ -2137,7 +2146,7 @@ fn executeModelTools(
                     },
                 };
                 successful_searches += 1;
-                try accumulateHits(arena, hits, seen, &.{page_hit});
+                try accumulateHits(arena, hits, seen, state_ptrs.hit_tables, null, &.{page_hit});
                 const source = page_hit._source.?.map;
                 var details = JsonObject{};
                 try details.map.put(arena, "tool_call_id", .{ .string = call.id });
@@ -2297,7 +2306,7 @@ fn executeModelTools(
                 const from_key = if (config.strategy == .tree) state.parents.get(args.value.next_key) else state.current_key;
                 navigation_advanced[index] = true;
                 state.moves += 1;
-                const payload = executeNavigationRead(alloc, arena, runner, request, active_queries[index], config, active_predicates[index], args.value.next_key, state, &tool_context_tokens, hits, seen, live) catch |err| switch (err) {
+                const payload = executeNavigationRead(alloc, arena, runner, request, active_queries[index], config, active_predicates[index], args.value.next_key, state, &tool_context_tokens, hits, seen, state_ptrs.hit_tables, live) catch |err| switch (err) {
                     error.AgentContextLimitExceeded => {
                         try appendStep(arena, steps, live, .{ .kind = .planning, .name = if (config.strategy == .tree) "tree_navigation" else "graph_navigation", .action = "stopped navigation at the accumulated context budget", .status = .skipped });
                         outcome.exhausted = true;
@@ -2335,7 +2344,7 @@ fn executeModelTools(
                     continue;
                 }
                 navigation_advanced[index] = true;
-                const payload = executeNavigationRead(alloc, arena, runner, request, query, config, active_predicates[index], config.start_key, state, &tool_context_tokens, hits, seen, live) catch |err| switch (err) {
+                const payload = executeNavigationRead(alloc, arena, runner, request, query, config, active_predicates[index], config.start_key, state, &tool_context_tokens, hits, seen, state_ptrs.hit_tables, live) catch |err| switch (err) {
                     error.AgentContextLimitExceeded => {
                         try appendStep(arena, steps, live, .{ .kind = .planning, .name = if (config.strategy == .tree) "tree_navigation" else "graph_navigation", .action = "stopped navigation at the accumulated context budget", .status = .skipped });
                         outcome.exhausted = true;
@@ -2357,7 +2366,7 @@ fn executeModelTools(
             const found = executed.hits;
             successful_searches += 1;
             last_hit_counts[index] = found.len;
-            try accumulateHits(arena, hits, seen, found);
+            try accumulateHits(arena, hits, seen, state_ptrs.hit_tables, query.table, found);
             try strategies.append(arena, detectStrategy(query));
             var details = try buildToolStepDetails(arena, query, index, detectStrategy(query));
             try details.map.put(arena, "tool_call_id", .{ .string = call.id });
@@ -2582,6 +2591,7 @@ fn executeNavigationRead(
     context_tokens: *usize,
     hits: *std.ArrayListUnmanaged(QueryHit),
     seen: *std.StringHashMapUnmanaged(void),
+    hit_tables: *std.ArrayListUnmanaged(?[]const u8),
     live: *LiveEmitter,
 ) ![]const u8 {
     const table = scope.table.?;
@@ -2619,7 +2629,7 @@ fn executeNavigationRead(
     if (key) |expected| if (!std.mem.eql(u8, current._id, expected)) return error.InvalidRetrievalAgentRequest;
     state.current_key = current._id;
     try state.visited.put(arena, current._id, {});
-    try accumulateHits(arena, hits, seen, &.{current});
+    try accumulateHits(arena, hits, seen, hit_tables, table, &.{current});
     try live.emitHits(&.{current}, false);
 
     var node_instruction: ?[]const u8 = null;
@@ -2881,16 +2891,23 @@ fn runQueryWithResults(
     return .{ .hits = hits, .summaries = summaries };
 }
 
+/// Hits are identified by table and key: equal keys from different tables are
+/// different documents. `hit_tables` stays parallel to `hit_list` (null for
+/// web and fetched pages) so callers can attribute every hit to its table.
 fn accumulateHits(
     arena: std.mem.Allocator,
     hit_list: *std.ArrayListUnmanaged(QueryHit),
     seen_ids: *std.StringHashMapUnmanaged(void),
+    hit_tables: *std.ArrayListUnmanaged(?[]const u8),
+    table: ?[]const u8,
     hits: []const QueryHit,
 ) !void {
     for (hits) |hit| {
-        if (seen_ids.contains(hit._id)) continue;
-        try seen_ids.put(arena, hit._id, {});
+        const key = if (table) |name| try std.fmt.allocPrint(arena, "{s}\x00{s}", .{ name, hit._id }) else hit._id;
+        if (seen_ids.contains(key)) continue;
+        try seen_ids.put(arena, key, {});
         try hit_list.append(arena, hit);
+        try hit_tables.append(arena, table);
     }
 }
 
@@ -11803,9 +11820,10 @@ test "retrieval graph navigation fills candidate slots and bounds lookahead" {
         var context_bytes: usize = 0;
         var hits = std.ArrayListUnmanaged(QueryHit).empty;
         var seen = std.StringHashMapUnmanaged(void).empty;
+        var hit_tables = std.ArrayListUnmanaged(?[]const u8).empty;
         var live = LiveEmitter{ .alloc = alloc };
         var fake = Fake{ .exhausted = exhausted };
-        const payload = try executeNavigationRead(alloc, arena, .{ .ptr = &fake, .vtable = &.{ .run_query = Fake.run } }, parsed.value, parsed.value.queries[0], retrievalNavigation(parsed.value).?, .{}, "b", &state, &context_bytes, &hits, &seen, &live);
+        const payload = try executeNavigationRead(alloc, arena, .{ .ptr = &fake, .vtable = &.{ .run_query = Fake.run } }, parsed.value, parsed.value.queries[0], retrievalNavigation(parsed.value).?, .{}, "b", &state, &context_bytes, &hits, &seen, &hit_tables, &live);
         const result = try std.json.parseFromSlice(std.json.Value, arena, payload, .{});
         if (exhausted) {
             try std.testing.expectEqual(@as(usize, 0), state.neighbors.len);
@@ -11901,8 +11919,9 @@ test "retrieval graph navigation pruning uses memory proportional to candidates"
         var context_bytes: usize = 0;
         var hits = std.ArrayListUnmanaged(QueryHit).empty;
         var seen = std.StringHashMapUnmanaged(void).empty;
+        var hit_tables = std.ArrayListUnmanaged(?[]const u8).empty;
         var live = LiveEmitter{ .alloc = alloc };
-        const payload = try executeNavigationRead(alloc, arena, .{ .ptr = undefined, .vtable = &.{ .run_query = Fake.query } }, parsed.value, parsed.value.queries[0], retrievalNavigation(parsed.value).?, .{}, "a", &state, &context_bytes, &hits, &seen, &live);
+        const payload = try executeNavigationRead(alloc, arena, .{ .ptr = undefined, .vtable = &.{ .run_query = Fake.query } }, parsed.value, parsed.value.queries[0], retrievalNavigation(parsed.value).?, .{}, "a", &state, &context_bytes, &hits, &seen, &hit_tables, &live);
         try std.testing.expect(payload.len <= @as(usize, @intCast(tokens * 4)));
         try std.testing.expectEqual(@as(usize, if (tokens == 256) 0 else 1), state.neighbors.len);
         if (tokens == 300) {
@@ -12086,9 +12105,10 @@ test "retrieval tree navigation retains siblings when a selected node disappears
     var state = NavigationState{ .started = true, .current_key = "root", .neighbors = &.{ .{ .key = "a", .depth = 1 }, .{ .key = "b", .depth = 1 } } };
     var hits = std.ArrayListUnmanaged(QueryHit).empty;
     var seen = std.StringHashMapUnmanaged(void).empty;
+    var hit_tables = std.ArrayListUnmanaged(?[]const u8).empty;
     var live = LiveEmitter{ .alloc = alloc };
     var context_bytes: usize = 0;
-    _ = try executeNavigationRead(alloc, arena, .{ .ptr = undefined, .vtable = &.{ .run_query = Fake.run } }, parsed.value, parsed.value.queries[1], config, .{}, "a", &state, &context_bytes, &hits, &seen, &live);
+    _ = try executeNavigationRead(alloc, arena, .{ .ptr = undefined, .vtable = &.{ .run_query = Fake.run } }, parsed.value, parsed.value.queries[1], config, .{}, "a", &state, &context_bytes, &hits, &seen, &hit_tables, &live);
     try std.testing.expect(state.current_key == null);
     try std.testing.expect(state.canMove(config, "b"));
     try std.testing.expect(!state.canMove(config, "a"));

@@ -170,7 +170,12 @@ const Registry = struct {
             try self.by_ref.put(arena, url, i);
             try self.by_ref.put(arena, try std.fmt.allocPrint(arena, "{s}:{s}", .{ item.source, url }), i);
         }
-        if (item.doc_id) |doc| try self.by_ref.put(arena, doc, i);
+        if (item.doc_id) |doc| {
+            // A bare key may name documents in several tables; the first one
+            // registered keeps it, and "table/key" is always unambiguous.
+            if (!self.by_ref.contains(doc)) try self.by_ref.put(arena, doc, i);
+            if (item.table) |table| try self.by_ref.put(arena, try std.fmt.allocPrint(arena, "{s}/{s}", .{ table, doc }), i);
+        }
     }
 
     fn dedupKey(arena: std.mem.Allocator, item: Evidence) ![]const u8 {
@@ -192,7 +197,6 @@ const Registry = struct {
                 if (candidate.title != null) existing.title = candidate.title;
             }
             existing.sub_question_ids = try appendUnique(arena, existing.sub_question_ids orelse &[_][]const u8{}, sub_question_id);
-            try self.by_ref.put(arena, try arena.dupe(u8, hit._id), i);
             return existing.id;
         }
         if (self.items.items.len >= self.max) return null;
@@ -201,7 +205,7 @@ const Registry = struct {
         item.sub_question_ids = try arena.dupe([]const u8, &.{sub_question_id});
         try self.items.append(arena, item);
         try self.index(arena, self.items.items.len - 1);
-        try self.by_ref.put(arena, try arena.dupe(u8, hit._id), self.items.items.len - 1);
+        if (!self.by_ref.contains(hit._id)) try self.by_ref.put(arena, try arena.dupe(u8, hit._id), self.items.items.len - 1);
         return item.id;
     }
 
@@ -687,17 +691,27 @@ const Run = struct {
 
     // -- research -----------------------------------------------------------
 
+    /// Researcher request. `iterations == 0` builds the no-tools retry:
+    /// pipeline mode under the caller's tool policies with web tools removed
+    /// (error.FallbackNotPermitted when that policy cannot be expressed).
     fn researcherBody(self: *Run, sub: SubQuestion, iterations: i64) ![]const u8 {
         var body = std.json.ObjectMap.empty;
         try body.put(self.arena, "query", .{ .string = sub.question });
+        const raw_steps = if (self.raw.get("steps")) |s| if (s == .object) s.object else null else null;
+        const raw_research = if (raw_steps) |s| if (s.get("research")) |r| if (r == .object) r.object else null else null else null;
+        const research_tools = if (raw_research) |r| r.get("tools") else null;
+        const pipeline = iterations == 0;
+        const global_tools = if (pipeline) try withoutWebTools(self.arena, self.raw.get("tools")) else self.raw.get("tools");
+        const local_tools = if (pipeline) try withoutWebTools(self.arena, research_tools) else research_tools;
         const raw_queries = self.raw.get("queries") orelse std.json.Value{ .array = std.json.Array.init(self.arena) };
-        if (iterations == 0 and raw_queries == .array) {
+        if (pipeline and raw_queries == .array) {
             // Pipeline mode executes declared queries directly. A bare table
-            // scope gets a full-text match on the sub-question so the
-            // no-tools retry still searches for this sub-question.
+            // scope gets a full-text match on the sub-question, but only when
+            // both tool policies allow full-text search.
+            const full_text = toolAllowed(global_tools, "full_text_search") and toolAllowed(local_tools, "full_text_search");
             var direct = std.json.Array.init(self.arena);
             for (raw_queries.array.items) |query| {
-                if (query != .object or hasPlanFields(query.object)) {
+                if (query != .object or hasPlanFields(query.object) or !full_text) {
                     try direct.append(query);
                     continue;
                 }
@@ -709,11 +723,10 @@ const Run = struct {
             }
             try body.put(self.arena, "queries", .{ .array = direct });
         } else try body.put(self.arena, "queries", raw_queries);
-        inline for (.{ "accumulated_filters", "tools", "max_context_tokens", "reserve_tokens" }) |field| {
-            // Pipeline mode (no model loop) cannot use web tools.
-            const skip = iterations == 0 and std.mem.eql(u8, field, "tools");
-            if (!skip) if (self.raw.get(field)) |value| try body.put(self.arena, field, value);
+        inline for (.{ "accumulated_filters", "max_context_tokens", "reserve_tokens" }) |field| {
+            if (self.raw.get(field)) |value| try body.put(self.arena, field, value);
         }
+        if (global_tools) |tools| try body.put(self.arena, "tools", tools);
         var knowledge = std.ArrayListUnmanaged(u8).empty;
         if (self.request.agent_knowledge) |k| try knowledge.print(self.arena, "{s}\n\n", .{k});
         try knowledge.print(self.arena, "Research brief (context for this sub-question): {s}", .{self.brief});
@@ -722,8 +735,6 @@ const Run = struct {
         try body.put(self.arena, "interactive", .{ .bool = false });
         try body.put(self.arena, "max_internal_iterations", .{ .integer = iterations });
 
-        const raw_steps = if (self.raw.get("steps")) |s| if (s == .object) s.object else null else null;
-        const raw_research = if (raw_steps) |s| if (s.get("research")) |r| if (r == .object) r.object else null else null else null;
         // Researcher generator: steps.research, then the request default.
         const source = if (raw_research) |r| (if (r.get("generator") != null or r.get("chain") != null) r else self.raw) else self.raw;
         if (source.get("generator")) |generator| try body.put(self.arena, "generator", try withMaxTokens(self.arena, generator, role_max_tokens.researcher));
@@ -741,10 +752,9 @@ const Run = struct {
             try body.put(self.arena, "chain", .{ .array = links });
         }
         var retrieval = std.json.ObjectMap.empty;
-        if (raw_research) |r| if (iterations > 0) {
-            if (r.get("tools")) |tools| try retrieval.put(self.arena, "tools", tools);
-            if (r.get("navigation")) |navigation| try retrieval.put(self.arena, "navigation", navigation);
-        };
+        if (local_tools) |tools| try retrieval.put(self.arena, "tools", tools);
+        // Agentic navigation needs the model loop; the pipeline retry omits it.
+        if (raw_research) |r| if (!pipeline) if (r.get("navigation")) |navigation| try retrieval.put(self.arena, "navigation", navigation);
         var generation = std.json.ObjectMap.empty;
         const instructions = if (self.request.steps) |steps| if (steps.research) |r| r.instructions else null else null;
         try generation.put(self.arena, "system_prompt", .{ .string = if (instructions) |extra| try std.fmt.allocPrint(self.arena, "{s}\nAdditional instructions: {s}", .{ researcher_prompt, extra }) else researcher_prompt });
@@ -792,26 +802,48 @@ const Run = struct {
             try self.live.progress("sub_question_started", .{ .sub_question_id = sub.id, .question = sub.question, .round = self.round + 1 });
         }
         const outcomes = try runResearchers(self.arena, self.query_runner, self.generator, bodies, per_tools, self.budget.max_parallel);
+        // Charge every attempt before deciding on retries: a success costs
+        // what it reports, and a failure is charged its whole allocation
+        // because it may have used all of it before failing.
+        for (outcomes) |*outcome| {
+            outcome.llm_calls, outcome.tool_calls = if (outcome.body) |body| reportedUsage(self.arena, body) else |_| .{ per_iterations, per_tools };
+        }
+        var committed: i64 = 0;
+        for (outcomes) |outcome| committed += outcome.llm_calls;
         // A researcher whose tool loop failed at the model level (for example
         // malformed tool-call output from a small local model) is retried
-        // once without tools: the caller's declared queries run directly and
-        // the finding is generated from their hits.
+        // once without tools, under the caller's tool policy with web tools
+        // removed. The retry costs exactly one generation.
         var degraded = std.ArrayListUnmanaged(usize).empty;
         for (outcomes, 0..) |outcome, slot| {
             _ = outcome.body catch |err| if (modelLevelFailure(err)) try degraded.append(self.arena, slot);
         }
-        const affordable: usize = @intCast(@max(0, self.budget.max_llm_calls - self.llm_calls - self.reservedLlmCalls()));
-        if (degraded.items.len > 0 and affordable > 0 and self.request.queries.len > 0) {
-            const retry = degraded.items[0..@min(degraded.items.len, affordable)];
-            const retry_bodies = try self.arena.alloc([]const u8, retry.len);
-            for (retry, retry_bodies) |slot, *body| body.* = try self.researcherBody(self.sub_questions.items[funded[slot]], 0);
-            const retried = try runResearchers(self.arena, self.query_runner, self.generator, retry_bodies, per_tools, self.budget.max_parallel);
-            for (retry, retried) |slot, outcome| {
-                // Charge the failed tool-loop attempt's single model call.
-                self.llm_calls += 1;
+        const affordable: usize = @intCast(@max(0, self.budget.max_llm_calls - self.llm_calls - committed - self.reservedLlmCalls()));
+        var retry_slots = std.ArrayListUnmanaged(usize).empty;
+        var retry_bodies = std.ArrayListUnmanaged([]const u8).empty;
+        for (degraded.items) |slot| {
+            if (retry_slots.items.len >= affordable) break;
+            const body = self.researcherBody(self.sub_questions.items[funded[slot]], 0) catch |err| switch (err) {
+                error.FallbackNotPermitted => continue,
+                else => return err,
+            };
+            try retry_slots.append(self.arena, slot);
+            try retry_bodies.append(self.arena, body);
+        }
+        if (retry_slots.items.len > 0) {
+            const retried = try runResearchers(self.arena, self.query_runner, self.generator, retry_bodies.items, per_tools, self.budget.max_parallel);
+            for (retry_slots.items, retried) |slot, outcome| {
+                const failed_attempt = outcomes[slot];
+                var merged = outcome;
+                // The retry's cost adds to the failed attempt's charge. A
+                // failed retry costs its single generation at most.
+                const retry_llm, const retry_tools = if (outcome.body) |body| reportedUsage(self.arena, body) else |_| .{ 1, 0 };
+                merged.llm_calls = failed_attempt.llm_calls + retry_llm;
+                merged.tool_calls = failed_attempt.tool_calls + retry_tools;
                 // A failed retry is a failed finding, never a request error:
                 // the tool-loop attempt already validated the request.
-                outcomes[slot] = if (outcome.body) |_| outcome else |err| .{ .body = if (isRequestError(err)) error.ResearcherRetryFailed else err };
+                merged.body = if (outcome.body) |body| body else |err| if (isRequestError(err)) error.ResearcherRetryFailed else err;
+                outcomes[slot] = merged;
                 try self.appendStep(.{ .kind = .tool_call, .name = "research", .action = try std.fmt.allocPrint(self.arena, "retried {s} without tools after a model tool-call failure", .{self.sub_questions.items[funded[slot]].id}), .status = if (outcome.body) |_| .success else |_| .@"error" });
             }
         }
@@ -829,6 +861,8 @@ const Run = struct {
     fn absorbResearcher(self: *Run, index: usize, outcome: ResearcherOutcome) !void {
         var sub = &self.sub_questions.items[index];
         self.researcher_runs += 1;
+        self.llm_calls += outcome.llm_calls;
+        self.tool_calls += outcome.tool_calls;
         const encoded = outcome.body catch |err| {
             if (isRequestError(err)) return err;
             sub.status = "failed";
@@ -844,13 +878,13 @@ const Run = struct {
             return;
         };
         const parsed = std.json.parseFromSliceLeaky(metadata.RetrievalAgentResult, self.arena, encoded, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return error.InvalidResearchAgentRequest;
-        const llm_used: i64 = if (parsed.usage) |usage| usage.llm_calls orelse (parsed.iteration orelse 0) else parsed.iteration orelse 0;
-        self.llm_calls += llm_used;
-        self.tool_calls += parsed.tool_calls_made orelse 0;
+        const llm_used = outcome.llm_calls;
 
         var evidence_ids = std.ArrayListUnmanaged([]const u8).empty;
-        for (parsed.hits) |hit| {
-            if (try self.registry.addHit(self.arena, hit, self.single_table, sub.id)) |id| {
+        for (parsed.hits, 0..) |hit, hit_index| {
+            // Retrieval reports each hit's table; web and fetched pages have none.
+            const table: ?[]const u8 = if (hit_index < outcome.tables.len) outcome.tables[hit_index] else self.single_table;
+            if (try self.registry.addHit(self.arena, hit, table, sub.id)) |id| {
                 var dup = false;
                 for (evidence_ids.items) |existing| if (std.mem.eql(u8, existing, id)) {
                     dup = true;
@@ -887,7 +921,7 @@ const Run = struct {
             .status = parsed.status,
             .round = @intCast(self.round + 1),
             .llm_calls = llm_used,
-            .tool_calls = parsed.tool_calls_made,
+            .tool_calls = outcome.tool_calls,
         };
         try self.findings.append(self.arena, finding);
         try self.live.progress("finding", finding);
@@ -1235,6 +1269,46 @@ fn modelLevelFailure(err: anyerror) bool {
     };
 }
 
+const web_tool_names = [_][]const u8{ "web_search", "fetch" };
+
+/// A tool policy with web access removed, for the pipeline-mode retry, which
+/// cannot use web tools. Removing entries only narrows the policy; a list
+/// that would become empty is refused, because an empty list means "no
+/// restriction".
+fn withoutWebTools(arena: std.mem.Allocator, tools: ?std.json.Value) !?std.json.Value {
+    const value = tools orelse return null;
+    if (value != .object) return error.FallbackNotPermitted;
+    var narrowed = try value.object.clone(arena);
+    inline for (.{ "web_search_config", "web_search_connection", "fetch_config" }) |field| _ = narrowed.orderedRemove(field);
+    if (narrowed.get("enabled_tools")) |enabled| {
+        if (enabled != .array) return error.FallbackNotPermitted;
+        var kept = std.json.Array.init(arena);
+        for (enabled.array.items) |tool| {
+            if (tool == .string) {
+                var web = false;
+                for (web_tool_names) |name| if (std.mem.eql(u8, tool.string, name)) {
+                    web = true;
+                };
+                if (web) continue;
+            }
+            try kept.append(tool);
+        }
+        if (enabled.array.items.len > 0 and kept.items.len == 0) return error.FallbackNotPermitted;
+        try narrowed.put(arena, "enabled_tools", .{ .array = kept });
+    }
+    return .{ .object = narrowed };
+}
+
+/// Whether a tool policy permits `name`. No policy, or no list, allows all.
+fn toolAllowed(tools: ?std.json.Value, name: []const u8) bool {
+    const value = tools orelse return true;
+    if (value != .object) return false;
+    const enabled = value.object.get("enabled_tools") orelse return true;
+    if (enabled != .array or enabled.array.items.len == 0) return true;
+    for (enabled.array.items) |tool| if (tool == .string and std.mem.eql(u8, tool.string, name)) return true;
+    return false;
+}
+
 /// Caller-supplied search plan fields; a query without them is a table scope.
 fn hasPlanFields(query: std.json.ObjectMap) bool {
     inline for (.{ "full_text_search", "semantic_search", "query", "embeddings", "graph_queries", "aggregations", "count" }) |field| {
@@ -1257,7 +1331,26 @@ fn withMaxTokens(arena: std.mem.Allocator, generator: std.json.Value, max_tokens
 
 const ResearcherOutcome = struct {
     body: anyerror![]const u8,
+    /// Source table of each result hit, parallel to the result's `hits`.
+    tables: []const ?[]const u8 = &.{},
+    /// Charged usage: reported usage for a success, the whole allocation for
+    /// a failure (see runResearchRound).
+    llm_calls: i64 = 0,
+    tool_calls: i64 = 0,
 };
+
+/// Usage a successful researcher reports. `usage.llm_calls` counts every
+/// model round including delegated query planning.
+fn reportedUsage(arena: std.mem.Allocator, body: []const u8) struct { i64, i64 } {
+    const Usage = struct {
+        usage: ?struct { llm_calls: ?i64 = null } = null,
+        iteration: ?i64 = null,
+        tool_calls_made: ?i64 = null,
+    };
+    const parsed = std.json.parseFromSliceLeaky(Usage, arena, body, .{ .ignore_unknown_fields = true }) catch return .{ 0, 0 };
+    const llm = if (parsed.usage) |usage| usage.llm_calls orelse (parsed.iteration orelse 0) else parsed.iteration orelse 0;
+    return .{ llm, parsed.tool_calls_made orelse 0 };
+}
 
 /// Run researcher bodies in batches of `max_parallel` on the server runtime.
 /// Each job owns its arena (thread-safe backing when concurrent); encoded
@@ -1278,11 +1371,13 @@ fn runResearchers(
         tool_calls: i64,
         arena_impl: std.heap.ArenaAllocator,
         result: anyerror![]const u8 = error.ResearcherNotRun,
+        tables: std.ArrayListUnmanaged(?[]const u8) = .empty,
 
         fn run(job: *@This()) void {
             const job_arena = job.arena_impl.allocator();
             job.result = if (retrieval_agent.executeWithOptions(job_arena, job.query_runner, job.generator, job.body, null, .{
                 .budget = .{ .max_tool_calls = job.tool_calls },
+                .hit_tables = &job.tables,
             })) |encoded| encoded.body else |err| err;
         }
     };
@@ -1305,7 +1400,9 @@ fn runResearchers(
             group.await(io) catch {};
         } else for (jobs) |*job| job.run();
         for (jobs, outcomes[offset..end]) |*job, *outcome| {
-            outcome.* = .{ .body = if (job.result) |body| try arena.dupe(u8, body) else |err| err };
+            const tables = try arena.alloc(?[]const u8, job.tables.items.len);
+            for (job.tables.items, tables) |table, *copy| copy.* = if (table) |name| try arena.dupe(u8, name) else null;
+            outcome.* = .{ .body = if (job.result) |body| try arena.dupe(u8, body) else |err| err, .tables = tables };
         }
         offset = end;
     }
@@ -1487,7 +1584,10 @@ pub fn execute(
     };
     if (!stream) return .{ .content_type = "application/json", .body = try std.json.Stringify.valueAlloc(alloc, result, .{ .emit_null_optional_fields = false }) };
     const active = effective_sink.?;
-    if (result.status == .incomplete or result.status == .failed) try active.emitValue(arena, "error", .{ .@"error" = @tagName(result.status), .reason = if (result.incomplete_details) |d| d.reason else null });
+    // An incomplete run (deadline, budget, max_rounds) is a resumable result,
+    // not a failure: `done` carries its research_state and any partial report,
+    // and clients that stop at `error` would discard them.
+    if (result.status == .failed) try active.emitValue(arena, "error", .{ .@"error" = @tagName(result.status) });
     try active.emitValue(arena, "done", result);
     return .{ .content_type = "text/event-stream", .body = if (sink != null) try alloc.dupe(u8, "") else try alloc.dupe(u8, buffered.body.items) };
 }
@@ -1510,6 +1610,10 @@ const TestFake = struct {
     /// Fail every tool-bearing researcher call, as a small local model with
     /// malformed tool-call output does.
     fail_tool_calls: bool = false,
+    /// Researchers search every declared query instead of only the first.
+    search_all: bool = false,
+    /// Every model call, whatever its outcome.
+    calls: std.atomic.Value(usize) = .init(0),
     roles: std.atomic.Value(usize) = .init(0),
     researcher_turns: std.atomic.Value(usize) = .init(0),
     planner_calls: std.atomic.Value(usize) = .init(0),
@@ -1519,7 +1623,7 @@ const TestFake = struct {
     fn query(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, body: []const u8) !query_api.QueryResponse {
         const self: *TestFake = @ptrCast(@alignCast(ptr));
         _ = self.queries.fetchAdd(1, .monotonic);
-        try std.testing.expectEqualStrings("docs", table);
+        try std.testing.expect(std.mem.eql(u8, table, "docs") or std.mem.eql(u8, table, "other"));
         // Mandatory predicates reach every researcher query.
         try std.testing.expect(std.mem.indexOf(u8, body, "tenant-a") != null);
         return .{ .json = try alloc.dupe(u8,
@@ -1529,6 +1633,7 @@ const TestFake = struct {
 
     fn generate(ptr: *anyopaque, a: std.mem.Allocator, chain: []const generating.ChainLink, messages: []const generating.ChatMessage) !generating.GenerateResult {
         const self: *TestFake = @ptrCast(@alignCast(ptr));
+        _ = self.calls.fetchAdd(1, .monotonic);
         const system = messages[0].content.?.text;
         const reply: []const u8 = if (std.mem.indexOf(u8, system, "planner of a deep research agent") != null) blk: {
             _ = self.planner_calls.fetchAdd(1, .monotonic);
@@ -1553,8 +1658,9 @@ const TestFake = struct {
             const last = messages[messages.len - 1];
             if (last.role != .tool) {
                 _ = self.researcher_turns.fetchAdd(1, .monotonic);
-                const calls = try a.alloc(generating.ToolCall, 1);
+                const calls = try a.alloc(generating.ToolCall, if (self.search_all) 2 else 1);
                 calls[0] = .{ .id = try a.dupe(u8, "s"), .name = try a.dupe(u8, "search"), .arguments = try a.dupe(u8, "{\"query_index\":0}") };
+                if (self.search_all) calls[1] = .{ .id = try a.dupe(u8, "s1"), .name = try a.dupe(u8, "search"), .arguments = try a.dupe(u8, "{\"query_index\":1}") };
                 return .{ .allocator = a, .content = try a.dupe(u8, ""), .tool_calls = calls };
             }
             var saw_prompt = false;
@@ -1818,4 +1924,120 @@ test "research agent retry searches the sub-question text for a bare table scope
     try std.testing.expect(Capture.saw_sub_question.load(.monotonic));
     try std.testing.expectEqual(AgentStatus.completed, parsed.value.status);
     try std.testing.expect(parsed.value.evidence.?.len > 0);
+}
+
+test "research retry keeps the caller's tool policy" {
+    const Capture = struct {
+        var saw_sub_question = std.atomic.Value(bool).init(false);
+        fn query(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, body: []const u8) !query_api.QueryResponse {
+            if (std.mem.indexOf(u8, body, "When does reranking help?") != null) saw_sub_question.store(true, .monotonic);
+            return TestFake.query(ptr, alloc, table, body);
+        }
+    };
+    // Full-text search is not enabled, so the retry must not synthesize a
+    // full-text query for the bare table scope.
+    var fake = TestFake{ .fail_tool_calls = true };
+    const body =
+        \\{"query":"q","queries":[{"table":"docs","filter_query":{"term":"tenant-a","field":"tenant"}}],"generator":{"provider":"antfly","model":"test"},"stream":false,"budget":{"max_rounds":1},"tools":{"enabled_tools":["add_filter"]}}
+    ;
+    const encoded = try execute(std.testing.allocator, .{ .ptr = &fake, .vtable = &.{ .run_query = Capture.query } }, .{ .ptr = &fake, .vtable = &.{ .execute_chain = TestFake.generate } }, body, null, .{});
+    defer std.testing.allocator.free(encoded.body);
+    const parsed = try std.json.parseFromSlice(Result, std.testing.allocator, encoded.body, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+    defer parsed.deinit();
+    // The retry ran only what add_filter permits: the caller's own filter
+    // query, never a synthesized full-text search for the sub-question.
+    try std.testing.expect(!Capture.saw_sub_question.load(.monotonic));
+    try std.testing.expect(std.mem.indexOf(u8, encoded.body, "retried q1 without tools") != null);
+
+    // A policy that allows only web tools cannot be narrowed to a no-web
+    // retry without becoming unrestricted, so no retry runs.
+    try std.testing.expectError(error.FallbackNotPermitted, withoutWebTools(parsed.arena.allocator(), (try std.json.parseFromSliceLeaky(std.json.Value, parsed.arena.allocator(), "{\"enabled_tools\":[\"web_search\",\"fetch\"]}", .{}))));
+    const narrowed = (try withoutWebTools(parsed.arena.allocator(), try std.json.parseFromSliceLeaky(std.json.Value, parsed.arena.allocator(), "{\"enabled_tools\":[\"web_search\",\"full_text_search\"],\"web_search_connection\":\"w\"}", .{}))).?;
+    try std.testing.expect(narrowed.object.get("web_search_connection") == null);
+    try std.testing.expectEqual(@as(usize, 1), narrowed.object.get("enabled_tools").?.array.items.len);
+    try std.testing.expect(toolAllowed(narrowed, "full_text_search"));
+    try std.testing.expect(!toolAllowed(narrowed, "web_search"));
+}
+
+test "research charges failed researchers their allocation and never exceeds the model-call budget" {
+    for ([_]i64{ 4, 5, 6, 8, 12 }) |max_calls| {
+        var fake = TestFake{ .fail_tool_calls = true };
+        const body = try std.fmt.allocPrint(std.testing.allocator,
+            \\{{"query":"q","queries":[{{"table":"docs","full_text_search":{{"match":"hybrid"}},"filter_query":{{"term":"tenant-a","field":"tenant"}}}}],"generator":{{"provider":"antfly","model":"test"}},"stream":false,"budget":{{"max_rounds":1,"researcher_iterations":3,"max_llm_calls":{d}}}}}
+        , .{max_calls});
+        defer std.testing.allocator.free(body);
+        const parsed = try runJson(&fake, null, body, .{});
+        defer parsed.deinit();
+        const reported = parsed.value.usage.?.llm_calls.?;
+        // Reported usage never undercounts real calls, and stays in budget.
+        try std.testing.expect(@as(i64, @intCast(fake.calls.load(.monotonic))) <= reported);
+        try std.testing.expect(reported <= max_calls);
+    }
+}
+
+test "research streams an incomplete run as done without an error event" {
+    var fake = TestFake{};
+    const r = fake.runners(null);
+    const body =
+        \\{"query":"q","queries":[{"table":"docs","filter_query":{"term":"tenant-a","field":"tenant"}}],"generator":{"provider":"antfly","model":"test"},"stream":true,"budget":{"max_rounds":1,"max_llm_calls":3}}
+    ;
+    const encoded = try execute(std.testing.allocator, r[0], r[1], body, null, .{});
+    defer std.testing.allocator.free(encoded.body);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.body, "event: done") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.body, "event: error") == null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.body, "\"status\":\"incomplete\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.body, "\"research_state\"") != null);
+}
+
+test "research keeps equal document keys from different tables apart" {
+    var fake = TestFake{ .search_all = true };
+    const body =
+        \\{"query":"q","queries":[{"table":"docs","full_text_search":{"match":"a"},"filter_query":{"term":"tenant-a","field":"tenant"}},{"table":"other","full_text_search":{"match":"a"},"filter_query":{"term":"tenant-a","field":"tenant"}}],"generator":{"provider":"antfly","model":"test"},"stream":false,"budget":{"max_rounds":1,"max_sub_questions":1}}
+    ;
+    const parsed = try runJson(&fake, null, body, .{});
+    defer parsed.deinit();
+    const evidence = parsed.value.evidence.?;
+    // Both tables return doc:rrf and doc:rerank: four distinct documents.
+    try std.testing.expectEqual(@as(usize, 4), evidence.len);
+    var docs_tables: usize = 0;
+    for (evidence) |item| {
+        try std.testing.expect(item.table != null);
+        if (std.mem.eql(u8, item.doc_id.?, "doc:rrf")) docs_tables += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), docs_tables);
+}
+
+test "research job advance checkpoints each phase before running the next" {
+    const research_jobs = @import("research_jobs.zig");
+    const Probe = struct {
+        var store: *research_jobs.Store = undefined;
+        var checked = std.atomic.Value(bool).init(false);
+        fn query(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, body: []const u8) !query_api.QueryResponse {
+            // The research phase is running: the plan phase of this same
+            // advance must already be persisted.
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const record = (try store.load(arena.allocator(), "rsj_ckpt", "alice")).?;
+            try std.testing.expectEqualStrings("research", record.phase);
+            try std.testing.expectEqual(research_jobs.JobState.running, record.state);
+            try std.testing.expect(std.mem.indexOf(u8, record.request, "\"research_state\"") != null);
+            checked.store(true, .monotonic);
+            return TestFake.query(ptr, alloc, table, body);
+        }
+    };
+    const alloc = std.testing.allocator;
+    var fake = TestFake{};
+    var store = research_jobs.Store.init(alloc, .{});
+    defer store.deinit();
+    Probe.store = &store;
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    const request = try research_jobs.normalizeRequest(arena, try std.json.parseFromSliceLeaky(std.json.Value, arena, test_request, .{}));
+    alloc.free(try store.create(alloc, "rsj_ckpt", "alice", "q", request));
+    const claimed = (try store.begin(arena, "rsj_ckpt", "alice", 60_000)).?.started;
+    const record = try research_jobs.advanceClaimed(&store, arena, .{ .ptr = &fake, .vtable = &.{ .run_query = Probe.query } }, .{ .ptr = &fake, .vtable = &.{ .execute_chain = TestFake.generate } }, claimed, 10, null, 60_000);
+    try std.testing.expect(Probe.checked.load(.monotonic));
+    try std.testing.expectEqual(research_jobs.JobState.succeeded, record.state);
+    try std.testing.expectEqual(@as(u64, 5), record.advances);
 }

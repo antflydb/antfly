@@ -290,6 +290,28 @@ pub const Store = struct {
         return record;
     }
 
+    /// Persist a completed phase while the attempt keeps its lease, so a crash
+    /// in a later phase of the same advance resumes after this one. Returns
+    /// null when the attempt was superseded or cancellation was requested:
+    /// the caller must stop and call `finish`.
+    pub fn checkpoint(self: *Store, arena: std.mem.Allocator, claimed: Record, outcome: Outcome, lease_ms: u64) !?Record {
+        const now = nowMillis();
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        const encoded = self.jobs.get(claimed.job_id) orelse return error.NotFound;
+        var record = try std.json.parseFromSliceLeaky(Record, arena, try arena.dupe(u8, encoded), .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+        if (record.attempt != claimed.attempt or record.state != .running or record.cancel_requested) return null;
+        record.phase = outcome.phase;
+        record.request = outcome.request;
+        record.result = outcome.result;
+        record.advances += 1;
+        record.lease_until_ms = now +| lease_ms;
+        record.updated_at_ms = now;
+        record.expires_at_ms = now + self.retentionMillis();
+        try self.putLocked(record);
+        return record;
+    }
+
     pub fn requestCancel(self: *Store, arena: std.mem.Allocator, job_id: []const u8, owner: []const u8) !?Record {
         const now = nowMillis();
         lock(&self.mutex);
@@ -485,6 +507,32 @@ pub fn advance(
         .result = try std.json.Stringify.valueAlloc(arena, result, .{ .emit_null_optional_fields = false }),
         .last_error = if (state == .failed) reason orelse @tagName(result.status) else null,
     };
+}
+
+/// Run up to `max_phases` phases of a claimed job, one phase per pass, and
+/// checkpoint after each. Stops early on a terminal or failed phase, on
+/// cancellation, or when the attempt is superseded. Always ends with
+/// `finish` unless superseded, and returns the latest record.
+pub fn advanceClaimed(
+    store: *Store,
+    arena: std.mem.Allocator,
+    query_runner: research_agent.QueryRunner,
+    generator: research_agent.GenerationRunner,
+    claimed: Record,
+    max_phases: usize,
+    deadline_ns: ?u64,
+    lease_ms: u64,
+) !Record {
+    var current = claimed;
+    var phase: usize = 0;
+    while (true) : (phase += 1) {
+        const outcome = try advance(arena, query_runner, generator, current.request, 1, deadline_ns);
+        const expired = if (deadline_ns) |deadline| platform_time.monotonicNs() >= deadline else false;
+        const last = phase + 1 >= max_phases or outcome.state != .queued or expired;
+        if (last) return store.finish(arena, claimed, outcome);
+        current = (try store.checkpoint(arena, claimed, outcome, lease_ms)) orelse
+            return store.finish(arena, claimed, outcome);
+    }
 }
 
 /// Public ResearchJob JSON for a record. The stored request is not exposed.

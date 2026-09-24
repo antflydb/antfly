@@ -1113,7 +1113,12 @@ export class AntflyClient {
               break;
             case "done": {
               const result = JSON.parse(frame.data);
-              if (result === null || typeof result !== "object" || Array.isArray(result)) {
+              if (
+                result === null ||
+                typeof result !== "object" ||
+                Array.isArray(result) ||
+                typeof result.status !== "string"
+              ) {
                 throw new Error("Research agent returned an invalid done result");
               }
               callbacks.onDone?.(result);

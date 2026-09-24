@@ -1080,8 +1080,12 @@ func (c *AntflyClient) ResearchAgent(ctx context.Context, req ResearchAgentReque
 		return &result, nil
 	}
 
-	// Build result from streaming events
+	// Build result from streaming events. Only a well-formed done event
+	// completes the call: a stream that ends early (connection reset,
+	// truncation) or carries a malformed done is an error, never an empty
+	// result.
 	result := &ResearchAgentResult{}
+	sawDone := false
 
 	for eventType, data := range readSSEEvents(resp.Body) {
 		switch oapi.SSEEvent(eventType) {
@@ -1176,7 +1180,13 @@ func (c *AntflyClient) ResearchAgent(ctx context.Context, req ResearchAgentReque
 				}
 			}
 		case oapi.SSEEventDone:
-			_ = json.Unmarshal([]byte(data), result)
+			if err := json.Unmarshal([]byte(data), result); err != nil {
+				return nil, fmt.Errorf("parsing research agent done event: %w", err)
+			}
+			if result.Status == "" {
+				return nil, errors.New("research agent done event has no status")
+			}
+			sawDone = true
 		case oapi.SSEEventError:
 			var agentErr ResearchAgentError
 			if json.Unmarshal([]byte(data), &agentErr) != nil {
@@ -1191,6 +1201,9 @@ func (c *AntflyClient) ResearchAgent(ctx context.Context, req ResearchAgentReque
 		}
 	}
 
+	if !sawDone {
+		return nil, errors.New("research agent stream ended without a done event")
+	}
 	return result, nil
 }
 

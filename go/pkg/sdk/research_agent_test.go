@@ -362,3 +362,47 @@ func TestRunResearchJob(t *testing.T) {
 		t.Errorf("unexpected update sequence: %+v", updates)
 	}
 }
+
+func TestResearchAgentStreamingRequiresValidDone(t *testing.T) {
+	cases := map[string]string{
+		"truncated":      "event: step_progress\ndata: {\"name\":\"research\",\"phase\":\"plan\",\"brief\":\"b\",\"sub_questions\":[]}\n\n",
+		"malformed":      "event: done\ndata: {not json\n\n",
+		"missing status": "event: done\ndata: {\"research_state\":{\"phase\":\"done\"}}\n\n",
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				fmt.Fprint(w, body)
+			}))
+			defer server.Close()
+			client, err := NewAntflyClient(server.URL, server.Client())
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := client.ResearchAgent(context.Background(), ResearchAgentRequest{Query: "x", Stream: true})
+			if err == nil {
+				t.Fatalf("expected error, got result %+v", result)
+			}
+		})
+	}
+}
+
+func TestResearchAgentStreamingIncompleteDoneIsAResult(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "event: done\ndata: {\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"deadline\"},\"research_state\":{\"phase\":\"research\"}}\n\n")
+	}))
+	defer server.Close()
+	client, err := NewAntflyClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := client.ResearchAgent(context.Background(), ResearchAgentRequest{Query: "x", Stream: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != "incomplete" || result.ResearchState.Phase != "research" {
+		t.Fatalf("expected a resumable incomplete result, got %+v", result)
+	}
+}

@@ -5545,8 +5545,7 @@ pub const AntflyApiHandler = struct {
         };
         const deadline_ms = research_agent.deadlineMs(arena, claimed.request);
         runners.setContext(self.agentRequestContextWithTimeout(ctx, deadline_ms));
-        const outcome = try research_jobs.advance(arena, runners.query.iface(), runners.generation.iface(), claimed.request, phases, runners.query.request_context.deadline_ns);
-        return store.finish(arena, claimed, outcome);
+        return research_jobs.advanceClaimed(store, arena, runners.query.iface(), runners.generation.iface(), claimed, phases, runners.query.request_context.deadline_ns, lease_ms);
     }
 
     pub fn getResearchJob(self: *AntflyApiHandler, ctx: *httpx.Context, job_id: []const u8) !httpx.Response {

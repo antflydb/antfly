@@ -44,6 +44,9 @@ byte-for-byte:
 - `max_internal_iterations` and the tool-call budget are carved from what the run has left after reserving the model
   calls that later phases need (reflections, the writer, and the verifier). A sub-question the budget cannot fund is
   marked `skipped` and the run reports `max_llm_calls` or `max_tool_calls`.
+- A successful researcher is charged the usage it reports; a failed one is charged its whole allocation, because it
+  may have spent all of it before failing. Retries are funded only from what remains after those charges, so reported
+  usage never undercounts and never exceeds the budget.
 
 Researchers run through `retrieval_agent.executeWithOptions` with a lent `agent_tools.Budget`. With a server runtime
 (`QueryRunner.io`) they run concurrently in a `std.Io.Group`; each job owns an arena backed by the thread-safe
@@ -55,13 +58,18 @@ each sub-question with `build_query`. A caller query with fixed search text is e
 a scoped corpus and wrong for broad research.
 
 A researcher whose tool loop fails at the model level (for example a small local model emitting tool-call syntax the
-inference runtime cannot parse) is retried once without tools. The retry runs the declared queries directly; a bare
-table scope gets a full-text `match` on the sub-question text, and the finding is generated from those hits. A failed
-retry is a failed finding, not a request error.
+inference runtime cannot parse) is retried once without tools. The retry keeps the caller's tool policies with web
+tools removed; if removing them would empty an `enabled_tools` list (which would mean "no restriction"), there is no
+retry. It runs the declared queries directly, and a bare table scope gets a full-text `match` on the sub-question text
+only when both policies allow `full_text_search`. A failed retry is a failed finding, not a request error.
+
+Retrieval reports each hit's source table (`ExecuteOptions.hit_tables`) and deduplicates by table and key, so equal
+keys from different tables stay separate evidence.
 
 ## Evidence and citations
 
-The registry dedups by `(table, doc_id)` for table hits and by URL for web and fetched pages; a fetched page replaces
+The registry dedups by `(table, doc_id)` for table hits (a bare key resolves to the first table's document;
+`table/key` is always unambiguous) and by URL for web and fetched pages; a fetched page replaces
 the same URL's search snippet. Evidence IDs (`E1`, `E2`, ...) are stable within a run and across resumes. Claim
 sources resolve through hit `_id`, URL, or evidence ID, and unknown references are dropped.
 
@@ -82,11 +90,14 @@ reason `deadline` and a resumable `research_state`.
 
 - **Synchronous:** `POST /agents/research` as JSON or SSE. SSE reuses the retrieval event names; `step_progress`
   carries `phase` values `plan`, `sub_question_started`, `finding`, `reflection`, `section`, and `verification`.
+  An incomplete run (deadline, budget, `max_rounds`) ends with `done` only, carrying its `research_state` and any
+  partial report; `error` is reserved for failures.
 - **Client-carried continuation:** the result's `research_state` (plan, findings, evidence, reflections, report,
   usage, and never raw transcripts or credentials) resumes the run at its phase. Every resumed request is
   re-authorized.
 - **Durable jobs:** `POST /agents/research/jobs` stores the request (streaming and interactivity forced off) and
-  optionally runs phases immediately. `POST .../advance` runs up to `max_phases` phases and checkpoints after each;
+  optionally runs phases immediately. `POST .../advance` runs up to `max_phases` phases and checkpoints after each
+  one while holding its lease, so a crash in a later phase keeps the completed ones;
   `GET` returns the job with its latest result; `POST .../cancel` stops it. The client or the CLI (`--job`) drives
   advances, which keeps every pass bounded and restart-safe without a background scheduler.
 
