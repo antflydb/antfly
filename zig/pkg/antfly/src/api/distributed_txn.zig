@@ -5938,6 +5938,7 @@ fn consumerTests() type {
                             .resolve_group = resolve,
                             .status_group = status,
                             .status_group_until = statusUntil,
+                            .acknowledge_group = acknowledge,
                         },
                     };
                 }

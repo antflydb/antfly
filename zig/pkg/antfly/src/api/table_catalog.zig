@@ -2710,6 +2710,42 @@ pub fn validateCatalogRouteFenceUntil(
     }
 }
 
+/// A read-index miss may be reported only while the selected owner is still
+/// current in a metadata read-index snapshot. An eventual positive route is
+/// insufficient: a retired owner can still answer an old read barrier.
+pub fn validateAuthoritativeCatalogRouteFenceUntil(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+    key: []const u8,
+    fence: metadata_api.CatalogRouteFence,
+    deadline_ns: ?u64,
+) !void {
+    try fence.validate();
+    if (catalog.vtable.free_routing_snapshot == unsupportedFreeRoutingSnapshot)
+        return error.CatalogRoutingUnavailable;
+    const snapshot = if (catalog.vtable.linearizable_table_routing_snapshot) |capture|
+        try capture(catalog.ptr, table_name, deadline_ns)
+    else if (catalog.vtable.linearizable_routing_snapshot) |capture|
+        try capture(catalog.ptr, deadline_ns)
+    else
+        return error.CatalogRoutingUnavailable;
+    var owned_snapshot = snapshot;
+    defer catalog.vtable.free_routing_snapshot(catalog.ptr, &owned_snapshot);
+    var plan = (try routePlanFromSnapshotWithBudget(alloc, owned_snapshot, table_name, .{ .key = key }, catalog.budget(deadline_ns))) orelse
+        return error.TopologyChanged;
+    defer plan.deinit(alloc);
+    if (plan.metadata_group_id != fence.metadata_group_id or
+        !std.meta.eql(plan.metadata_incarnation, fence.metadata_incarnation) or
+        plan.table_id != fence.table_id or
+        plan.topology_epoch != fence.topology_epoch or
+        plan.groups.len != 1 or
+        !std.meta.eql(plan.groups[0], fence.route))
+    {
+        return error.TopologyChanged;
+    }
+}
+
 /// Resolve a span and compute the routing epoch from one catalog snapshot.
 /// Resolve a bounded set of document keys from an already pinned routing
 /// session. No per-key metadata RPC is needed. Retain only owning groups, and

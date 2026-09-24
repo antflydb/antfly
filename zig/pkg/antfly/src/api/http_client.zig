@@ -1008,7 +1008,23 @@ pub const ApiHttpClient = struct {
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
-            404 => return error.NotFound,
+            404 => {
+                if (std.mem.eql(u8, read_consistency, "read_index")) {
+                    var route_ack = false;
+                    var absence = false;
+                    for (resp.headers) |header| {
+                        if (std.ascii.eqlIgnoreCase(header.name, route_metadata_api.catalog_route_fence_ack_header)) {
+                            if (route_ack or !std.mem.eql(u8, header.value, route_metadata_api.catalog_route_fence_ack_value)) return error.NotFound;
+                            route_ack = true;
+                        } else if (std.ascii.eqlIgnoreCase(header.name, route_metadata_api.read_index_absence_header)) {
+                            if (absence or !std.mem.eql(u8, header.value, route_metadata_api.read_index_absence_value)) return error.NotFound;
+                            absence = true;
+                        }
+                    }
+                    if (route_ack and absence) return error.AuthoritativeLookupMissing;
+                }
+                return error.NotFound;
+            },
             408, 504 => return error.Timeout,
             409 => return remoteGroupConflictError(resp.body),
             503 => return remoteStorageReadUnavailableError(resp.body),
