@@ -597,6 +597,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .txn_resolve_group_local_until = txnResolveGroupLocalUntil,
                 .txn_decide_group_local_with_pre_decision_context = txnDecideGroupLocalWithPreDecisionContext,
                 .txn_status_group_local = txnStatusGroupLocal,
+                .txn_status_group_local_with_request = txnStatusGroupLocalWithRequest,
                 .txn_status_group_local_until = txnStatusGroupLocalUntil,
                 .txn_acknowledge_group_local = txnAcknowledgeGroupLocal,
                 .txn_acknowledge_group_local_until = txnAcknowledgeGroupLocalUntil,
@@ -3131,6 +3132,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 !entry.identity.eql(descriptor.identity) or
                 !std.mem.eql(u8, entry.schema_json, descriptor.schema_json) or
                 !std.mem.eql(u8, entry.indexes_json, descriptor.indexes_json) or
+                !restoreIdentitiesEqual(entry.restore, descriptor.restore) or
                 !descriptor_contract.initialRangesEqual(entry.initial_range, descriptor.initial_range) or
                 !std.meta.eql(entry.table_storage, descriptor.table_storage))
             {
@@ -3148,6 +3150,11 @@ pub const ProvisionedKernelOwnerSource = struct {
             return error.StorageReadTemporarilyUnavailable;
         _ = self.owner_cache_hits.fetchAdd(1, .monotonic);
         return .{ .source = self, .entry = entry };
+    }
+
+    fn restoreIdentitiesEqual(a: ?@import("../storage/restore_identity.zig").Identity, b: ?@import("../storage/restore_identity.zig").Identity) bool {
+        if (a) |identity| return if (b) |other| identity.eql(other) else false;
+        return b == null;
     }
 
     const Residency = enum { transient, resident };
@@ -3315,6 +3322,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             if (!std.mem.eql(u8, entry.schema_json, descriptor.schema_json) or
                 !std.mem.eql(u8, entry.indexes_json, descriptor.indexes_json) or
                 !std.mem.eql(u8, entry.restore_bootstrap_json, descriptor.restore_bootstrap_json) or
+                !restoreIdentitiesEqual(entry.restore, descriptor.restore) or
                 !descriptor_contract.initialRangesEqual(entry.initial_range, descriptor.initial_range) or
                 entry.restore_cancel_recovery != descriptor.restore_cancel_recovery or
                 entry.restore_ha_replay != descriptor.restore_ha_replay or
@@ -5127,6 +5135,43 @@ pub const ProvisionedKernelOwnerSource = struct {
         var lease = (try self.acquireHiddenTransactionOwner(group_id, table_name)) orelse try self.acquire(group_id, table_name);
         defer lease.deinit();
         return switch (try lease.owner().transactionStatus(table_name, txn_id)) {
+            .pending => .pending,
+            .committed => .committed,
+            .aborted => .aborted,
+        };
+    }
+
+    fn txnStatusGroupLocalWithRequest(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: @import("distributed_txn_contract.zig").TxnStatusRequest,
+        context: request_operation.RequestContext,
+    ) !?db_types.TxnStatus {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try context.ensureActive();
+        const scope = req.restore_staging_scope orelse return error.InvalidTxnRequest;
+        const plan_id = req.restore_staging_plan_id orelse return error.InvalidTxnRequest;
+        // A hidden participant's status is a decision input. A stale replica
+        // cannot substitute for an applied ReadIndex, even during cold owner
+        // recovery from the exact restore plan.
+        try self.read_safety_barrier.waitReadSafe(group_id, "transaction:status:read_index");
+        try context.ensureActive();
+        var descriptor = try self.resolveRestoreDescriptor(alloc, group_id, table_name, scope, plan_id, .resolve, context);
+        defer descriptor.deinit(alloc);
+        const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
+        defer alloc.free(path);
+        var lease = try self.acquireDescriptorWithMode(group_id, table_name, path, descriptor.view(), false, .resident, .{
+            .execution_deadline_ns = context.deadline_ns,
+            .execution_io = context.deadline_io,
+            .cancellation = context.cancellation,
+        });
+        defer lease.deinit();
+        try context.ensureActive();
+        const status = try lease.owner().transactionStatus(table_name, req.txn_id);
+        try context.ensureActive();
+        return switch (status) {
             .pending => .pending,
             .committed => .committed,
             .aborted => .aborted,

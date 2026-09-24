@@ -327,7 +327,7 @@ pub fn compileStorageKernelReplicatedCompletion(
             req.merge_source_transition != null or req.merge_checkpoint != null or req.merge_replication != null)
             return error.InvalidBatchRequest;
         const begin = mutation.begin;
-        var selection = try selectBeginParticipants(alloc, table_name, group_id, begin.participants);
+        var selection = try selectBeginParticipants(alloc, table_name, group_id, begin.participants, req.restore_staging_scope, req.restore_staging_plan_id);
         defer selection.deinit(alloc);
         return db.compileReplicatedBegin(alloc, .{
             .txn_id = begin.txn_id,
@@ -400,9 +400,9 @@ const BeginParticipantSelection = struct {
     }
 };
 
-fn selectBeginParticipants(alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, participants: []const []const u8) !BeginParticipantSelection {
+fn selectBeginParticipants(alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, participants: []const []const u8, restore_staging_scope: ?[32]u8, restore_staging_plan_id: ?[16]u8) !BeginParticipantSelection {
     if (participants.len == 0) return error.InvalidBatchRequest;
-    const local = try distributed_txn.participantIdForGroup(alloc, table_name, group_id);
+    const local = try distributed_txn.participantIdForGroupScoped(alloc, table_name, group_id, restore_staging_scope, restore_staging_plan_id);
     errdefer alloc.free(local);
     var seen = std.StringHashMapUnmanaged(void).empty;
     defer seen.deinit(alloc);
@@ -430,7 +430,7 @@ pub fn applyReplicatedTransactionMutationInternal(
     if (req.relational_index_maintenance) |command| if (command.owner_group_id != group_id) return error.PreparedGenerationChanged;
     switch (mutation) {
         .begin => |begin| {
-            var selection = try selectBeginParticipants(alloc, table_name, group_id, begin.participants);
+            var selection = try selectBeginParticipants(alloc, table_name, group_id, begin.participants, req.restore_staging_scope, req.restore_staging_plan_id);
             defer selection.deinit(alloc);
             // Only the coordinator owns the full participant fan-out. A
             // follower tracks itself, making successful cleanup O(N) rather
