@@ -1252,6 +1252,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "distributed graph root probe retires resolved keys between shard waves",
             "distributed graph supports cross-range traverse target selectors",
             "distributed graph traverse routes cross-table frontier by table generation",
+            "distributed graph fans out per-group expand and hydrate with worker io",
         }),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

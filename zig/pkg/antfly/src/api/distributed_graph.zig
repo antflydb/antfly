@@ -1709,14 +1709,68 @@ const GraphExpandFanoutSlot = struct {
     result: ?GraphExpandResponse = null,
     err: ?anyerror = null,
 
-    fn init() GraphExpandFanoutSlot {
-        return .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
+    fn init(backing: std.mem.Allocator) GraphExpandFanoutSlot {
+        return .{ .arena = std.heap.ArenaAllocator.init(backing) };
     }
 
     fn deinit(self: *GraphExpandFanoutSlot) void {
         self.arena.deinit();
         self.* = undefined;
     }
+};
+
+// Expansion responses may be larger than the final merged page. Charge their
+// entire concurrent lifetime to the request allocator, which may itself be an
+// unsynchronized arena or an admitted allocator.
+const GraphExpandFanoutBacking = struct {
+    parent: std.mem.Allocator,
+    mutex: std.atomic.Mutex = .unlocked,
+
+    fn lock(self: *@This()) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn allocator(self: *@This()) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = alloc,
+            .resize = resize,
+            .remap = remap,
+            .free = free,
+        } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
+        return self.parent.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
+        return self.parent.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
+        return self.parent.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
+        self.parent.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+const GraphExpandFanoutSlots = struct {
+    backing: *GraphExpandFanoutBacking,
+    slots: []GraphExpandFanoutSlot,
 };
 
 const GraphHydrateFanoutSlot = struct {
@@ -4338,7 +4392,7 @@ fn executeDistributedTraverse(
                 }
             } else {
                 const fanout_start_ns = platform_time.monotonicNs();
-                const slots = try executeGraphExpandBatchesParallel(
+                const fanout = try executeGraphExpandBatchesParallel(
                     alloc,
                     io,
                     graph_fanout_plan.width,
@@ -4352,9 +4406,9 @@ fn executeDistributedTraverse(
                     consistency,
                 );
                 recordGraphParallelFanout(.expand, @intCast(platform_time.monotonicNs() - fanout_start_ns));
-                defer deinitGraphExpandFanoutSlots(alloc, slots);
+                defer deinitGraphExpandFanoutSlots(alloc, fanout);
 
-                for (slots, batch_entries) |slot, batch_entry| {
+                for (fanout.slots, batch_entries) |slot, batch_entry| {
                     const step_result = slot.result.?;
                     try consumeDistributedExpansionWork(request_work_budget, step_result.expansions);
                     const admitted = try graphExpansionNodeAdmissionMaskAlloc(
@@ -6718,16 +6772,20 @@ fn collectGraphExpandBatchEntries(
     return entries;
 }
 
-fn initGraphExpandFanoutSlots(alloc: std.mem.Allocator, count: usize) ![]GraphExpandFanoutSlot {
+fn initGraphExpandFanoutSlots(alloc: std.mem.Allocator, count: usize) !GraphExpandFanoutSlots {
+    const backing = try alloc.create(GraphExpandFanoutBacking);
+    errdefer alloc.destroy(backing);
+    backing.* = .{ .parent = alloc };
     const slots = try alloc.alloc(GraphExpandFanoutSlot, count);
     errdefer alloc.free(slots);
-    for (slots) |*slot| slot.* = .init();
-    return slots;
+    for (slots) |*slot| slot.* = .init(backing.allocator());
+    return .{ .backing = backing, .slots = slots };
 }
 
-fn deinitGraphExpandFanoutSlots(alloc: std.mem.Allocator, slots: []GraphExpandFanoutSlot) void {
-    for (slots) |*slot| slot.deinit();
-    alloc.free(slots);
+fn deinitGraphExpandFanoutSlots(alloc: std.mem.Allocator, fanout: GraphExpandFanoutSlots) void {
+    for (fanout.slots) |*slot| slot.deinit();
+    alloc.free(fanout.slots);
+    alloc.destroy(fanout.backing);
 }
 
 fn executeGraphExpandBatchesParallel(
@@ -6742,9 +6800,10 @@ fn executeGraphExpandBatchesParallel(
     include_paths: bool,
     algebraic_semiring_selected: bool,
     consistency: raft_mod.ReadConsistency,
-) ![]GraphExpandFanoutSlot {
-    const slots = try initGraphExpandFanoutSlots(alloc, entries.len);
-    errdefer deinitGraphExpandFanoutSlots(alloc, slots);
+) !GraphExpandFanoutSlots {
+    const fanout = try initGraphExpandFanoutSlots(alloc, entries.len);
+    errdefer deinitGraphExpandFanoutSlots(alloc, fanout);
+    const slots = fanout.slots;
 
     const Fiber = struct {
         fn run(
@@ -6798,13 +6857,15 @@ fn executeGraphExpandBatchesParallel(
                 consistency,
             });
         }
-        group.await(io) catch {};
+        // Await joins every worker before the shared request-backed allocator
+        // can retire; a canceled group cannot provide complete slot results.
+        try group.await(io);
     }
 
     for (slots) |slot| {
         if (slot.err) |err| return err;
     }
-    return slots;
+    return fanout;
 }
 
 fn collectSeenNodes(
@@ -15404,6 +15465,7 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
         hydrate_active: std.atomic.Value(u32) = .init(0),
         max_expand_active: std.atomic.Value(u32) = .init(0),
         max_hydrate_active: std.atomic.Value(u32) = .init(0),
+        expand_scratch_bytes: usize = 0,
 
         fn updateMax(max_value: *std.atomic.Value(u32), current: u32) void {
             var observed = max_value.load(.monotonic);
@@ -15492,6 +15554,14 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
                 .clock = .awake,
                 .raw = .fromNanoseconds(10 * std.time.ns_per_ms),
             }, state.io_impl.io());
+
+            if (state.expand_scratch_bytes != 0) {
+                // The worker may decode transient data that is never merged
+                // into the final page. Its slot allocator must still be
+                // charged to the original request.
+                const scratch = try alloc.alloc(u8, state.expand_scratch_bytes);
+                @memset(scratch, 0x5a);
+            }
 
             try std.testing.expectEqual(@as(usize, 1), req.frontier.len);
             const node_key = if (group_id == 11) "doc:b" else "doc:o";
@@ -15623,6 +15693,24 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
         .read_index,
     ));
     try std.testing.expectEqual(@as(u32, 2), state.expand_calls.load(.monotonic));
+
+    cancellation.store(false, .release);
+    state.expand_scratch_bytes = 2 * 1024 * 1024;
+    const limited_buffer = try std.testing.allocator.alloc(u8, 1024 * 1024);
+    defer std.testing.allocator.free(limited_buffer);
+    var limited = std.heap.FixedBufferAllocator.init(limited_buffer);
+    var limited_req = req;
+    limited_req.execution_deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    try std.testing.expectError(error.OutOfMemory, executeCrossRange(
+        limited.allocator(),
+        FakeCatalog.iface(),
+        FakeWorker.iface(&state),
+        "docs",
+        limited_req,
+        base_result,
+        .read_index,
+    ));
+    try std.testing.expect(state.expand_calls.load(.monotonic) >= 4);
 }
 
 test "system catalog graph binding alone performs no admission hydration" {
