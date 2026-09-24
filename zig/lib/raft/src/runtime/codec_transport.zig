@@ -106,6 +106,7 @@ const PendingRetry = struct {
     frame: codec_iface.EncodedFrame,
     attempts: u32,
     retry_round: u64,
+    replaceable_heartbeat: bool = false,
 
     fn deinit(self: *PendingRetry, alloc: std.mem.Allocator) void {
         alloc.free(self.frame.bytes);
@@ -297,6 +298,7 @@ pub const CodecTransportHost = struct {
             .peer_id = batch.peer_id,
             .endpoint = endpoint,
             .frame = frame,
+            .replaceable_heartbeat = isReplaceableHeartbeatBatch(batch),
         }) catch {
             self.metrics.send_failures += 1;
             // Failure ownership is per group. A later route change/removal
@@ -304,7 +306,7 @@ pub const CodecTransportHost = struct {
             for (batch.groups) |group| {
                 const isolated = try self.codec.encodePeerBatch(self.alloc, .{ .peer_id = batch.peer_id, .groups = &.{group} });
                 defer self.codec.freeFrame(self.alloc, isolated);
-                try self.scheduleRetry(group.group_id, if (group.messages.len > 0) group.messages[0].from else null, batch.peer_id, isolated, 1);
+                try self.scheduleRetry(group.group_id, if (group.messages.len > 0) group.messages[0].from else null, batch.peer_id, isolated, 1, isReplaceableHeartbeatGroup(group));
             }
             self.codec.freeFrame(self.alloc, frame);
             return;
@@ -320,6 +322,7 @@ pub const CodecTransportHost = struct {
         peer_id: core.types.NodeId,
         frame: codec_iface.EncodedFrame,
         attempt: u32,
+        replaceable_heartbeat: bool,
     ) !void {
         if (attempt >= self.retry_policy.max_attempts or self.pending_retries.items.len >= self.retry_policy.max_pending_frames or frame.bytes.len > self.retry_policy.max_pending_bytes -| self.pending_retry_bytes) {
             // Raft transport is lossy; bounded retry retention never prevents
@@ -340,6 +343,7 @@ pub const CodecTransportHost = struct {
             },
             .attempts = attempt,
             .retry_round = self.current_round + bounded_delay,
+            .replaceable_heartbeat = replaceable_heartbeat,
         });
         self.pending_retry_bytes += frame.bytes.len;
         self.metrics.retries_scheduled += 1;
@@ -425,7 +429,7 @@ pub const CodecTransportHost = struct {
                     if (!self.peer_routes.contains(.{ .group_id = group.group_id, .node_id = completion.peer_id })) continue;
                     const frame = try self.codec.encodePeerBatch(self.alloc, .{ .peer_id = completion.peer_id, .groups = &.{group} });
                     defer self.codec.freeFrame(self.alloc, frame);
-                    try self.scheduleRetry(group.group_id, completion.source_id, completion.peer_id, frame, completion.attempt);
+                    try self.scheduleRetry(group.group_id, completion.source_id, completion.peer_id, frame, completion.attempt, completion.replaceable_heartbeat and isReplaceableHeartbeatGroup(group));
                 },
                 else => {},
             }
@@ -456,6 +460,7 @@ pub const CodecTransportHost = struct {
                 .peer_id = pending.peer_id,
                 .endpoint = endpoint.endpoint(),
                 .frame = pending.frame,
+                .replaceable_heartbeat = pending.replaceable_heartbeat,
             };
             self.driver.sendFrame(req) catch {
                 if (pending.attempts + 1 >= self.retry_policy.max_attempts) {
@@ -479,6 +484,33 @@ pub const CodecTransportHost = struct {
         self.pending_retries.items.len = kept;
     }
 };
+
+fn isReplaceableHeartbeatGroup(group: transport_iface.GroupMessageBatch) bool {
+    if (group.messages.len == 0) return false;
+    for (group.messages) |message| {
+        if (message.msg_type != .heartbeat or message.context.len != 0 or
+            message.entries.len != 0 or message.snapshot != null or message.responses.len != 0) return false;
+    }
+    return true;
+}
+
+fn isReplaceableHeartbeatBatch(batch: transport_iface.PeerBatch) bool {
+    if (batch.groups.len == 0) return false;
+    for (batch.groups) |group| if (!isReplaceableHeartbeatGroup(group)) return false;
+    return true;
+}
+
+test "only context-free outbound heartbeat batches are replaceable" {
+    var context = "read-index".*;
+    const heartbeat = core.Message{ .msg_type = .heartbeat, .from = 1, .to = 2 };
+    const read_index = core.Message{ .msg_type = .heartbeat, .from = 1, .to = 2, .context = &context };
+    const response = core.Message{ .msg_type = .heartbeat_response, .from = 1, .to = 2 };
+    const append = core.Message{ .msg_type = .append_entries, .from = 1, .to = 2 };
+    try std.testing.expect(isReplaceableHeartbeatBatch(.{ .peer_id = 2, .groups = &.{.{ .group_id = 7, .messages = &.{heartbeat} }} }));
+    for ([_]core.Message{ read_index, response, append }) |message| {
+        try std.testing.expect(!isReplaceableHeartbeatBatch(.{ .peer_id = 2, .groups = &.{.{ .group_id = 7, .messages = &.{message} }} }));
+    }
+}
 
 fn firstSourceNodeId(batch: transport_iface.PeerBatch) ?core.types.NodeId {
     for (batch.groups) |group| {

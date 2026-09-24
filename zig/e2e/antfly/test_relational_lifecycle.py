@@ -15,7 +15,14 @@ auth_api = auth.auth_api
 
 
 def _constraint_status(api, table):
-    response = api._request("GET", f"/tables/{table}/constraints/status")
+    path = f"/tables/{table}/constraints/status"
+    # AuthApi exposes raw HTTP through request_raw; the stateful fixture's
+    # existing helper is named _request.
+    response = (
+        api.request_raw("GET", path, timeout=30)
+        if hasattr(api, "request_raw")
+        else api._request("GET", path)
+    )
     if response.status_code == 409 and (
         "constraint schema or ownership changed; refresh and retry" in response.text
     ):

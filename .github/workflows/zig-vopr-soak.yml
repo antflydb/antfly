@@ -90,6 +90,8 @@ jobs:
           ref: ${{ inputs.head_sha || github.sha }}
           persist-credentials: false
           submodules: true
+      - name: Sample ARC runner disk use
+        uses: ./.github/actions/runner-disk-audit
       - name: Load pinned toolchain policy
         id: toolchain
         uses: ./.github/actions/load-toolchain-policy
@@ -144,6 +146,8 @@ jobs:
           ref: ${{ inputs.head_sha || github.sha }}
           persist-credentials: false
           submodules: true
+      - name: Sample ARC runner disk use
+        uses: ./.github/actions/runner-disk-audit
       - name: Load pinned toolchain policy
         id: toolchain
         uses: ./.github/actions/load-toolchain-policy
@@ -253,6 +257,8 @@ jobs:
           ref: ${{ inputs.head_sha || github.sha }}
           persist-credentials: false
           submodules: true
+      - name: Sample ARC runner disk use
+        uses: ./.github/actions/runner-disk-audit
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: vopr-runner
@@ -351,11 +357,6 @@ jobs:
           retention-days: 90
           overwrite: true
           if-no-files-found: error
-      - name: Report runtime disk headroom
-        if: always()
-        run: |
-          df -h "$RUNNER_TEMP" "$GITHUB_WORKSPACE"
-          du -sh "$RUNNER_TEMP" "$GITHUB_WORKSPACE" || true
 
   # Native production stress complements the replayable scheduling campaigns.
   # Build once, repeat against those bytes, and keep every case's result.
@@ -372,6 +373,8 @@ jobs:
           ref: ${{ inputs.head_sha || github.sha }}
           persist-credentials: false
           submodules: true
+      - name: Sample ARC runner disk use
+        uses: ./.github/actions/runner-disk-audit
       - name: Prepare evidence directories
         run: |
           mkdir -p "$RUNNER_TEMP/production-e2e-soak/tmp" "$RUNNER_TEMP/production-e2e-soak/reports"
@@ -442,6 +445,8 @@ jobs:
           ref: ${{ inputs.head_sha || github.sha }}
           persist-credentials: false
           submodules: true
+      - name: Sample ARC runner disk use
+        uses: ./.github/actions/runner-disk-audit
       - name: Prepare evidence directories
         run: |
           mkdir -p "$RUNNER_TEMP/production-e2e-soak/tmp" "$RUNNER_TEMP/production-e2e-soak/reports"
@@ -560,11 +565,6 @@ jobs:
           path: ${{ runner.temp }}/production-e2e-soak/tmp
           retention-days: 30
           if-no-files-found: warn
-      - name: Report runtime disk headroom
-        if: always()
-        run: |
-          df -h "$RUNNER_TEMP" "$GITHUB_WORKSPACE"
-          du -sh "$RUNNER_TEMP" "$GITHUB_WORKSPACE" || true
 
   cluster-restore:
     needs: production-build
@@ -588,6 +588,8 @@ jobs:
           ref: ${{ inputs.head_sha || github.sha }}
           persist-credentials: false
           submodules: true
+      - name: Sample ARC runner disk use
+        uses: ./.github/actions/runner-disk-audit
       - name: Prepare evidence directories
         run: |
           mkdir -p "$RUNNER_TEMP/production-e2e-soak/tmp" "$RUNNER_TEMP/production-e2e-soak/reports"
@@ -656,11 +658,6 @@ jobs:
           path: ${{ runner.temp }}/production-e2e-soak/tmp
           retention-days: 30
           if-no-files-found: warn
-      - name: Report runtime disk headroom
-        if: always()
-        run: |
-          df -h "$RUNNER_TEMP" "$GITHUB_WORKSPACE"
-          du -sh "$RUNNER_TEMP" "$GITHUB_WORKSPACE" || true
 
   corpus:
     needs: [build, qualify, campaign]
@@ -673,6 +670,8 @@ jobs:
           ref: ${{ inputs.head_sha || github.sha }}
           persist-credentials: false
           submodules: true
+      - name: Sample ARC runner disk use
+        uses: ./.github/actions/runner-disk-audit
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: vopr-runner
@@ -908,8 +907,3 @@ jobs:
       - name: Clear secrets corpus before the next scenario
         if: always()
         run: rm -rf "$RUNNER_TEMP/vopr-corpus-retained"
-      - name: Report runtime disk headroom
-        if: always()
-        run: |
-          df -h "$RUNNER_TEMP" "$GITHUB_WORKSPACE"
-          du -sh "$RUNNER_TEMP" "$GITHUB_WORKSPACE" || true
