@@ -619,7 +619,6 @@ pub const ModelRegistry = struct {
         }
         try self.writePulledModelManifest(io, transaction.staging, tasks_csv, capabilities_csv);
         try download.completeManagedDownload(self.allocator, io, transaction.staging);
-        try transaction.commit(io);
 
         // Gemma4 QAT gguf checkpoints ship a sibling MTP assistant repo that
         // enables self-speculative decoding; fetch it best-effort so the
@@ -627,7 +626,9 @@ pub const ModelRegistry = struct {
         // repos must not fail the primary pull. The companion never inherits
         // the caller's task/capability overrides (it is a drafter, not a
         // servable generator), and an already-installed companion is not
-        // re-fetched on primary re-pulls.
+        // re-fetched on primary re-pulls. It runs before the primary commits
+        // so that a cancellation during it leaves nothing installed; any
+        // other companion failure is logged and the primary still commits.
         if (try gemma4MtpAssistantCompanionRefAlloc(self.allocator, ref)) |companion_ref| {
             defer self.allocator.free(companion_ref);
             const companion_installed = blk: {
@@ -643,8 +644,14 @@ pub const ModelRegistry = struct {
                         .{ companion_ref, @errorName(err) },
                     );
                 };
+                // A cancel during the companion (from the progress callback or
+                // the task's Io) cancels the whole pull. Checked here rather
+                // than by error name because this call is recursive.
+                try progress_sink.checkCancelled();
+                try io.checkCancel();
             }
         }
+        try transaction.commit(io);
     }
 
     /// Companion MTP assistant ref for a Gemma4 QAT gguf model
