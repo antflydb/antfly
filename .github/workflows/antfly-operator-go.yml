@@ -65,7 +65,7 @@ jobs:
       (inputs.pr_number == '' ||
       github.run_attempt == 1) }}
     needs: admission
-    runs-on: arc-antfly-standard
+    runs-on: arc-antfly-standard-runtime
     timeout-minutes: 30
     defaults:
       run:
