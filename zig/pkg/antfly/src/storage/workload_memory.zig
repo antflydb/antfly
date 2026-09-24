@@ -112,11 +112,13 @@ pub const WorkingMemory = struct {
             self.last_failure = err;
             return null;
         };
-        return self.backing.rawAlloc(len, alignment, ret_addr) orelse {
+        const result = self.backing.rawAlloc(len, alignment, ret_addr) orelse {
             self.shrink(len);
             self.last_failure = error.OutOfMemory;
             return null;
         };
+        self.last_failure = null;
+        return result;
     }
 
     fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
@@ -130,9 +132,11 @@ pub const WorkingMemory = struct {
         };
         if (!self.backing.rawResize(memory, alignment, new_len, ret_addr)) {
             self.shrink(additional);
+            self.last_failure = error.OutOfMemory;
             return false;
         }
         if (new_len < memory.len) self.shrink(memory.len - new_len);
+        self.last_failure = null;
         return true;
     }
 
@@ -147,9 +151,11 @@ pub const WorkingMemory = struct {
         };
         const result = self.backing.rawRemap(memory, alignment, new_len, ret_addr) orelse {
             self.shrink(additional);
+            self.last_failure = error.OutOfMemory;
             return null;
         };
         if (new_len < memory.len) self.shrink(memory.len - new_len);
+        self.last_failure = null;
         return result;
     }
 
@@ -181,6 +187,31 @@ test "workload admission working memory checks class and ResourceManager before 
     allocator.free(first);
     try std.testing.expectEqual(@as(u64, 20), ledger.snapshot().total.retained_bytes);
     try std.testing.expectEqual(@as(u64, 20), manager.snapshot().memory.used_bytes);
+}
+
+test "workload admission scan allocator reports the latest physical resize failure" {
+    const total: resources.Bundle = .{ .handles = 4, .requests = 1, .retained_bytes = 100 };
+    var ledger = try resources.Ledger.init(std.testing.allocator, .{ .total = total, .lanes = @splat(.{ .ceiling = total }) });
+    defer ledger.deinit();
+    var manager = resource_manager.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 100 } });
+    defer manager.deinit(std.testing.allocator);
+    var request = try ledger.admit(.general_read, 0);
+    defer request.release() catch unreachable;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    var memory = try WorkingMemory.init(&manager, .relational_preparation_working_set, &ledger, &request, failing.allocator(), 0);
+    defer memory.deinit();
+    const allocator = memory.allocator();
+
+    try std.testing.expectError(error.OutOfMemory, allocator.alloc(u8, 101));
+    try std.testing.expectEqual(error.AdmissionRequestTooLarge, memory.allocationFailure(error.OutOfMemory));
+    const buffer = try allocator.alloc(u8, 10);
+    defer allocator.free(buffer);
+    try std.testing.expect(memory.last_failure == null);
+    try std.testing.expect(!allocator.resize(buffer, 20));
+    try std.testing.expectEqual(error.OutOfMemory, memory.allocationFailure(error.OutOfMemory));
+    try std.testing.expectEqual(@as(u64, 10), memory.live_bytes);
+    try std.testing.expectEqual(@as(u64, 10), ledger.snapshot().total.retained_bytes);
+    try std.testing.expectEqual(@as(u64, 10), manager.snapshot().memory.used_bytes);
 }
 
 test "workload admission working memory rollback and completion credits survive suspension" {

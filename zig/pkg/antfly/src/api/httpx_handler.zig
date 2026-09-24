@@ -11244,7 +11244,7 @@ test "workload admission native batch offload keeps parsing and output charged" 
         var lease: ?RequestAdmission.Lease = null;
         defer if (lease) |*value| value.release();
         try std.testing.expect((try handler.acquirePublicOperation(&ctx, "batchWrite", &lease)) == null);
-        var response = AntflyApiHandler.handleTableBatchOffEventLoop(&ctx, runtime.ptr(), "docs", "{\"inserts\":{\"doc\":{\"title\":\"alpha\"}}}", api) catch |err| try AntflyApiHandler.mapIngressError(&ctx, err);
+        var response = AntflyApiHandler.handleTableBatchOffEventLoop(&ctx, runtime.ptr(), "docs", "{\"inserts\":{\"doc\":{\"title\":\"alpha\"}}}", api, public_table_http.handleTableBatch) catch |err| try AntflyApiHandler.mapIngressError(&ctx, err);
         var response_live = true;
         defer if (response_live) response.deinit();
         try std.testing.expect(fixture.called);

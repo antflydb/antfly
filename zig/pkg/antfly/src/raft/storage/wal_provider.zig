@@ -349,12 +349,21 @@ test "workload admission native installation precedes durable reconciliation and
     try std.testing.expectEqual(@as(usize, 1), fixture.frees);
     try std.testing.expectEqual(@as(usize, 0), fixture.progress_queries);
     fixture.reject_reconciliation = false;
+    {
+        var desc = try provider.descriptorFactory().buildDescriptor(record);
+        defer provider.descriptorFactory().freeDescriptor(alloc, &desc);
+        // Native proof advances the physical apply watermark, but Raft must
+        // replay the entry through its state machine before reporting completion.
+        try std.testing.expectEqual(@as(u64, 1), state.appliedIndex());
+        try std.testing.expectEqual(@as(u64, 0), desc.group.raft_config.applied);
+    }
+    try state.setAppliedIndex(1);
     var desc = try provider.descriptorFactory().buildDescriptor(record);
     defer provider.descriptorFactory().freeDescriptor(alloc, &desc);
     try std.testing.expectEqual(@as(u64, 1), desc.group.raft_config.applied);
     try std.testing.expect(state.native_startup_reconciled);
     try std.testing.expectEqual(@as(usize, 2), fixture.reconciliations);
-    try std.testing.expectEqual(@as(usize, 1), fixture.progress_queries);
+    try std.testing.expectEqual(@as(usize, 2), fixture.progress_queries);
 }
 
 test "wal replica provider wires host through WAL-backed local state" {
