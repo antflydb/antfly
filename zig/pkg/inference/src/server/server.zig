@@ -107,6 +107,8 @@ const executor_microbatch = @import("executor_microbatch.zig");
 pub const ExecutorCancellation = executor_microbatch.Cancellation;
 const execution_control_mod = @import("../execution_control.zig");
 const InferenceExecutionControl = execution_control_mod.InferenceExecutionControl;
+const cancellable_rerank_batch_size: usize = 8;
+const native_call_cancellation_grace_ns: u64 = 5 * std.time.ns_per_s;
 
 fn httpInferenceExecutionControl(node: *Node, ctx: *httpx.Context) InferenceExecutionControl {
     const Check = struct {
@@ -123,6 +125,7 @@ fn httpInferenceExecutionControl(node: *Node, ctx: *httpx.Context) InferenceExec
     return .{
         .io = ctx.io,
         .deadline_ns = ctx.application_deadline_ns,
+        .cancellation_grace_ns = native_call_cancellation_grace_ns,
         .ptr = ctx,
         .check_fn = Check.check,
         .hard_cancellation = if (node.hard_cancellation_watchdog) |watchdog|
@@ -4125,6 +4128,8 @@ pub const Node = struct {
         supplied: InferenceExecutionControl,
     ) InferenceExecutionControl {
         var control = supplied;
+        if (control.cancellation_grace_ns == null)
+            control.cancellation_grace_ns = native_call_cancellation_grace_ns;
         if (control.io == null) control.io = io orelse self.session_manager.io;
         if (control.hard_cancellation == null) {
             if (self.hard_cancellation_watchdog) |watchdog|
@@ -4578,6 +4583,7 @@ pub const Node = struct {
         var deadline_control = DeadlineControl{ .deadline_ns = deadline_ns, .upstream = upstream_control };
         const execution_control = self.bindExecutionControl(request_io, .{
             .io = if (upstream_control) |control| control.io else null,
+            .deadline_ns = deadline_ns,
             .ptr = &deadline_control,
             .check_fn = DeadlineControl.check,
             .hard_cancellation = if (upstream_control) |control| control.hard_cancellation else null,
@@ -4586,6 +4592,7 @@ pub const Node = struct {
         defer model_handle.release();
         const model = model_handle.get();
         var pipeline = self.createRerankingPipeline(allocator, model);
+        pipeline.config.batch_size = @min(pipeline.config.batch_size, cancellable_rerank_batch_size);
         pipeline.execution_control = execution_control;
         var prepared = try pipeline.prepareInputs(query, documents);
         defer prepared.deinit();
@@ -10970,6 +10977,11 @@ pub const Node = struct {
             for (parsed_docs.items, 0..) |doc, idx| flat_texts[idx] = doc.text;
 
             var pipeline = self.createRerankingPipeline(ctx.allocator, model);
+            // A cancelled client must release the model between bounded
+            // batches. Metal/CUDA cannot stop a driver call in place;
+            // restarting the worker for every abandoned search would evict
+            // the model for the next one.
+            pipeline.config.batch_size = @min(pipeline.config.batch_size, cancellable_rerank_batch_size);
             pipeline.execution_control = execution_control;
             var prepared = pipeline.prepareInputs(query, flat_texts) catch |err|
                 return inferenceFailureResponse(ctx, err);

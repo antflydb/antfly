@@ -996,6 +996,9 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
     var progress_adapter = ProgressAdapter{ .view = context.progress };
     const execution_control = inference.InferenceExecutionControl{
         .deadline_ns = deadline_ns,
+        // Give any model's current native call time to reach a safe boundary
+        // before a cancelled request forces the supervisor to replace it.
+        .cancellation_grace_ns = 5 * std.time.ns_per_s,
         .cancellation = if (context.cancellation.is_cancelled != null)
             .{ .ptr = &cancellation_adapter, .is_cancelled_fn = CancellationAdapter.requested }
         else
