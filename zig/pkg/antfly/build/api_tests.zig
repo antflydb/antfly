@@ -1253,6 +1253,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "distributed graph supports cross-range traverse target selectors",
             "distributed graph traverse routes cross-table frontier by table generation",
             "distributed graph fans out per-group expand and hydrate with worker io",
+            "distributed graph edge reader routes outgoing and fans out incoming adjacency",
         }),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
