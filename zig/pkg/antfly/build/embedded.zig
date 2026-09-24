@@ -372,16 +372,9 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     const capi_conformance_step = b.step("capi-conformance", "Run the shared libantfly conformance cases against the C ABI");
     capi_conformance_step.dependOn(&run_capi_conformance.step);
 
-    // The Go test binary is not the `antfly` executable, so it cannot re-exec
-    // itself the way the CLI does to spawn the sandboxed inference worker
-    // (see inference_worker.zig's `resolveWorkerExecutable`). Point it at the
-    // `antfly` binary this same build tree produces so it never falls
-    // through to an unrelated `antfly` a developer happens to have on PATH.
-    const lite_go_worker_env = b.fmt("ANTFLY_INFERENCE_WORKER={s}", .{b.getInstallPath(.bin, "antfly")});
     const run_lite_go_tests = b.addSystemCommand(&.{
         "env",
         "GOWORK=off",
-        lite_go_worker_env,
         "go",
         "test",
         "-tags",
@@ -403,7 +396,6 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "env",
         "ANTFLY_LITE_REQUIRE_LIBRARY=1",
         lite_lib_dir_env,
-        lite_go_worker_env,
         "uv",
         "run",
         "--locked",
@@ -418,7 +410,6 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     const run_lite_rs_tests = b.addSystemCommand(&.{
         "env",
         lite_lib_dir_env,
-        lite_go_worker_env,
         "cargo",
         "test",
         "--locked",
@@ -438,7 +429,6 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "env",
         "ANTFLY_LITE_REQUIRE_LIBRARY=1",
         lite_lib_dir_env,
-        lite_go_worker_env,
         "pnpm",
         "run",
         "test",
@@ -451,7 +441,6 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     const run_lite_go_example = b.addSystemCommand(&.{
         "env",
         "GOWORK=off",
-        lite_go_worker_env,
         "go",
         "run",
         ".",
@@ -470,7 +459,6 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     const run_lite_go_retrieval_template = b.addSystemCommand(&.{
         "env",
         "GOWORK=off",
-        lite_go_worker_env,
         "go",
         "run",
         ".",
@@ -521,6 +509,16 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi lite explicit resource budget overrides are reported in status",
         "capi lite defaults embedded generation budgets when no override is given",
         "capi lite drains an antfly embedder with no api_url through the embedded inference provider",
+        "capi inference options are prefix compatible and reject unknown flags and reserved bits",
+        "capi inference calls reject null, closed, and database handles",
+        "capi inference lists models and reports route errors with the runtime's JSON",
+        "capi inference embeds text with a local model",
+        "capi inference reranks documents with a local model",
+        "capi inference chunks text without a model",
+        "capi inference generates text with a local model and rejects streaming",
+        "capi inference pull rejects invalid requests with a JSON error",
+        "capi inference pulls a model with progress into the handle's models directory",
+        "capi inference streaming reports request errors without a model",
         "capi get edges json does not double free a non-empty edge slice",
         "run until idle no-progress error maps to a dedicated stalled ABI code, not internal",
         "capi lite merged indexes JSON discovers a standalone asset extractor and chunk enrichment with no owning index",

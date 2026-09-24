@@ -1230,6 +1230,8 @@ test "session vtable exposes required entry points" {
     try std.testing.expect(@hasField(Session.VTable, "backend"));
     try std.testing.expect(@hasField(Session.VTable, "close"));
     try std.testing.expect(@hasField(Session.VTable, "independentBatchRows"));
+    try std.testing.expect(@hasField(Session.VTable, "hasLayaDecisions"));
+    try std.testing.expect(@hasField(Session.VTable, "runLayaDecisions"));
 }
 
 const AdmissionProbeSession = struct {

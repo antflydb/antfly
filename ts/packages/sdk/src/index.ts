@@ -124,6 +124,7 @@ export type {
   Level,
   ModelsResponse,
   RequestOptions,
+  RerankDocument,
   RerankRequest,
   RerankResponse,
   RewriteRequest,

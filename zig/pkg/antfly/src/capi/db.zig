@@ -19,6 +19,7 @@ const raft_engine = @import("raft_engine");
 const storage_root = @import("antfly_storage_root");
 const antfly = if (@hasDecl(storage_root, "runtime_impl")) storage_root.runtime_impl else storage_root;
 const TestDirectory = antfly.testing.TestDirectory;
+pub const TestDirectoryType = TestDirectory;
 const vector_mod = @import("antfly_vector").vector;
 const capi = @import("types.zig");
 pub const ApiTypes = capi;
@@ -77,7 +78,7 @@ const backup_restore = antfly.raft.storage.backup_restore;
 const common_config = antfly.common_config;
 const common_secrets = antfly.common_secrets;
 const scraping = antfly.scraping;
-const inference_provider = antfly.inference_provider;
+pub const inference_provider = antfly.inference_provider;
 const managed_embedder = antfly.managed_embedder;
 const raft_catalog = antfly.raft_catalog;
 const indexes_api = antfly.public_api.indexes;
@@ -655,7 +656,7 @@ test "storage-owner reverse callbacks preserve semantic error identity" {
     );
 }
 
-fn monotonicNowNs() u64 {
+pub fn monotonicNowNs() u64 {
     return antfly.platform_time.monotonicNs();
 }
 
@@ -1790,16 +1791,28 @@ const ReadableLeaseHook = struct {
             .outcome_unknown => return error.DurabilityOutcomeUnknown,
             .unsupported => return error.UnsupportedOperation,
             .stalled => return error.Stalled,
+            .cancelled => return error.Canceled,
             .internal => return error.Internal,
         }
     }
 };
 
+/// Whether this build links the local inference runtime, which both Lite
+/// handles with local inference and `antfly_inference_open` require.
+pub fn localInferenceRuntimeAvailable() bool {
+    return capi_build_options.inference_enabled and
+        lite_backend.capabilitiesForProfile(.native).local_inference_runtime;
+}
+
+comptime {
+    _ = @import("inference.zig");
+}
+
 /// Resolves a caller's handle id without entering it. Exports go through
 /// `enterHandle` instead; this is for close and for internal callers (the
 /// storage-owner ABI, tests) that do not race close.
 fn asHandle(ptr: ?*anyopaque) ?*Handle {
-    const id = HandleRegistry.decode(ptr) orelse return null;
+    const id = handle_registry.decode(ptr) orelse return null;
     const slot = handle_registry.slotFor(id.index) orelse return null;
     if (slot.state.load(.acquire) >> 1 != id.generation) return null;
     return slot.handle.load(.acquire);
@@ -1819,165 +1832,198 @@ fn asHandle(ptr: ?*anyopaque) ?*Handle {
 /// 4096. So on 64-bit POSIX targets each id is encoded as an address inside
 /// a PROT_NONE reservation this process owns and never touches: a real,
 /// unique address that no allocator can ever return.
-const HandleRegistry = struct {
-    const chunk_len = 256;
-    const index_bits = 20;
-    const max_slots = 1 << index_bits;
-    const max_chunks = max_slots / chunk_len;
-    /// Handle values are 8-byte aligned offsets into the reservation.
-    const stride_shift = 3;
-    const reserve_address_space = @bitSizeOf(usize) == 64 and switch (builtin.os.tag) {
-        .linux, .macos, .freebsd, .netbsd, .openbsd, .dragonfly, .ios => true,
-        else => false,
-    };
-
-    const Slot = struct {
-        /// `generation << 1 | closing`. The slot is open for `generation`
-        /// exactly when the closing bit is clear.
-        state: std.atomic.Value(u64) = .init(0),
-        /// Calls that have entered, or are trying to, for any generation.
-        active: std.atomic.Value(u32) = .init(0),
-        handle: std.atomic.Value(?*Handle) = .init(null),
-        next_free: u32 = 0,
-    };
-
-    const Id = struct {
-        index: u32,
-        generation: u64,
-    };
-
-    chunks: [max_chunks]std.atomic.Value(?*[chunk_len]Slot) = @splat(.init(null)),
-    mutex: std.atomic.Mutex = .unlocked,
-    slot_count: u32 = 0,
-    free_head: ?u32 = null,
-    /// Start of the id reservation (0 until the first registration, or on
-    /// targets that use plain integer ids) and the generation width it fits.
-    base: std.atomic.Value(usize) = .init(0),
-    generation_bits: u6 = 0,
-
-    fn generationMask(self: *const HandleRegistry) u64 {
-        return (@as(u64, 1) << self.generation_bits) - 1;
-    }
-
-    /// Reserves the id address space on first use. Called with `mutex` held.
-    fn ensureIdSpace(self: *HandleRegistry) !void {
-        if (self.generation_bits != 0) return;
-        if (comptime !reserve_address_space) {
-            self.generation_bits = @bitSizeOf(usize) - index_bits - 1;
-            return;
-        }
-        // Prefer 17 generation bits (1 TiB of address space, no memory);
-        // step down if the platform limits reservations.
-        for ([_]u6{ 17, 13, 9 }) |bits| {
-            const len = @as(usize, 1) << (index_bits + bits + stride_shift);
-            const region = std.posix.mmap(null, len, .{}, .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .NORESERVE = true }, -1, 0) catch continue;
-            self.generation_bits = bits;
-            self.base.store(@intFromPtr(region.ptr), .release);
-            return;
-        }
-        return error.OutOfMemory;
-    }
-
-    fn encode(self: *const HandleRegistry, id: Id) *anyopaque {
-        const offset = (id.generation << index_bits | id.index);
-        if (comptime !reserve_address_space) {
-            // Plain ids; index + 1 keeps the value non-null.
-            return @ptrFromInt(@as(usize, @intCast(offset + 1)));
-        }
-        return @ptrFromInt(self.base.load(.acquire) + (@as(usize, @intCast(offset)) << stride_shift));
-    }
-
-    fn decode(ptr: ?*anyopaque) ?Id {
-        const raw = @intFromPtr(ptr orelse return null);
-        const offset: u64 = if (comptime !reserve_address_space) blk: {
-            break :blk @as(u64, raw) - 1;
-        } else blk: {
-            const base = handle_registry.base.load(.acquire);
-            if (base == 0 or raw < base) return null;
-            const delta = raw - base;
-            if (delta & ((1 << stride_shift) - 1) != 0) return null;
-            const offset = delta >> stride_shift;
-            if (offset >> index_bits > handle_registry.generationMask()) return null;
-            break :blk offset;
+pub fn HandleRegistryOf(comptime T: type) type {
+    return struct {
+        const Self = @This();
+        const chunk_len = 256;
+        const index_bits = 20;
+        const max_slots = 1 << index_bits;
+        const max_chunks = max_slots / chunk_len;
+        /// Handle values are 8-byte aligned offsets into the reservation.
+        const stride_shift = 3;
+        const reserve_address_space = @bitSizeOf(usize) == 64 and switch (builtin.os.tag) {
+            .linux, .macos, .freebsd, .netbsd, .openbsd, .dragonfly, .ios => true,
+            else => false,
         };
-        return .{
-            .index = @intCast(offset & (max_slots - 1)),
-            .generation = offset >> index_bits,
+
+        const Slot = struct {
+            /// `generation << 1 | closing`. The slot is open for `generation`
+            /// exactly when the closing bit is clear.
+            state: std.atomic.Value(u64) = .init(0),
+            /// Calls that have entered, or are trying to, for any generation.
+            active: std.atomic.Value(u32) = .init(0),
+            handle: std.atomic.Value(?*T) = .init(null),
+            next_free: u32 = 0,
         };
-    }
 
-    fn slotFor(self: *HandleRegistry, index: u32) ?*Slot {
-        const chunk_index = index / chunk_len;
-        if (chunk_index >= max_chunks) return null;
-        const chunk = self.chunks[chunk_index].load(.acquire) orelse return null;
-        return &chunk[index % chunk_len];
-    }
+        const Id = struct {
+            index: u32,
+            generation: u64,
+        };
 
-    /// Publishes `handle` and returns the id callers hold.
-    fn register(self: *HandleRegistry, handle: *Handle) !*anyopaque {
-        antfly.platform_sync.lockYielding(&self.mutex);
-        defer self.mutex.unlock();
-        try self.ensureIdSpace();
-        const index = if (self.free_head) |free| blk: {
-            self.free_head = if (self.slotFor(free).?.next_free == 0) null else self.slotFor(free).?.next_free - 1;
-            break :blk free;
-        } else blk: {
-            const index = self.slot_count;
+        chunks: [max_chunks]std.atomic.Value(?*[chunk_len]Slot) = @splat(.init(null)),
+        mutex: std.atomic.Mutex = .unlocked,
+        slot_count: u32 = 0,
+        free_head: ?u32 = null,
+        /// Start of the id reservation (0 until the first registration, or on
+        /// targets that use plain integer ids) and the generation width it fits.
+        base: std.atomic.Value(usize) = .init(0),
+        generation_bits: u6 = 0,
+
+        fn generationMask(self: *const Self) u64 {
+            return (@as(u64, 1) << self.generation_bits) - 1;
+        }
+
+        /// Reserves the id address space on first use. Called with `mutex` held.
+        fn ensureIdSpace(self: *Self) !void {
+            if (self.generation_bits != 0) return;
+            if (comptime !reserve_address_space) {
+                self.generation_bits = @bitSizeOf(usize) - index_bits - 1;
+                return;
+            }
+            // Prefer 17 generation bits (1 TiB of address space, no memory);
+            // step down if the platform limits reservations.
+            for ([_]u6{ 17, 13, 9 }) |bits| {
+                const len = @as(usize, 1) << (index_bits + bits + stride_shift);
+                const region = std.posix.mmap(null, len, .{}, .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .NORESERVE = true }, -1, 0) catch continue;
+                self.generation_bits = bits;
+                self.base.store(@intFromPtr(region.ptr), .release);
+                return;
+            }
+            return error.OutOfMemory;
+        }
+
+        fn encode(self: *const Self, id: Id) *anyopaque {
+            const offset = (id.generation << index_bits | id.index);
+            if (comptime !reserve_address_space) {
+                // Plain ids; index + 1 keeps the value non-null.
+                return @ptrFromInt(@as(usize, @intCast(offset + 1)));
+            }
+            return @ptrFromInt(self.base.load(.acquire) + (@as(usize, @intCast(offset)) << stride_shift));
+        }
+
+        fn decode(self: *const Self, ptr: ?*anyopaque) ?Id {
+            const raw = @intFromPtr(ptr orelse return null);
+            const offset: u64 = if (comptime !reserve_address_space) blk: {
+                break :blk @as(u64, raw) - 1;
+            } else blk: {
+                const base = self.base.load(.acquire);
+                if (base == 0 or raw < base) return null;
+                const delta = raw - base;
+                if (delta & ((1 << stride_shift) - 1) != 0) return null;
+                const offset = delta >> stride_shift;
+                if (offset >> index_bits > self.generationMask()) return null;
+                break :blk offset;
+            };
+            return .{
+                .index = @intCast(offset & (max_slots - 1)),
+                .generation = offset >> index_bits,
+            };
+        }
+
+        fn slotFor(self: *Self, index: u32) ?*Slot {
             const chunk_index = index / chunk_len;
-            if (chunk_index >= max_chunks) return error.OutOfMemory;
-            if (self.chunks[chunk_index].load(.acquire) == null) {
-                const chunk = try std.heap.page_allocator.create([chunk_len]Slot);
-                chunk.* = @splat(.{});
-                self.chunks[chunk_index].store(chunk, .release);
-            }
-            self.slot_count += 1;
-            break :blk index;
-        };
-        const slot = self.slotFor(index).?;
-        slot.handle.store(handle, .release);
-        const generation = slot.state.load(.acquire) >> 1;
-        return self.encode(.{ .index = index, .generation = generation });
-    }
-
-    /// Claims the slot for close. Returns the handle to free, or null when
-    /// the id is stale or another close already claimed it. Waits for every
-    /// call that entered (or is backing out) to leave first.
-    fn beginClose(self: *HandleRegistry, ptr: ?*anyopaque) ?struct { *Handle, Id } {
-        const id = decode(ptr) orelse return null;
-        const slot = self.slotFor(id.index) orelse return null;
-        if (slot.state.cmpxchgStrong(id.generation << 1, id.generation << 1 | 1, .seq_cst, .seq_cst) != null) return null;
-        // A call that counted itself before the closing bit was set may still
-        // be queued behind a handle lock, so poll rather than taking the lock:
-        // yield first, then back off so a long search does not spin a core.
-        var spins: u32 = 0;
-        while (slot.active.load(.seq_cst) != 0) : (spins +|= 1) {
-            if (spins < 64) {
-                std.Thread.yield() catch {};
-            } else {
-                handleLockIo().sleep(.fromMicroseconds(500), .awake) catch {};
-            }
+            if (chunk_index >= max_chunks) return null;
+            const chunk = self.chunks[chunk_index].load(.acquire) orelse return null;
+            return &chunk[index % chunk_len];
         }
-        const handle = slot.handle.swap(null, .acq_rel) orelse return null;
-        return .{ handle, id };
-    }
 
-    /// Releases a slot claimed by `beginClose` after its handle is freed.
-    fn finishClose(self: *HandleRegistry, id: Id) void {
-        const slot = self.slotFor(id.index).?;
-        antfly.platform_sync.lockYielding(&self.mutex);
-        defer self.mutex.unlock();
-        if (id.generation >= self.generationMask()) {
-            // The slot has used every generation an id can encode. Wrapping
-            // would let an old id match a future handle, so retire it: the
-            // state stays claimed (closing bit set), which no id can enter or
-            // close, and the slot never returns to the free list.
-            return;
+        /// Publishes `handle` and returns the id callers hold.
+        pub fn register(self: *Self, handle: *T) !*anyopaque {
+            antfly.platform_sync.lockYielding(&self.mutex);
+            defer self.mutex.unlock();
+            try self.ensureIdSpace();
+            const index = if (self.free_head) |free| blk: {
+                self.free_head = if (self.slotFor(free).?.next_free == 0) null else self.slotFor(free).?.next_free - 1;
+                break :blk free;
+            } else blk: {
+                const index = self.slot_count;
+                const chunk_index = index / chunk_len;
+                if (chunk_index >= max_chunks) return error.OutOfMemory;
+                if (self.chunks[chunk_index].load(.acquire) == null) {
+                    const chunk = try std.heap.page_allocator.create([chunk_len]Slot);
+                    chunk.* = @splat(.{});
+                    self.chunks[chunk_index].store(chunk, .release);
+                }
+                self.slot_count += 1;
+                break :blk index;
+            };
+            const slot = self.slotFor(index).?;
+            slot.handle.store(handle, .release);
+            const generation = slot.state.load(.acquire) >> 1;
+            return self.encode(.{ .index = index, .generation = generation });
         }
-        slot.state.store((id.generation + 1) << 1, .release);
-        slot.next_free = if (self.free_head) |free| free + 1 else 0;
-        self.free_head = id.index;
-    }
-};
+
+        /// Claims the slot for close. Returns the handle to free, or null when
+        /// the id is stale or another close already claimed it. Waits for every
+        /// call that entered (or is backing out) to leave first.
+        pub fn beginClose(self: *Self, ptr: ?*anyopaque) ?struct { *T, Id } {
+            const id = self.decode(ptr) orelse return null;
+            const slot = self.slotFor(id.index) orelse return null;
+            if (slot.state.cmpxchgStrong(id.generation << 1, id.generation << 1 | 1, .seq_cst, .seq_cst) != null) return null;
+            // A call that counted itself before the closing bit was set may still
+            // be queued behind a handle lock, so poll rather than taking the lock:
+            // yield first, then back off so a long search does not spin a core.
+            var spins: u32 = 0;
+            while (slot.active.load(.seq_cst) != 0) : (spins +|= 1) {
+                if (spins < 64) {
+                    std.Thread.yield() catch {};
+                } else {
+                    handleLockIo().sleep(.fromMicroseconds(500), .awake) catch {};
+                }
+            }
+            const handle = slot.handle.swap(null, .acq_rel) orelse return null;
+            return .{ handle, id };
+        }
+
+        /// Counts a call into the handle `ptr` names, so `beginClose` waits
+        /// for it. Returns null for a stale, closing, or foreign id. Pair
+        /// with `leave(slot)`.
+        pub fn enter(self: *Self, ptr: ?*anyopaque) ?struct { *T, *Slot } {
+            const id = self.decode(ptr) orelse return null;
+            const slot = self.slotFor(id.index) orelse return null;
+            // Count the call before checking the slot state so close either
+            // sees this call and waits for it, or this call sees closing (or a
+            // newer generation) and backs out. Each side stores then loads the
+            // other's variable, so both need seq_cst: weaker orderings let both
+            // loads miss both stores. The slot itself is never freed, so this
+            // is safe even if the handle was closed before we got here.
+            _ = slot.active.fetchAdd(1, .seq_cst);
+            if (slot.state.load(.seq_cst) != id.generation << 1) {
+                _ = slot.active.fetchSub(1, .release);
+                return null;
+            }
+            const handle = slot.handle.load(.acquire) orelse {
+                _ = slot.active.fetchSub(1, .release);
+                return null;
+            };
+            return .{ handle, slot };
+        }
+
+        pub fn leave(slot: *Slot) void {
+            _ = slot.active.fetchSub(1, .release);
+        }
+
+        /// Releases a slot claimed by `beginClose` after its handle is freed.
+        pub fn finishClose(self: *Self, id: Id) void {
+            const slot = self.slotFor(id.index).?;
+            antfly.platform_sync.lockYielding(&self.mutex);
+            defer self.mutex.unlock();
+            if (id.generation >= self.generationMask()) {
+                // The slot has used every generation an id can encode. Wrapping
+                // would let an old id match a future handle, so retire it: the
+                // state stays claimed (closing bit set), which no id can enter or
+                // close, and the slot never returns to the free list.
+                return;
+            }
+            slot.state.store((id.generation + 1) << 1, .release);
+            slot.next_free = if (self.free_head) |free| free + 1 else 0;
+            self.free_head = id.index;
+        }
+    };
+}
+
+const HandleRegistry = HandleRegistryOf(Handle);
 
 var handle_registry: HandleRegistry = .{};
 
@@ -2050,13 +2096,13 @@ const HandleGuard = struct {
             },
             .exclusive => self.handle.api_lock.unlock(io),
         }
-        _ = self.slot.active.fetchSub(1, .release);
+        HandleRegistry.leave(self.slot);
     }
 };
 
 /// The handle locks are called from arbitrary foreign threads, so they use
 /// the process-wide threaded Io, whose waits block the calling OS thread.
-fn handleLockIo() std.Io {
+pub fn handleLockIo() std.Io {
     return std.Options.debug_io;
 }
 
@@ -2065,23 +2111,7 @@ fn handleLockIo() std.Io {
 /// export, at entry: the lock is not reentrant, so internal helpers must not
 /// call it again.
 fn enterHandle(ptr: ?*anyopaque, access: HandleAccess) ?HandleGuard {
-    const id = HandleRegistry.decode(ptr) orelse return null;
-    const slot = handle_registry.slotFor(id.index) orelse return null;
-    // Count the call before checking the slot state so close either sees this
-    // call and waits for it, or this call sees closing (or a newer
-    // generation) and backs out. Each side stores then loads the other's
-    // variable, so both need seq_cst: weaker orderings let both loads miss
-    // both stores. The slot itself is never freed, so this is safe even if
-    // the handle was closed before we got here.
-    _ = slot.active.fetchAdd(1, .seq_cst);
-    if (slot.state.load(.seq_cst) != id.generation << 1) {
-        _ = slot.active.fetchSub(1, .release);
-        return null;
-    }
-    const handle = slot.handle.load(.acquire) orelse {
-        _ = slot.active.fetchSub(1, .release);
-        return null;
-    };
+    const handle, const slot = handle_registry.enter(ptr) orelse return null;
     const io = handleLockIo();
     switch (access) {
         .read => handle.api_lock.lockSharedUncancelable(io),
@@ -8557,7 +8587,7 @@ fn optionFieldPresent(comptime Options: type, abi_size: u32, comptime field_name
     return abi_size >= offset + @sizeOf(Field);
 }
 
-fn readOptionField(
+pub fn readOptionField(
     comptime Options: type,
     options: *const Options,
     abi_size: u32,
@@ -8570,7 +8600,7 @@ fn readOptionField(
     return std.mem.bytesAsValue(Field, raw[offset..][0..@sizeOf(Field)]).*;
 }
 
-fn validateOpenOptionsReserved(comptime Options: type, options: *const Options, abi_size: u32) !void {
+pub fn validateOpenOptionsReserved(comptime Options: type, options: *const Options, abi_size: u32) !void {
     if (comptime optionHasField(Options, "reserved0")) {
         if (optionFieldPresent(Options, abi_size, "reserved0")) {
             if (readOptionField(Options, options, abi_size, "reserved0").? != 0) return error.InvalidArgument;
@@ -8999,7 +9029,7 @@ pub export fn antfly_lite_open_status_only(path: ?[*:0]const u8, out_handle: ?*?
     return openLiteHandle(path_slice, .{ .open_mode = .status_only }, false, out_handle);
 }
 
-fn resetOutBuffer(out_buf: ?*capi.Buffer) ?*capi.Buffer {
+pub fn resetOutBuffer(out_buf: ?*capi.Buffer) ?*capi.Buffer {
     const out = out_buf orelse return null;
     out.* = .{};
     return out;
@@ -9533,7 +9563,7 @@ pub export fn antfly_db_set_readable_lease_hook(
 }
 
 /// Frees bytes this library returned as a pointer/length pair.
-fn freeRawBuffer(ptr: ?[*]u8, len: usize) void {
+pub fn freeRawBuffer(ptr: ?[*]u8, len: usize) void {
     if (ptr == null or len == 0) return;
     std.heap.c_allocator.free(ptr.?[0..len]);
 }
@@ -15426,7 +15456,7 @@ test "capi handle ids are safe to use after close and across slot reuse" {
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path_b, &b));
     defer antfly_db_close(b);
     try std.testing.expect(a != b);
-    try std.testing.expectEqual(HandleRegistry.decode(a).?.index, HandleRegistry.decode(b).?.index);
+    try std.testing.expectEqual(handle_registry.decode(a).?.index, handle_registry.decode(b).?.index);
     if (HandleRegistry.reserve_address_space) {
         // Ids are addresses in the reservation, so bindings can keep them in
         // pointer-typed fields that a garbage collector inspects.
@@ -15453,15 +15483,15 @@ test "capi handle registry retires a slot instead of wrapping its generation" {
     // Put a slot at the front of the free list, then move it to the last
     // generation an id can encode.
     const first_id = try registerTestHandle(&first);
-    const index = HandleRegistry.decode(first_id).?.index;
+    const index = handle_registry.decode(first_id).?.index;
     unregisterTestHandle(first_id);
     const slot = handle_registry.slotFor(index).?;
     const last_generation = handle_registry.generationMask();
     slot.state.store(last_generation << 1, .release);
 
     const second_id = try registerTestHandle(&second);
-    try std.testing.expectEqual(index, HandleRegistry.decode(second_id).?.index);
-    try std.testing.expectEqual(last_generation, HandleRegistry.decode(second_id).?.generation);
+    try std.testing.expectEqual(index, handle_registry.decode(second_id).?.index);
+    try std.testing.expectEqual(last_generation, handle_registry.decode(second_id).?.generation);
     unregisterTestHandle(second_id);
 
     // Retired: still claimed, unusable by any id, and never handed out again.
@@ -15471,7 +15501,7 @@ test "capi handle registry retires a slot instead of wrapping its generation" {
     unregisterTestHandle(second_id);
     const third_id = try registerTestHandle(&third);
     defer unregisterTestHandle(third_id);
-    try std.testing.expect(HandleRegistry.decode(third_id).?.index != index);
+    try std.testing.expect(handle_registry.decode(third_id).?.index != index);
     const wrapped = handle_registry.encode(.{ .index = index, .generation = 0 });
     try std.testing.expect(enterHandle(wrapped, .read) == null);
 }

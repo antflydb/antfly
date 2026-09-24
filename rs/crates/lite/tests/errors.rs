@@ -34,11 +34,11 @@ fn c_description(code: i32) -> String {
         .into_owned()
 }
 
-/// Codes 0-9 plus 255, the full range antfly.h's `antfly_error_code` and the
-/// Go binding's `ErrorCode` cover (including `ANTFLY_STALLED` = 9, which the
-/// live library recognizes -- see the crate-level report for why the header
-/// enum itself does not list it).
-const ALL_CODES: &[i32] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 255];
+/// Codes 0-10 plus 255, the full range antfly.h's `antfly_error_code` and
+/// the Go binding's `ErrorCode` cover (`ANTFLY_CANCELLED` = 10 is the
+/// caller-cancelled-a-callback code used by `Inference::pull`/
+/// `Inference::generate_stream`).
+const ALL_CODES: &[i32] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 255];
 
 #[test]
 fn error_names_match_c_abi_for_every_known_code() {

@@ -15,6 +15,7 @@
 //! Query values shared by distributed control and the physical query engine.
 //! Keep this module free of DB, index-manager, backend, and cache imports.
 
+const std = @import("std");
 const types = @import("../types.zig");
 const aggregations = @import("../aggregations.zig");
 const doc_set = @import("../doc_set.zig");
@@ -234,4 +235,64 @@ pub fn requestBindsRootTextIndex(req: types.SearchRequest) bool {
 
 pub fn requestBindsFilterTextIndex(req: types.SearchRequest) bool {
     return req.filter_text != null or req.exclusion_text != null;
+}
+
+/// Paging window each retrieval component executes before fusion or
+/// coordinator post-processing. Post-processing transforms (fusion, pruning,
+/// reranking) need every candidate that can reach the final page, so they
+/// widen the component window from offset zero instead of paging it.
+pub const ComponentPaging = struct {
+    offset: u32,
+    limit: u32,
+};
+
+pub fn requestHasPostprocessPageTransforms(req: types.SearchRequest) bool {
+    return req.merge_config != null or
+        req.pruner != null or
+        req.reranker != null;
+}
+
+pub fn componentPaging(req: types.SearchRequest) ComponentPaging {
+    var limit = if (req.reranker) |reranker|
+        reranker.candidate_count orelse (reranker.top_n orelse req.limit) +| req.offset
+    else
+        req.limit +| req.offset;
+    const needs_component_window = requestHasPostprocessPageTransforms(req);
+
+    if (!needs_component_window) {
+        return .{
+            .offset = req.offset,
+            .limit = req.limit,
+        };
+    }
+
+    if (req.merge_config) |merge_config| {
+        if (merge_config.window_size > limit) limit = merge_config.window_size;
+    }
+    if (req.reranker) |reranker| {
+        const reranker_window = reranker.candidate_count orelse (reranker.top_n orelse req.limit) +| req.offset;
+        if (reranker_window > limit) limit = reranker_window;
+    }
+
+    return .{
+        .offset = 0,
+        .limit = limit,
+    };
+}
+
+pub fn pagingCandidateWindow(paging: ComponentPaging) u32 {
+    return paging.offset +| paging.limit;
+}
+
+pub fn scoreOrderCandidateWindowK(requested_k: u32, paging: ComponentPaging) u32 {
+    return @max(requested_k, pagingCandidateWindow(paging));
+}
+
+/// Score-ordered prefix that each vector component of a composed request
+/// contributes to fusion. A vector component's matching set is defined by this
+/// window, so callers that need that set (for example, aggregation collection)
+/// must derive it from the caller's original request, never from an internally
+/// widened copy.
+pub fn composedVectorComponentWindow(req: types.SearchRequest) u32 {
+    return pagingCandidateWindow(componentPaging(req));
 }

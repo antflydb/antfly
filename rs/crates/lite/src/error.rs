@@ -51,6 +51,10 @@ pub enum Error {
     /// A bounded drain (e.g. `run_until_idle`) made no forward progress for
     /// its configured stall window and gave up.
     Stalled,
+    /// The caller cancelled the call by returning `false` from its progress
+    /// or stream callback (e.g. [`crate::Inference::pull`]'s progress
+    /// callback or [`crate::Inference::generate_stream`]'s chunk callback).
+    Cancelled,
     /// An internal error occurred.
     Internal,
     /// A C ABI error code this binding does not recognize, carrying the raw
@@ -73,6 +77,7 @@ impl Error {
             7 => Error::OutcomeUnknown,
             8 => Error::Unsupported,
             9 => Error::Stalled,
+            10 => Error::Cancelled,
             255 => Error::Internal,
             other => Error::Unknown(other),
         }
@@ -90,6 +95,7 @@ impl Error {
             Error::OutcomeUnknown => 7,
             Error::Unsupported => 8,
             Error::Stalled => 9,
+            Error::Cancelled => 10,
             Error::Internal => 255,
             Error::Unknown(code) => *code,
         }
@@ -107,6 +113,7 @@ impl Error {
             Error::OutcomeUnknown => "ANTFLY_OUTCOME_UNKNOWN",
             Error::Unsupported => "ANTFLY_UNSUPPORTED",
             Error::Stalled => "ANTFLY_STALLED",
+            Error::Cancelled => "ANTFLY_CANCELLED",
             Error::Internal => "ANTFLY_INTERNAL",
             Error::Unknown(_) => "ANTFLY_UNKNOWN_ERROR",
         }
@@ -138,6 +145,7 @@ impl Error {
                 "a bounded drain made no forward progress for its configured stall window and \
                  gave up"
             }
+            Error::Cancelled => "the caller cancelled the operation",
             Error::Internal => "an internal error occurred",
             Error::Unknown(_) => "unknown Antfly error code",
         }

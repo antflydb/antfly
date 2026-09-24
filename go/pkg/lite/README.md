@@ -89,25 +89,95 @@ application requests a local inference runtime; Lite reports `local_embedded`
 whenever the loaded build advertises `LocalInferenceRuntime`, which is true
 by default for the standard `libantfly` (see "Embedded inference" above).
 
-**Worker executable resolution.** GPU-hosted and driver-backed backends
-(Metal, CUDA, ONNX, PJRT) construct and, for Metal/CUDA/PJRT, execute models
-in a separate, replaceable worker process rather than inside the Go process
--- crash containment for an unabortable driver call or GPU state corruption
-means the process that made the call must be the one that gets killed and
-respawned, and that must never be the Go host. Unlike the `antfly` CLI (which
-re-execs `argv[0]`, itself), a Go binary linking `libantfly` has no
-`antfly`-shaped `argv[0]` to re-exec, so the runtime resolves the worker
-executable itself, in order: the `ANTFLY_INFERENCE_WORKER` environment
-variable (a path to the worker executable, typically an `antfly` binary);
-otherwise an `antfly` binary next to the loaded `libantfly`; otherwise
-`antfly` on `PATH`. In a build that includes Metal (the macOS default), CUDA,
-ONNX, or PJRT, opening a `LocalRuntimeConfigured` handle spawns the worker, and
-all local inference, CPU models included, runs there. If none of these
-resolve, the spawn fails with a clear error naming `ANTFLY_INFERENCE_WORKER` --
-set it (or place an `antfly` binary next to `libantfly` or on `PATH`) before
-opening the handle. See
-`zig/LITE.md`'s "Local Embedded Inference" section for the full resolution
-order and rationale.
+**In-process execution.** `libantfly` runs inference in-process on every
+backend, including Metal, CUDA, and ONNX -- there is no separate worker
+process, and `ANTFLY_INFERENCE_WORKER` is not used by `libantfly`. A call
+that has already reached a GPU driver cannot be interrupted: a `call_timeout_ms`
+deadline or a `Close` only takes effect once the call returns on its own, and
+a driver fault terminates the process (unlike the `antfly` server, which runs
+models in a separate, restartable worker process it can kill). Size
+`InferenceOptions`/`OpenOptions` resource budgets and keep concurrent calls
+bounded accordingly. See `zig/LITE.md`'s "Local Embedded Inference" section
+for the full rationale.
+
+### Embedded inference without a database
+
+`OpenInference` opens a standalone `*Inference` handle that runs models with
+no `DB` attached -- models load on first use and stay cached until `Close`.
+Each method sends and receives the JSON of the matching `/ai/v1` route of the
+Antfly inference HTTP API (see `specs/openapi/inference/api.yaml`):
+`Embed`, `Rerank`, `Chunk`, `Generate`, `GenerateBatch`, `Rewrite`, `Extract`,
+`Read` (OCR), `Transcribe`, and `ListModels`. `Generate` always returns a
+complete response; a request with `"stream": true` fails with
+`InvalidArgument`. Use `GenerateStream` to stream chunks instead.
+
+```go
+inf, err := lite.OpenInference(&lite.InferenceOptions{ModelsDir: "/path/to/models"})
+if err != nil {
+    // Unsupported means this build does not link the inference runtime, or
+    // it failed to start.
+}
+defer inf.Close()
+
+body, err := inf.Chunk([]byte(`{"input":"Ants live in colonies."}`))
+```
+
+Like `DB`, an `*Inference` is safe for concurrent use by multiple goroutines,
+and `Close` waits for in-flight calls before releasing the handle; calls made
+after `Close` return `InvalidArgument`.
+
+On failure, every JSON method still returns the runtime's JSON error body
+(`{"error": ..., "message": ...}`) wrapped in an `*InferenceError`, alongside
+the mapped stable `ErrorCode` (an HTTP 404, such as a model that is not
+installed, maps to `NotFound`; 4xx to `InvalidArgument`; 429/503/504 or an
+elapsed call timeout to `Busy`; 501/507, meaning the model does not fit the
+configured memory budgets, to `Unsupported`; a `Pull` or `GenerateStream`
+callback returning `false`, or its `ctx` becoming done, to `Cancelled`). Use `errors.As` for the API
+error code (e.g. `"MODEL_NOT_FOUND"`) and message, or `errors.Is(err, lite.NotFound)`
+for the stable code:
+
+```go
+_, err := inf.Embed(request)
+var infErr *lite.InferenceError
+if errors.As(err, &infErr) {
+    log.Printf("inference call failed: %s: %s", infErr.API.Code, infErr.API.Message)
+}
+```
+
+Models are not downloaded automatically. Use `Pull` to fetch a model from the
+Hugging Face Hub into the handle's models directory, like
+`antfly inference pull`. The optional progress callback runs synchronously on
+the calling goroutine as each file starts, every 16 MiB, and as each file
+completes:
+
+```go
+_, err := inf.Pull(ctx, []byte(`{"model":"owner/name"}`), func(p lite.PullProgress) bool {
+    log.Printf("%s: %s %d/%d bytes (cached=%v)", p.Model, p.File, p.BytesDownloaded, p.TotalBytes, p.Cached)
+    return true // false stops the pull
+})
+```
+
+`Pull` and `GenerateStream` both take a `context.Context` (nil is treated as
+`context.Background()`) alongside their own callback-return-value mechanism
+for stopping early -- the callback returning `false`, or `ctx` being done at
+the point a callback fires, both stop the call, and either way the call
+returns `lite.Cancelled` (the `ANTFLY_CANCELLED` C ABI code). Each progress
+report is a rendezvous: the call waits for the callback to return before
+continuing, so cancellation takes effect exactly at the report where the
+callback returns `false` (or `ctx` is observed done) -- for `Pull`, that can
+be each file start, every 16 MiB, or each file end (`ctx` itself is only
+checked when a report fires, not continuously); for `GenerateStream`, each
+streamed chunk. For `Pull`, files already fully downloaded before
+cancellation stay staged, so pulling the same model again resumes rather than
+restarts.
+
+```go
+err := inf.GenerateStream(ctx, request, func(chunk []byte) bool {
+    // chunk is a "chat.completion.chunk" JSON document; it is only valid
+    // during this call, so copy it before returning if you need to keep it.
+    return true // false stops generation
+})
+```
 
 ### Concurrency
 

@@ -259,3 +259,37 @@ export interface StableSnapshotReport {
   page_count: number;
   tail_bytes: number;
 }
+
+// --- Embedded inference (antfly_inference_*, see antfly.h's "Embedded
+// inference without a database" and zig/CAPI.md's "Inference") ---
+
+/**
+ * Configures Inference.open(). See antfly_inference_options in antfly.h.
+ * All fields are optional; unset numeric budgets mean "automatic".
+ */
+export interface InferenceOptions {
+  /** Models directory. Empty (default) uses $ANTFLY_INFERENCE_MODELS_DIR, else ~/.antfly/inference/models. */
+  modelsDir?: string;
+  hostBudgetMb?: number;
+  backendBudgetMb?: number;
+  processMemoryBudgetMb?: number;
+  combinedBudgetMb?: number;
+  kvBudgetMb?: number;
+  scratchBudgetMb?: number;
+  /** Deadline for each call in milliseconds; 0 (default) means none. */
+  callTimeoutMs?: Uint64Like;
+}
+
+/** One progress report from Inference.pull(), mirroring antfly_inference_pull_progress. */
+export interface PullProgress {
+  /** The model reference being pulled (one report series per requested variant). */
+  model: string;
+  file: string;
+  bytesDownloaded: bigint;
+  /** 0n when unknown. */
+  totalBytes: bigint;
+  filesDone: bigint;
+  filesTotal: bigint;
+  /** The file was already present and verified; nothing was downloaded. */
+  cached: boolean;
+}

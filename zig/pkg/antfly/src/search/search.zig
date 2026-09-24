@@ -4075,7 +4075,8 @@ test "search pure bool should uses WAND top-k" {
 
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
     try std.testing.expectEqual(@as(u32, 2), result.hits[0].doc_id);
-    try std.testing.expectEqual(TotalHitsRelation.gte, result.total_hits_relation);
+    try std.testing.expectEqual(@as(u32, 3), result.total_hits);
+    try std.testing.expectEqual(TotalHitsRelation.exact, result.total_hits_relation);
 }
 
 test "pure conjunction block pruning retains earliest cutoff ties" {

@@ -74,21 +74,120 @@ and `restore_file` take the destination's `storage=` too). `Storage.LITE`
 destinations still require a `.aflite` path client-side; `Storage.DIRECTORY`
 has no suffix requirement.
 
-### Embedded inference worker resolution
+## Embedded inference (no database)
 
-GPU-hosted and driver-backed inference backends (Metal, CUDA, ONNX, PJRT)
-run in a separate, replaceable worker process rather than inside the Python
-process, for crash containment. A Python process linking `libantfly` has no
-`antfly`-shaped `argv[0]` to re-exec, so the runtime resolves the worker
-executable itself, in order: the `ANTFLY_INFERENCE_WORKER` environment
-variable (a path to the worker executable, typically an `antfly` binary);
-otherwise an `antfly` binary next to the loaded `libantfly`; otherwise
-`antfly` on `PATH`. If none of these resolve, calls into a process-isolated
-backend fail with a clear error naming `ANTFLY_INFERENCE_WORKER`. Set it (or
-place an `antfly` binary next to `libantfly` or on `PATH`) before opening a
-`local_runtime=True` handle that needs Metal/CUDA/ONNX/PJRT models. See
-`zig/LITE.md`'s "Local Embedded Inference" section for the full resolution
-order and rationale; this mirrors the Go binding's README verbatim.
+`antfly_lite.Inference` runs the same embedded inference runtime as a
+`local_runtime=True` Lite handle, but standalone -- no database, no
+`.aflite` file:
+
+```python
+import antfly_lite
+
+with antfly_lite.Inference.open() as inf:
+    print(inf.chunk({"input": "Ants live in colonies. Workers gather food."}))
+    print(inf.embed({"model": "Qwen/Qwen3-Embedding-0.6B-GGUF", "input": ["hello"]}))
+```
+
+`Inference.open()` takes keyword-only options: `models_dir` (defaults to
+`$ANTFLY_INFERENCE_MODELS_DIR`, else `~/.antfly/inference/models`),
+the same `host_budget_mb`/`backend_budget_mb`/`process_memory_budget_mb`/
+`combined_budget_mb`/`kv_budget_mb`/`scratch_budget_mb` resource-budget
+overrides as `OpenOptions` (0 means automatic), and `call_timeout_ms` (a
+per-call deadline; 0 means none -- see "Inference runs in-process" below for
+what it can and cannot interrupt). It raises `UnsupportedError` if this
+build does not link the inference runtime or the runtime cannot start.
+
+Each call takes the request JSON and returns the response JSON of the
+matching `/ai/v1` route of the Antfly inference HTTP API: `embed()`,
+`rerank()`, `chunk()`, `generate()`, `generate_batch()` (up to 128
+non-streaming requests per call; per-item failures are reported in the
+response, not raised), `rewrite()`, `extract()`, `read()` (OCR),
+`transcribe()`, and `list_models()`. Requests accept the same `dict` / `str`
+/ `bytes` JSON forms as `Database` methods, and responses honor the same
+`raw=True` convention. `generate()` and `generate_batch()` requests always
+return complete responses; `"stream": true` raises `InvalidArgumentError`
+-- use `generate_stream()` to stream.
+
+On failure, the C API still returns a JSON error body (`{"error": ...,
+"message": ...}`); this binding folds it into the raised exception's
+message rather than discarding it, using the same `AntflyError` subclasses
+as `Database` (a missing model raises `NotFoundError`, for example).
+
+### Streaming generation
+
+`generate_stream(request, on_chunk)` streams a generate call; it sets
+`"stream": true` for you (do not set it in `request`). `on_chunk` is called
+synchronously on the calling thread for each chunk -- the parsed JSON of a
+`chat.completion.chunk` -- as the model produces tokens:
+
+```python
+def on_chunk(chunk):
+    print(chunk["choices"][0]["delta"].get("content", ""), end="")
+
+
+with antfly_lite.Inference.open() as inf:
+    inf.generate_stream(
+        {"model": "ggml-org/gemma-4-e2b-it-gguf:gguf:Q4_0", "messages": [{"role": "user", "content": "hi"}]},
+        on_chunk,
+    )
+```
+
+A request rejected before generation starts (such as a missing model) fails
+like `generate()`, with the runtime's JSON error folded into the exception.
+A failure partway through the stream raises `InternalError` with a
+`STREAM_FAILED` body. On success `generate_stream()` returns `None` -- there
+is no final response body, only the chunks already delivered to `on_chunk`.
+
+### Pulling models
+
+Models are not downloaded automatically. `pull(request, progress=None)`
+downloads one from the Hugging Face Hub into the handle's models directory,
+like `antfly inference pull` (`request = {"model": "owner/name[:variant]",
+...}`); `close()` waits for it. Pass `progress=callable` to receive an
+`antfly_lite.PullProgress` (`model`, `file`, `bytes_downloaded`,
+`total_bytes`, `files_done`, `files_total`, `cached`) synchronously on the
+calling thread as each file starts, every 16 MiB, and as it completes.
+Completed files stay staged across a cancelled or interrupted pull, so
+pulling the same model again resumes rather than restarts.
+
+### Cancellation
+
+`pull()`'s `progress` callback and `generate_stream()`'s `on_chunk` callback
+can stop the call in progress by returning `False` (returning `None` or
+`True`, including implicitly by falling off the end of the function, keeps
+going -- existing callbacks that don't return anything keep working
+unchanged). A cancelled call raises `antfly_lite.CancelledError`.
+Cancellation only takes effect at the next report -- for `pull()`, each
+file's start, every 16 MiB, and its end; for `generate_stream()`, each
+chunk -- it does not interrupt work in progress between reports.
+
+If the callback itself raises, this binding captures the exception, cancels
+the call the same way, and re-raises the original exception once the
+underlying C call returns; it never unwinds across the C ABI boundary, and
+it takes priority over whatever error the call itself would otherwise
+report.
+
+`Inference` handles have the same threading contract as `Database` (see
+"Threading" below): safe for concurrent use by multiple threads, and
+`close()` (idempotent, safe to call repeatedly and concurrently) waits for
+in-flight calls before releasing the handle. Calls made after `close()`
+raise `InvalidArgumentError`. `progress`/`on_chunk` callbacks always run on
+the calling thread, never a library-owned thread.
+
+### Inference runs in-process
+
+`libantfly` runs every inference backend -- including Metal, CUDA, and ONNX
+-- in the calling process, on every backend, for both `local_runtime=True`
+Lite handles and standalone `Inference` handles. There is no separate
+worker process; `ANTFLY_INFERENCE_WORKER` is not used.
+
+This is the trade SQLite makes for driver-backed extensions: once a call
+reaches the device or driver it cannot be interrupted. `call_timeout_ms`
+(and closing a handle) only take effect once the call returns; a call stuck
+in the driver blocks close instead of being abandoned; and a GPU driver
+fault terminates the process. Calls on CPU backends still stop
+cooperatively. See `zig/CAPI.md`'s "Inference In Process" section for the
+full rationale.
 
 ## JSON conventions
 
@@ -155,6 +254,13 @@ to wait for another writer to close instead of failing immediately with
 - **Backup/restore**: `backup()`, `import_backup()`, `backup_to_file()`;
   module-level `restore()`, `restore_file()` (both accept `storage=` to
   select the destination kind).
+- **Embedded inference (no database)**: `Inference.open()`, `embed()`,
+  `rerank()`, `chunk()`, `generate()`, `generate_stream()`,
+  `generate_batch()`, `rewrite()`, `extract()`, `read()`, `transcribe()`,
+  `list_models()`, `pull()` (with a `PullProgress` dataclass for progress
+  callbacks; both `pull()` and `generate_stream()` accept a callback that
+  can cancel the call by returning `False`). See "Embedded inference (no
+  database)" above.
 - **Module-level, no handle needed**: `check_file()`,
   `copy_stable_snapshot_file()`, `decode_artifact_id()`, `abi_version()`,
   `threading_mode()`, `THREADING_SERIALIZED`, `validate_abi()`.
@@ -163,7 +269,8 @@ to wait for another writer to close instead of failing immediately with
   `InvalidArgumentError`, `NotFoundError`, `VersionConflictError`,
   `IntentConflictError`, `TxnNotFoundError`, `BusyError`,
   `OutcomeUnknownError`, `UnsupportedError`, `StalledError`,
-  `InternalError`. Unrecognized codes raise `AntflyError` directly.
+  `CancelledError`, `InternalError`. Unrecognized codes raise `AntflyError`
+  directly.
 
 `create()` provisions the default `full_text_index_v0` full-text index,
 matching the server's table-create behavior, so `add_index()` is only

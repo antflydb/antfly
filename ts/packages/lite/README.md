@@ -137,20 +137,105 @@ Platform file names: `libantfly.dylib` (macOS), `libantfly.so` (Linux),
 Call `resolveLibrary()` yourself to see which tier resolved and why, without
 loading the library.
 
-### Embedded inference / `ANTFLY_INFERENCE_WORKER`
+### Embedded inference
 
-`libantfly` always links the standalone inference runtime in-process. GPU-hosted
-and driver-backed backends (Metal, CUDA, ONNX, PJRT) construct and execute
-models in a separate, replaceable worker process rather than inside the
-Node process, for crash containment. Node has no `antfly`-shaped `argv[0]`
-to re-exec, so the runtime resolves the worker executable itself, in order:
-the `ANTFLY_INFERENCE_WORKER` environment variable (a path to the worker
-executable, typically an `antfly` binary); otherwise an `antfly` binary next
-to the loaded `libantfly`; otherwise `antfly` on `PATH`. Set one of these
-before opening a handle with `localRuntimeConfigured: true` that needs
-Metal/CUDA/ONNX/PJRT models. See `zig/LITE.md`'s "Local Embedded Inference"
-section for the full resolution order and rationale, and
-`go/pkg/lite/README.md` for the equivalent Go documentation.
+`libantfly` runs inference **in-process**, in the calling process, on every
+backend -- Metal, CUDA, ONNX, and CPU alike -- for both `Database` (with
+`localRuntimeConfigured: true`) and the standalone `Inference` handle below.
+There is no separate worker process and no `ANTFLY_INFERENCE_WORKER`
+variable to configure. This is the trade SQLite makes for extensions that
+touch a GPU driver: a call that reaches the device or driver has no per-call
+abort, so `callTimeoutMs` and `close()` only take effect once the call
+returns, and a driver fault terminates the process. Calls on CPU backends
+still stop cooperatively. (The `antfly` server instead runs these backends
+in a worker process it can kill and restart; a library cannot do that to its
+host program.) See `zig/CAPI.md`'s "Inference In Process" section for the
+full rationale.
+
+### `Inference`: embedded inference without a database
+
+`Inference.open(options?)` starts the embedded inference runtime with no
+database attached -- models load on first use and stay cached until
+`close()`. Each call sends the request JSON and returns the response JSON of
+the matching `/ai/v1` route of the Antfly inference HTTP API
+(`specs/openapi/inference/api.yaml`):
+
+```typescript
+import { Inference } from "@antfly/lite";
+
+const inf = await Inference.open({ modelsDir: "/path/to/models" });
+try {
+  const { data } = (await inf.chunk({
+    input: "Ants live in colonies. Workers gather food.",
+  })) as { data: unknown[] };
+
+  const embeddings = await inf.embed({ model: "owner/name", input: ["hello"] });
+} finally {
+  await inf.close();
+}
+```
+
+- **Calls**: `embed`, `rerank`, `chunk`, `generate`, `generateBatch`,
+  `rewrite`, `extract`, `read` (OCR), `transcribe`, `listModels` -- each with
+  a bare form (parsed JSON) and a `...Raw` form (raw `Buffer`), following the
+  same convention as `Database`. Binary inputs (images, audio) go inline in
+  the request JSON, as base64 or `data:` URIs. Responses are always
+  complete: a `generate` request with `"stream": true` rejects with
+  `InvalidArgumentError` -- use `generateStream()` to stream.
+- **Errors**: every failed inference call still gets a JSON error body from
+  `libantfly` (`{"error": ..., "message": ...}`); this binding folds it into
+  the thrown `AntflyError`'s message and exposes the parsed body as
+  `.body`, in addition to the usual `.code`/`.codeName`. A model that is not
+  installed rejects with `NotFoundError` (`.body.error === "MODEL_NOT_FOUND"`).
+- **`generateStream(request, onChunk)`** streams a generate request (the
+  same body as `generate()`, with `"stream"` set for you). `onChunk` is
+  called **synchronously, on the calling thread**, once per streamed chunk
+  (a parsed `chat.completion.chunk` JSON object). Returning `false` from
+  `onChunk` stops generation early and the call rejects with
+  `CancelledError`; a thrown error also stops generation and is rethrown.
+  Like `pull()` below, `generateStream()` runs synchronously and blocks the
+  Node event loop for its duration -- the same koffi callback-threading
+  constraint applies, which is why this binding exposes a callback rather
+  than an async iterator (an async iterator would need the call running off
+  the JS thread, which a koffi callback cannot do safely). `generateStreamRaw`
+  gives `onChunk` the raw per-chunk `Buffer` instead of parsed JSON.
+- **`pull(request, onProgress?, signal?)`** downloads a model from the
+  Hugging Face Hub into the handle's models directory, like
+  `antfly inference pull`: `{ model: "owner/name[:variant]", variants?,
+  token?, tasks?, capabilities?, projector?, maxArtifactBytes?,
+  maxModelBytes? }` (as request JSON; field names follow the HTTP API, e.g.
+  `"model"`). The optional `onProgress` callback is called synchronously, on
+  the calling thread, as each file starts, every 16 MiB, and as it
+  completes. Returning `false` from `onProgress` cancels the pull -- the
+  call then rejects with `CancelledError`, and completed files stay staged,
+  so a later `pull()` for the same model resumes rather than restarts; a
+  thrown error also cancels the pull and is rethrown. The optional `signal`
+  (`AbortSignal`) is a best-effort, honestly-limited convenience on top of
+  that: because `pull()` blocks the JS thread for its whole duration, there
+  is no way to interrupt it asynchronously the way `fetch(url, { signal })`
+  can. An already-aborted signal rejects before the pull starts; otherwise
+  it is only checked at the same report points as `onProgress` -- prefer
+  returning `false` from `onProgress` when you need precise control.
+  Unlike every other `Inference`/`Database` call, **`pull()` runs
+  synchronously and blocks the Node event loop** for its duration -- this is
+  intentional: JS execution is single-threaded, and a callback koffi
+  delivers from a background thread (as happens for a call dispatched via
+  `fn.async(...)`, which runs on koffi's worker thread pool) has to be
+  queued back onto the JS main thread rather than invoked as a true
+  blocking round-trip; per koffi's docs that queuing only runs "as soon as
+  the event loop has a chance to run", which could reorder or delay a
+  report arbitrarily relative to the (already-freed) native data it points
+  to, or even deadlock. Calling synchronously keeps the whole call,
+  including every callback invocation, on one OS thread throughout,
+  matching the C API's "called on the calling thread" guarantee exactly.
+  `close()` waits for a pull in progress.
+- **Options**: `InferenceOptions` -- `modelsDir` (defaults to
+  `$ANTFLY_INFERENCE_MODELS_DIR`, else `~/.antfly/inference/models`),
+  the same `*BudgetMb` resource knobs as `Database`'s `OpenOptions`, and
+  `callTimeoutMs` (a deadline per call; 0 means none).
+- **Lifecycle**: `close()` is idempotent, safe to call concurrently, and
+  waits for in-flight calls; `Inference` implements `AsyncDisposable`
+  (`await using`), same as `Database`.
 
 ## ABI validation
 
@@ -223,7 +308,11 @@ Subclasses: `InvalidArgumentError` (1), `NotFoundError` (2),
 `BusyError` (6), `OutcomeUnknownError` (7, not safe to retry automatically --
 publication may have succeeded but crash durability could not be confirmed),
 `UnsupportedError` (8, not transient), `StalledError` (9, a bounded drain
-like `runUntilIdle` made no progress and gave up), `InternalError` (255).
+like `runUntilIdle` made no progress and gave up), `CancelledError` (10, the
+caller returned `false` from an `Inference.pull()` `onProgress` or
+`Inference.generateStream()` `onChunk` callback -- a callback that throws
+instead stops the operation the same way, but rejects with the thrown error
+itself, not `CancelledError`), `InternalError` (255).
 
 ## API surface
 
@@ -251,6 +340,13 @@ Mirrors `go/pkg/lite`'s surface idiomatically:
 - **Module-level**: `checkFile`, `restore`/`restoreFile` (both take
   `RestoreOptions` -- `{ storage, replace }`), `copyStableSnapshotFile`,
   `decodeArtifactId`, `abiVersion`, `threadingMode`, `validateAbi`.
+- **`Inference`**: `Inference.open(options?)`, `close()`,
+  `[Symbol.asyncDispose]`; `embed`/`rerank`/`chunk`/`generate`/
+  `generateBatch`/`rewrite`/`extract`/`read`/`transcribe`/`listModels`
+  (each with a `...Raw` form); `generateStream(request, onChunk)` /
+  `generateStreamRaw`; `pull(request, onProgress?, signal?)`; plus
+  `InferenceOptions`, `PullProgress`, `CancelledError`,
+  `validateInferenceAbi`. See "Embedded inference" above.
 
 See `src/index.ts` for the full export list and `src/types.ts` for typed
 `Status` / `Capabilities` / report interfaces.
@@ -276,7 +372,19 @@ concurrency.test.ts` covers mixed concurrent operations, `close()` racing
 in-flight calls, `busyTimeoutMs` behavior, and that concurrent searches
 overlap instead of serializing on the event loop. `test/errors.test.ts` and
 `test/discovery.test.ts` include pure tests that need no native library at
-all.
+all. `test/inference.test.ts` covers the `Inference` handle: open/close,
+calls that need no model (`chunk`, `listModels`), missing-model
+`NotFoundError` for both `embed` and `generateStream`, `pull({})`/
+streaming-`generate`/malformed-JSON-`generateStream` `InvalidArgumentError`
+cases, an optional real-embedding test gated on a locally installed Qwen
+model, an optional `generateStream` test gated on a locally installed Gemma
+generate model (`~/.antfly/inference/models/ggml-org/gemma-4-e2b-it-gguf*`)
+covering both a normal multi-chunk stream and cancelling after two chunks
+(`CancelledError`, exactly two `onChunk` calls), and a network-gated
+`pull()` test (`ANTFLY_INFERENCE_PULL_TEST_MODEL`, e.g.
+`sparse-encoder-testing/splade-bert-tiny-nq-onnx`) that cancels on the first
+progress report (`CancelledError`, model still absent from `listModels()`),
+then pulls the same model to completion with progress callbacks.
 
 ## License
 
