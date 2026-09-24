@@ -2788,6 +2788,7 @@ pub fn parseQueryRequestWithDeadline(
         req.dense_queries = vector_queries.dense;
         req.sparse_queries = vector_queries.sparse;
     }
+    try normalizeVectorMatchAllComponent(alloc, request, &req);
     if (contract_fields.has_embedding_limits)
         try applyInternalEmbeddingLimits(alloc, effective_body, &req);
     req.graph_queries = try buildGraphQueries(alloc, request);
@@ -3206,6 +3207,7 @@ fn buildPreflightSearchRequestAlloc(
     errdefer vector_queries.deinit(alloc);
     req.dense_queries = vector_queries.dense;
     req.sparse_queries = vector_queries.sparse;
+    try normalizeVectorMatchAllComponent(alloc, request, &req);
     req.graph_queries = try buildGraphQueries(alloc, request);
     if (comptime @hasField(@TypeOf(request), "expand_strategy")) {
         if (request.expand_strategy) |expand_strategy| {
@@ -3220,11 +3222,29 @@ fn buildPreflightSearchRequestAlloc(
     };
 }
 
+/// A vector request may carry match-all solely to execute filters. It is not a
+/// third retrieval source. Keep an explicitly requested match-all as a text
+/// component, wrapped so aggregation planning can distinguish the two cases.
+fn normalizeVectorMatchAllComponent(alloc: std.mem.Allocator, request: anytype, req: *db_mod.types.SearchRequest) !void {
+    if (req.dense_queries.len == 0 and req.sparse_queries.len == 0) return;
+    const text = req.full_text orelse return;
+    if (text != .match_all) return;
+    const explicit_query_match_all = if (request.query) |query|
+        query == .object and query.object.get("match_all") != null
+    else
+        false;
+    if (request.full_text_search == null and !explicit_query_match_all) {
+        req.full_text = null;
+        return;
+    }
+    const must = try alloc.alloc(db_mod.types.TextQuery, 1);
+    must[0] = text;
+    req.full_text = .{ .bool_query = .{ .must = must } };
+}
+
 fn preflightRequestHasFullTextResults(req: db_mod.types.SearchRequest) bool {
     if (req.full_text != null) return true;
-    if (req.full_text_queries.len > 0) return true;
-    if (req.filter_text != null or req.exclusion_text != null) return true;
-    return req.filter_query_json.len > 0 or req.exclusion_query_json.len > 0;
+    return req.full_text_queries.len > 0;
 }
 
 fn preflightBaseResultSetCount(req: db_mod.types.SearchRequest) u32 {
@@ -17043,6 +17063,31 @@ fn consumerTests() type {
             try std.testing.expect(parsed.req.full_text != null);
             try std.testing.expect(parsed.req.filter_query_json.len > 0);
             try std.testing.expect(parsed.req.exclusion_query_json.len > 0);
+        }
+
+        test "api query contract keeps filter carriers out of vector fusion" {
+            const alloc = std.testing.allocator;
+            inline for (.{
+                \\{"embeddings":{"a":[1,0],"b":[0,1]},"indexes":["a","b"],"limit":10}
+                ,
+                \\{"embeddings":{"a":[1,0],"b":[0,1]},"indexes":["a","b"],"filter_query":{"term":{"path":"/status","value":"active"}},"limit":10}
+                ,
+                \\{"embeddings":{"a":[1,0],"b":[0,1]},"indexes":["a","b"],"fields":["key"],"aggregations":{"keys":{"type":"terms","field":"key","size":100}},"limit":10}
+                ,
+            }) |body| {
+                var parsed = try parseQueryRequest(alloc, null, "docs", body);
+                defer parsed.deinit(alloc);
+                try std.testing.expectEqual(@as(usize, 2), parsed.req.dense_queries.len);
+                try std.testing.expect(parsed.req.full_text == null);
+                try std.testing.expectEqual(@as(usize, 0), parsed.req.full_text_queries.len);
+            }
+
+            var explicit = try parseQueryRequest(alloc, null, "docs",
+                \\{"embeddings":{"a":[1,0],"b":[0,1]},"indexes":["a","b"],"full_text_search":{"match_all":{}},"limit":10}
+            );
+            defer explicit.deinit(alloc);
+            try std.testing.expect(explicit.req.full_text.? == .bool_query);
+            try std.testing.expect(explicit.req.full_text.?.bool_query.must[0] == .match_all);
         }
 
         test "api query contract parses packed sparse embeddings via antfly-json" {

@@ -3422,6 +3422,11 @@ pub fn encodeQueryRequestWithGraphWireMode(
         );
     } else if (req.full_text) |full_text| {
         try appendTextQueryField(alloc, &out, &first, "full_text_search", full_text);
+    } else if ((dense_queries.len > 0 or sparse_queries.len > 0) and req.query == .match_all) {
+        // The storage request defaults to match-all, but a vector-only query
+        // has no text retrieval component. Serializing that default would make
+        // the owner parse it as an explicit full-text search and fuse arbitrary
+        // document-order hits into the ranked page.
     } else {
         try appendQueryField(alloc, &out, &first, req.query, req.limit);
     }

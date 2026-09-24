@@ -40,6 +40,10 @@ __all__ = [
     "AntflySlice",
     "AntflyBuffer",
     "AntflyOpenOptions",
+    "AntflyInferenceOptions",
+    "AntflyInferencePullProgress",
+    "AntflyInferencePullProgressFn",
+    "AntflyInferenceStreamFn",
     "AntflyWriteIntent",
     "AntflyVersionPredicate",
     "OPEN_FLAG_NO_SYNC",
@@ -55,6 +59,7 @@ __all__ = [
     "make_slice",
     "take_buffer",
     "path_to_bytes",
+    "slice_to_bytes",
 ]
 
 
@@ -149,6 +154,63 @@ class AntflyOpenOptions(ctypes.Structure):
     ]
 
 
+class AntflyInferenceOptions(ctypes.Structure):
+    """antfly_inference_options. Must be initialized with
+    antfly_inference_options_init before fields are set (see antfly.h
+    "Embedded inference without a database"). options may be omitted
+    entirely (NULL) for defaults; this binding always initializes and passes
+    an explicit struct."""
+
+    _fields_ = [
+        ("abi_size", ctypes.c_uint32),
+        # No flags are defined yet; must be zero.
+        ("flags", ctypes.c_uint32),
+        ("models_dir", AntflySlice),
+        ("host_budget_mb", ctypes.c_uint32),
+        ("backend_budget_mb", ctypes.c_uint32),
+        ("process_memory_budget_mb", ctypes.c_uint32),
+        ("combined_budget_mb", ctypes.c_uint32),
+        ("kv_budget_mb", ctypes.c_uint32),
+        ("scratch_budget_mb", ctypes.c_uint32),
+        ("call_timeout_ms", ctypes.c_uint64),
+        ("reserved", ctypes.c_uint64 * 8),
+    ]
+
+
+class AntflyInferencePullProgress(ctypes.Structure):
+    """antfly_inference_pull_progress. Passed by the library to a pull
+    progress callback; the slices are only valid during the callback."""
+
+    _fields_ = [
+        ("abi_size", ctypes.c_uint32),
+        ("reserved0", ctypes.c_uint32),
+        ("model", AntflySlice),
+        ("file", AntflySlice),
+        ("bytes_downloaded", ctypes.c_uint64),
+        ("total_bytes", ctypes.c_uint64),
+        ("files_done", ctypes.c_uint64),
+        ("files_total", ctypes.c_uint64),
+        ("cached", ctypes.c_bool),
+    ]
+
+
+# antfly_inference_pull_progress_fn: bool(void *context, const
+# antfly_inference_pull_progress *progress), called synchronously on the
+# calling thread as each file starts, every 16 MiB, and as it completes.
+# Returning true continues the pull; false cancels it (the call then returns
+# ANTFLY_CANCELLED; completed files stay staged, so a later pull resumes).
+AntflyInferencePullProgressFn = ctypes.CFUNCTYPE(
+    ctypes.c_bool, ctypes.c_void_p, ctypes.POINTER(AntflyInferencePullProgress)
+)
+
+# antfly_inference_stream_fn: bool(void *context, antfly_slice chunk_json),
+# called synchronously on the calling thread for each streamed
+# "chat.completion.chunk" JSON chunk (valid only during the callback).
+# Returning true continues generation; false stops it (the call then returns
+# ANTFLY_CANCELLED).
+AntflyInferenceStreamFn = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, AntflySlice)
+
+
 class AntflyWriteIntent(ctypes.Structure):
     _fields_ = [
         ("key", AntflySlice),
@@ -170,6 +232,7 @@ TxnIDArray = ctypes.c_uint8 * 16
 _VOID_P = ctypes.c_void_p
 _BUF_P = ctypes.POINTER(AntflyBuffer)
 _OPTS_P = ctypes.POINTER(AntflyOpenOptions)
+_INFERENCE_OPTS_P = ctypes.POINTER(AntflyInferenceOptions)
 _TXN_P = ctypes.POINTER(TxnIDArray)
 _ERR = ctypes.c_int  # antfly_error_code (C enum, backed by `int`)
 
@@ -296,6 +359,33 @@ _FUNCTIONS: list[tuple[str, list[object], object]] = [
     ("antfly_db_find_shortest_path_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
     ("antfly_db_find_k_shortest_paths_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
     ("antfly_db_match_pattern_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
+    # Embedded inference without a database (antfly.h "Embedded inference
+    # without a database"). antfly_inference_* takes its own handle kind,
+    # from a separate registry than antfly_db_*.
+    ("antfly_inference_options_size", [], ctypes.c_uint32),
+    ("antfly_inference_options_init", [_INFERENCE_OPTS_P], _ERR),
+    ("antfly_inference_open", [_INFERENCE_OPTS_P, ctypes.POINTER(_VOID_P)], _ERR),
+    ("antfly_inference_close", [_VOID_P], None),
+    ("antfly_inference_embed_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
+    ("antfly_inference_rerank_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
+    ("antfly_inference_chunk_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
+    ("antfly_inference_generate_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
+    (
+        "antfly_inference_generate_stream_json",
+        [_VOID_P, AntflySlice, AntflyInferenceStreamFn, _VOID_P, _BUF_P],
+        _ERR,
+    ),
+    ("antfly_inference_generate_batch_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
+    ("antfly_inference_rewrite_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
+    ("antfly_inference_extract_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
+    ("antfly_inference_read_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
+    ("antfly_inference_transcribe_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
+    ("antfly_inference_list_models_json", [_VOID_P, _BUF_P], _ERR),
+    (
+        "antfly_inference_pull_json",
+        [_VOID_P, AntflySlice, AntflyInferencePullProgressFn, _VOID_P, _BUF_P],
+        _ERR,
+    ),
 ]
 
 _lib: ctypes.CDLL | None = None
@@ -351,6 +441,12 @@ def validate_abi() -> None:
     want_size = ctypes.sizeof(AntflyOpenOptions)
     if got_size != want_size:
         raise ABIVersionError(f"lite: C ABI open options size {got_size}, compiled struct size {want_size}")
+    got_inf_size = lib.antfly_inference_options_size()
+    want_inf_size = ctypes.sizeof(AntflyInferenceOptions)
+    if got_inf_size != want_inf_size:
+        raise ABIVersionError(
+            f"lite: C ABI inference options size {got_inf_size}, compiled struct size {want_inf_size}"
+        )
 
 
 def make_slice(data: bytes) -> tuple[AntflySlice, object]:
@@ -384,3 +480,12 @@ def take_buffer(buf: AntflyBuffer) -> bytes:
 
 def path_to_bytes(path: str | os.PathLike[str]) -> bytes:
     return os.fsencode(os.fspath(path))
+
+
+def slice_to_bytes(sl: AntflySlice) -> bytes:
+    """Copy an antfly_slice's contents without freeing it (for borrowed
+    slices such as antfly_inference_pull_progress fields, which are only
+    valid during the callback that receives them)."""
+    if not sl.ptr or sl.len == 0:
+        return b""
+    return ctypes.string_at(sl.ptr, sl.len)

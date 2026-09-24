@@ -2679,7 +2679,8 @@ test "multi-segment search merges per-segment top-k globally" {
     defer alloc.free(results.hits);
 
     try std.testing.expectEqual(@as(usize, 2), results.hits.len);
-    try std.testing.expectEqual(scorer_mod.TotalHitsRelation.gte, results.total_relation);
+    try std.testing.expectEqual(@as(u32, 4), results.total_count);
+    try std.testing.expectEqual(scorer_mod.TotalHitsRelation.exact, results.total_relation);
     try std.testing.expectEqual(@as(u32, 0), results.hits[0].doc_id);
     try std.testing.expectEqual(@as(u32, 2), results.hits[1].doc_id);
     try std.testing.expect(results.hits[0].score >= results.hits[1].score);

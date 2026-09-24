@@ -1098,6 +1098,9 @@ fn writeSyntheticMetadata(
 }
 
 pub const DownloadProgress = struct {
+    /// The model reference being pulled; set by `ModelRegistry.pullWithProgress`
+    /// (a pull can include a companion model with its own reports).
+    model: []const u8 = "",
     file: []const u8,
     bytes_downloaded: u64,
     total_bytes: ?u64,
@@ -1114,6 +1117,15 @@ pub const ProgressCallback = *const fn (progress: DownloadProgress, ctx: ?*anyop
 pub const ProgressSink = struct {
     callback: ?ProgressCallback = null,
     context: ?*anyopaque = null,
+    /// Set by the consumer (typically from `callback`) to stop the download.
+    /// Checked after each file's end report and before and after every
+    /// artifact, so a cancel decided in a callback is always honored.
+    cancelled: ?*const std.atomic.Value(bool) = null,
+
+    pub fn checkCancelled(self: ProgressSink) error{Canceled}!void {
+        const flag = self.cancelled orelse return;
+        if (flag.load(.acquire)) return error.Canceled;
+    }
 };
 
 const progress_report_bytes: u64 = 16 * 1024 * 1024;
@@ -2068,6 +2080,7 @@ pub fn downloadModel(
                 .cached = cached,
             }, progress.context);
         }
+        try progress.checkCancelled();
     }
 
     if (try writeSyntheticMetadata(allocator, io, dest_dir, synthetic_metadata)) |metadata_receipt| {
@@ -2333,7 +2346,11 @@ pub fn resolveModelSnapshot(
                 if (snippet_len < body.len) "..." else "",
             },
         );
-        return error.HubApiError;
+        return switch (resp.status.code) {
+            404 => error.HubModelNotFound,
+            401, 403 => error.HubAccessDenied,
+            else => error.HubApiError,
+        };
     }
 
     const body = resp.body orelse return error.EmptyResponse;
@@ -2846,6 +2863,43 @@ fn downloadFile(
 }
 
 fn downloadFileAtRevision(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    owner: []const u8,
+    name: []const u8,
+    revision: []const u8,
+    filename: []const u8,
+    dest_dir: []const u8,
+    config: HubConfig,
+    progress: ProgressSink,
+    file_index: usize,
+    files_total: usize,
+    total_bytes: ?u64,
+    expected_sha256: ?[]const u8,
+    expected_git_blob_sha1: ?[]const u8,
+) !bool {
+    try progress.checkCancelled();
+    const cached = try downloadFileAtRevisionUnchecked(
+        allocator,
+        io,
+        owner,
+        name,
+        revision,
+        filename,
+        dest_dir,
+        config,
+        progress,
+        file_index,
+        files_total,
+        total_bytes,
+        expected_sha256,
+        expected_git_blob_sha1,
+    );
+    try progress.checkCancelled();
+    return cached;
+}
+
+fn downloadFileAtRevisionUnchecked(
     allocator: std.mem.Allocator,
     io: std.Io,
     owner: []const u8,

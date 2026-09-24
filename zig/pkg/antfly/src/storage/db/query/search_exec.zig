@@ -1427,38 +1427,11 @@ fn validateComposedSortPageOptions(req: types.SearchRequest) !void {
     }
 }
 
-const ComponentPaging = struct {
-    offset: u32,
-    limit: u32,
-};
-
-fn componentPaging(req: types.SearchRequest) ComponentPaging {
-    var limit = if (req.reranker) |reranker|
-        reranker.candidate_count orelse (reranker.top_n orelse req.limit) +| req.offset
-    else
-        req.limit +| req.offset;
-    const needs_component_window = requestHasPostprocessPageTransforms(req);
-
-    if (!needs_component_window) {
-        return .{
-            .offset = req.offset,
-            .limit = req.limit,
-        };
-    }
-
-    if (req.merge_config) |merge_config| {
-        if (merge_config.window_size > limit) limit = merge_config.window_size;
-    }
-    if (req.reranker) |reranker| {
-        const reranker_window = reranker.candidate_count orelse (reranker.top_n orelse req.limit) +| req.offset;
-        if (reranker_window > limit) limit = reranker_window;
-    }
-
-    return .{
-        .offset = 0,
-        .limit = limit,
-    };
-}
+const ComponentPaging = control_contract.ComponentPaging;
+const componentPaging = control_contract.componentPaging;
+const pagingCandidateWindow = control_contract.pagingCandidateWindow;
+const scoreOrderCandidateWindowK = control_contract.scoreOrderCandidateWindowK;
+const requestHasPostprocessPageTransforms = control_contract.requestHasPostprocessPageTransforms;
 
 fn composedFusionRequest(req: types.SearchRequest) types.SearchRequest {
     if (req.reranker == null and req.pruner == null) return req;
@@ -1520,10 +1493,32 @@ test "reranker component paging includes the post-rerank offset" {
     try std.testing.expectEqual(@as(u32, 2), legacy_top_n.limit);
 }
 
-fn requestHasPostprocessPageTransforms(req: types.SearchRequest) bool {
-    return req.merge_config != null or
-        req.pruner != null or
-        req.reranker != null;
+test "composed vector component window matches component paging" {
+    // Fusion alone widens the component window to offset zero.
+    try std.testing.expectEqual(@as(u32, 30), control_contract.composedVectorComponentWindow(.{
+        .limit = 30,
+        .merge_config = .{ .strategy = .rrf },
+    }));
+    // A larger fusion window is part of what each component contributes.
+    try std.testing.expectEqual(@as(u32, 50), control_contract.composedVectorComponentWindow(.{
+        .limit = 30,
+        .merge_config = .{ .strategy = .rrf, .window_size = 50 },
+    }));
+    // Reranking reorders every candidate in its window, so the window counts.
+    try std.testing.expectEqual(@as(u32, 80), control_contract.composedVectorComponentWindow(.{
+        .limit = 30,
+        .merge_config = .{ .strategy = .rrf },
+        .reranker = .{ .provider = .antfly, .field = "body", .candidate_count = 80 },
+    }));
+    // Without page transforms the component pages directly.
+    try std.testing.expectEqual(@as(u32, 12), control_contract.composedVectorComponentWindow(.{
+        .limit = 10,
+        .offset = 2,
+    }));
+    // The helper and the executor agree for every shape above.
+    const req: types.SearchRequest = .{ .limit = 30, .merge_config = .{ .strategy = .rrf, .window_size = 40 } };
+    try std.testing.expectEqual(pagingCandidateWindow(componentPaging(req)), control_contract.composedVectorComponentWindow(req));
+    try std.testing.expectEqual(@as(u32, 40), scoreOrderCandidateWindowK(30, componentPaging(req)));
 }
 
 fn hasStoredPatternFilters(req: types.SearchRequest) bool {
@@ -13320,6 +13315,8 @@ fn searchDenseInternal(
             results.candidate_coverage,
             hbc_effective_k,
             bounded_full_candidate_count,
+            raw_hits.len,
+            route.exact_native_filter,
         );
         const candidate_ceiling_reached = candidate_window >= candidate_ceiling;
         if (!candidate_window_incomplete and exhaustive_broad_live_window) {
@@ -13788,14 +13785,6 @@ test "dense search route uses measured per-index costs pressure and hysteresis" 
     try std.testing.expect(sticky_exact.exact_native_filter);
 }
 
-fn pagingCandidateWindow(paging: ComponentPaging) u32 {
-    return paging.offset +| paging.limit;
-}
-
-fn scoreOrderCandidateWindowK(requested_k: u32, paging: ComponentPaging) u32 {
-    return @max(requested_k, pagingCandidateWindow(paging));
-}
-
 fn scoreOrderWindowTotalHitsRelation(effective_k: u32, bounded_candidate_count: u64, raw_hit_count: usize) types.TotalHitsRelation {
     if (@as(u64, effective_k) < bounded_candidate_count and raw_hit_count >= @as(usize, @intCast(effective_k))) return .gte;
     return .exact;
@@ -13859,9 +13848,11 @@ fn denseCandidateWindowIncomplete(
     coverage: vectorindex_mod.CandidateCoverage,
     candidate_window: u32,
     bounded_full_candidate_count: u32,
+    raw_hit_count: usize,
+    exact_native_filter: bool,
 ) bool {
     return switch (coverage) {
-        .exhausted => false,
+        .exhausted => !exact_native_filter and scoreOrderWindowTotalHitsRelation(candidate_window, bounded_full_candidate_count, raw_hit_count) == .gte,
         .more => true,
         .unknown => candidateWindowIncomplete(candidate_window, bounded_full_candidate_count),
     };
@@ -13932,9 +13923,13 @@ test "adaptive candidate window covers requested offset page and grows bounded" 
     try std.testing.expectEqual(@as(u32, 2000), growAdaptiveCandidateWindow(1025, 2000, 1025));
     try std.testing.expect(candidateWindowIncomplete(1025, 2000));
     try std.testing.expect(!candidateWindowIncomplete(2000, 2000));
-    try std.testing.expect(!denseCandidateWindowIncomplete(.exhausted, 10, 1_000_000));
-    try std.testing.expect(denseCandidateWindowIncomplete(.more, 10, 10));
-    try std.testing.expect(denseCandidateWindowIncomplete(.unknown, 10, 1_000_000));
+    try std.testing.expect(denseCandidateWindowIncomplete(.exhausted, 10, 1_000_000, 10, false));
+    try std.testing.expect(!denseCandidateWindowIncomplete(.exhausted, 10, 1_000_000, 9, false));
+    try std.testing.expect(!denseCandidateWindowIncomplete(.exhausted, 10, 10, 10, false));
+    try std.testing.expect(!denseCandidateWindowIncomplete(.exhausted, 10, 1_000_000, 10, true));
+    try std.testing.expect(denseCandidateWindowIncomplete(.more, 10, 10, 9, true));
+    try std.testing.expect(denseCandidateWindowIncomplete(.unknown, 10, 1_000_000, 9, false));
+    try std.testing.expect(!denseCandidateWindowIncomplete(.unknown, 10, 10, 10, false));
     try std.testing.expectEqual(@as(u32, 7), initialAdaptiveCandidateWindow(7, paging));
 
     // Group collection starts with an overfetch window and may grow it again.

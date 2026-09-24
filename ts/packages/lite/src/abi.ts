@@ -21,7 +21,7 @@
 //     http://www.apache.org/licenses/LICENSE-2.0
 
 import koffi from "koffi";
-import { AntflyOpenOptions, loadNative } from "./native.js";
+import { AntflyInferenceOptions, AntflyOpenOptions, loadNative } from "./native.js";
 import { SUPPORTED_ABI_VERSION } from "./types.js";
 
 /** Thrown by validateAbi() when the loaded libantfly does not match the header this binding was written against. */
@@ -64,6 +64,23 @@ export function validateAbi(): void {
   if (gotSize !== wantSize) {
     throw new AbiMismatchError(
       `lite: C ABI open options size ${gotSize}, compiled header size ${wantSize}`
+    );
+  }
+}
+
+/**
+ * Verifies that the loaded C library's antfly_inference_options struct size
+ * matches the header this binding was compiled against, like validateAbi()
+ * does for antfly_open_options. Called automatically by Inference.open();
+ * exposed so applications can fail fast at startup too.
+ */
+export function validateInferenceAbi(): void {
+  const native = loadNative();
+  const gotSize = native.inferenceOptionsSize();
+  const wantSize = koffi.sizeof(AntflyInferenceOptions);
+  if (gotSize !== wantSize) {
+    throw new AbiMismatchError(
+      `lite: C ABI inference options size ${gotSize}, compiled header size ${wantSize}`
     );
   }
 }

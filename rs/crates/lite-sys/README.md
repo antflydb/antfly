@@ -45,8 +45,10 @@ archive containing `lib/libantfly.*`, then set `ANTFLY_LIB_DIR` to that
   it never references an `extern "C"` item, so it needs no dylib.
 - `cargo test -p antfly-lite-sys --features libantfly` additionally runs
   `tests/abi_sizes.rs`, which links against the real library and checks that
-  this crate's `#[repr(C)]` `antfly_open_options` struct agrees with
-  `antfly_open_options_size()`.
+  this crate's `#[repr(C)]` `antfly_open_options`/`antfly_inference_options`/
+  `antfly_inference_pull_progress` structs (sizes and field offsets) agree
+  with `antfly_open_options_size()`/`antfly_inference_options_size()` and
+  the header's documented field order.
 
 ## ABI coverage
 
@@ -57,7 +59,22 @@ version 2: `antfly_db` is a typed opaque handle (`*mut antfly_db`, not
 `*mut c_void`); `antfly_*` functions are library-level and take no handle,
 `antfly_db_*` functions take an `antfly_db` handle of any storage kind
 (`.aflite` file or a normal Antfly directory, selected by
-`antfly_open_options.storage_kind`), and `antfly_lite_*` functions are
-`.aflite` file-format operations plus shortcuts for opening one. There is a
-single `antfly_open_options` struct (no more separate
-`antfly_lite_open_options`).
+`antfly_open_options.storage_kind`), `antfly_lite_*` functions are
+`.aflite` file-format operations plus shortcuts for opening one, and
+`antfly_inference_*` functions take an `antfly_inference` handle -- a
+separate, database-less embedded inference runtime opened with
+`antfly_inference_open` (see "Embedded inference without a database" in
+`antfly.h` and `zig/CAPI.md`'s "Inference" section) and closed with
+`antfly_inference_close`. There is a single `antfly_open_options` struct
+(no more separate `antfly_lite_open_options`).
+
+Two callback-taking calls can be cancelled by their callback returning
+`false`, reported as the `ANTFLY_CANCELLED` (10) error code:
+`antfly_inference_pull_json`'s `antfly_inference_pull_progress_fn` (`true`
+continues, `false` cancels the download) and
+`antfly_inference_generate_stream_json`'s `antfly_inference_stream_fn`
+(`true` continues, `false` stops generation). Both callbacks are called
+synchronously on the calling thread and are a rendezvous -- the download/
+generation waits for the callback to return before continuing -- so a
+`false` return always takes effect at that call, even at the very last
+report or chunk.

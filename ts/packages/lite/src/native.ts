@@ -119,6 +119,73 @@ const PUint8Out = koffi.out(koffi.pointer("uint8_t"));
 const PUint64Out = koffi.out(koffi.pointer("uint64_t"));
 const PBoolOut = koffi.out(koffi.pointer("bool"));
 
+// --- Embedded inference (antfly_inference_*, see "Embedded inference
+// without a database" in antfly.h) -------------------------------------
+
+// antfly_inference is an opaque handle, like antfly_db (see "Naming" in
+// antfly.h): typed pointer, own registry, same close/generation safety.
+const AntflyInferenceOpaque = koffi.opaque("antfly_inference");
+export const PAntflyInference = koffi.pointer(AntflyInferenceOpaque);
+const PAntflyInferenceOut = koffi.out(koffi.pointer(AntflyInferenceOpaque, 2));
+
+// Field order and types below must match antfly_inference_options in
+// antfly.h exactly; ABI size agreement is checked at runtime against
+// antfly_inference_options_size() (see validateInferenceAbi in abi.ts).
+export const AntflyInferenceOptions = koffi.struct("antfly_inference_options", {
+  abi_size: "uint32_t",
+  flags: "uint32_t",
+  models_dir: AntflySlice,
+  host_budget_mb: "uint32_t",
+  backend_budget_mb: "uint32_t",
+  process_memory_budget_mb: "uint32_t",
+  combined_budget_mb: "uint32_t",
+  kv_budget_mb: "uint32_t",
+  scratch_budget_mb: "uint32_t",
+  call_timeout_ms: "uint64_t",
+  reserved: koffi.array("uint64_t", 8),
+});
+
+const PAntflyInferenceOptions = koffi.pointer(AntflyInferenceOptions);
+const PAntflyInferenceOptionsOut = koffi.out(PAntflyInferenceOptions);
+
+// One report to an antfly_inference_pull_json progress callback. The
+// antfly_slice fields (model, file) are valid only during the callback.
+export const AntflyInferencePullProgress = koffi.struct("antfly_inference_pull_progress", {
+  abi_size: "uint32_t",
+  reserved0: "uint32_t",
+  model: AntflySlice,
+  file: AntflySlice,
+  bytes_downloaded: "uint64_t",
+  total_bytes: "uint64_t",
+  files_done: "uint64_t",
+  files_total: "uint64_t",
+  cached: "bool",
+});
+
+// antfly_inference_pull_progress_fn: bool(void *context, const
+// antfly_inference_pull_progress *progress). Returning true continues the
+// pull, false cancels it (the call then returns ANTFLY_CANCELLED; completed
+// files stay staged so a re-pull resumes). koffi cannot auto-decode a
+// callback's pointer-to-struct argument (see inference.ts's decoding of the
+// raw pointer via koffi.decode); this only declares the ABI shape.
+const AntflyInferencePullProgressFnProto = koffi.proto(
+  "antfly_inference_pull_progress_fn",
+  "bool",
+  ["void *", koffi.pointer(AntflyInferencePullProgress)]
+);
+export const PAntflyInferencePullProgressFn = koffi.pointer(AntflyInferencePullProgressFnProto);
+
+// antfly_inference_stream_fn: bool(void *context, antfly_slice chunk_json).
+// chunk_json is passed by value (not by pointer), so koffi decodes it
+// directly into a {ptr, len} JS object for the callback -- see
+// inference.ts's decodeSliceUtf8. Returning true continues generation,
+// false stops it (the call then returns ANTFLY_CANCELLED).
+const AntflyInferenceStreamFnProto = koffi.proto("antfly_inference_stream_fn", "bool", [
+  "void *",
+  AntflySlice,
+]);
+export const PAntflyInferenceStreamFn = koffi.pointer(AntflyInferenceStreamFnProto);
+
 export interface NativeLibrary {
   handle: LibraryHandle;
   resolved: ResolvedLibrary;
@@ -268,6 +335,40 @@ export interface NativeLibrary {
   dbFindShortestPathJson: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
   dbFindKShortestPathsJson: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
   dbMatchPatternJson: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
+
+  // --- Embedded inference (antfly_inference_*) ---
+  inferenceOptionsSize: KoffiFunc<() => number>;
+  inferenceOptionsInit: KoffiFunc<(options: object) => number>;
+  inferenceOpen: KoffiFunc<(options: object | null, outHandle: unknown[]) => number>;
+  inferenceClose: KoffiFunc<(handle: unknown) => void>;
+  inferenceEmbedJson: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
+  inferenceRerankJson: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
+  inferenceChunkJson: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
+  inferenceGenerateJson: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
+  inferenceGenerateStreamJson: KoffiFunc<
+    (
+      handle: unknown,
+      request: object,
+      onChunk: unknown,
+      chunkContext: unknown,
+      out: object
+    ) => number
+  >;
+  inferenceGenerateBatchJson: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
+  inferenceRewriteJson: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
+  inferenceExtractJson: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
+  inferenceReadJson: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
+  inferenceTranscribeJson: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
+  inferenceListModelsJson: KoffiFunc<(handle: unknown, out: object) => number>;
+  inferencePullJson: KoffiFunc<
+    (
+      handle: unknown,
+      request: object,
+      progress: unknown,
+      progressContext: unknown,
+      out: object
+    ) => number
+  >;
 }
 
 let cached: NativeLibrary | undefined;
@@ -556,6 +657,80 @@ function buildNative(): NativeLibrary {
     dbMatchPatternJson: f("antfly_db_match_pattern_json", "uint32_t", [
       PAntflyDb,
       AntflySlice,
+      PAntflyBufferOut,
+    ]),
+
+    // --- Embedded inference (antfly_inference_*) ---
+    inferenceOptionsSize: f("antfly_inference_options_size", "uint32_t", []),
+    inferenceOptionsInit: f("antfly_inference_options_init", "uint32_t", [
+      PAntflyInferenceOptionsOut,
+    ]),
+    inferenceOpen: f("antfly_inference_open", "uint32_t", [
+      PAntflyInferenceOptions,
+      PAntflyInferenceOut,
+    ]),
+    inferenceClose: f("antfly_inference_close", "void", [PAntflyInference]),
+    inferenceEmbedJson: f("antfly_inference_embed_json", "uint32_t", [
+      PAntflyInference,
+      AntflySlice,
+      PAntflyBufferOut,
+    ]),
+    inferenceRerankJson: f("antfly_inference_rerank_json", "uint32_t", [
+      PAntflyInference,
+      AntflySlice,
+      PAntflyBufferOut,
+    ]),
+    inferenceChunkJson: f("antfly_inference_chunk_json", "uint32_t", [
+      PAntflyInference,
+      AntflySlice,
+      PAntflyBufferOut,
+    ]),
+    inferenceGenerateJson: f("antfly_inference_generate_json", "uint32_t", [
+      PAntflyInference,
+      AntflySlice,
+      PAntflyBufferOut,
+    ]),
+    inferenceGenerateStreamJson: f("antfly_inference_generate_stream_json", "uint32_t", [
+      PAntflyInference,
+      AntflySlice,
+      PAntflyInferenceStreamFn,
+      "void *",
+      PAntflyBufferOut,
+    ]),
+    inferenceGenerateBatchJson: f("antfly_inference_generate_batch_json", "uint32_t", [
+      PAntflyInference,
+      AntflySlice,
+      PAntflyBufferOut,
+    ]),
+    inferenceRewriteJson: f("antfly_inference_rewrite_json", "uint32_t", [
+      PAntflyInference,
+      AntflySlice,
+      PAntflyBufferOut,
+    ]),
+    inferenceExtractJson: f("antfly_inference_extract_json", "uint32_t", [
+      PAntflyInference,
+      AntflySlice,
+      PAntflyBufferOut,
+    ]),
+    inferenceReadJson: f("antfly_inference_read_json", "uint32_t", [
+      PAntflyInference,
+      AntflySlice,
+      PAntflyBufferOut,
+    ]),
+    inferenceTranscribeJson: f("antfly_inference_transcribe_json", "uint32_t", [
+      PAntflyInference,
+      AntflySlice,
+      PAntflyBufferOut,
+    ]),
+    inferenceListModelsJson: f("antfly_inference_list_models_json", "uint32_t", [
+      PAntflyInference,
+      PAntflyBufferOut,
+    ]),
+    inferencePullJson: f("antfly_inference_pull_json", "uint32_t", [
+      PAntflyInference,
+      AntflySlice,
+      PAntflyInferencePullProgressFn,
+      "void *",
       PAntflyBufferOut,
     ]),
   };

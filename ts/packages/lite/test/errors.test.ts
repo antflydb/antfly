@@ -26,6 +26,7 @@ import { abiVersion, threadingMode, validateAbi } from "../src/abi.js";
 import {
   AntflyError,
   BusyError,
+  CancelledError,
   ErrorCode,
   errorCodeDescription,
   errorCodeName,
@@ -57,6 +58,7 @@ describe("errorCodeName / errorCodeDescription (pure)", () => {
     expect(errorCodeName(ErrorCode.OutcomeUnknown)).toBe("ANTFLY_OUTCOME_UNKNOWN");
     expect(errorCodeName(ErrorCode.Unsupported)).toBe("ANTFLY_UNSUPPORTED");
     expect(errorCodeName(ErrorCode.Stalled)).toBe("ANTFLY_STALLED");
+    expect(errorCodeName(ErrorCode.Cancelled)).toBe("ANTFLY_CANCELLED");
     expect(errorCodeName(ErrorCode.Internal)).toBe("ANTFLY_INTERNAL");
   });
 
@@ -66,7 +68,7 @@ describe("errorCodeName / errorCodeDescription (pure)", () => {
   });
 
   it("every code has a non-empty description", () => {
-    for (const code of [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 255]) {
+    for (const code of [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 255]) {
       expect(errorCodeDescription(code).length).toBeGreaterThan(0);
     }
   });
@@ -83,6 +85,7 @@ describe("errorFromCode (pure)", () => {
     [ErrorCode.OutcomeUnknown, OutcomeUnknownError],
     [ErrorCode.Unsupported, UnsupportedError],
     [ErrorCode.Stalled, StalledError],
+    [ErrorCode.Cancelled, CancelledError],
     [ErrorCode.Internal, InternalError],
   ];
 
@@ -105,7 +108,7 @@ describe("errorFromCode (pure)", () => {
 // loaded libantfly's antfly_error_code_name/antfly_error_code_description,
 // and validates ABI/struct-size agreement.
 describeWithLibrary("native ABI cross-checks", () => {
-  const codes = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 255];
+  const codes = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 255];
 
   it.each(codes)("name and description for code %i match the native library", (code) => {
     const native = loadNative();
