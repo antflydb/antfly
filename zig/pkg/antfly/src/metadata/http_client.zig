@@ -1066,7 +1066,7 @@ pub const MetadataHttpClient = struct {
         if (response.status != 200) return switch (response.status) {
             400 => error.InvalidCatalogName,
             404 => error.CatalogNotFound,
-            409 => error.CatalogGenerationChanged,
+            409 => if (input == .policy_publication_status and std.mem.eql(u8, response.body, "RowPolicyCatalogChanged")) error.RowPolicyCatalogChanged else error.CatalogGenerationChanged,
             413 => error.CatalogCommandTooLarge,
             426 => error.TableTopologyProtocolUpgradeRequired,
             503 => error.NotLeader,
@@ -4236,6 +4236,26 @@ test "system catalog direct read carries identity and deadline without a discove
     try std.testing.expectError(error.Timeout, client.readSystemCatalog("http://metadata.invalid", .snapshot, 0, null));
     try std.testing.expectError(error.InvalidCatalogMutation, client.readSystemCatalog("http://metadata.invalid", .{ .mutate = .{ .mutation = .{ .action = .create, .kind = .database, .name = "denied" } } }, 25, null));
     try std.testing.expectEqual(@as(usize, 2), executor.calls);
+}
+
+test "system catalog policy publication status preserves absent stamp without reclassifying other conflicts" {
+    const alloc = std.testing.allocator;
+    const Executor = struct {
+        body: []const u8,
+        fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(std.mem.endsWith(u8, request.uri, "/internal/v1/system-catalog"));
+            return .{ .status = 409, .body = try a.dupe(u8, self.body) };
+        }
+    };
+    var executor = Executor{ .body = "RowPolicyCatalogChanged" };
+    var client = MetadataHttpClient.init(alloc, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    _ = client.withSettingAuthority("policy-status-test-secret", "policy-status-test");
+    try std.testing.expectError(error.RowPolicyCatalogChanged, client.readSystemCatalog("http://metadata.invalid", .{ .policy_publication_status = 7 }, 25, null));
+    executor.body = "CatalogGenerationChanged";
+    try std.testing.expectError(error.CatalogGenerationChanged, client.readSystemCatalog("http://metadata.invalid", .{ .policy_publication_status = 7 }, 25, null));
+    executor.body = "RowPolicyCatalogChanged";
+    try std.testing.expectError(error.CatalogGenerationChanged, client.readSystemCatalog("http://metadata.invalid", .snapshot, 25, null));
 }
 
 test "metadata mutation topology avoids diagnostics and owns parsed roles across compatibility fallback" {

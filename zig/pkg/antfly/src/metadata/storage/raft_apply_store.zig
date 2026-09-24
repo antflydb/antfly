@@ -472,7 +472,14 @@ test "FK generation publication initial create reserves hidden identity before a
         .plan = forged_placement,
     }, .{});
     defer alloc.free(forged_begin);
-    try std.testing.expectError(error.GenerationPublicationChanged, store.applyStandaloneCommand(group_id, .{ .apply_fk_initial_create = forged_begin }));
+    const before_preflight = try store.systemCatalogMeta(alloc, group_id);
+    try std.testing.expectError(error.GenerationPublicationChanged, store.preflightFkInitialCreateCommand(group_id, forged_begin));
+    const after_preflight = try store.systemCatalogMeta(alloc, group_id);
+    try std.testing.expectEqual(before_preflight.revision, after_preflight.revision);
+    try std.testing.expectEqual(before_preflight.next_id, after_preflight.next_id);
+    // An already committed stale begin advances Raft without altering the
+    // projection or making subsequent catalog reads fail.
+    try store.applyStandaloneCommand(group_id, .{ .apply_fk_initial_create = forged_begin });
     const begin = try std.json.Stringify.valueAlloc(alloc, fk_generation_publication.InitialCommand{
         .plan_id = id,
         .child_table_id = candidate.child.table_id,
@@ -571,6 +578,33 @@ test "FK generation publication initial create reserves hidden identity before a
         .plan = plan2,
     }, .{});
     defer alloc.free(begin2);
+    // An unrelated topology writer can win between the exact preflight and
+    // committed Raft apply. Its child-table range collision is a deterministic
+    // pre-write rejection, not an error that may poison metadata replay.
+    const conflicting_group_id: u64 = 9991;
+    {
+        // Model a range-index winner at the exact committed projection cut.
+        // Public upsert_range intentionally ignores a missing table, whereas
+        // the stale-begin branch must also tolerate a preexisting indexed
+        // membership left by an independent topology transition.
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try store.putTableRangeIndexTxn(&txn, group_id, candidate2.child.table_id, conflicting_group_id);
+        try txn.commit();
+    }
+    try std.testing.expectError(error.TableTransitionActive, store.preflightFkInitialCreateCommand(group_id, begin2));
+    const collision_meta = try store.systemCatalogMeta(alloc, group_id);
+    try store.applyStandaloneCommand(group_id, .{ .apply_fk_initial_create = begin2 });
+    const after_collision_meta = try store.systemCatalogMeta(alloc, group_id);
+    try std.testing.expectEqual(collision_meta.revision, after_collision_meta.revision);
+    try std.testing.expectEqual(collision_meta.next_id, after_collision_meta.next_id);
+    try std.testing.expectError(error.GenerationPublicationNotFound, store.fkInitialCreateStatusJson(alloc, group_id, candidate2.child.table_id));
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try store.deleteTableRangeIndexTxn(&txn, group_id, candidate2.child.table_id, conflicting_group_id);
+        try txn.commit();
+    }
     try store.applyStandaloneCommand(group_id, .{ .apply_fk_initial_create = begin2 });
     const next_json = try store.fkInitialCreateWorkJson(alloc, group_id, candidate.child.table_id);
     defer alloc.free(next_json);
@@ -590,7 +624,13 @@ test "FK generation publication initial create reserves hidden identity before a
         .plan = plan,
     }, .{});
     defer alloc.free(duplicate);
-    try std.testing.expectError(error.GenerationPublicationChanged, store.applyStandaloneCommand(group_id, .{ .apply_fk_initial_create = duplicate }));
+    try std.testing.expectError(error.GenerationPublicationChanged, store.preflightFkInitialCreateCommand(group_id, duplicate));
+    try store.applyStandaloneCommand(group_id, .{ .apply_fk_initial_create = duplicate });
+    const after_stale_json = try store.fkInitialCreateStatusJson(alloc, group_id, candidate.child.table_id);
+    defer alloc.free(after_stale_json);
+    var after_stale = try std.json.parseFromSlice(fk_generation_publication.InitialPublication, alloc, after_stale_json, .{});
+    defer after_stale.deinit();
+    try std.testing.expectEqual(@as(u64, 1), after_stale.value.revision);
     const cancel_json = try std.json.Stringify.valueAlloc(alloc, fk_generation_publication.InitialCommand{
         .plan_id = id,
         .child_table_id = candidate.child.table_id,
@@ -7018,6 +7058,37 @@ pub const RaftApplyStore = struct {
         try txn.put(publication_key, encoded);
     }
 
+    /// Evaluate the exact state-machine command against the current
+    /// projection before proposing it. The write transaction is always
+    /// aborted: validation and the candidate's writes share one code path,
+    /// but no hidden reservation becomes visible before Raft commits it.
+    pub fn preflightFkInitialCreateCommand(self: *RaftApplyStore, group_id: u64, bytes: []const u8) !void {
+        var txn = try self.store.beginWriteTxn();
+        defer txn.abort();
+        try self.applyFkInitialCreateTxn(&txn, group_id, bytes);
+    }
+
+    fn applyCommittedFkInitialCreateTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !void {
+        var parsed = try std.json.parseFromSlice(fk_generation_publication.InitialCommand, self.alloc, bytes, .{});
+        defer parsed.deinit();
+        const begin = parsed.value.action == .begin;
+        self.applyFkInitialCreateTxn(txn, group_id, bytes) catch |err| {
+            // A different metadata proposer can win after our preflight but
+            // before this entry applies. Every begin CAS check runs before
+            // the first txn.put, so a stale begin is a safe committed no-op.
+            // Malformed commands, I/O errors, and later-phase failures are
+            // not swallowed here; those need their own pre-write proof.
+            if (begin) switch (err) {
+                error.GenerationPublicationChanged,
+                error.CatalogAlreadyExists,
+                error.TableTransitionActive,
+                => return,
+                else => {},
+            };
+            return err;
+        };
+    }
+
     fn setFkInitialTableLocksTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, plan: fk_generation_publication.InitialCreatePlan, acquire: bool) !void {
         _ = self;
         var buf: [160]u8 = undefined;
@@ -11148,7 +11219,7 @@ pub const RaftApplyStore = struct {
             .apply_sql_policies => |bytes| try self.applySqlPoliciesTxn(txn, group_id, bytes),
             .apply_sql_policy_publication => |bytes| try self.applySqlPolicyPublicationTxn(txn, group_id, bytes),
             .apply_fk_generation_publication => |bytes| try self.applyFkGenerationPublicationTxn(txn, group_id, bytes),
-            .apply_fk_initial_create => |bytes| try self.applyFkInitialCreateTxn(txn, group_id, bytes),
+            .apply_fk_initial_create => |bytes| try self.applyCommittedFkInitialCreateTxn(txn, group_id, bytes),
             .apply_store_report_update => |bytes| try self.applyStoreReportUpdateTxn(txn, group_id, bytes),
             .apply_store_report_baseline => |bytes| try self.applyStoreReportBaselineTxn(txn, group_id, bytes),
             .initialize_metadata_incarnation => |incarnation| {

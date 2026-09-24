@@ -6006,6 +6006,12 @@ pub const DataServer = struct {
         api_server_cfg.fk_generation_source = .{ .ptr = self, .execute_fn = fkGenerationSourceControl };
         api_server_cfg.fk_initial_child = .{ .ptr = self, .execute_fn = fkInitialChildControl };
         api_server_cfg.row_policy_install = .{ .ptr = self, .execute_fn = installRowPolicyControl };
+        // Distributed session/publication routes may resolve to another data
+        // owner, including a hidden initial-FK child not yet publicly listed.
+        // Reuse the Raft host's transport unless the caller supplied one.
+        if (api_server_cfg.session_executor == null) {
+            if (self.data_raft) |raft| api_server_cfg.session_executor = raft.host.http_host.request_executor;
+        }
         api_server_cfg.resource_manager = &self.provisioned_storage.resource_manager;
         self.configureHAPublicGateState();
         self.attachHaExecutors(&api_server_cfg);

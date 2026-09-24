@@ -75,8 +75,13 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
             "FK generation publication was admitted. Poll the table schema and constraint status; do not replay the DDL.";
         return .{ .mutation_outcome = if (publication.state == .admission_unknown) null else .committed_pending, .receipt = receipt };
     }
-    if (ddl.schema_change) |change| if (change == .add_column and (!change.add_column.nullable or change.add_column.default_value != null))
-        return rewriteSchema(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated);
+    if (ddl.schema_change) |change| switch (change) {
+        .add_column => |column| if (!column.nullable or column.default_value != null)
+            return rewriteSchema(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated),
+        .add_unique => |constraint| if (constraint.primary)
+            return rewriteSchema(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated),
+        else => {},
+    };
     const retirement = try requiresRetirement(a, definition.schema_json, schema);
     const validation = ddl.schema_change.? == .validate_constraint;
     const activation_required = if (ddl.schema_change) |change| switch (change) {
@@ -141,9 +146,7 @@ fn rewriteSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authen
     receipt.restore_job_id = try std.fmt.allocPrint(alloc, "{d}", .{job_id});
     // Shared native restore machinery reserves the entire dependency cohort,
     // transforms into unpublished storage, validates, and publishes atomically.
-    var response = server.handlePublicSchemaRewrite(table.*, schema, receipt.idempotency_key, identity, context) catch |err| {
-        return rewriteCallFailure(receipt, err);
-    };
+    var response = server.handlePublicSchemaRewrite(table.*, schema, receipt.idempotency_key, identity, context) catch |err| return rewriteCallFailure(receipt, err);
     defer response.deinit(server.alloc);
     return rewriteResponse(alloc, response.status, response.body, receipt);
 }
@@ -155,7 +158,10 @@ fn rewriteResponse(alloc: std.mem.Allocator, status: u16, body_bytes: []const u8
         404 => error.TableNotFound,
         409 => error.SchemaVersionChanged,
         400 => error.InvalidSchemaUpdateRequest,
-        else => error.SqlWriteCapacityUnavailable,
+        // A generic server response does not prove whether a durable begin
+        // happened before response construction failed. Keep the pre-owned
+        // recovery handle and forbid replay.
+        else => return unknownRewriteOutcome(receipt),
     };
     var body = std.json.parseFromSlice(struct {
         job_id: ?[]const u8 = null,
@@ -194,6 +200,8 @@ fn rewriteCallFailure(receipt: catalog.DdlReceipt, err: anyerror) anyerror!catal
         error.UnsupportedSqlExecution,
         error.AsyncRestoreUnavailable,
         => err,
+        error.StoredDestinationAuthorizationRevoked => error.Forbidden,
+        error.GroupLeaderUnavailable => error.RestoreValidationPending,
         else => unknownRewriteOutcome(receipt),
     };
 }
@@ -215,9 +223,14 @@ test "SQL rewrite response retains admitted and uncertain restore handles" {
     try std.testing.expectEqualStrings("41", unknown.receipt.?.restore_job_id.?);
     try std.testing.expectEqualStrings("auto:abc", unknown.receipt.?.idempotency_key.?);
     try std.testing.expectError(error.SqlWriteCapacityUnavailable, rewriteResponse(alloc, 503, "{\"error\":\"worker unavailable\"}", receipt));
+    const unclassified = try rewriteResponse(alloc, 500, "{\"error\":\"failed to create restore job\"}", receipt);
+    try std.testing.expectEqual(.admission_unknown, unclassified.receipt.?.state);
+    try std.testing.expectEqualStrings("41", unclassified.receipt.?.restore_job_id.?);
     try std.testing.expectEqual(.admission_unknown, (try rewriteResponse(alloc, 503, "{\"admission_outcome\":\"unknown\"}", receipt)).receipt.?.state);
     try std.testing.expectEqual(.admission_unknown, (try rewriteResponse(alloc, 503, "{malformed", receipt)).receipt.?.state);
     try std.testing.expectError(error.RestoreValidationPending, rewriteCallFailure(receipt, error.RestoreValidationPending));
+    try std.testing.expectError(error.RestoreValidationPending, rewriteCallFailure(receipt, error.GroupLeaderUnavailable));
+    try std.testing.expectError(error.Forbidden, rewriteCallFailure(receipt, error.StoredDestinationAuthorizationRevoked));
     const response_oom = try rewriteCallFailure(receipt, error.OutOfMemory);
     try std.testing.expectEqual(.admission_unknown, response_oom.receipt.?.state);
     try std.testing.expectEqualStrings("41", response_oom.receipt.?.restore_job_id.?);

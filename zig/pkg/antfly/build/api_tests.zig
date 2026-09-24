@@ -1980,11 +1980,61 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addFilteredTestRunArtifact(b, hosted_fk_placement_tests).step);
     const sql_rewrite_receipt_tests = b.addTest(.{
         .root_module = api_backup_restore_test_mod,
-        .filters = &.{ "SQL rewrite response retains admitted and uncertain restore handles", "SQL DDL receipt status distinguishes unknown admission", "primary key schema lowering rejects deferred timing and empty keys", "relational primary keys cannot defer enforcement" },
+        .filters = &.{ "SQL rewrite response retains admitted and uncertain restore handles", "SQL DDL receipt status distinguishes unknown admission", "initial foreign-key create distinguishes unknown admission from accepted work", "primary key schema lowering rejects deferred timing and empty keys", "relational primary keys cannot defer enforcement" },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-sql-rewrite-receipt-test", "Run SQL rewrite receipt and unknown-admission response regression")
         .dependOn(&addFilteredTestRunArtifact(b, sql_rewrite_receipt_tests).step);
+    const sql_primary_key_rewrite_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api_sql_primary_key_rewrite_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configureConsumer(b, sql_primary_key_rewrite_test_mod);
+    @import("storage.zig").configureLmdb(b, sql_primary_key_rewrite_test_mod, options.lmdb_engine, true);
+    sql_primary_key_rewrite_test_mod.addImport("antfly_admin_openapi", antfly_imports.admin_openapi);
+    sql_primary_key_rewrite_test_mod.addImport("antfly_internal_openapi", antfly_imports.internal_openapi);
+    sql_primary_key_rewrite_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const pk_usermgr_storage = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pk_usermgr_storage.addImport("antfly_root", sql_primary_key_rewrite_test_mod);
+    pk_usermgr_storage.addImport("antfly_platform", antfly_imports.platform);
+    sql_primary_key_rewrite_test_mod.addImport("usermgr_storage", pk_usermgr_storage);
+    const sql_primary_key_rewrite_tests = b.addTest(.{
+        .root_module = sql_primary_key_rewrite_test_mod,
+        .filters = &.{"mounted SQL ADD PRIMARY KEY validates existing rows before publication"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-sql-primary-key-rewrite-test", "Run mounted SQL primary-key rewrite regression")
+        .dependOn(&addFilteredTestRunArtifact(b, sql_primary_key_rewrite_tests).step);
+    const hosted_initial_fk_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api_hosted_initial_fk_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configureConsumer(b, hosted_initial_fk_test_mod);
+    @import("storage.zig").configureLmdb(b, hosted_initial_fk_test_mod, options.lmdb_engine, true);
+    hosted_initial_fk_test_mod.addImport("antfly_admin_openapi", antfly_imports.admin_openapi);
+    hosted_initial_fk_test_mod.addImport("antfly_internal_openapi", antfly_imports.internal_openapi);
+    hosted_initial_fk_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const hosted_fk_usermgr_storage = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    hosted_fk_usermgr_storage.addImport("antfly_root", hosted_initial_fk_test_mod);
+    hosted_fk_usermgr_storage.addImport("antfly_platform", antfly_imports.platform);
+    hosted_initial_fk_test_mod.addImport("usermgr_storage", hosted_fk_usermgr_storage);
+    const hosted_initial_fk_tests = b.addTest(.{
+        .root_module = hosted_initial_fk_test_mod,
+        .filters = &.{ "FK plan table and range descriptors survive snapshot release", "initial FK plan waits for all external parent schema migrations", "mounted hosted FK parent owner is read-index ready" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-hosted-initial-fk-test", "Run mounted hosted initial-FK owner publication regression")
+        .dependOn(&addFilteredTestRunArtifact(b, hosted_initial_fk_tests).step);
     const lib_api_standalone_backup_restore_tests = b.addTest(.{
         .root_module = api_backup_restore_test_mod,
         .filters = &.{
@@ -2075,7 +2125,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .run_api_transactions_docid_tests = run_api_transactions_docid_tests,
         .run_api_table_writes_docid_tests = run_api_table_writes_docid_tests,
         .run_api_table_reads_docid_tests = run_api_table_reads_docid_tests,
-        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{ api_table_reads_linked_tests.executable, lib_api_distributed_query_availability_tests.executable, api_table_writes_docid_tests.executable, api_relational_topology_contract_tests.consumer.executable, api_table_writes_production_regression_tests.consumer.executable, hosted_batch_tests.consumer.executable, api_create_structural_retry_tests.consumer.executable, api_table_writes_restore_repeat_tests.consumer.executable, hosted_fk_placement_tests }) catch @panic("OOM"),
+        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{ api_table_reads_linked_tests.executable, lib_api_distributed_query_availability_tests.executable, api_table_writes_docid_tests.executable, api_relational_topology_contract_tests.consumer.executable, api_table_writes_production_regression_tests.consumer.executable, hosted_batch_tests.consumer.executable, api_create_structural_retry_tests.consumer.executable, api_table_writes_restore_repeat_tests.consumer.executable, hosted_fk_placement_tests, sql_primary_key_rewrite_tests, hosted_initial_fk_tests }) catch @panic("OOM"),
         .run_api_public_table_http_docid_tests = run_api_public_table_http_docid_tests,
         .run_raft_transition_runtime_docid_tests = run_raft_transition_runtime_docid_tests,
         .run_api_table_writes_production_regression_unit_tests = run_api_table_writes_production_regression_unit_tests,

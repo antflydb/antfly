@@ -22,6 +22,11 @@ const metadata_incarnation = @import("../incarnation.zig");
 const metadata_table_manager = @import("../table_manager.zig");
 const topology_protocol = @import("../topology_protocol.zig");
 
+/// Result of an aborting owner-side initial-FK admission transaction. Keep
+/// expected CAS conflicts out of generic storage error statuses so the
+/// storage-free control process can return a definite non-admission result.
+pub const InitialFkPreflight = enum { ready, generation_changed, catalog_exists, table_transition_active };
+
 pub const AppliedMetadataCheckpoint = struct {
     commit_index: u64,
     input_kind: enum(u8) { committed_entries = 0, snapshot = 1 },

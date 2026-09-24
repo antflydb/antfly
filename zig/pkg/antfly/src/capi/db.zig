@@ -4451,6 +4451,19 @@ pub fn metadataApplyStoreProjection(
     const handle = asMetadataApplyStore(store_ptr) orelse return .invalid_argument;
     const alloc = handle.alloc;
     return switch (request.kind) {
+        .fk_initial_create_preflight => blk: {
+            if (request.key.len == 0 or request.key.len > 2 * 1024 * 1024) break :blk .invalid_argument;
+            const result: antfly.capi_dependencies.metadata_storage_raft_apply_contract.InitialFkPreflight = result: {
+                handle.store.preflightFkInitialCreateCommand(request.group_id, request.key.slice()) catch |err| break :result switch (err) {
+                    error.GenerationPublicationChanged => .generation_changed,
+                    error.CatalogAlreadyExists => .catalog_exists,
+                    error.TableTransitionActive => .table_transition_active,
+                    else => break :blk storageOwnerStatusFromError(err),
+                };
+                break :result .ready;
+            };
+            break :blk metadataProjectionJson(alloc, out_json, result);
+        },
         .flush_ha_outbox => blk: {
             handle.store.flushHAOutbox() catch |err| break :blk storageOwnerStatusFromError(err);
             break :blk metadataProjectionJson(alloc, out_json, true);

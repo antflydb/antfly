@@ -458,6 +458,19 @@ pub const RaftApplyStore = struct {
     pub fn fkInitialCreatePrepareJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: fk_generation_publication.InitialCreatePrepareRequest) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .fk_initial_create_prepare = request });
     }
+    pub fn preflightFkInitialCreateCommand(self: *RaftApplyStore, group_id: u64, bytes: []const u8) !void {
+        const result = try self.projection(contract.InitialFkPreflight, .{
+            .kind = .fk_initial_create_preflight,
+            .group_id = group_id,
+            .key = .fromSlice(bytes),
+        });
+        return switch (result) {
+            .ready => {},
+            .generation_changed => error.GenerationPublicationChanged,
+            .catalog_exists => error.CatalogAlreadyExists,
+            .table_transition_active => error.TableTransitionActive,
+        };
+    }
     pub fn fkInitialChildDecisionJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: fk_generation_publication.InitialChildDecisionRequest) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .fk_initial_child_decision = request });
     }

@@ -3276,6 +3276,8 @@ test "split data runtime registers a store with metadata" {
 
 test "hosted relational parent placement opens a real Raft owner" {
     const alloc = std.testing.allocator;
+    const trusted_secret = "hosted-fk-setting-authority-secret";
+    const trusted_issuer = "hosted-fk-test";
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const metadata_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/hosted-parent-metadata", .{tmp.sub_path});
@@ -3298,7 +3300,10 @@ test "hosted relational parent placement opens a real Raft owner" {
         .metadata_group_id = 2113,
         .replica_root_dir = metadata_root,
         .replica_catalog_path = catalog_path,
-    } }, .{ .host = .{ .host = .{ .descriptor_factory = factory.iface() } } }, .{});
+    } }, .{ .host = .{ .host = .{ .descriptor_factory = factory.iface() } } }, .{
+        .setting_authority_secret = trusted_secret,
+        .setting_authority_issuer = trusted_issuer,
+    });
     defer svc.deinit();
     _ = try svc.ensureMetadataReplica(.{ .group_id = 2113, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .empty });
     try svc.campaignMetadataGroup();
@@ -3306,11 +3311,17 @@ test "hosted relational parent placement opens a real Raft owner" {
 
     var metadata_server: metadata_http_server.MetadataHttpServer = undefined;
     var metadata_listener: metadata_http_test_runtime.Runtime = undefined;
-    const metadata_api = try startMetadataAdminListener(alloc, &svc, &metadata_server, &metadata_listener);
+    metadata_server = metadata_http_server.MetadataHttpServer.init(alloc, .{
+        .setting_authority_secret = trusted_secret,
+        .setting_authority_issuer = trusted_issuer,
+    }, metadata_http_server.AdminSource.fromMetadataService(&svc));
+    metadata_listener = try metadata_http_test_runtime.Runtime.startOwned(alloc, &metadata_server);
+    const metadata_api = try metadata_listener.baseUri(alloc);
     defer stopMetadataAdminListener(alloc, metadata_api, &metadata_server, &metadata_listener);
     var data_server = try data_runtime.DataServer.initFromMetadataApiUrl(alloc, .{
         .replica_root_dir = data_root,
         .store_registration = .{ .node_id = 9, .store_id = 9, .role = "data", .failure_domain = "rack-a" },
+        .api_server_cfg = .{ .trusted_principal_secret = trusted_secret, .trusted_principal_issuer = trusted_issuer },
     }, metadata_api);
     defer data_server.deinit();
     try data_server.start();
@@ -3320,6 +3331,14 @@ test "hosted relational parent placement opens a real Raft owner" {
     defer executor.deinit();
     const transport = executor.executor();
     var metadata_client = metadata_http_client.MetadataHttpClient.init(alloc, transport);
+    const now: i64 = @intCast(@divFloor(platform.time.realtimeNs(), std.time.ns_per_s));
+    const claims = try std.fmt.allocPrint(alloc,
+        \\{{"iss":"{s}","sub":"user:hosted-fk-admin","tenant":"test","admin":true,"iat":{d},"exp":{d}}}
+    , .{ trusted_issuer, now, now + 3600 });
+    defer alloc.free(claims);
+    const trusted_token = try public_test_helpers.encodeTrustedPrincipalToken(alloc, trusted_secret, claims);
+    defer alloc.free(trusted_token);
+    const trusted_headers = [_]http_common.RequestHeader{.{ .name = http_server.trusted_principal_header, .value = trusted_token }};
 
     // The split runtime is deterministic: start() schedules registration,
     // while this production lane and metadata Raft rounds commit it.
@@ -3340,7 +3359,7 @@ test "hosted relational parent placement opens a real Raft owner" {
     const parent_body =
         \\{"num_shards":1,"schema":{"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"parent_key","columns":["a","b"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"integer"}},"required":["a","b"],"additionalProperties":false}}}}}
     ;
-    var created = try transport.execute(alloc, .{ .method = .POST, .uri = parent_uri, .content_type = "application/json", .body = parent_body });
+    var created = try transport.execute(alloc, .{ .method = .POST, .uri = parent_uri, .headers = &trusted_headers, .content_type = "application/json", .body = parent_body });
     defer created.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), created.status);
 

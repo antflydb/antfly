@@ -251,6 +251,19 @@ test "SQL DDL receipt status distinguishes unknown admission" {
     try std.testing.expectEqual(@as(u16, 409), AntflyApiHandler.sqlDdlReceiptHttpStatus(.admission_unknown));
 }
 
+test "initial foreign-key create distinguishes unknown admission from accepted work" {
+    const base: http_server_mod.ApiHttpServer.FkInitialCreateBegin = .{
+        .plan_id = @splat(0),
+        .catalog_id = 1,
+        .child_table_id = 2,
+        .state = .pending,
+    };
+    try std.testing.expectEqual(@as(u16, 202), AntflyApiHandler.fkInitialCreateHttpStatus(base));
+    var uncertain = base;
+    uncertain.state = .admission_unknown;
+    try std.testing.expectEqual(@as(u16, 409), AntflyApiHandler.fkInitialCreateHttpStatus(uncertain));
+}
+
 test "gzip request bodies are decoded with an expanded-size limit" {
     const encoded = [_]u8{ 31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 171, 174, 5, 0, 67, 191, 166, 163, 2, 0, 0, 0 };
     var decoded = try gunzipRequestBodyAlloc(null, std.testing.allocator, &encoded, 2);
@@ -5432,6 +5445,10 @@ pub const AntflyApiHandler = struct {
         };
     }
 
+    fn fkInitialCreateHttpStatus(accepted: http_server_mod.ApiHttpServer.FkInitialCreateBegin) u16 {
+        return if (accepted.state == .admission_unknown) 409 else 202;
+    }
+
     pub fn globalQuery(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
@@ -6498,6 +6515,8 @@ pub const AntflyApiHandler = struct {
                 error.CatalogGenerationChanged,
                 error.TableGenerationChanged,
                 => return jsonErrorResponse(ctx, 409, "table name or owner generation changed; refresh and retry"),
+                error.ForeignKeyParentSchemaPending => return jsonErrorResponse(ctx, 503, "parent support-index schema migration is still settling; no child CREATE was admitted, retry after parent maintenance completes"),
+                error.DeadlineExceeded => return jsonErrorResponse(ctx, 503, "initial foreign-key preparation timed out; no child CREATE was admitted, retry after parent maintenance completes"),
                 error.MetadataCapabilityUnavailable, error.UnsupportedOperation => return jsonErrorResponse(ctx, 409, "coordinated initial foreign key publication is unavailable on this deployment"),
                 else => return witnessDDLError(ctx, err),
             };
@@ -6537,7 +6556,7 @@ pub const AntflyApiHandler = struct {
                 error.MetadataCapabilityUnavailable, error.UnsupportedOperation => return jsonErrorResponse(ctx, 409, "coordinated initial foreign key publication is unavailable on this deployment"),
                 else => return witnessDDLError(ctx, err),
             };
-            return jsonResponse(ctx, 202, if (accepted.state == .admission_unknown) unknown_response else pending_response);
+            return jsonResponse(ctx, fkInitialCreateHttpStatus(accepted), if (accepted.state == .admission_unknown) unknown_response else pending_response);
         }
         std.log.info("public create table begin table={s}", .{decoded_table_name});
         const metadata_create_start_ns = platform_time.monotonicNs();

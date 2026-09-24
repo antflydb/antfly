@@ -12,9 +12,27 @@ const publication = @import("../metadata/fk_generation_publication.zig");
 const topology = @import("../storage/db/relational_integrity_topology_contract.zig");
 const tables = @import("tables.zig");
 
+/// The returned publication plan belongs to the caller's request arena, not
+/// to the short-lived metadata snapshot used to derive it.
+pub fn ownedTableForPlan(alloc: std.mem.Allocator, table: records.TableRecord) !records.TableRecord {
+    return metadata.cloneTable(alloc, table);
+}
+
 pub fn rangesFor(alloc: std.mem.Allocator, snapshot: @import("../metadata/api.zig").AdminSnapshot, table_id: u64) ![]records.RangeRecord {
     var selected: std.ArrayList(records.RangeRecord) = .empty;
-    for (snapshot.ranges) |range| if (range.table_id == table_id) try selected.append(alloc, range);
+    errdefer {
+        for (selected.items) |range| metadata.freeRange(alloc, range);
+        selected.deinit(alloc);
+    }
+    // Publication plans outlive the linearizable snapshot. Preserve every
+    // range-owned field, not only the routing key used by ownerFences.
+    for (snapshot.ranges) |range| if (range.table_id == table_id) {
+        const owned = try metadata.cloneRange(alloc, range);
+        selected.append(alloc, owned) catch |err| {
+            metadata.freeRange(alloc, owned);
+            return err;
+        };
+    };
     if (selected.items.len == 0 or selected.items.len > publication.max_owners) return error.InvalidGenerationPublication;
     metadata.sortKeyspaceRanges(records.RangeRecord, selected.items);
     try metadata.validateCompleteKeyspaceRanges(selected.items);
@@ -101,7 +119,7 @@ pub fn build(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, contex
                 try server_mod.resolveEffectiveRowFilterJson(alloc, identity, names[0]) != null) return error.Forbidden;
             const parent_ranges = try rangesFor(alloc, snapshot, parent_table.table_id);
             try parents.append(alloc, .{
-                .table = parent_table,
+                .table = try ownedTableForPlan(alloc, parent_table),
                 .ranges = parent_ranges,
                 .fences = try ownerFences(server, alloc, context, id, parent_table, parent_ranges, .child_generation_parent),
                 .transitions = &.{},
@@ -130,7 +148,7 @@ pub fn build(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, contex
     }
     const result: publication.Plan = .{
         .id = id,
-        .child_before = current,
+        .child_before = try ownedTableForPlan(alloc, current),
         .child_after = after,
         .child_catalog_before_b64 = catalog_b64,
         .child_ranges = child_ranges,
@@ -139,4 +157,46 @@ pub fn build(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, contex
     };
     try result.validate(alloc);
     return result;
+}
+
+test "FK plan table and range descriptors survive snapshot release" {
+    const alloc = std.testing.allocator;
+    const source_table = try metadata.cloneTable(alloc, .{
+        .table_id = 7,
+        .name = "parent",
+        .schema_json = "{\"version\":1}",
+        .indexes_json = "{\"parent_key\":{}}",
+    });
+    const owned_table = try ownedTableForPlan(alloc, source_table);
+    defer metadata.freeTable(alloc, owned_table);
+    metadata.freeTable(alloc, source_table);
+    try std.testing.expectEqualStrings("parent", owned_table.name);
+    try std.testing.expectEqualStrings("{\"version\":1}", owned_table.schema_json);
+    try std.testing.expectEqualStrings("{\"parent_key\":{}}", owned_table.indexes_json);
+
+    const source_range = try metadata.cloneRange(alloc, .{
+        .group_id = 91,
+        .range_id = 91,
+        .table_id = 7,
+        .start_key = "",
+        .restore_backup_id = "snapshot-backup",
+    });
+    var snapshot_ranges = [_]records.RangeRecord{source_range};
+    const snapshot: @import("../metadata/api.zig").AdminSnapshot = .{
+        .status = undefined,
+        .tables = &.{},
+        .ranges = &snapshot_ranges,
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+    };
+    const owned = try rangesFor(alloc, snapshot, 7);
+    defer {
+        for (owned) |range| metadata.freeRange(alloc, range);
+        alloc.free(owned);
+    }
+    metadata.freeRange(alloc, source_range);
+    try std.testing.expectEqualStrings("snapshot-backup", owned[0].restore_backup_id);
+    try std.testing.expectEqual(@as(u64, 91), owned[0].group_id);
 }

@@ -185,6 +185,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         test_imports.configure(b, test_mod.*, true, true);
         test_mod.*.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     }
+    const initial_fk_admission_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[metadata_unit_baseline_mods.len - 1],
+        .filters = &.{ "initial self FK reserves one hidden child owner", "FK generation publication initial create reserves hidden identity" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-metadata-initial-fk-admission-test", "Run initial-FK preflight and stale-begin metadata fault regressions")
+        .dependOn(&addFilteredTestRunArtifact(b, initial_fk_admission_tests).step);
 
     const store_observer_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[2],
@@ -452,6 +459,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-relational-index-system-test", "Run LSM index lifecycle, standby replay, and work-count benchmarks").dependOn(&addCuratedTestRunArtifact(b, relational_index_system_tests, relational_index_system_tests.filters).step);
+    const sql_pk_transform_tests = b.addTest(.{
+        .root_module = relational_index_system_mod,
+        .filters = &.{"SQL primary-key rewrite retains a present key across nullable-to-required row mapping"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-sql-primary-key-transform-test", "Run focused SQL primary-key native row-transform regression")
+        .dependOn(&addFilteredTestRunArtifact(b, sql_pk_transform_tests).step);
     const api_restore_jobs_tests = b.addTest(.{
         .root_module = api_restore_jobs_test_mod,
         .filters = &.{

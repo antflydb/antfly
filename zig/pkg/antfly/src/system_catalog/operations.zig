@@ -301,6 +301,11 @@ pub fn mutateFkInitialCreate(svc: anytype, alloc: std.mem.Allocator, context: op
     const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
     defer alloc.free(bytes);
     if (bytes.len > fk_publication.max_bytes) return error.CatalogCommandTooLarge;
+    // A rejected begin must never become a failing Raft apply entry. Keep
+    // the mutation lock across this exact aborting-txn preflight and proposal;
+    // a competing metadata leader may still win, in which case committed
+    // stale begin entries are deterministic no-ops at apply.
+    try store.preflightFkInitialCreateCommand(svc.metadata_group_id, bytes);
     try context.ensureActive();
     const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_fk_initial_create = bytes });
     svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;

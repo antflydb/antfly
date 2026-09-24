@@ -515,6 +515,8 @@ pub const MetadataProjectionKind = enum(u32) {
     verify_table_create_projection = 39,
     system_catalog = 41,
     backup_cohort = 63,
+    /// Abort-only validation of a proposed initial-FK Raft command.
+    fk_initial_create_preflight = 64,
     backup_cohort_progress = 43,
     backup_cohorts = 44,
     restore_staging_job = 45,
