@@ -2,10 +2,12 @@ package sdk
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -139,6 +141,103 @@ func TestReadRetriesKeepOriginalBodyTimeout(t *testing.T) {
 	}
 }
 
+func TestReadRetriesForwardOnlyRemainingBodyTimeout(t *testing.T) {
+	original := "{\"large\": 12345678901234567890123456789, \"nested\": {\"timeout_ms\": 999}, \"timeout_ms\": 300 }\n" +
+		"{\"timeout_ms\":120,\"other\":1.0000}\n"
+	var requests []string
+	var deadlines []time.Time
+	transport, _ := NewReadRetryTransport(admissionRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(req.Body)
+		_ = req.Body.Close()
+		if req.ContentLength != int64(len(body)) {
+			t.Fatalf("stale content length: %d for %d bytes", req.ContentLength, len(body))
+		}
+		requests = append(requests, string(body))
+		deadline, ok := req.Context().Deadline()
+		if !ok {
+			t.Fatal("missing original deadline")
+		}
+		deadlines = append(deadlines, deadline)
+		if len(requests) == 1 {
+			return retryResponse(429, rejectedQuery), nil
+		}
+		return retryResponse(200, "ok"), nil
+	}), ReadRetryPolicy{MaxAttempts: 2, MaxElapsed: time.Second, InitialBackoff: 30 * time.Millisecond, MaxBackoff: 30 * time.Millisecond})
+	req, _ := http.NewRequest(http.MethodPost, "http://test/db/v1/query", strings.NewReader(original))
+	req.Header.Set("Content-Type", "application/x-ndjson")
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if len(requests) != 2 || requests[0] != original || !deadlines[0].Equal(deadlines[1]) {
+		t.Fatalf("requests=%q deadlines=%v", requests, deadlines)
+	}
+	lines := strings.Split(strings.TrimSpace(requests[1]), "\n")
+	if len(lines) != 2 || !strings.Contains(lines[0], `"large": 12345678901234567890123456789, "nested": {"timeout_ms": 999}`) ||
+		!strings.Contains(lines[1], `,"other":1.0000}`) {
+		t.Fatalf("unrelated JSON bytes changed: %q", requests[1])
+	}
+	var first, second map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &first); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(lines[1]), &second); err != nil {
+		t.Fatal(err)
+	}
+	firstTimeout := first["timeout_ms"].(float64)
+	secondTimeout := second["timeout_ms"].(float64)
+	if firstTimeout != secondTimeout || firstTimeout <= 0 || firstTimeout >= 110 {
+		t.Fatalf("remaining timeout not forwarded: %v %v", firstTimeout, secondTimeout)
+	}
+}
+
+func TestReadRetriesDoNotRewriteNonQueryWrites(t *testing.T) {
+	original := `{"timeout_ms":120,"large":12345678901234567890123456789}`
+	calls := 0
+	transport, _ := NewReadRetryTransport(admissionRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		body, _ := io.ReadAll(req.Body)
+		_ = req.Body.Close()
+		if string(body) != original {
+			t.Fatalf("write body changed: %s", body)
+		}
+		return retryResponse(429, rejectedQuery), nil
+	}), retryPolicy())
+	req, _ := http.NewRequest(http.MethodPost, "http://test/db/v1/tables/docs/batch", strings.NewReader(original))
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if calls != 1 {
+		t.Fatalf("write retried %d times", calls)
+	}
+}
+
+func TestReadRetriesLeaveAmbiguousDuplicateTimeoutBodyUnchanged(t *testing.T) {
+	original := `{"timeout_ms":120,"timeout_ms":20}`
+	calls := 0
+	transport, _ := NewReadRetryTransport(admissionRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		body, _ := io.ReadAll(req.Body)
+		_ = req.Body.Close()
+		if string(body) != original {
+			t.Fatalf("ambiguous body changed: %s", body)
+		}
+		return retryResponse(429, rejectedQuery), nil
+	}), retryPolicy())
+	req, _ := http.NewRequest(http.MethodPost, "http://test/db/v1/query", strings.NewReader(original))
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if calls != 1 {
+		t.Fatalf("ambiguous query retried %d times", calls)
+	}
+}
+
 func TestReadRetriesPreserveOversizedAndUnknownLengthErrors(t *testing.T) {
 	for _, length := range []int64{-1, 5} {
 		calls := 0
@@ -187,4 +286,89 @@ func TestReadRetriesBoundAttemptsAndCallerDeadline(t *testing.T) {
 	if calls > 1 {
 		t.Fatalf("deadline extended; calls=%d err=%v", calls, err)
 	}
+}
+
+type delayedQueryBody struct {
+	first  bool
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (b *delayedQueryBody) Read(p []byte) (int, error) {
+	if !b.first {
+		b.first = true
+		return copy(p, "first"), nil
+	}
+	<-b.closed
+	// Simulate a transport that returns data after cancellation.
+	return copy(p, "late"), nil
+}
+
+func (b *delayedQueryBody) Close() error {
+	b.once.Do(func() { close(b.closed) })
+	return nil
+}
+
+func TestReadRetriesDeadlineClosesSuccessfulStreamAndRejectsLateBytes(t *testing.T) {
+	body := &delayedQueryBody{closed: make(chan struct{})}
+	pool, _ := newAdmissionTransport(admissionRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: body}, nil
+	}), ClientAdmission{MaxInFlight: 1})
+	transport, _ := NewReadRetryTransport(pool, retryPolicy())
+	req, _ := http.NewRequest(http.MethodPost, "http://test/db/v1/query", strings.NewReader(`{"timeout_ms":40}`))
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	buffer := make([]byte, 16)
+	if n, err := response.Body.Read(buffer); err != nil || string(buffer[:n]) != "first" {
+		t.Fatalf("first chunk: %q, %v", buffer[:n], err)
+	}
+	if len(pool.active) != 1 {
+		t.Fatal("stream did not retain admission")
+	}
+	result := make(chan error, 1)
+	go func() {
+		n, err := response.Body.Read(buffer)
+		if n != 0 {
+			result <- errors.New("late bytes escaped deadline")
+			return
+		}
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("read error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("deadline did not close blocked response")
+	}
+	if len(pool.active) != 0 {
+		t.Fatal("deadline did not release admission")
+	}
+}
+
+func TestReadRetriesDiscardLateSuccessfulHeaders(t *testing.T) {
+	calls := 0
+	closed := false
+	transport, _ := NewReadRetryTransport(admissionRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		<-req.Context().Done()
+		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: &closeTrackingBody{closed: &closed}}, nil
+	}), retryPolicy())
+	req, _ := http.NewRequest(http.MethodPost, "http://test/db/v1/query", strings.NewReader(`{"timeout_ms":20}`))
+	response, err := transport.RoundTrip(req)
+	if response != nil || !errors.Is(err, context.DeadlineExceeded) || !closed || calls != 1 {
+		t.Fatalf("response=%v err=%v closed=%v calls=%d", response, err, closed, calls)
+	}
+}
+
+type closeTrackingBody struct{ closed *bool }
+
+func (b *closeTrackingBody) Read([]byte) (int, error) { return 0, io.EOF }
+func (b *closeTrackingBody) Close() error {
+	*b.closed = true
+	return nil
 }

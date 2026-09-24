@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -47,49 +48,164 @@ func NewReadRetryTransport(base http.RoundTripper, policy ReadRetryPolicy) (http
 
 var retryQueryPath = regexp.MustCompile(`^/db/v1/(query|tables/[^/]+/query|databases/[^/]+/namespaces/[^/]+/tables/[^/]+/query)$`)
 
+type timeoutSpan struct{ start, end int }
+
+func skipJSONSpace(data []byte, position int) int {
+	for position < len(data) && (data[position] == ' ' || data[position] == '\t' || data[position] == '\r' || data[position] == '\n') {
+		position++
+	}
+	return position
+}
+
+func jsonStringEnd(data []byte, position int) int {
+	position++
+	for position < len(data) {
+		if data[position] == '\\' {
+			position += 2
+		} else if data[position] == '"' {
+			return position + 1
+		} else {
+			position++
+		}
+	}
+	return len(data)
+}
+
+// The line is fully validated before this scan. Locate only top-level values;
+// nested fields and the spelling of all other bytes remain untouched.
+func jsonValueEnd(data []byte, position int) int {
+	depth := 0
+	inString := false
+	for position < len(data) {
+		switch data[position] {
+		case '"':
+			inString = !inString
+		case '\\':
+			if inString {
+				position++
+			}
+		case '{', '[':
+			if !inString {
+				depth++
+			}
+		case '}', ']':
+			if !inString {
+				if depth == 0 {
+					return position
+				}
+				depth--
+			}
+		case ',':
+			if !inString && depth == 0 {
+				return position
+			}
+		}
+		position++
+	}
+	return position
+}
+
+func queryLineTimeouts(line []byte, offset int, maximum *time.Duration, spans *[]timeoutSpan) bool {
+	var object map[string]json.RawMessage
+	if json.Unmarshal(line, &object) != nil || object == nil {
+		return false
+	}
+	position := skipJSONSpace(line, 0) + 1
+	seen := make(map[string]bool)
+	for {
+		position = skipJSONSpace(line, position)
+		if line[position] == '}' {
+			return true
+		}
+		end := jsonStringEnd(line, position)
+		var key string
+		if json.Unmarshal(line[position:end], &key) != nil || seen[key] {
+			return false
+		}
+		seen[key] = true
+		position = skipJSONSpace(line, end)
+		position = skipJSONSpace(line, position+1) // colon
+		start := position
+		position = jsonValueEnd(line, position)
+		if key == "timeout_ms" {
+			valueEnd := position
+			for valueEnd > start && (line[valueEnd-1] == ' ' || line[valueEnd-1] == '\t' || line[valueEnd-1] == '\r' || line[valueEnd-1] == '\n') {
+				valueEnd--
+			}
+			value := line[start:valueEnd]
+			if !bytes.Equal(value, []byte("null")) {
+				var milliseconds uint64
+				if !bytes.Equal(value, []byte("-0")) && json.Unmarshal(value, &milliseconds) != nil {
+					return false
+				}
+				if milliseconds <= uint64(*maximum/time.Millisecond) {
+					*maximum = min(*maximum, time.Duration(milliseconds)*time.Millisecond)
+				}
+				*spans = append(*spans, timeoutSpan{offset + start, offset + valueEnd})
+			}
+		}
+		position = skipJSONSpace(line, position)
+		if line[position] == '}' {
+			return true
+		}
+		position++ // comma
+	}
+}
+
 // Inspect a bounded replay copy without changing caller bytes. Invalid or large
 // bodies bypass retries rather than guessing their timeout/serialization contract.
 func queryRetryBudget(req *http.Request, maximum time.Duration) (time.Duration, bool) {
+	budget, _, _, valid := queryRetryPlan(req, maximum)
+	return budget, valid
+}
+
+func queryRetryPlan(req *http.Request, maximum time.Duration) (time.Duration, []timeoutSpan, []byte, bool) {
 	if req.Body == nil || req.GetBody == nil {
-		return maximum, false
+		return maximum, nil, nil, false
 	}
 	copy, err := req.GetBody()
 	if err != nil {
-		return maximum, false
+		return maximum, nil, nil, false
 	}
 	defer copy.Close()
 	body, err := io.ReadAll(io.LimitReader(copy, (1<<20)+1))
 	if err != nil || len(body) > 1<<20 {
-		return maximum, false
+		return maximum, nil, nil, false
 	}
-	lines := [][]byte{body}
-	if strings.EqualFold(strings.TrimSpace(strings.Split(req.Header.Get("Content-Type"), ";")[0]), "application/x-ndjson") {
-		lines = bytes.Split(body, []byte{'\n'})
-	}
+	ndjson := strings.EqualFold(strings.TrimSpace(strings.Split(req.Header.Get("Content-Type"), ";")[0]), "application/x-ndjson")
+	spans := []timeoutSpan{}
 	seen := false
-	for _, line := range lines {
+	for offset := 0; offset < len(body); {
+		end := len(body)
+		if ndjson {
+			if newline := bytes.IndexByte(body[offset:], '\n'); newline >= 0 {
+				end = offset + newline + 1
+			}
+		}
+		line := body[offset:end]
 		if len(bytes.TrimSpace(line)) == 0 {
+			offset = end
 			continue
 		}
-		var object map[string]json.RawMessage
-		if json.Unmarshal(line, &object) != nil || object == nil {
-			return maximum, false
+		if !queryLineTimeouts(line, offset, &maximum, &spans) {
+			return maximum, nil, nil, false
 		}
 		seen = true
-		value, found := object["timeout_ms"]
-		if !found || string(value) == "null" {
-			continue
-		}
-		var milliseconds uint64
-		if string(value) != "-0" && json.Unmarshal(value, &milliseconds) != nil {
-			return maximum, false
-		}
-		// Comparing before conversion avoids Duration overflow for valid u64 values.
-		if milliseconds <= uint64(maximum/time.Millisecond) {
-			maximum = min(maximum, time.Duration(milliseconds)*time.Millisecond)
-		}
+		offset = end
 	}
-	return maximum, seen
+	return maximum, spans, body, seen
+}
+
+func remainingQueryBody(body []byte, spans []timeoutSpan, deadline time.Time) []byte {
+	remaining := max(0, time.Until(deadline)/time.Millisecond)
+	result := make([]byte, 0, len(body)+len(spans)*20)
+	position := 0
+	for _, span := range spans {
+		result = append(result, body[position:span.start]...)
+		result = strconv.AppendInt(result, int64(remaining), 10)
+		position = span.end
+	}
+	return append(result, body[position:]...)
 }
 
 func (t *readRetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -97,7 +213,7 @@ func (t *readRetryTransport) RoundTrip(req *http.Request) (*http.Response, error
 		return t.base.RoundTrip(req)
 	}
 	started := time.Now()
-	budget, recognized := queryRetryBudget(req, t.policy.MaxElapsed)
+	budget, spans, originalBody, recognized := queryRetryPlan(req, t.policy.MaxElapsed)
 	if !recognized {
 		return t.base.RoundTrip(req)
 	}
@@ -111,14 +227,24 @@ func (t *readRetryTransport) RoundTrip(req *http.Request) (*http.Response, error
 		}
 		response, err := t.base.RoundTrip(current)
 		if err != nil {
+			if response != nil && response.Body != nil {
+				_ = response.Body.Close()
+			}
 			cancel()
 			return response, err
+		}
+		if err := ctx.Err(); err != nil {
+			if response.Body != nil {
+				_ = response.Body.Close()
+			}
+			cancel()
+			return nil, err
 		}
 		finish := func() (*http.Response, error) {
 			if response.Body == nil {
 				cancel()
 			} else {
-				response.Body = &admissionBody{ReadCloser: response.Body, release: cancel}
+				response.Body = newDeadlineBody(response.Body, ctx, cancel)
 			}
 			return response, nil
 		}
@@ -166,11 +292,11 @@ func (t *readRetryTransport) RoundTrip(req *http.Request) (*http.Response, error
 		}
 		current = req.Clone(ctx)
 		if req.Body != nil {
-			current.Body, err = req.GetBody()
-			if err != nil {
-				cancel()
-				return nil, err
-			}
+			replay := remainingQueryBody(originalBody, spans, end)
+			current.Body = io.NopCloser(bytes.NewReader(replay))
+			current.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(replay)), nil }
+			current.ContentLength = int64(len(replay))
+			current.Header.Del("Content-Length")
 		}
 	}
 }
@@ -178,6 +304,54 @@ func (t *readRetryTransport) RoundTrip(req *http.Request) (*http.Response, error
 type replayedErrorBody struct {
 	io.Reader
 	io.Closer
+}
+
+// Keep the original query deadline after RoundTrip has returned headers. A
+// custom RoundTripper may ignore request cancellation during body reads.
+type deadlineBody struct {
+	io.ReadCloser
+	ctx     context.Context
+	release context.CancelFunc
+	once    sync.Once
+	done    chan struct{}
+}
+
+func newDeadlineBody(body io.ReadCloser, ctx context.Context, release context.CancelFunc) *deadlineBody {
+	wrapped := &deadlineBody{ReadCloser: body, ctx: ctx, release: release, done: make(chan struct{})}
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = wrapped.Close()
+		case <-wrapped.done:
+		}
+	}()
+	return wrapped
+}
+
+func (b *deadlineBody) Read(p []byte) (int, error) {
+	if err := b.ctx.Err(); err != nil {
+		_ = b.Close()
+		return 0, err
+	}
+	n, err := b.ReadCloser.Read(p)
+	if expired := b.ctx.Err(); expired != nil {
+		_ = b.Close()
+		return 0, expired
+	}
+	if err != nil {
+		_ = b.Close()
+	}
+	return n, err
+}
+
+func (b *deadlineBody) Close() error {
+	var err error
+	b.once.Do(func() {
+		err = b.ReadCloser.Close()
+		b.release()
+		close(b.done)
+	})
+	return err
 }
 
 func (t *readRetryTransport) CloseIdleConnections() {
