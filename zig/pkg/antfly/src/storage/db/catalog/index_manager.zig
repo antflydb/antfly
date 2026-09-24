@@ -5769,7 +5769,7 @@ pub const IndexManager = struct {
         ) bool {
             const request = self.generated_templates[template_index];
             if (request.kind != .chunk_text) return false;
-            if (request.persist_artifact or request.full_text_index or request.consumer_indexes.len > 0) return true;
+            if (request.independently_required or request.full_text_index or request.consumer_indexes.len > 0) return true;
             for (self.chunk_dependents[template_index]) |dependent_index| {
                 const consumer = self.generated_templates[dependent_index];
                 if (!generatedEmbeddingRequired(extracted, consumer)) continue;
@@ -13714,14 +13714,14 @@ pub const IndexManager = struct {
             if (entry.chunk_name) |chunk_name| {
                 if (self.getEnrichment(.chunk, chunk_name)) |chunk_cfg| {
                     if (chunk_cfg.source_artifact_name.len == 0) {
-                        try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, true, false);
+                        try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, true, false, true);
                     }
                 }
             }
             for (entry.source_artifact_names) |artifact_name| {
                 const chunk_cfg = self.getEnrichment(.chunk, artifact_name) orelse continue;
                 if (chunk_cfg.source_artifact_name.len > 0) continue;
-                try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, true, false);
+                try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, true, false, true);
             }
         }
 
@@ -13729,7 +13729,7 @@ pub const IndexManager = struct {
             for (entry.artifact_sources) |source| {
                 const chunk_cfg = self.getEnrichment(.chunk, source.artifact_name) orelse continue;
                 if (chunk_cfg.source_artifact_name.len > 0) continue;
-                try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, false, true);
+                try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, false, true, true);
             }
         }
 
@@ -13794,21 +13794,8 @@ pub const IndexManager = struct {
                     if (embedding_cfg.expected_dims > 0 and embedding_cfg.expected_dims != entry.dims) continue;
                     if (embedding_cfg.source_artifact_name.len > 0) {
                         const chunk_cfg = self.getEnrichment(.chunk, embedding_cfg.source_artifact_name) orelse return error.InvalidIndexConfig;
-                        if (chunk_cfg.source_artifact_name.len == 0 and !hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.name)) {
-                            try requests.append(alloc, .{
-                                .kind = .chunk_text,
-                                .index_name = try alloc.dupe(u8, entry.config.name),
-                                .artifact_name = try alloc.dupe(u8, chunk_cfg.name),
-                                .doc_key = try alloc.dupe(u8, doc_key),
-                                .source_field = try alloc.dupe(u8, chunk_cfg.source_field),
-                                .source_template = if (chunk_cfg.source_template.len > 0) try alloc.dupe(u8, chunk_cfg.source_template) else "",
-                                .chunk_size = chunk_cfg.chunk_size,
-                                .chunk_overlap = chunk_cfg.chunk_overlap,
-                                .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
-                                .full_text_index = chunk_cfg.full_text_index,
-                                .execution_json = if (chunk_cfg.execution_json.len > 0) try alloc.dupe(u8, chunk_cfg.execution_json) else "",
-                            });
-                        }
+                        if (chunk_cfg.source_artifact_name.len == 0)
+                            try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, false, true, false);
                         if (!hasGeneratedDenseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, chunk_cfg.name, embedding_name)) {
                             try requests.append(alloc, .{
                                 .kind = .dense_embedding,
@@ -13912,21 +13899,8 @@ pub const IndexManager = struct {
                     if (embedding_cfg.expected_dims != 0) continue;
                     if (embedding_cfg.source_artifact_name.len > 0) {
                         const chunk_cfg = self.getEnrichment(.chunk, embedding_cfg.source_artifact_name) orelse return error.InvalidIndexConfig;
-                        if (chunk_cfg.source_artifact_name.len == 0 and !hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.name)) {
-                            try requests.append(alloc, .{
-                                .kind = .chunk_text,
-                                .index_name = try alloc.dupe(u8, entry.config.name),
-                                .artifact_name = try alloc.dupe(u8, chunk_cfg.name),
-                                .doc_key = try alloc.dupe(u8, doc_key),
-                                .source_field = try alloc.dupe(u8, chunk_cfg.source_field),
-                                .source_template = if (chunk_cfg.source_template.len > 0) try alloc.dupe(u8, chunk_cfg.source_template) else "",
-                                .chunk_size = chunk_cfg.chunk_size,
-                                .chunk_overlap = chunk_cfg.chunk_overlap,
-                                .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
-                                .full_text_index = chunk_cfg.full_text_index,
-                                .execution_json = if (chunk_cfg.execution_json.len > 0) try alloc.dupe(u8, chunk_cfg.execution_json) else "",
-                            });
-                        }
+                        if (chunk_cfg.source_artifact_name.len == 0)
+                            try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, false, true, false);
                         if (!hasGeneratedSparseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, chunk_cfg.name, embedding_name)) {
                             try requests.append(alloc, .{
                                 .kind = .sparse_embedding,
@@ -31058,6 +31032,7 @@ fn appendGeneratedChunkRequest(
     chunk_cfg: *const enrichment_catalog.EnrichmentConfig,
     full_text_index: bool,
     persist_artifact: bool,
+    independently_required: bool,
 ) !void {
     for (requests.items) |*request| {
         if (request.kind != .chunk_text) continue;
@@ -31071,6 +31046,7 @@ fn appendGeneratedChunkRequest(
         // cannot change persistence or default full-text behavior.
         request.full_text_index = request.full_text_index or full_text_index or chunk_cfg.full_text_index;
         request.persist_artifact = request.persist_artifact or persist_artifact;
+        request.independently_required = request.independently_required or independently_required;
         return;
     }
 
@@ -31086,6 +31062,7 @@ fn appendGeneratedChunkRequest(
         .chunker_json = chunk_cfg.chunker_json,
         .full_text_index = full_text_index or chunk_cfg.full_text_index,
         .persist_artifact = persist_artifact,
+        .independently_required = independently_required,
         .execution_json = chunk_cfg.execution_json,
     });
     errdefer enrichment_types.freeGeneratedRequest(alloc, request);
@@ -35051,6 +35028,7 @@ test "dense index unions multiple embedding artifact sources without overwriting
         .kind = .chunk,
         .field = "body",
         .chunk_size = 256,
+        .chunker_json = "{\"provider\":\"antfly\",\"model\":\"fixed-bert-tokenizer\",\"store_chunks\":false,\"text\":{\"target_tokens\":128}}",
     });
     try manager.addEnrichment(&store, .{
         .name = "body_dense_v1",
@@ -35075,6 +35053,9 @@ test "dense index unions multiple embedding artifact sources without overwriting
     try std.testing.expect(hasGeneratedDenseEmbeddingRequest(generated, "doc:generated", "title", "", "", "title_dense_v1"));
     try std.testing.expect(hasGeneratedChunkRequest(generated, "doc:generated", "body", "", "document_chunks_v1"));
     try std.testing.expect(hasGeneratedDenseEmbeddingRequest(generated, "doc:generated", "text", "", "document_chunks_v1", "body_dense_v1"));
+    for (generated) |request| if (request.kind == .chunk_text) {
+        try std.testing.expect(request.persist_artifact);
+    };
 
     var write_plan = try manager.acquireWritePlanSnapshot();
     defer write_plan.release();

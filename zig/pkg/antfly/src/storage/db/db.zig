@@ -46372,27 +46372,193 @@ fn appendStaleChunkArtifactDeleteKeys(
 ) !void {
     const prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "chunk", artifact_name);
     defer alloc.free(prefix);
-    const existing = try db.core.store.scanPrefixKeysPage(alloc, prefix, null, std.math.maxInt(usize));
-    defer {
-        for (existing) |key| alloc.free(key);
-        alloc.free(existing);
+    var desired = std.StringHashMapUnmanaged(void).empty;
+    defer desired.deinit(alloc);
+    for (desired_chunk_keys) |key| try desired.put(alloc, key, {});
+    var deleted = std.StringHashMapUnmanaged(void).empty;
+    defer deleted.deinit(alloc);
+    for (artifact_delete_keys.items) |key| try deleted.put(alloc, key, {});
+
+    var cursor: ?[]u8 = null;
+    defer if (cursor) |key| alloc.free(key);
+    while (true) {
+        const existing = try db.core.store.scanPrefixKeysPage(alloc, prefix, cursor, 256);
+        defer freeOwnedKeySlice(alloc, existing);
+        if (existing.len == 0) break;
+        for (existing) |entry| {
+            // A chunk producer may finish before a deferred embedding provider.
+            // Keep derived embeddings until their own consumer has successfully
+            // prepared the replacement in this commit or a later replay window.
+            if (internal_keys.isDerivedEmbeddingArtifactKey(entry) or desired.contains(entry) or deleted.contains(entry)) continue;
+            const key = try alloc.dupe(u8, entry);
+            errdefer alloc.free(key);
+            try deleted.put(alloc, key, {});
+            errdefer _ = deleted.remove(key);
+            try artifact_delete_keys.append(alloc, key);
+        }
+        const next_cursor = try alloc.dupe(u8, existing[existing.len - 1]);
+        if (cursor) |key| alloc.free(key);
+        cursor = next_cursor;
+        if (existing.len < 256) break;
+    }
+}
+
+const InlineChunkEmbeddingCleanup = struct {
+    groups: std.ArrayListUnmanaged(Group) = .empty,
+
+    const Group = struct {
+        artifact_name: []const u8,
+        embeddings: std.StringHashMapUnmanaged(std.StringHashMapUnmanaged(void)) = .empty,
+    };
+
+    fn deinit(self: *InlineChunkEmbeddingCleanup, alloc: Allocator) void {
+        for (self.groups.items) |*group| {
+            var iterator = group.embeddings.iterator();
+            while (iterator.next()) |entry| {
+                var keys = entry.value_ptr.iterator();
+                while (keys.next()) |key| alloc.free(key.key_ptr.*);
+                entry.value_ptr.deinit(alloc);
+            }
+            group.embeddings.deinit(alloc);
+        }
+        self.groups.deinit(alloc);
     }
 
-    for (existing) |entry| {
-        // A chunk producer may finish before a deferred embedding provider.
-        // Keep derived embeddings until their own consumer has successfully
-        // prepared the replacement in this commit or a later replay window.
-        if (internal_keys.isDerivedEmbeddingArtifactKey(entry)) continue;
-        if (containsKey(desired_chunk_keys, entry)) continue;
-        var already_deleted = false;
-        for (artifact_delete_keys.items) |key| {
-            if (std.mem.eql(u8, key, entry)) {
-                already_deleted = true;
+    fn add(
+        self: *InlineChunkEmbeddingCleanup,
+        alloc: Allocator,
+        db: *DB,
+        doc_value: []const u8,
+        request: enrichment_types.GeneratedEnrichmentRequest,
+        cache: *std.ArrayListUnmanaged(ChunkCacheEntry),
+    ) !void {
+        const artifact_name = requestArtifactName(request);
+        var group: *Group = undefined;
+        for (self.groups.items) |*candidate| {
+            if (std.mem.eql(u8, candidate.artifact_name, artifact_name)) {
+                group = candidate;
                 break;
             }
+        } else {
+            try self.groups.append(alloc, .{ .artifact_name = artifact_name });
+            group = &self.groups.items[self.groups.items.len - 1];
         }
-        if (!already_deleted) try artifact_delete_keys.append(alloc, try alloc.dupe(u8, entry));
+
+        const embedding_name = requestEmbeddingName(request);
+        const entry = try group.embeddings.getOrPut(alloc, embedding_name);
+        if (!entry.found_existing) entry.value_ptr.* = .empty;
+        var chunks_created: usize = 0;
+        const sources = try chunkEmbeddingSourcesForRequest(alloc, db, doc_value, request, cache, &chunks_created);
+        defer freeChunkEmbeddingSources(alloc, sources);
+        for (sources) |source| {
+            const key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, source.key, embedding_name);
+            errdefer alloc.free(key);
+            const desired_entry = try entry.value_ptr.getOrPut(alloc, key);
+            if (desired_entry.found_existing) alloc.free(key);
+        }
     }
+
+    fn flush(
+        self: *const InlineChunkEmbeddingCleanup,
+        alloc: Allocator,
+        db: *DB,
+        doc_key: []const u8,
+        artifact_delete_keys: *std.ArrayListUnmanaged([]const u8),
+    ) !void {
+        for (self.groups.items) |group| {
+            const prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "chunk", group.artifact_name);
+            defer alloc.free(prefix);
+            var cursor: ?[]u8 = null;
+            defer if (cursor) |key| alloc.free(key);
+            while (true) {
+                const existing = try db.core.store.scanPrefixKeysPage(alloc, prefix, cursor, 256);
+                defer freeOwnedKeySlice(alloc, existing);
+                if (existing.len == 0) break;
+                for (existing) |key| {
+                    if (!internal_keys.isDerivedEmbeddingArtifactKey(key)) continue;
+                    const embedding_name = (try internal_keys.artifactNameView(key)) orelse blk: {
+                        // Escaped binary names cannot be borrowed from the key.
+                        var names = group.embeddings.iterator();
+                        while (names.next()) |entry| {
+                            if (internal_keys.matchesDerivedEmbeddingArtifactName(key, entry.key_ptr.*))
+                                break :blk entry.key_ptr.*;
+                        }
+                        continue;
+                    };
+                    const desired = group.embeddings.get(embedding_name) orelse continue;
+                    if (!desired.contains(key)) try artifact_delete_keys.append(alloc, try alloc.dupe(u8, key));
+                }
+                const next_cursor = try alloc.dupe(u8, existing[existing.len - 1]);
+                if (cursor) |key| alloc.free(key);
+                cursor = next_cursor;
+                if (existing.len < 256) break;
+            }
+        }
+    }
+};
+
+test "db computeEnrichments inline chunk embedding cleanup pages across embedding names" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    var cleanup = InlineChunkEmbeddingCleanup{};
+    defer cleanup.deinit(alloc);
+    try cleanup.groups.append(alloc, .{ .artifact_name = "chunks" });
+    const group = &cleanup.groups.items[0];
+    try group.embeddings.put(alloc, "dense", .empty);
+    try group.embeddings.put(alloc, "sparse", .empty);
+
+    for (0..270) |i| {
+        const chunk_key = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:a", "chunks", @intCast(i));
+        defer alloc.free(chunk_key);
+        try db.core.store.put(chunk_key, "old chunk");
+        const key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, chunk_key, "dense");
+        defer alloc.free(key);
+        try db.core.store.put(key, "old");
+        if (i == 269) try group.embeddings.getPtr("dense").?.put(alloc, try alloc.dupe(u8, key), {});
+    }
+    const chunk_key = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:a", "chunks", 0);
+    defer alloc.free(chunk_key);
+    const sparse_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, chunk_key, "sparse");
+    defer alloc.free(sparse_key);
+    try db.core.store.put(sparse_key, "old");
+    try group.embeddings.getPtr("sparse").?.put(alloc, try alloc.dupe(u8, sparse_key), {});
+    const stale_sparse_chunk = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:a", "chunks", 1);
+    defer alloc.free(stale_sparse_chunk);
+    const stale_sparse_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, stale_sparse_chunk, "sparse");
+    defer alloc.free(stale_sparse_key);
+    try db.core.store.put(stale_sparse_key, "old");
+    const foreign_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, chunk_key, "foreign");
+    defer alloc.free(foreign_key);
+    try db.core.store.put(foreign_key, "old");
+
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (deletes.items) |key| alloc.free(key);
+        deletes.deinit(alloc);
+    }
+    try cleanup.flush(alloc, &db, "doc:a", &deletes);
+    try std.testing.expectEqual(@as(usize, 270), deletes.items.len);
+    try std.testing.expect(sliceContainsKey(deletes.items, stale_sparse_key));
+    try std.testing.expect(!sliceContainsKey(deletes.items, sparse_key));
+    try std.testing.expect(!sliceContainsKey(deletes.items, foreign_key));
+
+    const retained_chunk = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:a", "chunks", 269);
+    defer alloc.free(retained_chunk);
+    var chunk_deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (chunk_deletes.items) |key| alloc.free(key);
+        chunk_deletes.deinit(alloc);
+    }
+    try appendStaleChunkArtifactDeleteKeys(alloc, &db, "doc:a", "chunks", &.{retained_chunk}, &chunk_deletes);
+    try std.testing.expectEqual(@as(usize, 269), chunk_deletes.items.len);
+    try std.testing.expect(!sliceContainsKey(chunk_deletes.items, retained_chunk));
+    try std.testing.expect(!sliceContainsKey(chunk_deletes.items, stale_sparse_key));
 }
 
 fn appendStalePrecomputedChunkEmbeddingDeletes(
@@ -46404,6 +46570,7 @@ fn appendStalePrecomputedChunkEmbeddingDeletes(
     pending_writes: *const PendingArtifactWriteIndex,
     chunk_deletes: []const []const u8,
     artifact_delete_keys: *std.ArrayListUnmanaged([]const u8),
+    inline_cleanup: *InlineChunkEmbeddingCleanup,
 ) !void {
     if (!requestUsesChunkSource(request)) return;
 
@@ -46427,28 +46594,7 @@ fn appendStalePrecomputedChunkEmbeddingDeletes(
         return;
     }
 
-    var chunks_created: usize = 0;
-    const sources = try chunkEmbeddingSourcesForRequest(alloc, db, doc_value, request, cache, &chunks_created);
-    defer freeChunkEmbeddingSources(alloc, sources);
-    var desired = std.StringHashMapUnmanaged(void).empty;
-    defer desired.deinit(alloc);
-    for (sources) |source| try desired.put(alloc, source.key, {});
-
-    const prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "chunk", requestArtifactName(request));
-    defer alloc.free(prefix);
-    const existing = try db.core.store.scanPrefixKeysPage(alloc, prefix, null, std.math.maxInt(usize));
-    defer {
-        for (existing) |key| alloc.free(key);
-        alloc.free(existing);
-    }
-    for (existing) |key| {
-        if (!internal_keys.isDerivedEmbeddingArtifactKey(key) or
-            !internal_keys.matchesDerivedEmbeddingArtifactName(key, requestEmbeddingName(request))) continue;
-        const base_key = (try internal_keys.derivedEmbeddingBaseKeyAlloc(alloc, key)) orelse continue;
-        defer alloc.free(base_key);
-        if (desired.contains(base_key)) continue;
-        try artifact_delete_keys.append(alloc, try alloc.dupe(u8, key));
-    }
+    try inline_cleanup.add(alloc, db, doc_value, request, cache);
 }
 
 fn chunkArtifactKeysForChunksAlloc(
@@ -52657,6 +52803,8 @@ fn prepareGeneratedEnrichments(
             }
             chunk_cache.deinit(alloc);
         }
+        var inline_embedding_cleanup = InlineChunkEmbeddingCleanup{};
+        defer inline_embedding_cleanup.deinit(alloc);
 
         const document_execution: ?*enrichment_runtime_mod.PrecommitDocumentExecution = if (self.enrichment_runtime) |runtime|
             if (precompute_mode == .all and enrichment_runtime_mod.PrecommitDocumentExecution.useful(generated)) try enrichment_runtime_mod.PrecommitDocumentExecution.create(runtime, generated, (try extracted[i].logicalJson()).?) else null
@@ -52751,7 +52899,7 @@ fn prepareGeneratedEnrichments(
                         },
                         else => return err,
                     };
-                    try appendStalePrecomputedChunkEmbeddingDeletes(alloc, self, cleaned, request, &chunk_cache, &pending_writes, pending_deletes.forDoc(request.doc_key), &artifact_delete_keys);
+                    try appendStalePrecomputedChunkEmbeddingDeletes(alloc, self, cleaned, request, &chunk_cache, &pending_writes, pending_deletes.forDoc(request.doc_key), &artifact_delete_keys, &inline_embedding_cleanup);
                     try appendPrecomputedCoverageCandidate(
                         alloc,
                         &coverage_candidates,
@@ -52770,7 +52918,7 @@ fn prepareGeneratedEnrichments(
                         },
                         else => return err,
                     };
-                    try appendStalePrecomputedChunkEmbeddingDeletes(alloc, self, cleaned, request, &chunk_cache, &pending_writes, pending_deletes.forDoc(request.doc_key), &artifact_delete_keys);
+                    try appendStalePrecomputedChunkEmbeddingDeletes(alloc, self, cleaned, request, &chunk_cache, &pending_writes, pending_deletes.forDoc(request.doc_key), &artifact_delete_keys, &inline_embedding_cleanup);
                     try appendPrecomputedCoverageCandidate(
                         alloc,
                         &coverage_candidates,
@@ -52780,6 +52928,7 @@ fn prepareGeneratedEnrichments(
                 },
             }
         }
+        try inline_embedding_cleanup.flush(alloc, self, req.writes[i].key, &artifact_delete_keys);
     }
 
     try flushPrecomputeAssetProducerBatch(alloc, self, &deferred_asset_producer_items, &artifact_writes, &documents, &coverage_outcomes);
