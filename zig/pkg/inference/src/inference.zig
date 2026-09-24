@@ -113,6 +113,7 @@ pub const native_compute = struct {
 };
 
 test {
+    _ = @import("hard_cancellation_watchdog.zig");
     _ = @import("models/laya.zig");
     _ = @import("finetune/laya/graph.zig");
     _ = @import("finetune/laya/objective.zig");
