@@ -143222,6 +143222,7 @@ test "workload admission physical completion staged control BEGIN retains a pool
         try std.testing.expectEqualDeep(id, held.declaration.txn_id);
         try std.testing.expect(held.held.wal_credit > 0);
         try std.testing.expect(held.held.publication.remainingBytes() > 0);
+        try std.testing.expect(held.output_pin.path != null);
         const authority: control_record.Authority = .{
             .group_id = binding.identity.group_id,
             .incarnation = binding.identity.incarnation,
@@ -143233,6 +143234,9 @@ test "workload admission physical completion staged control BEGIN retains a pool
         defer restored.deinit();
         try std.testing.expectEqualDeep(id, restored.declaration.txn_id);
         try std.testing.expectEqual(@as(u64, 1), restored.guard.record.begin.index);
+        const output_path = try @import("../lsm_backend/repository.zig").runPath(alloc, backend.root_dir.?, restored.guard.record.output_run_id);
+        defer alloc.free(output_path);
+        try std.testing.expectEqualStrings(output_path, held.output_pin.path.?);
         lease.vtable.proposal_result(lease.context, &.{ .state = proposal.state, .first_index = 1, .last_index = 1, .payloads = proposal.proposals });
         try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.apply_accepted.?(lease.context, 1, 1, payloads[0]));
         try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try db.getTransactionStatus(id));
@@ -143354,6 +143358,7 @@ test "workload admission physical completion rejected staged BEGIN retires nativ
         var result: abi.CheckResult = undefined;
         try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.check(lease.context, &proposal, &result));
         try std.testing.expect(backend.completion_pool.?.control_owners[0] != null);
+        try std.testing.expect(backend.completion_pool.?.control_owners[0].?.output_pin.path != null);
         lease.vtable.proposal_result(lease.context, &.{ .state = proposal.state, .payloads = proposal.proposals });
         try std.testing.expect(backend.completion_pool.?.control_owners[0] == null);
         try std.testing.expect(!try control_guard.hasAny(backend.storage.?, alloc, backend.root_dir.?));

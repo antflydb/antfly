@@ -418,6 +418,7 @@ pub fn Pool(comptime Backend: type) type {
         };
         const ControlOwner = struct {
             held: *control_resources.Resources,
+            output_pin: Backend.CompletionRunPathPin,
             declaration: control_begin.Declaration,
             begin: completion.AcceptedIdentity,
         };
@@ -647,6 +648,7 @@ pub fn Pool(comptime Backend: type) type {
         pub fn destroy(self: *Self) void {
             self.releaseCells();
             for (&self.control_owners) |*owner| if (owner.*) |*active| {
+                active.output_pin.release();
                 active.held.destroy();
                 owner.* = null;
             };
@@ -785,6 +787,14 @@ pub fn Pool(comptime Backend: type) type {
                 .run_ids = self.cell_count,
                 .wal_segments = self.cell_count,
             });
+            // Prepay the run-path registry node from the retained pool domain;
+            // later publication must not allocate a new path reference.
+            const pin_alloc = self.control.allocator();
+            const output_path = try repository.runPath(pin_alloc, backend.root_dir.?, self.control_output_ids[slot]);
+            defer pin_alloc.free(output_path);
+            var output_pin = try Backend.pinCompletionRunPath(pin_alloc, output_path);
+            var pin_transferred = false;
+            errdefer if (!pin_transferred) output_pin.release();
             const manager = backend.options.resource_manager orelse return error.CompletionResourceManagerRequired;
             const held = try control_resources.Resources.create(backend.allocator, manager, &self.compiler, declaration.txn_id, .{
                 .publication_bytes = proof.owners[count].publication_bytes,
@@ -809,8 +819,9 @@ pub fn Pool(comptime Backend: type) type {
             };
             var publication = try control_guard.Publication.prepare(backend.allocator, backend.root_dir.?, .{ .record = owner_record, .envelope = envelope });
             defer publication.deinit();
-            self.control_owners[slot] = .{ .held = held, .declaration = declaration, .begin = identity };
+            self.control_owners[slot] = .{ .held = held, .output_pin = output_pin, .declaration = declaration, .begin = identity };
             transferred = true;
+            pin_transferred = true;
             publication.stage(backend.storage.?) catch |err| {
                 self.failed = true;
                 backend.fenceFailedBulkWal();
@@ -1511,6 +1522,7 @@ pub fn Pool(comptime Backend: type) type {
                     backend.fenceFailedBulkWal();
                     return err;
                 };
+                active.output_pin.release();
                 active.held.destroy();
                 owner.* = null;
                 return;
