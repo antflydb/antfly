@@ -6591,7 +6591,7 @@ test "workload admission completion installation pins owner through ordinary ret
     defer source.completion_installations.deinit(alloc);
     var record: ProvisionedKernelOwnerSource.CompletionInstallation = .{ .binding = .{}, .read_schema_json = &.{}, .settings_json = &.{}, .settings = .{}, .state = .backed, .active = true };
     try source.completion_installations.put(alloc, 7, &record);
-    var entry: ProvisionedKernelOwnerSource.Entry = .{ .group_id = 7, .table_name = @constCast("docs"), .generation = 1, .identity = .{ .table_id = 1, .range_id = 2, .shard_id = 7 }, .schema_json = &.{}, .indexes_json = &.{}, .owner = undefined };
+    var entry: ProvisionedKernelOwnerSource.Entry = .{ .group_id = 7, .table_name = @constCast("docs"), .generation = 1, .identity = .{ .table_id = 1, .range_id = 2, .shard_id = 7 }, .schema_json = &.{}, .indexes_json = &.{}, .restore_bootstrap_json = &.{}, .owner = undefined };
     try source.entries.append(alloc, &entry);
     try std.testing.expectEqual(@as(usize, 0), source.retireAll());
     try std.testing.expectEqual(@as(usize, 0), source.retireTable("docs"));
