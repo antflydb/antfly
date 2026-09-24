@@ -395,6 +395,17 @@ pub const HostedParticipantWorker = struct {
         return client;
     }
 
+    fn controlBaseUri(self: *const HostedParticipantWorker, router: table_router.HostedGroupRouter, alloc: std.mem.Allocator, group_id: u64, node_id: u64, public_uri: []const u8) ![]u8 {
+        // Route resolution already proved this public peer usable. Legacy
+        // routers and unsigned rolling peers keep that URL without a second
+        // catalog lookup. The protected listener requires signed service auth.
+        const secret = self.internal_service_secret orelse return try alloc.dupe(u8, public_uri);
+        const issuer = self.internal_service_issuer orelse return try alloc.dupe(u8, public_uri);
+        if (secret.len == 0 or issuer.len == 0 or router.vtable.node_control_base_uri_for_group == null)
+            return try alloc.dupe(u8, public_uri);
+        return (try router.nodeControlBaseUriForGroup(alloc, group_id, node_id)) orelse error.GroupLeaderUnavailable;
+    }
+
     pub fn worker(self: *HostedParticipantWorker) ParticipantWorker {
         return .{
             .ptr = self,
@@ -778,6 +789,8 @@ pub const HostedParticipantWorker = struct {
         switch (route) {
             .local => _ = (try bounded.writes.txnDecideGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.status, req.commit_version, req.topology_epoch, req.sync_level, context)) orelse return error.PreDecisionNotProposed,
             .remote => |remote| {
+                const control_uri = bounded.controlBaseUri(bounded.router, alloc, group_id, remote.node_id, remote.base_uri) catch return error.PreDecisionNotProposed;
+                defer alloc.free(control_uri);
                 const body = encodeTxnResolveRequest(alloc, req) catch return error.PreDecisionNotProposed;
                 defer alloc.free(body);
                 const budget = bounded.remainingPreDecisionAttemptBudget(deadline) catch return error.PreDecisionNotProposed;
@@ -796,7 +809,7 @@ pub const HostedParticipantWorker = struct {
                 };
                 var scope: DeadlineCancellation = .{ .context = context };
                 var cancellation = http_common.RequestCancellation.fromToken(.{ .ptr = &scope, .check_fn = DeadlineCancellation.check, .is_cancelled_fn = DeadlineCancellation.isCancelled });
-                const result = client.fetchGroupTxnDecideWithContext(remote.base_uri, group_id, table_name, body, &tracker, budget.client_timeout_ms, budget.server_budget_ms, &cancellation) catch |err| {
+                const result = client.fetchGroupTxnDecideWithContext(control_uri, group_id, table_name, body, &tracker, budget.client_timeout_ms, budget.server_budget_ms, &cancellation) catch |err| {
                     if (tracker.load() == .not_sent) return error.PreDecisionNotProposed;
                     return err;
                 };
@@ -838,6 +851,8 @@ pub const HostedParticipantWorker = struct {
                     try self.writes.txnResolveGroupLocalWithCancellation(alloc, group_id, table_name, req.txn_id, req.status, req.commit_version, req.topology_epoch, req.sync_level, operation_cancellation)) orelse return error.UnknownGroup;
             },
             .remote => |remote| {
+                const control_uri = try self.controlBaseUri(router, alloc, group_id, remote.node_id, remote.base_uri);
+                defer alloc.free(control_uri);
                 var client = self.httpClient(alloc);
                 const body = try encodeTxnResolveRequest(alloc, req);
                 defer alloc.free(body);
@@ -849,7 +864,7 @@ pub const HostedParticipantWorker = struct {
                 var request_cancellation = http_common.RequestCancellation.fromToken(operation_cancellation);
                 var response = if (deadline_ns) |deadline|
                     try client.fetchGroupTxnResolveWithControlAndTimeout(
-                        remote.base_uri,
+                        control_uri,
                         group_id,
                         table_name,
                         body,
@@ -858,7 +873,7 @@ pub const HostedParticipantWorker = struct {
                     )
                 else
                     try client.fetchGroupTxnResolveWithControl(
-                        remote.base_uri,
+                        control_uri,
                         group_id,
                         table_name,
                         body,
@@ -898,19 +913,21 @@ pub const HostedParticipantWorker = struct {
             else
                 (try self.writes.txnStatusGroupAuthoritativeLocal(alloc, group_id, table_name, txn_id)) orelse error.UnknownGroup,
             .remote => |remote| blk: {
+                const control_uri = try self.controlBaseUri(router, alloc, group_id, remote.node_id, remote.base_uri);
+                defer alloc.free(control_uri);
                 var client = self.httpClient(alloc);
                 const body = try encodeTxnStatusRequestWithScope(alloc, req);
                 defer alloc.free(body);
                 var response = if (deadline_ns) |deadline|
                     try client.fetchGroupTxnStatusWithTimeout(
-                        remote.base_uri,
+                        control_uri,
                         group_id,
                         table_name,
                         body,
                         try remainingDeadlineTimeoutMs(deadline),
                     )
                 else
-                    try client.fetchGroupTxnStatus(remote.base_uri, group_id, table_name, body);
+                    try client.fetchGroupTxnStatus(control_uri, group_id, table_name, body);
                 defer response.deinit(alloc);
                 const parsed = try parseTxnStatusResponse(alloc, response.body);
                 break :blk parsed.status;
@@ -929,11 +946,13 @@ pub const HostedParticipantWorker = struct {
         switch (route) {
             .local => _ = (try self.writes.txnAcknowledgeGroupLocalUntil(alloc, group_id, table_name, req.txn_id, req.participant, deadline_ns)) orelse return error.UnknownGroup,
             .remote => |remote| {
+                const control_uri = try self.controlBaseUri(router, alloc, group_id, remote.node_id, remote.base_uri);
+                defer alloc.free(control_uri);
                 var client = self.httpClient(alloc);
                 const body = try encodeTxnAcknowledgeRequest(alloc, req);
                 defer alloc.free(body);
                 var cancellation = http_common.RequestCancellation.fromToken(scope.token());
-                var response = try client.fetchGroupTxnAcknowledgeWithControlAndTimeout(remote.base_uri, group_id, table_name, body, try remainingDeadlineTimeoutMs(deadline_ns), &cancellation);
+                var response = try client.fetchGroupTxnAcknowledgeWithControlAndTimeout(control_uri, group_id, table_name, body, try remainingDeadlineTimeoutMs(deadline_ns), &cancellation);
                 response.deinit(alloc);
             },
         }
@@ -946,10 +965,12 @@ pub const HostedParticipantWorker = struct {
         switch (route) {
             .local => _ = (try acknowledgeGroupLocalWithRequest(self.writes, alloc, group_id, table_name, req, .none)) orelse return error.UnknownGroup,
             .remote => |remote| {
+                const control_uri = try self.controlBaseUri(self.router, alloc, group_id, remote.node_id, remote.base_uri);
+                defer alloc.free(control_uri);
                 var client = self.httpClient(alloc);
                 const body = try encodeTxnAcknowledgeRequest(alloc, req);
                 defer alloc.free(body);
-                var response = try client.fetchGroupTxnAcknowledge(remote.base_uri, group_id, table_name, body);
+                var response = try client.fetchGroupTxnAcknowledge(control_uri, group_id, table_name, body);
                 response.deinit(alloc);
             },
         }
@@ -4183,6 +4204,85 @@ fn consumerTests() type {
                 HostedParticipantWorker.default_pre_decision_attempt_timeout_ms -
                     contract.max_pre_decision_server_budget_ms,
             );
+        }
+
+        test "hosted participant transaction recovery uses internal control endpoint and authenticates requests" {
+            const Router = struct {
+                fn localNode(_: *anyopaque) u64 {
+                    return 1;
+                }
+                fn localStatus(_: *anyopaque, _: u64) @import("../raft/host.zig").HostedReplicaStatus {
+                    return .absent;
+                }
+                fn leader(_: *anyopaque, _: u64) ?u64 {
+                    return 2;
+                }
+                fn nodeStatus(_: *anyopaque, _: u64, _: u64) @import("../raft/host.zig").HostedReplicaStatus {
+                    return .active;
+                }
+                fn publicUri(_: *anyopaque, alloc: std.mem.Allocator, _: u64) !?[]u8 {
+                    return try alloc.dupe(u8, "http://public.invalid");
+                }
+                fn controlUri(_: *anyopaque, alloc: std.mem.Allocator, _: u64, _: u64, _: table_router.RouteBudget) !?[]u8 {
+                    return try alloc.dupe(u8, "http://internal.invalid");
+                }
+                fn iface(comptime with_internal: bool) table_router.HostedGroupRouter {
+                    return .{ .ptr = undefined, .vtable = if (with_internal) &.{
+                        .local_node_id = localNode,
+                        .local_status = localStatus,
+                        .group_leader_node_id = leader,
+                        .node_status = nodeStatus,
+                        .node_base_uri = publicUri,
+                        .node_control_base_uri_for_group = controlUri,
+                    } else &.{
+                        .local_node_id = localNode,
+                        .local_status = localStatus,
+                        .group_leader_node_id = leader,
+                        .node_status = nodeStatus,
+                        .node_base_uri = publicUri,
+                    } };
+                }
+            };
+            const Executor = struct {
+                expected_base: []const u8,
+                expect_auth: bool = true,
+                calls: usize = 0,
+                fn iface(self: *@This()) http_common.RequestExecutor {
+                    return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+                }
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expect(std.mem.startsWith(u8, req.uri, self.expected_base));
+                    try std.testing.expectEqual(self.expect_auth, req.header(@import("internal_service_auth.zig").header_name) != null);
+                    self.calls += 1;
+                    return .{
+                        .status = 200,
+                        .body = try alloc.dupe(u8, if (std.mem.endsWith(u8, req.uri, "/txn-status")) "{\"status\":\"committed\"}" else "{}"),
+                    };
+                }
+            };
+            const alloc = std.testing.allocator;
+            const txn_id: db_mod.types.TxnId = @splat(7);
+            const resolution: TxnResolveRequest = .{ .txn_id = txn_id, .status = .committed, .commit_version = 19 };
+            inline for (.{ true, false }) |with_internal| {
+                var executor: Executor = .{ .expected_base = if (with_internal) "http://internal.invalid" else "http://public.invalid" };
+                var worker = HostedParticipantWorker.init(undefined, Router.iface(with_internal), undefined, executor.iface());
+                _ = worker.withInternalServiceAuth("transaction-routing-secret-0123456789", "transaction-routing-test");
+                var public_route = (try table_router.resolveGroupRoute(alloc, undefined, worker.router, 77, .prefer_leader)).?;
+                defer public_route.deinit(alloc);
+                try std.testing.expectEqualStrings("http://public.invalid", public_route.remote.base_uri);
+                try HostedParticipantWorker.resolveFirstDecisionWithContext(&worker, alloc, 77, "docs", resolution, .{
+                    .deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_s,
+                });
+                try worker.worker().resolveGroup(alloc, 77, "docs", resolution);
+                try std.testing.expectEqual(db_mod.types.TxnStatus.committed, try worker.worker().statusGroup(alloc, 77, "docs", txn_id));
+                try worker.worker().acknowledgeGroup(alloc, 77, "docs", .{ .txn_id = txn_id, .participant = "table:docs:group:77" });
+                try std.testing.expectEqual(@as(usize, 4), executor.calls);
+            }
+            var unsigned_executor: Executor = .{ .expected_base = "http://public.invalid", .expect_auth = false };
+            var unsigned_worker = HostedParticipantWorker.init(undefined, Router.iface(true), undefined, unsigned_executor.iface());
+            try std.testing.expectEqual(db_mod.types.TxnStatus.committed, try unsigned_worker.worker().statusGroup(alloc, 77, "docs", txn_id));
+            try std.testing.expectEqual(@as(usize, 1), unsigned_executor.calls);
         }
 
         test "hosted participant rediscovery retries only pre-decision leader unavailability" {

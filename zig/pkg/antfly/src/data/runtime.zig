@@ -10795,7 +10795,14 @@ pub const DataServer = struct {
             previous_target_node_id,
         ) orelse return null;
         const target_store = findSnapshotStoreByNodeId(snapshot.stores, target_node_id) orelse return null;
-        const endpoint = recoveryStatusEndpoint(target_store) orelse return null;
+        const can_authenticate = if (self.api_server_cfg.internal_service_secret) |secret|
+            if (self.api_server_cfg.internal_service_issuer) |issuer|
+                secret.len != 0 and issuer.len != 0
+            else
+                false
+        else
+            false;
+        const endpoint = recoveryStatusEndpoint(target_store, can_authenticate) orelse return null;
         return .{
             .node_id = target_node_id,
             .base_uri = try alloc.dupe(u8, endpoint),
@@ -27615,8 +27622,8 @@ fn findSnapshotStoreByNodeId(
 
 /// Only recovery-status RPCs use this endpoint. General group routing still
 /// needs the public URL because the protected listener has a narrow route set.
-fn recoveryStatusEndpoint(store: antfly.metadata.StoreRecord) ?[]const u8 {
-    if (store.internal_api_url.len != 0) return store.internal_api_url;
+fn recoveryStatusEndpoint(store: antfly.metadata.StoreRecord, authenticated: bool) ?[]const u8 {
+    if (authenticated and store.internal_api_url.len != 0) return store.internal_api_url;
     if (store.api_url.len != 0) return store.api_url;
     return null;
 }
@@ -42338,9 +42345,10 @@ fn consumerTests() type {
             defer route.deinit(alloc);
             try std.testing.expectEqualStrings("http://new", route.remote.base_uri);
             try std.testing.expectEqual(@as(u64, 2), route.remote.node_id);
-            try std.testing.expectEqualStrings("http://new-internal", recoveryStatusEndpoint(stores[1]).?);
-            try std.testing.expectEqualStrings("http://old", recoveryStatusEndpoint(stores[0]).?);
-            try std.testing.expect(recoveryStatusEndpoint(.{ .store_id = 40, .node_id = 4 }) == null);
+            try std.testing.expectEqualStrings("http://new-internal", recoveryStatusEndpoint(stores[1], true).?);
+            try std.testing.expectEqualStrings("http://new", recoveryStatusEndpoint(stores[1], false).?);
+            try std.testing.expectEqualStrings("http://old", recoveryStatusEndpoint(stores[0], true).?);
+            try std.testing.expect(recoveryStatusEndpoint(.{ .store_id = 40, .node_id = 4 }, true) == null);
 
             statuses[0].leader_store_id = 30;
             const failed_leader = try ControlReadGeneration.create(alloc, snapshot);
