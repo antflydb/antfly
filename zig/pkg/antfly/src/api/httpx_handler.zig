@@ -7039,6 +7039,7 @@ pub const AntflyApiHandler = struct {
                 error.LsmRootWriterAlreadyOpen,
                 error.ResidentDbRetryRequired,
                 error.StorageReadTemporarilyUnavailable,
+                error.StorageKernelOwnerStaleDescriptor,
                 error.ConcurrencyUnavailable,
                 error.GenerationTransitionActive,
                 => {
@@ -11348,6 +11349,42 @@ test "httpx lookup revalidates missing catalog bindings across restore" {
             try std.testing.expectEqual(@as(usize, 1), fake.lookups);
         }
     }
+}
+
+test "httpx antfly scan reports a stale owner descriptor as temporarily unavailable" {
+    const alloc = std.testing.allocator;
+    const FakeReads = struct {
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return error.UnexpectedTestCall;
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return error.UnexpectedTestCall;
+        }
+
+        fn scanStream(_: *anyopaque, _: std.mem.Allocator, table_name: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency, _: table_reads.ScanStreamSink) !bool {
+            try std.testing.expectEqualStrings("docs", table_name);
+            return error.StorageKernelOwnerStaleDescriptor;
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return error.UnexpectedTestCall;
+        }
+    };
+    var status = LookupStatusSource{};
+    var api_server = ApiHttpServer.init(alloc, .{}, status.iface(), .{
+        .ptr = undefined,
+        .vtable = &.{ .lookup = FakeReads.lookup, .scan = FakeReads.scan, .scan_stream = FakeReads.scanStream, .query = FakeReads.query },
+    }, null);
+    defer api_server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &api_server };
+    var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/tables/docs/documents");
+    defer request.deinit();
+    var ctx = httpx.Context.init(alloc, undefined, &request);
+    defer ctx.deinit();
+    var response = try handler.scanKeys(&ctx, "docs");
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
 }
 
 test "httpx antfly scan honors optional body and documented bad requests" {

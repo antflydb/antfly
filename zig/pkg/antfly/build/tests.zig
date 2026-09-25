@@ -1598,6 +1598,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "httpx write admission rejects saturated table mutations",
         "httpx request lifecycle hook suspends after admission without leaking capacity",
         "httpx owned response preserves retryable JSON metadata",
+        "httpx antfly scan",
         "httpx inference connection uses the configured shared admission owner",
         "local inference connection admission is owned exactly once by its target",
         "httpx inference connection requires inference write permission",
