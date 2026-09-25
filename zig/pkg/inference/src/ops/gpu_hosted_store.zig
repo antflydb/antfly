@@ -72,6 +72,9 @@ pub const LazyWeightEntry = struct {
         .spill_tier = .disk,
     },
     prefer_dense: bool = false,
+    /// Quantize the dense source to Q8_0 when it loads (Laya
+    /// `weight_quantization`). Reloads after eviction quantize again.
+    quantize_q8_0: bool = false,
     active_tier: ResidencyTier = .disk,
     last_access_epoch: u64 = 0,
 };
@@ -364,6 +367,23 @@ pub fn ensureHostLazyWeightLoadedSimple(data: *WeightStore, entry: *LazyWeightEn
     if (entry.quantized_storage != null and !entry.prefer_dense) return;
 
     const tensor_store = data.tensor_store orelse return error.MissingWeight;
+    if (entry.quantize_q8_0) {
+        var dense = try tensor_store.loadTensorRef(&entry.tensor_ref);
+        defer dense.deinit();
+        var storage = try @import("../models/weight_source.zig").quantizeDenseQ8_0(data.allocator, &dense.tensor);
+        errdefer storage.deinit();
+        const bytes = storage.raw_bytes.len;
+        if (data.tier_cache) |*tier_cache| {
+            tier_cache.reserve(.host, bytes) catch |err| {
+                tier_cache.noteDenied(.host, bytes);
+                return err;
+            };
+        }
+        entry.loaded_bytes = bytes;
+        entry.quantized_storage = storage;
+        entry.active_tier = .host;
+        return;
+    }
     if (data.allow_direct_quant and !entry.prefer_dense) {
         if (try tensor_store.loadQuantizedStorageRef(&entry.tensor_ref)) |storage_value| {
             var loaded_storage = storage_value;

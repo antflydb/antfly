@@ -41,6 +41,24 @@ pub const Packing = struct {
     }
 };
 
+/// Serving precision of the encoder and decision-head linear weights (LAYA.md,
+/// step 1d). Embeddings, norms, the type embedding, the scorer and the action
+/// head stay dense. Quantization happens at load from the dense checkpoint.
+pub const WeightQuantization = enum(u8) { none, q8_0 };
+
+/// Whether `name` (a checkpoint tensor name) is a linear weight that
+/// `weight_quantization` applies to.
+pub fn quantizedLinear(name: []const u8) bool {
+    const encoder = [_][]const u8{ ".attn.Wqkv.weight", ".attn.Wo.weight", ".mlp.Wi.weight", ".mlp.Wo.weight" };
+    const head = [_][]const u8{ ".self_attn.in_proj_weight", ".self_attn.out_proj.weight", ".linear1.weight", ".linear2.weight" };
+    if (std.mem.startsWith(u8, name, "encoder.layers.")) {
+        for (encoder) |suffix| if (std.mem.endsWith(u8, name, suffix)) return true;
+    } else if (std.mem.startsWith(u8, name, "head.layers.")) {
+        for (head) |suffix| if (std.mem.endsWith(u8, name, suffix)) return true;
+    }
+    return false;
+}
+
 pub const Config = struct {
     mask_token: [128]u8 = "[MASK]".* ++ ([_]u8{0} ** 122),
     mask_token_len: usize = 6,
@@ -51,6 +69,13 @@ pub const Config = struct {
     temperature: [3]f32 = .{ 1, 1, 1 },
     buckets: [3][4]?f32 = .{ .{ null, null, null, null }, .{ null, null, null, null }, .{ null, null, null, null } },
     packing: Packing = .{},
+    weight_quantization: WeightQuantization = .none,
+
+    /// The configured precision, unless ANTFLY_LAYA_WEIGHT_QUANT names one.
+    pub fn effectiveWeightQuantization(self: Config) !WeightQuantization {
+        const value = @import("antfly_platform").env.getenv("ANTFLY_LAYA_WEIGHT_QUANT") orelse return self.weight_quantization;
+        return std.meta.stringToEnum(WeightQuantization, value) orelse error.InvalidLayaConfig;
+    }
 
     pub fn scale(self: Config, kind: QuestionType, count: usize) f32 {
         const bucket: usize = if (count <= 2) 0 else if (count <= 5) 1 else if (count <= 10) 2 else 3;
@@ -94,6 +119,10 @@ pub const Config = struct {
             }
         }
         if (obj.get("packing")) |v| out.packing = try parsePacking(v, out.max_len);
+        if (obj.get("weight_quantization")) |v| {
+            if (v != .string) return error.InvalidLayaConfig;
+            out.weight_quantization = std.meta.stringToEnum(WeightQuantization, v.string) orelse return error.InvalidLayaConfig;
+        }
         return out;
     }
 };
@@ -220,4 +249,17 @@ pub fn validateReader(reader: *const @import("safetensors.zig").MMapReader, cfg:
         try Check.norm(reader, try std.fmt.bufPrint(&name, "head.layers.{d}.norm1", .{layer}), d, true);
         try Check.norm(reader, try std.fmt.bufPrint(&name, "head.layers.{d}.norm2", .{layer}), d, true);
     }
+}
+
+test "laya weight quantization covers encoder and head linears only" {
+    for ([_][]const u8{ "encoder.layers.0.attn.Wqkv.weight", "encoder.layers.27.mlp.Wo.weight", "head.layers.1.self_attn.in_proj_weight", "head.layers.0.linear2.weight" }) |name|
+        try std.testing.expect(quantizedLinear(name));
+    for ([_][]const u8{ "encoder.embeddings.tok_embeddings.weight", "encoder.layers.0.mlp_norm.weight", "head.layers.0.self_attn.in_proj_bias", "head.layers.0.linear1.bias", "scorer.1.weight", "act_head.0.weight", "type_emb.weight" }) |name|
+        try std.testing.expect(!quantizedLinear(name));
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"weight_quantization\":\"q8_0\"}", .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(WeightQuantization.q8_0, (try Config.parse(parsed.value)).weight_quantization);
+    const bad = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"weight_quantization\":\"q4\"}", .{});
+    defer bad.deinit();
+    try std.testing.expectError(error.InvalidLayaConfig, Config.parse(bad.value));
 }
