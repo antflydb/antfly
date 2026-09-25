@@ -75,3 +75,16 @@ uv pip install --python .venv/bin/python -r ../gliner25/requirements.txt \
 `protobuf` and `sentencepiece` are needed only to load the DeBERTa tokenizers
 of released GLiNER2.5 checkpoints. MPS and CPU agree to 1.5e-6 in label
 probabilities and give identical entity spans; MPS is the default.
+
+`laya_baselines.py` scores a Laya checkpoint on the same classification
+subsamples through the native serving evaluation
+(`antfly-inference finetune eval laya`, models/laya/LAYA.md). Datasets with
+more labels than the model admits (20, or 255 candidate-packed) are marked not
+applicable. Typed-decisions states over 316 Laya tokens are dropped, as in
+LAYA.md's step-0 evaluation. `baselines_tables.py` renders reports as
+Markdown tables, and can score every model's typed-decisions predictions on
+the subset another model admits.
+
+Encoder latency for the GLiNER2.5 and Laya encoders is a ReleaseFast test,
+`src/bench/antenna_encoder_timing_test.zig`. Results and commands:
+[work-log/completed/inference/antenna/2026-09-25-baselines.md](../../../../../work-log/completed/inference/antenna/2026-09-25-baselines.md).
