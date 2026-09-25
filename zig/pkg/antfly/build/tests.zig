@@ -3103,6 +3103,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "full cluster VOPR bounded startup cleanup exact replay",
         },
         .max_rss = full_cluster_vopr_max_rss,
+        // Fault histories can log production error-level diagnostics while
+        // their exact-replay and scenario assertions still pass. Use the
+        // repository runner so those logs remain visible without converting
+        // expected injected failures into a test-runner failure.
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     const run_full_cluster_vopr_tests = b.addRunArtifact(full_cluster_vopr_tests);
     const full_cluster_vopr_test_step = b.step(
