@@ -20,6 +20,37 @@ this requested implementation/correctness scope.
 
 ## Current work
 
+- The operator inventory now links public, internal, SDK, and job entry points
+  to their admission owners. Synchronous artifact-range reprocessing acquires
+  foreground write capacity before it walks groups and releases that lease on
+  every exit path. Its policy and saturation regression are committed, with the
+  focused API gate pending while the DATA VOPR diagnostic runs. Other helper
+  and retained-work accounting remains open under item 7.
+- Public DATA HTTP upload buffering now uses the resolved process memory
+  envelope instead of reserving its former fixed 2 GiB by default. It retains
+  space for one configured 64 MiB request and its growth overlap, and rejects
+  a known process limit below the 192 MiB minimum before listener start. The
+  real chunked maximum-size upload gate passed 2/2; protected status under
+  public body-budget saturation passed 1/1. This bounds one transport owner,
+  not the shared process heap. The default DATA test target now links the real
+  storage kernel; its unrelated three-node VOPR transition test still fails
+  and is under investigation.
+- Durable API transaction sessions now persist and verify a digest of the
+  effective sealed staged request, including writes staged before commit.
+  Restart rejects a changed payload. Legacy sealed records remain readable,
+  but commit replay, new execution, and terminal coordinator ACK fail closed
+  without this digest and report an unknown outcome. The transaction contract
+  gate passed 97/97 with no leaks. Participant BEGIN records still lack a
+  matching durable write-set digest, so status-only committed retries remain
+  `CommitDecisionUnknown` across rolling peers.
+- Trusted local restart now restores one or two published BEGIN owners from
+  the installed guard set before WAL replay, then requires exact native rows
+  and durable Raft observations before readiness. Real DB tests reject an
+  aliased output path and missing or wrong proof; three or four owners and
+  multi-owner accepted sidecars remain fenced. A restored pool caps later
+  BEGIN admission at two, including sparse occupied slots. The native durable
+  gate passed 54/54 with no leaks. Multi-owner decisions and terminal ACK
+  interleavings remain open; production activation stays disabled.
 - V4 proof validation now rejects an out-of-range owner count before using it
   as a shift amount. The focused durable gate passed 52/52, including malformed
   ABI counts of 8 and `u32` maximum, with no leaks.
@@ -58,9 +89,9 @@ this requested implementation/correctness scope.
   Missing, replaced, uncommitted, compacted, corrupt, and zero-byte sidecars
   remain fail-closed. The focused native durable gate passed 51/51; workload
   admission passed 311/311 owning and 394 broad tests with one skip, with no
-  leaks. This bounded single-owner profile remains test-only; multi-owner
-  restoration, replicated fault schedules, and production activation remain
-  open.
+  leaks. This bounded single-owner transition profile remains test-only;
+  multi-owner accepted-transition restoration, replicated fault schedules,
+  and production activation remain open.
 - Distributed join now rechecks the original cancellation and deadline after a
   worker reply, before parsing results or dispatching another partial-page
   request. A delayed real-socket worker fixture passed 4/4 focused tests: both
