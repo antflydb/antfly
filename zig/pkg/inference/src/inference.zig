@@ -116,6 +116,7 @@ test {
     _ = @import("hard_cancellation_watchdog.zig");
     _ = @import("models/laya.zig");
     _ = @import("finetune/laya/graph.zig");
+    _ = @import("bench/antenna_encoder_timing_test.zig");
     _ = @import("finetune/modern_bert_trunk.zig");
     _ = @import("finetune/modern_bert_trunk_test.zig");
     _ = @import("finetune/laya/objective.zig");

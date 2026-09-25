@@ -41,6 +41,54 @@ python antenna_datasets.py --pin       # re-pin after deliberately changing a so
 
 The module needs only the standard library and `pyarrow` (for Parquet).
 
+## Baselines
+
+`baselines.py` evaluates one GLiNER2 checkpoint directory (span or boundary,
+including students exported by the native trainer) with the pinned upstream
+(`scripts/gliner25/oracle.py`, commit `3c913c7`):
+
+- classification accuracy, macro-F1 and ECE (15 bins, top-label confidence)
+  on Banking77, CLINC150, AG News, SST-5 and typed-decisions. Every label is
+  scored in one pass with upstream's `Classifier`; single-label tasks use its
+  softmax probability. Typed-decisions is scored per question (choice and
+  noul as single-label with label descriptions, score as ordinal) and also
+  reports soft cross-entropy against the gold distribution.
+- zero-shot NER exact span-and-type micro precision, recall and F1 on CrossNER
+  and MIT at threshold 0.5.
+
+Each test split is a fixed seeded subsample (seed 20260925; 500
+classification records, 300 NER sentences, all 2,000 typed-decisions
+questions) unless `--full`. The report records the sampled ids, source pins,
+weight SHA-256, device and versions, and groups datasets into in-domain (the
+pilot's training datasets: Banking77, AG News, CrossNER AI/literature/music,
+MIT restaurant) and held-out (CLINC150, SST-5, typed-decisions, CrossNER
+politics/science, MIT movie).
+
+```sh
+uv venv --python 3.12.3 .venv
+uv pip install --python .venv/bin/python -r ../gliner25/requirements.txt \
+  pyarrow==21.0.0 protobuf==6.32.1 sentencepiece==0.2.1
+.venv/bin/python baselines.py --model-dir <checkpoint> --upstream <GLiNER2 checkout> \
+  [--model-id <hub id> --revision <sha>] [--device mps|cpu] --output report.json
+```
+
+`protobuf` and `sentencepiece` are needed only to load the DeBERTa tokenizers
+of released GLiNER2.5 checkpoints. MPS and CPU agree to 1.5e-6 in label
+probabilities and give identical entity spans; MPS is the default.
+
+`laya_baselines.py` scores a Laya checkpoint on the same classification
+subsamples through the native serving evaluation
+(`antfly-inference finetune eval laya`, models/laya/LAYA.md). Datasets with
+more labels than the model admits (20, or 255 candidate-packed) are marked not
+applicable. Typed-decisions states over 316 Laya tokens are dropped, as in
+LAYA.md's step-0 evaluation. `baselines_tables.py` renders reports as
+Markdown tables, and can score every model's typed-decisions predictions on
+the subset another model admits.
+
+Encoder latency for the GLiNER2.5 and Laya encoders is a ReleaseFast test,
+`src/bench/antenna_encoder_timing_test.zig`. Results and commands:
+[work-log/completed/inference/antenna/2026-09-25-baselines.md](../../../../../work-log/completed/inference/antenna/2026-09-25-baselines.md).
+
 ## Student and teacher targets
 
 Both scripts run on the pinned GLiNER2.5 oracle
