@@ -50,12 +50,18 @@ def byte_offsets(text: str, start: int, end: int) -> tuple[int, int]:
     return len(text[:start].encode()), len(text[:end].encode())
 
 
+def fits(args, splitter, text: str) -> bool:
+    """Upstream truncates past max_len words; the native job rejects such
+    rows instead. Keep only texts both see whole."""
+    return len(list(splitter(text, lower=False))) <= args.max_words
+
+
 def classification_rows(args, datasets, classifier, split: str, rng: random.Random) -> list[dict[str, Any]]:
     from gliner2.classification import ClassificationConfig, ClassificationSchema
 
     rows = []
     for name, task in CLASSIFICATION.items():
-        records = list(datasets.load_classification(name, split))
+        records = [record for record in datasets.load_classification(name, split) if fits(args, classifier.model.processor.word_splitter, record["text"])]
         rng.shuffle(records)
         names = list(datasets.label_names(name))
         for record in records[: args.per_dataset]:
@@ -76,10 +82,10 @@ def classification_rows(args, datasets, classifier, split: str, rng: random.Rand
     return rows
 
 
-def entity_rows(args, datasets, extractor, split: str, rng: random.Random) -> list[dict[str, Any]]:
+def entity_rows(args, datasets, extractor, splitter, split: str, rng: random.Random) -> list[dict[str, Any]]:
     rows = []
     for name in NER:
-        records = list(datasets.load_ner(name, split))
+        records = [record for record in datasets.load_ner(name, split) if fits(args, splitter, record["text"])]
         rng.shuffle(records)
         types = list(datasets.entity_types(name))
         for record in records[: args.per_dataset]:
@@ -115,7 +121,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         extractor = AutoExtractor.from_pretrained(str(args.teacher_entities), local_files_only=True, map_location="cpu",
                                                   use_flashdeberta=False).float().eval()
     rng = random.Random(args.seed)
-    rows = classification_rows(args, datasets, classifier, "train", rng) + entity_rows(args, datasets, extractor, "train", rng)
+    rows = classification_rows(args, datasets, classifier, "train", rng) + entity_rows(args, datasets, extractor, teacher.processor.word_splitter, "train", rng)
     # The native job requires disjoint splits by text; datasets repeat texts.
     seen: set[str] = set()
     rows = [row for row in rows if not (row["text"] in seen or seen.add(row["text"]))]
