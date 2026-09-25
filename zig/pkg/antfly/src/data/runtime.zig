@@ -6662,6 +6662,10 @@ pub const DataServer = struct {
             // follower fallback could publish a partial graph while the
             // acknowledged leader had already reached `full_index`.
             self.read_source.read_safety_barrier = self.dataReadSafetyBarrier();
+            // Direct physical DATA mode uses the same applied ReadIndex proof
+            // as the compiled owner. An absent UNIQUE/FK row must never be
+            // inferred from a follower's stale fallback.
+            if (comptime !linked_storage) self.read_source.strict_read_index_absence = true;
             _ = self.read_source.withGraphReadBarrier(self.dataGraphReadBarrier());
             _ = self.read_source.withDistributedRouting(
                 self.dataReadGroupRouter(),
@@ -23091,8 +23095,38 @@ const RemoteMetadataSource = struct {
             lockAtomic(&self.metadata.cache_mutex);
             const observed = blk: {
                 const snapshot = self.metadata.cached_snapshot orelse break :blk null;
-                const range = findRangeByGroupId(snapshot.ranges, self.group_id) orelse break :blk null;
-                const table = findTableById(snapshot.tables, range.table_id) orelse break :blk null;
+                const table_id = if (findRangeByGroupId(snapshot.ranges, self.group_id)) |range|
+                    range.table_id
+                else destination: {
+                    // Split destinations receive placements before cutover
+                    // publishes their range. Use only the active transition
+                    // whose source still belongs to this table and whose
+                    // destination placement names this local replica.
+                    var placed = false;
+                    for (snapshot.placement_intents) |intent| {
+                        if (intent.record.group_id == self.group_id and intent.record.local_node_id == self.node_id) {
+                            placed = true;
+                            break;
+                        }
+                    }
+                    if (!placed) break :blk null;
+                    var matched: ?u64 = null;
+                    for (snapshot.split_transitions) |transition| {
+                        if (transition.destination_group_id != self.group_id or transition.split_key == null) continue;
+                        switch (transition.phase) {
+                            .finalized, .rolled_back => continue,
+                            else => {},
+                        }
+                        const source = findRangeByGroupId(snapshot.ranges, transition.source_group_id) orelse continue;
+                        if (source.table_id == 0 or source.table_id != transition.table_contract.table_id) continue;
+                        const candidate = findTableById(snapshot.tables, source.table_id) orelse continue;
+                        if (!std.mem.eql(u8, candidate.name, transition.table_contract.table_name)) continue;
+                        if (matched != null) break :blk null;
+                        matched = source.table_id;
+                    }
+                    break :destination matched orelse break :blk null;
+                };
+                const table = findTableById(snapshot.tables, table_id) orelse break :blk null;
                 break :blk @as(?antfly.common.table_storage.Settings, table.storage);
             };
             self.metadata.cache_mutex.unlock();
@@ -54100,7 +54134,38 @@ fn implementationTests() type {
             var guard_live = true;
             defer if (guard_live) guard.detach();
             try std.testing.expectError(error.CompletionAdmissionUnavailable, guard.check(status, .campaign));
+            var split_source = [_]antfly.metadata.RangeRecord{.{ .group_id = 76, .table_id = 42, .start_key = "" }};
+            var split_placement = [_]antfly.raft.reconciler.PlacementIntent{.{
+                .record = .{ .group_id = 77, .replica_id = 771, .local_node_id = 1 },
+                .store_id = 1,
+            }};
+            var split_transition = [_]antfly.metadata.SplitTransitionRecord{.{
+                .transition_id = 1,
+                .attempt_epoch = 1,
+                .source_group_id = 76,
+                .destination_group_id = 77,
+                .split_key = "m",
+                .table_contract = .{ .table_id = 42, .table_name = "docs" },
+            }};
             var tables = [_]antfly.metadata.TableRecord{.{ .table_id = 42, .name = "docs" }};
+            const split_snapshot: antfly.metadata_api.AdminSnapshot = .{
+                .status = .{ .metadata_group_id = 9, .metrics = .{} },
+                .tables = &tables,
+                .ranges = &split_source,
+                .stores = &.{},
+                .placement_intents = &split_placement,
+                .split_transitions = &split_transition,
+                .merge_transitions = &.{},
+            };
+            remote.cached_snapshot = try cloneAdminSnapshotOwned(alloc, split_snapshot);
+            try guard.check(status, .campaign);
+            remote.cached_snapshot.?.split_transitions[0].table_contract.table_id = 43;
+            try std.testing.expectError(error.CompletionAdmissionUnavailable, guard.check(status, .campaign));
+            remote.cached_snapshot.?.split_transitions[0].table_contract.table_id = 42;
+            remote.cached_snapshot.?.placement_intents[0].record.local_node_id = 2;
+            try std.testing.expectError(error.CompletionAdmissionUnavailable, guard.check(status, .campaign));
+            freeAdminSnapshotOwned(alloc, &remote.cached_snapshot.?);
+            remote.cached_snapshot = null;
             var ranges = [_]antfly.metadata.RangeRecord{.{ .group_id = 77, .table_id = 42, .start_key = "" }};
             const snapshot: antfly.metadata_api.AdminSnapshot = .{
                 .status = .{ .metadata_group_id = 9, .metrics = .{} },

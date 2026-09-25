@@ -3019,6 +3019,10 @@ pub const ProvisionedTableReadSource = struct {
     /// merge stay on this source; a compiled storage owner can supply only the
     /// group-local callbacks without replacing the orchestration vtable.
     local_read_source: ?TableReadSource = null,
+    /// A DATA Raft owner can certify read-index absence through its applied
+    /// barrier and pinned physical generation even without the compiled owner.
+    /// Legacy non-Raft readers keep their historical stale fallback.
+    strict_read_index_absence: bool = false,
     graph_read_barrier: ?GraphReadBarrier = null,
     /// Optional production data-plane routing for public reads. Internal
     /// group-local endpoints remain on the resident owner, while a public
@@ -3398,7 +3402,7 @@ pub const ProvisionedTableReadSource = struct {
     pub fn source(self: *ProvisionedTableReadSource) TableReadSource {
         return .{
             .ptr = self,
-            .strict_read_index_absence = if (self.local_read_source) |local| local.strict_read_index_absence else false,
+            .strict_read_index_absence = self.strict_read_index_absence or (if (self.local_read_source) |local| local.strict_read_index_absence else false),
             .vtable = &.{
                 .acquire_join_view = JoinReadBinding(ProvisionedTableReadSource).acquire,
                 .lookup = lookup,
@@ -3551,7 +3555,7 @@ pub const ProvisionedTableReadSource = struct {
         // so removing that cycle does not serialize distributed reads.
         if (consistency == .stale or group_ids.len == 0) return;
         const allow_stale_fallback = !(consistency == .read_index and request == .lookup and
-            (if (self.local_read_source) |local| local.strict_read_index_absence else false));
+            (self.strict_read_index_absence or (if (self.local_read_source) |local| local.strict_read_index_absence else false)));
         const plan = planFanout(.query, self.io_impl, group_ids.len);
         if (!plan.parallel) {
             for (group_ids) |group_id| {
@@ -16201,6 +16205,15 @@ fn consumerTests() type {
             var stale_input = input;
             stale_input.consistency = .stale;
             try std.testing.expectError(error.NotFound, operations.lookup(std.testing.allocator, context, stale_input));
+            // A direct DATA Raft source opts into the same strict absence
+            // contract. The default legacy source may fall back to stale,
+            // while an opted-in failed ReadIndex cannot authorize absence.
+            var direct = ProvisionedTableReadSource.init("unused", catalog, .{ .ptr = &fixture, .vtable = &.{ .wait_read_safe = Fixture.notLeader } });
+            try std.testing.expect(!direct.source().strict_read_index_absence);
+            try direct.prepareGroupsForReadAdmission(std.testing.allocator, &.{7}, .{ .lookup = .{ .key = "absent", .opts = .{} } }, .read_index);
+            direct.strict_read_index_absence = true;
+            try std.testing.expect(direct.source().strict_read_index_absence);
+            try std.testing.expectError(error.NotLeader, direct.prepareGroupsForReadAdmission(std.testing.allocator, &.{7}, .{ .lookup = .{ .key = "absent", .opts = .{} } }, .read_index));
             var provisioned = ProvisionedTableReadSource.init("unused", catalog, .{ .ptr = &fixture, .vtable = &.{ .wait_read_safe = Fixture.notLeader } });
             _ = provisioned.withLocalReadSource(hosted.local_read_source.?);
             try std.testing.expect(provisioned.source().strict_read_index_absence);
