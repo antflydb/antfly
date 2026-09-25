@@ -465,7 +465,8 @@ test "distributed txn MATCH PARTIAL diagnostic admits guarded deletion and corre
         defer db.close();
         try db.setSchemaJson(alloc, initial);
         try db.batch(.{ .writes = &.{.{ .key = "orphan", .value = "{\"a\":9,\"b\":9,\"x\":99,\"y\":null}" }} });
-        try db.setSchemaJson(alloc, declaration);
+        try std.testing.expectError(error.ForeignKeyGenerationPublicationRequired, db.setSchemaJson(alloc, declaration));
+        try @import("relational_fk_test_publication.zig").install(alloc, &db, initial, declaration, 1);
         inline for (.{ "by_a", "by_b" }) |index| {
             for (0..16) |_| {
                 if ((try db.relationalIndexBuildStatus(index)).state == .ready) break;

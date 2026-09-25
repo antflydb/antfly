@@ -643,6 +643,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = api_session_maintenance_test_mod,
         .filters = &.{
             "durable session mutations publish only after persistence succeeds",
+            "durable SQL LOCAL DEFAULT preserves committed setting across restart and savepoint",
             "durable transaction sessions retain terminal commit coordinator handoff",
             "repair-required transaction sessions replay propagation once then release coordination",
             "committed repair session without coordinator replays a write handoff",
@@ -1574,7 +1575,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-api-aggregation-test", "Run captured aggregation collection, completeness and generation regressions").dependOn(&api_aggregation_tests.run(b).step);
     const api_transaction_contract_tests = b.addTest(.{
         .root_module = api_transactions_docid_test_mod,
-        .filters = &.{ "distributed txn", "hosted participant", "stable distributed transaction retry", "internal batch parser owns binary staged restore controls", "merge page internal codec", "online merge private" },
+        .filters = &.{ "distributed txn", "hosted participant", "stable distributed transaction retry", "internal batch parser owns binary staged restore controls", "merge page internal codec", "online merge private", "durable SQL session rejects duplicate savepoint ids" },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-transactions-test", "Run transaction coordinator and participant contracts").dependOn(&addFilteredTestRunArtifact(b, api_transaction_contract_tests).step);
@@ -2036,10 +2037,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     sql_primary_key_rewrite_test_mod.addImport("usermgr_storage", pk_usermgr_storage);
     const sql_primary_key_rewrite_tests = b.addTest(.{
         .root_module = sql_primary_key_rewrite_test_mod,
-        .filters = &.{"mounted SQL ADD PRIMARY KEY guards publication until rewrite validates"},
+        .filters = &.{"mounted SQL ADD PRIMARY KEY publishes only validated fresh generation"},
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
-    b.step("antfly-api-sql-primary-key-rewrite-test", "Run guarded mounted SQL primary-key rewrite preconditions")
+    b.step("antfly-api-sql-primary-key-rewrite-test", "Run mounted SQL primary-key rewrite publication and failure cases")
         .dependOn(&addFilteredTestRunArtifact(b, sql_primary_key_rewrite_tests).step);
     const hosted_initial_fk_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_hosted_initial_fk_test_root.zig"),
@@ -2066,6 +2067,63 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-api-hosted-initial-fk-test", "Run mounted hosted initial-FK owner publication regression")
         .dependOn(&addFilteredTestRunArtifact(b, hosted_initial_fk_tests).step);
+    const hosted_fk_drop_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api_hosted_fk_drop_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configureConsumer(b, hosted_fk_drop_test_mod);
+    @import("storage.zig").configureLmdb(b, hosted_fk_drop_test_mod, options.lmdb_engine, true);
+    hosted_fk_drop_test_mod.addImport("antfly_admin_openapi", antfly_imports.admin_openapi);
+    hosted_fk_drop_test_mod.addImport("antfly_internal_openapi", antfly_imports.internal_openapi);
+    hosted_fk_drop_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const hosted_fk_drop_usermgr_storage = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    hosted_fk_drop_usermgr_storage.addImport("antfly_root", hosted_fk_drop_test_mod);
+    hosted_fk_drop_usermgr_storage.addImport("antfly_platform", antfly_imports.platform);
+    hosted_fk_drop_test_mod.addImport("usermgr_storage", hosted_fk_drop_usermgr_storage);
+    const hosted_fk_drop_tests = b.addTest(.{
+        .root_module = hosted_fk_drop_test_mod,
+        .filters = &.{"mounted hosted external-parent FK DROP publishes after parent ACK"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-hosted-fk-drop-test", "Run mounted external-parent FK DROP retirement and restart")
+        .dependOn(&addFilteredTestRunArtifact(b, hosted_fk_drop_tests).step);
+    const hosted_self_fk_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api_hosted_self_fk_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configureConsumer(b, hosted_self_fk_test_mod);
+    @import("storage.zig").configureLmdb(b, hosted_self_fk_test_mod, options.lmdb_engine, true);
+    hosted_self_fk_test_mod.addImport("antfly_admin_openapi", antfly_imports.admin_openapi);
+    hosted_self_fk_test_mod.addImport("antfly_internal_openapi", antfly_imports.internal_openapi);
+    hosted_self_fk_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const hosted_self_fk_usermgr_storage = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    hosted_self_fk_usermgr_storage.addImport("antfly_root", hosted_self_fk_test_mod);
+    hosted_self_fk_usermgr_storage.addImport("antfly_platform", antfly_imports.platform);
+    hosted_self_fk_test_mod.addImport("usermgr_storage", hosted_self_fk_usermgr_storage);
+    const hosted_self_fk_guard_tests = b.addTest(.{
+        .root_module = hosted_self_fk_test_mod,
+        .filters = &.{ "mounted hosted self-FK public admission remains guarded", "public ordinary self-FK publication remains guarded before metadata admission" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-hosted-self-fk-guard-test", "Run mounted public self-FK admission guard regression")
+        .dependOn(&addFilteredTestRunArtifact(b, hosted_self_fk_guard_tests).step);
+    const hosted_self_fk_diagnostic_tests = b.addTest(.{
+        .root_module = hosted_self_fk_test_mod,
+        .filters = &.{"mounted hosted self-FK ADD DROP restart diagnostic"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-hosted-self-fk-diagnostic", "Opt-in mounted self-FK ADD/DROP/restart diagnostic; requires a bounded guard lift")
+        .dependOn(&addFilteredTestRunArtifact(b, hosted_self_fk_diagnostic_tests).step);
     const lib_api_standalone_backup_restore_tests = b.addTest(.{
         .root_module = api_backup_restore_test_mod,
         .filters = &.{
@@ -2156,7 +2214,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .run_api_transactions_docid_tests = run_api_transactions_docid_tests,
         .run_api_table_writes_docid_tests = run_api_table_writes_docid_tests,
         .run_api_table_reads_docid_tests = run_api_table_reads_docid_tests,
-        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{ api_table_reads_linked_tests.executable, lib_api_distributed_query_availability_tests.executable, api_table_writes_docid_tests.executable, api_relational_topology_contract_tests.consumer.executable, api_table_writes_production_regression_tests.consumer.executable, hosted_batch_tests.consumer.executable, api_create_structural_retry_tests.consumer.executable, api_table_writes_restore_repeat_tests.consumer.executable, hosted_fk_placement_tests, sql_primary_key_rewrite_tests, hosted_initial_fk_tests }) catch @panic("OOM"),
+        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{ api_table_reads_linked_tests.executable, lib_api_distributed_query_availability_tests.executable, api_table_writes_docid_tests.executable, api_relational_topology_contract_tests.consumer.executable, api_table_writes_production_regression_tests.consumer.executable, hosted_batch_tests.consumer.executable, api_create_structural_retry_tests.consumer.executable, api_table_writes_restore_repeat_tests.consumer.executable, hosted_fk_placement_tests, sql_primary_key_rewrite_tests, hosted_initial_fk_tests, hosted_fk_drop_tests, hosted_self_fk_guard_tests, hosted_self_fk_diagnostic_tests }) catch @panic("OOM"),
         .run_api_public_table_http_docid_tests = run_api_public_table_http_docid_tests,
         .run_raft_transition_runtime_docid_tests = run_raft_transition_runtime_docid_tests,
         .run_api_table_writes_production_regression_unit_tests = run_api_table_writes_production_regression_unit_tests,

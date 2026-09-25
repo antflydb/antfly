@@ -149,7 +149,7 @@ fn waitForDonorRoute(alloc: std.mem.Allocator, io: std.Io, metadata: *metadata_r
     return error.DonorRouteUnavailable;
 }
 
-test "mounted SQL ADD PRIMARY KEY guards publication until rewrite validates" {
+test "mounted SQL ADD PRIMARY KEY publishes only validated fresh generation" {
     const alloc = std.testing.allocator;
     const process_alloc = platform.allocator.processAllocator(alloc);
     const internal_secret = "pk-rewrite-e2e-internal-service-secret-v1";
@@ -167,9 +167,16 @@ test "mounted SQL ADD PRIMARY KEY guards publication until rewrite validates" {
     defer rewrite_permission.deinit(alloc);
     var rewrite_user = try auth_manager.createUser(rewrite_username, rewrite_password, &.{rewrite_permission});
     defer rewrite_user.deinit(alloc);
+    var reader_permission = try usermgr.Permission.initOwned(alloc, .table, "*", .read);
+    defer reader_permission.deinit(alloc);
+    var reader_user = try auth_manager.createUser("pk-reader", "pk-reader-durable-password", &.{reader_permission});
+    defer reader_user.deinit(alloc);
     const rewrite_authorization = try basicAuthorization(alloc, rewrite_username, rewrite_password);
     defer alloc.free(rewrite_authorization);
     const rewrite_headers = [_]http.RequestHeader{.{ .name = "authorization", .value = rewrite_authorization }};
+    const reader_authorization = try basicAuthorization(alloc, "pk-reader", "pk-reader-durable-password");
+    defer alloc.free(reader_authorization);
+    const reader_headers = [_]http.RequestHeader{.{ .name = "authorization", .value = reader_authorization }};
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
@@ -216,7 +223,8 @@ test "mounted SQL ADD PRIMARY KEY guards publication until rewrite validates" {
         .store_registration = .{ .node_id = 9, .store_id = 9, .role = "data" },
         .api_server_cfg = .{ .deployment_mode = .distributed, .trusted_principal_secret = trusted_secret, .trusted_principal_issuer = issuer, .internal_service_secret = internal_secret, .internal_service_issuer = issuer, .internal_service_auth_capability = "v1; mode=enforce" },
     }, metadata_uri);
-    defer data.deinit();
+    var data_live = true;
+    defer if (data_live) data.deinit();
     try data.start();
     for (0..32) |_| {
         data.registerNodeIfConfigured() catch |err| switch (err) {
@@ -229,10 +237,12 @@ test "mounted SQL ADD PRIMARY KEY guards publication until rewrite validates" {
         break;
     } else return error.StoreRegistrationNotVisible;
     var data_raft = raft.ManagedProgressDriver.init(io_impl.io(), .{ .ptr = &data, .run_once = dataRaft }, std.time.ns_per_ms);
-    defer data_raft.deinit();
+    var data_raft_live = true;
+    defer if (data_raft_live) data_raft.deinit();
     try data_raft.start();
     var data_control = raft.ManagedProgressDriver.init(io_impl.io(), .{ .ptr = &data, .run_once = dataControl }, std.time.ns_per_ms);
-    defer data_control.deinit();
+    var data_control_live = true;
+    defer if (data_control_live) data_control.deinit();
     try data_control.start();
     const base = try data.baseUri(alloc);
     defer alloc.free(base);
@@ -252,7 +262,8 @@ test "mounted SQL ADD PRIMARY KEY guards publication until rewrite validates" {
         .{ .name = "pk_null", .rows = "{\"inserts\":{\"row-null\":{\"id\":null,\"note\":\"missing\"}},\"sync_level\":\"full_text\"}", .succeeds = false },
         .{ .name = "pk_duplicate", .rows = "{\"inserts\":{\"row-a\":{\"id\":7,\"note\":\"first\"},\"row-b\":{\"id\":7,\"note\":\"second\"}},\"sync_level\":\"full_text\"}", .succeeds = false },
     };
-    for (cases) |case| {
+    var terminal_table_ids: [cases.len]u64 = undefined;
+    for (cases, 0..) |case, case_index| {
         const create = try std.fmt.allocPrint(alloc, "CREATE TABLE {s} (id BIGINT, note TEXT)", .{case.name});
         defer alloc.free(create);
         var created = try sql(alloc, transport, &headers, base, create);
@@ -315,25 +326,17 @@ test "mounted SQL ADD PRIMARY KEY guards publication until rewrite validates" {
         }
         const alter = try std.fmt.allocPrint(alloc, "ALTER TABLE {s} ADD CONSTRAINT {s}_key PRIMARY KEY (id)", .{ case.name, case.name });
         defer alloc.free(alter);
+        var forbidden = try sql(alloc, transport, &reader_headers, metadata_uri, alter);
+        defer forbidden.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 403), forbidden.status);
+        var after_forbidden_response = try table(alloc, transport, &headers, base, case.name);
+        defer after_forbidden_response.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), after_forbidden_response.status);
+        var after_forbidden = try std.json.parseFromSlice(std.json.Value, alloc, after_forbidden_response.body, .{});
+        defer after_forbidden.deinit();
+        try std.testing.expectEqualStrings(before_id, (try field(after_forbidden.value, "table_id")).string);
         var admitted = try sql(alloc, transport, &rewrite_headers, metadata_uri, alter);
         defer admitted.deinit(alloc);
-        if (admitted.status == 501) {
-            // This target remains useful while production keeps the rewrite
-            // guard on: prove existing rows are readable and no generation was
-            // published. Once the guard lifts, continue through all three
-            // positive/negative lifecycle cases below.
-            try std.testing.expect(case.succeeds);
-            var guarded_response = try table(alloc, transport, &headers, base, case.name);
-            defer guarded_response.deinit(alloc);
-            try std.testing.expectEqual(@as(u16, 200), guarded_response.status);
-            var guarded = try std.json.parseFromSlice(std.json.Value, alloc, guarded_response.body, .{});
-            defer guarded.deinit();
-            try std.testing.expectEqualStrings(before_id, (try field(guarded.value, "table_id")).string);
-            const guarded_schema = try field(guarded.value, "schema");
-            const guarded_constraints = if (guarded_schema == .object) guarded_schema.object.get("unique_constraints") else null;
-            try std.testing.expect(guarded_constraints == null or guarded_constraints.? == .null or (guarded_constraints.? == .array and guarded_constraints.?.array.items.len == 0));
-            return;
-        }
         if (admitted.status != 202 and admitted.status != 409) std.debug.print("PK ALTER table={s} status={d} body={s}\n", .{ case.name, admitted.status, admitted.body });
         try std.testing.expect(admitted.status == 202 or admitted.status == 409);
         var admitted_json = try std.json.parseFromSlice(std.json.Value, alloc, admitted.body, .{});
@@ -369,6 +372,10 @@ test "mounted SQL ADD PRIMARY KEY guards publication until rewrite validates" {
             @memcpy(last_phase[0..last_phase_len], phase[0..last_phase_len]);
             if (std.mem.eql(u8, phase, if (case.succeeds) "succeeded" else "failed")) {
                 std.debug.print("PK job terminal table={s} body={s}\n", .{ case.name, response.body });
+                if (!case.succeeds) try std.testing.expectEqualStrings(
+                    if (std.mem.eql(u8, case.name, "pk_null")) "BackupIntegrityFailure" else "ConstraintActivationFailed",
+                    (try field(parsed.value, "error")).string,
+                );
                 terminal = true;
                 break;
             }
@@ -383,12 +390,77 @@ test "mounted SQL ADD PRIMARY KEY guards publication until rewrite validates" {
         var after = try std.json.parseFromSlice(std.json.Value, alloc, after_response.body, .{});
         defer after.deinit();
         const after_id = (try field(after.value, "table_id")).string;
+        terminal_table_ids[case_index] = try std.fmt.parseUnsigned(u64, after_id, 10);
         try std.testing.expectEqual(case.succeeds, !std.mem.eql(u8, before_id, after_id));
         const schema = try field(after.value, "schema");
         const constraints = if (schema == .object) schema.object.get("unique_constraints") else null;
         try std.testing.expectEqual(case.succeeds, constraints != null and constraints.? == .array and constraints.?.array.items.len == 1);
         if (case.succeeds) {
             var duplicate = try batch(alloc, transport, &headers, base, case.name, "{\"inserts\":{\"row-duplicate\":{\"id\":1,\"note\":\"duplicate\"}},\"sync_level\":\"full_text\"}");
+            defer duplicate.deinit(alloc);
+            try std.testing.expectEqual(@as(u16, 409), duplicate.status);
+            try std.testing.expect(std.mem.indexOf(u8, duplicate.body, "UniqueConstraintViolation") != null);
+        } else {
+            const keys: []const []const u8 = if (std.mem.eql(u8, case.name, "pk_null")) &.{"row-null"} else &.{ "row-a", "row-b" };
+            for (keys) |key| {
+                var fetched = try document(alloc, transport, &headers, base, case.name, key);
+                defer fetched.deinit(alloc);
+                try std.testing.expectEqual(@as(u16, 200), fetched.status);
+            }
+        }
+    }
+    // A new data-owner process must recover the published PK generation and
+    // both failed jobs' untouched old generations from durable state. Keep
+    // metadata running so its placement routes are reprojected to this owner.
+    data_control.deinit();
+    data_control_live = false;
+    data_raft.deinit();
+    data_raft_live = false;
+    data.deinit();
+    data_live = false;
+    data = try data_runtime.DataServer.initFromMetadataApiUrl(process_alloc, .{
+        .replica_root_dir = data_root,
+        .replica_catalog_path = data_catalog,
+        .store_registration = .{ .node_id = 9, .store_id = 9, .role = "data" },
+        .api_server_cfg = .{ .deployment_mode = .distributed, .trusted_principal_secret = trusted_secret, .trusted_principal_issuer = issuer, .internal_service_secret = internal_secret, .internal_service_issuer = issuer, .internal_service_auth_capability = "v1; mode=enforce" },
+    }, metadata_uri);
+    data_live = true;
+    try data.start();
+    for (0..32) |_| {
+        data.registerNodeIfConfigured() catch |err| switch (err) {
+            error.StoreRegistrationNotVisible => {
+                try io_impl.io().sleep(.fromMilliseconds(1), .awake);
+                continue;
+            },
+            else => return err,
+        };
+        break;
+    } else return error.StoreRegistrationNotVisible;
+    data_raft = raft.ManagedProgressDriver.init(io_impl.io(), .{ .ptr = &data, .run_once = dataRaft }, std.time.ns_per_ms);
+    data_raft_live = true;
+    try data_raft.start();
+    data_control = raft.ManagedProgressDriver.init(io_impl.io(), .{ .ptr = &data, .run_once = dataControl }, std.time.ns_per_ms);
+    data_control_live = true;
+    try data_control.start();
+    const restarted_base = try data.baseUri(alloc);
+    defer alloc.free(restarted_base);
+    for (cases, terminal_table_ids) |case, expected_table_id| {
+        try waitForDonorRoute(alloc, io_impl.io(), &metadata, &data, expected_table_id);
+        var response = try table(alloc, transport, &headers, restarted_base, case.name);
+        defer response.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), response.status);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(expected_table_id, try std.fmt.parseUnsigned(u64, (try field(parsed.value, "table_id")).string, 10));
+        const schema = try field(parsed.value, "schema");
+        const constraints = if (schema == .object) schema.object.get("unique_constraints") else null;
+        try std.testing.expectEqual(case.succeeds, constraints != null and constraints.? == .array and constraints.?.array.items.len == 1);
+        const key = if (std.mem.eql(u8, case.name, "pk_null")) "row-null" else "row-a";
+        var fetched = try document(alloc, transport, &headers, restarted_base, case.name, key);
+        defer fetched.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), fetched.status);
+        if (case.succeeds) {
+            var duplicate = try batch(alloc, transport, &headers, restarted_base, case.name, "{\"inserts\":{\"restart-duplicate\":{\"id\":1}},\"sync_level\":\"full_text\"}");
             defer duplicate.deinit(alloc);
             try std.testing.expectEqual(@as(u16, 409), duplicate.status);
             try std.testing.expect(std.mem.indexOf(u8, duplicate.body, "UniqueConstraintViolation") != null);

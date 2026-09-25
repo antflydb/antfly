@@ -32,6 +32,9 @@ const mappings = [_]Mapping{
     .{ .status = .catalog_already_exists, .err = error.CatalogAlreadyExists },
     .{ .status = .catalog_command_too_large, .err = error.CatalogCommandTooLarge },
     .{ .status = .catalog_generation_changed, .err = error.CatalogGenerationChanged },
+    .{ .status = .generation_publication_not_found, .err = error.GenerationPublicationNotFound },
+    .{ .status = .generation_publication_changed, .err = error.GenerationPublicationChanged },
+    .{ .status = .generation_retired, .err = error.GenerationRetired },
     .{ .status = .catalog_id_exhausted, .err = error.CatalogIdExhausted },
     .{ .status = .catalog_not_found, .err = error.CatalogNotFound },
     .{ .status = .catalog_projection_refresh_required, .err = error.CatalogProjectionRefreshRequired },
@@ -915,6 +918,13 @@ pub fn validateForTest() !void {
 }
 
 test "registered storage-kernel errors are unique and round trip without losing identity" {
+    // A stale FK attachment must remain a semantic rejection across the
+    // storage-owner ABI. Collapsing it to StorageKernelFailure can poison a
+    // replicated apply entry and stall every later proposal on that owner.
+    const retired = failureFromError(error.GenerationRetired, .storage_owner, abi.abi_version, 23);
+    try std.testing.expectEqual(abi.Status.generation_retired, retired.status);
+    try validateFailureEnvelope(retired.status, &retired, abi.abi_version);
+    try std.testing.expectError(error.GenerationRetired, statusToError(retired.status));
     // A newly created/rebuilt ANN index has no serving generation yet. This
     // expected state must survive both compiled query boundaries as a retry,
     // rather than becoming an unregistered StorageKernelFailure (HTTP 500).

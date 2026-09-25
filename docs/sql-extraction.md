@@ -29,8 +29,10 @@ feature inventory. Current additions include:
   tracking and owner-fenced atomic prepare; unsupported providers reject BEGIN.
 - Native catalog/schema/index/constraint DDL and durable pending/invalid
   receipts; pending activation/rewrite is not reported as synchronous success.
-  ALTER TABLE ADD PRIMARY KEY remains guarded: its non-null/unique fresh-generation
-  rewrite needs stable mounted publication and failure evidence before activation.
+  ALTER TABLE ADD PRIMARY KEY uses the metadata-owned non-null/unique
+  fresh-generation rewrite. Mounted SQL verifies authorized pending receipts,
+  successful publication, NULL/duplicate failure isolation, and data-owner
+  restart persistence; broader schema-rewrite and restore gates remain separate.
   Uncertain restore admission now retains an idempotency key and deterministic
   job handle in the SQL receipt, with a non-success HTTP status and no-replay
   guidance rather than presenting an unconfirmed job as accepted.
@@ -276,8 +278,14 @@ captured relational plan, cardinality, quota and read authorization.
 The exact `sql-1532` parenthesized multi-column UPDATE has mounted evidence for
 both committed cells. Explicit ROW and parenthesized tuple expressions lower
 to the same simultaneous assignment plan; duplicate targets and arity mismatch
-fail during compilation. A row-valued subselect producing multiple columns is
-not yet admitted; scalar subqueries inside an explicit ROW are.
+fail during compilation. A multi-column UPDATE row assignment now accepts an
+explicit-width SELECT inside parentheses. It binds positional outputs through
+one guarded mutation capture, checks scalar cardinality before commit, and
+preserves the child's ORDER BY/LIMIT and aliases. A materialized typed row
+producer supplies all positional assignments through one physical source scan;
+SELECT * and correlation from inside the row source to the UPDATE
+target remain outside this admitted shape. Scalar subqueries inside an
+explicit ROW also remain supported.
 UPDATE `DEFAULT`, including inside ROW, omits the old declared cell before
 native normalization. A mounted relational test verifies the schema-provided
 value in RETURNING alongside an incremented tuple member; relational and
@@ -351,12 +359,36 @@ view, including joined expressions and pull streams. Missing capture, stale
 generations, dynamic names, and client overlays on policy-sensitive values fail
 closed. Metadata Raft now owns durable setting records, revision-fenced
 publication, snapshot/import state, and an administrator-only public mutation
-route. The production SQL adapter obtains authenticated scoped snapshots; it
-does not grant SQL SET authority to mutate the durable registry. Pgwire now
+route. The production SQL adapter obtains authenticated scoped snapshots; SQL
+SET changes only an authorized session overlay, never the durable registry.
+Attached HTTP `/sql` sessions now accept typed dotted-name SET/SET LOCAL,
+RESET and SHOW, plus RESET ALL, through the same complete-command parser as
+pgwire. RESET ALL atomically clears the active and commit-time durable overlays;
+savepoint rollback can restore them. It clears stale identities without a
+catalog read, leaving the next statement to capture fresh defaults. The owner
+keeps `SET LOCAL name = DEFAULT` transaction-local: it removes only the active
+override and preserves the durable commit-time overlay across savepoint
+rollback and restart; pgwire's session value resumes after transaction end. The owner
+checks principal, lease, catalog generation and policy-sensitive write gates
+before a durable overlay mutation; SHOW and `current_setting` read the active
+overlay, including after a separately prepared statement is executed in the
+session. HTTP PREPARE accepts `session_id` and holds the session execution lease
+while it authenticates the principal, hydrates the database/namespace and
+durable active setting overlay, describes the statement, and publishes the
+immutable prepared resource. Such resources bind the exact session ID and
+scoped setting-catalog epoch: execute rehydrates current values under its own
+lease, refuses a different or ended session, and rejects a changed catalog.
+The focused mounted test covers SET-before-PREPARE, a competing SET admission
+probe at the exact describe catalog capture, later SET-before-execute,
+authorization/scope denial, epoch change, and cold API-instance rehydration;
+the durable-store test covers restart of both resource and attached session.
+Pgwire now
 holds typed, identity-fenced dotted-name overlays with SET/SET LOCAL/SHOW/RESET,
 transaction/savepoint rollback, RESET ALL/DISCARD ALL, and prepared-plan epoch
-checks. Those overlays belong to one connection; they are not restart-durable
-or available to HTTP durable sessions. Durable-session overlays and
+checks. Pgwire overlays belong to one connection and are not restart-durable;
+HTTP overlays are owned by the durable transaction session. HTTP DISCARD ALL
+remains unsupported because it would also need to clear connection-owned
+prepared and cursor resources. Cross-owner
 failover/security workload gates remain open. A durable setting registry alone
 is not policy parity. Schema-bound policy definitions survive catalog Raft
 replay, snapshot/import, and table retirement. SQL CREATE/ALTER/DROP POLICY
@@ -574,9 +606,44 @@ opaque values, so no sequence counter exists to reset. Once owned sequences
 are introduced, their new counter generation must be part of the same staging
 plan and publication transaction.
 
-Graph indexes still require a graph cutover proof and are rejected before
-admission. Graph-derived state and metrics must be fenced with their old owner
-generation and proven empty on the new owner before this guard can be removed.
+Graph indexes still require a graph cutover proof. Admission rejects the entire
+FK-closed TRUNCATE cohort before owner reads or job creation if any selected
+table has a graph index, including an incoming-FK CASCADE child. Existing
+generation-bound graph retirement intent and pristine-new-owner checks remain
+preparatory only: graph-derived state, metrics, readers and workers must be
+fenced with their old owner generation before this guard can be removed.
+The new V2 graph configuration digest is a tested prerequisite: metadata
+declarations and loaded owner definitions agree across JSON key ordering,
+explicit incarnations, and the provisioner's derived-incarnation fallback.
+It is not a seal receipt or publication authority. In-flight V1 plans retain
+their raw-JSON digest and current guarded behavior.
+
+The required graph cutover is one coordinated owner/metadata protocol, not a
+coordinator-computed digest on the existing `old_fenced` command:
+
+- Add a pre-seal owner admission gate for every graph metric coordinator and
+  worker sweep, direct maintenance entrypoint, graph mutation, and graph read.
+  Close new worker-snapshot admission under the index catalog lock, then drain
+  existing schedule pins without holding a lock a pinned worker needs. The
+  ordinary topology `drained` bit currently covers transactions only.
+- Persist an exact old-owner graph seal through Raft, bound to the active
+  rewrite-source fence, old physical table/incarnation, locally verified graph
+  index declarations, target generation, and staging-plan digest. Do not trust
+  the plan's graph digest without comparing it to the owner's durable index
+  configuration. A retry must return the same receipt; stale attempts fail.
+- Rehydrate the closed graph admission gate from the durable fence/seal before
+  optional graph runtimes start after restart. Cancellation reopens it only
+  after the exact durable cancel tombstone, while publication retains the old
+  generation closed until its retirement is complete.
+- Have the coordinator read the seal receipt from the old owner at read-index,
+  then require its exact digest for every old range in metadata's `old_fenced`
+  transition before atomic cohort publication. Metadata currently validates
+  only group/range and plan digest and accepts any nonzero old completion
+  digest; a coordinator-made hash of the fence is not owner evidence.
+- Keep public graph TRUNCATE guarded until fault tests cover an in-flight
+  worker/read/write at seal, lost seal reply, owner restart before and after
+  receipt, stale or forged receipt, cancellation, and multi-table CASCADE
+  cutover with new-owner pristine graph state.
 
 Incoming-FK CASCADE selection must never truncate an outgoing parent implicitly.
 The current safe boundary rejects a selected child whose FK parent is outside
@@ -587,8 +654,14 @@ coordinator would be unsafe because native RESTRICT checks, participant commit
 validation and referential-action cursors also consume those references.
 
 Existing constraint retirement is correct but row-oriented: it scans children
-and joins individual reference detaches to ordinary 2PC. Completing the
-generation-level path without copying parent data requires a shared lifecycle:
+and joins individual reference detaches to ordinary 2PC. The legacy retirement
+worker still admits non-FK generations, including UNIQUE,
+with durable page/restart proofs. It deliberately rejects an FK-removing target
+at admission: its ready checkpoint does not carry the parent-owner ACK and
+generation fence required to publish a changed child FK schema. FK retirement
+must use the coordinated publication protocol rather than treating a drained
+child claim as that missing cross-owner proof. Completing the generation-level
+path without copying parent data requires a shared lifecycle:
 
 1. Pin and reserve untouched parent definitions/ranges and exact old child FK
    generations in the staging plan. Fence and drain affected parent owners as
@@ -626,11 +699,96 @@ and ACK protocol, while FK-bearing initial CREATE uses hidden child owners and
 publishes the table only after parent and child receipts. Standalone initial
 self-referential FK CREATE now uses authenticated native hidden-child owner
 receipts and an atomic local catalog publication; a two-range restart fixture
-and public valid/orphan-write fixture cover this path. Standalone initial FK
+and public valid/orphan-write fixture cover this path. The ordinary FK
+publication supervisor selects nonterminal work through a durable fixed-width
+active index instead of parsing historical publications on every tick; the
+index and phase transition share one metadata transaction and snapshot.
+Standalone initial FK
 CREATE with external parents and initial MATCH PARTIAL declarations remain
 guarded until their owner or atomic support-index paths are proven. Hidden-owner
 standby replay has a Raft-bound batch envelope, but seed/promotion fault
 coverage remains a release gate.
+
+Hosted external-parent FK DROP is routed from SQL DROP CONSTRAINT or the REST
+schema update through that same publication plan: an old-to-null generation
+transition fences and drains child owners, obtains staged/activated/ACKed
+parent-owner receipts, publishes the child schema at metadata, then installs it
+with an exact Raft-bound source receipt. A focused state-machine test covers
+DROP ordering across serialized restart. A mounted public SQL ADD/DROP workload
+has passed parent-ACK-before-child-publication, valid child insert and blocked
+parent delete before DROP, terminal DROP, cold owner restart, and permitted
+parent delete afterward. A later repetition stalled on the pre-DROP parent
+DELETE at Raft target index 10/applied 9; repeated stable completion remains a
+release gate. The native parent-action lookup filters retired
+inverse references before planning while scanning only a bounded physical
+page; an empty retired-only page still advances its continuation to later live
+references. GC currently scans routing-first reference keys, including live
+records; high-churn retirement needs a bounded-scale proof or an atomically
+maintained generation locator covering attach/detach, GC, restore, and range
+handoff. `GenerationRetired` remains a typed pre-decision conflict rather
+than poisoning Raft apply. The post-publication generation-GC poll uses a
+cursor-capable snapshot read; a point-probe transaction previously returned
+`Unsupported` before any GC page could be prepared. A byte-equal child index
+catalog is not a valid publication invariant because a schema-version bump stages
+`full_text_index_vN`; the plan re-derives the exact successor catalog using the
+candidate's fresh index incarnation and rejects unrelated index edits. A
+subsequent mounted DROP rerun stalled with a data-Raft apply index one behind
+the requested index during pre-DROP parent DELETE; that intermittent failure
+is still under exact-entry investigation, so the first pass is not soak proof.
+The pure index validator currently lives in `api/tables.zig` and is called by metadata
+plan validation; moving the shared index-derivation helpers to a
+metadata-neutral schema module remains layering cleanup.
+Self-referential ordinary FK ADD/DROP remains guarded at public publication
+admission. The internal plan now binds the same owner range and dual-role fence
+as child source and parent, and the owner keeps that fence through parent
+activation/ACK until atomic child schema/catalog installation. Before the
+public guard can be lifted, the mounted ADD/DROP and fault/restart matrix below
+must pass; the legacy constraint-retirement checkpoint is not that proof.
+Standalone ordinary FK generation publication also remains unsupported.
+The opt-in `antfly-api-hosted-self-fk-guard-test` asserts public SQL admission
+remains closed. `antfly-api-hosted-self-fk-diagnostic` is a separate,
+nondefault ADD/enforcement/DROP/restart probe that may run only during an
+authorized bounded guard lift. It passed one mounted run with ADD publication,
+parent/child inserts, blocked parent delete, DROP publication, cold owner
+restart, and permitted parent delete. The guard was restored immediately;
+one happy-path run is not the lost-ACK/concurrency/failover matrix below.
+Focused owner tests now prove that an old transaction blocks staging until it
+drains, duplicate Raft phase entries are idempotent, and the exact dual fence
+and old schema pin survive separate cold restarts after begin, stage,
+activation, and ACK. Metadata phase tests reject forged/stale receipts and
+recover after activation and ACK for both ADD and DROP. Coordinator restart
+and active-fence standby/handoff still need deterministic fault proof.
+
+Self-FK dual-role implementation ledger (keep the public guard until all steps
+are proved):
+
+1. Plan one exact child/parent owner cut per range, with the same table ID and
+   namespace in both roles. Validate old-to-new or old-to-null generations,
+   complete range coverage and a pinned catalog digest; do not count the same
+   group as two independent receipt owners.
+2. Add a Raft-persisted dual-role topology fence. Its begin command must block
+   old-generation child writes and parent attachments under one admission
+   epoch. After the owner drains in-flight sensitive transactions, stage and
+   activate the accepted parent generation without the current parent action's
+   `stageRelease`; persist plan/fence/generation-bound stage, activation and
+   ACK receipts with applied term/index. Generic release or cancel cannot lift
+   an activated fence.
+3. Give metadata explicit dual-role receipt phases. It must re-read the exact
+   owner decision, advance by revision CAS, permit cancellation only before
+   irreversible activation, and publish the successor child descriptor only
+   after every dual-role parent ACK. Restart must derive the next action from
+   durable receipts, not a supervisor cursor or a lost HTTP response.
+4. Install the published child schema, integrity catalog, accepted generation,
+   Raft marker and fence release in one owner transaction. Verify the metadata
+   publication decision and before/after schema and catalog digests before
+   that commit. Neither a parent activation nor a retry may reopen admission
+   between ACK and this atomic install; handoff must carry the fenced state.
+5. Prove crashes and failover after begin, drain, activation, lost ACK,
+   metadata publication and owner install; stale/duplicate Raft entries,
+   topology changes and cancel races; and concurrent old-generation writes.
+   Mounted self-FK ADD and DROP workloads must check pre-cutover blocking,
+   post-cutover enforcement or removal, and no stale-generation attachment or
+   reference visibility after restart before the public guard is removed.
 
 Initial MATCH PARTIAL support-index installation now reserves the parent
 descriptor, hidden child identity, locks, and durable work in one metadata
@@ -639,10 +797,19 @@ group, and admits a local Raft leader from a paired public/private metadata
 cut. Hidden-child topology proposals now carry an exact private compiled-owner
 descriptor through Raft instead of resolving an unpublished public table, and
 skip the public dense-repair admission probe only for that no-document-write
-control. The mounted lifecycle still stalls in `provisioning_child` without a
-child receipt after these changes; the private owner/control apply boundary and
-rollback fault matrix remain unproven, so initial MATCH PARTIAL CREATE stays
-publicly guarded.
+control. The mounted private lifecycle now reaches `published` with durable
+child provision/release and parent stage/activate/ACK receipts, and survives a
+data-owner restart. A temporary guard-off public CREATE also returned 202 and
+reached the same terminal publication. A catalog identity mismatch at this cut
+was fixed: the logical binding now uses the physical child table ID, and a
+focused metadata test resolves it after publication without preflight signals.
+In a mounted guard-off diagnostic, public child metadata GET returned 200 and
+a valid MATCH PARTIAL child insert committed with `202 committed_pending`; the
+fixture verifies visibility without replaying that mutation, then exercises
+orphan rejection and parent-delete protection. A post-owner-restart read still
+needs bounded readiness/transport classification, and hosted replica failover
+and distributed rollback fault coverage remain. The public CREATE guard stays
+enabled until those gates pass.
 Standalone cancellation has an exact hidden-owner retirement
 path and a checksummed local intent. Its self-FK two-range crash/restart and
 terminal cold-root tests pass, but this does not retire offline hosted replicas:

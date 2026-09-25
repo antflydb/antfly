@@ -1808,6 +1808,10 @@ pub fn configureStorageKernelOwnerDbAtOpen(
         defer db_mod.types.freeIndexConfigs(alloc, indexes);
         if (indexes.len != 0) return;
     }
+    // Metadata publishes the successor only after parent ACKs, before the
+    // exact child install Raft entry. A cold owner must reopen on its durable
+    // old schema and index catalog while the child-source fence is active.
+    if (schema_json.len > 0 and try db.childGenerationSourcePinsSchemaJson(schema_json)) return;
     // Catch-up may request an owner using an older Raft entry's pinned
     // descriptor after this physical generation has a newer durable schema.
     // Never roll back its schema, managed runtimes, or index definitions.
@@ -1938,6 +1942,8 @@ pub fn reconcileStorageKernelOwnerDb(
     antfly_provider: ?managed_embedder.AntflyProvider,
     installed: ?*OwnerManagedConfig,
 ) !StorageKernelReconcileResult {
+    if (schema_json.len > 0 and try db.childGenerationSourcePinsSchemaJson(schema_json))
+        return .{ .state = .busy };
     if (target_index_name == null and schema_json.len > 0) try applyLocalTableSchemaJson(alloc, db, schema_json);
     const installed_matches = if (installed) |state| state.matches(indexes_json) else false;
     const replace = indexes_json.len > 0 and backend_runtime != null and !installed_matches;

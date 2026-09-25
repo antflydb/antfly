@@ -211,6 +211,7 @@ test "SQL target-only mutation subqueries share one captured relational plan" {
         .{ .sql = "UPDATE target SET cold='new' WHERE _id IN (SELECT id FROM source)", .tag = "UPDATE" },
         .{ .sql = "UPDATE target SET cold='new' WHERE EXISTS (SELECT id FROM source WHERE source.id=target._id)", .tag = "UPDATE" },
         .{ .sql = "UPDATE target SET n=(SELECT delta FROM source WHERE source.id=target._id),cold='new'", .tag = "UPDATE" },
+        .{ .sql = "UPDATE target SET (n,cold)=(SELECT delta,'new' FROM source WHERE id='a')", .tag = "UPDATE" },
         .{ .sql = "DELETE FROM target WHERE _id IN (SELECT id FROM source)", .tag = "DELETE" },
     }) |case| {
         var backend: Backend = .{};
@@ -226,6 +227,35 @@ test "SQL target-only mutation subqueries share one captured relational plan" {
         try std.testing.expectEqual(@as(usize, 1), backend.commits);
         try std.testing.expectEqual(@as(usize, 2), backend.writes);
     }
+}
+
+test "SQL row subquery assigns positional values after bounded ordered source" {
+    for ([_][]const u8{
+        "UPDATE target SET (n,cold)=(SELECT delta AS amount,'new' AS label FROM source ORDER BY amount DESC LIMIT 1) RETURNING n,cold",
+        "WITH s AS (SELECT delta FROM source) UPDATE target SET (n,cold)=(SELECT delta,'new' FROM s ORDER BY delta DESC LIMIT 1) RETURNING n,cold",
+        "WITH \"$update_row_source_0\" AS (SELECT delta FROM source) UPDATE target SET (n,cold)=(SELECT delta,'new' FROM \"$update_row_source_0\" ORDER BY delta DESC LIMIT 1) RETURNING n,cold",
+    }) |sql| {
+        var backend: Backend = .{};
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u64, 2), result.output.rows_affected);
+        try std.testing.expectEqualStrings("20", result.output.rows[0][0].string);
+        try std.testing.expectEqualStrings("new", result.output.rows[0][1].string);
+        try std.testing.expectEqual(@as(usize, 1), backend.captures);
+        try std.testing.expectEqual(@as(usize, 2), backend.last_scan_count);
+        try std.testing.expectEqual(@as(usize, 1), backend.commits);
+    }
+}
+
+test "SQL row subquery cannot escape its independent derived source" {
+    var backend: Backend = .{};
+    var compiled = try compiler.compile(std.testing.allocator, "UPDATE target SET (n,cold)=(SELECT delta,'new' FROM source WHERE source.id=target._id)", .{});
+    defer compiled.deinit();
+    try std.testing.expectError(error.UndefinedColumn, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{}));
+    try std.testing.expectEqual(@as(usize, 0), backend.captures);
+    try std.testing.expectEqual(@as(usize, 0), backend.commits);
 }
 
 test "SQL mutation membership subquery scales by captured rows" {
@@ -264,6 +294,7 @@ test "SQL mutation scalar subquery rejects multiple rows before commit" {
     for ([_][]const u8{
         "UPDATE target SET n=(SELECT delta FROM source WHERE source.id=target._id),cold='new'",
         "UPDATE target SET (n,cold)=ROW((SELECT delta FROM source WHERE source.id=target._id),'new')",
+        "UPDATE target SET (n,cold)=(SELECT delta,'new' FROM source)",
     }) |sql| {
         var backend: Backend = .{ .duplicates = true };
         var compiled = try compiler.compile(std.testing.allocator, sql, .{});

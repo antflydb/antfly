@@ -10,6 +10,8 @@ pub const prefix = "\x00\x00__metadata__:relational_integrity_child_generation:"
 pub const staged_receipt_key = "\x00\x00__metadata__:relational_integrity_child_generation_staged";
 pub const activation_receipt_key = "\x00\x00__metadata__:relational_integrity_child_generation_activation";
 pub const acknowledged_receipt_key = "\x00\x00__metadata__:relational_integrity_child_generation_acknowledged";
+pub const dual_acknowledged_fence_key = "\x00\x00__metadata__:relational_integrity_child_generation_dual_ack_fence";
+pub const dual_canceled_fence_key = "\x00\x00__metadata__:relational_integrity_child_generation_dual_cancel_fence";
 pub const cancel_receipt_key = "\x00\x00__metadata__:relational_integrity_child_generation_canceled";
 pub const source_cancel_receipt_key = "\x00\x00__metadata__:relational_integrity_child_source_canceled";
 pub const source_fence_receipt_key = "\x00\x00__metadata__:relational_integrity_child_source_fenced";
@@ -325,7 +327,7 @@ pub fn cancelTransition(alloc: std.mem.Allocator, txn: anytype, transition: Tran
 pub fn completionReceipt(fence: @import("relational_integrity_topology_contract.zig").Fence, transitions: []const Transition) !integrity.Digest {
     try validateTransitions(transitions);
     const encoded = try fence.encode();
-    if (fence.role != .child_generation_parent) return error.InvalidGenerationAdmission;
+    if (fence.role != .child_generation_parent and fence.role != .child_generation_dual) return error.InvalidGenerationAdmission;
     var hash = std.crypto.hash.Blake3.init(.{});
     hash.update("antfly accepted child FK generation owner activation v2");
     hash.update(&encoded);
@@ -340,7 +342,7 @@ pub fn completionReceipt(fence: @import("relational_integrity_topology_contract.
 
 pub fn stageReceipt(fence: @import("relational_integrity_topology_contract.zig").Fence, transitions: []const Transition) !integrity.Digest {
     const encoded = try fence.encode();
-    if (fence.role != .child_generation_parent) return error.InvalidGenerationAdmission;
+    if (fence.role != .child_generation_parent and fence.role != .child_generation_dual) return error.InvalidGenerationAdmission;
     const batch_digest = try transitionsDigest(transitions);
     var hash = std.crypto.hash.Blake3.init(.{});
     hash.update("antfly accepted child FK generation owner stage v1");
@@ -355,8 +357,8 @@ pub fn stageReceipt(fence: @import("relational_integrity_topology_contract.zig")
 
 pub fn cancelReceipt(fence: @import("relational_integrity_topology_contract.zig").Fence, transitions: ?[]const Transition) !integrity.Digest {
     const encoded = try fence.encode();
-    if ((transitions == null and fence.role != .child_generation_source) or
-        (transitions != null and fence.role != .child_generation_parent)) return error.InvalidGenerationAdmission;
+    if ((transitions == null and fence.role != .child_generation_source and fence.role != .child_generation_dual) or
+        (transitions != null and fence.role != .child_generation_parent and fence.role != .child_generation_dual)) return error.InvalidGenerationAdmission;
     var hash = std.crypto.hash.Blake3.init(.{});
     hash.update("antfly accepted child FK generation owner cancel v1");
     hash.update(&encoded);
@@ -378,7 +380,7 @@ pub fn stageCanceledReceipt(txn: anytype, fence: @import("relational_integrity_t
 }
 
 pub fn sourceFenceDigest(fence: @import("relational_integrity_topology_contract.zig").Fence) !integrity.Digest {
-    if (fence.role != .child_generation_source) return error.InvalidGenerationAdmission;
+    if (fence.role != .child_generation_source and fence.role != .child_generation_dual) return error.InvalidGenerationAdmission;
     const encoded = try fence.encode();
     var digest: integrity.Digest = undefined;
     std.crypto.hash.Blake3.hash(&encoded, &digest, .{});
@@ -393,7 +395,7 @@ pub fn stageSourceFencedReceipt(txn: anytype, fence: @import("relational_integri
 
 pub fn sourceInstallDigest(fence: @import("relational_integrity_topology_contract.zig").Fence, before_schema_json_digest: integrity.Digest, schema_json_digest: integrity.Digest, before_catalog_digest: integrity.Digest, after_catalog_digest: integrity.Digest) !integrity.Digest {
     const encoded_fence = try fence.encode();
-    if (fence.role != .child_generation_source) return error.InvalidGenerationAdmission;
+    if (fence.role != .child_generation_source and fence.role != .child_generation_dual) return error.InvalidGenerationAdmission;
     var hash = std.crypto.hash.Blake3.init(.{});
     hash.update("antfly child FK generation owner schema install v1");
     hash.update(&encoded_fence);
@@ -498,11 +500,83 @@ pub fn stageAcknowledgement(txn: anytype, fence: @import("relational_integrity_t
             !std.meta.eql(scope.active_generation, transition.next_generation)) return error.GenerationAdmissionChanged;
     }
     const topology = @import("relational_integrity_topology.zig");
-    if (try topology.current(txn) != null) return error.IntegrityTopologyChanged;
-    const completed = (try topology.completed(txn)) orelse return error.IntegrityTopologyFenceMissing;
-    if (!completed.eql(fence)) return error.IntegrityTopologyChanged;
+    if (fence.role == .child_generation_dual) {
+        const active = (try topology.current(txn)) orelse return error.IntegrityTopologyFenceMissing;
+        if (!active.eql(fence)) return error.IntegrityTopologyChanged;
+    } else {
+        if (try topology.current(txn) != null) return error.IntegrityTopologyChanged;
+        const completed = (try topology.completed(txn)) orelse return error.IntegrityTopologyFenceMissing;
+        if (!completed.eql(fence)) return error.IntegrityTopologyChanged;
+    }
     const encoded = (AppliedReceipt{ .digest = receipt, .term = term, .index = index }).encode();
     try txn.put(acknowledged_receipt_key, &encoded);
+    if (fence.role == .child_generation_dual) {
+        const encoded_fence = try fence.encode();
+        try txn.put(dual_acknowledged_fence_key, &encoded_fence);
+    }
+}
+
+/// A dual-role owner may release its one shared fence only when the parent
+/// activation and acknowledgement for this exact admission epoch are durable.
+pub fn requireDualInstallReady(txn: anytype, fence: @import("relational_integrity_topology_contract.zig").Fence) !void {
+    if (fence.role != .child_generation_dual) return;
+    const topology = @import("relational_integrity_topology.zig");
+    const active = (try topology.current(txn)) orelse return error.IntegrityTopologyFenceMissing;
+    if (!active.eql(fence)) return error.IntegrityTopologyChanged;
+    const encoded = txn.get(dual_acknowledged_fence_key) catch return error.GenerationAdmissionAcknowledgementPending;
+    const acknowledged = try @import("relational_integrity_topology_contract.zig").Fence.decode(encoded);
+    if (!acknowledged.eql(fence)) return error.GenerationAdmissionAcknowledgementPending;
+    try requireAcknowledged(txn);
+}
+
+pub fn requireDualParentCanceled(txn: anytype, fence: @import("relational_integrity_topology_contract.zig").Fence) !void {
+    if (fence.role != .child_generation_dual) return;
+    const topology = @import("relational_integrity_topology.zig");
+    const completed = (try topology.completed(txn)) orelse return error.GenerationAdmissionPending;
+    if (!completed.eql(fence)) return error.GenerationAdmissionChanged;
+    const encoded = txn.get(dual_canceled_fence_key) catch return error.GenerationAdmissionPending;
+    const canceled = try @import("relational_integrity_topology_contract.zig").Fence.decode(encoded);
+    if (!canceled.eql(fence)) return error.GenerationAdmissionChanged;
+    _ = try AppliedReceipt.decode(txn.get(cancel_receipt_key) catch return error.GenerationAdmissionPending);
+}
+
+/// Compare every durable self-child accepted scope with the candidate schema
+/// catalog, in both directions. The local parent and child share this owner,
+/// so a forged activation must not publish a different FK generation even
+/// with a valid schema/catalog digest and a durable ACK.
+pub fn requireDualCatalogMatch(alloc: std.mem.Allocator, txn: anytype, table_id: u64, candidate: @import("relational_integrity_catalog.zig").Catalog) !void {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    var own_name: ?[]const u8 = null;
+    var entry = try cursor.seekAtOrAfter(prefix);
+    while (entry) |record| : (entry = try cursor.next()) {
+        if (!std.mem.startsWith(u8, record.key, prefix)) break;
+        const scope = try Scope.decode(record.value);
+        if (scope.child_table_id != table_id) continue;
+        if (own_name) |name| {
+            if (!std.mem.eql(u8, name, scope.child_table_name)) return error.GenerationAdmissionChanged;
+        } else own_name = try arena.allocator().dupe(u8, scope.child_table_name);
+        if (scope.phase != .active) return error.GenerationAdmissionChanged;
+        const candidate_binding = candidate.find(.foreign_key, scope.constraint_name);
+        const binding = if (candidate_binding) |value| blk: {
+            const payload = std.json.parseFromSliceLeaky(struct { parent_table: []const u8 }, arena.allocator(), value.definition.payload, .{ .ignore_unknown_fields = true }) catch return error.IntegrityCatalogChanged;
+            break :blk if (std.mem.eql(u8, payload.parent_table, scope.child_table_name)) value else null;
+        } else null;
+        if (scope.active_generation) |generation| {
+            if (binding == null or !std.mem.eql(u8, &binding.?.generation, &generation)) return error.GenerationAdmissionChanged;
+        } else if (binding != null) return error.GenerationAdmissionChanged;
+    }
+    const table_name = own_name orelse return error.GenerationAdmissionChanged;
+    for (candidate.bindings) |binding| {
+        if (binding.retired or binding.definition.kind != .foreign_key) continue;
+        const payload = std.json.parseFromSliceLeaky(struct { parent_table: []const u8 }, arena.allocator(), binding.definition.payload, .{ .ignore_unknown_fields = true }) catch return error.IntegrityCatalogChanged;
+        if (!std.mem.eql(u8, payload.parent_table, table_name)) continue;
+        const scope = (try load(txn, table_name, binding.definition.name)) orelse return error.GenerationAdmissionChanged;
+        if (scope.child_table_id != table_id or scope.phase != .active or scope.active_generation == null or
+            !std.mem.eql(u8, &scope.active_generation.?, &binding.generation)) return error.GenerationAdmissionChanged;
+    }
 }
 
 pub fn stageTransferred(txn: anytype, physical_key: []const u8, value: []const u8) !void {

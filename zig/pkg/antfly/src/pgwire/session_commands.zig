@@ -54,7 +54,7 @@ pub const ApplicationName = struct {
 };
 pub const ApplicationNameSetting = union(enum) { show, set: struct { local: bool, value: ApplicationName }, reset };
 pub const EncodingSetting = union(enum) { show, set: struct { local: bool }, reset };
-pub const CatalogSetting = union(enum) { show: []const u8, set: struct { name: []const u8, value: []const u8, local: bool }, reset: []const u8 };
+pub const CatalogSetting = union(enum) { show: []const u8, set: struct { name: []const u8, value: []const u8, local: bool }, reset: []const u8, reset_local: []const u8 };
 pub const Setting = union(enum) {
     search_path: SearchPathSetting,
     statement_timeout: TimeoutSetting,
@@ -129,7 +129,7 @@ pub fn catalogSetting(alloc: std.mem.Allocator, input: []const u8) !?CatalogSett
         break :blk input[start..p.pos];
     };
     try p.finish();
-    if (!quoted and std.ascii.eqlIgnoreCase(value, "default")) return .{ .reset = name };
+    if (!quoted and std.ascii.eqlIgnoreCase(value, "default")) return if (local) .{ .reset_local = name } else .{ .reset = name };
     return .{ .set = .{ .name = name, .value = value, .local = local } };
 }
 
@@ -143,6 +143,7 @@ test "pgwire dotted catalog settings preserve quoted default and reject trailing
     try std.testing.expect(!literal.local);
     try std.testing.expect((try settingCommand(alloc, "SET LOCAL app.limit TO 4")).?.catalog.set.local);
     try std.testing.expect((try settingCommand(alloc, "SET app.limit = DEFAULT")).?.catalog == .reset);
+    try std.testing.expect((try settingCommand(alloc, "SET LOCAL app.limit = DEFAULT")).?.catalog == .reset_local);
     try std.testing.expectError(error.InvalidSqlSyntax, settingCommand(alloc, "SHOW app.limit; SELECT 1"));
 }
 

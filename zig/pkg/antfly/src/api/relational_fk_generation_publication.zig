@@ -125,7 +125,6 @@ pub const SourceReceipt = struct {
             self.child_table_id != request.child_table_id or
             self.child_group_id != request.child_group_id or
             self.action != request.action or
-            self.before_schema_version == 0 or
             self.after_schema_version <= self.before_schema_version or
             self.applied_term == 0 or self.applied_index == 0 or
             std.mem.allEqual(u8, &self.plan_digest, 0) or
@@ -302,6 +301,20 @@ test "FK generation child source request and receipt bind schema cut" {
         .applied_index = 7,
     };
     try receipt.validate(req);
+    // A newly created SQL table has native schema version zero. Its first
+    // FK generation is the valid 0 -> 1 schema cut.
+    var initial = receipt;
+    initial.before_schema_version = 0;
+    initial.after_schema_version = 1;
+    try initial.validate(req);
+    const wire = try std.json.Stringify.valueAlloc(std.testing.allocator, initial, .{});
+    defer std.testing.allocator.free(wire);
+    var decoded = try std.json.parseFromSlice(SourceReceipt, std.testing.allocator, wire, .{});
+    defer decoded.deinit();
+    try decoded.value.validate(req);
+    try std.testing.expectEqual(initial.digest(), decoded.value.digest());
+    initial.after_schema_version = 0;
+    try std.testing.expectError(error.InvalidGenerationPublication, initial.validate(req));
     var changed = receipt;
     changed.after_schema_digest = @splat(9);
     const first = receipt.digest();

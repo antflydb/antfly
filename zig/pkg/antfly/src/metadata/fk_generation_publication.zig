@@ -33,6 +33,25 @@ pub fn key(buf: []u8, metadata_group_id: u64, child_table_id: u64) ![]const u8 {
     return std.fmt.bufPrint(buf, prefix ++ "{d}:{d}", .{ metadata_group_id, child_table_id });
 }
 
+/// Only nonterminal publications have a work key. Fixed-width hex keeps the
+/// supervisor's resume cursor ordered without scanning historical records.
+pub fn workPrefixForGroup(buf: []u8, metadata_group_id: u64) ![]const u8 {
+    return std.fmt.bufPrint(buf, "\x00\x00__metadata__:fk_generation_work:{d}:", .{metadata_group_id});
+}
+
+pub fn workKey(buf: []u8, metadata_group_id: u64, child_table_id: u64) ![]const u8 {
+    return std.fmt.bufPrint(buf, "\x00\x00__metadata__:fk_generation_work:{d}:{x:0>16}", .{ metadata_group_id, child_table_id });
+}
+
+test "FK generation pending keys preserve numeric order" {
+    var left_buf: [160]u8 = undefined;
+    var right_buf: [160]u8 = undefined;
+    const left = try workKey(&left_buf, 7, 9);
+    const right = try workKey(&right_buf, 7, 10);
+    try std.testing.expect(std.mem.order(u8, left, right) == .lt);
+    try std.testing.expectEqual(@as(usize, 16), left.len - (try workPrefixForGroup(&right_buf, 7)).len);
+}
+
 pub fn tableLockKey(buf: []u8, metadata_group_id: u64, table_id: u64) ![]const u8 {
     return std.fmt.bufPrint(buf, "\x00\x00__metadata__:fk_generation_table_lock:{d}:{d}", .{ metadata_group_id, table_id });
 }
@@ -173,6 +192,18 @@ pub const Plan = struct {
         if (before.storage_mode != .relational or after.storage_mode != .relational or
             after.version != next_version)
             return error.InvalidGenerationPublication;
+        // A schema version may require a successor full-text incarnation.
+        // Verify the entire successor index catalog against the deterministic
+        // DDL derivation, rather than allowing unrelated index/runtime edits
+        // to cross the child-source fence.
+        if (!try @import("../api/tables.zig").foreignKeyPublicationIndexesValid(
+            alloc,
+            self.child_before.name,
+            self.child_before.indexes_json,
+            self.child_after.indexes_json,
+            self.child_after.schema_json,
+            next_version,
+        )) return error.InvalidGenerationPublication;
         const catalog_len = std.base64.standard.Decoder.calcSizeForSlice(self.child_catalog_before_b64) catch return error.InvalidGenerationPublication;
         if (catalog_len > integrity_catalog.max_catalog_bytes) return error.InvalidGenerationPublication;
         const catalog_bytes = try alloc.alloc(u8, catalog_len);
@@ -197,17 +228,26 @@ pub const Plan = struct {
         const after_foreign = try after.relationalForeignKeyDefinitions(alloc);
         defer if (after_foreign.len > 0) alloc.free(after_foreign);
         try table_manager.validateCompleteKeyspaceRanges(self.child_ranges);
-        try validateOwnerFences(self.id, self.child_before, self.child_ranges, self.child_fences, .child_generation_source);
+        const self_parent = for (self.parents) |parent| {
+            if (parent.table.table_id == self.child_before.table_id) break true;
+        } else false;
+        try validateOwnerFences(self.id, self.child_before, self.child_ranges, self.child_fences, if (self_parent) .child_generation_dual else .child_generation_source);
         var owner_count = self.child_ranges.len;
         var constraint_count: usize = 0;
         for (self.parents, 0..) |parent, index| {
-            if (parent.support_before != null or parent.support_after != null or parent.table.table_id == 0 or parent.table.table_id == self.child_before.table_id or
+            if (parent.support_before != null or parent.support_after != null or parent.table.table_id == 0 or
                 parent.ranges.len == 0 or parent.ranges.len > max_owners or parent.fences.len != parent.ranges.len or
                 parent.transitions.len == 0 or parent.transitions.len > max_constraints) return error.InvalidGenerationPublication;
             for (self.parents[0..index]) |prior| if (prior.table.table_id == parent.table.table_id) return error.InvalidGenerationPublication;
             try table_manager.validateCompleteKeyspaceRanges(parent.ranges);
-            try validateOwnerFences(self.id, parent.table, parent.ranges, parent.fences, .child_generation_parent);
-            owner_count = std.math.add(usize, owner_count, parent.ranges.len) catch return error.InvalidGenerationPublication;
+            const dual = parent.table.table_id == self.child_before.table_id;
+            try validateOwnerFences(self.id, parent.table, parent.ranges, parent.fences, if (dual) .child_generation_dual else .child_generation_parent);
+            if (dual) {
+                if (!table_manager.tableDefinitionsEqual(parent.table, self.child_before) or parent.ranges.len != self.child_ranges.len) return error.InvalidGenerationPublication;
+                for (parent.ranges, self.child_ranges, parent.fences, self.child_fences) |parent_range, child_range, parent_fence, child_fence| {
+                    if (!table_manager.rangeRecordsEqual(parent_range, child_range) or !parent_fence.eql(child_fence)) return error.InvalidGenerationPublication;
+                }
+            } else owner_count = std.math.add(usize, owner_count, parent.ranges.len) catch return error.InvalidGenerationPublication;
             constraint_count = std.math.add(usize, constraint_count, parent.transitions.len) catch return error.InvalidGenerationPublication;
             if (owner_count > max_owners or constraint_count > max_constraints) return error.InvalidGenerationPublication;
             for (parent.transitions, 0..) |transition, ti| {
@@ -1443,6 +1483,195 @@ test "FK generation publication rejects an unbound or empty plan" {
     try std.testing.expectError(error.InvalidGenerationPublication, plan.validate(std.testing.allocator));
 }
 
+test "self-FK generation plan binds both roles to one exact dual owner fence" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const before_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent_id":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
+    ;
+    const after_json =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"self_fk","child_columns":["parent_id"],"parent_table":"nodes","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent_id":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
+    ;
+    var before = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, before_json);
+    defer before.deinit(alloc);
+    var compiled = try compileCatalog(alloc, before, 101, null);
+    defer compiled.deinit();
+    const old_b64 = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(compiled.value.len));
+    _ = std.base64.standard.Encoder.encode(old_b64, compiled.value);
+    const derived = try deriveTransitions(alloc, 101, "nodes", before_json, after_json, old_b64);
+    try std.testing.expectEqual(@as(usize, 1), derived.len);
+    try std.testing.expectEqualStrings("nodes", derived[0].parent_table_name);
+    var id: Id = @splat(0);
+    std.mem.writeInt(u64, id[0..8], 7, .little);
+    std.mem.writeInt(u64, id[8..16], 1, .little);
+    const table: records.TableRecord = .{ .table_id = 101, .name = "nodes", .schema_json = before_json };
+    const range: records.RangeRecord = .{ .table_id = 101, .group_id = 301, .range_id = 301, .doc_identity_shard_id = 301, .doc_identity_range_id = 301, .start_key = "" };
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(compiled.value, &digest, .{});
+    const fence: topology.Fence = .{ .transition_id = 7, .attempt = 1, .peer_group_id = 301, .owner_group_id = 301, .role = .child_generation_dual, .namespace = .{ .table_id = 101, .shard_id = 301, .range_id = 301 }, .catalog_digest = digest };
+    const plan: Plan = .{
+        .id = id,
+        .child_before = table,
+        .child_after = .{ .table_id = 101, .name = "nodes", .schema_json = after_json },
+        .child_catalog_before_b64 = old_b64,
+        .child_ranges = &.{range},
+        .child_fences = &.{fence},
+        .parents = &.{.{ .table = table, .ranges = &.{range}, .fences = &.{fence}, .transitions = &.{derived[0].transition} }},
+    };
+    try plan.validate(alloc);
+    var wrong_role = fence;
+    wrong_role.role = .child_generation_source;
+    var invalid = plan;
+    invalid.child_fences = &.{wrong_role};
+    try std.testing.expectError(error.InvalidGenerationPublication, invalid.validate(alloc));
+    invalid = plan;
+    const changed_range: records.RangeRecord = .{ .table_id = 101, .group_id = 302, .range_id = 301, .doc_identity_shard_id = 301, .doc_identity_range_id = 301, .start_key = "" };
+    invalid.parents = &.{.{ .table = table, .ranges = &.{changed_range}, .fences = &.{fence}, .transitions = &.{derived[0].transition} }};
+    try std.testing.expectError(error.InvalidGenerationPublication, invalid.validate(alloc));
+
+    const dropped_json =
+        \\{"version":3,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent_id":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
+    ;
+    var added = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, after_json);
+    defer added.deinit(alloc);
+    var added_catalog = try compileCatalog(alloc, added, 101, compiled.value);
+    defer added_catalog.deinit();
+    const added_b64 = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(added_catalog.value.len));
+    _ = std.base64.standard.Encoder.encode(added_b64, added_catalog.value);
+    const dropped = try deriveTransitions(alloc, 101, "nodes", after_json, dropped_json, added_b64);
+    try std.testing.expectEqual(@as(usize, 1), dropped.len);
+    try std.testing.expect(dropped[0].transition.expected_generation != null and dropped[0].transition.next_generation == null);
+    var added_digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(added_catalog.value, &added_digest, .{});
+    var drop_fence = fence;
+    drop_fence.catalog_digest = added_digest;
+    const added_table: records.TableRecord = .{ .table_id = 101, .name = "nodes", .schema_json = after_json };
+    const drop_plan: Plan = .{
+        .id = id,
+        .child_before = added_table,
+        .child_after = .{ .table_id = 101, .name = "nodes", .schema_json = dropped_json },
+        .child_catalog_before_b64 = added_b64,
+        .child_ranges = &.{range},
+        .child_fences = &.{drop_fence},
+        .parents = &.{.{ .table = added_table, .ranges = &.{range}, .fences = &.{drop_fence}, .transitions = &.{dropped[0].transition} }},
+    };
+    try drop_plan.validate(alloc);
+    try exerciseSelfPublicationRecovery(alloc, plan);
+    try exerciseSelfPublicationRecovery(alloc, drop_plan);
+}
+
+fn exerciseSelfPublicationRecovery(alloc: std.mem.Allocator, plan: Plan) !void {
+    const control = @import("../api/relational_fk_generation_publication.zig");
+    const admission = @import("../storage/db/relational_integrity_generation_admission.zig");
+    const digest = try plan.digest(alloc);
+    const identity = try plan.childIdentity(alloc);
+    const range = plan.child_ranges[0];
+    const fence_bytes = try plan.child_fences[0].encode();
+    var fence_digest: Digest = undefined;
+    std.crypto.hash.Blake3.hash(&fence_bytes, &fence_digest, .{});
+    var source: control.SourceReceipt = .{
+        .plan_id = plan.id,
+        .child_table_id = plan.child_before.table_id,
+        .child_group_id = range.group_id,
+        .action = .fence,
+        .plan_digest = digest,
+        .fence_digest = fence_digest,
+        .before_schema_version = identity.before_schema_version,
+        .before_schema_digest = identity.before_schema_digest,
+        .before_catalog_digest = identity.before_catalog_digest,
+        .after_schema_version = identity.after_schema_version,
+        .after_schema_digest = identity.after_schema_digest,
+        .after_catalog_digest = identity.after_catalog_digest,
+        .applied_term = 1,
+        .applied_index = 1,
+    };
+    const transition = plan.parents[0].transitions[0];
+    const transitions_digest = try admission.transitionsDigest(&.{.{
+        .child_table_id = transition.child_table_id,
+        .child_table_name = transition.child_table_name,
+        .constraint_name = transition.constraint_name,
+        .expected_generation = transition.expected_generation,
+        .next_generation = transition.next_generation,
+        .plan_id = plan.id,
+        .decision_digest = digest,
+    }});
+    var parent: control.Receipt = .{
+        .plan_id = plan.id,
+        .parent_table_id = plan.child_before.table_id,
+        .parent_group_id = range.group_id,
+        .child_table_id = plan.child_before.table_id,
+        .action = .stage,
+        .transitions_digest = transitions_digest,
+        .decision_digest = digest,
+        .applied_term = 1,
+        .applied_index = 2,
+    };
+    const make = struct {
+        fn command(state: Publication, action: @FieldType(Command, "action"), source_receipt: ?control.SourceReceipt, parent_receipt: ?control.Receipt) Command {
+            return .{ .plan_id = state.plan.id, .child_table_id = state.plan.child_before.table_id, .expected_revision = state.revision, .action = action, .source_receipt = source_receipt, .parent_receipt = parent_receipt };
+        }
+    }.command;
+    var value: Publication = .{ .plan = plan, .plan_digest = digest, .child_identity = identity, .revision = 1, .phase = .fencing_child };
+    try value.validate(alloc);
+    var wrong_source = source;
+    wrong_source.fence_digest = @splat(99);
+    try std.testing.expectError(error.InvalidGenerationPublication, value.apply(alloc, make(value, .child_fenced, wrong_source, null)));
+    value = try value.apply(alloc, make(value, .child_fenced, source, null));
+    value = try value.apply(alloc, make(value, .parent_staged, null, parent));
+    {
+        // A pre-decision cancellation may retire both roles, but a delayed
+        // activation receipt cannot revive the canceled publication.
+        var canceled = try value.apply(alloc, make(value, .cancel, null, null));
+        var canceled_parent = parent;
+        canceled_parent.action = .cancel;
+        canceled_parent.applied_index = 3;
+        canceled = try canceled.apply(alloc, make(canceled, .parent_canceled, null, canceled_parent));
+        var canceled_source = source;
+        canceled_source.action = .cancel;
+        canceled_source.applied_index = 4;
+        canceled = try canceled.apply(alloc, make(canceled, .child_canceled, canceled_source, null));
+        try std.testing.expectEqual(Phase.canceled, canceled.phase);
+        try canceled.validateState(alloc);
+        var late_parent = parent;
+        late_parent.action = .activate;
+        late_parent.applied_index = 5;
+        try std.testing.expectError(error.GenerationPublicationChanged, canceled.apply(alloc, make(canceled, .parent_activated, null, late_parent)));
+    }
+    parent.action = .activate;
+    parent.applied_index = 3;
+    value = try value.apply(alloc, make(value, .parent_activated, null, parent));
+    try std.testing.expectEqual(Phase.acknowledging_parents, value.phase);
+    try std.testing.expectError(error.GenerationPublicationChanged, value.apply(alloc, make(value, .publish_child, null, null)));
+    try std.testing.expectError(error.GenerationPublicationChanged, value.apply(alloc, make(value, .cancel, null, null)));
+
+    // Recover after activation, then prove the exact parent ACK is required.
+    const activated_bytes = try std.json.Stringify.valueAlloc(alloc, value, .{});
+    value = try std.json.parseFromSliceLeaky(Publication, alloc, activated_bytes, .{});
+    try value.validate(alloc);
+    parent.action = .acknowledge;
+    parent.applied_index = 4;
+    var wrong_parent = parent;
+    wrong_parent.parent_group_id += 1;
+    try std.testing.expectError(error.InvalidGenerationPublication, value.apply(alloc, make(value, .parent_acknowledged, null, wrong_parent)));
+    const ack = make(value, .parent_acknowledged, null, parent);
+    value = try value.apply(alloc, ack);
+    try std.testing.expectEqual(Phase.publishing_child, value.phase);
+    try std.testing.expectError(error.GenerationPublicationChanged, value.apply(alloc, ack));
+
+    // Recover after ACK, then ensure replay cannot advance the same revision.
+    const acknowledged_bytes = try std.json.Stringify.valueAlloc(alloc, value, .{});
+    value = try std.json.parseFromSliceLeaky(Publication, alloc, acknowledged_bytes, .{});
+    try value.validate(alloc);
+    value = try value.apply(alloc, make(value, .publish_child, null, null));
+    source.action = .install;
+    source.applied_index = 5;
+    const install = make(value, .child_installed, source, null);
+    value = try value.apply(alloc, install);
+    try std.testing.expectEqual(Phase.published, value.phase);
+    try std.testing.expectError(error.GenerationPublicationChanged, value.apply(alloc, install));
+}
+
 test "initial MATCH PARTIAL publication pins parent witness support" {
     const alloc = std.testing.allocator;
     const child_json =
@@ -1539,4 +1768,118 @@ test "FK generation publication derives history-bound replacement and reparentin
     wrong.next_generation = @splat(9);
     forged.parents = &.{.{ .table = .{ .table_id = 202, .name = "parent_a" }, .ranges = &.{parent_range}, .fences = &.{parent_fence}, .transitions = &.{wrong} }};
     try std.testing.expectError(error.InvalidGenerationPublication, forged.validate(alloc));
+}
+
+test "FK generation DROP requires drained child receipt and parent ACK before schema publication" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const before_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"fk","child_columns":["id"],"parent_table":"parent","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const after_json =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    var before = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, before_json);
+    defer before.deinit(alloc);
+    var compiled = try compileCatalog(alloc, before, 101, null);
+    defer compiled.deinit();
+    const old_b64 = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(compiled.value.len));
+    _ = std.base64.standard.Encoder.encode(old_b64, compiled.value);
+    const derived = try deriveTransitions(alloc, 101, "child", before_json, after_json, old_b64);
+    try std.testing.expectEqual(@as(usize, 1), derived.len);
+    try std.testing.expectEqualStrings("parent", derived[0].parent_table_name);
+    try std.testing.expect(derived[0].transition.expected_generation != null);
+    try std.testing.expect(derived[0].transition.next_generation == null);
+
+    var id: Id = @splat(0);
+    std.mem.writeInt(u64, id[0..8], 7, .little);
+    std.mem.writeInt(u64, id[8..16], 1, .little);
+    const child_range: records.RangeRecord = .{ .table_id = 101, .group_id = 301, .range_id = 301, .doc_identity_shard_id = 301, .doc_identity_range_id = 301, .start_key = "" };
+    const parent_range: records.RangeRecord = .{ .table_id = 202, .group_id = 401, .range_id = 401, .doc_identity_shard_id = 401, .doc_identity_range_id = 401, .start_key = "" };
+    const child_fence: topology.Fence = .{ .transition_id = 7, .attempt = 1, .peer_group_id = 301, .owner_group_id = 301, .role = .child_generation_source, .namespace = .{ .table_id = 101, .shard_id = 301, .range_id = 301 }, .catalog_digest = @splat(1) };
+    const parent_fence: topology.Fence = .{ .transition_id = 7, .attempt = 1, .peer_group_id = 401, .owner_group_id = 401, .role = .child_generation_parent, .namespace = .{ .table_id = 202, .shard_id = 401, .range_id = 401 }, .catalog_digest = @splat(2) };
+    const plan: Plan = .{
+        .id = id,
+        .child_before = .{ .table_id = 101, .name = "child", .schema_json = before_json },
+        .child_after = .{ .table_id = 101, .name = "child", .schema_json = after_json },
+        .child_catalog_before_b64 = old_b64,
+        .child_ranges = &.{child_range},
+        .child_fences = &.{child_fence},
+        .parents = &.{.{ .table = .{ .table_id = 202, .name = "parent" }, .ranges = &.{parent_range}, .fences = &.{parent_fence}, .transitions = &.{derived[0].transition} }},
+    };
+    const digest = try plan.digest(alloc);
+    const identity = try plan.childIdentity(alloc);
+    var value: Publication = .{ .plan = plan, .plan_digest = digest, .child_identity = identity, .revision = 1, .phase = .fencing_child };
+    try value.validate(alloc);
+    const command = struct {
+        fn make(state: Publication, action: @FieldType(Command, "action"), source: ?@import("../api/relational_fk_generation_publication.zig").SourceReceipt, parent: ?@import("../api/relational_fk_generation_publication.zig").Receipt) Command {
+            return .{ .plan_id = state.plan.id, .child_table_id = state.plan.child_before.table_id, .expected_revision = state.revision, .action = action, .source_receipt = source, .parent_receipt = parent };
+        }
+    }.make;
+    try std.testing.expectError(error.GenerationPublicationChanged, value.apply(alloc, command(value, .publish_child, null, null)));
+    const control = @import("../api/relational_fk_generation_publication.zig");
+    const admission = @import("../storage/db/relational_integrity_generation_admission.zig");
+    const fence_bytes = try child_fence.encode();
+    var fence_digest: Digest = undefined;
+    std.crypto.hash.Blake3.hash(&fence_bytes, &fence_digest, .{});
+    var source: control.SourceReceipt = .{
+        .plan_id = id,
+        .child_table_id = 101,
+        .child_group_id = 301,
+        .action = .fence,
+        .plan_digest = digest,
+        .fence_digest = fence_digest,
+        .before_schema_version = identity.before_schema_version,
+        .before_schema_digest = identity.before_schema_digest,
+        .before_catalog_digest = identity.before_catalog_digest,
+        .after_schema_version = identity.after_schema_version,
+        .after_schema_digest = identity.after_schema_digest,
+        .after_catalog_digest = identity.after_catalog_digest,
+        .applied_term = 1,
+        .applied_index = 1,
+    };
+    value = try value.apply(alloc, command(value, .child_fenced, source, null));
+    try std.testing.expectEqual(Phase.staging_parents, value.phase);
+    try std.testing.expectError(error.GenerationPublicationChanged, value.apply(alloc, command(value, .publish_child, null, null)));
+    const transition = derived[0].transition;
+    const transitions_digest = try admission.transitionsDigest(&.{.{
+        .child_table_id = transition.child_table_id,
+        .child_table_name = transition.child_table_name,
+        .constraint_name = transition.constraint_name,
+        .expected_generation = transition.expected_generation,
+        .next_generation = transition.next_generation,
+        .plan_id = id,
+        .decision_digest = digest,
+    }});
+    var parent: control.Receipt = .{
+        .plan_id = id,
+        .parent_table_id = 202,
+        .parent_group_id = 401,
+        .child_table_id = 101,
+        .action = .stage,
+        .transitions_digest = transitions_digest,
+        .decision_digest = digest,
+        .applied_term = 1,
+        .applied_index = 2,
+    };
+    value = try value.apply(alloc, command(value, .parent_staged, null, parent));
+    try std.testing.expectEqual(Phase.activating_parents, value.phase);
+    parent.action = .activate;
+    parent.applied_index = 3;
+    value = try value.apply(alloc, command(value, .parent_activated, null, parent));
+    try std.testing.expectEqual(Phase.acknowledging_parents, value.phase);
+    try std.testing.expectError(error.GenerationPublicationChanged, value.apply(alloc, command(value, .publish_child, null, null)));
+    const serialized = try std.json.Stringify.valueAlloc(alloc, value, .{});
+    value = try std.json.parseFromSliceLeaky(Publication, alloc, serialized, .{});
+    parent.action = .acknowledge;
+    parent.applied_index = 4;
+    value = try value.apply(alloc, command(value, .parent_acknowledged, null, parent));
+    try std.testing.expectEqual(Phase.publishing_child, value.phase);
+    value = try value.apply(alloc, command(value, .publish_child, null, null));
+    try std.testing.expectEqual(Phase.installing_child, value.phase);
+    source.action = .install;
+    source.applied_index = 5;
+    value = try value.apply(alloc, command(value, .child_installed, source, null));
+    try std.testing.expectEqual(Phase.published, value.phase);
 }

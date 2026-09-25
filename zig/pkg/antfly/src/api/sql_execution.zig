@@ -24,6 +24,75 @@ const wire = @import("antfly_metadata_openapi").types;
 const db_types = @import("../storage/db/types.zig");
 const setting_catalog = @import("../sql/setting_catalog.zig");
 
+const SettingOverlaySource = enum { durable_session, connection };
+
+fn attachedSettingOverlay(source: SettingOverlaySource, caller: []const setting_catalog.OverlayEntry, durable: []const setting_catalog.OverlayEntry) ![]const setting_catalog.OverlayEntry {
+    return switch (source) {
+        .durable_session => durable,
+        .connection => if (durable.len == 0) caller else error.SettingOverlayConflict,
+    };
+}
+
+fn refreshAttachedSettingOverlay(
+    registry: *@import("transactions.zig").SessionRegistry,
+    alloc: std.mem.Allocator,
+    id: db_types.TxnId,
+    source: SettingOverlaySource,
+    caller: []const setting_catalog.OverlayEntry,
+    retained: *?@import("transactions.zig").SessionRegistry.SqlState,
+) ![]const setting_catalog.OverlayEntry {
+    retained.* = (try registry.getSqlState(alloc, id)) orelse return error.SqlTransactionNotActive;
+    return attachedSettingOverlay(source, caller, retained.*.?.setting_active.items);
+}
+
+test "SQL attached setting overlay keeps HTTP durable authority separate from pgwire connection state" {
+    const caller = [_]setting_catalog.OverlayEntry{.{ .identity = .{ .id = 1, .generation = 1 }, .value = .{ .integer = 99 } }};
+    const durable = [_]setting_catalog.OverlayEntry{.{ .identity = .{ .id = 1, .generation = 1 }, .value = .{ .integer = 5 } }};
+    const http = try attachedSettingOverlay(.durable_session, &caller, &durable);
+    try std.testing.expectEqual(@as(i64, 5), http[0].value.integer);
+    const pgwire = try attachedSettingOverlay(.connection, &caller, &.{});
+    try std.testing.expectEqual(@as(i64, 99), pgwire[0].value.integer);
+    try std.testing.expectError(error.SettingOverlayConflict, attachedSettingOverlay(.connection, &caller, &durable));
+}
+
+test "SQL attached setting overlay refresh observes a setting committed after attachment" {
+    const alloc = std.testing.allocator;
+    var registry = @import("transactions.zig").SessionRegistry.init(null);
+    defer registry.deinit(alloc);
+    const Fixture = struct {
+        const definitions = [_]setting_catalog.Definition{.{
+            .identity = .{ .id = 1, .generation = 1 },
+            .name = "app.limit",
+            .kind = .integer,
+            .session_writable = true,
+            .default = .{ .integer = 3 },
+        }};
+        fn load(_: *anyopaque, _: std.mem.Allocator, scope: setting_catalog.Scope) !setting_catalog.RawSnapshot {
+            return .{ .scope = scope, .epoch = 1, .definitions = &definitions };
+        }
+    };
+    var marker: u8 = 0;
+    const owner: setting_catalog.Owner = .{ .ptr = &marker, .load = Fixture.load };
+    const begun = try registry.beginForPrincipal(alloc, .{ .sql = .{ .database = "main", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 7, "alice");
+    try registry.setSqlSetting(alloc, begun.txn_id, "alice", owner, "app.limit", .{ .integer = 5 }, false);
+    // Model an attachment that precedes another request's committed SET;
+    // the lease-held read must not reuse this earlier owned snapshot.
+    var attached = (try registry.getSqlState(alloc, begun.txn_id)).?;
+    defer attached.deinit(alloc);
+    {
+        const mutation_lease = registry.tryAcquireCommitExecution(begun.txn_id) orelse return error.TestExpectedSessionLease;
+        defer mutation_lease.release();
+        try registry.setSqlSetting(alloc, begun.txn_id, "alice", owner, "app.limit", .{ .integer = 7 }, false);
+    }
+    const lease = registry.tryAcquireCommitExecution(begun.txn_id) orelse return error.TestExpectedSessionLease;
+    defer lease.release();
+    var refreshed: ?@import("transactions.zig").SessionRegistry.SqlState = null;
+    defer if (refreshed) |*state| state.deinit(alloc);
+    const overlay = try refreshAttachedSettingOverlay(&registry, alloc, begun.txn_id, .durable_session, attached.setting_active.items, &refreshed);
+    try std.testing.expectEqual(@as(i64, 5), attached.setting_active.items[0].value.integer);
+    try std.testing.expectEqual(@as(i64, 7), overlay[0].value.integer);
+}
+
 fn supportsRangeGuards(server: *const http_server.ApiHttpServer) bool {
     const reads = server.table_reads orelse return false;
     const writes = server.table_writes orelse return false;
@@ -64,6 +133,9 @@ pub const Adapter = struct {
     inserting: bool = false,
     prepared_bindings: ?[]const @import("sql_prepared.zig").Binding = null,
     setting_overlay: []const setting_catalog.OverlayEntry = &.{},
+    /// Pgwire supplies its own connection-owned overlay. HTTP attached
+    /// sessions always read the durable transaction overlay instead.
+    setting_overlay_source: SettingOverlaySource = .durable_session,
     expected_setting_epoch: ?u64 = null,
     collect_prepared_bindings: ?*std.ArrayListUnmanaged(@import("sql_prepared.zig").Binding) = null,
     /// One linearizable publication lookup and role capture per table in a
@@ -85,19 +157,22 @@ pub const Adapter = struct {
         const sessions = @import("../sql/session.zig");
         const previous_database = self.database;
         const previous_namespace = self.namespace;
+        const previous_setting_overlay = self.setting_overlay;
         var inherited: ?@import("transactions.zig").SessionRegistry.SqlState = null;
         defer {
             self.database = previous_database;
             self.namespace = previous_namespace;
+            self.setting_overlay = previous_setting_overlay;
             if (inherited) |*state| state.deinit(self.server.alloc);
         }
-        if (self.session_id) |encoded| if (self.inherit_session_database or self.inherit_session_namespace) {
+        if (self.session_id) |encoded| {
             const id = @import("distributed_txn.zig").parseTxnIdHex(encoded) catch return error.SqlTransactionNotActive;
             if (try self.server.txn_sessions.principalAccess(self.server.alloc, id, http_server.transactionPrincipal(self.identity.*)) != .allowed) return error.SqlTransactionNotActive;
             inherited = (try self.server.txn_sessions.getSqlState(self.server.alloc, id)) orelse return error.SqlTransactionNotActive;
             if (self.inherit_session_database) self.database = inherited.?.metadata.database;
             if (self.inherit_session_namespace) self.namespace = inherited.?.metadata.namespace;
-        };
+            self.setting_overlay = try attachedSettingOverlay(self.setting_overlay_source, self.setting_overlay, inherited.?.setting_active.items);
+        }
         var coordinator = session_api.Coordinator{ .server = self.server, .identity = self.identity, .context = self.context };
         var owner = session_api.Adapter{ .alloc = self.server.alloc, .registry = &self.server.txn_sessions, .node_id = self.server.localSessionNodeId(), .commit_context = &coordinator, .commit_fn = session_api.Coordinator.commit, .supports_range_guards = supportsRangeGuards(self.server) };
         var session = sessions.Session{ .owner = owner.owner(), .scope = .{ .principal = http_server.transactionPrincipal(self.identity.*) orelse "", .database = self.database, .namespace = self.session_namespace orelse self.namespace } };
@@ -189,6 +264,15 @@ pub const Adapter = struct {
             var result = statement: {
                 const execution_lease = self.server.txn_sessions.tryAcquireCommitExecution(id) orelse return error.SqlWriteCapacityUnavailable;
                 defer execution_lease.release();
+                // A concurrent HTTP SET/RESET may have committed after the
+                // initial session attachment but before this statement's
+                // execution lease. Refresh the overlay while holding the
+                // same lease that serializes session setting mutations.
+                var leased_settings: ?@import("transactions.zig").SessionRegistry.SqlState = null;
+                defer if (leased_settings) |*state| state.deinit(self.server.alloc);
+                if (self.session_id != null and compiled.uses_current_setting) {
+                    self.setting_overlay = try refreshAttachedSettingOverlay(&self.server.txn_sessions, self.server.alloc, id, self.setting_overlay_source, previous_setting_overlay, &leased_settings);
+                }
                 _ = try session.statement(switch (compiled.statement) {
                     .select, .explain => false,
                     else => true,

@@ -1478,7 +1478,7 @@ pub const DBCore = struct {
         reconciled_row_count: ?u64,
         source_fence: @import("relational_integrity_topology_contract.zig").Fence,
     ) !bool {
-        if (source_fence.role != .child_generation_source) return error.InvalidIntegrityTopologyFence;
+        if (source_fence.role != .child_generation_source and source_fence.role != .child_generation_dual) return error.InvalidIntegrityTopologyFence;
         return self.commitPreparedSchemaMetadataMode(prepared, metadata_writes, metadata_deletes, reconciled_row_count, false, source_fence);
     }
 
@@ -1595,10 +1595,22 @@ pub const DBCore = struct {
                     var manager = try participants.core.initTxnManager();
                     defer manager.deinit();
                     try topology.requireDrained(txn, &manager, expected);
+                    try @import("relational_integrity_generation_admission.zig").requireDualInstallReady(txn, expected);
+                    if (expected.role == .child_generation_dual)
+                        try @import("relational_integrity_generation_admission.zig").requireDualCatalogMatch(
+                            participants.core.alloc,
+                            txn,
+                            expected.namespace.table_id,
+                            (participants.prepared.integrity_catalog orelse return error.IntegrityCatalogChanged).catalog,
+                        );
                 } else try topology.requireUnfenced(txn);
                 try @import("online_integrity_shadow.zig").requireCatalogMutable(txn);
                 try participants.stageChanges(txn);
-                if (participants.child_fence) |expected| try topology.stageRelease(txn, expected);
+                if (participants.child_fence) |expected| {
+                    if (expected.role == .child_generation_dual)
+                        try txn.delete(@import("relational_integrity_generation_admission.zig").dual_acknowledged_fence_key);
+                    try topology.stageRelease(txn, expected);
+                }
             }
 
             pub fn stageChanges(participants: @This(), txn: anytype) !void {

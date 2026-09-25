@@ -1272,7 +1272,8 @@ test "imported runtime I/O views override raw runtime including unavailable view
 test "session maintenance activation follows current range leadership without follower RPCs" {
     const Fake = struct {
         leader: u64 = 0,
-        reads: usize = 0,
+        activation_reads: [2]usize = .{ 0, 0 },
+        generation_gc_reads: [2]usize = .{ 0, 0 },
         fn owns(ptr: *anyopaque, group: u64) bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.leader == group;
@@ -1296,9 +1297,16 @@ test "session maintenance activation follows current range leadership without fo
                 .merge_transitions = &.{},
             };
         }
-        fn lookup(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+        fn lookup(ptr: *anyopaque, _: std.mem.Allocator, table: []const u8, key: []const u8, options: db_mod.types.LookupOptions, consistency: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.reads += 1;
+            if (!std.mem.eql(u8, table, "rows") or consistency != .read_index) return error.TestUnexpectedLookup;
+            const range: usize = if (key.len == 0) 0 else if (std.mem.eql(u8, key, "m")) 1 else return error.TestUnexpectedLookup;
+            if (self.leader != 0 and self.leader != @as(u64, if (range == 0) 10 else 20)) return error.TestFollowerLookup;
+            if (options.relational_activation_json.len != 0 and options.relational_topology_json.len == 0) {
+                self.activation_reads[range] += 1;
+            } else if (options.relational_topology_json.len != 0 and options.relational_activation_json.len == 0) {
+                self.generation_gc_reads[range] += 1;
+            } else return error.TestUnexpectedLookup;
             return null;
         }
     };
@@ -1311,16 +1319,21 @@ test "session maintenance activation follows current range leadership without fo
     }, .{ .ptr = &fake, .vtable = &.{ .batch = undefined } });
     defer server.deinit();
     for (0..2) |_| try server.advanceRelationalActivationOnce();
-    try std.testing.expectEqual(@as(usize, 0), fake.reads);
+    try std.testing.expectEqual([2]usize{ 0, 0 }, fake.activation_reads);
+    try std.testing.expectEqual([2]usize{ 0, 0 }, fake.generation_gc_reads);
     fake.leader = 20;
     for (0..2) |_| try server.advanceRelationalActivationOnce();
-    try std.testing.expectEqual(@as(usize, 1), fake.reads);
+    try std.testing.expectEqual([2]usize{ 0, 1 }, fake.activation_reads);
+    try std.testing.expectEqual([2]usize{ 0, 1 }, fake.generation_gc_reads);
     fake.leader = 10;
     for (0..2) |_| try server.advanceRelationalActivationOnce();
-    try std.testing.expectEqual(@as(usize, 2), fake.reads);
+    try std.testing.expectEqual([2]usize{ 1, 1 }, fake.activation_reads);
+    try std.testing.expectEqual([2]usize{ 1, 1 }, fake.generation_gc_reads);
     server.cfg.relational_maintenance_leadership = null;
+    fake.leader = 0;
     for (0..2) |_| try server.advanceRelationalActivationOnce();
-    try std.testing.expectEqual(@as(usize, 4), fake.reads);
+    try std.testing.expectEqual([2]usize{ 2, 2 }, fake.activation_reads);
+    try std.testing.expectEqual([2]usize{ 2, 2 }, fake.generation_gc_reads);
 }
 
 pub const ApiHttpServerConfig = struct {
@@ -3090,6 +3103,34 @@ const MetadataMutationRetryPolicy = struct {
         return shouldRetryMetadataMutation(err, elapsed_ns, self.timeout_ns);
     }
 };
+
+fn requireFkGenerationPublicActivation(plan: @import("../metadata/fk_generation_publication.zig").Plan) !void {
+    for (plan.parents) |parent| if (parent.table.table_id == plan.child_before.table_id)
+        return error.ForeignKeySelfPublicationNotActivated;
+}
+
+test "public ordinary self-FK publication remains guarded before metadata admission" {
+    const publication = @import("../metadata/fk_generation_publication.zig");
+    const parent: publication.Parent = .{
+        .table = .{ .table_id = 7, .name = "nodes" },
+        .ranges = &.{},
+        .fences = &.{},
+        .transitions = &.{},
+    };
+    const plan: publication.Plan = .{
+        .id = @splat(1),
+        .child_before = .{ .table_id = 7, .name = "nodes" },
+        .child_after = .{ .table_id = 7, .name = "nodes" },
+        .child_catalog_before_b64 = "",
+        .child_ranges = &.{},
+        .child_fences = &.{},
+        .parents = &.{parent},
+    };
+    try std.testing.expectError(error.ForeignKeySelfPublicationNotActivated, requireFkGenerationPublicActivation(plan));
+    var external = plan;
+    external.child_before.table_id = 8;
+    try requireFkGenerationPublicActivation(external);
+}
 
 pub const ApiHttpServer = struct {
     /// Lazily started only at the stable server address. HTTP ingress must be
@@ -5019,6 +5060,10 @@ pub const ApiHttpServer = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const plan = try @import("fk_generation_plan_builder.zig").build(self, a, context, identity, before, proposed_schema_json);
+        // The dual-role protocol is implemented below this boundary, but is
+        // not a public DDL capability until mounted ADD/DROP/restart evidence
+        // covers the complete metadata and owner route.
+        try requireFkGenerationPublicActivation(plan);
         const result: FkGenerationBegin = .{
             .plan_id = plan.id,
             .child_table_id = plan.child_before.table_id,
@@ -12937,6 +12982,7 @@ pub const ApiHttpServer = struct {
             error.ConstraintNotFound,
             error.VersionConflict,
             error.PreparedGenerationChanged,
+            error.GenerationRetired,
             error.PreparedSchemaChanged,
             error.SchemaVersionChanged,
             error.CatalogGenerationChanged,

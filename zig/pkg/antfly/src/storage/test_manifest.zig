@@ -154,6 +154,7 @@ comptime {
     _ = @import("db/graph_runtime.zig");
     _ = @import("db/graph_asset_state.zig");
     _ = @import("db/graph_edge_contender.zig");
+    _ = @import("db/graph_retirement_config.zig");
     _ = @import("db/graph_state_name.zig");
     _ = @import("db/lease.zig");
     _ = @import("db/maintenance/graph_metric_runtime.zig");

@@ -387,6 +387,46 @@ const Parser = struct {
         if (query.columns.len > 1) return self.fail(error.InvalidSqlSyntax, "subquery must return one column in this expression");
     }
 
+    fn rowSubqueryWidth(self: *Parser, query: ast.Select, width: usize) Error!void {
+        if (query.set_operation) |set| {
+            try self.rowSubqueryWidth(set.left.*, width);
+            try self.rowSubqueryWidth(set.right.*, width);
+            return;
+        }
+        // A wildcard's width depends on the catalog. Keep this parser-owned
+        // expansion explicit so no assignment can silently discard a column.
+        if (query.count_all or query.columns.len != width)
+            return self.fail(error.InvalidSqlSyntax, "row subquery column count differs from assignment targets");
+    }
+
+    fn rowSubqueryAssignments(self: *Parser, targets: []const []const u8, assignments: *std.ArrayList(ast.Assignment), ctes: *std.ArrayList(ast.Cte)) Error!void {
+        self.relation_depth += 1;
+        defer self.relation_depth -= 1;
+        if (self.relation_depth >= self.limits.max_depth) return self.fail(error.SqlLimitExceeded, "SQL subquery nesting limit exceeded");
+        const nested = try self.statement();
+        if (nested != .select) return self.fail(error.InvalidSqlSyntax, "row assignment requires SELECT");
+        try self.expect(.rparen);
+        const query = try self.alloc.create(ast.Select);
+        query.* = nested.select;
+        try self.rowSubqueryWidth(query.*, targets.len);
+        const names = try self.alloc.alloc([]const u8, targets.len);
+        for (names, 0..) |*output_name, index| output_name.* = try std.fmt.allocPrint(self.alloc, "$row_{d}", .{index});
+        // A NUL-prefixed name cannot be spelled by SQL identifiers and thus
+        // cannot shadow a user WITH binding, including quoted `$` names.
+        const cte_name = try std.fmt.allocPrint(self.alloc, "\x00$update_row_source_{d}", .{ctes.items.len});
+        try ctes.append(self.alloc, .{ .name = cte_name, .columns = names, .query = query, .materialization = .materialized });
+        // Both scalar projections reference one typed materialized producer.
+        // Positional names leave the child's aliases and ordering intact.
+        for (targets, names) |target, output_name| {
+            const row_source = try self.relationNode(.{ .table = .{ .name = .{ .table = cte_name }, .alias = "$row_source" } });
+            const output_field = try self.scalarNode(.{ .column = try std.fmt.allocPrint(self.alloc, "$row_source\x00{s}", .{output_name}) });
+            const value_query = try self.alloc.create(ast.Select);
+            value_query.* = .{ .source = row_source, .columns = try self.alloc.dupe(ast.Projection, &.{.{ .expression = output_field }}) };
+            const expression = try self.scalarNode(.{ .call = .{ .name = "$scalar", .args = &.{}, .subquery = value_query } });
+            try assignments.append(self.alloc, .{ .field = target, .expression = expression });
+        }
+    }
+
     fn scalar(self: *Parser, depth: usize, minimum: u8) Error!*const ast.Scalar {
         if (depth >= self.limits.max_depth) return self.fail(error.SqlLimitExceeded, "SQL scalar nesting budget exceeded");
         var left: *const ast.Scalar = undefined;
@@ -1182,6 +1222,7 @@ const Parser = struct {
         var source = try self.relationTail(target);
         try self.expectKeyword(.set);
         var assignments = std.ArrayList(ast.Assignment).empty;
+        var row_ctes = std.ArrayList(ast.Cte).empty;
         var seen: std.StringHashMapUnmanaged(void) = .empty;
         while (true) {
             const tuple = self.take(.lparen);
@@ -1203,6 +1244,11 @@ const Parser = struct {
             if (tuple) {
                 _ = self.keyword(.row);
                 try self.expect(.lparen);
+                if (self.pos < self.tokens.len and (self.tokens[self.pos].isKeyword(.select) or self.tokens[self.pos].isKeyword(.with))) {
+                    try self.rowSubqueryAssignments(targets.items, &assignments, &row_ctes);
+                    if (!self.take(.comma)) break;
+                    continue;
+                }
                 for (targets.items, 0..) |column, i| {
                     if (i != 0) try self.expect(.comma);
                     if (self.keyword(.default)) {
@@ -1229,7 +1275,7 @@ const Parser = struct {
             if (source != target) return self.fail(error.InvalidSqlSyntax, "use either joined UPDATE or UPDATE FROM");
             source = try self.relationNode(.{ .join = .{ .kind = .cross, .left = target, .right = try self.relation() } });
         }
-        return .{ .table = table, .alias = alias, .source = if (alias != null or source != target) source else null, .assignments = try assignments.toOwnedSlice(self.alloc), .predicate = try self.where(), .returning = try self.returning() };
+        return .{ .table = table, .alias = alias, .source = if (alias != null or source != target) source else null, .ctes = try row_ctes.toOwnedSlice(self.alloc), .assignments = try assignments.toOwnedSlice(self.alloc), .predicate = try self.where(), .returning = try self.returning() };
     }
 
     fn delete(self: *Parser) Error!ast.Delete {
@@ -1822,6 +1868,7 @@ const Parser = struct {
             var result = try self.statement();
             switch (result) {
                 .update => |*mutation| {
+                    try ctes.appendSlice(self.alloc, mutation.ctes);
                     mutation.ctes = try ctes.toOwnedSlice(self.alloc);
                     if (mutation.source == null) mutation.source = try self.relationNode(.{ .table = .{ .name = mutation.table, .alias = mutation.alias, .mutation_target = true, .mutation_document = true, .mutation_presence = true } });
                     return result;
@@ -2076,6 +2123,16 @@ test "compiler UPDATE row assignments flatten simultaneous typed expressions" {
     try std.testing.expectError(error.DuplicateSqlColumn, compile(std.testing.allocator, "UPDATE rows SET (quantity, status) = ROW(1, 'x'), status='y'", .{}));
     try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "UPDATE rows SET (quantity, status) = ROW(1)", .{}));
     try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "UPDATE rows SET (quantity, status) = ROW(1, 'x', 3)", .{}));
+    var queried = try compile(std.testing.allocator, "UPDATE rows SET (quantity, status) = (SELECT n, 'copied' FROM source ORDER BY n LIMIT 1)", .{});
+    defer queried.deinit();
+    try std.testing.expectEqual(@as(usize, 2), queried.statement.update.assignments.len);
+    for (queried.statement.update.assignments) |assignment| {
+        try std.testing.expect(assignment.expression.?.* == .call);
+        try std.testing.expectEqualStrings("$scalar", assignment.expression.?.call.name);
+    }
+    try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "UPDATE rows SET (quantity, status) = (SELECT n FROM source)", .{}));
+    try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "UPDATE rows SET (quantity, status) = (SELECT n, status, id FROM source)", .{}));
+    try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "WITH \"\x00$update_row_source_0\" AS (SELECT n FROM source) UPDATE rows SET (quantity, status) = (SELECT n, 'copied' FROM source)", .{}));
 }
 
 test "compiler INSERT defaults retain per-row omission beside scalar sources" {

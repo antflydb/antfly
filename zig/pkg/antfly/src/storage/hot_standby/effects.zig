@@ -535,7 +535,8 @@ pub fn encodeSchemaMetadataMutationAlloc(
 }
 
 pub fn encodePublishedChildSchemaMetadataMutationAlloc(alloc: Allocator, schema: schema_mod.TableSchema, public_schema_json: []const u8, published: PublishedChildSchema) ![]u8 {
-    if (published.fence.role != .child_generation_source or published.applied_term == 0 or published.applied_index == 0) return error.InvalidGenerationPublication;
+    if ((published.fence.role != .child_generation_source and published.fence.role != .child_generation_dual) or
+        published.applied_term == 0 or published.applied_index == 0) return error.InvalidGenerationPublication;
     const schema_bytes = try schema_mod.serializeSchema(alloc, schema);
     defer alloc.free(schema_bytes);
     return try std.json.Stringify.valueAlloc(alloc, MetadataMutationPayload{
@@ -852,6 +853,24 @@ test "storage.hot_standby effects appends schema metadata payload as HA metadata
     try std.testing.expectEqual(@as(u32, 8), decoded_published.schema.version);
     try std.testing.expect(decoded_published.published_child.?.fence.eql(published_fence));
     try std.testing.expectEqual(@as(u64, 11), decoded_published.published_child.?.applied_index);
+
+    var dual = published;
+    dual.fence.role = .child_generation_dual;
+    dual.fence.peer_group_id = dual.fence.owner_group_id;
+    const dual_payload = try encodePublishedChildSchemaMetadataMutationAlloc(alloc, .{ .version = 8, .default_type = "row" }, "{\"version\":8}", dual);
+    defer alloc.free(dual_payload);
+    const dual_lsn = try appendEncodedSchemaMetadataMutation(&primary, dual_payload, .{});
+    var dual_entry = (try primary.log.entryAt(alloc, dual_lsn)) orelse return error.TestExpectedEqual;
+    defer dual_entry.deinit(alloc);
+    var decoded_dual = try decodeSchemaMetadataMutation(alloc, dual_entry.record);
+    defer decoded_dual.deinit();
+    try std.testing.expect(decoded_dual.published_child.?.fence.eql(dual.fence));
+    var invalid_dual = dual;
+    invalid_dual.fence.role = .child_generation_parent;
+    try std.testing.expectError(error.InvalidGenerationPublication, encodePublishedChildSchemaMetadataMutationAlloc(alloc, .{ .version = 8, .default_type = "row" }, "{\"version\":8}", invalid_dual));
+    invalid_dual = dual;
+    invalid_dual.applied_index = 0;
+    try std.testing.expectError(error.InvalidGenerationPublication, encodePublishedChildSchemaMetadataMutationAlloc(alloc, .{ .version = 8, .default_type = "row" }, "{\"version\":8}", invalid_dual));
 
     const legacy_schema_bytes = try schema_mod.serializeSchema(alloc, .{
         .version = 6,

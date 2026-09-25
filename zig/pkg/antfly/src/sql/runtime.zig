@@ -79,6 +79,21 @@ pub const Result = struct {
         result.output.command_tag = try state.arena.allocator().dupe(u8, command_tag);
         return result;
     }
+
+    pub fn singleText(alloc: std.mem.Allocator, command_tag: []const u8, column_name: []const u8, value: []const u8) !Result {
+        var result = try empty(alloc, command_tag);
+        errdefer result.deinit();
+        const arena = result.state.arena.allocator();
+        const columns = try arena.alloc(Column, 1);
+        columns[0] = .{ .name = try arena.dupe(u8, column_name), .type = .string };
+        const row = try arena.alloc(Json, 1);
+        row[0] = .{ .string = try arena.dupe(u8, value) };
+        const rows = try arena.alloc([]const Json, 1);
+        rows[0] = row;
+        result.output.columns = columns;
+        result.output.rows = rows;
+        return result;
+    }
 };
 
 pub fn execute(alloc: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled, parameters: []const Json, limits: Limits) !Result {

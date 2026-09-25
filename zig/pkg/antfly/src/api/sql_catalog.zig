@@ -20,9 +20,6 @@ fn newReceipt(alloc: std.mem.Allocator, target: domain.Target, table_id: u64, ve
 }
 
 fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, alloc: std.mem.Allocator, target: domain.Target, ddl: @import("../sql/ast.zig").CatalogDdl) !catalog.DdlOutcome {
-    // Keep SQL PRIMARY KEY rewrite disabled until mounted positive and negative
-    // publication tests prove the durable metadata-owner path end to end.
-    if (ddl.schema_change) |change| if (change == .add_unique and change.add_unique.primary) return error.UnsupportedSqlExecution;
     if (!server.source.vtable.supports_query_definitions) return error.UnsupportedSqlExecution;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();

@@ -410,6 +410,87 @@ pub const SqlMetadata = struct {
     }
 };
 
+const setting_catalog = @import("../sql/setting_catalog.zig");
+const SettingEntries = std.ArrayListUnmanaged(setting_catalog.OverlayEntry);
+
+fn deinitSettingEntries(alloc: std.mem.Allocator, entries: *SettingEntries) void {
+    for (entries.items) |entry| if (entry.value == .string) alloc.free(entry.value.string);
+    entries.deinit(alloc);
+    entries.* = .empty;
+}
+
+fn cloneSettingEntries(alloc: std.mem.Allocator, entries: []const setting_catalog.OverlayEntry) !SettingEntries {
+    var result: SettingEntries = .empty;
+    errdefer deinitSettingEntries(alloc, &result);
+    for (entries) |entry| try putSettingEntry(alloc, &result, entry);
+    return result;
+}
+
+fn putSettingEntry(alloc: std.mem.Allocator, entries: *SettingEntries, entry: setting_catalog.OverlayEntry) !void {
+    const max_entries = 128;
+    const max_value_bytes = 64 * 1024;
+    var old_bytes: usize = 0;
+    var found = false;
+    var total_bytes: usize = 0;
+    for (entries.items) |existing| {
+        if (existing.value == .string) total_bytes = std.math.add(usize, total_bytes, existing.value.string.len) catch return error.SettingLimitExceeded;
+        if (existing.identity.id == entry.identity.id) {
+            found = true;
+            if (existing.value == .string) old_bytes = existing.value.string.len;
+        }
+    }
+    const new_bytes: usize = if (entry.value == .string) entry.value.string.len else 0;
+    const prospective_bytes = std.math.add(usize, total_bytes - old_bytes, new_bytes) catch return error.SettingLimitExceeded;
+    if ((!found and entries.items.len >= max_entries) or prospective_bytes > max_value_bytes) return error.SettingLimitExceeded;
+    const value: setting_catalog.Value = switch (entry.value) {
+        .boolean => |v| .{ .boolean = v },
+        .integer => |v| .{ .integer = v },
+        .string => |v| .{ .string = try alloc.dupe(u8, v) },
+    };
+    for (entries.items) |*existing| if (existing.identity.id == entry.identity.id) {
+        if (existing.value == .string) alloc.free(existing.value.string);
+        existing.* = .{ .identity = entry.identity, .value = value };
+        return;
+    };
+    errdefer if (value == .string) alloc.free(value.string);
+    try entries.append(alloc, .{ .identity = entry.identity, .value = value });
+}
+
+fn removeSettingEntry(alloc: std.mem.Allocator, entries: *SettingEntries, id: u64) void {
+    for (entries.items, 0..) |entry, i| if (entry.identity.id == id) {
+        if (entry.value == .string) alloc.free(entry.value.string);
+        _ = entries.swapRemove(i);
+        return;
+    };
+}
+
+fn decodeSettingEntries(alloc: std.mem.Allocator, value: std.json.Value) !SettingEntries {
+    const array = switch (value) {
+        .array => |items| items,
+        else => return error.InvalidTransactionSessionRecord,
+    };
+    if (array.items.len > 128) return error.InvalidTransactionSessionRecord;
+    var result: SettingEntries = .empty;
+    errdefer deinitSettingEntries(alloc, &result);
+    for (array.items) |item| {
+        var parsed = std.json.parseFromValue(setting_catalog.OverlayEntry, alloc, item, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidTransactionSessionRecord,
+        };
+        defer parsed.deinit();
+        const entry = parsed.value;
+        if (entry.identity.id == 0 or entry.identity.generation == 0 or
+            (entry.value == .string and (entry.value.string.len > 4096 or !std.unicode.utf8ValidateSlice(entry.value.string))))
+            return error.InvalidTransactionSessionRecord;
+        for (result.items) |prior| if (prior.identity.id == entry.identity.id) return error.InvalidTransactionSessionRecord;
+        putSettingEntry(alloc, &result, entry) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidTransactionSessionRecord,
+        };
+    }
+    return result;
+}
+
 pub const StageReadRequest = struct {
     table_name: []u8,
     key: []u8,
@@ -806,24 +887,33 @@ pub const Savepoint = struct {
     name: ?[]u8 = null,
     snapshot: OwnedTransactionCommitRequest,
     read_snapshots: std.StringArrayHashMapUnmanaged(SessionReadSnapshot) = .empty,
+    setting_active: SettingEntries = .empty,
+    setting_committed: SettingEntries = .empty,
 
     pub fn deinit(self: *Savepoint, alloc: std.mem.Allocator) void {
         if (self.name) |name| alloc.free(name);
         self.snapshot.deinit(alloc);
         deinitReadSnapshotMap(alloc, &self.read_snapshots);
+        deinitSettingEntries(alloc, &self.setting_active);
+        deinitSettingEntries(alloc, &self.setting_committed);
         self.* = undefined;
     }
 
     pub fn clone(self: Savepoint, alloc: std.mem.Allocator) !Savepoint {
         const name = if (self.name) |name| try alloc.dupe(u8, name) else null;
-        errdefer if (name) |value| alloc.free(value);
+        const snapshot = self.snapshot.clone(alloc) catch |err| {
+            if (name) |value| alloc.free(value);
+            return err;
+        };
         var out: Savepoint = .{
             .id = self.id,
             .name = name,
-            .snapshot = try self.snapshot.clone(alloc),
+            .snapshot = snapshot,
         };
-        errdefer out.snapshot.deinit(alloc);
+        errdefer out.deinit(alloc);
         out.read_snapshots = try cloneReadSnapshotMap(alloc, self.read_snapshots);
+        out.setting_active = try cloneSettingEntries(alloc, self.setting_active.items);
+        out.setting_committed = try cloneSettingEntries(alloc, self.setting_committed.items);
         return out;
     }
 };
@@ -854,6 +944,8 @@ pub const Session = struct {
     /// Persisted before releasing the retained coordinator's topology fence.
     terminal_commit: ?TerminalCommit = null,
     read_snapshots: std.StringArrayHashMapUnmanaged(SessionReadSnapshot) = .empty,
+    setting_active: SettingEntries = .empty,
+    setting_committed: SettingEntries = .empty,
     next_savepoint_id: u64 = 1,
     savepoints: std.AutoHashMapUnmanaged(u64, Savepoint) = .empty,
 
@@ -872,6 +964,8 @@ pub const Session = struct {
         if (self.execution_plan) |bytes| alloc.free(bytes);
         if (self.terminal_commit) |*terminal| terminal.deinit(alloc);
         deinitReadSnapshotMap(alloc, &self.read_snapshots);
+        deinitSettingEntries(alloc, &self.setting_active);
+        deinitSettingEntries(alloc, &self.setting_committed);
         var it = self.savepoints.iterator();
         while (it.next()) |entry| entry.value_ptr.deinit(alloc);
         self.savepoints.deinit(alloc);
@@ -896,6 +990,8 @@ pub const Session = struct {
         if (self.execution_plan) |bytes| out.execution_plan = try alloc.dupe(u8, bytes);
         if (self.terminal_commit) |terminal| out.terminal_commit = try terminal.clone(alloc);
         out.read_snapshots = try cloneReadSnapshotMap(alloc, self.read_snapshots);
+        out.setting_active = try cloneSettingEntries(alloc, self.setting_active.items);
+        out.setting_committed = try cloneSettingEntries(alloc, self.setting_committed.items);
         try out.savepoints.ensureUnusedCapacity(alloc, self.savepoints.count());
         var it = self.savepoints.iterator();
         while (it.next()) |entry| {
@@ -1713,6 +1809,7 @@ pub const SessionRegistry = struct {
 
     pub const SqlState = struct {
         metadata: SqlMetadata,
+        setting_active: SettingEntries = .empty,
         owner_node_id: u64,
         execution_started: bool,
         terminal: ?TerminalCommitStatus,
@@ -1720,6 +1817,7 @@ pub const SessionRegistry = struct {
 
         pub fn deinit(self: *SqlState, alloc: std.mem.Allocator) void {
             self.metadata.deinit(alloc);
+            deinitSettingEntries(alloc, &self.setting_active);
         }
     };
 
@@ -1731,14 +1829,20 @@ pub const SessionRegistry = struct {
         if (self.sessions.getPtr(txn_id)) |existing| {
             defer self.mutex.unlock();
             const metadata = existing.sql orelse return null;
-            return .{ .metadata = try metadata.clone(alloc), .owner_node_id = existing.owner_node_id, .execution_started = existing.commit_execution_started, .terminal = if (existing.terminal_commit) |terminal| terminal.status else null, .savepoints = existing.savepoints.count() };
+            var result: SqlState = .{ .metadata = try metadata.clone(alloc), .owner_node_id = existing.owner_node_id, .execution_started = existing.commit_execution_started, .terminal = if (existing.terminal_commit) |terminal| terminal.status else null, .savepoints = existing.savepoints.count() };
+            errdefer result.deinit(alloc);
+            result.setting_active = try cloneSettingEntries(alloc, existing.setting_active.items);
+            return result;
         }
         self.mutex.unlock();
         const durable = self.durable orelse return null;
         var loaded = (try durable.load(txn_id)) orelse return null;
         defer loaded.deinit(durable.alloc);
         const metadata = loaded.sql orelse return null;
-        return .{ .metadata = try metadata.clone(alloc), .owner_node_id = loaded.owner_node_id, .execution_started = loaded.commit_execution_started, .terminal = if (loaded.terminal_commit) |terminal| terminal.status else null, .savepoints = loaded.savepoints.count() };
+        var result: SqlState = .{ .metadata = try metadata.clone(alloc), .owner_node_id = loaded.owner_node_id, .execution_started = loaded.commit_execution_started, .terminal = if (loaded.terminal_commit) |terminal| terminal.status else null, .savepoints = loaded.savepoints.count() };
+        errdefer result.deinit(alloc);
+        result.setting_active = try cloneSettingEntries(alloc, loaded.setting_active.items);
+        return result;
     }
 
     /// Read-only SQL statements must not consume an obsolete cached session
@@ -1760,6 +1864,104 @@ pub const SessionRegistry = struct {
         errdefer candidate.deinit(alloc);
         if (candidate.commit_execution_started) return error.SqlTransactionOutcomeUnknown;
         if (candidate.sql) |*metadata| metadata.failed = failed else return error.SqlTransactionNotActive;
+        touchSession(&candidate);
+        try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
+        try self.persistLocked(candidate);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
+        self.publishCandidateLocked(alloc, publish_target, &candidate);
+    }
+
+    /// The registry is the HTTP setting owner: it rechecks the current
+    /// principal-scoped catalog before durably changing either overlay.
+    const SettingInput = union(enum) { typed: setting_catalog.Value, raw: []const u8 };
+
+    pub fn setSqlSetting(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, principal: ?[]const u8, owner: setting_catalog.Owner, name: []const u8, value: setting_catalog.Value, local: bool) !void {
+        return self.setSqlSettingInput(alloc, txn_id, principal, owner, name, .{ .typed = value }, local);
+    }
+
+    pub fn setSqlSettingRaw(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, principal: ?[]const u8, owner: setting_catalog.Owner, name: []const u8, raw: []const u8, local: bool) !void {
+        return self.setSqlSettingInput(alloc, txn_id, principal, owner, name, .{ .raw = raw }, local);
+    }
+
+    fn setSqlSettingInput(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, principal: ?[]const u8, owner: setting_catalog.Owner, name: []const u8, input: SettingInput, local: bool) !void {
+        const session_lock = self.sessionLock(txn_id);
+        session_lock.lock();
+        defer session_lock.unlock();
+        var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return error.SqlTransactionNotActive;
+        errdefer candidate.deinit(alloc);
+        if (!principalsEqual(candidate.principal, principal)) return error.Forbidden;
+        const metadata = candidate.sql orelse return error.SqlTransactionNotActive;
+        if (metadata.failed) return error.SqlTransactionAborted;
+        if (candidate.commit_body_digest != null or candidate.commit_execution_started) return error.TransactionCommitSealed;
+        var view = try setting_catalog.View.capture(alloc, owner, .{ .principal = principal orelse "", .database = metadata.database }, candidate.setting_active.items);
+        defer view.deinit();
+        const definition = try view.writable(name);
+        const value = switch (input) {
+            .typed => |typed| typed,
+            .raw => |raw| try setting_catalog.parseValue(definition.kind, raw),
+        };
+        if (std.meta.activeTag(value) != definition.kind or (value == .string and (value.string.len > 4096 or !std.unicode.utf8ValidateSlice(value.string)))) return error.InvalidSettingValue;
+        const entry: setting_catalog.OverlayEntry = .{ .identity = definition.identity, .value = value };
+        try putSettingEntry(alloc, &candidate.setting_active, entry);
+        if (!local) try putSettingEntry(alloc, &candidate.setting_committed, entry);
+        touchSession(&candidate);
+        try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
+        try self.persistLocked(candidate);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
+        self.publishCandidateLocked(alloc, publish_target, &candidate);
+    }
+
+    pub fn resetSqlSetting(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, principal: ?[]const u8, owner: setting_catalog.Owner, name: []const u8) !void {
+        return self.resetSqlSettingMode(alloc, txn_id, principal, owner, name, false);
+    }
+
+    pub fn resetLocalSqlSetting(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, principal: ?[]const u8, owner: setting_catalog.Owner, name: []const u8) !void {
+        return self.resetSqlSettingMode(alloc, txn_id, principal, owner, name, true);
+    }
+
+    fn resetSqlSettingMode(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, principal: ?[]const u8, owner: setting_catalog.Owner, name: []const u8, local: bool) !void {
+        const session_lock = self.sessionLock(txn_id);
+        session_lock.lock();
+        defer session_lock.unlock();
+        var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return error.SqlTransactionNotActive;
+        errdefer candidate.deinit(alloc);
+        if (!principalsEqual(candidate.principal, principal)) return error.Forbidden;
+        const metadata = candidate.sql orelse return error.SqlTransactionNotActive;
+        if (metadata.failed) return error.SqlTransactionAborted;
+        if (candidate.commit_body_digest != null or candidate.commit_execution_started) return error.TransactionCommitSealed;
+        var view = try setting_catalog.View.capture(alloc, owner, .{ .principal = principal orelse "", .database = metadata.database }, candidate.setting_active.items);
+        defer view.deinit();
+        const definition = try view.writable(name);
+        removeSettingEntry(alloc, &candidate.setting_active, definition.identity.id);
+        if (!local) removeSettingEntry(alloc, &candidate.setting_committed, definition.identity.id);
+        touchSession(&candidate);
+        try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
+        try self.persistLocked(candidate);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
+        self.publishCandidateLocked(alloc, publish_target, &candidate);
+    }
+
+    /// RESET ALL removes only this transaction's client-owned overlays. No
+    /// catalog read is needed: clearing stale identities is safe even when a
+    /// definition has changed, and the next statement captures fresh defaults.
+    pub fn resetAllSqlSettings(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, principal: ?[]const u8) !void {
+        const session_lock = self.sessionLock(txn_id);
+        session_lock.lock();
+        defer session_lock.unlock();
+        var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return error.SqlTransactionNotActive;
+        errdefer candidate.deinit(alloc);
+        if (!principalsEqual(candidate.principal, principal)) return error.Forbidden;
+        const metadata = candidate.sql orelse return error.SqlTransactionNotActive;
+        if (metadata.failed) return error.SqlTransactionAborted;
+        if (candidate.commit_body_digest != null or candidate.commit_execution_started) return error.TransactionCommitSealed;
+        deinitSettingEntries(alloc, &candidate.setting_active);
+        deinitSettingEntries(alloc, &candidate.setting_committed);
         touchSession(&candidate);
         try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
         try self.persistLocked(candidate);
@@ -2384,6 +2586,8 @@ pub const SessionRegistry = struct {
         errdefer if (!savepoint_inserted) new_savepoint.deinit(alloc);
         new_savepoint.name = if (name) |value| try alloc.dupe(u8, value) else null;
         new_savepoint.read_snapshots = try cloneReadSnapshotMap(alloc, candidate.read_snapshots);
+        new_savepoint.setting_active = try cloneSettingEntries(alloc, candidate.setting_active.items);
+        new_savepoint.setting_committed = try cloneSettingEntries(alloc, candidate.setting_committed.items);
         try candidate.savepoints.put(alloc, savepoint_id, new_savepoint);
         savepoint_inserted = true;
         touchSession(&candidate);
@@ -2446,6 +2650,16 @@ pub const SessionRegistry = struct {
             const read_snapshots = try cloneReadSnapshotMap(alloc, savepoint.read_snapshots);
             deinitReadSnapshotMap(alloc, &candidate.read_snapshots);
             candidate.read_snapshots = read_snapshots;
+            const active = try cloneSettingEntries(alloc, savepoint.setting_active.items);
+            const committed = cloneSettingEntries(alloc, savepoint.setting_committed.items) catch |err| {
+                var disposable = active;
+                deinitSettingEntries(alloc, &disposable);
+                return err;
+            };
+            deinitSettingEntries(alloc, &candidate.setting_active);
+            deinitSettingEntries(alloc, &candidate.setting_committed);
+            candidate.setting_active = active;
+            candidate.setting_committed = committed;
             if (candidate.sql) |*metadata| metadata.failed = false;
         }
         // Numeric ids define nesting even when SQL names shadow older names.
@@ -4768,6 +4982,14 @@ fn encodeSessionRecord(alloc: std.mem.Allocator, session: Session) ![]u8 {
         try appendReadSnapshotJson(alloc, &out, entry.value_ptr.*);
     }
     try out.append(alloc, ']');
+    try out.appendSlice(alloc, ",\"setting_active\":");
+    const active_settings = try std.json.Stringify.valueAlloc(alloc, session.setting_active.items, .{});
+    defer alloc.free(active_settings);
+    try out.appendSlice(alloc, active_settings);
+    try out.appendSlice(alloc, ",\"setting_committed\":");
+    const committed_settings = try std.json.Stringify.valueAlloc(alloc, session.setting_committed.items, .{});
+    defer alloc.free(committed_settings);
+    try out.appendSlice(alloc, committed_settings);
     try out.appendSlice(alloc, ",\"savepoints\":[");
     var it = session.savepoints.iterator();
     var first = true;
@@ -4791,6 +5013,14 @@ fn encodeSessionRecord(alloc: std.mem.Allocator, session: Session) ![]u8 {
             try appendReadSnapshotJson(alloc, &out, snapshot_entry.value_ptr.*);
         }
         try out.append(alloc, ']');
+        try out.appendSlice(alloc, ",\"setting_active\":");
+        const point_active = try std.json.Stringify.valueAlloc(alloc, entry.value_ptr.setting_active.items, .{});
+        defer alloc.free(point_active);
+        try out.appendSlice(alloc, point_active);
+        try out.appendSlice(alloc, ",\"setting_committed\":");
+        const point_committed = try std.json.Stringify.valueAlloc(alloc, entry.value_ptr.setting_committed.items, .{});
+        defer alloc.free(point_committed);
+        try out.appendSlice(alloc, point_committed);
         try out.append(alloc, '}');
     }
     try out.appendSlice(alloc, "]}");
@@ -4926,6 +5156,8 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
     if (obj.get("read_snapshots")) |snapshots_value| {
         try decodeReadSnapshotsInto(alloc, snapshots_value, &session.read_snapshots);
     }
+    if (obj.get("setting_active")) |value| session.setting_active = try decodeSettingEntries(alloc, value);
+    if (obj.get("setting_committed")) |value| session.setting_committed = try decodeSettingEntries(alloc, value);
     const savepoints_value = obj.get("savepoints") orelse return error.InvalidTransactionSessionRecord;
     const savepoints = switch (savepoints_value) {
         .array => |arr| arr,
@@ -4941,26 +5173,35 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
             .number_string => |text| try recordNumber(text),
             else => return error.InvalidTransactionSessionRecord,
         };
+        if (session.savepoints.contains(id)) return error.InvalidTransactionSessionRecord;
         const snapshot = try parseStoredCommitValue(alloc, entry_obj.get("snapshot") orelse return error.InvalidTransactionSessionRecord);
         var owned_snapshot = snapshot;
-        errdefer owned_snapshot.deinit(alloc);
+        var transferred = false;
+        errdefer if (!transferred) owned_snapshot.deinit(alloc);
         const name: ?[]u8 = if (entry_obj.get("name")) |value| switch (value) {
             .null => null,
             .string => |text| if (text.len > 0 and text.len <= 63) try alloc.dupe(u8, text) else return error.InvalidTransactionSessionRecord,
             else => return error.InvalidTransactionSessionRecord,
         } else null;
-        errdefer if (name) |text| alloc.free(text);
+        errdefer if (!transferred) if (name) |text| alloc.free(text);
         var read_snapshots: std.StringArrayHashMapUnmanaged(SessionReadSnapshot) = .empty;
-        errdefer deinitReadSnapshotMap(alloc, &read_snapshots);
+        errdefer if (!transferred) deinitReadSnapshotMap(alloc, &read_snapshots);
         if (entry_obj.get("read_snapshots")) |read_snapshots_value| {
             try decodeReadSnapshotsInto(alloc, read_snapshots_value, &read_snapshots);
         }
+        var setting_active = if (entry_obj.get("setting_active")) |value| try decodeSettingEntries(alloc, value) else SettingEntries.empty;
+        errdefer if (!transferred) deinitSettingEntries(alloc, &setting_active);
+        var setting_committed = if (entry_obj.get("setting_committed")) |value| try decodeSettingEntries(alloc, value) else SettingEntries.empty;
+        errdefer if (!transferred) deinitSettingEntries(alloc, &setting_committed);
         try session.savepoints.put(alloc, id, .{
             .id = id,
             .name = name,
             .snapshot = snapshot,
             .read_snapshots = read_snapshots,
+            .setting_active = setting_active,
+            .setting_committed = setting_committed,
         });
+        transferred = true;
     }
     return session;
 }
@@ -5166,6 +5407,156 @@ test "durable transaction sessions preserve and enforce principal bindings" {
     const anonymous_sessions = try reader.listStatusesForPrincipal(std.testing.allocator, null);
     defer std.testing.allocator.free(anonymous_sessions);
     try std.testing.expectEqual(@as(usize, 1), anonymous_sessions.len);
+}
+
+test "durable session mutations publish only after persistence succeeds: HTTP SQL settings survive restart and savepoint rollback" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "system/api-sql-setting-sessions" });
+    defer store.deinit();
+    var durable = DurableSessionStore.initRuntime(alloc, &store);
+    const Fixture = struct {
+        generation: u64 = 1,
+        const definitions = [_]setting_catalog.Definition{
+            .{ .identity = .{ .id = 1, .generation = 1 }, .name = "app.limit", .kind = .integer, .session_writable = true, .default = .{ .integer = 3 } },
+            .{ .identity = .{ .id = 2, .generation = 1 }, .name = "app.secret", .kind = .string, .policy_sensitive = true, .default = .{ .string = "hidden" } },
+        };
+        fn load(ptr: *anyopaque, allocator: std.mem.Allocator, scope: setting_catalog.Scope) !setting_catalog.RawSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!std.mem.eql(u8, scope.principal, "alice") or !std.mem.eql(u8, scope.database, "main")) return error.Forbidden;
+            var values = definitions;
+            values[0].identity.generation = self.generation;
+            // The snapshot is borrowed only until View.capture returns.
+            return .{ .scope = scope, .epoch = self.generation, .definitions = try allocator.dupe(setting_catalog.Definition, &values) };
+        }
+    };
+    var fixture: Fixture = .{};
+    const owner: setting_catalog.Owner = .{ .ptr = &fixture, .load = Fixture.load };
+    var id: db_mod.types.TxnId = undefined;
+    {
+        var registry = SessionRegistry.init(&durable);
+        defer registry.deinit(alloc);
+        const begun = try registry.beginForPrincipal(alloc, .{ .sql = .{ .database = "main", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 7, "alice");
+        id = begun.txn_id;
+        try std.testing.expectError(error.Forbidden, registry.setSqlSetting(alloc, id, "bob", owner, "app.limit", .{ .integer = 5 }, false));
+        try std.testing.expectError(error.SettingWriteForbidden, registry.setSqlSetting(alloc, id, "alice", owner, "app.secret", .{ .string = "leak" }, false));
+        try registry.setSqlSetting(alloc, id, "alice", owner, "app.limit", .{ .integer = 5 }, false);
+        const point = (try registry.createNamedSavepoint(alloc, id, "before_local")).?;
+        try registry.setSqlSetting(alloc, id, "alice", owner, "app.limit", .{ .integer = 7 }, true);
+        durable.fail_writes_for_test = true;
+        try std.testing.expectError(error.InjectedSessionStoreFailure, registry.setSqlSetting(alloc, id, "alice", owner, "app.limit", .{ .integer = 9 }, false));
+        durable.fail_writes_for_test = false;
+        var after_failure = (try registry.getSqlState(alloc, id)).?;
+        defer after_failure.deinit(alloc);
+        try std.testing.expectEqual(@as(i64, 7), after_failure.setting_active.items[0].value.integer);
+        _ = try registry.rollbackToSavepoint(alloc, id, point.savepoint_id);
+    }
+    {
+        var registry = SessionRegistry.init(&durable);
+        defer registry.deinit(alloc);
+        var resumed = (try registry.getSqlState(alloc, id)).?;
+        defer resumed.deinit(alloc);
+        try std.testing.expectEqual(@as(i64, 5), resumed.setting_active.items[0].value.integer);
+        var view = try setting_catalog.View.capture(alloc, owner, .{ .principal = "alice", .database = "main" }, resumed.setting_active.items);
+        defer view.deinit();
+        try std.testing.expectEqual(@as(i64, 5), (try view.resolve("app.limit")).value.integer);
+        try registry.setSqlSetting(alloc, id, "alice", owner, "app.limit", .{ .integer = 8 }, false);
+        try registry.resetSqlSetting(alloc, id, "alice", owner, "app.limit");
+        var reset_state = (try registry.getSqlState(alloc, id)).?;
+        defer reset_state.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), reset_state.setting_active.items.len);
+        try registry.setSqlSetting(alloc, id, "alice", owner, "app.limit", .{ .integer = 8 }, false);
+        const before_reset_all = (try registry.createNamedSavepoint(alloc, id, "before_reset_all")).?;
+        try std.testing.expectError(error.Forbidden, registry.resetAllSqlSettings(alloc, id, "bob"));
+        try registry.resetAllSqlSettings(alloc, id, "alice");
+        var cleared_at_savepoint = (try registry.getSqlState(alloc, id)).?;
+        defer cleared_at_savepoint.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), cleared_at_savepoint.setting_active.items.len);
+        var persisted_clear = (try durable.load(id)).?;
+        defer persisted_clear.deinit(durable.alloc);
+        try std.testing.expectEqual(@as(usize, 0), persisted_clear.setting_committed.items.len);
+        _ = try registry.rollbackToSavepoint(alloc, id, before_reset_all.savepoint_id);
+        durable.fail_writes_for_test = true;
+        try std.testing.expectError(error.InjectedSessionStoreFailure, registry.resetAllSqlSettings(alloc, id, "alice"));
+        durable.fail_writes_for_test = false;
+        var after_reset_failure = (try registry.getSqlState(alloc, id)).?;
+        defer after_reset_failure.deinit(alloc);
+        try std.testing.expectEqual(@as(i64, 8), after_reset_failure.setting_active.items[0].value.integer);
+        fixture.generation = 2;
+        try std.testing.expectError(error.SettingCatalogChanged, setting_catalog.View.capture(alloc, owner, .{ .principal = "alice", .database = "main" }, resumed.setting_active.items));
+        try std.testing.expectError(error.SettingCatalogChanged, registry.setSqlSetting(alloc, id, "alice", owner, "app.limit", .{ .integer = 9 }, false));
+        try std.testing.expectError(error.SettingCatalogChanged, registry.resetSqlSetting(alloc, id, "alice", owner, "app.limit"));
+        // Removing stale client overlays does not need a catalog round trip.
+        try registry.resetAllSqlSettings(alloc, id, "alice");
+    }
+    {
+        var registry = SessionRegistry.init(&durable);
+        defer registry.deinit(alloc);
+        var resumed = (try registry.getSqlState(alloc, id)).?;
+        defer resumed.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), resumed.setting_active.items.len);
+        var persisted_clear = (try durable.load(id)).?;
+        defer persisted_clear.deinit(durable.alloc);
+        try std.testing.expectEqual(@as(usize, 0), persisted_clear.setting_committed.items.len);
+        var view = try setting_catalog.View.capture(alloc, owner, .{ .principal = "alice", .database = "main" }, resumed.setting_active.items);
+        defer view.deinit();
+        try std.testing.expectEqual(@as(i64, 3), (try view.resolve("app.limit")).value.integer);
+    }
+}
+
+test "durable SQL LOCAL DEFAULT preserves committed setting across restart and savepoint" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "system/api-sql-local-default-sessions" });
+    defer store.deinit();
+    var durable = DurableSessionStore.initRuntime(alloc, &store);
+    const Fixture = struct {
+        const definition: setting_catalog.Definition = .{ .identity = .{ .id = 1, .generation = 1 }, .name = "app.limit", .kind = .integer, .session_writable = true, .default = .{ .integer = 3 } };
+        fn load(_: *anyopaque, _: std.mem.Allocator, scope: setting_catalog.Scope) !setting_catalog.RawSnapshot {
+            return .{ .scope = scope, .epoch = 1, .definitions = &.{definition} };
+        }
+    };
+    var marker: u8 = 0;
+    const owner: setting_catalog.Owner = .{ .ptr = &marker, .load = Fixture.load };
+    var id: db_mod.types.TxnId = undefined;
+    var point_id: u64 = undefined;
+    {
+        var registry = SessionRegistry.init(&durable);
+        defer registry.deinit(alloc);
+        const begun = try registry.beginForPrincipal(alloc, .{ .sql = .{ .database = "main", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 7, "alice");
+        id = begun.txn_id;
+        try registry.setSqlSetting(alloc, id, "alice", owner, "app.limit", .{ .integer = 5 }, false);
+        point_id = (try registry.createNamedSavepoint(alloc, id, "before_default")).?.savepoint_id;
+        durable.fail_writes_for_test = true;
+        try std.testing.expectError(error.InjectedSessionStoreFailure, registry.resetLocalSqlSetting(alloc, id, "alice", owner, "app.limit"));
+        durable.fail_writes_for_test = false;
+        var before = (try registry.getSqlState(alloc, id)).?;
+        defer before.deinit(alloc);
+        try std.testing.expectEqual(@as(i64, 5), before.setting_active.items[0].value.integer);
+        try registry.resetLocalSqlSetting(alloc, id, "alice", owner, "app.limit");
+        var state = (try registry.getSqlState(alloc, id)).?;
+        defer state.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), state.setting_active.items.len);
+        var persisted = (try durable.load(id)).?;
+        defer persisted.deinit(durable.alloc);
+        try std.testing.expectEqual(@as(i64, 5), persisted.setting_committed.items[0].value.integer);
+    }
+    {
+        var registry = SessionRegistry.init(&durable);
+        defer registry.deinit(alloc);
+        var state = (try registry.getSqlState(alloc, id)).?;
+        defer state.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), state.setting_active.items.len);
+        _ = try registry.rollbackToSavepoint(alloc, id, point_id);
+        var restored = (try registry.getSqlState(alloc, id)).?;
+        defer restored.deinit(alloc);
+        try std.testing.expectEqual(@as(i64, 5), restored.setting_active.items[0].value.integer);
+        var persisted = (try durable.load(id)).?;
+        defer persisted.deinit(durable.alloc);
+        try std.testing.expectEqual(@as(i64, 5), persisted.setting_committed.items[0].value.integer);
+    }
 }
 
 test "durable session mutations publish only after persistence succeeds" {
@@ -6078,6 +6469,25 @@ test "transaction session named savepoints shadow release and roll back nested s
     try std.testing.expectEqual(@as(usize, 1), (try registry.getStatus(alloc, session.txn_id)).?.savepoint_count);
     _ = (try registry.releaseNamedSavepoint(alloc, session.txn_id, "point")).?;
     try std.testing.expectEqual(@as(usize, 0), (try registry.getStatus(alloc, session.txn_id)).?.savepoint_count);
+}
+
+test "durable SQL session rejects duplicate savepoint ids without double freeing overlays" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(null);
+    defer registry.deinit(alloc);
+    const info = try registry.beginForPrincipal(alloc, .{ .sql = .{ .database = "app", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 9, "alice");
+    _ = (try registry.createNamedSavepoint(alloc, info.txn_id, "first")).?;
+    _ = (try registry.createNamedSavepoint(alloc, info.txn_id, "second")).?;
+    const bytes = try encodeSessionRecord(alloc, registry.sessions.get(info.txn_id).?);
+    defer alloc.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer parsed.deinit();
+    const points = parsed.value.object.getPtr("savepoints").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), points.len);
+    try points[1].object.put(parsed.arena.allocator(), "id", points[0].object.get("id").?);
+    const invalid = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+    defer alloc.free(invalid);
+    try std.testing.expectError(error.InvalidTransactionSessionRecord, decodeSessionRecord(alloc, info.txn_id, invalid));
 }
 
 test "SQL session metadata and schema fences survive durable records" {

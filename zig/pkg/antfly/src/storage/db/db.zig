@@ -6576,6 +6576,11 @@ pub const DB = struct {
                     std.log.debug("owner open retains newer durable schema path={s} durable_version={d} descriptor_version={d}", .{
                         path, db.core.schema.?.version, prepared_schema.runtime_schema.version,
                     });
+                } else if (try childGenerationSourcePinsSchema(db.core, prepared_schema.runtime_schema.version)) {
+                    // Parent ACKs precede the metadata child descriptor cut.
+                    // A cold owner may reopen in that interval, but the
+                    // descriptor cannot install an FK generation. Keep the
+                    // durable old schema until exact Raft install does so.
                 } else if (prepared_schema.public_schema_json) |public_json| {
                     const versioned_public_key = try public_table_schema.versionedSchemaKeyAlloc(alloc, prepared_schema.runtime_schema.version);
                     defer alloc.free(versioned_public_key);
@@ -10552,7 +10557,7 @@ pub const DB = struct {
     /// owner receipt and HA LSN in one standby transaction. Generic metadata
     /// replay deliberately cannot publish a changed FK generation.
     fn setPublishedChildSchemaReplicatedApplyWithMarker(self: *DB, table_schema: schema_mod.TableSchema, schema_json: []const u8, published: ha_effects_mod.PublishedChildSchema, lsn: u64) !void {
-        if (lsn == 0 or published.fence.role != .child_generation_source or
+        if (lsn == 0 or (published.fence.role != .child_generation_source and published.fence.role != .child_generation_dual) or
             !published.fence.namespace.eql(self.core.identity_namespace) or
             published.applied_term == 0 or published.applied_index == 0) return error.InvalidGenerationPublication;
         var schema_digest: [32]u8 = undefined;
@@ -23846,19 +23851,28 @@ pub const DB = struct {
         var last_key: ?[]const u8 = null;
         var more = false;
         var bytes: usize = 0;
+        var scanned: usize = 0;
         const started = platform_time.monotonicNs();
         while (entry) |item| : (entry = try cursor.next()) {
             if (!std.mem.startsWith(u8, item.key, &prefix)) break;
-            if (references.items.len >= limit or (references.items.len != 0 and platform_time.monotonicNs() -| started >= 5 * std.time.ns_per_ms) or item.value.len > 1024 * 1024 - bytes) {
-                if (references.items.len == 0) return error.IntegrityRecordTooLarge;
+            // Retired generations remain on disk until bounded GC, but they
+            // are no longer dependencies of the parent. Budget physical rows
+            // and advance the cursor even when a page contains only tombstoned
+            // references, or an old generation could make this read unbounded.
+            if (scanned >= limit or (scanned != 0 and platform_time.monotonicNs() -| started >= 5 * std.time.ns_per_ms) or item.value.len > 1024 * 1024 - bytes) {
+                if (scanned == 0) return error.IntegrityRecordTooLarge;
                 more = true;
                 break;
             }
             if (self.backend_runtime.io()) |io| try io.checkCancel();
-            const copy = try owned.dupe(u8, item.value);
-            try references.append(owned, try integrity.Reference.decode(item.key, copy));
+            const reference = try integrity.Reference.decode(item.key, item.value);
+            if (!try @import("relational_integrity_generation_retirement.zig").isRetired(&read, reference)) {
+                const copy = try owned.dupe(u8, item.value);
+                try references.append(owned, try integrity.Reference.decode(item.key, copy));
+            }
             last_key = try owned.dupe(u8, item.key);
-            bytes += copy.len;
+            scanned += 1;
+            bytes += item.value.len;
         }
         const next: ?[]const u8 = if (more) next: {
             const raw = last_key orelse return error.InvalidIntegrityBudget;
@@ -28088,7 +28102,7 @@ pub const DB = struct {
     /// direct metadata read-index decision. The schema, integrity catalog,
     /// Raft marker and source-fence release commit atomically.
     pub fn installPublishedChildSchema(self: *DB, alloc: Allocator, schema_json: []const u8, publication: PublishedChildSchema) !void {
-        if (publication.fence.role != .child_generation_source or
+        if ((publication.fence.role != .child_generation_source and publication.fence.role != .child_generation_dual) or
             !publication.fence.namespace.eql(self.core.identity_namespace)) return error.InvalidIntegrityTopologyFence;
         var digest: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(schema_json, &digest, .{});
@@ -28950,6 +28964,8 @@ pub const DB = struct {
             std.mem.eql(u8, key, generation_admission.staged_receipt_key) or
             std.mem.eql(u8, key, generation_admission.activation_receipt_key) or
             std.mem.eql(u8, key, generation_admission.acknowledged_receipt_key) or
+            std.mem.eql(u8, key, generation_admission.dual_acknowledged_fence_key) or
+            std.mem.eql(u8, key, generation_admission.dual_canceled_fence_key) or
             std.mem.eql(u8, key, generation_admission.cancel_receipt_key) or
             std.mem.eql(u8, key, generation_admission.source_cancel_receipt_key) or
             std.mem.eql(u8, key, generation_admission.source_fence_receipt_key) or
@@ -29506,7 +29522,9 @@ pub const DB = struct {
             .generation_gc => {
                 self.core.lockApplyShared();
                 defer self.core.unlockApplyShared();
-                var read = try self.core.store.beginProbeTxn();
+                // GC preparation scans a bounded key range. Probe transactions
+                // support point reads only and cannot open the required cursor.
+                var read = try self.core.store.beginReadTxn();
                 defer read.abort();
                 if (try @import("relational_integrity_topology.zig").current(&read) != null) {
                     try @import("relational_integrity_json.zig").write(@as(?@import("relational_integrity_generation_retirement.zig").GcCommand, null), &stream);
@@ -29586,6 +29604,34 @@ pub const DB = struct {
         var manager = try self.core.initTxnManager();
         defer manager.deinit();
         return .{ .fence = fence, .drained = !try manager.hasTopologySensitiveTransactions() };
+    }
+
+    fn childGenerationSourcePinsSchema(core: *db_core.DBCore, candidate_version: u32) !bool {
+        var read = try core.store.beginProbeTxn();
+        defer read.abort();
+        const fence = (try @import("relational_integrity_topology.zig").current(&read)) orelse return false;
+        if (fence.role != .child_generation_source and fence.role != .child_generation_dual) return false;
+        const durable = core.schema orelse return error.IntegrityCatalogChanged;
+        if (!fence.namespace.eql(core.identity_namespace)) return error.IdentityNamespaceMismatch;
+        const encoded_catalog = read.get(@import("relational_integrity_catalog.zig").key) catch return error.IntegrityCatalogChanged;
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(encoded_catalog, &digest, .{});
+        if (!std.mem.eql(u8, &digest, &fence.catalog_digest)) return error.IntegrityCatalogChanged;
+        if (candidate_version <= durable.version) return false;
+        if (candidate_version != (std.math.add(u32, durable.version, 1) catch return error.GenerationAdmissionChanged))
+            return error.GenerationAdmissionChanged;
+        return true;
+    }
+
+    /// The metadata successor is visible before its exact Raft schema install.
+    /// Callers configuring a reopened owner must retain its old schema and
+    /// indexes while the verified child-source fence remains active.
+    pub fn childGenerationSourcePinsSchemaJson(self: *DB, schema_json: []const u8) !bool {
+        var parsed = try public_table_schema.parseValidatedTableSchema(self.alloc, schema_json);
+        defer parsed.deinit(self.alloc);
+        self.core.lockApplyShared();
+        defer self.core.unlockApplyShared();
+        return childGenerationSourcePinsSchema(self.core, parsed.version);
     }
 
     /// The allocator belongs to one bounded transfer request/arena. All slices
@@ -29918,7 +29964,7 @@ pub const DB = struct {
         if (req.relational_topology) |command| if (command.fence.role == .backup_snapshot and (command.action != .begin and command.action != .release and command.action != .cancel)) return error.InvalidBatchRequest;
         if (req.split_transition) |transition| if (transition.kind != .finalize) return error.InvalidBatchRequest;
         if (req.relational_topology) |command| if (command.action == .install_child_schema) {
-            if (command.fence.role != .child_generation_source or command.child_schema_install == null or
+            if ((command.fence.role != .child_generation_source and command.fence.role != .child_generation_dual) or command.child_schema_install == null or
                 command.transfer != null or command.parent_retirement != null or command.parent_activation != null or
                 command.child_generations != null) return error.InvalidBatchRequest;
             const install = command.child_schema_install.?;
@@ -30044,7 +30090,7 @@ pub const DB = struct {
             (command.action == .stage_parent_retirement) != (command.parent_retirement != null) or
             ((command.action == .activate_parent_retirement or command.action == .acknowledge_parent_retirement) != (command.parent_activation != null)) or
             ((command.action == .stage_child_generation or command.action == .activate_child_generation or command.action == .acknowledge_child_generation or
-                (command.action == .cancel and command.fence.role == .child_generation_parent)) != (command.child_generations != null))) return error.InvalidBatchRequest;
+                (command.action == .cancel and (command.fence.role == .child_generation_parent or command.fence.role == .child_generation_dual))) != (command.child_generations != null))) return error.InvalidBatchRequest;
         if (command.child_schema_install != null) return error.InvalidBatchRequest;
         switch (command.action) {
             .begin => {
@@ -30083,11 +30129,11 @@ pub const DB = struct {
                     }
                 }
                 try topology.stageBegin(&txn, command.fence);
-                if (command.fence.role == .child_generation_source)
+                if (command.fence.role == .child_generation_source or command.fence.role == .child_generation_dual)
                     try @import("relational_integrity_generation_admission.zig").stageSourceFencedReceipt(&txn, command.fence, if (raft_entry) |entry| entry.term else 0, if (raft_entry) |entry| entry.index else 0);
             },
             .release => {
-                if (command.fence.role == .child_generation_parent or command.fence.role == .child_generation_source or command.fence.role == .truncate_parent)
+                if (command.fence.role == .child_generation_parent or command.fence.role == .child_generation_source or command.fence.role == .child_generation_dual or command.fence.role == .truncate_parent)
                     return error.GenerationAdmissionActivationRequired;
                 if ((command.fence.role == .split_destination or command.fence.role == .merge_destination) and try topology.current(&txn) != null) {
                     var progress = try @import("relational_integrity_handoff.zig").loadProgress(self.alloc, &txn);
@@ -30122,14 +30168,20 @@ pub const DB = struct {
                 // abort decision may lift it; generic cancellation could
                 // admit a delayed old-generation attach after activation.
                 if (command.fence.role == .child_generation_source) return error.GenerationAdmissionActivationRequired;
-                if (command.fence.role == .child_generation_parent) {
+                if (command.fence.role == .child_generation_parent or command.fence.role == .child_generation_dual) {
                     const admission = @import("relational_integrity_generation_admission.zig");
                     const transitions = command.child_generations.?;
                     try admission.validateTransitions(transitions);
                     for (transitions) |transition| try admission.cancelTransition(self.alloc, &txn, transition);
                     try admission.stageCanceledReceipt(&txn, command.fence, transitions, if (raft_entry) |entry| entry.term else 0, if (raft_entry) |entry| entry.index else 0);
                 }
+                if (command.fence.role == .child_generation_dual)
+                    try txn.delete(@import("relational_integrity_generation_admission.zig").dual_acknowledged_fence_key);
                 try topology.stageCancel(&txn, command.fence);
+                if (command.fence.role == .child_generation_dual) {
+                    const encoded_fence = try command.fence.encode();
+                    try txn.put(@import("relational_integrity_generation_admission.zig").dual_canceled_fence_key, &encoded_fence);
+                }
             },
             .abort_transition => {
                 if (command.fence.role == .merge_destination and try topology.current(&txn) != null) {
@@ -30204,7 +30256,7 @@ pub const DB = struct {
                 try retirement.stageAcknowledgement(&txn, command.fence, activation.plan_digest, activation.publication_digest);
             },
             .stage_child_generation => {
-                if (command.fence.role != .child_generation_parent) return error.InvalidGenerationAdmission;
+                if (command.fence.role != .child_generation_parent and command.fence.role != .child_generation_dual) return error.InvalidGenerationAdmission;
                 var manager = try self.core.initTxnManager();
                 defer manager.deinit();
                 try topology.requireDrained(&txn, &manager, command.fence);
@@ -30215,7 +30267,7 @@ pub const DB = struct {
                 try admission.stageStagedReceipt(&txn, command.fence, transitions, if (raft_entry) |entry| entry.term else 0, if (raft_entry) |entry| entry.index else 0);
             },
             .activate_child_generation => {
-                if (command.fence.role != .child_generation_parent) return error.InvalidGenerationAdmission;
+                if (command.fence.role != .child_generation_parent and command.fence.role != .child_generation_dual) return error.InvalidGenerationAdmission;
                 const admission = @import("relational_integrity_generation_admission.zig");
                 const transitions = command.child_generations.?;
                 try admission.validateTransitions(transitions);
@@ -30227,8 +30279,12 @@ pub const DB = struct {
                     for (transitions) |transition| try admission.activateTransition(self.alloc, &txn, transition);
                     try @import("relational_integrity_generation_retirement.zig").stageChildGenerationRetirements(self.alloc, &txn, command.fence, transitions);
                     try admission.stageCompletion(&txn, command.fence, transitions, if (raft_entry) |entry| entry.term else 0, if (raft_entry) |entry| entry.index else 0);
-                    try topology.stageRelease(&txn, command.fence);
+                    // The same fence still protects the old child schema. A
+                    // dual-role owner releases it only with the published
+                    // schema/catalog install, never at parent activation.
+                    if (command.fence.role != .child_generation_dual) try topology.stageRelease(&txn, command.fence);
                 } else {
+                    if (command.fence.role == .child_generation_dual) return error.IntegrityTopologyFenceMissing;
                     const completed = (try topology.completed(&txn)) orelse return error.IntegrityTopologyFenceMissing;
                     const expected = try admission.completionReceipt(command.fence, transitions);
                     const stored = txn.get(admission.activation_receipt_key) catch return error.GenerationAdmissionChanged;
@@ -30237,15 +30293,20 @@ pub const DB = struct {
                 }
             },
             .acknowledge_child_generation => {
-                if (command.fence.role != .child_generation_parent) return error.InvalidGenerationAdmission;
+                if (command.fence.role != .child_generation_parent and command.fence.role != .child_generation_dual) return error.InvalidGenerationAdmission;
                 try @import("relational_integrity_generation_admission.zig").stageAcknowledgement(&txn, command.fence, command.child_generations.?, if (raft_entry) |entry| entry.term else 0, if (raft_entry) |entry| entry.index else 0);
             },
             .cancel_child_generation_source => {
-                if (command.fence.role != .child_generation_source) return error.InvalidGenerationAdmission;
+                if (command.fence.role != .child_generation_source and command.fence.role != .child_generation_dual) return error.InvalidGenerationAdmission;
                 // The private owner route must independently read the durable
                 // metadata canceling decision before proposing this command.
                 // The source has no accepted-generation state to undo; the
                 // exact fence receipt consumes its admission epoch forever.
+                if (command.fence.role == .child_generation_dual) {
+                    try @import("relational_integrity_generation_admission.zig").requireDualParentCanceled(&txn, command.fence);
+                    try txn.delete(@import("relational_integrity_generation_admission.zig").dual_acknowledged_fence_key);
+                    try txn.delete(@import("relational_integrity_generation_admission.zig").dual_canceled_fence_key);
+                }
                 try topology.stageCancel(&txn, command.fence);
                 try @import("relational_integrity_generation_admission.zig").stageCanceledReceipt(&txn, command.fence, null, if (raft_entry) |entry| entry.term else 0, if (raft_entry) |entry| entry.index else 0);
             },
@@ -129234,6 +129295,104 @@ test "db owner open does not downgrade a newer durable schema for Raft catch-up"
     const public_json = try reopened.core.store.get(alloc, public_schema_json_key);
     defer alloc.free(public_json);
     try std.testing.expectEqualStrings(newer_json, public_json);
+}
+
+test "db owner reopen pins old child schema until exact generation install" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db-child-generation-owner-reopen");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    const namespace: doc_identity.Namespace = .{ .table_id = 17, .shard_id = 19, .range_id = 19 };
+    const old_json =
+        \\{"version":0,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const next_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"fk","child_columns":["id"],"parent_table":"parent","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    var parsed_next = try public_table_schema.parseValidatedTableSchema(alloc, next_json);
+    defer parsed_next.deinit(alloc);
+    const next_schema = try public_table_schema.deriveRuntimeTableSchema(alloc, parsed_next);
+    defer schema_mod.freeSchema(alloc, next_schema);
+    var fence: @import("relational_integrity_topology.zig").Fence = undefined;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .identity_namespace = namespace, .start_optional_runtimes = false });
+        defer db.close();
+        try db.setSchemaJson(alloc, old_json);
+        const catalog = try db.core.store.get(alloc, @import("relational_integrity_catalog.zig").key);
+        defer alloc.free(catalog);
+        var catalog_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(catalog, &catalog_digest, .{});
+        fence = .{
+            .transition_id = 1,
+            .attempt = 1,
+            .peer_group_id = 19,
+            .owner_group_id = 19,
+            .role = .child_generation_source,
+            .namespace = namespace,
+            .catalog_digest = catalog_digest,
+        };
+        try db.batch(.{ .relational_topology = .{ .action = .begin, .fence = fence } });
+        try std.testing.expect(try db.childGenerationSourcePinsSchemaJson(next_json));
+    }
+    var after_catalog_digest: [32]u8 = undefined;
+    {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{
+            .identity_namespace = namespace,
+            .start_optional_runtimes = false,
+            .schema_before_index_load = .{ .runtime_schema = next_schema, .public_schema_json = next_json },
+        });
+        defer reopened.close();
+        try std.testing.expectEqual(@as(u32, 0), reopened.core.schema.?.version);
+        try std.testing.expect(try reopened.childGenerationSourcePinsSchemaJson(next_json));
+        const public_json = try reopened.core.store.get(alloc, public_schema_json_key);
+        defer alloc.free(public_json);
+        try std.testing.expectEqualStrings(old_json, public_json);
+        const old_catalog = try reopened.core.store.get(alloc, @import("relational_integrity_catalog.zig").key);
+        defer alloc.free(old_catalog);
+        var before_catalog_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(old_catalog, &before_catalog_digest, .{});
+        var prepared = try reopened.core.prepareSchemaMetadataPublishedChild(next_schema, &.{.{ .key = public_schema_json_key, .value = next_json }});
+        defer prepared.deinit();
+        std.crypto.hash.Blake3.hash(prepared.integrity_catalog.?.value, &after_catalog_digest, .{});
+        var old_json_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(old_json, &old_json_digest, .{});
+        var next_json_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(next_json, &next_json_digest, .{});
+        const install: DB.PublishedChildSchema = .{
+            .fence = fence,
+            .before_schema_json_digest = old_json_digest,
+            .schema_json_digest = next_json_digest,
+            .before_catalog_digest = before_catalog_digest,
+            .after_catalog_digest = after_catalog_digest,
+            .raft_entry = .{ .term = 1, .index = 1 },
+        };
+        try reopened.installPublishedChildSchema(alloc, next_json, install);
+        try reopened.installPublishedChildSchema(alloc, next_json, install);
+        try std.testing.expectEqual(@as(u32, 1), reopened.core.schema.?.version);
+        try std.testing.expect((try reopened.relationalTopologyStatus()).fence == null);
+    }
+    var installed = try DB.open(alloc, std.mem.span(path), .{
+        .identity_namespace = namespace,
+        .start_optional_runtimes = false,
+        .schema_before_index_load = .{ .runtime_schema = next_schema, .public_schema_json = next_json },
+    });
+    defer installed.close();
+    try std.testing.expectEqual(@as(u32, 1), installed.core.schema.?.version);
+    try std.testing.expect(!(try installed.childGenerationSourcePinsSchemaJson(next_json)));
+    const installed_public = try installed.core.store.get(alloc, public_schema_json_key);
+    defer alloc.free(installed_public);
+    try std.testing.expectEqualStrings(next_json, installed_public);
+    const installed_catalog = try installed.core.store.get(alloc, @import("relational_integrity_catalog.zig").key);
+    defer alloc.free(installed_catalog);
+    var installed_digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(installed_catalog, &installed_digest, .{});
+    try std.testing.expectEqual(after_catalog_digest, installed_digest);
+    const receipt_bytes = try installed.core.store.get(alloc, @import("relational_integrity_generation_admission.zig").source_install_receipt_key);
+    defer alloc.free(receipt_bytes);
+    const receipt = try @import("relational_integrity_generation_admission.zig").AppliedReceipt.decode(receipt_bytes);
+    try std.testing.expectEqual(@as(u64, 1), receipt.term);
+    try std.testing.expectEqual(@as(u64, 1), receipt.index);
 }
 
 test "db provisioning schema is persisted before configured full text indexes open" {

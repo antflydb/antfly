@@ -8,6 +8,7 @@ const publication = @import("../metadata/fk_generation_publication.zig");
 const owner = @import("relational_fk_generation_publication.zig");
 
 pub const Target = union(enum) {
+    seal_support,
     child: struct { table_name: []const u8, group_id: u64, action: owner.InitialChildAction },
     parent: struct { table_name: []const u8, table_id: u64, group_id: u64, action: owner.Action },
     publish_child,
@@ -16,6 +17,7 @@ pub const Target = union(enum) {
 pub fn next(value: publication.InitialPublication) !?Target {
     const work = (try value.nextWork()) orelse return null;
     return switch (work.target) {
+        .seal_support => .seal_support,
         .child => |child| .{ .child = .{ .table_name = work.child_table_name, .group_id = child.group_id, .action = child.action } },
         .parent => |parent| .{ .parent = .{ .table_name = parent.table_name, .table_id = parent.table_id, .group_id = parent.group_id, .action = parent.action } },
         .publish_child => .publish_child,
@@ -40,8 +42,10 @@ test "FK initial create coordinator resumes hidden child and parent receipts" {
         .plan_digest = @splat(2),
         .candidate = undefined,
         .revision = 1,
-        .phase = .provisioning_child,
+        .phase = .preparing_support,
     };
+    try std.testing.expect((try next(value)).? == .seal_support);
+    value.phase = .provisioning_child;
     try std.testing.expectEqual(owner.InitialChildAction.provision, (try next(value)).?.child.action);
     value.phase = .staging_parents;
     try std.testing.expectEqual(owner.Action.stage, (try next(value)).?.parent.action);

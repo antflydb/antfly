@@ -100,13 +100,16 @@ pub fn build(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, contex
         if (std.mem.readInt(u64, id[0..8], .little) != 0 and std.mem.readInt(u64, id[8..16], .little) != 0) break;
     }
     const child_ranges = try rangesFor(alloc, snapshot, current.table_id);
-    const child_fences = try ownerFences(server, alloc, context, id, current, child_ranges, .child_generation_source);
+    const self_parent = for (derived) |item| {
+        if (std.mem.eql(u8, item.parent_table_name, current.name)) break true;
+    } else false;
+    const child_fences = try ownerFences(server, alloc, context, id, current, child_ranges, if (self_parent) .child_generation_dual else .child_generation_source);
     var parents: std.ArrayList(publication.Parent) = .empty;
     for (derived) |item| {
         const parent_table = for (snapshot.tables) |table| {
             if (std.mem.eql(u8, table.name, item.parent_table_name)) break table;
         } else return error.ForeignKeyParentTableNotFound;
-        if (parent_table.table_id == current.table_id or parent_table.storage_migration != null or
+        if (parent_table.storage_migration != null or
             parent_table.relational_retirement_json.len != 0 or parent_table.restore_backup_id.len != 0) return error.TableTransitionActive;
         var found: ?*publication.Parent = null;
         for (parents.items) |*parent| if (parent.table.table_id == parent_table.table_id) {
@@ -117,11 +120,12 @@ pub fn build(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, contex
             const names = try server.logicalTableNamesInArena(alloc, context, &.{parent_table.name});
             if (names.len != 1 or !try server_mod.tablePermissionCurrentlyAllowed(identity, names[0], .admin) or
                 try server_mod.resolveEffectiveRowFilterJson(alloc, identity, names[0]) != null) return error.Forbidden;
-            const parent_ranges = try rangesFor(alloc, snapshot, parent_table.table_id);
+            const dual = parent_table.table_id == current.table_id;
+            const parent_ranges = if (dual) child_ranges else try rangesFor(alloc, snapshot, parent_table.table_id);
             try parents.append(alloc, .{
                 .table = try ownedTableForPlan(alloc, parent_table),
                 .ranges = parent_ranges,
-                .fences = try ownerFences(server, alloc, context, id, parent_table, parent_ranges, .child_generation_parent),
+                .fences = if (dual) child_fences else try ownerFences(server, alloc, context, id, parent_table, parent_ranges, .child_generation_parent),
                 .transitions = &.{},
             });
             found = &parents.items[parents.items.len - 1];

@@ -16,7 +16,8 @@ class SQLPreparedExecutionRequest:
     Attributes:
         parameters (list[Any] | Unset):
         limit (int | Unset):  Default: 128.
-        session_id (str | Unset): Optional durable transaction session, independent of the prepared resource lifetime.
+        session_id (str | Unset): Optional durable transaction session. Required when the resource was prepared against
+            a session; otherwise independent of the prepared resource lifetime.
     """
 
     parameters: list[Any] | Unset = UNSET

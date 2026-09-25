@@ -119,7 +119,7 @@ pub const Active = struct {
         const entry = bytes[8..][0..entry_len];
         try validateEntry(entry);
         const fence = topology.Fence.decode(bytes[8 + entry_len + 32 ..][0..136]) catch return error.InvalidGenerationRetirement;
-        if (fence.role != .truncate_parent and fence.role != .child_generation_parent) return error.InvalidGenerationRetirement;
+        if (fence.role != .truncate_parent and fence.role != .child_generation_parent and fence.role != .child_generation_dual) return error.InvalidGenerationRetirement;
         return .{ .entry = entry, .publication_digest = bytes[8 + entry_len ..][0..32].*, .fence = fence };
     }
 };
@@ -172,7 +172,7 @@ pub const GcProgress = struct {
 fn encodeActive(alloc: std.mem.Allocator, encoded_entry: []const u8, publication_digest: integrity.Digest, fence: topology.Fence) ![]u8 {
     try validateEntry(encoded_entry);
     if (std.mem.allEqual(u8, &publication_digest, 0) or
-        (fence.role != .truncate_parent and fence.role != .child_generation_parent)) return error.InvalidGenerationRetirement;
+        (fence.role != .truncate_parent and fence.role != .child_generation_parent and fence.role != .child_generation_dual)) return error.InvalidGenerationRetirement;
     const encoded_fence = try fence.encode();
     const bytes = try alloc.alloc(u8, active_len);
     @memcpy(bytes[0..4], "AIG3");
@@ -386,6 +386,16 @@ pub fn stagePending(alloc: std.mem.Allocator, txn: anytype, manager: *@import(".
     try topology.requireDrained(txn, manager, fence);
     const encoded = try encodePending(alloc, fence, plan_digest, entries);
     defer alloc.free(encoded);
+    // Activation moves the pending record to completed_pending_key before its
+    // metadata ACK. A delayed stage replay must not recreate the active key:
+    // ownerStatus would then report an irreversible activation as pending.
+    if (try optionalKey(txn, completed_pending_key)) |completed| {
+        const prior = try Pending.decode(completed);
+        if (prior.fence.eql(fence) or try optionalKey(txn, acknowledged_receipt_key) == null) {
+            if (!std.mem.eql(u8, completed, encoded)) return error.GenerationRetirementChanged;
+            return;
+        }
+    }
     if (try optional(txn)) |before| {
         _ = try Pending.decode(before);
         if (!std.mem.eql(u8, before, encoded)) return error.GenerationRetirementChanged;
@@ -478,7 +488,7 @@ pub fn stageVerifiedActivation(alloc: std.mem.Allocator, txn: anytype, fence: to
 /// delayed old-generation attach can never resurrect deleted references.
 pub fn stageChildGenerationRetirements(alloc: std.mem.Allocator, txn: anytype, fence: topology.Fence, transitions: []const @import("relational_integrity_generation_admission.zig").Transition) !void {
     const admission = @import("relational_integrity_generation_admission.zig");
-    if (fence.role != .child_generation_parent) return error.InvalidGenerationRetirement;
+    if (fence.role != .child_generation_parent and fence.role != .child_generation_dual) return error.InvalidGenerationRetirement;
     try admission.validateTransitions(transitions);
     var added = false;
     for (transitions) |transition| {

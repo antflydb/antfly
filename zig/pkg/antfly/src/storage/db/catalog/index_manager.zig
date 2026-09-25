@@ -16984,6 +16984,36 @@ pub const IndexManager = struct {
         return self.graph_indexes.items.len > 0;
     }
 
+    /// An owner-local graph declaration fingerprint for generation retirement.
+    /// Capture the loaded definitions under the catalog lock; metadata must
+    /// derive the same value from its table record before sealing this owner.
+    pub fn graphRetirementConfigDigest(self: *IndexManager, alloc: Allocator) !?@import("../graph_retirement_config.zig").Digest {
+        const configs = blk: {
+            self.catalog_mutex.lockShared();
+            defer self.catalog_mutex.unlockShared();
+            if (self.graph_indexes.items.len == 0) return null;
+            const snapshot = try alloc.alloc(types.IndexConfig, self.graph_indexes.items.len);
+            errdefer alloc.free(snapshot);
+            var cloned: usize = 0;
+            errdefer {
+                for (snapshot[0..cloned]) |*config| config.deinit(alloc);
+            }
+            for (self.graph_indexes.items, snapshot) |entry, *config| {
+                config.* = try types.IndexConfig.clone(alloc, entry.config);
+                cloned += 1;
+            }
+            break :blk snapshot;
+        };
+        defer types.freeIndexConfigs(alloc, configs);
+        return @import("../graph_retirement_config.zig").fromLoaded(alloc, configs);
+    }
+
+    test "graph retirement digest loaded owner snapshot requires a graph index" {
+        var manager = try IndexManager.init(std.testing.allocator, ".");
+        defer manager.deinit();
+        try std.testing.expect((try manager.graphRetirementConfigDigest(std.testing.allocator)) == null);
+    }
+
     pub fn graphIndexes(self: *const IndexManager) []const GraphIndex {
         return self.graph_indexes.items;
     }

@@ -225,21 +225,50 @@ test "SQL TRUNCATE original multi-table case admits one atomic empty cohort" {
     }
 }
 
-test "SQL TRUNCATE graph index admission binds retirement to the exact incarnations" {
-    var fixture: Fixture = .{};
+test "SQL TRUNCATE graph index fails before owner reads and job admission" {
+    for ([_]bool{ false, true }) |restart| {
+        var fixture: Fixture = .{};
+        defer fixture.deinit();
+        fixture.tables[0].indexes_json = "{\"links\":{\"type\":\"graph\"}}";
+        var server = try fixture.server();
+        defer server.deinit();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        var statement = ddl;
+        statement.restart_identity = restart;
+        try std.testing.expectError(error.UnsupportedSqlExecution, truncate.execute(&server, null, .{}, "default", "public", arena.allocator(), statement));
+        try std.testing.expectEqual(@as(usize, 0), fixture.owner_reads);
+        try std.testing.expectEqual(@as(usize, 0), fixture.admissions);
+        try std.testing.expect(fixture.plan == null and fixture.job_value == null);
+    }
+}
+
+test "SQL TRUNCATE CASCADE rejects graph child before admitting whole cohort" {
+    var fixture: Fixture = .{ .logical_name = "parent", .second_logical_name = "child" };
     defer fixture.deinit();
-    fixture.tables[0].indexes_json = "{\"links\":{\"type\":\"graph\"}}";
+    fixture.tables[0].schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    fixture.tables[1].schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"fk","child_columns":["parent_id"],"parent_table":"physical","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"parent_id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    fixture.tables[1].indexes_json = "{\"links\":{\"type\":\"graph\"}}";
+    var parsed = try compiler.compile(alloc, "TRUNCATE parent CASCADE", .{});
+    defer parsed.deinit();
     var server = try fixture.server();
     defer server.deinit();
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
-    const outcome = try truncate.execute(&server, null, .{}, "default", "public", arena.allocator(), ddl);
-    try std.testing.expectEqual(.pending, outcome.receipt.?.state);
-    var plan = try std.json.parseFromSlice(stages.Plan, alloc, fixture.plan.?, .{});
-    defer plan.deinit();
-    const target = plan.value.targets[0];
-    try std.testing.expectEqualDeep(stages.graphRetirementDigest(100, target.table.table_id, fixture.tables[0].indexes_json), target.graph_retirement_digest.?);
-    try std.testing.expectEqualDeep(target.graph_retirement_digest, (try stages.ownerScope(alloc, plan.value, try plan.value.digest(alloc), target, target.ranges[0])).graph_retirement_digest);
+    try std.testing.expectError(error.UnsupportedSqlExecution, truncate.execute(&server, null, .{}, "default", "public", arena.allocator(), parsed.statement.catalog_ddl));
+    try std.testing.expectEqual(@as(usize, 0), fixture.owner_reads);
+    try std.testing.expectEqual(@as(usize, 0), fixture.admissions);
+    try std.testing.expect(fixture.plan == null and fixture.job_value == null);
+    var permissions = [_]@import("../usermgr/mod.zig").Permission{.{ .resource = @constCast("*"), .resource_type = .table, .type = .admin }};
+    var filters = [_]@import("../usermgr/mod.zig").RowFilterEntry{.{ .table = @constCast("child"), .filter = @constCast("{}") }};
+    const identity: http.AuthenticatedIdentity = .{ .username = @constCast("user"), .permissions = &permissions, .row_filter = &filters };
+    try std.testing.expectError(error.Forbidden, truncate.execute(&server, identity, .{}, "default", "public", arena.allocator(), parsed.statement.catalog_ddl));
+    try std.testing.expectEqual(@as(usize, 0), fixture.owner_reads);
+    try std.testing.expectEqual(@as(usize, 0), fixture.admissions);
 }
 
 test "SQL TRUNCATE original CASCADE case closes incoming FK cohort" {
@@ -271,7 +300,7 @@ test "SQL TRUNCATE original CASCADE case closes incoming FK cohort" {
     try std.testing.expectEqualStrings("archived_records", plan.value.targets[1].catalog_binding.?.name);
 }
 
-test "SQL TRUNCATE child-only external parent admits exact retirement plan and reconciles unknown reply" {
+test "SQL TRUNCATE child-only external parent rejects before owner reads or admission" {
     for ([_]bool{ false, true }) |unknown| {
         var fixture: Fixture = .{ .logical_name = "parent", .second_logical_name = "child", .unknown = unknown };
         defer fixture.deinit();
@@ -287,21 +316,13 @@ test "SQL TRUNCATE child-only external parent admits exact retirement plan and r
         defer server.deinit();
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
-        const outcome = try truncate.execute(&server, null, .{}, "default", "public", arena.allocator(), parsed.statement.catalog_ddl);
-        try std.testing.expectEqual(@as(usize, 1), fixture.integrity_reads);
-        try std.testing.expectEqual(@as(usize, 2), fixture.owner_reads);
-        try std.testing.expectEqual(@as(usize, 1), fixture.admissions);
-        try std.testing.expectEqual(@as(@TypeOf(outcome.receipt.?.state), if (unknown) .admission_unknown else .pending), outcome.receipt.?.state);
-        var plan = try std.json.parseFromSlice(stages.Plan, alloc, fixture.plan.?, .{});
-        defer plan.deinit();
-        try std.testing.expectEqual(@as(usize, 1), plan.value.targets.len);
-        try std.testing.expectEqual(@as(usize, 1), plan.value.external_fk_parents.len);
-        const parent = plan.value.external_fk_parents[0];
-        try std.testing.expectEqual(@as(u64, 100), parent.table.table_id);
-        try std.testing.expectEqual(@as(u64, 200), parent.fences[0].owner_group_id);
-        try std.testing.expectEqual(@as(u64, 101), parent.foreign_keys[0].child_table_id);
-        try std.testing.expectEqualStrings("fk", parent.foreign_keys[0].constraint_name);
-        try std.testing.expect(!std.mem.eql(u8, &parent.foreign_keys[0].generation, &parent.foreign_keys[0].next_generation));
+        const denied: http.AuthenticatedIdentity = .{ .username = @constCast("user") };
+        try std.testing.expectError(error.Forbidden, truncate.execute(&server, denied, .{}, "default", "public", arena.allocator(), parsed.statement.catalog_ddl));
+        try std.testing.expectError(error.SqlTruncateExternalForeignKey, truncate.execute(&server, null, .{}, "default", "public", arena.allocator(), parsed.statement.catalog_ddl));
+        try std.testing.expectEqual(@as(usize, 0), fixture.integrity_reads);
+        try std.testing.expectEqual(@as(usize, 0), fixture.owner_reads);
+        try std.testing.expectEqual(@as(usize, 0), fixture.admissions);
+        try std.testing.expect(fixture.plan == null);
     }
 }
 

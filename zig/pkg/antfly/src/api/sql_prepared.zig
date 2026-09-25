@@ -51,8 +51,23 @@ pub const Resource = struct {
     database: []const u8,
     namespace: []const u8,
     statement: []const u8,
+    /// A resource described against a durable SQL session cannot later be
+    /// executed against another session's (possibly policy-sensitive) values.
+    /// Null preserves the original session-independent resource contract.
+    session_id: ?[32]u8 = null,
+    /// The described types depend on the scoped setting definitions, not on
+    /// the mutable session values. Execution re-reads values at its own cut.
+    setting_epoch: ?u64 = null,
     parameter_types: []const ?ast.ColumnType,
     bindings: []const Binding,
+
+    pub fn verifyExecutionSession(self: Resource, encoded: ?[]const u8) !void {
+        if (self.session_id) |attached| {
+            const supplied = @import("distributed_txn.zig").parseTxnIdHex(encoded orelse return error.SqlTransactionNotActive) catch return error.SqlTransactionNotActive;
+            const expected = @import("distributed_txn.zig").parseTxnIdHex(&attached) catch return error.SqlPreparedNotFound;
+            if (!std.mem.eql(u8, &expected, &supplied)) return error.SqlTransactionNotActive;
+        }
+    }
 };
 
 pub const Owned = struct {
@@ -217,6 +232,7 @@ test "SQL prepared durable directory preserves ownership expiry admission and lo
     var loaded = try load(&recreated, alloc, &first.id, "alice", 7, 2);
     defer loaded.deinit();
     try std.testing.expectEqualStrings(first.statement, loaded.value.statement);
+    try loaded.value.verifyExecutionSession(null);
     try std.testing.expectEqual(ast.ColumnType.integer, loaded.value.parameter_types[0].?);
     store.fail_writes_for_test = true;
     var read_during_write_failure = try load(&store, alloc, &first.id, "alice", 7, 2);
@@ -264,13 +280,15 @@ test "SQL prepared resource survives native store restart and transaction cleanu
     const alloc = std.testing.allocator;
     var directory = try @import("../common/test_directory.zig").TestDirectory.init("sql-prepared-restart");
     defer directory.cleanup();
-    const resource: Resource = .{ .id = @splat('a'), .principal = "alice", .owner_node_id = 7, .expires_at_ms = 1000, .database = "app", .namespace = "public", .statement = "SELECT 1", .parameter_types = &.{}, .bindings = &.{} };
+    var resource: Resource = .{ .id = @splat('a'), .principal = "alice", .owner_node_id = 7, .expires_at_ms = 1000, .database = "app", .namespace = "public", .statement = "SELECT 1", .setting_epoch = 9, .parameter_types = &.{}, .bindings = &.{} };
     {
         var opened = try transactions.OpenedSessionStore.open(alloc, directory.path());
         defer opened.deinit();
-        try create(opened.durableStore(), resource, 1);
         var registry = transactions.SessionRegistry.init(opened.durableStore());
         defer registry.deinit(alloc);
+        const attached = try registry.beginForPrincipal(alloc, .{ .sql = .{ .database = "app", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 7, "alice");
+        resource.session_id = std.fmt.bytesToHex(attached.txn_id, .lower);
+        try create(opened.durableStore(), resource, 1);
         const transaction = try registry.beginForPrincipal(alloc, .{}, 7, "alice");
         try std.testing.expect(registry.removeBeforeExecution(alloc, transaction.txn_id));
     }
@@ -279,7 +297,18 @@ test "SQL prepared resource survives native store restart and transaction cleanu
         defer reopened.deinit();
         var value = try load(reopened.durableStore(), alloc, &resource.id, "alice", 7, 2);
         defer value.deinit();
+        var registry = transactions.SessionRegistry.init(reopened.durableStore());
+        defer registry.deinit(alloc);
+        const attached_session = resource.session_id.?;
+        const attached_id = try @import("distributed_txn.zig").parseTxnIdHex(&attached_session);
+        var state = (try registry.getSqlState(alloc, attached_id)).?;
+        defer state.deinit(alloc);
+        try std.testing.expectEqualStrings("app", state.metadata.database);
         try std.testing.expectEqualStrings("SELECT 1", value.value.statement);
+        try std.testing.expectEqual(@as(?u64, 9), value.value.setting_epoch);
+        try value.value.verifyExecutionSession(&attached_session);
+        try std.testing.expectError(error.SqlTransactionNotActive, value.value.verifyExecutionSession(null));
+        try std.testing.expectError(error.SqlTransactionNotActive, value.value.verifyExecutionSession("22222222222222222222222222222222"));
         try close(reopened.durableStore(), &resource.id, "alice", 7, 2);
     }
     var reopened = try transactions.OpenedSessionStore.open(alloc, directory.path());

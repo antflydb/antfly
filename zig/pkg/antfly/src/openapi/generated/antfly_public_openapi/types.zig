@@ -12709,12 +12709,15 @@ pub const SQLPrepareRequest = struct {
     statement: []const u8,
     database: ?[]const u8 = null,
     namespace: ?[]const u8 = null,
+    /// Optional durable SQL session. Preparation binds its authenticated scope and current setting catalog under the session lease; execution must supply the same session.
+    session_id: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "statement", "statement", false },
         .{ "database", "database", true },
         .{ "namespace", "namespace", true },
+        .{ "session_id", "session_id", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -12737,6 +12740,10 @@ pub const SQLPrepareRequest = struct {
             try jw.objectField("namespace");
             try jw.write(value);
         }
+        if (self.session_id) |value| {
+            try jw.objectField("session_id");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };
@@ -12744,7 +12751,7 @@ pub const SQLPrepareRequest = struct {
 pub const SQLPreparedExecutionRequest = struct {
     parameters: ?[]const std.json.Value = null,
     limit: ?i64 = null,
-    /// Optional durable transaction session, independent of the prepared resource lifetime.
+    /// Optional durable transaction session. Required when the resource was prepared against a session; otherwise independent of the prepared resource lifetime.
     session_id: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.

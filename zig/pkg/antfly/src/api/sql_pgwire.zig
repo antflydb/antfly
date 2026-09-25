@@ -350,7 +350,7 @@ const OwnedRead = struct {
         self.authority.request.binding_guard = if (request.binding_guard) |guard| try arena.dupe(u8, guard) else null;
         self.authority.request.setting_overlay = try cloneSettingOverlay(arena, request.setting_overlay);
         self.authority.request.session_id = self.session_id;
-        self.native_adapter = .{ .server = server, .identity = &self.identity, .context = try self.authority.context(), .database = self.authority.request.database.?, .namespace = self.authority.request.namespace.?, .session_id = self.session_id, .setting_overlay = self.authority.request.setting_overlay, .expected_setting_epoch = self.authority.request.setting_epoch };
+        self.native_adapter = .{ .server = server, .identity = &self.identity, .context = try self.authority.context(), .database = self.authority.request.database.?, .namespace = self.authority.request.namespace.?, .session_id = self.session_id, .setting_overlay = self.authority.request.setting_overlay, .setting_overlay_source = .connection, .expected_setting_epoch = self.authority.request.setting_epoch };
         var transaction_lease: ?@import("transactions.zig").SessionRegistry.CommitExecution = null;
         defer if (transaction_lease) |lease| lease.release();
         if (self.session_id) |id_hex| {
@@ -753,6 +753,7 @@ const Job = struct {
             .session_id = self.request.session_id,
             .session_namespace = self.request.session_namespace,
             .setting_overlay = self.request.setting_overlay,
+            .setting_overlay_source = .connection,
             .expected_setting_epoch = self.request.setting_epoch,
         };
         // describe/execute capture a single settings view. The adapter's

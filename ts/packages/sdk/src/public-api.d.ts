@@ -657,7 +657,7 @@ export interface paths {
         put?: never;
         /**
          * Create a durable prepared SQL resource
-         * @description Binds SELECT, INSERT, UPDATE or DELETE without executing it. The immutable resource belongs to the authenticated principal and API node, expires after one hour, and survives transaction COMMIT and owner restart with the same durable store and node identity. Owner failover is not automatic; execute and close must reach owner_node_id. Each durable store admits at most 128 resources and 4 MiB of serialized prepared state. Expired resources are reclaimed atomically during subsequent creation or close. Execution authenticates and authorizes again and rejects changed catalog identities or schemas. A native durable session store is required.
+         * @description Binds SELECT, INSERT, UPDATE or DELETE without executing it. The immutable resource belongs to the authenticated principal and API node, expires after one hour, and survives transaction COMMIT and owner restart with the same durable store and node identity. A session-bound resource is executable only while its attached session remains active. Owner failover is not automatic; execute and close must reach owner_node_id. Each durable store admits at most 128 resources and 4 MiB of serialized prepared state. Expired resources are reclaimed atomically during subsequent creation or close. Execution authenticates and authorizes again and rejects changed catalog identities or schemas. When session_id is supplied, preparation uses the attached session's authenticated database, namespace and setting overlay under its execution lease. The resource is bound to that session; execution re-reads current values but rejects a changed setting catalog. A native durable session store is required.
          */
         post: operations["prepareSQL"];
         delete?: never;
@@ -4288,12 +4288,14 @@ export interface components {
             statement: string;
             database?: string;
             namespace?: string;
+            /** @description Optional durable SQL session. Preparation binds its authenticated scope and current setting catalog under the session lease; execution must supply the same session. */
+            session_id?: string;
         };
         SQLPreparedExecutionRequest: {
             parameters?: unknown[];
             /** @default 128 */
             limit?: number;
-            /** @description Optional durable transaction session, independent of the prepared resource lifetime. */
+            /** @description Optional durable transaction session. Required when the resource was prepared against a session; otherwise independent of the prepared resource lifetime. */
             session_id?: string;
         };
         SQLPreparedResponse: {

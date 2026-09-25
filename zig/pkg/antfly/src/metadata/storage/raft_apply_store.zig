@@ -132,6 +132,9 @@ test "FK generation publication begins durably and rejects stale CAS and topolog
         .child_fences = &.{child_fence},
         .parents = &.{.{ .table = parent, .ranges = &.{parent_range}, .fences = &.{parent_fence}, .transitions = &.{derived[0].transition} }},
     };
+    var altered_index_plan = plan;
+    altered_index_plan.child_after.indexes_json = "{\"unexpected\":{}}";
+    try std.testing.expectError(error.InvalidGenerationPublication, altered_index_plan.validate(alloc));
     const begin = try std.json.Stringify.valueAlloc(alloc, fk_generation_publication.Command{ .plan_id = id, .child_table_id = child.table_id, .expected_revision = 0, .action = .begin, .plan = plan }, .{});
     defer alloc.free(begin);
     try store.applyStandaloneCommand(group_id, .{ .apply_fk_generation_publication = begin });
@@ -141,6 +144,47 @@ test "FK generation publication begins durably and rejects stale CAS and topolog
     defer publication.deinit();
     try std.testing.expectEqual(fk_generation_publication.Phase.fencing_child, publication.value.phase);
     try std.testing.expectEqual(@as(u64, 1), publication.value.revision);
+    // A transient owner failure happens after the supervisor has advanced its
+    // in-memory cursor, but before a durable child receipt is recorded. The
+    // same unfinished publication must be returned on the next pass.
+    const retry_work = try store.fkGenerationPublicationWorkJson(alloc, group_id, child.table_id);
+    defer alloc.free(retry_work);
+    var retry = try std.json.parseFromSlice(fk_generation_publication.Publication, alloc, retry_work, .{});
+    defer retry.deinit();
+    try std.testing.expectEqual(child.table_id, retry.value.plan.child_before.table_id);
+    try std.testing.expectEqual(fk_generation_publication.Phase.fencing_child, retry.value.phase);
+    const source_receipt: @import("../../api/relational_fk_generation_publication.zig").SourceReceipt = .{
+        .plan_id = id,
+        .child_table_id = child.table_id,
+        .child_group_id = child_range.group_id,
+        .action = .fence,
+        .plan_digest = publication.value.plan_digest,
+        .fence_digest = try @import("../../storage/db/relational_integrity_generation_admission.zig").sourceFenceDigest(child_fence),
+        .before_schema_version = publication.value.child_identity.before_schema_version,
+        .before_schema_digest = publication.value.child_identity.before_schema_digest,
+        .before_catalog_digest = publication.value.child_identity.before_catalog_digest,
+        .after_schema_version = publication.value.child_identity.after_schema_version,
+        .after_schema_digest = publication.value.child_identity.after_schema_digest,
+        .after_catalog_digest = publication.value.child_identity.after_catalog_digest,
+        .applied_term = 1,
+        .applied_index = 3,
+    };
+    const fenced_command = try std.json.Stringify.valueAlloc(alloc, fk_generation_publication.Command{
+        .plan_id = id,
+        .child_table_id = child.table_id,
+        .expected_revision = 1,
+        .action = .child_fenced,
+        .source_receipt = source_receipt,
+    }, .{});
+    defer alloc.free(fenced_command);
+    try store.applyStandaloneCommand(group_id, .{ .apply_fk_generation_publication = fenced_command });
+    const advanced_json = try store.fkGenerationPublicationStatusJson(alloc, group_id, child.table_id);
+    defer alloc.free(advanced_json);
+    var advanced = try std.json.parseFromSlice(fk_generation_publication.Publication, alloc, advanced_json, .{});
+    defer advanced.deinit();
+    try std.testing.expectEqual(fk_generation_publication.Phase.staging_parents, advanced.value.phase);
+    try std.testing.expectEqual(@as(usize, 1), advanced.value.child_fenced.len);
+    try std.testing.expectEqualStrings(child.name, advanced.value.plan.child_before.name);
     const stale = try std.json.Stringify.valueAlloc(alloc, fk_generation_publication.Command{ .plan_id = id, .child_table_id = child.table_id, .expected_revision = 9, .action = .cancel }, .{});
     defer alloc.free(stale);
     try std.testing.expectError(error.GenerationPublicationChanged, store.applyStandaloneCommand(group_id, .{ .apply_fk_generation_publication = stale }));
@@ -162,6 +206,30 @@ test "FK generation publication begins durably and rejects stale CAS and topolog
     try injected.put(parent_key, forged_bytes);
     try injected.commit();
     try std.testing.expectError(error.GenerationPublicationChanged, store.fkGenerationPublicationSourceDecisionJson(alloc, group_id, .{ .plan_id = id, .child_table_id = child.table_id, .child_table_name = child.name, .child_group_id = child_range.group_id, .action = .fence }));
+    // Terminal transitions retire their work key atomically with the record.
+    // Model both projections directly so the selector's read-side behavior
+    // stays independent of the command path tested above.
+    var terminal = publication.value;
+    terminal.phase = .canceled;
+    const terminal_bytes = try std.json.Stringify.valueAlloc(alloc, terminal, .{});
+    defer alloc.free(terminal_bytes);
+    var terminal_txn = try store.store.beginWriteTxn();
+    errdefer terminal_txn.abort();
+    var publication_key_buf: [160]u8 = undefined;
+    try terminal_txn.put(try fk_generation_publication.key(&publication_key_buf, group_id, child.table_id), terminal_bytes);
+    var work_key_buf: [160]u8 = undefined;
+    try terminal_txn.delete(try fk_generation_publication.workKey(&work_key_buf, group_id, child.table_id));
+    try terminal_txn.commit();
+    const no_work = try store.fkGenerationPublicationWorkJson(alloc, group_id, child.table_id);
+    defer alloc.free(no_work);
+    try std.testing.expectEqualStrings("null", no_work);
+    // An index entry without its matching nonterminal publication must fail
+    // closed rather than silently losing supervisor work after a snapshot.
+    var orphan_txn = try store.store.beginWriteTxn();
+    errdefer orphan_txn.abort();
+    try orphan_txn.put(try fk_generation_publication.workKey(&work_key_buf, group_id, child.table_id), &id);
+    try orphan_txn.commit();
+    try std.testing.expectError(error.InvalidGenerationPublication, store.fkGenerationPublicationWorkJson(alloc, group_id, child.table_id));
 }
 
 test "initial self FK reserves one hidden child owner and no duplicate parent route" {
@@ -322,7 +390,33 @@ test "initial self FK reserves one hidden child owner and no duplicate parent ro
     try store.applyStandaloneCommand(group_id, .{ .apply_fk_initial_create = released });
     const published = try std.json.Stringify.valueAlloc(alloc, fk_generation_publication.InitialCommand{ .plan_id = id, .child_table_id = child.table_id, .expected_revision = 3, .action = .publish_child }, .{});
     defer alloc.free(published);
+    const PublicationSignals = struct {
+        child_id: u64,
+        table: usize = 0,
+        ranges: usize = 0,
+
+        fn onProjection(ptr: *anyopaque, signal: ProjectionSignal) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (signal.table_id != self.child_id) return;
+            switch (signal.kind) {
+                .table => self.table += 1,
+                .range => self.ranges += 1,
+                else => {},
+            }
+        }
+    };
+    var signals = PublicationSignals{ .child_id = child.table_id };
+    try store.addProjectionListener(.{ .ptr = &signals, .vtable = &.{ .on_projection_signal = PublicationSignals.onProjection } });
+    try store.preflightFkInitialCreateCommand(group_id, published);
+    try std.testing.expectEqual(@as(usize, 0), signals.table);
+    try std.testing.expectEqual(@as(usize, 0), signals.ranges);
     try store.applyStandaloneCommand(group_id, .{ .apply_fk_initial_create = published });
+    try std.testing.expectEqual(@as(usize, 1), signals.table);
+    try std.testing.expectEqual(plan.child_ranges.len, signals.ranges);
+    const resolved = (try store.resolveSystemCatalogIdentity(alloc, group_id, .{ .table = "nodes" })).?;
+    defer alloc.free(resolved.name);
+    try std.testing.expectEqual(child.table_id, resolved.table_id);
+    try std.testing.expectEqualStrings(child.name, resolved.name);
     const visible = try store.listTables(alloc, group_id);
     defer store.freeTables(alloc, visible);
     try std.testing.expectEqual(@as(usize, 1), visible.len);
@@ -433,7 +527,8 @@ test "FK generation publication initial create reserves hidden identity before a
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/initial-fk-create", .{tmp.sub_path});
     defer alloc.free(root);
     var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
-    defer store.deinit();
+    var store_open = true;
+    defer if (store_open) store.deinit();
     const group_id = group_ids.main_metadata_group_id;
     try store.applyStandaloneCommand(group_id, .{ .initialize_metadata_incarnation = "11111111111111111111111111111111".* });
     const schema_json =
@@ -701,6 +796,30 @@ test "FK generation publication initial create reserves hidden identity before a
     }, .{});
     defer alloc.free(child_cancel_json);
     try store.applyStandaloneCommand(group_id, .{ .apply_fk_initial_create = child_cancel_json });
+    // The parent owner can be offline after the child has acknowledged its
+    // cancel. Metadata must retain the hidden reservation and pending parent
+    // work across a restart, rather than publishing or forgetting the child.
+    const waiting_json = try store.fkInitialCreateStatusJson(alloc, group_id, candidate.child.table_id);
+    defer alloc.free(waiting_json);
+    var waiting = try std.json.parseFromSlice(fk_generation_publication.InitialPublication, alloc, waiting_json, .{});
+    defer waiting.deinit();
+    try std.testing.expectEqual(fk_generation_publication.InitialPhase.canceling, waiting.value.phase);
+    const waiting_tables = try store.listTables(alloc, group_id);
+    defer store.freeTables(alloc, waiting_tables);
+    try std.testing.expectEqual(@as(usize, 2), waiting_tables.len);
+    store.deinit();
+    store_open = false;
+    var recovered = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer recovered.deinit();
+    const resumed_json = try recovered.fkInitialCreateWorkJson(alloc, group_id, candidate2.child.table_id);
+    defer alloc.free(resumed_json);
+    var resumed = try std.json.parseFromSlice(?fk_generation_publication.InitialWork, alloc, resumed_json, .{});
+    defer resumed.deinit();
+    try std.testing.expectEqual(fk_generation_publication.InitialPhase.canceling, resumed.value.?.phase);
+    try std.testing.expectEqual(parent_range.group_id, resumed.value.?.target.parent.group_id);
+    const recovered_tables = try recovered.listTables(alloc, group_id);
+    defer recovered.freeTables(alloc, recovered_tables);
+    try std.testing.expectEqual(@as(usize, 2), recovered_tables.len);
     const admission = @import("../../storage/db/relational_integrity_generation_admission.zig");
     const parent_transition: admission.Transition = .{
         .child_table_id = candidate.child.table_id,
@@ -730,8 +849,8 @@ test "FK generation publication initial create reserves hidden identity before a
         .parent_receipt = parent_receipt,
     }, .{});
     defer alloc.free(parent_cancel_json);
-    try store.applyStandaloneCommand(group_id, .{ .apply_fk_initial_create = parent_cancel_json });
-    const post_terminal_json = try store.fkInitialCreateWorkJson(alloc, group_id, candidate2.child.table_id);
+    try recovered.applyStandaloneCommand(group_id, .{ .apply_fk_initial_create = parent_cancel_json });
+    const post_terminal_json = try recovered.fkInitialCreateWorkJson(alloc, group_id, candidate2.child.table_id);
     defer alloc.free(post_terminal_json);
     var post_terminal = try std.json.parseFromSlice(?fk_generation_publication.InitialWork, alloc, post_terminal_json, .{});
     defer post_terminal.deinit();
@@ -7065,7 +7184,12 @@ pub const RaftApplyStore = struct {
 
     fn validateFkGenerationCutTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, plan: fk_generation_publication.Plan, published: bool) !void {
         try self.validateFkGenerationTableTxn(txn, group_id, if (published) plan.child_after else plan.child_before, plan.child_ranges);
-        for (plan.parents) |parent| try self.validateFkGenerationTableTxn(txn, group_id, parent.table, parent.ranges);
+        for (plan.parents) |parent| {
+            // A self-parent is the child descriptor, not a second table. Its
+            // after-image was checked by the first validation above.
+            if (published and parent.table.table_id == plan.child_before.table_id) continue;
+            try self.validateFkGenerationTableTxn(txn, group_id, parent.table, parent.ranges);
+        }
     }
 
     fn fkGenerationTableLockedTxn(_: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, table_id: u64) !bool {
@@ -7113,6 +7237,10 @@ pub const RaftApplyStore = struct {
     fn setFkGenerationTableLocksTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, plan: fk_generation_publication.Plan, acquire: bool) !void {
         for (0..plan.parents.len + 1) |i| {
             const table_id = if (i == 0) plan.child_before.table_id else plan.parents[i - 1].table.table_id;
+            // Dual-role self-FK owners share the child table lock. A second
+            // acquisition would reject our own publication, while a second
+            // release would fail after the first removal.
+            if (i != 0 and table_id == plan.child_before.table_id) continue;
             var key_buf: [160]u8 = undefined;
             const key = try fk_generation_publication.tableLockKey(&key_buf, group_id, table_id);
             const existing = txn.get(key) catch |err| switch (err) {
@@ -7449,6 +7577,11 @@ pub const RaftApplyStore = struct {
                 owned.deinit();
                 return error.CatalogAlreadyExists;
             }
+            if (try system_catalog_storage.getById(a, txn, group_id, .table, plan.child.table_id)) |existing| {
+                var owned = existing;
+                owned.deinit();
+                return error.GenerationPublicationChanged;
+            }
             if (try stagingGet(txn, try fk_generation_publication.initialNameKey(&name_buf, group_id, plan.namespace_id, plan.logical_name)) != null or
                 try stagingGet(txn, try fk_generation_publication.initialPhysicalNameKey(&name_buf, group_id, plan.child.name)) != null or
                 try stagingGet(txn, try restore_staging.nameKey(&name_buf, group_id, plan.child.name)) != null or
@@ -7520,11 +7653,14 @@ pub const RaftApplyStore = struct {
                 }
                 try self.advanceTableTransitionGenerationWithRangeChangesTxn(txn, group_id, publication.plan.child.table_id, added.items, &.{});
                 const meta = try system_catalog_storage.readMeta(a, txn, group_id);
-                var upserts = [_]system_catalog.Resource{.{ .kind = .table, .id = publication.plan.catalog_id, .parent_id = publication.plan.namespace_id, .name = publication.plan.logical_name, .tablespace_id = publication.plan.tablespace_id, .storage_name = publication.plan.child.name }};
+                // The resource identity must match the physical table ID.
+                // catalog_id reserves only the monotonic name/allocator slot.
+                var upserts = [_]system_catalog.Resource{.{ .kind = .table, .id = publication.plan.child.table_id, .parent_id = publication.plan.namespace_id, .name = publication.plan.logical_name, .tablespace_id = publication.plan.tablespace_id, .storage_name = publication.plan.child.name }};
                 var empty: [0]system_catalog.Resource = .{};
                 var command_hash: [32]u8 = undefined;
                 std.crypto.hash.sha2.Sha256.hash(bytes, &command_hash, .{});
-                try system_catalog_storage.applyDelta(a, txn, group_id, .{ .upserts = &upserts, .removes = &empty, .next_id = meta.next_id }, meta, command_hash);
+                const next_id = std.math.add(u64, publication.plan.catalog_id, 1) catch return error.InvalidGenerationPublication;
+                try system_catalog_storage.applyDelta(a, txn, group_id, .{ .upserts = &upserts, .removes = &empty, .next_id = @max(meta.next_id, next_id) }, meta, command_hash);
             }
             if (publication.phase == .published or publication.phase == .canceled) {
                 try self.setFkInitialTableLocksTxn(txn, group_id, publication.plan, false);
@@ -7553,14 +7689,38 @@ pub const RaftApplyStore = struct {
     /// but no hidden reservation becomes visible before Raft commits it.
     pub fn preflightFkInitialCreateCommand(self: *RaftApplyStore, group_id: u64, bytes: []const u8) !void {
         var txn = try self.store.beginWriteTxn();
-        defer txn.abort();
+        // The real apply path buffers notifications until commit. Preflight
+        // runs the same mutation helpers against an aborted transaction, so
+        // it must also buffer (and discard) every nested table/range/catalog
+        // signal instead of waking readers for state that never committed.
+        var discarded: CommittedApplyOutcome = .{ .alloc = self.alloc, .collect_transition_deltas = false };
+        std.debug.assert(self.active_outcome == null);
+        self.active_outcome = &discarded;
+        defer {
+            txn.abort();
+            self.active_outcome = null;
+            discarded.deinit();
+        }
         try self.applyFkInitialCreateTxn(&txn, group_id, bytes);
+        if (discarded.failure) |err| return err;
     }
 
     fn applyCommittedFkInitialCreateTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !void {
         var parsed = try std.json.parseFromSlice(fk_generation_publication.InitialCommand, self.alloc, bytes, .{});
         defer parsed.deinit();
-        const action = parsed.value.action;
+        const command = parsed.value;
+        const action = command.action;
+        var publication_arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer publication_arena.deinit();
+        var key_buf: [160]u8 = undefined;
+        const publication_key = try fk_generation_publication.initialKey(&key_buf, group_id, command.child_table_id);
+        // DocStore's write transaction does not read its pending puts. Pin the
+        // immutable pre-publication plan before applying the transition; the
+        // state machine validates that same revision in this transaction.
+        const prior_publication: ?fk_generation_publication.InitialPublication = if (action == .publish_child)
+            try std.json.parseFromSliceLeaky(fk_generation_publication.InitialPublication, publication_arena.allocator(), try txn.get(publication_key), .{})
+        else
+            null;
         self.applyFkInitialCreateTxn(txn, group_id, bytes) catch |err| {
             // A different metadata proposer can win after our preflight but
             // before this entry applies. Every begin CAS check runs before
@@ -7577,6 +7737,23 @@ pub const RaftApplyStore = struct {
             };
             return err;
         };
+        // Preflight uses applyFkInitialCreateTxn directly. Only a committed
+        // transition may wake readers; the apply outcome dispatches these
+        // signals after the transaction commits. In particular, publishing a
+        // hidden child also publishes its table, ranges, and logical catalog
+        // binding, so cached public routes must advance with that same cut.
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = publication_key });
+        if (action == .publish_child) {
+            const child = prior_publication.?.plan.child;
+            // putTableRecordTxnMode above already buffers the child table-key
+            // and table-projection signals. The manually published ranges do
+            // not pass through that helper and need their own notifications.
+            for (prior_publication.?.plan.child_ranges) |range| {
+                const range_key = try rangeKeyForGroup(&key_buf, group_id, range.group_id);
+                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = range_key });
+                self.notifyProjectionListeners(.{ .kind = .range, .metadata_group_id = group_id, .group_id = range.group_id, .table_id = child.table_id });
+            }
+        }
     }
 
     fn setFkInitialTableLocksTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, plan: fk_generation_publication.InitialCreatePlan, acquire: bool) !void {
@@ -7594,26 +7771,33 @@ pub const RaftApplyStore = struct {
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
         var prefix_buf: [160]u8 = undefined;
-        const key_prefix = try fk_generation_publication.prefixForGroup(&prefix_buf, group_id);
+        const key_prefix = try fk_generation_publication.workPrefixForGroup(&prefix_buf, group_id);
         var cursor = try txn.openCursor();
         defer cursor.close();
-        var found_id: u64 = std.math.maxInt(u64);
-        var found: ?[]u8 = null;
-        errdefer if (found) |bytes| alloc.free(bytes);
-        var entry = try cursor.seekAtOrAfter(key_prefix);
-        while (entry) |row| : (entry = try cursor.next()) {
-            if (!std.mem.startsWith(u8, row.key, key_prefix)) break;
-            const table_id = std.fmt.parseInt(u64, row.key[key_prefix.len..], 10) catch return error.InvalidGenerationPublication;
-            if (table_id <= after_child_table_id or table_id >= found_id) continue;
-            var publication = try std.json.parseFromSlice(fk_generation_publication.Publication, self.alloc, row.value, .{});
-            defer publication.deinit();
-            if (publication.value.plan.child_before.table_id != table_id) return error.InvalidGenerationPublication;
-            if (publication.value.phase == .published or publication.value.phase == .canceled) continue;
-            if (found) |bytes| alloc.free(bytes);
-            found = try alloc.dupe(u8, row.value);
-            found_id = table_id;
-        }
-        return found orelse alloc.dupe(u8, "null");
+        var after_key_buf: [160]u8 = undefined;
+        var entry = if (after_child_table_id == std.math.maxInt(u64))
+            null
+        else
+            try cursor.seekAtOrAfter(try fk_generation_publication.workKey(&after_key_buf, group_id, after_child_table_id + 1));
+        if (entry == null or !std.mem.startsWith(u8, entry.?.key, key_prefix))
+            entry = try cursor.seekAtOrAfter(key_prefix);
+        const row = entry orelse return alloc.dupe(u8, "null");
+        if (!std.mem.startsWith(u8, row.key, key_prefix)) return alloc.dupe(u8, "null");
+        if (row.key.len != key_prefix.len + 16 or row.value.len != 16) return error.InvalidGenerationPublication;
+        const table_id = std.fmt.parseInt(u64, row.key[key_prefix.len..], 16) catch return error.InvalidGenerationPublication;
+        var key_buf: [160]u8 = undefined;
+        const publication_bytes = txn.get(try fk_generation_publication.key(&key_buf, group_id, table_id)) catch |err| switch (err) {
+            error.NotFound => return error.InvalidGenerationPublication,
+            else => return err,
+        };
+        var publication = try std.json.parseFromSlice(fk_generation_publication.Publication, self.alloc, publication_bytes, .{});
+        defer publication.deinit();
+        if (publication.value.plan.child_before.table_id != table_id or
+            !std.mem.eql(u8, row.value, &publication.value.plan.id) or
+            publication.value.phase == .published or publication.value.phase == .canceled)
+            return error.InvalidGenerationPublication;
+        try publication.value.validateState(self.alloc);
+        return alloc.dupe(u8, publication_bytes);
     }
 
     pub fn fkGenerationPublicationDecisionJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: fk_generation_publication.DecisionRequest) ![]u8 {
@@ -7718,11 +7902,16 @@ pub const RaftApplyStore = struct {
             else => return err,
         };
         var publication: fk_generation_publication.Publication = undefined;
+        // Publication.apply retains the prior plan and all of its string
+        // slices. Keep the decoded owner alive until the replacement has been
+        // fully serialized and copied into the transaction.
+        var previous: ?std.json.Parsed(fk_generation_publication.Publication) = null;
+        defer if (previous) |*value| value.deinit();
         if (command.action == .begin) {
             if (existing) |current_bytes| {
-                var previous = try std.json.parseFromSlice(fk_generation_publication.Publication, alloc, current_bytes, .{});
-                defer previous.deinit();
-                if (previous.value.phase != .published and previous.value.phase != .canceled) return error.GenerationPublicationChanged;
+                var prior_terminal = try std.json.parseFromSlice(fk_generation_publication.Publication, alloc, current_bytes, .{});
+                defer prior_terminal.deinit();
+                if (prior_terminal.value.phase != .published and prior_terminal.value.phase != .canceled) return error.GenerationPublicationChanged;
             }
             const plan = command.plan.?;
             const plan_digest = try plan.digest(alloc);
@@ -7733,9 +7922,8 @@ pub const RaftApplyStore = struct {
             try self.setFkGenerationTableLocksTxn(txn, group_id, plan, true);
             publication = .{ .plan = plan, .plan_digest = plan_digest, .child_identity = try plan.childIdentity(alloc), .revision = 1, .phase = .fencing_child };
         } else {
-            var previous = try std.json.parseFromSlice(fk_generation_publication.Publication, alloc, existing orelse return error.GenerationPublicationNotFound, .{});
-            defer previous.deinit();
-            publication = try previous.value.apply(alloc, command);
+            previous = try std.json.parseFromSlice(fk_generation_publication.Publication, alloc, existing orelse return error.GenerationPublicationNotFound, .{ .allocate = .alloc_always });
+            publication = try previous.?.value.apply(alloc, command);
             if (command.action == .publish_child) {
                 try self.validateFkGenerationCutTxn(txn, group_id, publication.plan, false);
                 var table_key_buf: [160]u8 = undefined;
@@ -7746,6 +7934,12 @@ pub const RaftApplyStore = struct {
         const encoded = try std.json.Stringify.valueAlloc(alloc, publication, .{});
         if (encoded.len > fk_generation_publication.max_bytes) return error.InvalidGenerationPublication;
         try txn.put(key, encoded);
+        var work_key_buf: [160]u8 = undefined;
+        const work_key = try fk_generation_publication.workKey(&work_key_buf, group_id, table_id);
+        if (publication.phase == .published or publication.phase == .canceled)
+            try txn.delete(work_key)
+        else
+            try txn.put(work_key, &publication.plan.id);
         self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
         self.notifyProjectionListeners(.{ .kind = .table, .metadata_group_id = group_id, .table_name = publication.plan.child_before.name, .table_id = table_id });
     }
@@ -11104,6 +11298,7 @@ pub const RaftApplyStore = struct {
         backup_cohort_lock,
         restore_staging,
         fk_generation_publication,
+        fk_generation_work,
         fk_generation_table_lock,
         fk_initial_create,
         fk_initial_work,
@@ -11154,6 +11349,7 @@ pub const RaftApplyStore = struct {
         .{ .projection = .backup_cohort_lock, .key = .{ .prefix = backupCohortLockPrefixForGroup } },
         .{ .projection = .restore_staging, .key = .{ .prefix = restore_staging.prefix } },
         .{ .projection = .fk_generation_publication, .key = .{ .prefix = fk_generation_publication.prefixForGroup } },
+        .{ .projection = .fk_generation_work, .key = .{ .prefix = fk_generation_publication.workPrefixForGroup } },
         .{ .projection = .fk_generation_table_lock, .key = .{ .prefix = fk_generation_publication.tableLockPrefix } },
         .{ .projection = .fk_initial_create, .key = .{ .prefix = fk_generation_publication.initialPrefixForGroup } },
         .{ .projection = .fk_initial_work, .key = .{ .prefix = fk_generation_publication.initialWorkPrefixForGroup } },
@@ -11189,7 +11385,7 @@ pub const RaftApplyStore = struct {
             .apply_sql_settings => metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.catalog_revision),
             .apply_sql_policies => metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.catalog_revision),
             .apply_sql_policy_publication => metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.catalog_revision),
-            .apply_fk_generation_publication => metadataSnapshotProjectionBit(.fk_generation_publication) | metadataSnapshotProjectionBit(.fk_generation_table_lock) | metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.table) | metadataSnapshotProjectionBit(.catalog_revision),
+            .apply_fk_generation_publication => metadataSnapshotProjectionBit(.fk_generation_publication) | metadataSnapshotProjectionBit(.fk_generation_work) | metadataSnapshotProjectionBit(.fk_generation_table_lock) | metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.table) | metadataSnapshotProjectionBit(.catalog_revision),
             .apply_fk_initial_create => metadataSnapshotProjectionBit(.fk_initial_create) | metadataSnapshotProjectionBit(.fk_initial_work) | metadataSnapshotProjectionBit(.fk_initial_name) | metadataSnapshotProjectionBit(.fk_initial_physical_name) | metadataSnapshotProjectionBit(.fk_initial_group) | metadataSnapshotProjectionBit(.fk_generation_table_lock) | metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.table) | metadataSnapshotProjectionBit(.range) | metadataSnapshotProjectionBit(.catalog_revision),
             .initialize_metadata_incarnation => metadataSnapshotProjectionBit(.metadata_incarnation) |
                 metadataSnapshotProjectionBit(.catalog_revision),

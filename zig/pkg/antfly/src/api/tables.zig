@@ -1780,6 +1780,38 @@ pub fn prepareForeignKeyPublicationRecord(alloc: std.mem.Allocator, table: *cons
     return applySchemaRecord(alloc, table, schema_json, false, true, null);
 }
 
+/// Recompute the only index-catalog delta a generation publication may carry.
+/// The next full-text index has a freshly allocated private incarnation, so
+/// take that one value from the candidate; every other byte must be derived
+/// from the old catalog and accepted successor schema by the normal DDL path.
+pub fn foreignKeyPublicationIndexesValid(alloc: std.mem.Allocator, table_name: []const u8, before_indexes_json: []const u8, after_indexes_json: []const u8, after_schema_json: []const u8, next_version: u32) !bool {
+    if (next_version == 0) return false;
+    var candidate = try std.json.parseFromSlice(std.json.Value, alloc, after_indexes_json, .{});
+    defer candidate.deinit();
+    if (candidate.value != .object) return false;
+    const next_name = try std.fmt.allocPrint(alloc, "full_text_index_v{d}", .{next_version});
+    defer alloc.free(next_name);
+    const incarnation = if (candidate.value.object.get(next_name)) |value|
+        coverage_policy_mod.incarnation(value) orelse return false
+    else
+        null;
+    if (incarnation) |next_incarnation| {
+        var prior = try std.json.parseFromSlice(std.json.Value, alloc, before_indexes_json, .{});
+        defer prior.deinit();
+        if (prior.value != .object) return false;
+        var entries = prior.value.object.iterator();
+        while (entries.next()) |entry| {
+            if (coverage_policy_mod.incarnation(entry.value_ptr.*)) |old_incarnation|
+                if (old_incarnation == next_incarnation) return false;
+        }
+    }
+    const regenerated = try regenerateAlgebraicIndexesFromSchemaAlloc(alloc, table_name, before_indexes_json, after_schema_json);
+    defer alloc.free(regenerated);
+    const expected = try upsertVersionedFullTextIndex(alloc, regenerated, next_version - 1, next_version, incarnation);
+    defer alloc.free(expected);
+    return std.mem.eql(u8, expected, after_indexes_json);
+}
+
 fn applySchemaRecord(alloc: std.mem.Allocator, table: *const metadata_table_manager.TableRecord, schema_json: []const u8, rewrite: bool, fk_publication: bool, pinned_incarnation: ?u64) !metadata_table_manager.TableRecord {
     try @import("../schema/relational_index_namespace.zig").validate(alloc, schema_json, table.indexes_json);
     const current_version = try schemaVersion(table.schema_json);
@@ -5769,6 +5801,11 @@ test "metadata.schema update preserves read schema and adds versioned full-text 
         "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"string\"}}}}},\"dynamic_templates\":{\"body\":{\"mapping\":{\"type\":\"text\"}}}}",
     );
     defer metadata_table_manager.freeTable(std.testing.allocator, updated);
+
+    try std.testing.expect(try foreignKeyPublicationIndexesValid(std.testing.allocator, table.name, table.indexes_json, updated.indexes_json, updated.schema_json, 1));
+    const forged = try std.fmt.allocPrint(std.testing.allocator, "{s},\"rogue\":{{\"type\":\"full_text\"}}}}", .{updated.indexes_json[0 .. updated.indexes_json.len - 1]});
+    defer std.testing.allocator.free(forged);
+    try std.testing.expect(!try foreignKeyPublicationIndexesValid(std.testing.allocator, table.name, table.indexes_json, forged, updated.schema_json, 1));
 
     try std.testing.expect(std.mem.indexOf(u8, updated.schema_json, "\"version\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, updated.read_schema_json, "\"version\":0") != null);

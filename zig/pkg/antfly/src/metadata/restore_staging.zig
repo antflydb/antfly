@@ -59,6 +59,33 @@ pub fn graphRetirementDigest(source_table_id: u64, target_table_id: u64, indexes
     hash.final(&digest);
     return digest;
 }
+
+/// Versioned owner-comparable digest for a future graph seal. The v1 raw-JSON
+/// digest above remains the plan format for already admitted jobs; changing it
+/// in place would invalidate replayed immutable plans.
+pub fn graphRetirementDigestV2(alloc: std.mem.Allocator, source_table_id: u64, target_table_id: u64, indexes_json: []const u8) !?Digest {
+    const config_digest = (try @import("../storage/db/graph_retirement_config.zig").fromMetadata(alloc, indexes_json)) orelse return null;
+    return @import("../storage/db/graph_retirement_config.zig").retirementDigest(source_table_id, target_table_id, config_digest);
+}
+
+test "graph retirement digest matches production index config extraction for explicit and legacy incarnations" {
+    const alloc = std.testing.allocator;
+    const graph_config = @import("../storage/db/graph_retirement_config.zig");
+    const table_index_config = @import("../api/table_index_config.zig");
+    for ([_][]const u8{
+        "{\"links\":{\"type\":\"graph\",\"_index_incarnation\":17,\"edge_types\":[{\"name\":\"knows\"}],\"settings\":{\"b\":2,\"a\":1}}}",
+        "{\"links\":{\"type\":\"graph\",\"edge_types\":[{\"name\":\"knows\"}],\"settings\":{\"b\":2,\"a\":1}}}",
+    }) |indexes_json| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
+        defer parsed.deinit();
+        const raw = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(parsed.value.object.get("links").?, .{})});
+        defer alloc.free(raw);
+        var loaded = try table_index_config.parseIndexConfig(alloc, "links", raw);
+        defer loaded.deinit(alloc);
+        try std.testing.expectEqualDeep((try graph_config.fromMetadata(alloc, indexes_json)).?, (try graph_config.fromLoaded(alloc, &.{loaded})).?);
+        try std.testing.expectEqualDeep((try graphRetirementDigestV2(alloc, 100, 200, indexes_json)).?, graph_config.retirementDigest(100, 200, (try graph_config.fromLoaded(alloc, &.{loaded})).?));
+    }
+}
 pub const ProvisioningProjection = @import("restore_provisioning_contract.zig").ProvisioningProjection;
 pub const ProvisioningRequest = struct { node_id: u64 };
 

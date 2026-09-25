@@ -1260,6 +1260,7 @@ const RaftTableApplyStateMachine = struct {
         ForeignKeyParentMissing,
         ForeignKeyCoordinationRequired,
         ForeignKeyReferenced,
+        GenerationRetired,
         UniqueConstraintViolation,
         ForeignKeyActionInProgress,
         PreparedGenerationChanged,
@@ -1370,9 +1371,10 @@ const RaftTableApplyStateMachine = struct {
 
         fn forRequest(err: anyerror, req: antfly.db.types.BatchRequest) ?ExpectedApplyFailure {
             // A committed transaction decision cannot be converted into a
-            // rejected row mutation merely because source retention is full.
-            // Its journal capacity must have been reserved before that decision.
-            if (err == error.RetainedEffectsFull) if (req.transaction) |control| {
+            // rejected participant mutation by late retention pressure or a
+            // newly retired FK generation. Both conditions must be prevented
+            // during prepare, before the coordinator commits its decision.
+            if (err == error.RetainedEffectsFull or err == error.GenerationRetired) if (req.transaction) |control| {
                 if (control == .resolve and control.resolve.status == .committed) return null;
             };
             return fromError(err);
@@ -10089,7 +10091,8 @@ pub const DataServer = struct {
             !std.mem.eql(u8, decision.parent_table.name, table_name) or
             decision.parent_range.group_id != group_id or
             !decision.fence.namespace.eql(.{ .table_id = request.parent_table_id, .shard_id = @import("../metadata/table_manager.zig").rangeDocIdentityShardId(decision.parent_range), .range_id = @import("../metadata/table_manager.zig").rangeDocIdentityRangeId(decision.parent_range) }) or
-            decision.fence.owner_group_id != group_id or decision.fence.role != .child_generation_parent or
+            decision.fence.owner_group_id != group_id or
+            decision.fence.role != (if (request.parent_table_id == request.child_table_id) @as(@TypeOf(decision.fence.role), .child_generation_dual) else .child_generation_parent) or
             std.mem.allEqual(u8, &decision.plan_digest, 0)) return error.GenerationPublicationChanged;
         const transitions = try scratch.alloc(admission.Transition, decision.transitions.len);
         for (decision.transitions, transitions) |transition, *out| out.* = .{
@@ -10122,6 +10125,13 @@ pub const DataServer = struct {
         var prior_response = (try read_source.lookupGroupLocal(scratch, group_id, table_name, "", .{ .relational_topology_json = "{\"mode\":\"generation_publication\"}" }, .read_index)) orelse return error.GenerationAdmissionPending;
         defer prior_response.deinit(scratch);
         const prior = try std.json.parseFromSliceLeaky(admission.OwnerStatus, scratch, prior_response.json, .{ .allocate = .alloc_always });
+        if (request.action == .stage and decision.fence.role == .child_generation_dual) {
+            const source_receipt = prior.source_fence_receipt orelse return error.GenerationAdmissionPending;
+            const source_digest = try admission.sourceFenceDigest(decision.fence);
+            if (prior.fence == null or !prior.fence.?.eql(decision.fence) or
+                !std.mem.eql(u8, &source_receipt.digest, &source_digest) or
+                source_receipt.term == 0 or source_receipt.index == 0) return error.GenerationAdmissionPending;
+        }
         const prior_applied = switch (request.action) {
             .stage => prior.staged_receipt,
             .activate => prior.activation_receipt,
@@ -10130,10 +10140,16 @@ pub const DataServer = struct {
         };
         const already_completed = if (prior_applied) |applied|
             std.mem.eql(u8, &applied.digest, &expected) and applied.term != 0 and applied.index != 0 and
-                (if (request.action == .stage) prior.fence != null and prior.fence.?.eql(decision.fence) else if (request.action == .activate or request.action == .cancel) prior.completed != null and prior.completed.?.eql(decision.fence) else true)
+                (if (request.action == .stage or (request.action == .activate and decision.fence.role == .child_generation_dual))
+                    prior.fence != null and prior.fence.?.eql(decision.fence)
+                else if (request.action == .activate or request.action == .cancel)
+                    prior.completed != null and prior.completed.?.eql(decision.fence)
+                else
+                    true)
         else
             false;
         if (request.action == .stage and !already_completed and (prior.fence == null or !prior.fence.?.eql(decision.fence))) {
+            if (decision.fence.role == .child_generation_dual) return error.GenerationAdmissionPending;
             // Admission is durable before the staged accepted-generation CAS.
             try self.proposeRaftBatchGroup(alloc, group_id, table_name, .{ .relational_topology = .{ .action = .begin, .fence = decision.fence } }, .{ .discovery = .cached, .required_local_term = leader_term });
         }
@@ -10158,7 +10174,9 @@ pub const DataServer = struct {
         } orelse return error.GenerationAdmissionPending;
         if (!std.mem.eql(u8, &applied.digest, &expected) or applied.term == 0 or applied.index == 0 or
             (request.action == .stage and (status.fence == null or !status.fence.?.eql(decision.fence))) or
-            ((request.action == .activate or request.action == .cancel) and (status.completed == null or !status.completed.?.eql(decision.fence)))) return error.GenerationAdmissionChanged;
+            (request.action == .activate and decision.fence.role == .child_generation_dual and (status.fence == null or !status.fence.?.eql(decision.fence))) or
+            ((request.action == .cancel or (request.action == .activate and decision.fence.role != .child_generation_dual)) and
+                (status.completed == null or !status.completed.?.eql(decision.fence)))) return error.GenerationAdmissionChanged;
         const receipt: antfly.public_api.relational_fk_generation_publication.Receipt = .{
             .plan_id = request.plan_id,
             .parent_table_id = request.parent_table_id,
@@ -10209,7 +10227,8 @@ pub const DataServer = struct {
             !std.mem.eql(u8, decision.child_after.name, table_name) or
             decision.child_range.group_id != group_id or
             !decision.fence.namespace.eql(.{ .table_id = request.child_table_id, .shard_id = @import("../metadata/table_manager.zig").rangeDocIdentityShardId(decision.child_range), .range_id = @import("../metadata/table_manager.zig").rangeDocIdentityRangeId(decision.child_range) }) or
-            decision.fence.owner_group_id != group_id or decision.fence.role != .child_generation_source or
+            decision.fence.owner_group_id != group_id or
+            (decision.fence.role != .child_generation_source and decision.fence.role != .child_generation_dual) or
             std.mem.allEqual(u8, &decision.plan_digest, 0)) return error.GenerationPublicationChanged;
         const read_source = self.read_source.source();
         var identity_response = (try read_source.lookupGroupLocal(scratch, group_id, table_name, "", .{ .relational_topology_json = "{\"mode\":\"identity\"}" }, .read_index)) orelse return error.GenerationAdmissionPending;
@@ -10288,6 +10307,11 @@ pub const DataServer = struct {
                 .after_catalog_digest = next_digest,
             } } }, .{ .discovery = .cached, .required_local_term = leader_term });
         } else if (request.action == .cancel and !already_completed) {
+            // A self-referential owner must roll back its staged parent
+            // admission before the shared source fence can reopen writes.
+            if (decision.fence.role == .child_generation_dual and
+                (prior.cancel_receipt == null or prior.completed == null or !prior.completed.?.eql(decision.fence)))
+                return error.GenerationAdmissionPending;
             try self.proposeRaftBatchGroup(alloc, group_id, table_name, .{ .relational_topology = .{ .action = .cancel_child_generation_source, .fence = decision.fence } }, .{ .discovery = .cached, .required_local_term = leader_term });
         }
         var status_response = (try read_source.lookupGroupLocal(scratch, group_id, table_name, "", .{ .relational_topology_json = "{\"mode\":\"generation_publication\"}" }, .read_index)) orelse return error.GenerationAdmissionPending;
@@ -25266,7 +25290,7 @@ const RemoteMetadataSource = struct {
                 ));
                 const read = client.readSystemCatalog(self.base_uris[index], input, attempt_ms, &cancellation) catch |err| {
                     switch (err) {
-                        error.InvalidCatalogName, error.CatalogNotFound, error.CatalogGenerationChanged, error.CatalogCommandTooLarge, error.OutOfMemory, error.Cancelled, error.Canceled => return err,
+                        error.InvalidCatalogName, error.CatalogNotFound, error.CatalogGenerationChanged, error.GenerationPublicationNotFound, error.CatalogCommandTooLarge, error.OutOfMemory, error.Cancelled, error.Canceled => return err,
                         else => {
                             if (!antfly.metadata.authority.isRetryableError(err) and
                                 !isRetryableControlPlaneTransportError(err) and err != error.RemoteUnavailable)
@@ -34761,6 +34785,7 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(?RaftTableApplyStateMachine.ExpectedApplyFailure, null), RaftTableApplyStateMachine.ExpectedApplyFailure.fromError(error.ResourceBudgetExceeded));
             try std.testing.expectEqual(@as(?RaftTableApplyStateMachine.ExpectedApplyFailure, null), RaftTableApplyStateMachine.ExpectedApplyFailure.fromError(error.OnlineSourcePinPending));
             try std.testing.expectEqual(@as(?RaftTableApplyStateMachine.ExpectedApplyFailure, null), RaftTableApplyStateMachine.ExpectedApplyFailure.fromError(error.InvalidData));
+            try std.testing.expectEqual(error.GenerationRetired, RaftTableApplyStateMachine.ExpectedApplyFailure.fromError(error.GenerationRetired).?.toError());
             inline for (@typeInfo(@import("../schema/relational_expression_errors.zig").Error).error_set.?) |field| {
                 const reason = @field(@import("../schema/relational_expression_errors.zig").Error, field.name);
                 try std.testing.expectEqual(reason, RaftTableApplyStateMachine.ExpectedApplyFailure.fromError(reason).?.toError());
@@ -34817,6 +34842,8 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(u64, 21), apply_sm.appliedIndex(group_id));
             const committed_resolution: antfly.db.types.BatchRequest = .{ .transaction = .{ .resolve = .{ .txn_id = txn_a, .status = .committed, .commit_version = 400 } } };
             try std.testing.expectEqual(@as(?RaftTableApplyStateMachine.ExpectedApplyFailure, null), RaftTableApplyStateMachine.ExpectedApplyFailure.forRequest(error.RetainedEffectsFull, committed_resolution));
+            try std.testing.expectEqual(@as(?RaftTableApplyStateMachine.ExpectedApplyFailure, null), RaftTableApplyStateMachine.ExpectedApplyFailure.forRequest(error.GenerationRetired, committed_resolution));
+            try std.testing.expectEqual(RaftTableApplyStateMachine.ExpectedApplyFailure.GenerationRetired, RaftTableApplyStateMachine.ExpectedApplyFailure.forRequest(error.GenerationRetired, .{}).?);
             const committed_payload = try data_raft_batch.encodeWithStorageOwnerDescriptor(alloc, "docs", committed_resolution, if (descriptor) |*value| value.view() else null);
             defer alloc.free(committed_payload);
             const committed_entry = [_]raft_engine.core.Entry{.{ .term = 2, .index = 22, .entry_type = .normal, .data = committed_payload }};

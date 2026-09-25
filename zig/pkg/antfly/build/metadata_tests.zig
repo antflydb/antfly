@@ -47,7 +47,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-metadata-backup-cohort-test", "Run durable backup cohort admission and recovery contracts").dependOn(&addFilteredTestRunArtifact(b, backup_cohort_tests).step);
     const restore_staging_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{ "relational integrity restore staging", "restore staging authority", "metadata module compiles", "metadata storage module compiles" },
+        .filters = &.{ "relational integrity restore staging", "restore staging authority", "graph retirement digest", "metadata module compiles", "metadata storage module compiles" },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-metadata-restore-staging-test", "Run atomic hidden restore target publication contracts").dependOn(&addFilteredTestRunArtifact(b, restore_staging_tests).step);

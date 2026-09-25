@@ -883,6 +883,13 @@ test "pgwire typed catalog settings honor local savepoint reset and discard over
         "SET app.limit = 9\x00",
         "ROLLBACK TO saved\x00",
         "SHOW app.limit\x00",
+        "SAVEPOINT before_default\x00",
+        "SET LOCAL app.limit = DEFAULT\x00",
+        "SHOW app.limit\x00",
+        "ROLLBACK TO before_default\x00",
+        "SHOW app.limit\x00",
+        "SET LOCAL app.limit = DEFAULT\x00",
+        "SHOW app.limit\x00",
         "COMMIT\x00",
         "SHOW app.limit\x00",
         "RESET ALL\x00",
@@ -896,7 +903,7 @@ test "pgwire typed catalog settings honor local savepoint reset and discard over
     var mock: Mock = .{};
     var output = try run(&mock, input.written(), .{});
     defer output.deinit();
-    const expected = [_][]const u8{ "5", "7", "7", "5", "3", "3", "9007199254740993", "2" };
+    const expected = [_][]const u8{ "5", "7", "7", "3", "7", "3", "5", "3", "3", "9007199254740993", "2" };
     var index: usize = 0;
     var cursor: protocol.Cursor = .{ .bytes = output.written() };
     while (cursor.offset < cursor.bytes.len) {
@@ -926,6 +933,7 @@ test "pgwire original app setting reset all and discard all commands are connect
     for ([_][]const u8{
         "SET app.tenant_id = 'tenant-a';\x00",
         "SHOW app.tenant_id;\x00",
+        "SHOW app.tenant;\x00",
         "RESET app.tenant_id;\x00",
         "SHOW app.tenant_id;\x00",
         "SET app.tenant_id = 'tenant-b';\x00",
@@ -939,7 +947,7 @@ test "pgwire original app setting reset all and discard all commands are connect
     var mock: Mock = .{};
     var output = try run(&mock, input.written(), .{});
     defer output.deinit();
-    const expected = [_][]const u8{ "tenant-a", "unassigned", "unassigned", "unassigned" };
+    const expected = [_][]const u8{ "tenant-a", "owner", "unassigned", "unassigned", "unassigned" };
     var index: usize = 0;
     var cursor: protocol.Cursor = .{ .bytes = output.written() };
     while (cursor.offset < cursor.bytes.len) {
@@ -968,6 +976,7 @@ test "pgwire typed catalog setting writes fail closed for policy type and local 
         "SET app.limit = nope\x00",
         "SET app.unknown = 1\x00",
         "SET LOCAL app.limit = 8\x00",
+        "SET LOCAL app.limit = DEFAULT\x00",
         "SHOW app.limit\x00",
     }) |statement| try frame(&input.writer, 'Q', statement);
     try frame(&input.writer, 'X', "");
@@ -975,6 +984,7 @@ test "pgwire typed catalog setting writes fail closed for policy type and local 
     var output = try run(&mock, input.written(), .{});
     defer output.deinit();
     for ([_][]const u8{ "42501", "22023", "42704", "25P01" }) |state| try std.testing.expect(std.mem.indexOf(u8, output.written(), state) != null);
+    try std.testing.expect(std.mem.count(u8, output.written(), "25P01") >= 2);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "3") != null);
     try std.testing.expectEqual(@as(usize, 0), mock.executions);
 }

@@ -5505,6 +5505,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.graph_runtime.",
             "storage.db.graph_asset_state.",
             "storage.db.graph_edge_contender.",
+            "storage.db.graph_retirement_config.",
             "storage.db.graph_state_name.",
             "storage.db.lease.",
             "storage.db.merge_contract.",
@@ -6067,10 +6068,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
                 .path = b.path("pkg/antfly/src/test_runner.zig"),
                 .mode = .simple,
             },
-            // The consolidated service/HTTP lane reaches roughly 9.3 GiB on
-            // macOS Zig 0.16. This is compiler scheduling capacity, not an
-            // Antfly runtime budget; retain headroom for codegen variance.
-            .max_rss = 12 * 1024 * 1024 * 1024,
+            // Both consolidated metadata lanes now peak near 13.5 GiB with
+            // the full relational activation tests. Give Zig's scheduler a
+            // truthful per-compile bound with headroom; the heavy CI runner
+            // reserves 24 GiB and cannot safely run two such compiles at once.
+            .max_rss = 16 * 1024 * 1024 * 1024,
         });
     }
     const unit_metadata_compile_step = b.step(

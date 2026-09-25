@@ -581,6 +581,10 @@ pub const Session = struct {
                 try state.reset(owner, raw.scope, name);
                 return .{ .command_tag = "RESET", .transaction_status = self.status, .session_id = self.session_id };
             },
+            .reset_local => |name| {
+                try state.resetLocal(owner, raw.scope, name);
+                return .{ .command_tag = "SET", .transaction_status = self.status, .session_id = self.session_id };
+            },
             .show => |name| {
                 var view = try settings_catalog.View.capture(alloc, owner, raw.scope, state.values());
                 defer view.deinit();

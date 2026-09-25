@@ -410,7 +410,7 @@ test "distributed txn retirement compares retained schema numbers without roundi
     try std.testing.expect(!try retainedSchemaEqual(alloc, "{\"checks\":[{}]}", "{\"checks\":[]}"));
 }
 
-test "distributed txn retirement drains self foreign keys before unique claims with durable checkpoints" {
+test "distributed txn retirement drains unique claims with durable checkpoints" {
     try testRetirementDrain(.none);
 }
 
@@ -533,7 +533,7 @@ fn testRetirementDrain(pressure: RetirementPressure) !void {
     var db_open = true;
     defer if (db_open) db.close();
     const declaration =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","relational_indexes":[{"name":"pk","keys":[{"column":"id"}],"description":"SQL UNIQUE INDEX"},{"name":"retained","keys":[{"column":"parent"}]}],"unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"parent_fk","child_columns":["parent"],"parent_table":"rows","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent":{"type":"integer"}},"additionalProperties":false}}}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","relational_indexes":[{"name":"pk","keys":[{"column":"id"}],"description":"SQL UNIQUE INDEX"},{"name":"retained","keys":[{"column":"parent"}]}],"unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent":{"type":"integer"}},"additionalProperties":false}}}}
     ;
     const target =
         \\{"version":2,"storage_mode":"relational","default_type":"row","relational_indexes":[{"name":"retained","keys":[{"column":"parent"}]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent":{"type":"integer"}},"additionalProperties":false}}}}
@@ -598,6 +598,13 @@ fn testRetirementDrain(pressure: RetirementPressure) !void {
     const writer: writes.TableWriteSource = .{ .ptr = &fixture, .vtable = &.{ .batch = Fixture.batch, .commit_batch_with_cancellation = Fixture.commitBatch } };
     var tables = [_]records.TableRecord{.{ .table_id = 400, .name = "rows", .schema_json = declaration }};
     const ranges = [_]records.RangeRecord{.{ .table_id = 400, .group_id = 401, .range_id = 401, .start_key = "" }};
+    if (pressure == .none) {
+        const guarded_declaration =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","relational_indexes":[{"name":"pk","keys":[{"column":"id"}],"description":"SQL UNIQUE INDEX"},{"name":"retained","keys":[{"column":"parent"}]}],"unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"parent_fk","child_columns":["parent"],"parent_table":"rows","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent":{"type":"integer"}},"additionalProperties":false}}}}
+        ;
+        const guarded_tables = [_]records.TableRecord{.{ .table_id = 400, .name = "rows", .schema_json = guarded_declaration }};
+        try std.testing.expectError(error.ForeignKeyGenerationPublicationRequired, begin(alloc, reader, &guarded_tables, &ranges, "rows", target, false));
+    }
     var initial = try planner.prepareWithCoverage(alloc, reader, &tables, &ranges, &.{.{ .table_name = "rows", .writes = &.{ .{ .key = "a", .value = "{\"id\":1}" }, .{ .key = "b", .value = "{\"id\":2,\"parent\":1}" } } }});
     defer initial.deinit();
     try commit(alloc, writer, initial.tables, .{});

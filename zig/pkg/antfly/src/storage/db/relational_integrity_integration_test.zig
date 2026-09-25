@@ -17,6 +17,314 @@ const integrity = @import("relational_integrity.zig");
 const catalog = @import("relational_integrity_catalog.zig");
 const tuples = @import("relational_index_keys.zig");
 
+test "self-FK dual owner preserves one admission fence across begin stage and activation restarts" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/self-fk-dual-midphase", .{tmp.sub_path});
+    defer alloc.free(path);
+    const namespace: @import("doc_identity.zig").Namespace = .{ .table_id = 71, .shard_id = 41, .range_id = 41 };
+    const options: db_mod.OpenOptions = .{ .identity_namespace = namespace, .start_optional_runtimes = false, .start_index_workers = false };
+    const old_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent_id":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
+    ;
+    const next_json =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"self_fk","child_columns":["parent_id"],"parent_table":"nodes","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent_id":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
+    ;
+    const topology = @import("relational_integrity_topology.zig");
+    const admission = @import("relational_integrity_generation_admission.zig");
+    var fence: topology.Fence = undefined;
+    var transition: admission.Transition = undefined;
+    {
+        var db = try db_mod.DB.open(alloc, path, options);
+        defer db.close();
+        try db.setSchemaJson(alloc, old_json);
+        const old_catalog = try db.core.store.get(alloc, catalog.key);
+        defer alloc.free(old_catalog);
+        var old_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(old_catalog, &old_digest, .{});
+        var parsed = try @import("../../schema/mod.zig").parseValidatedTableSchema(alloc, next_json);
+        defer parsed.deinit(alloc);
+        const runtime_schema = try @import("../../schema/mod.zig").deriveRuntimeTableSchema(alloc, parsed);
+        defer @import("../schema.zig").freeSchema(alloc, runtime_schema);
+        var prepared = try db.core.prepareSchemaMetadataPublishedChild(runtime_schema, &.{.{ .key = "\x00\x00__metadata__:schema_json", .value = next_json }});
+        defer prepared.deinit();
+        const generation = (prepared.integrity_catalog.?.catalog.find(.foreign_key, "self_fk") orelse return error.IntegrityCatalogChanged).generation;
+        transition = .{ .child_table_id = namespace.table_id, .child_table_name = "nodes", .constraint_name = "self_fk", .expected_generation = null, .next_generation = generation, .plan_id = @splat(6), .decision_digest = @splat(7) };
+        fence = .{ .role = .child_generation_dual, .transition_id = 11, .attempt = 1, .admission_epoch = 1, .peer_group_id = 41, .owner_group_id = 41, .namespace = namespace, .catalog_digest = old_digest };
+        // A transaction admitted before the fence must resolve before the
+        // dual-role parent can stage the new accepted generation.
+        const old_txn = try db.beginTransaction(1_700_000_000_000_000_000);
+        try db.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .begin, .fence = fence } }, .{ .term = 1, .index = 1 });
+        try std.testing.expectError(error.TransactionTopologyBusy, db.applyRelationalTopologyControl(.{ .action = .stage_child_generation, .fence = fence, .child_generations = &.{transition} }, null));
+        try db.abortTransaction(old_txn, 1_700_000_000_000_000_001);
+    }
+    {
+        var db = try db_mod.DB.open(alloc, path, options);
+        defer db.close();
+        try std.testing.expect((try db.relationalTopologyStatus()).fence.?.eql(fence));
+        try std.testing.expect(try db.childGenerationSourcePinsSchemaJson(next_json));
+        try std.testing.expectError(error.ForeignKeyGenerationPublicationRequired, db.setSchemaJson(alloc, next_json));
+        var split = fence;
+        split.role = .split_source;
+        split.transition_id = 99;
+        split.admission_epoch += 1;
+        try std.testing.expectError(error.IntegrityTopologyBusy, db.applyRelationalTopologyControl(.{ .action = .begin, .fence = split }, null));
+        try db.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .begin, .fence = fence } }, .{ .term = 1, .index = 1 });
+        try db.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .stage_child_generation, .fence = fence, .child_generations = &.{transition} } }, .{ .term = 1, .index = 2 });
+        try db.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .stage_child_generation, .fence = fence, .child_generations = &.{transition} } }, .{ .term = 1, .index = 2 });
+    }
+    {
+        var db = try db_mod.DB.open(alloc, path, options);
+        defer db.close();
+        try std.testing.expect((try db.relationalTopologyStatus()).fence.?.eql(fence));
+        try std.testing.expect(try db.childGenerationSourcePinsSchemaJson(next_json));
+        try std.testing.expectError(error.GenerationAdmissionActivationRequired, db.applyRelationalTopologyControl(.{ .action = .release, .fence = fence }, null));
+        try db.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .activate_child_generation, .fence = fence, .child_generations = &.{transition} } }, .{ .term = 1, .index = 3 });
+        try db.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .activate_child_generation, .fence = fence, .child_generations = &.{transition} } }, .{ .term = 1, .index = 3 });
+    }
+    {
+        var db = try db_mod.DB.open(alloc, path, options);
+        defer db.close();
+        try std.testing.expect((try db.relationalTopologyStatus()).fence.?.eql(fence));
+        try std.testing.expect(try db.childGenerationSourcePinsSchemaJson(next_json));
+        try std.testing.expectError(error.GenerationAdmissionChanged, db.applyRelationalTopologyControl(.{ .action = .cancel, .fence = fence, .child_generations = &.{transition} }, null));
+        {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectError(error.GenerationAdmissionAcknowledgementPending, admission.requireDualInstallReady(&read, fence));
+        }
+        try db.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .acknowledge_child_generation, .fence = fence, .child_generations = &.{transition} } }, .{ .term = 1, .index = 4 });
+        try db.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .acknowledge_child_generation, .fence = fence, .child_generations = &.{transition} } }, .{ .term = 1, .index = 4 });
+    }
+    {
+        var db = try db_mod.DB.open(alloc, path, options);
+        defer db.close();
+        try std.testing.expect((try db.relationalTopologyStatus()).fence.?.eql(fence));
+        try std.testing.expect(try db.childGenerationSourcePinsSchemaJson(next_json));
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try admission.requireDualInstallReady(&read, fence);
+    }
+}
+
+test "self-FK owner retains one fence through parent ACK and atomic child install across restart" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/self-fk-dual-owner", .{tmp.sub_path});
+    defer alloc.free(path);
+    const namespace: @import("doc_identity.zig").Namespace = .{ .table_id = 71, .shard_id = 41, .range_id = 41 };
+    const options: db_mod.OpenOptions = .{ .identity_namespace = namespace, .start_optional_runtimes = false, .start_index_workers = false };
+    const old_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent_id":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
+    ;
+    const next_json =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"self_fk","child_columns":["parent_id"],"parent_table":"nodes","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent_id":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
+    ;
+    const topology = @import("relational_integrity_topology.zig");
+    const admission = @import("relational_integrity_generation_admission.zig");
+    var transition: admission.Transition = undefined;
+    var fence: topology.Fence = undefined;
+    var before_digest: [32]u8 = undefined;
+    {
+        var db = try db_mod.DB.open(alloc, path, options);
+        defer db.close();
+        try db.setSchemaJson(alloc, old_json);
+        const old_catalog = try db.core.store.get(alloc, catalog.key);
+        defer alloc.free(old_catalog);
+        std.crypto.hash.Blake3.hash(old_catalog, &before_digest, .{});
+        var next_public = try @import("../../schema/mod.zig").parseValidatedTableSchema(alloc, next_json);
+        defer next_public.deinit(alloc);
+        const next_runtime = try @import("../../schema/mod.zig").deriveRuntimeTableSchema(alloc, next_public);
+        defer @import("../schema.zig").freeSchema(alloc, next_runtime);
+        var next_prepared = try db.core.prepareSchemaMetadataPublishedChild(next_runtime, &.{.{ .key = "\x00\x00__metadata__:schema_json", .value = next_json }});
+        defer next_prepared.deinit();
+        const next_generation = (next_prepared.integrity_catalog.?.catalog.find(.foreign_key, "self_fk") orelse return error.IntegrityCatalogChanged).generation;
+        transition = .{ .child_table_id = 71, .child_table_name = "nodes", .constraint_name = "self_fk", .expected_generation = null, .next_generation = next_generation, .plan_id = @splat(6), .decision_digest = @splat(7) };
+        fence = .{ .role = .child_generation_dual, .transition_id = 11, .attempt = 1, .admission_epoch = 2, .peer_group_id = 41, .owner_group_id = 41, .namespace = namespace, .catalog_digest = before_digest };
+        var abandoned = fence;
+        abandoned.transition_id = 10;
+        abandoned.admission_epoch = 1;
+        try db.applyRelationalTopologyControl(.{ .action = .begin, .fence = abandoned }, null);
+        try db.applyRelationalTopologyControl(.{ .action = .stage_child_generation, .fence = abandoned, .child_generations = &.{transition} }, null);
+        try std.testing.expectError(error.GenerationAdmissionPending, db.applyRelationalTopologyControl(.{ .action = .cancel_child_generation_source, .fence = abandoned }, null));
+        try db.applyRelationalTopologyControl(.{ .action = .cancel, .fence = abandoned, .child_generations = &.{transition} }, null);
+        try db.applyRelationalTopologyControl(.{ .action = .cancel_child_generation_source, .fence = abandoned }, null);
+        try db.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .begin, .fence = fence } }, .{ .term = 1, .index = 1 });
+        try db.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .stage_child_generation, .fence = fence, .child_generations = &.{transition} } }, .{ .term = 1, .index = 2 });
+        try std.testing.expectError(error.GenerationAdmissionActivationRequired, db.applyRelationalTopologyControl(.{ .action = .release, .fence = fence }, null));
+        try std.testing.expectError(error.ForeignKeyGenerationPublicationRequired, db.setSchemaJson(alloc, next_json));
+        try db.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .activate_child_generation, .fence = fence, .child_generations = &.{transition} } }, .{ .term = 1, .index = 3 });
+        try std.testing.expect((try db.relationalTopologyStatus()).fence.?.eql(fence));
+        try std.testing.expectError(error.GenerationAdmissionChanged, db.applyRelationalTopologyControl(.{ .action = .cancel, .fence = fence, .child_generations = &.{transition} }, null));
+        {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectError(error.GenerationAdmissionAcknowledgementPending, admission.requireDualInstallReady(&read, fence));
+        }
+        try db.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .acknowledge_child_generation, .fence = fence, .child_generations = &.{transition} } }, .{ .term = 1, .index = 4 });
+        try std.testing.expectError(error.InvalidIntegrityOperation, db.batch(.{ .deletes = &.{admission.dual_acknowledged_fence_key} }));
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try admission.requireDualInstallReady(&read, fence);
+        try admission.requireDualCatalogMatch(alloc, &read, namespace.table_id, next_prepared.integrity_catalog.?.catalog);
+        const forged_bindings = try alloc.dupe(catalog.Binding, next_prepared.integrity_catalog.?.catalog.bindings);
+        defer alloc.free(forged_bindings);
+        for (forged_bindings) |*candidate_binding| if (!candidate_binding.retired and candidate_binding.definition.kind == .foreign_key) {
+            candidate_binding.generation = @splat(9);
+            break;
+        };
+        var forged_catalog = next_prepared.integrity_catalog.?.catalog;
+        forged_catalog.bindings = forged_bindings;
+        try std.testing.expectError(error.GenerationAdmissionChanged, admission.requireDualCatalogMatch(alloc, &read, namespace.table_id, forged_catalog));
+    }
+    {
+        var reopened = try db_mod.DB.open(alloc, path, options);
+        defer reopened.close();
+        try std.testing.expect(try reopened.childGenerationSourcePinsSchemaJson(next_json));
+        {
+            var read = try reopened.core.store.beginReadTxn();
+            defer read.abort();
+            try admission.requireDualInstallReady(&read, fence);
+        }
+        var parsed = try @import("../../schema/mod.zig").parseValidatedTableSchema(alloc, next_json);
+        defer parsed.deinit(alloc);
+        const runtime_schema = try @import("../../schema/mod.zig").deriveRuntimeTableSchema(alloc, parsed);
+        defer @import("../schema.zig").freeSchema(alloc, runtime_schema);
+        var prepared = try reopened.core.prepareSchemaMetadataPublishedChild(runtime_schema, &.{.{ .key = "\x00\x00__metadata__:schema_json", .value = next_json }});
+        defer prepared.deinit();
+        var after_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(prepared.integrity_catalog.?.value, &after_digest, .{});
+        var old_json_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(old_json, &old_json_digest, .{});
+        var next_json_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(next_json, &next_json_digest, .{});
+        const command: topology.Command = .{ .action = .install_child_schema, .fence = fence, .child_schema_install = .{ .schema_json = next_json, .before_schema_json_digest = old_json_digest, .schema_json_digest = next_json_digest, .before_catalog_digest = before_digest, .after_catalog_digest = after_digest } };
+        try reopened.batchRaftReplicatedApply(.{ .relational_topology = command }, .{ .term = 1, .index = 5 });
+        try reopened.batchRaftReplicatedApply(.{ .relational_topology = command }, .{ .term = 1, .index = 5 });
+        try std.testing.expect((try reopened.relationalTopologyStatus()).fence == null);
+        {
+            var read = try reopened.core.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectError(error.NotFound, read.get(admission.dual_acknowledged_fence_key));
+        }
+        const published = (try reopened.getSchemaJson(alloc)).?;
+        defer alloc.free(published);
+        try std.testing.expectEqualStrings(next_json, published);
+
+        // Standby replay must not treat a parent activation as publication
+        // authority. The exact dual-role ACK is durable across promotion and
+        // the HA schema-cut record consumes it atomically with fence release.
+        const standby_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/self-fk-dual-standby", .{tmp.sub_path});
+        defer alloc.free(standby_path);
+        const effects = @import("../hot_standby/effects.zig");
+        const ha_payload = try effects.encodePublishedChildSchemaMetadataMutationAlloc(alloc, runtime_schema, next_json, .{
+            .fence = fence,
+            .before_schema_json_digest = old_json_digest,
+            .schema_json_digest = next_json_digest,
+            .before_catalog_digest = before_digest,
+            .after_catalog_digest = after_digest,
+            .applied_term = 1,
+            .applied_index = 5,
+        });
+        defer alloc.free(ha_payload);
+        const ha_record: @import("../hot_standby/replication_record.zig").Record = .{
+            .kind = .metadata_mutation,
+            .payload_codec = .json,
+            .cluster_id = 1,
+            .timeline_id = 1,
+            .epoch = 1,
+            .lsn = 1,
+            .previous_lsn = 0,
+            .payload = ha_payload,
+        };
+        {
+            var standby = try db_mod.DB.open(alloc, standby_path, options);
+            defer standby.close();
+            try standby.setSchemaJson(alloc, old_json);
+            try standby.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .begin, .fence = fence } }, .{ .term = 2, .index = 1 });
+            try standby.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .stage_child_generation, .fence = fence, .child_generations = &.{transition} } }, .{ .term = 2, .index = 2 });
+            try standby.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .activate_child_generation, .fence = fence, .child_generations = &.{transition} } }, .{ .term = 2, .index = 3 });
+            try std.testing.expectError(error.GenerationAdmissionAcknowledgementPending, standby.applyHAReplicationRecord(ha_record));
+            try std.testing.expect((try standby.relationalTopologyStatus()).fence.?.eql(fence));
+            const old = (try standby.getSchemaJson(alloc)).?;
+            defer alloc.free(old);
+            try std.testing.expectEqualStrings(old_json, old);
+        }
+        {
+            var standby = try db_mod.DB.open(alloc, standby_path, options);
+            defer standby.close();
+            try std.testing.expect((try standby.relationalTopologyStatus()).fence.?.eql(fence));
+            try standby.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .acknowledge_child_generation, .fence = fence, .child_generations = &.{transition} } }, .{ .term = 2, .index = 4 });
+            try standby.applyHAReplicationRecord(ha_record);
+            try standby.applyHAReplicationRecord(ha_record);
+            try std.testing.expect((try standby.relationalTopologyStatus()).fence == null);
+            const after = (try standby.getSchemaJson(alloc)).?;
+            defer alloc.free(after);
+            try std.testing.expectEqualStrings(next_json, after);
+        }
+        {
+            var promoted = try db_mod.DB.open(alloc, standby_path, options);
+            defer promoted.close();
+            try std.testing.expect((try promoted.relationalTopologyStatus()).fence == null);
+            const after = (try promoted.getSchemaJson(alloc)).?;
+            defer alloc.free(after);
+            try std.testing.expectEqualStrings(next_json, after);
+            const receipt = try promoted.core.store.get(alloc, admission.source_install_receipt_key);
+            defer alloc.free(receipt);
+            _ = try admission.AppliedReceipt.decode(receipt);
+        }
+    }
+    var installed = try db_mod.DB.open(alloc, path, options);
+    defer installed.close();
+    const published = (try installed.getSchemaJson(alloc)).?;
+    defer alloc.free(published);
+    try std.testing.expectEqualStrings(next_json, published);
+    try std.testing.expect((try installed.relationalTopologyStatus()).fence == null);
+
+    // A corrupted internal activation cannot turn the valid metadata schema
+    // digest into permission to expose an unmatched accepted generation.
+    const bad_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/self-fk-dual-forged", .{tmp.sub_path});
+    defer alloc.free(bad_path);
+    var bad_fence = fence;
+    bad_fence.transition_id = 31;
+    bad_fence.admission_epoch = 1;
+    var forged_transition = transition;
+    forged_transition.next_generation = @splat(9);
+    {
+        var bad = try db_mod.DB.open(alloc, bad_path, options);
+        defer bad.close();
+        try bad.setSchemaJson(alloc, old_json);
+        try bad.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .begin, .fence = bad_fence } }, .{ .term = 2, .index = 1 });
+        try bad.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .stage_child_generation, .fence = bad_fence, .child_generations = &.{forged_transition} } }, .{ .term = 2, .index = 2 });
+        try bad.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .activate_child_generation, .fence = bad_fence, .child_generations = &.{forged_transition} } }, .{ .term = 2, .index = 3 });
+        try bad.batchRaftReplicatedApply(.{ .relational_topology = .{ .action = .acknowledge_child_generation, .fence = bad_fence, .child_generations = &.{forged_transition} } }, .{ .term = 2, .index = 4 });
+    }
+    {
+        var bad = try db_mod.DB.open(alloc, bad_path, options);
+        defer bad.close();
+        var parsed = try @import("../../schema/mod.zig").parseValidatedTableSchema(alloc, next_json);
+        defer parsed.deinit(alloc);
+        const runtime_schema = try @import("../../schema/mod.zig").deriveRuntimeTableSchema(alloc, parsed);
+        defer @import("../schema.zig").freeSchema(alloc, runtime_schema);
+        var prepared = try bad.core.prepareSchemaMetadataPublishedChild(runtime_schema, &.{.{ .key = "\x00\x00__metadata__:schema_json", .value = next_json }});
+        defer prepared.deinit();
+        var after_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(prepared.integrity_catalog.?.value, &after_digest, .{});
+        var old_json_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(old_json, &old_json_digest, .{});
+        var next_json_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(next_json, &next_json_digest, .{});
+        const install: topology.Command = .{ .action = .install_child_schema, .fence = bad_fence, .child_schema_install = .{ .schema_json = next_json, .before_schema_json_digest = old_json_digest, .schema_json_digest = next_json_digest, .before_catalog_digest = before_digest, .after_catalog_digest = after_digest } };
+        try std.testing.expectError(error.GenerationAdmissionChanged, bad.batchRaftReplicatedApply(.{ .relational_topology = install }, .{ .term = 2, .index = 5 }));
+        try std.testing.expect((try bad.relationalTopologyStatus()).fence.?.eql(bad_fence));
+        const still_old = (try bad.getSchemaJson(alloc)).?;
+        defer alloc.free(still_old);
+        try std.testing.expectEqualStrings(old_json, still_old);
+    }
+}
+
 test "initial partial FK parent support remains unready until every owner index survives restart" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -380,8 +688,21 @@ test "initial FK child owner stays hidden across restart until replicated releas
             .public_schema_json_digest = public_digest,
             .catalog_digest = catalog_digest,
         };
+        // The standby was offline when the primary committed release. A
+        // promotion before catch-up must retain its durable hidden gate;
+        // local restart or a stale bootstrap is not publication authority.
+        {
+            var offline_promoted = try db_mod.DB.open(alloc, standby_path, standby_options);
+            defer offline_promoted.close();
+            try std.testing.expectError(error.InitialChildNotPublished, offline_promoted.lookup(alloc, "leak", .{}));
+            try std.testing.expectError(error.InitialChildNotPublished, offline_promoted.batch(.{ .writes = &.{.{ .key = "leak", .value = "{}" }} }));
+            const hidden_bytes = try offline_promoted.core.store.get(alloc, hidden.key);
+            defer alloc.free(hidden_bytes);
+            try std.testing.expectEqual(hidden.Phase.hidden, (try hidden.Record.decode(hidden_bytes)).phase);
+        }
         var standby = try db_mod.DB.open(alloc, standby_path, standby_options);
-        defer standby.close();
+        var standby_open = true;
+        defer if (standby_open) standby.close();
         const payload = try @import("../hot_standby/effects.zig").encodeInitialChildMutationRequestAlloc(alloc, .{ .relational_topology = release }, .{ .term = 2, .index = 2 });
         defer alloc.free(payload);
         const record: @import("../hot_standby/replication_record.zig").RecordView = .{
@@ -400,6 +721,14 @@ test "initial FK child owner stays hidden across restart until replicated releas
         defer alloc.free(replayed);
         try std.testing.expectEqualSlices(u8, stored, replayed);
         try std.testing.expect((try standby.lookup(alloc, "leak", .{})) == null);
+        standby.close();
+        standby_open = false;
+        var caught_up_promoted = try db_mod.DB.open(alloc, standby_path, standby_options);
+        defer caught_up_promoted.close();
+        try std.testing.expect((try caught_up_promoted.lookup(alloc, "leak", .{})) == null);
+        const promoted_bytes = try caught_up_promoted.core.store.get(alloc, hidden.key);
+        defer alloc.free(promoted_bytes);
+        try std.testing.expectEqual(hidden.Phase.released, (try hidden.Record.decode(promoted_bytes)).phase);
     }
 }
 
@@ -614,9 +943,16 @@ test "relational integrity accepted generation survives restart and bounded two-
     const address = try integrity.Address.init(@splat(7), "parent-tuple");
     const claim: integrity.Claim = .{ .tuple = "parent-tuple", .parent_table = "parents", .parent_key = "p", .schema_version = 1 };
     const old: integrity.Reference = .{ .child_table = "children", .child_key = "old", .constraint_name = "fk", .constraint_generation = @splat(3) };
-    const live: integrity.Reference = .{ .child_table = "children", .child_key = "live", .constraint_name = "other_fk", .constraint_generation = @splat(4) };
+    var live: integrity.Reference = .{ .child_table = "children", .child_key = "live", .constraint_name = "other_fk", .constraint_generation = @splat(4) };
     const old_key = try old.key(address);
-    const live_key = try live.key(address);
+    var live_key = try live.key(address);
+    var live_key_buffer: [32]u8 = undefined;
+    var salt: usize = 0;
+    while (std.mem.order(u8, &old_key, &live_key) != .lt) : (salt += 1) {
+        if (salt >= 256) return error.TestNoOrderedReferenceKey;
+        live.child_key = try std.fmt.bufPrint(&live_key_buffer, "live-{d}", .{salt});
+        live_key = try live.key(address);
+    }
     var fence: topology.Fence = .{ .role = .truncate_parent, .transition_id = 11, .attempt = 1, .peer_group_id = 21, .owner_group_id = 31, .namespace = namespace, .catalog_digest = undefined };
     {
         var db = try db_mod.DB.open(alloc, path, options);
@@ -652,6 +988,20 @@ test "relational integrity accepted generation survives restart and bounded two-
     {
         var db = try db_mod.DB.open(alloc, path, options);
         defer db.close();
+        const replay_stage: topology.Command = .{ .fence = fence, .action = .stage_parent_retirement, .parent_retirement = .{ .plan_digest = @splat(5), .entries = &.{.{ .child_table_id = 51, .child_table_name = "children", .constraint_name = "fk", .generation = old.constraint_generation, .next_generation = @splat(5) }} } };
+        try db.applyRelationalTopologyControl(replay_stage, null);
+        var changed_stage = replay_stage;
+        changed_stage.parent_retirement = .{ .plan_digest = @splat(6), .entries = replay_stage.parent_retirement.?.entries };
+        try std.testing.expectError(error.GenerationRetirementChanged, db.applyRelationalTopologyControl(changed_stage, null));
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, retirement.key));
+        {
+            var probe = try db.core.store.beginProbeTxn();
+            defer probe.abort();
+            const status = (try retirement.ownerStatus(alloc, &probe)).?;
+            defer alloc.free(status.entries);
+            try std.testing.expect(status.completed);
+            try std.testing.expect(!status.acknowledged);
+        }
         var split = fence;
         split.role = .split_source;
         split.transition_id += 1;
@@ -700,6 +1050,30 @@ test "relational integrity accepted generation survives restart and bounded two-
         try std.testing.expect(!(try retirement.isRetired(&read, successor)));
         try std.testing.expectError(error.GenerationRetired, integrity.prepare(alloc, &read, &.{.{ .address = address, .operation = .{ .attach = old } }}));
         try std.testing.expectError(error.ForeignKeyReferenced, integrity.prepare(alloc, &read, &.{.{ .address = address, .operation = .{ .release = .{ .parent_table = "parents", .parent_key = "p" } } }}));
+        // The public parent-action cursor must not revive retired references.
+        // With a one-record physical page, the first page is empty but still
+        // advances; the live successor appears on the next page.
+        const query = try std.json.Stringify.valueAlloc(alloc, .{ .kind = "references", .address = address, .limit = 1 }, .{});
+        defer alloc.free(query);
+        var first = (try db.lookup(alloc, &address.routing, .{ .relational_integrity_jobs_json = query })) orelse return error.TestMissingReferencePage;
+        defer first.deinit(alloc);
+        var first_page = try std.json.parseFromSlice(struct { references: []std.json.Value, next: ?[]const u8 }, alloc, first.json, .{ .ignore_unknown_fields = true });
+        defer first_page.deinit();
+        try std.testing.expectEqual(@as(usize, 0), first_page.value.references.len);
+        const continuation = first_page.value.next orelse return error.TestMissingReferenceContinuation;
+        const resumed_query = try std.json.Stringify.valueAlloc(alloc, .{ .kind = "references", .address = address, .after = continuation, .limit = 1 }, .{});
+        defer alloc.free(resumed_query);
+        var second = (try db.lookup(alloc, &address.routing, .{ .relational_integrity_jobs_json = resumed_query })) orelse return error.TestMissingReferencePage;
+        defer second.deinit(alloc);
+        var second_page = try std.json.parseFromSlice(struct { references: []std.json.Value, next: ?[]const u8 }, alloc, second.json, .{ .ignore_unknown_fields = true });
+        defer second_page.deinit();
+        try std.testing.expectEqual(@as(usize, 1), second_page.value.references.len);
+        try std.testing.expect(second_page.value.next == null);
+        // Exercise the owner lookup used by the supervisor, not just the GC
+        // helper: a point-probe transaction cannot provide its range cursor.
+        var gc_lookup = (try db.lookup(alloc, &address.routing, .{ .relational_topology_json = "{\"mode\":\"generation_gc\"}" })) orelse return error.TestMissingGenerationGcPage;
+        defer gc_lookup.deinit(alloc);
+        try std.testing.expect(!std.mem.eql(u8, gc_lookup.json, "null"));
         // Exactly one reference is examined per page, including live rows;
         // each committed progress record survives an owner reopen.
         var pages: usize = 0;

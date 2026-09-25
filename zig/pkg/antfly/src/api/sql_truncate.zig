@@ -309,9 +309,6 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
             if (std.mem.eql(u8, bound.name, table.name) and bound.table_id == table.table_id) break;
         } else return error.CatalogGenerationChanged;
     }
-    // Child-only TRUNCATE retains external parents and retires the old child
-    // witness generations there. The parent fences are part of the same
-    // immutable plan and metadata publication decision as the new child.
     const selected = try selectInternal(a, snapshot.tables, requested, ddl.cascade, true);
     const names = try a.alloc([]const u8, selected.len);
     for (selected, names) |table, *name| {
@@ -322,6 +319,17 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
         if (!try server_mod.tablePermissionCurrentlyAllowed(identity, name, .admin)) return error.Forbidden;
         if (try server_mod.resolveEffectiveRowFilterJson(a, identity, name) != null) return error.Forbidden;
     }
+    // The external-parent retirement protocol is staged, but its mounted
+    // publication/ACK/restart proof is not complete. Check the exact same
+    // selected cohort only after authorization, before owner reads or a
+    // durable job ID. Do not disclose an FK dependency to another principal.
+    _ = try selectInternal(a, snapshot.tables, requested, ddl.cascade, false);
+    // Graph-derived state and metrics do not yet have a cutover proof
+    // spanning the old and fresh owner generations. A pristine target alone
+    // cannot prove dependent graph readers and workers are fenced. Check
+    // only after authorization of the entire FK-closed cohort, but before
+    // source reads or durable job admission.
+    for (selected) |table| if (try stages.hasGraphIndex(a, table.indexes_json)) return error.UnsupportedSqlExecution;
     const principal = server_mod.storedDestinationPrincipal(identity);
     try server.requireEmptyGenerationAuthority(principal, names);
     var random: [16]u8 = undefined;
