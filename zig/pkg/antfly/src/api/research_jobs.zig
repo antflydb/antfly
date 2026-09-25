@@ -285,7 +285,9 @@ pub const Store = struct {
         const encoded = self.jobs.get(claimed.job_id) orelse return error.NotFound;
         var record = try std.json.parseFromSliceLeaky(Record, arena, try arena.dupe(u8, encoded), .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
         if (record.attempt != claimed.attempt or record.state != .running) return record;
-        record.state = if (record.cancel_requested and outcome.state != .succeeded and outcome.state != .failed) .cancelled else outcome.state;
+        // A cancellation acknowledged during the attempt always wins, even
+        // over a terminal outcome; the latest result stays inspectable.
+        record.state = if (record.cancel_requested) .cancelled else outcome.state;
         record.phase = outcome.phase;
         record.request = outcome.request;
         record.result = outcome.result;
@@ -703,4 +705,20 @@ test "research job cleanup removes records that no longer parse" {
     store.cleanupExpiredJobs();
     try std.testing.expect(!store.jobs.contains("rsj_bad"));
     try std.testing.expect(!store.meta.contains("rsj_bad"));
+}
+
+test "research job cancellation wins over a terminal outcome of the running attempt" {
+    const alloc = std.testing.allocator;
+    var store = Store.init(alloc, .{});
+    defer store.deinit();
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    alloc.free(try store.create(alloc, "rsj_c", "alice", "q", "{}"));
+    const claimed = (try store.begin(arena, "rsj_c", "alice", 60_000)).?.started;
+    const cancelled = (try store.requestCancel(arena, "rsj_c", "alice")).?;
+    try std.testing.expect(cancelled.cancel_requested);
+    const final = try store.finish(arena, claimed, .{ .state = .succeeded, .phase = "done", .request = "{}", .result = "{}" });
+    try std.testing.expectEqual(JobState.cancelled, final.state);
+    try std.testing.expectEqualStrings("{}", final.result.?);
 }

@@ -815,7 +815,11 @@ const Run = struct {
             outcome.llm_calls, outcome.tool_calls = if (outcome.body) |body| reportedUsage(self.arena, body) else |_| .{ per_iterations, per_tools };
         }
         var committed: i64 = 0;
-        for (outcomes) |outcome| committed += outcome.llm_calls;
+        var committed_tools: i64 = 0;
+        for (outcomes) |outcome| {
+            committed += outcome.llm_calls;
+            committed_tools += outcome.tool_calls;
+        }
         // A researcher whose tool loop failed at the model level (for example
         // malformed tool-call output from a small local model) is retried
         // once without tools, under the caller's tool policy with web tools
@@ -824,7 +828,13 @@ const Run = struct {
         for (outcomes, 0..) |outcome, slot| {
             _ = outcome.body catch |err| if (modelLevelFailure(err)) try degraded.append(self.arena, slot);
         }
-        const affordable: usize = @intCast(@max(0, self.budget.max_llm_calls - self.llm_calls - committed - self.reservedLlmCalls()));
+        // A pipeline retry executes each declared query exactly once and
+        // generates once, so its cost is known before it runs; fund retries
+        // only from what both budgets have left after the charges above.
+        const retry_tool_cost: i64 = @intCast(self.request.queries.len);
+        const llm_left = @max(0, self.budget.max_llm_calls - self.llm_calls - committed - self.reservedLlmCalls());
+        const tools_left = @max(0, self.budget.max_tool_calls - self.tool_calls - committed_tools);
+        const affordable: usize = @intCast(@min(llm_left, if (retry_tool_cost == 0) llm_left else @divTrunc(tools_left, retry_tool_cost)));
         var retry_slots = std.ArrayListUnmanaged(usize).empty;
         var retry_bodies = std.ArrayListUnmanaged([]const u8).empty;
         for (degraded.items) |slot| {
@@ -843,7 +853,12 @@ const Run = struct {
                 var merged = outcome;
                 // The retry's cost adds to the failed attempt's charge. A
                 // failed retry costs its single generation at most.
-                const retry_llm, const retry_tools = if (outcome.body) |body| reportedUsage(self.arena, body) else |_| .{ 1, 0 };
+                // A pipeline retry that reached generation made one model
+                // call even if an older server reports none.
+                const retry_llm, const retry_tools = if (outcome.body) |body| blk: {
+                    const llm, const tools = reportedUsage(self.arena, body);
+                    break :blk .{ @max(llm, 1), @max(tools, retry_tool_cost) };
+                } else |_| .{ 1, retry_tool_cost };
                 merged.llm_calls = failed_attempt.llm_calls + retry_llm;
                 merged.tool_calls = failed_attempt.tool_calls + retry_tools;
                 // A failed retry is a failed finding, never a request error:
@@ -2162,4 +2177,35 @@ test "research retry never replaces a navigation target with a full-text search"
     try std.testing.expect(!hasPlanFields(map));
     try map.put(std.testing.allocator, "count", .{ .bool = true });
     try std.testing.expect(hasPlanFields(map));
+}
+
+test "research retries never exceed the tool-call budget" {
+    const Count = struct {
+        var queries = std.atomic.Value(usize).init(0);
+        fn query(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, body: []const u8) !query_api.QueryResponse {
+            _ = queries.fetchAdd(1, .monotonic);
+            return TestFake.query(ptr, alloc, table, body);
+        }
+    };
+    // Researcher allocations of 1 leave tool budget for funded retries; the
+    // default allocation spends it all on the failed attempts.
+    for ([_][2]i64{ .{ 2, 8 }, .{ 3, 8 }, .{ 4, 8 }, .{ 6, 8 }, .{ 3, 1 }, .{ 6, 1 } }) |case| {
+        const max_tools = case[0];
+        Count.queries.store(0, .monotonic);
+        var fake = TestFake{ .fail_tool_calls = true };
+        const body = try std.fmt.allocPrint(std.testing.allocator,
+            \\{{"query":"q","queries":[{{"table":"docs","full_text_search":{{"match":"hybrid"}},"filter_query":{{"term":"tenant-a","field":"tenant"}}}}],"generator":{{"provider":"antfly","model":"test"}},"stream":false,"budget":{{"max_rounds":1,"max_tool_calls":{d},"researcher_tool_calls":{d}}}}}
+        , .{ max_tools, case[1] });
+        defer std.testing.allocator.free(body);
+        const encoded = try execute(std.testing.allocator, .{ .ptr = &fake, .vtable = &.{ .run_query = Count.query } }, .{ .ptr = &fake, .vtable = &.{ .execute_chain = TestFake.generate } }, body, null, .{});
+        defer std.testing.allocator.free(encoded.body);
+        const parsed = try std.json.parseFromSlice(Result, std.testing.allocator, encoded.body, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+        defer parsed.deinit();
+        const reported = parsed.value.usage.?.tool_calls.?;
+        try std.testing.expect(@as(i64, @intCast(Count.queries.load(.monotonic))) <= reported);
+        try std.testing.expect(reported <= max_tools);
+        try std.testing.expect(@as(i64, @intCast(fake.calls.load(.monotonic))) <= parsed.value.usage.?.llm_calls.?);
+        // With spare tool budget the retries run and produce findings.
+        if (case[1] == 1 and max_tools == 6) try std.testing.expect(Count.queries.load(.monotonic) > 0);
+    }
 }

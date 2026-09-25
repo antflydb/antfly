@@ -45,8 +45,9 @@ byte-for-byte:
   calls that later phases need (reflections, the writer, and the verifier). A sub-question the budget cannot fund is
   marked `skipped` and the run reports `max_llm_calls` or `max_tool_calls`.
 - A successful researcher is charged the usage it reports; a failed one is charged its whole allocation, because it
-  may have spent all of it before failing. Retries are funded only from what remains after those charges, so reported
-  usage never undercounts and never exceeds the budget.
+  may have spent all of it before failing. A pipeline retry costs one generation and one tool call per declared query,
+  and runs only when both budgets have that much left after those charges, so reported usage never undercounts and
+  never exceeds either budget.
 
 Researchers run through `retrieval_agent.executeWithOptions` with a lent `agent_tools.Budget`. With a server runtime
 (`QueryRunner.io`) they run concurrently in a `std.Io.Group`; each job owns an arena backed by the thread-safe
@@ -108,7 +109,7 @@ Durable job details (`research_jobs.zig`):
 - Jobs are owned by the authenticated username. Other principals get 404, and IDs are 128-bit random.
 - Each advance claims an attempt with a lease that covers the longest permitted pass. A concurrent advance gets
   409; a pass whose lease expired is superseded and its late checkpoint is discarded.
-- Cancellation during a pass wins over a non-terminal checkpoint.
+- Cancellation acknowledged during a pass wins over whatever that pass would have recorded, terminal or not.
 - Stored requests must not carry inline API keys; generators reference the secret store, the environment, or server
   connections.
 - An owner may hold 16 active jobs. Records expire after seven days.

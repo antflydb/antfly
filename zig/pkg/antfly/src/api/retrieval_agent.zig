@@ -1546,6 +1546,8 @@ fn executeInternal(
         generated_content = try arena.dupe(u8, result.content);
         try live.emitTextChunks("generation", generated_content.?);
         if (cfg.chain.len > 0) model_used = try arena.dupe(u8, cfg.chain[0].generator.model);
+        // Pipeline generation is one model call; report it like the loop does.
+        model_usage = .{ .llm_calls = 1, .resources_retrieved = @intCast(hit_list.items.len) };
         try appendStep(arena, &steps_list, &live, .{
             .kind = .generation,
             .name = "generation",
@@ -12442,6 +12444,29 @@ test "retrieval agent fetch shrinks non-ASCII pages to the context budget" {
     const parsed = try std.json.parseFromSlice(RetrievalAgentResult, std.testing.allocator, encoded, .{});
     defer parsed.deinit();
     try std.testing.expectEqual(AgentStatus.completed, parsed.value.status);
+}
+
+test "pipeline retrieval reports its generation call in usage" {
+    const Fake = struct {
+        fn query(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const u8) !query_api.QueryResponse {
+            return .{ .json = try alloc.dupe(u8,
+                \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"body":"alpha"}}]}}]}
+            ) };
+        }
+        fn generate(_: *anyopaque, a: std.mem.Allocator, _: []const generating.ChainLink, _: []const generating.ChatMessage) !generating.GenerateResult {
+            return .{ .allocator = a, .content = try a.dupe(u8, "answer") };
+        }
+    };
+    var fake: u8 = 0;
+    const body =
+        \\{"query":"alpha","queries":[{"table":"docs","full_text_search":{"match":"alpha"}}],"stream":false,"generator":{"provider":"antfly","model":"test"},"steps":{"generation":{}}}
+    ;
+    const encoded = try executeJson(std.testing.allocator, .{ .ptr = &fake, .vtable = &.{ .run_query = Fake.query } }, .{ .ptr = &fake, .vtable = &.{ .execute_chain = Fake.generate } }, body);
+    defer std.testing.allocator.free(encoded);
+    const parsed = try std.json.parseFromSlice(RetrievalAgentResult, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed.value.usage.?.llm_calls.?);
+    try std.testing.expectEqual(@as(i64, 1), parsed.value.tool_calls_made.?);
 }
 
 test "retrieval agent honors a lent tool-call budget" {
