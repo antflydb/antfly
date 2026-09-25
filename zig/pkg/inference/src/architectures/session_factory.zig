@@ -2440,6 +2440,7 @@ fn detectArchitectureWithGgufFile(
                 const wrapper = try parseLegacyGlinerWrapper(allocator, config_bytes);
                 var cfg = try loadLegacyGlinerEncoderConfig(allocator, model_path, wrapper);
                 cfg.gliner_count_layer = wrapper.count_layer;
+                cfg.gliner_gguf_weights = mf.usesGgufWeights();
                 try applyGlinerLabelTokenIds(allocator, model_path, mf, &cfg);
                 return .{ .gliner = cfg };
             }
@@ -2448,6 +2449,7 @@ fn detectArchitectureWithGgufFile(
                 // config.json and use antfly_inference_bundle/gliner_config sidecars
                 // to identify the GLiNER wrapper.
                 var cfg = try deberta_mod.parseConfig(allocator, config_bytes);
+                cfg.gliner_gguf_weights = mf.usesGgufWeights();
                 try applyGlinerLabelTokenIds(allocator, model_path, mf, &cfg);
                 return .{ .gliner = cfg };
             }
@@ -9052,8 +9054,9 @@ fn archRunImpl(
             // The GLiNER span head and DeBERTa encoder run encoder-shaped
             // quantized GEMMs. Bounded f16 mirrors avoid per-row quantized
             // setup while leaving other model sessions unchanged.
-            cb.preferEagerQuantMirrors(true);
-            const hidden = try deberta_arch.forwardCt(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len, true);
+            const mirrors = deberta_mod.glinerPrefersWeightMirrors(cfg);
+            cb.preferEagerQuantMirrors(mirrors);
+            const hidden = try deberta_arch.forwardCt(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len, mirrors);
             defer cb.free(hidden);
 
             // Eager head path -- keeps the encoder/head boundary on the

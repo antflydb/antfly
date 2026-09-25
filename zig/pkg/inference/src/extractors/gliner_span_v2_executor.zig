@@ -44,8 +44,9 @@ pub const Options = struct {
     /// Split classification tasks across sequences so each sequence (its task
     /// prompts plus the full text) stays within this many tokens, repeating
     /// the text rather than truncating it. DeBERTa-v3 was pretrained at 512
-    /// positions. A task whose prompt plus text alone exceeds the budget still
-    /// runs as its own sequence. Zero disables splitting (upstream behavior).
+    /// positions. When some task's prompt plus the text alone already exceeds
+    /// the budget no split can reach it, so the item runs as one sequence
+    /// (upstream behavior). Zero disables splitting.
     max_prompt_tokens: usize = 512,
     pipeline: pipeline.Options = .{},
     control: ?Control = null,
@@ -112,8 +113,9 @@ pub fn classificationLogitsProfiled(
     const attention_mask = try allocator.alloc(i64, seq_len);
     defer allocator.free(attention_mask);
     @memset(attention_mask, 1);
-    cb.preferEagerQuantMirrors(true);
-    const hidden = try deberta_arch.forwardCtProfiled(cb, allocator, config, sample.input_ids, attention_mask, 1, seq_len, true, if (profile) |p| &p.encoder else null);
+    const mirrors = deberta_mod.glinerPrefersWeightMirrors(config);
+    cb.preferEagerQuantMirrors(mirrors);
+    const hidden = try deberta_arch.forwardCtProfiled(cb, allocator, config, sample.input_ids, attention_mask, 1, seq_len, mirrors, if (profile) |p| &p.encoder else null);
     defer cb.free(hidden);
     if (profile) |p| {
         try cb.evalTensor(hidden);
@@ -128,6 +130,13 @@ pub fn classificationLogitsProfiled(
         if (label.marker_index >= seq_len) return error.InvalidExtractionInput;
         position.* = @intCast(label.marker_index);
     }
+    // One Metal frame for the whole head instead of a synchronous command
+    // buffer per op; the readback below happens after it completes.
+    var head_frame_active = false;
+    if (cb.kind() == .metal and !cb.decoderRuntimeHasActiveFrame()) {
+        head_frame_active = cb.decoderRuntimeBeginFrame() catch false;
+    }
+    errdefer if (head_frame_active) cb.decoderRuntimeCancelFrame() catch {};
     const marker_states = (try cb.takeRows(hidden, positions, labels.len, H)) orelse gather: {
         const ids = try allocator.alloc(i64, labels.len);
         defer allocator.free(ids);
@@ -154,6 +163,10 @@ pub fn classificationLogitsProfiled(
     defer cb.free(b2);
     const logits_ct = try cb.linear(first, w2, b2, labels.len, 2 * H, 1);
     defer cb.free(logits_ct);
+    if (head_frame_active) {
+        head_frame_active = false;
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+    }
     if (profile) |p| {
         try cb.evalTensor(logits_ct);
         const now = nowNs();
@@ -194,7 +207,8 @@ pub const TaskRange = struct { start: usize, end: usize };
 
 /// Greedy contiguous split of `task_count` tasks: each range grows while its
 /// full prompt length (reported by `prompt_len` for tasks [start, end)) stays
-/// within `budget`. A single task always forms at least one range.
+/// within `budget`. If a single task cannot fit, splitting only multiplies
+/// encoder work without reaching the budget, so all tasks share one range.
 pub fn planTaskRanges(
     allocator: Allocator,
     task_count: usize,
@@ -211,6 +225,11 @@ pub fn planTaskRanges(
     }
     var start: usize = 0;
     while (start < task_count) {
+        if (try prompt_len(context, start, start + 1) > budget) {
+            ranges.clearRetainingCapacity();
+            try ranges.append(allocator, .{ .start = 0, .end = task_count });
+            return ranges.toOwnedSlice(allocator);
+        }
         var end = start + 1;
         while (end < task_count and try prompt_len(context, start, end + 1) <= budget) end += 1;
         try ranges.append(allocator, .{ .start = start, .end = end });
@@ -339,7 +358,7 @@ pub fn execute(cb: *const compute.ComputeBackend, allocator: Allocator, config: 
     return writer.finish(prompt_tokens);
 }
 
-test "gliner span v2 task split is greedy, contiguous and keeps oversize tasks alone" {
+test "gliner span v2 task split is greedy, contiguous and never splits an unreachable budget" {
     const a = std.testing.allocator;
     // Prompt length = text + sum of task costs.
     const Costs = struct {
@@ -356,10 +375,17 @@ test "gliner span v2 task split is greedy, contiguous and keeps oversize tasks a
     defer a.free(one);
     try std.testing.expectEqualSlices(TaskRange, &.{.{ .start = 0, .end = 3 }}, one);
 
-    const split = Costs{ .text = 300, .tasks = &.{ 100, 100, 150, 400, 50 } };
+    const split = Costs{ .text = 300, .tasks = &.{ 100, 100, 150, 200, 50 } };
     const ranges = try planTaskRanges(a, 5, 512, &split, Costs.len);
     defer a.free(ranges);
+    // 400, 500 | 450 | 500 | 350: tasks 3 and 4 together would be 550.
     try std.testing.expectEqualSlices(TaskRange, &.{ .{ .start = 0, .end = 2 }, .{ .start = 2, .end = 3 }, .{ .start = 3, .end = 4 }, .{ .start = 4, .end = 5 } }, ranges);
+
+    // Task 3 alone (300 + 400) exceeds the budget: one sequence, not four.
+    const unreachable_budget = Costs{ .text = 300, .tasks = &.{ 100, 100, 150, 400, 50 } };
+    const single = try planTaskRanges(a, 5, 512, &unreachable_budget, Costs.len);
+    defer a.free(single);
+    try std.testing.expectEqualSlices(TaskRange, &.{.{ .start = 0, .end = 5 }}, single);
 
     const disabled = try planTaskRanges(a, 5, 0, &split, Costs.len);
     defer a.free(disabled);
@@ -542,6 +568,14 @@ test "gliner span v2 GLiNER2.5-Decide CountLSTM v1 entity head parity" {
     }
 }
 
+test "gliner span v2 GLiNER2.5-Decide Q8_0 bundle Metal parity" {
+    if (!@import("build_options").enable_metal) return error.SkipZigTest;
+    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_DECIDE_Q8_BUNDLE_DIR") orelse return error.SkipZigTest;
+    // Q8_0 encoder weights: decisions must match exactly; probabilities and
+    // logits carry quantization error.
+    try testDecideParity(directory, true, 5e-2);
+}
+
 // Warm Metal latency breakdown: ANTFLY_GLINER25_DECIDE_BENCH=1 plus the model dir.
 test "gliner span v2 GLiNER2.5-Decide Metal latency profile" {
     if (!@import("build_options").enable_metal) return error.SkipZigTest;
@@ -574,7 +608,10 @@ test "gliner span v2 GLiNER2.5-Decide Metal latency profile" {
         \\{"name":"topics","labels":["hvac","billing","housekeeping","noise","safety"],"multi_label":true,"threshold":0.4}]},
         \\"inputs":[{"content":"Guest in room 1408 says the AC has been out since yesterday and they want to move tonight or leave. They also asked for the incidentals hold to be released."}]}
     ;
-    var request = try wire.parseJson(a, raw, .{});
+    const tiny =
+        \\{"schema_version":2,"model":"decide","schema":{"classifications":[{"name":"answer","labels":["yes","no"]}]},"inputs":[{"content":"ok thanks"}]}
+    ;
+    var request = try wire.parseJson(a, if (env.getenvBool("ANTFLY_GLINER25_DECIDE_BENCH_TINY")) tiny else raw, .{});
     defer request.deinit();
     const item = request.items[0];
     const counts = try a.alloc(usize, item.compiled.schema.classifications.len);
@@ -597,6 +634,9 @@ test "gliner span v2 GLiNER2.5-Decide Metal latency profile" {
             const start = nowNs();
             var managed = try factory.getManagedComputeBackend(session, a, null, control);
             defer managed.deinit();
+            // Measurement only: without execution control the encoder skips
+            // its per-2-layer cancellation submit-and-wait.
+            if (env.getenvBool("ANTFLY_GLINER25_DECIDE_BENCH_NO_CONTROL_SYNC")) managed.backend.execution_control = null;
             var prepared = try processor.prepare(a, tokenizer.tokenizer(), &.{.{ .text = item.text, .schema = &item.compiled }}, (Options{}).processor);
             defer prepared.deinit();
             const prepared_at = nowNs();
@@ -659,7 +699,7 @@ test "gliner span v2 GLiNER2.5-Decide splits an over-budget prompt across sequen
         \\{"name":"product","labels":["streaming","music","bundle"],"label_definitions":{"streaming":{"description":"The video streaming subscription"},"music":{"description":"The music subscription"},"bundle":{"description":"The combined streaming and music bundle"}}},
         \\{"name":"topics","labels":["billing","outage","account","content","device","privacy"],"multi_label":true,"threshold":0.4},
         \\{"name":"churn_risk","labels":["low","medium","high"],"prompt":"How likely is this customer to cancel within a month?"}]},
-        \\"inputs":[{"content":"Hello, I have been a customer for six years and I am writing because my subscription renewed on April 15 for 5,400 yen even though the service had been down for most of the previous week. I tried to log in several times from my television and my phone, and each time the app showed an error saying the account could not be verified. I contacted support by chat twice and was told that an engineer would look into it, but nobody ever followed up. On top of that I noticed a second charge on my card for a music add-on that I never ordered. I would like both charges refunded, and I want someone to explain why my account was locked in the first place. If this cannot be resolved this week I will cancel everything and move to a different provider, which I would honestly regret because the catalog has always been excellent. Please call me back rather than sending another automated email, because the last three emails I received did not address any of my questions and one of them even asked me to reset a password I had already reset."}]}
+        \\"inputs":[{"content":"Hello, I have been a customer for six years and I am writing because my subscription renewed on April 15 for 5,400 yen even though the service had been down for most of the previous week. I tried to log in several times from my television and my phone, and each time the app showed an error saying the account could not be verified. I contacted support by chat twice and was told that an engineer would look into it, but nobody ever followed up. On top of that I noticed a second charge on my card for a music add-on that I never ordered. I would like both charges refunded, and I want someone to explain why my account was locked in the first place. If this cannot be resolved this week I will cancel everything and move to a different provider, which I would honestly regret because the catalog has always been excellent. Please call me back rather than sending another automated email, because the last three emails I received did not address any of my questions and one of them even asked me to reset a password I had already reset. A week later nothing has changed. The television app still says my account cannot be verified, the second charge is still on my statement, and the chat agent I spoke to this morning told me that refunds for outages are only issued as account credit, which is not acceptable to me because I intend to leave if this continues. I have attached screenshots of both charges and of the error message, and I have already reset my password twice as instructed."}]}
     ;
     var request = try wire.parseJson(a, raw, .{});
     defer request.deinit();
@@ -668,10 +708,11 @@ test "gliner span v2 GLiNER2.5-Decide splits an over-budget prompt across sequen
 
     var whole = try itemClassificationLogits(&managed.backend, a, config, tokenizer.tokenizer(), item, processor_options, 0, null);
     defer whole.deinit(a);
-    var split = try itemClassificationLogits(&managed.backend, a, config, tokenizer.tokenizer(), item, processor_options, 512, null);
+    const budget: usize = 400;
+    var split = try itemClassificationLogits(&managed.backend, a, config, tokenizer.tokenizer(), item, processor_options, budget, null);
     defer split.deinit(a);
     std.debug.print("decide split: whole {d} tokens in {d} sequence, split {d} tokens in {d} sequences\n", .{ whole.prompt_tokens, whole.sequences, split.prompt_tokens, split.sequences });
-    try std.testing.expect(whole.prompt_tokens > 512);
+    try std.testing.expect(whole.prompt_tokens > budget);
     try std.testing.expect(split.sequences > 1);
     try std.testing.expectEqual(whole.rows.len, split.rows.len);
 

@@ -29,6 +29,17 @@ writer. Only the encoder and head differ.
   `threshold`, `top_k`, `activation`, and the constraint DSL.
 - **Entities / relations**: the legacy span route (`schema_version` 1,
   `antfly inference extract`) with the CountLSTM v1 label projection.
+- **Long prompts**: every task's prompt is joined in front of the text in one
+  sequence (upstream early fusion). When the combined sequence exceeds 512
+  tokens (DeBERTa-v3's pretraining length) the executor splits the tasks
+  greedily, in schema order, across several sequences and repeats the full
+  text in each, rather than truncating the text. Logits are reassembled in
+  schema order and presented once, so cross-task constraints still apply. If
+  any single task's prompt plus the text alone exceeds 512, no split can reach
+  the budget, so the item runs as one sequence like upstream (hard ceiling
+  4096 tokens); long texts need text windowing, not task splitting. Below the
+  budget the route is identical to upstream. On an 8-task, 483-token support ticket split at a
+  400-token budget, all 8 top labels matched the unsplit run.
 - Mixed classification + span tasks in one `schema_version: 2` request, and
   `long_document` windows, are rejected with
   `UnsupportedGlinerSpanV2Task` / `UnsupportedGlinerSpanLongDocument`.
@@ -58,9 +69,27 @@ antfly inference export ~/.antfly/inference/models/fastino/GLiNER2.5-Decide \
   --output ~/.antfly/inference/models/fastino/GLiNER2.5-Decide-Q8_0/gliner2-encoder.Q8_0.gguf
 ```
 
+`classifier.*` stays dense in every exported bundle (~8 MB): a quantized
+classifier costs more per request (27 ms vs 5 ms on Metal) than it saves.
+
 The exporter reads the encoder geometry from `encoder_config/config.json`
 and copies it into the bundle; the loader refuses a non-base wrapper without
 that sidecar (`MissingGlinerEncoderConfig`) rather than assuming base size.
+
+## Metal weight mirrors
+
+Base-size GLiNER encoders use bounded F16 weight mirrors on Metal. For the
+large encoder the policy depends on the artifact:
+
+- **Q8_0 bundle**: no mirrors; the bundle's Q8_0 kernels run directly
+  (interleaved A/B on M4, 102 tokens: ~75 ms vs ~110 ms with mirrors, and
+  ~0.5 GB less live admission).
+- **F32 safetensors**: mirrors stay on. Without them Metal quantizes dense
+  weights to Q8_0 on the fly, which changes numerics (logit error 3e-2 vs
+  8e-4) without the user choosing a quantized artifact.
+
+`TERMITE_METAL_GLINER_LARGE_WEIGHT_MIRRORS=1` forces mirrors for a large
+bundle.
 
 ## Parity
 
@@ -73,14 +102,19 @@ prompts and ordinal labels, plus 2 entity cases).
 |---|---|---|---|
 | native F32 | exact | 4.8e-6 | 8/8 |
 | Metal F32 | exact | 8.1e-4 | 8/8 |
-| Metal Q8_0 (HTTP) | exact | — | 8/8 (confidence within 3e-3) |
+| Metal Q8_0 bundle | exact | 3.1e-2 | 8/8 |
 
 Entity spans (legacy route) match upstream on native and Metal F32 to
 four decimals; Q8_0 keeps every entity with confidence within 5e-3.
 
 ```bash
 ANTFLY_GLINER25_DECIDE_MODEL_DIR=~/.antfly/inference/models/fastino/GLiNER2.5-Decide \
+ANTFLY_GLINER25_DECIDE_Q8_BUNDLE_DIR=~/.antfly/inference/models/fastino/GLiNER2.5-Decide-Q8_0 \
   zig build inference-test -- --test-filter "GLiNER2.5-Decide"
+
+# Stage latency breakdown (use -Doptimize=ReleaseFast for meaningful numbers)
+ANTFLY_GLINER25_DECIDE_BENCH=1 ANTFLY_GLINER25_DECIDE_MODEL_DIR=<model or bundle> \
+  zig build inference-test -Doptimize=ReleaseFast -- --test-filter "Decide Metal latency"
 ```
 
 The model card's "potential outputs" are illustrative: upstream itself returns

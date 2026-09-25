@@ -1126,6 +1126,18 @@ test "gliner boundary export cannot write a legacy span bundle" {
     try requireLegacyGlinerExportProfile(.{ .allocator = a, .gliner_model_type = "gliner2" });
 }
 
+/// The classification MLP is a few MB but runs on every classification
+/// request; a quantized copy costs more per request (GLiNER2.5-Decide Metal:
+/// 27 ms vs 5 ms) than it saves in bundle size.
+fn keepGlinerHeadTensorDense(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, "classifier.");
+}
+
+test "gliner head export keeps the classifier dense" {
+    try std.testing.expect(keepGlinerHeadTensorDense("classifier.0.weight"));
+    try std.testing.expect(!keepGlinerHeadTensorDense("span_rep.span_rep_layer.project_start.0.weight"));
+}
+
 fn defaultGlinerHeadOutputPath(allocator: std.mem.Allocator, output_path: []const u8) ![]u8 {
     const parent = std.fs.path.dirname(output_path) orelse ".";
     return std.fs.path.join(allocator, &.{ parent, "gliner_head.gguf" });
@@ -1346,7 +1358,8 @@ fn writeGlinerHeadGguf(
         const dimensions = try glinerHeadDimsForRecord(allocator, record.descriptor.name, record.descriptor.shape, transform);
         errdefer allocator.free(dimensions);
         const tensor_quantization = supportedQuantizationForDescriptor(false, quantization, record.descriptor, transform);
-        const filtered_quantization = if (quantizationFilterMatches(filter, record.descriptor.name, record.descriptor.name))
+        const filtered_quantization = if (quantizationFilterMatches(filter, record.descriptor.name, record.descriptor.name) and
+            !keepGlinerHeadTensorDense(record.descriptor.name))
             tensor_quantization
         else
             .none;
