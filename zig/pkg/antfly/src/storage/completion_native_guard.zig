@@ -35,6 +35,30 @@ fn items(comptime T: type, ptr: ?[*]const T, len: u64) ![]const T {
     return ptr.?[0..@intCast(len)];
 }
 
+fn validateControlV4Frame(input: *const abi.ControlDurableLogV4) !void {
+    const frame = &input.applied;
+    // Check the untrusted ABI count before narrowing it to a shift amount.
+    if (frame.count > abi.max_durable_controls or
+        input.version != abi.control_proof_abi_version_v4 or
+        !std.mem.allEqual(u8, &input.reserved, 0) or
+        input.accepted_mask >> @intCast(frame.count) != 0 or
+        frame.version != abi.control_proof_abi_version_v3 or frame.reserved != 0 or
+        frame.commit_index > frame.last_index or frame.compacted_index > frame.commit_index or
+        (frame.compacted_index == 0) != (frame.compacted_term == 0) or
+        frame.document.mode != frame.mode or frame.document.compacted_index != frame.compacted_index or
+        frame.document.compacted_term != frame.compacted_term or frame.document.last_index != frame.last_index or
+        frame.document.commit_index != frame.commit_index) return error.InvalidArgument;
+}
+
+test "workload admission physical completion control v4 rejects out-of-range ABI counts before shifting" {
+    var proof: abi.ControlDurableLogV4 = .{};
+    try validateControlV4Frame(&proof);
+    for ([_]u32{ 8, std.math.maxInt(u32) }) |count| {
+        proof.applied.count = count;
+        try std.testing.expectError(error.InvalidArgument, validateControlV4Frame(&proof));
+    }
+}
+
 pub fn Guard(comptime DB: type) type {
     return struct {
         fn db(raw: ?*anyopaque) *DB {
@@ -508,15 +532,7 @@ pub fn Guard(comptime DB: type) type {
         }
         fn reconcileControlV4Impl(owner: *DB, input: *const abi.ControlDurableLogV4) !void {
             const frame = &input.applied;
-            if (input.version != abi.control_proof_abi_version_v4 or
-                !std.mem.allEqual(u8, &input.reserved, 0) or
-                input.accepted_mask >> @intCast(frame.count) != 0 or
-                frame.version != abi.control_proof_abi_version_v3 or frame.count > abi.max_durable_controls or frame.reserved != 0 or
-                frame.commit_index > frame.last_index or frame.compacted_index > frame.commit_index or
-                (frame.compacted_index == 0) != (frame.compacted_term == 0) or
-                frame.document.mode != frame.mode or frame.document.compacted_index != frame.compacted_index or
-                frame.document.compacted_term != frame.compacted_term or frame.document.last_index != frame.last_index or
-                frame.document.commit_index != frame.commit_index) return error.InvalidArgument;
+            try validateControlV4Frame(input);
             const mode: @FieldType(native.completion_pool_mod.DurableLog, "mode") = switch (frame.mode) {
                 .startup_complete => .startup_complete,
                 .persisted_replacement => .persisted_replacement,
