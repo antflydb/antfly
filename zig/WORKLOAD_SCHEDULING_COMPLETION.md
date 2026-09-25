@@ -20,14 +20,35 @@ this requested implementation/correctness scope.
 
 ## Current work
 
-- Trusted local restart now reconstructs one slot-0 applied BEGIN owner before
+- A versioned v4 control proof now binds an accepted-but-unapplied decision or
+  named ACK sidecar to BEGIN, latest applied, and the exact committed accepted
+  entry from one immutable DATA WAL image. Restart loads its owned capacity
+  before replay, then either applies the proven transition through the native
+  owner or retires a sidecar already reflected in exact native progress.
+  Missing, replaced, uncommitted, compacted, corrupt, and zero-byte sidecars
+  remain fail-closed. The focused native durable gate passed 51/51; workload
+  admission passed 311/311 owning and 394 broad tests with one skip, with no
+  leaks. This bounded single-owner profile remains test-only; multi-owner
+  restoration, replicated fault schedules, and production activation remain
+  open.
+- Distributed join now rechecks the original cancellation and deadline after a
+  worker reply, before parsing results or dispatching another partial-page
+  request. A delayed real-socket worker fixture passed 4/4 focused tests: both
+  cancellation and deadline cases stopped after one request, published no
+  partial result, and drained bounded socket work. The fixture uses a test
+  transport callback; full production coordinator routing remains unqualified.
+- The PR's local format gate now passes across Zig, Go, Python, TypeScript,
+  and Rust. Its Go operator source and nine workload qualification Python
+  scripts were formatted without behavior changes. The PR CI routing tests
+  passed 84/84 and CI Python tests passed 71/71; the selected hosted CI suites
+  still require their normal manual trigger.
+- Trusted local restart reconstructs one slot-0 applied BEGIN owner before
   WAL replay from its published guard, measured manifest runs, and retained
-  capacity. It requires exact committed v2 BEGIN proof before readiness and
+  capacity. It requires exact committed BEGIN proof before readiness and
   then applies a real owner-backed decision. The DB test rejects missing
-  manifest, orphan document guard, output-ID alias, and wrong v2 digest;
-  the durable gate passed 51/51 with no leaks. Accepted transition sidecars,
-  already-applied decision/ACK restart, multiple owners, and larger run
-  profiles remain fenced; production activation is still disabled.
+  manifest, orphan document guard, output-ID alias, and wrong BEGIN digest.
+  Multiple owners and larger run profiles remain fenced; production
+  activation is still disabled.
 - A fresh ReleaseFast binary at `08807fe878` passed the six-process ordinary
   DATA quorum driver with zero cleanup errors. The driver checked all-replica
   applied progress, successor election after DATA leader loss, exact reads,
