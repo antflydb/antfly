@@ -786,8 +786,19 @@ pub const HostedParticipantWorker = struct {
         var route = (table_router.resolveGroupRoute(alloc, bounded.catalog, bounded.router, group_id, .prefer_leader) catch return error.PreDecisionNotProposed) orelse return error.PreDecisionNotProposed;
         defer route.deinit(alloc);
         ensurePreDecisionContextActive(context) catch return error.PreDecisionNotProposed;
+        const attempted_node_id = switch (route) {
+            .local => bounded.router.localNodeId(),
+            .remote => |remote| remote.node_id,
+        };
         switch (route) {
-            .local => _ = (try bounded.writes.txnDecideGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.status, req.commit_version, req.topology_epoch, req.sync_level, context)) orelse return error.PreDecisionNotProposed,
+            .local => {
+                const result = bounded.writes.txnDecideGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.status, req.commit_version, req.topology_epoch, req.sync_level, context) catch |err| {
+                    if (err != error.PreDecisionNotProposed) return err;
+                    return bounded.resolveFirstDecisionFromCandidates(alloc, group_id, table_name, req, attempted_node_id, null, deadline, context);
+                };
+                if (result == null)
+                    return bounded.resolveFirstDecisionFromCandidates(alloc, group_id, table_name, req, attempted_node_id, null, deadline, context);
+            },
             .remote => |remote| {
                 const control_uri = bounded.controlBaseUri(bounded.router, alloc, group_id, remote.node_id, remote.base_uri) catch return error.PreDecisionNotProposed;
                 defer alloc.free(control_uri);
@@ -813,9 +824,65 @@ pub const HostedParticipantWorker = struct {
                     if (tracker.load() == .not_sent) return error.PreDecisionNotProposed;
                     return err;
                 };
-                if (result == .not_proposed) return error.PreDecisionNotProposed;
+                if (result == .not_proposed)
+                    return bounded.resolveFirstDecisionFromCandidates(alloc, group_id, table_name, req, attempted_node_id, body, deadline, context);
             },
         }
+    }
+
+    fn resolveFirstDecisionFromCandidates(self: *HostedParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest, attempted_node_id: u64, encoded_body: ?[]const u8, deadline_ns: u64, context: PreDecisionContext) !void {
+        ensurePreDecisionContextActive(context) catch return error.PreDecisionNotProposed;
+        ensurePreDecisionDeadline(deadline_ns, self.preDecisionNowNs()) catch return error.PreDecisionNotProposed;
+        const node_ids = (self.router.groupNodeIds(alloc, group_id) catch return error.PreDecisionNotProposed) orelse return error.PreDecisionNotProposed;
+        defer alloc.free(node_ids);
+        var owned_body: ?[]u8 = null;
+        defer if (owned_body) |body| alloc.free(body);
+        for (node_ids) |node_id| {
+            if (node_id == attempted_node_id) continue;
+            ensurePreDecisionContextActive(context) catch return error.PreDecisionNotProposed;
+            ensurePreDecisionDeadline(deadline_ns, self.preDecisionNowNs()) catch return error.PreDecisionNotProposed;
+            if (node_id == self.router.localNodeId()) {
+                if (self.router.localStatus(group_id) != .active) continue;
+                const attempt_context = self.localPreDecisionContext(deadline_ns) catch return error.PreDecisionNotProposed;
+                const result = self.writes.txnDecideGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.status, req.commit_version, req.topology_epoch, req.sync_level, attempt_context) catch |err| {
+                    if (err == error.PreDecisionNotProposed) continue;
+                    return err;
+                };
+                if (result != null) return;
+                continue;
+            }
+            if (self.router.nodeStatus(node_id, group_id)) |status| {
+                if (status != .active) continue;
+            }
+            const public_uri = (self.router.nodeBaseUriForGroup(alloc, group_id, node_id) catch return error.PreDecisionNotProposed) orelse continue;
+            defer alloc.free(public_uri);
+            const control_uri = self.controlBaseUri(self.router, alloc, group_id, node_id, public_uri) catch return error.PreDecisionNotProposed;
+            defer alloc.free(control_uri);
+            const body = encoded_body orelse blk: {
+                const value = encodeTxnResolveRequest(alloc, req) catch return error.PreDecisionNotProposed;
+                owned_body = value;
+                break :blk value;
+            };
+            const budget = self.remainingPreDecisionAttemptBudget(deadline_ns) catch return error.PreDecisionNotProposed;
+            var client = self.httpClient(alloc);
+            var tracker: http_common.RequestDeliveryTracker = .{};
+            const DeadlineCancellation = struct {
+                context: PreDecisionContext,
+                fn check(raw: *const anyopaque) !void {
+                    const scope: *const @This() = @ptrCast(@alignCast(raw));
+                    try ensurePreDecisionContextActive(scope.context);
+                }
+                fn isCancelled(raw: *const anyopaque) bool {
+                    check(raw) catch return true;
+                    return false;
+                }
+            };
+            var scope: DeadlineCancellation = .{ .context = context };
+            var cancellation = http_common.RequestCancellation.fromToken(.{ .ptr = &scope, .check_fn = DeadlineCancellation.check, .is_cancelled_fn = DeadlineCancellation.isCancelled });
+            const result = try client.fetchGroupTxnDecideWithContext(control_uri, group_id, table_name, body, &tracker, budget.client_timeout_ms, budget.server_budget_ms, &cancellation);
+            if (result == .applied) return;
+        }
+        return error.PreDecisionNotProposed;
     }
 
     fn resolveGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest) !void {
@@ -4283,6 +4350,130 @@ fn consumerTests() type {
             var unsigned_worker = HostedParticipantWorker.init(undefined, Router.iface(true), undefined, unsigned_executor.iface());
             try std.testing.expectEqual(db_mod.types.TxnStatus.committed, try unsigned_worker.worker().statusGroup(alloc, 77, "docs", txn_id));
             try std.testing.expectEqual(@as(usize, 1), unsigned_executor.calls);
+        }
+
+        test "hosted participant first decision rediscovers only after definite non-submission" {
+            const Router = struct {
+                leader_hint: ?u64 = null,
+                local_active: bool = true,
+
+                fn iface(self: *@This()) table_router.HostedGroupRouter {
+                    return .{ .ptr = self, .vtable = &.{
+                        .local_node_id = localNode,
+                        .local_status = localStatus,
+                        .group_leader_node_id = leader,
+                        .group_node_ids = nodes,
+                        .node_status = nodeStatus,
+                        .node_base_uri = publicUri,
+                        .node_control_base_uri_for_group = controlUri,
+                    } };
+                }
+                fn localNode(_: *anyopaque) u64 {
+                    return 1;
+                }
+                fn localStatus(ptr: *anyopaque, _: u64) raft_host.HostedReplicaStatus {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    return if (self.local_active) .active else .absent;
+                }
+                fn leader(ptr: *anyopaque, _: u64) ?u64 {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    return self.leader_hint;
+                }
+                fn nodes(_: *anyopaque, alloc: std.mem.Allocator, _: u64, _: table_router.RouteBudget) ![]u64 {
+                    return try alloc.dupe(u64, &.{ 1, 2, 3 });
+                }
+                fn nodeStatus(_: *anyopaque, _: u64, _: u64) raft_host.HostedReplicaStatus {
+                    return .active;
+                }
+                fn publicUri(_: *anyopaque, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
+                    return try std.fmt.allocPrint(alloc, "http://public-{d}", .{node_id});
+                }
+                fn controlUri(_: *anyopaque, alloc: std.mem.Allocator, _: u64, node_id: u64, _: table_router.RouteBudget) !?[]u8 {
+                    return try std.fmt.allocPrint(alloc, "http://control-{d}", .{node_id});
+                }
+            };
+            const Writes = struct {
+                calls: usize = 0,
+                fn iface(self: *@This()) table_writes.TableWriteSource {
+                    return .{ .ptr = self, .vtable = &.{ .batch = batch, .txn_decide_group_local_with_pre_decision_context = decide } };
+                }
+                fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+                    return error.UnexpectedBatch;
+                }
+                fn decide(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: db_mod.types.TxnStatus, _: u64, _: u64, _: db_mod.types.SyncLevel, _: PreDecisionContext) !?void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.calls += 1;
+                    return error.PreDecisionNotProposed;
+                }
+            };
+            const Executor = struct {
+                const First = enum { definite, ambiguous_status, ambiguous_transport };
+                first: First = .definite,
+                calls: usize = 0,
+                first_node: u64 = 2,
+                fn iface(self: *@This()) http_common.RequestExecutor {
+                    return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+                }
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.calls += 1;
+                    const node_id = if (self.calls == 1) self.first_node else @as(u64, 3);
+                    const prefix = try std.fmt.allocPrint(alloc, "http://control-{d}/", .{node_id});
+                    defer alloc.free(prefix);
+                    try std.testing.expect(std.mem.startsWith(u8, req.uri, prefix));
+                    try std.testing.expect(req.header(@import("internal_service_auth.zig").header_name) != null);
+                    try std.testing.expect(req.header(contract.pre_decision_remaining_ms_header) != null);
+                    try std.testing.expect(req.timeout_ms != null);
+                    if (self.calls == 1) return switch (self.first) {
+                        .definite => try http_route_helpers.textResponseWithHeaders(alloc, 503, "not proposed", &.{.{
+                            .name = contract.pre_decision_outcome_header,
+                            .value = contract.first_decision_not_proposed_v1,
+                        }}),
+                        .ambiguous_status => try http_route_helpers.textResponse(alloc, 503, "unavailable"),
+                        .ambiguous_transport => {
+                            const tracker = req.delivery_tracker orelse return error.TestExpectedDeliveryTracker;
+                            tracker.markMayHaveBeenSent();
+                            return error.ConnectionRefused;
+                        },
+                    };
+                    return try http_route_helpers.textResponse(alloc, 200, "{}");
+                }
+            };
+            const alloc = std.testing.allocator;
+            const resolution: TxnResolveRequest = .{ .txn_id = @splat(7), .status = .committed, .commit_version = 19 };
+            const context: PreDecisionContext = .{ .deadline_ns = platform_time.monotonicNs() +| 30 * std.time.ns_per_s };
+
+            // Without a leader hint, placement order first selects node 2;
+            // its proof and a local non-submission permit probing node 3.
+            var no_hint_router: Router = .{};
+            var no_hint_writes: Writes = .{};
+            var no_hint_executor: Executor = .{};
+            var no_hint_worker = HostedParticipantWorker.init(undefined, no_hint_router.iface(), no_hint_writes.iface(), no_hint_executor.iface());
+            _ = no_hint_worker.withInternalServiceAuth("cluster-secret", "cluster-a");
+            try HostedParticipantWorker.resolveFirstDecisionWithContext(&no_hint_worker, alloc, 77, "docs", resolution, context);
+            try std.testing.expectEqual(@as(usize, 1), no_hint_writes.calls);
+            try std.testing.expectEqual(@as(usize, 2), no_hint_executor.calls);
+
+            // A stale remote hint is equally safe to replace when its first
+            // response carries the authenticated versioned non-submission proof.
+            var stale_router: Router = .{ .leader_hint = 2, .local_active = false };
+            var stale_writes: Writes = .{};
+            var stale_executor: Executor = .{};
+            var stale_worker = HostedParticipantWorker.init(undefined, stale_router.iface(), stale_writes.iface(), stale_executor.iface());
+            _ = stale_worker.withInternalServiceAuth("cluster-secret", "cluster-a");
+            try HostedParticipantWorker.resolveFirstDecisionWithContext(&stale_worker, alloc, 77, "docs", resolution, context);
+            try std.testing.expectEqual(@as(usize, 0), stale_writes.calls);
+            try std.testing.expectEqual(@as(usize, 2), stale_executor.calls);
+
+            inline for (.{ Executor.First.ambiguous_status, Executor.First.ambiguous_transport }) |first| {
+                var ambiguous_router: Router = .{ .leader_hint = 2, .local_active = false };
+                var ambiguous_writes: Writes = .{};
+                var ambiguous_executor: Executor = .{ .first = first };
+                var ambiguous_worker = HostedParticipantWorker.init(undefined, ambiguous_router.iface(), ambiguous_writes.iface(), ambiguous_executor.iface());
+                _ = ambiguous_worker.withInternalServiceAuth("cluster-secret", "cluster-a");
+                try std.testing.expectError(if (first == .ambiguous_status) error.UnexpectedHttpStatus else error.ConnectionRefused, HostedParticipantWorker.resolveFirstDecisionWithContext(&ambiguous_worker, alloc, 77, "docs", resolution, context));
+                try std.testing.expectEqual(@as(usize, 1), ambiguous_executor.calls);
+            }
         }
 
         test "hosted participant rediscovery retries only pre-decision leader unavailability" {
