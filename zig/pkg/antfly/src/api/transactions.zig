@@ -743,6 +743,10 @@ pub const Session = struct {
     /// present, the effective request is sealed in `staged`; retries must carry
     /// the same body (or omit it if the first attempt omitted it).
     commit_body_digest: ?[32]u8 = null,
+    /// Fingerprint of the effective staged request, including writes staged
+    /// before commit. This guards the durable session against a changed
+    /// payload on restart; it is not participant BEGIN identity evidence.
+    sealed_request_digest: ?[32]u8 = null,
     /// Set durably after API/schema/read-set validation and immediately before
     /// invoking 2PC. Once true, background maintenance owns completion even if
     /// the initiating process disappears.
@@ -795,6 +799,7 @@ pub const Session = struct {
             .sync_level = self.sync_level,
             .next_savepoint_id = self.next_savepoint_id,
             .commit_body_digest = self.commit_body_digest,
+            .sealed_request_digest = self.sealed_request_digest,
             .commit_execution_started = self.commit_execution_started,
         };
         errdefer out.deinit(alloc);
@@ -2109,6 +2114,9 @@ pub const SessionRegistry = struct {
         if (candidate.commit_body_digest) |sealed_digest| {
             if (!std.mem.eql(u8, &sealed_digest, &body_digest)) return error.TransactionCommitRequestMismatch;
             const sealed = candidate.staged orelse return error.InvalidTransactionSessionRecord;
+            const digest = candidate.sealed_request_digest orelse return error.TransactionCommitIdentityUnavailable;
+            const actual = try sealedRequestDigest(alloc, sealed);
+            if (!std.mem.eql(u8, &digest, &actual)) return error.InvalidTransactionSessionRecord;
             var out = try sealed.clone(alloc);
             errdefer out.deinit(alloc);
             touchSession(&candidate);
@@ -2137,6 +2145,7 @@ pub const SessionRegistry = struct {
         candidate.staged = null;
         candidate.staged = try out.clone(retained_alloc);
         candidate.commit_body_digest = body_digest;
+        candidate.sealed_request_digest = try sealedRequestDigest(alloc, out);
         touchSession(&candidate);
         try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
         try self.persistLocked(alloc, candidate);
@@ -2253,6 +2262,7 @@ pub const SessionRegistry = struct {
         var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
         errdefer candidate.deinit(alloc);
         if (candidate.commit_body_digest == null or candidate.staged == null) return error.InvalidTransactionSessionRecord;
+        if (candidate.sealed_request_digest == null) return error.TransactionCommitIdentityUnavailable;
         if (candidate.execution_plan) |bytes| {
             const result = try parseExecutionPlan(alloc, bytes);
             candidate.deinit(alloc);
@@ -2301,6 +2311,7 @@ pub const SessionRegistry = struct {
         const alloc = candidate.allocationAllocator(retained_alloc);
         errdefer candidate.deinit(alloc);
         if (candidate.commit_body_digest == null or candidate.staged == null) return error.InvalidTransactionSessionRecord;
+        if (candidate.sealed_request_digest == null) return error.TransactionCommitIdentityUnavailable;
         if (candidate.commit_execution_started) {
             candidate.deinit(alloc);
             return {};
@@ -2521,6 +2532,12 @@ pub const SessionRegistry = struct {
         };
         defer candidate.deinit(alloc);
 
+        // Reject an unbound legacy recovery obligation before a new owner
+        // adopts its lease. Neither replay nor terminal ACK is safe when the
+        // original effective request cannot be identified.
+        if (sessionNeedsRecovery(candidate) and candidate.sealed_request_digest == null)
+            return error.TransactionCommitIdentityUnavailable;
+
         if (candidate.owner_node_id != owner_node_id) {
             const durable = self.durable orelse return null;
             if (self.durable_scope != .cluster_shared or self.lease_store == null or self.owner_lease_ttl_ns == null or owner_node_id == 0) return null;
@@ -2559,6 +2576,7 @@ pub const SessionRegistry = struct {
             if (terminal.status != .committed or repair_handoff_needs_coordinator) {
                 if (candidate.commit_body_digest == null or !candidate.commit_execution_started)
                     return error.InvalidTransactionSessionRecord;
+                if (candidate.sealed_request_digest == null) return error.TransactionCommitIdentityUnavailable;
                 const request = candidate.staged orelse return error.InvalidTransactionSessionRecord;
                 var cloned_request = try request.clone(alloc);
                 errdefer cloned_request.deinit(alloc);
@@ -2586,6 +2604,10 @@ pub const SessionRegistry = struct {
             if (terminal.coordinator_acknowledged) return null;
             const group_id = terminal.coordinator_group_id orelse return null;
             const table_name = terminal.coordinator_table_name orelse return error.InvalidTransactionSessionRecord;
+            // A terminal status alone does not bind an old session's writes to
+            // this coordinator. Do not retire its durable decision by ACK when
+            // a rolling peer omitted the effective-request identity.
+            if (candidate.sealed_request_digest == null) return error.TransactionCommitIdentityUnavailable;
             return .{ .acknowledge = .{
                 .txn_id = txn_id,
                 .owner_node_id = owner_node_id,
@@ -2594,6 +2616,7 @@ pub const SessionRegistry = struct {
             } };
         }
         if (candidate.commit_body_digest == null or !candidate.commit_execution_started) return null;
+        if (candidate.sealed_request_digest == null) return error.TransactionCommitIdentityUnavailable;
         const request = candidate.staged orelse return error.InvalidTransactionSessionRecord;
         var cloned_request = try request.clone(alloc);
         errdefer cloned_request.deinit(alloc);
@@ -4903,6 +4926,13 @@ fn encodeSessionRecord(alloc: std.mem.Allocator, session: Session) ![]u8 {
     } else {
         try out.appendSlice(alloc, "null");
     }
+    try out.appendSlice(alloc, ",\"sealed_request_digest\":");
+    if (session.sealed_request_digest) |digest| {
+        const hex = std.fmt.bytesToHex(digest, .lower);
+        try appendJsonString(alloc, &out, &hex);
+    } else {
+        try out.appendSlice(alloc, "null");
+    }
     try out.appendSlice(alloc, ",\"commit_execution_started\":");
     try out.appendSlice(alloc, if (session.commit_execution_started) "true" else "false");
     try out.appendSlice(alloc, ",\"execution_plan\":");
@@ -5032,6 +5062,23 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
             else => return error.InvalidTransactionSessionRecord,
         }
     }
+    if (obj.get("sealed_request_digest")) |digest_value| {
+        switch (digest_value) {
+            .string => |encoded| {
+                if (encoded.len != 64) return error.InvalidTransactionSessionRecord;
+                var digest: [32]u8 = undefined;
+                _ = std.fmt.hexToBytes(&digest, encoded) catch return error.InvalidTransactionSessionRecord;
+                session.sealed_request_digest = digest;
+            },
+            .null => {},
+            else => return error.InvalidTransactionSessionRecord,
+        }
+    }
+    if (session.sealed_request_digest) |digest| {
+        if (session.commit_body_digest == null or session.staged == null) return error.InvalidTransactionSessionRecord;
+        const actual = try sealedRequestDigest(alloc, session.staged.?);
+        if (!std.mem.eql(u8, &digest, &actual)) return error.InvalidTransactionSessionRecord;
+    }
     session.commit_execution_started = if (obj.get("commit_execution_started")) |value| switch (value) {
         .bool => |started| started,
         else => return error.InvalidTransactionSessionRecord,
@@ -5137,6 +5184,14 @@ fn commitBodyDigest(
     req: ?*const OwnedTransactionCommitRequest,
 ) ![32]u8 {
     const encoded = if (req) |value| try encodeCommitRequest(alloc, value.*) else try alloc.dupe(u8, "null");
+    defer alloc.free(encoded);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(encoded, &digest, .{});
+    return digest;
+}
+
+fn sealedRequestDigest(alloc: std.mem.Allocator, req: OwnedTransactionCommitRequest) ![32]u8 {
+    const encoded = try encodeCommitRequestMode(alloc, req, true);
     defer alloc.free(encoded);
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(encoded, &digest, .{});
@@ -5874,6 +5929,41 @@ test "transaction session commit request is sealed across retries" {
         error.TransactionCommitSealed,
         reader.stage(alloc, txn_id, &changed_body),
     );
+
+    // The digest covers the merged staged payload, rather than only the
+    // optional body used to identify an HTTP retry. Restart must reject a
+    // durable record whose staged writes changed under the sealed identity.
+    var tampered = (try durable.load(txn_id)) orelse return error.TestExpectedEqual;
+    defer tampered.deinit(alloc);
+    try std.testing.expect(tampered.sealed_request_digest != null);
+    tampered.staged.?.deinit(alloc);
+    tampered.staged = try changed_body.clone(alloc);
+    const tampered_record = try encodeSessionRecord(alloc, tampered);
+    defer alloc.free(tampered_record);
+    try std.testing.expectError(error.InvalidTransactionSessionRecord, decodeSessionRecord(alloc, txn_id, tampered_record));
+
+    // Older peers have no effective-request digest. They remain readable for
+    // inspection, but cannot mutate or resume from a payload with no proof.
+    tampered.sealed_request_digest = null;
+    tampered.commit_execution_started = true;
+    const legacy_record = try encodeSessionRecord(alloc, tampered);
+    defer alloc.free(legacy_record);
+    var legacy = try decodeSessionRecord(alloc, txn_id, legacy_record);
+    defer legacy.deinit(alloc);
+    try std.testing.expect(legacy.sealed_request_digest == null);
+    try durable.save(legacy, null);
+    var legacy_reader = SessionRegistry.init(&durable);
+    defer legacy_reader.deinit(alloc);
+    try std.testing.expectError(error.TransactionCommitIdentityUnavailable, legacy_reader.cloneCommitRequest(alloc, txn_id, &first_body));
+    try std.testing.expectError(error.TransactionCommitIdentityUnavailable, legacy_reader.markCommitExecutionStarted(alloc, txn_id));
+    try std.testing.expectError(error.TransactionCommitIdentityUnavailable, legacy_reader.claimPendingRecovery(alloc, txn_id, 9, nextTxnTimestamp()));
+    legacy.terminal_commit = .{
+        .status = .committed,
+        .coordinator_group_id = 7,
+        .coordinator_table_name = try alloc.dupe(u8, "docs"),
+    };
+    try durable.save(legacy, null);
+    try std.testing.expectError(error.TransactionCommitIdentityUnavailable, legacy_reader.claimPendingRecovery(alloc, txn_id, 9, nextTxnTimestamp()));
 }
 
 test "durable recovery index tracks only validated commit execution and terminal handoff" {

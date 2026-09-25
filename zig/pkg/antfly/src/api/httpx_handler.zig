@@ -5491,7 +5491,7 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(409);
                 return ctx.text("transaction commit retry body does not match the sealed request");
             },
-            error.SessionLeaseLost, error.TransactionCommitAlreadyStarted => return transactionOutcomeUnknown(ctx, txn_id),
+            error.SessionLeaseLost, error.TransactionCommitAlreadyStarted, error.TransactionCommitIdentityUnavailable => return transactionOutcomeUnknown(ctx, txn_id),
             else => return err,
         }) orelse {
             _ = ctx.status(400);
