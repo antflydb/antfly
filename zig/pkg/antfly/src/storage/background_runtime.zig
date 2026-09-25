@@ -473,6 +473,11 @@ pub const Config = struct {
     /// runtimes use this for lifecycle locks and durable metadata without
     /// acquiring a worker executor. It must outlive the runtime.
     filesystem_io: ?Io = null,
+    /// Test-only borrowed descriptor domain. Production always uses the
+    /// process-wide pool; a fixture may isolate a small capacity without
+    /// changing global admission for other runtimes. The caller must destroy
+    /// this pool only after the runtime and all native storage owners close.
+    test_native_storage_pool: ?*storage_io.NativeStoragePool = null,
 };
 
 pub const BorrowedIo = struct {
@@ -960,6 +965,7 @@ pub const BackendRuntime = struct {
     retired_generation_cleanup_owner_id: u64,
     owner_registry: *OwnerRegistry,
     native_storage_pool: *storage_io.NativeStoragePool,
+    owns_native_storage_pool: bool,
     borrowed_storage: ?storage_io.IoStorage = null,
     lsm_owner_clone_registry: LsmOwnerCloneRegistry,
     borrowed_filesystem_io: ?Io = null,
@@ -1018,6 +1024,8 @@ pub const BackendRuntime = struct {
         try config.lane_limits.validate();
         if (config.borrowed_io != null and config.backend != .manual)
             return error.BorrowedIoRequiresManualBackend;
+        if (!builtin.is_test and config.test_native_storage_pool != null)
+            return error.TestOnlyNativeStoragePool;
 
         const owner_registry = try alloc.create(OwnerRegistry);
         errdefer alloc.destroy(owner_registry);
@@ -1027,10 +1035,11 @@ pub const BackendRuntime = struct {
         const retired_generation_cleanup_owner_id: u64 = 1;
         try owner_registry.register(retired_generation_cleanup_owner_id);
 
-        const native_storage_pool = try alloc.create(storage_io.NativeStoragePool);
-        errdefer alloc.destroy(native_storage_pool);
-        native_storage_pool.* = storage_io.NativeStoragePool.init(alloc);
-        errdefer native_storage_pool.deinit();
+        const owns_native_storage_pool = config.test_native_storage_pool == null;
+        const native_storage_pool = config.test_native_storage_pool orelse try alloc.create(storage_io.NativeStoragePool);
+        errdefer if (owns_native_storage_pool) alloc.destroy(native_storage_pool);
+        if (owns_native_storage_pool) native_storage_pool.* = storage_io.NativeStoragePool.init(alloc);
+        errdefer if (owns_native_storage_pool) native_storage_pool.deinit();
 
         var runtime = BackendRuntime{
             .alloc = alloc,
@@ -1040,6 +1049,7 @@ pub const BackendRuntime = struct {
             .retired_generation_cleanup_owner_id = retired_generation_cleanup_owner_id,
             .owner_registry = owner_registry,
             .native_storage_pool = native_storage_pool,
+            .owns_native_storage_pool = owns_native_storage_pool,
             .lsm_owner_clone_registry = LsmOwnerCloneRegistry.init(alloc),
             .borrowed_filesystem_io = config.filesystem_io,
             .durable_jobs = undefined,
@@ -1175,8 +1185,10 @@ pub const BackendRuntime = struct {
             self.alloc.destroy(vtable);
             self.threaded_network_io_vtable = null;
         }
-        self.native_storage_pool.deinit();
-        self.alloc.destroy(self.native_storage_pool);
+        if (self.owns_native_storage_pool) {
+            self.native_storage_pool.deinit();
+            self.alloc.destroy(self.native_storage_pool);
+        }
         self.lsm_owner_clone_registry.deinit();
         self.owner_registry.deinit();
         self.alloc.destroy(self.owner_registry);
@@ -2379,6 +2391,39 @@ test "backend runtime handle owns a stable runtime pointer" {
     try std.testing.expect(first.io_impl == null);
     try std.testing.expect(first.io() == null);
     try std.testing.expect(first.filesystemIo() != null);
+}
+
+test "backend runtime test descriptor pool injection leaves process admission unchanged" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var isolated = storage_io.NativeStoragePool.initWithCapacityForTest(alloc, 2);
+    defer isolated.deinit();
+    var ordinary = try BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    defer ordinary.deinit();
+    const process_pool = ordinary.ptr().nativeStoragePool();
+    const original = process_pool.snapshotStats();
+    try std.testing.expect(process_pool.fd_cache != isolated.fd_cache);
+
+    {
+        var injected = try BackendRuntimeHandle.init(alloc, .{
+            .backend = .manual,
+            .test_native_storage_pool = &isolated,
+        });
+        defer injected.deinit();
+        try std.testing.expect(injected.ptr().nativeStoragePool() == &isolated);
+        try std.testing.expectEqual(@as(usize, 2), injected.ptr().snapshotNativeStorageStats().fd_admission_capacity);
+        try std.testing.expectEqual(original.fd_admission_capacity, process_pool.snapshotStats().fd_admission_capacity);
+        try isolated.reserveDescriptorsForTest(std.testing.io, 2);
+        defer isolated.releaseDescriptorsForTest(std.testing.io, 2);
+        try std.testing.expectEqual(@as(usize, 2), injected.ptr().snapshotNativeStorageStats().fd_admitted_descriptors);
+        try std.testing.expectEqual(original.fd_admitted_descriptors, process_pool.snapshotStats().fd_admitted_descriptors);
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), isolated.snapshotStats().fd_admitted_descriptors);
+    var later = try BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    defer later.deinit();
+    try std.testing.expect(later.ptr().nativeStoragePool().fd_cache == process_pool.fd_cache);
+    try std.testing.expectEqual(original.fd_admission_capacity, later.ptr().snapshotNativeStorageStats().fd_admission_capacity);
 }
 
 test "backend runtime durable lane runs inline jobs" {
