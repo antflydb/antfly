@@ -178,6 +178,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     secret_store: ?*anyopaque = null,
     context: client.Context = .{},
     owns_context: bool = true,
+    context_init_mutex: std.atomic.Mutex = .unlocked,
     mutex: std.atomic.Mutex = .unlocked,
     quiescing: bool = false,
     entries: std.ArrayListUnmanaged(*Entry) = .empty,
@@ -409,6 +410,11 @@ pub const ProvisionedKernelOwnerSource = struct {
     }
 
     fn ensureContextConfigured(self: *ProvisionedKernelOwnerSource) !void {
+        // Cold hidden-owner reads can arrive concurrently with one another or
+        // with an owner acquisition. Context creation and configuration must
+        // publish as one operation before any caller uses the handle.
+        lock(&self.context_init_mutex);
+        defer self.context_init_mutex.unlock();
         try self.context.ensure();
         if (self.remote_content_configured) return;
         const security_json = try common_config.remoteContentSecurityJsonAlloc(self.alloc, self.remote_content);
@@ -625,6 +631,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     }
 
     pub fn contextMetrics(self: *ProvisionedKernelOwnerSource) !abi.ContextMetricsResult {
+        try self.ensureContextConfigured();
         return try self.context.metrics();
     }
 
@@ -1203,6 +1210,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         // table owner. The control-only caller cannot invalidate them through
         // its legacy DB-cache path, so make the physical publication boundary
         // explicit before a new owner can open the replacement generation.
+        try self.ensureContextConfigured();
         try self.context.invalidateCaches();
         return durability_uncertain;
     }

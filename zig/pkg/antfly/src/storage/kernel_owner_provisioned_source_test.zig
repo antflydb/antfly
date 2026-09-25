@@ -152,6 +152,72 @@ test "empty hidden bootstrap read retries when the root generation advances" {
     try std.testing.expectEqual(@as(usize, 2), generation.reads);
 }
 
+test "concurrent cold hidden bootstrap reads share one configured context" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    var owners = kernel_owner_source.ProvisionedKernelOwnerSource.init(
+        alloc,
+        root,
+        table_catalog.emptyCatalogSource(),
+        read_gate.alreadyReadSafeBarrier(),
+    );
+    defer owners.deinit();
+
+    const Worker = struct {
+        source: *kernel_owner_source.ProvisionedKernelOwnerSource,
+        ready: *std.atomic.Value(usize),
+        start: *std.atomic.Value(bool),
+        handle: ?*anyopaque = null,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            _ = self.ready.fetchAdd(1, .acq_rel);
+            while (!self.start.load(.acquire)) std.atomic.spinLoopHint();
+            const bootstrap = self.source.readHAHiddenOwnerBootstrap(std.heap.page_allocator, 7196, 71) catch |err| {
+                self.failure = err;
+                return;
+            };
+            if (bootstrap) |value| {
+                var parsed = value;
+                parsed.deinit();
+                self.failure = error.UnexpectedBootstrap;
+                return;
+            }
+            self.handle = self.source.storageContextHandle() catch |err| {
+                self.failure = err;
+                return;
+            };
+        }
+    };
+    const worker_count = 8;
+    var ready: std.atomic.Value(usize) = .init(0);
+    var start: std.atomic.Value(bool) = .init(false);
+    var workers: [worker_count]Worker = undefined;
+    var threads: [worker_count]std.Thread = undefined;
+    var started: usize = 0;
+    errdefer {
+        start.store(true, .release);
+        for (threads[0..started]) |thread| thread.join();
+    }
+    for (&workers, &threads) |*worker, *thread| {
+        worker.* = .{ .source = &owners, .ready = &ready, .start = &start };
+        thread.* = try std.Thread.spawn(.{}, Worker.run, .{worker});
+        started += 1;
+    }
+    while (ready.load(.acquire) != worker_count) std.atomic.spinLoopHint();
+    start.store(true, .release);
+    for (threads[0..started]) |thread| thread.join();
+    started = 0;
+    const expected = workers[0].handle orelse return error.MissingStorageContext;
+    for (workers) |worker| {
+        if (worker.failure) |err| return err;
+        try std.testing.expectEqual(expected, worker.handle orelse return error.MissingStorageContext);
+    }
+}
+
 test "hidden constrained lookup recovers cold compiled owner from exact plan authority" {
     const alloc = std.testing.allocator;
     const Source = kernel_owner_source.ProvisionedKernelOwnerSource;
