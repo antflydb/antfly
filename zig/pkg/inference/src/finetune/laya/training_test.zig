@@ -128,6 +128,7 @@ test "laya training forward objective and every parameter gradient match PyTorch
     if (trace) try compareTraces(scratch, root, &program, cb, backward.outputs[program.wrt.len..], "backward");
     var worst: f32 = 0;
     var mismatches: usize = 0;
+    var worst_relative: f64 = 0;
     for (program.wrt, backward.outputs[0..program.wrt.len]) |id, output| {
         const name = program.graph.parameterName(program.graph.node(id));
         var expected_tensor = try expected_gradients.readTensor(name);
@@ -147,12 +148,13 @@ test "laya training forward objective and every parameter gradient match PyTorch
             expected_sq += @as(f64, want) * want;
         }
         worst = @max(worst, error_max);
+        worst_relative = @max(worst_relative, @sqrt(error_sq / @max(expected_sq, 1e-30)));
         if (error_max > 5e-5 + magnitude * 0.002) {
             std.debug.print("Laya gradient mismatch {s}: error={d} scale={d} relative_l2={d}\n", .{ name, error_max, magnitude, @sqrt(error_sq / @max(expected_sq, 1e-30)) });
             mismatches += 1;
         }
     }
-    std.debug.print("Laya {s}: {d} gradient tensors, max absolute error={d}\n", .{ @tagName(execution), program.wrt.len, worst });
+    std.debug.print("Laya {s}: {d} gradient tensors, max absolute error={d}, max relative L2 error={d}\n", .{ @tagName(execution), program.wrt.len, worst, worst_relative });
     try std.testing.expectEqual(@as(usize, 0), mismatches);
 }
 
