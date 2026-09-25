@@ -6847,6 +6847,50 @@ const JoinReadJob = struct {
     req: db_mod.types.SearchRequest,
 };
 
+// Parallel right-side reads retain response and parsed-JSON scratch until the
+// whole batch has joined. Charge that lifetime to the caller's request budget,
+// and serialize access because the caller allocator may be an arena.
+const JoinFanoutBacking = struct {
+    parent: std.mem.Allocator,
+    mutex: std.atomic.Mutex = .unlocked,
+
+    fn lock(self: *@This()) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn allocator(self: *@This()) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
+        return self.parent.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
+        return self.parent.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
+        return self.parent.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
+        self.parent.rawFree(memory, alignment, ret_addr);
+    }
+};
+
 /// Bounded fanout owns isolated result arenas. Request preparation and output
 /// publication stay on the caller, in catalog order; all launched I/O is drained
 /// before any arena or request-scoped routing lease can be released.
@@ -6875,10 +6919,13 @@ fn appendJoinReadJobs(ctx: JoinContext, alloc: std.mem.Allocator, source: table_
         return true;
     }
     const Slot = struct {
-        arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
+        arena: std.heap.ArenaAllocator,
         hits: ?std.json.Array = null,
         failure: ?anyerror = null,
         supported: bool = false,
+        fn init(backing: std.mem.Allocator) @This() {
+            return .{ .arena = .init(backing) };
+        }
         fn run(slot: *@This(), src: table_reads.TableReadSource, table: []const u8, job: JoinReadJob) void {
             const owned = slot.arena.allocator();
             slot.hits = std.json.Array.init(owned);
@@ -6891,10 +6938,12 @@ fn appendJoinReadJobs(ctx: JoinContext, alloc: std.mem.Allocator, source: table_
     var receiver = try ctx.fanout_io.?.receive();
     const io = receiver.io();
     const width = 8;
+    var fanout_backing = JoinFanoutBacking{ .parent = alloc };
     var start: usize = 0;
     while (start < jobs.len) : (start += width) {
         try ctx.ensureExecutionDeadline();
-        var slots: [width]Slot = @splat(.{});
+        var slots: [width]Slot = undefined;
+        for (&slots) |*slot| slot.* = .init(fanout_backing.allocator());
         defer for (&slots) |*slot| slot.arena.deinit();
         const batch = jobs[start..@min(start + width, jobs.len)];
         var tasks: std.Io.Group = .init;
@@ -9761,6 +9810,39 @@ test "distributed join fanout bounds concurrency drains errors and preserves gro
     jobs[0].req.graph_query_transport = .{ .dialect = .canonical, .operations_json = "{}", .admitted_operations_ptr = &fixture, .admitted_operations_len = 0 };
     try std.testing.expect(try appendJoinReadJobs(ctx, alloc, source, "customers", jobs[0..2], &hits));
     try std.testing.expectEqual(@as(usize, 1), fixture.peak.load(.acquire));
+}
+
+test "distributed join fanout charges worker scratch to request quota" {
+    const Fixture = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+
+        fn query(ptr: *anyopaque, alloc: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.calls.fetchAdd(1, .acq_rel);
+            // Each worker retains this scratch in its result arena until the
+            // batch joins. Either fits alone; both exceed the request quota.
+            const scratch = try alloc.alloc(u8, 600 * 1024);
+            @memset(scratch, 'x');
+            return .{ .json = try alloc.dupe(u8, "{\"responses\":[{\"hits\":{\"total\":{\"value\":0,\"relation\":\"exact\"},\"hits\":[]}}]}") };
+        }
+    };
+
+    const storage = try std.testing.allocator.alloc(u8, 1024 * 1024);
+    defer std.testing.allocator.free(storage);
+    var quota = std.heap.FixedBufferAllocator.init(storage);
+    const alloc = quota.allocator();
+    var fixture: Fixture = .{};
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .limited(2) });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ctx = JoinContext{ .ptr = &fixture, .fanout_io = @import("../runtime_io_abi.zig").Borrow.init(&io), .vtable = undefined };
+    const source = table_reads.TableReadSource{ .ptr = &fixture, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .query_group_local = Fixture.query } };
+    var hits = std.json.Array.init(alloc);
+    defer hits.deinit();
+    const jobs = [_]JoinReadJob{ .{ .group_id = 1, .req = .{} }, .{ .group_id = 2, .req = .{} } };
+    try std.testing.expectError(error.OutOfMemory, appendJoinReadJobs(ctx, alloc, source, "customers", &jobs, &hits));
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), hits.items.len);
 }
 
 test "distributed join finalizer refuses to replace an admitted split topology" {
