@@ -16,6 +16,7 @@ pub const progress_prefix = "\x00\x00__metadata__:completion_control_receipt_v2:
 pub const encoded_bytes = 256;
 pub const receipt_bytes = 48;
 pub const progress_bytes = 208;
+pub const progress_bitmap_bits = 96;
 pub const owner_key_bytes = owner_prefix.len + 16;
 pub const receipt_key_bytes = receipt_prefix.len + 16;
 pub const progress_key_bytes = progress_prefix.len + 16;
@@ -78,6 +79,9 @@ pub const Progress = struct {
     decision: Decision,
     acknowledged: u32,
     resolved_digest: [32]u8,
+    /// v3 encodes exact participant ordinals in the 12 bytes reserved by v2.
+    /// An all-zero bitmap denotes a historical v2 receipt.
+    ack_bitmap: [12]u8 = @splat(0),
 
     pub fn validate(self: Progress) !void {
         try self.begin.validate();
@@ -91,6 +95,12 @@ pub const Progress = struct {
             .acknowledgement => if (self.latest.index == self.begin.index or self.decision == .none or self.acknowledged == 0 or
                 std.mem.allEqual(u8, &self.resolved_digest, 0)) return error.InvalidCompletionSlot,
         }
+        if (!std.mem.allEqual(u8, &self.ack_bitmap, 0)) {
+            if (self.phase != .acknowledgement or self.acknowledged > progress_bitmap_bits) return error.InvalidCompletionSlot;
+            var bits: u32 = 0;
+            for (self.ack_bitmap) |byte| bits += @as(u32, @popCount(byte));
+            if (bits != self.acknowledged) return error.InvalidCompletionSlot;
+        }
     }
 
     pub fn verifyOwner(self: Progress, owner: Record) !void {
@@ -98,31 +108,44 @@ pub const Progress = struct {
         if (!std.mem.eql(u8, &self.txn_id, &owner.txn_id) or
             !std.meta.eql(self.begin, owner.begin) or
             self.acknowledged > owner.participants.count) return error.InvalidCompletionSlot;
+        if (!std.mem.allEqual(u8, &self.ack_bitmap, 0)) {
+            if (owner.participants.count > progress_bitmap_bits) return error.InvalidCompletionSlot;
+            for (owner.participants.count..progress_bitmap_bits) |index| {
+                const byte = self.ack_bitmap[index / 8];
+                if (byte & (@as(u8, 1) << @intCast(index % 8)) != 0) return error.InvalidCompletionSlot;
+            }
+        }
     }
 
     pub fn encode(self: Progress) ![progress_bytes]u8 {
         try self.validate();
         var bytes: [progress_bytes]u8 = @splat(0);
-        @memcpy(bytes[0..8], "AFCTLRP2");
-        std.mem.writeInt(u16, bytes[8..10], 2, .little);
+        const v3 = !std.mem.allEqual(u8, &self.ack_bitmap, 0);
+        @memcpy(bytes[0..8], if (v3) "AFCTLRP3" else "AFCTLRP2");
+        std.mem.writeInt(u16, bytes[8..10], if (v3) 3 else 2, .little);
         bytes[10] = @intFromEnum(self.phase);
         bytes[11] = @intFromEnum(self.decision);
         @memcpy(bytes[16..32], &self.txn_id);
         @memcpy(bytes[32..80], &try self.begin.encode());
         @memcpy(bytes[80..128], &try self.latest.encode());
         std.mem.writeInt(u32, bytes[128..132], self.acknowledged, .little);
+        @memcpy(bytes[132..144], &self.ack_bitmap);
         @memcpy(bytes[144..176], &self.resolved_digest);
         @memcpy(bytes[176..208], &progressChecksum(&bytes));
         return bytes;
     }
 
     pub fn decode(bytes: []const u8) !Progress {
-        if (bytes.len != progress_bytes or !std.mem.eql(u8, bytes[0..8], "AFCTLRP2"))
+        if (bytes.len != progress_bytes)
             return error.InvalidCompletionSlot;
-        if (std.mem.readInt(u16, bytes[8..10], .little) != 2)
+        const v2 = std.mem.eql(u8, bytes[0..8], "AFCTLRP2");
+        const v3 = std.mem.eql(u8, bytes[0..8], "AFCTLRP3");
+        if (!v2 and !v3) return error.InvalidCompletionSlot;
+        if (std.mem.readInt(u16, bytes[8..10], .little) != (if (v3) @as(u16, 3) else 2))
             return error.UnsupportedCompletionSlotVersion;
         if (!std.mem.allEqual(u8, bytes[12..16], 0) or
-            !std.mem.allEqual(u8, bytes[132..144], 0)) return error.InvalidCompletionSlot;
+            (v2 and !std.mem.allEqual(u8, bytes[132..144], 0)) or
+            (v3 and std.mem.allEqual(u8, bytes[132..144], 0))) return error.InvalidCompletionSlot;
         if (!std.mem.eql(u8, bytes[176..208], &progressChecksum(bytes)))
             return error.CompletionSlotChecksumMismatch;
         const phase: Phase = switch (bytes[10]) {
@@ -144,6 +167,7 @@ pub const Progress = struct {
             .phase = phase,
             .decision = decision,
             .acknowledged = std.mem.readInt(u32, bytes[128..132], .little),
+            .ack_bitmap = bytes[132..144].*,
             .resolved_digest = bytes[144..176].*,
         };
         try self.validate();
@@ -389,6 +413,16 @@ test "workload admission completion compiler v2 progress retains begin and uniqu
         other.begin.digest[0] ^= 1;
         try std.testing.expectError(error.InvalidCompletionSlot, other.verifyOwner(owner));
     }
+    progress.ack_bitmap[0] = 0b0000_0010;
+    const v3 = try progress.encode();
+    try std.testing.expectEqualStrings("AFCTLRP3", v3[0..8]);
+    try std.testing.expectEqualDeep(progress, try Progress.decode(&v3));
+    var invalid_bitmap = progress;
+    invalid_bitmap.ack_bitmap[0] = 0b0000_0100;
+    try std.testing.expectError(error.InvalidCompletionSlot, invalid_bitmap.verifyOwner(owner));
+    invalid_bitmap.ack_bitmap[0] = 0b0000_0011;
+    try std.testing.expectError(error.InvalidCompletionSlot, invalid_bitmap.encode());
+    progress.ack_bitmap = @splat(0);
     progress.acknowledged = owner.participants.count + 1;
     try std.testing.expectError(error.InvalidCompletionSlot, progress.verifyOwner(owner));
     progress.acknowledged = 0;

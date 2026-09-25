@@ -12,8 +12,46 @@ const slot = @import("completion_slot.zig");
 
 pub const Transition = union(enum) {
     decision: record.Progress.Decision,
-    acknowledgement: struct { count: u32, resolved_digest: [32]u8 },
+    acknowledgement: struct { count: u32, participant_index: u32, resolved_digest: [32]u8 },
 };
+
+pub fn resolvedDigest(encoded: []const u8) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly-completion-control-resolved-v1\x00");
+    hash.update(encoded);
+    return hash.finalResult();
+}
+
+/// Reconstruct the exact named ACK set from the canonical metadata rows.
+/// The staged v3 receipt uses the original participant ordinals, independent
+/// of ACK arrival order. Duplicate names or resolutions fail closed.
+pub fn resolvedBitmap(participants: []const u8, resolved: ?[]const u8) ![12]u8 {
+    var names: [record.progress_bitmap_bits][]const u8 = undefined;
+    var list = try shape.ParticipantIterator.init(participants);
+    if (list.count > record.progress_bitmap_bits) return error.UnsupportedCompletionProfile;
+    var count: usize = 0;
+    while (try list.next()) |name| {
+        for (names[0..count]) |previous| if (std.mem.eql(u8, previous, name)) return error.UnsupportedCompletionProfile;
+        names[count] = name;
+        count += 1;
+    }
+    var bits: [12]u8 = @splat(0);
+    if (resolved) |encoded| {
+        var acknowledgements = try shape.ParticipantIterator.init(encoded);
+        while (try acknowledgements.next()) |name| {
+            const index: usize = found: {
+                for (names[0..count], 0..) |candidate, i| {
+                    if (std.mem.eql(u8, candidate, name)) break :found i;
+                }
+                return error.UnsupportedCompletionProfile;
+            };
+            const mask = @as(u8, 1) << @intCast(index % 8);
+            if (bits[index / 8] & mask != 0) return error.UnsupportedCompletionProfile;
+            bits[index / 8] |= mask;
+        }
+    }
+    return bits;
+}
 
 pub fn inspect(
     operations: []const slot.Operation,
@@ -105,16 +143,21 @@ pub fn inspect(
         while (try old_names.next()) |old_name|
             if (std.mem.eql(u8, name, old_name)) return error.UnsupportedCompletionProfile;
     }
-    var enlisted = false;
+    var participant_index: ?u32 = null;
     var names = try shape.ParticipantIterator.init(participants);
+    var ordinal: u64 = 0;
     while (try names.next()) |candidate| {
-        if (std.mem.eql(u8, name, candidate)) enlisted = true;
+        if (std.mem.eql(u8, name, candidate)) {
+            if (participant_index != null) return error.UnsupportedCompletionProfile;
+            participant_index = std.math.cast(u32, ordinal) orelse return error.UnsupportedCompletionProfile;
+        }
+        ordinal += 1;
     }
-    if (!enlisted) return error.UnsupportedCompletionProfile;
-    var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("antfly-completion-control-resolved-v1\x00");
-    hash.update(next_resolved);
-    return .{ .acknowledgement = .{ .count = next.count, .resolved_digest = hash.finalResult() } };
+    return .{ .acknowledgement = .{
+        .count = next.count,
+        .participant_index = participant_index orelse return error.UnsupportedCompletionProfile,
+        .resolved_digest = resolvedDigest(next_resolved),
+    } };
 }
 
 fn matches(key: []const u8, comptime prefix: []const u8, txn_id: [16]u8) bool {

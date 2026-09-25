@@ -144201,6 +144201,80 @@ test "workload admission physical completion staged control BEGIN retains a pool
         try std.testing.expectEqual(control_record.Progress.Decision.committed, progress.decision);
         try std.testing.expectEqual(@as(u64, 1), progress.begin.index);
         try std.testing.expectEqual(@as(u64, 5), progress.latest.index);
+        // ACK order differs from immutable enlistment order, so the v3 bitmap
+        // must identify names by ordinal rather than by arrival count.
+        const ack_names = [_][]const u8{ participant, local_participant };
+        for (ack_names, 0..) |name, ordinal| {
+            const previous: u64 = @intCast(5 + ordinal);
+            const ack_wire = blk: {
+                var read = try manager.store.beginRead();
+                defer read.abort();
+                break :blk try manager.compileControlMutation(alloc, &read, .{
+                    .txn_id = id,
+                    .action = .{ .acknowledge = name },
+                }, .{
+                    .group_id = binding.identity.group_id,
+                    .incarnation = binding.identity.incarnation,
+                    .policy_digest = binding.identity.policy_digest,
+                    .schema_catalog_digest = binding.schema_catalog_digest,
+                    .previous_term = 1,
+                    .previous_index = previous,
+                }, @splat(19), "owned-control-ack-test", &.{});
+            };
+            defer alloc.free(ack_wire);
+            const ack_payloads = [_]abi.Bytes{.{ .ptr = ack_wire.ptr, .len = ack_wire.len }};
+            const ack_proposal: abi.Check = .{ .kind = .proposal, .new_work_allowed = 1, .state = .{
+                .term = 1,
+                .applied_term = 1,
+                .applied_term_known = 1,
+                .applied_index = previous,
+                .last_index = previous,
+            }, .proposals = .{ .ptr = &ack_payloads, .len = 1 } };
+            try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.check(lease.context, &ack_proposal, &result));
+            const accepted_index = previous + 1;
+            lease.vtable.proposal_result(lease.context, &.{ .state = ack_proposal.state, .first_index = accepted_index, .last_index = accepted_index, .payloads = ack_proposal.proposals });
+            try std.testing.expectEqual(@as(u64, previous), pool.progress.?.index);
+            try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.apply_accepted.?(lease.context, 1, accepted_index, ack_payloads[0]));
+            try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.apply_accepted.?(lease.context, 1, accepted_index, ack_payloads[0]));
+            const ack_value = (try db.core.getStoreValue(alloc, &progress_key)).?;
+            defer alloc.free(ack_value);
+            try std.testing.expectEqualStrings("AFCTLRP3", ack_value[0..8]);
+            const ack_progress = try control_record.Progress.decode(ack_value);
+            try std.testing.expectEqual(control_record.Progress.Phase.acknowledgement, ack_progress.phase);
+            try std.testing.expectEqual(@as(u32, @intCast(ordinal + 1)), ack_progress.acknowledged);
+            try std.testing.expectEqual(@as(u8, if (ordinal == 0) 2 else 3), ack_progress.ack_bitmap[0]);
+            try std.testing.expectEqual(accepted_index, ack_progress.latest.index);
+            try std.testing.expectError(error.FileNotFound, pool.io.storage().fileSize(accepted_path));
+            if (ordinal == 0) {
+                const duplicate = blk: {
+                    var read = try manager.store.beginRead();
+                    defer read.abort();
+                    break :blk try manager.compileControlMutation(alloc, &read, .{
+                        .txn_id = id,
+                        .action = .{ .acknowledge = name },
+                    }, .{
+                        .group_id = binding.identity.group_id,
+                        .incarnation = binding.identity.incarnation,
+                        .policy_digest = binding.identity.policy_digest,
+                        .schema_catalog_digest = binding.schema_catalog_digest,
+                        .previous_term = 1,
+                        .previous_index = accepted_index,
+                    }, @splat(19), "owned-control-duplicate-ack-test", &.{});
+                };
+                defer alloc.free(duplicate);
+                const duplicate_payloads = [_]abi.Bytes{.{ .ptr = duplicate.ptr, .len = duplicate.len }};
+                const duplicate_proposal: abi.Check = .{ .kind = .proposal, .new_work_allowed = 1, .state = .{
+                    .term = 1,
+                    .applied_term = 1,
+                    .applied_term_known = 1,
+                    .applied_index = accepted_index,
+                    .last_index = accepted_index,
+                }, .proposals = .{ .ptr = &duplicate_payloads, .len = 1 } };
+                try std.testing.expectEqual(runtime_failure_abi.Status.unsupported_completion_profile, lease.vtable.check(lease.context, &duplicate_proposal, &result));
+                try std.testing.expectError(error.FileNotFound, pool.io.storage().fileSize(accepted_path));
+            }
+        }
+        try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try db.getTransactionStatus(id));
     }
     try std.testing.expectError(error.CompletionRecoveryCapacityRequired, DB.open(alloc, std.mem.span(tmp.path().ptr), options));
     const path = std.mem.span(tmp.path().ptr);

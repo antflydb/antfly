@@ -432,6 +432,44 @@ pub fn Pool(comptime Backend: type) type {
             transition: ?control_transition.Transition = null,
         };
         const ControlTarget = struct { slot_index: usize, transition: control_transition.Transition };
+
+        fn controlOwnerRecord(self: *const Self, index: usize) control_record.Record {
+            const active = self.control_owners[index].?;
+            return .{
+                .authority = .{
+                    .group_id = self.config.identity.group_id,
+                    .incarnation = self.config.identity.incarnation,
+                    .policy_digest = self.config.identity.policy_digest,
+                    .schema_catalog_digest = self.config.schema_catalog_digest,
+                    .generation = self.config.identity.generation,
+                },
+                .txn_id = active.declaration.txn_id,
+                .begin = .{ .term = active.begin.term, .index = active.begin.index, .digest = active.begin.digest },
+                .participants = active.declaration.participants,
+                .slot_index = @intCast(index),
+                .output_run_id = self.control_output_ids[index],
+            };
+        }
+
+        fn priorControlProgress(self: *Self, backend: *Backend, alloc: Allocator, namespace: ?[]const u8, owner_index: usize, participants: []const u8, old_resolved: ?[]const u8) !control_record.Progress {
+            const owner_record = self.controlOwnerRecord(owner_index);
+            var prior_point = try self.point(backend, alloc, namespace, &control_record.progressKey(owner_record.txn_id));
+            defer prior_point.deinit(alloc);
+            const prior = try control_record.Progress.decode(prior_point.value orelse return error.UnsupportedCompletionProfile);
+            try prior.verifyOwner(owner_record);
+            if (prior.phase == .begin or prior.decision == .none or prior.acknowledged >= owner_record.participants.count or
+                (prior.acknowledged != 0 and std.mem.allEqual(u8, &prior.ack_bitmap, 0)))
+                return error.UnsupportedCompletionProfile;
+            if (prior.acknowledged == 0) {
+                if (old_resolved != null or !std.mem.allEqual(u8, &prior.resolved_digest, 0)) return error.UnsupportedCompletionProfile;
+            } else {
+                if (old_resolved == null or !std.mem.eql(u8, &prior.resolved_digest, &control_transition.resolvedDigest(old_resolved.?)))
+                    return error.UnsupportedCompletionProfile;
+                const expected = try control_transition.resolvedBitmap(participants, old_resolved);
+                if (!std.mem.eql(u8, &expected, &prior.ack_bitmap)) return error.UnsupportedCompletionProfile;
+            }
+            return prior;
+        }
         config: Config,
         /// Local component-test opt-in only; no installation/config ABI can
         /// activate the incomplete decision/ACK lifecycle.
@@ -671,6 +709,13 @@ pub fn Pool(comptime Backend: type) type {
                 return error.CompletionAdmissionUnavailable;
             for (self.cells[0..self.cell_count]) |cell| if (cell.phase == .accepted or cell.phase == .prepared)
                 return error.CompletionReservationBusy;
+            // v3's exact bitmap is fixed at 96 participants. Larger legal
+            // BEGINs stay fenced until a separately certified bitmap format
+            // and capacity profile exist.
+            for (self.control_owners) |owner| if (owner) |active| {
+                if (active.declaration.participants.count > control_record.progress_bitmap_bits)
+                    return error.UnsupportedCompletionProfile;
+            };
             self.control_transition_staging = true;
         }
 
@@ -790,7 +835,26 @@ pub fn Pool(comptime Backend: type) type {
                                 defer participants.deinit(alloc);
                                 var resolved = try self.point(backend, alloc, descriptor.namespace, resolved_key);
                                 defer resolved.deinit(alloc);
+                                // The v3 ordinal map is only meaningful for
+                                // a unique immutable participant list. Check
+                                // it before even the first decision sidecar.
+                                if (self.control_transition_staging)
+                                    _ = try control_transition.resolvedBitmap(participants.value orelse return error.UnsupportedCompletionProfile, resolved.value);
                                 const transition = try control_transition.inspect(entry.entry.prepare_operations, active.declaration, before.value orelse return error.UnsupportedCompletionProfile, participants.value orelse return error.UnsupportedCompletionProfile, resolved.value);
+                                switch (transition) {
+                                    .decision => {
+                                        var progress = try self.point(backend, alloc, descriptor.namespace, &control_record.progressKey(active.declaration.txn_id));
+                                        defer progress.deinit(alloc);
+                                        if (progress.value != null) return error.UnsupportedCompletionProfile;
+                                    },
+                                    .acknowledgement => |ack| {
+                                        if (ack.participant_index >= control_record.progress_bitmap_bits) return error.UnsupportedCompletionProfile;
+                                        const prior = try self.priorControlProgress(backend, alloc, descriptor.namespace, owner_index, participants.value.?, resolved.value);
+                                        if (prior.acknowledged + 1 != ack.count or
+                                            prior.ack_bitmap[ack.participant_index / 8] & (@as(u8, 1) << @intCast(ack.participant_index % 8)) != 0)
+                                            return error.UnsupportedCompletionProfile;
+                                    },
+                                }
                                 return .{ .slot_index = owner_index, .transition = transition };
                             };
                         }
@@ -807,12 +871,14 @@ pub fn Pool(comptime Backend: type) type {
             for (self.cells[0..self.cell_count]) |cell| {
                 if (cell.phase == .accepted or (cell.phase == .prepared and !cell.slot.retired)) return error.CompletionReservationBusy;
             }
-            // This stage accepts only a first decision. ACK application and
-            // owner retirement need the same prepaid path plus checkpointing.
             if (!self.control_transition_staging) return error.CompletionAdmissionUnavailable;
             switch (target.transition) {
                 .decision => {},
-                else => return error.CompletionAdmissionUnavailable,
+                .acknowledgement => |ack| {
+                    if (active.declaration.participants.count > control_record.progress_bitmap_bits or
+                        ack.participant_index >= active.declaration.participants.count)
+                        return error.UnsupportedCompletionProfile;
+                },
             }
             try self.certifyActiveControls(backend, .{});
             try self.validateBaseline(backend, alloc, entry);
@@ -861,10 +927,6 @@ pub fn Pool(comptime Backend: type) type {
             };
             const active = &self.control_owners[owner_index].?;
             const transition = active.transition orelse return error.InvalidCompletionSlot;
-            const decision = switch (transition) {
-                .decision => |value| value,
-                else => return error.CompletionAdmissionUnavailable,
-            };
             var borrow = try self.compiler.tryBorrow();
             defer borrow.release() catch unreachable;
             const alloc = try borrow.allocator();
@@ -878,37 +940,67 @@ pub fn Pool(comptime Backend: type) type {
             const ns = @import("../backend_types.zig").Namespace{ .name = decoded.decoded_descriptor.descriptor.namespace };
             var incoming: state.ActiveMemTable = .{};
             defer incoming.deinit(alloc);
+            var new_resolved: ?[]const u8 = null;
             for (decoded.entry.prepare_operations) |op| {
                 if (op.bindings.len != 0) return error.InvalidCompletionSlot;
+                if (op.key.len == control_shape.resolved_participants_prefix.len + 16 and
+                    std.mem.startsWith(u8, op.key, control_shape.resolved_participants_prefix) and
+                    std.mem.eql(u8, op.key[control_shape.resolved_participants_prefix.len..], &active.declaration.txn_id))
+                    new_resolved = op.value;
                 try incoming.upsert(alloc, ns, op.key, op.value, op.kind == .delete);
             }
-            const authority: control_record.Authority = .{
-                .group_id = self.config.identity.group_id,
-                .incarnation = self.config.identity.incarnation,
-                .policy_digest = self.config.identity.policy_digest,
-                .schema_catalog_digest = self.config.schema_catalog_digest,
-                .generation = self.config.identity.generation,
+            const owner_record = self.controlOwnerRecord(owner_index);
+            const progress: control_record.Progress = switch (transition) {
+                .decision => |decision| .{
+                    .txn_id = active.declaration.txn_id,
+                    .begin = accepted.begin,
+                    .latest = accepted.transition,
+                    .phase = .decision,
+                    .decision = decision,
+                    .acknowledged = 0,
+                    .resolved_digest = @splat(0),
+                },
+                .acknowledgement => |ack| blk: {
+                    const participants_key = try std.mem.concat(alloc, u8, &.{ control_shape.participants_prefix, &active.declaration.txn_id });
+                    defer alloc.free(participants_key);
+                    const resolved_key = try std.mem.concat(alloc, u8, &.{ control_shape.resolved_participants_prefix, &active.declaration.txn_id });
+                    defer alloc.free(resolved_key);
+                    var participants = try self.point(backend, alloc, decoded.decoded_descriptor.descriptor.namespace, participants_key);
+                    defer participants.deinit(alloc);
+                    var resolved = try self.point(backend, alloc, decoded.decoded_descriptor.descriptor.namespace, resolved_key);
+                    defer resolved.deinit(alloc);
+                    const prior = try self.priorControlProgress(backend, alloc, decoded.decoded_descriptor.descriptor.namespace, owner_index, participants.value orelse return error.UnsupportedCompletionProfile, resolved.value);
+                    if (prior.acknowledged + 1 != ack.count or ack.participant_index >= control_record.progress_bitmap_bits)
+                        return error.UnsupportedCompletionProfile;
+                    var bitmap = prior.ack_bitmap;
+                    const mask = @as(u8, 1) << @intCast(ack.participant_index % 8);
+                    if (bitmap[ack.participant_index / 8] & mask != 0) return error.UnsupportedCompletionProfile;
+                    bitmap[ack.participant_index / 8] |= mask;
+                    const next_resolved = new_resolved orelse return error.UnsupportedCompletionProfile;
+                    if (!std.mem.eql(u8, &control_transition.resolvedDigest(next_resolved), &ack.resolved_digest) or
+                        !std.mem.eql(u8, &try control_transition.resolvedBitmap(participants.value.?, next_resolved), &bitmap))
+                        return error.UnsupportedCompletionProfile;
+                    break :blk .{
+                        .txn_id = active.declaration.txn_id,
+                        .begin = accepted.begin,
+                        .latest = accepted.transition,
+                        .phase = .acknowledgement,
+                        .decision = prior.decision,
+                        .acknowledged = ack.count,
+                        .resolved_digest = ack.resolved_digest,
+                        .ack_bitmap = bitmap,
+                    };
+                },
             };
-            const owner_record: control_record.Record = .{
-                .authority = authority,
-                .txn_id = active.declaration.txn_id,
-                .begin = accepted.begin,
-                .participants = active.declaration.participants,
-                .slot_index = @intCast(owner_index),
-                .output_run_id = self.control_output_ids[owner_index],
-            };
-            const progress: control_record.Progress = .{
-                .txn_id = active.declaration.txn_id,
-                .begin = accepted.begin,
-                .latest = accepted.transition,
-                .phase = .decision,
-                .decision = decision,
-                .acknowledged = 0,
-                .resolved_digest = @splat(0),
-            };
-            const owner_value = try owner_record.encode();
+            try progress.verifyOwner(owner_record);
             const progress_value = try progress.encode();
-            try incoming.upsert(alloc, ns, &control_record.ownerKey(active.declaration.txn_id), &owner_value, false);
+            switch (transition) {
+                .decision => {
+                    const owner_value = try owner_record.encode();
+                    try incoming.upsert(alloc, ns, &control_record.ownerKey(active.declaration.txn_id), &owner_value, false);
+                },
+                .acknowledgement => {},
+            }
             try incoming.upsert(alloc, ns, &control_record.progressKey(active.declaration.txn_id), &progress_value, false);
             const marker = identity.encode();
             try incoming.upsert(alloc, ns, &@import("../internal_keys.zig").raft_document_applied_entry_key, marker[0..16], false);

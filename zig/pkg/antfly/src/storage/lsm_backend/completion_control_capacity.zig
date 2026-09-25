@@ -458,6 +458,10 @@ test "workload admission completion control capacity covers interleaved publicat
         }
         const identity: @import("completion_runtime.zig").AcceptedIdentity = .{ .term = 3, .index = 1 + transition * 4 + owner, .digest = @splat(0x39) };
         const native_progress = @import("completion_pool.zig").encodeProgress(.{ .capacity = 4, .group_id = 7, .node_id = 9, .incarnation = @splat(11), .policy_digest = @splat(13), .generation = 17 }, identity);
+        var ack_bitmap: [12]u8 = @splat(0);
+        if (transition > 1) {
+            for (0..transition - 1) |ack_index| ack_bitmap[ack_index / 8] |= @as(u8, 1) << @intCast(ack_index % 8);
+        }
         const progress = try (record.Progress{
             .txn_id = txn_id,
             .begin = .{ .term = 3, .index = 1 + owner, .digest = @splat(0x39) },
@@ -466,6 +470,7 @@ test "workload admission completion control capacity covers interleaved publicat
             .decision = if (transition == 0) .none else .committed,
             .acknowledged = if (transition <= 1) 0 else @intCast(transition - 1),
             .resolved_digest = if (transition <= 1) @splat(0) else @splat(0x71),
+            .ack_bitmap = ack_bitmap,
         }).encode();
         try incoming.upsert(alloc, .{ .name = "docs" }, &record.progressKey(txn_id), &progress, false);
         try incoming.upsert(alloc, .{ .name = "docs" }, entry.group_progress_key, &native_progress, false);
