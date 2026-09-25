@@ -286,11 +286,13 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
     if (finalize_deferred and backend.root_dir != null and !backend.options.backend.read_only) {
         if (@hasDecl(BackendType, "finalizeDeferredStorageWork")) {
             backend.finalizeDeferredStorageWork() catch |err| {
-                if (err == error.FileNotFound) {
-                    std.log.warn("lsm backend close skipped deferred storage finalization root={?s} err={}", .{ backend.root_dir, err });
-                    return;
+                switch (err) {
+                    // A canceled close or removed root can interrupt finalization
+                    // during teardown. Either way, release the in-memory state;
+                    // unexpected finalization failures remain error-level logs.
+                    error.Canceled, error.FileNotFound => std.log.warn("lsm backend close skipped deferred storage finalization root={?s} err={}", .{ backend.root_dir, err }),
+                    else => std.log.err("lsm backend close skipped deferred storage finalization root={?s} err={}", .{ backend.root_dir, err }),
                 }
-                std.log.err("lsm backend close skipped deferred storage finalization root={?s} err={}", .{ backend.root_dir, err });
             };
         } else if (backend.mutable.entryCount() > 0) {
             compaction_mod.flushMutable(BackendType, backend) catch |err| {

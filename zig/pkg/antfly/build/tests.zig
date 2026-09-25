@@ -3108,11 +3108,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "full cluster VOPR bounded startup cleanup exact replay",
         },
         .max_rss = full_cluster_vopr_max_rss,
-        // Fault histories can log production error-level diagnostics while
-        // their exact-replay and scenario assertions still pass. Use the
-        // repository runner so those logs remain visible without converting
-        // expected injected failures into a test-runner failure.
-        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     const run_full_cluster_vopr_tests = b.addRunArtifact(full_cluster_vopr_tests);
     const full_cluster_vopr_test_step = b.step(
@@ -3125,7 +3120,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = antfly_test_mod,
         .filters = &.{"full cluster VOPR graph inflight restart repeated exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
-        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("full-cluster-graph-replay-soak-test", "Repeat the graph restart recorded history and exact replay")
         .dependOn(&b.addRunArtifact(full_cluster_graph_replay_soak_tests).step);
@@ -3133,7 +3127,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = antfly_test_mod,
         .filters = &.{"full cluster graph inflight restart cutoff drains parked hooks"},
         .max_rss = full_cluster_vopr_max_rss,
-        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("full-cluster-graph-cutoff-test", "Verify graph restart hooks drain at a bounded replay cutoff")
         .dependOn(&b.addRunArtifact(full_cluster_graph_cutoff_tests).step);
@@ -3141,7 +3134,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = antfly_test_mod,
         .filters = &.{"failed node replacement leaves a drainable empty slot"},
         .max_rss = full_cluster_vopr_max_rss,
-        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("full-cluster-node-replacement-test", "Verify failed metadata replacement leaves a safe empty slot")
         .dependOn(&b.addRunArtifact(full_cluster_node_replacement_tests).step);
