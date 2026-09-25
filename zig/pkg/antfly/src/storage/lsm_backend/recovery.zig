@@ -286,12 +286,14 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
     if (finalize_deferred and backend.root_dir != null and !backend.options.backend.read_only) {
         if (@hasDecl(BackendType, "finalizeDeferredStorageWork")) {
             backend.finalizeDeferredStorageWork() catch |err| {
-                switch (err) {
-                    // A canceled close or removed root can interrupt finalization
-                    // during teardown. Either way, release the in-memory state;
-                    // unexpected finalization failures remain error-level logs.
-                    error.Canceled, error.FileNotFound => std.log.warn("lsm backend close skipped deferred storage finalization root={?s} err={}", .{ backend.root_dir, err }),
-                    else => std.log.err("lsm backend close skipped deferred storage finalization root={?s} err={}", .{ backend.root_dir, err }),
+                // A canceled close can leave below-threshold writes only in
+                // memory when the WAL is disabled. Keep that failed durability
+                // boundary at error level. With a WAL, committed mutations can
+                // be replayed after a canceled close-time flush.
+                if (err == error.FileNotFound or (err == error.Canceled and backend.options.wal_enabled)) {
+                    std.log.warn("lsm backend close skipped deferred storage finalization root={?s} err={}", .{ backend.root_dir, err });
+                } else {
+                    std.log.err("lsm backend close skipped deferred storage finalization root={?s} err={}", .{ backend.root_dir, err });
                 }
             };
         } else if (backend.mutable.entryCount() > 0) {
