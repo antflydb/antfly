@@ -1151,13 +1151,22 @@ fn parseSpanEncoderConfigFromCatalog(
     manifest: *ModelManifest,
     allocator: std.mem.Allocator,
     catalog: *const ArtifactCatalog,
+    wrapper_config: []const u8,
 ) !void {
     if (manifest.gliner_architecture != .span or
         !std.mem.eql(u8, manifest.config_model_arch, "extractor")) return;
     const bytes = try catalog.readOptional("encoder_config/config.json") orelse {
-        // Existing ONNX-only GLiNER bundles retain the wrapper config without
-        // shipping native encoder weights or their nested config.
-        if (try catalog.exists("model.safetensors")) return error.MissingGlinerSpanEncoderConfig;
+        // Older span bundles put complete encoder geometry in config.json.
+        // Native bundles whose wrapper omits it need the nested sidecar.
+        if (try catalog.exists("model.safetensors")) {
+            const parsed = try std.json.parseFromSlice(std.json.Value, allocator, wrapper_config, .{});
+            defer parsed.deinit();
+            if (parsed.value != .object) return error.MissingGlinerSpanEncoderConfig;
+            inline for (.{ "hidden_size", "intermediate_size", "num_hidden_layers", "num_attention_heads", "vocab_size", "max_position_embeddings" }) |field| {
+                const value = parsed.value.object.get(field) orelse return error.MissingGlinerSpanEncoderConfig;
+                if (jsonU32(value) == null) return error.MissingGlinerSpanEncoderConfig;
+            }
+        }
         return;
     };
     defer allocator.free(bytes);
@@ -1187,7 +1196,7 @@ fn loadFromCatalog(allocator: std.mem.Allocator, catalog: *const ArtifactCatalog
         defer allocator.free(config_bytes);
         if (!try parseBoundaryConfigFromCatalog(&manifest, allocator, catalog, config_bytes)) {
             try ignoreNonResourceMetadataError(parseConfigJson(&manifest, allocator, config_bytes));
-            try parseSpanEncoderConfigFromCatalog(&manifest, allocator, catalog);
+            try parseSpanEncoderConfigFromCatalog(&manifest, allocator, catalog, config_bytes);
         }
     }
     if (manifest.gliner_architecture != .boundary and manifest.native_arch_hint == .none and manifest.max_position_embeddings == 512 and manifest.hidden_size == 768) {

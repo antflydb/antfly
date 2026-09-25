@@ -71,8 +71,10 @@ def generate(source_root: Path, model_dir: Path | None = None) -> dict:
     from gliner2.classification.schema import ClassificationSchema
     from gliner2.classification.scoring import ClassificationScorer
 
-    snapshot = model_dir.resolve() if model_dir is not None else Path(
-        snapshot_download(repo_id=REPO, revision=REVISION)
+    snapshot = (
+        model_dir.resolve()
+        if model_dir is not None
+        else Path(snapshot_download(repo_id=REPO, revision=REVISION))
     )
     weight = snapshot / "model.safetensors"
     if weight.stat().st_size != WEIGHT_SIZE or sha256(weight) != WEIGHT_SHA256:
@@ -95,19 +97,27 @@ def generate(source_root: Path, model_dir: Path | None = None) -> dict:
         ids = batch.input_ids[0].tolist()
         active = int(batch.attention_mask[0].sum().item())
         ids = ids[:active]
-        marker_positions = [i for i, token_id in enumerate(ids) if token_id == L_TOKEN_ID]
+        marker_positions = [
+            i for i, token_id in enumerate(ids) if token_id == L_TOKEN_ID
+        ]
         expected_markers = sum(len(labels) for _, labels in case["tasks"])
         if len(marker_positions) != expected_markers:
-            raise RuntimeError(f"{case['name']}: expected {expected_markers} [L] markers")
+            raise RuntimeError(
+                f"{case['name']}: expected {expected_markers} [L] markers"
+            )
 
         scores = scorer.score(case["text"], compiled, max_len=512)
         task_output = {}
         for task, labels in case["tasks"]:
-            logits = {label: stable_float(scores.logit(task, label)) for label in labels}
+            logits = {
+                label: stable_float(scores.logit(task, label)) for label in labels
+            }
             probabilities = {
                 label: stable_float(scores.probability(task, label)) for label in labels
             }
-            winner = max(labels, key=lambda label: (probabilities[label], -labels.index(label)))
+            winner = max(
+                labels, key=lambda label: (probabilities[label], -labels.index(label))
+            )
             task_output[task] = {
                 "labels": list(labels),
                 "logits": logits,
@@ -140,15 +150,28 @@ def generate(source_root: Path, model_dir: Path | None = None) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source-root", required=True, type=Path,
-                        help="reviewed GLiNER2 source checkout containing gliner2/")
+    parser.add_argument(
+        "--source-root",
+        required=True,
+        type=Path,
+        help="reviewed GLiNER2 source checkout containing gliner2/",
+    )
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--model-dir", type=Path,
-                        help="local copy of the pinned checkpoint; avoids a Hub download")
-    parser.add_argument("--check", action="store_true",
-                        help="compare generated canonical JSON with --output")
+    parser.add_argument(
+        "--model-dir",
+        type=Path,
+        help="local copy of the pinned checkpoint; avoids a Hub download",
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="compare generated canonical JSON with --output",
+    )
     args = parser.parse_args()
-    actual = json.dumps(generate(args.source_root, args.model_dir), indent=2, sort_keys=True) + "\n"
+    actual = (
+        json.dumps(generate(args.source_root, args.model_dir), indent=2, sort_keys=True)
+        + "\n"
+    )
     if args.check:
         expected = args.output.read_text(encoding="utf-8")
         if actual != expected:

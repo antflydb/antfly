@@ -8943,6 +8943,8 @@ pub const Node = struct {
         defer manifest.deinit();
         if (manifest.gliner_classification_head == .label_marker_mlp) {
             try decision_executor.preflight(&request);
+            failure.* = .{ .stage = "model" };
+            observer.emit(.{ .phase = .model });
             allocation_failure.clear();
             var handle = self.model_manager.acquireFromDirWithControl(model_path, control orelse .{}) catch |err| {
                 allocation_failure.clear();
@@ -8956,6 +8958,8 @@ pub const Node = struct {
             return decision_executor.execute(scratch, &pipeline, &request, execution_options.max_response_bytes, control);
         }
         try boundary_executor.preflight(&request, execution_options);
+        failure.* = .{ .stage = "model" };
+        observer.emit(.{ .phase = .model });
         if (manifest.gliner_architecture != .boundary) return error.UnsupportedExtractionModel;
         const test_qualification = if (builtin.is_test) self.test_allow_unqualified_gliner_boundary else false;
         if (!test_qualification and !manifest.mayLoadQualifiedGlinerBoundaryRuntime()) return error.UnsupportedGlinerBoundaryRuntime;

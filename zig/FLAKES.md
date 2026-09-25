@@ -1,5 +1,44 @@
 # Zig runtime flakes
 
+## 2026-09-25: non-GLiNER failures in run 36168024127
+
+[CI run 36168024127](https://github.com/antflydb/antfly/actions/runs/36168024127)
+has three failures outside the GLiNER2.5-Decide changes. They are recorded here
+for follow-up; no runtime, test, or workflow change for these failures is
+included with the GLiNER fixes.
+
+The [ordinary Antfly E2E job](https://github.com/antflydb/antfly/actions/runs/36168024127/job/108198671180)
+ran no tests. Pytest's isolation scheduler rejected the collected
+`test_index_lifecycle.py` mixed serverless-runtime group because it requires
+two Antfly process slots, while the workflow sets
+`ANTFLY_E2E_PROCESS_SLOTS=1`. This is a reproducible CI configuration mismatch,
+not evidence that an E2E assertion is flaky. A focused local run of that
+scheduler group passed with two slots. The workflow setting needs a separate
+decision because the single-slot limit also protects multi-node tests from
+concurrent disk contention.
+
+The [operator inference job](https://github.com/antflydb/antfly/actions/runs/36168024127/job/108198671285)
+failed only `TestInferenceRuntimeContract/lazy` after 240.02 seconds; its other
+11 scenarios passed. During the lazy scenario's cold model pull, the log shows
+64 MiB of a 127.3 MiB `model.safetensors` file downloaded after about
+3.7 minutes at roughly 290 KiB/s. The test's four-minute context includes
+that pull and runtime startup, so a download deadline is the likely immediate
+cause. The excerpt does not contain the scenario's final error, and one run
+does not establish how often this happens. This model is unrelated to GLiNER.
+
+The [recovery-0 job](https://github.com/antflydb/antfly/actions/runs/36168024127/job/108198671138)
+failed
+`test_fk_cascade_recovers_claims_references_and_rows[transaction_resolve-owner]`
+while batching parent rows after the injected owner fault. The request first
+received `503 write unavailable` and eventually hit a client read timeout.
+Data-node logs include `MetadataSnapshotHeadMismatch` during replica-root
+refresh and `LeaderUnavailable` during transaction prepare; metadata Raft
+status still showed a leader and matching commit indexes when diagnostics
+were captured. Those observations do not identify which condition prevented
+write recovery. Preserve the data-group leader and replica convergence
+diagnostics on recurrence before changing retry or timeout behavior. This is
+an unresolved availability failure, not a confirmed flaky assertion.
+
 ## 2026-09-23: executable chunk embeddings and transient rewrite owner routing
 
 [PR #868 CI run 35937420037](https://github.com/antflydb/antfly/actions/runs/35937420037)
