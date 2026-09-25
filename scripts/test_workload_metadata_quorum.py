@@ -53,8 +53,9 @@ class QuorumEvidenceTests(unittest.TestCase):
             with self.subTest(field=field):
                 cluster, rows = cluster_fixture()
                 rows[quorum.METADATA[1]][field] = value
-                with self.assertRaises(TimeoutError), patch.object(
-                    quorum.time, "sleep"
+                with (
+                    self.assertRaises(TimeoutError),
+                    patch.object(quorum.time, "sleep"),
                 ):
                     cluster.leader(quorum.METADATA, timeout=0.002)
 

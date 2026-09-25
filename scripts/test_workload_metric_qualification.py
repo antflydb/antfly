@@ -36,15 +36,15 @@ class MetricAssertionTests(unittest.TestCase):
             clock[0] += 0.05
             return copy.deepcopy(sample)
 
-        with patch.object(
-            cluster.time, "monotonic", side_effect=lambda: clock[0]
-        ), patch.object(
-            cluster.time,
-            "sleep",
-            side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
-        ), patch.object(
-            cluster, "request", side_effect=response
-        ) as calls:
+        with (
+            patch.object(cluster.time, "monotonic", side_effect=lambda: clock[0]),
+            patch.object(
+                cluster.time,
+                "sleep",
+                side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+            ),
+            patch.object(cluster, "request", side_effect=response) as calls,
+        ):
             result = cluster.poll_metrics(1, action, submitted, emitted.append)
         return result, emitted, calls.call_count
 

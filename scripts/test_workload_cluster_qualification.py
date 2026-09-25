@@ -215,9 +215,10 @@ class ClusterTests(unittest.TestCase):
             "is_write": True,
             "expect": {"transport_error": True},
         }
-        with patch.object(
-            cluster.http.client, "HTTPConnection", Connection
-        ), patch.object(cluster.time, "monotonic", return_value=20):
+        with (
+            patch.object(cluster.http.client, "HTTPConnection", Connection),
+            patch.object(cluster.time, "monotonic", return_value=20),
+        ):
             result = cluster.request(1, action, 1, submitted=10)
         self.assertEqual(Connection.sent, 0)
         self.assertEqual(result["client_wait_ms"], 10000)
@@ -263,9 +264,10 @@ class ClusterTests(unittest.TestCase):
     def test_artifact_mismatch_retains_failure_and_checksums_without_starting(self):
         plan = self.plan()
         plan["artifacts"]["candidate"]["sha256"] = "0" * 64
-        with tempfile.TemporaryDirectory() as tmp, patch.object(
-            cluster, "Cluster"
-        ) as constructor:
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(cluster, "Cluster") as constructor,
+        ):
             output = Path(tmp) / "evidence"
             result = cluster.run(plan, output)
             self.assertFalse(result["correctness_passed"])

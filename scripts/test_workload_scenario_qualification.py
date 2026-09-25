@@ -134,14 +134,14 @@ class ScenarioTests(unittest.TestCase):
                 "pause_seconds": 0.8,
             },
         }
-        with patch.object(
-            scenarios.http.client, "HTTPConnection", Connection
-        ), patch.object(
-            scenarios.time, "monotonic", side_effect=lambda: clock[0]
-        ), patch.object(
-            scenarios.time,
-            "sleep",
-            side_effect=lambda value: clock.__setitem__(0, clock[0] + value),
+        with (
+            patch.object(scenarios.http.client, "HTTPConnection", Connection),
+            patch.object(scenarios.time, "monotonic", side_effect=lambda: clock[0]),
+            patch.object(
+                scenarios.time,
+                "sleep",
+                side_effect=lambda value: clock.__setitem__(0, clock[0] + value),
+            ),
         ):
             with self.assertRaises(TimeoutError):
                 scenarios.stream_request(1, op, 100.5)
@@ -182,8 +182,9 @@ class ScenarioTests(unittest.TestCase):
                 }
             ],
         }
-        with tempfile.TemporaryDirectory() as tmp, patch.object(
-            harness, "HTTP", Client
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(harness, "HTTP", Client),
         ):
             result = harness.run_load(
                 1,

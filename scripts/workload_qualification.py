@@ -848,8 +848,7 @@ def prometheus_error(status: int, body: bytes, headers: dict[str, str]) -> str |
     if status != 200:
         return f"metrics HTTP status {status}"
     content_type = (
-        {key.lower(): value for key, value in headers.items()}
-        .get("content-type", "")
+        {key.lower(): value for key, value in headers.items()}.get("content-type", "")
         .split(";", 1)[0]
         .strip()
         .lower()
@@ -1308,7 +1307,9 @@ def outcome_summary(
         else (
             "generator_invalid"
             if not generator_valid
-            else "smoke_evidence" if purpose == "smoke" else "partial_matrix_evidence"
+            else "smoke_evidence"
+            if purpose == "smoke"
+            else "partial_matrix_evidence"
         )
     )
     return {

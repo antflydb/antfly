@@ -266,8 +266,9 @@ class DispatchQualificationTests(unittest.TestCase):
             emit({"observed": {dispatch.ACTIVE: 32}})
             return {"passed": True}
 
-        with patch.object(runner, "poll_metrics", poll), self.assertRaises(
-            AssertionError
+        with (
+            patch.object(runner, "poll_metrics", poll),
+            self.assertRaises(AssertionError),
         ):
             cluster.sampled_phase("saturated")
 

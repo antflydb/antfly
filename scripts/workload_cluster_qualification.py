@@ -489,7 +489,9 @@ def poll_metrics(port, action, submitted, emit):
         "failure": (
             failure
             if failure
-            else None if passed else "original metrics action deadline expired"
+            else None
+            if passed
+            else "original metrics action deadline expired"
         ),
         "expected": action["expected"],
         "sampled_stable_seconds": action["stable_seconds"],

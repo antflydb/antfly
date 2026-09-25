@@ -311,7 +311,9 @@ def progress_gates(samples, operations, seconds):
                 "status": (
                     "failed"
                     if failed
-                    else "observed_progress" if eligible else "unavailable"
+                    else "observed_progress"
+                    if eligible
+                    else "unavailable"
                 ),
                 "scope": "client backlog only; server continuously-eligible proof remains required",
             }

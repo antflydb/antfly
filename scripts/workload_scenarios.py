@@ -262,7 +262,7 @@ def mixed_fixture(rows=4096, read_percent=90, graph_depth=32):
             "amount": index,
         }
         if index + 1 < rows:
-            value["_edges"] = {"graph_idx": {"cites": [{"target": f"row{index+1}"}]}}
+            value["_edges"] = {"graph_idx": {"cites": [{"target": f"row{index + 1}"}]}}
         return value
 
     setup = [
