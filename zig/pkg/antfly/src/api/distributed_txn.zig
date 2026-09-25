@@ -6058,6 +6058,8 @@ fn consumerTests() type {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.begin_calls += 1;
                     try std.testing.expect(req.retain_terminal);
+                    try std.testing.expectEqual(@as(u64, 10_000), req.begin_timestamp);
+                    try std.testing.expectEqual(@as(usize, 2), req.participants.len);
                     if (group == self.failed_begin_group) return self.begin_error;
                 }
 
@@ -6147,6 +6149,32 @@ fn consumerTests() type {
                 null,
                 .{ .retain_terminal = true },
             ));
+            try std.testing.expectEqual(@as(usize, 1), recorder.status_calls);
+            try std.testing.expectEqual(@as(usize, 0), recorder.prepare_calls);
+            try std.testing.expectEqual(@as(usize, 0), recorder.resolve_calls);
+            try std.testing.expectEqual(@as(usize, 0), recorder.abort_calls);
+            // A retry can reuse the same stable ID, BEGIN timestamp, and
+            // participant cohort while changing the write values. Even a
+            // future status reply that proves BEGIN identity alone cannot
+            // establish that this request's payload was the committed one:
+            // the durable BEGIN record has no write-set digest.
+            recorder = .{ .begin_error = error.DecisionConflict, .observed_status = .committed };
+            try std.testing.expectError(error.CommitDecisionUnknown, executeMultiTableCommitWithOptions(
+                std.testing.allocator,
+                FakeCatalog.iface(),
+                recorder.worker(),
+                txn_id,
+                10_000,
+                10_001,
+                &.{.{ .table_name = "docs", .writes = &.{
+                    .{ .key = "doc:a", .value = "{\"revision\":2}" },
+                    .{ .key = "doc:z", .value = "{\"revision\":2}" },
+                } }},
+                .write,
+                null,
+                .{ .retain_terminal = true },
+            ));
+            try std.testing.expectEqual(@as(usize, 1), recorder.begin_calls);
             try std.testing.expectEqual(@as(usize, 1), recorder.status_calls);
             try std.testing.expectEqual(@as(usize, 0), recorder.prepare_calls);
             try std.testing.expectEqual(@as(usize, 0), recorder.resolve_calls);
