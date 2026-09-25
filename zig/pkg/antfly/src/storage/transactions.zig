@@ -28,13 +28,15 @@ const docstore = @import("docstore.zig");
 const DocStore = docstore.DocStore;
 const internal_keys = @import("internal_keys.zig");
 const lsm_backend = @import("lsm_backend.zig");
+const retained_effects = @import("retained_effects.zig");
 const mem_backend = @import("mem_backend.zig");
 const platform_time = @import("antfly_platform").time;
 const build_options = @import("build_options");
 const tracing = @import("../tracing/antfly_trace_writer.zig");
 const stderr_writer = @import("../tracing/stderr_writer.zig");
 const ttl = @import("ttl.zig");
-const retained_effects = @import("retained_effects.zig");
+const completion_mutations = @import("completion_mutations.zig");
+pub const completion_compiler = @import("completion_compiler.zig");
 
 // ============================================================================
 // Key prefixes
@@ -46,13 +48,23 @@ const intents_prefix = "\x00\x00__txn_intents__:";
 // same backend batch as the corresponding intent, so the DB apply mutex makes
 // lock acquisition and ordinary batch admission linearizable.
 const intent_locks_prefix = "\x00\x00__txn_intent_locks__:";
+
+/// Physical conflict dependency for a logical document key. Replicated plan
+/// compilation must bind this absence/presence as well as document contents.
+pub fn makeIntentLockKeyAlloc(alloc: Allocator, user_key: []const u8) ![]u8 {
+    const length = try std.math.add(usize, intent_locks_prefix.len, user_key.len);
+    const key = try alloc.alloc(u8, length);
+    @memcpy(key[0..intent_locks_prefix.len], intent_locks_prefix);
+    @memcpy(key[intent_locks_prefix.len..], user_key);
+    return key;
+}
 // Pending transactions retain their exact user keys so collection and
 // resolution use point probes instead of cloning the whole mutable memtable.
 // Resolution deletes this sidecar atomically with the intents; terminal
 // history uses TxnRecord.intents_resolved instead.
-const intent_keys_prefix = "\x00\x00__txn_intent_keys__:";
+const intent_keys_prefix = @import("completion_control_budget.zig").intent_keys_prefix;
 const intent_members_prefix = "\x00\x00__txn_intent_members__:";
-const intent_admission_prefix = "\x00\x00__txn_intent_admission__:";
+const intent_admission_prefix = @import("completion_control_budget.zig").intent_admission_prefix;
 const IntentAdmission = struct {
     count: u64 = 0,
     bytes: u64 = 0,
@@ -67,25 +79,85 @@ const IntentAdmission = struct {
     }
 };
 const IntentCost = struct { bytes: u64, retained: u64 };
-// Read dependencies that are not also writes need durable shared guards.
-// A predicate check alone is not a prepare vote: another transaction could
-// delete its parent row after the check but before the coordinator commits.
-// Readers share key-oriented entries, while the transaction-oriented members
-// make resolution proportional to its own read set (never all readers).
+// Durable read dependencies share key-oriented guards and retain a per-transaction
+// member list so resolution work remains proportional to the transaction's reads.
 const read_guards_prefix = "\x00\x00__txn_read_guards__:";
 const read_members_prefix = "\x00\x00__txn_read_members__:";
 const read_admission_prefix = "\x00\x00__txn_read_admission__:";
 const read_guard_count_key = "\x00\x00__txn_read_guard_count";
 const max_read_guards_per_transaction = 65_536;
+const completion_prefix = @import("completion_control_budget.zig").completion_prefix;
+const completion_summary_key = @import("completion_control_budget.zig").completion_summary_key;
+pub const CompletionLimits = struct {
+    max_transaction_bytes: u64 = 0,
+    max_count: u64 = 0,
+    max_bytes: u64 = 0,
+
+    fn enabled(self: @This()) bool {
+        return self.max_count != 0 or self.max_bytes != 0;
+    }
+};
+const CompletionRecord = struct {
+    metadata_bytes: u64,
+    intent_bytes: u64 = 0,
+
+    fn bytes(self: @This()) !u64 {
+        return std.math.add(u64, self.metadata_bytes, self.intent_bytes) catch error.TransactionTooLarge;
+    }
+
+    fn encode(self: @This()) [16]u8 {
+        var out: [16]u8 = undefined;
+        std.mem.writeInt(u64, out[0..8], self.metadata_bytes, .little);
+        std.mem.writeInt(u64, out[8..16], self.intent_bytes, .little);
+        return out;
+    }
+
+    fn decode(raw: []const u8) !@This() {
+        if (raw.len != 16) return error.InvalidTxnRecord;
+        return .{ .metadata_bytes = std.mem.readInt(u64, raw[0..8], .little), .intent_bytes = std.mem.readInt(u64, raw[8..16], .little) };
+    }
+};
+const CompletionUsage = struct {
+    count: u64 = 0,
+    bytes: u64 = 0,
+
+    fn encode(self: @This()) [16]u8 {
+        var out: [16]u8 = undefined;
+        std.mem.writeInt(u64, out[0..8], self.count, .little);
+        std.mem.writeInt(u64, out[8..16], self.bytes, .little);
+        return out;
+    }
+
+    fn decode(raw: []const u8) !@This() {
+        if (raw.len != 16) return error.InvalidTxnRecord;
+        return .{ .count = std.mem.readInt(u64, raw[0..8], .little), .bytes = std.mem.readInt(u64, raw[8..16], .little) };
+    }
+};
+
+const CompletionChange = struct {
+    key: [completion_prefix.len + 16]u8,
+    record: ?[16]u8,
+    summary: [16]u8,
+    previous: ?CompletionRecord,
+
+    fn append(self: *const @This(), alloc: Allocator, writes: *std.ArrayListUnmanaged(docstore.KVPair), deletes: *std.ArrayListUnmanaged([]const u8)) !void {
+        if (self.record) |*record| {
+            try writes.append(alloc, .{ .key = &self.key, .value = record });
+        } else try deletes.append(alloc, &self.key);
+        try writes.append(alloc, .{ .key = completion_summary_key, .value = &self.summary });
+    }
+};
 // Durable epoch leases. A prepare vote and its schema identity are one atomic
 // mutation; resolution retires both. Historical immutable schemas remain
 // usable after a new active epoch is published and after participant restart.
-const schema_leases_prefix = "\x00\x00__txn_schema_leases__:";
-const records_prefix = "\x00\x00__txn_records__:";
-const participants_prefix = "\x00\x00__txn_participants__:";
-const resolved_participants_prefix = "\x00\x00__txn_resolved_participants__:";
+const schema_leases_prefix = @import("completion_control_budget.zig").schema_leases_prefix;
+const records_prefix = @import("completion_control_budget.zig").records_prefix;
+const participants_prefix = @import("completion_control_budget.zig").participants_prefix;
+const resolved_participants_prefix = @import("completion_control_budget.zig").resolved_participants_prefix;
 const ha_batch_outbox_prefix = "\x00\x00__txn_ha_batch_outbox__:";
 const ha_replay_outbox_prefix = "\x00\x00__txn_ha_replay_outbox__:";
+
+pub const CompletionControlBudget = @import("completion_control_budget.zig").Budget;
 
 // ============================================================================
 // Types
@@ -255,6 +327,9 @@ pub const RecoveryStats = struct {
 };
 
 pub const RecoveryOptions = struct {
+    /// A DB resolver owns physical row/index application. If it deferred,
+    /// metadata cleanup must not retry through a different allocator/pipeline.
+    resolve_terminal_intents: bool = true,
     /// Distributed decisions must be replicated by their coordinator. DB-local
     /// maintenance disables this and asks the coordinator callback to propose
     /// the decision through data Raft instead.
@@ -286,6 +361,7 @@ pub const TxnSummaryPage = struct {
 };
 
 pub const ResolutionExtraBatch = struct {
+    preparation_allocator: ?Allocator = null,
     /// Recovery owns one budgeted snapshot through atomic resolution.
     captured_intents: ?[]backend_scan.OwnedKVPair = null,
     cleanup_context: ?*anyopaque = null,
@@ -441,7 +517,35 @@ const txn_record_v2_size = 49;
 const txn_record_v3_size = 50;
 const txn_record_v4_size = 51;
 const txn_record_v5_size = 52;
-const txn_record_v6_size = 53;
+const txn_record_v6_size = @import("completion_control_budget.zig").txn_record_v6_size;
+
+/// Only begin metadata may omit derived replay publication. Never grant this
+/// exemption to document mutations, decisions, acknowledgements or intents.
+pub fn isBeginCompletionMutation(operations: []const completion_compiler.slot.Operation) bool {
+    var id: ?TxnId = null;
+    for (operations) |op| {
+        if (op.bindings.len != 0) return false;
+        if (op.key.len != records_prefix.len + 16 or !std.mem.startsWith(u8, op.key, records_prefix)) continue;
+        if (id != null or op.kind != .put or op.value.len != txn_record_v6_size or op.value[0] != @intFromEnum(TxnStatus.pending)) return false;
+        const record = decodeRecord(op.value) catch return false;
+        if (record.status != .pending or record.prepared or record.intent_revision != 0 or record.replay_sequence != 0 or record.intents_resolved)
+            return false;
+        id = op.key[records_prefix.len..][0..16].*;
+    }
+    const txn_id = id orelse return false;
+    for (operations) |op| {
+        if (std.mem.eql(u8, op.key, completion_summary_key)) {
+            if (op.kind != .put or op.value.len != 16) return false;
+            continue;
+        }
+        const allowed = inline for (.{ records_prefix, participants_prefix, resolved_participants_prefix, completion_prefix }) |prefix| {
+            if (op.key.len == prefix.len + 16 and std.mem.startsWith(u8, op.key, prefix) and
+                std.mem.eql(u8, op.key[prefix.len..], &txn_id)) break true;
+        } else false;
+        if (!allowed) return false;
+    }
+    return true;
+}
 
 // ============================================================================
 // TxnManager
@@ -453,6 +557,11 @@ pub const TxnManager = struct {
     alloc: Allocator,
     trace_writer: ?tracing.AntflyTraceWriter = null,
     shard_id: []const u8 = "local",
+    /// Must come from the replicated table catalog. The caller's apply lock
+    /// serializes these point reads with the batch that publishes the change.
+    completion_limits: CompletionLimits = .{},
+    /// Private compiler capability; never enabled on a live manager.
+    capture_physical_mutations: bool = false,
 
     pub const RecoveryExtraBatchHooks = struct {
         ctx: ?*anyopaque = null,
@@ -481,13 +590,345 @@ pub const TxnManager = struct {
         self.* = undefined;
     }
 
+    fn completionMetadataBytes(participants: []const []const u8) !u64 {
+        const control = try CompletionControlBudget.measure(participants);
+        // Preserve the existing small-transaction working-state allowance;
+        // additionally cover the full sequence of participant-list rewrites.
+        // The ledger is admission accounting, not proof of physical backing.
+        var bytes: u64 = 4096;
+        for (participants) |participant| {
+            const payload = std.math.mul(u64, participant.len, 64) catch return error.TransactionTooLarge;
+            bytes = std.math.add(u64, bytes, std.math.add(u64, payload, 128) catch return error.TransactionTooLarge) catch return error.TransactionTooLarge;
+        }
+        return @max(bytes, control.wal_bytes);
+    }
+
+    fn completionRecord(self: *TxnManager, txn_id: TxnId) !?CompletionRecord {
+        const key = makeSidecarKey(completion_prefix, txn_id);
+        const raw = self.getAlloc(self.alloc, &key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer self.alloc.free(raw);
+        return try CompletionRecord.decode(raw);
+    }
+
+    fn completionUsage(self: *TxnManager) !?CompletionUsage {
+        const raw = self.getAlloc(self.alloc, completion_summary_key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer self.alloc.free(raw);
+        return try CompletionUsage.decode(raw);
+    }
+
+    /// Bootstrap once from authoritative records. New stores pay an empty
+    /// scan. A catalog upgrade cannot invent an empty ledger for old pending
+    /// work. Large or legacy unmetered state requires explicit reconciliation
+    /// before admission; terminal cleanup remains available in the meantime.
+    pub fn reconcileCompletionAdmission(self: *TxnManager) !void {
+        if (!self.completion_limits.enabled() or try self.completionUsage() != null) return;
+        const page = try self.listTransactionsPage(self.alloc, null, 65_536);
+        defer self.alloc.free(page.items);
+        if (page.next_after != null) return error.TransactionRecoveryReconciliationRequired;
+        const Entry = struct { key: [completion_prefix.len + 16]u8, value: [16]u8 };
+        var entries = std.ArrayListUnmanaged(Entry).empty;
+        defer entries.deinit(self.alloc);
+        var usage: CompletionUsage = .{};
+        for (page.items) |txn| {
+            // Inspect metadata lengths before copying participant arrays from
+            // a legacy store. The current policy is an explicit hard bound on
+            // bootstrap working state, not just a post-allocation check.
+            {
+                var read = try self.store.beginRead();
+                defer read.abort();
+                inline for (.{ participants_prefix, resolved_participants_prefix }) |prefix| {
+                    const key = makeSidecarKey(prefix, txn.txn_id);
+                    const raw = read.get(&key) catch |err| switch (err) {
+                        error.NotFound => null,
+                        else => return err,
+                    };
+                    if (raw) |value| {
+                        const bound = if (self.completion_limits.max_bytes != 0) self.completion_limits.max_bytes else 128 * 1024 * 1024;
+                        if (value.len > bound / 64) return error.TransactionRecoveryReconciliationRequired;
+                    }
+                }
+            }
+            if (txn.status != .pending and txn.intents_resolved_known and txn.intents_resolved) {
+                if (try self.completionCanRetire(txn.txn_id, null)) continue;
+            }
+            const participants = try self.getParticipants(self.alloc, txn.txn_id);
+            defer freeParticipantList(self.alloc, participants);
+            const admission = try self.loadIntentAdmission(self.alloc, txn.txn_id);
+            if (admission == null) {
+                var prefix: [intents_prefix.len + 17]u8 = undefined;
+                @memcpy(prefix[0..intents_prefix.len], intents_prefix);
+                @memcpy(prefix[intents_prefix.len..][0..16], &txn.txn_id);
+                prefix[intents_prefix.len + 16] = ':';
+                var read = try self.store.beginRead();
+                defer read.abort();
+                if (try readHasPrefix(&read, &prefix)) return error.TransactionRecoveryReconciliationRequired;
+            }
+            const record: CompletionRecord = .{
+                .metadata_bytes = try completionMetadataBytes(participants),
+                .intent_bytes = if (admission) |value| value.bytes else 0,
+            };
+            usage.count = std.math.add(u64, usage.count, 1) catch return error.TransactionRecoveryReconciliationRequired;
+            usage.bytes = std.math.add(u64, usage.bytes, try record.bytes()) catch return error.TransactionRecoveryReconciliationRequired;
+            if ((self.completion_limits.max_count != 0 and usage.count > self.completion_limits.max_count) or
+                (self.completion_limits.max_bytes != 0 and usage.bytes > self.completion_limits.max_bytes))
+                return error.TransactionRecoveryReconciliationRequired;
+            try entries.append(self.alloc, .{ .key = makeSidecarKey(completion_prefix, txn.txn_id), .value = record.encode() });
+        }
+        var writes = std.ArrayListUnmanaged(docstore.KVPair).empty;
+        defer writes.deinit(self.alloc);
+        for (entries.items) |*entry| try writes.append(self.alloc, .{ .key = &entry.key, .value = &entry.value });
+        const summary = usage.encode();
+        try writes.append(self.alloc, .{ .key = completion_summary_key, .value = &summary });
+        var batch = try self.store.beginSerializedBatch();
+        errdefer batch.abort();
+        if (batch.get(completion_summary_key)) |_| {
+            // Another owner initialized the ledger after our read snapshot.
+            // Never overwrite its subsequent admitted work with this snapshot.
+            batch.abort();
+            return;
+        } else |err| if (err != error.NotFound) return err;
+        for (writes.items) |write| try batch.put(write.key, write.value);
+        try batch.commit();
+    }
+
+    fn completionChange(self: *TxnManager, txn_id: TxnId, next: ?CompletionRecord) !?CompletionChange {
+        if (next != null and self.completion_limits.enabled()) try self.reconcileCompletionAdmission();
+        const before = (try self.completionUsage()) orelse return null;
+        const previous = try self.completionRecord(txn_id);
+        if (previous == null and next == null) return null;
+        const after = try self.adjustCompletionUsage(before, previous, next);
+        return .{ .key = makeSidecarKey(completion_prefix, txn_id), .record = if (next) |record| record.encode() else null, .summary = after.encode(), .previous = previous };
+    }
+
+    fn adjustCompletionUsage(self: *TxnManager, before: CompletionUsage, previous: ?CompletionRecord, next: ?CompletionRecord) !CompletionUsage {
+        var after = before;
+        if (previous) |record| {
+            after.count = std.math.sub(u64, after.count, 1) catch return error.InvalidTxnRecord;
+            after.bytes = std.math.sub(u64, after.bytes, try record.bytes()) catch return error.InvalidTxnRecord;
+        }
+        if (next) |record| {
+            if (self.completion_limits.max_transaction_bytes != 0 and
+                try record.bytes() > self.completion_limits.max_transaction_bytes and
+                (previous == null or try record.bytes() > try previous.?.bytes())) return error.TransactionTooLarge;
+            after.count = std.math.add(u64, after.count, 1) catch return error.TransactionRecoveryCapacityExhausted;
+            after.bytes = std.math.add(u64, after.bytes, try record.bytes()) catch return error.TransactionRecoveryCapacityExhausted;
+        }
+        // Lowered ceilings never block retirement, a shrinking prepare, or
+        // idempotent work needed to finish an already accepted obligation.
+        if ((self.completion_limits.max_count != 0 and after.count > self.completion_limits.max_count and after.count > before.count) or
+            (self.completion_limits.max_bytes != 0 and after.bytes > self.completion_limits.max_bytes and after.bytes > before.bytes))
+            return error.TransactionRecoveryCapacityExhausted;
+        return after;
+    }
+
+    fn completionCanRetire(self: *TxnManager, txn_id: TxnId, resolved_participant: ?[]const u8) !bool {
+        return self.completionCanRetireClearingOutbox(txn_id, resolved_participant, null);
+    }
+
+    fn completionCanRetireClearingOutbox(self: *TxnManager, txn_id: TxnId, resolved_participant: ?[]const u8, cleared: ?HAOutboxKind) !bool {
+        const batch_key = makeTransactionHABatchOutboxKey(txn_id);
+        const replay_key = makeTransactionHAReplayOutboxKey(txn_id);
+        if (cleared != .batch and try self.keyExists(&batch_key)) return false;
+        if (cleared != .replay and try self.keyExists(&replay_key)) return false;
+        const record = try self.loadTransactionRecord(txn_id);
+        // Followers own local intent application; only the coordinator owns
+        // fanout/acknowledgement debt for the entire participant set.
+        if (record.coordinator_known and !record.coordinator) return true;
+        const unresolved = try self.getUnresolvedParticipants(self.alloc, txn_id);
+        defer freeParticipantList(self.alloc, unresolved);
+        for (unresolved) |participant| {
+            if (resolved_participant) |resolved| if (std.mem.eql(u8, participant, resolved)) continue;
+            return false;
+        }
+        return true;
+    }
+
+    fn completionRetirement(self: *TxnManager, txn_id: TxnId, resolved_participant: ?[]const u8, writes: []const docstore.KVPair) !?CompletionChange {
+        if (try self.completionRecord(txn_id) == null) return null;
+        for (writes) |write| {
+            if (std.mem.startsWith(u8, write.key, ha_batch_outbox_prefix) or
+                std.mem.startsWith(u8, write.key, ha_replay_outbox_prefix)) return null;
+        }
+        if (!(try self.completionCanRetire(txn_id, resolved_participant))) return null;
+        return self.completionChange(txn_id, null);
+    }
+
     /// Create a new pending transaction record.
     pub fn initTransaction(self: *TxnManager, txn_id: TxnId, timestamp: u64) !void {
         try self.initTransactionWithParticipants(txn_id, timestamp, &.{});
     }
 
+    pub const BeginInput = struct {
+        txn_id: TxnId,
+        timestamp: u64,
+        created_at: u64,
+        topology_epoch: u64,
+        participants: []const []const u8,
+        coordinator: bool,
+        retain_terminal: bool,
+    };
+
+    /// Run the actual begin and completion-ledger logic on a private overlay.
+    /// The caller holds the DB apply fence and owns the immutable snapshot.
+    /// Returning a plan grants no acceptance authority or completion backing.
+    pub fn compileBeginMutation(
+        self: *TxnManager,
+        alloc: Allocator,
+        snapshot: *backend_erased.ReadTxn,
+        input: BeginInput,
+        authority: @import("completion_candidate.zig").Authority,
+        input_digest: [32]u8,
+        profile_fence: []const u8,
+        additional_dependencies: []const []const u8,
+    ) ![]u8 {
+        var overlay = try completion_compiler.Overlay.init(alloc, snapshot, .{ .max_operations = 256, .max_bytes = 256 * 1024 });
+        defer overlay.deinit();
+        var private: TxnManager = .{ .store = overlay.store(), .owns_store = false, .alloc = alloc, .completion_limits = self.completion_limits };
+        // Never let first-use reconciliation scan or initialize backing state
+        // while compiling a point-certified consensus candidate.
+        if (private.completion_limits.enabled() and try private.completionUsage() == null)
+            return error.TransactionRecoveryReconciliationRequired;
+        try private.initTransactionWithParticipantsCreatedAtRoleAndRetention(input.txn_id, input.timestamp, input.created_at, input.participants, input.coordinator, input.retain_terminal);
+        if (overlay.log.count == 0) {
+            // An idempotent begin still carries its Raft progress. Retain an
+            // exact record rewrite rather than creating a fake document event.
+            const key = makeRecordKey(input.txn_id);
+            const record = try snapshot.get(&key);
+            try overlay.log.put(&key, record);
+        }
+        return @import("completion_candidate.zig").encodeMutationPlan(alloc, authority, input_digest, profile_fence, lsm_backend.Backend.durable_completion_limits, snapshot, &overlay.log, overlay.baseline_reads.items, additional_dependencies);
+    }
+
     pub fn initTransactionWithParticipants(self: *TxnManager, txn_id: TxnId, timestamp: u64, participants: []const []const u8) !void {
         try self.initTransactionWithParticipantsCreatedAt(txn_id, timestamp, timestamp, participants);
+    }
+
+    pub const ControlInput = struct {
+        txn_id: TxnId,
+        action: union(enum) {
+            resolve_metadata: struct { status: TxnStatus, timestamp: u64 },
+            acknowledge: []const u8,
+            cleanup: struct { cutoff: u64, retained_cutoff: u64 },
+        },
+    };
+
+    /// Compile the real metadata-only decision, acknowledgement, and cleanup
+    /// implementations without publishing any primary state. Prepared document
+    /// resolution continues to use its preowned outcome template. This produces
+    /// a physical candidate only: a distinct retained control owner must supply
+    /// acceptance authority and future completion capacity before DATA uses it.
+    pub fn compileControlMutation(
+        self: *TxnManager,
+        alloc: Allocator,
+        snapshot: *backend_erased.ReadTxn,
+        input: ControlInput,
+        authority: @import("completion_candidate.zig").Authority,
+        input_digest: [32]u8,
+        profile_fence: []const u8,
+        additional_dependencies: []const []const u8,
+    ) ![]u8 {
+        var overlay = try completion_compiler.Overlay.init(alloc, snapshot, .{ .max_operations = 256, .max_bytes = 256 * 1024 });
+        defer overlay.deinit();
+        var private: TxnManager = .{ .store = overlay.store(), .owns_store = false, .alloc = alloc, .completion_limits = self.completion_limits };
+        if (private.completion_limits.enabled() and try private.completionUsage() == null)
+            return error.TransactionRecoveryReconciliationRequired;
+        if (try private.hasHAOutbox(input.txn_id)) return error.UnsupportedCompletionProfile;
+        const record: ?TxnRecord = private.loadTransactionRecord(input.txn_id) catch |err| switch (err) {
+            error.TxnNotFound => null,
+            else => return err,
+        };
+        switch (input.action) {
+            .resolve_metadata => |resolve| {
+                if (resolve.status == .pending or resolve.timestamp == 0) return error.InvalidArgument;
+                const current = record orelse return error.TxnNotFound;
+                // Every supported intent producer advances the record revision.
+                // Certify that point dependency and the admission sidecar; never
+                // infer an empty intent prefix merely because a scan is absent.
+                if (!current.prepared_known or current.prepared or current.intent_revision != 0 or current.replay_sequence != 0)
+                    return error.UnsupportedCompletionProfile;
+                if (try private.loadIntentAdmission(alloc, input.txn_id)) |admission| {
+                    if (admission.count != 0 or admission.bytes != 0) return error.UnsupportedCompletionProfile;
+                }
+                _ = try private.resolveIntentsWithExtraBatch(input.txn_id, resolve.status, resolve.timestamp, .{
+                    .known_intent_keys = &.{},
+                    .expected_intent_revision = 0,
+                });
+            },
+            .acknowledge => |participant| {
+                const current = record orelse return error.TxnNotFound;
+                if (current.status == .pending or !current.intents_resolved_known or !current.intents_resolved)
+                    return error.UnsupportedCompletionProfile;
+                try private.markParticipantResolved(input.txn_id, participant);
+            },
+            .cleanup => |cleanup| {
+                if (record) |current| {
+                    if (current.status != .pending) {
+                        if (!current.intents_resolved_known or !current.intents_resolved)
+                            return error.UnsupportedCompletionProfile;
+                        _ = try private.cleanupTransactionMetadataIfEligible(input.txn_id, cleanup.cutoff, cleanup.retained_cutoff);
+                    }
+                    // A pending record cannot be cleaned regardless of its
+                    // intents. Its certified record alone proves the no-op.
+                } else _ = try private.cleanupTransactionMetadataIfEligible(input.txn_id, cleanup.cutoff, cleanup.retained_cutoff);
+            },
+        }
+        if (overlay.log.count == 0) {
+            // Even a no-op may be assigned a new consensus identity. Preserve
+            // the exact point state; an absent cleanup must not invent a record.
+            const key = makeRecordKey(input.txn_id);
+            if (record != null) {
+                try overlay.log.put(&key, try snapshot.get(&key));
+            } else try overlay.log.delete(&key);
+        }
+        return @import("completion_candidate.zig").encodeMutationPlan(alloc, authority, input_digest, profile_fence, lsm_backend.Backend.durable_completion_limits, snapshot, &overlay.log, overlay.baseline_reads.items, additional_dependencies);
+    }
+
+    /// Capture with physical control backing retained before the transaction's
+    /// promise. The proposal callback borrows bytes after compilation releases
+    /// the shared native workspace, allowing admission to reenter it. This seam
+    /// deliberately grants no authority to propose or acknowledge consensus.
+    pub fn withReservedControlMutation(
+        self: *TxnManager,
+        held: *@import("lsm_backend/completion_control_resources.zig").Resources,
+        snapshot: *backend_erased.ReadTxn,
+        input: ControlInput,
+        authority: @import("completion_candidate.zig").Authority,
+        input_digest: [32]u8,
+        profile_fence: []const u8,
+        additional_dependencies: []const []const u8,
+        comptime T: type,
+        context: anytype,
+        comptime candidate: anytype,
+    ) !T {
+        if (!std.mem.eql(u8, &held.txn_id, &input.txn_id)) return error.InvalidArgument;
+        const Capture = struct {
+            manager: *TxnManager,
+            snapshot: *backend_erased.ReadTxn,
+            input: ControlInput,
+            authority: @import("completion_candidate.zig").Authority,
+            digest: [32]u8,
+            fence: []const u8,
+            dependencies: []const []const u8,
+
+            fn compile(capture: @This(), alloc: Allocator) ![]u8 {
+                return capture.manager.compileControlMutation(alloc, capture.snapshot, capture.input, capture.authority, capture.digest, capture.fence, capture.dependencies);
+            }
+        };
+        return held.withCandidate(T, Capture{
+            .manager = self,
+            .snapshot = snapshot,
+            .input = input,
+            .authority = authority,
+            .digest = input_digest,
+            .fence = profile_fence,
+            .dependencies = additional_dependencies,
+        }, Capture.compile, context, candidate);
     }
 
     pub fn initTransactionWithParticipantsCreatedAt(
@@ -590,6 +1031,7 @@ pub const TxnManager = struct {
             .coordinator = coordinator,
             .retain_terminal = retain_terminal,
         };
+        var completion = try self.completionChange(txn_id, .{ .metadata_bytes = try completionMetadataBytes(participants) });
         const record_value = try self.encodeRecord(record);
         defer self.alloc.free(record_value);
         const participant_key = makeSidecarKey(participants_prefix, txn_id);
@@ -605,13 +1047,14 @@ pub const TxnManager = struct {
         try writes.appendSlice(self.alloc, extra_batch.writes);
         var deletes = std.ArrayListUnmanaged([]const u8).empty;
         defer deletes.deinit(self.alloc);
+        if (completion) |*change| try change.append(self.alloc, &writes, &deletes);
         if (participants.len > 0) {
             try deletes.append(self.alloc, &resolved_key);
         } else {
             try deletes.appendSlice(self.alloc, &.{ &participant_key, &resolved_key });
         }
         try deletes.appendSlice(self.alloc, extra_batch.deletes);
-        try self.applyBatch(writes.items, deletes.items, null);
+        try self.applyBatchWithCompletion(writes.items, deletes.items, null, completion);
         if (self.trace_writer) |tw| {
             tw.traceEvent(&.{
                 .name = "InitTransaction",
@@ -763,6 +1206,14 @@ pub const TxnManager = struct {
             total_bytes > previous_bytes)
             return error.TransactionTooLarge;
 
+        var completion: ?CompletionChange = null;
+        if (self.completion_limits.enabled()) try self.reconcileCompletionAdmission();
+        if (try self.completionUsage() != null) {
+            var reserved = (try self.completionRecord(txn_id)) orelse return error.InvalidTxnRecord;
+            reserved.intent_bytes = admission.bytes;
+            completion = try self.completionChange(txn_id, reserved);
+        }
+
         for (intents, 0..) |intent, index| {
             if (last_intents.get(intent.key).? != index) continue;
             const member_key = try makeIntentMemberKey(self.alloc, txn_id, intent.key);
@@ -827,7 +1278,11 @@ pub const TxnManager = struct {
 
         try writes.appendSlice(self.alloc, extra_batch.writes);
 
-        try self.applyBatchWithReservation(writes.items, extra_batch.deletes, null, .{ .previous = if (previous_admission) |old| old.reservation() else 0, .next = admission.reservation() });
+        var completion_deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer completion_deletes.deinit(self.alloc);
+        try completion_deletes.appendSlice(self.alloc, extra_batch.deletes);
+        if (completion) |*change| try change.append(self.alloc, &writes, &completion_deletes);
+        try self.applyBatchWithCompletion(writes.items, completion_deletes.items, null, completion);
 
         self.traceWriteIntentSuccess(txn_id, intents, predicates);
     }
@@ -846,6 +1301,187 @@ pub const TxnManager = struct {
         status: TxnStatus,
         timestamp: u64,
         extra_batch: ResolutionExtraBatch,
+    ) !ResolutionOutcome {
+        return self.resolveIntentsWithExtraBatchImpl(txn_id, status, timestamp, extra_batch, null);
+    }
+
+    pub const ResolutionInspection = struct {
+        mutations: completion_mutations.Plan,
+        outcome: ResolutionOutcome,
+
+        pub fn deinit(self: *@This()) void {
+            self.mutations.deinit();
+            self.* = undefined;
+        }
+    };
+
+    /// Inspects the ordered document/transaction primary-store mutations of a resolution,
+    /// including replay expansion and freshly recomputed completion accounting.
+    /// The caller must hold the same apply serialization as real resolution.
+    /// No write or resolution trace is published. The result is an observation,
+    /// NOT a prepare-time certificate or an executable retry: shared counters,
+    /// replay sequence and acknowledgement state may change immediately after
+    /// the backend snapshot is released. No backend resources are reserved.
+    /// Unknown keyspaces are rejected: relational/columnar and payload-owner
+    /// expansion need a separate plan.
+    pub fn inspectResolutionMutations(
+        self: *TxnManager,
+        txn_id: TxnId,
+        status: TxnStatus,
+        timestamp: u64,
+        extra_batch: ResolutionExtraBatch,
+        limits: completion_mutations.Limits,
+    ) !ResolutionInspection {
+        var mutations = try completion_mutations.Plan.init(self.alloc, limits);
+        errdefer mutations.deinit();
+        const outcome = try self.resolveIntentsWithExtraBatchImpl(txn_id, status, timestamp, extra_batch, &mutations);
+        return .{ .mutations = mutations, .outcome = outcome };
+    }
+
+    /// Compile before the real prepare vote using the exact prepare and resolve
+    /// implementations against a private, point-only overlay. The caller must
+    /// retain the DB eligibility fences and immutable snapshot through actual
+    /// prepare. This result owns templates, not backend completion resources.
+    pub fn compileCompletionTemplates(
+        self: *TxnManager,
+        txn_id: TxnId,
+        intents: []const WriteIntent,
+        predicates: []const VersionPredicate,
+        prepare_extra: MutationExtraBatch,
+        commit_extra: ResolutionExtraBatch,
+        abort_extra: ResolutionExtraBatch,
+        options: completion_compiler.Options,
+    ) !completion_compiler.CompiledTemplates {
+        if (intents.len == 0 or intents.len > 32 or prepare_extra.schema_binding == null)
+            return error.UnsupportedCompletionTemplate;
+        for (intents) |intent| if (intent.key.len == 0 or (!options.physical_mutations and intent.prepared_row != null))
+            return error.UnsupportedCompletionTemplate;
+        if (!options.physical_mutations and (prepare_extra.schema_binding.?.version != null or
+            prepare_extra.writes.len != 0 or prepare_extra.deletes.len != 0)) return error.UnsupportedCompletionTemplate;
+        for ([_]ResolutionExtraBatch{ commit_extra, abort_extra }) |extra| {
+            if (extra.captured_intents != null or extra.skip_intent_keys.len != 0 or extra.cleanup_context != null or
+                (!options.physical_mutations and (extra.writes.len != 0 or extra.deletes.len != 0 or
+                    extra.completion_writes.len != 0 or extra.completion_deletes.len != 0 or extra.skip_all_intent_application)) or
+                (!options.allow_named_participants and extra.resolved_participant != null))
+                return error.UnsupportedCompletionTemplate;
+        }
+        if (abort_extra.replay != null or options.timestamp == 0) return error.UnsupportedCompletionTemplate;
+        const scratch = try self.alloc.alloc(u8, options.scratch_bytes);
+        defer self.alloc.free(scratch);
+        var fixed = std.heap.FixedBufferAllocator.init(scratch);
+        const alloc = fixed.allocator();
+        var overlay = try completion_compiler.Overlay.init(alloc, options.snapshot, options.plan_limits);
+        defer overlay.deinit();
+        var private = TxnManager{ .store = overlay.store(), .owns_store = false, .alloc = alloc, .completion_limits = self.completion_limits, .capture_physical_mutations = options.physical_mutations };
+        const original = try private.loadTransactionRecord(txn_id);
+        if (original.status != .pending or original.prepared or !original.prepared_known or original.intent_revision != 0 or original.replay_sequence != 0)
+            return error.UnsupportedCompletionTemplate;
+        if (try private.loadIntentAdmission(alloc, txn_id)) |admission| {
+            if (admission.count != 0 or admission.bytes != 0) return error.UnsupportedCompletionTemplate;
+        }
+        const participants = try private.getParticipants(alloc, txn_id);
+        defer freeParticipantList(alloc, participants);
+        if ((!options.allow_named_participants and participants.len != 0) or try private.hasHAOutbox(txn_id)) return error.UnsupportedCompletionTemplate;
+        // Reconciliation scans belong before compilation, never in its bounded
+        // workspace. No fallback may initialize the real store here.
+        if (private.completion_limits.enabled() and try private.completionUsage() == null)
+            return error.TransactionRecoveryReconciliationRequired;
+        if (commit_extra.replay) |replay| {
+            if (replay.sequence == 0 or replay.sequence == std.math.maxInt(u64) or options.replay_payload_sequence_offset != 6)
+                return error.UnsupportedCompletionTemplate;
+            const journal = @import("db/derived/change_journal.zig");
+            var decoded = try journal.decodeRecord(alloc, replay.payload);
+            defer decoded.deinit();
+            if (decoded.record.version != 1 or decoded.record.sequence != replay.sequence or
+                replay.payload.len < 14 or !std.mem.eql(u8, replay.payload[0..4], "CJ2\x00"))
+                return error.UnsupportedCompletionTemplate;
+        } else if (options.replay_payload_sequence_offset != null) return error.UnsupportedCompletionTemplate;
+        var prepare = prepare_extra;
+        prepare.preparation_allocator = alloc;
+        try private.writeIntentsExtraBatch(txn_id, intents, predicates, prepare);
+        if (!options.physical_mutations) for (overlay.log.operations()) |op| try validateInspectedCompletionKey(op.key);
+        const prepared = try private.loadTransactionRecord(txn_id);
+        for ([_]ResolutionExtraBatch{ commit_extra, abort_extra }) |extra| {
+            if (extra.expected_intent_revision) |expected| if (expected != prepared.intent_revision)
+                return error.IntentSnapshotChanged;
+        }
+        const keys = try alloc.alloc([]const u8, intents.len);
+        for (intents, keys) |intent, *key| key.* = intent.key;
+        var commit = commit_extra;
+        commit.preparation_allocator = alloc;
+        commit.known_intent_keys = keys;
+        commit.expected_intent_revision = prepared.intent_revision;
+        var aborted = abort_extra;
+        aborted.preparation_allocator = alloc;
+        aborted.known_intent_keys = keys;
+        aborted.expected_intent_revision = prepared.intent_revision;
+        var commit_plan = try private.inspectResolutionMutations(txn_id, .committed, options.timestamp, commit, options.plan_limits);
+        defer commit_plan.deinit();
+        var abort_plan = try private.inspectResolutionMutations(txn_id, .aborted, options.timestamp, aborted, options.plan_limits);
+        defer abort_plan.deinit();
+        var prepare_template = try completion_compiler.Template.copy(self.alloc, &overlay.log);
+        errdefer prepare_template.deinit();
+        var commit_template = try completion_compiler.Template.copy(self.alloc, &commit_plan.mutations);
+        errdefer commit_template.deinit();
+        var abort_template = try completion_compiler.Template.copy(self.alloc, &abort_plan.mutations);
+        errdefer abort_template.deinit();
+        try bindCompletionTemplate(&prepare_template, txn_id, .pending, null, options);
+        try bindCompletionTemplate(&commit_template, txn_id, .committed, commit.replay, options);
+        try bindCompletionTemplate(&abort_template, txn_id, .aborted, null, options);
+        return .{ .prepare = prepare_template, .commit = commit_template, .abort = abort_template, .intent_revision = prepared.intent_revision, .timestamp = options.timestamp, .replay_sequence = if (commit.replay) |replay| replay.sequence else null, .baseline_reads = try overlay.copyBaselineReads(self.alloc) };
+    }
+
+    fn bindCompletionTemplate(template: *completion_compiler.Template, txn_id: TxnId, status: TxnStatus, replay: ?ReplayAppend, options: completion_compiler.Options) !void {
+        const record_key = makeRecordKey(txn_id);
+        for (template.operations, 0..) |op, i| {
+            if (op.kind == .delete) continue;
+            if (std.mem.eql(u8, op.key, completion_summary_key)) {
+                if (op.value.len != 16) return error.UnsupportedCompletionTemplate;
+                try template.bind(i, .{ .kind = .shared_ledger_count, .target = .value, .byte_order = .little, .offset = 0 });
+                try template.bind(i, .{ .kind = .shared_ledger_bytes, .target = .value, .byte_order = .little, .offset = 8 });
+            } else if (std.mem.eql(u8, op.key, &record_key) and status != .pending) {
+                if (op.value.len != txn_record_v6_size) return error.UnsupportedCompletionTemplate;
+                if (status == .committed) try template.bind(i, .{ .kind = .commit_timestamp, .target = .value, .byte_order = .little, .offset = 9 });
+                try template.bind(i, .{ .kind = .commit_timestamp, .target = .value, .byte_order = .little, .offset = 25 });
+                if (replay != null) try template.bind(i, .{ .kind = .replay_sequence, .target = .value, .byte_order = .little, .offset = 41 });
+            } else if (internal_keys.isTtlKey(op.key) and status == .committed) {
+                if (op.value.len != 8) return error.UnsupportedCompletionTemplate;
+                if (@import("completion_physical.zig").bindTimestampKey(options.timestamp_keys, op.key))
+                    try template.bind(i, .{ .kind = .commit_timestamp, .target = .value, .byte_order = .little, .offset = 0 });
+            } else if (std.mem.eql(u8, op.key, &internal_keys.raft_document_applied_entry_key)) {
+                if (!options.allow_raft_marker or op.value.len != 16) return error.UnsupportedCompletionTemplate;
+                try template.bind(i, .{ .kind = .raft_term, .target = .value, .byte_order = .little, .offset = 0 });
+                try template.bind(i, .{ .kind = .raft_index, .target = .value, .byte_order = .little, .offset = 8 });
+            } else if (op.key.len != 0 and op.key[0] == internal_keys.replay_namespace) {
+                const entry = replay orelse return error.UnsupportedCompletionTemplate;
+                if (std.mem.eql(u8, op.key, &internal_keys.replay_meta_init_key)) {
+                    if (op.value.len != 0) return error.UnsupportedCompletionTemplate;
+                } else if (std.mem.eql(u8, op.key, &internal_keys.replay_meta_next_sequence_key)) {
+                    if (op.value.len != 8) return error.UnsupportedCompletionTemplate;
+                    try template.bind(i, .{ .kind = .replay_next_sequence, .target = .value, .byte_order = .little, .offset = 0 });
+                } else if (op.key.len == 4 and op.key[1] == 0xff and op.key[2] == internal_keys.replay_meta_latest_sequence_kind) {
+                    if (op.value.len != 8) return error.UnsupportedCompletionTemplate;
+                    try template.bind(i, .{ .kind = .replay_sequence, .target = .value, .byte_order = .little, .offset = 0 });
+                } else if (op.key.len == internal_keys.replay_key_len and op.key[1] != 0xff) {
+                    if (std.mem.readInt(u64, op.key[2..10], .big) != entry.sequence or op.value.len < 14 or
+                        !std.mem.eql(u8, op.value[0..4], "CJ2\x00") or std.mem.readInt(u64, op.value[6..14], .little) != entry.sequence)
+                        return error.UnsupportedCompletionTemplate;
+                    try template.bind(i, .{ .kind = .replay_sequence, .target = .key, .byte_order = .big, .offset = 2 });
+                    try template.bind(i, .{ .kind = .replay_sequence, .target = .value, .byte_order = .little, .offset = 6 });
+                } else if (!options.physical_mutations) return error.UnsupportedCompletionTemplate;
+            }
+            if (options.physical_mutations and status == .committed)
+                try @import("completion_physical.zig").bindOperation(template, i, if (replay) |entry| entry.sequence else 0, options.timestamp_keys);
+        }
+    }
+
+    fn resolveIntentsWithExtraBatchImpl(
+        self: *TxnManager,
+        txn_id: TxnId,
+        status: TxnStatus,
+        timestamp: u64,
+        extra_batch: ResolutionExtraBatch,
+        capture: ?*completion_mutations.Plan,
     ) !ResolutionOutcome {
         const rec_key = makeRecordKey(txn_id);
         const schema_lease_key = makeSidecarKey(schema_leases_prefix, txn_id);
@@ -889,7 +1525,7 @@ pub const TxnManager = struct {
         const was_terminal = record.status != .pending;
         applyResolveDecision(&record, status, timestamp) catch |err| {
             if (err == TxnError.DecisionConflict) {
-                if (self.trace_writer) |tw| {
+                if (if (capture == null) self.trace_writer else null) |tw| {
                     tw.traceEvent(&.{
                         .name = "ResolveDecisionConflict",
                         .txn_id = txn_id,
@@ -908,8 +1544,13 @@ pub const TxnManager = struct {
             if (resolved_participant_value) |value| {
                 try completion_writes.append(self.alloc, .{ .key = &resolved_participant_key, .value = value });
             }
-            if (completion_writes.items.len != 0 or extra_batch.completion_deletes.len != 0) {
-                try self.applyBatch(completion_writes.items, extra_batch.completion_deletes, null);
+            var completion_deletes = std.ArrayListUnmanaged([]const u8).empty;
+            defer completion_deletes.deinit(self.alloc);
+            try completion_deletes.appendSlice(self.alloc, extra_batch.completion_deletes);
+            var retirement = try self.completionRetirement(txn_id, extra_batch.resolved_participant, completion_writes.items);
+            if (retirement) |*change| try change.append(self.alloc, &completion_writes, &completion_deletes);
+            if (completion_writes.items.len != 0 or completion_deletes.items.len != 0) {
+                try self.emitOrApplyCompletionBatch(completion_writes.items, completion_deletes.items, null, retirement, capture);
             }
             return .{
                 .applied = false,
@@ -966,8 +1607,9 @@ pub const TxnManager = struct {
             try completion_deletes.append(self.alloc, &stale_admission_key);
             try completion_deletes.append(self.alloc, &schema_lease_key);
             try completion_deletes.appendSlice(self.alloc, extra_batch.completion_deletes);
-            const admission = try self.loadIntentAdmission(self.alloc, txn_id);
-            try self.applyBatchWithReservation(completion_writes.items, completion_deletes.items, null, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 });
+            var retirement = try self.completionRetirement(txn_id, extra_batch.resolved_participant, completion_writes.items);
+            if (retirement) |*change| try change.append(self.alloc, &completion_writes, &completion_deletes);
+            try self.emitOrApplyCompletionBatch(completion_writes.items, completion_deletes.items, null, retirement, capture);
             return .{
                 .applied = false,
                 .replay_sequence = record.replay_sequence,
@@ -1092,10 +1734,12 @@ pub const TxnManager = struct {
         try deletes.appendSlice(self.alloc, extra_batch.deletes);
         try deletes.appendSlice(self.alloc, extra_batch.completion_deletes);
 
-        const admission = try self.loadIntentAdmission(self.alloc, txn_id);
-        try self.applyBatchWithReservation(writes.items, deletes.items, extra_batch.replay, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 });
+        var retirement = try self.completionRetirement(txn_id, extra_batch.resolved_participant, writes.items);
+        if (retirement) |*change| try change.append(self.alloc, &writes, &deletes);
 
-        if (self.trace_writer) |tw| {
+        try self.emitOrApplyCompletionBatch(writes.items, deletes.items, extra_batch.replay, retirement, capture);
+
+        if (if (capture == null) self.trace_writer else null) |tw| {
             tw.traceEvent(&.{
                 .name = if (status == .committed) "CommitTransaction" else "AbortTransaction",
                 .txn_id = txn_id,
@@ -1239,16 +1883,26 @@ pub const TxnManager = struct {
     }
 
     pub fn clearHAOutbox(self: *TxnManager, txn_id: TxnId, kind: HAOutboxKind) !void {
-        switch (kind) {
-            .batch => {
-                const key = makeTransactionHABatchOutboxKey(txn_id);
-                try self.applyBatch(&.{}, &.{&key}, null);
-            },
-            .replay => {
-                const key = makeTransactionHAReplayOutboxKey(txn_id);
-                try self.applyBatch(&.{}, &.{&key}, null);
-            },
+        const batch_key = makeTransactionHABatchOutboxKey(txn_id);
+        const replay_key = makeTransactionHAReplayOutboxKey(txn_id);
+        const key: []const u8 = switch (kind) {
+            .batch => &batch_key,
+            .replay => &replay_key,
+        };
+        var writes = std.ArrayListUnmanaged(docstore.KVPair).empty;
+        defer writes.deinit(self.alloc);
+        var deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer deletes.deinit(self.alloc);
+        try deletes.append(self.alloc, key);
+        var retirement: ?CompletionChange = null;
+        if (try self.completionRecord(txn_id) != null) {
+            const record = try self.loadTransactionRecord(txn_id);
+            if (record.status != .pending and record.intents_resolved_known and record.intents_resolved and
+                try self.completionCanRetireClearingOutbox(txn_id, null, kind))
+                retirement = try self.completionChange(txn_id, null);
         }
+        if (retirement) |*change| try change.append(self.alloc, &writes, &deletes);
+        try self.applyBatchWithCompletion(writes.items, deletes.items, null, retirement);
     }
 
     pub fn collectIntentDocumentKeys(
@@ -1448,7 +2102,7 @@ pub const TxnManager = struct {
         // has already cleaned the transaction. Do not recreate an orphaned
         // resolved-participants sidecar in that case, and reject corrupt
         // acknowledgements for participants that were never enlisted.
-        _ = try self.loadTransactionRecord(txn_id);
+        const record = try self.loadTransactionRecord(txn_id);
         const participants = try self.getParticipants(self.alloc, txn_id);
         defer freeParticipantList(self.alloc, participants);
         var enlisted = false;
@@ -1489,7 +2143,15 @@ pub const TxnManager = struct {
         defer writes.deinit(self.alloc);
         try writes.append(self.alloc, .{ .key = &key, .value = encoded });
         try writes.appendSlice(self.alloc, extra_batch.writes);
-        try self.applyBatch(writes.items, extra_batch.deletes, null);
+        var deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer deletes.deinit(self.alloc);
+        try deletes.appendSlice(self.alloc, extra_batch.deletes);
+        var retirement = if (record.status != .pending and record.intents_resolved_known and record.intents_resolved)
+            try self.completionRetirement(txn_id, participant, writes.items)
+        else
+            null;
+        if (retirement) |*change| try change.append(self.alloc, &writes, &deletes);
+        try self.applyBatchWithCompletion(writes.items, deletes.items, null, retirement);
     }
 
     pub fn getParticipants(self: *TxnManager, alloc: Allocator, txn_id: TxnId) ![][]u8 {
@@ -1610,6 +2272,10 @@ pub const TxnManager = struct {
             }
 
             if (!(summary.intents_resolved_known and summary.intents_resolved) and try self.hasAnyIntents(txn_id)) {
+                if (!options.resolve_terminal_intents) {
+                    stats.deferred_unresolved += 1;
+                    continue;
+                }
                 const resolve_ts = switch (summary.status) {
                     .committed => if (summary.commit_version > 0) summary.commit_version else summary.begin_timestamp,
                     .aborted => if (summary.finalized_at > 0) summary.finalized_at else resolution_timestamp,
@@ -1961,10 +2627,7 @@ pub const TxnManager = struct {
     }
 
     fn makeIntentLockKey(self: *TxnManager, user_key: []const u8) ![]u8 {
-        const key = try self.alloc.alloc(u8, intent_locks_prefix.len + user_key.len);
-        @memcpy(key[0..intent_locks_prefix.len], intent_locks_prefix);
-        @memcpy(key[intent_locks_prefix.len..], user_key);
-        return key;
+        return makeIntentLockKeyAlloc(self.alloc, user_key);
     }
 
     fn loadTransactionRecord(self: *TxnManager, txn_id: TxnId) !TxnRecord {
@@ -2223,7 +2886,12 @@ pub const TxnManager = struct {
         try deletes.append(self.alloc, &admission_key);
         try deletes.appendSlice(self.alloc, &.{ &record_key, &participant_key, &resolved_key, &ha_batch_key, &ha_replay_key, &intent_keys_key, &schema_lease_key });
         try deletes.appendSlice(self.alloc, extra_batch.deletes);
-        try self.applyBatch(extra_batch.writes, deletes.items, null);
+        var writes = std.ArrayListUnmanaged(docstore.KVPair).empty;
+        defer writes.deinit(self.alloc);
+        try writes.appendSlice(self.alloc, extra_batch.writes);
+        var retirement = try self.completionChange(txn_id, null);
+        if (retirement) |*change| try change.append(self.alloc, &writes, &deletes);
+        try self.applyBatchWithCompletion(writes.items, deletes.items, null, retirement);
     }
 
     fn saveParticipantSet(self: *TxnManager, comptime prefix: []const u8, txn_id: TxnId, participants: []const []const u8) !void {
@@ -2294,14 +2962,76 @@ pub const TxnManager = struct {
     }
 
     fn applyBatch(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend) !void {
-        return self.applyBatchWithReservation(writes, deletes, replay, null);
+        return self.applyBatchWithCompletion(writes, deletes, replay, null);
     }
 
     const ReservationChange = struct { previous: u64, next: u64 };
+
     fn applyBatchWithReservation(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange) !void {
         var batch = try self.store.beginBatch();
         errdefer batch.abort();
         if (reservation) |change| try retained_effects.replaceReservation(&batch, change.previous, change.next);
+        for (deletes) |key| batch.delete(key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+        for (writes) |kv| try batch.put(kv.key, kv.value);
+        if (replay) |entry| try batch.setReplayOpaque(entry.sequence, entry.payload);
+        try batch.commit();
+    }
+
+    fn applyBatchWithCompletion(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, completion: ?CompletionChange) !void {
+        return self.emitOrApplyCompletionBatch(writes, deletes, replay, completion, null);
+    }
+
+    fn emitOrApplyCompletionBatch(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, completion: ?CompletionChange, capture: ?*completion_mutations.Plan) !void {
+        var batch = if (completion != null) try self.store.beginSerializedBatch() else try self.store.beginBatch();
+        errdefer batch.abort();
+        var summary: ?[16]u8 = null;
+        if (completion) |change| {
+            const current_record = batch.get(&change.key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            const previous: ?CompletionRecord = if (current_record) |raw| try CompletionRecord.decode(raw) else null;
+            if (!std.meta.eql(previous, change.previous)) return error.TransactionCompletionChanged;
+            const current_summary = try CompletionUsage.decode(try batch.get(completion_summary_key));
+            const next: ?CompletionRecord = if (change.record) |raw| try CompletionRecord.decode(&raw) else null;
+            // Background acknowledgements do not hold the foreground DB apply
+            // mutex. The explicit shared writer gate spans this re-read and
+            // commit/abort; an ordinary native LSM batch alone does not.
+            // Independent completion writers cannot lose each other's credits.
+            summary = (try self.adjustCompletionUsage(current_summary, previous, next)).encode();
+        }
+        if (capture) |sink| {
+            if (self.capture_physical_mutations) {
+                var physical: completion_compiler.PhysicalSink = .{ .baseline = &batch, .plan = sink };
+                var runtime = physical.runtime(self.alloc);
+                const writer = physical.writer(self.alloc, &runtime);
+                for (deletes) |key| try writer.delete(key);
+                for (writes) |kv| {
+                    if (completion != null and std.mem.eql(u8, kv.key, completion_summary_key)) continue;
+                    try writer.put(kv.key, kv.value);
+                }
+                if (summary) |*value| try writer.put(completion_summary_key, value);
+                if (replay) |entry| try writer.setReplayOpaque(entry.sequence, entry.payload);
+                batch.abort();
+                return;
+            }
+            // Retain the shared completion writer gate for the same ledger
+            // calculation when present, but never mutate or commit this batch.
+            for (deletes) |key| try validateInspectedCompletionKey(key);
+            for (writes) |kv| try validateInspectedCompletionKey(kv.key);
+            for (deletes) |key| try sink.delete(key);
+            for (writes) |kv| {
+                if (completion != null and std.mem.eql(u8, kv.key, completion_summary_key)) continue;
+                try sink.put(kv.key, kv.value);
+            }
+            if (summary) |*value| try sink.put(completion_summary_key, value);
+            if (replay) |entry| try docstore.emitReplayMutations(self.alloc, sink, entry.sequence, entry.payload);
+            batch.abort();
+            return;
+        }
         for (deletes) |key| {
             batch.delete(key) catch |err| switch (err) {
                 error.NotFound => {},
@@ -2309,10 +3039,28 @@ pub const TxnManager = struct {
             };
         }
         for (writes) |kv| {
+            if (completion != null and std.mem.eql(u8, kv.key, completion_summary_key)) continue;
             try batch.put(kv.key, kv.value);
         }
+        if (summary) |*value| try batch.put(completion_summary_key, value);
         if (replay) |entry| try batch.setReplayOpaque(entry.sequence, entry.payload);
         try batch.commit();
+    }
+
+    fn validateInspectedCompletionKey(key: []const u8) !void {
+        // These keyspaces pass through DocStore unchanged. Other keys may
+        // allocate columnar dirty/manifest or external payload ownership rows.
+        if (internal_keys.isPrimaryDocumentKey(key) or internal_keys.isTtlKey(key) or
+            std.mem.eql(u8, key, completion_summary_key)) return;
+        inline for (.{ records_prefix, schema_leases_prefix, participants_prefix, resolved_participants_prefix, intent_keys_prefix, intent_admission_prefix, read_admission_prefix, completion_prefix }) |prefix| {
+            if (key.len == prefix.len + 16 and std.mem.startsWith(u8, key, prefix)) return;
+        }
+        inline for (.{ intents_prefix, intent_members_prefix, read_members_prefix }) |prefix| {
+            if (key.len > prefix.len + 17 and std.mem.startsWith(u8, key, prefix) and key[prefix.len + 16] == ':') return;
+        }
+        if (key.len > intent_locks_prefix.len and std.mem.startsWith(u8, key, intent_locks_prefix)) return;
+        if (std.mem.eql(u8, key, read_guard_count_key)) return;
+        return error.UnsupportedCompletionMutation;
     }
 
     fn traceWriteIntentSuccess(self: *TxnManager, txn_id: TxnId, intents: []const WriteIntent, predicates: []const VersionPredicate) void {
@@ -2690,6 +3438,10 @@ fn decodeParticipantList(alloc: Allocator, raw: []const u8) ![][]u8 {
     var count_buf: [4]u8 = undefined;
     @memcpy(&count_buf, raw[0..4]);
     const count = std.mem.readInt(u32, &count_buf, .little);
+    // Every element needs its own length word, even when its payload is empty.
+    // Reject impossible counts before they turn a small corrupt record into a
+    // huge decoded allocation during recovery.
+    if (count > (raw.len - 4) / 4) return TxnError.InvalidTxnRecord;
     var result = try alloc.alloc([]u8, count);
     var initialized: usize = 0;
     errdefer {
@@ -2774,165 +3526,1080 @@ fn tempTestPath(alloc: Allocator, label: []const u8) ![:0]u8 {
 // Tests
 // ============================================================================
 
-test "retained transaction reservations survive LSM reopen and guarantee committed resolution at quota" {
-    const alloc = std.testing.allocator;
-    const path = try tempTestPath(alloc, "txn-retained-reserved");
-    defer alloc.free(path);
-    defer cleanupTestDir(path);
-    const id: TxnId = @splat(73);
-    const ns: retained_effects.Namespace = @splat(1);
-    // A near-frame-limit transaction remains admissible: reserving a blanket
-    // six-times JSON allowance would wrongly reject this before preparation.
-    const payload = try alloc.alloc(u8, retained_effects.max_frame_bytes - 1024);
-    defer alloc.free(payload);
-    @memset(payload, 'x');
-    const physical = try internal_keys.documentKeyAlloc(alloc, "reserved");
-    defer alloc.free(physical);
-    const filler_key = try internal_keys.documentKeyAlloc(alloc, "filler");
-    defer alloc.free(filler_key);
-    const integrity = @import("db/relational_integrity_contract.zig");
-    const address = try integrity.Address.init(@splat(3), "parent");
-    const claim_key = address.claimKey();
-    const claim_value = try (integrity.Claim{ .tuple = "parent", .parent_table = "parents", .parent_key = "reserved", .schema_version = 1 }).encode(alloc, address);
-    defer alloc.free(claim_value);
-    const claim_intent: WriteIntent = .{ .key = &claim_key, .value = claim_value };
-    var expected_reserved: u64 = 0;
+fn expectResolutionInspectionMatchesStore(alloc: Allocator, baseline: []const backend_scan.OwnedKVPair, plan: *const completion_mutations.Plan, actual: *backend_erased.Store) !void {
+    var mirror = mem_backend.Backend.init(alloc, .{});
+    defer mirror.close();
+    var expected = try mirror.runtimeStore(alloc, .{});
+    defer expected.deinit();
     {
-        var backend = try lsm_backend.Backend.open(alloc, path, .{ .flush_threshold_bytes = 1024 * 1024 });
-        defer backend.close();
-        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
-        defer store.close();
-        try store.put(&internal_keys.identity_namespace_key, &ns);
-        {
-            var txn = try store.beginWriteTxn();
-            errdefer txn.abort();
-            _ = try retained_effects.admit(&txn, ns, 1, @splat(1), retained_effects.max_frame_bytes);
-            try txn.commit();
-        }
-        var manager = try TxnManager.init(alloc, &store);
-        defer manager.deinit();
-        try manager.initTransaction(id, 1);
-        const intent: WriteIntent = .{ .key = "reserved", .value = payload };
-        try manager.writeIntents(id, &.{ intent, claim_intent }, &.{});
-        expected_reserved = (try manager.loadIntentAdmission(alloc, id)).?.reservation();
-        try std.testing.expectEqual(@as(u64, payload.len + physical.len + 16 + 48 + claim_key.len + claim_value.len + 16), expected_reserved);
-        // Repeated/duplicate-key prepares replace their credits, not add them.
-        try manager.writeIntents(id, &.{ intent, claim_intent, .{ .key = "reserved", .value = "smaller" }, intent }, &.{});
-        {
-            var read = try store.beginReadTxn();
-            defer read.abort();
-            try std.testing.expectEqual(expected_reserved, (try retained_effects.loadReservations(&read)).?.bytes);
-        }
-        const filler = try alloc.alloc(u8, @intCast(retained_effects.max_frame_bytes - expected_reserved - 48 - 16 - filler_key.len));
-        defer alloc.free(filler);
-        @memset(filler, 'f');
-        try store.put(filler_key, filler);
-        try std.testing.expectError(error.RetainedEffectsFull, store.put(filler_key, "cannot steal committed credits"));
-        const rejected: TxnId = @splat(74);
-        try manager.initTransaction(rejected, 2);
-        try std.testing.expectError(error.RetainedEffectsFull, manager.writeIntents(rejected, &.{.{ .key = "another", .value = "x" }}, &.{}));
-        try manager.checkOrdinaryWriteConflict("another");
-        try std.testing.expect(!(try manager.loadTransactionRecord(rejected)).prepared);
+        var batch = try expected.beginBatch();
+        errdefer batch.abort();
+        for (baseline) |kv| try batch.put(kv.key, kv.value);
+        for (plan.operations()) |mutation| switch (mutation.kind) {
+            .put => try batch.put(mutation.key, mutation.value),
+            .delete => batch.delete(mutation.key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            },
+        };
+        try batch.commit();
     }
-    {
-        var backend = try lsm_backend.Backend.open(alloc, path, .{ .flush_threshold_bytes = 1024 * 1024 });
-        defer backend.close();
-        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
-        defer store.close();
-        var manager = try TxnManager.init(alloc, &store);
-        defer manager.deinit();
-        try manager.resolveIntents(id, .committed, 1234);
-        try manager.resolveIntents(id, .committed, 1234);
-        var read = try store.beginReadTxn();
-        defer read.abort();
-        try std.testing.expectEqualSlices(u8, payload, try read.get(physical));
-        try std.testing.expectEqualSlices(u8, claim_value, try read.get(&claim_key));
-        try std.testing.expectEqual(@as(u64, 0), (try retained_effects.loadReservations(&read)).?.bytes);
-        const state = (try retained_effects.load(&read)).?;
-        try std.testing.expectEqual(@as(u64, 2), state.latest);
-        try std.testing.expectEqual(@as(u64, retained_effects.max_frame_bytes), state.retained_bytes);
-        var reader = (try retained_effects.read(&read, ns, 1, @splat(1), 1)).?;
-        const claim_effect = (try reader.next()).?;
-        try std.testing.expect(claim_effect.isIntegrity());
-        try std.testing.expectEqualSlices(u8, claim_value, claim_effect.value.?);
-        try std.testing.expectEqual(@as(u64, 0), claim_effect.timestamp);
-        const effect = (try reader.next()).?;
-        try std.testing.expectEqual(@as(u64, 1234), effect.timestamp);
-        try std.testing.expect(try reader.next() == null);
+    const expected_rows = try backend_scan.scanPrefix(alloc, &expected, "");
+    defer backend_scan.freeResults(alloc, expected_rows);
+    const actual_rows = try backend_scan.scanPrefix(alloc, actual, "");
+    defer backend_scan.freeResults(alloc, actual_rows);
+    try std.testing.expectEqual(expected_rows.len, actual_rows.len);
+    for (expected_rows, actual_rows) |a, b| {
+        try std.testing.expectEqualStrings(a.key, b.key);
+        try std.testing.expectEqualStrings(a.value, b.value);
     }
 }
 
-test "retained transaction reservations admit existing prepares release abort and fence untracked roots" {
+fn rebindCompiledTemplateForTest(template: *completion_compiler.Template, timestamp: u64, sequence: u64, usage: CompletionUsage) !void {
+    for (template.operations) |op| for (op.bindings) |binding| {
+        const value = switch (binding.kind) {
+            .commit_timestamp => timestamp,
+            .replay_sequence => sequence,
+            .replay_next_sequence => try std.math.add(u64, sequence, 1),
+            .shared_ledger_count => usage.count,
+            .shared_ledger_bytes => usage.bytes,
+            .raft_term, .raft_index => return error.UnsupportedCompletionTemplate,
+        };
+        const target = @constCast(switch (binding.target) {
+            .key => op.key,
+            .value => op.value,
+        });
+        std.mem.writeInt(u64, target[binding.offset..][0..8], value, if (binding.byte_order == .little) .little else .big);
+    };
+}
+
+test "workload admission completion compiler derives native control ownership from actual fresh BEGIN" {
     const alloc = std.testing.allocator;
-    var backend = mem_backend.Backend.init(alloc, .{});
+    const begin = @import("lsm_backend/completion_control_begin.zig");
+    const record = @import("lsm_backend/completion_control_record.zig");
+    const guard = @import("lsm_backend/completion_control_guard.zig");
+    const entry = @import("lsm_backend/completion_entry.zig");
+    var backend = lsm_backend.Backend.init(alloc, .{});
     defer backend.close();
     var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
     defer store.close();
     var manager = try TxnManager.init(alloc, &store);
     defer manager.deinit();
-    const ns: retained_effects.Namespace = @splat(2);
-    try store.put(&internal_keys.identity_namespace_key, &ns);
-    const id: TxnId = @splat(5);
-    try manager.initTransaction(id, 1);
-    try manager.writeIntents(id, &.{.{ .key = "existing", .value = "before admission" }}, &.{});
-    {
-        var txn = try store.beginWriteTxn();
-        errdefer txn.abort();
-        _ = try retained_effects.admit(&txn, ns, 1, @splat(1), retained_effects.default_limit);
-        try txn.commit();
+    manager.completion_limits = .{ .max_count = 16, .max_bytes = 1024 * 1024 };
+    try manager.reconcileCompletionAdmission();
+    const authority: @import("completion_candidate.zig").Authority = .{
+        .group_id = 9,
+        .incarnation = @splat(3),
+        .policy_digest = @splat(4),
+        .schema_catalog_digest = @splat(5),
+        .previous_term = 2,
+        .previous_index = 17,
+    };
+    var case: u8 = 0;
+    for ([_]bool{ false, true }) |coordinator| for ([_]bool{ false, true }) |retain_terminal| for ([_][]const []const u8{ &.{}, &.{ "coordinator", "left\x00\xff", "right" } }) |participants| {
+        case += 1;
+        const id: TxnId = @splat(case);
+        const input: TxnManager.BeginInput = .{
+            .txn_id = id,
+            .timestamp = 100,
+            .created_at = 90,
+            .topology_epoch = 0,
+            .participants = participants,
+            .coordinator = coordinator,
+            .retain_terminal = retain_terminal,
+        };
+        {
+            var snapshot = try manager.store.beginRead();
+            defer snapshot.abort();
+            const wire = try manager.compileBeginMutation(alloc, &snapshot, input, authority, @splat(case), "native-control-begin", &.{});
+            defer alloc.free(wire);
+            var decoded = try entry.decode(alloc, wire);
+            defer decoded.deinit();
+            const declaration = try begin.inspect(decoded.entry.prepare_operations);
+            try std.testing.expectEqualDeep(id, declaration.txn_id);
+            try std.testing.expectEqualDeep(try CompletionControlBudget.measure(participants), declaration.budget);
+            try std.testing.expectEqualDeep(try record.Participants.measure(participants), declaration.participants);
+            try std.testing.expectEqual(coordinator, declaration.coordinator);
+            try std.testing.expectEqual(retain_terminal, declaration.retain_terminal);
+            try std.testing.expectError(error.TxnNotFound, manager.loadTransactionRecord(id));
+            const owned_record: record.Record = .{
+                .authority = .{ .group_id = authority.group_id, .incarnation = authority.incarnation, .policy_digest = authority.policy_digest, .schema_catalog_digest = authority.schema_catalog_digest, .generation = 7 },
+                .txn_id = declaration.txn_id,
+                .begin = .{ .term = 2, .index = 18, .digest = entry.protocol.payloadDigest(wire) },
+                .participants = declaration.participants,
+                .slot_index = case % record.max_owners,
+                .output_run_id = 100 + @as(u64, case),
+            };
+            const retained = try (guard.Guard{ .record = owned_record, .envelope = wire }).encode(alloc);
+            defer alloc.free(retained);
+            const restored = try guard.Guard.decode(retained);
+            try std.testing.expectEqualDeep(owned_record, restored.record);
+            try restored.validateBegin(alloc);
+            if (case == 1) {
+                const storage_io = @import("lsm_backend/storage_io.zig");
+                const repository = @import("lsm_backend/repository.zig");
+                var filesystem = storage_io.IoStorage.init(std.Options.debug_io);
+                var path_buffer: [256]u8 = undefined;
+                const root = repository.tmpPath(&path_buffer, "native-control-publication");
+                defer repository.cleanupTmp(root);
+                try filesystem.storage().createDirPath(std.mem.span(root));
+                var publication = try guard.Publication.prepare(alloc, std.mem.span(root), restored);
+                defer publication.deinit();
+                try std.testing.expectError(error.InvalidCompletionSlot, publication.publish(filesystem.storage()));
+                try publication.stage(filesystem.storage());
+                try std.testing.expect(try guard.hasAny(filesystem.storage(), alloc, std.mem.span(root)));
+                try std.testing.expectError(error.CompletionRecoveryCapacityRequired, guard.load(alloc, filesystem.storage(), std.mem.span(root), owned_record.slot_index, owned_record.authority));
+                try std.testing.expectError(error.CompletionReservationBusy, publication.stage(filesystem.storage()));
+                try publication.publish(filesystem.storage());
+                var installed = (try guard.load(alloc, filesystem.storage(), std.mem.span(root), owned_record.slot_index, owned_record.authority)) orelse return error.TestUnexpectedResult;
+                defer installed.deinit();
+                try std.testing.expectEqualDeep(owned_record, installed.guard.record);
+                try std.testing.expectEqualSlices(u8, wire, installed.guard.envelope);
+                try std.testing.expectEqualDeep(declaration, installed.declaration);
+                try std.testing.expectError(error.CompletionReservationBusy, publication.stage(filesystem.storage()));
+                var owners = try guard.loadAll(alloc, filesystem.storage(), std.mem.span(root), owned_record.authority);
+                try std.testing.expectEqual(@as(usize, 1), owners.count);
+                try std.testing.expectEqualDeep(declaration, owners.owners[owned_record.slot_index].?.declaration);
+                const output_layout = @import("lsm_backend/completion_output_layout.zig");
+                const held_outputs = try output_layout.loadHeld(alloc, filesystem.storage(), std.mem.span(root), owned_record.authority);
+                try std.testing.expectEqual(owned_record.output_run_id, held_outputs.ids[owned_record.slot_index].?);
+                const control_capacity = @import("lsm_backend/completion_control_capacity.zig");
+                const certified = try control_capacity.certifyRestored(.{
+                    .cost = .{},
+                    .mutable_growth = .{},
+                    .baseline_frontier_bytes = 0,
+                    .max_mutable_entries = 0,
+                    .current_runs = 0,
+                    .future_document_outputs = 4,
+                    .append = .{},
+                }, &owners, .{
+                    .format = .{ .metadata_bytes = 2 * 1024 * 1024 },
+                    .max_record_bytes = 256 * 1024,
+                    .max_inputs = 72,
+                    .max_path_bytes = 544,
+                    .single_drain_metadata_bytes = 2 * 1024 * 1024,
+                    .max_retained_wal_bytes = 8 * 1024 * 1024,
+                    .replay_workspace_bytes = 32 * 1024 * 1024,
+                    .compiler_workspace_bytes = 32 * 1024 * 1024,
+                });
+                try std.testing.expectEqual(@as(usize, 1), certified.owner_count);
+                try std.testing.expectEqual(declaration.budget.mutations, certified.owners[0].append.records);
+                owners.deinit();
+                var duplicate_record = owned_record;
+                duplicate_record.slot_index += 1;
+                duplicate_record.output_run_id += 1;
+                var duplicate_publication = try guard.Publication.prepare(alloc, std.mem.span(root), .{ .record = duplicate_record, .envelope = wire });
+                defer duplicate_publication.deinit();
+                try duplicate_publication.stage(filesystem.storage());
+                try duplicate_publication.publish(filesystem.storage());
+                try std.testing.expectError(error.InvalidCompletionSlot, guard.loadAll(alloc, filesystem.storage(), std.mem.span(root), owned_record.authority));
+                try std.testing.expectError(error.InvalidCompletionSlot, output_layout.loadHeld(alloc, filesystem.storage(), std.mem.span(root), owned_record.authority));
+            }
+            var wrong_participants = owned_record;
+            wrong_participants.participants.digest[0] ^= 1;
+            try std.testing.expectError(error.InvalidCompletionSlot, (guard.Guard{
+                .record = wrong_participants,
+                .envelope = wire,
+            }).validateBegin(alloc));
+            var wrong_authority = owned_record;
+            wrong_authority.authority.schema_catalog_digest[0] ^= 1;
+            try std.testing.expectError(error.InvalidCompletionSlot, (guard.Guard{
+                .record = wrong_authority,
+                .envelope = wire,
+            }).validateBegin(alloc));
+            var wrong_index = owned_record;
+            wrong_index.begin.index += 1;
+            try std.testing.expectError(error.InvalidCompletionSlot, (guard.Guard{
+                .record = wrong_index,
+                .envelope = wire,
+            }).validateBegin(alloc));
+            var wrong_term = owned_record;
+            wrong_term.begin.term = 1;
+            try std.testing.expectError(error.InvalidCompletionSlot, (guard.Guard{
+                .record = wrong_term,
+                .envelope = wire,
+            }).validateBegin(alloc));
+            var restored_entry = try entry.decode(alloc, restored.envelope);
+            defer restored_entry.deinit();
+            try std.testing.expectEqualDeep(declaration, try begin.inspect(restored_entry.entry.prepare_operations));
+
+            var operations: [5]completion_compiler.slot.Operation = undefined;
+            @memcpy(&operations, decoded.entry.prepare_operations);
+            for (operations, 0..) |op, i| {
+                if (std.mem.startsWith(u8, op.key, records_prefix)) {
+                    var value = op.value[0..txn_record_v6_size].*;
+                    value[49] = 1; // Already prepared is not fresh BEGIN debt.
+                    operations[i].value = &value;
+                    try std.testing.expectError(error.InvalidCompletionSlot, begin.inspect(&operations));
+                    operations[i] = op;
+                } else if (std.mem.startsWith(u8, op.key, completion_prefix)) {
+                    var value = op.value[0..16].*;
+                    std.mem.writeInt(u64, value[0..8], declaration.budget.wal_bytes - 1, .little);
+                    operations[i].value = &value;
+                    try std.testing.expectError(error.CompletionPlanCapacityExceeded, begin.inspect(&operations));
+                    operations[i] = op;
+                }
+                operations[i].key = "unrelated-document-key";
+                try std.testing.expectError(error.InvalidCompletionSlot, begin.inspect(&operations));
+                operations[i] = op;
+            }
+            operations[1] = operations[0];
+            try std.testing.expectError(error.InvalidCompletionSlot, begin.inspect(&operations));
+        }
+        try manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(id, 100, 90, participants, coordinator, retain_terminal);
+        var snapshot = try manager.store.beginRead();
+        defer snapshot.abort();
+        const duplicate = try manager.compileBeginMutation(alloc, &snapshot, input, authority, @splat(case), "native-control-begin", &.{});
+        defer alloc.free(duplicate);
+        var decoded_duplicate = try entry.decode(alloc, duplicate);
+        defer decoded_duplicate.deinit();
+        try std.testing.expectError(error.UnsupportedCompletionProfile, begin.inspect(decoded_duplicate.entry.prepare_operations));
+    };
+}
+
+test "workload admission completion compiler captures actual controls with preowned memory across retries" {
+    const alloc = std.testing.allocator;
+    const transition = @import("lsm_backend/completion_control_transition.zig");
+    const control_record = @import("lsm_backend/completion_control_record.zig");
+    const control_shape = @import("completion_control_budget.zig");
+    const entry_codec = @import("lsm_backend/completion_entry.zig");
+    const domains = @import("lsm_backend/completion_allocator.zig");
+    const resources = @import("resource_manager.zig");
+    const control = @import("lsm_backend/completion_control_resources.zig");
+    var backing = std.testing.FailingAllocator.init(alloc, .{});
+    var resource_manager = resources.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer resource_manager.deinit(alloc);
+    var compiler = try domains.CompilerWorkspace.init(backing.allocator(), &resource_manager, 32 * 1024 * 1024);
+    defer compiler.deinit() catch unreachable;
+    const id: TxnId = @splat(203);
+    const held = try control.Resources.create(backing.allocator(), &resource_manager, &compiler, id, .{
+        .publication_bytes = 1024 * 1024,
+        .wal_bytes = 1024 * 1024,
+    });
+    defer held.destroy();
+    var backend = lsm_backend.Backend.init(backing.allocator(), .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(backing.allocator(), try backend.runtimeStore(backing.allocator(), .{}));
+    defer store.close();
+    var manager = try TxnManager.init(backing.allocator(), &store);
+    defer manager.deinit();
+    manager.completion_limits = .{ .max_count = 4, .max_bytes = 1024 * 1024 };
+    const participants = [_][]const u8{ "coordinator", "left", "right" };
+    const declaration: @import("lsm_backend/completion_control_begin.zig").Declaration = .{
+        .txn_id = id,
+        .participants = try control_record.Participants.measure(&participants),
+        .budget = try control_shape.Budget.measure(&participants),
+        .coordinator = true,
+        .retain_terminal = false,
+        .ledger_bytes = (try control_shape.Budget.measure(&participants)).wal_bytes,
+    };
+    try manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(id, 100, 90, &participants, true, false);
+    const authority: @import("completion_candidate.zig").Authority = .{
+        .group_id = 9,
+        .incarnation = @splat(3),
+        .policy_digest = @splat(4),
+        .schema_catalog_digest = @splat(5),
+        .previous_term = 2,
+        .previous_index = 17,
+    };
+    const Capture = struct {
+        expected: []const u8,
+        reject: bool,
+        compiler: *domains.CompilerWorkspace,
+
+        fn reenter(_: void, _: Allocator) !void {}
+        fn proposal(capture: @This(), wire: []const u8) !void {
+            try std.testing.expectEqualSlices(u8, capture.expected, wire);
+            try capture.compiler.withCompletion(void, {}, reenter);
+            if (capture.reject) return error.NotProposed;
+        }
+    };
+    compiler.generation = std.math.maxInt(u64);
+    const initial_publication = held.publication.remainingBytes();
+    const initial_wal = held.wal_credit;
+    for (0..participants.len + 1) |step| {
+        const input: TxnManager.ControlInput = .{
+            .txn_id = id,
+            .action = if (step == 0) .{ .resolve_metadata = .{ .status = .committed, .timestamp = 200 } } else .{ .acknowledge = participants[step - 1] },
+        };
+        {
+            // Acquisition is intentionally outside this compiler-only proof.
+            // The DATA bridge still must provide a bounded acquired snapshot.
+            var snapshot = try manager.store.beginRead();
+            defer snapshot.abort();
+            const expected = try manager.compileControlMutation(alloc, &snapshot, input, authority, @splat(6), "control-resource-test", &.{});
+            defer alloc.free(expected);
+            var decoded = try entry_codec.decode(alloc, expected);
+            defer decoded.deinit();
+            const before_record = try manager.getAlloc(alloc, &makeRecordKey(id));
+            defer alloc.free(before_record);
+            const before_participants = try manager.getAlloc(alloc, &makeSidecarKey(participants_prefix, id));
+            defer alloc.free(before_participants);
+            const before_resolved: ?[]u8 = manager.getAlloc(alloc, &makeSidecarKey(resolved_participants_prefix, id)) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            defer if (before_resolved) |value| alloc.free(value);
+            const classified = try transition.inspect(decoded.entry.prepare_operations, declaration, before_record, before_participants, before_resolved);
+            if (step == 0) {
+                try std.testing.expectEqual(.committed, classified.decision);
+            } else {
+                try std.testing.expectEqual(@as(u32, @intCast(step)), classified.acknowledgement.count);
+                try std.testing.expect(!std.mem.allEqual(u8, &classified.acknowledgement.resolved_digest, 0));
+            }
+            backing.fail_index = backing.alloc_index;
+            backing.resize_fail_index = backing.resize_index;
+            resource_manager.memory.budget.hard_limit_bytes = 1;
+            defer {
+                backing.fail_index = std.math.maxInt(usize);
+                backing.resize_fail_index = std.math.maxInt(usize);
+                resource_manager.memory.budget.hard_limit_bytes = 0;
+            }
+            var capture: Capture = .{ .expected = expected, .reject = true, .compiler = &compiler };
+            for (0..16) |_| try std.testing.expectError(error.NotProposed, manager.withReservedControlMutation(held, &snapshot, input, authority, @splat(6), "control-resource-test", &.{}, void, capture, Capture.proposal));
+            capture.reject = false;
+            try manager.withReservedControlMutation(held, &snapshot, input, authority, @splat(6), "control-resource-test", &.{}, void, capture, Capture.proposal);
+            var wrong_owner = input;
+            wrong_owner.txn_id = @splat(204);
+            try std.testing.expectError(error.InvalidArgument, manager.withReservedControlMutation(held, &snapshot, wrong_owner, authority, @splat(6), "control-resource-test", &.{}, void, capture, Capture.proposal));
+            try std.testing.expectEqual(initial_publication, held.publication.remainingBytes());
+            try std.testing.expectEqual(initial_wal, held.wal_credit);
+            try std.testing.expect(!backing.has_induced_failure);
+        }
+        // Real publication supplies the next compiler baseline. Application's
+        // durable control-owner integration is a separate, still-open stage.
+        if (step == 0) try manager.resolveIntents(id, .committed, 200) else try manager.markParticipantResolved(id, participants[step - 1]);
+        if (step != 0) {
+            var retry_snapshot = try manager.store.beginRead();
+            defer retry_snapshot.abort();
+            const duplicate = try manager.compileControlMutation(alloc, &retry_snapshot, input, authority, @splat(6), "control-resource-test", &.{});
+            defer alloc.free(duplicate);
+            var decoded_duplicate = try entry_codec.decode(alloc, duplicate);
+            defer decoded_duplicate.deinit();
+            const after_record = try manager.getAlloc(alloc, &makeRecordKey(id));
+            defer alloc.free(after_record);
+            const after_participants = try manager.getAlloc(alloc, &makeSidecarKey(participants_prefix, id));
+            defer alloc.free(after_participants);
+            const after_resolved = try manager.getAlloc(alloc, &makeSidecarKey(resolved_participants_prefix, id));
+            defer alloc.free(after_resolved);
+            try std.testing.expectError(error.UnsupportedCompletionProfile, transition.inspect(
+                decoded_duplicate.entry.prepare_operations,
+                declaration,
+                after_record,
+                after_participants,
+                after_resolved,
+            ));
+        }
     }
-    try manager.resolveIntents(id, .aborted, 2);
-    {
-        var txn = try store.beginReadTxn();
-        defer txn.abort();
-        try std.testing.expectEqual(@as(u64, 0), (try retained_effects.loadReservations(&txn)).?.bytes);
-        try std.testing.expectEqual(@as(u64, 0), (try retained_effects.load(&txn)).?.latest);
+    try std.testing.expectEqualDeep(CompletionUsage{}, (try manager.completionUsage()).?);
+}
+
+test "workload admission completion compiler lifetime control budget covers real WAL rewrites and admission" {
+    const alloc = std.testing.allocator;
+    const codec = @import("lsm_backend/completion_entry.zig");
+    const wal = @import("lsm_backend/wal.zig");
+    const authority: @import("completion_candidate.zig").Authority = .{
+        .group_id = 9,
+        .incarnation = @splat(3),
+        .policy_digest = @splat(4),
+        .schema_catalog_digest = @splat(5),
+        .previous_term = 2,
+        .previous_index = 17,
+    };
+    const Totals = struct {
+        mutations: u64 = 0,
+        operations: u64 = 0,
+        payload: u64 = 0,
+        largest: u64 = 0,
+        largest_key: u64 = 0,
+        largest_record: u64 = 0,
+        wal_bytes: u64 = 0,
+
+        const Rows = struct {
+            operations: []const completion_compiler.slot.Operation,
+            pub fn entryCount(self: @This()) usize {
+                return self.operations.len;
+            }
+            pub fn entryAt(self: @This(), index: usize) struct { namespace_name: ?[]const u8, key: []const u8, value: []const u8, tombstone: bool } {
+                const op = self.operations[index];
+                return .{ .namespace_name = "docs", .key = op.key, .value = op.value, .tombstone = op.kind == .delete };
+            }
+        };
+
+        fn include(self: *@This(), wire: []const u8) !void {
+            var entry = try codec.decode(alloc, wire);
+            defer entry.deinit();
+            const operations = entry.entry.prepare_operations;
+            var payload: u64 = 0;
+            for (operations) |op| {
+                payload += op.key.len + op.value.len;
+                self.largest_key = @max(self.largest_key, op.key.len);
+                self.largest_record = @max(self.largest_record, op.key.len + op.value.len);
+            }
+            self.mutations += 1;
+            self.operations += operations.len;
+            self.payload += payload;
+            self.largest = @max(self.largest, payload);
+            // Use the production WAL encoder, including namespace and record
+            // framing. Preparing bytes performs no filesystem operations.
+            var append = try wal.PreparedAppend.init(alloc, "/control-budget-test", Rows{ .operations = operations }, true, .{});
+            defer append.deinit();
+            self.wal_bytes += append.record.len;
+        }
+
+        fn control(self: *@This(), manager: *TxnManager, input: TxnManager.ControlInput) !void {
+            var read = try manager.store.beginRead();
+            defer read.abort();
+            const wire = try manager.compileControlMutation(alloc, &read, input, authority, @splat(6), "control-budget-test", &.{});
+            defer alloc.free(wire);
+            try self.include(wire);
+        }
+    };
+    // Enough distinct participants to exceed the old fixed 64x name-byte
+    // allowance, with unequal binary name lengths and adversarial ACK order.
+    var names: [192][96]u8 = undefined;
+    var participants: [names.len][]const u8 = undefined;
+    for (&names, &participants, 0..) |*name, *participant, i| {
+        @memset(name, @intCast(i));
+        participant.* = name[0 .. 64 + i % 33];
     }
-    // Simulate a released pre-accounting prepared root. One prefix probe must
-    // deny source admission, never scan or silently evict the prepared vote.
-    {
-        var txn = try store.beginWriteTxn();
-        errdefer txn.abort();
-        try retained_effects.release(&txn, ns, 1, @splat(1));
-        try txn.delete(retained_effects.reservation_key);
-        try txn.put(intents_prefix ++ "old", "untracked");
-        try txn.commit();
+    const budget = try CompletionControlBudget.measure(&participants);
+    const charge = try TxnManager.completionMetadataBytes(&participants);
+    var old_charge: u64 = 4096;
+    for (participants) |participant| old_charge += 128 + 64 * participant.len;
+    try std.testing.expect(charge > old_charge);
+    for ([_]TxnStatus{ .committed, .aborted }) |status| {
+        var backend = lsm_backend.Backend.init(alloc, .{});
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        var manager = try TxnManager.init(alloc, &store);
+        defer manager.deinit();
+        const id: TxnId = @splat(202);
+        manager.completion_limits = .{ .max_count = 1, .max_bytes = old_charge };
+        // Admission rejects before creating the transaction or participant set.
+        try std.testing.expectError(error.TransactionRecoveryCapacityExhausted, manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(id, 100, 90, &participants, true, false));
+        try std.testing.expectError(error.TxnNotFound, manager.loadTransactionRecord(id));
+        try std.testing.expectEqualDeep(CompletionUsage{}, (try manager.completionUsage()).?);
+        manager.completion_limits.max_bytes = charge;
+        var totals: Totals = .{};
+        {
+            var read = try manager.store.beginRead();
+            defer read.abort();
+            const wire = try manager.compileBeginMutation(alloc, &read, .{
+                .txn_id = id,
+                .timestamp = 100,
+                .created_at = 90,
+                .topology_epoch = 0,
+                .participants = &participants,
+                .coordinator = true,
+                .retain_terminal = false,
+            }, authority, @splat(6), "control-budget-test", &.{});
+            defer alloc.free(wire);
+            try totals.include(wire);
+        }
+        try manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(id, 100, 90, &participants, true, false);
+        try std.testing.expectEqual(charge, (try manager.completionUsage()).?.bytes);
+        // Lowering admission after begin must not prevent the promised cleanup.
+        manager.completion_limits.max_bytes = 1;
+        try totals.control(&manager, .{ .txn_id = id, .action = .{ .resolve_metadata = .{ .status = status, .timestamp = 200 } } });
+        try manager.resolveIntents(id, status, 200);
+        for (0..participants.len) |ordinal| {
+            const index = if (status == .committed) ordinal else participants.len - ordinal - 1;
+            const participant = participants[index];
+            try totals.control(&manager, .{ .txn_id = id, .action = .{ .acknowledge = participant } });
+            try manager.markParticipantResolved(id, participant);
+            // Duplicate acknowledgements do not retire credit twice. Their
+            // fresh Raft-index costs are deliberately outside this certificate.
+            try manager.markParticipantResolved(id, participant);
+            const usage = (try manager.completionUsage()).?;
+            try std.testing.expectEqual(if (ordinal + 1 == participants.len) @as(u64, 0) else charge, usage.bytes);
+        }
+        try std.testing.expectEqualDeep(CompletionUsage{}, (try manager.completionUsage()).?);
+        try std.testing.expectEqual(budget.mutations, totals.mutations);
+        try std.testing.expect(totals.operations <= budget.operations);
+        try std.testing.expect(totals.payload <= budget.payload_bytes);
+        try std.testing.expect(totals.largest <= budget.max_mutation_payload_bytes);
+        try std.testing.expect(totals.largest_key <= budget.max_key_bytes);
+        try std.testing.expect(totals.largest_record <= budget.max_record_payload_bytes);
+        try std.testing.expect(totals.wal_bytes <= budget.wal_bytes);
+        // Demonstrate the previous charge actually undercounted encoded writes,
+        // rather than merely comparing two versions of the sizing formula.
+        try std.testing.expect(totals.wal_bytes > old_charge);
     }
-    {
-        var txn = try store.beginWriteTxn();
-        defer txn.abort();
-        try std.testing.expectError(error.RetainedEffectsFull, retained_effects.admit(&txn, ns, 2, @splat(2), retained_effects.default_limit));
-    }
-    try store.delete(intents_prefix ++ "old");
-    {
-        var txn = try store.beginWriteTxn();
-        errdefer txn.abort();
-        _ = try retained_effects.admit(&txn, ns, 2, @splat(2), retained_effects.default_limit);
-        try txn.commit();
+    // No allocation or arithmetic wrap is possible for unencodable declarations.
+    try std.testing.expectError(error.TransactionTooLarge, CompletionControlBudget.fromEncodedList(std.math.maxInt(u64), 4));
+    try std.testing.expectError(error.TransactionTooLarge, CompletionControlBudget.fromEncodedList(1, std.math.maxInt(u64)));
+    try std.testing.expectError(error.TransactionTooLarge, CompletionControlBudget.fromEncodedList(std.math.maxInt(u32), std.math.maxInt(u32)));
+}
+
+test "workload admission completion compiler metadata controls match actual decision acknowledgements and cleanup" {
+    const alloc = std.testing.allocator;
+    const candidate = @import("completion_candidate.zig");
+    const entry_codec = @import("lsm_backend/completion_entry.zig");
+    const authority: candidate.Authority = .{
+        .group_id = 9,
+        .incarnation = @splat(3),
+        .policy_digest = @splat(4),
+        .schema_catalog_digest = @splat(5),
+        .previous_term = 2,
+        .previous_index = 17,
+    };
+    const Check = struct {
+        fn step(manager: *TxnManager, input: TxnManager.ControlInput) !void {
+            const before = try backend_scan.scanPrefix(alloc, &manager.store, "");
+            defer backend_scan.freeResults(alloc, before);
+            const wire = blk: {
+                var snapshot = try manager.store.beginRead();
+                defer snapshot.abort();
+                const first = try manager.compileControlMutation(alloc, &snapshot, input, authority, @splat(6), "control-test", &.{});
+                errdefer alloc.free(first);
+                const duplicate = try manager.compileControlMutation(alloc, &snapshot, input, authority, @splat(6), "control-test", &.{});
+                defer alloc.free(duplicate);
+                try std.testing.expectEqualSlices(u8, first, duplicate);
+                break :blk first;
+            };
+            defer alloc.free(wire);
+            var plan = try completion_mutations.Plan.init(alloc, .{ .max_operations = 256, .max_bytes = 256 * 1024 });
+            defer plan.deinit();
+            // Compilation must leave the complete store unchanged, including
+            // shared completion counters and participant metadata.
+            try expectResolutionInspectionMatchesStore(alloc, before, &plan, &manager.store);
+            var decoded = try entry_codec.decode(alloc, wire);
+            defer decoded.deinit();
+            try std.testing.expectEqual(.mutation, decoded.entry.kind);
+            try std.testing.expect(decoded.decoded_descriptor.descriptor.commit.len == 0 and decoded.decoded_descriptor.descriptor.abort.len == 0);
+            for (decoded.entry.prepare_operations) |op| {
+                try std.testing.expectEqual(@as(usize, 0), op.bindings.len);
+                switch (op.kind) {
+                    .put => try plan.put(op.key, op.value),
+                    .delete => try plan.delete(op.key),
+                }
+            }
+            switch (input.action) {
+                .resolve_metadata => |value| _ = try manager.resolveIntentsWithExtraBatch(input.txn_id, value.status, value.timestamp, .{ .known_intent_keys = &.{}, .expected_intent_revision = 0 }),
+                .acknowledge => |participant| try manager.markParticipantResolved(input.txn_id, participant),
+                .cleanup => |value| _ = try manager.cleanupTransactionMetadataIfEligible(input.txn_id, value.cutoff, value.retained_cutoff),
+            }
+            try expectResolutionInspectionMatchesStore(alloc, before, &plan, &manager.store);
+        }
+    };
+    for ([_]TxnStatus{ .committed, .aborted }) |status| {
+        for ([_]bool{ false, true }) |prepared| {
+            var backend = lsm_backend.Backend.init(alloc, .{});
+            defer backend.close();
+            var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+            defer store.close();
+            var manager = try TxnManager.init(alloc, &store);
+            defer manager.deinit();
+            manager.completion_limits = .{ .max_count = 4, .max_bytes = 1024 * 1024, .max_transaction_bytes = 64 * 1024 };
+            const id: TxnId = @splat(201);
+            const participants = [_][]const u8{ "coordinator", "left", "right" };
+            try manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(id, 100, 90, &participants, true, true);
+            try Check.step(&manager, .{ .txn_id = id, .action = .{ .cleanup = .{ .cutoff = 1000, .retained_cutoff = 1000 } } });
+            const decision: TxnManager.ControlInput = .{ .txn_id = id, .action = .{ .resolve_metadata = .{ .status = status, .timestamp = 200 } } };
+            if (prepared) {
+                try manager.writeIntents(id, &.{.{ .key = "doc", .value = "value" }}, &.{});
+                {
+                    var snapshot = try manager.store.beginRead();
+                    defer snapshot.abort();
+                    try std.testing.expectError(error.UnsupportedCompletionProfile, manager.compileControlMutation(alloc, &snapshot, decision, authority, @splat(6), "control-test", &.{}));
+                }
+                // Document outcomes keep their existing prepared owner. Only
+                // subsequent acknowledgement metadata uses this compiler.
+                try manager.resolveIntents(id, status, 200);
+            } else {
+                try Check.step(&manager, decision);
+                try Check.step(&manager, decision);
+            }
+            {
+                var snapshot = try manager.store.beginRead();
+                defer snapshot.abort();
+                try std.testing.expectError(error.InvalidParticipant, manager.compileControlMutation(alloc, &snapshot, .{ .txn_id = id, .action = .{ .acknowledge = "not-enlisted" } }, authority, @splat(6), "control-test", &.{}));
+            }
+            for (participants) |participant| {
+                const ack: TxnManager.ControlInput = .{ .txn_id = id, .action = .{ .acknowledge = participant } };
+                try Check.step(&manager, ack);
+                try Check.step(&manager, ack);
+            }
+            try std.testing.expectEqual(@as(u64, 0), (try manager.completionUsage()).?.count);
+            try Check.step(&manager, .{ .txn_id = id, .action = .{ .cleanup = .{ .cutoff = 100, .retained_cutoff = 100 } } });
+            try Check.step(&manager, .{ .txn_id = id, .action = .{ .cleanup = .{ .cutoff = 1000, .retained_cutoff = 1000 } } });
+            try Check.step(&manager, .{ .txn_id = id, .action = .{ .cleanup = .{ .cutoff = 1000, .retained_cutoff = 1000 } } });
+            try std.testing.expectError(error.TxnNotFound, manager.loadTransactionRecord(id));
+        }
     }
 }
 
-test "retained transaction byte bounds count exact physical rows without parsing ordinary values" {
-    var tiny: [1]u8 = undefined;
-    var fixed = std.heap.FixedBufferAllocator.init(&tiny);
-    const raw: WriteIntent = .{ .key = "binary\x00key", .value = "{\"number\":9007199254740993}" };
-    try std.testing.expectEqual(@as(u64, raw.value.?.len + 16 + 2 + internal_keys.encodedComponentLen(raw.key)), try retainedIntentBytes(fixed.allocator(), raw));
-    const typed: WriteIntent = .{ .key = "row", .value = "sidecar", .prepared_row = "already encoded defaults and generated values" };
-    try std.testing.expectEqual(@as(u64, typed.prepared_row.?.len + 23), try retainedIntentBytes(fixed.allocator(), typed));
-    const address = try @import("db/relational_integrity_contract.zig").Address.init(@splat(1), "parent");
-    const claim_key = address.claimKey();
-    // Physical integrity keys are already encoded; neither JSON parsing nor
-    // primary-key escaping belongs in their exact prepared reservation.
-    const claim: WriteIntent = .{ .key = &claim_key, .value = "binary\x00\\_edges" };
-    try std.testing.expectEqual(@as(u64, 16 + claim_key.len + claim.value.?.len), try retainedIntentBytes(fixed.allocator(), claim));
-    try std.testing.expectEqual(@as(u64, 16 + claim_key.len), try retainedIntentBytes(fixed.allocator(), .{ .key = &claim_key, .value = null }));
-    const special: WriteIntent = .{ .key = "row", .value = "{\"_edges\":[],\"literal\":\"\\u000b\\u2028\\\\\"}" };
-    try std.testing.expect((try retainedIntentBytes(std.testing.allocator, special)) >= special.value.?.len + 23);
-    for ([_][]const u8{
-        "\x00\x00__metadata__:relational_integrity_activation",
-        "\x00\x00__metadata__:relational_integrity_retirement",
-        "\x00\x00__metadata__:restore_staging_owner",
-    }) |key| try std.testing.expectEqual(@as(u64, 0), try retainedIntentBytes(fixed.allocator(), .{ .key = key, .value = "binary\x00\\_edges" }));
+test "workload admission completion compiler prepares privately and matches both real outcomes after rebinding" {
+    const alloc = std.testing.allocator;
+    const journal = @import("db/derived/change_journal.zig");
+    const key = "compiler-doc";
+    for ([_]TxnStatus{ .committed, .aborted }) |status| {
+        var backend = lsm_backend.Backend.init(alloc, .{});
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        var manager = try TxnManager.init(alloc, &store);
+        defer manager.deinit();
+        manager.completion_limits = .{ .max_count = 4, .max_bytes = 1024 * 1024 };
+        const id: TxnId = @splat(121);
+        try putVisibleDoc(&store, alloc, key, "old");
+        try manager.initTransaction(id, 100);
+        const intents = [_]WriteIntent{.{ .key = key, .value = "replacement" }};
+        const sample_payload = try journal.encodeRecord(alloc, .{
+            .sequence = 7,
+            .changed_doc_keys = &.{key},
+            .overwritten_doc_keys = &.{key},
+            .target_hints = &.{ .full_text, .dense_vector, .sparse_vector, .algebraic },
+        });
+        defer alloc.free(sample_payload);
+        var snapshot = try manager.store.beginRead();
+        var compiled = manager.compileCompletionTemplates(id, &intents, &.{}, .{ .schema_binding = .{} }, .{ .replay = .{ .sequence = 7, .payload = sample_payload } }, .{}, .{ .snapshot = &snapshot, .timestamp = 200, .replay_payload_sequence_offset = 6 }) catch |err| {
+            snapshot.abort();
+            return err;
+        };
+        snapshot.abort();
+        defer compiled.deinit();
+        try std.testing.expect(!(try manager.loadTransactionRecord(id)).prepared);
+        try std.testing.expectEqual(@as(u64, 0), (try manager.loadTransactionRecord(id)).intent_revision);
+        try std.testing.expect(try manager.loadIntentAdmission(alloc, id) == null);
+        const old = try getVisibleDoc(&store, alloc, key);
+        defer alloc.free(old);
+        try std.testing.expectEqualStrings("old", old);
+        // Unrelated transaction debt invalidates the sample shared counters.
+        // Bind the exact result under the real serialized transition instead.
+        const other: TxnId = @splat(122);
+        try manager.initTransaction(other, 101);
+        try manager.writeIntents(other, &.{.{ .key = "unrelated", .value = "preserved" }}, &.{});
+        const before_prepare = try backend_scan.scanPrefix(alloc, &manager.store, "");
+        defer backend_scan.freeResults(alloc, before_prepare);
+        try manager.writeIntentsExtraBatch(id, &intents, &.{}, .{ .schema_binding = .{} });
+        try rebindCompiledTemplateForTest(&compiled.prepare, 400, 11, (try manager.completionUsage()).?);
+        try expectResolutionInspectionMatchesStore(alloc, before_prepare, &compiled.prepare.plan, &manager.store);
+        const before_resolve = try backend_scan.scanPrefix(alloc, &manager.store, "");
+        defer backend_scan.freeResults(alloc, before_resolve);
+        const actual_payload = try journal.encodeRecord(alloc, .{
+            .sequence = 11,
+            .changed_doc_keys = &.{key},
+            .overwritten_doc_keys = &.{key},
+            .target_hints = &.{ .full_text, .dense_vector, .sparse_vector, .algebraic },
+        });
+        defer alloc.free(actual_payload);
+        _ = try manager.resolveIntentsWithExtraBatch(id, status, 400, .{
+            .replay = if (status == .committed) .{ .sequence = 11, .payload = actual_payload } else null,
+            .known_intent_keys = &.{key},
+            .expected_intent_revision = compiled.intent_revision,
+        });
+        const chosen = if (status == .committed) &compiled.commit else &compiled.abort;
+        try rebindCompiledTemplateForTest(chosen, 400, 11, (try manager.completionUsage()).?);
+        try expectResolutionInspectionMatchesStore(alloc, before_resolve, &chosen.plan, &manager.store);
+        try std.testing.expectEqual(@as(u64, 1), (try manager.completionUsage()).?.count);
+    }
+}
+
+test "workload admission completion compiler candidate covers absent reads and preserves future bindings" {
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    var manager = try TxnManager.init(alloc, &store);
+    defer manager.deinit();
+    const id: TxnId = @splat(129);
+    try manager.initTransaction(id, 100);
+    var read = try manager.store.beginRead();
+    defer read.abort();
+    var compiled = try manager.compileCompletionTemplates(id, &.{.{ .key = "new", .value = "value" }}, &.{}, .{ .schema_binding = .{} }, .{}, .{}, .{ .snapshot = &read, .timestamp = 200 });
+    defer compiled.deinit();
+    const slot = completion_compiler.slot;
+    const descriptor = try slot.encode(alloc, .{
+        .txn_id = id,
+        .intent_revision = compiled.intent_revision,
+        .limits = lsm_backend.Backend.durable_completion_limits,
+        .profile_fence = "candidate-test",
+        .commit = compiled.commit.operations,
+        .abort = compiled.abort.operations,
+    }, .{});
+    defer alloc.free(descriptor);
+    const candidate = @import("completion_candidate.zig");
+    const wire = try candidate.encode(alloc, .{
+        .group_id = 9,
+        .incarnation = @splat(3),
+        .policy_digest = @splat(4),
+        .schema_catalog_digest = @splat(5),
+        .previous_term = 2,
+        .previous_index = 17,
+    }, id, @splat(6), descriptor, &compiled, &read, &.{ "absent-transform-input", "absent-transform-input" });
+    defer alloc.free(wire);
+    const entry_codec = @import("lsm_backend/completion_entry.zig");
+    var decoded = try entry_codec.decode(alloc, wire);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(u64, 17), decoded.entry.previous_index);
+    try std.testing.expectEqual(@as(u64, 2), decoded.entry.previous_term);
+    var absent_count: usize = 0;
+    for (decoded.entry.baseline_keys) |key| if (std.mem.eql(u8, key, "absent-transform-input")) {
+        absent_count += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), absent_count);
+    for (decoded.entry.prepare_operations) |op| try std.testing.expectEqual(@as(usize, 0), op.bindings.len);
+    var future_bindings: usize = 0;
+    for (decoded.decoded_descriptor.descriptor.commit) |op| future_bindings += op.bindings.len;
+    try std.testing.expect(future_bindings != 0);
+    try std.testing.expect(!(try manager.loadTransactionRecord(id)).prepared);
+    var changed = entry_codec.BaselineHasher.init();
+    for (decoded.entry.baseline_keys) |key| {
+        const value = if (std.mem.eql(u8, key, "absent-transform-input")) "now-present" else read.get(key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        try changed.add(key, value);
+    }
+    try std.testing.expect(!std.mem.eql(u8, &changed.finish(), &decoded.entry.baseline_digest));
+}
+
+test "workload admission completion compiler bounded failures never prepare backing transaction" {
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{});
+    defer runtime.deinit();
+    var manager = try TxnManager.init(alloc, &runtime);
+    defer manager.deinit();
+    const id: TxnId = @splat(123);
+    try manager.initTransaction(id, 100);
+    var snapshot = try manager.store.beginRead();
+    defer snapshot.abort();
+    const intents = [_]WriteIntent{.{ .key = "doc", .value = "replacement" }};
+    const base_options: completion_compiler.Options = .{ .snapshot = &snapshot, .timestamp = 200 };
+    var options = base_options;
+    options.scratch_bytes = 32;
+    try std.testing.expectError(error.OutOfMemory, manager.compileCompletionTemplates(id, &intents, &.{}, .{ .schema_binding = .{} }, .{}, .{}, options));
+    options = base_options;
+    options.plan_limits = .{ .max_operations = 1, .max_bytes = 1024 };
+    try std.testing.expectError(error.CompletionPlanCapacityExceeded, manager.compileCompletionTemplates(id, &intents, &.{}, .{ .schema_binding = .{} }, .{}, .{}, options));
+    manager.completion_limits = .{ .max_count = 4, .max_bytes = 1024 * 1024 };
+    try std.testing.expectError(error.TransactionRecoveryReconciliationRequired, manager.compileCompletionTemplates(id, &intents, &.{}, .{ .schema_binding = .{} }, .{}, .{}, base_options));
+    try std.testing.expect(!(try manager.loadTransactionRecord(id)).prepared);
+    try std.testing.expect(try manager.loadIntentAdmission(alloc, id) == null);
+    var overlay = try completion_compiler.Overlay.init(alloc, &snapshot, .{ .max_operations = 4, .max_bytes = 1024 });
+    defer overlay.deinit();
+    var private_store = overlay.store();
+    var read = try private_store.beginRead();
+    defer read.abort();
+    try std.testing.expectError(error.UnsupportedCompletionTemplateScan, read.openCursor());
+    try std.testing.expectError(error.UnsupportedCompletionTemplateWrite, private_store.beginWrite());
+    // Absence is a dependency too; duplicate probes must not consume the
+    // bounded footprint twice, and overlay-local writes are not base reads.
+    try std.testing.expectError(error.NotFound, read.get("absent-dependency"));
+    try std.testing.expectError(error.NotFound, read.get("absent-dependency"));
+    var batch = try private_store.beginBatch();
+    try batch.put("overlay-local", "value");
+    try std.testing.expectEqualStrings("value", try batch.get("overlay-local"));
+    batch.abort();
+    const dependencies = try overlay.copyBaselineReads(alloc);
+    defer {
+        for (dependencies) |key| alloc.free(key);
+        alloc.free(dependencies);
+    }
+    try std.testing.expectEqual(@as(usize, 1), dependencies.len);
+    try std.testing.expectEqualStrings("absent-dependency", dependencies[0]);
+}
+
+test "workload admission completion compiler allocation failure unwinds every output without backing writes" {
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{});
+    defer runtime.deinit();
+    var manager = try TxnManager.init(alloc, &runtime);
+    defer manager.deinit();
+    const id: TxnId = @splat(124);
+    try manager.initTransaction(id, 100);
+    var snapshot = try manager.store.beginRead();
+    defer snapshot.abort();
+    const Case = struct {
+        fn run(failing: Allocator, source: *TxnManager, read: *backend_erased.ReadTxn, txn_id: TxnId) !void {
+            var local = source.*;
+            local.alloc = failing;
+            var compiled = try local.compileCompletionTemplates(txn_id, &.{.{ .key = "doc", .value = "replacement" }}, &.{}, .{ .schema_binding = .{} }, .{}, .{}, .{ .snapshot = read, .timestamp = 200 });
+            defer compiled.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Case.run, .{ &manager, &snapshot, id });
+    try std.testing.expect(!(try manager.loadTransactionRecord(id)).prepared);
+    try std.testing.expect(try manager.loadIntentAdmission(alloc, id) == null);
+}
+
+test "workload admission completion inspection matches commit abort replay and terminal retry" {
+    const alloc = std.testing.allocator;
+    const journal = @import("db/derived/change_journal.zig");
+    const key = "doc:\x00\xff:one";
+    for ([_]TxnStatus{ .committed, .aborted }) |status| {
+        var backend = lsm_backend.Backend.init(alloc, .{});
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        var manager = try TxnManager.init(alloc, &store);
+        defer manager.deinit();
+        manager.completion_limits = .{ .max_count = 4, .max_bytes = 1024 * 1024 };
+        const id: TxnId = @splat(81);
+        try putVisibleDoc(&store, alloc, key, "old");
+        try manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(id, 100, 100, &.{"local"}, true, true);
+        try manager.writeIntentsExtraBatch(id, &.{.{ .key = key, .value = "replacement" }}, &.{}, .{ .schema_binding = .{} });
+        const payload = try journal.encodeRecord(alloc, .{
+            .sequence = 7,
+            .changed_doc_keys = &.{key},
+            .overwritten_doc_keys = &.{key},
+            .target_hints = &.{ .full_text, .dense_vector, .sparse_vector, .algebraic },
+        });
+        defer alloc.free(payload);
+        const extra: ResolutionExtraBatch = .{
+            .resolved_participant = "local",
+            .replay = if (status == .committed) .{ .sequence = 7, .payload = payload } else null,
+            .expected_intent_revision = 1,
+        };
+        const baseline = try backend_scan.scanPrefix(alloc, &manager.store, "");
+        defer backend_scan.freeResults(alloc, baseline);
+        const usage = (try manager.completionUsage()).?;
+        var unsupported = extra;
+        unsupported.writes = &.{.{ .key = "\x00\x00__metadata__:schema", .value = "{}" }};
+        try std.testing.expectError(error.UnsupportedCompletionMutation, manager.inspectResolutionMutations(id, status, 200, unsupported, .{ .max_operations = 64, .max_bytes = 65536 }));
+        // Failure after a prefix has been captured must not retire an intent,
+        // acknowledgement, completion credit or terminal record.
+        try std.testing.expectError(error.CompletionPlanCapacityExceeded, manager.inspectResolutionMutations(id, status, 200, extra, .{ .max_operations = 1, .max_bytes = 4096 }));
+        try std.testing.expectEqual(TxnStatus.pending, try manager.getTransactionStatus(id));
+        try std.testing.expectEqualDeep(usage, (try manager.completionUsage()).?);
+        var inspected = try manager.inspectResolutionMutations(id, status, 200, extra, .{ .max_operations = 64, .max_bytes = 65536 });
+        defer inspected.deinit();
+        const old = try getVisibleDoc(&store, alloc, key);
+        defer alloc.free(old);
+        try std.testing.expectEqualStrings("old", old);
+        try std.testing.expectEqual(TxnStatus.pending, try manager.getTransactionStatus(id));
+        try std.testing.expectEqualDeep(usage, (try manager.completionUsage()).?);
+        const outcome = try manager.resolveIntentsWithExtraBatch(id, status, 200, extra);
+        try std.testing.expectEqualDeep(inspected.outcome, outcome);
+        try expectResolutionInspectionMatchesStore(alloc, baseline, &inspected.mutations, &manager.store);
+        try std.testing.expectEqualDeep(CompletionUsage{}, (try manager.completionUsage()).?);
+        if (status == .committed) try std.testing.expectEqual(@as(u64, 200), (try readTimestampRuntime(&manager.store, alloc, key)).?);
+
+        // A newer foreground write must survive a terminal retry. The captured
+        // retry has no user writes or replay, even if the caller supplies them.
+        try putVisibleDoc(&store, alloc, key, "newer");
+        var retry = try manager.inspectResolutionMutations(id, status, 200, extra, .{ .max_operations = 64, .max_bytes = 65536 });
+        defer retry.deinit();
+        try std.testing.expect(!retry.outcome.applied);
+        try std.testing.expectEqual(@as(usize, 0), retry.mutations.count);
+        _ = try manager.resolveIntentsWithExtraBatch(id, status, 200, extra);
+        const newer = try getVisibleDoc(&store, alloc, key);
+        defer alloc.free(newer);
+        try std.testing.expectEqualStrings("newer", newer);
+    }
+}
+
+test "workload admission completion inspection rebinds shared accounting after unrelated prepare" {
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{});
+    defer runtime.deinit();
+    var manager = try TxnManager.init(alloc, &runtime);
+    defer manager.deinit();
+    manager.completion_limits = .{ .max_count = 4, .max_bytes = 1024 * 1024 };
+    const first: TxnId = @splat(91);
+    const second: TxnId = @splat(92);
+    try manager.initTransaction(first, 100);
+    try manager.writeIntents(first, &.{.{ .key = "a", .value = "first" }}, &.{});
+    const limits: completion_mutations.Limits = .{ .max_operations = 64, .max_bytes = 65536 };
+    var before = try manager.inspectResolutionMutations(first, .committed, 200, .{}, limits);
+    defer before.deinit();
+    try manager.initTransaction(second, 101);
+    try manager.writeIntents(second, &.{.{ .key = "b", .value = "second" }}, &.{});
+    var after = try manager.inspectResolutionMutations(first, .committed, 200, .{}, limits);
+    defer after.deinit();
+    var before_usage: ?CompletionUsage = null;
+    var after_usage: ?CompletionUsage = null;
+    for (before.mutations.operations()) |op| if (std.mem.eql(u8, op.key, completion_summary_key)) {
+        before_usage = try CompletionUsage.decode(op.value);
+    };
+    for (after.mutations.operations()) |op| if (std.mem.eql(u8, op.key, completion_summary_key)) {
+        after_usage = try CompletionUsage.decode(op.value);
+    };
+    try std.testing.expectEqual(@as(u64, 0), before_usage.?.count);
+    try std.testing.expectEqual(@as(u64, 1), after_usage.?.count);
+    const baseline = try backend_scan.scanPrefix(alloc, &manager.store, "");
+    defer backend_scan.freeResults(alloc, baseline);
+    try manager.resolveIntents(first, .committed, 200);
+    try expectResolutionInspectionMatchesStore(alloc, baseline, &after.mutations, &manager.store);
+    try std.testing.expectEqualDeep(after_usage.?, (try manager.completionUsage()).?);
+    try std.testing.expectEqual(TxnStatus.pending, try manager.getTransactionStatus(second));
+}
+
+test "workload admission storage completion debt is atomic through coordinator handoff" {
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{});
+    defer runtime.deinit();
+    var manager = try TxnManager.init(alloc, &runtime);
+    defer manager.deinit();
+    manager.completion_limits = .{ .max_count = 1, .max_bytes = 64 * 1024 };
+    const first: TxnId = .{71} ** 16;
+    const second: TxnId = .{72} ** 16;
+    try manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(first, 100, 100, &.{"coordinator"}, true, true);
+    const begun = (try manager.completionUsage()).?;
+    try std.testing.expectEqual(@as(u64, 1), begun.count);
+    try std.testing.expectError(error.TransactionRecoveryCapacityExhausted, manager.initTransaction(second, 101));
+    try std.testing.expectError(error.TxnNotFound, manager.getTransactionStatus(second));
+    try manager.writeIntents(first, &.{.{ .key = "a", .value = "value" }}, &.{});
+    const prepared = (try manager.completionUsage()).?;
+    try std.testing.expect(prepared.bytes > begun.bytes);
+    const excessive: [2048]u8 = @splat('x');
+    try std.testing.expectError(error.TransactionRecoveryCapacityExhausted, manager.writeIntents(first, &.{.{ .key = "b", .value = &excessive }}, &.{}));
+    try std.testing.expectEqualDeep(prepared, (try manager.completionUsage()).?);
+    try manager.checkOrdinaryWriteConflict("b");
+
+    // A tighter policy cannot revoke accepted obligations or prevent terminal
+    // completion, and an idempotent prepare cannot spend the credits twice.
+    manager.completion_limits.max_bytes = 1;
+    try manager.writeIntents(first, &.{.{ .key = "a", .value = "value" }}, &.{});
+    try std.testing.expectEqualDeep(prepared, (try manager.completionUsage()).?);
+    try manager.resolveIntents(first, .committed, 200);
+    try std.testing.expectEqualDeep(prepared, (try manager.completionUsage()).?);
+    try manager.markParticipantResolved(first, "coordinator");
+    try std.testing.expectEqualDeep(CompletionUsage{}, (try manager.completionUsage()).?);
+    try manager.markParticipantResolved(first, "coordinator");
+    try std.testing.expectEqualDeep(CompletionUsage{}, (try manager.completionUsage()).?);
+    manager.completion_limits.max_bytes = 64 * 1024;
+    try manager.initTransaction(second, 201);
+    try manager.resolveIntents(second, .aborted, 202);
+    try std.testing.expectEqualDeep(CompletionUsage{}, (try manager.completionUsage()).?);
+}
+
+test "workload admission storage completion survives reopen and restores legacy pending debt" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "txn-completion-reopen");
+    defer alloc.free(path);
+    defer cleanupTestDir(path);
+    const first: TxnId = .{73} ** 16;
+    const second: TxnId = .{74} ** 16;
+    {
+        var store = try DocStore.open(alloc, path, .{});
+        defer store.close();
+        var writer = try TxnManager.init(alloc, &store);
+        defer writer.deinit();
+        // Simulate an older writer: no completion summary exists yet.
+        try writer.initTransaction(first, 100);
+        try writer.writeIntents(first, &.{.{ .key = "a", .value = "value" }}, &.{});
+    }
+    {
+        var store = try DocStore.open(alloc, path, .{});
+        defer store.close();
+        var reader = try TxnManager.init(alloc, &store);
+        defer reader.deinit();
+        reader.completion_limits = .{ .max_count = 1, .max_bytes = 64 * 1024 };
+        try reader.reconcileCompletionAdmission();
+        try std.testing.expectEqual(@as(u64, 1), (try reader.completionUsage()).?.count);
+        try std.testing.expectError(error.TransactionRecoveryCapacityExhausted, reader.initTransaction(second, 101));
+    }
+    {
+        var store = try DocStore.open(alloc, path, .{});
+        defer store.close();
+        var reader = try TxnManager.init(alloc, &store);
+        defer reader.deinit();
+        reader.completion_limits = .{ .max_count = 1, .max_bytes = 1 };
+        try std.testing.expectEqual(@as(u64, 1), (try reader.completionUsage()).?.count);
+        try reader.resolveIntents(first, .committed, 200);
+        try std.testing.expectEqualDeep(CompletionUsage{}, (try reader.completionUsage()).?);
+        const value = try getVisibleDocRuntime(&reader.store, alloc, "a");
+        defer alloc.free(value);
+        try std.testing.expectEqualStrings("value", value);
+    }
+}
+
+test "workload admission follower completion does not wait for coordinator fanout acknowledgements" {
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{});
+    defer runtime.deinit();
+    var manager = try TxnManager.init(alloc, &runtime);
+    defer manager.deinit();
+    manager.completion_limits = .{ .max_count = 1, .max_bytes = 64 * 1024 };
+    const id: TxnId = .{75} ** 16;
+    try manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(id, 100, 100, &.{ "coordinator", "follower" }, false, false);
+    try manager.writeIntents(id, &.{.{ .key = "a", .value = "value" }}, &.{});
+    try manager.resolveIntents(id, .committed, 200);
+    try std.testing.expectEqualDeep(CompletionUsage{}, (try manager.completionUsage()).?);
+}
+
+test "workload admission independent storage writers cannot overspend one completion slot" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "txn-completion-concurrent");
+    defer alloc.free(path);
+    defer cleanupTestDir(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    try exerciseIndependentCompletionWriters(&store);
+}
+
+test "workload admission native completion writers share one admission gate" {
+    const alloc = std.testing.allocator;
+    for (0..16) |_| {
+        var backend = lsm_backend.Backend.init(alloc, .{ .flush_threshold = 4096 });
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        try exerciseIndependentCompletionWriters(&store);
+    }
+}
+
+fn exerciseIndependentCompletionWriters(store: *DocStore) !void {
+    const alloc = std.testing.allocator;
+    const State = struct {
+        store: *DocStore,
+        ready: std.atomic.Value(usize) = .init(0),
+        go: std.atomic.Value(bool) = .init(false),
+        failures: [2]?anyerror = .{ null, null },
+
+        fn run(self: *@This(), index: usize) void {
+            var manager = TxnManager.init(std.testing.allocator, self.store) catch |err| {
+                self.failures[index] = err;
+                _ = self.ready.fetchAdd(1, .release);
+                return;
+            };
+            defer manager.deinit();
+            manager.completion_limits = .{ .max_count = 1, .max_bytes = 64 * 1024 };
+            _ = self.ready.fetchAdd(1, .release);
+            while (!self.go.load(.acquire)) std.atomic.spinLoopHint();
+            const id: TxnId = @splat(@intCast(90 + index));
+            manager.initTransaction(id, 100) catch |err| {
+                self.failures[index] = err;
+            };
+        }
+    };
+    var state: State = .{ .store = store };
+    const first = try std.Thread.spawn(.{}, State.run, .{ &state, @as(usize, 0) });
+    const second = std.Thread.spawn(.{}, State.run, .{ &state, @as(usize, 1) }) catch |err| {
+        state.go.store(true, .release);
+        first.join();
+        return err;
+    };
+    while (state.ready.load(.acquire) != 2) std.atomic.spinLoopHint();
+    state.go.store(true, .release);
+    first.join();
+    second.join();
+    var successes: usize = 0;
+    for (state.failures) |failure| {
+        if (failure) |err| try std.testing.expectEqual(error.TransactionRecoveryCapacityExhausted, err) else successes += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), successes);
+    var reader = try TxnManager.init(alloc, store);
+    defer reader.deinit();
+    try std.testing.expectEqual(@as(u64, 1), (try reader.completionUsage()).?.count);
+    const records = try reader.listTransactions(alloc);
+    defer alloc.free(records);
+    try std.testing.expectEqual(@as(usize, 1), records.len);
 }
 
 test "transaction cumulative admission is atomic and membership metadata is incremental" {

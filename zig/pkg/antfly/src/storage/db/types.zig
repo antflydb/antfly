@@ -1331,6 +1331,8 @@ pub const LookupOptions = struct {
     relational_activation_json: []const u8 = "",
     relational_index_status_json: []const u8 = "",
     relational_topology_json: []const u8 = "",
+    /// Borrowed synchronous read driver; never part of the transport contract.
+    read_execution: ?*resource_manager_mod.DenseExecution.Runtime.Lease = null,
     fields: []const []const u8 = &.{},
     include_all_fields: bool = true,
     /// Internal, absolute monotonic deadline used by routed lookups. It is not
@@ -1403,6 +1405,10 @@ pub const ScanOptions = struct {
     /// Schema-bound typed row query carried by the routed scan transport. It
     /// is never interpreted as a search DSL or permitted to replace RLS filters.
     relational_query_json: []const u8 = "",
+    /// Borrowed synchronous driver. The outer streamed scan owns its parked
+    /// state until every cursor/snapshot has unwound; never serialized.
+    read_execution: ?*@import("../dense_execution.zig").Runtime.Lease = null,
+
     /// Internal differential-testing and benchmark baseline; never serialized.
     disable_columnar_scan: bool = false,
     /// Internal request-local decoded payload reuse budget. Includes retained
@@ -1641,6 +1647,7 @@ pub fn freeParticipantIds(alloc: Allocator, items: [][]u8) void {
 pub const ExecutionContext = struct {
     io: ?std.Io = null,
     max_parallelism: ?usize = null,
+    read_execution: ?*resource_manager_mod.DenseExecution.Runtime.Lease = null,
 };
 
 /// API transport metadata retained alongside the canonical graph execution
@@ -1786,6 +1793,9 @@ pub const SearchRequest = struct {
     /// trusted internal row predicate before owner-routed admission.
     graph_table_read_authorizer: ?GraphTableReadAuthorizer = null,
     identity_read_generation: ?u64 = null,
+    /// Process-local borrowed driver. Copies used for nested operators retain
+    /// it only during the outer DB call; returned request metadata clears it.
+    read_execution: ?*resource_manager_mod.DenseExecution.Runtime.Lease = null,
     execution_deadline_ns: ?u64 = null,
     /// Borrowed listener lifecycle signal. It is request-local and must never
     /// be retained by asynchronous work after query execution returns.
@@ -1839,6 +1849,7 @@ const hierarchy_children_supported_internal_fields = [_][]const u8{
     "resolved_doc_filter_wire_context",
     "identity_read_generation",
     "execution_deadline_ns",
+    "read_execution",
     "cancellation",
     "graph_execution_limits",
     "graph_owning_table",

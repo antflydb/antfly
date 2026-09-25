@@ -25,9 +25,17 @@ pub const HttpRequest = struct {
     /// Borrowed from the listener and valid only while `handle` is running.
     /// Application work must not retain this callback beyond the request.
     cancellation: cancellation_mod.CancellationToken = .none,
+    deadline_ns: ?u64 = null,
+    deadline_io: ?std.Io = null,
+    /// Borrowed from an adapter that admitted before body materialization.
+    ingress: ?*@import("ingress.zig").Scope = null,
 
     pub fn ensureActive(self: HttpRequest) !void {
-        return self.cancellation.check();
+        try self.cancellation.check();
+        if (self.deadline_ns) |deadline| {
+            const now: u64 = if (self.deadline_io) |io| @intCast(@max(0, std.Io.Clock.now(.awake, io).nanoseconds)) else @import("antfly_platform").time.monotonicNs();
+            if (now >= deadline) return error.DeadlineExceeded;
+        }
     }
 };
 
@@ -36,10 +44,16 @@ pub const HttpResponse = struct {
     content_type: []u8,
     body: []u8,
     retry_after_seconds: ?u32 = null,
+    memory_owner: ?*@import("../../common/workload_allocator.zig").Owner = null,
+    ingress: ?*@import("ingress.zig").Scope = null,
 
-    pub fn deinit(self: *HttpResponse, alloc: Allocator) void {
+    pub fn deinit(self: *HttpResponse, fallback_alloc: Allocator) void {
+        const owner = self.memory_owner;
+        const alloc = if (owner) |memory| memory.allocator() else fallback_alloc;
         alloc.free(self.content_type);
         alloc.free(self.body);
+        if (owner) |memory| memory.release();
+        if (self.ingress) |scope| scope.release();
         self.* = undefined;
     }
 };

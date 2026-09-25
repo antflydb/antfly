@@ -67,6 +67,9 @@ pub const HttpResult = struct {
     content_type: []const u8,
     headers: []const HttpHeader = &.{},
     body: []u8,
+    /// Borrowed from a session header; allows an adapter to roll back a new
+    /// session when its final envelope cannot be published.
+    created_session_id: ?[]const u8 = null,
 
     pub fn deinit(self: *HttpResult, alloc: std.mem.Allocator) void {
         if (self.headers.len > 0) {
@@ -139,6 +142,16 @@ pub const InMemorySessionStore = struct {
 
     pub fn initWithOptions(alloc: std.mem.Allocator, io: std.Io, options: Options) InMemorySessionStore {
         return .{ .alloc = alloc, .io = io, .options = options };
+    }
+
+    /// The caller installs the lifetime owner before publishing this store.
+    /// Existing allocations cannot be reassigned to another allocator.
+    pub fn installAllocator(self: *InMemorySessionStore, alloc: std.mem.Allocator) !void {
+        const io = self.io orelse std.Io.Threaded.global_single_threaded.io();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.sessions.capacity() != 0) return error.McpSessionStoreAlreadyAllocated;
+        self.alloc = alloc;
     }
 
     pub fn deinit(self: *InMemorySessionStore, alloc: std.mem.Allocator) void {
@@ -313,7 +326,8 @@ pub const Server = struct {
         defer arena_impl.deinit();
         const temp_alloc = arena_impl.allocator();
 
-        const request = std.json.parseFromSliceLeaky(std.json.Value, temp_alloc, body, .{}) catch {
+        const request = std.json.parseFromSliceLeaky(std.json.Value, temp_alloc, body, .{}) catch |err| {
+            if (err == error.OutOfMemory) return err;
             return .{
                 .status = 200,
                 .content_type = "application/json",
@@ -352,6 +366,7 @@ pub const Server = struct {
                 .content_type = "application/json",
                 .headers = headers,
                 .body = response_body,
+                .created_session_id = if (headers.len > 0) headers[0].value else null,
             };
         }
         return .{
@@ -429,7 +444,8 @@ pub const Server = struct {
         defer arena_impl.deinit();
         const temp_alloc = arena_impl.allocator();
 
-        const request = std.json.parseFromSliceLeaky(std.json.Value, temp_alloc, body, .{}) catch {
+        const request = std.json.parseFromSliceLeaky(std.json.Value, temp_alloc, body, .{}) catch |err| {
+            if (err == error.OutOfMemory) return err;
             return try stringifyValue(alloc, try errorResponse(temp_alloc, .null, -32700, "parse error"));
         };
         const response = (try self.handleJsonRpcRequest(temp_alloc, request)) orelse return null;

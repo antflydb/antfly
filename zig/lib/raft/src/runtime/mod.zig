@@ -18,6 +18,7 @@ pub const frame_driver_iface = @import("frame_driver_iface.zig");
 pub const snapshot_transport_iface = @import("snapshot_transport_iface.zig");
 pub const snapshot_iface = @import("snapshot_iface.zig");
 pub const storage_iface = @import("storage_iface.zig");
+pub const completion_admission_iface = @import("completion_admission_iface.zig");
 pub const backpressure_iface = @import("backpressure_iface.zig");
 pub const limit_backpressure = @import("limit_backpressure.zig");
 pub const replica = @import("replica.zig");

@@ -351,8 +351,20 @@ pub const Group = struct {
         return self.raw_node.hasReady();
     }
 
+    pub fn previewReady(self: *const Group) core.Ready {
+        return self.raw_node.previewReady();
+    }
+
     pub fn ready(self: *Group) core.Ready {
         return self.raw_node.ready();
+    }
+
+    pub fn prepareReady(self: *Group) core.Ready {
+        return self.raw_node.prepareReady();
+    }
+
+    pub fn acceptPreparedReady(self: *Group, rd: core.Ready) void {
+        self.raw_node.acceptPreparedReady(rd);
     }
 
     pub fn advance(self: *Group, rd: core.Ready) void {

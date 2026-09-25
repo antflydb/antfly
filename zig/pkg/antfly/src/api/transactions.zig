@@ -435,6 +435,45 @@ pub const PendingSessionRecovery = union(enum) {
     }
 };
 
+/// A single replay owns its private prepaid workspace until all replay buffers
+/// are destroyed. Copies of the cached session share this identity, so a second
+/// maintenance pass cannot consume the first pass's reserved capacity.
+const RecoveryWorkspace = struct {
+    memory: *@import("../common/workload_allocator.zig").Owner,
+    refs: std.atomic.Value(usize) = .init(1),
+    claimed: std.atomic.Value(bool) = .init(false),
+
+    fn retain(self: *@This()) void {
+        _ = self.refs.fetchAdd(1, .monotonic);
+    }
+
+    fn release(self: *@This()) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        const memory = self.memory;
+        memory.allocator().destroy(self);
+        memory.release();
+    }
+};
+
+pub const OwnedSessionRecovery = struct {
+    work: PendingSessionRecovery,
+    memory: ?*RecoveryWorkspace,
+    fallback: std.mem.Allocator,
+
+    pub fn allocator(self: *const @This()) std.mem.Allocator {
+        return if (self.memory) |memory| memory.memory.allocator() else self.fallback;
+    }
+
+    pub fn deinit(self: *@This()) void {
+        self.work.deinit(self.allocator());
+        if (self.memory) |memory| {
+            memory.claimed.store(false, .release);
+            memory.release();
+        }
+        self.* = undefined;
+    }
+};
+
 pub const SessionStatus = struct {
     txn_id: db_mod.types.TxnId,
     owner_node_id: u64,
@@ -687,6 +726,9 @@ pub const Savepoint = struct {
 };
 
 pub const Session = struct {
+    /// Process-local prepaid completion workspace; never serialized.
+    recovery_memory: ?*@import("../common/workload_allocator.zig").Owner = null,
+    recovery_workspace: ?*RecoveryWorkspace = null,
     txn_id: db_mod.types.TxnId,
     owner_node_id: u64,
     /// Stable authenticated subject that created this session. `null` is the
@@ -701,6 +743,10 @@ pub const Session = struct {
     /// present, the effective request is sealed in `staged`; retries must carry
     /// the same body (or omit it if the first attempt omitted it).
     commit_body_digest: ?[32]u8 = null,
+    /// Fingerprint of the effective staged request, including writes staged
+    /// before commit. This guards the durable session against a changed
+    /// payload on restart; it is not participant BEGIN identity evidence.
+    sealed_request_digest: ?[32]u8 = null,
     /// Set durably after API/schema/read-set validation and immediately before
     /// invoking 2PC. Once true, background maintenance owns completion even if
     /// the initiating process disappears.
@@ -722,7 +768,16 @@ pub const Session = struct {
         };
     }
 
-    pub fn deinit(self: *Session, alloc: std.mem.Allocator) void {
+    pub fn allocationAllocator(self: Session, fallback: std.mem.Allocator) std.mem.Allocator {
+        return if (self.recovery_memory) |owner| owner.allocator() else fallback;
+    }
+
+    pub fn deinit(self: *Session, fallback: std.mem.Allocator) void {
+        const memory = self.recovery_memory;
+        const workspace = self.recovery_workspace;
+        const alloc = self.allocationAllocator(fallback);
+        defer if (memory) |owner| owner.release();
+        defer if (workspace) |value| value.release();
         if (self.principal) |principal| alloc.free(principal);
         if (self.staged) |*staged| staged.deinit(alloc);
         if (self.execution_plan) |bytes| alloc.free(bytes);
@@ -744,6 +799,7 @@ pub const Session = struct {
             .sync_level = self.sync_level,
             .next_savepoint_id = self.next_savepoint_id,
             .commit_body_digest = self.commit_body_digest,
+            .sealed_request_digest = self.sealed_request_digest,
             .commit_execution_started = self.commit_execution_started,
         };
         errdefer out.deinit(alloc);
@@ -759,6 +815,46 @@ pub const Session = struct {
         return out;
     }
 };
+
+const RecoveryUsage = struct {
+    count: usize = 0,
+    bytes: u64 = 0,
+
+    fn add(self: *RecoveryUsage, bytes: u64) void {
+        self.count +|= 1;
+        self.bytes +|= bytes;
+    }
+};
+
+const RecoveryLimits = struct {
+    max_count: ?usize = null,
+    max_bytes: ?u64 = null,
+    max_scan_records: usize = 1024,
+    record_bytes: u64 = 16 * 1024 * 1024,
+
+    fn enabled(self: RecoveryLimits) bool {
+        return self.max_count != null or self.max_bytes != null;
+    }
+
+    fn check(self: RecoveryLimits, usage: RecoveryUsage) !void {
+        if (self.max_count) |limit| if (usage.count > limit) return error.RecoveryCapacityExhausted;
+        if (self.max_bytes) |limit| if (usage.bytes > limit) return error.RecoveryCapacityExhausted;
+    }
+};
+
+/// Parse only ownership metadata. Staged writes and snapshot values are
+/// skipped without creating another copy of the retained transaction body.
+fn encodedSessionNeedsRecovery(alloc: std.mem.Allocator, raw: []const u8) !bool {
+    const Metadata = struct {
+        commit_body_digest: ?[]const u8 = null,
+        commit_execution_started: bool = false,
+        terminal_commit: ?TerminalCommit = null,
+    };
+    const parsed = try std.json.parseFromSlice(Metadata, alloc, raw, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    if (parsed.value.terminal_commit) |terminal| return terminalNeedsRecovery(terminal);
+    return parsed.value.commit_body_digest != null and parsed.value.commit_execution_started;
+}
 
 pub const DurableSessionStore = struct {
     alloc: std.mem.Allocator,
@@ -807,6 +903,67 @@ pub const DurableSessionStore = struct {
                 try txn.commit();
             },
         }
+    }
+
+    /// Reserve recovery before publishing the first executable commit. The
+    /// serialized storage write transaction is the admission lock, so another
+    /// API owner or a restarted registry cannot spend the same capacity.
+    fn saveRecoveryStart(self: *DurableSessionStore, session: Session, max_record_bytes: ?usize, limits: RecoveryLimits) !void {
+        if (self.fail_writes_for_test) return error.InjectedSessionStoreFailure;
+        const key = try makeSessionKey(self.alloc, session.txn_id);
+        defer self.alloc.free(key);
+        const value = try encodeSessionRecord(self.alloc, session);
+        defer self.alloc.free(value);
+        if (max_record_bytes) |limit| if (value.len > limit) return error.SessionRecordTooLarge;
+        switch (self.backend) {
+            .docstore => |store| {
+                var txn = try store.beginWriteTxn();
+                errdefer txn.abort();
+                try self.admitRecoveryTxn(&txn, key, limits);
+                try putSessionAndExpiryTxn(self, &txn, key, value, session);
+                try txn.commit();
+            },
+            .runtime => |store| {
+                var txn = try store.beginWrite();
+                errdefer txn.abort();
+                try self.admitRecoveryTxn(&txn, key, limits);
+                try putSessionAndExpiryTxn(self, &txn, key, value, session);
+                try txn.commit();
+            },
+        }
+    }
+
+    fn admitRecoveryTxn(self: *DurableSessionStore, txn: anytype, key: []const u8, limits: RecoveryLimits) !void {
+        if (!limits.enabled()) return;
+        if (txn.get(key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        }) |raw| if (try encodedSessionNeedsRecovery(self.alloc, raw)) return;
+
+        // Do not trust an aggregate persisted by a newer binary: an older
+        // writer may not maintain it. Scan the authoritative records in this
+        // same transaction, including legacy sessions missing recovery indexes.
+        // Both records and total bytes examined have hard configured bounds.
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var usage: RecoveryUsage = .{};
+        var scanned: usize = 0;
+        var scanned_bytes: u64 = 0;
+        const scan_bytes = @as(u64, limits.max_scan_records) *| limits.record_bytes;
+        var entry = try cursor.seekAtOrAfter(session_prefix);
+        while (entry) |row| : (entry = try cursor.next()) {
+            if (!std.mem.startsWith(u8, row.key, session_prefix)) break;
+            if (scanned >= limits.max_scan_records or row.value.len > scan_bytes -| scanned_bytes)
+                return error.RecoveryCapacityExhausted;
+            scanned += 1;
+            scanned_bytes += row.value.len;
+            if (try encodedSessionNeedsRecovery(self.alloc, row.value)) {
+                usage.add(@max(limits.record_bytes, row.value.len));
+                try limits.check(usage);
+            }
+        }
+        usage.add(limits.record_bytes);
+        try limits.check(usage);
     }
 
     /// Atomically publishes a session owner and its fencing lease in the same
@@ -899,6 +1056,11 @@ pub const DurableSessionStore = struct {
         if (current_raw) |raw| {
             var previous = try decodeSessionRecord(self.alloc, session.txn_id, raw);
             defer previous.deinit(self.alloc);
+            // The execution boundary is monotonic even when a second API
+            // registry still holds a pre-start cached copy. Check under the
+            // same write transaction that publishes the replacement.
+            if (previous.commit_execution_started and !session.commit_execution_started)
+                return error.TransactionCommitAlreadyStarted;
             previous_needs_recovery = sessionNeedsRecovery(previous);
             const old_expiry_key = try makeSessionExpiryKey(self.alloc, previous.last_touched_timestamp, session.txn_id);
             defer self.alloc.free(old_expiry_key);
@@ -922,10 +1084,14 @@ pub const DurableSessionStore = struct {
     }
 
     pub fn load(self: *DurableSessionStore, txn_id: db_mod.types.TxnId) !?Session {
-        const key = try makeSessionKey(self.alloc, txn_id);
-        defer self.alloc.free(key);
+        return self.loadWithAllocator(self.alloc, txn_id);
+    }
+
+    fn loadWithAllocator(self: *DurableSessionStore, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !?Session {
+        const key = try makeSessionKey(alloc, txn_id);
+        defer alloc.free(key);
         const value = switch (self.backend) {
-            .docstore => |store| store.get(self.alloc, key) catch |err| switch (err) {
+            .docstore => |store| store.get(alloc, key) catch |err| switch (err) {
                 error.NotFound => return null,
                 else => return err,
             },
@@ -936,11 +1102,11 @@ pub const DurableSessionStore = struct {
                     error.NotFound => return null,
                     else => return err,
                 };
-                break :blk try self.alloc.dupe(u8, raw);
+                break :blk try alloc.dupe(u8, raw);
             },
         };
-        defer self.alloc.free(value);
-        return try decodeSessionRecord(self.alloc, txn_id, value);
+        defer alloc.free(value);
+        return try decodeSessionRecord(alloc, txn_id, value);
     }
 
     pub fn delete(self: *DurableSessionStore, txn_id: db_mod.types.TxnId) !void {
@@ -963,6 +1129,53 @@ pub const DurableSessionStore = struct {
         }
     }
 
+    const DeleteGuard = union(enum) {
+        open_owner: u64,
+        expired_before: u64,
+    };
+
+    fn deleteGuarded(self: *DurableSessionStore, txn_id: db_mod.types.TxnId, guard: DeleteGuard) !bool {
+        if (self.fail_writes_for_test) return error.InjectedSessionStoreFailure;
+        const key = try makeSessionKey(self.alloc, txn_id);
+        defer self.alloc.free(key);
+        switch (self.backend) {
+            .docstore => |store| {
+                var txn = try store.beginWriteTxn();
+                errdefer txn.abort();
+                const removed = try self.deleteGuardedTxn(&txn, key, txn_id, guard);
+                try txn.commit();
+                return removed;
+            },
+            .runtime => |store| {
+                var txn = try store.beginWrite();
+                errdefer txn.abort();
+                const removed = try self.deleteGuardedTxn(&txn, key, txn_id, guard);
+                try txn.commit();
+                return removed;
+            },
+        }
+    }
+
+    fn deleteGuardedTxn(self: *DurableSessionStore, txn: anytype, key: []const u8, txn_id: db_mod.types.TxnId, guard: DeleteGuard) !bool {
+        const raw = (txn.get(key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        }) orelse return false;
+        var current = try decodeSessionRecord(self.alloc, txn_id, raw);
+        defer current.deinit(self.alloc);
+        switch (guard) {
+            .open_owner => |owner| {
+                if (current.owner_node_id != owner) return error.SessionLeaseLost;
+                if (current.commit_execution_started or current.terminal_commit != null) return error.TransactionCommitAlreadyStarted;
+            },
+            .expired_before => |cutoff| {
+                if (current.last_touched_timestamp >= cutoff or sessionNeedsRecovery(current)) return false;
+            },
+        }
+        try self.deleteSessionAndExpiryTxn(txn, key, txn_id);
+        return true;
+    }
+
     fn putSessionAndExpiryTxn(self: *DurableSessionStore, txn: anytype, key: []const u8, value: []const u8, session: Session) !void {
         var previous_needs_recovery = false;
         if (txn.get(key) catch |err| switch (err) {
@@ -971,6 +1184,11 @@ pub const DurableSessionStore = struct {
         }) |raw| {
             var previous = try decodeSessionRecord(self.alloc, session.txn_id, raw);
             defer previous.deinit(self.alloc);
+            // The execution boundary is monotonic even when a second API
+            // registry still holds a pre-start cached copy. Check under the
+            // same write transaction that publishes the replacement.
+            if (previous.commit_execution_started and !session.commit_execution_started)
+                return error.TransactionCommitAlreadyStarted;
             previous_needs_recovery = sessionNeedsRecovery(previous);
             const old_expiry_key = try makeSessionExpiryKey(self.alloc, previous.last_touched_timestamp, session.txn_id);
             defer self.alloc.free(old_expiry_key);
@@ -1368,6 +1586,10 @@ pub const SessionLeaseStore = struct {
 pub const SessionRegistry = struct {
     const session_lock_count = 64;
 
+    retained_allocator: ?std.mem.Allocator = null,
+    recovery_gate: ?*@import("../common/workload_admission.zig").Controller = null,
+    recovery_backing: ?std.mem.Allocator = null,
+
     mutex: AtomicMutex = .{},
     session_locks: [session_lock_count]AtomicMutex = [_]AtomicMutex{.{}} ** session_lock_count,
     // Record locks protect individual durable mutations. Execution ownership
@@ -1380,6 +1602,8 @@ pub const SessionRegistry = struct {
     max_savepoints: ?usize = null,
     max_sessions: ?usize = null,
     max_record_bytes: ?usize = null,
+    max_recovery_count: ?usize = null,
+    max_recovery_bytes: ?u64 = null,
     durable_scope: SessionStoreScope = .node_local,
     known_durable_session_count: ?usize = null,
     reserved_session_count: usize = 0,
@@ -1442,7 +1666,227 @@ pub const SessionRegistry = struct {
         };
     }
 
-    pub fn deinit(self: *SessionRegistry, alloc: std.mem.Allocator) void {
+    /// Install before publishing the registry. Retained records and table
+    /// capacity use this allocator; method results retain their caller allocator.
+    pub fn installRetainedAllocator(self: *SessionRegistry, alloc: std.mem.Allocator) !void {
+        self.lockAllSessions();
+        defer self.unlockAllSessions();
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.sessions.capacity() != 0 or self.reserved_session_count != 0) return error.SessionRegistryAlreadyAllocated;
+        self.retained_allocator = alloc;
+    }
+
+    pub fn installRetainedOwner(self: *SessionRegistry, owner: *@import("../common/workload_allocator.zig").Owner, gate: *@import("../common/workload_admission.zig").Controller) !void {
+        try self.installRetainedAllocator(owner.allocator());
+        self.recovery_gate = gate;
+        self.recovery_backing = owner.backing;
+        errdefer {
+            var it = self.sessions.valueIterator();
+            while (it.next()) |session| session.deinit(owner.allocator());
+            self.sessions.deinit(owner.allocator());
+            self.sessions = .empty;
+            self.retained_allocator = null;
+            self.recovery_gate = null;
+            self.recovery_backing = null;
+            self.known_durable_session_count = null;
+        }
+        try self.restoreCompletionReservations();
+    }
+
+    /// Startup fence: authoritative rows, including records from older writers,
+    /// are inspected before ordinary sessions share this retained-state pool.
+    /// Reduced budgets fail startup instead of abandoning existing obligations.
+    fn restoreCompletionReservations(self: *SessionRegistry) !void {
+        const durable = self.durable orelse return;
+        const Scan = struct {
+            registry: *SessionRegistry,
+            count: usize = 0,
+            fn visit(ptr: *anyopaque, key: []const u8, value: []const u8) anyerror!bool {
+                const scan: *@This() = @ptrCast(@alignCast(ptr));
+                const registry = scan.registry;
+                if (scan.count >= (registry.max_sessions orelse 1024)) return error.SessionLimitExceeded;
+                scan.count += 1;
+                if (value.len > (registry.max_record_bytes orelse 16 * 1024 * 1024)) return error.SessionRecordTooLarge;
+                const id = try distributed_txn.parseTxnIdHex(key[session_prefix.len..]);
+                const alloc = registry.retained_allocator.?;
+                var session = try decodeSessionRecord(alloc, id, value);
+                var owned = true;
+                defer if (owned) session.deinit(alloc);
+                if (!sessionNeedsRecovery(session)) return true;
+                try registry.reserveCompletion(&session, alloc);
+                try registry.sessions.put(alloc, id, session);
+                owned = false;
+                return true;
+            }
+        };
+        var scan: Scan = .{ .registry = self };
+        try durable.scanPrefixWithContext(session_prefix, &scan, Scan.visit);
+        self.known_durable_session_count = scan.count;
+    }
+
+    const CloneCounter = struct {
+        backing: std.mem.Allocator,
+        live: usize = 0,
+        peak: usize = 0,
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = free } };
+        }
+        fn allocate(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const result = self.backing.rawAlloc(len, alignment, ret) orelse return null;
+            self.live += len;
+            self.peak = @max(self.peak, self.live);
+            return result;
+        }
+        fn free(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ret: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.backing.rawFree(bytes, alignment, ret);
+            self.live -= bytes.len;
+        }
+    };
+
+    fn completionNameBound(session: Session) usize {
+        var bound: usize = if (session.terminal_commit) |terminal| if (terminal.coordinator_table_name) |name| name.len else 0 else 0;
+        if (session.staged) |request| {
+            for (request.tables) |table| bound = @max(bound, request.physicalName(table.table_name).len);
+            for (request.read_set) |read| bound = @max(bound, request.physicalName(read.table_name).len);
+        }
+        return bound;
+    }
+
+    /// Reserve both the live immutable sealed record and its next candidate
+    /// before the durable start marker. Later terminal transitions reuse this
+    /// prepaid capacity even when ordinary retained-state admission is full.
+    fn reserveCompletion(self: *SessionRegistry, candidate: *Session, alloc: std.mem.Allocator) !void {
+        if (candidate.recovery_memory != null) return;
+        const gate = self.recovery_gate orelse return;
+        const capacity = blk: {
+            var counter: CloneCounter = .{ .backing = self.retainedAllocator(alloc) };
+            const measured_alloc = counter.allocator();
+            var probe = try candidate.clone(measured_alloc);
+            defer probe.deinit(measured_alloc);
+            if (probe.terminal_commit) |*terminal| terminal.deinit(measured_alloc);
+            probe.terminal_commit = null;
+            const terminal_name = try measured_alloc.alloc(u8, completionNameBound(candidate.*));
+            @memset(terminal_name, 1); // maximum JSON escaping: six bytes per byte
+            probe.terminal_commit = .{
+                .status = .committed_visibility_pending,
+                .repair_required = false,
+                .coordinator_group_id = std.math.maxInt(u64),
+                .coordinator_table_name = terminal_name,
+                .coordinator_acknowledged = false,
+            };
+            probe.owner_node_id = std.math.maxInt(u64);
+            probe.begin_timestamp = std.math.maxInt(u64);
+            probe.last_touched_timestamp = std.math.maxInt(u64);
+            // A sealed execution plan requires the started marker when the
+            // measured record is decoded below. Both boolean spellings have
+            // the same encoded length.
+            probe.commit_execution_started = candidate.execution_plan != null;
+            var next = try probe.clone(measured_alloc);
+            defer next.deinit(measured_alloc);
+            const encoded = try encodeSessionRecord(measured_alloc, next);
+            defer measured_alloc.free(encoded);
+            if (self.max_record_bytes) |limit| if (encoded.len > limit) return error.SessionRecordTooLarge;
+            // Persistence validates the previous durable row while the cached
+            // record, next candidate, and encoded replacement are live. Pay
+            // for that decoder's real arena and hash-map capacities as well.
+            // The public JSON decoder accepts signed integer fields, so use
+            // the largest representable value for this measurement only; the
+            // encoded replacement above still measures the full u64 ceiling.
+            probe.owner_node_id = std.math.maxInt(i64);
+            probe.begin_timestamp = std.math.maxInt(i64);
+            probe.last_touched_timestamp = std.math.maxInt(i64);
+            probe.terminal_commit.?.coordinator_group_id = std.math.maxInt(i64);
+            const previous_encoded = try encodeSessionRecord(measured_alloc, probe);
+            defer measured_alloc.free(previous_encoded);
+            var previous = try decodeSessionRecord(measured_alloc, probe.txn_id, previous_encoded);
+            defer previous.deinit(measured_alloc);
+            const session_key = try makeSessionKey(measured_alloc, probe.txn_id);
+            defer measured_alloc.free(session_key);
+            const old_expiry_key = try makeSessionExpiryKey(measured_alloc, std.math.maxInt(u64), probe.txn_id);
+            defer measured_alloc.free(old_expiry_key);
+            const expiry_key = try makeSessionExpiryKey(measured_alloc, std.math.maxInt(u64), probe.txn_id);
+            defer measured_alloc.free(expiry_key);
+            const recovery_key = try makeSessionRecoveryKey(measured_alloc, probe.txn_id);
+            defer measured_alloc.free(recovery_key);
+            break :blk counter.peak;
+        };
+        const owner = try @import("../common/workload_allocator.zig").Owner.createReserved(self.recovery_backing.?, gate, capacity);
+        errdefer owner.release();
+        const workspace = try self.reserveReplayWorkspace(candidate.*, alloc);
+        errdefer workspace.release();
+        var reserved = try candidate.clone(owner.allocator());
+        reserved.recovery_memory = owner;
+        reserved.recovery_workspace = workspace;
+        candidate.deinit(alloc);
+        candidate.* = reserved;
+    }
+
+    /// Measure the actual JSON decoder, including its arena and hash-table
+    /// capacities, while the immutable request clone and table view coexist.
+    /// This covers API replay preparation only; storage/RPC execution retains
+    /// its own allocator and separate admission contract.
+    fn reserveReplayWorkspace(self: *SessionRegistry, candidate: Session, alloc: std.mem.Allocator) !*RecoveryWorkspace {
+        var counter: CloneCounter = .{ .backing = self.retainedAllocator(alloc) };
+        const measured = counter.allocator();
+        var probe = try candidate.clone(measured);
+        defer probe.deinit(measured);
+        if (probe.terminal_commit) |*terminal| terminal.deinit(measured);
+        probe.terminal_commit = null;
+        const name = try measured.alloc(u8, completionNameBound(candidate));
+        @memset(name, 1);
+        probe.terminal_commit = .{
+            .status = .committed_visibility_pending,
+            .repair_required = false,
+            .coordinator_group_id = std.math.maxInt(i64),
+            .coordinator_table_name = name,
+            .coordinator_acknowledged = false,
+        };
+        probe.commit_execution_started = true;
+        const encoded = try encodeSessionRecord(measured, probe);
+        defer measured.free(encoded);
+        const key = try makeSessionKey(measured, candidate.txn_id);
+        defer measured.free(key);
+        var decoded = try decodeSessionRecord(measured, candidate.txn_id, encoded);
+        defer decoded.deinit(measured);
+        if (decoded.staged) |request| {
+            var replay = try request.clone(measured);
+            defer replay.deinit(measured);
+            const tables = try replay.distributedTables(measured);
+            defer if (tables.len > 0) measured.free(tables);
+        }
+        // The probe remains live throughout measurement, conservatively paying
+        // for metadata changes and terminal acknowledgement strings as well.
+        const capacity = try std.math.add(usize, counter.peak, @sizeOf(RecoveryWorkspace));
+        const memory = try @import("../common/workload_allocator.zig").Owner.createReserved(self.recovery_backing.?, self.recovery_gate.?, capacity);
+        errdefer memory.release();
+        const workspace = try memory.allocator().create(RecoveryWorkspace);
+        workspace.* = .{ .memory = memory };
+        return workspace;
+    }
+
+    fn cloneMutation(self: *SessionRegistry, source: Session, alloc: std.mem.Allocator) !Session {
+        const memory = source.recovery_memory;
+        var cloned = try source.clone(if (memory) |owner| owner.allocator() else self.retainedAllocator(alloc));
+        if (memory) |owner| {
+            owner.retain();
+            cloned.recovery_memory = owner;
+        }
+        if (source.recovery_workspace) |workspace| {
+            workspace.retain();
+            cloned.recovery_workspace = workspace;
+        }
+        return cloned;
+    }
+
+    fn retainedAllocator(self: *const SessionRegistry, fallback: std.mem.Allocator) std.mem.Allocator {
+        return self.retained_allocator orelse fallback;
+    }
+
+    pub fn deinit(self: *SessionRegistry, caller_alloc: std.mem.Allocator) void {
+        const alloc = self.retainedAllocator(caller_alloc);
         var it = self.sessions.iterator();
         while (it.next()) |entry| entry.value_ptr.deinit(alloc);
         self.sessions.deinit(alloc);
@@ -1463,11 +1907,12 @@ pub const SessionRegistry = struct {
 
     pub fn beginForPrincipal(
         self: *SessionRegistry,
-        alloc: std.mem.Allocator,
+        caller_alloc: std.mem.Allocator,
         req: BeginRequest,
         owner_node_id: u64,
         principal: ?[]const u8,
     ) !SessionInfo {
+        const alloc = self.retainedAllocator(caller_alloc);
         const txn_id = newSessionTxnId(owner_node_id);
         const now = nextTxnTimestamp();
         var session: Session = .{
@@ -1486,7 +1931,7 @@ pub const SessionRegistry = struct {
             self.mutex.unlock();
             return err;
         };
-        self.sessions.ensureUnusedCapacity(alloc, 1) catch |err| {
+        self.sessions.ensureUnusedCapacity(alloc, @intCast(self.reserved_session_count + 1)) catch |err| {
             self.mutex.unlock();
             return err;
         };
@@ -1502,7 +1947,7 @@ pub const SessionRegistry = struct {
             const ttl_ms = @max(@as(u64, 1), self.owner_lease_ttl_ns.? / std.time.ns_per_ms);
             if (!(try self.durable.?.saveWithLease(session, null, now / std.time.ns_per_ms, ttl_ms, true, self.max_record_bytes))) return error.SessionLeaseLost;
         } else {
-            try self.persistLocked(session);
+            try self.persistLocked(alloc, session);
             try self.renewLeaseLocked(txn_id, owner_node_id);
         }
         self.mutex.lock();
@@ -1570,16 +2015,18 @@ pub const SessionRegistry = struct {
         validate: *const fn (*anyopaque, std.mem.Allocator, ?*const OwnedTransactionCommitRequest, *OwnedTransactionCommitRequest, *const OwnedTransactionCommitRequest) anyerror!void,
     };
 
-    pub fn stage(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, req: *const OwnedTransactionCommitRequest) !?SessionInfo {
-        return self.stageValidated(alloc, txn_id, req, null);
+    pub fn stage(self: *SessionRegistry, caller_alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, req: *const OwnedTransactionCommitRequest) !?SessionInfo {
+        return self.stageValidated(caller_alloc, txn_id, req, null);
     }
 
-    pub fn stageValidated(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, req: *const OwnedTransactionCommitRequest, validator: ?StageValidator) !?SessionInfo {
+    pub fn stageValidated(self: *SessionRegistry, caller_alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, req: *const OwnedTransactionCommitRequest, validator: ?StageValidator) !?SessionInfo {
+        const retained_alloc = self.retainedAllocator(caller_alloc);
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();
 
-        var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
+        var candidate = (try self.loadSessionMutationCloneAssumeStripe(retained_alloc, txn_id)) orelse return null;
+        const alloc = candidate.allocationAllocator(retained_alloc);
         errdefer candidate.deinit(alloc);
         if (candidate.commit_body_digest != null) return error.TransactionCommitSealed;
         var previous = if (validator != null and candidate.staged != null) try candidate.staged.?.clone(alloc) else null;
@@ -1594,7 +2041,7 @@ pub const SessionRegistry = struct {
         if (validator) |value| try value.validate(value.ptr, alloc, if (previous) |*old| old else null, &candidate.staged.?, req);
         touchSession(&candidate);
         try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-        try self.persistLocked(candidate);
+        try self.persistLocked(alloc, candidate);
 
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -1620,16 +2067,18 @@ pub const SessionRegistry = struct {
 
     pub fn stageRead(
         self: *SessionRegistry,
-        alloc: std.mem.Allocator,
+        caller_alloc: std.mem.Allocator,
         txn_id: db_mod.types.TxnId,
         req: *const OwnedTransactionCommitRequest,
         snapshot: StageReadSnapshot,
     ) !?SessionInfo {
+        const retained_alloc = self.retainedAllocator(caller_alloc);
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();
 
-        var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
+        var candidate = (try self.loadSessionMutationCloneAssumeStripe(retained_alloc, txn_id)) orelse return null;
+        const alloc = candidate.allocationAllocator(retained_alloc);
         errdefer candidate.deinit(alloc);
         if (candidate.commit_body_digest != null) return error.TransactionCommitSealed;
         try upsertReadSnapshot(alloc, &candidate.read_snapshots, snapshot);
@@ -1640,7 +2089,7 @@ pub const SessionRegistry = struct {
         }
         touchSession(&candidate);
         try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-        try self.persistLocked(candidate);
+        try self.persistLocked(alloc, candidate);
 
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -1658,17 +2107,21 @@ pub const SessionRegistry = struct {
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();
-        var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
-        errdefer candidate.deinit(alloc);
+        var candidate = (try self.loadSessionMutationCloneAssumeStripe(self.retainedAllocator(alloc), txn_id)) orelse return null;
+        const retained_alloc = candidate.allocationAllocator(self.retainedAllocator(alloc));
+        errdefer candidate.deinit(retained_alloc);
         const body_digest = try commitBodyDigest(alloc, extra_req);
         if (candidate.commit_body_digest) |sealed_digest| {
             if (!std.mem.eql(u8, &sealed_digest, &body_digest)) return error.TransactionCommitRequestMismatch;
             const sealed = candidate.staged orelse return error.InvalidTransactionSessionRecord;
+            const digest = candidate.sealed_request_digest orelse return error.TransactionCommitIdentityUnavailable;
+            const actual = try sealedRequestDigest(alloc, sealed);
+            if (!std.mem.eql(u8, &digest, &actual)) return error.InvalidTransactionSessionRecord;
             var out = try sealed.clone(alloc);
             errdefer out.deinit(alloc);
             touchSession(&candidate);
             try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-            try self.persistLocked(candidate);
+            try self.persistLocked(alloc, candidate);
             self.mutex.lock();
             defer self.mutex.unlock();
             const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
@@ -1685,14 +2138,17 @@ pub const SessionRegistry = struct {
         }
         if (out.tables.len == 0) {
             out.deinit(alloc);
+            candidate.deinit(retained_alloc);
             return null;
         }
-        if (candidate.staged) |*staged| staged.deinit(alloc);
-        candidate.staged = try out.clone(alloc);
+        if (candidate.staged) |*staged| staged.deinit(retained_alloc);
+        candidate.staged = null;
+        candidate.staged = try out.clone(retained_alloc);
         candidate.commit_body_digest = body_digest;
+        candidate.sealed_request_digest = try sealedRequestDigest(alloc, out);
         touchSession(&candidate);
         try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-        try self.persistLocked(candidate);
+        try self.persistLocked(alloc, candidate);
         self.mutex.lock();
         defer self.mutex.unlock();
         const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
@@ -1724,19 +2180,21 @@ pub const SessionRegistry = struct {
 
     pub fn recordTerminalCommitWithRepair(
         self: *SessionRegistry,
-        alloc: std.mem.Allocator,
+        caller_alloc: std.mem.Allocator,
         txn_id: db_mod.types.TxnId,
         status: TerminalCommitStatus,
         repair_required: bool,
         coordinator_group_id: ?u64,
         coordinator_table_name: ?[]const u8,
     ) !?void {
+        const retained_alloc = self.retainedAllocator(caller_alloc);
         if ((coordinator_group_id == null) != (coordinator_table_name == null)) return error.InvalidTransactionSessionRecord;
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();
 
-        var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
+        var candidate = (try self.loadSessionMutationCloneAssumeStripe(retained_alloc, txn_id)) orelse return null;
+        const alloc = candidate.allocationAllocator(retained_alloc);
         errdefer candidate.deinit(alloc);
         const coordinator_acknowledged = if (candidate.terminal_commit) |terminal| blk: {
             const fills_provisional_repair_handoff = terminal.status == .committed and
@@ -1753,6 +2211,9 @@ pub const SessionRegistry = struct {
             }
             break :blk if (fills_provisional_repair_handoff) false else terminal.coordinator_acknowledged;
         } else false;
+        if (candidate.recovery_memory != null) {
+            if (coordinator_table_name) |name| if (name.len > completionNameBound(candidate)) return error.InvalidTransactionSessionRecord;
+        }
         if (candidate.terminal_commit) |*terminal| terminal.deinit(alloc);
         candidate.terminal_commit = null;
         const owned_coordinator_table_name = if (coordinator_table_name) |table_name| try alloc.dupe(u8, table_name) else null;
@@ -1765,7 +2226,7 @@ pub const SessionRegistry = struct {
         };
         touchSession(&candidate);
         try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-        try self.persistLocked(candidate);
+        try self.persistLocked(alloc, candidate);
 
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -1801,6 +2262,7 @@ pub const SessionRegistry = struct {
         var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
         errdefer candidate.deinit(alloc);
         if (candidate.commit_body_digest == null or candidate.staged == null) return error.InvalidTransactionSessionRecord;
+        if (candidate.sealed_request_digest == null) return error.TransactionCommitIdentityUnavailable;
         if (candidate.execution_plan) |bytes| {
             const result = try parseExecutionPlan(alloc, bytes);
             candidate.deinit(alloc);
@@ -1812,12 +2274,25 @@ pub const SessionRegistry = struct {
         candidate.execution_plan = try encodeExecutionPlan(alloc, selected orelse tables);
         var result = try parseExecutionPlan(alloc, candidate.execution_plan.?);
         errdefer result.deinit();
+        try self.reserveCompletion(&candidate, alloc);
         candidate.commit_execution_started = true;
         touchSession(&candidate);
         try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-        try self.persistLocked(candidate);
+        if (self.durable) |durable| {
+            try durable.saveRecoveryStart(candidate, self.max_record_bytes, self.recoveryLimits());
+        } else try self.persistLocked(alloc, candidate);
         self.mutex.lock();
         defer self.mutex.unlock();
+        if (self.durable == null) {
+            const limits = self.recoveryLimits();
+            if (limits.enabled()) {
+                var usage: RecoveryUsage = .{};
+                var it = self.sessions.valueIterator();
+                while (it.next()) |existing| if (sessionNeedsRecovery(existing.*)) usage.add(limits.record_bytes);
+                usage.add(limits.record_bytes);
+                try limits.check(usage);
+            }
+        }
         const target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
         self.publishCandidateLocked(alloc, target, &candidate);
         return result;
@@ -1825,28 +2300,53 @@ pub const SessionRegistry = struct {
 
     pub fn markCommitExecutionStarted(
         self: *SessionRegistry,
-        alloc: std.mem.Allocator,
+        caller_alloc: std.mem.Allocator,
         txn_id: db_mod.types.TxnId,
     ) !?void {
+        const retained_alloc = self.retainedAllocator(caller_alloc);
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();
-        var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
+        var candidate = (try self.loadSessionMutationCloneAssumeStripe(retained_alloc, txn_id)) orelse return null;
+        const alloc = candidate.allocationAllocator(retained_alloc);
         errdefer candidate.deinit(alloc);
         if (candidate.commit_body_digest == null or candidate.staged == null) return error.InvalidTransactionSessionRecord;
+        if (candidate.sealed_request_digest == null) return error.TransactionCommitIdentityUnavailable;
         if (candidate.commit_execution_started) {
             candidate.deinit(alloc);
             return {};
         }
+        try self.reserveCompletion(&candidate, alloc);
         candidate.commit_execution_started = true;
         touchSession(&candidate);
         try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-        try self.persistLocked(candidate);
+        if (self.durable) |durable| {
+            try durable.saveRecoveryStart(candidate, self.max_record_bytes, self.recoveryLimits());
+        } else try self.persistLocked(alloc, candidate);
         self.mutex.lock();
         defer self.mutex.unlock();
+        if (self.durable == null) {
+            const limits = self.recoveryLimits();
+            if (limits.enabled()) {
+                var usage: RecoveryUsage = .{};
+                var it = self.sessions.valueIterator();
+                while (it.next()) |existing| if (sessionNeedsRecovery(existing.*)) usage.add(limits.record_bytes);
+                usage.add(limits.record_bytes);
+                try limits.check(usage);
+            }
+        }
         const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
         self.publishCandidateLocked(alloc, publish_target, &candidate);
         return {};
+    }
+
+    fn recoveryLimits(self: *const SessionRegistry) RecoveryLimits {
+        return .{
+            .max_count = self.max_recovery_count,
+            .max_bytes = self.max_recovery_bytes,
+            .max_scan_records = self.max_sessions orelse 1024,
+            .record_bytes = self.max_record_bytes orelse 16 * 1024 * 1024,
+        };
     }
 
     /// Records the durable acknowledgement receipt after the replicated
@@ -1854,22 +2354,27 @@ pub const SessionRegistry = struct {
     /// consulting a coordinator route that topology is now free to retire.
     pub fn markTerminalCoordinatorAcknowledged(
         self: *SessionRegistry,
-        alloc: std.mem.Allocator,
+        caller_alloc: std.mem.Allocator,
         txn_id: db_mod.types.TxnId,
     ) !?void {
+        const retained_alloc = self.retainedAllocator(caller_alloc);
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();
 
-        var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
+        var candidate = (try self.loadSessionMutationCloneAssumeStripe(retained_alloc, txn_id)) orelse return null;
+        const alloc = candidate.allocationAllocator(retained_alloc);
         errdefer candidate.deinit(alloc);
         const terminal = if (candidate.terminal_commit) |*value| value else return error.InvalidTransactionSessionRecord;
         if (terminal.coordinator_group_id == null) return error.InvalidTransactionSessionRecord;
-        if (terminal.coordinator_acknowledged) return {};
+        if (terminal.coordinator_acknowledged) {
+            candidate.deinit(alloc);
+            return {};
+        }
         terminal.coordinator_acknowledged = true;
         touchSession(&candidate);
         try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-        try self.persistLocked(candidate);
+        try self.persistLocked(alloc, candidate);
 
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -1968,6 +2473,44 @@ pub const SessionRegistry = struct {
     /// Claims indexed work under the session lease and returns a stable clone
     /// of the exact action to execute. A foreign owner is transferred only
     /// after its durable lease expires.
+    pub fn claimPendingRecoveryOwned(
+        self: *SessionRegistry,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        owner_node_id: u64,
+        now_ns: u64,
+    ) !?OwnedSessionRecovery {
+        var memory: ?*RecoveryWorkspace = null;
+        if (self.recovery_gate != null) {
+            // Startup restores local obligations. An adopted foreign session
+            // must also acquire its full reservation before it can be replayed.
+            self.mutex.lock();
+            const cached = self.sessions.contains(txn_id);
+            self.mutex.unlock();
+            if (!cached) _ = (try self.getStatus(alloc, txn_id)) orelse return null;
+            self.mutex.lock();
+            memory = if (self.sessions.getPtr(txn_id)) |session| session.recovery_workspace else null;
+            if (memory) |workspace| workspace.retain();
+            self.mutex.unlock();
+            const workspace = memory orelse return error.RecoveryReservationRequired;
+            if (workspace.claimed.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) {
+                workspace.release();
+                return null;
+            }
+        }
+        var transferred = false;
+        defer if (!transferred) {
+            if (memory) |workspace| {
+                workspace.claimed.store(false, .release);
+                workspace.release();
+            }
+        };
+        const work_alloc = if (memory) |workspace| workspace.memory.allocator() else alloc;
+        const work = (try self.claimPendingRecovery(work_alloc, txn_id, owner_node_id, now_ns)) orelse return null;
+        transferred = true;
+        return .{ .work = work, .memory = memory, .fallback = alloc };
+    }
+
     pub fn claimPendingRecovery(
         self: *SessionRegistry,
         alloc: std.mem.Allocator,
@@ -1980,29 +2523,42 @@ pub const SessionRegistry = struct {
         defer session_lock.unlock();
 
         var candidate = if (self.durable) |durable|
-            (try durable.load(txn_id)) orelse return null
+            (try durable.loadWithAllocator(alloc, txn_id)) orelse return null
         else blk: {
             self.mutex.lock();
             defer self.mutex.unlock();
             const session = self.sessions.getPtr(txn_id) orelse return null;
             break :blk try session.clone(alloc);
         };
-        defer candidate.deinit(if (self.durable) |durable| durable.alloc else alloc);
+        defer candidate.deinit(alloc);
+
+        // Reject an unbound legacy recovery obligation before a new owner
+        // adopts its lease. Neither replay nor terminal ACK is safe when the
+        // original effective request cannot be identified.
+        if (sessionNeedsRecovery(candidate) and candidate.sealed_request_digest == null)
+            return error.TransactionCommitIdentityUnavailable;
 
         if (candidate.owner_node_id != owner_node_id) {
             const durable = self.durable orelse return null;
             if (self.durable_scope != .cluster_shared or self.lease_store == null or self.owner_lease_ttl_ns == null or owner_node_id == 0) return null;
-            var adopted = try candidate.clone(alloc);
+            const retained_alloc = self.retainedAllocator(alloc);
+            var adopted = try self.cloneAdoptedCandidate(candidate, retained_alloc);
             var adopted_owned = true;
-            defer if (adopted_owned) adopted.deinit(alloc);
+            defer if (adopted_owned) adopted.deinit(retained_alloc);
             const expected_owner = adopted.owner_node_id;
             adopted.owner_node_id = owner_node_id;
             touchSession(&adopted);
+            const reserved_slot = try self.reserveCachePublication(retained_alloc, txn_id);
+            defer self.releaseCachePublication(reserved_slot);
+            var replay = try adopted.clone(alloc);
+            var replay_owned = true;
+            defer if (replay_owned) replay.deinit(alloc);
             const ttl_ms = @max(@as(u64, 1), self.owner_lease_ttl_ns.? / std.time.ns_per_ms);
             if (!(try durable.saveWithLease(adopted, expected_owner, now_ns / std.time.ns_per_ms, ttl_ms, true, self.max_record_bytes))) return null;
-            candidate.deinit(durable.alloc);
-            candidate = try adopted.clone(durable.alloc);
-            try self.publishAdoptedCandidateAssumeStripe(alloc, txn_id, &adopted);
+            candidate.deinit(alloc);
+            candidate = replay;
+            replay_owned = false;
+            try self.publishAdoptedCandidateAssumeStripe(retained_alloc, txn_id, &adopted);
             adopted_owned = false;
         } else if (self.lease_store != null and self.owner_lease_ttl_ns != null) {
             try self.renewLeaseLockedAt(txn_id, owner_node_id, now_ns);
@@ -2020,6 +2576,7 @@ pub const SessionRegistry = struct {
             if (terminal.status != .committed or repair_handoff_needs_coordinator) {
                 if (candidate.commit_body_digest == null or !candidate.commit_execution_started)
                     return error.InvalidTransactionSessionRecord;
+                if (candidate.sealed_request_digest == null) return error.TransactionCommitIdentityUnavailable;
                 const request = candidate.staged orelse return error.InvalidTransactionSessionRecord;
                 var cloned_request = try request.clone(alloc);
                 errdefer cloned_request.deinit(alloc);
@@ -2047,6 +2604,10 @@ pub const SessionRegistry = struct {
             if (terminal.coordinator_acknowledged) return null;
             const group_id = terminal.coordinator_group_id orelse return null;
             const table_name = terminal.coordinator_table_name orelse return error.InvalidTransactionSessionRecord;
+            // A terminal status alone does not bind an old session's writes to
+            // this coordinator. Do not retire its durable decision by ACK when
+            // a rolling peer omitted the effective-request identity.
+            if (candidate.sealed_request_digest == null) return error.TransactionCommitIdentityUnavailable;
             return .{ .acknowledge = .{
                 .txn_id = txn_id,
                 .owner_node_id = owner_node_id,
@@ -2055,6 +2616,7 @@ pub const SessionRegistry = struct {
             } };
         }
         if (candidate.commit_body_digest == null or !candidate.commit_execution_started) return null;
+        if (candidate.sealed_request_digest == null) return error.TransactionCommitIdentityUnavailable;
         const request = candidate.staged orelse return error.InvalidTransactionSessionRecord;
         var cloned_request = try request.clone(alloc);
         errdefer cloned_request.deinit(alloc);
@@ -2070,11 +2632,13 @@ pub const SessionRegistry = struct {
         } };
     }
 
-    pub fn createSavepoint(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !?SavepointInfo {
+    pub fn createSavepoint(self: *SessionRegistry, caller_alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !?SavepointInfo {
+        const retained_alloc = self.retainedAllocator(caller_alloc);
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();
-        var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
+        var candidate = (try self.loadSessionMutationCloneAssumeStripe(retained_alloc, txn_id)) orelse return null;
+        const alloc = candidate.allocationAllocator(retained_alloc);
         errdefer candidate.deinit(alloc);
         if (candidate.commit_body_digest != null) return error.TransactionCommitSealed;
         if (self.max_savepoints) |limit| {
@@ -2097,7 +2661,7 @@ pub const SessionRegistry = struct {
         savepoint_inserted = true;
         touchSession(&candidate);
         try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-        try self.persistLocked(candidate);
+        try self.persistLocked(alloc, candidate);
         self.mutex.lock();
         defer self.mutex.unlock();
         const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
@@ -2105,22 +2669,28 @@ pub const SessionRegistry = struct {
         return .{ .txn_id = txn_id, .savepoint_id = savepoint_id };
     }
 
-    pub fn rollbackToSavepoint(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, savepoint_id: u64) !?SavepointInfo {
+    pub fn rollbackToSavepoint(self: *SessionRegistry, caller_alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, savepoint_id: u64) !?SavepointInfo {
+        const retained_alloc = self.retainedAllocator(caller_alloc);
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();
-        var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
+        var candidate = (try self.loadSessionMutationCloneAssumeStripe(retained_alloc, txn_id)) orelse return null;
+        const alloc = candidate.allocationAllocator(retained_alloc);
         errdefer candidate.deinit(alloc);
         if (candidate.commit_body_digest != null) return error.TransactionCommitSealed;
-        if (!candidate.savepoints.contains(savepoint_id)) return null;
+        if (!candidate.savepoints.contains(savepoint_id)) {
+            candidate.deinit(alloc);
+            return null;
+        }
         const savepoint = candidate.savepoints.getPtr(savepoint_id).?;
         if (candidate.staged) |*staged| staged.deinit(alloc);
+        candidate.staged = null;
         candidate.staged = try savepoint.snapshot.clone(alloc);
         deinitReadSnapshotMap(alloc, &candidate.read_snapshots);
         candidate.read_snapshots = try cloneReadSnapshotMap(alloc, savepoint.read_snapshots);
         touchSession(&candidate);
         try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-        try self.persistLocked(candidate);
+        try self.persistLocked(alloc, candidate);
         self.mutex.lock();
         defer self.mutex.unlock();
         const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
@@ -2153,24 +2723,6 @@ pub const SessionRegistry = struct {
         details.tables = try sessionTableDetails(alloc, session.staged);
         details.read_snapshots = try sessionReadSnapshots(alloc, &session);
         details.savepoint_ids = try sessionSavepointIds(alloc, &session);
-        if (session.staged) |*staged| {
-            var bindings = std.ArrayList(CatalogBinding).empty;
-            errdefer {
-                for (bindings.items) |binding| {
-                    alloc.free(binding.logical);
-                    alloc.free(binding.physical);
-                }
-                bindings.deinit(alloc);
-            }
-            for (staged.catalog_bindings.items) |binding| {
-                const logical = try alloc.dupe(u8, binding.logical);
-                errdefer alloc.free(logical);
-                const physical = try alloc.dupe(u8, binding.physical);
-                errdefer alloc.free(physical);
-                try bindings.append(alloc, .{ .logical = logical, .physical = physical });
-            }
-            details.catalog_bindings = try bindings.toOwnedSlice(alloc);
-        }
         return details;
     }
 
@@ -2286,15 +2838,18 @@ pub const SessionRegistry = struct {
         return null;
     }
 
-    pub fn adopt(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, owner_node_id: u64) !bool {
+    pub fn adopt(self: *SessionRegistry, caller_alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, owner_node_id: u64) !bool {
+        const alloc = self.retainedAllocator(caller_alloc);
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();
         const durable = self.durable orelse return false;
         var persisted = (try durable.load(txn_id)) orelse return false;
         defer persisted.deinit(durable.alloc);
-        var candidate = try persisted.clone(alloc);
+        var candidate = try self.cloneAdoptedCandidate(persisted, alloc);
         errdefer candidate.deinit(alloc);
+        const reserved_slot = try self.reserveCachePublication(alloc, txn_id);
+        defer self.releaseCachePublication(reserved_slot);
         if (candidate.owner_node_id == owner_node_id) {
             try self.publishAdoptedCandidateAssumeStripe(alloc, txn_id, &candidate);
             return true;
@@ -2305,19 +2860,23 @@ pub const SessionRegistry = struct {
         if (self.lease_store != null and self.owner_lease_ttl_ns != null) {
             const now_ns = nextTxnTimestamp();
             const ttl_ms = @max(@as(u64, 1), self.owner_lease_ttl_ns.? / std.time.ns_per_ms);
-            if (!(try durable.saveWithLease(candidate, expected_owner, now_ns / std.time.ns_per_ms, ttl_ms, false, self.max_record_bytes))) return false;
-        } else try self.persistLocked(candidate);
+            if (!(try durable.saveWithLease(candidate, expected_owner, now_ns / std.time.ns_per_ms, ttl_ms, false, self.max_record_bytes))) {
+                candidate.deinit(alloc);
+                return false;
+            }
+        } else try self.persistLocked(alloc, candidate);
         try self.publishAdoptedCandidateAssumeStripe(alloc, txn_id, &candidate);
         return true;
     }
 
     pub fn adoptIfLeaseExpired(
         self: *SessionRegistry,
-        alloc: std.mem.Allocator,
+        caller_alloc: std.mem.Allocator,
         txn_id: db_mod.types.TxnId,
         owner_node_id: u64,
         now_ns: ?u64,
     ) !bool {
+        const alloc = self.retainedAllocator(caller_alloc);
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();
@@ -2330,8 +2889,10 @@ pub const SessionRegistry = struct {
         // it can overwrite staged work that the previous owner published.
         var persisted = (try durable.load(txn_id)) orelse return false;
         defer persisted.deinit(durable.alloc);
-        var candidate = try persisted.clone(alloc);
+        var candidate = try self.cloneAdoptedCandidate(persisted, alloc);
         errdefer candidate.deinit(alloc);
+        const reserved_slot = try self.reserveCachePublication(alloc, txn_id);
+        defer self.releaseCachePublication(reserved_slot);
         if (candidate.owner_node_id == owner_node_id) {
             try self.publishAdoptedCandidateAssumeStripe(alloc, txn_id, &candidate);
             return true;
@@ -2341,7 +2902,10 @@ pub const SessionRegistry = struct {
         candidate.owner_node_id = owner_node_id;
         touchSession(&candidate);
         const ttl_ms = @max(@as(u64, 1), self.owner_lease_ttl_ns.? / std.time.ns_per_ms);
-        if (!(try durable.saveWithLease(candidate, expected_owner, effective_now / std.time.ns_per_ms, ttl_ms, true, self.max_record_bytes))) return false;
+        if (!(try durable.saveWithLease(candidate, expected_owner, effective_now / std.time.ns_per_ms, ttl_ms, true, self.max_record_bytes))) {
+            candidate.deinit(alloc);
+            return false;
+        }
         try self.publishAdoptedCandidateAssumeStripe(alloc, txn_id, &candidate);
         return true;
     }
@@ -2374,20 +2938,68 @@ pub const SessionRegistry = struct {
             var current = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse continue;
             defer current.deinit(alloc);
             if (current.last_touched_timestamp >= cutoff_ns) continue;
-            if (current.terminal_commit) |terminal| {
-                if (terminal.coordinator_group_id != null and !terminal.coordinator_acknowledged) continue;
-            }
-            try self.deletePersistent(txn_id);
+            // TTL is not terminal evidence for an irrevocable transaction.
+            if (sessionNeedsRecovery(current)) continue;
+            if (self.durable) |durable| {
+                if (!(try durable.deleteGuarded(txn_id, .{ .expired_before = cutoff_ns }))) continue;
+                self.noteDurableDelete();
+            } else try self.deletePersistent(txn_id);
             self.releaseLease(txn_id, current.owner_node_id) catch {};
             self.mutex.lock();
             if (self.sessions.fetchRemove(txn_id)) |removed| {
                 var session = removed.value;
-                session.deinit(alloc);
+                session.deinit(self.retainedAllocator(alloc));
                 removed_count += 1;
             }
             self.mutex.unlock();
         }
         return removed_count;
+    }
+
+    /// Reads the durable start marker when available, rather than treating a
+    /// potentially stale process-local cache as proof that preparation never ran.
+    pub fn executionStarted(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !?bool {
+        _ = alloc;
+        const stripe = self.sessionLock(txn_id);
+        stripe.lock();
+        defer stripe.unlock();
+        if (self.durable) |durable| {
+            var current = (try durable.load(txn_id)) orelse return null;
+            defer current.deinit(durable.alloc);
+            return current.commit_execution_started;
+        }
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return if (self.sessions.getPtr(txn_id)) |current| current.commit_execution_started else null;
+    }
+
+    /// User abort may retire only a session which has not crossed the durable
+    /// execution boundary. The durable check and delete share one write txn.
+    pub fn abortOpenSession(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !bool {
+        const stripe = self.sessionLock(txn_id);
+        stripe.lock();
+        defer stripe.unlock();
+        var current = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return false;
+        defer current.deinit(alloc);
+        if (current.commit_execution_started or current.terminal_commit != null) return error.TransactionCommitAlreadyStarted;
+        if (self.durable) |durable| {
+            if (!(try durable.deleteGuarded(txn_id, .{ .open_owner = current.owner_node_id }))) return false;
+            self.noteDurableDelete();
+        }
+        self.releaseLease(txn_id, current.owner_node_id) catch {};
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.sessions.fetchRemove(txn_id)) |removed| {
+            var session = removed.value;
+            session.deinit(self.retainedAllocator(alloc));
+        }
+        return true;
+    }
+
+    fn noteDurableDelete(self: *SessionRegistry) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.known_durable_session_count) |count| self.known_durable_session_count = count -| 1;
     }
 
     pub fn remove(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) bool {
@@ -2413,7 +3025,7 @@ pub const SessionRegistry = struct {
         defer self.mutex.unlock();
         const removed = self.sessions.fetchRemove(txn_id) orelse return false;
         var session = removed.value;
-        session.deinit(alloc);
+        session.deinit(self.retainedAllocator(alloc));
         return true;
     }
 
@@ -2434,11 +3046,51 @@ pub const SessionRegistry = struct {
         }
     }
 
+    fn reserveCachePublication(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.sessions.contains(txn_id)) return false;
+        try self.sessions.ensureUnusedCapacity(self.retainedAllocator(alloc), @intCast(self.reserved_session_count + 1));
+        self.reserved_session_count += 1;
+        return true;
+    }
+
+    fn releaseCachePublication(self: *SessionRegistry, reserved: bool) void {
+        if (!reserved) return;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.reserved_session_count -= 1;
+    }
+
+    fn cloneAdoptedCandidate(self: *SessionRegistry, persisted: Session, alloc: std.mem.Allocator) !Session {
+        self.mutex.lock();
+        var cached_workspace: ?*RecoveryWorkspace = null;
+        const cached_owner = if (self.sessions.getPtr(persisted.txn_id)) |cached| blk: {
+            if (!std.meta.eql(cached.commit_body_digest, persisted.commit_body_digest)) break :blk null;
+            cached_workspace = cached.recovery_workspace;
+            if (cached_workspace) |workspace| workspace.retain();
+            break :blk cached.recovery_memory;
+        } else null;
+        if (cached_owner) |owner| owner.retain();
+        self.mutex.unlock();
+        if (cached_owner) |owner| {
+            errdefer owner.release();
+            errdefer if (cached_workspace) |workspace| workspace.release();
+            var cloned = try persisted.clone(owner.allocator());
+            cloned.recovery_memory = owner;
+            cloned.recovery_workspace = cached_workspace;
+            return cloned;
+        }
+        var cloned = try persisted.clone(self.retainedAllocator(alloc));
+        errdefer cloned.deinit(self.retainedAllocator(alloc));
+        if (sessionNeedsRecovery(cloned)) try self.reserveCompletion(&cloned, self.retainedAllocator(alloc));
+        return cloned;
+    }
+
     fn publishCandidateLocked(self: *SessionRegistry, alloc: std.mem.Allocator, current: *Session, candidate: *Session) void {
-        _ = self;
         var previous = current.*;
         current.* = candidate.*;
-        previous.deinit(alloc);
+        previous.deinit(self.retainedAllocator(alloc));
     }
 
     /// Publishes an authoritative durable ownership transition into this
@@ -2455,16 +3107,41 @@ pub const SessionRegistry = struct {
             self.mutex.unlock();
             return;
         }
-        self.sessions.put(alloc, txn_id, candidate.*) catch |err| {
-            self.mutex.unlock();
-            return err;
-        };
+        self.sessions.putAssumeCapacity(txn_id, candidate.*);
         candidate.* = undefined;
         self.mutex.unlock();
     }
 
-    fn persistLocked(self: *SessionRegistry, session: Session) !void {
-        if (self.durable) |durable| try durable.save(session, self.max_record_bytes);
+    fn persistLocked(self: *SessionRegistry, alloc: std.mem.Allocator, session: Session) !void {
+        if (self.durable) |durable| {
+            // The view contains only borrowed backend handles and immutable
+            // options. Never mutate the shared store allocator across calls.
+            var scoped = durable.*;
+            scoped.alloc = session.allocationAllocator(alloc);
+            scoped.save(session, self.max_record_bytes) catch |err| {
+                if (err == error.TransactionCommitAlreadyStarted) {
+                    // Discard only a stale pre-start cache entry. No live
+                    // completion reserve may be released on this rejection.
+                    // The next access reloads the authoritative record and
+                    // reserves its pending completion workspace before use.
+                    self.mutex.lock();
+                    defer self.mutex.unlock();
+                    if (self.sessions.getPtr(session.txn_id)) |cached| {
+                        if (!cached.commit_execution_started and cached.recovery_memory == null) {
+                            var removed = self.sessions.fetchRemove(session.txn_id).?.value;
+                            removed.deinit(self.retainedAllocator(alloc));
+                        }
+                    }
+                }
+                return err;
+            };
+        } else if (self.max_record_bytes) |limit| {
+            // The same record ceiling bounds recovery reservations for an
+            // in-memory registry. Keep mutations under that ceiling too.
+            const encoded = try encodeSessionRecord(alloc, session);
+            defer alloc.free(encoded);
+            if (encoded.len > limit) return error.SessionRecordTooLarge;
+        }
     }
 
     fn deletePersistent(self: *SessionRegistry, txn_id: db_mod.types.TxnId) !void {
@@ -2499,9 +3176,17 @@ pub const SessionRegistry = struct {
     /// The caller holds the txn stripe. Durable reads happen without the global
     /// registry mutex; publication is a short double-checked map operation.
     fn loadSessionCloneAssumeStripe(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !?Session {
+        return self.loadSessionCloneModeAssumeStripe(alloc, txn_id, false);
+    }
+
+    fn loadSessionMutationCloneAssumeStripe(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !?Session {
+        return self.loadSessionCloneModeAssumeStripe(alloc, txn_id, true);
+    }
+
+    fn loadSessionCloneModeAssumeStripe(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, mutation: bool) !?Session {
         self.mutex.lock();
         if (self.sessions.getPtr(txn_id)) |session| {
-            const cloned = session.clone(alloc) catch |err| {
+            const cloned = (if (mutation) self.cloneMutation(session.*, alloc) else session.clone(alloc)) catch |err| {
                 self.mutex.unlock();
                 return err;
             };
@@ -2518,11 +3203,23 @@ pub const SessionRegistry = struct {
         if (self.sessions.getPtr(txn_id)) |session| {
             loaded.deinit(durable.alloc);
             loaded_owned = false;
-            return try session.clone(alloc);
+            return if (mutation) try self.cloneMutation(session.*, alloc) else try session.clone(alloc);
         }
-        try self.sessions.put(alloc, txn_id, loaded);
+        const retained_alloc = self.retainedAllocator(alloc);
+        var retained = try loaded.clone(retained_alloc);
+        if (sessionNeedsRecovery(retained)) self.reserveCompletion(&retained, retained_alloc) catch |err| {
+            retained.deinit(retained_alloc);
+            return err;
+        };
+        self.sessions.ensureUnusedCapacity(retained_alloc, @intCast(self.reserved_session_count + 1)) catch |err| {
+            retained.deinit(retained_alloc);
+            return err;
+        };
+        self.sessions.putAssumeCapacity(txn_id, retained);
+        loaded.deinit(durable.alloc);
         loaded_owned = false;
-        return try self.sessions.getPtr(txn_id).?.clone(alloc);
+        const cached = self.sessions.getPtr(txn_id).?;
+        return if (mutation) try self.cloneMutation(cached.*, alloc) else try cached.clone(alloc);
     }
 
     fn renewLeaseLocked(self: *SessionRegistry, txn_id: db_mod.types.TxnId, owner_node_id: u64) !void {
@@ -3132,6 +3829,16 @@ pub fn encodeSessionStageConflictResponse(
     return try encodeSessionCommitResponse(alloc, txn_id, "conflict", conflict, null);
 }
 
+/// Stable sessions may retire only after the source has established abort.
+/// Coordinator begin can return "participant unavailable" before observing
+/// any decision, including when replaying a previously committed transaction.
+/// Prepare conflicts follow a successful durable abort in the executor. Begin
+/// fanout conflicts are conservatively retained because the current outcome
+/// contract does not distinguish them from an unavailable coordinator.
+pub fn conflictProvesAbort(outcome: distributed_txn.CommitConflict) bool {
+    return !std.mem.eql(u8, outcome.message, "participant unavailable") or outcome.phase == .prepare;
+}
+
 pub fn conflictFromOutcome(outcome: distributed_txn.CommitConflict) CommitConflict {
     return .{
         .table_name = outcome.table_name,
@@ -3629,7 +4336,8 @@ fn cloneReadSnapshotMap(
     while (it.next()) |entry| {
         const owned_key = try alloc.dupe(u8, entry.key_ptr.*);
         errdefer alloc.free(owned_key);
-        const snapshot = try entry.value_ptr.clone(alloc);
+        var snapshot = try entry.value_ptr.clone(alloc);
+        errdefer snapshot.deinit(alloc);
         try out.put(alloc, owned_key, snapshot);
     }
     return out;
@@ -4150,12 +4858,14 @@ fn makeSessionRecoveryKey(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) 
 }
 
 fn sessionNeedsRecovery(session: Session) bool {
-    if (session.terminal_commit) |terminal| {
-        return terminal.status != .committed or
-            (terminal.repair_required and terminal.coordinator_group_id == null) or
-            (terminal.coordinator_group_id != null and !terminal.coordinator_acknowledged);
-    }
+    if (session.terminal_commit) |terminal| return terminalNeedsRecovery(terminal);
     return session.commit_body_digest != null and session.commit_execution_started;
+}
+
+fn terminalNeedsRecovery(terminal: TerminalCommit) bool {
+    return terminal.status != .committed or
+        (terminal.repair_required and terminal.coordinator_group_id == null) or
+        (terminal.coordinator_group_id != null and !terminal.coordinator_acknowledged);
 }
 
 const ParsedSessionExpiryKey = struct {
@@ -4211,6 +4921,13 @@ fn encodeSessionRecord(alloc: std.mem.Allocator, session: Session) ![]u8 {
     }
     try out.appendSlice(alloc, ",\"commit_body_digest\":");
     if (session.commit_body_digest) |digest| {
+        const hex = std.fmt.bytesToHex(digest, .lower);
+        try appendJsonString(alloc, &out, &hex);
+    } else {
+        try out.appendSlice(alloc, "null");
+    }
+    try out.appendSlice(alloc, ",\"sealed_request_digest\":");
+    if (session.sealed_request_digest) |digest| {
         const hex = std.fmt.bytesToHex(digest, .lower);
         try appendJsonString(alloc, &out, &hex);
     } else {
@@ -4299,14 +5016,6 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
             }
         else
             sessionOwnerNodeId(txn_id),
-        .principal = if (obj.get("principal")) |value|
-            switch (value) {
-                .string => |principal| try alloc.dupe(u8, principal),
-                .null => null,
-                else => return error.InvalidTransactionSessionRecord,
-            }
-        else
-            null,
         .begin_timestamp = switch (obj.get("begin_timestamp") orelse return error.InvalidTransactionSessionRecord) {
             .integer => |v| try nonNegativeRecordInteger(v),
             .number_string => |text| try recordNumber(text),
@@ -4321,6 +5030,15 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
         },
     };
     errdefer session.deinit(alloc);
+    session.principal = if (obj.get("principal")) |value|
+        switch (value) {
+            .string => |principal| try alloc.dupe(u8, principal),
+            .null => null,
+            else => return error.InvalidTransactionSessionRecord,
+        }
+    else
+        null;
+
     session.last_touched_timestamp = if (obj.get("last_touched_timestamp")) |value|
         switch (value) {
             .integer => |v| try nonNegativeRecordInteger(v),
@@ -4343,6 +5061,23 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
             .null => {},
             else => return error.InvalidTransactionSessionRecord,
         }
+    }
+    if (obj.get("sealed_request_digest")) |digest_value| {
+        switch (digest_value) {
+            .string => |encoded| {
+                if (encoded.len != 64) return error.InvalidTransactionSessionRecord;
+                var digest: [32]u8 = undefined;
+                _ = std.fmt.hexToBytes(&digest, encoded) catch return error.InvalidTransactionSessionRecord;
+                session.sealed_request_digest = digest;
+            },
+            .null => {},
+            else => return error.InvalidTransactionSessionRecord,
+        }
+    }
+    if (session.sealed_request_digest) |digest| {
+        if (session.commit_body_digest == null or session.staged == null) return error.InvalidTransactionSessionRecord;
+        const actual = try sealedRequestDigest(alloc, session.staged.?);
+        if (!std.mem.eql(u8, &digest, &actual)) return error.InvalidTransactionSessionRecord;
     }
     session.commit_execution_started = if (obj.get("commit_execution_started")) |value| switch (value) {
         .bool => |started| started,
@@ -4417,7 +5152,9 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
             .number_string => |text| try recordNumber(text),
             else => return error.InvalidTransactionSessionRecord,
         };
-        const snapshot = try parseStoredCommitValue(alloc, entry_obj.get("snapshot") orelse return error.InvalidTransactionSessionRecord);
+        if (session.savepoints.contains(id)) return error.InvalidTransactionSessionRecord;
+        var snapshot = try parseStoredCommitValue(alloc, entry_obj.get("snapshot") orelse return error.InvalidTransactionSessionRecord);
+        errdefer snapshot.deinit(alloc);
         var read_snapshots: std.StringArrayHashMapUnmanaged(SessionReadSnapshot) = .empty;
         errdefer deinitReadSnapshotMap(alloc, &read_snapshots);
         if (entry_obj.get("read_snapshots")) |read_snapshots_value| {
@@ -4447,6 +5184,14 @@ fn commitBodyDigest(
     req: ?*const OwnedTransactionCommitRequest,
 ) ![32]u8 {
     const encoded = if (req) |value| try encodeCommitRequest(alloc, value.*) else try alloc.dupe(u8, "null");
+    defer alloc.free(encoded);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(encoded, &digest, .{});
+    return digest;
+}
+
+fn sealedRequestDigest(alloc: std.mem.Allocator, req: OwnedTransactionCommitRequest) ![32]u8 {
+    const encoded = try encodeCommitRequestMode(alloc, req, true);
     defer alloc.free(encoded);
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(encoded, &digest, .{});
@@ -4990,6 +5735,107 @@ test "terminal commit response preserves live debt ahead of repair" {
     );
 }
 
+fn beginSealedRecoveryTestSession(registry: *SessionRegistry, alloc: std.mem.Allocator) !db_mod.types.TxnId {
+    const session = try registry.begin(alloc, .{ .sync_level = .write }, 9);
+    var request = try parseCommitRequest(alloc,
+        \\{"read_set":[],"tables":{"docs":{"inserts":{"doc:a":{"value":1}}}}}
+    );
+    defer request.deinit(alloc);
+    var sealed = (try registry.cloneCommitRequest(alloc, session.txn_id, &request)) orelse return error.TestExpectedSession;
+    sealed.deinit(alloc);
+    return session.txn_id;
+}
+
+test "workload admission in memory recovery remains reserved through coordinator acknowledgement" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.initWithOptions(null, null, null, null, 8, 4096);
+    defer registry.deinit(alloc);
+    registry.max_recovery_count = 1;
+    const first = try beginSealedRecoveryTestSession(&registry, alloc);
+    const second = try beginSealedRecoveryTestSession(&registry, alloc);
+    _ = try registry.markCommitExecutionStarted(alloc, first);
+    try std.testing.expectError(error.RecoveryCapacityExhausted, registry.markCommitExecutionStarted(alloc, second));
+    try std.testing.expect(!registry.sessions.get(second).?.commit_execution_started);
+    _ = try registry.recordTerminalCommit(alloc, first, .committed, 1, "docs");
+    try std.testing.expectError(error.RecoveryCapacityExhausted, registry.markCommitExecutionStarted(alloc, second));
+    _ = try registry.markTerminalCoordinatorAcknowledged(alloc, first);
+    _ = try registry.markCommitExecutionStarted(alloc, second);
+    try std.testing.expect(registry.sessions.get(second).?.commit_execution_started);
+}
+
+test "workload admission recovery survives store reopen missing indexes and reduced limits" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/recovery-admission", .{tmp.sub_path});
+    defer alloc.free(path);
+    var first: db_mod.types.TxnId = undefined;
+    var second: db_mod.types.TxnId = undefined;
+    {
+        var opened = try OpenedSessionStore.open(alloc, path);
+        defer opened.deinit();
+        var registry = SessionRegistry.initWithOptions(opened.durableStore(), null, null, null, 8, 4096);
+        defer registry.deinit(alloc);
+        registry.max_recovery_count = 2;
+        registry.max_recovery_bytes = 4096;
+        first = try beginSealedRecoveryTestSession(&registry, alloc);
+        second = try beginSealedRecoveryTestSession(&registry, alloc);
+        _ = try registry.markCommitExecutionStarted(alloc, first);
+        try std.testing.expectError(error.RecoveryCapacityExhausted, registry.markCommitExecutionStarted(alloc, second));
+        const key = try makeSessionRecoveryKey(alloc, first);
+        defer alloc.free(key);
+        var txn = try opened.docstore.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.delete(key); // Legacy/incomplete index must not lose ownership.
+        try txn.commit();
+    }
+    {
+        var opened = try OpenedSessionStore.open(alloc, path);
+        defer opened.deinit();
+        var registry = SessionRegistry.initWithOptions(opened.durableStore(), null, null, null, 8, 4096);
+        defer registry.deinit(alloc);
+        registry.max_recovery_count = 1;
+        registry.max_recovery_bytes = 1024; // Lower than the existing reservation.
+        try std.testing.expectError(error.RecoveryCapacityExhausted, registry.markCommitExecutionStarted(alloc, second));
+        var persisted = (try opened.durable.load(second)).?;
+        defer persisted.deinit(alloc);
+        try std.testing.expect(!persisted.commit_execution_started);
+        _ = try registry.markCommitExecutionStarted(alloc, first); // Retry needs no new reservation.
+        _ = try registry.recordTerminalCommit(alloc, first, .committed, 1, "docs");
+        _ = try registry.markTerminalCoordinatorAcknowledged(alloc, first);
+        registry.max_recovery_bytes = 4096;
+        _ = try registry.markCommitExecutionStarted(alloc, second);
+    }
+}
+
+test "workload admission recovery uses the runtime write transaction and bounded scan" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "system/api-transaction-sessions" });
+    defer store.deinit();
+    var durable = DurableSessionStore.initRuntime(alloc, &store);
+    var first_registry = SessionRegistry.initWithOptions(&durable, null, null, null, 8, 4096);
+    defer first_registry.deinit(alloc);
+    var second_registry = SessionRegistry.initWithOptions(&durable, null, null, null, 8, 4096);
+    defer second_registry.deinit(alloc);
+    first_registry.max_recovery_count = 1;
+    second_registry.max_recovery_count = 1;
+    const first = try beginSealedRecoveryTestSession(&first_registry, alloc);
+    const second = try beginSealedRecoveryTestSession(&second_registry, alloc);
+    _ = try first_registry.markCommitExecutionStarted(alloc, first);
+    try std.testing.expectError(error.RecoveryCapacityExhausted, second_registry.markCommitExecutionStarted(alloc, second));
+    _ = try first_registry.recordTerminalCommit(alloc, first, .committed, null, null);
+    second_registry.max_sessions = 1; // Existing records exceed new scan policy.
+    try std.testing.expectError(error.RecoveryCapacityExhausted, second_registry.markCommitExecutionStarted(alloc, second));
+    second_registry.max_sessions = 8;
+    durable.fail_writes_for_test = true;
+    try std.testing.expectError(error.InjectedSessionStoreFailure, second_registry.markCommitExecutionStarted(alloc, second));
+    durable.fail_writes_for_test = false;
+    try std.testing.expect(!second_registry.sessions.get(second).?.commit_execution_started);
+    _ = try second_registry.markCommitExecutionStarted(alloc, second);
+}
+
 test "durable session limits bound count and encoded record size" {
     var backend = mem_backend.Backend.init(std.testing.allocator, .{});
     defer backend.close();
@@ -5083,6 +5929,41 @@ test "transaction session commit request is sealed across retries" {
         error.TransactionCommitSealed,
         reader.stage(alloc, txn_id, &changed_body),
     );
+
+    // The digest covers the merged staged payload, rather than only the
+    // optional body used to identify an HTTP retry. Restart must reject a
+    // durable record whose staged writes changed under the sealed identity.
+    var tampered = (try durable.load(txn_id)) orelse return error.TestExpectedEqual;
+    defer tampered.deinit(alloc);
+    try std.testing.expect(tampered.sealed_request_digest != null);
+    tampered.staged.?.deinit(alloc);
+    tampered.staged = try changed_body.clone(alloc);
+    const tampered_record = try encodeSessionRecord(alloc, tampered);
+    defer alloc.free(tampered_record);
+    try std.testing.expectError(error.InvalidTransactionSessionRecord, decodeSessionRecord(alloc, txn_id, tampered_record));
+
+    // Older peers have no effective-request digest. They remain readable for
+    // inspection, but cannot mutate or resume from a payload with no proof.
+    tampered.sealed_request_digest = null;
+    tampered.commit_execution_started = true;
+    const legacy_record = try encodeSessionRecord(alloc, tampered);
+    defer alloc.free(legacy_record);
+    var legacy = try decodeSessionRecord(alloc, txn_id, legacy_record);
+    defer legacy.deinit(alloc);
+    try std.testing.expect(legacy.sealed_request_digest == null);
+    try durable.save(legacy, null);
+    var legacy_reader = SessionRegistry.init(&durable);
+    defer legacy_reader.deinit(alloc);
+    try std.testing.expectError(error.TransactionCommitIdentityUnavailable, legacy_reader.cloneCommitRequest(alloc, txn_id, &first_body));
+    try std.testing.expectError(error.TransactionCommitIdentityUnavailable, legacy_reader.markCommitExecutionStarted(alloc, txn_id));
+    try std.testing.expectError(error.TransactionCommitIdentityUnavailable, legacy_reader.claimPendingRecovery(alloc, txn_id, 9, nextTxnTimestamp()));
+    legacy.terminal_commit = .{
+        .status = .committed,
+        .coordinator_group_id = 7,
+        .coordinator_table_name = try alloc.dupe(u8, "docs"),
+    };
+    try durable.save(legacy, null);
+    try std.testing.expectError(error.TransactionCommitIdentityUnavailable, legacy_reader.claimPendingRecovery(alloc, txn_id, 9, nextTxnTimestamp()));
 }
 
 test "durable recovery index tracks only validated commit execution and terminal handoff" {
@@ -5790,31 +6671,336 @@ test "transaction catalog binding clone releases partial allocations" {
     try std.testing.checkAllAllocationFailures(alloc, checkCatalogBoundRequestClone, .{request});
 }
 
-test "distributed txn session observed predicates survive private persistence without public injection or duplicate growth" {
+test "workload admission transaction retained records survive caller teardown and bound mutation" {
     const alloc = std.testing.allocator;
+    var gate = @import("../common/workload_admission.zig").Controller.initConfigured(0, .{ .max_retained_bytes = 1024 * 1024 });
+    defer gate.deinitMemory();
+    const owner = try @import("../common/workload_allocator.zig").Owner.create(alloc, &gate);
+    defer owner.release();
+    var registry = SessionRegistry.init(null);
+    var registry_live = true;
+    defer if (registry_live) registry.deinit(alloc);
+    try registry.installRetainedOwner(owner, &gate);
+    registry.max_record_bytes = 4096;
+    var txn_id: db_mod.types.TxnId = undefined;
+    {
+        var request_arena = std.heap.ArenaAllocator.init(alloc);
+        defer request_arena.deinit();
+        const request_alloc = request_arena.allocator();
+        const session = try registry.beginForPrincipal(request_alloc, .{ .sync_level = .write }, 9, "user:alice");
+        txn_id = session.txn_id;
+        var request = try parseCommitRequest(request_alloc,
+            \\{"read_set":[],"tables":{"docs":{"inserts":{"doc:a":{"value":1}}}}}
+        );
+        defer request.deinit(request_alloc);
+        _ = try registry.stage(request_alloc, txn_id, &request);
+        _ = try registry.createSavepoint(request_alloc, txn_id);
+    }
+    try std.testing.expect(owner.live.load(.acquire) > 0);
+    const before = gate.stats().retained_bytes;
+    try gate.reconfigure(0, .{ .max_retained_bytes = before });
+    var extra = try parseCommitRequest(alloc,
+        \\{"read_set":[],"tables":{"docs":{"inserts":{"doc:b":{"value":2}}}}}
+    );
+    defer extra.deinit(alloc);
+    try std.testing.expectError(error.OutOfMemory, registry.stage(alloc, txn_id, &extra));
+    try std.testing.expectEqual(before, gate.stats().retained_bytes);
+    var details = (try registry.getDetails(alloc, txn_id)).?;
+    defer details.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), details.status.staged_write_count);
+    try gate.reconfigure(0, .{ .max_retained_bytes = 1024 * 1024 });
+    _ = try registry.rollbackToSavepoint(alloc, txn_id, details.savepoint_ids[0]);
+    var sealed = (try registry.cloneCommitRequest(alloc, txn_id, null)).?;
+    const sealed_bytes = gate.stats().retained_bytes;
+    sealed.deinit(alloc);
+    try std.testing.expectEqual(sealed_bytes, gate.stats().retained_bytes);
+    _ = try registry.markCommitExecutionStarted(alloc, txn_id);
+    try std.testing.expect(registry.sessions.get(txn_id).?.recovery_memory != null);
+    try std.testing.expect((try registry.executionStarted(alloc, txn_id)).?);
+    try std.testing.expectError(error.TransactionCommitAlreadyStarted, registry.abortOpenSession(alloc, txn_id));
+    try gate.reconfigure(0, .{ .max_retained_bytes = gate.stats().retained_bytes });
+    gate.close();
+    try std.testing.expectError(error.OutOfMemory, registry.beginForPrincipal(alloc, .{ .sync_level = .write }, 9, "blocked"));
+    try std.testing.expectEqual(@as(usize, 0), try registry.cleanupExpired(alloc, std.math.maxInt(u64)));
+    _ = try registry.recordTerminalCommit(alloc, txn_id, .committed, 1, "docs");
+    try std.testing.expectEqual(@as(usize, 0), try registry.cleanupExpired(alloc, std.math.maxInt(u64)));
+    _ = try registry.markTerminalCoordinatorAcknowledged(alloc, txn_id);
+    _ = try registry.markTerminalCoordinatorAcknowledged(alloc, txn_id);
+    try std.testing.expectEqual(@as(usize, 1), try registry.cleanupExpired(alloc, std.math.maxInt(u64)));
+    registry.deinit(alloc);
+    registry_live = false;
+    try std.testing.expectEqual(@as(usize, 0), owner.live.load(.acquire));
+}
+
+test "workload admission durable transaction cache has independent retained allocator" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/retained-session", .{tmp.sub_path}, 0);
+    defer alloc.free(path);
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+    var durable = DurableSessionStore.init(alloc, &store);
+    var txn_id: db_mod.types.TxnId = undefined;
+    {
+        var writer = SessionRegistry.init(&durable);
+        defer writer.deinit(alloc);
+        txn_id = try beginSealedRecoveryTestSession(&writer, alloc);
+        _ = try writer.markCommitExecutionStarted(alloc, txn_id);
+    }
+    var gate = @import("../common/workload_admission.zig").Controller.initConfigured(0, .{ .max_retained_bytes = 1024 * 1024 });
+    defer gate.deinitMemory();
+    const owner = try @import("../common/workload_allocator.zig").Owner.create(alloc, &gate);
+    defer owner.release();
+    var reader = SessionRegistry.init(&durable);
+    var reader_live = true;
+    defer if (reader_live) reader.deinit(alloc);
+    try gate.reconfigure(0, .{ .max_retained_bytes = @sizeOf(@import("../common/workload_allocator.zig").Owner) + 32 });
+    try std.testing.expectError(error.OutOfMemory, reader.installRetainedOwner(owner, &gate));
+    try std.testing.expectEqual(@as(usize, 0), owner.live.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), reader.sessions.count());
+    try std.testing.expect(reader.retained_allocator == null);
+    try gate.reconfigure(0, .{ .max_retained_bytes = 1024 * 1024 });
+    try reader.installRetainedOwner(owner, &gate);
+    try std.testing.expect(reader.sessions.get(txn_id).?.recovery_memory != null);
+    {
+        var request = std.heap.ArenaAllocator.init(alloc);
+        defer request.deinit();
+        const status = (try reader.getStatus(request.allocator(), txn_id)).?;
+        try std.testing.expectEqual(@as(usize, 1), status.staged_write_count);
+    }
+    try std.testing.expect(owner.live.load(.acquire) > 0);
+    var recovery = (try reader.claimPendingRecovery(alloc, txn_id, 9, nextTxnTimestamp())).?;
+    defer recovery.deinit(alloc);
+    try std.testing.expect(recovery == .commit);
+    try std.testing.expectEqual(@as(usize, 0), try reader.cleanupExpired(alloc, std.math.maxInt(u64)));
+    reader.deinit(alloc);
+    reader_live = false;
+    try std.testing.expectEqual(@as(usize, 0), owner.live.load(.acquire));
+    // Returned recovery work remains caller-owned after the cache is destroyed.
+    try std.testing.expectEqualStrings("docs", recovery.commit.request.tables[0].table_name);
+}
+
+test "workload admission transaction session allocation failure preserves retained ownership" {
+    const Fixture = struct {
+        fn run(failing: std.mem.Allocator) !void {
+            const alloc = std.testing.allocator;
+            var gate = @import("../common/workload_admission.zig").Controller.initConfigured(0, .{ .max_retained_bytes = 1024 * 1024 });
+            defer gate.deinitMemory();
+            const owner = try @import("../common/workload_allocator.zig").Owner.create(failing, &gate);
+            defer owner.release();
+            var registry = SessionRegistry.init(null);
+            defer registry.deinit(alloc);
+            try registry.installRetainedOwner(owner, &gate);
+            registry.max_record_bytes = 4096;
+            var request = try parseCommitRequest(alloc,
+                \\{"read_set":[],"tables":{"docs":{"inserts":{"doc:a":{"value":1}}}}}
+            );
+            defer request.deinit(alloc);
+            const session = try registry.beginForPrincipal(alloc, .{ .sync_level = .write }, 9, "user:alice");
+            _ = try registry.stageRead(alloc, session.txn_id, &request, .{
+                .table_name = "docs",
+                .key = "doc:a",
+                .version = 1,
+                .document_json = "{}",
+            });
+            const savepoint = (try registry.createSavepoint(alloc, session.txn_id)).?;
+            _ = try registry.rollbackToSavepoint(alloc, session.txn_id, savepoint.savepoint_id);
+            var sealed = (try registry.cloneCommitRequest(alloc, session.txn_id, null)).?;
+            sealed.deinit(alloc);
+            _ = try registry.markCommitExecutionStarted(alloc, session.txn_id);
+            _ = try registry.recordTerminalCommit(alloc, session.txn_id, .committed, 1, "docs");
+            _ = try registry.markTerminalCoordinatorAcknowledged(alloc, session.txn_id);
+            _ = try registry.markTerminalCoordinatorAcknowledged(alloc, session.txn_id);
+            try std.testing.expect(registry.remove(alloc, session.txn_id));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "workload admission durable abort and expiry cannot retire a remotely started session" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/retained-abort", .{tmp.sub_path}, 0);
+    defer alloc.free(path);
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+    var durable = DurableSessionStore.init(alloc, &store);
+    var gate = @import("../common/workload_admission.zig").Controller.initConfigured(0, .{ .max_retained_bytes = 1024 * 1024 });
+    defer gate.deinitMemory();
+    const owner = try @import("../common/workload_allocator.zig").Owner.create(alloc, &gate);
+    defer owner.release();
+    var first = SessionRegistry.init(&durable);
+    defer first.deinit(alloc);
+    try first.installRetainedOwner(owner, &gate);
+    const id = try beginSealedRecoveryTestSession(&first, alloc);
+    var second = SessionRegistry.init(&durable);
+    defer second.deinit(alloc);
+    try second.installRetainedOwner(owner, &gate);
+    _ = try second.markCommitExecutionStarted(alloc, id);
+    try std.testing.expect(!first.sessions.get(id).?.commit_execution_started);
+    try std.testing.expect((try first.executionStarted(alloc, id)).?);
+    try std.testing.expectError(error.TransactionCommitAlreadyStarted, first.abortOpenSession(alloc, id));
+    try std.testing.expectEqual(@as(usize, 0), try first.cleanupExpired(alloc, std.math.maxInt(u64)));
+    var persisted = (try durable.load(id)).?;
+    defer persisted.deinit(alloc);
+    try std.testing.expect(persisted.commit_execution_started);
+
+    // A retry may touch/seal a cached copy before checking the authoritative
+    // execution marker. Neither ordinary nor lease-bearing writes may regress
+    // that marker or erase its recovery index.
     var request = try parseCommitRequest(alloc,
-        \\{"read_set":[{"table":"docs","key":"a","version":"18446744073709551615"}],"tables":{"docs":{}},"observed_predicates":{"docs":[{"key":"forged","version":"1","digest":null}]}}
+        \\{"read_set":[],"tables":{"docs":{"inserts":{"doc:a":{"value":1}}}}}
     );
     defer request.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), request.tables[0].predicates.items.len);
-    const observations = [_]db_mod.types.TransactionVersionPredicate{
-        .{ .key = "a", .expected_version = std.math.maxInt(u64), .expected_content_digest = @splat(255) },
-        .{ .key = "b", .expected_version = 0 },
+    try std.testing.expectError(error.TransactionCommitAlreadyStarted, durable.saveWithLease(
+        first.sessions.get(id).?,
+        9,
+        0,
+        1000,
+        false,
+        null,
+    ));
+    try std.testing.expectError(error.TransactionCommitAlreadyStarted, first.cloneCommitRequest(alloc, id, &request));
+    try std.testing.expect(!first.sessions.contains(id));
+    var retried = (try first.cloneCommitRequest(alloc, id, &request)).?;
+    defer retried.deinit(alloc);
+    try std.testing.expect(first.sessions.get(id).?.commit_execution_started);
+    try std.testing.expect(first.sessions.get(id).?.recovery_memory != null);
+    try std.testing.expect(second.sessions.get(id).?.recovery_memory != null);
+    try std.testing.expect((try first.executionStarted(alloc, id)).?);
+    const retained_before_abort = gate.stats().retained_bytes;
+    try std.testing.expectError(error.TransactionCommitAlreadyStarted, first.abortOpenSession(alloc, id));
+    try std.testing.expectEqual(retained_before_abort, gate.stats().retained_bytes);
+}
+
+test "workload admission uncertain begin conflict is not terminal evidence" {
+    var conflict: distributed_txn.CommitConflict = .{
+        .table_name = "docs",
+        .key = "",
+        .message = "participant unavailable",
+        .phase = .begin,
     };
-    try appendPredicates(alloc, &request.tables[0].predicates, &observations);
-    const public = try encodeCommitRequest(alloc, request);
-    defer alloc.free(public);
-    try std.testing.expect(std.mem.indexOf(u8, public, "observed_predicates") == null);
-    const stored = try encodeCommitRequestMode(alloc, request, true);
-    defer alloc.free(stored);
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stored, .{});
-    defer parsed.deinit();
-    var restored = try parseStoredCommitValue(alloc, parsed.value);
-    defer restored.deinit(alloc);
-    try restored.mergeFrom(alloc, &request);
-    const predicates = restored.tables[0].predicates.items;
-    try std.testing.expectEqual(@as(usize, 2), predicates.len);
-    try std.testing.expectEqual(std.math.maxInt(u64), predicates[0].expected_version);
-    try std.testing.expectEqualSlices(u8, &@as([32]u8, @splat(255)), &predicates[0].expected_content_digest.?);
-    try std.testing.expectEqual(@as(u64, 0), predicates[1].expected_version);
+    try std.testing.expect(!conflictProvesAbort(conflict));
+    conflict.phase = null;
+    try std.testing.expect(!conflictProvesAbort(conflict));
+    conflict.phase = .prepare;
+    try std.testing.expect(conflictProvesAbort(conflict));
+    conflict.phase = .begin;
+    conflict.message = "transaction decision conflict";
+    try std.testing.expect(conflictProvesAbort(conflict));
+}
+
+test "workload admission completion record capacity is checked before execution starts" {
+    const alloc = std.testing.allocator;
+    var gate = @import("../common/workload_admission.zig").Controller.initConfigured(0, .{ .max_retained_bytes = 1024 * 1024 });
+    defer gate.deinitMemory();
+    const owner = try @import("../common/workload_allocator.zig").Owner.create(alloc, &gate);
+    defer owner.release();
+    var registry = SessionRegistry.init(null);
+    defer registry.deinit(alloc);
+    try registry.installRetainedOwner(owner, &gate);
+    const id = try beginSealedRecoveryTestSession(&registry, alloc);
+    const encoded = try encodeSessionRecord(alloc, registry.sessions.get(id).?);
+    defer alloc.free(encoded);
+    registry.max_record_bytes = encoded.len + 1;
+    const before = gate.stats().retained_bytes;
+    try std.testing.expectError(error.SessionRecordTooLarge, registry.markCommitExecutionStarted(alloc, id));
+    try std.testing.expectEqual(before, gate.stats().retained_bytes);
+    try std.testing.expect(!(try registry.executionStarted(alloc, id)).?);
+    try std.testing.expect(try registry.abortOpenSession(alloc, id));
+}
+
+test "workload admission recovery replay is prepaid exclusive and outlives its registry" {
+    const alloc = std.testing.allocator;
+    var gate = @import("../common/workload_admission.zig").Controller.initConfigured(0, .{ .max_retained_bytes = 1024 * 1024 });
+    defer gate.deinitMemory();
+    const owner = try @import("../common/workload_allocator.zig").Owner.create(alloc, &gate);
+    defer owner.release();
+    var registry = SessionRegistry.init(null);
+    var registry_live = true;
+    defer if (registry_live) registry.deinit(alloc);
+    try registry.installRetainedOwner(owner, &gate);
+    const id = try beginSealedRecoveryTestSession(&registry, alloc);
+    _ = try registry.markCommitExecutionStarted(alloc, id);
+    const reserved = gate.stats().retained_bytes;
+    try gate.reconfigure(0, .{ .max_retained_bytes = reserved });
+    gate.close();
+
+    var first = (try registry.claimPendingRecoveryOwned(alloc, id, 9, nextTxnTimestamp())).?;
+    defer first.deinit();
+    try std.testing.expect((try registry.claimPendingRecoveryOwned(alloc, id, 9, nextTxnTimestamp())) == null);
+    const tables = try first.work.commit.request.distributedTables(first.allocator());
+    defer first.allocator().free(tables);
+    try std.testing.expectEqualStrings("docs", tables[0].table_name);
+    try std.testing.expectEqual(reserved, gate.stats().retained_bytes);
+    // A cancelled client cannot abort this obligation. Terminal bookkeeping
+    // has a separate prepaid workspace and remains possible during a replay.
+    try std.testing.expectError(error.TransactionCommitAlreadyStarted, registry.abortOpenSession(alloc, id));
+    _ = try registry.recordTerminalCommit(alloc, id, .committed, 1, "docs");
+    try std.testing.expectEqual(reserved, gate.stats().retained_bytes);
+    registry.deinit(alloc);
+    registry_live = false;
+    try std.testing.expect(gate.stats().retained_bytes > 0);
+    try std.testing.expectEqualStrings("docs", first.work.commit.request.tables[0].table_name);
+}
+
+test "workload admission durable replay restores private memory before ordinary sessions" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/prepaid-replay", .{tmp.sub_path}, 0);
+    defer alloc.free(path);
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+    var durable = DurableSessionStore.init(alloc, &store);
+    var id: db_mod.types.TxnId = undefined;
+    {
+        var writer = SessionRegistry.init(&durable);
+        defer writer.deinit(alloc);
+        id = try beginSealedRecoveryTestSession(&writer, alloc);
+        _ = try writer.markCommitExecutionStarted(alloc, id);
+    }
+    var gate = @import("../common/workload_admission.zig").Controller.initConfigured(0, .{ .max_retained_bytes = 1024 * 1024 });
+    defer gate.deinitMemory();
+    const owner = try @import("../common/workload_allocator.zig").Owner.create(alloc, &gate);
+    defer owner.release();
+    var reader = SessionRegistry.init(&durable);
+    defer reader.deinit(alloc);
+    try reader.installRetainedOwner(owner, &gate);
+    const reserved = gate.stats().retained_bytes;
+    try gate.reconfigure(0, .{ .max_retained_bytes = reserved });
+    gate.close();
+    var rejected = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    var replay = (try reader.claimPendingRecoveryOwned(rejected.allocator(), id, 9, nextTxnTimestamp())).?;
+    try std.testing.expectEqualStrings("docs", replay.work.commit.request.tables[0].table_name);
+    replay.deinit();
+    var retried = (try reader.claimPendingRecoveryOwned(rejected.allocator(), id, 9, nextTxnTimestamp())).?;
+    defer retried.deinit();
+    // Store serialization and validation use the original record completion
+    // reserve, independently of the currently active replay workspace.
+    durable.alloc = rejected.allocator();
+    defer durable.alloc = alloc;
+    _ = try reader.recordTerminalCommit(rejected.allocator(), id, .committed, 1, "docs");
+    try std.testing.expectEqual(reserved, gate.stats().retained_bytes);
+    try std.testing.expectEqual(@as(usize, 0), rejected.alloc_index);
+}
+
+test "workload admission durable session decoder releases every partial allocation" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(null);
+    defer registry.deinit(alloc);
+    const id = try beginSealedRecoveryTestSession(&registry, alloc);
+    _ = try registry.markCommitExecutionStarted(alloc, id);
+    _ = try registry.recordTerminalCommit(alloc, id, .committed_visibility_pending, 1, "docs");
+    const body = try encodeSessionRecord(alloc, registry.sessions.get(id).?);
+    defer alloc.free(body);
+    const Fixture = struct {
+        fn run(failing: std.mem.Allocator, txn_id: db_mod.types.TxnId, encoded: []const u8) !void {
+            var session = try decodeSessionRecord(failing, txn_id, encoded);
+            session.deinit(failing);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Fixture.run, .{ id, body });
 }

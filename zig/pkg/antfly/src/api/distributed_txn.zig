@@ -127,6 +127,11 @@ pub const pre_decision_server_response_reserve_ms = contract.pre_decision_server
 pub const ParticipantWorker = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    pre_decision_context: ?PreDecisionContext = null,
+    /// Production adapters opt into bounded recovery. Null explicitly keeps
+    /// the legacy custom-worker contract; it is never an automatic fallback.
+    recovery_timeout_ns: ?u64 = null,
+    recovery_deadline_ns: ?u64 = null,
 
     pub const VTable = struct {
         status_group_scoped: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnStatusRequest, deadline_ns: ?u64) anyerror!db_mod.types.TxnStatus = null,
@@ -193,39 +198,84 @@ pub const ParticipantWorker = struct {
             txn_id: db_mod.types.TxnId,
             deadline_ns: u64,
         ) anyerror!db_mod.types.TxnStatus = null,
+        begin_group_with_context: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, TxnBeginRequest, PreDecisionContext) anyerror!void = null,
+        prepare_group_with_context: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, TxnPrepareRequest, PreDecisionContext) anyerror!void = null,
+        resolve_first_decision_with_context: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, TxnResolveRequest, PreDecisionContext) anyerror!void = null,
+        acknowledge_group_until: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, TxnAcknowledgeRequest, u64) anyerror!void = null,
+        resolve_group_until_with_cancellation: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, TxnResolveRequest, u64, db_mod.types.CancellationToken) anyerror!void = null,
     };
 
+    pub fn startRecovery(self: ParticipantWorker) ParticipantWorker {
+        var bounded = self;
+        bounded.pre_decision_context = null;
+        if (bounded.recovery_deadline_ns == null) if (bounded.recovery_timeout_ns) |timeout| {
+            bounded.recovery_deadline_ns = platform_time.monotonicNs() +| timeout;
+        };
+        return bounded;
+    }
+
     pub fn beginGroup(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnBeginRequest) !void {
+        if (self.pre_decision_context) |context| {
+            ensurePreDecisionContextActive(context) catch return error.PreDecisionNotProposed;
+            const call = self.vtable.begin_group_with_context orelse return error.PreDecisionNotProposed;
+            return try call(self.ptr, alloc, group_id, table_name, req, context);
+        }
         try self.vtable.begin_group(self.ptr, alloc, group_id, table_name, req);
     }
 
     pub fn prepareGroup(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnPrepareRequest) !void {
+        if (self.pre_decision_context) |context| {
+            try ensurePreDecisionContextActive(context);
+            const call = self.vtable.prepare_group_with_context orelse return error.PreDecisionNotProposed;
+            return try call(self.ptr, alloc, group_id, table_name, req, context);
+        }
         try self.vtable.prepare_group(self.ptr, alloc, group_id, table_name, req);
     }
 
     pub fn resolveGroup(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest) !void {
+        if (self.recovery_deadline_ns) |deadline| return self.resolveGroupUntil(alloc, group_id, table_name, req, deadline);
         try self.vtable.resolve_group(self.ptr, alloc, group_id, table_name, req);
     }
 
     pub fn resolveGroupWithCancellation(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest, cancellation: db_mod.types.CancellationToken) !void {
+        if (self.recovery_deadline_ns) |deadline| {
+            if (cancellation.ptr == null) return self.resolveGroupUntil(alloc, group_id, table_name, req, deadline);
+            try ensureDecisionRecoveryDeadline(deadline);
+            const callback = self.vtable.resolve_group_until_with_cancellation orelse return error.CommitPropagationIncomplete;
+            return try callback(self.ptr, alloc, group_id, table_name, req, deadline, cancellation);
+        }
         const resolve = self.vtable.resolve_group_with_cancellation orelse
             return try self.resolveGroup(alloc, group_id, table_name, req);
         try resolve(self.ptr, alloc, group_id, table_name, req, cancellation);
     }
 
+    fn resolveFirstDecision(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest, cancellation: db_mod.types.CancellationToken, resume_committed: bool) !void {
+        if (!resume_committed) if (self.pre_decision_context) |context| {
+            ensurePreDecisionContextActive(context) catch return error.PreDecisionNotProposed;
+            const callback = self.vtable.resolve_first_decision_with_context orelse return error.PreDecisionNotProposed;
+            return try callback(self.ptr, alloc, group_id, table_name, req, context);
+        };
+        return try self.resolveGroupWithCancellation(alloc, group_id, table_name, req, cancellation);
+    }
+
     pub fn statusGroup(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId) !db_mod.types.TxnStatus {
+        if (self.recovery_deadline_ns) |deadline| return self.statusGroupUntil(alloc, group_id, table_name, txn_id, deadline);
         return try self.vtable.status_group(self.ptr, alloc, group_id, table_name, txn_id);
     }
 
     pub fn statusGroupWithRequest(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnStatusRequest, deadline_ns: ?u64) !db_mod.types.TxnStatus {
         try validateRestorePlan(req.restore_staging_scope, req.restore_staging_plan_id);
-        if (deadline_ns) |deadline| try ensureDecisionRecoveryDeadline(deadline);
+        const effective_deadline_ns: ?u64 = if (self.recovery_deadline_ns) |recovery_deadline|
+            if (deadline_ns) |request_deadline| @min(recovery_deadline, request_deadline) else recovery_deadline
+        else
+            deadline_ns;
+        if (effective_deadline_ns) |deadline| try ensureDecisionRecoveryDeadline(deadline);
         if (req.restore_staging_scope != null) {
             if (req.restore_staging_plan_id == null) return error.InvalidTxnRequest;
             const callback = self.vtable.status_group_scoped orelse return error.CommitDecisionUnknown;
-            return callback(self.ptr, alloc, group_id, table_name, req, deadline_ns);
+            return callback(self.ptr, alloc, group_id, table_name, req, effective_deadline_ns);
         }
-        return if (deadline_ns) |deadline| self.statusGroupUntil(alloc, group_id, table_name, req.txn_id, deadline) else self.statusGroup(alloc, group_id, table_name, req.txn_id);
+        return if (effective_deadline_ns) |deadline| self.statusGroupUntil(alloc, group_id, table_name, req.txn_id, deadline) else self.statusGroup(alloc, group_id, table_name, req.txn_id);
     }
 
     pub fn resolveGroupUntil(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest, deadline_ns: u64) !void {
@@ -244,6 +294,11 @@ pub const ParticipantWorker = struct {
     }
 
     pub fn acknowledgeGroup(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeRequest) !void {
+        if (self.recovery_deadline_ns) |deadline| {
+            if (platform_time.monotonicNs() >= deadline) return error.Timeout;
+            const callback = self.vtable.acknowledge_group_until orelse return error.CommitPropagationIncomplete;
+            return try callback(self.ptr, alloc, group_id, table_name, req, deadline);
+        }
         const acknowledge = self.vtable.acknowledge_group orelse return;
         try acknowledge(self.ptr, alloc, group_id, table_name, req);
     }
@@ -284,7 +339,7 @@ pub const RecoveryResolver = struct {
 };
 
 pub const HostedParticipantWorker = struct {
-    const default_pre_decision_timeout_ms: u32 = 20_000;
+    const default_pre_decision_timeout_ms: u32 = contract.default_transaction_admission_timeout_ms;
     /// The data-Raft write path may spend its complete bounded window finding
     /// a leader before it can return the authenticated `not-proposed` proof.
     /// Keep the outer HTTP deadline strictly later so request admission,
@@ -312,6 +367,7 @@ pub const HostedParticipantWorker = struct {
     /// rediscovery window before another replica is tried.
     pre_decision_timeout_ms: u32 = default_pre_decision_timeout_ms,
     pre_decision_attempt_timeout_ms: u32 = default_pre_decision_attempt_timeout_ms,
+    pre_decision_context: ?PreDecisionContext = null,
 
     pub fn init(
         catalog: table_catalog.CatalogSource,
@@ -339,21 +395,63 @@ pub const HostedParticipantWorker = struct {
         return client;
     }
 
+    fn controlBaseUri(self: *const HostedParticipantWorker, router: table_router.HostedGroupRouter, alloc: std.mem.Allocator, group_id: u64, node_id: u64, public_uri: []const u8) ![]u8 {
+        // Route resolution already proved this public peer usable. Legacy
+        // routers and unsigned rolling peers keep that URL without a second
+        // catalog lookup. The protected listener requires signed service auth.
+        const secret = self.internal_service_secret orelse return try alloc.dupe(u8, public_uri);
+        const issuer = self.internal_service_issuer orelse return try alloc.dupe(u8, public_uri);
+        if (secret.len == 0 or issuer.len == 0 or router.vtable.node_control_base_uri_for_group == null)
+            return try alloc.dupe(u8, public_uri);
+        return (try router.nodeControlBaseUriForGroup(alloc, group_id, node_id)) orelse error.GroupLeaderUnavailable;
+    }
+
     pub fn worker(self: *HostedParticipantWorker) ParticipantWorker {
         return .{
             .ptr = self,
+            .recovery_timeout_ns = contract.default_transaction_recovery_timeout_ns,
             .vtable = &.{
                 .begin_group = beginGroup,
                 .prepare_group = prepareGroup,
+                .begin_group_with_context = beginGroupWithContext,
+                .prepare_group_with_context = prepareGroupWithContext,
+                .resolve_first_decision_with_context = resolveFirstDecisionWithContext,
                 .resolve_group = resolveGroup,
                 .resolve_group_with_cancellation = resolveGroupWithCancellation,
                 .resolve_group_until = resolveGroupUntil,
+                .resolve_group_until_with_cancellation = resolveGroupUntilWithCancellation,
                 .status_group = statusGroup,
                 .status_group_scoped = statusGroupScoped,
                 .status_group_until = statusGroupUntil,
                 .acknowledge_group = acknowledgeGroup,
+                .acknowledge_group_until = acknowledgeGroupUntil,
             },
         };
+    }
+
+    fn beginGroupWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnBeginRequest, context: PreDecisionContext) !void {
+        var bounded: HostedParticipantWorker = @as(*HostedParticipantWorker, @ptrCast(@alignCast(ptr))).*;
+        bounded.pre_decision_context = context;
+        bounded.router = bounded.router.withBudget(.{
+            .clock = .{ .deadline_ns = context.deadline_ns, .io = context.deadline_io },
+            .cancellation = context.cancellation,
+        });
+        try beginGroup(&bounded, alloc, group_id, table_name, req);
+    }
+
+    fn prepareGroupWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnPrepareRequest, context: PreDecisionContext) !void {
+        var bounded: HostedParticipantWorker = @as(*HostedParticipantWorker, @ptrCast(@alignCast(ptr))).*;
+        bounded.pre_decision_context = context;
+        bounded.router = bounded.router.withBudget(.{
+            .clock = .{ .deadline_ns = context.deadline_ns, .io = context.deadline_io },
+            .cancellation = context.cancellation,
+        });
+        try prepareGroup(&bounded, alloc, group_id, table_name, req);
+    }
+
+    fn preDecisionNowNs(self: *const HostedParticipantWorker) u64 {
+        if (self.pre_decision_context) |context| return (table_catalog.RoutingBudget{ .io = context.deadline_io }).nowNs();
+        return self.executor.monotonicNs();
     }
 
     fn beginGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnBeginRequest) !void {
@@ -365,7 +463,7 @@ pub const HostedParticipantWorker = struct {
         var route = (table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader) catch |err|
             return preDecisionSetupNotProposed(group_id, "initial-route", err)) orelse return error.UnknownGroup;
         defer route.deinit(alloc);
-        ensurePreDecisionDeadline(deadline_ns, self.executor.monotonicNs()) catch |err| {
+        ensurePreDecisionDeadline(deadline_ns, self.preDecisionNowNs()) catch |err| {
             if (err == error.Timeout) return error.PreDecisionNotProposed;
             return err;
         };
@@ -375,12 +473,11 @@ pub const HostedParticipantWorker = struct {
         };
         switch (route) {
             .local => {
-                var context = self.localPreDecisionContext(deadline_ns) catch |err| {
+                const context = self.localPreDecisionContext(deadline_ns) catch |err| {
                     if (err == error.Timeout) return error.PreDecisionNotProposed;
                     return err;
                 };
-                context.restore_staging_scope = req.restore_staging_scope;
-                context.restore_staging_plan_id = req.restore_staging_plan_id;
+                if (self.pre_decision_context != null and (self.writes.vtable.txn_begin_group_local_with_pre_decision_context == null or self.writes.vtable.txn_decide_group_local_with_pre_decision_context == null)) return error.PreDecisionNotProposed;
                 const result = self.writes.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.retain_terminal, req.participants, context) catch |err| {
                     if (!isLocalPreDecisionCandidateMiss(err, self.writes.vtable.txn_begin_group_local_with_pre_decision_context != null)) return err;
                     return try self.beginGroupFromCandidates(alloc, group_id, table_name, req, attempted_node_id, null, deadline_ns);
@@ -423,13 +520,14 @@ pub const HostedParticipantWorker = struct {
         const deadline_ns = try self.preDecisionDeadlineNs();
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse return error.UnknownGroup;
         defer route.deinit(alloc);
-        try ensurePreDecisionDeadline(deadline_ns, self.executor.monotonicNs());
+        try ensurePreDecisionDeadline(deadline_ns, self.preDecisionNowNs());
         const attempted_node_id = switch (route) {
             .local => self.router.localNodeId(),
             .remote => |remote| remote.node_id,
         };
         switch (route) {
             .local => {
+                if (self.pre_decision_context != null and self.writes.vtable.txn_prepare_group_local_with_pre_decision_context == null) return error.PreDecisionNotProposed;
                 const result = self.writes.txnPrepareGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.topology_epoch, req.req, try self.localPreDecisionContext(deadline_ns)) catch |err| {
                     if (!isLocalPreDecisionCandidateMiss(err, self.writes.vtable.txn_prepare_group_local_with_pre_decision_context != null)) return err;
                     return try self.prepareGroupFromCandidates(alloc, group_id, table_name, req, attempted_node_id, null, deadline_ns);
@@ -471,7 +569,7 @@ pub const HostedParticipantWorker = struct {
         encoded_body: ?[]const u8,
         deadline_ns: u64,
     ) !void {
-        ensurePreDecisionDeadline(deadline_ns, self.executor.monotonicNs()) catch |err| {
+        ensurePreDecisionDeadline(deadline_ns, self.preDecisionNowNs()) catch |err| {
             if (err == error.Timeout) return error.PreDecisionNotProposed;
             return err;
         };
@@ -515,18 +613,17 @@ pub const HostedParticipantWorker = struct {
         body: []const u8,
         deadline_ns: u64,
     ) !bool {
-        ensurePreDecisionDeadline(deadline_ns, self.executor.monotonicNs()) catch |err| {
+        ensurePreDecisionDeadline(deadline_ns, self.preDecisionNowNs()) catch |err| {
             if (err == error.Timeout) return false;
             return err;
         };
         if (node_id == self.router.localNodeId()) {
             if (self.router.localStatus(group_id) != .active) return false;
-            var context = self.localPreDecisionContext(deadline_ns) catch |err| {
+            const context = self.localPreDecisionContext(deadline_ns) catch |err| {
                 if (err == error.Timeout) return false;
                 return err;
             };
-            context.restore_staging_scope = req.restore_staging_scope;
-            context.restore_staging_plan_id = req.restore_staging_plan_id;
+            if (self.pre_decision_context != null and (self.writes.vtable.txn_begin_group_local_with_pre_decision_context == null or self.writes.vtable.txn_decide_group_local_with_pre_decision_context == null)) return error.PreDecisionNotProposed;
             const result = self.writes.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.retain_terminal, req.participants, context) catch |err| {
                 if (isLocalPreDecisionCandidateMiss(err, self.writes.vtable.txn_begin_group_local_with_pre_decision_context != null)) return false;
                 return err;
@@ -576,7 +673,7 @@ pub const HostedParticipantWorker = struct {
         encoded_body: ?[]const u8,
         deadline_ns: u64,
     ) !void {
-        try ensurePreDecisionDeadline(deadline_ns, self.executor.monotonicNs());
+        try ensurePreDecisionDeadline(deadline_ns, self.preDecisionNowNs());
         const node_ids = (try self.router.groupNodeIds(alloc, group_id)) orelse return error.GroupLeaderUnavailable;
         defer alloc.free(node_ids);
         var owned_body: ?[]u8 = null;
@@ -611,9 +708,10 @@ pub const HostedParticipantWorker = struct {
         body: []const u8,
         deadline_ns: u64,
     ) !bool {
-        try ensurePreDecisionDeadline(deadline_ns, self.executor.monotonicNs());
+        try ensurePreDecisionDeadline(deadline_ns, self.preDecisionNowNs());
         if (node_id == self.router.localNodeId()) {
             if (self.router.localStatus(group_id) != .active) return false;
+            if (self.pre_decision_context != null and self.writes.vtable.txn_prepare_group_local_with_pre_decision_context == null) return error.PreDecisionNotProposed;
             const result = self.writes.txnPrepareGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.topology_epoch, req.req, try self.localPreDecisionContext(deadline_ns)) catch |err| {
                 if (isLocalPreDecisionCandidateMiss(err, self.writes.vtable.txn_prepare_group_local_with_pre_decision_context != null)) return false;
                 return err;
@@ -647,11 +745,17 @@ pub const HostedParticipantWorker = struct {
         if (self.pre_decision_timeout_ms == 0 or self.pre_decision_attempt_timeout_ms == 0)
             return error.Timeout;
         const duration_ns = @as(u64, self.pre_decision_timeout_ms) *| std.time.ns_per_ms;
-        return self.executor.monotonicNs() +| duration_ns;
+        const configured = self.preDecisionNowNs() +| duration_ns;
+        if (self.pre_decision_context) |context| {
+            try ensurePreDecisionContextActive(context);
+            if (context.deadline_ns) |deadline| return @min(configured, deadline);
+        }
+        return configured;
     }
 
     fn remainingPreDecisionAttemptBudget(self: *const HostedParticipantWorker, deadline_ns: u64) !PreDecisionAttemptBudget {
-        const remaining_ms = try remainingPreDecisionTimeoutMs(deadline_ns, self.executor.monotonicNs());
+        if (self.pre_decision_context) |context| try ensurePreDecisionContextActive(context);
+        const remaining_ms = try remainingPreDecisionTimeoutMs(deadline_ns, self.preDecisionNowNs());
         const client_timeout_ms = @min(remaining_ms, self.pre_decision_attempt_timeout_ms);
         if (client_timeout_ms <= pre_decision_response_reserve_ms + contract.pre_decision_server_response_reserve_ms)
             return error.Timeout;
@@ -667,7 +771,51 @@ pub const HostedParticipantWorker = struct {
     fn localPreDecisionContext(self: *const HostedParticipantWorker, deadline_ns: u64) !PreDecisionContext {
         const budget = try self.remainingPreDecisionAttemptBudget(deadline_ns);
         const duration_ns = @as(u64, budget.server_budget_ms) *| std.time.ns_per_ms;
-        return .{ .deadline_ns = self.executor.monotonicNs() +| duration_ns, .deadline_io = self.executor.clock_io };
+        return .{
+            .deadline_ns = @min(deadline_ns, self.preDecisionNowNs() +| duration_ns),
+            .deadline_io = if (self.pre_decision_context) |context| context.deadline_io else self.executor.clock_io,
+            .cancellation = if (self.pre_decision_context) |context| context.cancellation else .none,
+        };
+    }
+
+    fn resolveFirstDecisionWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest, context: PreDecisionContext) !void {
+        var bounded: HostedParticipantWorker = @as(*HostedParticipantWorker, @ptrCast(@alignCast(ptr))).*;
+        bounded.pre_decision_context = context;
+        bounded.router = bounded.router.withBudget(.{ .clock = .{ .deadline_ns = context.deadline_ns, .io = context.deadline_io }, .cancellation = context.cancellation });
+        const deadline = bounded.preDecisionDeadlineNs() catch return error.PreDecisionNotProposed;
+        var route = (table_router.resolveGroupRoute(alloc, bounded.catalog, bounded.router, group_id, .prefer_leader) catch return error.PreDecisionNotProposed) orelse return error.PreDecisionNotProposed;
+        defer route.deinit(alloc);
+        ensurePreDecisionContextActive(context) catch return error.PreDecisionNotProposed;
+        switch (route) {
+            .local => _ = (try bounded.writes.txnDecideGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.status, req.commit_version, req.topology_epoch, req.sync_level, context)) orelse return error.PreDecisionNotProposed,
+            .remote => |remote| {
+                const control_uri = bounded.controlBaseUri(bounded.router, alloc, group_id, remote.node_id, remote.base_uri) catch return error.PreDecisionNotProposed;
+                defer alloc.free(control_uri);
+                const body = encodeTxnResolveRequest(alloc, req) catch return error.PreDecisionNotProposed;
+                defer alloc.free(body);
+                const budget = bounded.remainingPreDecisionAttemptBudget(deadline) catch return error.PreDecisionNotProposed;
+                var client = bounded.httpClient(alloc);
+                var tracker: http_common.RequestDeliveryTracker = .{};
+                const DeadlineCancellation = struct {
+                    context: PreDecisionContext,
+                    fn check(raw: *const anyopaque) !void {
+                        const self: *const @This() = @ptrCast(@alignCast(raw));
+                        try ensurePreDecisionContextActive(self.context);
+                    }
+                    fn isCancelled(raw: *const anyopaque) bool {
+                        check(raw) catch return true;
+                        return false;
+                    }
+                };
+                var scope: DeadlineCancellation = .{ .context = context };
+                var cancellation = http_common.RequestCancellation.fromToken(.{ .ptr = &scope, .check_fn = DeadlineCancellation.check, .is_cancelled_fn = DeadlineCancellation.isCancelled });
+                const result = client.fetchGroupTxnDecideWithContext(control_uri, group_id, table_name, body, &tracker, budget.client_timeout_ms, budget.server_budget_ms, &cancellation) catch |err| {
+                    if (tracker.load() == .not_sent) return error.PreDecisionNotProposed;
+                    return err;
+                };
+                if (result == .not_proposed) return error.PreDecisionNotProposed;
+            },
+        }
     }
 
     fn resolveGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest) !void {
@@ -682,17 +830,29 @@ pub const HostedParticipantWorker = struct {
         try resolveGroupWithin(ptr, alloc, group_id, table_name, req, .none, deadline_ns);
     }
 
+    fn resolveGroupUntilWithCancellation(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest, deadline_ns: u64, cancellation: db_mod.types.CancellationToken) !void {
+        try resolveGroupWithin(ptr, alloc, group_id, table_name, req, cancellation, deadline_ns);
+    }
+
     fn resolveGroupWithin(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest, cancellation: db_mod.types.CancellationToken, deadline_ns: ?u64) !void {
         const self: *HostedParticipantWorker = @ptrCast(@alignCast(ptr));
         if (deadline_ns) |deadline| try ensureDecisionRecoveryDeadline(deadline);
-        var deadline_cancellation = DecisionRecoveryCancellation{ .deadline_ns = deadline_ns orelse 0 };
+        var deadline_cancellation = DecisionRecoveryCancellation{ .deadline_ns = deadline_ns orelse 0, .other = cancellation };
         const operation_cancellation = if (deadline_ns != null) deadline_cancellation.token() else cancellation;
-        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse return error.UnknownGroup;
+        const router = if (deadline_ns) |deadline| self.router.withBudget(.{ .clock = .{ .deadline_ns = deadline }, .cancellation = operation_cancellation }) else self.router;
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, router, group_id, .prefer_leader)) orelse return error.UnknownGroup;
         defer route.deinit(alloc);
         if (deadline_ns) |deadline| try ensureDecisionRecoveryDeadline(deadline);
         switch (route) {
-            .local => _ = (try resolveGroupLocalWithRequest(self.writes, alloc, group_id, table_name, req, operation_cancellation)) orelse return error.UnknownGroup,
+            .local => {
+                _ = (if (deadline_ns) |deadline|
+                    try self.writes.txnResolveGroupLocalUntil(alloc, group_id, table_name, req.txn_id, req.status, req.commit_version, req.topology_epoch, req.sync_level, deadline, cancellation)
+                else
+                    try self.writes.txnResolveGroupLocalWithCancellation(alloc, group_id, table_name, req.txn_id, req.status, req.commit_version, req.topology_epoch, req.sync_level, operation_cancellation)) orelse return error.UnknownGroup;
+            },
             .remote => |remote| {
+                const control_uri = try self.controlBaseUri(router, alloc, group_id, remote.node_id, remote.base_uri);
+                defer alloc.free(control_uri);
                 var client = self.httpClient(alloc);
                 const body = try encodeTxnResolveRequest(alloc, req);
                 defer alloc.free(body);
@@ -704,7 +864,7 @@ pub const HostedParticipantWorker = struct {
                 var request_cancellation = http_common.RequestCancellation.fromToken(operation_cancellation);
                 var response = if (deadline_ns) |deadline|
                     try client.fetchGroupTxnResolveWithControlAndTimeout(
-                        remote.base_uri,
+                        control_uri,
                         group_id,
                         table_name,
                         body,
@@ -713,7 +873,7 @@ pub const HostedParticipantWorker = struct {
                     )
                 else
                     try client.fetchGroupTxnResolveWithControl(
-                        remote.base_uri,
+                        control_uri,
                         group_id,
                         table_name,
                         body,
@@ -741,7 +901,8 @@ pub const HostedParticipantWorker = struct {
         try validateRestorePlan(req.restore_staging_scope, req.restore_staging_plan_id);
         const txn_id = req.txn_id;
         if (deadline_ns) |deadline| try ensureDecisionRecoveryDeadline(deadline);
-        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse return error.UnknownGroup;
+        const router = if (deadline_ns) |deadline| self.router.withBudget(.{ .clock = .{ .deadline_ns = deadline } }) else self.router;
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, router, group_id, .prefer_leader)) orelse return error.UnknownGroup;
         defer route.deinit(alloc);
         if (deadline_ns) |deadline| try ensureDecisionRecoveryDeadline(deadline);
         return switch (route) {
@@ -752,24 +913,49 @@ pub const HostedParticipantWorker = struct {
             else
                 (try self.writes.txnStatusGroupAuthoritativeLocal(alloc, group_id, table_name, txn_id)) orelse error.UnknownGroup,
             .remote => |remote| blk: {
+                const control_uri = try self.controlBaseUri(router, alloc, group_id, remote.node_id, remote.base_uri);
+                defer alloc.free(control_uri);
                 var client = self.httpClient(alloc);
                 const body = try encodeTxnStatusRequestWithScope(alloc, req);
                 defer alloc.free(body);
                 var response = if (deadline_ns) |deadline|
                     try client.fetchGroupTxnStatusWithTimeout(
-                        remote.base_uri,
+                        control_uri,
                         group_id,
                         table_name,
                         body,
                         try remainingDeadlineTimeoutMs(deadline),
                     )
                 else
-                    try client.fetchGroupTxnStatus(remote.base_uri, group_id, table_name, body);
+                    try client.fetchGroupTxnStatus(control_uri, group_id, table_name, body);
                 defer response.deinit(alloc);
                 const parsed = try parseTxnStatusResponse(alloc, response.body);
                 break :blk parsed.status;
             },
         };
+    }
+
+    fn acknowledgeGroupUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeRequest, deadline_ns: u64) !void {
+        const self: *HostedParticipantWorker = @ptrCast(@alignCast(ptr));
+        try ensureDecisionRecoveryDeadline(deadline_ns);
+        var scope: DecisionRecoveryCancellation = .{ .deadline_ns = deadline_ns };
+        const router = self.router.withBudget(.{ .clock = .{ .deadline_ns = deadline_ns }, .cancellation = scope.token() });
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, router, group_id, .prefer_leader)) orelse return error.UnknownGroup;
+        defer route.deinit(alloc);
+        try ensureDecisionRecoveryDeadline(deadline_ns);
+        switch (route) {
+            .local => _ = (try self.writes.txnAcknowledgeGroupLocalUntil(alloc, group_id, table_name, req.txn_id, req.participant, deadline_ns)) orelse return error.UnknownGroup,
+            .remote => |remote| {
+                const control_uri = try self.controlBaseUri(router, alloc, group_id, remote.node_id, remote.base_uri);
+                defer alloc.free(control_uri);
+                var client = self.httpClient(alloc);
+                const body = try encodeTxnAcknowledgeRequest(alloc, req);
+                defer alloc.free(body);
+                var cancellation = http_common.RequestCancellation.fromToken(scope.token());
+                var response = try client.fetchGroupTxnAcknowledgeWithControlAndTimeout(control_uri, group_id, table_name, body, try remainingDeadlineTimeoutMs(deadline_ns), &cancellation);
+                response.deinit(alloc);
+            },
+        }
     }
 
     fn acknowledgeGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeRequest) !void {
@@ -779,10 +965,12 @@ pub const HostedParticipantWorker = struct {
         switch (route) {
             .local => _ = (try acknowledgeGroupLocalWithRequest(self.writes, alloc, group_id, table_name, req, .none)) orelse return error.UnknownGroup,
             .remote => |remote| {
+                const control_uri = try self.controlBaseUri(self.router, alloc, group_id, remote.node_id, remote.base_uri);
+                defer alloc.free(control_uri);
                 var client = self.httpClient(alloc);
                 const body = try encodeTxnAcknowledgeRequest(alloc, req);
                 defer alloc.free(body);
-                var response = try client.fetchGroupTxnAcknowledge(remote.base_uri, group_id, table_name, body);
+                var response = try client.fetchGroupTxnAcknowledge(control_uri, group_id, table_name, body);
                 response.deinit(alloc);
             },
         }
@@ -816,7 +1004,11 @@ fn beginDefinitelyCreatedNoState(err: anyerror) bool {
 }
 
 fn retainedBeginOutcomeUnknown(err: anyerror) bool {
-    return err == error.RaftBatchWriteOutcomeUnknown or
+    // A conflicting pending BEGIN can belong to an earlier execution of the
+    // stable ID with different metadata. This attempt cannot abort it merely
+    // because its own BEGIN was rejected.
+    return err == error.DecisionConflict or
+        err == error.RaftBatchWriteOutcomeUnknown or
         err == error.UnexpectedHttpStatus or
         err == error.ClientShuttingDown or
         isPreDecisionTransportUnavailable(err);
@@ -877,6 +1069,8 @@ fn logPreDecisionSetupFailure(group_id: u64, node_id: u64, stage: []const u8, er
     });
 }
 
+pub const ensurePreDecisionContextActive = contract.ensurePreDecisionContextActive;
+
 fn ensurePreDecisionDeadline(deadline_ns: u64, now_ns: u64) !void {
     if (now_ns >= deadline_ns) return error.Timeout;
 }
@@ -887,6 +1081,7 @@ fn ensureDecisionRecoveryDeadline(deadline_ns: u64) !void {
 
 const DecisionRecoveryCancellation = struct {
     deadline_ns: u64,
+    other: db_mod.types.CancellationToken = .none,
 
     fn token(self: *const DecisionRecoveryCancellation) db_mod.types.CancellationToken {
         return .{ .ptr = self, .is_cancelled_fn = isCancelled };
@@ -894,7 +1089,7 @@ const DecisionRecoveryCancellation = struct {
 
     fn isCancelled(ptr: *const anyopaque) bool {
         const self: *const DecisionRecoveryCancellation = @ptrCast(@alignCast(ptr));
-        return platform_time.monotonicNs() >= self.deadline_ns;
+        return platform_time.monotonicNs() >= self.deadline_ns or self.other.isCancelled();
     }
 };
 
@@ -922,18 +1117,43 @@ pub const LocalTableWriteParticipantWorker = struct {
     pub fn worker(self: *LocalTableWriteParticipantWorker) ParticipantWorker {
         return .{
             .ptr = self,
+            .recovery_timeout_ns = contract.default_transaction_recovery_timeout_ns,
             .vtable = &.{
                 .begin_group = beginGroup,
                 .prepare_group = prepareGroup,
+                .begin_group_with_context = beginGroupWithContext,
+                .prepare_group_with_context = prepareGroupWithContext,
+                .resolve_first_decision_with_context = resolveFirstDecisionWithContext,
                 .resolve_group = resolveGroup,
                 .resolve_group_with_cancellation = resolveGroupWithCancellation,
                 .resolve_group_until = resolveGroupUntil,
+                .resolve_group_until_with_cancellation = resolveGroupUntilWithCancellation,
                 .status_group = statusGroup,
                 .status_group_scoped = statusGroupScoped,
                 .status_group_until = statusGroupUntil,
                 .acknowledge_group = acknowledgeGroup,
+                .acknowledge_group_until = acknowledgeGroupUntil,
             },
         };
+    }
+
+    fn beginGroupWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnBeginRequest, context: PreDecisionContext) !void {
+        const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
+        try ensurePreDecisionContextActive(context);
+        if (self.writes.vtable.txn_begin_group_local_with_pre_decision_context == null or self.writes.vtable.txn_decide_group_local_with_pre_decision_context == null) return error.PreDecisionNotProposed;
+        _ = (try self.writes.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.retain_terminal, req.participants, context)) orelse return error.UnknownGroup;
+    }
+
+    fn prepareGroupWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnPrepareRequest, context: PreDecisionContext) !void {
+        const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
+        try ensurePreDecisionContextActive(context);
+        if (self.writes.vtable.txn_prepare_group_local_with_pre_decision_context == null) return error.PreDecisionNotProposed;
+        _ = (try self.writes.txnPrepareGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.topology_epoch, req.req, context)) orelse return error.UnknownGroup;
+    }
+
+    fn resolveFirstDecisionWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest, context: PreDecisionContext) !void {
+        const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
+        _ = (try self.writes.txnDecideGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.status, req.commit_version, req.topology_epoch, req.sync_level, context)) orelse return error.PreDecisionNotProposed;
     }
 
     fn beginGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnBeginRequest) !void {
@@ -956,14 +1176,23 @@ pub const LocalTableWriteParticipantWorker = struct {
     }
 
     fn resolveGroupUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest, deadline_ns: u64) !void {
+        return try resolveGroupUntilWithCancellation(ptr, alloc, group_id, table_name, req, deadline_ns, .none);
+    }
+
+    fn resolveGroupUntilWithCancellation(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest, deadline_ns: u64, cancellation: db_mod.types.CancellationToken) !void {
         try ensureDecisionRecoveryDeadline(deadline_ns);
-        var deadline_cancellation = DecisionRecoveryCancellation{ .deadline_ns = deadline_ns };
-        try resolveGroupWithCancellation(ptr, alloc, group_id, table_name, req, deadline_cancellation.token());
+        const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
+        _ = (try self.writes.txnResolveGroupLocalUntil(alloc, group_id, table_name, req.txn_id, req.status, req.commit_version, req.topology_epoch, req.sync_level, deadline_ns, cancellation)) orelse return error.UnknownGroup;
     }
 
     fn statusGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId) !db_mod.types.TxnStatus {
         const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
         return (try self.writes.txnStatusGroupLinearizable(alloc, group_id, table_name, txn_id)) orelse error.UnknownGroup;
+    }
+
+    fn statusGroupScoped(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnStatusRequest, deadline_ns: ?u64) !db_mod.types.TxnStatus {
+        const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
+        return (try self.writes.txnStatusGroupLocalWithRequest(alloc, group_id, table_name, req, .{ .deadline_ns = deadline_ns })) orelse error.UnknownGroup;
     }
 
     fn statusGroupUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, deadline_ns: u64) !db_mod.types.TxnStatus {
@@ -978,9 +1207,9 @@ pub const LocalTableWriteParticipantWorker = struct {
         )) orelse error.UnknownGroup;
     }
 
-    fn statusGroupScoped(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnStatusRequest, deadline_ns: ?u64) !db_mod.types.TxnStatus {
+    fn acknowledgeGroupUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeRequest, deadline_ns: u64) !void {
         const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
-        return (try self.writes.txnStatusGroupLocalWithRequest(alloc, group_id, table_name, req, .{ .deadline_ns = deadline_ns })) orelse error.UnknownGroup;
+        _ = (try self.writes.txnAcknowledgeGroupLocalUntil(alloc, group_id, table_name, req.txn_id, req.participant, deadline_ns)) orelse return error.UnknownGroup;
     }
 
     fn acknowledgeGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeRequest) !void {
@@ -992,6 +1221,10 @@ pub const LocalTableWriteParticipantWorker = struct {
 pub const ExecuteResult = contract.ExecuteResult;
 
 pub const ExecuteOptions = struct {
+    /// One original ingress deadline and clock span routing and every begin/
+    /// prepare wave. Null preserves the legacy per-operation contract. Cleanup
+    /// and known-decision recovery deliberately do not borrow this context.
+    pre_decision_context: ?PreDecisionContext = null,
     /// Preserve the terminal coordinator decision for an externally supplied
     /// transaction ID's retry window.
     retain_terminal: bool = false,
@@ -1143,7 +1376,7 @@ pub fn executeMultiTableCommitWithOptions(
 fn executeMultiTableCommitOnce(
     alloc: std.mem.Allocator,
     catalog: table_catalog.CatalogSource,
-    worker: ParticipantWorker,
+    original_worker: ParticipantWorker,
     txn_id: db_mod.types.TxnId,
     begin_timestamp: u64,
     commit_version: u64,
@@ -1152,6 +1385,13 @@ fn executeMultiTableCommitOnce(
     trace_writer: ?tracing.AntflyTraceWriter,
     options: ExecuteOptions,
 ) !CommitOutcome {
+    var worker = original_worker;
+    if (options.pre_decision_context) |context| {
+        try ensurePreDecisionContextActive(context);
+        if (worker.vtable.begin_group_with_context == null or worker.vtable.prepare_group_with_context == null or worker.vtable.resolve_first_decision_with_context == null)
+            return error.PreDecisionNotProposed;
+        worker.pre_decision_context = context;
+    }
     var participants = std.ArrayListUnmanaged(ParticipantTxn).empty;
     defer {
         for (participants.items) |*participant| participant.deinit(alloc);
@@ -1159,26 +1399,32 @@ fn executeMultiTableCommitOnce(
     }
 
     for (tables) |table| {
+        if (worker.pre_decision_context) |context| try ensurePreDecisionContextActive(context);
         var routing = (try table_catalog.transactionRoutingSnapshot(alloc, catalog, table.table_name)) orelse return error.TableNotFound;
         defer routing.deinit(alloc);
+        if (worker.pre_decision_context) |context| try ensurePreDecisionContextActive(context);
         const topology_epoch = routing.topology_epoch;
 
-        for (table.writes) |write| {
+        for (table.writes, 0..) |write, item_index| {
+            if (item_index % 64 == 0) if (worker.pre_decision_context) |context| try ensurePreDecisionContextActive(context);
             const group_id = routing.resolveGroupForKey(write.key) orelse return error.UnknownGroup;
             const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
             try participant.writes.append(alloc, write);
         }
-        for (table.deletes) |key| {
+        for (table.deletes, 0..) |key, item_index| {
+            if (item_index % 64 == 0) if (worker.pre_decision_context) |context| try ensurePreDecisionContextActive(context);
             const group_id = routing.resolveGroupForKey(key) orelse return error.UnknownGroup;
             const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
             try participant.deletes.append(alloc, key);
         }
-        for (table.predicates) |predicate| {
+        for (table.predicates, 0..) |predicate, item_index| {
+            if (item_index % 64 == 0) if (worker.pre_decision_context) |context| try ensurePreDecisionContextActive(context);
             const group_id = routing.resolveGroupForKey(predicate.key) orelse return error.UnknownGroup;
             const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
             try participant.predicates.append(alloc, predicate);
         }
-        for (table.transforms) |transform| {
+        for (table.transforms, 0..) |transform, item_index| {
+            if (item_index % 64 == 0) if (worker.pre_decision_context) |context| try ensurePreDecisionContextActive(context);
             const group_id = routing.resolveGroupForKey(transform.key) orelse return error.UnknownGroup;
             const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
             try participant.transforms.append(alloc, transform);
@@ -1259,7 +1505,10 @@ fn executeMultiTableCommitOnce(
 
     var begun_count: usize = 0;
     var abort_on_error = true;
-    var resume_committed = false;
+    // The current status protocol carries only the decision enum. Keep
+    // commit-only resume disabled until a status reply can prove that its
+    // BEGIN identity matches this request's timestamp and participant set.
+    const resume_committed = false;
     errdefer {
         if (abort_on_error) {
             if (trace_writer) |tw| {
@@ -1277,7 +1526,7 @@ fn executeMultiTableCommitOnce(
         }
     }
 
-    if (participants.items.len > 0) coordinator_begin: {
+    if (participants.items.len > 0) {
         const participant = participants.items[0];
         worker.beginGroup(alloc, participant.group_id, participant.table_name, .{
             .txn_id = txn_id,
@@ -1295,8 +1544,9 @@ fn executeMultiTableCommitOnce(
                 // even a failed/not-proposed BEGIN says nothing about an older
                 // execution of this ID. Probe the authoritative decision before
                 // attempting abort or reporting a terminal conflict.
-                // Resume commit-only propagation instead of treating that
-                // terminal record as a failed fresh begin.
+                // A committed status without BEGIN identity keeps recovery
+                // pending; it cannot authorize this request's phase two.
+                worker = worker.startRecovery();
                 const status = worker.statusGroupWithRequest(
                     alloc,
                     participant.group_id,
@@ -1309,9 +1559,13 @@ fn executeMultiTableCommitOnce(
                 };
                 if (status) |observed| switch (observed) {
                     .committed => {
-                        resume_committed = true;
+                        // A lost BEGIN reply and an ID collision are
+                        // indistinguishable with status-only evidence. Leave
+                        // the durable record for explicit recovery; reporting
+                        // success or propagating this request's decision could
+                        // commit a different operation.
                         abort_on_error = false;
-                        break :coordinator_begin;
+                        return error.CommitDecisionUnknown;
                     },
                     .aborted => {
                         abort_on_error = false;
@@ -1321,10 +1575,9 @@ fn executeMultiTableCommitOnce(
                 };
             }
             if (options.retain_terminal and retainedBeginOutcomeUnknown(err)) {
-                // BEGIN is idempotent for the same stable ID and participant
-                // set. Preserve a pending record and let the session retry;
-                // aborting here turns a slow/unknown Raft reply into a
-                // permanent 409 on the next commit attempt.
+                // A pending record may be an idempotent earlier attempt or a
+                // conflicting execution of this stable ID. Neither this
+                // failed BEGIN nor status=pending grants abort ownership.
                 abort_on_error = false;
                 return error.CommitDecisionUnknown;
             }
@@ -1354,6 +1607,8 @@ fn executeMultiTableCommitOnce(
         begun_count = 1;
     }
 
+    if (resume_committed) worker = worker.startRecovery();
+
     if (!resume_committed and participants.items.len > 1) {
         runBeginFanout(
             worker,
@@ -1368,8 +1623,9 @@ fn executeMultiTableCommitOnce(
             const participant_index = failure_offset + 1;
             const failure = fanout_slots[participant_index].err.?;
             if (options.retain_terminal and retainedBeginOutcomeUnknown(failure)) {
-                // Every contacted participant may have persisted BEGIN. A
-                // stable-ID retry can safely finish those idempotent begins.
+                // A contacted follower may retain an earlier execution of
+                // this stable ID. Do not abort it (or the coordinator) based
+                // on a failed follower BEGIN from this invocation.
                 abort_on_error = false;
                 return error.CommitDecisionUnknown;
             }
@@ -1450,6 +1706,11 @@ fn executeMultiTableCommitOnce(
                 }
             }
             if (already_checked) continue;
+            if (worker.pre_decision_context) |context| ensurePreDecisionContextActive(context) catch |err| {
+                abort_on_error = false;
+                if (participants.items.len > 0) try abortParticipants(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len);
+                return err;
+            };
             table_catalog.validateTransactionTopologyEpoch(alloc, catalog, participant.table_name, participant.topology_epoch) catch |err| {
                 abort_on_error = false;
                 try abortParticipants(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len);
@@ -1458,10 +1719,17 @@ fn executeMultiTableCommitOnce(
         }
     }
 
+    if (!resume_committed) if (worker.pre_decision_context) |context| ensurePreDecisionContextActive(context) catch |err| {
+        abort_on_error = false;
+        if (participants.items.len > 0) try abortParticipants(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len);
+        return err;
+    };
+
     // Visibility and propagation can both remain pending (for example, when
     // the coordinator's write becomes durable but its visibility barrier
     // fails and a follower was only proposed). Track them independently so a
     // later phase-two outcome cannot hide an earlier recovery obligation.
+    var recovery_worker: ?ParticipantWorker = if (resume_committed) worker else null;
     var visibility_pending = false;
     var visibility_retry_pending = false;
     var visibility_repair_required = false;
@@ -1470,9 +1738,7 @@ fn executeMultiTableCommitOnce(
     if (participants.items.len > 0) {
         const participant = participants.items[0];
         const coordinator_sync_level: db_mod.types.SyncLevel = if (sync_level == .propose) .write else sync_level;
-        worker.resolveGroupWithCancellation(alloc, participant.group_id, participant.table_name, .{
-            .restore_staging_scope = participant.restore_staging_scope,
-            .restore_staging_plan_id = participant.restore_staging_plan_id,
+        worker.resolveFirstDecision(alloc, participant.group_id, participant.table_name, .{
             .txn_id = txn_id,
             .status = .committed,
             .commit_version = commit_version,
@@ -1487,8 +1753,17 @@ fn executeMultiTableCommitOnce(
             // the caller's requested visibility contract and are recoverable
             // from the durable coordinator decision.
             .sync_level = coordinator_sync_level,
-        }, options.post_commit_cancellation) catch |err| switch (err) {
+        }, options.post_commit_cancellation, resume_committed) catch |err| switch (err) {
+            error.PreDecisionNotProposed => {
+                if (resume_committed) return resumedCommitPropagationFailure(participants.items, options);
+                abort_on_error = false;
+                // Only a first-submission rejection permits choosing abort.
+                // A failure of that durable cleanup remains an error/unknown.
+                try abortParticipants(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len);
+                return error.PreDecisionNotProposed;
+            },
             error.DecisionConflict => {
+                if (resume_committed) return resumedCommitPropagationFailure(participants.items, options);
                 if (trace_writer) |tw| {
                     tw.traceEvent(&.{
                         .name = "ResolveDecisionConflict",
@@ -1503,6 +1778,7 @@ fn executeMultiTableCommitOnce(
                 return .{ .conflict = participantDecisionConflict(participant, .resolve) };
             },
             error.TxnNotFound, error.InvalidTxnRecord => {
+                if (resume_committed) return resumedCommitPropagationFailure(participants.items, options);
                 if (trace_writer) |tw| {
                     tw.traceEvent(&.{
                         .name = "ResolveTornTransactionState",
@@ -1523,9 +1799,10 @@ fn executeMultiTableCommitOnce(
                 // (for example while mirroring or waiting for an index). Read
                 // the participant record before deciding whether abort is
                 // still legal.
+                recovery_worker = worker.startRecovery();
                 const durable_status = resolveCoordinatorDecisionAfterFailure(
                     alloc,
-                    worker,
+                    recovery_worker.?,
                     participant,
                     txn_id,
                     commit_version,
@@ -1533,6 +1810,7 @@ fn executeMultiTableCommitOnce(
                     err,
                     options.post_commit_cancellation,
                 ) catch |status_err| {
+                    if (resume_committed) return resumedCommitPropagationFailure(participants.items, options);
                     // The outcome is uncertain. Recovery will consult the
                     // participant record; aborting here could contradict a
                     // commit that already became durable.
@@ -1556,6 +1834,7 @@ fn executeMultiTableCommitOnce(
                         visibility_retry_pending = err != error.EnrichmentWorkerFailed;
                     },
                     .pending => {
+                        if (resume_committed) return resumedCommitPropagationFailure(participants.items, options);
                         // Once the commit submission may have crossed the
                         // Raft proposal boundary, pending means "not observed
                         // yet", never "safe to abort". The same decision can
@@ -1565,6 +1844,7 @@ fn executeMultiTableCommitOnce(
                         return error.CommitDecisionUnknown;
                     },
                     .aborted => {
+                        if (resume_committed) return resumedCommitPropagationFailure(participants.items, options);
                         abort_on_error = false;
                         try abortParticipants(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len);
                         return .{ .conflict = participantDecisionConflict(participant, .resolve) };
@@ -1579,7 +1859,7 @@ fn executeMultiTableCommitOnce(
     }
 
     runResolveFollowerFanout(
-        worker,
+        recovery_worker orelse worker.startRecovery(),
         txn_id,
         commit_version,
         participants.items,
@@ -1675,7 +1955,22 @@ fn executeMultiTableCommitOnce(
     return .{ .committed = result };
 }
 
-const coordinator_resolution_timeout_ns: u64 = 5 * std.time.ns_per_s;
+// Authoritative committed evidence is monotonic. A later inconsistent retry
+// response cannot authorize abort, nor can it certify this attempt's requested
+// decision metadata for further participant propagation. Leave durable recovery
+// enlisted and preserve the known committed outcome for ephemeral callers.
+fn resumedCommitPropagationFailure(participants: []const ParticipantTxn, options: ExecuteOptions) !CommitOutcome {
+    std.debug.assert(participants.len != 0);
+    if (options.report_post_commit_failure) return error.CommitPropagationIncomplete;
+    return .{ .committed = .{
+        .participant_count = participants.len,
+        .coordinator_group_id = participants[0].group_id,
+        .coordinator_table_name = participants[0].table_name,
+        .propagation_pending = true,
+    } };
+}
+
+const coordinator_resolution_timeout_ns: u64 = contract.default_transaction_recovery_timeout_ns;
 const coordinator_resolution_retry_ns: u64 = 25 * std.time.ns_per_ms;
 
 /// Resolve an ambiguous coordinator submission without changing transaction
@@ -1701,7 +1996,7 @@ fn resolveCoordinatorDecisionAfterFailure(
         commit_version,
         sync_level,
         initial_resolve_error,
-        platform_time.monotonicNs() +| coordinator_resolution_timeout_ns,
+        worker.recovery_deadline_ns orelse platform_time.monotonicNs() +| coordinator_resolution_timeout_ns,
     );
 }
 
@@ -2156,7 +2451,7 @@ pub fn resolveParticipant(
     commit_version: u64,
 ) !void {
     const ref = parseParticipantRef(participant) orelse return error.InvalidParticipant;
-    try worker.resolveGroup(alloc, ref.group_id, ref.table_name, .{
+    try worker.startRecovery().resolveGroup(alloc, ref.group_id, ref.table_name, .{
         .restore_staging_scope = ref.restore_staging_scope,
         .restore_staging_plan_id = ref.restore_staging_plan_id,
         .txn_id = txn_id,
@@ -3093,7 +3388,7 @@ fn parseTxnStatus(text: []const u8) ?db_mod.types.TxnStatus {
 
 fn abortParticipants(
     alloc: std.mem.Allocator,
-    worker: ParticipantWorker,
+    original_worker: ParticipantWorker,
     txn_id: db_mod.types.TxnId,
     timestamp: u64,
     participants: []const ParticipantTxn,
@@ -3101,6 +3396,7 @@ fn abortParticipants(
     attempted_count: usize,
 ) !void {
     if (participants.len == 0) return;
+    const worker = original_worker.startRecovery();
     std.debug.assert(participant_ids.len == participants.len);
     std.debug.assert(attempted_count > 0 and attempted_count <= participants.len);
 
@@ -3174,7 +3470,7 @@ fn abortParticipants(
 
 fn abortParticipantsWithContactMask(
     alloc: std.mem.Allocator,
-    worker: ParticipantWorker,
+    original_worker: ParticipantWorker,
     txn_id: db_mod.types.TxnId,
     timestamp: u64,
     participants: []const ParticipantTxn,
@@ -3183,6 +3479,7 @@ fn abortParticipantsWithContactMask(
     retained: bool,
 ) !void {
     if (participants.len == 0) return;
+    const worker = original_worker.startRecovery();
     std.debug.assert(participant_ids.len == participants.len and slots.len == participants.len);
     // Contact evidence is invocation-local, not transaction-local. In a
     // retained replay even a definitely unproposed BEGIN can have old intents.
@@ -3583,6 +3880,273 @@ fn consumerTests() type {
     const test_owner_root = @import("antfly_source_root");
     if (@hasDecl(test_owner_root, "implementation_tests_only") and test_owner_root.implementation_tests_only) return struct {};
     const Suite = struct {
+        test "distributed txn preserves original deadline across participant waves and cleanup" {
+            const FakeCatalog = struct {
+                fn iface() table_catalog.CatalogSource {
+                    return .{
+                        .ptr = undefined,
+                        .vtable = &.{
+                            .admin_snapshot = adminSnapshot,
+                            .free_admin_snapshot = freeAdminSnapshot,
+                        },
+                    };
+                }
+
+                fn adminSnapshot(_: *anyopaque) !@import("../metadata/api.zig").AdminSnapshot {
+                    const metadata_table_manager = @import("../metadata/table_manager.zig");
+                    const raft_reconciler = @import("../raft/reconciler.zig");
+                    const metadata_transition_state = @import("../metadata/transition_state.zig");
+                    return .{
+                        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .placement_role = "data" }})[0..]),
+                        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                            .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = "doc:m" },
+                            .{ .group_id = 7002, .table_id = 7, .start_key = "doc:m", .end_key = null },
+                        })[0..]),
+                        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                    };
+                }
+
+                fn freeAdminSnapshot(_: *anyopaque, _: *@import("../metadata/api.zig").AdminSnapshot) void {}
+            };
+            const VoprIo = @import("vopr").vopr_io.VoprIo;
+            const Recorder = struct {
+                clock: *VoprIo,
+                expected: PreDecisionContext,
+                begins: usize = 0,
+                prepares: usize = 0,
+                aborts: usize = 0,
+                acks: usize = 0,
+                cancel: ?*std.atomic.Value(bool) = null,
+                fn worker(self: *@This()) ParticipantWorker {
+                    return .{ .ptr = self, .vtable = &.{
+                        .begin_group = legacyBegin,
+                        .prepare_group = legacyPrepare,
+                        .begin_group_with_context = begin,
+                        .prepare_group_with_context = prepare,
+                        .resolve_first_decision_with_context = decide,
+                        .resolve_group = resolve,
+                        .status_group = status,
+                        .acknowledge_group = acknowledge,
+                    } };
+                }
+                fn legacyBegin(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnBeginRequest) !void {
+                    return error.LegacyMustNotRun;
+                }
+                fn legacyPrepare(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest) !void {
+                    return error.LegacyMustNotRun;
+                }
+                fn check(self: *@This(), context: PreDecisionContext) !void {
+                    try std.testing.expectEqual(self.expected.deadline_ns, context.deadline_ns);
+                    try std.testing.expect(context.deadline_io.?.userdata == self.expected.deadline_io.?.userdata);
+                    try std.testing.expect(context.cancellation.ptr == self.expected.cancellation.ptr);
+                    try ensurePreDecisionContextActive(context);
+                    self.clock.monotonic_ns += std.time.ns_per_s;
+                }
+                fn begin(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnBeginRequest, context: PreDecisionContext) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try self.check(context);
+                    self.begins += 1;
+                }
+                fn prepare(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest, context: PreDecisionContext) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try self.check(context);
+                    self.prepares += 1;
+                    if (self.cancel) |signal| signal.store(true, .release);
+                }
+                fn decide(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnResolveRequest, _: PreDecisionContext) !void {
+                    return error.FirstDecisionMustNotRun;
+                }
+                fn resolve(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, req: TxnResolveRequest) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqual(db_mod.types.TxnStatus.aborted, req.status);
+                    // Cleanup remains usable after the caller's deadline/cancellation.
+                    try std.testing.expect(self.clock.monotonic_ns >= self.expected.deadline_ns.? or self.expected.cancellation.isCancelled());
+                    self.aborts += 1;
+                }
+                fn status(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
+                    return .aborted;
+                }
+                fn acknowledge(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnAcknowledgeRequest) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.acks += 1;
+                }
+            };
+            inline for (.{ false, true }) |cancelled| {
+                var clock = try VoprIo.init(.{ .monotonic_ns = std.time.ns_per_s });
+                defer clock.deinit();
+                var signal = std.atomic.Value(bool).init(false);
+                const context: PreDecisionContext = .{
+                    .deadline_ns = (if (cancelled) @as(u64, 100) else 4) * std.time.ns_per_s,
+                    .deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&clock.io()),
+                    .cancellation = db_mod.types.CancellationToken.fromAtomic(&signal),
+                };
+                var recorder: Recorder = .{ .clock = &clock, .expected = context, .cancel = if (cancelled) &signal else null };
+                const tables = [_]TableCommitRequest{.{ .table_name = "docs", .writes = &.{
+                    .{ .key = "doc:a", .value = "{}" }, .{ .key = "doc:z", .value = "{}" },
+                } }};
+                const expected_error = if (cancelled) error.Canceled else error.PreDecisionDeadlineExceeded;
+                try std.testing.expectError(expected_error, executeMultiTableCommitWithOptions(
+                    std.testing.allocator,
+                    FakeCatalog.iface(),
+                    recorder.worker(),
+                    [_]u8{1} ** 16,
+                    10_000,
+                    10_001,
+                    &tables,
+                    .write,
+                    null,
+                    .{ .pre_decision_context = context, .max_parallel_participants = 1 },
+                ));
+                try std.testing.expectEqual(@as(usize, 2), recorder.begins);
+                try std.testing.expectEqual(@as(usize, 1), recorder.prepares);
+                try std.testing.expectEqual(@as(usize, 2), recorder.aborts);
+                try std.testing.expectEqual(@as(usize, 1), recorder.acks);
+                // An already-expired request does not even need a valid catalog.
+                try std.testing.expectError(expected_error, executeMultiTableCommitWithOptions(
+                    std.testing.allocator,
+                    undefined,
+                    recorder.worker(),
+                    [_]u8{2} ** 16,
+                    10_000,
+                    10_001,
+                    &tables,
+                    .write,
+                    null,
+                    .{ .pre_decision_context = context },
+                ));
+                try std.testing.expectEqual(@as(usize, 2), recorder.begins);
+            }
+        }
+
+        test "transaction first decision distinguishes rejected admission from accepted and resumed recovery" {
+            const FakeCatalog = struct {
+                fn iface() table_catalog.CatalogSource {
+                    return .{
+                        .ptr = undefined,
+                        .vtable = &.{
+                            .admin_snapshot = adminSnapshot,
+                            .free_admin_snapshot = freeAdminSnapshot,
+                        },
+                    };
+                }
+
+                fn adminSnapshot(_: *anyopaque) !@import("../metadata/api.zig").AdminSnapshot {
+                    const metadata_table_manager = @import("../metadata/table_manager.zig");
+                    const raft_reconciler = @import("../raft/reconciler.zig");
+                    const metadata_transition_state = @import("../metadata/transition_state.zig");
+                    return .{
+                        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .placement_role = "data" }})[0..]),
+                        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                            .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = "doc:m" },
+                            .{ .group_id = 7002, .table_id = 7, .start_key = "doc:m", .end_key = null },
+                        })[0..]),
+                        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                    };
+                }
+
+                fn freeAdminSnapshot(_: *anyopaque, _: *@import("../metadata/api.zig").AdminSnapshot) void {}
+            };
+            const VoprIo = @import("vopr").vopr_io.VoprIo;
+            const Recorder = struct {
+                const Mode = enum { rejected, lost_response, accepted, resumed };
+                mode: Mode,
+                clock: *VoprIo,
+                context: PreDecisionContext,
+                first: usize = 0,
+                aborts: usize = 0,
+                recovery: usize = 0,
+                fn worker(self: *@This()) ParticipantWorker {
+                    return .{ .ptr = self, .vtable = &.{
+                        .begin_group = legacyBegin,
+                        .prepare_group = legacyPrepare,
+                        .begin_group_with_context = begin,
+                        .prepare_group_with_context = prepare,
+                        .resolve_first_decision_with_context = decide,
+                        .resolve_group = resolve,
+                        .status_group = status,
+                        .resolve_group_until = resolveUntil,
+                        .status_group_until = statusUntil,
+                    } };
+                }
+                fn legacyBegin(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnBeginRequest) !void {
+                    return error.UnexpectedLegacy;
+                }
+                fn legacyPrepare(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest) !void {
+                    return error.UnexpectedLegacy;
+                }
+                fn begin(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnBeginRequest, _: PreDecisionContext) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    if (self.mode == .resumed) {
+                        self.clock.monotonic_ns = self.context.deadline_ns.?;
+                        return error.DecisionConflict;
+                    }
+                }
+                fn prepare(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest, _: PreDecisionContext) !void {}
+                fn decide(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, req: TxnResolveRequest, context: PreDecisionContext) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqual(self.context.deadline_ns, context.deadline_ns);
+                    try std.testing.expect(context.deadline_io.?.userdata == self.context.deadline_io.?.userdata);
+                    try std.testing.expectEqual(db_mod.types.TxnStatus.committed, req.status);
+                    self.first += 1;
+                    // Deadline expires inside routing/admission, before receipt or
+                    // after acceptance depending on the callback's exact evidence.
+                    self.clock.monotonic_ns = self.context.deadline_ns.?;
+                    switch (self.mode) {
+                        .rejected => return error.PreDecisionNotProposed,
+                        .lost_response => return error.Timeout,
+                        .accepted => {},
+                        .resumed => return error.FirstDecisionMustNotRun,
+                    }
+                }
+                fn resolve(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, req: TxnResolveRequest) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expect(self.clock.monotonic_ns >= self.context.deadline_ns.?);
+                    if (req.status == .aborted) {
+                        try std.testing.expectEqual(Mode.rejected, self.mode);
+                        self.aborts += 1;
+                    } else {
+                        try std.testing.expect(self.mode != .rejected);
+                        self.recovery += 1;
+                    }
+                }
+                fn status(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
+                    return .committed;
+                }
+                fn statusUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group: u64, table: []const u8, id: db_mod.types.TxnId, _: u64) !db_mod.types.TxnStatus {
+                    return status(ptr, alloc, group, table, id);
+                }
+                fn resolveUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group: u64, table: []const u8, req: TxnResolveRequest, _: u64) !void {
+                    return resolve(ptr, alloc, group, table, req);
+                }
+            };
+            inline for (std.meta.tags(Recorder.Mode)) |mode| {
+                var clock = try VoprIo.init(.{ .monotonic_ns = std.time.ns_per_s });
+                defer clock.deinit();
+                const context: PreDecisionContext = .{ .deadline_ns = 10 * std.time.ns_per_s, .deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&clock.io()) };
+                var recorder: Recorder = .{ .mode = mode, .clock = &clock, .context = context };
+                const tables = [_]TableCommitRequest{.{ .table_name = "docs", .writes = &.{ .{ .key = "doc:a", .value = "{}" }, .{ .key = "doc:z", .value = "{}" } } }};
+                const result = executeMultiTableCommitWithOptions(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), [_]u8{3} ** 16, 10_000, 10_001, &tables, .write, null, .{ .pre_decision_context = context, .max_parallel_participants = 1, .report_post_commit_failure = false });
+                if (mode == .rejected) {
+                    try std.testing.expectError(error.PreDecisionNotProposed, result);
+                    try std.testing.expectEqual(@as(usize, 2), recorder.aborts);
+                } else {
+                    const outcome = try result;
+                    try std.testing.expectEqual(std.meta.Tag(CommitOutcome).committed, std.meta.activeTag(outcome));
+                    try std.testing.expectEqual(@as(usize, 0), recorder.aborts);
+                    try std.testing.expect(recorder.recovery >= 1);
+                }
+                try std.testing.expectEqual(@as(usize, if (mode == .resumed) 0 else 1), recorder.first);
+            }
+        }
+
         test "transaction attempt budgets follow the borrowed transport clock" {
             var vopr_io = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = 7 * std.time.ns_per_s });
             defer vopr_io.deinit();
@@ -3601,6 +4165,10 @@ fn consumerTests() type {
             const local = try worker.localPreDecisionContext(deadline);
             try std.testing.expectEqual(@as(?u64, 9 * std.time.ns_per_s), local.deadline_ns);
             try std.testing.expect(local.deadline_io.?.userdata == borrow.userdata);
+            var bounded = worker;
+            bounded.pre_decision_context = .{ .deadline_ns = 9 * std.time.ns_per_s, .deadline_io = borrow };
+            try std.testing.expectEqual(@as(u64, 9 * std.time.ns_per_s), try bounded.preDecisionDeadlineNs());
+            try std.testing.expectEqual(@as(?u64, 8 * std.time.ns_per_s), (try bounded.localPreDecisionContext(9 * std.time.ns_per_s)).deadline_ns);
             vopr_io.monotonic_ns += 2 * std.time.ns_per_s;
             try std.testing.expectEqual(@as(u32, 1_000), (try worker.remainingPreDecisionAttemptBudget(deadline)).server_budget_ms);
             vopr_io.monotonic_ns += 2 * std.time.ns_per_s;
@@ -3636,6 +4204,85 @@ fn consumerTests() type {
                 HostedParticipantWorker.default_pre_decision_attempt_timeout_ms -
                     contract.max_pre_decision_server_budget_ms,
             );
+        }
+
+        test "hosted participant transaction recovery uses internal control endpoint and authenticates requests" {
+            const Router = struct {
+                fn localNode(_: *anyopaque) u64 {
+                    return 1;
+                }
+                fn localStatus(_: *anyopaque, _: u64) @import("../raft/host.zig").HostedReplicaStatus {
+                    return .absent;
+                }
+                fn leader(_: *anyopaque, _: u64) ?u64 {
+                    return 2;
+                }
+                fn nodeStatus(_: *anyopaque, _: u64, _: u64) @import("../raft/host.zig").HostedReplicaStatus {
+                    return .active;
+                }
+                fn publicUri(_: *anyopaque, alloc: std.mem.Allocator, _: u64) !?[]u8 {
+                    return try alloc.dupe(u8, "http://public.invalid");
+                }
+                fn controlUri(_: *anyopaque, alloc: std.mem.Allocator, _: u64, _: u64, _: table_router.RouteBudget) !?[]u8 {
+                    return try alloc.dupe(u8, "http://internal.invalid");
+                }
+                fn iface(comptime with_internal: bool) table_router.HostedGroupRouter {
+                    return .{ .ptr = undefined, .vtable = if (with_internal) &.{
+                        .local_node_id = localNode,
+                        .local_status = localStatus,
+                        .group_leader_node_id = leader,
+                        .node_status = nodeStatus,
+                        .node_base_uri = publicUri,
+                        .node_control_base_uri_for_group = controlUri,
+                    } else &.{
+                        .local_node_id = localNode,
+                        .local_status = localStatus,
+                        .group_leader_node_id = leader,
+                        .node_status = nodeStatus,
+                        .node_base_uri = publicUri,
+                    } };
+                }
+            };
+            const Executor = struct {
+                expected_base: []const u8,
+                expect_auth: bool = true,
+                calls: usize = 0,
+                fn iface(self: *@This()) http_common.RequestExecutor {
+                    return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+                }
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expect(std.mem.startsWith(u8, req.uri, self.expected_base));
+                    try std.testing.expectEqual(self.expect_auth, req.header(@import("internal_service_auth.zig").header_name) != null);
+                    self.calls += 1;
+                    return .{
+                        .status = 200,
+                        .body = try alloc.dupe(u8, if (std.mem.endsWith(u8, req.uri, "/txn-status")) "{\"status\":\"committed\"}" else "{}"),
+                    };
+                }
+            };
+            const alloc = std.testing.allocator;
+            const txn_id: db_mod.types.TxnId = @splat(7);
+            const resolution: TxnResolveRequest = .{ .txn_id = txn_id, .status = .committed, .commit_version = 19 };
+            inline for (.{ true, false }) |with_internal| {
+                var executor: Executor = .{ .expected_base = if (with_internal) "http://internal.invalid" else "http://public.invalid" };
+                var worker = HostedParticipantWorker.init(undefined, Router.iface(with_internal), undefined, executor.iface());
+                _ = worker.withInternalServiceAuth("transaction-routing-secret-0123456789", "transaction-routing-test");
+                var public_route = (try table_router.resolveGroupRoute(alloc, undefined, worker.router, 77, .prefer_leader)).?;
+                defer public_route.deinit(alloc);
+                try std.testing.expectEqualStrings("http://public.invalid", public_route.remote.base_uri);
+                try HostedParticipantWorker.resolveFirstDecisionWithContext(&worker, alloc, 77, "docs", resolution, .{
+                    .deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_s,
+                });
+                try worker.worker().resolveGroup(alloc, 77, "docs", resolution);
+                try std.testing.expectEqual(db_mod.types.TxnStatus.committed, try worker.worker().statusGroup(alloc, 77, "docs", txn_id));
+                try worker.worker().acknowledgeGroup(alloc, 77, "docs", .{ .txn_id = txn_id, .participant = "table:docs:group:77" });
+                try std.testing.expectEqual(@as(usize, 4), executor.calls);
+            }
+            var unsigned_executor: Executor = .{ .expected_base = "http://public.invalid", .expect_auth = false };
+            var unsigned_worker = HostedParticipantWorker.init(undefined, Router.iface(true), undefined, unsigned_executor.iface());
+            try std.testing.expectEqual(db_mod.types.TxnStatus.committed, try unsigned_worker.worker().statusGroup(alloc, 77, "docs", txn_id));
+            try std.testing.expectEqual(@as(usize, 1), unsigned_executor.calls);
         }
 
         test "hosted participant rediscovery retries only pre-decision leader unavailability" {
@@ -4920,6 +5567,189 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 2), fully_begun.acknowledgement_count);
         }
 
+        test "transaction recovery shares abort and acknowledgement budget independently of admission" {
+            const Fixture = struct {
+                deadline: ?u64 = null,
+                resolves: usize = 0,
+                statuses: usize = 0,
+                acks: usize = 0,
+                expire_on_ack: bool = false,
+                expected_status: db_mod.types.TxnStatus = .aborted,
+                fail_first_resolve: bool = true,
+                fn begin(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnBeginRequest) !void {
+                    return error.UnexpectedLegacyCall;
+                }
+                fn prepare(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest) !void {
+                    return error.UnexpectedLegacyCall;
+                }
+                fn resolve(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnResolveRequest) !void {
+                    return error.UnexpectedLegacyCall;
+                }
+                fn status(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
+                    return error.UnexpectedLegacyCall;
+                }
+                fn observe(self: *@This(), deadline: u64) !void {
+                    if (self.deadline) |original| try std.testing.expectEqual(original, deadline) else self.deadline = deadline;
+                }
+                fn resolveUntil(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, req: TxnResolveRequest, deadline: u64) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try self.observe(deadline);
+                    try std.testing.expectEqual(self.expected_status, req.status);
+                    self.resolves += 1;
+                    if (self.fail_first_resolve and self.resolves == 1) return error.Timeout;
+                }
+                fn statusUntil(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, deadline: u64) !db_mod.types.TxnStatus {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try self.observe(deadline);
+                    self.statuses += 1;
+                    return .aborted;
+                }
+                fn ackUntil(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnAcknowledgeRequest, deadline: u64) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try self.observe(deadline);
+                    self.acks += 1;
+                    if (self.expire_on_ack) {
+                        while (platform_time.monotonicNs() < deadline) std.atomic.spinLoopHint();
+                        return error.Timeout;
+                    }
+                }
+                fn worker(self: *@This()) ParticipantWorker {
+                    return .{ .ptr = self, .recovery_timeout_ns = 10 * std.time.ns_per_ms, .pre_decision_context = .{ .deadline_ns = 0 }, .vtable = &.{
+                        .begin_group = begin,
+                        .prepare_group = prepare,
+                        .resolve_group = resolve,
+                        .status_group = status,
+                        .resolve_group_until = resolveUntil,
+                        .status_group_until = statusUntil,
+                        .acknowledge_group_until = ackUntil,
+                    } };
+                }
+            };
+            const participants = [_]ParticipantTxn{
+                .{ .table_name = "docs", .group_id = 1, .topology_epoch = 1 },
+                .{ .table_name = "docs", .group_id = 2, .topology_epoch = 1 },
+                .{ .table_name = "docs", .group_id = 3, .topology_epoch = 1 },
+            };
+            const ids = [_][]const u8{ "one", "two", "three" };
+            const id = try parseTxnIdHex("abcdefabcdefabcdefabcdefabcdefab");
+            var healthy: Fixture = .{};
+            try abortParticipants(std.testing.allocator, healthy.worker(), id, 7, &participants, &ids, 3);
+            try std.testing.expectEqual(@as(usize, 3), healthy.resolves);
+            try std.testing.expectEqual(@as(usize, 1), healthy.statuses);
+            try std.testing.expectEqual(@as(usize, 2), healthy.acks);
+            const restarted = healthy.worker().startRecovery();
+            try std.testing.expect(restarted.pre_decision_context == null);
+            try std.testing.expectEqual(restarted.recovery_deadline_ns, restarted.startRecovery().recovery_deadline_ns);
+            var expired: Fixture = .{ .expire_on_ack = true };
+            try abortParticipants(std.testing.allocator, expired.worker(), id, 7, &participants, &ids, 3);
+            try std.testing.expectEqual(@as(usize, 2), expired.resolves);
+            try std.testing.expectEqual(@as(usize, 1), expired.acks);
+            // The second follower remains enlisted: no resolve or ACK was dispatched after the same window expired.
+            var committed: Fixture = .{ .expected_status = .committed, .fail_first_resolve = false, .expire_on_ack = true };
+            const recovery = committed.worker().startRecovery();
+            var first: ParticipantFanoutSlot = .{};
+            ResolveFollowerFanoutTask.run(recovery, &participants[0], &participants[1], ids[1], id, 7, .write, true, .none, &first);
+            try std.testing.expect(first.propagation_pending);
+            try std.testing.expectEqual(error.Timeout, first.acknowledgement_err.?);
+            var second: ParticipantFanoutSlot = .{};
+            ResolveFollowerFanoutTask.run(recovery, &participants[0], &participants[2], ids[2], id, 7, .write, true, .none, &second);
+            try std.testing.expect(second.propagation_pending);
+            try std.testing.expectEqual(@as(usize, 1), committed.resolves);
+            try std.testing.expectEqual(@as(usize, 1), committed.acks);
+        }
+
+        test "distributed txn recovery status requests keep the worker deadline" {
+            const Recorder = struct {
+                bounded_calls: usize = 0,
+                scoped_calls: usize = 0,
+                last_deadline_ns: ?u64 = null,
+
+                fn begin(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnBeginRequest) !void {}
+                fn prepare(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest) !void {}
+                fn resolve(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnResolveRequest) !void {}
+                fn legacy(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
+                    return error.UnexpectedLegacyCall;
+                }
+                fn bounded(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, deadline_ns: u64) !db_mod.types.TxnStatus {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.bounded_calls += 1;
+                    self.last_deadline_ns = deadline_ns;
+                    return .pending;
+                }
+                fn scoped(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnStatusRequest, deadline_ns: ?u64) !db_mod.types.TxnStatus {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.scoped_calls += 1;
+                    self.last_deadline_ns = deadline_ns;
+                    return .pending;
+                }
+            };
+            var recorder: Recorder = .{};
+            const id = try parseTxnIdHex("abcdefabcdefabcdefabcdefabcdefab");
+            const worker: ParticipantWorker = .{ .ptr = &recorder, .recovery_timeout_ns = std.time.ns_per_s, .vtable = &.{
+                .begin_group = Recorder.begin,
+                .prepare_group = Recorder.prepare,
+                .resolve_group = Recorder.resolve,
+                .status_group = Recorder.legacy,
+                .status_group_until = Recorder.bounded,
+                .status_group_scoped = Recorder.scoped,
+            } };
+            const recovery = worker.startRecovery();
+            const recovery_deadline = recovery.recovery_deadline_ns.?;
+            try std.testing.expectEqual(db_mod.types.TxnStatus.pending, try recovery.statusGroupWithRequest(std.testing.allocator, 1, "docs", .{ .txn_id = id }, null));
+            try std.testing.expectEqual(recovery_deadline, recorder.last_deadline_ns.?);
+            try std.testing.expectEqual(@as(usize, 1), recorder.bounded_calls);
+
+            const shorter_deadline = recovery_deadline - std.time.ns_per_ms;
+            try std.testing.expectEqual(db_mod.types.TxnStatus.pending, try recovery.statusGroupWithRequest(std.testing.allocator, 1, "docs", .{ .txn_id = id }, shorter_deadline));
+            try std.testing.expectEqual(shorter_deadline, recorder.last_deadline_ns.?);
+            const scoped_req: TxnStatusRequest = .{ .txn_id = id, .restore_staging_scope = [_]u8{1} ** 32, .restore_staging_plan_id = [_]u8{1} ** 16 };
+            try std.testing.expectEqual(db_mod.types.TxnStatus.pending, try recovery.statusGroupWithRequest(std.testing.allocator, 1, "docs", scoped_req, null));
+            try std.testing.expectEqual(recovery_deadline, recorder.last_deadline_ns.?);
+            try std.testing.expectEqual(@as(usize, 1), recorder.scoped_calls);
+
+            var expired = recovery;
+            expired.recovery_deadline_ns = 0;
+            try std.testing.expectError(error.CommitDecisionUnknown, expired.statusGroupWithRequest(std.testing.allocator, 1, "docs", .{ .txn_id = id }, null));
+            try std.testing.expectError(error.CommitDecisionUnknown, expired.statusGroupWithRequest(std.testing.allocator, 1, "docs", scoped_req, null));
+            try std.testing.expectEqual(@as(usize, 2), recorder.bounded_calls);
+            try std.testing.expectEqual(@as(usize, 1), recorder.scoped_calls);
+        }
+
+        test "transaction recovery retains shutdown cancellation and rejects unbounded fallback" {
+            var canceled = std.atomic.Value(bool).init(true);
+            const token = db_mod.types.CancellationToken.fromAtomic(&canceled);
+            const deadline = platform_time.monotonicNs() + std.time.ns_per_s;
+            const scope = DecisionRecoveryCancellation{ .deadline_ns = deadline, .other = token };
+            try std.testing.expectError(error.Canceled, scope.token().check());
+            canceled.store(false, .release);
+            try scope.token().check();
+            const expired = DecisionRecoveryCancellation{ .deadline_ns = 0, .other = token };
+            try std.testing.expectError(error.Canceled, expired.token().check());
+            const Fixture = struct {
+                fn begin(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnBeginRequest) !void {}
+                fn prepare(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest) !void {}
+                fn resolve(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnResolveRequest) !void {
+                    return error.UnexpectedLegacyCall;
+                }
+                fn status(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
+                    return error.UnexpectedLegacyCall;
+                }
+                fn combined(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnResolveRequest, until: u64, cancellation: db_mod.types.CancellationToken) !void {
+                    try std.testing.expect(until > platform_time.monotonicNs());
+                    try cancellation.check();
+                }
+            };
+            const worker: ParticipantWorker = .{ .ptr = undefined, .recovery_deadline_ns = deadline, .vtable = &.{ .begin_group = Fixture.begin, .prepare_group = Fixture.prepare, .resolve_group = Fixture.resolve, .status_group = Fixture.status } };
+            const id = try parseTxnIdHex("abcdefabcdefabcdefabcdefabcdefab");
+            try std.testing.expectError(error.CommitPropagationIncomplete, worker.resolveGroupWithCancellation(std.testing.allocator, 1, "docs", .{ .txn_id = id, .status = .committed, .commit_version = 7 }, token));
+            try std.testing.expectError(error.CommitPropagationIncomplete, worker.acknowledgeGroup(std.testing.allocator, 1, "docs", .{ .txn_id = id, .participant = "two" }));
+            const combined_worker: ParticipantWorker = .{ .ptr = undefined, .recovery_deadline_ns = deadline, .vtable = &.{ .begin_group = Fixture.begin, .prepare_group = Fixture.prepare, .resolve_group = Fixture.resolve, .status_group = Fixture.status, .resolve_group_until_with_cancellation = Fixture.combined } };
+            canceled.store(true, .release);
+            try std.testing.expectError(error.Canceled, combined_worker.resolveGroupWithCancellation(std.testing.allocator, 1, "docs", .{ .txn_id = id, .status = .committed, .commit_version = 7 }, token));
+            canceled.store(false, .release);
+            try combined_worker.resolveGroupWithCancellation(std.testing.allocator, 1, "docs", .{ .txn_id = id, .status = .committed, .commit_version = 7 }, token);
+        }
+
         test "distributed txn coordinator groups by range and commits all participants" {
             const FakeCatalog = struct {
                 fn iface() table_catalog.CatalogSource {
@@ -5161,7 +5991,7 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 1), recorder.activation_prepares);
         }
 
-        test "stable distributed transaction retry resumes a durable commit decision" {
+        test "stable distributed transaction retry requires matching begin identity before claiming commit" {
             const FakeCatalog = struct {
                 fn iface() table_catalog.CatalogSource {
                     return .{
@@ -5207,6 +6037,8 @@ fn consumerTests() type {
                 prepare_calls: usize = 0,
                 resolve_calls: usize = 0,
                 status_calls: usize = 0,
+                resolve_error: ?anyerror = null,
+                abort_calls: usize = 0,
 
                 fn worker(self: *@This()) ParticipantWorker {
                     return .{
@@ -5216,6 +6048,7 @@ fn consumerTests() type {
                             .prepare_group = prepare,
                             .resolve_group = resolve,
                             .status_group = status,
+                            .status_group_until = statusUntil,
                             .acknowledge_group = acknowledge,
                         },
                     };
@@ -5225,6 +6058,8 @@ fn consumerTests() type {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.begin_calls += 1;
                     try std.testing.expect(req.retain_terminal);
+                    try std.testing.expectEqual(@as(u64, 10_000), req.begin_timestamp);
+                    try std.testing.expectEqual(@as(usize, 2), req.participants.len);
                     if (group == self.failed_begin_group) return self.begin_error;
                 }
 
@@ -5236,7 +6071,9 @@ fn consumerTests() type {
                 fn resolve(ptr: *anyopaque, _: std.mem.Allocator, group: u64, _: []const u8, req: TxnResolveRequest) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.resolve_calls += 1;
+                    if (req.status == .aborted) self.abort_calls += 1;
                     try std.testing.expectEqual(if (self.observed_status == .pending) db_mod.types.TxnStatus.aborted else self.observed_status, req.status);
+                    if (self.resolve_error) |err| return err;
                     if (self.expect_live_topology) {
                         try std.testing.expect(req.topology_epoch != 0);
                     } else {
@@ -5259,128 +6096,214 @@ fn consumerTests() type {
                 fn status(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.status_calls += 1;
-                    if (self.status_error) |err| return err;
+                    if (self.status_calls > 1 and (if (self.resolve_error) |err| err == error.ConnectionResetByPeer else false)) return .aborted;
                     return self.observed_status;
+                }
+
+                fn statusUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, deadline_ns: u64) !db_mod.types.TxnStatus {
+                    try ensureDecisionRecoveryDeadline(deadline_ns);
+                    return status(ptr, alloc, group_id, table_name, txn_id);
                 }
             };
 
-            for ([_]anyerror{ error.DecisionConflict, error.RaftBatchWriteOutcomeUnknown, error.UnexpectedHttpStatus, error.Timeout, error.UnknownGroup, error.PreDecisionNotProposed }) |begin_error| {
-                var recorder = Recorder{ .begin_error = begin_error };
-                const txn_id = try parseTxnIdHex("0123456789abcdeffedcba9876543210");
-                const outcome = try executeMultiTableCommitWithOptions(
+            var recorder = Recorder{};
+            const txn_id = try parseTxnIdHex("0123456789abcdeffedcba9876543210");
+            for ([_]anyerror{ error.RaftBatchWriteOutcomeUnknown, error.UnexpectedHttpStatus, error.Timeout, error.UnknownGroup, error.PreDecisionNotProposed }) |begin_error| {
+                recorder = .{ .begin_error = begin_error };
+                try std.testing.expectError(error.CommitDecisionUnknown, executeMultiTableCommitWithOptions(
                     std.testing.allocator,
                     FakeCatalog.iface(),
                     recorder.worker(),
                     txn_id,
                     10_000,
                     10_001,
-                    &.{.{
-                        .table_name = "docs",
-                        .transforms = &.{
-                            .{
-                                .key = "doc:a",
-                                .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }},
-                            },
-                            .{
-                                .key = "doc:z",
-                                .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }},
-                            },
-                        },
-                    }},
+                    &.{.{ .table_name = "docs", .writes = &.{
+                        .{ .key = "doc:a", .value = "{}" },
+                        .{ .key = "doc:z", .value = "{}" },
+                    } }},
                     .write,
                     null,
                     .{ .retain_terminal = true },
-                );
-                try std.testing.expect(outcome == .committed);
+                ));
                 try std.testing.expectEqual(@as(usize, 1), recorder.begin_calls);
                 try std.testing.expectEqual(@as(usize, 1), recorder.status_calls);
                 try std.testing.expectEqual(@as(usize, 0), recorder.prepare_calls);
-                try std.testing.expectEqual(@as(usize, 2), recorder.resolve_calls);
-                // An unavailable decision is not permission to abort a possibly
-                // committed stable transaction, even if BEGIN was not proposed.
-                recorder = .{ .begin_error = begin_error, .status_error = error.LeaderUnavailable };
-                try std.testing.expectError(error.CommitDecisionUnknown, executeMultiTableCommitWithOptions(
-                    std.testing.allocator,
-                    FakeCatalog.iface(),
-                    recorder.worker(),
-                    txn_id,
-                    10_000,
-                    10_001,
-                    &.{.{ .table_name = "docs", .writes = &.{.{ .key = "doc:a", .value = "{}" }} }},
-                    .write,
-                    null,
-                    .{ .retain_terminal = true },
-                ));
-                try std.testing.expectEqual(@as(usize, 1), recorder.status_calls);
-                try std.testing.expectEqual(@as(usize, 0), recorder.prepare_calls);
                 try std.testing.expectEqual(@as(usize, 0), recorder.resolve_calls);
+                try std.testing.expectEqual(@as(usize, 0), recorder.abort_calls);
             }
-            // A lost BEGIN outcome on a stable session ID must remain
-            // retryable. In particular, an unknown Raft apply result is not
-            // evidence that the session should be durably aborted.
-            for ([_]u64{ 7001, 7002 }) |failed_group| {
-                var recorder = Recorder{
-                    .failed_begin_group = failed_group,
-                    .begin_error = error.RaftBatchWriteOutcomeUnknown,
-                    .observed_status = .pending,
-                };
-                const txn_id = try parseTxnIdHex("0123456789abcdeffedcba9876543210");
-                const request = &[_]TableCommitRequest{.{ .table_name = "docs", .writes = &.{
+            // A committed status alone cannot prove that an explicit BEGIN
+            // conflict belongs to this request rather than an ID collision.
+            recorder = .{ .begin_error = error.DecisionConflict, .observed_status = .committed };
+            try std.testing.expectError(error.CommitDecisionUnknown, executeMultiTableCommitWithOptions(
+                std.testing.allocator,
+                FakeCatalog.iface(),
+                recorder.worker(),
+                txn_id,
+                10_000,
+                10_001,
+                &.{.{ .table_name = "docs", .writes = &.{
                     .{ .key = "doc:a", .value = "{}" },
                     .{ .key = "doc:z", .value = "{}" },
-                } }};
-                try std.testing.expectError(error.CommitDecisionUnknown, executeMultiTableCommitWithOptions(
-                    std.testing.allocator,
-                    FakeCatalog.iface(),
-                    recorder.worker(),
-                    txn_id,
-                    10_000,
-                    10_001,
-                    request,
-                    .write,
-                    null,
-                    .{ .retain_terminal = true },
-                ));
-                try std.testing.expectEqual(@as(usize, 0), recorder.resolve_calls);
-                recorder.failed_begin_group = 0;
-                recorder.observed_status = .committed;
-                recorder.expect_live_topology = true;
-                const resumed = try executeMultiTableCommitWithOptions(
-                    std.testing.allocator,
-                    FakeCatalog.iface(),
-                    recorder.worker(),
-                    txn_id,
-                    10_000,
-                    10_001,
-                    request,
-                    .write,
-                    null,
-                    .{ .retain_terminal = true },
-                );
-                try std.testing.expect(resumed == .committed);
-            }
-            // Model an earlier interrupted execution with a prepared follower.
-            // Neither coordinator BEGIN failure nor a follower's explicit
-            // not-proposed result proves that old participant has no intents.
-            for ([_]u64{ 7001, 7002 }) |failed_group| {
-                for ([_]?anyerror{ null, error.Timeout, error.TxnNotFound }) |resolve_error| {
-                    var recorder = Recorder{ .failed_begin_group = failed_group, .begin_error = error.PreDecisionNotProposed, .observed_status = .pending, .follower_resolve_error = resolve_error };
-                    const result = executeMultiTableCommitWithOptions(
+                } }},
+                .write,
+                null,
+                .{ .retain_terminal = true },
+            ));
+            try std.testing.expectEqual(@as(usize, 1), recorder.status_calls);
+            try std.testing.expectEqual(@as(usize, 0), recorder.prepare_calls);
+            try std.testing.expectEqual(@as(usize, 0), recorder.resolve_calls);
+            try std.testing.expectEqual(@as(usize, 0), recorder.abort_calls);
+            // A retry can reuse the same stable ID, BEGIN timestamp, and
+            // participant cohort while changing the write values. Even a
+            // future status reply that proves BEGIN identity alone cannot
+            // establish that this request's payload was the committed one:
+            // the durable BEGIN record has no write-set digest.
+            recorder = .{ .begin_error = error.DecisionConflict, .observed_status = .committed };
+            try std.testing.expectError(error.CommitDecisionUnknown, executeMultiTableCommitWithOptions(
+                std.testing.allocator,
+                FakeCatalog.iface(),
+                recorder.worker(),
+                txn_id,
+                10_000,
+                10_001,
+                &.{.{ .table_name = "docs", .writes = &.{
+                    .{ .key = "doc:a", .value = "{\"revision\":2}" },
+                    .{ .key = "doc:z", .value = "{\"revision\":2}" },
+                } }},
+                .write,
+                null,
+                .{ .retain_terminal = true },
+            ));
+            try std.testing.expectEqual(@as(usize, 1), recorder.begin_calls);
+            try std.testing.expectEqual(@as(usize, 1), recorder.status_calls);
+            try std.testing.expectEqual(@as(usize, 0), recorder.prepare_calls);
+            try std.testing.expectEqual(@as(usize, 0), recorder.resolve_calls);
+            try std.testing.expectEqual(@as(usize, 0), recorder.abort_calls);
+            // Even if a later phase-two callback could answer, status-only
+            // evidence cannot authorize it after an ambiguous BEGIN reply.
+            for ([_]anyerror{ error.DecisionConflict, error.TxnNotFound, error.InvalidTxnRecord, error.ConnectionResetByPeer }) |retry_error| {
+                for ([_]bool{ true, false }) |report_failure| {
+                    recorder = .{ .begin_error = error.RaftBatchWriteOutcomeUnknown, .resolve_error = retry_error };
+                    try std.testing.expectError(error.CommitDecisionUnknown, executeMultiTableCommitWithOptions(
                         std.testing.allocator,
                         FakeCatalog.iface(),
                         recorder.worker(),
-                        @splat(7),
+                        txn_id,
                         10_000,
                         10_001,
-                        &.{.{ .table_name = "docs", .writes = &.{ .{ .key = "doc:a", .value = "{}" }, .{ .key = "doc:z", .value = "{}" } } }},
+                        &.{.{ .table_name = "docs", .writes = &.{
+                            .{ .key = "doc:a", .value = "{}" },
+                            .{ .key = "doc:z", .value = "{}" },
+                        } }},
+                        .write,
+                        null,
+                        .{ .retain_terminal = true, .report_post_commit_failure = report_failure },
+                    ));
+                    try std.testing.expectEqual(@as(usize, 1), recorder.begin_calls);
+                    try std.testing.expectEqual(@as(usize, 1), recorder.status_calls);
+                    try std.testing.expectEqual(@as(usize, 0), recorder.prepare_calls);
+                    try std.testing.expectEqual(@as(usize, 0), recorder.resolve_calls);
+                    try std.testing.expectEqual(@as(usize, 0), recorder.abort_calls);
+                }
+            }
+            {
+                // A lost BEGIN outcome on a stable session ID must remain
+                // retryable. In particular, an unknown Raft apply result is not
+                // evidence that the session should be durably aborted.
+                for ([_]u64{ 7001, 7002 }) |failed_group| {
+                    var recovery_recorder = Recorder{
+                        .failed_begin_group = failed_group,
+                        .begin_error = error.RaftBatchWriteOutcomeUnknown,
+                        .observed_status = .pending,
+                    };
+                    const recovery_txn_id = try parseTxnIdHex("0123456789abcdeffedcba9876543210");
+                    const request = &[_]TableCommitRequest{.{ .table_name = "docs", .writes = &.{
+                        .{ .key = "doc:a", .value = "{}" },
+                        .{ .key = "doc:z", .value = "{}" },
+                    } }};
+                    try std.testing.expectError(error.CommitDecisionUnknown, executeMultiTableCommitWithOptions(
+                        std.testing.allocator,
+                        FakeCatalog.iface(),
+                        recovery_recorder.worker(),
+                        recovery_txn_id,
+                        10_000,
+                        10_001,
+                        request,
+                        .write,
+                        null,
+                        .{ .retain_terminal = true },
+                    ));
+                    try std.testing.expectEqual(@as(usize, 0), recovery_recorder.resolve_calls);
+                    recovery_recorder.failed_begin_group = 0;
+                    recovery_recorder.observed_status = .committed;
+                    recovery_recorder.expect_live_topology = true;
+                    const resumed = try executeMultiTableCommitWithOptions(
+                        std.testing.allocator,
+                        FakeCatalog.iface(),
+                        recovery_recorder.worker(),
+                        recovery_txn_id,
+                        10_000,
+                        10_001,
+                        request,
                         .write,
                         null,
                         .{ .retain_terminal = true },
                     );
-                    if (failed_group == 7001) try std.testing.expectError(error.TransactionBeginFailed, result) else try std.testing.expect((try result) == .conflict);
-                    try std.testing.expectEqual(@as(usize, 2), recorder.resolve_calls);
-                    try std.testing.expectEqual(resolve_error == null, recorder.follower_resolved);
-                    try std.testing.expectEqual(resolve_error == null, recorder.follower_acknowledged);
+                    try std.testing.expect(resumed == .committed);
+                }
+                // A pending record with this stable ID may belong to an
+                // earlier execution whose BEGIN metadata conflicts with this
+                // request. The rejected coordinator or follower BEGIN cannot
+                // abort that record, even after the other BEGINs answered.
+                for ([_]u64{ 7001, 7002 }) |failed_group| {
+                    var conflicting = Recorder{
+                        .failed_begin_group = failed_group,
+                        .begin_error = error.DecisionConflict,
+                        .observed_status = .pending,
+                    };
+                    try std.testing.expectError(error.CommitDecisionUnknown, executeMultiTableCommitWithOptions(
+                        std.testing.allocator,
+                        FakeCatalog.iface(),
+                        conflicting.worker(),
+                        txn_id,
+                        10_000,
+                        10_001,
+                        &.{.{ .table_name = "docs", .writes = &.{
+                            .{ .key = "doc:a", .value = "{}" },
+                            .{ .key = "doc:z", .value = "{}" },
+                        } }},
+                        .write,
+                        null,
+                        .{ .retain_terminal = true },
+                    ));
+                    try std.testing.expectEqual(@as(usize, if (failed_group == 7001) 1 else 0), conflicting.status_calls);
+                    try std.testing.expectEqual(@as(usize, 0), conflicting.prepare_calls);
+                    try std.testing.expectEqual(@as(usize, 0), conflicting.resolve_calls);
+                    try std.testing.expectEqual(@as(usize, 0), conflicting.abort_calls);
+                }
+                // Model an earlier interrupted execution with a prepared follower.
+                // Neither coordinator BEGIN failure nor a follower's explicit
+                // not-proposed result proves that old participant has no intents.
+                for ([_]u64{ 7001, 7002 }) |failed_group| {
+                    for ([_]?anyerror{ null, error.Timeout, error.TxnNotFound }) |resolve_error| {
+                        var recovery_recorder = Recorder{ .failed_begin_group = failed_group, .begin_error = error.PreDecisionNotProposed, .observed_status = .pending, .follower_resolve_error = resolve_error };
+                        const result = executeMultiTableCommitWithOptions(
+                            std.testing.allocator,
+                            FakeCatalog.iface(),
+                            recovery_recorder.worker(),
+                            @splat(7),
+                            10_000,
+                            10_001,
+                            &.{.{ .table_name = "docs", .writes = &.{ .{ .key = "doc:a", .value = "{}" }, .{ .key = "doc:z", .value = "{}" } } }},
+                            .write,
+                            null,
+                            .{ .retain_terminal = true },
+                        );
+                        if (failed_group == 7001) try std.testing.expectError(error.TransactionBeginFailed, result) else try std.testing.expect((try result) == .conflict);
+                        try std.testing.expectEqual(@as(usize, 2), recovery_recorder.resolve_calls);
+                        try std.testing.expectEqual(resolve_error == null, recovery_recorder.follower_resolved);
+                        try std.testing.expectEqual(resolve_error == null, recovery_recorder.follower_acknowledged);
+                    }
                 }
             }
         }

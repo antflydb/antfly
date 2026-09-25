@@ -64,7 +64,20 @@ pub const Outbound = struct {
             .start = start,
             .write = write,
             .close = close,
+            .constrain_timeout = constrainTimeout,
         };
+    }
+
+    fn constrainTimeout(raw: ?*anyopaque, remaining_ns: u64, sent_at_native_ns: u64) callconv(.c) abi.CallbackStatus {
+        const self: *Outbound = @ptrCast(@alignCast(raw orelse return .failed));
+        // Sample destination first: elapsed sampling/dispatch only shortens the
+        // original budget, including providers with a different clock epoch.
+        const local_now = @import("std").Io.Clock.awake.now(self.context.io).nanoseconds;
+        const native_now = @import("antfly_platform").time.monotonicNs();
+        if (sent_at_native_ns > native_now) return .failed;
+        const remaining = remaining_ns -| (native_now - sent_at_native_ns);
+        self.context.constrainStreamDeadline(local_now +| @as(i96, remaining)) catch |err| return callbackStatusAfterIo(self.context, err);
+        return .ok;
     }
 
     fn isCancelled(raw: ?*const anyopaque) callconv(.c) u8 {
@@ -140,6 +153,7 @@ pub fn installInbound(
             .start = inboundStart,
             .write = inboundWrite,
             .close = inboundClose,
+            .constrain_deadline = if (stream.constrain_timeout != null) inboundConstrainDeadline else null,
         };
     }
 }
@@ -176,6 +190,15 @@ fn inboundStart(raw: ?*anyopaque, status: u16, content_type: []const u8, headers
 fn inboundWrite(raw: ?*anyopaque, bytes: []const u8) !void {
     const stream: *const abi.StreamSink = @ptrCast(@alignCast(raw orelse return error.StreamUnavailable));
     try callbackResult(stream.write.?(stream.context, abi.Bytes.init(bytes)));
+}
+
+fn inboundConstrainDeadline(raw: ?*anyopaque, io: @import("std").Io, deadline_ns: i96) !void {
+    const stream: *const abi.StreamSink = @ptrCast(@alignCast(raw orelse return error.StreamUnavailable));
+    // Native sample precedes source clock sampling, so cross-clock conversion
+    // and archive dispatch cannot manufacture additional lifetime.
+    const sent_at = @import("antfly_platform").time.monotonicNs();
+    const remaining: u64 = @intCast(@min(@as(i96, @import("std").math.maxInt(u64)), @max(0, deadline_ns - @import("std").Io.Clock.awake.now(io).nanoseconds)));
+    try callbackResult(stream.constrain_timeout.?(stream.context, remaining, sent_at));
 }
 
 fn inboundClose(raw: ?*anyopaque) !void {
@@ -503,4 +526,23 @@ test "outbound callbacks prefer cancellation that arrives during transport IO" {
 
     cancellation.store(false, .release);
     try std.testing.expectEqual(.canceled, stream_sink.close.?(stream_sink.context));
+}
+
+test "workload admission linked stream deadlines subtract dispatch delay and never extend" {
+    const std = @import("std");
+    var request = try httpx.Request.init(std.testing.allocator, .GET, "http://localhost/scan");
+    defer request.deinit();
+    var context = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer context.deinit();
+    var outbound = Outbound{ .context = &context };
+    const sink = outbound.stream();
+    const now = @import("antfly_platform").time.monotonicNs();
+    try std.testing.expectEqual(abi.CallbackStatus.ok, sink.constrain_timeout.?(sink.context, std.time.ns_per_s, now));
+    const first = context.stream_deadline_ns.?;
+    try std.testing.expectEqual(abi.CallbackStatus.ok, sink.constrain_timeout.?(sink.context, 2 * std.time.ns_per_s, now));
+    try std.testing.expectEqual(first, context.stream_deadline_ns.?);
+    try std.testing.expectEqual(abi.CallbackStatus.failed, sink.constrain_timeout.?(sink.context, std.time.ns_per_s, std.math.maxInt(u64)));
+    try std.testing.expectEqual(first, context.stream_deadline_ns.?);
+    // An already consumed budget arrives as timeout, never a fresh duration.
+    try std.testing.expectEqual(abi.CallbackStatus.timeout, sink.constrain_timeout.?(sink.context, 0, now));
 }

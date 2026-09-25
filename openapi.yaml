@@ -14929,6 +14929,60 @@ components:
       properties:
         byte_range:
           $ref: '#/components/schemas/ByteRange'
+    TransactionRecoveryStoragePolicy:
+      type: object
+      additionalProperties: false
+      required:
+        - protocol_version
+        - max_count
+        - max_bytes
+        - max_transaction_bytes
+      description: Immutable, creation-only transaction completion policy. Enable only after every replica
+        is upgraded to support protocol version 1. Existing tables require a separate migration; this
+        setting does not fence older live peers. The node transaction completion reserve must accommodate
+        this policy.
+      properties:
+        protocol_version:
+          type: integer
+          format: uint32
+          enum:
+            - 1
+        completion_protocol_version:
+          type: integer
+          format: uint32
+          enum:
+            - 0
+            - 1
+          default: 0
+          description: Physical completion protocol. Zero retains logical recovery accounting only; version
+            1 requires reserved completion and matching profile version 1. Requires compatible metadata
+            and storage owners; no legacy prepare fallback is permitted.
+        profile_version:
+          type: integer
+          format: uint32
+          enum:
+            - 0
+            - 1
+          default: 0
+          description: Version of the bounded point-plan profile. Must be zero with completion protocol
+            zero, or one with completion protocol one.
+        max_count:
+          type: integer
+          format: uint64
+          minimum: 1
+          maximum: 65536
+        max_bytes:
+          type: integer
+          format: uint64
+          minimum: 4096
+          maximum: 1099511627776
+        max_transaction_bytes:
+          type: integer
+          format: uint64
+          minimum: 4096
+          maximum: 1099511627776
+          description: Total deterministic metadata and intent completion credits per transaction; cannot
+            exceed max_bytes.
     TableStorageSettings:
       type: object
       additionalProperties: false
@@ -14938,6 +14992,10 @@ components:
         default does not migrate data. Snapshot/backup and split operations currently reject vector_store
         tables; explicitly select primary_lsm when these operations are required.
       properties:
+        transaction_recovery:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/TransactionRecoveryStoragePolicy'
         dense_embeddings:
           type: string
           enum:
@@ -20919,13 +20977,18 @@ components:
           description: >
             Optional query execution deadline in milliseconds. The server applies this as a
 
-            cooperative deadline across query planning, search execution, aggregation reruns,
+            cooperative deadline across admission waiting, query planning, search execution, aggregation
+            reruns,
 
             sorting, and response post-processing. If the deadline expires before the query
 
             completes, the HTTP API returns 504. When omitted, semantic query embedding planning
 
             and provider I/O use a 30-second default deadline.
+
+            NDJSON batches share their submission time and use the shortest explicit timeout
+
+            in the batch. Waiting, retries, and later batch lines do not reset this budget.
           example: 5000
         order_by:
           type: array

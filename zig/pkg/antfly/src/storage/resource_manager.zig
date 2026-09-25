@@ -18,6 +18,7 @@ const platform_time = @import("antfly_platform").time;
 const shared_platform_time = @import("antfly_platform").time;
 const cache_budget = @import("../common/cache_budget.zig");
 pub const DenseWorkAdmission = @import("dense_work_admission.zig");
+pub const DenseExecution = @import("dense_execution.zig");
 const admission = @import("admission_waiter.zig");
 const dense_perf = @import("dense_perf_experiments.zig");
 pub const ProjectionPageCache = @import("projection_page_cache.zig");
@@ -768,6 +769,10 @@ const BatchReservationIdentity = struct {
 
 const ObserverIdentity = struct {
     current: u64,
+    metadata_pin_identity: u64 = 0,
+    completion_pins: usize = 0,
+    completion_reservation_identity: u64 = 0,
+    completion_published: bool = false,
 };
 
 const ObserverKey = struct {
@@ -810,17 +815,29 @@ test "dense aggregate resource manager bounds callers and helpers together" {
     manager.dense_driver_admission.capacity = 2;
     var caller = try manager.dense_driver_admission.acquire(null, null);
     defer caller.release();
-    try std.testing.expect(manager.tryAcquireDenseReadTask());
-    try std.testing.expect(!manager.tryAcquireDenseReadTask());
+    var helper = manager.tryAcquireDenseReadTask().?;
+    try std.testing.expect(manager.tryAcquireDenseReadTask() == null);
     try std.testing.expectEqual(@as(u32, 1), manager.denseReadTaskStats().active);
-    manager.releaseDenseReadTask();
-    try std.testing.expect(manager.tryAcquireDenseReadTask());
-    manager.releaseDenseReadTask();
+    helper.release();
+    helper = manager.tryAcquireDenseReadTask().?;
+    helper.release();
     caller.release();
     manager.dense_driver_admission.assertIdle();
 }
 
 pub const ResourceManager = struct {
+    /// Immutable runtime bootstrap policy. These are never request fields;
+    /// restored obligations consult authority independently from new admission.
+    durable_completion_enabled: bool = false,
+    durable_completion_authority: @import("../common/durable_completion_policy.zig").Authority = .none,
+    durable_completion_configured: bool = false,
+    transaction_completion_mutex: std.atomic.Mutex = .unlocked,
+    transaction_completion: ?struct {
+        workspace: *@import("../common/workload_completion.zig").Workspace,
+        metadata: *@import("../common/workload_completion.zig").Workspace,
+        capacity: usize,
+        host_reservation: Reservation,
+    } = null,
     dense_checkpoint_ready: @import("maintenance_signal.zig").Signal = .{},
     mutex: std.atomic.Mutex = .unlocked,
     reclaimer_mutex: std.atomic.Mutex = .unlocked,
@@ -859,6 +876,7 @@ pub const ResourceManager = struct {
     dense_read_extra_task_limit: u32 = 0,
     dense_rerank_admission: DenseWorkAdmission.Queue = .{},
     dense_driver_admission: DenseWorkAdmission.Queue = .{},
+    dense_execution: ?*DenseExecution.Runtime = null,
     dense_aggregate_admission: bool = false,
     dense_phase_admission: bool = false,
     dense_scan_prediction: bool = false,
@@ -918,6 +936,8 @@ pub const ResourceManager = struct {
     capacity_source: ?CapacitySource = null,
     identity_allocator: std.mem.Allocator,
     next_identity: u64 = 1,
+    next_observer_metadata_pin_identity: u64 = 1,
+    observer_metadata_pins: usize = 0,
     reservation_identities: IdentityLedger(u64, ReservationIdentity) = .empty,
     batch_reservation_identities: IdentityLedger(u64, BatchReservationIdentity) = .empty,
     observer_identities: IdentityLedger(ObserverKey, ObserverIdentity) = .empty,
@@ -1005,16 +1025,113 @@ pub const ResourceManager = struct {
 
     /// Optional parallelism is nonblocking. The admitted query caller always
     /// drains its queue, so no generation/scratch lease waits for more workers.
-    pub fn tryAcquireDenseReadTask(self: *ResourceManager) bool {
+    pub const DenseDriverLease = struct {
+        legacy: DenseWorkAdmission.Queue.Lease = .{},
+        scheduled: DenseExecution.Runtime.Lease = .{},
+        /// Borrowed from the synchronous outer DB read; never retired here.
+        borrowed: ?*DenseExecution.Runtime.Lease = null,
+
+        pub fn scheduledLease(self: *const @This()) ?*DenseExecution.Runtime.Lease {
+            if (self.borrowed) |lease| return lease;
+            return if (self.scheduled.runtime != null) @constCast(&self.scheduled) else null;
+        }
+
+        pub fn release(self: *@This()) void {
+            self.scheduled.release();
+            self.legacy.release();
+        }
+    };
+
+    /// Configure before publishing the manager to callers. Repeated identical
+    /// setup is harmless; changing policy on a live manager is not supported.
+    pub fn configureDenseExecution(self: *ResourceManager, config: DenseExecution.Config) !void {
+        try config.validate();
+        if (config.protected.enabled() or config.max_scan_state_bytes != 0) return error.InvalidConfig;
+        if (config.max_runnable_tasks == 0) return;
+        if (self.dense_execution) |runtime| {
+            if (runtime.scope != .dense_only or !std.meta.eql(runtime.config, config)) return error.AdmissionBusy;
+            return;
+        }
+        if (config.max_runnable_tasks != 0)
+            self.dense_execution = try DenseExecution.Runtime.create(self.identity_allocator, config);
+    }
+
+    pub fn configureReadExecution(self: *ResourceManager, config: DenseExecution.Config) !void {
+        try config.validate();
+        if (config.max_runnable_tasks == 0) return;
+        if (self.dense_execution) |runtime| {
+            if (runtime.scope != .all_reads or !std.meta.eql(runtime.config, config)) return error.AdmissionBusy;
+            return;
+        }
+        const runtime = try DenseExecution.Runtime.create(self.identity_allocator, config);
+        runtime.scope = .all_reads;
+        self.dense_execution = runtime;
+    }
+
+    pub fn acquireReadDriver(self: *ResourceManager, io: std.Io, options: @import("../common/workload_admission.zig").Options) !?DenseExecution.Runtime.Lease {
+        const runtime = self.dense_execution orelse return null;
+        if (runtime.scope != .all_reads) return null;
+        var effective = options;
+        effective.io = io;
+        return try runtime.acquire(effective);
+    }
+
+    pub fn acquireReadDriverWithState(self: *ResourceManager, io: std.Io, options: @import("../common/workload_admission.zig").Options, maximum_retained_bytes: u64) !?DenseExecution.Runtime.Lease {
+        const runtime = self.dense_execution orelse return null;
+        if (runtime.scope != .all_reads) return null;
+        var effective = options;
+        effective.io = io;
+        return try runtime.acquireWithState(effective, maximum_retained_bytes);
+    }
+
+    pub fn borrowReadDriver(self: *ResourceManager, lease: *DenseExecution.Runtime.Lease) !DenseDriverLease {
+        if (lease.runtime != self.dense_execution or lease.request == null or lease.job == null) return error.InvalidLease;
+        return .{ .borrowed = lease };
+    }
+
+    pub fn acquireDenseDriver(self: *ResourceManager, io: std.Io, cancellation: ?DenseWorkAdmission.Cancellation) !DenseDriverLease {
+        if (self.dense_execution) |runtime| return .{ .scheduled = try runtime.acquire(.{
+            .io = io,
+            .cancellation = if (cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled } else .none,
+        }) };
+        return .{ .legacy = if (self.dense_aggregate_admission) try self.dense_driver_admission.acquire(io, cancellation) else .{} };
+    }
+
+    pub fn denseExecutionStats(self: *const ResourceManager) DenseExecution.Stats {
+        return if (self.dense_execution) |runtime| runtime.stats() else .{};
+    }
+
+    pub const DenseReadTaskLease = struct {
+        manager: ?*ResourceManager = null,
+        driver: DenseDriverLease = .{},
+
+        pub fn release(self: *@This()) void {
+            const manager = self.manager orelse return;
+            self.manager = null;
+            const previous = manager.dense_read_extra_tasks.fetchSub(1, .release);
+            std.debug.assert(previous != 0);
+            self.driver.release();
+        }
+    };
+
+    pub fn tryAcquireDenseReadTask(self: *ResourceManager) ?DenseReadTaskLease {
+        var scheduled: DenseExecution.Runtime.Lease = .{};
+        if (self.dense_execution) |runtime| {
+            scheduled = runtime.tryAcquire() orelse {
+                _ = self.dense_read_denied_tasks.fetchAdd(1, .monotonic);
+                return null;
+            };
+        }
         var driver: DenseWorkAdmission.Queue.Lease = .{};
-        if (self.dense_aggregate_admission) {
+        if (self.dense_execution == null and self.dense_aggregate_admission) {
             driver = self.dense_driver_admission.tryAcquire() orelse {
                 _ = self.dense_read_denied_tasks.fetchAdd(1, .monotonic);
-                return false;
+                return null;
             };
         }
         var granted = false;
         defer if (!granted) driver.release();
+        defer if (!granted) scheduled.release();
         var active = self.dense_read_extra_tasks.load(.monotonic);
         while (active < self.dense_read_extra_task_limit) {
             if (self.dense_read_extra_tasks.cmpxchgWeak(active, active + 1, .acquire, .monotonic)) |updated| {
@@ -1022,20 +1139,11 @@ pub const ResourceManager = struct {
             } else {
                 _ = self.dense_read_peak_extra_tasks.fetchMax(active + 1, .monotonic);
                 granted = true;
-                return true;
+                return .{ .manager = self, .driver = .{ .legacy = driver, .scheduled = scheduled } };
             }
         }
         _ = self.dense_read_denied_tasks.fetchAdd(1, .monotonic);
-        return false;
-    }
-
-    pub fn releaseDenseReadTask(self: *ResourceManager) void {
-        const previous = self.dense_read_extra_tasks.fetchSub(1, .release);
-        std.debug.assert(previous != 0);
-        if (self.dense_aggregate_admission) {
-            var driver: DenseWorkAdmission.Queue.Lease = .{ .queue = &self.dense_driver_admission };
-            driver.release();
-        }
+        return null;
     }
 
     pub fn denseReadTaskStats(self: *const ResourceManager) DenseReadTaskStats {
@@ -1547,6 +1655,13 @@ pub const ResourceManager = struct {
     /// ledger. Reservation handles remain strict because they can outlive the
     /// backing allocation and must be released before their manager.
     pub fn deinit(self: *ResourceManager, alloc: std.mem.Allocator) void {
+        if (self.transaction_completion) |*completion| {
+            completion.workspace.destroy();
+            completion.metadata.destroy();
+            completion.host_reservation.release();
+            self.transaction_completion = null;
+        }
+        if (self.dense_execution) |runtime| runtime.destroy();
         self.dense_checkpoint_ready.assertUnbound();
         self.dense_rerank_admission.assertIdle();
         self.dense_driver_admission.assertIdle();
@@ -1585,6 +1700,8 @@ pub const ResourceManager = struct {
         self.reservation_identities = .empty;
         self.batch_reservation_identities.deinit(self.identity_allocator);
         self.batch_reservation_identities = .empty;
+        if (self.observer_metadata_pins != 0)
+            @panic("resource manager deinitialized with live observer metadata pins");
         self.observer_identities.deinit(self.identity_allocator);
         self.observer_identities = .empty;
     }
@@ -2118,6 +2235,58 @@ pub const ResourceManager = struct {
         };
     }
 
+    /// Configure at the manager's final address, before publishing ordinary
+    /// work. The complete allocation ceiling remains charged to aggregate host
+    /// memory; foreground work cannot spend idle completion capacity. One pool
+    /// serves every DB sharing this manager, including legacy durable replay.
+    pub fn configureTransactionCompletion(self: *ResourceManager, capacity: usize) !void {
+        if (capacity == 0) return;
+        lockAtomic(&self.transaction_completion_mutex);
+        defer self.transaction_completion_mutex.unlock();
+        if (self.transaction_completion) |completion| {
+            if (completion.capacity < capacity) return error.TransactionCompletionCapacityMismatch;
+            return;
+        }
+        const Workspace = @import("../common/workload_completion.zig").Workspace;
+        if (capacity < 2) return error.InvalidTransactionCompletionCapacity;
+        // Metadata may survive a synchronous resolver RPC. It must not own the
+        // same lane needed by that RPC's local participant row application.
+        const row_capacity = capacity / 2;
+        const metadata_capacity = capacity - row_capacity;
+        const host_bytes = try std.math.add(usize, try Workspace.hostBytes(row_capacity), try Workspace.hostBytes(metadata_capacity));
+        var reservation = try self.reserveWithoutReclaim(.relational_preparation_working_set, host_bytes);
+        errdefer reservation.release();
+        const workspace = try Workspace.create(self.identity_allocator, row_capacity);
+        errdefer workspace.destroy();
+        const metadata = try Workspace.create(self.identity_allocator, metadata_capacity);
+        self.transaction_completion = .{ .workspace = workspace, .metadata = metadata, .capacity = capacity, .host_reservation = reservation };
+    }
+
+    pub fn configureDurableCompletion(self: *ResourceManager, enabled: bool, authority: @import("../common/durable_completion_policy.zig").Authority) !void {
+        if (authority == .raft_apply) return error.InvalidConfig;
+        lockAtomic(&self.transaction_completion_mutex);
+        defer self.transaction_completion_mutex.unlock();
+        if (self.durable_completion_configured) {
+            if (self.durable_completion_enabled != enabled or self.durable_completion_authority != authority) return error.InvalidConfig;
+            return;
+        }
+        self.durable_completion_enabled = enabled;
+        self.durable_completion_authority = authority;
+        self.durable_completion_configured = true;
+    }
+
+    pub fn transactionCompletion(self: *ResourceManager) ?*@import("../common/workload_completion.zig").Workspace {
+        lockAtomic(&self.transaction_completion_mutex);
+        defer self.transaction_completion_mutex.unlock();
+        return if (self.transaction_completion) |completion| completion.workspace else null;
+    }
+
+    pub fn transactionCompletionMetadata(self: *ResourceManager) ?*@import("../common/workload_completion.zig").Workspace {
+        lockAtomic(&self.transaction_completion_mutex);
+        defer self.transaction_completion_mutex.unlock();
+        return if (self.transaction_completion) |completion| completion.metadata else null;
+    }
+
     /// Performs the final non-blocking admission check at a commit boundary.
     /// Unlike `reserve`, this never invokes reclaimers: callers may use it
     /// while holding a short mutation fence when failure still precedes WAL
@@ -2583,6 +2752,12 @@ pub const ResourceManager = struct {
             self.memory.accounting_errors +|= 1;
             return error.ResourceAccountingMismatch;
         }
+        // A completion ticket owns both its unused reservation and this
+        // observer. Generic observation cannot discard or mint that credit.
+        if (owned.completion_pins != 0 and previous != next) {
+            self.memory.accounting_errors +|= 1;
+            return error.ResourceAccountingMismatch;
+        }
 
         const state = &self.slices[sliceIndex(slice)];
         if (previous > state.used_bytes or previous > self.memory.used_bytes) {
@@ -2621,7 +2796,7 @@ pub const ResourceManager = struct {
             self.memory.soft_limit_events +|= 1;
         if (!enforce_limits and self.memory.budget.hard_limit_bytes > 0 and memory_next > self.memory.budget.hard_limit_bytes)
             self.memory.hard_limit_rejections +|= 1;
-        if (next == 0) _ = self.observer_identities.remove(key);
+        if (next == 0 and owned.completion_pins == 0 and owned.metadata_pin_identity == 0) _ = self.observer_identities.remove(key);
         self.pressure_change.advance();
     }
 
@@ -2723,6 +2898,7 @@ pub const ResourceManager = struct {
                 self.memory.accounting_errors +|= 1;
                 return error.ResourceAccountingMismatch;
             }
+            if (owned.completion_pins != 0) return error.ResourceAccountingMismatch;
             break :blk owned.current;
         } else blk: {
             if (destination.* != 0) {
@@ -2731,6 +2907,7 @@ pub const ResourceManager = struct {
             }
             break :blk 0;
         };
+        if (source_owned.completion_pins != 0) return error.ResourceAccountingMismatch;
 
         var inserted_destination = false;
         if (destination_previous == 0 and destination_next != 0 and
@@ -2769,12 +2946,14 @@ pub const ResourceManager = struct {
             return error.ResourceBudgetExceeded;
         }
 
-        if (source_next == 0) {
+        if (source_next == 0 and source_owned.metadata_pin_identity == 0) {
             _ = self.observer_identities.remove(source_key);
         } else {
             self.observer_identities.getPtr(source_key).?.current = source_next;
         }
-        if (destination_next == 0) {
+        if (destination_next == 0 and
+            (self.observer_identities.get(destination_key) orelse ObserverIdentity{ .current = 0 }).metadata_pin_identity == 0)
+        {
             _ = self.observer_identities.remove(destination_key);
         } else {
             self.observer_identities.getPtr(destination_key).?.current = destination_next;
@@ -2797,6 +2976,36 @@ pub const ResourceManager = struct {
         defer self.mutex.unlock();
         try self.reconcileUsageLocked(slice, @intFromPtr(current), current.*, next, true);
         current.* = next;
+    }
+
+    /// Prepare the bookkeeping for a stable-address observer before a sealed
+    /// operation. This owns metadata only: it grants no usage/admission credit.
+    /// Exactly one pin may live on an observer; generic accounting may still
+    /// change its usage, including through zero, without allocating its entry.
+    pub fn pinObserverMetadata(self: *ResourceManager, slice: Slice, current: *u64) !ObserverMetadataPin {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.next_observer_metadata_pin_identity == std.math.maxInt(u64))
+            return error.ObserverMetadataIdentityExhausted;
+        const key = ObserverKey{ .slice = slice, .identity = @intFromPtr(current) };
+        const existing = self.observer_identities.get(key);
+        if (existing) |owned| {
+            if (owned.current != current.* or owned.completion_pins != 0) {
+                self.memory.accounting_errors +|= 1;
+                return error.ResourceAccountingMismatch;
+            }
+            if (owned.metadata_pin_identity != 0) return error.ObserverMetadataAlreadyPinned;
+        } else if (current.* != 0) {
+            self.memory.accounting_errors +|= 1;
+            return error.ResourceAccountingMismatch;
+        }
+        const entry = try self.observer_identities.getOrPut(self.identity_allocator, key);
+        if (!entry.found_existing) entry.value_ptr.* = .{ .current = 0 };
+        const identity = self.next_observer_metadata_pin_identity;
+        self.next_observer_metadata_pin_identity += 1;
+        entry.value_ptr.metadata_pin_identity = identity;
+        self.observer_metadata_pins += 1;
+        return .{ .manager = self, .slice = slice, .current = current, .identity = identity };
     }
 
     pub fn observeUsage(self: *ResourceManager, slice: Slice, current: *u64, next: u64) void {
@@ -3262,6 +3471,299 @@ fn hbcClockEntries(budget_bytes: u64, estimated_entry_bytes: u64) usize {
     return @intCast(entries);
 }
 
+/// Exclusive metadata lifetime for an ordinary observer. The manager and
+/// counter must outlive this pin. Copies do not acquire ownership: canonical
+/// generations reject stale releases even if the observer address is reused.
+pub const ObserverMetadataPin = struct {
+    manager: *ResourceManager,
+    slice: Slice,
+    current: *u64,
+    identity: u64,
+
+    pub fn release(self: *ObserverMetadataPin) !void {
+        const manager = self.manager;
+        lockAtomic(&manager.mutex);
+        defer manager.mutex.unlock();
+        const key = ObserverKey{ .slice = self.slice, .identity = @intFromPtr(self.current) };
+        const owned = manager.observer_identities.getPtr(key) orelse {
+            manager.memory.accounting_errors +|= 1;
+            return error.ResourceAccountingMismatch;
+        };
+        if (self.identity == 0 or owned.metadata_pin_identity != self.identity or
+            owned.current != self.current.* or owned.completion_pins != 0)
+        {
+            manager.memory.accounting_errors +|= 1;
+            return error.ResourceAccountingMismatch;
+        }
+        owned.metadata_pin_identity = 0;
+        manager.observer_metadata_pins -= 1;
+        if (owned.current == 0) _ = manager.observer_identities.remove(key);
+        self.identity = 0;
+    }
+};
+
+/// Prepaid ownership for one completion allocation/publication lifetime.
+/// The manager and tracked counter must remain at stable addresses, and the
+/// caller serializes this move-only ticket with its publication/reclamation.
+/// While the ticket is live, the counter is exclusively updated through it.
+/// This is an accounting primitive, not evidence that physical buffers were
+/// freed, a durable transaction ticket, or permission to bypass backend limits.
+pub const CompletionCredit = struct {
+    reservation: Reservation,
+    tracked: *u64,
+    staged: u64 = 0,
+    closed: bool = false,
+
+    pub fn init(manager: *ResourceManager, slice: Slice, capacity: u64, tracked: *u64) !CompletionCredit {
+        var reservation = try manager.reserveWithoutReclaim(slice, capacity);
+        errdefer reservation.release();
+        lockAtomic(&manager.mutex);
+        defer manager.mutex.unlock();
+        if (tracked.* != 0) return error.ResourceAccountingMismatch;
+        const key = ObserverKey{ .slice = slice, .identity = @intFromPtr(tracked) };
+        if (manager.observer_identities.contains(key)) return error.ResourceAccountingMismatch;
+        _ = try manager.reservationIdentityLocked(&reservation);
+        // Register before allocation/publication. All subsequent ownership
+        // transfers are allocation-free, including at an aggregate hard cap.
+        try manager.observer_identities.put(manager.identity_allocator, key, .{
+            .current = 0,
+            .completion_pins = 1,
+            .completion_reservation_identity = reservation.identity,
+        });
+        return .{ .reservation = reservation, .tracked = tracked };
+    }
+
+    /// Call before allocating bytes. Allocation failure must rollback only
+    /// after the allocator has freed every partial allocation in that charge.
+    pub fn stage(self: *CompletionCredit, bytes: u64) !void {
+        if (self.closed) return error.ReservationReleased;
+        try self.move(bytes, true, false);
+    }
+
+    pub fn rollback(self: *CompletionCredit, bytes: u64) !void {
+        if (self.closed) return error.ReservationReleased;
+        try self.move(bytes, false, false);
+    }
+
+    /// No allocation or accounting mutation occurs at the irreversible boundary.
+    pub fn markPublished(self: *CompletionCredit) !void {
+        if (self.closed) return error.ReservationReleased;
+        const manager = self.reservation.manager;
+        lockAtomic(&manager.mutex);
+        defer manager.mutex.unlock();
+        const key = ObserverKey{ .slice = self.reservation.slice, .identity = @intFromPtr(self.tracked) };
+        const observer = manager.observer_identities.getPtr(key) orelse return error.ResourceAccountingMismatch;
+        if (observer.completion_reservation_identity != self.reservation.identity or
+            observer.completion_pins != 1 or observer.current != self.staged or observer.current != self.tracked.*)
+            return error.ResourceAccountingMismatch;
+        if (observer.completion_published) return error.CompletionAlreadyPublished;
+        // Canonical state lives with the pinned observer, not in a copyable
+        // ticket value. A stale pre-publication alias cannot restore credit.
+        observer.completion_published = true;
+    }
+
+    /// Call only after physical reclamation, including the final reader pin.
+    /// Request return, cancellation, WAL append, and flush alone are not proof.
+    pub fn reclaim(self: *CompletionCredit, bytes: u64) !void {
+        if (self.closed) return error.ReservationReleased;
+        try self.move(bytes, false, true);
+    }
+
+    /// Release unused credit while retaining every live allocation charge.
+    pub fn releaseUnused(self: *CompletionCredit) void {
+        if (self.closed) return;
+        self.reservation.shrink(self.reservation.bytes);
+    }
+
+    pub fn deinit(self: *CompletionCredit) !void {
+        if (self.closed) return;
+        if (self.staged != 0) return error.CompletionOwnershipLive;
+        const manager = self.reservation.manager;
+        {
+            lockAtomic(&manager.mutex);
+            defer manager.mutex.unlock();
+            const key = ObserverKey{ .slice = self.reservation.slice, .identity = @intFromPtr(self.tracked) };
+            const observer = manager.observer_identities.get(key) orelse return error.ResourceAccountingMismatch;
+            if (observer.completion_reservation_identity != self.reservation.identity) return error.ResourceAccountingMismatch;
+            const reservation = manager.reservation_identities.get(self.reservation.identity) orelse return error.ReservationReleased;
+            if (observer.current != 0 or observer.completion_pins != 1 or self.tracked.* != 0 or
+                reservation.bytes != self.reservation.bytes or reservation.slice != self.reservation.slice)
+                return error.ResourceAccountingMismatch;
+            _ = manager.observer_identities.remove(key);
+        }
+        self.reservation.release();
+        self.closed = true;
+    }
+
+    fn move(self: *CompletionCredit, bytes: u64, into_observer: bool, reclamation: bool) !void {
+        const manager = self.reservation.manager;
+        lockAtomic(&manager.mutex);
+        defer manager.mutex.unlock();
+        const reservation = manager.reservation_identities.getPtr(self.reservation.identity) orelse return error.ReservationReleased;
+        const key = ObserverKey{ .slice = self.reservation.slice, .identity = @intFromPtr(self.tracked) };
+        const observer = manager.observer_identities.getPtr(key) orelse return error.ResourceAccountingMismatch;
+        if (observer.completion_reservation_identity != self.reservation.identity) return error.ResourceAccountingMismatch;
+        if (observer.completion_published and !reclamation) return error.CompletionAlreadyPublished;
+        if (reservation.slice != self.reservation.slice or reservation.bytes != self.reservation.bytes or
+            observer.current != self.tracked.* or observer.current != self.staged or observer.completion_pins != 1)
+            return error.ResourceAccountingMismatch;
+        if (into_observer) {
+            if (bytes > reservation.bytes) return error.ResourceBudgetExceeded;
+            const next = std.math.add(u64, observer.current, bytes) catch return error.ResourceAccountingMismatch;
+            reservation.bytes -= bytes;
+            observer.current = next;
+        } else {
+            if (bytes > observer.current) return error.ResourceAccountingMismatch;
+            const next = std.math.add(u64, reservation.bytes, bytes) catch return error.ResourceAccountingMismatch;
+            observer.current -= bytes;
+            reservation.bytes = next;
+        }
+        self.reservation.bytes = reservation.bytes;
+        self.tracked.* = observer.current;
+        self.staged = observer.current;
+        // Ownership changes under the same accounting lock. Slice and host
+        // totals (and peaks) never change, even with subsequently reduced caps.
+    }
+};
+
+test "workload admission completion credit never exposes capacity during concurrent handoff" {
+    var manager = ResourceManager.init(.{ .identity_allocator = std.testing.allocator, .memory_budget = .{ .hard_limit_bytes = 100 } });
+    defer manager.deinit(std.testing.allocator);
+    var tracked: u64 = 0;
+    var credit = try CompletionCredit.init(&manager, .lsm_in_memory_state, 100, &tracked);
+    defer credit.deinit() catch unreachable;
+    const Probe = struct {
+        fn run(rm: *ResourceManager, bad: *std.atomic.Value(bool)) void {
+            for (0..2000) |_| {
+                if (rm.reserveWithoutReclaim(.lsm_in_memory_state, 1)) |held| {
+                    var owned = held;
+                    owned.release();
+                    bad.store(true, .release);
+                } else |err| {
+                    if (err != error.ResourceBudgetExceeded) bad.store(true, .release);
+                }
+                if (rm.snapshot().memory.used_bytes != 100) bad.store(true, .release);
+            }
+        }
+    };
+    var bad = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, Probe.run, .{ &manager, &bad });
+    for (0..2000) |_| {
+        try credit.stage(64);
+        try credit.rollback(64);
+    }
+    thread.join();
+    try std.testing.expect(!bad.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 100), manager.snapshot().memory.peak_bytes);
+}
+
+test "workload admission completion credit preserves published pinned ownership" {
+    const alloc = std.testing.allocator;
+    var manager = ResourceManager.init(.{ .identity_allocator = alloc, .memory_budget = .{ .hard_limit_bytes = 100 } });
+    defer manager.deinit(alloc);
+    var tracked: u64 = 0;
+    var credit = try CompletionCredit.init(&manager, .lsm_in_memory_state, 100, &tracked);
+    try credit.stage(64);
+    const retained = try alloc.alloc(u8, 64);
+    try credit.markPublished();
+    credit.releaseUnused();
+    try std.testing.expectEqual(@as(u64, 64), manager.snapshot().memory.used_bytes);
+    try std.testing.expectError(error.CompletionAlreadyPublished, credit.rollback(64));
+    try std.testing.expectError(error.CompletionOwnershipLive, credit.deinit());
+    try std.testing.expect(!manager.tryObserveUsage(.lsm_in_memory_state, &tracked, 0));
+    try std.testing.expectEqual(@as(u64, 64), tracked);
+    try std.testing.expectEqual(@as(u64, 64), manager.snapshot().memory.used_bytes);
+    // A surviving reader still owns the allocation after the submitting
+    // request releases unused credit. Only its final free permits retirement.
+    @memset(retained, 7);
+    try std.testing.expectEqual(@as(u8, 7), retained[63]);
+    alloc.free(retained);
+    try credit.reclaim(64);
+    try std.testing.expectEqual(@as(u64, 64), manager.snapshot().memory.used_bytes);
+    try credit.deinit();
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+}
+
+test "workload admission completion credit transfers survive reduced limits without allocation" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var manager = ResourceManager.init(.{ .identity_allocator = failing.allocator(), .memory_budget = .{ .hard_limit_bytes = 100 } });
+    defer manager.deinit(std.testing.allocator);
+    var tracked: u64 = 0;
+    var credit = try CompletionCredit.init(&manager, .lsm_in_memory_state, 100, &tracked);
+    defer credit.deinit() catch unreachable;
+    failing.fail_index = failing.alloc_index;
+    manager.memory.budget.hard_limit_bytes = 1;
+    manager.slices[sliceIndex(.lsm_in_memory_state)].budget.hard_limit_bytes = 1;
+    try credit.stage(100);
+    try std.testing.expectError(error.ResourceBudgetExceeded, credit.stage(1));
+    try credit.rollback(100);
+    try credit.stage(100);
+    try credit.markPublished();
+    try credit.reclaim(100);
+    try std.testing.expectEqual(@as(u64, 100), manager.snapshot().memory.used_bytes);
+    try std.testing.expect(!failing.has_induced_failure);
+}
+
+test "workload admission completion credit stale alias cannot roll back published ownership" {
+    var manager = ResourceManager.init(.{ .identity_allocator = std.testing.allocator, .memory_budget = .{ .hard_limit_bytes = 100 } });
+    defer manager.deinit(std.testing.allocator);
+    var tracked: u64 = 0;
+    var credit = try CompletionCredit.init(&manager, .lsm_in_memory_state, 100, &tracked);
+    var before_stage = credit;
+    try credit.stage(64);
+    var before_publish = credit;
+    try credit.markPublished();
+    try std.testing.expectError(error.CompletionAlreadyPublished, before_publish.rollback(64));
+    try std.testing.expectError(error.CompletionAlreadyPublished, before_publish.stage(1));
+    try std.testing.expectError(error.CompletionAlreadyPublished, before_publish.markPublished());
+    try std.testing.expectError(error.CompletionAlreadyPublished, before_stage.rollback(0));
+    try std.testing.expectError(error.ResourceAccountingMismatch, before_stage.deinit());
+    try std.testing.expectEqual(@as(u64, 64), tracked);
+    try std.testing.expectEqual(@as(u64, 100), manager.snapshot().memory.used_bytes);
+    try credit.reclaim(64);
+    try credit.deinit();
+    // Reusing the same counter address must not authorize an older ticket.
+    var next = try CompletionCredit.init(&manager, .lsm_in_memory_state, 100, &tracked);
+    defer next.deinit() catch unreachable;
+    try std.testing.expectError(error.ResourceAccountingMismatch, before_stage.markPublished());
+    try std.testing.expectError(error.ResourceAccountingMismatch, before_stage.deinit());
+    try next.stage(1);
+    try next.rollback(1);
+}
+
+test "workload admission completion credit rolls back actual backing allocation failure" {
+    var manager = ResourceManager.init(.{ .identity_allocator = std.testing.allocator, .memory_budget = .{ .hard_limit_bytes = 100 } });
+    defer manager.deinit(std.testing.allocator);
+    var tracked: u64 = 0;
+    var credit = try CompletionCredit.init(&manager, .lsm_in_memory_state, 100, &tracked);
+    defer credit.deinit() catch unreachable;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try credit.stage(64);
+    try std.testing.expectError(error.OutOfMemory, failing.allocator().alloc(u8, 64));
+    try credit.rollback(64);
+    try std.testing.expectEqual(@as(u64, 0), tracked);
+    try std.testing.expectEqual(@as(u64, 100), credit.reservation.reservedBytes());
+    try std.testing.expectEqual(@as(u64, 100), manager.snapshot().memory.used_bytes);
+}
+
+test "workload admission completion credit initialization failure leaves no charge" {
+    const Fixture = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var manager = ResourceManager.init(.{ .identity_allocator = alloc, .memory_budget = .{ .hard_limit_bytes = 100 } });
+            defer manager.deinit(alloc);
+            var tracked: u64 = 0;
+            var credit = CompletionCredit.init(&manager, .lsm_in_memory_state, 100, &tracked) catch |err| {
+                try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+                return err;
+            };
+            try credit.stage(100);
+            try credit.rollback(100);
+            try credit.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
 pub const Reservation = struct {
     manager: *ResourceManager,
     identity: u64,
@@ -3332,6 +3834,36 @@ pub const OwnedSplitReservation = struct {
         self.secondary_bytes = 0;
     }
 };
+
+test "workload admission node completion pool owns host capacity before data saturation" {
+    const Workspace = @import("../common/workload_completion.zig").Workspace;
+    const capacity = 1024;
+    const reserved = 2 * try Workspace.hostBytes(capacity / 2);
+    var manager = ResourceManager.init(.{
+        .identity_allocator = std.testing.allocator,
+        .memory_budget = .{ .hard_limit_bytes = reserved + 4096 },
+    });
+    defer manager.deinit(std.testing.allocator);
+    try manager.configureTransactionCompletion(capacity);
+    const workspace = manager.transactionCompletion().?;
+    try manager.configureTransactionCompletion(capacity);
+    try std.testing.expect(workspace == manager.transactionCompletion().?);
+    try std.testing.expectEqual(@as(u64, reserved), manager.snapshot().memory.used_bytes);
+    var data = try manager.reserveWithoutReclaim(.relational_preparation_working_set, 4096);
+    defer data.release();
+    try std.testing.expectError(error.ResourceBudgetExceeded, manager.reserveWithoutReclaim(.relational_preparation_working_set, 1));
+    var completion = try workspace.tryAcquire();
+    defer completion.release();
+    var metadata = try manager.transactionCompletionMetadata().?.tryAcquire();
+    defer metadata.release();
+    const metadata_payload = try metadata.allocator().alloc(u8, capacity / 2);
+    metadata.allocator().free(metadata_payload);
+    const payload = try completion.allocator().alloc(u8, capacity / 2);
+    completion.allocator().free(payload);
+    try std.testing.expectEqual(@as(u64, reserved + 4096), manager.snapshot().memory.used_bytes);
+    try std.testing.expectError(error.TransactionCompletionBusy, workspace.tryAcquire());
+    try std.testing.expectError(error.TransactionCompletionCapacityMismatch, manager.configureTransactionCompletion(capacity + 1));
+}
 
 /// Accounts allocator-backed working sets before each allocation reaches the
 /// backing allocator. One operation may make bounded progress above the normal
@@ -5595,4 +6127,99 @@ test "resource manager records index repair activation pause separately from cle
     try std.testing.expectEqual(@as(u64, 30 * std.time.ns_per_ms), stats.last_pause_ns);
     try std.testing.expectEqual(@as(u64, 30 * std.time.ns_per_ms), stats.max_pause_ns);
     try std.testing.expectEqual(@as(u64, 25 * std.time.ns_per_ms), stats.last_budget_ns);
+}
+
+test "workload admission observer metadata pin admits bookkeeping before allocation-free zero transitions" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var manager = ResourceManager.init(.{ .identity_allocator = failing.allocator(), .memory_budget = .{ .hard_limit_bytes = 32 } });
+    defer manager.deinit(std.testing.allocator);
+    var current: u64 = 0;
+    var pin = try manager.pinObserverMetadata(.lsm_in_memory_state, &current);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+    try std.testing.expectError(error.ObserverMetadataAlreadyPinned, manager.pinObserverMetadata(.lsm_in_memory_state, &current));
+    failing.fail_index = failing.alloc_index;
+    try manager.adjustUsage(.lsm_in_memory_state, &current, 32);
+    try std.testing.expectError(error.ResourceBudgetExceeded, manager.adjustUsage(.lsm_in_memory_state, &current, 33));
+    try manager.adjustUsage(.lsm_in_memory_state, &current, 0);
+    try manager.adjustUsage(.lsm_in_memory_state, &current, 16);
+    manager.memory.budget.hard_limit_bytes = 1;
+    manager.observeUsage(.lsm_in_memory_state, &current, 8);
+    manager.observeUsage(.lsm_in_memory_state, &current, 0);
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 1), manager.observer_identities.count());
+    try pin.release();
+    try std.testing.expectEqual(@as(usize, 0), manager.observer_identities.count());
+}
+
+test "workload admission observer metadata pin canonical generation rejects copied stale release and completion owner" {
+    var manager = ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
+    defer manager.deinit(std.testing.allocator);
+    var current: u64 = 0;
+    var pin = try manager.pinObserverMetadata(.lsm_in_memory_state, &current);
+    try std.testing.expectError(error.ResourceAccountingMismatch, CompletionCredit.init(&manager, .lsm_in_memory_state, 16, &current));
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(usize, 0), manager.reservation_identities.count());
+    var stale = pin;
+    try pin.release();
+    var replacement = try manager.pinObserverMetadata(.lsm_in_memory_state, &current);
+    try std.testing.expectError(error.ResourceAccountingMismatch, stale.release());
+    try std.testing.expectEqual(@as(usize, 1), manager.observer_metadata_pins);
+    try manager.adjustUsage(.lsm_in_memory_state, &current, 8);
+    try replacement.release();
+    try std.testing.expectEqual(@as(u64, 8), current);
+    manager.observeUsage(.lsm_in_memory_state, &current, 0);
+    var credit = try CompletionCredit.init(&manager, .lsm_in_memory_state, 16, &current);
+    try std.testing.expectError(error.ResourceAccountingMismatch, manager.pinObserverMetadata(.lsm_in_memory_state, &current));
+    try credit.deinit();
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+}
+
+test "workload admission observer metadata pin preserves atomic transfer endpoints without post-seal allocation" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var manager = ResourceManager.init(.{ .identity_allocator = failing.allocator(), .memory_budget = .{ .hard_limit_bytes = 32 } });
+    defer manager.deinit(std.testing.allocator);
+    var source: u64 = 0;
+    var destination: u64 = 0;
+    var source_pin = try manager.pinObserverMetadata(.lsm_wal_retention, &source);
+    defer source_pin.release() catch unreachable;
+    var destination_pin = try manager.pinObserverMetadata(.lsm_wal_retention, &destination);
+    defer destination_pin.release() catch unreachable;
+    try manager.adjustUsage(.lsm_wal_retention, &source, 32);
+    manager.memory.budget.hard_limit_bytes = 1;
+    failing.fail_index = failing.alloc_index;
+    try manager.transferUsage(.lsm_wal_retention, &source, 0, &destination, 32);
+    try std.testing.expectEqual(@as(u64, 32), manager.snapshot().memory.used_bytes);
+    try manager.transferUsage(.lsm_wal_retention, &destination, 0, &source, 32);
+    manager.observeUsage(.lsm_wal_retention, &source, 0);
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 2), manager.observer_identities.count());
+}
+
+test "workload admission observer metadata pin allocation failure rolls back bookkeeping and identity exhaustion fails closed" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var manager = ResourceManager.init(.{ .identity_allocator = failing.allocator() });
+    defer manager.deinit(std.testing.allocator);
+    var current: u64 = 0;
+    try std.testing.expectError(error.OutOfMemory, manager.pinObserverMetadata(.lsm_wal_retention, &current));
+    try std.testing.expectEqual(@as(usize, 0), manager.observer_metadata_pins);
+    try std.testing.expectEqual(@as(usize, 0), manager.observer_identities.count());
+    failing.fail_index = std.math.maxInt(usize);
+    manager.next_observer_metadata_pin_identity = std.math.maxInt(u64);
+    try std.testing.expectError(error.ObserverMetadataIdentityExhausted, manager.pinObserverMetadata(.lsm_wal_retention, &current));
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+}
+
+test "workload admission durable completion bootstrap is immutable and recovery authority survives disabled admission" {
+    var manager = ResourceManager.init(.{});
+    defer manager.deinit(std.testing.allocator);
+    try manager.configureDurableCompletion(false, .standalone_local);
+    try manager.configureDurableCompletion(false, .standalone_local);
+    try std.testing.expect(!manager.durable_completion_enabled);
+    try std.testing.expectEqual(@import("../common/durable_completion_policy.zig").Authority.standalone_local, manager.durable_completion_authority);
+    try std.testing.expectError(error.InvalidConfig, manager.configureDurableCompletion(true, .standalone_local));
+    try std.testing.expectError(error.InvalidConfig, manager.configureDurableCompletion(false, .none));
+    var untrusted = ResourceManager.init(.{});
+    defer untrusted.deinit(std.testing.allocator);
+    try std.testing.expectError(error.InvalidConfig, untrusted.configureDurableCompletion(true, .raft_apply));
+    try std.testing.expect(!untrusted.durable_completion_configured);
 }

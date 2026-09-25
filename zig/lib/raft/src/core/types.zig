@@ -301,11 +301,18 @@ pub const ConfState = struct {
     auto_leave: bool = false,
 
     pub fn clone(self: ConfState, alloc: Allocator) !ConfState {
+        const voters = try alloc.dupe(NodeId, self.voters);
+        errdefer alloc.free(voters);
+        const voters_outgoing = try alloc.dupe(NodeId, self.voters_outgoing);
+        errdefer alloc.free(voters_outgoing);
+        const learners = try alloc.dupe(NodeId, self.learners);
+        errdefer alloc.free(learners);
+        const learners_next = try alloc.dupe(NodeId, self.learners_next);
         return .{
-            .voters = try alloc.dupe(NodeId, self.voters),
-            .voters_outgoing = try alloc.dupe(NodeId, self.voters_outgoing),
-            .learners = try alloc.dupe(NodeId, self.learners),
-            .learners_next = try alloc.dupe(NodeId, self.learners_next),
+            .voters = voters,
+            .voters_outgoing = voters_outgoing,
+            .learners = learners,
+            .learners_next = learners_next,
             .auto_leave = self.auto_leave,
         };
     }

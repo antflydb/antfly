@@ -473,11 +473,17 @@ pub const Config = struct {
     /// runtimes use this for lifecycle locks and durable metadata without
     /// acquiring a worker executor. It must outlive the runtime.
     filesystem_io: ?Io = null,
+    /// Test-only borrowed descriptor domain. Production always uses the
+    /// process-wide pool; a fixture may isolate a small capacity without
+    /// changing global admission for other runtimes. The caller must destroy
+    /// this pool only after the runtime and all native storage owners close.
+    test_native_storage_pool: ?*storage_io.NativeStoragePool = null,
 };
 
 pub const BorrowedIo = struct {
     general: Io,
     request_forward: ?Io = null,
+    metadata_http: ?Io = null,
     raft_inbound: ?Io = null,
     raft_outbound: ?Io = null,
     api: ?Io = null,
@@ -959,6 +965,7 @@ pub const BackendRuntime = struct {
     retired_generation_cleanup_owner_id: u64,
     owner_registry: *OwnerRegistry,
     native_storage_pool: *storage_io.NativeStoragePool,
+    owns_native_storage_pool: bool,
     borrowed_storage: ?storage_io.IoStorage = null,
     lsm_owner_clone_registry: LsmOwnerCloneRegistry,
     borrowed_filesystem_io: ?Io = null,
@@ -978,6 +985,10 @@ pub const BackendRuntime = struct {
     raft_outbound_io_impl: std.atomic.Value(?*IoImpl) = .init(null),
     request_forward_io_impl: std.atomic.Value(?*IoImpl) = .init(null),
     request_forward_lane_gate: LaneLeaseGate = .{},
+    raft_request_forward_io_impl: std.atomic.Value(?*IoImpl) = .init(null),
+    raft_request_forward_lane_gate: LaneLeaseGate = .{},
+    metadata_http_io_impl: std.atomic.Value(?*IoImpl) = .init(null),
+    metadata_http_lane_gate: LaneLeaseGate = .{},
     api_io_impl: std.atomic.Value(?*IoImpl) = .init(null),
     inference_io_impl: std.atomic.Value(?*IoImpl) = .init(null),
     pdf_render_executor: std.atomic.Value(?*bounded_worker_lane.Executor) = .init(null),
@@ -1003,6 +1014,8 @@ pub const BackendRuntime = struct {
     control_lane_acquisitions_total: std.atomic.Value(u64) = .init(0),
     control_lane_rejections_total: std.atomic.Value(u64) = .init(0),
     threaded_jobs: ?*ThreadedDurableJobLane = null,
+    commit_jobs_io_impl: ?*IoImpl = null,
+    cleanup_jobs_io_impl: ?*IoImpl = null,
     durable_jobs: DurableJobLane,
     db_open_configurator: ?DbOpenConfigurator = null,
 
@@ -1011,6 +1024,8 @@ pub const BackendRuntime = struct {
         try config.lane_limits.validate();
         if (config.borrowed_io != null and config.backend != .manual)
             return error.BorrowedIoRequiresManualBackend;
+        if (!builtin.is_test and config.test_native_storage_pool != null)
+            return error.TestOnlyNativeStoragePool;
 
         const owner_registry = try alloc.create(OwnerRegistry);
         errdefer alloc.destroy(owner_registry);
@@ -1020,10 +1035,11 @@ pub const BackendRuntime = struct {
         const retired_generation_cleanup_owner_id: u64 = 1;
         try owner_registry.register(retired_generation_cleanup_owner_id);
 
-        const native_storage_pool = try alloc.create(storage_io.NativeStoragePool);
-        errdefer alloc.destroy(native_storage_pool);
-        native_storage_pool.* = storage_io.NativeStoragePool.init(alloc);
-        errdefer native_storage_pool.deinit();
+        const owns_native_storage_pool = config.test_native_storage_pool == null;
+        const native_storage_pool = config.test_native_storage_pool orelse try alloc.create(storage_io.NativeStoragePool);
+        errdefer if (owns_native_storage_pool) alloc.destroy(native_storage_pool);
+        if (owns_native_storage_pool) native_storage_pool.* = storage_io.NativeStoragePool.init(alloc);
+        errdefer if (owns_native_storage_pool) native_storage_pool.deinit();
 
         var runtime = BackendRuntime{
             .alloc = alloc,
@@ -1033,6 +1049,7 @@ pub const BackendRuntime = struct {
             .retired_generation_cleanup_owner_id = retired_generation_cleanup_owner_id,
             .owner_registry = owner_registry,
             .native_storage_pool = native_storage_pool,
+            .owns_native_storage_pool = owns_native_storage_pool,
             .lsm_owner_clone_registry = LsmOwnerCloneRegistry.init(alloc),
             .borrowed_filesystem_io = config.filesystem_io,
             .durable_jobs = undefined,
@@ -1047,15 +1064,21 @@ pub const BackendRuntime = struct {
             } else {
                 const io_impl = try initIoLane(alloc, config.lane_limits.durable_background);
                 errdefer deinitIoLane(alloc, io_impl);
+                const commit_io_impl = try initIoLane(alloc, config.lane_limits.durable_commit);
+                errdefer deinitIoLane(alloc, commit_io_impl);
+                const cleanup_io_impl = try initIoLane(alloc, config.lane_limits.durable_cleanup);
+                errdefer deinitIoLane(alloc, cleanup_io_impl);
                 const threaded_network_io_vtable = try threaded_connect_io.createVTable(alloc, io_impl);
                 errdefer alloc.destroy(threaded_network_io_vtable);
                 const threaded_jobs = try alloc.create(ThreadedDurableJobLane);
                 errdefer alloc.destroy(threaded_jobs);
-                threaded_jobs.* = ThreadedDurableJobLane.init(alloc, io_impl, owner_registry);
+                threaded_jobs.* = ThreadedDurableJobLane.init(alloc, io_impl, commit_io_impl, cleanup_io_impl, owner_registry);
                 try threaded_jobs.start();
                 errdefer threaded_jobs.deinit();
 
                 runtime.io_impl = io_impl;
+                runtime.commit_jobs_io_impl = commit_io_impl;
+                runtime.cleanup_jobs_io_impl = cleanup_io_impl;
                 runtime.threaded_network_io_vtable = threaded_network_io_vtable;
                 runtime.threaded_jobs = threaded_jobs;
                 runtime.durable_jobs = threaded_jobs.lane();
@@ -1099,12 +1122,16 @@ pub const BackendRuntime = struct {
         const coordinator_io = self.io();
         self.worker_lane_gate.close();
         self.request_forward_lane_gate.close();
+        self.raft_request_forward_lane_gate.close();
+        self.metadata_http_lane_gate.close();
         self.api_lane_gate.close();
         self.inference_lane_gate.close();
         self.pdf_render_lane_gate.close();
         self.control_lane_gate.close();
         self.worker_lane_gate.waitDrained(coordinator_io);
         self.request_forward_lane_gate.waitDrained(coordinator_io);
+        self.raft_request_forward_lane_gate.waitDrained(coordinator_io);
+        self.metadata_http_lane_gate.waitDrained(coordinator_io);
         self.api_lane_gate.waitDrained(coordinator_io);
         self.inference_lane_gate.waitDrained(coordinator_io);
         self.pdf_render_lane_gate.waitDrained(coordinator_io);
@@ -1114,6 +1141,14 @@ pub const BackendRuntime = struct {
             jobs.deinit();
             self.alloc.destroy(jobs);
             self.threaded_jobs = null;
+        }
+        if (self.commit_jobs_io_impl) |io_impl| {
+            deinitIoLane(self.alloc, io_impl);
+            self.commit_jobs_io_impl = null;
+        }
+        if (self.cleanup_jobs_io_impl) |io_impl| {
+            deinitIoLane(self.alloc, io_impl);
+            self.cleanup_jobs_io_impl = null;
         }
         if (self.api_io_impl.swap(null, .acq_rel)) |io_impl| {
             deinitIoLane(self.alloc, io_impl);
@@ -1133,6 +1168,12 @@ pub const BackendRuntime = struct {
         if (self.request_forward_io_impl.swap(null, .acq_rel)) |io_impl| {
             deinitIoLane(self.alloc, io_impl);
         }
+        if (self.raft_request_forward_io_impl.swap(null, .acq_rel)) |io_impl| {
+            deinitIoLane(self.alloc, io_impl);
+        }
+        if (self.metadata_http_io_impl.swap(null, .acq_rel)) |io_impl| {
+            deinitIoLane(self.alloc, io_impl);
+        }
         if (self.raft_inbound_io_impl.swap(null, .acq_rel)) |io_impl| {
             deinitIoLane(self.alloc, io_impl);
         }
@@ -1144,8 +1185,10 @@ pub const BackendRuntime = struct {
             self.alloc.destroy(vtable);
             self.threaded_network_io_vtable = null;
         }
-        self.native_storage_pool.deinit();
-        self.alloc.destroy(self.native_storage_pool);
+        if (self.owns_native_storage_pool) {
+            self.native_storage_pool.deinit();
+            self.alloc.destroy(self.native_storage_pool);
+        }
         self.lsm_owner_clone_registry.deinit();
         self.owner_registry.deinit();
         self.alloc.destroy(self.owner_registry);
@@ -1321,6 +1364,7 @@ pub const BackendRuntime = struct {
     pub const RequestForwardLaneLease = struct {
         runtime: *BackendRuntime,
         borrowed_io: Io,
+        gate: *LaneLeaseGate,
         released: bool = false,
 
         pub fn io(self: *const @This()) Io {
@@ -1331,15 +1375,32 @@ pub const BackendRuntime = struct {
         pub fn release(self: *@This()) void {
             if (self.released) return;
             self.released = true;
-            self.runtime.request_forward_lane_gate.release(self.runtime.io());
+            self.gate.release(self.runtime.io());
         }
     };
 
     pub fn acquireRequestForwardLane(self: *BackendRuntime) !RequestForwardLaneLease {
-        const capacity = self.lane_limits.request_forward / threaded_io_limits.request_forward_workers_per_request;
-        _ = self.request_forward_lane_gate.tryAcquireBounded(capacity) orelse
+        return self.acquireRequestForwardLaneWithPriority(false);
+    }
+
+    /// In the native backend, Data Raft leader forwarding owns one complete
+    /// six-worker HTTP task graph on a separate executor. General distributed
+    /// reads cannot occupy its workers, including while completed tasks retire.
+    /// The two executors stay within the configured forwarding worker ceiling.
+    /// Borrowed schedulers preserve their injected I/O and enforce only the
+    /// logical lease quotas; their physical isolation is the caller's choice.
+    pub fn acquireRaftRequestForwardLane(self: *BackendRuntime) !RequestForwardLaneLease {
+        return self.acquireRequestForwardLaneWithPriority(true);
+    }
+
+    fn acquireRequestForwardLaneWithPriority(self: *BackendRuntime, raft: bool) !RequestForwardLaneLease {
+        const raft_workers = threaded_io_limits.request_forward_workers_per_request;
+        const lane_workers = if (raft) raft_workers else self.lane_limits.request_forward - raft_workers;
+        const capacity = lane_workers / raft_workers;
+        const gate = if (raft) &self.raft_request_forward_lane_gate else &self.request_forward_lane_gate;
+        _ = gate.tryAcquireBounded(capacity) orelse
             return error.RequestForwardCapacityUnavailable;
-        errdefer self.request_forward_lane_gate.release(self.io());
+        errdefer gate.release(self.io());
         const forward_io = if (self.borrowed_io) |borrowed|
             borrowed.request_forward orelse borrowed.general
         else if (comptime builtin.os.tag == .freestanding)
@@ -1347,7 +1408,8 @@ pub const BackendRuntime = struct {
         else if (self.backend == .manual)
             if (self.io_impl) |impl| self.threadedNetworkIo(impl) else return error.BackendRuntimeUnavailable
         else blk: {
-            const impl = self.ensureSpecializedIoLane(&self.request_forward_io_impl, self.lane_limits.request_forward) orelse
+            const slot = if (raft) &self.raft_request_forward_io_impl else &self.request_forward_io_impl;
+            const impl = self.ensureSpecializedIoLane(slot, lane_workers) orelse
                 return error.BackendRuntimeUnavailable;
             // Group/Future completion precedes Threaded's busy-count release.
             // Count every still-busy task, including those whose request lease
@@ -1358,12 +1420,42 @@ pub const BackendRuntime = struct {
             const sync_io = Io.Threaded.global_single_threaded.io();
             impl.mutex.lockUncancelable(sync_io);
             const remaining = @intFromEnum(impl.concurrent_limit) -| impl.busy_count;
-            const reserved = self.request_forward_lane_gate.active() * threaded_io_limits.request_forward_workers_per_request;
+            const reserved = gate.active() * raft_workers;
             impl.mutex.unlock(sync_io);
             if (reserved > remaining) return error.RequestForwardCapacityUnavailable;
             break :blk self.threadedNetworkIo(impl);
         };
-        return .{ .runtime = self, .borrowed_io = forward_io };
+        return .{ .runtime = self, .borrowed_io = forward_io, .gate = gate };
+    }
+
+    /// Complete metadata HTTP task graphs for Raft routing and recovery. The
+    /// default profile reserves one. This executor is separate from public API
+    /// work and Raft leader forwarding, and stays within the configured
+    /// BackendRuntime aggregate. Borrowed schedulers own physical isolation.
+    pub fn acquireMetadataHttpLane(self: *BackendRuntime) !RequestForwardLaneLease {
+        const gate = &self.metadata_http_lane_gate;
+        const capacity = self.lane_limits.metadata_http / threaded_io_limits.request_forward_workers_per_request;
+        _ = gate.tryAcquireBounded(capacity) orelse return error.MetadataHttpCapacityUnavailable;
+        errdefer gate.release(self.io());
+        const metadata_io = if (self.borrowed_io) |borrowed|
+            borrowed.metadata_http orelse borrowed.api orelse borrowed.general
+        else if (comptime builtin.os.tag == .freestanding)
+            return error.BackendRuntimeUnavailable
+        else if (self.backend == .manual)
+            if (self.io_impl) |impl| self.threadedNetworkIo(impl) else return error.BackendRuntimeUnavailable
+        else blk: {
+            const impl = self.ensureSpecializedIoLane(&self.metadata_http_io_impl, self.lane_limits.metadata_http) orelse
+                return error.BackendRuntimeUnavailable;
+            const sync_io = Io.Threaded.global_single_threaded.io();
+            impl.mutex.lockUncancelable(sync_io);
+            const remaining = @intFromEnum(impl.concurrent_limit) -| impl.busy_count;
+            const reserved = gate.active() * threaded_io_limits.request_forward_workers_per_request;
+            impl.mutex.unlock(sync_io);
+            if (reserved > remaining)
+                return error.MetadataHttpCapacityUnavailable;
+            break :blk self.threadedNetworkIo(impl);
+        };
+        return .{ .runtime = self, .borrowed_io = metadata_io, .gate = gate };
     }
 
     pub fn raftOutboundIoImpl(self: *BackendRuntime) ?*IoImpl {
@@ -1932,7 +2024,7 @@ const inline_vtable = DurableJobLane.VTable{
 };
 
 const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
-    fn init(_: Allocator, _: *IoImpl, _: *OwnerRegistry) ThreadedDurableJobLane {
+    fn init(_: Allocator, _: *IoImpl, _: *IoImpl, _: *IoImpl, _: *OwnerRegistry) ThreadedDurableJobLane {
         return .{};
     }
 
@@ -1994,6 +2086,8 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
 
     alloc: Allocator,
     io_impl: *IoImpl,
+    commit_io_impl: *IoImpl,
+    cleanup_io_impl: *IoImpl,
     owners: *OwnerRegistry,
     mutex: std.atomic.Mutex = .unlocked,
     reap_mutex: std.atomic.Mutex = .unlocked,
@@ -2003,11 +2097,21 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
     reaper_future: ?Io.Future(void) = null,
     entries: std.ArrayListUnmanaged(*Entry) = .empty,
 
-    fn init(alloc: Allocator, io_impl: *IoImpl, owners: *OwnerRegistry) ThreadedDurableJobLane {
+    fn init(alloc: Allocator, io_impl: *IoImpl, commit_io_impl: *IoImpl, cleanup_io_impl: *IoImpl, owners: *OwnerRegistry) ThreadedDurableJobLane {
         return .{
             .alloc = alloc,
             .io_impl = io_impl,
+            .commit_io_impl = commit_io_impl,
+            .cleanup_io_impl = cleanup_io_impl,
             .owners = owners,
+        };
+    }
+
+    fn jobIo(self: *ThreadedDurableJobLane, class: Job.Class) Io {
+        return switch (class) {
+            .maintenance => self.io_impl.io(),
+            .commit_durable => self.commit_io_impl.io(),
+            .cleanup => self.cleanup_io_impl.io(),
         };
     }
 
@@ -2051,7 +2155,8 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         try self.entries.ensureUnusedCapacity(self.alloc, 1);
-        entry.future = try self.io_impl.io().concurrent(runEntry, .{entry});
+        const job_io = self.jobIo(job.class);
+        entry.future = try job_io.concurrent(runEntry, .{entry});
         self.entries.appendAssumeCapacity(entry);
     }
 
@@ -2219,7 +2324,8 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
     }
 
     fn awaitAndDestroy(self: *ThreadedDurableJobLane, entry: *Entry) void {
-        _ = entry.future.await(self.io_impl.io());
+        const job_io = self.jobIo(entry.job.class);
+        _ = entry.future.await(job_io);
         if (entry.completed.swap(false, .acq_rel)) {
             _ = self.completed_count.fetchSub(1, .monotonic);
         }
@@ -2285,6 +2391,39 @@ test "backend runtime handle owns a stable runtime pointer" {
     try std.testing.expect(first.io_impl == null);
     try std.testing.expect(first.io() == null);
     try std.testing.expect(first.filesystemIo() != null);
+}
+
+test "backend runtime test descriptor pool injection leaves process admission unchanged" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var isolated = storage_io.NativeStoragePool.initWithCapacityForTest(alloc, 2);
+    defer isolated.deinit();
+    var ordinary = try BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    defer ordinary.deinit();
+    const process_pool = ordinary.ptr().nativeStoragePool();
+    const original = process_pool.snapshotStats();
+    try std.testing.expect(process_pool.fd_cache != isolated.fd_cache);
+
+    {
+        var injected = try BackendRuntimeHandle.init(alloc, .{
+            .backend = .manual,
+            .test_native_storage_pool = &isolated,
+        });
+        defer injected.deinit();
+        try std.testing.expect(injected.ptr().nativeStoragePool() == &isolated);
+        try std.testing.expectEqual(@as(usize, 2), injected.ptr().snapshotNativeStorageStats().fd_admission_capacity);
+        try std.testing.expectEqual(original.fd_admission_capacity, process_pool.snapshotStats().fd_admission_capacity);
+        try isolated.reserveDescriptorsForTest(std.testing.io, 2);
+        defer isolated.releaseDescriptorsForTest(std.testing.io, 2);
+        try std.testing.expectEqual(@as(usize, 2), injected.ptr().snapshotNativeStorageStats().fd_admitted_descriptors);
+        try std.testing.expectEqual(original.fd_admitted_descriptors, process_pool.snapshotStats().fd_admitted_descriptors);
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), isolated.snapshotStats().fd_admitted_descriptors);
+    var later = try BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    defer later.deinit();
+    try std.testing.expect(later.ptr().nativeStoragePool().fd_cache == process_pool.fd_cache);
+    try std.testing.expectEqual(original.fd_admission_capacity, later.ptr().snapshotNativeStorageStats().fd_admission_capacity);
 }
 
 test "backend runtime durable lane runs inline jobs" {
@@ -3076,6 +3215,7 @@ test "backend runtime borrows backend-agnostic std.Io lanes" {
             .api = api,
             .control = control,
             .request_forward = forward,
+            .metadata_http = forward,
         },
     });
     defer handle.deinit();
@@ -3095,6 +3235,14 @@ test "backend runtime borrows backend-agnostic std.Io lanes" {
     try std.testing.expectEqual(@intFromPtr(&forward_token), @intFromPtr(forwarding.io().userdata.?));
     forwarding.release();
     try std.testing.expect(handle.ptr().request_forward_io_impl.load(.acquire) == null);
+    var raft_forwarding = try handle.ptr().acquireRaftRequestForwardLane();
+    try std.testing.expectEqual(@intFromPtr(&forward_token), @intFromPtr(raft_forwarding.io().userdata.?));
+    raft_forwarding.release();
+    try std.testing.expect(handle.ptr().raft_request_forward_io_impl.load(.acquire) == null);
+    var metadata_http = try handle.ptr().acquireMetadataHttpLane();
+    try std.testing.expectEqual(@intFromPtr(&forward_token), @intFromPtr(metadata_http.io().userdata.?));
+    metadata_http.release();
+    try std.testing.expect(handle.ptr().metadata_http_io_impl.load(.acquire) == null);
 
     var lease = try handle.ptr().acquireApiLane();
     try std.testing.expectEqual(@intFromPtr(&api_token), @intFromPtr(lease.io().userdata.?));
@@ -3128,6 +3276,8 @@ test "backend runtime deinit closes admission and waits for active lane leases" 
     const runtime = handle.ptr();
     var lease = try runtime.acquireApiLane();
     var forwarding = try runtime.acquireRequestForwardLane();
+    var raft_forwarding = try runtime.acquireRaftRequestForwardLane();
+    var metadata_http = try runtime.acquireMetadataHttpLane();
     var deinitialized = std.atomic.Value(bool).init(false);
     var deinit_thread = try std.testing.io.concurrent(struct {
         fn run(h: *BackendRuntimeHandle, done: *std.atomic.Value(bool)) void {
@@ -3139,18 +3289,26 @@ test "backend runtime deinit closes admission and waits for active lane leases" 
     defer if (!deinit_thread_awaited) {
         lease.release();
         forwarding.release();
+        raft_forwarding.release();
+        metadata_http.release();
         deinit_thread.await(std.testing.io);
     };
 
     while (!runtime.api_lane_gate.isClosed()) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expectError(error.BackendRuntimeShuttingDown, runtime.acquireApiLane());
     try std.testing.expectError(error.RequestForwardCapacityUnavailable, runtime.acquireRequestForwardLane());
+    try std.testing.expectError(error.RequestForwardCapacityUnavailable, runtime.acquireRaftRequestForwardLane());
+    try std.testing.expectError(error.MetadataHttpCapacityUnavailable, runtime.acquireMetadataHttpLane());
     try std.testing.expect(runtime.inferenceIo() == null);
     try std.testing.expect(runtime.inference_io_impl.load(.acquire) == null);
     try std.testing.expect(!deinitialized.load(.acquire));
     lease.release();
     try std.testing.expect(!deinitialized.load(.acquire));
     forwarding.release();
+    try std.testing.expect(!deinitialized.load(.acquire));
+    raft_forwarding.release();
+    try std.testing.expect(!deinitialized.load(.acquire));
+    metadata_http.release();
     deinit_thread.await(std.testing.io);
     deinit_thread_awaited = true;
     try std.testing.expect(deinitialized.load(.acquire));
@@ -3355,6 +3513,54 @@ test "backend runtime async lane limit is CPU aware" {
     try std.testing.expectEqual(expected, boundedIoAsyncLimit(8));
 }
 
+test "backend runtime Data Raft forwarding progresses under saturated distributed reads" {
+    if (builtin.os.tag == .freestanding or builtin.single_threaded) return error.SkipZigTest;
+
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{
+        .lane_limits = .{ .request_forward = 12 },
+    });
+    defer handle.deinit();
+    const runtime = handle.ptr();
+    var general = try runtime.acquireRequestForwardLane();
+    defer general.release();
+    const general_io = general.io();
+    var release: Io.Event = .unset;
+    var all_started: Io.Event = .unset;
+    var started: std.atomic.Value(usize) = .init(0);
+    var reads: Io.Group = .init;
+    defer {
+        release.set(general_io);
+        reads.cancel(general_io);
+    }
+    const BlockedRead = struct {
+        fn run(task_io: Io, started_count: *std.atomic.Value(usize), ready: *Io.Event, unblock: *Io.Event) void {
+            if (started_count.fetchAdd(1, .acq_rel) + 1 == 6) ready.set(task_io);
+            unblock.waitUncancelable(task_io);
+        }
+    };
+    for (0..6) |_| try reads.concurrent(general_io, BlockedRead.run, .{ general_io, &started, &all_started, &release });
+    try all_started.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    try std.testing.expectError(error.RequestForwardCapacityUnavailable, runtime.acquireRequestForwardLane());
+
+    var raft = try runtime.acquireRaftRequestForwardLane();
+    defer raft.release();
+    var progressed: Io.Event = .unset;
+    var raft_tasks: Io.Group = .init;
+    defer raft_tasks.cancel(raft.io());
+    const SignalProgress = struct {
+        fn run(task_io: Io, done: *Io.Event) void {
+            done.set(task_io);
+        }
+    };
+    try raft_tasks.concurrent(raft.io(), SignalProgress.run, .{ raft.io(), &progressed });
+    try progressed.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    try raft_tasks.await(raft.io());
+    try std.testing.expectEqual(@as(usize, 1), runtime.request_forward_lane_gate.active());
+    try std.testing.expectEqual(@as(usize, 1), runtime.raft_request_forward_lane_gate.active());
+    release.set(general_io);
+    try reads.await(general_io);
+}
+
 test "backend runtime forwarding admission includes retiring executor tasks" {
     if (builtin.os.tag == .freestanding or builtin.single_threaded) return error.SkipZigTest;
     const PausedAllocator = struct {
@@ -3377,7 +3583,7 @@ test "backend runtime forwarding admission includes retiring executor tasks" {
         fn free(ptr: *anyopaque, buf: []u8, align_: std.mem.Alignment, ra: usize) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.hold.load(.acquire)) {
-                if (self.retiring.fetchAdd(1, .release) + 1 == 6) self.all_retiring.set(std.testing.io);
+                if (self.retiring.fetchAdd(1, .release) + 1 == 12) self.all_retiring.set(std.testing.io);
                 self.release.waitUncancelable(std.testing.io);
             }
             std.heap.page_allocator.rawFree(buf, align_, ra);
@@ -3386,12 +3592,14 @@ test "backend runtime forwarding admission includes retiring executor tasks" {
 
     var allocator: PausedAllocator = .{};
     var handle = try BackendRuntimeHandle.init(allocator.allocator(), .{
-        .lane_limits = .{ .request_forward = 6 },
+        .lane_limits = .{ .request_forward = 12 },
     });
     defer handle.deinit();
     const runtime = handle.ptr();
     var lease = try runtime.acquireRequestForwardLane();
     defer lease.release();
+    var raft_lease = try runtime.acquireRaftRequestForwardLane();
+    defer raft_lease.release();
     const io = lease.io();
     var release: Io.Event = .unset;
     var tasks: Io.Group = .init;
@@ -3407,6 +3615,7 @@ test "backend runtime forwarding admission includes retiring executor tasks" {
         }
     };
     for (0..6) |_| try tasks.concurrent(io, Task.run, .{ io, &release });
+    for (0..6) |_| try tasks.concurrent(raft_lease.io(), Task.run, .{ raft_lease.io(), &release });
     allocator.hold.store(true, .release);
     defer allocator.hold.store(false, .release);
     release.set(io);
@@ -3415,13 +3624,21 @@ test "backend runtime forwarding admission includes retiring executor tasks" {
     // The request has finished and releases its lease, but its slots are busy.
     try allocator.all_retiring.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
     lease.release();
+    raft_lease.release();
     const admission = runtime.acquireRequestForwardLane();
     if (admission) |value| {
         var unexpected = value;
         unexpected.release();
         return error.TestUnexpectedResult;
     } else |err| try std.testing.expectEqual(error.RequestForwardCapacityUnavailable, err);
+    const raft_admission = runtime.acquireRaftRequestForwardLane();
+    if (raft_admission) |value| {
+        var unexpected = value;
+        unexpected.release();
+        return error.TestUnexpectedResult;
+    } else |err| try std.testing.expectEqual(error.RequestForwardCapacityUnavailable, err);
     try std.testing.expectEqual(@as(usize, 0), runtime.request_forward_lane_gate.active());
+    try std.testing.expectEqual(@as(usize, 0), runtime.raft_request_forward_lane_gate.active());
     allocator.hold.store(false, .release);
     allocator.release.set(std.testing.io);
     // Only this test waits for the deliberately paused retirement. Production
@@ -3446,7 +3663,7 @@ test "backend runtime honors reduced per-lane limits under the aggregate ceiling
         .api = 5,
         .raft_inbound = 2,
         .raft_outbound = 2,
-        .request_forward = 6,
+        .request_forward = 12,
         .inference = 4,
         .control = 1,
         .pdf_render = 1,
@@ -3463,12 +3680,22 @@ test "backend runtime honors reduced per-lane limits under the aggregate ceiling
 
     try std.testing.expectEqual(limits, runtime.laneStats().limits);
     try std.testing.expectEqual(std.Io.Limit.limited(limits.durable_background), runtime.io_impl.?.concurrent_limit);
+    try std.testing.expectEqual(std.Io.Limit.limited(limits.durable_commit), runtime.commit_jobs_io_impl.?.concurrent_limit);
+    try std.testing.expectEqual(std.Io.Limit.limited(limits.durable_cleanup), runtime.cleanup_jobs_io_impl.?.concurrent_limit);
     try std.testing.expectEqual(std.Io.Limit.limited(limits.raft_inbound), runtime.raftInboundIoImpl().?.concurrent_limit);
     try std.testing.expectEqual(std.Io.Limit.limited(limits.raft_outbound), runtime.raftOutboundIoImpl().?.concurrent_limit);
     var forward_lease = try runtime.acquireRequestForwardLane();
     defer forward_lease.release();
-    try std.testing.expectEqual(std.Io.Limit.limited(limits.request_forward), runtime.request_forward_io_impl.load(.acquire).?.concurrent_limit);
+    try std.testing.expectEqual(std.Io.Limit.limited(limits.request_forward - threaded_io_limits.request_forward_workers_per_request), runtime.request_forward_io_impl.load(.acquire).?.concurrent_limit);
     try std.testing.expectError(error.RequestForwardCapacityUnavailable, runtime.acquireRequestForwardLane());
+    var raft_forward_lease = try runtime.acquireRaftRequestForwardLane();
+    defer raft_forward_lease.release();
+    try std.testing.expectEqual(std.Io.Limit.limited(threaded_io_limits.request_forward_workers_per_request), runtime.raft_request_forward_io_impl.load(.acquire).?.concurrent_limit);
+    try std.testing.expectError(error.RequestForwardCapacityUnavailable, runtime.acquireRaftRequestForwardLane());
+    var metadata_http_lease = try runtime.acquireMetadataHttpLane();
+    defer metadata_http_lease.release();
+    try std.testing.expectEqual(std.Io.Limit.limited(limits.metadata_http), runtime.metadata_http_io_impl.load(.acquire).?.concurrent_limit);
+    try std.testing.expectError(error.MetadataHttpCapacityUnavailable, runtime.acquireMetadataHttpLane());
     var api_lease = try runtime.acquireApiLane();
     defer api_lease.release();
     var inference_lease = try runtime.acquireInferenceLane();
@@ -3959,7 +4186,7 @@ test "backend runtime idle reaper waits on shutdown instead of an unconditional 
     defer io_impl.deinit();
     var owners = OwnerRegistry.init(std.testing.allocator);
     defer owners.deinit();
-    var lane = ThreadedDurableJobLane.init(std.testing.allocator, &io_impl, &owners);
+    var lane = ThreadedDurableJobLane.init(std.testing.allocator, &io_impl, &io_impl, &io_impl, &owners);
     defer lane.deinit();
     var probe: Probe = .{ .lane = &lane };
     var vtable = std.testing.io.vtable.*;
@@ -4035,6 +4262,155 @@ test "backend runtime durable lane deinits threaded job payload after completion
 
     try std.testing.expectEqual(@as(u32, 1), ctx.ran.load(.acquire));
     try std.testing.expectEqual(@as(u32, 1), ctx.deinits.load(.acquire));
+}
+
+test "backend runtime protected durable jobs progress under saturated maintenance workers" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const Context = struct {
+        maintenance_started: std.atomic.Value(bool) = .init(false),
+        protected_finished: std.atomic.Value(u32) = .init(0),
+        release_maintenance: Io.Event = .unset,
+
+        fn maintenance(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.maintenance_started.store(true, .release);
+            self.release_maintenance.waitUncancelable(std.testing.io);
+        }
+
+        fn protected(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.protected_finished.fetchAdd(1, .acq_rel);
+        }
+
+        fn deinit(_: *anyopaque) void {}
+    };
+
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{
+        .backend = .io_threaded,
+        .lane_limits = .{ .durable_background = 2, .durable_commit = 2, .durable_cleanup = 2 },
+    });
+    defer handle.deinit();
+    var context = Context{};
+    defer context.release_maintenance.set(std.testing.io);
+    const runtime = handle.ptr();
+    try std.testing.expect(runtime.commit_jobs_io_impl.? != runtime.io_impl.?);
+    try std.testing.expect(runtime.cleanup_jobs_io_impl.? != runtime.io_impl.?);
+    try std.testing.expect(runtime.commit_jobs_io_impl.? != runtime.cleanup_jobs_io_impl.?);
+    try std.testing.expectEqual(std.Io.Limit.limited(2), runtime.commit_jobs_io_impl.?.concurrent_limit);
+    try std.testing.expectEqual(std.Io.Limit.limited(2), runtime.cleanup_jobs_io_impl.?.concurrent_limit);
+    const owner = try runtime.allocOwnerId();
+    try runtime.durable_jobs.submit(.{
+        .owner_id = owner,
+        .class = .maintenance,
+        .ptr = &context,
+        .run = Context.maintenance,
+        .deinit = Context.deinit,
+    });
+    const deadline = Io.Clock.Timestamp.fromNow(std.testing.io, .{ .raw = .fromSeconds(5), .clock = .awake });
+    while (!context.maintenance_started.load(.acquire)) {
+        if (Io.Clock.Timestamp.now(std.testing.io, .awake).compare(.gte, deadline)) return error.TestUnexpectedResult;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectError(error.ConcurrencyUnavailable, runtime.durable_jobs.submit(.{
+        .owner_id = owner,
+        .class = .maintenance,
+        .ptr = &context,
+        .run = Context.maintenance,
+        .deinit = Context.deinit,
+    }));
+    try runtime.durable_jobs.submit(.{
+        .owner_id = owner,
+        .class = .commit_durable,
+        .ptr = &context,
+        .run = Context.protected,
+        .deinit = Context.deinit,
+    });
+    while (context.protected_finished.load(.acquire) < 1) {
+        if (Io.Clock.Timestamp.now(std.testing.io, .awake).compare(.gte, deadline)) return error.TestUnexpectedResult;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try runtime.durable_jobs.submit(.{
+        .owner_id = owner,
+        .class = .cleanup,
+        .ptr = &context,
+        .run = Context.protected,
+        .deinit = Context.deinit,
+    });
+    while (context.protected_finished.load(.acquire) < 2) {
+        if (Io.Clock.Timestamp.now(std.testing.io, .awake).compare(.gte, deadline)) return error.TestUnexpectedResult;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(context.maintenance_started.load(.acquire));
+}
+
+test "backend runtime commit completion progresses while cleanup workers drain" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const Context = struct {
+        cleanup_started: std.atomic.Value(bool) = .init(false),
+        commit_finished: std.atomic.Value(bool) = .init(false),
+        deinited: std.atomic.Value(u32) = .init(0),
+        release_cleanup: Io.Event = .unset,
+
+        fn cleanup(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.cleanup_started.store(true, .release);
+            self.release_cleanup.waitUncancelable(std.testing.io);
+        }
+
+        fn commit(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.commit_finished.store(true, .release);
+        }
+
+        fn deinit(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.deinited.fetchAdd(1, .acq_rel);
+        }
+    };
+
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{
+        .backend = .io_threaded,
+        .lane_limits = .{ .durable_background = 2, .durable_commit = 1, .durable_cleanup = 1 },
+    });
+    defer handle.deinit();
+    var context = Context{};
+    defer context.release_cleanup.set(std.testing.io);
+    const runtime = handle.ptr();
+    const owner = try runtime.allocOwnerId();
+    try runtime.durable_jobs.submit(.{
+        .owner_id = owner,
+        .class = .cleanup,
+        .ptr = &context,
+        .run = Context.cleanup,
+        .deinit = Context.deinit,
+    });
+    const deadline = Io.Clock.Timestamp.fromNow(std.testing.io, .{ .raw = .fromSeconds(5), .clock = .awake });
+    while (!context.cleanup_started.load(.acquire)) {
+        if (Io.Clock.Timestamp.now(std.testing.io, .awake).compare(.gte, deadline)) return error.TestUnexpectedResult;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectError(error.ConcurrencyUnavailable, runtime.durable_jobs.submit(.{
+        .owner_id = owner,
+        .class = .cleanup,
+        .ptr = &context,
+        .run = Context.cleanup,
+        .deinit = Context.deinit,
+    }));
+    try runtime.durable_jobs.submit(.{
+        .owner_id = owner,
+        .class = .commit_durable,
+        .ptr = &context,
+        .run = Context.commit,
+        .deinit = Context.deinit,
+    });
+    while (!context.commit_finished.load(.acquire)) {
+        if (Io.Clock.Timestamp.now(std.testing.io, .awake).compare(.gte, deadline)) return error.TestUnexpectedResult;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(context.cleanup_started.load(.acquire));
+    context.release_cleanup.set(std.testing.io);
+    runtime.durable_jobs.closeOwner(owner);
+    try std.testing.expectEqual(@as(u32, 2), context.deinited.load(.acquire));
 }
 
 test "backend runtime threaded worker releases payload before reaper joins" {

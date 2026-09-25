@@ -298,8 +298,15 @@ pub const QueryRuntime = struct {
     }
 
     pub fn openVersionSession(self: *QueryRuntime, namespace: []const u8, version: u64) !QuerySession {
-        var manifest = try self.manifests.getAlloc(namespace, version);
-        errdefer manifest.deinit(self.alloc);
+        return self.openVersionSessionUsingAllocator(self.alloc, namespace, version);
+    }
+
+    /// Request-owned manifests and read buffers use the caller's allocator;
+    /// shared cache entries, metrics and lease-cache synchronization stay owned
+    /// by the runtime. Never copy a live QueryRuntime to change its allocator.
+    pub fn openVersionSessionUsingAllocator(self: *QueryRuntime, alloc: Allocator, namespace: []const u8, version: u64) !QuerySession {
+        var manifest = try self.manifests.vtable.get_alloc(self.manifests.ptr, alloc, namespace, version);
+        errdefer manifest.deinit(alloc);
         var lease: ?read_lease.Lease = null;
         for (manifest.artifacts) |artifact| {
             if (artifact.kind == .document_facts or (artifact.kind == .graph_segment and artifact.metadata_version == graph_segment_mod.page_graph.Root.metadata_version)) {
@@ -308,7 +315,7 @@ pub const QueryRuntime = struct {
             }
         }
         return .{
-            .alloc = self.alloc,
+            .alloc = alloc,
             .artifacts = self.artifacts,
             .cache = self.cache,
             .manifest = manifest,
@@ -317,9 +324,13 @@ pub const QueryRuntime = struct {
     }
 
     pub fn openHeadSession(self: *QueryRuntime, namespace: []const u8) !QuerySession {
+        return self.openHeadSessionUsingAllocator(self.alloc, namespace);
+    }
+
+    pub fn openHeadSessionUsingAllocator(self: *QueryRuntime, alloc: Allocator, namespace: []const u8) !QuerySession {
         var version = try self.progress.getHead(namespace);
         for (0..3) |_| {
-            return self.openVersionSession(namespace, version) catch |err| switch (err) {
+            return self.openVersionSessionUsingAllocator(alloc, namespace, version) catch |err| switch (err) {
                 error.FileNotFound, error.ManifestVersionRetired => {
                     const next = try self.progress.getHead(namespace);
                     if (next == version) return err;
@@ -386,6 +397,9 @@ pub const QueryRuntime = struct {
 };
 
 pub const QuerySession = struct {
+    execution_runtime: ?*@import("../../storage/dense_execution.zig").Runtime = null,
+    helper_execution: ?@import("../../storage/dense_execution.zig").Runtime.Lease = null,
+
     alloc: Allocator,
     artifacts: *artifacts_mod.ArtifactStore,
     cache: ?*cache_mod.QueryCache = null,
@@ -404,6 +418,23 @@ pub const QuerySession = struct {
     graph_metric_retained_scope: ?*GraphMetricReadBudget.Reservation = null,
     // Pre-admitted transport workspace owned by a joined parent execution.
     graph_metric_transport_credit: usize = 0,
+
+    /// Optional child work never waits while its parent owns a runnable slot.
+    /// A rejected helper runs inline under the parent's existing permit.
+    pub fn acquireExecutionHelper(self: *QuerySession) bool {
+        const runtime = self.execution_runtime orelse return true;
+        self.helper_execution = runtime.tryAcquire() orelse return false;
+        return true;
+    }
+
+    pub fn releaseExecutionHelper(self: *QuerySession) void {
+        if (self.helper_execution) |*lease| lease.release();
+        self.helper_execution = null;
+    }
+
+    pub fn beginExecutionHelper(self: *QuerySession) void {
+        if (self.helper_execution) |*lease| if (self.io) |io| lease.startWork(io);
+    }
 
     pub fn graphAdjacencyCache(self: *QuerySession) ?@import("../graph_segment/topology_reader.zig").ReadCache {
         if (self.cache == null) return null;
@@ -516,6 +547,7 @@ pub const QuerySession = struct {
             .cache = self.cache,
             .manifest = self.manifest,
             .owns_manifest = false,
+            .execution_runtime = self.execution_runtime,
             .io = self.io,
             .cancellation = self.cancellation,
             .read_lease = self.read_lease,
@@ -1544,4 +1576,123 @@ fn cleanupTmp(path: [*:0]const u8) void {
     var io_impl = threadedIo();
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
+}
+
+test "workload admission serverless graph helpers fall back inline and retire independently" {
+    const Execution = @import("../../storage/dense_execution.zig");
+    const execution = try Execution.Runtime.create(std.testing.allocator, .{ .max_runnable_tasks = 2, .max_outstanding_tasks = 4 });
+    defer execution.destroy();
+    execution.scope = .all_reads;
+    var driver = try execution.acquire(.{ .io = std.testing.io });
+    defer driver.release();
+    var parent = QuerySession{
+        .alloc = std.testing.allocator,
+        .artifacts = undefined,
+        .manifest = .{ .namespace = @constCast("docs"), .version = 1, .built_at_ns = 1, .wal_start_lsn = 1, .wal_end_lsn = 1, .stats = .{}, .artifacts = @constCast(&.{}) },
+        .owns_manifest = false,
+        .execution_runtime = execution,
+        .io = std.testing.io,
+    };
+    defer parent.deinit();
+    var child = parent.forkGraphMetricRead(std.testing.allocator);
+    defer child.deinit();
+    try std.testing.expect(child.acquireExecutionHelper());
+    defer child.releaseExecutionHelper();
+    try std.testing.expectEqual(@as(u64, 2), execution.stats().runnable);
+    var inline_child = parent.forkGraphMetricRead(std.testing.allocator);
+    defer inline_child.deinit();
+    try std.testing.expect(!inline_child.acquireExecutionHelper());
+    try std.testing.expect(inline_child.helper_execution == null);
+    // Match graph_metric_reader: rejected optional work runs synchronously
+    // under the parent's existing runnable owner, without waiting or regrant.
+    const Inline = struct {
+        fn work(session: *QuerySession) !void {
+            session.beginExecutionHelper();
+            defer session.releaseExecutionHelper();
+            try session.readCancellation().check();
+            try std.testing.expectEqualStrings("docs", session.namespace());
+            try std.testing.expectEqual(@as(u64, 2), session.execution_runtime.?.stats().runnable);
+        }
+    };
+    try Inline.work(&inline_child);
+    try std.testing.expectEqual(@as(u64, 2), execution.stats().outstanding);
+    driver.release();
+    try std.testing.expectEqual(@as(u64, 1), execution.stats().runnable);
+    try std.testing.expectEqual(@as(u64, 1), execution.stats().outstanding);
+    child.releaseExecutionHelper();
+    try std.testing.expectEqual(@as(u64, 0), execution.stats().runnable);
+    try std.testing.expectEqual(@as(u64, 0), execution.stats().outstanding);
+    try std.testing.expectEqualStrings("docs", parent.namespace());
+}
+
+test "workload admission serverless graph helper cancellation joins before borrowed session teardown" {
+    const alloc = std.testing.allocator;
+    const Execution = @import("../../storage/dense_execution.zig");
+    const execution = try Execution.Runtime.create(alloc, .{ .max_runnable_tasks = 2, .max_outstanding_tasks = 3 });
+    defer execution.destroy();
+    execution.scope = .all_reads;
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var driver = try execution.acquire(.{ .io = io });
+    defer driver.release();
+    var cancelled = std.atomic.Value(bool).init(false);
+    var parent = QuerySession{
+        .alloc = alloc,
+        .artifacts = undefined,
+        .manifest = .{ .namespace = try alloc.dupe(u8, "borrowed-parent"), .version = 1, .built_at_ns = 1, .wal_start_lsn = 1, .wal_end_lsn = 1, .stats = .{}, .artifacts = try alloc.alloc(manifest_mod.ArtifactRef, 0) },
+        .execution_runtime = execution,
+        .io = io,
+        .cancellation = CancellationToken.fromAtomic(&cancelled),
+    };
+    defer parent.deinit();
+    var child = parent.forkGraphMetricRead(alloc);
+    defer child.deinit();
+    try std.testing.expect(child.acquireExecutionHelper());
+    defer child.releaseExecutionHelper();
+    const Worker = struct {
+        child: *QuerySession,
+        io: std.Io,
+        started: std.Io.Event = .unset,
+        finish: std.Io.Event = .unset,
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            self.child.beginExecutionHelper();
+            defer self.child.releaseExecutionHelper();
+            self.started.set(self.io);
+            self.finish.wait(self.io) catch |err| {
+                self.failure = err;
+                return;
+            };
+            std.testing.expectEqualStrings("borrowed-parent", self.child.namespace()) catch |err| {
+                self.failure = err;
+                return;
+            };
+            self.child.readCancellation().check() catch |err| {
+                self.failure = err;
+                return;
+            };
+        }
+    };
+    var worker: Worker = .{ .child = &child, .io = io };
+    var group: std.Io.Group = .init;
+    // A concurrent grant guarantees the handshake runs before awaiting the
+    // group. The actual graph readers use the same worker-owned defer contract.
+    try group.concurrent(io, Worker.run, .{&worker});
+    defer group.cancel(io);
+    defer worker.finish.set(io);
+    try worker.started.wait(io);
+    cancelled.store(true, .release);
+    driver.release();
+    try std.testing.expectEqual(@as(u64, 1), execution.stats().runnable);
+    try std.testing.expectEqual(@as(u64, 1), execution.stats().outstanding);
+    // The caller keeps the borrowed manifest/session alive until quiescence.
+    try std.testing.expectEqual(parent.manifest.namespace.ptr, child.manifest.namespace.ptr);
+    worker.finish.set(io);
+    try group.await(io);
+    try std.testing.expectEqual(error.Canceled, worker.failure.?);
+    try std.testing.expect(child.helper_execution == null);
+    try std.testing.expectEqual(@as(u64, 0), execution.stats().runnable);
+    try std.testing.expectEqual(@as(u64, 0), execution.stats().outstanding);
+    try std.testing.expectEqualStrings("borrowed-parent", parent.namespace());
 }

@@ -94,6 +94,8 @@ const capi_min_thread_stack_size = 8 * 1024 * 1024;
 const kernel_runtime_services = antfly.kernel_runtime_services;
 
 const StorageOwnerContext = struct {
+    durable_completion_enabled: bool = false,
+    durable_completion_authority: antfly.common.durable_completion_policy.Authority = .none,
     allocator_bridge: ?kernel_runtime_services.memory.Allocator = null,
     io_receiver: ?kernel_runtime_services.executor.Receiver = null,
     alloc: Allocator,
@@ -676,6 +678,7 @@ fn tempTestAflitePath(alloc: Allocator, root: []const u8, label: []const u8) ![:
 }
 
 const Handle = struct {
+    owner_refs: std.atomic.Value(usize) = .init(1),
     alloc: std.mem.Allocator,
     db: db_mod.DB,
     open_mode: db_mod.OpenOptions.OpenMode = .writer,
@@ -1621,6 +1624,7 @@ fn refreshLiteManagedEmbeddingRuntime(handle: *Handle) !void {
 }
 
 fn closeHandle(handle: *Handle) void {
+    if (handle.owner_refs.fetchSub(1, .acq_rel) != 1) return;
     const storage_owner_context = handle.storage_owner_context;
     const storage_owner_transaction_recovery = handle.storage_owner_transaction_recovery;
     const storage_owner_runtime_hooks = handle.storage_owner_runtime_hooks;
@@ -3579,7 +3583,7 @@ pub fn storageOwnerContextCreate(
 ) callconv(.c) kernel_owner_abi.Status {
     out_context.* = null;
     if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
-    out_context.* = createStorageOwnerContext(.{ .context = request.* }) catch |err| return storageOwnerStatusFromError(err);
+    out_context.* = createStorageOwnerContext(.{ .context = request.* }, null) catch |err| return storageOwnerStatusFromError(err);
     return .ok;
 }
 
@@ -3589,14 +3593,25 @@ pub fn storageOwnerContextCreateWithRuntime(
 ) callconv(.c) kernel_owner_abi.Status {
     out_context.* = null;
     if (request.version != kernel_runtime_services.abi_version or request._reserved != 0 or request.context.version != kernel_owner_abi.abi_version) return .invalid_abi;
-    out_context.* = createStorageOwnerContext(request.*) catch |err| return storageOwnerStatusFromError(err);
+    out_context.* = createStorageOwnerContext(request.*, null) catch |err| return storageOwnerStatusFromError(err);
     return .ok;
 }
 
 /// Keep fallible construction in an error union: errdefer does not run when
 /// an ABI function returns a scalar failure status.
-fn createStorageOwnerContext(services: kernel_runtime_services.Request) !*StorageOwnerContext {
+fn createStorageOwnerContext(
+    services: kernel_runtime_services.Request,
+    test_native_storage_pool: ?*antfly.lsm_backend.storage_io.NativeStoragePool,
+) !*StorageOwnerContext {
+    if (!builtin.is_test and test_native_storage_pool != null) unreachable;
     const request = services.context;
+    if (request.durable_completion_enabled > 1 or !std.mem.allEqual(u8, &request._completion_reserved, 0)) return error.InvalidConfig;
+    const completion_authority = std.enums.fromInt(antfly.common.durable_completion_policy.Authority, request.durable_completion_authority) orelse return error.InvalidConfig;
+    // Replicated authority is issued only by the committed apply protocol,
+    // never by a generic context configuration call.
+    if (completion_authority == .raft_apply) return error.InvalidConfig;
+    if (completion_authority != .none and (request.storage_kind != .directory or request.no_sync != 0)) return error.UnsupportedCompletionBackend;
+    if (request.dense_max_runnable_tasks != 0 and request.read_max_runnable_tasks != 0) return error.InvalidConfig;
     const bridge = if (services.allocator) |value| blk: {
         if (!value.valid()) return error.InvalidArgument;
         break :blk value.*;
@@ -3606,6 +3621,8 @@ fn createStorageOwnerContext(services: kernel_runtime_services.Request) !*Storag
     const context = try bootstrap_alloc.create(StorageOwnerContext);
     errdefer bootstrap_alloc.destroy(context);
     context.* = .{
+        .durable_completion_enabled = request.durable_completion_enabled != 0,
+        .durable_completion_authority = completion_authority,
         .allocator_bridge = bridge,
         .io_receiver = receiver,
         .alloc = undefined,
@@ -3622,11 +3639,39 @@ fn createStorageOwnerContext(services: kernel_runtime_services.Request) !*Storag
         memory_budget.smartResourceBudgets(memory_limit);
     context.resources = try .initWithBudgets(alloc, budgets);
     errdefer context.resources.deinit();
+    try context.resources.resource_manager.configureDurableCompletion(context.durable_completion_enabled, context.durable_completion_authority);
+    try context.resources.resource_manager.configureTransactionCompletion(std.math.cast(usize, request.transaction_completion_bytes) orelse return error.InvalidConfig);
+    try context.resources.resource_manager.configureDenseExecution(.{
+        .max_runnable_tasks = request.dense_max_runnable_tasks,
+        .max_outstanding_tasks = request.dense_max_outstanding_tasks,
+        .max_queued_tasks = request.dense_max_queued_tasks,
+        .max_wait_ms = request.dense_max_wait_ms,
+        .max_working_bytes = request.dense_max_working_bytes,
+        .max_suspended_io = request.dense_max_suspended_io,
+    });
+    try context.resources.resource_manager.configureReadExecution(.{
+        .max_runnable_tasks = request.read_max_runnable_tasks,
+        .max_outstanding_tasks = request.read_max_outstanding_tasks,
+        .max_queued_tasks = request.read_max_queued_tasks,
+        .max_wait_ms = request.read_max_wait_ms,
+        .max_working_bytes = request.read_max_working_bytes,
+        .max_suspended_io = request.read_max_suspended_io,
+        .max_scan_state_bytes = request.read_max_scan_state_bytes,
+        .max_scan_snapshot_ms = request.read_max_scan_snapshot_ms,
+        .protected = .{
+            .max_runnable_tasks = request.read_protected_runnable_tasks,
+            .max_outstanding_tasks = request.read_protected_outstanding_tasks,
+            .max_working_bytes = request.read_protected_working_bytes,
+            .max_transition_tasks = request.read_transition_tasks,
+            .max_transition_bytes = request.read_transition_bytes,
+        },
+    });
     var runtime_config = db_mod.background_runtime.Config{};
     if (context.io_receiver) |*io| runtime_config = .{
         .backend = .manual,
         .borrowed_io = .{ .general = io.io() },
     };
+    runtime_config.test_native_storage_pool = test_native_storage_pool;
     context.backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, runtime_config);
     errdefer context.backend_runtime.deinit();
     context.resources.attachResourceManager();
@@ -3659,6 +3704,100 @@ fn createStorageOwnerContext(services: kernel_runtime_services.Request) !*Storag
 pub fn storageOwnerContextDestroy(context: ?*anyopaque) callconv(.c) kernel_owner_abi.Status {
     const owner_context = asStorageOwnerContext(context) orelse return .ok;
     return if (owner_context.deinitIfIdle()) .ok else .busy;
+}
+
+test "capi physical owner shares an injected protected native fd pool" {
+    const storage_io = antfly.lsm_backend.storage_io;
+    if (builtin.os.tag == .windows or builtin.single_threaded) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const sst = try std.fs.path.join(alloc, &.{ root, "protected.sst" });
+    defer alloc.free(sst);
+    const owner_path = try std.fs.path.join(alloc, &.{ root, "owner" });
+    defer alloc.free(owner_path);
+
+    var pool = storage_io.NativeStoragePool.initWithCapacityForTest(alloc, 16);
+    defer pool.deinit();
+    const context = try createStorageOwnerContext(.{}, &pool);
+    defer std.debug.assert(storageOwnerContextDestroy(context) == .ok);
+    try std.testing.expectEqual(&pool, context.backend_runtime.ptr().nativeStoragePool());
+
+    var native = try storage_io.NativeStorage.initWithPool(alloc, .threaded, &pool);
+    defer native.deinit();
+    const scope = try storage_io.NativeCompletionIo.createWithFiles(alloc, &native, root, &.{.{ .path = sst, .max_bytes = 64 }});
+    var scope_live = true;
+    defer if (scope_live) scope.deinit() catch unreachable;
+    try std.testing.expectEqual(@as(usize, 2), pool.snapshotStats().fd_admitted_descriptors);
+    const foreground_permits = pool.snapshotStats().fd_admission_capacity - pool.snapshotStats().fd_persistent_reserve - 2;
+    try pool.reserveDescriptorsForTest(std.testing.io, foreground_permits);
+    var foreground_permits_live = true;
+    defer if (foreground_permits_live) pool.releaseDescriptorsForTest(std.testing.io, foreground_permits);
+
+    const Open = struct {
+        request: kernel_owner_abi.OpenRequest,
+        owner: ?*anyopaque = null,
+        status: kernel_owner_abi.Status = .internal,
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            self.status = storageOwnerOpen(&self.request, &self.owner);
+            self.done.store(true, .release);
+        }
+    };
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var open = Open{ .request = .{
+        .context = context,
+        .path = .fromSlice(owner_path),
+        .table_name = .fromSlice("docs"),
+        .group_id = 7,
+    } };
+    var future = std.Io.async(io, Open.run, .{&open});
+    var awaited = false;
+    defer if (!awaited) {
+        if (scope_live) {
+            scope.deinit() catch unreachable;
+            scope_live = false;
+        }
+        future.await(io);
+        if (open.owner) |owner| storageOwnerClose(owner);
+    };
+    for (0..5_000) |_| {
+        if (open.done.load(.acquire) or pool.snapshotStats().fd_admission_waiters != 0) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    const blocked = !open.done.load(.acquire);
+    try std.testing.expect(open.done.load(.acquire) or pool.snapshotStats().fd_admission_waiters != 0);
+    if (!blocked) try std.testing.expect(open.status != .ok);
+
+    // The compiled physical owner cannot claim a transient descriptor while
+    // foreground reservations fill the pool, but the protected scope still
+    // completes real I/O with its preowned pair.
+    const storage = scope.storage();
+    var writer = try storage.beginAtomicWrite(alloc, sst);
+    try writer.appendSlice("protected-flush");
+    try writer.finish();
+    try storage.syncFileContentsAbsolute(sst);
+    try storage.syncParentAbsolute(sst);
+    try std.testing.expectEqual(@as(u64, "protected-flush".len), try storage.fileSize(sst));
+    if (blocked) try std.testing.expect(!open.done.load(.acquire));
+
+    try scope.deinit();
+    scope_live = false;
+    pool.releaseDescriptorsForTest(std.testing.io, foreground_permits);
+    foreground_permits_live = false;
+    future.await(io);
+    awaited = true;
+    if (open.owner) |owner| storageOwnerClose(owner);
+    if (open.status != .ok) {
+        var retry: ?*anyopaque = null;
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, storageOwnerOpen(&open.request, &retry));
+        storageOwnerClose(retry);
+    }
+    try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_admission_waiters);
 }
 
 pub fn storageContextAttachInferenceProvider(
@@ -3732,7 +3871,10 @@ pub fn storageOwnerContextMetrics(
     out_result.* = .{};
     const owner_context = asStorageOwnerContext(context) orelse return .invalid_argument;
     const stats = owner_context.resources.lsm_cache.snapshotStats();
+    const dense = owner_context.resources.resource_manager.denseExecutionStats();
     out_result.* = .{
+        .durable_completion_enabled = @intFromBool(owner_context.durable_completion_enabled),
+        .durable_completion_authority = @intFromEnum(owner_context.durable_completion_authority),
         .lsm_cache_used_bytes = @intCast(stats.used_bytes),
         .lsm_cache_entry_count = @intCast(stats.entry_count),
         .lsm_run_state = storageOwnerContextCacheKindStats(stats.run_state),
@@ -3740,6 +3882,27 @@ pub fn storageOwnerContextMetrics(
         .lsm_run_table_index = storageOwnerContextCacheKindStats(stats.run_table_index),
         .lsm_run_table_block = storageOwnerContextCacheKindStats(stats.run_table_block),
         .lsm_run_table_physical_block = storageOwnerContextCacheKindStats(stats.run_table_physical_block),
+        .dense_max_runnable_tasks = dense.max_runnable_tasks,
+        .dense_max_outstanding_tasks = dense.max_outstanding_tasks,
+        .dense_max_queued_tasks = dense.max_queued_tasks,
+        .dense_max_wait_ms = dense.max_wait_ms,
+        .dense_all_reads = @intFromBool(dense.all_reads),
+        .read_bounded_runnable = dense.bounded_runnable,
+        .read_bounded_outstanding = dense.bounded_outstanding,
+        .read_transition_outstanding = dense.transition_outstanding,
+        .read_transition_bytes = dense.transition_bytes,
+
+        .dense_runnable = dense.runnable,
+        .dense_outstanding = dense.outstanding,
+        .dense_queued = dense.queued,
+        .dense_max_working_bytes = dense.max_working_bytes,
+        .dense_max_suspended_io = dense.max_suspended_io,
+        .dense_suspended_io = dense.suspended_io,
+        .dense_effective_max_suspended_io = if (owner_context.resources.resource_manager.dense_execution) |runtime|
+            runtime.effectiveSuspendedIo(owner_context.backend_runtime.ptr().io() orelse std.Io.Threaded.global_single_threaded.io())
+        else
+            0,
+        .dense_working_bytes = dense.working_bytes,
     };
     return .ok;
 }
@@ -4222,6 +4385,13 @@ fn metadataProjectionJson(
     return .ok;
 }
 
+fn completionProjectionBytes(alloc: Allocator, out: *kernel_owner_abi.OwnedBytes, bytes: []const u8) kernel_owner_abi.Status {
+    if (bytes.len > kernel_owner_abi.completion_projection_max_response_bytes) return .invalid_argument;
+    const owned = alloc.dupe(u8, bytes) catch return .out_of_memory;
+    out.* = .{ .ptr = if (owned.len == 0) null else owned.ptr, .len = @intCast(owned.len) };
+    return .ok;
+}
+
 fn metadataProjectionStatusFromError(err: anyerror) kernel_owner_abi.Status {
     if (err == error.InvalidDerivedCatalogIndex)
         return storageOwnerStatusFromError(error.InvalidArgument);
@@ -4557,6 +4727,37 @@ pub fn metadataApplyStoreProjection(
             defer input.deinit();
             handle.store.updateStandaloneCatalog(request.group_id, request.arg0, input.value) catch |err| break :blk storageOwnerStatusFromError(err);
             break :blk metadataProjectionJson(alloc, out_json, true);
+        },
+        .capture_completion_activation, .completion_activation, .completion_installation_response => blk: {
+            // These are coherent metadata observations, never backing proof.
+            // Decode and collect in finite owner scratch across the C boundary.
+            if (request.key.slice().len > kernel_owner_abi.completion_projection_max_request_bytes) break :blk .invalid_argument;
+            const scratch = alloc.alloc(u8, 8 * 1024 * 1024) catch break :blk .out_of_memory;
+            defer alloc.free(scratch);
+            var fixed = std.heap.FixedBufferAllocator.init(scratch);
+            const bounded = fixed.allocator();
+            switch (request.kind) {
+                .capture_completion_activation => {
+                    const policy = std.json.parseFromSliceLeaky(antfly.common.table_storage.TransactionRecovery, bounded, request.key.slice(), .{}) catch |err| break :blk storageOwnerStatusFromError(err);
+                    const value = handle.store.captureCompletionActivation(bounded, request.group_id, request.arg0, policy) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk completionProjectionBytes(alloc, out_json, value);
+                },
+                .completion_activation => {
+                    var value = handle.store.getCompletionActivation(bounded, request.group_id, request.arg0) catch |err| break :blk storageOwnerStatusFromError(err);
+                    defer if (value) |*parsed| parsed.deinit();
+                    const encoded = if (value) |parsed| metadata_raft_apply.completion_activation.encode(bounded, parsed.value) catch |err| break :blk storageOwnerStatusFromError(err) else "null";
+                    break :blk completionProjectionBytes(alloc, out_json, encoded);
+                },
+                .completion_installation_response => {
+                    const protocol = antfly.metadata_completion_installation_protocol;
+                    const Input = struct { query: protocol.Request, keys: protocol.Keys };
+                    const input = std.json.parseFromSliceLeaky(Input, bounded, request.key.slice(), .{}) catch |err| break :blk storageOwnerStatusFromError(err);
+                    input.query.validate() catch |err| break :blk storageOwnerStatusFromError(err);
+                    const value = handle.store.completionInstallationResponse(bounded, request.group_id, input.query, input.keys) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk completionProjectionBytes(alloc, out_json, value);
+                },
+                else => unreachable,
+            }
         },
         .system_catalog => blk: {
             const contract = metadata_raft_apply.apply_contract;
@@ -5871,6 +6072,7 @@ pub fn storageOwnerOpen(
         }
     else
         null;
+    const online_source_authority = std.enums.fromInt(antfly.capi_dependencies.storage_source_authority.Kind, request.online_source_authority) orelse return .invalid_argument;
     const owner_context = asStorageOwnerContext(request.context);
     const alloc = if (owner_context) |context| context.alloc else std.heap.c_allocator;
     // A metadata restore intent can become visible before Raft bootstrap has
@@ -5954,6 +6156,18 @@ pub fn storageOwnerOpen(
     if (owner_context) |context| context.acquire();
     var context_borrowed = owner_context != null;
     defer if (context_borrowed) owner_context.?.release();
+    var completion_settings: ?std.json.Parsed(antfly.common.table_storage.Settings) = null;
+    defer if (completion_settings) |*settings| settings.deinit();
+    if (request.restore_bootstrap_json.len != 0 and request.completion_installation != null) return .invalid_argument;
+    const completion_config = if (request.completion_installation) |binding| installed: {
+        if (owner_context == null or identity_namespace == null or binding.identity.group_id != request.group_id or
+            binding.table_id != request.identity_table_id or binding.range_id != request.identity_range_id or
+            request.completion_settings_json.len == 0 or request.completion_settings_json.len > 4096)
+            return .invalid_argument;
+        completion_settings = std.json.parseFromSlice(antfly.common.table_storage.Settings, alloc, request.completion_settings_json.slice(), .{}) catch |err| return storageOwnerStatusFromError(err);
+        const io = owner_context.?.backend_runtime.ptr().filesystemIo() orelse return storageOwnerStatusFromError(error.ConcurrencyUnavailable);
+        break :installed db_mod.DB.completionInstallationPreflight(alloc, io, path, binding.*, request.schema_json.slice(), request.completion_read_schema_json.slice(), request.indexes_json.slice()) catch |err| return storageOwnerStatusFromError(err);
+    } else null;
     const prepared_schema = local_write.prepareOwnerSchemaBeforeIndexLoad(alloc, request.schema_json.slice()) catch |err| return storageOwnerStatusFromError(err);
     defer local_write.freeOwnerSchemaBeforeIndexLoad(alloc, prepared_schema);
     if (request.restore_cancel_recovery > 1 or request.restore_ha_replay > 1 or
@@ -5970,8 +6184,13 @@ pub fn storageOwnerOpen(
         if (!namespace.eql(bootstrap.scope.target_namespace) or !std.mem.eql(u8, bootstrap.table_name, table_name) or !std.mem.eql(u8, bootstrap.schema_json, request.schema_json.slice()) or !std.mem.eql(u8, bootstrap.indexes_json, request.indexes_json.slice())) return storageOwnerStatusFromError(error.RestoreStagingScopeChanged);
     }
     var open_options = db_mod.OpenOptions{
-        .online_source_authority = std.enums.fromInt(antfly.capi_dependencies.storage_source_authority.Kind, request.online_source_authority) orelse return .invalid_argument,
-        .table_storage = switch (request.dense_embedding_storage) {
+        .durable_completion_enabled = if (owner_context) |context| context.durable_completion_enabled else false,
+        .durable_completion_authority = if (request.completion_installation != null) .raft_apply else if (owner_context) |context| context.durable_completion_authority else .none,
+        .completion_pool_config = completion_config,
+        // A validated installation reopens the complete persisted policy.
+        // The dense-storage selector alone omits transaction recovery fields;
+        // installCompletion below checks the full desired settings exactly.
+        .table_storage = if (completion_config != null) null else switch (request.dense_embedding_storage) {
             .persisted => null,
             .primary_lsm => .{ .dense_embeddings = .primary_lsm },
             .vector_store => .{ .dense_embeddings = .vector_store },
@@ -5984,6 +6203,7 @@ pub fn storageOwnerOpen(
         .resource_manager = if (owner_context) |context| &context.resources.resource_manager else null,
         .backend_runtime = if (owner_context) |context| context.backend_runtime.ptr() else null,
         .identity_namespace = identity_namespace,
+        .online_source_authority = online_source_authority,
         .prefer_existing_identity_namespace = identity_namespace != null,
         .transaction_recovery = if (recovery) |value| value.dbConfig() else .{},
         .resolution_candidate_source = if (runtime_hooks) |value| value.candidateSource() else null,
@@ -6055,7 +6275,7 @@ pub fn storageOwnerOpen(
     // after the DB occupies its final address, and drain them on failure.
     if (restore_bootstrap) |bootstrap| {
         local_write.configureRestoreOwnerDb(alloc, &handle.db, bootstrap.value, request.restore_cancel_recovery != 0, request.restore_ha_replay != 0) catch |err| return storageOwnerStatusFromError(err);
-    } else local_write.configureStorageKernelOwnerDbAtOpen(
+    } else if (completion_config == null) local_write.configureStorageKernelOwnerDbAtOpen(
         alloc,
         &handle.db,
         table_name,
@@ -6068,10 +6288,13 @@ pub fn storageOwnerOpen(
         &handle.storage_owner_managed_config,
         request.historical_raft_apply != 0,
     ) catch |err| return storageOwnerStatusFromError(err);
-    // DB.open returns by value. Only now is the compiled owner's DB at its
-    // permanent address with configuration installed; use the same startup as
-    // resident caches so relational builds, retirement and durable outboxes
-    // make progress. Hidden restore owners must remain unpublished/quiescent.
+    if (request.completion_installation) |binding| {
+        handle.db.installCompletionBinding(binding.*, request.schema_json.slice(), request.completion_read_schema_json.slice(), request.indexes_json.slice(), completion_settings.?.value) catch |err| return storageOwnerStatusFromError(err);
+    }
+    // The opaque handle now owns the DB at its final address. Match resident
+    // cache installation: source verification and other DB-owned maintenance
+    // must progress even when this owner receives no foreground requests.
+    // A hidden restore owner stays unpublished until its scoped promotion.
     if (restore_bootstrap == null) {
         handle.db.activateResolverReplayRuntimes() catch |err| return storageOwnerStatusFromError(err);
         handle.db.startResidentBackgroundWorkersIfNeeded();
@@ -6084,6 +6307,214 @@ pub fn storageOwnerOpen(
     success = true;
     out_owner.* = owner_id;
     context_borrowed = false;
+    return .ok;
+}
+
+/// A native guard may outlive cache residency. Its own final release runs
+/// before the last physical owner reference so callbacks never see a closed DB.
+const StorageOwnerCompletionLease = struct {
+    handle: *Handle,
+    inner: kernel_owner_abi.completion_pool.Lease,
+    const pool = kernel_owner_abi.completion_pool;
+    fn from(raw: ?*anyopaque) *@This() {
+        return @ptrCast(@alignCast(raw.?));
+    }
+    fn check(raw: ?*anyopaque, request: *const pool.Check, result: *pool.CheckResult) callconv(.c) kernel_owner_abi.Status {
+        const self = from(raw);
+        return self.inner.vtable.check(self.inner.context, request, result);
+    }
+    fn proposalResult(raw: ?*anyopaque, request: *const pool.ProposalResult) callconv(.c) void {
+        const self = from(raw);
+        self.inner.vtable.proposal_result(self.inner.context, request);
+    }
+    fn release(raw: ?*anyopaque) callconv(.c) void {
+        const self = from(raw);
+        const handle = self.handle;
+        self.inner.vtable.release(self.inner.context);
+        handle.alloc.destroy(self);
+        closeHandle(handle);
+    }
+    fn apply(raw: ?*anyopaque, term: u64, index: u64, bytes: pool.Bytes) callconv(.c) kernel_owner_abi.Status {
+        const self = from(raw);
+        const callback = self.inner.vtable.apply_accepted orelse return storageOwnerStatusFromError(error.CompletionAdmissionUnavailable);
+        return callback(self.inner.context, term, index, bytes);
+    }
+    fn progress(raw: ?*anyopaque, output: *pool.Progress) callconv(.c) kernel_owner_abi.Status {
+        const self = from(raw);
+        const callback = self.inner.vtable.progress orelse return .not_found;
+        return callback(self.inner.context, output);
+    }
+    fn owns(raw: ?*anyopaque, term: u64, index: u64, bytes: pool.Bytes, output: *u8) callconv(.c) kernel_owner_abi.Status {
+        const self = from(raw);
+        output.* = 0;
+        const callback = self.inner.vtable.owns_accepted orelse return .ok;
+        return callback(self.inner.context, term, index, bytes, output);
+    }
+    fn durableCells(raw: ?*anyopaque, output: *pool.DurableCells) callconv(.c) kernel_owner_abi.Status {
+        const self = from(raw);
+        const callback = self.inner.vtable.durable_cells orelse return storageOwnerStatusFromError(error.CompletionAdmissionUnavailable);
+        return callback(self.inner.context, output);
+    }
+    fn reconcileDurable(raw: ?*anyopaque, request: *const pool.DurableLog) callconv(.c) kernel_owner_abi.Status {
+        const self = from(raw);
+        const callback = self.inner.vtable.reconcile_durable orelse return storageOwnerStatusFromError(error.CompletionAdmissionUnavailable);
+        return callback(self.inner.context, request);
+    }
+    const vtable: pool.VTable = .{ .check = check, .proposal_result = proposalResult, .release = release, .apply_accepted = apply, .progress = progress, .owns_accepted = owns, .durable_cells = durableCells, .reconcile_durable = reconcileDurable };
+};
+
+const StorageOwnerControlProofLeaseV2 = struct {
+    handle: *Handle,
+    inner: kernel_owner_abi.completion_pool.ControlLeaseV2,
+    const pool = kernel_owner_abi.completion_pool;
+    fn from(raw: ?*anyopaque) *@This() {
+        return @ptrCast(@alignCast(raw.?));
+    }
+    fn release(raw: ?*anyopaque) callconv(.c) void {
+        const self = from(raw);
+        const handle = self.handle;
+        self.inner.vtable.release(self.inner.context);
+        handle.alloc.destroy(self);
+        closeHandle(handle);
+    }
+    fn durableOwners(raw: ?*anyopaque, output: *pool.ControlDurableOwnersV2) callconv(.c) kernel_owner_abi.Status {
+        const self = from(raw);
+        return self.inner.vtable.durable_owners(self.inner.context, output);
+    }
+    fn reconcileDurable(raw: ?*anyopaque, request: *const pool.ControlDurableLogV2) callconv(.c) kernel_owner_abi.Status {
+        const self = from(raw);
+        return self.inner.vtable.reconcile_durable(self.inner.context, request);
+    }
+    const vtable: pool.ControlVTableV2 = .{ .release = release, .durable_owners = durableOwners, .reconcile_durable = reconcileDurable };
+};
+
+const StorageOwnerControlProofLeaseV3 = struct {
+    handle: *Handle,
+    inner: kernel_owner_abi.completion_pool.ControlLeaseV3,
+    const pool = kernel_owner_abi.completion_pool;
+    fn from(raw: ?*anyopaque) *@This() {
+        return @ptrCast(@alignCast(raw.?));
+    }
+    fn release(raw: ?*anyopaque) callconv(.c) void {
+        const self = from(raw);
+        const handle = self.handle;
+        self.inner.vtable.release(self.inner.context);
+        handle.alloc.destroy(self);
+        closeHandle(handle);
+    }
+    fn durableOwners(raw: ?*anyopaque, output: *pool.ControlDurableOwnersV3) callconv(.c) kernel_owner_abi.Status {
+        const self = from(raw);
+        return self.inner.vtable.durable_owners(self.inner.context, output);
+    }
+    fn reconcileDurable(raw: ?*anyopaque, request: *const pool.ControlDurableLogV3) callconv(.c) kernel_owner_abi.Status {
+        const self = from(raw);
+        return self.inner.vtable.reconcile_durable(self.inner.context, request);
+    }
+    const vtable: pool.ControlVTableV3 = .{ .release = release, .durable_owners = durableOwners, .reconcile_durable = reconcileDurable };
+};
+
+const StorageOwnerControlProofLeaseV4 = struct {
+    handle: *Handle,
+    inner: kernel_owner_abi.completion_pool.ControlLeaseV4,
+    const pool = kernel_owner_abi.completion_pool;
+    fn from(raw: ?*anyopaque) *@This() {
+        return @ptrCast(@alignCast(raw.?));
+    }
+    fn release(raw: ?*anyopaque) callconv(.c) void {
+        const self = from(raw);
+        const handle = self.handle;
+        self.inner.vtable.release(self.inner.context);
+        handle.alloc.destroy(self);
+        closeHandle(handle);
+    }
+    fn durableOwners(raw: ?*anyopaque, output: *pool.ControlDurableOwnersV4) callconv(.c) kernel_owner_abi.Status {
+        const self = from(raw);
+        return self.inner.vtable.durable_owners(self.inner.context, output);
+    }
+    fn reconcileDurable(raw: ?*anyopaque, request: *const pool.ControlDurableLogV4) callconv(.c) kernel_owner_abi.Status {
+        const self = from(raw);
+        return self.inner.vtable.reconcile_durable(self.inner.context, request);
+    }
+    const vtable: pool.ControlVTableV4 = .{ .release = release, .durable_owners = durableOwners, .reconcile_durable = reconcileDurable };
+};
+
+pub fn storageOwnerInstallCompletion(owner: ?*anyopaque, request: *const kernel_owner_abi.InstallCompletionRequest) callconv(.c) kernel_owner_abi.Status {
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    if (request.reserved != 0 or request.binding.identity.group_id != handle.storage_owner_group_id or request.settings_json.len == 0 or request.settings_json.len > 4096)
+        return .invalid_argument;
+    var settings = std.json.parseFromSlice(antfly.common.table_storage.Settings, handle.alloc, request.settings_json.slice(), .{}) catch |err| return storageOwnerStatusFromError(err);
+    defer settings.deinit();
+    handle.db.installCompletionBinding(request.binding, request.schema_json.slice(), request.read_schema_json.slice(), request.indexes_json.slice(), settings.value) catch |err| return storageOwnerStatusFromError(err);
+    return .ok;
+}
+
+pub fn storageOwnerAcquireCompletionLease(owner: ?*anyopaque, group_id: u64, node_id: u64, output: *kernel_owner_abi.completion_pool.Lease) callconv(.c) kernel_owner_abi.Status {
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    if (group_id == 0 or node_id == 0 or group_id != handle.storage_owner_group_id) return .invalid_argument;
+    const retained = handle.alloc.create(StorageOwnerCompletionLease) catch return .out_of_memory;
+    var success = false;
+    defer if (!success) handle.alloc.destroy(retained);
+    const inner = handle.db.acquireCompletionLease(group_id, node_id) catch |err| return storageOwnerStatusFromError(err);
+    _ = handle.owner_refs.fetchAdd(1, .monotonic);
+    retained.* = .{ .handle = handle, .inner = inner };
+    output.* = .{ .identity = inner.identity, .context = retained, .vtable = &StorageOwnerCompletionLease.vtable };
+    success = true;
+    return .ok;
+}
+
+pub fn storageOwnerAcquireControlProofLeaseV2(owner: ?*anyopaque, group_id: u64, node_id: u64, output: *kernel_owner_abi.completion_pool.ControlLeaseV2) callconv(.c) kernel_owner_abi.Status {
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    if (group_id == 0 or node_id == 0 or group_id != handle.storage_owner_group_id) return .invalid_argument;
+    const retained = handle.alloc.create(StorageOwnerControlProofLeaseV2) catch return .out_of_memory;
+    var success = false;
+    defer if (!success) handle.alloc.destroy(retained);
+    const inner = handle.db.acquireControlCompletionLeaseV2(group_id, node_id) catch |err| return storageOwnerStatusFromError(err);
+    _ = handle.owner_refs.fetchAdd(1, .monotonic);
+    retained.* = .{ .handle = handle, .inner = inner };
+    output.* = .{ .identity = inner.identity, .context = retained, .vtable = &StorageOwnerControlProofLeaseV2.vtable };
+    success = true;
+    return .ok;
+}
+
+pub fn storageOwnerAcquireControlProofLeaseV3(owner: ?*anyopaque, group_id: u64, node_id: u64, output: *kernel_owner_abi.completion_pool.ControlLeaseV3) callconv(.c) kernel_owner_abi.Status {
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    if (group_id == 0 or node_id == 0 or group_id != handle.storage_owner_group_id) return .invalid_argument;
+    const retained = handle.alloc.create(StorageOwnerControlProofLeaseV3) catch return .out_of_memory;
+    var success = false;
+    defer if (!success) handle.alloc.destroy(retained);
+    const inner = handle.db.acquireControlCompletionLeaseV3(group_id, node_id) catch |err| return storageOwnerStatusFromError(err);
+    _ = handle.owner_refs.fetchAdd(1, .monotonic);
+    retained.* = .{ .handle = handle, .inner = inner };
+    output.* = .{ .identity = inner.identity, .context = retained, .vtable = &StorageOwnerControlProofLeaseV3.vtable };
+    success = true;
+    return .ok;
+}
+
+pub fn storageOwnerAcquireControlProofLeaseV4(owner: ?*anyopaque, group_id: u64, node_id: u64, output: *kernel_owner_abi.completion_pool.ControlLeaseV4) callconv(.c) kernel_owner_abi.Status {
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    if (group_id == 0 or node_id == 0 or group_id != handle.storage_owner_group_id) return .invalid_argument;
+    const retained = handle.alloc.create(StorageOwnerControlProofLeaseV4) catch return .out_of_memory;
+    var success = false;
+    defer if (!success) handle.alloc.destroy(retained);
+    const inner = handle.db.acquireControlCompletionLeaseV4(group_id, node_id) catch |err| return storageOwnerStatusFromError(err);
+    _ = handle.owner_refs.fetchAdd(1, .monotonic);
+    retained.* = .{ .handle = handle, .inner = inner };
+    output.* = .{ .identity = inner.identity, .context = retained, .vtable = &StorageOwnerControlProofLeaseV4.vtable };
+    success = true;
+    return .ok;
+}
+
+pub fn storageOwnerAttestCompletionBacking(owner: ?*anyopaque, group_id: u64, node_id: u64, output: *kernel_owner_abi.completion_pool.NativeAttestation) callconv(.c) kernel_owner_abi.Status {
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    if (group_id == 0 or node_id == 0 or group_id != handle.storage_owner_group_id) return .invalid_argument;
+    output.* = handle.db.attestCompletionBacking(group_id, node_id) catch |err| return storageOwnerStatusFromError(err);
+    return .ok;
+}
+
+pub fn storageOwnerQuiesce(owner: ?*anyopaque) callconv(.c) kernel_owner_abi.Status {
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    handle.db.quiesceCompletionOwnerWorkers();
     return .ok;
 }
 
@@ -6596,6 +7027,28 @@ pub fn storageOwnerReplicatedBatchAtRaftEntryJson(
         .ptr = response.ptr,
         .len = @intCast(response.len),
     };
+    return .ok;
+}
+
+pub fn storageOwnerCompileReplicatedCompletion(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.CompileReplicatedCompletionRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request.reserved != 0 or (request.previous_term == 0) != (request.previous_index == 0)) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    if (request.request_json.len > 0 and request.request_json.ptr == null) return .invalid_argument;
+    var owned = batch_api.parseInternalBatchRequest(handle.alloc, request.request_json.slice()) catch |err|
+        return storageOwnerStatusFromError(err);
+    defer owned.deinit(handle.alloc);
+    const compiled = local_write.compileStorageKernelReplicatedCompletion(std.heap.c_allocator, &handle.db, request.table_name.slice(), handle.storage_owner_group_id, owned.req, .{
+        .term = request.previous_term,
+        .index = request.previous_index,
+    }) catch |err| return storageOwnerStatusFromError(err);
+    out_response.* = .{ .ptr = compiled.ptr, .len = @intCast(compiled.len) };
     return .ok;
 }
 

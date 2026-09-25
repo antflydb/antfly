@@ -4,6 +4,8 @@
  */
 
 import createClient, { type Client } from "openapi-fetch";
+import { admissionFetch } from "./admission.js";
+import { readRetryFetch } from "./read-retries.js";
 import { validateGraphQueryIdentifiers } from "./graph-identifiers.js";
 import { validateGraphQueryResponses } from "./graph-results.js";
 import { validateCreateIndexRequestRelationships } from "./index-config.js";
@@ -541,8 +543,10 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 export class AntflyClient {
   private client: Client<paths>;
   private config: AntflyConfig;
+  private readonly fetch: typeof globalThis.fetch;
 
   constructor(config: AntflyConfig) {
+    this.fetch = readRetryFetch(admissionFetch(config.admission), config.readRetries);
     this.config = {
       ...config,
       baseUrl: normalizeBaseUrl(config.baseUrl),
@@ -578,6 +582,7 @@ export class AntflyClient {
     }
 
     return createClient<paths>({
+      fetch: this.fetch,
       baseUrl: normalizeBaseUrl(this.config.baseUrl),
       headers,
       bodySerializer: (body) => {
@@ -624,7 +629,7 @@ export class AntflyClient {
       throw new Error(`${marshalErrorPrefix}: ${(error as Error).message}`);
     }
 
-    const response = await fetch(this.url(path), {
+    const response = await this.fetch(this.url(path), {
       method: "POST",
       headers: this.requestHeaders(),
       body: encodedBody,
@@ -833,7 +838,7 @@ export class AntflyClient {
     Object.assign(headers, this.config.headers);
 
     const abortController = new AbortController();
-    const response = await fetch(
+    const response = await this.fetch(
       `${normalizeBaseUrl(this.config.baseUrl)}/db/v1/agents/retrieval`,
       {
         method: "POST",
@@ -2081,6 +2086,7 @@ export class AntflyClient {
     ): AsyncGenerator<{ _id: string; [key: string]: unknown }> => {
       const config = this.config;
       const authHeader = this.getAuthHeader();
+      const fetch = this.fetch;
 
       async function* scanGenerator(): AsyncGenerator<{ _id: string; [key: string]: unknown }> {
         const headers: Record<string, string> = {

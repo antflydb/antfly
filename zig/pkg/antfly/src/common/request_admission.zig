@@ -15,77 +15,10 @@ pub const PrometheusClass = enum {
     inference,
 };
 
-/// Process-local, fail-fast admission for one foreground request class.
-/// A zero capacity disables the limit while retaining accounting.
-pub const RequestAdmission = struct {
-    capacity: usize,
-    in_flight: std.atomic.Value(usize) = .init(0),
-    rejected_total: std.atomic.Value(u64) = .init(0),
-    peak_in_flight: std.atomic.Value(usize) = .init(0),
-
-    pub fn init(capacity: usize) RequestAdmission {
-        return .{ .capacity = capacity };
-    }
-
-    pub fn tryAcquire(self: *RequestAdmission) bool {
-        var observed = self.in_flight.load(.acquire);
-        while (self.capacity == 0 or observed < self.capacity) {
-            if (self.in_flight.cmpxchgWeak(observed, observed + 1, .acq_rel, .acquire) == null) {
-                const admitted = observed + 1;
-                var peak = self.peak_in_flight.load(.acquire);
-                while (peak < admitted) {
-                    if (self.peak_in_flight.cmpxchgWeak(peak, admitted, .acq_rel, .acquire) == null) break;
-                    peak = self.peak_in_flight.load(.acquire);
-                }
-                return true;
-            }
-            observed = self.in_flight.load(.acquire);
-        }
-        _ = self.rejected_total.fetchAdd(1, .monotonic);
-        return false;
-    }
-
-    /// An admitted request whose ownership is explicit and single-release.
-    /// Prefer this at callback and provider boundaries so every error path
-    /// returns capacity to the shared admission controller.
-    pub const Lease = struct {
-        admission: *RequestAdmission,
-        active: bool = true,
-
-        pub fn release(self: *Lease) void {
-            if (!self.active) return;
-            self.admission.release();
-            self.active = false;
-        }
-    };
-
-    /// Acquires an RAII-style lease so admission can cover setup performed by
-    /// the caller before the core operation begins.
-    pub fn tryAcquireLease(self: *RequestAdmission) ?Lease {
-        if (!self.tryAcquire()) return null;
-        return .{ .admission = self };
-    }
-
-    pub fn release(self: *RequestAdmission) void {
-        _ = self.in_flight.fetchSub(1, .acq_rel);
-    }
-
-    pub const Stats = struct {
-        capacity: usize,
-        in_flight: usize,
-        peak_in_flight: usize,
-        rejected_total: u64,
-    };
-
-    pub fn stats(self: *const RequestAdmission) Stats {
-        return .{
-            .capacity = self.capacity,
-            .in_flight = self.in_flight.load(.acquire),
-            .peak_in_flight = self.peak_in_flight.load(.acquire),
-            .rejected_total = self.rejected_total.load(.acquire),
-        };
-    }
-};
+/// Shared process-local owner. Legacy calls remain fail-fast and zero capacity
+/// remains unlimited. Contextual calls may opt into bounded waiting.
+pub const workload = @import("workload_admission.zig");
+pub const RequestAdmission = workload.Controller;
 
 /// Emit the stable process-level metrics for a foreground admission class.
 /// Keeping names here prevents runtime-specific health endpoints from drifting.
@@ -130,6 +63,40 @@ pub fn appendPrometheusMetrics(
     try prometheus.appendPromMetric(writer, names.in_flight, "gauge", names.in_flight_help, stats.in_flight);
     try prometheus.appendPromMetric(writer, names.peak_in_flight, "gauge", names.peak_help, stats.peak_in_flight);
     try prometheus.appendPromMetric(writer, names.rejected_total, "counter", names.rejected_help, stats.rejected_total);
+    const prefix = "antfly_admission_" ++ @tagName(class);
+    try prometheus.appendPromMetric(writer, prefix ++ "_diagnostics_available", "gauge", "Whether the statistics provider exposes policy and limiting-resource diagnostics", @intFromBool(stats.policy_generation != 0));
+    if (stats.policy_generation != 0) {
+        try prometheus.appendPromMetric(writer, prefix ++ "_policy_generation", "gauge", "Process-local policy revision; resets on restart and advances on accepted reconfiguration", stats.policy_generation);
+        try prometheus.appendPromMetric(writer, prefix ++ "_outstanding_requests", "gauge", "Active plus queued foreground operations; excludes output retained after execution", stats.in_flight +| stats.queued);
+        const rejections = prefix ++ "_rejections_by_reason_total";
+        try writer.print("# HELP {s} Admission rejections by bounded limiting reason\n# TYPE {s} counter\n", .{ rejections, rejections });
+        inline for (@typeInfo(workload.RejectionReason).@"enum".fields, 0..) |field, i| {
+            try writer.print("{s}{{reason=\"{s}\"}} {d}\n", .{ rejections, field.name, stats.rejection_reasons[i] });
+        }
+        const denials = prefix ++ "_allocation_denials_total";
+        try writer.print("# HELP {s} Tracked allocation attempts denied by a budget; distinct from rejected requests\n# TYPE {s} counter\n", .{ denials, denials });
+        inline for (@typeInfo(workload.AllocationDenial).@"enum".fields, 0..) |field, i| {
+            try writer.print("{s}{{reason=\"{s}\"}} {d}\n", .{ denials, field.name, stats.allocation_denials[i] });
+        }
+    }
+    try prometheus.appendPromMetric(writer, prefix ++ "_queue_capacity_requests", "gauge", "Configured maximum queued requests", stats.max_queued_requests);
+    try prometheus.appendPromMetric(writer, prefix ++ "_queue_capacity_bytes", "gauge", "Configured maximum queued request bytes", stats.max_queued_bytes);
+    try prometheus.appendPromMetric(writer, prefix ++ "_retained_capacity_bytes", "gauge", "Configured request and tracked allocation byte ceiling; zero is unlimited", stats.max_retained_bytes);
+    try prometheus.appendPromMetric(writer, prefix ++ "_wait_ceiling_milliseconds", "gauge", "Configured admission wait ceiling; zero is fail fast", stats.max_wait_ms);
+    try prometheus.appendPromMetric(writer, prefix ++ "_draining", "gauge", "Whether this admission owner is closed to new work", @intFromBool(stats.draining));
+    try prometheus.appendPromMetric(writer, prefix ++ "_queued_requests", "gauge", "Requests waiting for admission", stats.queued);
+    try prometheus.appendPromMetric(writer, prefix ++ "_queued_bytes", "gauge", "Retained bytes owned by admission waiters", stats.queued_bytes);
+    try prometheus.appendPromMetric(writer, prefix ++ "_retained_bytes", "gauge", "Request reservations and tracked query or output allocations still owned", stats.retained_bytes);
+    try prometheus.appendPromMetric(writer, prefix ++ "_waited_requests_total", "counter", "Requests entering admission waiting", stats.waited_total);
+    try prometheus.appendPromMetric(writer, prefix ++ "_wait_nanoseconds_total", "counter", "Cumulative admission waiting time", stats.wait_ns_total);
+    try prometheus.appendPromMetric(writer, prefix ++ "_expired_requests_total", "counter", "Waiters retired on admission or request deadline", stats.expired_total);
+    try prometheus.appendPromMetric(writer, prefix ++ "_cancelled_requests_total", "counter", "Waiters retired on cancellation", stats.cancelled_total);
+    const histogram = prefix ++ "_wait_seconds";
+    try writer.print("# HELP {s} Admission queue residence time\n# TYPE {s} histogram\n", .{ histogram, histogram });
+    inline for (workload.wait_bucket_seconds, 0..) |bound, i| {
+        try writer.print("{s}_bucket{{le=\"{s}\"}} {d}\n", .{ histogram, bound, stats.wait_buckets[i] });
+    }
+    try writer.print("{s}_sum {d}\n{s}_count {d}\n", .{ histogram, @as(f64, @floatFromInt(stats.wait_ns_total)) / std.time.ns_per_s, histogram, stats.wait_completed_total });
 }
 
 test "request admission bounds positive capacity and preserves unlimited mode" {
@@ -187,4 +154,26 @@ test "request admission metrics use the shared admission namespace" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "antfly_admission_write_rejected_requests_total 2\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "antfly_admission_inference_capacity_requests 8\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "antfly_admission_inference_rejected_requests_total 4\n") != null);
+    // Partial inference/legacy providers must not advertise zero pressure as
+    // though they supplied complete diagnostics.
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "antfly_admission_inference_diagnostics_available 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "antfly_admission_inference_rejections_by_reason_total") == null);
+}
+
+test "request admission metrics expose actual fixed policy and bounded failure reasons" {
+    var gate = RequestAdmission.initConfigured(1, .{ .max_retained_bytes = 128 });
+    var lease = try gate.acquire(.{ .io = std.testing.io, .retained_bytes = 64 });
+    defer lease.release();
+    try std.testing.expect(!gate.tryAcquire());
+    try std.testing.expectError(error.AdmissionBytesExhausted, gate.reserveMemory(65));
+    try gate.reconfigure(2, .{ .max_retained_bytes = 128 });
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try appendPrometheusMetrics(&output.writer, .query, gate.stats());
+    const rendered = output.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "antfly_admission_query_policy_generation 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "antfly_admission_query_capacity_requests 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "antfly_admission_query_outstanding_requests 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "antfly_admission_query_rejections_by_reason_total{reason=\"execution_capacity\"} 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "antfly_admission_query_allocation_denials_total{reason=\"retained_bytes\"} 1\n") != null);
 }

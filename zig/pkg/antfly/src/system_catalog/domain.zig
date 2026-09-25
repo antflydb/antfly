@@ -885,11 +885,16 @@ pub fn httpStatus(err: anyerror) u16 {
         error.InvalidCatalogName, error.InvalidCatalogMutation, error.InvalidTablespaceLocation, error.InvalidTablespacePlacementPolicy, error.InvalidCreateTableRequest => 400,
         error.CatalogCommandTooLarge, error.CreateTableRequestTooLarge => 413,
         error.TableTopologyProtocolUpgradeRequired => 426,
+        error.CompletionAdmissionUnavailable, error.CompletionAdmissionPolicyChanged => 503,
         error.Forbidden => 403,
         error.UnsupportedOperation, error.MetadataIncarnationUnavailable, error.InvalidMetadataIncarnation, error.MetadataIncarnationMismatch, error.CatalogRoutingUnavailable, error.CatalogProjectionRefreshRequired, error.CatalogRoutingSnapshotTimeout, error.ResourceTemporarilyUnavailable => 503,
-        error.MetadataMutationOutcomeUnknown, error.NotLeader, error.Timeout, error.Cancelled, error.Canceled, error.DeadlineExceeded => 503,
+        error.MetadataMutationOutcomeUnknown, error.MetadataLinearizableReadTimeout, error.NotLeader, error.Timeout, error.Cancelled, error.Canceled, error.DeadlineExceeded => 503,
         else => 500,
     };
+}
+
+test "system catalog read timeout is retryable service unavailability" {
+    try std.testing.expectEqual(@as(u16, 503), httpStatus(error.MetadataLinearizableReadTimeout));
 }
 
 /// Only trusted native ingress constructs these immutable routing identities.

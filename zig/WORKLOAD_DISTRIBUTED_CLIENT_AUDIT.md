@@ -1,0 +1,405 @@
+# Distributed and client-contract audit
+
+This inventory tracks item 8 of the scheduling completion requirements. It is
+not whole-system qualification, and the SDK regressions below do not establish
+replicated completion, process-wide progress, or all distributed cancellation
+interleavings. The starting implementation was revision `3dc3ac6c4d`.
+
+## Authoritative implementation inventory
+
+| Contract | Implementation and existing evidence | Remaining qualification |
+| --- | --- | --- |
+| Query retry eligibility and unknown writes | `go/pkg/sdk/read_retries.go`, `py/packages/sdk/src/antfly/read_retries.py`, `ts/packages/sdk/src/read-retries.ts`, `rs/crates/sdk/src/read_retries.rs`. Automatic retries require query POST plus explicit admission-stage, execution-not-started 429 evidence. Arbitrary writes and transport failures do not qualify. | Cross-language malformed/rolling-version response matrix; public frontend mutation error/retry presentation audit. Existing unit tests are not evidence of real lost-write recovery. |
+| Original client deadline through response consumption | Go retains the original context until response-body retirement; Rust sets remaining total request timeout after local admission. Python's synchronous contract explicitly caps individual I/O waits, not arbitrary synchronous streaming duration. | Go/Rust current-tree runtime tests were inspected, not rerun in this slice. Synchronous Python cannot interrupt arbitrary custom blocking transports; its documented restriction remains. |
+| Local admission, cancellation and stream cleanup | Admission modules in each SDK hold permits through response lifetime. Python/TS deadline and cleanup fixes below add missing stream interleavings. | Broader custom transport shutdown, connection failures, idle abandoned responses, and every generated SDK endpoint are not qualified here. |
+| Durable remote attempt ownership | `api/workload_attempt_coordinator.zig`, `api/workload_attempt_worker.zig`, `api/workload_attempt_protocol.zig`, `api/http_client.zig`, `api/workload_coordinator_runtime.zig`. Existing tests cover lost terminal responses, signed identity/digest checks, worker restart, generation fences and durable uncertainty. | Partial fan-out with mixed terminal/unknown outcomes, cancellation during each ownership transition, shutdown with late replies, and mixed-version cluster runs remain separate tasks. Do not repeat prior response-loss fixtures as a substitute. |
+| Transaction coordinator recovery handoffs | `api/distributed_txn.zig`: existing tests include same-ID ambiguous decision retry, bounded deadline, participant fan-out, attempted-participant abort, topology change and no abort after durable commit. `api/transactions.zig` retains recovery through coordinator acknowledgement. | Audit each accepted-to-recovery ownership transfer against newly protected ordinary/control records. Production replicated fault matrix belongs to the overall completion work. |
+| Version negotiation and fallback | Attempt protocol validates signed versions/identity; DATA physical completion requires canonical protocol support rather than logical fallback. | Real rolling versions, unsupported worker behavior, discovery cancellation and no downgrade across all endpoint variants are not established by SDK tests. |
+
+## SDK deadline and cleanup slice
+
+The four SDK query-retry classifiers now require exact, unambiguous 429
+non-admission proof. Duplicate JSON fields (including future fields and escaped
+key aliases), malformed UTF-8, and case-changed proof keys cannot authorize a
+retry; a single future extension field remains compatible. Go, Python,
+TypeScript and Rust focused gates passed, with 29/29 Python, 27/27 TypeScript,
+and 4/4 Rust tests. The Rust full retry module also exposed a preexisting
+loopback fixture bug: its accepted socket inherited nonblocking mode. The
+fixture now switches to blocking mode before its bounded read. This matrix is
+SDK parser evidence, not real multi-peer write-loss qualification.
+
+Python async retries previously ended their timeout scope at response headers.
+A delayed streamed success or a paused consumer could exceed the original
+operation deadline. Returned streams now retain that deadline, reject late
+chunks, and close the transport exactly once. Repeated task cancellation may
+return before cleanup, while the underlying admission permit remains owned
+until transport closure completes. The synchronous Python limitation above is
+unchanged.
+
+TypeScript previously accepted late successful headers from a custom fetch
+implementation that ignored cancellation. It could also stall indefinitely
+while inspecting the bounded clone of a 429 body. The retry wrapper now rejects
+late replies and cancels both response tee branches together. Concurrent abort,
+read-error and consumer cancellation exposed a separate admission bug: a second
+`reader.cancel()` resolved before the first transport cleanup, returning the
+permit too early. All cancellation paths now join one cleanup promise; a
+pending read becoming EOF during cancellation cannot bypass that promise.
+
+Validation (actual exit 0):
+
+- Python retry/admission: 25 passed; `/tmp/workload-sdk-python-stream-deadline.log`.
+  Command: `uv run --project py/packages/sdk pytest py/packages/sdk/tests/test_read_retries.py py/packages/sdk/tests/test_admission.py -q`.
+- TypeScript retry/admission: 22 passed; `/tmp/workload-sdk-ts-deadline.log`.
+  Command: `pnpm --dir ts/packages/sdk exec vitest run test/read-retries.test.ts test/admission.test.ts --maxWorkers=1`.
+- TypeScript SDK typecheck and scoped Python Ruff checks passed. Scoped Biome
+  formatting was applied; preexisting non-null assertion warnings remain.
+
+The new Python tests failed before the fix (2 failed, 1 passed). The initial
+TypeScript late-reply/stalled-clone tests failed before the fix (2 failed,
+11 passed); the composed cleanup test independently reproduced premature permit
+release before the shared-cancellation fix. No new automatic write retry or
+fallback behavior was added.
+
+## Late terminal response boundary
+
+`ApiHttpClient.executeCoordinatedRead` now verifies signed terminal evidence and
+retires its durable attempt before checking caller cancellation and the original
+deadline. A late result is freed and returned as cancellation/deadline failure;
+the terminal proof still closes the remote obligation. An unsigned late response
+remains uncertain and charged. Expiry alone never retires a remote attempt.
+
+The owning `antfly-api-test` gate passed 1/1, no skips/failures/leaks, actual
+exit 0. Its regression covers signed and unsigned responses after both transport-
+triggered cancellation and deadline expiry, with one dispatch in every case.
+Log: `/tmp/workload-coordinator-late-terminal.log`. Reproduce from `zig/`:
+
+```sh
+zig build antfly-api-test -j1 --cache-dir /tmp/zig-local-cache \
+  --global-cache-dir /tmp/zig-global-cache -- \
+  --test-filter 'workload admission coordinator late terminal'
+```
+
+The audit also found that DATA HTTP/coordinator teardown preceded draining native
+DB callback users. This was handed to the runtime owner, who is implementing and
+testing a separate shutdown-order fix. It is not qualified by this API test.
+Existing join fan-out tests cover bounded concurrency, partial worker error,
+complete drain and cancellation before launch; inflight cancellation with mixed
+signed-terminal/unknown results still needs broader qualification.
+
+## Transaction retry and recovery handoffs
+
+A stable-ID retry can observe an authoritative committed coordinator record and
+then receive a conflicting, missing, or malformed response to its resolution
+retry. The coordinator previously entered abort cleanup in those branches.
+The same problem occurred after a transport failure followed by a contradictory
+aborted status. Committed evidence now remains authoritative: these inconsistent
+replies stop further dispatch and leave propagation pending. Callers configured
+to report post-commit failures receive `CommitPropagationIncomplete`; callers
+requesting structured outcomes retain `committed` with `propagation_pending`.
+No abort or follower acknowledgement is authorized by the later reply.
+
+The existing stable-ID regression now exercises these four failure schedules
+under both reporting policies, asserting one coordinator resolve, no abort,
+no re-prepare, and no follower resolve. Its exact owning API inventory filter is
+`stable distributed transaction retry resumes a durable commit decision`.
+
+The broader module inventory remains distinct from this regression:
+
+| Schedule | Source coverage | Still required |
+| --- | --- | --- |
+| Pre-decision transport failure and replica rediscovery | `hosted participant rediscovery retries only pre-decision leader unavailability` distinguishes proven not-sent/not-proposed from unknown timeout/reset and checks forged/legacy response handling. | Real peers across mixed versions, shutdown during dispatch, delayed server queue followed by abort recovery. |
+| Ambiguous coordinator commit | Same-ID retry, bounded unresolved retry, and one absolute recovery deadline tests; no new transaction ID or opposite decision after uncertainty. | Process loss between status, retry, durable participant resolution, and acknowledgement; real leader replacement. |
+| Partial participant fanout | Bounded concurrency, attempted-participant contact mask, durable abort before acknowledgement of untouched participants. Submitted tasks are joined before their arenas and slot arrays are released, including I/O cancellation. | Inflight cancellation/shutdown in each fanout phase, delayed replies during cleanup, and native ownership transfer under resource exhaustion. |
+| Post-commit visibility and acknowledgement | `distributed txn coordinator never aborts after durable commit decision` covers pending visibility, terminal repair, propagation and acknowledgement errors. | Retained coordinator/participant records across actual restart and all new protected record kinds. |
+| End-to-end caller deadline | The follow-up below adds an ingress context to commit callbacks, `ExecuteOptions`, participant waves and replica attempts. Ambiguous-decision recovery still has a separate bounded deadline and ignores client cancellation. | Owning validation of the follow-up, production DATA routed callback, legacy catalog preemption, and one shared abort/ack cleanup budget remain separate requirements. |
+
+Parallel table-read preflight now joins every started worker wave and checks
+the original request before dispatching a later wave or publishing a result.
+A five-group, two-worker cancellation fixture passed 1/1 with zero leaks: the
+first wave returned summaries while flipping cancellation, the caller returned
+`Cancelled`, and the remaining three groups were not dispatched. This covers
+the preflight handoff, not all late-reply schedules in remote query execution.
+
+The source inventory above is not a claim that all existing tests were rerun.
+Most transaction tests are not in the curated `antfly-api-test` compile inventory;
+passing only a runtime filter without adding the owning compile filter can select
+zero tests. The exact new regression is included explicitly. Broader qualification
+must first establish test discovery, then run the named schedules and real fault
+fixtures; item 8 remains open.
+
+Validation of the monotonic-decision fix: owning API gate 1/1 passed, 0 skipped,
+0 failed, 0 leaks, actual exit 0. This one test includes the existing successful
+resume and all eight injected failure/reporting-policy combinations. Log:
+`/tmp/workload-transaction-monotonic-decision2.log`. Reproduce from `zig/`:
+
+```sh
+zig build antfly-api-test -j1 --cache-dir /tmp/zig-local-cache \
+  --global-cache-dir /tmp/zig-global-cache -- \
+  --test-filter 'stable distributed transaction retry resumes a durable commit decision'
+```
+
+The initial gate exited 1 before running tests because of a native callback
+return-type integration error and a test-local optional-error comparison. Both
+were corrected before the successful owning gate; this was not a before-fix
+runtime reproduction. The separate runtime owner's subsequent DATA gate also
+passed 6/6, including the retained-owner shutdown ordering regression
+(`/tmp/workload-completion-capsule-data1.log`); that evidence remains narrower
+than the multi-peer shutdown schedules listed above.
+
+
+## Original transaction admission deadline (follow-up)
+
+The API now carries `PreDecisionContext` through appended transaction, batch and
+stable-ID commit callbacks. API ABI advances from 33 to 34. A supplied absolute
+deadline retains its originating clock and cancellation token across participant
+waves and replica rediscovery; each operation/attempt can shorten its remaining
+budget but cannot restart the caller's budget. A bounded caller cannot fall back
+to a callback that lacks this capability. Null-deadline in-process calls retain
+the legacy contract explicitly.
+
+Public POST batch and transaction-commit routes establish one **20-second total
+admission deadline at ingress when none exists**, before body decoding and
+admission/lifecycle waits. This changes the previous per-operation 20-second
+behavior. The value shares the existing participant default in
+`distributed_txn_contract`; no configurable public mutation timeout was found in
+the API/common configuration. Any existing shorter or longer deadline and its
+clock remain unchanged. The deadline bounds new work before a decision; it is
+not a promise to cancel a transaction that has already committed.
+
+Single-group atomic batches retain their existing execution path. Their routed
+Raft callback gains an explicit pre-decision context rather than converting the
+deadline into postcommit cancellation. Missing support fails before proposal.
+The DATA runtime owner is implementing that callback separately. Stateless retry
+loops retain the same context, bound backoff by its remaining time, and preserve
+unknown outcomes even if the deadline expires during the attempt. Abort cleanup,
+known-committed propagation and ambiguous decision recovery do not inherit this
+caller deadline.
+
+Focused regressions cover expiry/cancellation between participant waves with
+both begun participants aborted, no callback dispatch for expired requests,
+foreign callback dispatch with exact context and no legacy downgrade, accepted
+atomic completion after expiry, stateless definite-abort retry expiry versus
+unknown outcome, and public ingress default/preservation. Existing real loopback
+batch and stable-session handoff fixtures now assert that their commit hooks
+receive the ingress deadline and clock.
+
+The first owning API gate compiled and ran all ten selected tests: 9 passed,
+1 failed, 0 skipped, 0 leaks, actual exit 1
+(`/tmp/workload-transaction-original-deadline1.log`). The failure was a new
+clock-fixture expectation that offered only one second despite the existing
+response reserve requiring more; the fixture now supplies two seconds and
+asserts the one-second server budget. Production policy was unchanged. The
+corrected owning gate passed **10/10, 0 skipped, 0 failed, 0 leaks, actual exit 0**
+(`/tmp/workload-transaction-original-deadline2.log`). That receipt retains the
+exact ten-filter command and complete tool output. These changes do not qualify
+strict preemption inside legacy `CatalogSource.adminSnapshot` callbacks: checks
+bracket those calls, but their existing interface has no deadline parameter.
+Synchronous native atomic work may finish after its admission deadline; it is
+not interrupted or reported uncommitted afterward. One shared absolute
+abort/ack budget, transport cancellation during every remote attempt, and the
+multi-peer process-loss/shutdown schedules above remain open under item 8.
+
+
+The follow-up first-decision path now carries the original context through a
+separate participant callback, checked local-source callback, and local-only
+Raft admission callback. The new `/txn-decide-v1` RPC does not dispatch to the
+legacy resolution endpoint when the peer lacks that capability. Only an exact
+`PreDecisionNotProposed` result (or transport proof that no request was sent)
+permits durable abort. A generic cancellation, timeout, missing endpoint, or
+post-acceptance failure remains uncertain and enters same-decision recovery.
+Recovery, resumed committed transactions and later participant propagation still
+use the independent resolution path; no caller deadline is checked after a
+successful accepted decision. The HTTP transport borrows a cancellation scope
+that observes both the original clock/deadline and caller cancellation.
+
+API ABI35 appends the new capabilities. Failure ABI60 appends the exact
+`PreDecisionNotProposed` identity, and the checked API error transport preserves
+it separately from generic unavailable/cancellation statuses. New regression
+source covers first-submission rejection, response loss, accepted completion
+after expiry, resumed committed evidence, missing capability, versioned response
+proof and precise HTTP error classification. The owning API gate passed
+**15/15, 0 skipped, 0 failed, 0 leaks, actual exit 0**
+(`/tmp/workload-first-decision-api3.log`): the previous ten filters plus
+`--test-filter 'first decision'` select five new tests. Two earlier attempts
+failed solely on the new fixture's optional-error comparison; unwrapping the
+optional before comparing fixed the test, with no production change. A separate
+canonical failure-identity root passed **1/1, actual exit 0**
+(`/tmp/workload-first-decision-identity.log`):
+
+```sh
+zig test --dep runtime_failure_abi \
+  -Mroot=pkg/antfly/src/runtime_failure_identity.zig \
+  -Mruntime_failure_abi=pkg/antfly/src/runtime_failure_abi.zig \
+  --test-filter 'first decision rejection' \
+  --cache-dir /tmp/zig-local-cache --global-cache-dir /tmp/zig-global-cache
+```
+
+The matching DATA local-leader/user-receipt and SourceOwner acquisition hooks
+passed their separate four-test owning gate (actual exit 0,
+`/tmp/workload-first-decision-data1.log`, commit `025e550647`). These API results do not qualify the
+remaining aggregate abort/ack deadline or multi-peer process-loss/shutdown
+schedules listed above.
+
+Reproduce the validated API stage from `zig/` (loopback access required):
+
+```sh
+zig build antfly-api-test -j1 --cache-dir /tmp/zig-local-cache \
+  --global-cache-dir /tmp/zig-global-cache -- \
+  --test-filter 'distributed txn preserves original deadline across participant waves and cleanup' \
+  --test-filter 'transaction attempt budgets follow the borrowed transport clock' \
+  --test-filter 'transaction commit boundary preserves ingress context and never downgrades deadlines' \
+  --test-filter 'routed atomic batch preserves deadline without changing accepted outcome' \
+  --test-filter 'public transaction ingress establishes one original deadline before dispatch' \
+  --test-filter 'shared stateless batch retries borrow IO and preserve unknown outcomes' \
+  --test-filter 'stable distributed transaction retry resumes a durable commit decision' \
+  --test-filter 'compiled table write boundary transports cancellation and committed failure identity' \
+  --test-filter 'httpx multi batch route uses the batch commit hook and public response contract' \
+  --test-filter 'workload admission stable transaction commit durably hands off recovery before acknowledgement'
+```
+
+The appended callback inventory also required a field-count-scaled compile-time
+branch quota in the checked dispatcher, and an explicit error set in the
+existing owner-forwarding batch wrapper. The first DATA dependency compile found
+these before execution; both were corrected before this successful API gate.
+The target was invoked with `-j1`; its internal test/library children were seen
+compiling concurrently, so the target still needs scheduling review if strict
+single-compiler peak memory is required.
+
+
+### Aggregate abort and acknowledgement recovery (API 36, failure ABI 61)
+
+Production participant adapters start one independent five-second recovery
+window after a possible decision or when abort cleanup begins. Coordinator
+status/same-decision retry, participant waves and their acknowledgements retain
+that absolute deadline. Stable-ID retries start it before inspecting a conflicting
+coordinator begin. Expiry after known commit preserves committed propagation debt;
+expiry during abort delivery retains the remaining durable enlistment. An
+already-expired user admission deadline does not cancel this recovery window.
+Explicit follower/shutdown cancellation remains combined with its deadline.
+Legacy custom in-process workers retain their explicit null-budget contract.
+
+Bounded resolve and ACK use `/txn-resolve-v2` and `/txn-acknowledge-v2`, require
+a server budget, and never fall back to older endpoints. The transport reserves
+50 ms for the response and caps the remote work budget at five seconds. A peer
+without the capability leaves the participant enlisted. Native ACK receives its
+own absolute monotonic deadline through checked API ABI 36. The handler converts
+its ingress clock, and the owner checks again after acquisition before invoking
+C. Post-invocation errors retain their existing uncertainty classification.
+
+New focused tests cover shared abort/status/resolve/ACK windows; committed
+follower ACK expiry without dispatching later participants; preservation of an
+explicit cancellation token; absence of unbounded callback fallback; old-peer
+rejection; required server budgets and clock conversion; and checked ACK callback
+transport. The first SourceOwner attempt found a nested local-name shadow (fixed);
+the next attempt exhausted the
+build volume before tests, without source diagnostics. The third attempt lost
+a generated file while the shared cache changed externally. Subsequent team
+gates use repository-local `zig/.zig-cache/workload-local` and
+`zig/.zig-cache/workload-global` after the isolated `/tmp` retry also lost a
+generated tool artifact.
+
+This stage prevents late submission but does not yet interrupt SourceOwner
+catalog acquisition or synchronous native work already invoked. The next bounded
+stage needs an explicit resolve deadline callback and budgeted owner descriptor
+acquisition. General multi-peer loss, process shutdown/late response schedules,
+and the full eight-item completion qualification remain open.
+
+
+The real SourceOwner fixture subsequently exposed an undeclared compiled-boundary
+error: ACK of an unenlisted participant returned `StorageKernelFailure` instead
+of `InvalidParticipant`. Failure ABI 61 appends semantic status 575; the checked
+callback detail also preserves the same identity. The standalone identity gate
+passed **1/1, actual exit 0** (`/tmp/workload-recovery-invalid-participant.log`).
+The late-acquisition timeout assertion passed before this mapping failure; the
+owner fixture is retained unchanged for its follow-up gate.
+
+
+The first aggregate API run compiled successfully and passed **44/45 tests,
+0 skips, 0 leaks, actual exit 1** (`/tmp/workload-recovery-api1.log`). Its only
+failure was the new HTTP fixture using the invalid participant string `peer`;
+the parser correctly rejected it before dispatch. The fixture now uses the
+canonical table/group participant encoding. The broad recovery suite inventory
+also selected 23 existing native recovery tests, all of which passed; the default
+inventory has been narrowed to the seven exact new API/checked-status tests.
+The corrected owning gate passed **22/22, 0 skips, 0 failures, 0 leaks,
+actual exit 0** (`/tmp/workload-recovery-api2.log`). The custom runner prints a
+`failed command` diagnostic after expected warnings even when the build exits 0;
+the actual process exit was collected independently.
+
+
+After the semantic mapping fix, the real compiled-owner gate passed **1/1,
+0 skips, 0 failures, 0 leaks, actual exit 0**
+(`/tmp/workload-recovery-owner-deadline6.log`). It expires the native ACK deadline
+inside actual catalog acquisition and proves no ACK occurred, preserves the
+unenlisted-participant error with a fresh deadline, completes valid and duplicate
+ACKs, then cancels an abort during owner acquisition and proves the transaction
+remains pending until an independent retry resolves it.
+
+Reproduce the 22-test API gate from `zig/`:
+
+```sh
+zig build antfly-api-test -j1 --cache-dir .zig-cache/workload-local --global-cache-dir .zig-cache/workload-global -- \
+  --test-filter 'transaction recovery endpoint requires budget and translates the ingress clock' \
+  --test-filter 'transaction recovery shares abort and acknowledgement budget independently of admission' \
+  --test-filter 'transaction recovery retains shutdown cancellation and rejects unbounded fallback' \
+  --test-filter 'transaction recovery acknowledgement boundary rejects expiry and preserves accepted errors' \
+  --test-filter 'transaction recovery provisioned adapter never loses budget through legacy Raft callbacks' \
+  --test-filter 'transaction recovery transport requires bounded versioned peers without fallback' \
+  --test-filter 'transaction recovery invalid participant preserves checked status identity' \
+  --test-filter 'distributed txn preserves original deadline across participant waves and cleanup' \
+  --test-filter 'transaction attempt budgets follow the borrowed transport clock' \
+  --test-filter 'transaction commit boundary preserves ingress context and never downgrades deadlines' \
+  --test-filter 'routed atomic batch preserves deadline without changing accepted outcome' \
+  --test-filter 'public transaction ingress establishes one original deadline before dispatch' \
+  --test-filter 'shared stateless batch retries borrow IO and preserve unknown outcomes' \
+  --test-filter 'stable distributed transaction retry resumes a durable commit decision' \
+  --test-filter 'compiled table write boundary transports cancellation and committed failure identity' \
+  --test-filter 'httpx multi batch route uses the batch commit hook and public response contract' \
+  --test-filter 'workload admission stable transaction commit durably hands off recovery before acknowledgement' \
+  --test-filter 'first decision'
+```
+
+
+## Recovery owner acquisition and API 37
+
+API 37 appends `txn_resolve_group_local_until` with an absolute native monotonic
+deadline and a separate cancellation token, plus `txn_status_group_local_until`
+for a raw bounded local read. DATA retains its Raft barrier and then invokes the
+raw bounded callback; a storage owner does not claim to provide a quorum barrier. Hosted/local participant workers and
+versioned resolve ingress preserve this deadline; status ingress now translates
+its borrowed clock epoch before invoking the native deadline callback. Missing
+bounded capabilities never fall back to the legacy callback.
+
+Provisioned native recovery borrows only an exact resident generation. Cache,
+lifecycle, or activity contention returns a retryable incomplete result. Cold
+owners publish fixed-capacity, inline-name warmup hints without allocating,
+waiting, or opening storage on the request. DATA's existing lifecycle job drains
+one hint per attempt, rotates before I/O, retains failed attempts and newer
+revisions, and stops accepting work at shutdown. Local Hosted transaction begin
+requires a stable recovery source; a request-only native Hosted fallback is
+rejected before creating an obligation. Metadata's normal remote DATA routing
+continues to use its stable DATA owner.
+
+Raft recovery uses the existing context-aware proposal callback and independent
+recovery deadline. Precise pre-admission expiry becomes Timeout; accepted outcome
+uncertainty remains unchanged. Native resolution publishes cache invalidation on
+success and post-invocation errors. InvalidParticipant ACK is preserved across
+the checked boundary and maps to a deterministic HTTP 409 conflict.
+
+The matching compiled SourceOwner acquisition/queue gate passed **4/4, actual
+exit 0, no skips/failures/leaks** (`/tmp/workload-recovery-owner-bounded1.log`).
+The API owning gate then passed **28/28, actual exit 0, no skips/failures/leaks**
+(`/tmp/workload-recovery-bounded-api2.log`). This includes all prior 22 selected
+recovery/deadline/first-decision tests plus six bounded tests: actual native cold
+status/resolve and lifecycle warmup, queue capacity/error retention/shutdown,
+Hosted pre-begin capability refusal, shifted-clock operations/cancellation,
+checked resolve/status boundaries, and InvalidParticipant HTTP 409 mapping.
+Reproduce it with the 22-test command above plus
+`--test-filter 'transaction recovery bounded'`. The first attempt ended at
+compile-time fixture declaration errors (ambiguous function name, missing null
+optional dependencies, and a dispatch pointer signature); no tests ran in that
+attempt. DATA and updated compiled-owner raw-status qualification follow this
+API receipt; this is not a full end-to-end qualification claim. Synchronous native work already
+invoked remains owned by its storage/runtime contract, not interrupted by an
+expired admission timer. Multi-peer loss and shutdown schedules and the full
+eight-item completion qualification remain open.

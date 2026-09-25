@@ -2169,9 +2169,9 @@ pub const ProvisionedTableWriteCache = struct {
             self.db.setCoordinatedTtl(null, 0);
             if (comptime control_only_storage_sources) return;
             self.db.setQueryVisibilityHook(null);
-            self.db.setResolutionCandidateSource(null);
-            self.db.setEntitySink(null);
-            self.db.setPromotionOwner(null);
+            self.db.setResolutionCandidateSource(null) catch unreachable;
+            self.db.setEntitySink(null) catch unreachable;
+            self.db.setPromotionOwner(null) catch unreachable;
             self.promotion_owner_state = .{};
         }
 
@@ -2349,18 +2349,23 @@ pub const ProvisionedTableWriteCache = struct {
         }
     };
 
-    fn applyRuntimeHooksToDb(self: *ProvisionedTableWriteCache, db: *db_mod.DB, group_id: u64, owner_state: ?*PromotionOwnerState) void {
+    fn applyRuntimeHooksToDb(self: *ProvisionedTableWriteCache, db: *db_mod.DB, group_id: u64, owner_state: ?*PromotionOwnerState) !void {
+        var transition = if (self.resolution_candidate_source != null or self.entity_sink != null or self.promotion_leadership_source != null)
+            try db.core.completion_eligibility.beginTransition()
+        else
+            null;
+        defer if (transition) |*guard| guard.deinit();
+        try db.setResolutionCandidateSource(self.resolution_candidate_source);
+        try db.setEntitySink(self.entity_sink);
         db.setCoordinatedTtl(self.coordinated_ttl, group_id);
-        db.setResolutionCandidateSource(self.resolution_candidate_source);
-        db.setEntitySink(self.entity_sink);
         if (owner_state) |state| {
             state.* = .{
                 .group_id = group_id,
                 .leadership_source = self.promotion_leadership_source,
             };
-            db.setPromotionOwner(state.owner());
+            try db.setPromotionOwner(state.owner());
         } else {
-            db.setPromotionOwner(null);
+            try db.setPromotionOwner(null);
         }
     }
 
@@ -2414,13 +2419,13 @@ pub const ProvisionedTableWriteCache = struct {
         cached.deinit(self.alloc);
     }
 
-    fn refreshRuntimeHooksLocked(self: *ProvisionedTableWriteCache) void {
+    fn refreshRuntimeHooksLocked(self: *ProvisionedTableWriteCache) !void {
         if (comptime control_only_storage_sources) {
             std.debug.assert(self.entries.items.len == 0);
             return;
         }
         for (self.entries.items) |entry| {
-            self.applyRuntimeHooksToDb(&entry.db, entry.group_id, &entry.promotion_owner_state);
+            try self.applyRuntimeHooksToDb(&entry.db, entry.group_id, &entry.promotion_owner_state);
         }
     }
 
@@ -2514,10 +2519,15 @@ pub const ProvisionedTableWriteCache = struct {
         candidate_source: ?db_mod.CandidateSource,
         entity_sink_value: ?db_mod.EntitySink,
         leadership_source: ?PromotionLeadershipSourceContract,
+        coordinated_ttl: ?db_mod.coordinated_ttl.Port,
     ) bool {
         return candidateSourcesEqual(self.resolution_candidate_source, candidate_source) and
             entitySinksEqual(self.entity_sink, entity_sink_value) and
-            promotionLeadershipSourcesEqual(self.promotion_leadership_source, leadership_source);
+            promotionLeadershipSourcesEqual(self.promotion_leadership_source, leadership_source) and
+            (if (self.coordinated_ttl) |left|
+                if (coordinated_ttl) |right| left.ptr == right.ptr and left.expire_fn == right.expire_fn else false
+            else
+                coordinated_ttl == null);
     }
 
     fn setRuntimeHooksLocked(
@@ -2525,42 +2535,52 @@ pub const ProvisionedTableWriteCache = struct {
         candidate_source: ?db_mod.CandidateSource,
         entity_sink_value: ?db_mod.EntitySink,
         leadership_source: ?PromotionLeadershipSourceContract,
-        ttl_port: ?db_mod.coordinated_ttl.Port,
-    ) void {
-        const ttl_equal = if (self.coordinated_ttl) |current|
-            if (ttl_port) |next| current.ptr == next.ptr and current.expire_fn == next.expire_fn else false
-        else
-            ttl_port == null;
-        if (ttl_equal and self.runtimeHooksEqual(candidate_source, entity_sink_value, leadership_source)) return;
-        self.coordinated_ttl = ttl_port;
+        coordinated_ttl: ?db_mod.coordinated_ttl.Port,
+    ) !void {
+        if (self.runtimeHooksEqual(candidate_source, entity_sink_value, leadership_source, coordinated_ttl)) return;
+        const previous_resolution_candidate_source = self.resolution_candidate_source;
+        errdefer self.resolution_candidate_source = previous_resolution_candidate_source;
         self.resolution_candidate_source = candidate_source;
+        const previous_entity_sink = self.entity_sink;
+        errdefer self.entity_sink = previous_entity_sink;
         self.entity_sink = entity_sink_value;
+        const previous_promotion_leadership_source = self.promotion_leadership_source;
+        errdefer self.promotion_leadership_source = previous_promotion_leadership_source;
         self.promotion_leadership_source = leadership_source;
-        self.refreshRuntimeHooksLocked();
+        const previous_coordinated_ttl = self.coordinated_ttl;
+        errdefer self.coordinated_ttl = previous_coordinated_ttl;
+        self.coordinated_ttl = coordinated_ttl;
+        try self.refreshRuntimeHooksLocked();
     }
 
-    pub fn setResolutionCandidateSource(self: *ProvisionedTableWriteCache, source: ?db_mod.CandidateSource) void {
+    pub fn setResolutionCandidateSource(self: *ProvisionedTableWriteCache, source: ?db_mod.CandidateSource) !void {
         self.lockOpenMutex();
         defer self.unlockOpenMutex();
         if (candidateSourcesEqual(self.resolution_candidate_source, source)) return;
+        const previous_resolution_candidate_source = self.resolution_candidate_source;
+        errdefer self.resolution_candidate_source = previous_resolution_candidate_source;
         self.resolution_candidate_source = source;
-        self.refreshRuntimeHooksLocked();
+        try self.refreshRuntimeHooksLocked();
     }
 
-    pub fn setEntitySink(self: *ProvisionedTableWriteCache, sink: ?db_mod.EntitySink) void {
+    pub fn setEntitySink(self: *ProvisionedTableWriteCache, sink: ?db_mod.EntitySink) !void {
         self.lockOpenMutex();
         defer self.unlockOpenMutex();
         if (entitySinksEqual(self.entity_sink, sink)) return;
+        const previous_entity_sink = self.entity_sink;
+        errdefer self.entity_sink = previous_entity_sink;
         self.entity_sink = sink;
-        self.refreshRuntimeHooksLocked();
+        try self.refreshRuntimeHooksLocked();
     }
 
-    pub fn setPromotionLeadershipSource(self: *ProvisionedTableWriteCache, source: ?PromotionLeadershipSourceContract) void {
+    pub fn setPromotionLeadershipSource(self: *ProvisionedTableWriteCache, source: ?PromotionLeadershipSourceContract) !void {
         self.lockOpenMutex();
         defer self.unlockOpenMutex();
         if (promotionLeadershipSourcesEqual(self.promotion_leadership_source, source)) return;
+        const previous_promotion_leadership_source = self.promotion_leadership_source;
+        errdefer self.promotion_leadership_source = previous_promotion_leadership_source;
         self.promotion_leadership_source = source;
-        self.refreshRuntimeHooksLocked();
+        try self.refreshRuntimeHooksLocked();
     }
 
     fn setHAWriteGate(self: *ProvisionedTableWriteCache, gate: ?db_mod.HAWriteGate) !void {
@@ -3014,6 +3034,8 @@ pub const ProvisionedTableWriteCache = struct {
                         .hbc_cache = vector_cache,
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
+                        .durable_completion_enabled = if (open_mode == .restore_repair) false else if (manager) |value| value.durable_completion_enabled else false,
+                        .durable_completion_authority = if (open_mode == .restore_repair) .none else if (manager) |value| value.durable_completion_authority else .none,
                         .backend_runtime = runtime,
                         .identity_namespace = identity_namespace,
                         .prefer_existing_identity_namespace = identity_namespace != null,
@@ -3154,7 +3176,7 @@ pub const ProvisionedTableWriteCache = struct {
             .active_leases = 1,
             .bulk_ingest_session_open = start_bulk_session,
         };
-        self.applyRuntimeHooksToDb(&owned_entry.db, group_id, &owned_entry.promotion_owner_state);
+        try self.applyRuntimeHooksToDb(&owned_entry.db, group_id, &owned_entry.promotion_owner_state);
         try owned_entry.db.activateResolverReplayRuntimes();
         try self.entries.append(self.alloc, owned_entry);
         // Artifact-issue mutations invalidate their compact status summary in
@@ -3525,7 +3547,7 @@ pub const ProvisionedTableWriteCache = struct {
             .active_leases = 1,
             .bulk_ingest_session_open = start_bulk_session,
         };
-        self.applyRuntimeHooksToDb(&owned_entry.db, group_id, &owned_entry.promotion_owner_state);
+        try self.applyRuntimeHooksToDb(&owned_entry.db, group_id, &owned_entry.promotion_owner_state);
         try owned_entry.db.activateResolverReplayRuntimes();
         prepared.schema_json = null;
         errdefer owned_entry.deinit(self.alloc, self.backend_runtime);
@@ -3584,7 +3606,7 @@ pub const ProvisionedTableWriteCache = struct {
             .allow_generation_adoption = true,
             .allow_active_generation_adoption = true,
         };
-        self.applyRuntimeHooksToDb(&owned_entry.db, group_id, &owned_entry.promotion_owner_state);
+        try self.applyRuntimeHooksToDb(&owned_entry.db, group_id, &owned_entry.promotion_owner_state);
         try owned_entry.db.activateResolverReplayRuntimes();
         errdefer owned_entry.deinit(self.alloc, self.backend_runtime);
 
@@ -5826,6 +5848,18 @@ const LegacyTableWriteSource = struct {
     }
 };
 
+const TxnRecoveryDeadlineCancellation = struct {
+    deadline_ns: u64,
+    original: db_mod.types.CancellationToken = .none,
+    fn token(self: *const @This()) db_mod.types.CancellationToken {
+        return .{ .ptr = self, .is_cancelled_fn = isCancelled };
+    }
+    fn isCancelled(ptr: *const anyopaque) bool {
+        const self: *const @This() = @ptrCast(@alignCast(ptr));
+        return platform_time.monotonicNs() >= self.deadline_ns or self.original.isCancelled();
+    }
+};
+
 pub const RaftBatcher = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -5913,7 +5947,26 @@ pub const RaftBatcher = struct {
             txn_id: db_mod.types.TxnId,
             deadline_ns: u64,
         ) anyerror!db_mod.types.TxnStatus = null,
+        /// Same routed mutation and catalog fence, with the original caller's
+        /// deadline for admission only. Accepted outcomes must not become a
+        /// deadline failure during commit or visibility propagation.
+        batch_group_routed_with_pre_decision_context: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            fence: metadata_api.CatalogRouteFence,
+            table_name: []const u8,
+            req: db_mod.types.BatchRequest,
+            context: distributed_txn.PreDecisionContext,
+        ) anyerror!void = null,
+        /// Local leader only: no forwarding or legacy fallback is permitted.
+        decide_group_local_with_pre_decision_context: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, db_mod.types.BatchRequest, distributed_txn.PreDecisionContext) anyerror!void = null,
     };
+
+    pub fn decideGroupLocalWithPreDecisionContext(self: RaftBatcher, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_mod.types.BatchRequest, context: distributed_txn.PreDecisionContext) !void {
+        distributed_txn.ensurePreDecisionContextActive(context) catch return error.PreDecisionNotProposed;
+        const callback = self.vtable.decide_group_local_with_pre_decision_context orelse return error.PreDecisionNotProposed;
+        try callback(self.ptr, alloc, group_id, table_name, req, context);
+    }
 
     pub fn batchGroup(
         self: RaftBatcher,
@@ -5950,6 +6003,13 @@ pub const RaftBatcher = struct {
             return error.CatalogRouteFenceUnsupported;
         try fence.validate();
         return BoundaryAbi.call("batch_group_routed_with_cancellation", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, fence, table_name, req, cancellation });
+    }
+
+    pub fn batchGroupRoutedWithPreDecisionContext(self: RaftBatcher, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table_name: []const u8, req: db_mod.types.BatchRequest, context: distributed_txn.PreDecisionContext) !void {
+        try distributed_txn.ensurePreDecisionContextActive(context);
+        try fence.validate();
+        const callback = self.vtable.batch_group_routed_with_pre_decision_context orelse return error.PreDecisionNotProposed;
+        try callback(self.ptr, alloc, fence, table_name, req, context);
     }
 
     pub fn batchGroupLocal(
@@ -6037,16 +6097,7 @@ pub const RaftBatcher = struct {
     }
 };
 
-fn ensurePreDecisionContextActive(context: distributed_txn.PreDecisionContext) !void {
-    try context.cancellation.check();
-    if (context.deadline_ns) |deadline_ns| {
-        // This check is deliberately adjacent to mutation admission. Keep its
-        // error distinct from generic storage and transport deadlines so only
-        // this proven pre-proposal outcome may authorize replica failover.
-        const now_ns = (table_catalog.RoutingBudget{ .io = context.deadline_io }).nowNs();
-        if (now_ns >= deadline_ns) return error.PreDecisionDeadlineExceeded;
-    }
-}
+const ensurePreDecisionContextActive = distributed_txn.ensurePreDecisionContextActive;
 
 const DocumentChildRangeDispatchContext = struct {
     source: TableWriteSource,
@@ -6108,10 +6159,13 @@ pub const BoundTableWriteSource = struct {
                 .backup_pin_control = backupPinControl,
                 .restore_table = restoreTable,
                 .commit_transaction = commitTransaction,
+                .commit_transaction_with_context = commitTransactionWithContext,
                 .commit_transaction_with_cancellation = commitTransactionWithCancellation,
                 .commit_batch = commitBatch,
+                .commit_batch_with_context = commitBatchWithContext,
                 .commit_batch_with_cancellation = commitBatchWithCancellation,
                 .commit_transaction_with_id = commitTransactionWithId,
+                .commit_transaction_with_id_with_context = commitTransactionWithIdWithContext,
                 .commit_transaction_with_id_with_cancellation = commitTransactionWithIdAndCancellation,
                 .acknowledge_transaction_commit = acknowledgeTransactionCommit,
                 .batch = batch,
@@ -6125,8 +6179,14 @@ pub const BoundTableWriteSource = struct {
                 .txn_prepare_group_local_with_pre_decision_context = txnPrepareGroupLocalWithPreDecisionContext,
                 .txn_resolve_group_local = txnResolveGroupLocal,
                 .txn_resolve_group_local_with_cancellation = txnResolveGroupLocalWithCancellation,
+                .txn_decide_group_local_with_pre_decision_context = txnDecideGroupLocalWithPreDecisionContext,
                 .txn_status_group_local = txnStatusGroupLocal,
+                .txn_status_group_local_until = txnStatusGroupLocalUntil,
+                .txn_status_group_linearizable_until = txnStatusGroupLocalUntil,
+                .txn_status_group_authoritative_local_until = txnStatusGroupLocalUntil,
                 .txn_acknowledge_group_local = txnAcknowledgeGroupLocal,
+                .txn_acknowledge_group_local_until = txnAcknowledgeGroupLocalUntil,
+                .txn_resolve_group_local_until = txnResolveGroupLocalUntil,
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
                 .reprocess_document_artifact = reprocessDocumentArtifact,
                 .reprocess_document_artifact_range = reprocessDocumentArtifactRange,
@@ -6679,6 +6739,31 @@ pub const BoundTableWriteSource = struct {
         return try staged.publish();
     }
 
+    fn commitTransactionWithContext(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        context: distributed_txn.PreDecisionContext,
+    ) !?distributed_txn.CommitOutcome {
+        try distributed_txn.ensurePreDecisionContextActive(context);
+        const txn_source: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        const txn_io: ?Io = txn_source.db.backend_runtime.io();
+        return commitBoundTransaction(ptr, alloc, nextTxnId(txn_io), nextTxnTimestamp(txn_io), tables, sync_level, false, context.cancellation, context);
+    }
+
+    fn commitTransactionWithIdWithContext(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        begin_timestamp: u64,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        context: distributed_txn.PreDecisionContext,
+    ) !?distributed_txn.CommitOutcome {
+        return commitBoundTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, true, context.cancellation, context);
+    }
+
     fn commitTransaction(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -6698,7 +6783,7 @@ pub const BoundTableWriteSource = struct {
         const txn_source: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         const txn_io: ?Io = txn_source.db.backend_runtime.io();
         const txn_id = nextTxnId(txn_io);
-        return try commitBoundTransaction(ptr, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation);
+        return try commitBoundTransaction(ptr, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation, null);
     }
 
     fn commitBatch(
@@ -6710,14 +6795,24 @@ pub const BoundTableWriteSource = struct {
         return try commitBatchWithCancellation(ptr, alloc, tables, sync_level, .none);
     }
 
-    fn commitBatchWithCancellation(
+    fn commitBatchWithCancellation(ptr: *anyopaque, alloc: std.mem.Allocator, tables: []const distributed_txn.TableCommitRequest, sync_level: db_mod.types.SyncLevel, cancellation: db_mod.types.CancellationToken) !?distributed_txn.CommitOutcome {
+        return commitBatchWithOptionalContext(ptr, alloc, tables, sync_level, cancellation, null);
+    }
+
+    fn commitBatchWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, tables: []const distributed_txn.TableCommitRequest, sync_level: db_mod.types.SyncLevel, context: distributed_txn.PreDecisionContext) !?distributed_txn.CommitOutcome {
+        return commitBatchWithOptionalContext(ptr, alloc, tables, sync_level, context.cancellation, context);
+    }
+
+    fn commitBatchWithOptionalContext(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
+        context: ?distributed_txn.PreDecisionContext,
     ) !?distributed_txn.CommitOutcome {
-        if (tables.len == 1 and tables[0].predicates.len == 0 and tables[0].relational_index_maintenance == null) {
+        if (context) |bounded| try distributed_txn.ensurePreDecisionContextActive(bounded);
+        if (tables.len == 1 and tables[0].predicates.len == 0) {
             const table = tables[0];
             const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
             if (!std.mem.eql(u8, self.table_name, table.table_name)) return null;
@@ -6729,6 +6824,7 @@ pub const BoundTableWriteSource = struct {
                 .sync_level = sync_level,
             };
             try validateTableBatchAgainstLocalSchema(alloc, db, req.writes, req.deletes, req.transforms);
+            if (context) |bounded| try distributed_txn.ensurePreDecisionContextActive(bounded);
             db.batchWithVisibilityCancellation(req, cancellation) catch |err| switch (err) {
                 error.IntentConflict, error.VersionConflict => return .{ .conflict = boundConflict(table, err) },
                 else => return err,
@@ -6738,7 +6834,7 @@ pub const BoundTableWriteSource = struct {
         const txn_source: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         const txn_io: ?Io = txn_source.db.backend_runtime.io();
         const txn_id = nextTxnId(txn_io);
-        return try commitBoundTransaction(ptr, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation);
+        return try commitBoundTransaction(ptr, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation, context);
     }
 
     fn commitTransactionWithId(
@@ -6761,7 +6857,7 @@ pub const BoundTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
-        return try commitBoundTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, true, cancellation);
+        return try commitBoundTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, true, cancellation, null);
     }
 
     fn acknowledgeTransactionCommit(
@@ -6779,6 +6875,11 @@ pub const BoundTableWriteSource = struct {
         return {};
     }
 
+    fn prepareBoundBeforeDeadline(db: *db_mod.DB, context: ?distributed_txn.PreDecisionContext, txn_id: db_mod.types.TxnId, req: db_mod.types.TransactionIntentRequest) !void {
+        if (context) |bounded| try distributed_txn.ensurePreDecisionContextActive(bounded);
+        try db.writeTransaction(txn_id, req);
+    }
+
     fn commitBoundTransaction(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -6788,7 +6889,9 @@ pub const BoundTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         retain_terminal: bool,
         cancellation: db_mod.types.CancellationToken,
+        context: ?distributed_txn.PreDecisionContext,
     ) !?distributed_txn.CommitOutcome {
+        if (context) |bounded| try distributed_txn.ensurePreDecisionContextActive(bounded);
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (tables.len != 1) return error.UnsupportedOperation;
         const table = tables[0];
@@ -6802,6 +6905,7 @@ pub const BoundTableWriteSource = struct {
         defer alloc.free(local_participant);
         const participants = [_][]const u8{local_participant};
 
+        if (context) |bounded| try distributed_txn.ensurePreDecisionContextActive(bounded);
         _ = db.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(
             txn_id,
             begin_timestamp,
@@ -6857,7 +6961,7 @@ pub const BoundTableWriteSource = struct {
             },
             else => return err,
         };
-        db.writeTransaction(txn_id, .{
+        prepareBoundBeforeDeadline(db, context, txn_id, .{
             .writes = table.writes,
             .deletes = table.deletes,
             .transforms = table.transforms,
@@ -6901,6 +7005,11 @@ pub const BoundTableWriteSource = struct {
                 => return error.InvalidBatchRequest,
                 else => return err,
             }
+        };
+        if (context) |bounded| distributed_txn.ensurePreDecisionContextActive(bounded) catch |err| {
+            try db.resolveTransactionIntents(txn_id, .aborted, commit_version);
+            db.markTransactionParticipantResolved(txn_id, local_participant) catch {};
+            return err;
         };
         db.resolveTransactionIntentsWithSyncLevelAndCancellation(txn_id, .committed, commit_version, sync_level, cancellation) catch |err| {
             const durable_status = db.getTransactionStatus(txn_id) catch return err;
@@ -7136,7 +7245,24 @@ pub const BoundTableWriteSource = struct {
         return try txnResolveGroupLocalWithCancellation(ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, .none);
     }
 
-    fn txnResolveGroupLocalWithCancellation(
+    fn txnDecideGroupLocalWithPreDecisionContext(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, status: db_mod.types.TxnStatus, commit_version: u64, topology_epoch: u64, sync_level: db_mod.types.SyncLevel, context: distributed_txn.PreDecisionContext) anyerror!?void {
+        if (status != .committed) return error.PreDecisionNotProposed;
+        ensurePreDecisionContextActive(context) catch return error.PreDecisionNotProposed;
+        return try txnResolveGroupLocalImpl(ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, context.cancellation, context);
+    }
+
+    fn txnResolveGroupLocalUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, status: db_mod.types.TxnStatus, commit_version: u64, topology_epoch: u64, sync_level: db_mod.types.SyncLevel, deadline_ns: u64, cancellation: db_mod.types.CancellationToken) anyerror!?void {
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        try cancellation.check();
+        var scope: TxnRecoveryDeadlineCancellation = .{ .deadline_ns = deadline_ns, .original = cancellation };
+        return txnResolveGroupLocalWithCancellation(ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, scope.token());
+    }
+
+    fn txnResolveGroupLocalWithCancellation(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, status: db_mod.types.TxnStatus, commit_version: u64, topology_epoch: u64, sync_level: db_mod.types.SyncLevel, cancellation: db_mod.types.CancellationToken) anyerror!?void {
+        return try txnResolveGroupLocalImpl(ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, cancellation, null);
+    }
+
+    fn txnResolveGroupLocalImpl(
         ptr: *anyopaque,
         _: std.mem.Allocator,
         group_id: u64,
@@ -7147,10 +7273,13 @@ pub const BoundTableWriteSource = struct {
         _: u64,
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
+        first_context: ?distributed_txn.PreDecisionContext,
     ) !?void {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         const db = try self.activeDb();
+        if (first_context) |context| ensurePreDecisionContextActive(context) catch return error.PreDecisionNotProposed;
+        try cancellation.check();
         try db.resolveTransactionIntentsWithSyncLevelAndCancellation(txn_id, status, commit_version, sync_level, cancellation);
         const participant = try distributed_txn.participantIdForGroup(db.alloc, table_name, group_id);
         defer db.alloc.free(participant);
@@ -7158,6 +7287,13 @@ pub const BoundTableWriteSource = struct {
             transactions_mod.TxnError.TxnNotFound => if (status != .aborted) return err,
             else => return err,
         };
+    }
+
+    fn txnStatusGroupLocalUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, deadline_ns: u64) anyerror!?db_mod.types.TxnStatus {
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        const status = try txnStatusGroupLocal(ptr, alloc, group_id, table_name, txn_id);
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        return status;
     }
 
     fn txnStatusGroupLocal(
@@ -7172,19 +7308,31 @@ pub const BoundTableWriteSource = struct {
         return try (try self.activeDb()).getTransactionStatus(txn_id);
     }
 
-    fn txnAcknowledgeGroupLocal(
+    fn txnAcknowledgeGroupLocalUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, participant: []const u8, deadline_ns: u64) anyerror!?void {
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        return try txnAcknowledgeGroupLocalImpl(ptr, alloc, group_id, table_name, txn_id, participant, deadline_ns);
+    }
+
+    fn txnAcknowledgeGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, participant: []const u8) anyerror!?void {
+        return try txnAcknowledgeGroupLocalImpl(ptr, alloc, group_id, table_name, txn_id, participant, null);
+    }
+
+    fn txnAcknowledgeGroupLocalImpl(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         group_id: u64,
         table_name: []const u8,
         txn_id: db_mod.types.TxnId,
         participant: []const u8,
+        deadline_ns: ?u64,
     ) !?void {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         _ = group_id;
         _ = alloc;
-        try (try self.activeDb()).markTransactionParticipantResolved(txn_id, participant);
+        const db = try self.activeDb();
+        if (deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.Timeout;
+        try db.markTransactionParticipantResolved(txn_id, participant);
     }
 };
 
@@ -7833,6 +7981,103 @@ pub const ProvisionedTableWriteSource = struct {
             .internal => .internal,
         };
     }
+
+    fn requestRecoveryOwnerWarmup(self: *ProvisionedTableWriteSource, group_id: u64, table_name: []const u8) !void {
+        if (self.local_write_owner) |owner| return owner.requestRecoveryOwnerWarmup(group_id, table_name);
+        if (self.lifecycle.load(.acquire) != .open) return error.Canceled;
+        if (table_name.len == 0 or table_name.len > 1024) return error.CommitPropagationIncomplete;
+        if (!self.recovery_warmup_mutex.tryLock()) return error.CommitPropagationIncomplete;
+        defer self.recovery_warmup_mutex.unlock();
+        if (self.lifecycle.load(.acquire) != .open) return error.Canceled;
+        var free_slot: ?*RecoveryOwnerWarmup = null;
+        for (&self.recovery_warmups) |*request| {
+            if (request.table_name_len == 0) {
+                if (free_slot == null) free_slot = request;
+            } else if (request.group_id == group_id and std.mem.eql(u8, request.name(), table_name)) {
+                request.revision = std.math.add(u64, request.revision, 1) catch return error.CommitPropagationIncomplete;
+                return;
+            }
+        }
+        const slot = free_slot orelse return error.CommitPropagationIncomplete;
+        slot.group_id = group_id;
+        slot.table_name_len = table_name.len;
+        @memcpy(slot.table_name[0..table_name.len], table_name);
+        slot.revision = 1;
+        _ = self.recovery_warmup_pending.fetchAdd(1, .release);
+    }
+
+    pub fn hasPendingRecoveryOwnerWarmups(self: *const ProvisionedTableWriteSource) bool {
+        if (self.local_write_owner) |owner| return owner.hasPendingRecoveryOwnerWarmups();
+        return self.lifecycle.load(.acquire) == .open and self.recovery_warmup_pending.load(.acquire) != 0;
+    }
+
+    /// DATA owns and joins this lifecycle job. Requests only publish inline
+    /// hints; they never perform a cold open or retain caller-owned memory.
+    pub fn drainRecoveryOwnerWarmups(self: *ProvisionedTableWriteSource) !void {
+        if (self.local_write_owner) |owner| return owner.drainRecoveryOwnerWarmups();
+        if (!self.hasPendingRecoveryOwnerWarmups()) return;
+        if (self.recovery_warmup_draining.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
+        defer self.recovery_warmup_draining.store(false, .release);
+        const selected = blk: {
+            if (!self.recovery_warmup_mutex.tryLock()) return;
+            defer self.recovery_warmup_mutex.unlock();
+            if (self.lifecycle.load(.acquire) != .open) return;
+            for (0..self.recovery_warmups.len) |offset| {
+                const index = (self.recovery_warmup_cursor + offset) % self.recovery_warmups.len;
+                const request = self.recovery_warmups[index];
+                if (request.table_name_len == 0) continue;
+                self.recovery_warmup_cursor = (index + 1) % self.recovery_warmups.len;
+                break :blk .{ .index = index, .request = request };
+            }
+            return;
+        };
+        if (comptime control_only_storage_sources) return error.CommitPropagationIncomplete;
+        if (self.write_cache == null and self.startup_write_cache == null) return error.CommitPropagationIncomplete;
+        try prepareResidentDbForReadRetry(self, std.heap.page_allocator, selected.request.name(), selected.request.group_id, self.visibleRootGeneration(selected.request.group_id));
+        lockAtomic(&self.recovery_warmup_mutex);
+        defer self.recovery_warmup_mutex.unlock();
+        const current = &self.recovery_warmups[selected.index];
+        if (current.revision == selected.request.revision) {
+            current.table_name_len = 0;
+            _ = self.recovery_warmup_pending.fetchSub(1, .release);
+        }
+    }
+
+    /// Caller holds group operation admission through mutation and releases
+    /// this exact cache pin afterward. Contention never starts a cold open.
+    fn acquireResidentRecoveryDb(self: *ProvisionedTableWriteSource, group_id: u64, table_name: []const u8) !ProvisionedTableWriteCache.CachedDb {
+        if (!self.local_db_mutex.tryLock()) return error.CommitPropagationIncomplete;
+        defer self.local_db_mutex.unlock();
+        const generation = self.visibleRootGeneration(group_id);
+        for ([_]?*ProvisionedTableWriteCache{ self.write_cache, self.startup_write_cache }) |maybe_cache| {
+            const cache = maybe_cache orelse continue;
+            if (!cache.entry_lifecycle_mutex.tryLock()) return error.CommitPropagationIncomplete;
+            defer cache.entry_lifecycle_mutex.unlock();
+            for (cache.entries.items) |entry| {
+                if (entry.group_id != group_id or entry.lsm_root_generation != generation or !std.mem.eql(u8, entry.table_name, table_name)) continue;
+                if (entry.retired or entry.auto_bulk_ingest_finishing or !cache.entryHAWriteGateCurrent(entry)) continue;
+                entry.active_leases += 1;
+                return .{ .cache = cache, .entry = entry, .db = &entry.db, .schema_json = entry.schema_json };
+            }
+        }
+        try self.requestRecoveryOwnerWarmup(group_id, table_name);
+        return error.CommitPropagationIncomplete;
+    }
+
+    const RecoveryOwnerWarmup = struct {
+        group_id: u64 = 0,
+        table_name: [1024]u8 = undefined,
+        table_name_len: usize = 0,
+        revision: u64 = 0,
+        fn name(self: *const @This()) []const u8 {
+            return self.table_name[0..self.table_name_len];
+        }
+    };
+    recovery_warmup_mutex: std.atomic.Mutex = .unlocked,
+    recovery_warmups: [256]RecoveryOwnerWarmup = @splat(.{}),
+    recovery_warmup_pending: std.atomic.Value(usize) = .init(0),
+    recovery_warmup_draining: std.atomic.Value(bool) = .init(false),
+    recovery_warmup_cursor: usize = 0,
 
     replica_root_dir: []const u8,
     catalog: table_catalog.CatalogSource,
@@ -8515,27 +8760,33 @@ pub const ProvisionedTableWriteSource = struct {
     pub fn withResolutionCandidateSource(
         self: *ProvisionedTableWriteSource,
         resolution_candidate_source: ?db_mod.CandidateSource,
-    ) *ProvisionedTableWriteSource {
+    ) !*ProvisionedTableWriteSource {
+        const previous_resolution_candidate_source = self.resolution_candidate_source;
+        errdefer self.resolution_candidate_source = previous_resolution_candidate_source;
         self.resolution_candidate_source = resolution_candidate_source;
-        self.syncRuntimeHooksToCaches();
+        try self.syncRuntimeHooksToCaches();
         return self;
     }
 
     pub fn withEntitySink(
         self: *ProvisionedTableWriteSource,
         entity_sink: ?db_mod.EntitySink,
-    ) *ProvisionedTableWriteSource {
+    ) !*ProvisionedTableWriteSource {
+        const previous_entity_sink = self.entity_sink;
+        errdefer self.entity_sink = previous_entity_sink;
         self.entity_sink = entity_sink;
-        self.syncRuntimeHooksToCaches();
+        try self.syncRuntimeHooksToCaches();
         return self;
     }
 
     pub fn withPromotionLeadershipSource(
         self: *ProvisionedTableWriteSource,
         leadership_source: ?PromotionLeadershipSource,
-    ) *ProvisionedTableWriteSource {
+    ) !*ProvisionedTableWriteSource {
+        const previous_promotion_leadership_source = self.promotion_leadership_source;
+        errdefer self.promotion_leadership_source = previous_promotion_leadership_source;
         self.promotion_leadership_source = leadership_source;
-        self.syncRuntimeHooksToCaches();
+        try self.syncRuntimeHooksToCaches();
         return self;
     }
 
@@ -8640,23 +8891,23 @@ pub const ProvisionedTableWriteSource = struct {
         self.clearAllDirtyWriteTables();
     }
 
-    fn syncRuntimeHooksToCaches(self: *ProvisionedTableWriteSource) void {
+    fn syncRuntimeHooksToCaches(self: *ProvisionedTableWriteSource) !void {
         if (comptime control_only_storage_sources) return;
-        if (self.write_cache) |cache| self.syncRuntimeHooksToCache(cache);
+        if (self.write_cache) |cache| try self.syncRuntimeHooksToCache(cache);
         if (self.startup_write_cache) |cache| {
-            if (self.write_cache != cache) self.syncRuntimeHooksToCache(cache);
+            if (self.write_cache != cache) try self.syncRuntimeHooksToCache(cache);
         }
     }
 
     fn syncRuntimeHooksToCache(
         self: *ProvisionedTableWriteSource,
         cache: *ProvisionedTableWriteCache,
-    ) void {
+    ) !void {
         cache.lockOpenMutex();
         defer cache.unlockOpenMutex();
         lockAtomic(&self.local_db_mutex);
         defer self.local_db_mutex.unlock();
-        cache.setRuntimeHooksLocked(
+        try cache.setRuntimeHooksLocked(
             self.resolution_candidate_source,
             self.entity_sink,
             self.promotion_leadership_source,
@@ -8670,14 +8921,20 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         group_id: u64,
         owner_state: *ProvisionedTableWriteCache.PromotionOwnerState,
-    ) void {
-        db.setResolutionCandidateSource(self.resolution_candidate_source);
-        db.setEntitySink(self.entity_sink);
+    ) !void {
+        var transition = if (self.resolution_candidate_source != null or self.entity_sink != null or self.promotion_leadership_source != null)
+            try db.core.completion_eligibility.beginTransition()
+        else
+            null;
+        defer if (transition) |*guard| guard.deinit();
+        try db.setResolutionCandidateSource(self.resolution_candidate_source);
+        try db.setEntitySink(self.entity_sink);
+        db.setCoordinatedTtl(self.coordinated_ttl, group_id);
         owner_state.* = .{
             .group_id = group_id,
             .leadership_source = self.promotion_leadership_source,
         };
-        db.setPromotionOwner(owner_state.owner());
+        try db.setPromotionOwner(owner_state.owner());
         // Cold repair owners must report the same durable pending/clear edges
         // as resident writers. DB.close() clears this hook with a callback
         // barrier before table_name leaves the caller's scope.
@@ -13011,7 +13268,7 @@ pub const ProvisionedTableWriteSource = struct {
         cache.inference_api_url = self.inference_api_url;
         cache.secret_store = self.secret_store;
         cache.remote_content = self.remote_content;
-        self.syncRuntimeHooksToCache(cache);
+        try self.syncRuntimeHooksToCache(cache);
 
         const start_ns = platform_time.monotonicNs();
         const deadline_ns = start_ns +| replicated_apply_writer_open_timeout_ns;
@@ -13136,7 +13393,7 @@ pub const ProvisionedTableWriteSource = struct {
         cache.antfly_provider = self.antfly_provider;
         cache.inference_api_url = self.inference_api_url;
         cache.remote_content = self.remote_content;
-        self.syncRuntimeHooksToCache(cache);
+        try self.syncRuntimeHooksToCache(cache);
         const identity_namespace = if (managed_open_options.identity_namespace_override) |namespace|
             namespace
         else if (preloaded_metadata) |metadata|
@@ -13383,6 +13640,8 @@ pub const ProvisionedTableWriteSource = struct {
                         .hbc_cache = cache.hbc_cache,
                         .lsm_root_generation = lsm_root_generation,
                         .resource_manager = cache.resource_manager,
+                        .durable_completion_enabled = if (mode == .restore_repair or effective_open_options.staged_generation != null) false else if (cache.resource_manager) |value| value.durable_completion_enabled else false,
+                        .durable_completion_authority = if (mode == .restore_repair or effective_open_options.staged_generation != null) .none else if (cache.resource_manager) |value| value.durable_completion_authority else .none,
                         .backend_runtime = cache.backend_runtime,
                         .primary_backend = if (local_persisted_metadata) existingPrimaryBackend() else (db_mod.OpenOptions{}).primary_backend,
                         .identity_namespace = identity_namespace,
@@ -15269,7 +15528,7 @@ pub const ProvisionedTableWriteSource = struct {
                 };
             errdefer if (uncached_db) |*owned| owned.close();
             try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &uncached_db.?);
-            self.applyRuntimeHooksToUncachedDb(&uncached_db.?, table_name, group_id, &uncached_promotion_owner_state);
+            try self.applyRuntimeHooksToUncachedDb(&uncached_db.?, table_name, group_id, &uncached_promotion_owner_state);
             break :db_blk &uncached_db.?;
         };
         defer if (uncached_db) |*owned| owned.close();
@@ -20938,10 +21197,13 @@ pub const ProvisionedTableWriteSource = struct {
                 .drop_table = dropTable,
                 .graph_metric_maintenance_group_local = graphMetricMaintenanceGroupLocal,
                 .commit_transaction = commitTransaction,
+                .commit_transaction_with_context = commitTransactionWithContext,
                 .commit_transaction_with_cancellation = commitTransactionWithCancellation,
                 .commit_batch = commitBatch,
+                .commit_batch_with_context = commitBatchWithContext,
                 .commit_batch_with_cancellation = commitBatchWithCancellation,
                 .commit_transaction_with_id = commitTransactionWithId,
+                .commit_transaction_with_id_with_context = commitTransactionWithIdWithContext,
                 .commit_transaction_with_id_with_cancellation = commitTransactionWithIdAndCancellation,
                 .acknowledge_transaction_commit = acknowledgeTransactionCommit,
                 .backup_table = backupTable,
@@ -20960,13 +21222,16 @@ pub const ProvisionedTableWriteSource = struct {
                 .txn_prepare_group_local_with_pre_decision_context = txnPrepareGroupLocalWithPreDecisionContext,
                 .txn_resolve_group_local = txnResolveGroupLocal,
                 .txn_resolve_group_local_with_cancellation = txnResolveGroupLocalWithCancellation,
+                .txn_decide_group_local_with_pre_decision_context = txnDecideGroupLocalWithPreDecisionContext,
                 .txn_status_group_local = txnStatusGroupLocal,
-                .txn_status_group_local_with_request = txnStatusGroupLocalWithRequest,
+                .txn_status_group_local_until = txnStatusGroupLocalUntil,
                 .txn_status_group_linearizable = txnStatusGroupLinearizable,
                 .txn_status_group_linearizable_until = txnStatusGroupLinearizableUntil,
                 .txn_status_group_authoritative_local = txnStatusGroupAuthoritativeLocal,
                 .txn_status_group_authoritative_local_until = txnStatusGroupAuthoritativeLocalUntil,
                 .txn_acknowledge_group_local = txnAcknowledgeGroupLocal,
+                .txn_acknowledge_group_local_until = txnAcknowledgeGroupLocalUntil,
+                .txn_resolve_group_local_until = txnResolveGroupLocalUntil,
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
                 .corrupt_embedding_artifact_group_local = corruptEmbeddingArtifactGroupLocal,
                 .reprocess_document_artifact = reprocessDocumentArtifact,
@@ -22320,25 +22585,24 @@ pub const ProvisionedTableWriteSource = struct {
         return try self.batchWithVisibilityCancellation(alloc, table_name, req, .none);
     }
 
-    fn batchWithVisibilityCancellation(
+    fn batchWithVisibilityCancellation(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator, table_name: []const u8, req: db_mod.types.BatchRequest, cancellation: db_mod.types.CancellationToken) anyerror!?void {
+        return self.batchWithVisibilityContext(alloc, table_name, req, cancellation, null);
+    }
+
+    fn batchWithVisibilityContext(
         self: *ProvisionedTableWriteSource,
         alloc: std.mem.Allocator,
         table_name: []const u8,
         req: db_mod.types.BatchRequest,
         cancellation: db_mod.types.CancellationToken,
-    ) !?void {
-        try @import("../storage/db/online_source_contract.zig").validateRequest(req);
-        const control_group: ?u64 = if (req.online_source) |command| command.scope().fence.owner_group_id else if (req.relational_topology) |command| command.fence.owner_group_id else null;
-        if (control_group) |group_id| {
-            try enforceHAWriteGateOptional(self.ha_write_gate);
-            if (self.raft_batcher) |batcher| {
-                try batcher.batchGroupWithCancellation(alloc, group_id, table_name, req, cancellation);
-                return {};
-            }
-            return try batchGroupLocal(self, alloc, group_id, table_name, req);
-        }
+        context: ?distributed_txn.PreDecisionContext,
+    ) anyerror!?void {
+        if (context) |bounded| try distributed_txn.ensurePreDecisionContextActive(bounded);
         if (self.raft_batcher == null) {
-            if (self.local_write_owner) |owner| return try owner.batchWithVisibilityCancellation(alloc, table_name, req, cancellation);
+            if (self.local_write_owner) |owner| {
+                if (context != null) return error.PreDecisionNotProposed;
+                return try owner.batchWithVisibilityCancellation(alloc, table_name, req, cancellation);
+            }
         }
         try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginTableRequest(table_name);
@@ -22359,14 +22623,16 @@ pub const ProvisionedTableWriteSource = struct {
         }
 
         try cancellation.check();
+        if (context) |bounded| try distributed_txn.ensurePreDecisionContextActive(bounded);
         var routing = (try table_catalog.tableRoutingSnapshotForWrite(
             alloc,
             self.catalog,
             table_name,
-            self.catalog.budget(null).nowNs() +| write_routing_snapshot_timeout_ns,
+            try boundedWriteRoutingDeadline(self.catalog, context),
         )) orelse return null;
         defer routing.deinit(alloc);
         try cancellation.check();
+        if (context) |bounded| try distributed_txn.ensurePreDecisionContextActive(bounded);
 
         for (req.writes) |write| {
             const route = routing.resolveRouteForKey(write.key) orelse return null;
@@ -22385,6 +22651,7 @@ pub const ProvisionedTableWriteSource = struct {
         }
 
         if (self.raft_batcher) |batcher| {
+            if (context != null) return error.PreDecisionNotProposed;
             var accepted_groups: usize = 0;
             for (grouped.items) |group| {
                 batcher.batchGroupRoutedWithCancellation(alloc, group.route_fence orelse return error.CatalogRouteFenceRequired, table_name, .{
@@ -22412,7 +22679,7 @@ pub const ProvisionedTableWriteSource = struct {
         }
 
         for (grouped.items) |group| {
-            if (cancellation.ptr == null and self.canCoalesceProvisionedGroupBatch(group, req)) {
+            if (context == null and cancellation.ptr == null and self.canCoalesceProvisionedGroupBatch(group, req)) {
                 if (self.writeCoalescerActive(table_name, group.group_id)) {
                     try self.enqueueProvisionedGroupBatchCoalesced(alloc, table_name, group, req);
                 } else if (self.tryBeginGroupOperation(table_name, group.group_id)) {
@@ -22424,6 +22691,7 @@ pub const ProvisionedTableWriteSource = struct {
             } else {
                 self.beginGroupOperation(table_name, group.group_id);
                 defer self.endGroupOperation(table_name, group.group_id);
+                if (context) |bounded| try distributed_txn.ensurePreDecisionContextActive(bounded);
                 try self.applyProvisionedGroupBatchLocked(alloc, table_name, group, req, cancellation);
             }
         }
@@ -22903,6 +23171,31 @@ pub const ProvisionedTableWriteSource = struct {
         return {};
     }
 
+    fn commitTransactionWithContext(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        context: distributed_txn.PreDecisionContext,
+    ) !?distributed_txn.CommitOutcome {
+        try distributed_txn.ensurePreDecisionContextActive(context);
+        const txn_source: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const txn_io: ?Io = if (txn_source.backend_runtime) |runtime| runtime.io() else null;
+        return commitProvisionedTransaction(ptr, alloc, nextTxnId(txn_io), nextTxnTimestamp(txn_io), tables, sync_level, false, context.cancellation, context);
+    }
+
+    fn commitTransactionWithIdWithContext(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        begin_timestamp: u64,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        context: distributed_txn.PreDecisionContext,
+    ) !?distributed_txn.CommitOutcome {
+        return commitProvisionedTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, true, context.cancellation, context);
+    }
+
     fn commitTransaction(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -22922,7 +23215,7 @@ pub const ProvisionedTableWriteSource = struct {
         const txn_source: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         const txn_io: ?Io = if (txn_source.backend_runtime) |runtime| runtime.io() else null;
         const txn_id = nextTxnId(txn_io);
-        return try commitProvisionedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation);
+        return try commitProvisionedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation, null);
     }
 
     fn commitTransactionWithId(
@@ -22945,7 +23238,7 @@ pub const ProvisionedTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
-        return try commitProvisionedTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, true, cancellation);
+        return try commitProvisionedTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, true, cancellation, null);
     }
 
     fn acknowledgeTransactionCommit(
@@ -22958,12 +23251,14 @@ pub const ProvisionedTableWriteSource = struct {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         const participant = try distributed_txn.participantIdForGroup(alloc, coordinator_table_name, coordinator_group_id);
         defer alloc.free(participant);
-        return try self.source().txnAcknowledgeGroupLocal(
+        const deadline = platform_time.monotonicNs() +| @import("distributed_txn_contract.zig").default_transaction_recovery_timeout_ns;
+        return try self.source().txnAcknowledgeGroupLocalUntil(
             alloc,
             coordinator_group_id,
             coordinator_table_name,
             txn_id,
             participant,
+            deadline,
         );
     }
 
@@ -22976,7 +23271,9 @@ pub const ProvisionedTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         retain_terminal: bool,
         cancellation: db_mod.types.CancellationToken,
+        context: ?distributed_txn.PreDecisionContext,
     ) !?distributed_txn.CommitOutcome {
+        if (context) |bounded| try distributed_txn.ensurePreDecisionContextActive(bounded);
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try enforceHAWriteGateOptional(self.ha_write_gate);
         var worker_impl = distributed_txn.LocalTableWriteParticipantWorker.init(self.source());
@@ -22996,6 +23293,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .report_post_commit_failure = false,
                 .fanout_io = self.tableActivityIo(),
                 .post_commit_cancellation = cancellation,
+                .pre_decision_context = context,
             },
         );
     }
@@ -23009,16 +23307,26 @@ pub const ProvisionedTableWriteSource = struct {
         return try commitBatchWithCancellation(ptr, alloc, tables, sync_level, .none);
     }
 
-    fn commitBatchWithCancellation(
+    fn commitBatchWithCancellation(ptr: *anyopaque, alloc: std.mem.Allocator, tables: []const distributed_txn.TableCommitRequest, sync_level: db_mod.types.SyncLevel, cancellation: db_mod.types.CancellationToken) !?distributed_txn.CommitOutcome {
+        return commitBatchWithOptionalContext(ptr, alloc, tables, sync_level, cancellation, null);
+    }
+
+    fn commitBatchWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, tables: []const distributed_txn.TableCommitRequest, sync_level: db_mod.types.SyncLevel, context: distributed_txn.PreDecisionContext) !?distributed_txn.CommitOutcome {
+        return commitBatchWithOptionalContext(ptr, alloc, tables, sync_level, context.cancellation, context);
+    }
+
+    fn commitBatchWithOptionalContext(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
+        context: ?distributed_txn.PreDecisionContext,
     ) !?distributed_txn.CommitOutcome {
+        if (context) |bounded| try distributed_txn.ensurePreDecisionContextActive(bounded);
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try enforceHAWriteGateOptional(self.ha_write_gate);
-        return commitStatelessBatchWithRetries(self, commitProvisionedBatchOnce, alloc, tables, sync_level, cancellation);
+        return commitStatelessBatchWithRetries(self, commitProvisionedBatchOnce, alloc, tables, sync_level, cancellation, context);
     }
 
     fn commitProvisionedBatchOnce(
@@ -23027,11 +23335,12 @@ pub const ProvisionedTableWriteSource = struct {
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
+        context: ?distributed_txn.PreDecisionContext,
     ) !?distributed_txn.CommitOutcome {
-        if (try self.commitSingleGroupBatch(alloc, tables, sync_level, cancellation)) |outcome| return outcome;
+        if (try self.commitSingleGroupBatchWithContext(alloc, tables, sync_level, cancellation, context)) |outcome| return outcome;
         const txn_io: ?Io = if (self.backend_runtime) |runtime| runtime.io() else null;
         const txn_id = nextTxnId(txn_io);
-        return commitProvisionedTransaction(self, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation) catch |err| {
+        return commitProvisionedTransaction(self, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation, context) catch |err| {
             if (err == error.CommitDecisionUnknown)
                 public_table_http.setLastAmbiguousBatchTxnId(distributed_txn.encodeTxnIdHex(txn_id));
             return err;
@@ -23044,15 +23353,21 @@ pub const ProvisionedTableWriteSource = struct {
     /// and extra WAL records without strengthening the commit contract.
     /// Multi-group and multi-table batches still use the distributed
     /// transaction coordinator below.
-    fn commitSingleGroupBatch(
+    fn commitSingleGroupBatch(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator, tables: []const distributed_txn.TableCommitRequest, sync_level: db_mod.types.SyncLevel, cancellation: db_mod.types.CancellationToken) !?distributed_txn.CommitOutcome {
+        return self.commitSingleGroupBatchWithContext(alloc, tables, sync_level, cancellation, null);
+    }
+
+    fn commitSingleGroupBatchWithContext(
         self: *ProvisionedTableWriteSource,
         alloc: std.mem.Allocator,
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
+        context: ?distributed_txn.PreDecisionContext,
     ) !?distributed_txn.CommitOutcome {
+        if (context) |bounded| try distributed_txn.ensurePreDecisionContextActive(bounded);
         if (self.raft_batcher != null)
-            return try self.commitSingleGroupTransactionViaRaftBatcher(alloc, tables, sync_level, cancellation);
+            return try self.commitSingleGroupTransactionViaRaftBatcherWithContext(alloc, tables, sync_level, cancellation, context);
         // A forwarding facade does not own the activity fence for the local
         // writer. Leave it on the normal participant route until the hosted
         // path has an equivalent single-shard callback.
@@ -23114,7 +23429,7 @@ pub const ProvisionedTableWriteSource = struct {
         // one-participant proof above and the ordinary atomic batch admission.
         // `batch` retains the established schema, cache, coalescing, HA, and
         // sync-level behavior used by all non-transactional shard writes.
-        const applied = self.batchWithVisibilityCancellation(alloc, table_req.table_name, .{
+        const applied = self.batchWithVisibilityContext(alloc, table_req.table_name, .{
             .writes = transactionWritesAsBatchWrites(table_req.writes),
             .deletes = table_req.deletes,
             .transforms = table_req.transforms,
@@ -23122,7 +23437,7 @@ pub const ProvisionedTableWriteSource = struct {
             .timestamp_ns = nextTxnTimestamp(if (self.backend_runtime) |runtime| runtime.io() else null),
             .sync_level = sync_level,
             .reject_graph_transform_projections = true,
-        }, cancellation) catch |err| switch (err) {
+        }, cancellation, context) catch |err| switch (err) {
             error.IntentConflict, error.VersionConflict => return .{ .conflict = boundConflict(table_req, err) },
             error.InvalidArgument,
             error.InvalidGraphEdges,
@@ -23134,12 +23449,17 @@ pub const ProvisionedTableWriteSource = struct {
         return .{ .committed = .{ .participant_count = 1 } };
     }
 
-    fn commitSingleGroupTransactionViaRaftBatcher(
+    fn commitSingleGroupTransactionViaRaftBatcher(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator, tables: []const distributed_txn.TableCommitRequest, sync_level: db_mod.types.SyncLevel, cancellation: db_mod.types.CancellationToken) !?distributed_txn.CommitOutcome {
+        return self.commitSingleGroupTransactionViaRaftBatcherWithContext(alloc, tables, sync_level, cancellation, null);
+    }
+
+    fn commitSingleGroupTransactionViaRaftBatcherWithContext(
         self: *ProvisionedTableWriteSource,
         alloc: std.mem.Allocator,
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
+        context: ?distributed_txn.PreDecisionContext,
     ) !?distributed_txn.CommitOutcome {
         if (tables.len == 0) return .{ .committed = .{ .participant_count = 0 } };
         if (tables.len != 1) return null;
@@ -23151,7 +23471,7 @@ pub const ProvisionedTableWriteSource = struct {
             alloc,
             self.catalog,
             table_req.table_name,
-            self.catalog.budget(null).nowNs() +| write_routing_snapshot_timeout_ns,
+            try boundedWriteRoutingDeadline(self.catalog, context),
         )) orelse return null;
         defer routing.deinit(alloc);
 
@@ -23188,7 +23508,7 @@ pub const ProvisionedTableWriteSource = struct {
             .transforms = table_req.transforms,
             .sync_level = sync_level,
         };
-        batcher.batchGroupRoutedWithCancellation(alloc, routing.fenceForRoute(route), table_req.table_name, req, cancellation) catch |err| switch (err) {
+        (if (context) |bounded| batcher.batchGroupRoutedWithPreDecisionContext(alloc, routing.fenceForRoute(route), table_req.table_name, req, bounded) else batcher.batchGroupRoutedWithCancellation(alloc, routing.fenceForRoute(route), table_req.table_name, req, cancellation)) catch |err| switch (err) {
             error.IntentConflict, error.VersionConflict => return .{ .conflict = boundConflict(table_req, err) },
             else => return err,
         };
@@ -24171,7 +24491,70 @@ pub const ProvisionedTableWriteSource = struct {
         return try txnResolveGroupLocalWithCancellation(ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, .none);
     }
 
-    fn txnResolveGroupLocalWithCancellation(
+    fn txnDecideGroupLocalWithPreDecisionContext(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, status: db_mod.types.TxnStatus, commit_version: u64, topology_epoch: u64, sync_level: db_mod.types.SyncLevel, context: distributed_txn.PreDecisionContext) anyerror!?void {
+        if (status != .committed) return error.PreDecisionNotProposed;
+        ensurePreDecisionContextActive(context) catch return error.PreDecisionNotProposed;
+        return try txnResolveGroupLocalImpl(ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, context.cancellation, context);
+    }
+
+    fn recoveryAdmissionError(err: anyerror) anyerror {
+        return switch (err) {
+            error.PreDecisionDeadlineExceeded => error.Timeout,
+            error.PreDecisionNotProposed => error.CommitPropagationIncomplete,
+            else => err,
+        };
+    }
+
+    fn publishRecoveryMutation(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+        // Invocation may have made durable progress even when its final
+        // visibility or transport result is uncertain.
+        lockAtomic(&self.local_db_mutex);
+        self.markWriteCacheDirty(table_name);
+        self.invalidateReadCache(table_name);
+        self.local_db_mutex.unlock();
+        self.notifyLocalChange(table_name, .data);
+    }
+
+    fn txnResolveGroupLocalUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, status: db_mod.types.TxnStatus, commit_version: u64, topology_epoch: u64, sync_level: db_mod.types.SyncLevel, deadline_ns: u64, cancellation: db_mod.types.CancellationToken) anyerror!?void {
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        try cancellation.check();
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
+        const catalog_deadline = self.catalog.budget(null).deadlineFrom(table_catalog.RoutingBudget.init(deadline_ns));
+        if (topology_epoch != 0) try table_catalog.validatePinnedGroupTopologyUntil(alloc, self.catalog, table_name, group_id, topology_epoch, catalog_deadline);
+        if (self.raft_batcher) |batcher| {
+            if (batcher.vtable.batch_group_local_with_pre_decision_context == null) return error.CommitPropagationIncomplete;
+            batcher.batchGroupLocalWithPreDecisionContext(alloc, group_id, table_name, .{
+                .sync_level = sync_level,
+                .transaction = .{ .resolve = .{ .txn_id = txn_id, .status = status, .commit_version = commit_version } },
+            }, .{ .deadline_ns = deadline_ns, .cancellation = cancellation }) catch |err| return recoveryAdmissionError(err);
+            return {};
+        }
+        if (self.groupLocalWriteSource()) |owner| {
+            defer if (status == .committed) self.publishRecoveryMutation(table_name);
+            return owner.txnResolveGroupLocalUntil(alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, deadline_ns, cancellation);
+        }
+        if (comptime control_only_storage_sources) return error.StorageKernelOwnerUnavailable;
+        if (!self.tryBeginReplicatedApplyOperation(table_name, group_id)) return error.CommitPropagationIncomplete;
+        defer self.endGroupOperation(table_name, group_id);
+        var cached = try self.acquireResidentRecoveryDb(group_id, table_name);
+        defer cached.deinit(alloc);
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        try cancellation.check();
+        var scope: TxnRecoveryDeadlineCancellation = .{ .deadline_ns = deadline_ns, .original = cancellation };
+        defer if (status == .committed) self.publishRecoveryMutation(table_name);
+        try applyReplicatedTransactionMutationWithCancellation(alloc, cached.db, table_name, group_id, .{
+            .sync_level = sync_level,
+            .transaction = .{ .resolve = .{ .txn_id = txn_id, .status = status, .commit_version = commit_version } },
+        }, scope.token());
+        return {};
+    }
+
+    fn txnResolveGroupLocalWithCancellation(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, status: db_mod.types.TxnStatus, commit_version: u64, topology_epoch: u64, sync_level: db_mod.types.SyncLevel, cancellation: db_mod.types.CancellationToken) anyerror!?void {
+        return try txnResolveGroupLocalImpl(ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, cancellation, null);
+    }
+
+    fn txnResolveGroupLocalImpl(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         group_id: u64,
@@ -24182,6 +24565,7 @@ pub const ProvisionedTableWriteSource = struct {
         topology_epoch: u64,
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
+        first_context: ?distributed_txn.PreDecisionContext,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try enforceHAWriteGateOptional(self.ha_write_gate);
@@ -24199,14 +24583,20 @@ pub const ProvisionedTableWriteSource = struct {
             // dispatcher as begin/prepare; the transaction ID and replicated
             // decision make retries safe, while the forwarded batch hop remains
             // cache-only and bounded inside the data runtime.
-            try batcher.batchGroupWithCancellation(alloc, group_id, table_name, .{
+            const decision_request: db_mod.types.BatchRequest = .{
                 .sync_level = sync_level,
                 .transaction = .{ .resolve = .{
                     .txn_id = txn_id,
                     .status = status,
                     .commit_version = commit_version,
                 } },
-            }, cancellation);
+            };
+            if (first_context == null and cancellation.ptr != null and batcher.vtable.batch_group_with_cancellation == null)
+                return error.CommitDecisionUnknown;
+            if (first_context) |context|
+                try batcher.decideGroupLocalWithPreDecisionContext(alloc, group_id, table_name, decision_request, context)
+            else
+                try batcher.batchGroupWithCancellation(alloc, group_id, table_name, decision_request, cancellation);
             return {};
         }
         if (status == .committed) {
@@ -24222,16 +24612,12 @@ pub const ProvisionedTableWriteSource = struct {
             }
         }
         if (self.groupLocalWriteSource()) |owner| {
-            if ((try owner.txnResolveGroupLocal(
-                alloc,
-                group_id,
-                table_name,
-                txn_id,
-                status,
-                commit_version,
-                topology_epoch,
-                sync_level,
-            )) == null) return null;
+            if (first_context == null and cancellation.ptr != null and owner.vtable.txn_resolve_group_local_with_cancellation == null) return error.CommitDecisionUnknown;
+            const result = if (first_context) |context|
+                try owner.txnDecideGroupLocalWithPreDecisionContext(alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, context)
+            else
+                try owner.txnResolveGroupLocalWithCancellation(alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, cancellation);
+            if (result == null) return null;
             if (status == .committed) {
                 lockAtomic(&self.local_db_mutex);
                 self.markWriteCacheDirty(table_name);
@@ -24249,6 +24635,8 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.write_cache) |cache| {
             var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default_async, null, null);
             defer cached.deinit(alloc);
+            if (first_context) |context| ensurePreDecisionContextActive(context) catch return error.PreDecisionNotProposed;
+            try cancellation.check();
             try applyReplicatedTransactionMutationWithCancellation(alloc, cached.db, table_name, group_id, .{
                 .sync_level = sync_level,
                 .transaction = .{ .resolve = .{ .txn_id = txn_id, .status = status, .commit_version = commit_version } },
@@ -24264,6 +24652,8 @@ pub const ProvisionedTableWriteSource = struct {
             var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
+            if (first_context) |context| ensurePreDecisionContextActive(context) catch return error.PreDecisionNotProposed;
+            try cancellation.check();
             try applyReplicatedTransactionMutationWithCancellation(alloc, &db, table_name, group_id, .{
                 .sync_level = sync_level,
                 .transaction = .{ .resolve = .{ .txn_id = txn_id, .status = status, .commit_version = commit_version } },
@@ -24279,6 +24669,21 @@ pub const ProvisionedTableWriteSource = struct {
             self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
             self.notifyLocalChange(table_name, .data);
         }
+    }
+
+    fn txnStatusGroupLocalUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, deadline_ns: u64) anyerror!?db_mod.types.TxnStatus {
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (self.groupLocalWriteSource()) |owner| return owner.txnStatusGroupLocalUntil(alloc, group_id, table_name, txn_id, deadline_ns);
+        if (comptime control_only_storage_sources) return error.StorageKernelOwnerUnavailable;
+        if (!self.tryBeginReplicatedApplyOperation(table_name, group_id)) return error.CommitPropagationIncomplete;
+        defer self.endGroupOperation(table_name, group_id);
+        var cached = try self.acquireResidentRecoveryDb(group_id, table_name);
+        defer cached.deinit(alloc);
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        const status = try cached.db.getTransactionStatus(txn_id);
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        return status;
     }
 
     fn txnStatusGroupLocal(
@@ -24351,11 +24756,8 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?db_mod.types.TxnStatus {
         if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        const batcher = self.raft_batcher orelse {
-            const status = try txnStatusGroupLocal(ptr, alloc, group_id, table_name, txn_id);
-            if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
-            return status;
-        };
+        const batcher = self.raft_batcher orelse
+            return txnStatusGroupLocalUntil(ptr, alloc, group_id, table_name, txn_id, deadline_ns);
         return try batcher.txnStatusGroupUntil(alloc, group_id, table_name, txn_id, deadline_ns);
     }
 
@@ -24382,57 +24784,78 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?db_mod.types.TxnStatus {
         if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        const batcher = self.raft_batcher orelse {
-            const status = try txnStatusGroupLocal(ptr, alloc, group_id, table_name, txn_id);
-            if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
-            return status;
-        };
+        const batcher = self.raft_batcher orelse
+            return txnStatusGroupLocalUntil(ptr, alloc, group_id, table_name, txn_id, deadline_ns);
         return try batcher.txnStatusGroupLocalUntil(alloc, group_id, table_name, txn_id, deadline_ns);
     }
 
-    fn txnAcknowledgeGroupLocal(
+    fn txnAcknowledgeGroupLocalUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, participant: []const u8, deadline_ns: u64) anyerror!?void {
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
+        if (self.raft_batcher) |batcher| {
+            if (batcher.vtable.batch_group_local_with_pre_decision_context == null) return error.CommitPropagationIncomplete;
+            batcher.batchGroupLocalWithPreDecisionContext(alloc, group_id, table_name, .{
+                .sync_level = .write,
+                .transaction = .{ .acknowledge = .{ .txn_id = txn_id, .participant = participant } },
+            }, .{ .deadline_ns = deadline_ns }) catch |err| return recoveryAdmissionError(err);
+            return {};
+        }
+        if (self.groupLocalWriteSource()) |owner| return owner.txnAcknowledgeGroupLocalUntil(alloc, group_id, table_name, txn_id, participant, deadline_ns);
+        if (comptime control_only_storage_sources) return error.StorageKernelOwnerUnavailable;
+        if (!self.tryBeginReplicatedApplyOperation(table_name, group_id)) return error.CommitPropagationIncomplete;
+        defer self.endGroupOperation(table_name, group_id);
+        var cached = try self.acquireResidentRecoveryDb(group_id, table_name);
+        defer cached.deinit(alloc);
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        try cached.db.markTransactionParticipantResolved(txn_id, participant);
+        lockAtomic(&self.local_db_mutex);
+        self.markWriteCacheDirty(table_name);
+        self.local_db_mutex.unlock();
+        return {};
+    }
+
+    fn txnAcknowledgeGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, participant: []const u8) anyerror!?void {
+        return try txnAcknowledgeGroupLocalImpl(ptr, alloc, group_id, table_name, txn_id, participant, null);
+    }
+
+    fn txnAcknowledgeGroupLocalImpl(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         group_id: u64,
         table_name: []const u8,
         txn_id: db_mod.types.TxnId,
         participant: []const u8,
+        deadline_ns: ?u64,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try enforceHAWriteGateOptional(self.ha_write_gate);
         if (self.raft_batcher) |batcher| {
-            try batcher.batchGroupLocal(alloc, group_id, table_name, .{
+            const request: db_mod.types.BatchRequest = .{
                 .sync_level = .write,
                 .transaction = .{ .acknowledge = .{ .txn_id = txn_id, .participant = participant } },
-            });
+            };
+            if (deadline_ns) |deadline| {
+                if (platform_time.monotonicNs() >= deadline) return error.Timeout;
+                if (batcher.vtable.batch_group_local_with_cancellation == null) return error.CommitPropagationIncomplete;
+                var cancellation: TxnRecoveryDeadlineCancellation = .{ .deadline_ns = deadline };
+                try batcher.batchGroupLocalWithCancellation(alloc, group_id, table_name, request, cancellation.token());
+            } else try batcher.batchGroupLocal(alloc, group_id, table_name, request);
             return {};
         }
         self.beginGroupOperation(table_name, group_id);
         defer self.endGroupOperation(table_name, group_id);
-        if (comptime control_only_storage_sources) {
-            const owner = self.groupLocalWriteSource() orelse
-                return error.StorageKernelOwnerUnavailable;
-            return try owner.txnAcknowledgeGroupLocal(
-                alloc,
-                group_id,
-                table_name,
-                txn_id,
-                participant,
-            );
+        if (self.groupLocalWriteSource()) |owner| {
+            if (deadline_ns) |deadline| return try owner.txnAcknowledgeGroupLocalUntil(alloc, group_id, table_name, txn_id, participant, deadline);
+            return try owner.txnAcknowledgeGroupLocal(alloc, group_id, table_name, txn_id, participant);
         }
-        if (self.groupLocalWriteSource()) |owner|
-            return try owner.txnAcknowledgeGroupLocal(
-                alloc,
-                group_id,
-                table_name,
-                txn_id,
-                participant,
-            );
+        if (comptime control_only_storage_sources) return error.StorageKernelOwnerUnavailable;
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         if (self.write_cache) |cache| {
             var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default_async, null, null);
             defer cached.deinit(alloc);
+            if (deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.Timeout;
             try cached.db.markTransactionParticipantResolved(txn_id, participant);
             lockAtomic(&self.local_db_mutex);
             self.markWriteCacheDirty(table_name);
@@ -24441,6 +24864,7 @@ pub const ProvisionedTableWriteSource = struct {
             var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
+            if (deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.Timeout;
             try db.markTransactionParticipantResolved(txn_id, participant);
             self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
         }
@@ -26174,6 +26598,8 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .hbc_cache = cache.write_cache.hbc_cache,
                 .lsm_root_generation = lsm_root_generation,
                 .resource_manager = cache.write_cache.resource_manager,
+                .durable_completion_enabled = if (mode == .restore_repair) false else if (cache.write_cache.resource_manager) |value| value.durable_completion_enabled else false,
+                .durable_completion_authority = if (mode == .restore_repair) .none else if (cache.write_cache.resource_manager) |value| value.durable_completion_authority else .none,
                 .backend_runtime = cache.write_cache.backend_runtime,
                 .identity_namespace = identity_namespace,
                 .prefer_existing_identity_namespace = identity_namespace != null,
@@ -26247,10 +26673,13 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .graph_metric_maintenance_group_local = graphMetricMaintenanceGroupLocal,
                 .accept_committed_index_mutation = acceptCommittedIndexMutation,
                 .commit_transaction = commitTransaction,
+                .commit_transaction_with_context = commitTransactionWithContext,
                 .commit_transaction_with_cancellation = commitTransactionWithCancellation,
                 .commit_batch = commitBatch,
+                .commit_batch_with_context = commitBatchWithContext,
                 .commit_batch_with_cancellation = commitBatchWithCancellation,
                 .commit_transaction_with_id = commitTransactionWithId,
+                .commit_transaction_with_id_with_context = commitTransactionWithIdWithContext,
                 .commit_transaction_with_id_with_cancellation = commitTransactionWithIdAndCancellation,
                 .acknowledge_transaction_commit = acknowledgeTransactionCommit,
                 .backup_table = backupTable,
@@ -26265,9 +26694,14 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .txn_prepare_group_local_with_pre_decision_context = txnPrepareGroupLocalWithPreDecisionContext,
                 .txn_resolve_group_local = txnResolveGroupLocal,
                 .txn_resolve_group_local_with_cancellation = txnResolveGroupLocalWithCancellation,
+                .txn_decide_group_local_with_pre_decision_context = txnDecideGroupLocalWithPreDecisionContext,
                 .txn_status_group_local = txnStatusGroupLocal,
-                .txn_status_group_local_with_request = txnStatusGroupLocalWithRequest,
+                .txn_status_group_local_until = txnStatusGroupLocalUntil,
+                .txn_status_group_linearizable_until = txnStatusGroupLinearizableUntil,
+                .txn_status_group_authoritative_local_until = txnStatusGroupAuthoritativeLocalUntil,
                 .txn_acknowledge_group_local = txnAcknowledgeGroupLocal,
+                .txn_acknowledge_group_local_until = txnAcknowledgeGroupLocalUntil,
+                .txn_resolve_group_local_until = txnResolveGroupLocalUntil,
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
                 .reprocess_document_artifact = reprocessDocumentArtifact,
                 .reprocess_document_artifact_range = reprocessDocumentArtifactRange,
@@ -26805,6 +27239,31 @@ pub const HostedProvisionedTableWriteSource = struct {
         }
     }
 
+    fn commitTransactionWithContext(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        context: distributed_txn.PreDecisionContext,
+    ) !?distributed_txn.CommitOutcome {
+        try distributed_txn.ensurePreDecisionContextActive(context);
+        const txn_source: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const txn_io: ?Io = if (txn_source.backend_runtime) |runtime| runtime.io() else null;
+        return commitHostedTransaction(ptr, alloc, nextTxnId(txn_io), nextTxnTimestamp(txn_io), tables, sync_level, false, context.cancellation, context);
+    }
+
+    fn commitTransactionWithIdWithContext(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        begin_timestamp: u64,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        context: distributed_txn.PreDecisionContext,
+    ) !?distributed_txn.CommitOutcome {
+        return commitHostedTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, true, context.cancellation, context);
+    }
+
     fn commitTransaction(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -26824,7 +27283,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         const txn_source: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         const txn_io: ?Io = if (txn_source.backend_runtime) |runtime| runtime.io() else null;
         const txn_id = nextTxnId(txn_io);
-        return try commitHostedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation);
+        return try commitHostedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation, null);
     }
 
     fn commitBatch(
@@ -26836,15 +27295,25 @@ pub const HostedProvisionedTableWriteSource = struct {
         return try commitBatchWithCancellation(ptr, alloc, tables, sync_level, .none);
     }
 
-    fn commitBatchWithCancellation(
+    fn commitBatchWithCancellation(ptr: *anyopaque, alloc: std.mem.Allocator, tables: []const distributed_txn.TableCommitRequest, sync_level: db_mod.types.SyncLevel, cancellation: db_mod.types.CancellationToken) !?distributed_txn.CommitOutcome {
+        return commitBatchWithOptionalContext(ptr, alloc, tables, sync_level, cancellation, null);
+    }
+
+    fn commitBatchWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, tables: []const distributed_txn.TableCommitRequest, sync_level: db_mod.types.SyncLevel, context: distributed_txn.PreDecisionContext) !?distributed_txn.CommitOutcome {
+        return commitBatchWithOptionalContext(ptr, alloc, tables, sync_level, context.cancellation, context);
+    }
+
+    fn commitBatchWithOptionalContext(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
+        context: ?distributed_txn.PreDecisionContext,
     ) !?distributed_txn.CommitOutcome {
+        if (context) |bounded| try distributed_txn.ensurePreDecisionContextActive(bounded);
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        return commitStatelessBatchWithRetries(self, commitHostedBatchOnce, alloc, tables, sync_level, cancellation);
+        return commitStatelessBatchWithRetries(self, commitHostedBatchOnce, alloc, tables, sync_level, cancellation, context);
     }
 
     fn commitHostedBatchOnce(
@@ -26853,10 +27322,11 @@ pub const HostedProvisionedTableWriteSource = struct {
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
+        context: ?distributed_txn.PreDecisionContext,
     ) !?distributed_txn.CommitOutcome {
         const txn_io: ?Io = if (self.backend_runtime) |runtime| runtime.io() else null;
         const txn_id = nextTxnId(txn_io);
-        return try commitHostedTransaction(self, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation);
+        return try commitHostedTransaction(self, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation, context);
     }
 
     fn commitTransactionWithId(
@@ -26879,7 +27349,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
-        return try commitHostedTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, true, cancellation);
+        return try commitHostedTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, true, cancellation, null);
     }
 
     fn acknowledgeTransactionCommit(
@@ -26894,7 +27364,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         defer alloc.free(participant);
         var worker = distributed_txn.HostedParticipantWorker.init(self.catalog, self.router, self.source(), self.executor);
         _ = worker.withInternalServiceAuth(self.internal_service_secret, self.internal_service_issuer);
-        try worker.worker().acknowledgeGroup(alloc, coordinator_group_id, coordinator_table_name, .{
+        try worker.worker().startRecovery().acknowledgeGroup(alloc, coordinator_group_id, coordinator_table_name, .{
             .txn_id = txn_id,
             .participant = participant,
         });
@@ -26910,7 +27380,9 @@ pub const HostedProvisionedTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         retain_terminal: bool,
         cancellation: db_mod.types.CancellationToken,
+        context: ?distributed_txn.PreDecisionContext,
     ) !?distributed_txn.CommitOutcome {
+        if (context) |bounded| try distributed_txn.ensurePreDecisionContextActive(bounded);
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         var worker_impl = distributed_txn.HostedParticipantWorker.init(self.catalog, self.router, self.source(), self.executor);
         _ = worker_impl.withInternalServiceAuth(self.internal_service_secret, self.internal_service_issuer);
@@ -26930,6 +27402,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .report_post_commit_failure = false,
                 .fanout_io = if (self.backend_runtime) |runtime| runtime.apiIo() else null,
                 .post_commit_cancellation = cancellation,
+                .pre_decision_context = context,
             },
         );
     }
@@ -27294,11 +27767,24 @@ pub const HostedProvisionedTableWriteSource = struct {
     ) !?void {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try ensurePreDecisionContextActive(context);
+        // A local hosted route must have a stable recovery owner before it
+        // creates an obligation. Request-scoped adapters cannot own warmups.
+        if (req.transaction) |mutation| if (mutation == .begin) {
+            const owner = self.groupLocalWriteSource() orelse return error.PreDecisionNotProposed;
+            if (owner.vtable.txn_resolve_group_local_until == null or owner.vtable.txn_acknowledge_group_local_until == null or owner.vtable.txn_status_group_authoritative_local_until == null)
+                return error.PreDecisionNotProposed;
+        };
+
         if (comptime control_only_storage_sources) {
             if (topology_epoch != 0)
                 try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
             const local_source = self.groupLocalWriteSource() orelse
                 return error.StorageKernelOwnerUnavailable;
+            if (req.transaction) |mutation| if (mutation == .resolve and context.cancellation.ptr != null) {
+                if (local_source.vtable.txn_resolve_group_local_with_cancellation == null) return error.CommitDecisionUnknown;
+                const decision = mutation.resolve;
+                return try local_source.txnResolveGroupLocalWithCancellation(alloc, group_id, table_name, decision.txn_id, decision.status, decision.commit_version, topology_epoch, req.sync_level, context.cancellation);
+            };
             return try local_source.batchGroupLocal(alloc, group_id, table_name, req);
         }
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
@@ -27405,6 +27891,23 @@ pub const HostedProvisionedTableWriteSource = struct {
         }, topology_epoch, context);
     }
 
+    fn txnDecideGroupLocalWithPreDecisionContext(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, status: db_mod.types.TxnStatus, commit_version: u64, topology_epoch: u64, sync_level: db_mod.types.SyncLevel, context: distributed_txn.PreDecisionContext) anyerror!?void {
+        if (status != .committed) return error.PreDecisionNotProposed;
+        ensurePreDecisionContextActive(context) catch return error.PreDecisionNotProposed;
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (comptime control_only_storage_sources) {
+            if (topology_epoch != 0) try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
+            const local_source = self.groupLocalWriteSource() orelse return error.PreDecisionNotProposed;
+            return try local_source.txnDecideGroupLocalWithPreDecisionContext(alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, context);
+        }
+        // The helper checks the same original context after opening and just
+        // before native mutation. It never checks the deadline after mutation.
+        return batchGroupLocalFencedWithPreDecisionContext(ptr, alloc, group_id, table_name, .{
+            .sync_level = sync_level,
+            .transaction = .{ .resolve = .{ .txn_id = txn_id, .status = status, .commit_version = commit_version } },
+        }, topology_epoch, context);
+    }
+
     fn txnResolveGroupLocal(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -27417,6 +27920,14 @@ pub const HostedProvisionedTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
     ) !?void {
         return try txnResolveGroupLocalWithCancellation(ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, .none);
+    }
+
+    fn txnResolveGroupLocalUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, status: db_mod.types.TxnStatus, commit_version: u64, topology_epoch: u64, sync_level: db_mod.types.SyncLevel, deadline_ns: u64, cancellation: db_mod.types.CancellationToken) anyerror!?void {
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        try cancellation.check();
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const owner = self.groupLocalWriteSource() orelse return error.CommitPropagationIncomplete;
+        return owner.txnResolveGroupLocalUntil(alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, deadline_ns, cancellation);
     }
 
     fn txnResolveGroupLocalWithCancellation(
@@ -27439,6 +27950,27 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .commit_version = commit_version,
             } },
         }, topology_epoch, cancellation);
+    }
+
+    fn txnStatusGroupLinearizableUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, deadline_ns: u64) anyerror!?db_mod.types.TxnStatus {
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const owner = self.groupLocalWriteSource() orelse return error.DeadlineAwareTxnStatusUnsupported;
+        return owner.txnStatusGroupLinearizableUntil(alloc, group_id, table_name, txn_id, deadline_ns);
+    }
+
+    fn txnStatusGroupAuthoritativeLocalUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, deadline_ns: u64) anyerror!?db_mod.types.TxnStatus {
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const owner = self.groupLocalWriteSource() orelse return error.DeadlineAwareTxnStatusUnsupported;
+        return owner.txnStatusGroupAuthoritativeLocalUntil(alloc, group_id, table_name, txn_id, deadline_ns);
+    }
+
+    fn txnStatusGroupLocalUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, deadline_ns: u64) anyerror!?db_mod.types.TxnStatus {
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const owner = self.groupLocalWriteSource() orelse return error.DeadlineAwareTxnStatusUnsupported;
+        return owner.txnStatusGroupLocalUntil(alloc, group_id, table_name, txn_id, deadline_ns);
     }
 
     fn txnStatusGroupLocal(
@@ -27476,6 +28008,13 @@ pub const HostedProvisionedTableWriteSource = struct {
         var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
         defer cached.deinit(hosted_cache.write_cache.alloc);
         return try cached.db.getTransactionStatus(txn_id);
+    }
+
+    fn txnAcknowledgeGroupLocalUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, participant: []const u8, deadline_ns: u64) anyerror!?void {
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const owner = self.groupLocalWriteSource() orelse return error.CommitPropagationIncomplete;
+        return owner.txnAcknowledgeGroupLocalUntil(alloc, group_id, table_name, txn_id, participant, deadline_ns);
     }
 
     fn txnAcknowledgeGroupLocal(
@@ -28431,6 +28970,14 @@ fn nextTxnId(io: ?Io) db_mod.types.TxnId {
     return txn_id;
 }
 
+fn boundedWriteRoutingDeadline(catalog: table_catalog.CatalogSource, context: ?distributed_txn.PreDecisionContext) !u64 {
+    const configured = catalog.budget(null).nowNs() +| write_routing_snapshot_timeout_ns;
+    const bounded = context orelse return configured;
+    try distributed_txn.ensurePreDecisionContextActive(bounded);
+    const original = catalog.deadlineFrom(.{ .deadline_ns = bounded.deadline_ns, .io = bounded.deadline_io });
+    return if (original) |deadline| @min(configured, deadline) else configured;
+}
+
 fn commitStatelessBatchWithRetries(
     source: anytype,
     comptime commit_once: anytype,
@@ -28438,13 +28985,15 @@ fn commitStatelessBatchWithRetries(
     tables: []const distributed_txn.TableCommitRequest,
     sync_level: db_mod.types.SyncLevel,
     cancellation: db_mod.types.CancellationToken,
+    context: ?distributed_txn.PreDecisionContext,
 ) !?distributed_txn.CommitOutcome {
     const retry_conflicts = statelessBatchMayRetry(tables);
     var attempt: u8 = 0;
     while (true) : (attempt += 1) {
-        const outcome = commit_once(source, alloc, tables, sync_level, cancellation) catch |err| {
+        if (context) |bounded| try distributed_txn.ensurePreDecisionContextActive(bounded);
+        const outcome = commit_once(source, alloc, tables, sync_level, cancellation, context) catch |err| {
             if (retry_conflicts and attempt + 1 < stateless_batch_max_attempts and err == error.TopologyChanged) {
-                try sleepStatelessBatchRetry(source, attempt);
+                try sleepStatelessBatchRetry(source, attempt, context);
                 continue;
             }
             return err;
@@ -28457,7 +29006,7 @@ fn commitStatelessBatchWithRetries(
                 // a predicate-free stateless batch at either write source.
                 // Explicit OCC and ambiguous outcomes remain caller-visible.
                 if (retry_conflicts and attempt + 1 < stateless_batch_max_attempts) {
-                    try sleepStatelessBatchRetry(source, attempt);
+                    try sleepStatelessBatchRetry(source, attempt, context);
                     continue;
                 }
                 return result;
@@ -28466,8 +29015,12 @@ fn commitStatelessBatchWithRetries(
     }
 }
 
-fn sleepStatelessBatchRetry(source: anytype, attempt: u8) !void {
-    const delay_ns = statelessBatchRetryDelayNs(attempt);
+fn sleepStatelessBatchRetry(source: anytype, attempt: u8, context: ?distributed_txn.PreDecisionContext) !void {
+    var delay_ns = statelessBatchRetryDelayNs(attempt);
+    if (context) |bounded| {
+        try distributed_txn.ensurePreDecisionContextActive(bounded);
+        if (bounded.deadline_ns) |deadline| delay_ns = @min(delay_ns, deadline -| (table_catalog.RoutingBudget{ .io = bounded.deadline_io }).nowNs());
+    }
     if (source.backend_runtime) |runtime| {
         const io = runtime.io() orelse return error.BackendRuntimeIoUnavailable;
         try io.sleep(.fromNanoseconds(delay_ns), .awake);
@@ -34290,6 +34843,156 @@ fn consumerTests() type {
             }
         }
 
+        test "transaction recovery bounded cold owner warms outside request then resolves" {
+            const alloc = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/bounded-recovery", .{tmp.sub_path});
+            defer alloc.free(root);
+            const Catalog = struct {
+                fn iface() table_catalog.CatalogSource {
+                    return .{
+                        .ptr = undefined,
+                        .vtable = &.{
+                            .admin_snapshot = adminSnapshot,
+                            .free_admin_snapshot = freeAdminSnapshot,
+                            .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                            .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                            .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
+                        },
+                    };
+                }
+
+                fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+                    return .{
+                        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                            .table_id = 7,
+                            .name = "docs",
+                            .placement_role = "data",
+                            .indexes_json = "{\"indexes\":[]}",
+                        }})[0..]),
+                        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                            .group_id = 7001,
+                            .table_id = 7,
+                            .start_key = "",
+                            .end_key = null,
+                        }})[0..]),
+                        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                    };
+                }
+
+                fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+            };
+
+            var cache = ProvisionedTableWriteCache.init(alloc);
+            defer cache.deinit();
+            var source = ProvisionedTableWriteSource.init(root, Catalog.iface());
+            defer source.deinit();
+            source.write_cache = &cache;
+            const txn_id = [_]u8{9} ** 16;
+            const deadline = platform_time.monotonicNs() + 30 * std.time.ns_per_s;
+            try std.testing.expectError(error.CommitPropagationIncomplete, source.source().txnResolveGroupLocalUntil(alloc, 7001, "docs", txn_id, .aborted, 0, 0, .write, deadline, .none));
+            try std.testing.expectError(error.CommitPropagationIncomplete, source.source().txnStatusGroupLocalUntil(alloc, 7001, "docs", txn_id, deadline));
+            try std.testing.expectEqual(@as(usize, 0), cache.entries.items.len);
+            try std.testing.expect(source.hasPendingRecoveryOwnerWarmups());
+            try source.drainRecoveryOwnerWarmups();
+            try std.testing.expect(!source.hasPendingRecoveryOwnerWarmups());
+            try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
+            const participant = try distributed_txn.participantIdForGroup(alloc, "docs", 7001);
+            defer alloc.free(participant);
+            _ = try cache.entries.items[0].db.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(txn_id, 1, nextTxnTimestamp(cache.entries.items[0].db.backend_runtime.io()), &.{participant}, true, true);
+            _ = try source.source().txnResolveGroupLocalUntil(alloc, 7001, "docs", txn_id, .aborted, 0, 0, .write, deadline, .none);
+            try std.testing.expectEqual(db_mod.types.TxnStatus.aborted, try cache.entries.items[0].db.getTransactionStatus(txn_id));
+            try std.testing.expectEqual(db_mod.types.TxnStatus.aborted, (try source.source().txnStatusGroupLocalUntil(alloc, 7001, "docs", txn_id, deadline)).?);
+            _ = try source.source().txnAcknowledgeGroupLocalUntil(alloc, 7001, "docs", txn_id, participant, deadline);
+        }
+
+        test "transaction recovery bounded warmup queue retains failures and rejects late admission" {
+            var source = ProvisionedTableWriteSource.init("/unused-recovery-warmup", table_catalog.emptyCatalogSource());
+            defer source.deinit();
+            for (0..256) |index| try source.requestRecoveryOwnerWarmup(index + 1, "docs");
+            try source.requestRecoveryOwnerWarmup(1, "docs");
+            try std.testing.expectEqual(@as(usize, 256), source.recovery_warmup_pending.load(.acquire));
+            try std.testing.expectEqual(@as(u64, 2), source.recovery_warmups[0].revision);
+            try std.testing.expectError(error.CommitPropagationIncomplete, source.requestRecoveryOwnerWarmup(257, "docs"));
+            try std.testing.expectError(error.CommitPropagationIncomplete, source.drainRecoveryOwnerWarmups());
+            try std.testing.expect(source.hasPendingRecoveryOwnerWarmups());
+            try std.testing.expectEqual(@as(usize, 1), source.recovery_warmup_cursor);
+            try std.testing.expect(source.recovery_warmup_mutex.tryLock());
+            try std.testing.expectError(error.CommitPropagationIncomplete, source.requestRecoveryOwnerWarmup(1, "docs"));
+            source.recovery_warmup_mutex.unlock();
+            source.quiesce();
+            try std.testing.expect(!source.hasPendingRecoveryOwnerWarmups());
+            try std.testing.expectError(error.Canceled, source.requestRecoveryOwnerWarmup(1, "docs"));
+            try source.drainRecoveryOwnerWarmups();
+        }
+
+        test "transaction recovery bounded hosted profile refuses begin without stable recovery owner" {
+            var hosted = HostedProvisionedTableWriteSource.init("/must-not-open-recovery-profile", table_catalog.emptyCatalogSource(), undefined, undefined);
+            try std.testing.expectError(error.PreDecisionNotProposed, hosted.source().txnBeginGroupLocal(std.testing.allocator, 7, "docs", [_]u8{1} ** 16, 1, 0, true, &.{}));
+        }
+
+        test "transaction recovery provisioned adapter never loses budget through legacy Raft callbacks" {
+            const Fake = struct {
+                calls: usize = 0,
+                fn batch(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.BatchRequest) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.calls += 1;
+                }
+            };
+            var fake: Fake = .{};
+            var source = ProvisionedTableWriteSource.init("/unused-recovery-capability-test", table_catalog.emptyCatalogSource());
+            defer source.deinit();
+            _ = source.withRaftBatcher(.{ .ptr = &fake, .vtable = &.{ .batch_group = Fake.batch, .batch_group_local = Fake.batch } });
+            var stopped = std.atomic.Value(bool).init(false);
+            const cancellation = db_mod.types.CancellationToken.fromAtomic(&stopped);
+            try std.testing.expectError(error.CommitDecisionUnknown, source.source().txnResolveGroupLocalWithCancellation(std.testing.allocator, 7, "docs", [_]u8{1} ** 16, .aborted, 8, 0, .write, cancellation));
+            try std.testing.expectError(error.CommitPropagationIncomplete, source.source().txnAcknowledgeGroupLocalUntil(std.testing.allocator, 7, "docs", [_]u8{1} ** 16, "peer", platform_time.monotonicNs() + std.time.ns_per_s));
+            try std.testing.expectEqual(@as(usize, 0), fake.calls);
+        }
+
+        test "routed atomic batch preserves deadline without changing accepted outcome" {
+            const Capture = struct {
+                clock: *@import("vopr").vopr_io.VoprIo,
+                expected: distributed_txn.PreDecisionContext,
+                calls: usize = 0,
+                fn legacy(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.BatchRequest) !void {
+                    return error.LegacyMustNotRun;
+                }
+                fn routed(ptr: *anyopaque, _: std.mem.Allocator, _: metadata_api.CatalogRouteFence, _: []const u8, _: db_mod.types.BatchRequest, context: distributed_txn.PreDecisionContext) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqual(self.expected.deadline_ns, context.deadline_ns);
+                    try std.testing.expect(context.deadline_io.?.userdata == self.expected.deadline_io.?.userdata);
+                    self.calls += 1;
+                    // Accepted before expiry, durable completion afterward.
+                    self.clock.monotonic_ns = context.deadline_ns.?;
+                }
+            };
+            var clock = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = std.time.ns_per_s });
+            defer clock.deinit();
+            const context: distributed_txn.PreDecisionContext = .{ .deadline_ns = 2 * std.time.ns_per_s, .deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&clock.io()) };
+            var capture: Capture = .{ .clock = &clock, .expected = context };
+            const fence: metadata_api.CatalogRouteFence = .{
+                .metadata_group_id = 1,
+                .catalog_revision = 1,
+                .table_id = 7,
+                .topology_epoch = 1,
+                .route = .{ .group_id = 7001, .range_id = 7001, .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 } },
+            };
+            const legacy: RaftBatcher = .{ .ptr = &capture, .vtable = &.{ .batch_group = Capture.legacy, .batch_group_local = Capture.legacy } };
+            try std.testing.expectError(error.PreDecisionNotProposed, legacy.batchGroupRoutedWithPreDecisionContext(std.testing.allocator, fence, "docs", .{}, context));
+            try std.testing.expectEqual(@as(usize, 0), capture.calls);
+            const batcher: RaftBatcher = .{ .ptr = &capture, .vtable = &.{ .batch_group = Capture.legacy, .batch_group_local = Capture.legacy, .batch_group_routed_with_pre_decision_context = Capture.routed } };
+            try batcher.batchGroupRoutedWithPreDecisionContext(std.testing.allocator, fence, "docs", .{}, context);
+            try std.testing.expectEqual(@as(usize, 1), capture.calls);
+            try std.testing.expectError(error.PreDecisionDeadlineExceeded, batcher.batchGroupRoutedWithPreDecisionContext(std.testing.allocator, fence, "docs", .{}, context));
+            try std.testing.expectEqual(@as(usize, 1), capture.calls);
+        }
+
         test "stateless batch retries are bounded and exclude explicit OCC" {
             const plain = [_]distributed_txn.TableCommitRequest{.{
                 .table_name = "docs",
@@ -34324,7 +35027,7 @@ fn consumerTests() type {
                 failure: ?anyerror = null,
                 calls: usize = 0,
 
-                fn commit(self: *@This(), _: std.mem.Allocator, _: []const distributed_txn.TableCommitRequest, _: db_mod.types.SyncLevel, _: db_mod.types.CancellationToken) !?distributed_txn.CommitOutcome {
+                fn commit(self: *@This(), _: std.mem.Allocator, _: []const distributed_txn.TableCommitRequest, _: db_mod.types.SyncLevel, _: db_mod.types.CancellationToken, _: ?distributed_txn.PreDecisionContext) !?distributed_txn.CommitOutcome {
                     self.calls += 1;
                     if (self.calls < 3) {
                         if (self.failure) |err| return err;
@@ -34344,10 +35047,33 @@ fn consumerTests() type {
             });
             defer runtime.deinit();
             const tables = [_]distributed_txn.TableCommitRequest{.{ .table_name = "docs", .writes = &.{.{ .key = "doc:a", .value = "{}" }} }};
+            const DeadlineAttempt = struct {
+                backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+                clock: *@import("vopr").vopr_io.VoprIo,
+                calls: usize = 0,
+                unknown: bool,
+                fn commit(self: *@This(), _: std.mem.Allocator, _: []const distributed_txn.TableCommitRequest, _: db_mod.types.SyncLevel, _: db_mod.types.CancellationToken, context: ?distributed_txn.PreDecisionContext) !?distributed_txn.CommitOutcome {
+                    const bounded = context orelse return error.TestUnexpectedResult;
+                    try std.testing.expectEqual(@as(?u64, 2 * std.time.ns_per_s), bounded.deadline_ns);
+                    self.calls += 1;
+                    self.clock.monotonic_ns = bounded.deadline_ns.?;
+                    if (self.unknown) return error.CommitDecisionUnknown;
+                    return .{ .conflict = .{ .table_name = "docs", .key = "", .message = "definite abort" } };
+                }
+            };
+            inline for (.{ false, true }) |unknown| {
+                var deadline_clock = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = std.time.ns_per_s });
+                defer deadline_clock.deinit();
+                var attempt: DeadlineAttempt = .{ .backend_runtime = &runtime, .clock = &deadline_clock, .unknown = unknown };
+                const context: distributed_txn.PreDecisionContext = .{ .deadline_ns = 2 * std.time.ns_per_s, .deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&deadline_clock.io()) };
+                try std.testing.expectError(if (unknown) error.CommitDecisionUnknown else error.PreDecisionDeadlineExceeded, commitStatelessBatchWithRetries(&attempt, DeadlineAttempt.commit, std.testing.allocator, &tables, .write, .none, context));
+                try std.testing.expectEqual(@as(usize, 1), attempt.calls);
+                try std.testing.expectEqual(@as(usize, 0), clock.calls);
+            }
             for ([_]?anyerror{ null, error.TopologyChanged }) |failure| {
                 var attempt = Attempt{ .backend_runtime = &runtime, .failure = failure };
                 clock = .{};
-                const result = (try commitStatelessBatchWithRetries(&attempt, Attempt.commit, std.testing.allocator, &tables, .write, .none)).?;
+                const result = (try commitStatelessBatchWithRetries(&attempt, Attempt.commit, std.testing.allocator, &tables, .write, .none, null)).?;
                 try std.testing.expect(result == .committed);
                 try std.testing.expectEqual(@as(usize, 3), attempt.calls);
                 try std.testing.expectEqual(@as(usize, 2), clock.calls);
@@ -34356,7 +35082,7 @@ fn consumerTests() type {
             for ([_]anyerror{ error.CommitDecisionUnknown, error.RaftBatchWriteOutcomeUnknown, error.UnexpectedHttpStatus }) |failure| {
                 var attempt = Attempt{ .backend_runtime = &runtime, .failure = failure };
                 clock = .{};
-                try std.testing.expectError(failure, commitStatelessBatchWithRetries(&attempt, Attempt.commit, std.testing.allocator, &tables, .write, .none));
+                try std.testing.expectError(failure, commitStatelessBatchWithRetries(&attempt, Attempt.commit, std.testing.allocator, &tables, .write, .none, null));
                 try std.testing.expectEqual(@as(usize, 1), attempt.calls);
                 try std.testing.expectEqual(@as(usize, 0), clock.calls);
             }
@@ -34366,7 +35092,7 @@ fn consumerTests() type {
             }};
             var attempt = Attempt{ .backend_runtime = &runtime };
             clock = .{};
-            const conflict = (try commitStatelessBatchWithRetries(&attempt, Attempt.commit, std.testing.allocator, &conditional, .write, .none)).?;
+            const conflict = (try commitStatelessBatchWithRetries(&attempt, Attempt.commit, std.testing.allocator, &conditional, .write, .none, null)).?;
             try std.testing.expect(conflict == .conflict);
             try std.testing.expectEqual(@as(usize, 1), attempt.calls);
             try std.testing.expectEqual(@as(usize, 0), clock.calls);
@@ -57168,7 +57894,7 @@ fn implementationTests() type {
 
             var leadership = PoisonLeadership{};
             var write_cache = ProvisionedTableWriteCache.init(alloc);
-            write_cache.setPromotionLeadershipSource(leadership.source());
+            try write_cache.setPromotionLeadershipSource(leadership.source());
 
             var cached = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 0, "docs");
             try std.testing.expect(cached.db.promotion_runtime != null);
@@ -62936,6 +63662,45 @@ fn implementationTests() type {
             defer alloc.free(row);
             try std.testing.expectEqualStrings("{\"amount\":3}", row);
             try std.testing.expectEqual(@as(u32, 2), db.core.schema.?.version);
+        }
+
+        test "workload admission completion eligibility serving cache rejects repeated hook transitions" {
+            const alloc = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/completion-hook-fence", .{tmp.sub_path});
+            defer alloc.free(path);
+            var entry = ProvisionedTableWriteCache.Entry{
+                .group_id = 7,
+                .lsm_root_generation = 0,
+                .table_name = @constCast("docs"),
+                .managed_config_fingerprint = @splat(0),
+                .db = try db_mod.DB.open(alloc, path, .{ .start_optional_runtimes = false, .start_index_workers = false }),
+            };
+            defer entry.db.close();
+            defer entry.detachRuntimeHooks();
+            var cache = ProvisionedTableWriteCache.init(alloc);
+            defer cache.deinit();
+            try cache.entries.append(alloc, &entry);
+            // The test owns the stack entry and DB, not the cache.
+            defer cache.entries.clearRetainingCapacity();
+            const Leadership = struct {
+                fn local(_: *anyopaque, _: u64) bool {
+                    return false;
+                }
+            };
+            var context: u8 = 0;
+            const leadership: ProvisionedTableWriteCache.PromotionLeadershipSource = .{ .ptr = &context, .vtable = &.{ .is_local_leader = Leadership.local } };
+            try entry.db.core.completion_eligibility.begin(@splat(1));
+            for (0..2) |_| {
+                try std.testing.expectError(error.PreparedCompletionActive, cache.setPromotionLeadershipSource(leadership));
+                try std.testing.expect(cache.promotion_leadership_source == null);
+                try std.testing.expect(entry.db.promotion_owner == null);
+            }
+            try entry.db.core.completion_eligibility.retire(@splat(1));
+            try cache.setPromotionLeadershipSource(leadership);
+            try std.testing.expect(entry.db.promotion_owner != null);
+            try std.testing.expect(!entry.db.promotion_owner.?.isLocalOwner());
         }
 
         test "portable file restore rejects documents without identity coverage" {

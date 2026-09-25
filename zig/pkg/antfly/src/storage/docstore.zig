@@ -187,7 +187,16 @@ fn writeOriginalReplayHintEntries(txn: anytype, sequence: u64, mask: u8, payload
     }
 }
 
-fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []const u8) !void {
+/// Emit the ordered physical puts used by a replay append without opening a
+/// transaction. The sink supplies `put(key, value) !void` and must consume or
+/// copy both borrowed slices before returning. No sink reference is retained.
+/// The caller owns atomicity: a failure can follow earlier successful puts.
+/// Rejects a sequence without a representable successor before emitting puts.
+/// Invalid hint headers emit only the all-lane record; failed record decoding
+/// preserves the existing original-payload lane fallback, including on OOM.
+/// This enumerator neither reserves resources nor certifies completion.
+pub fn emitReplayMutations(alloc: Allocator, txn: anytype, sequence: u64, payload: []const u8) !void {
+    if (sequence == std.math.maxInt(u64)) return error.InvalidReplaySequence;
     try txn.put(internal_keys.replay_meta_init_key[0..], "");
     const next_raw = encodeReplayNextSequence(sequence + 1);
     try txn.put(internal_keys.replay_meta_next_sequence_key[0..], next_raw[0..]);
@@ -435,6 +444,7 @@ pub const DocStore = struct {
         .begin_current_scan = beginCurrentScanTxn,
         .begin_write = beginWriteTxn,
         .begin_batch = beginWriteBatch,
+        .write_serialization = writeSerialization,
     });
 
     pub const Txn = struct {
@@ -919,7 +929,7 @@ pub const DocStore = struct {
             }
 
             pub fn setReplayOpaque(self: @This(), sequence: u64, payload: []const u8) !void {
-                try writeReplayEntries(self.alloc, self, sequence, payload);
+                try emitReplayMutations(self.alloc, self, sequence, payload);
             }
         };
 
@@ -1491,6 +1501,13 @@ pub const DocStore = struct {
 
     pub fn beginWriteBatch(self: *DocStore) !Batch {
         return try self.beginWriteBatchWithOptions(.{});
+    }
+
+    pub fn writeSerialization(self: *DocStore) !backend_types.WriteSerialization {
+        return switch (self.kind) {
+            .lmdb => .{ .acquired_by_begin = true },
+            .runtime => try self.runtime_store.writeSerialization(),
+        };
     }
 
     pub fn beginWriteBatchWithOptions(self: *DocStore, options: backend_types.BatchOptions) !Batch {
@@ -4209,6 +4226,107 @@ test "docstore lmdb replay rows use replay keyspace" {
     try std.testing.expectEqual(@as(usize, 0), remaining.len);
 }
 
+test "docstore replay mutation sink matches physical apply and preserves ordered failure" {
+    const alloc = std.testing.allocator;
+    const Collector = struct {
+        items: std.ArrayListUnmanaged(OwnedKVPair) = .empty,
+        fail_at: ?usize = null,
+        calls: usize = 0,
+
+        pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {
+            const index = self.calls;
+            self.calls += 1;
+            if (self.fail_at == index) return error.InjectedSinkFailure;
+            const owned_key = try std.testing.allocator.dupe(u8, key);
+            errdefer std.testing.allocator.free(owned_key);
+            const owned_value = try std.testing.allocator.dupe(u8, value);
+            errdefer std.testing.allocator.free(owned_value);
+            try self.items.append(std.testing.allocator, .{ .key = owned_key, .value = owned_value });
+        }
+
+        fn deinit(self: *@This()) void {
+            for (self.items.items) |entry| {
+                std.testing.allocator.free(entry.key);
+                std.testing.allocator.free(entry.value);
+            }
+            self.items.deinit(std.testing.allocator);
+        }
+    };
+    const hints = [_]change_journal_mod.TargetHint{ .full_text, .dense_vector, .sparse_vector, .algebraic };
+    var rejected: Collector = .{};
+    defer rejected.deinit();
+    try std.testing.expectError(error.InvalidReplaySequence, emitReplayMutations(alloc, &rejected, std.math.maxInt(u64), "opaque"));
+    try std.testing.expectEqual(@as(usize, 0), rejected.calls);
+    const binary_key = "doc:\x00\xff:bounded";
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    var expected_count: usize = 0;
+    for ([_]u64{ 7, 8 }, 0..) |sequence, fixture| {
+        const payload = try change_journal_mod.encodeRecord(alloc, .{
+            .sequence = sequence,
+            .changed_doc_keys = &.{binary_key},
+            .overwritten_doc_keys = &.{binary_key},
+            .target_hints = if (fixture == 0) &.{} else &hints,
+        });
+        defer alloc.free(payload);
+        var collected: Collector = .{};
+        defer collected.deinit();
+        try emitReplayMutations(alloc, &collected, sequence, payload);
+        try std.testing.expectEqual(@as(usize, if (fixture == 0) 4 else 12), collected.items.items.len);
+        try std.testing.expectEqualSlices(u8, &internal_keys.replay_meta_init_key, collected.items.items[0].key);
+        try std.testing.expectEqualSlices(u8, &internal_keys.replay_meta_next_sequence_key, collected.items.items[1].key);
+        try std.testing.expectEqual(sequence + 1, std.mem.readInt(u64, collected.items.items[1].value[0..8], .little));
+        try std.testing.expectEqualSlices(u8, &internal_keys.replayEntryKey(internal_keys.replay_all_kind, sequence), collected.items.items[2].key);
+        try std.testing.expectEqualSlices(u8, payload, collected.items.items[2].value);
+        try std.testing.expectEqualSlices(u8, &internal_keys.replayLatestSequenceKey(internal_keys.replay_all_kind), collected.items.items[3].key);
+        if (fixture != 0) for (hints, 0..) |hint, i| {
+            const entry = collected.items.items[4 + i * 2];
+            try std.testing.expectEqualSlices(u8, &internal_keys.replayEntryKey(replayHintOrdinal(hint), sequence), entry.key);
+            try std.testing.expectEqualSlices(u8, &internal_keys.replayLatestSequenceKey(replayHintOrdinal(hint)), collected.items.items[5 + i * 2].key);
+            var decoded = try change_journal_mod.decodeRecord(alloc, entry.value);
+            defer decoded.deinit();
+            try std.testing.expectEqual(sequence, decoded.record.sequence);
+            try std.testing.expectEqualSlices(change_journal_mod.TargetHint, &.{hint}, decoded.record.target_hints);
+            try std.testing.expectEqualSlices(u8, binary_key, decoded.record.changed_doc_keys[0]);
+            try std.testing.expectEqualSlices(u8, binary_key, decoded.record.overwritten_doc_keys[0]);
+        };
+
+        // Read every physical row back from the real DocStore path. Count all
+        // replay keys as well, so extra expansion cannot hide behind point gets.
+        try store.putBatchWithReplay(null, &.{}, &.{}, .{ .sequence = sequence, .payload = payload });
+        for (collected.items.items) |entry| {
+            const value = try store.get(alloc, entry.key);
+            defer alloc.free(value);
+            try std.testing.expectEqualSlices(u8, entry.value, value);
+        }
+        expected_count += collected.items.items.len - (if (fixture == 0) @as(usize, 0) else 3);
+        const physical = try store.scanPrefix(alloc, &.{internal_keys.replay_namespace});
+        defer {
+            for (physical) |entry| {
+                alloc.free(entry.key);
+                alloc.free(entry.value);
+            }
+            alloc.free(physical);
+        }
+        try std.testing.expectEqual(expected_count, physical.len);
+        try std.testing.expectEqual(sequence + 1, store.nextReplaySequence(1));
+
+        for (0..collected.items.items.len) |failure_index| {
+            var failed: Collector = .{ .fail_at = failure_index };
+            defer failed.deinit();
+            try std.testing.expectError(error.InjectedSinkFailure, emitReplayMutations(alloc, &failed, sequence, payload));
+            try std.testing.expectEqual(failure_index + 1, failed.calls);
+            try std.testing.expectEqual(failure_index, failed.items.items.len);
+            for (failed.items.items, collected.items.items[0..failure_index]) |actual, expected| {
+                try std.testing.expectEqualSlices(u8, expected.key, actual.key);
+                try std.testing.expectEqualSlices(u8, expected.value, actual.value);
+            }
+        }
+    }
+}
+
 test "docstore indexes replay rows by hint and truncates them" {
     if (!supports_lmdb) return error.UnsupportedPlatform;
 
@@ -4598,4 +4716,147 @@ test "docstore runtime lsm persists replay rows across namespace reopen" {
     }
     try std.testing.expectEqual(@as(usize, 1), entries.len);
     try std.testing.expectEqualStrings("replay:1", entries[0].payload);
+}
+
+test "workload admission docstore serialized batches forward native shared gates without nesting" {
+    const alloc = std.testing.allocator;
+    {
+        var backend = lsm_backend.Backend.init(alloc, .{});
+        defer backend.close();
+        for ([_]bool{ false, true }) |already_gated| {
+            var inner = try backend.runtimeStore(alloc, .{});
+            if (already_gated) inner.write_gate = &backend.serialized_write_mutex;
+            var docs = try DocStore.openRuntime(alloc, inner);
+            defer docs.close();
+            var outer = try backend_erased.storeFrom(alloc, docs.backendStore());
+            defer outer.deinit();
+            // Same explicit gate on the outer graph-style view must not relock
+            // the inner gate. The ungated variant obtains the same native gate.
+            outer.write_gate = &backend.serialized_write_mutex;
+            {
+                var batch = try outer.beginSerializedBatch();
+                errdefer batch.abort();
+                try std.testing.expect(!backend.serialized_write_mutex.tryLock());
+                try batch.put("serialized-key", "committed");
+                // Snapshot readers remain usable while the participating writer is held.
+                var reader = try outer.beginRead();
+                reader.abort();
+                try batch.commit();
+            }
+            try std.testing.expect(backend.serialized_write_mutex.tryLock());
+            backend.serialized_write_mutex.unlock();
+            {
+                var read = try outer.beginRead();
+                defer read.abort();
+                try std.testing.expectEqualStrings("committed", try read.get("serialized-key"));
+            }
+            {
+                var batch = try outer.beginSerializedBatch();
+                errdefer batch.abort();
+                try batch.put("serialized-key", "aborted");
+                batch.abort();
+            }
+            try std.testing.expect(backend.serialized_write_mutex.tryLock());
+            backend.serialized_write_mutex.unlock();
+            {
+                var read = try outer.beginRead();
+                defer read.abort();
+                try std.testing.expectEqualStrings("committed", try read.get("serialized-key"));
+            }
+        }
+    }
+}
+
+test "workload admission native serialized batches prevent independent view lost updates" {
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var first = try backend.runtimeStore(alloc, .{});
+    defer first.deinit();
+    var second = try backend.runtimeStore(alloc, .{});
+    defer second.deinit();
+    {
+        var seed = try first.beginBatch();
+        errdefer seed.abort();
+        try seed.put("counter", "0");
+        try seed.commit();
+    }
+    // Atomic publication alone does not serialize a read/modify/write lifetime.
+    {
+        var a = try first.beginBatch();
+        var b = try second.beginBatch();
+        try std.testing.expectEqualStrings("0", try a.get("counter"));
+        try std.testing.expectEqualStrings("0", try b.get("counter"));
+        try a.put("counter", "1");
+        try b.put("counter", "1");
+        try a.commit();
+        try b.commit();
+        var read = try first.beginRead();
+        try std.testing.expectEqualStrings("1", try read.get("counter"));
+        read.abort();
+    }
+    const Worker = struct {
+        store: *backend_erased.Store,
+        ready: *std.atomic.Value(u32),
+        start: *std.atomic.Value(bool),
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            _ = self.ready.fetchAdd(1, .release);
+            while (!self.start.load(.acquire)) std.atomic.spinLoopHint();
+            self.increment() catch |err| {
+                self.failure = err;
+            };
+        }
+        fn increment(self: *@This()) !void {
+            var batch = try self.store.beginSerializedBatch();
+            errdefer batch.abort();
+            const old = try std.fmt.parseInt(u32, try batch.get("counter"), 10);
+            var buffer: [16]u8 = undefined;
+            try batch.put("counter", try std.fmt.bufPrint(&buffer, "{d}", .{old + 1}));
+            try batch.commit();
+        }
+    };
+    var ready: std.atomic.Value(u32) = .init(0);
+    var start: std.atomic.Value(bool) = .init(false);
+    var a: Worker = .{ .store = &first, .ready = &ready, .start = &start };
+    var b: Worker = .{ .store = &second, .ready = &ready, .start = &start };
+    const thread_a = try std.Thread.spawn(.{}, Worker.run, .{&a});
+    const thread_b = std.Thread.spawn(.{}, Worker.run, .{&b}) catch |err| {
+        start.store(true, .release);
+        thread_a.join();
+        return err;
+    };
+    while (ready.load(.acquire) != 2) std.atomic.spinLoopHint();
+    start.store(true, .release);
+    thread_a.join();
+    thread_b.join();
+    if (a.failure) |err| return err;
+    if (b.failure) |err| return err;
+    var read = try first.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("3", try read.get("counter"));
+}
+
+test "workload admission serialized batches reject whole-state replacement memory provider" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{});
+    defer runtime.deinit();
+    // A participating gate cannot prevent an unrelated ordinary snapshot
+    // writer from later replacing the whole store, including the ledger.
+    // Do not advertise native LSM's merge-safe serialization for this provider.
+    try std.testing.expectError(error.Unsupported, runtime.beginSerializedBatch());
+    var docs = try DocStore.openRuntime(alloc, &runtime);
+    defer docs.close();
+    var outer = try backend_erased.storeFrom(alloc, docs.backendStore());
+    defer outer.deinit();
+    try std.testing.expectError(error.Unsupported, outer.beginSerializedBatch());
+    outer.write_gate = &backend.serialized_write_mutex;
+    try std.testing.expectError(error.Unsupported, outer.beginSerializedBatch());
+    try std.testing.expect(backend.serialized_write_mutex.tryLock());
+    backend.serialized_write_mutex.unlock();
+    var ordinary = try outer.beginBatch();
+    try ordinary.put("ordinary", "still-supported");
+    try ordinary.commit();
 }

@@ -54,6 +54,7 @@ pub const Source = struct {
         create_table_with_context: ?*const fn (*anyopaque, std.mem.Allocator, operation.RequestContext, []const u8, tables_api.CreateTableRequest) anyerror!void = null,
         replace_definition: *const fn (*anyopaque, table_manager.TableRecord, table_manager.TableRecord) anyerror!void,
         replace_definition_stamped: ?*const fn (*anyopaque, table_manager.TableRecord, table_manager.TableRecord) anyerror!metadata_api.CatalogMutationStamp = null,
+        replace_definition_with_context: ?*const fn (*anyopaque, operation.RequestContext, table_manager.TableRecord, table_manager.TableRecord) anyerror!?metadata_api.CatalogMutationStamp = null,
         restore_table: *const fn (*anyopaque, std.mem.Allocator, []const u8, RestoreRequest) anyerror!void,
         restore_table_with_context: ?*const fn (*anyopaque, std.mem.Allocator, operation.RequestContext, []const u8, RestoreRequest) anyerror!void = null,
         drop_table: *const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror!void,
@@ -90,6 +91,8 @@ pub const Operations = struct {
         try validateNameAndContext(ctx, table_name);
         if (!std.mem.eql(u8, expected.name, table_name)) return error.ExpectedTableNameMismatch;
         if (!std.mem.eql(u8, replacement.name, table_name)) return error.TableNameMismatch;
+        if (self.source.vtable.replace_definition_with_context) |replace_fn|
+            return try replace_fn(self.source.ptr, ctx, expected, replacement);
         if (self.source.vtable.replace_definition_stamped) |replace_fn|
             return try replace_fn(self.source.ptr, expected, replacement);
         try self.source.vtable.replace_definition(self.source.ptr, expected, replacement);

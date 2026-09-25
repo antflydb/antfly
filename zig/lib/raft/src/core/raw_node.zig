@@ -154,7 +154,37 @@ pub const RawNode = struct {
         return self.raft.messages.items.len > 0;
     }
 
+    /// Borrow the next persistence/apply frontier without accepting it. Async
+    /// ready() advances acceptance state and owns generated storage messages;
+    /// resource gates must inspect this preview before that one-shot boundary.
+    /// Slices remain valid only until the next mutation of this RawNode.
+    pub fn previewReady(self: *const RawNode) ready_mod.Ready {
+        const prev_soft = if (self.async_storage_writes) self.prev_soft_state else self.raft.prev_soft_state;
+        const prev_hard = if (self.async_storage_writes) self.prev_hard_state else self.raft.prev_hard_state;
+        return .{
+            .soft_state = if (!types.SoftState.eql(self.raft.soft_state, prev_soft)) self.raft.soft_state else null,
+            .hard_state = if (!types.HardState.eql(self.raft.hard_state, prev_hard)) self.raft.hard_state else null,
+            .snapshot = if (!self.async_storage_writes or !self.raft.snapshot_in_progress) self.raft.pending_snapshot else null,
+            .entries = self.raft.log.unstableEntries(),
+            .committed_entries = if (self.async_storage_writes)
+                self.raft.log.nextCommittedEntriesMaxAllow(self.raft.cfg.max_committed_size_per_ready, false)
+            else
+                self.raft.log.nextCommittedEntriesMax(self.raft.cfg.max_committed_size_per_ready),
+            .read_states = self.raft.read_states.items,
+            .messages = self.raft.messages.items,
+        };
+    }
+
     pub fn ready(self: *RawNode) ready_mod.Ready {
+        const rd = self.prepareReady();
+        self.acceptPreparedReady(rd);
+        return rd;
+    }
+
+    /// Build owned async messages without consuming the persistence/apply
+    /// frontier. The caller must not mutate this node between preparation and
+    /// acceptance; discarding preparation is safe and leaves hasReady true.
+    pub fn prepareReady(self: *RawNode) ready_mod.Ready {
         if (!self.async_storage_writes) return self.raft.ready();
 
         self.clearReadyMessages();
@@ -183,9 +213,12 @@ pub const RawNode = struct {
             tryBuildStorageApplyMessage(self, rd.committed_entries) catch unreachable;
         }
 
-        self.acceptAsyncReady(rd);
         rd.messages = self.ready_messages.items;
         return rd;
+    }
+
+    pub fn acceptPreparedReady(self: *RawNode, rd: ready_mod.Ready) void {
+        if (self.async_storage_writes) self.acceptAsyncReady(rd);
     }
 
     pub fn advance(self: *RawNode, rd: ready_mod.Ready) void {

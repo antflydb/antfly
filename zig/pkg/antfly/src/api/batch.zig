@@ -435,6 +435,7 @@ fn parseBatchRequestWithOptions(
 
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, options) catch |err| switch (err) {
         error.ValueTooLong => return error.ValueTooLong,
+        error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidBatchRequest,
     };
     defer parsed.deinit();
@@ -1584,8 +1585,10 @@ fn parseInserts(
         // preserve replay and movement of durable data written by older nodes.
         if (require_document_objects and entry.value_ptr.* != .object)
             return error.InvalidBatchRequest;
+        const key = try alloc.dupe(u8, entry.key_ptr.*);
+        errdefer alloc.free(key);
         writes[initialized] = .{
-            .key = try alloc.dupe(u8, entry.key_ptr.*),
+            .key = key,
             .value = try std.json.Stringify.valueAlloc(alloc, entry.value_ptr.*, .{}),
         };
         initialized += 1;

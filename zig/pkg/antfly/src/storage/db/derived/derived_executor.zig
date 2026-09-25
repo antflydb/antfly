@@ -54,6 +54,7 @@ pub const Executor = struct {
 
     const VTable = struct {
         begin_shutdown: *const fn (ptr: *anyopaque) void,
+        quiesce_workers: *const fn (ptr: *anyopaque) void,
         deinit: *const fn (ptr: *anyopaque, alloc: Allocator) void,
         has_workers: *const fn (ptr: *anyopaque) bool,
         fail_if_unhealthy: *const fn (ptr: *anyopaque) anyerror!void,
@@ -79,6 +80,11 @@ pub const Executor = struct {
     /// publisher may currently be waiting on.
     pub fn beginShutdown(self: *Executor) void {
         self.vtable.begin_shutdown(self.ptr);
+    }
+
+    /// Join autonomous publishers while retaining accepted backlog ownership.
+    pub fn quiesceWorkers(self: *Executor) void {
+        self.vtable.quiesce_workers(self.ptr);
     }
 
     pub fn deinit(self: *Executor, alloc: Allocator) void {
@@ -501,6 +507,7 @@ fn initManual(
 
 const manual_vtable = Executor.VTable{
     .begin_shutdown = manualBeginShutdown,
+    .quiesce_workers = manualQuiesceWorkers,
     .deinit = manualDeinit,
     .has_workers = manualHasWorkers,
     .fail_if_unhealthy = manualFailIfUnhealthy,
@@ -647,6 +654,7 @@ fn initIoThreaded(
 
 const io_threaded_vtable = Executor.VTable{
     .begin_shutdown = ioThreadedBeginShutdown,
+    .quiesce_workers = ioThreadedQuiesceWorkers,
     .deinit = ioThreadedDeinit,
     .has_workers = ioThreadedHasWorkers,
     .fail_if_unhealthy = ioThreadedFailIfUnhealthy,
@@ -761,4 +769,15 @@ fn ioThreadedWaitForAll(ptr: *anyopaque, sequence: u64, wait: VisibilityWait) !v
 fn ioThreadedWaitForIndexes(ptr: *anyopaque, sequence: u64, index_names: []const []const u8, wait: VisibilityWait) !void {
     const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
     return try runtime.waitForIndexesWithVisibilityWait(sequence, index_names, wait);
+}
+
+fn manualQuiesceWorkers(ptr: *anyopaque) void {
+    const runtime: *ManualRuntime = @ptrCast(@alignCast(ptr));
+    for (runtime.workers.items) |worker| runtime.alloc.free(worker.name);
+    runtime.workers.clearRetainingCapacity();
+}
+
+fn ioThreadedQuiesceWorkers(ptr: *anyopaque) void {
+    const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
+    runtime.quiesceWorkers();
 }

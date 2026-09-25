@@ -125,6 +125,9 @@ pub const Run = struct {
     gc_requested: bool = false,
     bloom_filter: ?bloom.OwnedFilter,
     owns_metadata: bool = true,
+    /// Immutable path and key-bound ownership may originate in a prepaid
+    /// publication domain. Mutable cache fields still use the caller allocator.
+    metadata_allocator: ?Allocator = null,
     owns_path: bool = false,
     owns_bloom_filter: bool = true,
     cached_state_index: ?usize = null,
@@ -148,17 +151,18 @@ pub const Run = struct {
         }
         if (self.output_ticket) |ticket| ticket.abandon();
         self.output_ticket = null;
+        const metadata_allocator = self.metadata_allocator orelse allocator;
         if (self.owns_path) {
-            if (self.path) |path| allocator.free(path);
+            if (self.path) |path| metadata_allocator.free(path);
         }
         if (self.owns_metadata) {
             if (!self.owns_path) {
-                if (self.path) |path| allocator.free(path);
+                if (self.path) |path| metadata_allocator.free(path);
             }
-            if (self.smallest_namespace_name) |name| allocator.free(name);
-            allocator.free(self.smallest_key);
-            if (self.largest_namespace_name) |name| allocator.free(name);
-            allocator.free(self.largest_key);
+            if (self.smallest_namespace_name) |name| metadata_allocator.free(name);
+            metadata_allocator.free(self.smallest_key);
+            if (self.largest_namespace_name) |name| metadata_allocator.free(name);
+            metadata_allocator.free(self.largest_key);
         }
         if (self.owns_bloom_filter) {
             if (self.bloom_filter) |*filter| filter.deinit(allocator);
@@ -267,6 +271,7 @@ pub fn cloneRunSnapshot(allocator: Allocator, source: Run) !Run {
     errdefer if (metadata_owned) if (path) |owned| allocator.free(owned);
 
     var out = Run{
+        .metadata_allocator = allocator,
         .id = source.id,
         .level = source.level,
         .size_bytes = source.size_bytes,
@@ -311,6 +316,7 @@ pub fn cloneRunCompactionSnapshot(allocator: Allocator, source: Run) !Run {
     errdefer if (metadata_owned) allocator.free(largest_key);
 
     var out = Run{
+        .metadata_allocator = allocator,
         .id = source.id,
         .level = source.level,
         .size_bytes = source.size_bytes,
@@ -366,9 +372,13 @@ test "lsm snapshot clone has one metadata owner on state failure" {
 }
 
 pub fn ensureOpenDirsWithStorage(storage: storage_io.Storage, root_dir: []const u8) !void {
+    return ensureOpenDirsWithAllocator(storage, std.heap.page_allocator, root_dir);
+}
+
+pub fn ensureOpenDirsWithAllocator(storage: storage_io.Storage, allocator: Allocator, root_dir: []const u8) !void {
     try storage.createDirPath(root_dir);
-    const runs_dir = try std.fs.path.join(std.heap.page_allocator, &.{ root_dir, "runs" });
-    defer std.heap.page_allocator.free(runs_dir);
+    const runs_dir = try std.fs.path.join(allocator, &.{ root_dir, "runs" });
+    defer allocator.free(runs_dir);
     try storage.createDirPath(runs_dir);
 }
 
@@ -795,7 +805,7 @@ pub fn runMeta(run: Run) lsm_manifest.RunMeta {
 
 // Journal identities must survive staged restore's directory rename. Runtime
 // paths remain absolute for I/O; wire paths are relative to the owning root.
-fn manifestRelativePath(root: []const u8, path: []const u8) []const u8 {
+pub fn manifestRelativePath(root: []const u8, path: []const u8) []const u8 {
     const trimmed = std.mem.trimEnd(u8, root, "/\\");
     if (path.len > trimmed.len and std.mem.startsWith(u8, path, trimmed) and (path[trimmed.len] == '/' or path[trimmed.len] == '\\')) return std.mem.trimStart(u8, path[trimmed.len..], "/\\");
     return path;
@@ -1939,6 +1949,15 @@ pub const PersistedStreamingRunFile = struct {
     filter: bloom.OwnedFilter,
 };
 
+/// Writer-owned auxiliary buffers for a sequential, already prepared native
+/// provider. Provider-specific allocations are outside this bound. Directory
+/// and final path formatting each allocate at most root+32 bytes; the sink
+/// retains its fixed buffer. The padding covers their byte/struct alignment.
+pub fn streamingWriterWorkspaceBytes(root_bytes: usize) !usize {
+    const paths = try std.math.mul(usize, 2, try std.math.add(usize, root_bytes, 32));
+    return std.math.add(usize, table_write_buffer_size + 64, paths);
+}
+
 pub const StreamingRunFileWriter = struct {
     allocator: Allocator,
     path: []u8 = &.{},
@@ -1973,7 +1992,7 @@ pub const StreamingRunFileWriter = struct {
             .resource_manager = resource_manager,
             .max_file_bytes = max_file_bytes,
         };
-        try ensureOpenDirsWithStorage(storage, root_dir);
+        try ensureOpenDirsWithAllocator(storage, allocator, root_dir);
         self.path = try runPath(allocator, root_dir, run_id);
         errdefer {
             allocator.free(self.path);

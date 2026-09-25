@@ -76,6 +76,10 @@ pub const BootstrapConfig = struct {
     node_config: ?*const common_config.Config = null,
     secret_store: ?*common_secrets.FileStore = null,
     query_max_concurrent_requests: u32 = common_config.default_query_max_concurrent_requests,
+    query_admission_waiting: @import("../../common/workload_admission.zig").Config = .{},
+    write_admission_waiting: @import("../../common/workload_admission.zig").Config = .{},
+    ingress_admission: @import("../../common/workload_ingress.zig").Config = .{},
+    read_execution: @import("../../storage/dense_execution.zig").Config = .{},
     graph_execution_limits: @import("../../graph/work_budget.zig").Limits = .{},
     write_max_concurrent_requests: u32 = common_config.default_write_max_concurrent_requests,
     /// CPU fanout available to one graph-metric kernel. Work is scheduled on
@@ -409,6 +413,17 @@ pub const OwnedStack = struct {
     handler: api_mod.HttpHandler,
 
     pub fn init(self: *OwnedStack, alloc: Allocator, cfg: BootstrapConfig, io: std.Io) !void {
+        try cfg.ingress_admission.validate();
+        try cfg.read_execution.validate();
+        if (cfg.read_execution.protected.enabled() or cfg.read_execution.max_scan_state_bytes != 0) return error.UnsupportedReadExecutionPolicy;
+        if (cfg.node_config) |node_config| {
+            if (node_config.admission.transaction_completion_bytes != 0) return error.UnsupportedTransactionCompletionPolicy;
+            if (node_config.admission.durable_transaction_completion.enabled) return error.UnsupportedTransactionCompletionPolicy;
+            if (node_config.admission.remote_attempt_worker.max_attempts != 0 or
+                node_config.admission.remote_attempt_coordinator.max_attempts != 0)
+                return error.RemoteAttemptDurabilityRequired;
+        }
+        if (cfg.ingress_admission.recovery_requests != 0) return error.UnsupportedRecoveryIngressPolicy;
         try validateConfig(alloc, cfg);
         self.alloc = alloc;
         self.embedding_provider_runtime = managed_embedder.ProviderRuntime.init(alloc, io);
@@ -629,6 +644,14 @@ pub const OwnedStack = struct {
         self.handler.setIo(io);
         self.handler.setEmbeddingProviderRuntime(&self.embedding_provider_runtime);
         self.handler.configureAdmission(cfg.query_max_concurrent_requests, cfg.write_max_concurrent_requests);
+        try self.handler.query_admission.configure(cfg.query_admission_waiting);
+        try self.handler.write_admission.configure(cfg.write_admission_waiting);
+        self.handler.ingress_admission = .init(cfg.ingress_admission);
+        if (cfg.read_execution.max_runnable_tasks != 0) {
+            self.handler.read_execution = try @import("../../storage/dense_execution.zig").Runtime.create(alloc, cfg.read_execution);
+            self.handler.read_execution.?.scope = .all_reads;
+        }
+        errdefer if (self.handler.read_execution) |execution| execution.destroy();
         self.handler.setRemoteContent(cfg.remote_content);
         if (self.query_cache) |*query_cache| self.handler.setQueryCache(query_cache);
         self.handler.setPublishedSearchSources(search_sources.publishedSearchSourcesForNames(
@@ -661,6 +684,10 @@ pub const OwnedStack = struct {
     }
 
     pub fn deinit(self: *OwnedStack) void {
+        self.handler.query_admission.deinitMemory();
+        self.handler.write_admission.deinitMemory();
+        self.handler.ingress_admission.deinitMemory();
+        if (self.handler.read_execution) |execution| execution.destroy();
         self.runtime.deinit();
         if (self.managed_query_embedder) |*query_embedder| query_embedder.deinit();
         self.embedding_provider_runtime.deinit();

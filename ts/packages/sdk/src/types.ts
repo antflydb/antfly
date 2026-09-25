@@ -509,6 +509,9 @@ export interface AntflyConfig {
   baseUrl: string;
   headers?: Record<string, string>;
   auth?: AntflyAuth;
+  admission?: import("./admission.js").ClientAdmission | import("./admission.js").AdmissionPool;
+  /** Opt-in retries for explicit query admission rejections before execution. */
+  readRetries?: import("./read-retries.js").ReadRetryPolicy;
 }
 
 // Retrieval Agent types

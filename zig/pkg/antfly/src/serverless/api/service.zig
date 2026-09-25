@@ -19,10 +19,19 @@ const api_codec = @import("codec.zig");
 const builder_mod = @import("../build/builder.zig");
 const wal_mod = @import("../wal/mod.zig");
 
+/// Request-local evidence only; it never implies rollback after a WAL append
+/// begins. Backend append errors can arrive after a durable effect.
+pub const WriteOutcome = struct {
+    started: bool = false,
+    completed: bool = false,
+    cancellation: @import("../../common/cancellation.zig").CancellationToken = .none,
+};
+
 pub const Service = struct {
     alloc: Allocator,
     wal: *wal_mod.WalStore,
     builder: *builder_mod.Builder,
+    write_outcome: ?*WriteOutcome = null,
 
     pub fn init(alloc: Allocator, wal: *wal_mod.WalStore, builder: *builder_mod.Builder) Service {
         return .{
@@ -40,18 +49,34 @@ pub const Service = struct {
             .end_lsn = 0,
         };
 
+        // Finish all frontend allocations before crossing the durable append
+        // boundary. A memory ceiling must not reject the second encoding after
+        // the first mutation was already committed.
+        const namespace = try self.alloc.dupe(u8, req.namespace);
+        errdefer self.alloc.free(namespace);
+        const encoded = try self.alloc.alloc([]u8, req.mutations.len);
+        defer self.alloc.free(encoded);
+        var prepared: usize = 0;
+        defer for (encoded[0..prepared]) |bytes| self.alloc.free(bytes);
+        for (req.mutations, 0..) |mutation, index| {
+            encoded[index] = try api_codec.encodeMutationAlloc(self.alloc, mutation);
+            prepared += 1;
+        }
         var start_lsn: u64 = 0;
         var end_lsn: u64 = 0;
-        for (req.mutations, 0..) |mutation, idx| {
-            const encoded = try api_codec.encodeMutationAlloc(self.alloc, mutation);
-            defer self.alloc.free(encoded);
-            const lsn = try self.wal.append(req.namespace, req.timestamp_ns, encoded);
+        if (self.write_outcome) |outcome| {
+            if (!outcome.started) try outcome.cancellation.check();
+            outcome.started = true;
+        }
+        for (encoded, 0..) |bytes, idx| {
+            const lsn = try self.wal.append(req.namespace, req.timestamp_ns, bytes);
             if (idx == 0) start_lsn = lsn;
             end_lsn = lsn;
         }
+        if (self.write_outcome) |outcome| outcome.completed = true;
 
         return .{
-            .namespace = try self.alloc.dupe(u8, req.namespace),
+            .namespace = namespace,
             .mutation_count = req.mutations.len,
             .start_lsn = start_lsn,
             .end_lsn = end_lsn,
@@ -59,15 +84,14 @@ pub const Service = struct {
     }
 
     pub fn ingestTableBatch(self: *Service, req: api_types.TableIngestBatchDomainRequest) !api_types.TableIngestBatchResult {
-        var result = try self.ingestBatch(.{
+        const result = try self.ingestBatch(.{
             .namespace = req.table_name,
             .timestamp_ns = req.timestamp_ns,
             .mutations = req.mutations,
         });
-        defer result.deinit(self.alloc);
 
         return .{
-            .table_name = try self.alloc.dupe(u8, req.table_name),
+            .table_name = result.namespace,
             .mutation_count = result.mutation_count,
             .start_lsn = result.start_lsn,
             .end_lsn = result.end_lsn,
@@ -225,4 +249,76 @@ fn cleanupTmp(path: [*:0]const u8) void {
     var io_impl = threadedIo();
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
+}
+
+test "workload admission serverless write prepares all allocations before durable appends" {
+    const FakeWal = struct {
+        calls: u64 = 0,
+        fail_at: ?u64 = null,
+        fn store(self: *@This(), alloc: Allocator) wal_mod.WalStore {
+            return .{ .allocator = alloc, .ptr = self, .vtable = &.{ .deinit = deinit, .append = append, .read_from_alloc = read, .latest_lsn = latest, .truncate_prefix = truncate } };
+        }
+        fn deinit(_: Allocator, _: *anyopaque) void {}
+        fn append(ptr: *anyopaque, _: []const u8, _: u64, payload: []const u8) !u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(payload.len > 9);
+            self.calls += 1;
+            if (self.fail_at == self.calls) return error.InputOutput;
+            return self.calls;
+        }
+        fn read(_: *anyopaque, _: Allocator, _: []const u8, _: u64) ![]wal_mod.Record {
+            return error.UnsupportedOperation;
+        }
+        fn latest(ptr: *anyopaque, _: []const u8) !u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.calls;
+        }
+        fn truncate(_: *anyopaque, _: []const u8, _: u64) !u64 {
+            return error.UnsupportedOperation;
+        }
+    };
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            var fake: FakeWal = .{};
+            var wal = fake.store(alloc);
+            var outcome: WriteOutcome = .{};
+            var service = Service.init(alloc, &wal, undefined);
+            service.write_outcome = &outcome;
+            const mutations = [_]api_types.DocumentMutation{
+                .{ .kind = .upsert, .doc_id = "doc-a", .body = "first" },
+                .{ .kind = .upsert, .doc_id = "doc-b", .body = "second" },
+            };
+            var result = service.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 1, .mutations = &mutations }) catch |err| {
+                try std.testing.expectEqual(@as(u64, 0), fake.calls);
+                try std.testing.expect(!outcome.started and !outcome.completed);
+                return err;
+            };
+            defer result.deinit(alloc);
+            try std.testing.expectEqual(@as(u64, 2), fake.calls);
+            try std.testing.expect(outcome.started and outcome.completed);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+
+    var fake: FakeWal = .{ .fail_at = 2 };
+    var wal = fake.store(std.testing.allocator);
+    var service = Service.init(std.testing.allocator, &wal, undefined);
+    var outcome: WriteOutcome = .{};
+    service.write_outcome = &outcome;
+    const mutations = [_]api_types.DocumentMutation{
+        .{ .kind = .upsert, .doc_id = "doc-a", .body = "first" },
+        .{ .kind = .delete, .doc_id = "doc-b" },
+    };
+    try std.testing.expectError(error.InputOutput, service.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 1, .mutations = &mutations }));
+    try std.testing.expect(outcome.started and !outcome.completed);
+    try std.testing.expectEqual(@as(u64, 2), fake.calls);
+
+    // Cancellation observed after preparation still precedes the first append.
+    // Once an append starts, the loop remains mandatory and does not recheck it.
+    var cancelled = std.atomic.Value(bool).init(true);
+    fake = .{};
+    outcome = .{ .cancellation = .fromAtomic(&cancelled) };
+    try std.testing.expectError(error.Canceled, service.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 2, .mutations = &mutations }));
+    try std.testing.expectEqual(@as(u64, 0), fake.calls);
+    try std.testing.expect(!outcome.started);
 }

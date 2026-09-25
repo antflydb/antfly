@@ -144,7 +144,7 @@ pub fn create(
     // under the lane immediately before deriving the admission snapshot.
     const protocol_readiness = try svc.ensureTableTopologyProtocolReadyWithContext(
         request,
-        topology_protocol.atomic_table_topology_version,
+        topology_protocol.tableStorageVersion(normalized_req.storage orelse .{}, topology_protocol.atomic_table_topology_version),
     );
     lockTableCatalogMutation(svc, table_name);
     var catalog_locked = true;
@@ -241,7 +241,7 @@ pub fn restore(
     }
     const protocol_readiness = try svc.ensureTableTopologyProtocolReadyWithContext(
         request,
-        topology_protocol.atomic_table_topology_version,
+        topology_protocol.tableStorageVersion(table.storage, topology_protocol.atomic_table_topology_version),
     );
     lockTableCatalogMutation(svc, table.name);
     var catalog_locked = true;

@@ -4685,7 +4685,7 @@ test "compaction admitted pinned execution handoff benchmark" {
         }
         backend.next_run_id = count + 5;
         _ = try backend.planningDirectory();
-        backend.beginBatchMode(.{ .mode = .bulk_ingest });
+        try backend.beginBatchMode(.{ .mode = .bulk_ingest });
         defer backend.finishBatchMode(.{ .mode = .bulk_ingest });
         for (0..4096) |_| {
             _ = try backend.runMaintenanceStep();

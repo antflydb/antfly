@@ -24,6 +24,7 @@ const vector_wal = vectorindex.vector_block_wal;
 const vector_manifest = vectorindex.vector_block_manifest;
 const wal_view = @import("vector_wal_view.zig");
 const resource_manager_mod = @import("resource_manager.zig");
+const dense_execution = @import("dense_execution.zig");
 const internal_keys = @import("internal_keys.zig");
 const artifact_codec = @import("db/enrichment/artifact_codec.zig");
 
@@ -56,6 +57,8 @@ const checkpoint_merge_input_bytes: u64 = 4 * wal_checkpoint_bytes;
 const max_block_bytes: usize = if (@sizeOf(usize) >= 8) 8 * 1024 * 1024 * 1024 else std.math.maxInt(usize);
 var positional_read_test_nonce: std.atomic.Value(u64) = .init(0);
 var retained_block_identity: std.atomic.Value(u64) = .init(1);
+const PositionalReadTestHook = struct { ptr: *anyopaque, run: *const fn (*anyopaque) void };
+threadlocal var positional_read_test_hook: ?PositionalReadTestHook = null;
 
 pub fn checkpointBlockPathAlloc(alloc: Allocator, root_dir: []const u8, generation: u64, shard_id: u32) ![]u8 {
     const name = try std.fmt.allocPrint(alloc, "block-{d}-{d}.afvb", .{ generation, shard_id });
@@ -110,6 +113,10 @@ pub const RetainedBlock = struct {
     }
 
     fn readAllAt(self: RetainedBlock, out: []u8, offset: usize) !void {
+        return self.readAllAtScheduled(out, offset, null);
+    }
+
+    fn readAllAtScheduled(self: RetainedBlock, out: []u8, offset: usize, driver: ?*dense_execution.Runtime.Lease) !void {
         switch (self.shared.payload) {
             .heap => |bytes_value| {
                 if (offset > bytes_value.len or out.len > bytes_value.len - offset) return error.EndOfStream;
@@ -118,8 +125,13 @@ pub const RetainedBlock = struct {
             .mapped => |value| {
                 var read_len: usize = 0;
                 while (read_len < out.len) {
+                    var io_lease = if (driver) |owner| try owner.suspendIo() else null;
+                    if (builtin.is_test) if (positional_read_test_hook) |hook| hook.run(hook.ptr);
                     const rc = std.posix.system.pread(value.fd, out.ptr + read_len, out.len - read_len, @intCast(offset + read_len));
-                    switch (std.posix.errno(rc)) {
+                    // Capture errno before scheduler waits can overwrite it.
+                    const read_errno = std.posix.errno(rc);
+                    if (io_lease) |*lease| try driver.?.resumeIo(lease);
+                    switch (read_errno) {
                         .SUCCESS => {
                             const n: usize = @intCast(rc);
                             if (n == 0) return error.EndOfStream;
@@ -3690,9 +3702,13 @@ pub const Opened = struct {
         located: LocatedValue,
         scratch: []u8,
     ) anyerror!vector_block.Value {
+        return self.readExactIntoScheduled(located, scratch, null);
+    }
+
+    fn readExactIntoScheduled(self: *const Opened, located: LocatedValue, scratch: []u8, driver: ?*dense_execution.Runtime.Lease) anyerror!vector_block.Value {
         if (located == .block) {
             if (located.block.owner) |owner| {
-                if (owner != self) return owner.readExactInto(located, scratch);
+                if (owner != self) return owner.readExactIntoScheduled(located, scratch, driver);
             }
         }
         return switch (located) {
@@ -3704,9 +3720,9 @@ pub const Opened = struct {
                 if (scratch.len < required) return error.BufferTooSmall;
                 const vector_bytes = scratch[0..block.location.vector_len];
                 const residual_bytes = scratch[block.location.vector_len..required];
-                try self.blocks[block.reader_index].readAllAt(vector_bytes, block.location.vector_offset);
+                try self.blocks[block.reader_index].readAllAtScheduled(vector_bytes, block.location.vector_offset, driver);
                 if (residual_bytes.len != 0)
-                    try self.blocks[block.reader_index].readAllAt(residual_bytes, block.location.residual_offset);
+                    try self.blocks[block.reader_index].readAllAtScheduled(residual_bytes, block.location.residual_offset, driver);
                 break :blk try block.location.valueFromPayload(vector_bytes, residual_bytes);
             },
         };
@@ -3765,15 +3781,46 @@ pub const Opened = struct {
         io: ?std.Io,
         requests: []ExactReadRequest,
     ) !ReadBatchStats {
+        return self.readExactIntoBatchInner(io, requests, null);
+    }
+
+    /// Scoped native destinations are fully allocated before entering this
+    /// serial boundary. Helpers, heap copies, mapped views and validation never
+    /// run with the caller suspended. The OS pread itself is not preemptible.
+    pub fn readExactIntoBatchScheduled(self: *const Opened, requests: []ExactReadRequest, driver: *dense_execution.Runtime.Lease) !ReadBatchStats {
+        return self.readExactIntoBatchInner(null, requests, driver);
+    }
+
+    fn readExactIntoBatchInner(self: *const Opened, io: ?std.Io, requests: []ExactReadRequest, driver: ?*dense_execution.Runtime.Lease) !ReadBatchStats {
         if (self.resource_manager) |manager| if (manager.dense_projection_trace_enabled)
             @import("projection_read_trace.zig").record(self, requests);
         var stats: ReadBatchStats = .{};
         const profile_reads = if (self.resource_manager) |manager| manager.dense_read_profile else false;
-        try runPositionalReadBatchProfiled(ExactReadRequest, self, io, requests, runExactRead, self.resource_manager, if (profile_reads) &stats.dispatch else null);
+        if (driver) |owner| {
+            for (requests) |*request| {
+                try owner.options.?.check();
+                request.value = null;
+                request.err = null;
+                request.value = self.readExactIntoScheduled(request.located, request.scratch, owner) catch |err| {
+                    // A failed resume leaves only retained ownership. Unwind
+                    // immediately, without decode, fallback, or a fake release.
+                    if (owner.job == null) return err;
+                    try owner.options.?.check();
+                    request.err = err;
+                    continue;
+                };
+            }
+            if (profile_reads) {
+                stats.dispatch.batches += @intFromBool(requests.len != 0);
+                stats.dispatch.requests += requests.len;
+            }
+        } else {
+            try runPositionalReadBatchProfiled(ExactReadRequest, self, io, requests, runExactRead, self.resource_manager, if (profile_reads) &stats.dispatch else null);
+        }
         for (requests) |request| switch (request.located) {
             .wal => {},
             .block => |block| {
-                if (self.exactMappedEnabled(request.located)) {
+                if (driver == null and self.exactMappedEnabled(request.located)) {
                     // Mapped accesses can fault. These count requested views,
                     // not resident-cache hits or measured device I/O.
                     if (profile_reads) {
@@ -3989,14 +4036,16 @@ fn runPositionalReadBatchProfiled(
     const Work = struct {
         context: @TypeOf(context),
         requests: []Request,
+        io: std.Io,
         next: std.atomic.Value(usize) = .init(0),
-        manager: ?*resource_manager_mod.ResourceManager,
         profiled: bool,
         worker_wall_ns: std.atomic.Value(u64) = .init(0),
         worker_start_delay_ns: std.atomic.Value(u64) = .init(0),
 
-        fn worker(work: *@This(), submitted: u64) std.Io.Cancelable!void {
-            defer if (work.manager) |manager| manager.releaseDenseReadTask();
+        fn worker(work: *@This(), submitted: u64, owned_lease: resource_manager_mod.ResourceManager.DenseReadTaskLease) std.Io.Cancelable!void {
+            var lease = owned_lease;
+            if (lease.driver.scheduledLease()) |scheduled| scheduled.startWork(work.io);
+            defer lease.release();
             const start = if (work.profiled) time.monotonicNs() else 0;
             if (work.profiled) _ = work.worker_start_delay_ns.fetchAdd(start - submitted, .monotonic);
             defer if (work.profiled) {
@@ -4013,7 +4062,7 @@ fn runPositionalReadBatchProfiled(
             }
         }
     };
-    var work: Work = .{ .context = context, .requests = requests[completed..], .manager = resource_manager, .profiled = stats != null };
+    var work: Work = .{ .context = context, .requests = requests[completed..], .io = io, .profiled = stats != null };
     var group = std.Io.Group.init;
     // Drain all tasks even if the caller is cancelled while doing its share:
     // request buffers and the stack-owned queue must never escape this call.
@@ -4022,12 +4071,15 @@ fn runPositionalReadBatchProfiled(
     const ceiling: usize = if (resource_manager) |m| (if (m.dense_read_single_helper and !adaptive) 2 else Opened.positional_read_wave) else Opened.positional_read_wave;
     const workers = @min(requests.len - completed, ceiling);
     for (1..workers) |_| {
-        if (resource_manager) |manager| if (!manager.tryAcquireDenseReadTask()) {
-            if (stats) |p| p.denied += 1;
-            break;
-        };
-        group.concurrent(io, Work.worker, .{ &work, if (stats != null) time.monotonicNs() else 0 }) catch {
-            if (resource_manager) |manager| manager.releaseDenseReadTask();
+        var helper_lease: resource_manager_mod.ResourceManager.DenseReadTaskLease = .{};
+        if (resource_manager) |manager| {
+            helper_lease = manager.tryAcquireDenseReadTask() orelse {
+                if (stats) |p| p.denied += 1;
+                break;
+            };
+        }
+        group.concurrent(io, Work.worker, .{ &work, if (stats != null) time.monotonicNs() else 0, helper_lease }) catch {
+            helper_lease.release();
             if (stats) |p| p.denied += 1;
             break;
         };
@@ -6691,6 +6743,100 @@ test "vector block streaming delta merge skips superseded corruption and preserv
     var exact: [3]f32 = undefined;
     try std.testing.expectEqualSlices(f32, &.{ 10, 1.1234567, -250_000.125 }, try (try reopened.get("shared", 11, 10)).vector.decodeExactInto(&exact));
     try std.testing.expectEqualSlices(f32, &.{3.125}, try (try reopened.get("wal", 11, 1)).vector.decodeExactInto(exact[0..1]));
+}
+
+test "workload admission native pread retains state while another driver progresses and honors original lifetime" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const path = try std.fmt.allocPrint(alloc, "/tmp/antfly-dense-scheduled-read-{d}-{d}", .{ @import("antfly_platform").time.monotonicNs(), positional_read_test_nonce.fetchAdd(1, .monotonic) });
+    defer alloc.free(path);
+    const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o600);
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    const written = std.posix.system.write(fd, "dense io", 8);
+    _ = std.posix.system.close(fd);
+    try std.testing.expectEqual(@as(isize, 8), written);
+    var block = try RetainedBlock.init(alloc, .{ .mapped = try mapBlockFile(path) });
+    defer block.deinit(alloc);
+
+    const Worker = struct {
+        manager: *resource_manager_mod.ResourceManager,
+        block: RetainedBlock,
+        io: std.Io,
+        deadline: bool,
+        entered: std.atomic.Value(bool) = .init(false),
+        proceed: std.atomic.Value(bool) = .init(false),
+        cancelled: std.atomic.Value(bool) = .init(false),
+        result: ?anyerror = null,
+        fn gate(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.entered.store(true, .release);
+            while (!self.proceed.load(.acquire)) self.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+        }
+        fn run(self: *@This()) void {
+            self.runInner() catch |err| {
+                self.result = err;
+            };
+        }
+        fn runInner(self: *@This()) !void {
+            const runtime = self.manager.dense_execution.?;
+            var options: @import("../common/workload_admission.zig").Options = .{
+                .io = self.io,
+                .cancellation = @import("../common/cancellation.zig").CancellationToken.fromAtomic(&self.cancelled),
+            };
+            if (self.deadline) options.deadline_ns = options.now() + std.time.ns_per_s;
+            var driver = try runtime.acquire(options);
+            defer driver.release();
+            var memory = try @import("workload_memory.zig").WorkingMemory.init(self.manager, .dense_search_working_set, &runtime.ledger, &driver.request.?, std.testing.allocator, 0);
+            defer memory.deinit();
+            const bytes = try memory.allocator().alloc(u8, 8);
+            defer memory.allocator().free(bytes);
+            positional_read_test_hook = .{ .ptr = self, .run = gate };
+            defer positional_read_test_hook = null;
+            try self.block.readAllAtScheduled(bytes, 0, &driver);
+            try std.testing.expectEqualSlices(u8, "dense io", bytes);
+            try std.testing.expect(driver.job != null);
+        }
+    };
+    for (0..3) |mode| {
+        var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+        defer manager.deinit(alloc);
+        try manager.configureDenseExecution(.{ .max_runnable_tasks = 1, .max_outstanding_tasks = 3, .max_queued_tasks = 2, .max_wait_ms = 5000, .max_working_bytes = 128, .max_suspended_io = 1 });
+        var worker: Worker = .{ .manager = &manager, .block = block, .io = io, .deadline = mode == 2 };
+        var group = std.Io.Group.init;
+        defer group.cancel(io);
+        try group.concurrent(io, Worker.run, .{&worker});
+        defer worker.proceed.store(true, .release);
+        const until = std.Io.Clock.now(.awake, io).nanoseconds + 5 * std.time.ns_per_s;
+        while (!worker.entered.load(.acquire)) {
+            if (std.Io.Clock.now(.awake, io).nanoseconds >= until) return error.TestUnexpectedResult;
+            try io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+        }
+        const held = manager.dense_execution.?.stats();
+        try std.testing.expectEqual(@as(u64, 0), held.runnable);
+        try std.testing.expectEqual(@as(u64, 1), held.outstanding);
+        try std.testing.expectEqual(@as(u64, 1), held.suspended_io);
+        try std.testing.expectEqual(@as(u64, 8), held.working_bytes);
+        var other = try manager.dense_execution.?.acquire(.{ .io = io });
+        defer other.release();
+        try std.testing.expectEqual(@as(u64, 1), manager.dense_execution.?.stats().runnable);
+        // The sole suspended-I/O credit is occupied. Another caller retains
+        // coarse runnable ownership instead of creating unbounded I/O work.
+        var coarse_bytes: [8]u8 = undefined;
+        try block.readAllAtScheduled(&coarse_bytes, 0, &other);
+        try std.testing.expectEqualSlices(u8, "dense io", &coarse_bytes);
+        try std.testing.expect(other.job != null);
+        try std.testing.expectEqual(@as(u64, 1), manager.dense_execution.?.stats().suspended_io);
+        if (mode == 1) worker.cancelled.store(true, .release);
+        if (mode == 2) try io.sleep(std.Io.Duration.fromMilliseconds(1100), .awake);
+        worker.proceed.store(true, .release);
+        other.release();
+        try group.await(io);
+        if (mode == 0) try std.testing.expect(worker.result == null) else try std.testing.expectEqual(if (mode == 1) error.Canceled else error.DeadlineExceeded, worker.result.?);
+        try std.testing.expectEqual(@as(u64, 0), manager.dense_execution.?.ledger.snapshot().total.handles);
+        try std.testing.expectEqual(@as(u64, 0), manager.dense_execution.?.stats().working_bytes);
+    }
 }
 
 test "vector block merge read windows bind reused offsets to retained inode identity" {

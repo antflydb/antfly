@@ -104,8 +104,9 @@ pub const TableApi = struct {
     }
 
     pub const ExecuteBatchError = error{
-        RelationalIndexKeyTooLarge,
+        OutOfMemory,
         InvalidBatchRequest,
+        RelationalIndexKeyTooLarge,
         Forbidden,
         UnsupportedSyncLevel,
         GraphMetricFeatureNotEnabled,
@@ -136,6 +137,12 @@ pub const TableApi = struct {
     };
 
     pub const ExecuteQueryError = error{
+        AdmissionFull,
+        AdmissionQueueFull,
+        AdmissionBytesExhausted,
+        AdmissionRequestTooLarge,
+        AdmissionWaitTimeout,
+        AdmissionClosed,
         InvalidQueryRequest,
         InvalidFilterQueryRequest,
         InvalidExclusionQueryRequest,
@@ -1748,6 +1755,7 @@ fn executeOwnedTableBatch(alloc: std.mem.Allocator, table_name: []const u8, batc
         error.HAReadOnlyStandby => return .{ .status = 409, .body = try alloc.dupe(u8, "standby is read-only") },
         error.HAPromotedStandbyRequiresPrimaryOpen => return .{ .status = 409, .body = try alloc.dupe(u8, "promoted standby requires primary open") },
         error.HAFencedPrimary => return .{ .status = 409, .body = try alloc.dupe(u8, "fenced primary rejects writes") },
+        error.OutOfMemory => return error.OutOfMemory,
         error.Canceled => return error.Canceled,
         error.DeadlineExceeded => return error.DeadlineExceeded,
         error.InternalFailure => {
@@ -1796,6 +1804,22 @@ pub fn handleTableQueryRequest(
     };
     const response_body = api.executeTableQueryRequest(alloc, table_name, body, row_filter_json) catch |err| {
         switch (err) {
+            error.AdmissionFull,
+            error.AdmissionQueueFull,
+            error.AdmissionBytesExhausted,
+            error.AdmissionRequestTooLarge,
+            error.AdmissionWaitTimeout,
+            error.AdmissionClosed,
+            => return .{
+                .status = if (err == error.AdmissionClosed) 503 else 429,
+                .json = true,
+                .body = try std.json.Stringify.valueAlloc(alloc, .{
+                    .@"error" = @errorName(err),
+                    .reason = if (err == error.AdmissionClosed) "draining" else if (err == error.AdmissionRequestTooLarge) "resource_exhausted" else "instance_busy",
+                    .stage = "execution",
+                    .execution_started = true,
+                }, .{}),
+            },
             error.InvalidQueryRequest => {
                 if (db_mod.peekLastSortRejectionDiagnostic() != null) {
                     std.log.warn("public table query invalid exact sort table={s} err={}", .{ table_name, err });

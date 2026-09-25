@@ -1,0 +1,352 @@
+{
+  "actions": [
+    {
+      "action": "discover",
+      "at": 0,
+      "coordinator": 3,
+      "id": "worker",
+      "node": "data"
+    },
+    {
+      "action": "proxy_checkpoint",
+      "at": 1,
+      "id": "routed",
+      "node": "data"
+    },
+    {
+      "action": "request",
+      "at": 2,
+      "body": null,
+      "expect": {
+        "checks": [
+          {
+            "equals": "durable-a",
+            "path": [
+              "marker"
+            ]
+          }
+        ],
+        "status": 200
+      },
+      "is_write": false,
+      "method": "GET",
+      "node": "api",
+      "path": "/db/v1/tables/policy_fixture/documents/a"
+    },
+    {
+      "action": "assert_proxy",
+      "at": 3,
+      "checkpoint": "routed",
+      "minimums": {
+        "forwarded_downstream_bytes": 1,
+        "forwarded_upstream_bytes": 1
+      },
+      "node": "data",
+      "path_prefixes_include": [
+        "/internal/"
+      ]
+    },
+    {
+      "action": "partition",
+      "at": 4,
+      "node": "data"
+    },
+    {
+      "action": "request",
+      "at": 5,
+      "body": null,
+      "expect": {
+        "transport_error": true
+      },
+      "is_write": false,
+      "method": "GET",
+      "node": "data",
+      "path": "/db/v1/tables/policy_fixture/documents/a",
+      "via_proxy": true
+    },
+    {
+      "action": "heal",
+      "at": 6,
+      "node": "data"
+    },
+    {
+      "action": "request",
+      "at": 7,
+      "body": null,
+      "expect": {
+        "checks": [
+          {
+            "equals": "durable-a",
+            "path": [
+              "marker"
+            ]
+          }
+        ],
+        "status": 200
+      },
+      "is_write": false,
+      "method": "GET",
+      "node": "api",
+      "path": "/db/v1/tables/policy_fixture/documents/a"
+    },
+    {
+      "action": "kill",
+      "at": 8,
+      "node": "api"
+    },
+    {
+      "action": "restart",
+      "at": 9,
+      "node": "api"
+    },
+    {
+      "action": "request",
+      "at": 14,
+      "body": null,
+      "expect": {
+        "checks": [
+          {
+            "equals": "durable-a",
+            "path": [
+              "marker"
+            ]
+          }
+        ],
+        "status": 200
+      },
+      "is_write": false,
+      "method": "GET",
+      "node": "api",
+      "path": "/db/v1/tables/policy_fixture/documents/a"
+    }
+  ],
+  "artifacts": {
+    "candidate": {
+      "binary": "/absolute/path/to/antfly",
+      "optimization": "Debug",
+      "revision": "REPLACE",
+      "sha256": "REPLACE"
+    }
+  },
+  "max_schedule_lateness_seconds": 5,
+  "nodes": [
+    {
+      "artifact": "candidate",
+      "config": {
+        "health_metrics_interval_ms": 250
+      },
+      "name": "metadata",
+      "role": "metadata"
+    },
+    {
+      "artifact": "candidate",
+      "config": {
+        "admission": {
+          "dense_execution": {
+            "max_runnable_tasks": 0
+          },
+          "ingress": {
+            "control_requests": 2,
+            "control_retained_bytes": 262144,
+            "max_requests": 24,
+            "max_retained_bytes": 16777216,
+            "recovery_requests": 2,
+            "recovery_retained_bytes": 1048576
+          },
+          "query": {
+            "max_concurrent_requests": 4,
+            "waiting": {
+              "max_queued_bytes": 1048576,
+              "max_queued_requests": 8,
+              "max_retained_bytes": 8388608,
+              "max_wait_ms": 1000
+            }
+          },
+          "read_execution": {
+            "max_outstanding_tasks": 8,
+            "max_queued_tasks": 8,
+            "max_runnable_tasks": 2,
+            "max_scan_snapshot_ms": 30000,
+            "max_scan_state_bytes": 0,
+            "max_suspended_io": 2,
+            "max_wait_ms": 1000,
+            "max_working_bytes": 4194304,
+            "protected": {
+              "max_outstanding_tasks": 0,
+              "max_runnable_tasks": 0,
+              "max_transition_bytes": 0,
+              "max_transition_tasks": 0,
+              "max_working_bytes": 0
+            }
+          },
+          "remote_attempt_coordinator": {
+            "max_attempts": 4,
+            "max_bytes": 2097152,
+            "max_destination_attempts": 2,
+            "max_destinations": 2,
+            "max_run_ms": 5000
+          },
+          "remote_attempt_worker": {
+            "max_attempts": 8,
+            "max_bytes": 2097152,
+            "max_run_ms": 5000
+          },
+          "session_max_retained_bytes": 8388608,
+          "transaction_completion_bytes": 8388608,
+          "write": {
+            "max_concurrent_requests": 4,
+            "waiting": {
+              "max_queued_bytes": 1048576,
+              "max_queued_requests": 8,
+              "max_retained_bytes": 8388608,
+              "max_wait_ms": 1000
+            }
+          }
+        },
+        "health_metrics_interval_ms": 250
+      },
+      "metadata": "metadata",
+      "name": "data",
+      "node_id": 2,
+      "proxy_api": true,
+      "role": "data",
+      "store_role": "data"
+    },
+    {
+      "artifact": "candidate",
+      "config": {
+        "admission": {
+          "dense_execution": {
+            "max_runnable_tasks": 0
+          },
+          "ingress": {
+            "control_requests": 2,
+            "control_retained_bytes": 262144,
+            "max_requests": 24,
+            "max_retained_bytes": 16777216,
+            "recovery_requests": 2,
+            "recovery_retained_bytes": 1048576
+          },
+          "query": {
+            "max_concurrent_requests": 4,
+            "waiting": {
+              "max_queued_bytes": 1048576,
+              "max_queued_requests": 8,
+              "max_retained_bytes": 8388608,
+              "max_wait_ms": 1000
+            }
+          },
+          "read_execution": {
+            "max_outstanding_tasks": 8,
+            "max_queued_tasks": 8,
+            "max_runnable_tasks": 2,
+            "max_scan_snapshot_ms": 30000,
+            "max_scan_state_bytes": 0,
+            "max_suspended_io": 2,
+            "max_wait_ms": 1000,
+            "max_working_bytes": 4194304,
+            "protected": {
+              "max_outstanding_tasks": 0,
+              "max_runnable_tasks": 0,
+              "max_transition_bytes": 0,
+              "max_transition_tasks": 0,
+              "max_working_bytes": 0
+            }
+          },
+          "remote_attempt_coordinator": {
+            "max_attempts": 4,
+            "max_bytes": 2097152,
+            "max_destination_attempts": 2,
+            "max_destinations": 2,
+            "max_run_ms": 5000
+          },
+          "remote_attempt_worker": {
+            "max_attempts": 8,
+            "max_bytes": 2097152,
+            "max_run_ms": 5000
+          },
+          "session_max_retained_bytes": 8388608,
+          "transaction_completion_bytes": 8388608,
+          "write": {
+            "max_concurrent_requests": 4,
+            "waiting": {
+              "max_queued_bytes": 1048576,
+              "max_queued_requests": 8,
+              "max_retained_bytes": 8388608,
+              "max_wait_ms": 1000
+            }
+          }
+        },
+        "health_metrics_interval_ms": 250
+      },
+      "metadata": "metadata",
+      "name": "api",
+      "node_id": 3,
+      "role": "data",
+      "store_role": "api"
+    }
+  ],
+  "note": "Small local correctness cell; no Cloud machine or performance claim. Pin a fresh homogeneous candidate binary/SHA/revision before running. Tiny finite worker/coordinator journals, reserved recovery, ingress, sessions, completion and read budgets are opt-in on both stable node IDs. Worker8 records also bounds closure identities; terminal tombstones need not become zero. Table opts into immutable recovery policy; 1MiB transaction plus64KiB fits each half of8MiB completion reserve. This checks signed discovery, advertised routing, API partition/heal and API restart with existing committed data. It does not prove durable-decision interruption, coordinator reconciliation, unknown-write resolution or replicated failover; those require separate semantic fault cells. Policy/config parsing and live candidate behavior remain pending.",
+  "policy_version": 1,
+  "purpose": "fault_correctness",
+  "request_timeout": 3,
+  "schema": 1,
+  "setup": [
+    {
+      "action": "request",
+      "body": {
+        "num_shards": 1,
+        "storage": {
+          "transaction_recovery": {
+            "max_bytes": 4194304,
+            "max_count": 4,
+            "max_transaction_bytes": 1048576,
+            "protocol_version": 1
+          }
+        }
+      },
+      "expect": {
+        "checks": [
+          {
+            "equals": "policy_fixture",
+            "path": [
+              "name"
+            ]
+          }
+        ],
+        "status": 200
+      },
+      "is_write": true,
+      "method": "POST",
+      "node": "api",
+      "path": "/db/v1/tables/policy_fixture"
+    },
+    {
+      "action": "request",
+      "body": {
+        "inserts": {
+          "a": {
+            "marker": "durable-a"
+          }
+        },
+        "sync_level": "full_index"
+      },
+      "expect": {
+        "checks": [
+          {
+            "equals": 1,
+            "path": [
+              "inserted"
+            ]
+          }
+        ],
+        "status": 201
+      },
+      "is_write": true,
+      "method": "POST",
+      "node": "api",
+      "path": "/db/v1/tables/policy_fixture/batch"
+    }
+  ],
+  "startup_timeout": 60
+}

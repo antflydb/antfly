@@ -17,9 +17,9 @@ const schema_mod = @import("../schema.zig");
 const row_codec = @import("algebraic/relational_row_codec.zig");
 
 pub const key = "\x00\x00__metadata__:table_catalog";
-pub const encoded_len: usize = 48;
+pub const encoded_len: usize = 64;
 const magic = "ATBL";
-const format_version: u32 = 2;
+const format_version: u32 = 3;
 pub const default_transaction_admission_bytes: u64 = 128 * 1024 * 1024;
 
 pub const IndexState = enum(u8) {
@@ -48,6 +48,12 @@ pub const Catalog = struct {
     /// Logical command policy, replicated with the table rather than inferred
     /// from a replica's local memory envelope. Local pressure only delays apply.
     transaction_admission_bytes: u64 = default_transaction_admission_bytes,
+    /// Replicated bounds on outstanding completion obligations, including
+    /// unresolved coordinator notifications. Activation requires compatible
+    /// peers; a local setting cannot fence an older live Raft state machine.
+    /// Zero preserves the legacy policy until that activation boundary exists.
+    transaction_recovery_max_count: u64 = 0,
+    transaction_recovery_max_bytes: u64 = 0,
 
     pub fn encode(self: Catalog) [encoded_len]u8 {
         var out: [encoded_len]u8 = @splat(0);
@@ -63,12 +69,27 @@ pub const Catalog = struct {
         std.mem.writeInt(u64, out[24..32], self.row_count, .little);
         std.mem.writeInt(u64, out[32..40], self.generation, .little);
         std.mem.writeInt(u64, out[40..48], self.transaction_admission_bytes, .little);
+        std.mem.writeInt(u64, out[48..56], self.transaction_recovery_max_count, .little);
+        std.mem.writeInt(u64, out[56..64], self.transaction_recovery_max_bytes, .little);
         return out;
     }
 
+    /// Disabled tables keep the exact old wire representation. Merely running
+    /// an upgraded binary must not make normal tables unreadable on old peers.
+    pub fn encodeForPersistence(self: Catalog, buffer: *[encoded_len]u8) []const u8 {
+        buffer.* = self.encode();
+        if (self.transaction_recovery_max_count == 0 and self.transaction_recovery_max_bytes == 0) {
+            std.mem.writeInt(u32, buffer[4..8], 2, .little);
+            return buffer[0..48];
+        }
+        return buffer;
+    }
+
     pub fn decode(data: []const u8) !Catalog {
-        if (data.len != encoded_len or !std.mem.eql(u8, data[0..4], magic)) return error.InvalidTableCatalog;
-        if (std.mem.readInt(u32, data[4..8], .little) != format_version) return error.UnsupportedTableCatalogVersion;
+        if ((data.len != encoded_len and data.len != 48) or !std.mem.eql(u8, data[0..4], magic)) return error.InvalidTableCatalog;
+        const version = std.mem.readInt(u32, data[4..8], .little);
+        if (version != 2 and version != format_version) return error.UnsupportedTableCatalogVersion;
+        if ((version == 2 and data.len != 48) or (version == format_version and data.len != encoded_len)) return error.InvalidTableCatalog;
         const row_count = std.mem.readInt(u64, data[24..32], .little);
         if (data[8] > 1 or data[9] > @intFromEnum(schema_mod.StorageMode.relational) or
             data[10] > @intFromEnum(IndexState.failed) or data[11] > 1 or row_count > 1)
@@ -84,8 +105,11 @@ pub const Catalog = struct {
             .row_count = row_count,
             .generation = std.mem.readInt(u64, data[32..40], .little),
             .transaction_admission_bytes = std.mem.readInt(u64, data[40..48], .little),
+            .transaction_recovery_max_count = if (version == 2) 0 else std.mem.readInt(u64, data[48..56], .little),
+            .transaction_recovery_max_bytes = if (version == 2) 0 else std.mem.readInt(u64, data[56..64], .little),
         };
         if (catalog.transaction_admission_bytes == 0) return error.InvalidTableCatalog;
+        if ((catalog.transaction_recovery_max_count == 0) != (catalog.transaction_recovery_max_bytes == 0)) return error.InvalidTableCatalog;
         if (catalog.schema_format_version != schema_mod.storage_format_version or
             catalog.row_format_version != row_codec.ordinal_version)
             return error.UnsupportedTableCapabilityVersion;
@@ -168,4 +192,31 @@ test "table catalog is bound to its active runtime schema" {
     try (Catalog{}).validateForSchema(null);
     mismatched = .{ .mode_initialized = true, .storage_mode = .relational };
     try std.testing.expectError(error.TableCatalogSchemaMismatch, mismatched.validateForSchema(null));
+}
+
+test "workload admission catalog recovery policy preserves explicit legacy disablement" {
+    const catalog: Catalog = .{ .transaction_recovery_max_count = 7, .transaction_recovery_max_bytes = 32768 };
+    const encoded = catalog.encode();
+    const decoded = try Catalog.decode(&encoded);
+    try std.testing.expectEqual(@as(u64, 7), decoded.transaction_recovery_max_count);
+    try std.testing.expectEqual(@as(u64, 32768), decoded.transaction_recovery_max_bytes);
+    var legacy = encoded[0..48].*;
+    std.mem.writeInt(u32, legacy[4..8], 2, .little);
+    const old = try Catalog.decode(&legacy);
+    try std.testing.expectEqual(@as(u64, 0), old.transaction_recovery_max_count);
+    try std.testing.expectEqual(@as(u64, 0), old.transaction_recovery_max_bytes);
+    const upgraded = try Catalog.decode(&old.encode());
+    try std.testing.expectEqual(@as(u64, 0), upgraded.transaction_recovery_max_count);
+}
+
+test "workload admission disabled catalog policy preserves old on-disk format" {
+    var buffer: [encoded_len]u8 = undefined;
+    const old = (Catalog{}).encodeForPersistence(&buffer);
+    try std.testing.expectEqual(@as(usize, 48), old.len);
+    try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, old[4..8], .little));
+    try std.testing.expectEqual(Catalog{}, try Catalog.decode(old));
+    const active: Catalog = .{ .transaction_recovery_max_count = 2, .transaction_recovery_max_bytes = 8192 };
+    const current = active.encodeForPersistence(&buffer);
+    try std.testing.expectEqual(@as(usize, 64), current.len);
+    try std.testing.expectEqual(active, try Catalog.decode(current));
 }

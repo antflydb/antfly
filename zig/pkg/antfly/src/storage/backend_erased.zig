@@ -232,19 +232,21 @@ pub const ReadScope = struct {
     allocator: Allocator,
     ptr: *anyopaque,
     vtable: *const VTable,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
+    const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
     const VTable = struct {
         get: *const fn (*anyopaque, []const u8) anyerror![]const u8,
         get_many_sorted: ?*const fn (*anyopaque, []const []const u8, []?[]const u8) anyerror!void = null,
         close: *const fn (Allocator, *anyopaque) void,
     };
     pub fn get(self: *@This(), key: []const u8) ![]const u8 {
-        return self.vtable.get(self.ptr, key);
+        return BoundaryAbi.call("get", self.boundary_dispatch, self.vtable.get, .{ self.ptr, key });
     }
     /// Results share the scope lifetime, not the parent snapshot's lifetime.
     pub fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
         if (keys.len != values.len) return error.InvalidBatch;
         @memset(values, null);
-        if (self.vtable.get_many_sorted) |get_many| return get_many(self.ptr, keys, values);
+        if (self.vtable.get_many_sorted) |get_many| return BoundaryAbi.call("get_many_sorted", self.boundary_dispatch, get_many, .{ self.ptr, keys, values });
         for (keys, values) |key, *value| value.* = self.get(key) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
@@ -307,6 +309,8 @@ pub const ReadTxn = struct {
     allocator: Allocator,
     ptr: *anyopaque,
     vtable: *const VTable,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
+    const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     pub const VTable = struct {
         abort: *const fn (Allocator, *anyopaque) void,
@@ -323,14 +327,14 @@ pub const ReadTxn = struct {
     }
 
     pub fn get(self: *ReadTxn, key: []const u8) ![]const u8 {
-        return try self.vtable.get(self.ptr, key);
+        return try BoundaryAbi.call("get", self.boundary_dispatch, self.vtable.get, .{ self.ptr, key });
     }
 
     pub fn getManySorted(self: *ReadTxn, keys: []const []const u8, values: []?[]const u8) !void {
         if (keys.len != values.len) return error.InvalidBatch;
         @memset(values, null);
         if (self.vtable.get_many_sorted) |get_many_sorted| {
-            return try get_many_sorted(self.ptr, keys, values);
+            return try BoundaryAbi.call("get_many_sorted", self.boundary_dispatch, get_many_sorted, .{ self.ptr, keys, values });
         }
         for (keys, 0..) |key, i| {
             values[i] = self.get(key) catch |err| blk: {
@@ -341,14 +345,14 @@ pub const ReadTxn = struct {
     }
 
     pub fn openCursor(self: *ReadTxn) !Cursor {
-        return try self.vtable.open_cursor(self.allocator, self.ptr);
+        return try BoundaryAbi.call("open_cursor", self.boundary_dispatch, self.vtable.open_cursor, .{ self.allocator, self.ptr });
     }
 
     /// Owns the same immutable snapshot, with independent read/cursor scratch.
     /// The original handle may be aborted before this handle or its cursors.
     pub fn forkRead(self: *ReadTxn) !ReadTxn {
         const fork = self.vtable.fork_read orelse return error.ReadSnapshotForkUnsupported;
-        return fork(self.allocator, self.ptr);
+        return BoundaryAbi.call("fork_read", self.boundary_dispatch, fork, .{ self.allocator, self.ptr });
     }
 
     pub fn forkBorrowedRead(self: *ReadTxn) !ReadTxn {
@@ -356,7 +360,7 @@ pub const ReadTxn = struct {
     }
 
     pub fn openReadScope(self: *ReadTxn, alloc: Allocator) !ReadScope {
-        if (self.vtable.open_read_scope) |open| return open(alloc, self.ptr);
+        if (self.vtable.open_read_scope) |open| return BoundaryAbi.call("open_read_scope", self.boundary_dispatch, open, .{ alloc, self.ptr });
         var cursor = try self.openCursor();
         errdefer cursor.close();
         return cursorReadScope(alloc, cursor);
@@ -367,6 +371,8 @@ pub const ProbeTxn = struct {
     allocator: Allocator,
     ptr: *anyopaque,
     vtable: *const VTable,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
+    const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     pub const VTable = struct {
         /// One get_many_sorted call observes a single committed view. Separate
@@ -386,20 +392,21 @@ pub const ProbeTxn = struct {
     }
 
     pub fn get(self: *ProbeTxn, key: []const u8) ![]const u8 {
-        return try self.vtable.get(self.ptr, key);
+        return try BoundaryAbi.call("get", self.boundary_dispatch, self.vtable.get, .{ self.ptr, key });
     }
 
     /// May pin an immutable generation until abort. Prefer get for long-lived
     /// probes; use this for a short-lived point projection.
     pub fn getLeased(self: *ProbeTxn, key: []const u8) ![]const u8 {
-        return try (self.vtable.get_leased orelse self.vtable.get)(self.ptr, key);
+        if (self.vtable.get_leased) |get_leased| return BoundaryAbi.call("get_leased", self.boundary_dispatch, get_leased, .{ self.ptr, key });
+        return self.get(key);
     }
 
     pub fn getManySorted(self: *ProbeTxn, keys: []const []const u8, values: []?[]const u8) !void {
         if (keys.len != values.len) return error.InvalidBatch;
         @memset(values, null);
         if (self.vtable.get_many_sorted) |get_many_sorted| {
-            return try get_many_sorted(self.ptr, keys, values);
+            return try BoundaryAbi.call("get_many_sorted", self.boundary_dispatch, get_many_sorted, .{ self.ptr, keys, values });
         }
         for (keys, 0..) |key, i| {
             values[i] = self.get(key) catch |err| blk: {
@@ -418,7 +425,7 @@ pub const ProbeTxn = struct {
         if (keys.len != values.len) return error.InvalidBatch;
         if (self.vtable.get_many_sorted_with_block_cache_admission) |get_many_sorted| {
             @memset(values, null);
-            return try get_many_sorted(self.ptr, keys, values, admission);
+            return try BoundaryAbi.call("get_many_sorted_with_block_cache_admission", self.boundary_dispatch, get_many_sorted, .{ self.ptr, keys, values, admission });
         }
         return try self.getManySorted(keys, values);
     }
@@ -450,6 +457,8 @@ pub const NamespaceReadTxn = struct {
     allocator: Allocator,
     ptr: *anyopaque,
     vtable: *const VTable,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
+    const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     pub const VTable = struct {
         abort: *const fn (Allocator, *anyopaque) void,
@@ -464,14 +473,14 @@ pub const NamespaceReadTxn = struct {
     }
 
     pub fn get(self: *NamespaceReadTxn, namespace: backend_types.Namespace, key: []const u8) ![]const u8 {
-        return try self.vtable.get(self.ptr, namespace, key);
+        return try BoundaryAbi.call("get", self.boundary_dispatch, self.vtable.get, .{ self.ptr, namespace, key });
     }
 
     pub fn getManySorted(self: *NamespaceReadTxn, namespace: backend_types.Namespace, keys: []const []const u8, values: []?[]const u8) !void {
         if (keys.len != values.len) return error.InvalidBatch;
         @memset(values, null);
         if (self.vtable.get_many_sorted) |get_many_sorted| {
-            return try get_many_sorted(self.ptr, namespace, keys, values);
+            return try BoundaryAbi.call("get_many_sorted", self.boundary_dispatch, get_many_sorted, .{ self.ptr, namespace, keys, values });
         }
         for (keys, 0..) |key, i| {
             values[i] = self.get(namespace, key) catch |err| blk: {
@@ -483,7 +492,7 @@ pub const NamespaceReadTxn = struct {
 
     pub fn openCursor(self: *NamespaceReadTxn, namespace: backend_types.Namespace) !Cursor {
         const open_cursor = self.vtable.open_cursor orelse return error.Unsupported;
-        return try open_cursor(self.allocator, self.ptr, namespace);
+        return try BoundaryAbi.call("open_cursor", self.boundary_dispatch, open_cursor, .{ self.allocator, self.ptr, namespace });
     }
 };
 
@@ -553,6 +562,8 @@ pub const NamespaceWriteTxn = struct {
     allocator: Allocator,
     ptr: *anyopaque,
     vtable: *const VTable,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
+    const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     pub const VTable = struct {
         abort: *const fn (Allocator, *anyopaque) void,
@@ -571,20 +582,20 @@ pub const NamespaceWriteTxn = struct {
     }
 
     pub fn commit(self: *NamespaceWriteTxn) !void {
-        try self.vtable.commit(self.allocator, self.ptr);
+        try BoundaryAbi.call("commit", self.boundary_dispatch, self.vtable.commit, .{ self.allocator, self.ptr });
         self.* = undefined;
     }
 
     pub fn get(self: *NamespaceWriteTxn, namespace: backend_types.Namespace, key: []const u8) ![]const u8 {
-        return try self.vtable.get(self.ptr, namespace, key);
+        return try BoundaryAbi.call("get", self.boundary_dispatch, self.vtable.get, .{ self.ptr, namespace, key });
     }
 
     pub fn getManySorted(self: *NamespaceWriteTxn, namespace: backend_types.Namespace, keys: []const []const u8, values: []?[]const u8) !void {
         if (keys.len != values.len) return error.InvalidBatch;
-        if (self.vtable.get_many_sorted) |get_many_sorted| return try get_many_sorted(self.ptr, namespace, keys, values);
+        if (self.vtable.get_many_sorted) |get_many_sorted| return try BoundaryAbi.call("get_many_sorted", self.boundary_dispatch, get_many_sorted, .{ self.ptr, namespace, keys, values });
         @memset(values, null);
         for (keys, values) |key, *value| {
-            value.* = self.vtable.get(self.ptr, namespace, key) catch |err| switch (err) {
+            value.* = BoundaryAbi.call("get", self.boundary_dispatch, self.vtable.get, .{ self.ptr, namespace, key }) catch |err| switch (err) {
                 error.NotFound => null,
                 else => return err,
             };
@@ -592,21 +603,21 @@ pub const NamespaceWriteTxn = struct {
     }
 
     pub fn put(self: *NamespaceWriteTxn, namespace: backend_types.Namespace, key: []const u8, value: []const u8) !void {
-        try self.vtable.put(self.ptr, namespace, key, value);
+        try BoundaryAbi.call("put", self.boundary_dispatch, self.vtable.put, .{ self.ptr, namespace, key, value });
     }
 
     pub fn appendPut(self: *NamespaceWriteTxn, namespace: backend_types.Namespace, key: []const u8, value: []const u8) !void {
         const append_put = self.vtable.append_put orelse return error.Unsupported;
-        try append_put(self.ptr, namespace, key, value);
+        try BoundaryAbi.call("append_put", self.boundary_dispatch, append_put, .{ self.ptr, namespace, key, value });
     }
 
     pub fn delete(self: *NamespaceWriteTxn, namespace: backend_types.Namespace, key: []const u8) !void {
-        try self.vtable.delete(self.ptr, namespace, key);
+        try BoundaryAbi.call("delete", self.boundary_dispatch, self.vtable.delete, .{ self.ptr, namespace, key });
     }
 
     pub fn openCursor(self: *NamespaceWriteTxn, namespace: backend_types.Namespace) !Cursor {
         const open_cursor = self.vtable.open_cursor orelse return error.Unsupported;
-        return try open_cursor(self.allocator, self.ptr, namespace);
+        return try BoundaryAbi.call("open_cursor", self.boundary_dispatch, open_cursor, .{ self.allocator, self.ptr, namespace });
     }
 };
 
@@ -614,7 +625,9 @@ pub const Batch = struct {
     allocator: Allocator,
     ptr: *anyopaque,
     vtable: *const VTable,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
     write_gate: ?*std.atomic.Mutex = null,
+    const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     pub const VTable = struct {
         abort: *const fn (Allocator, *anyopaque) void,
@@ -637,13 +650,13 @@ pub const Batch = struct {
     }
 
     pub fn commit(self: *Batch) !void {
-        try self.vtable.commit(self.allocator, self.ptr);
+        try BoundaryAbi.call("commit", self.boundary_dispatch, self.vtable.commit, .{ self.allocator, self.ptr });
         if (self.write_gate) |mutex| mutex.unlock();
         self.* = undefined;
     }
 
     pub fn get(self: *Batch, key: []const u8) ![]const u8 {
-        return try self.vtable.get(self.ptr, key);
+        return try BoundaryAbi.call("get", self.boundary_dispatch, self.vtable.get, .{ self.ptr, key });
     }
 
     /// Return presence only. Native backends avoid retained value payloads and
@@ -652,7 +665,7 @@ pub const Batch = struct {
         if (keys.len != present.len) return error.InvalidBatch;
         for (keys, 0..) |key, i| if (i != 0 and std.mem.order(u8, keys[i - 1], key) == .gt) return error.InvalidBatch;
         @memset(present, false);
-        if (self.vtable.contains_many_sorted) |contains| return contains(self.ptr, keys, present);
+        if (self.vtable.contains_many_sorted) |contains| return BoundaryAbi.call("contains_many_sorted", self.boundary_dispatch, contains, .{ self.ptr, keys, present });
         for (keys, present) |key, *exists| exists.* = if (self.get(key)) |_| true else |err| switch (err) {
             error.NotFound => false,
             else => return err,
@@ -663,7 +676,7 @@ pub const Batch = struct {
         if (keys.len != values.len) return error.InvalidBatch;
         @memset(values, null);
         if (self.vtable.get_many_sorted) |get_many_sorted| {
-            return try get_many_sorted(self.ptr, keys, values);
+            return try BoundaryAbi.call("get_many_sorted", self.boundary_dispatch, get_many_sorted, .{ self.ptr, keys, values });
         }
         for (keys, 0..) |key, i| {
             values[i] = self.get(key) catch |err| blk: {
@@ -674,26 +687,26 @@ pub const Batch = struct {
     }
 
     pub fn put(self: *Batch, key: []const u8, value: []const u8) !void {
-        try self.vtable.put(self.ptr, key, value);
+        try BoundaryAbi.call("put", self.boundary_dispatch, self.vtable.put, .{ self.ptr, key, value });
     }
 
     pub fn appendPut(self: *Batch, key: []const u8, value: []const u8) !void {
         const append_put = self.vtable.append_put orelse return error.Unsupported;
-        try append_put(self.ptr, key, value);
+        try BoundaryAbi.call("append_put", self.boundary_dispatch, append_put, .{ self.ptr, key, value });
     }
 
     pub fn delete(self: *Batch, key: []const u8) !void {
-        try self.vtable.delete(self.ptr, key);
+        try BoundaryAbi.call("delete", self.boundary_dispatch, self.vtable.delete, .{ self.ptr, key });
     }
 
     pub fn openCursor(self: *Batch) !Cursor {
         const open_cursor = self.vtable.open_cursor orelse return error.Unsupported;
-        return try open_cursor(self.allocator, self.ptr);
+        return try BoundaryAbi.call("open_cursor", self.boundary_dispatch, open_cursor, .{ self.allocator, self.ptr });
     }
 
     pub fn setReplayOpaque(self: *Batch, sequence: u64, payload: []const u8) !void {
         const set_replay_opaque = self.vtable.set_replay_opaque orelse return error.Unsupported;
-        try set_replay_opaque(self.ptr, sequence, payload);
+        try BoundaryAbi.call("set_replay_opaque", self.boundary_dispatch, set_replay_opaque, .{ self.ptr, sequence, payload });
     }
 };
 
@@ -701,6 +714,8 @@ pub const NamespaceBatch = struct {
     allocator: Allocator,
     ptr: *anyopaque,
     vtable: *const VTable,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
+    const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     pub const VTable = struct {
         abort: *const fn (Allocator, *anyopaque) void,
@@ -718,20 +733,20 @@ pub const NamespaceBatch = struct {
     }
 
     pub fn commit(self: *NamespaceBatch) !void {
-        try self.vtable.commit(self.allocator, self.ptr);
+        try BoundaryAbi.call("commit", self.boundary_dispatch, self.vtable.commit, .{ self.allocator, self.ptr });
         self.* = undefined;
     }
 
     pub fn get(self: *NamespaceBatch, namespace: backend_types.Namespace, key: []const u8) ![]const u8 {
-        return try self.vtable.get(self.ptr, namespace, key);
+        return try BoundaryAbi.call("get", self.boundary_dispatch, self.vtable.get, .{ self.ptr, namespace, key });
     }
 
     pub fn getManySorted(self: *NamespaceBatch, namespace: backend_types.Namespace, keys: []const []const u8, values: []?[]const u8) !void {
         if (keys.len != values.len) return error.InvalidBatch;
-        if (self.vtable.get_many_sorted) |get_many_sorted| return try get_many_sorted(self.ptr, namespace, keys, values);
+        if (self.vtable.get_many_sorted) |get_many_sorted| return try BoundaryAbi.call("get_many_sorted", self.boundary_dispatch, get_many_sorted, .{ self.ptr, namespace, keys, values });
         @memset(values, null);
         for (keys, values) |key, *value| {
-            value.* = self.vtable.get(self.ptr, namespace, key) catch |err| switch (err) {
+            value.* = BoundaryAbi.call("get", self.boundary_dispatch, self.vtable.get, .{ self.ptr, namespace, key }) catch |err| switch (err) {
                 error.NotFound => null,
                 else => return err,
             };
@@ -739,16 +754,16 @@ pub const NamespaceBatch = struct {
     }
 
     pub fn put(self: *NamespaceBatch, namespace: backend_types.Namespace, key: []const u8, value: []const u8) !void {
-        try self.vtable.put(self.ptr, namespace, key, value);
+        try BoundaryAbi.call("put", self.boundary_dispatch, self.vtable.put, .{ self.ptr, namespace, key, value });
     }
 
     pub fn appendPut(self: *NamespaceBatch, namespace: backend_types.Namespace, key: []const u8, value: []const u8) !void {
         const append_put = self.vtable.append_put orelse return error.Unsupported;
-        try append_put(self.ptr, namespace, key, value);
+        try BoundaryAbi.call("append_put", self.boundary_dispatch, append_put, .{ self.ptr, namespace, key, value });
     }
 
     pub fn delete(self: *NamespaceBatch, namespace: backend_types.Namespace, key: []const u8) !void {
-        try self.vtable.delete(self.ptr, namespace, key);
+        try BoundaryAbi.call("delete", self.boundary_dispatch, self.vtable.delete, .{ self.ptr, namespace, key });
     }
 };
 
@@ -764,6 +779,47 @@ pub const Store = struct {
 
     pub const ReplayCallback = *const fn (*anyopaque, u64, []const u8) anyerror!void;
 
+    /// Replay visitors are synchronous borrows. Only a stop bit crosses runtime
+    /// units; the original error (including private replay sentinels) remains
+    /// in the consuming unit's stack until the provider has fully unwound.
+    pub const ReplayVisitor = *const fn (*anyopaque, u64, [*]const u8, usize) callconv(.c) bool;
+
+    fn ReplayConsumer(comptime Context: type, comptime callback: fn (Context, u64, []const u8) anyerror!void) type {
+        return struct {
+            ctx: Context,
+            failure: ?anyerror = null,
+
+            fn visit(ptr: *anyopaque, sequence: u64, payload: [*]const u8, len: usize) callconv(.c) bool {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                if (self.failure != null) return false;
+                callback(self.ctx, sequence, payload[0..len]) catch |err| {
+                    self.failure = err;
+                    return false;
+                };
+                return true;
+            }
+
+            fn complete(self: *@This(), result: anytype) @TypeOf(result) {
+                const value = result catch |err| return self.failure orelse err;
+                if (self.failure) |err| return err;
+                return value;
+            }
+        };
+    }
+
+    const ReplayRelay = struct {
+        ctx: *anyopaque,
+        visitor: ReplayVisitor,
+
+        fn consume(ptr: *anyopaque, sequence: u64, payload: []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            // Concrete iterators propagate callback errors immediately. This
+            // registered marker unwinds provider-local code only; complete()
+            // restores the consumer's exact error after the synchronous call.
+            if (!self.visitor(self.ctx, sequence, payload.ptr, payload.len)) return error.Cancelled;
+        }
+    };
+
     pub const VTable = struct {
         deinit: *const fn (Allocator, *anyopaque) void,
         capabilities: *const fn (*anyopaque) backend_types.Capabilities,
@@ -773,6 +829,7 @@ pub const Store = struct {
         begin_write: *const fn (Allocator, *anyopaque) anyerror!WriteTxn,
         begin_batch: *const fn (Allocator, *anyopaque) anyerror!Batch,
         begin_batch_with_options: ?*const fn (Allocator, *anyopaque, backend_types.BatchOptions) anyerror!Batch = null,
+        write_serialization: ?*const fn (*anyopaque) anyerror!backend_types.WriteSerialization = null,
         sync: ?*const fn (*anyopaque, bool) anyerror!void = null,
         sync_replay_state: ?*const fn (*anyopaque) anyerror!void = null,
         begin_bulk_ingest_session: ?*const fn (*anyopaque) anyerror!void = null,
@@ -783,9 +840,9 @@ pub const Store = struct {
         next_replay_sequence: ?*const fn (*anyopaque, u64) u64 = null,
         append_replay_opaque: ?*const fn (Allocator, *anyopaque, u64, []const u8) anyerror!void = null,
         iterate_replay_from: ?*const fn (Allocator, *anyopaque, u64) anyerror![]ReplayEntry = null,
-        for_each_replay_from: ?*const fn (*anyopaque, u64, *anyopaque, ReplayCallback) anyerror!void = null,
-        for_each_replay_lane_from: ?*const fn (*anyopaque, u8, u64, usize, *anyopaque, ReplayCallback) anyerror!backend_types.ReplayLaneIterationStats = null,
-        for_each_replay_from_matching_hint_mask: ?*const fn (*anyopaque, u64, u8, *anyopaque, ReplayCallback) anyerror!void = null,
+        for_each_replay_from: ?*const fn (*anyopaque, u64, *anyopaque, ReplayVisitor) anyerror!void = null,
+        for_each_replay_lane_from: ?*const fn (*anyopaque, u8, u64, usize, *anyopaque, ReplayVisitor) anyerror!backend_types.ReplayLaneIterationStats = null,
+        for_each_replay_from_matching_hint_mask: ?*const fn (*anyopaque, u64, u8, *anyopaque, ReplayVisitor) anyerror!void = null,
         truncate_replay_up_to: ?*const fn (Allocator, *anyopaque, u64) anyerror!void = null,
         // Append-only optional ABI extensions: older stores retain their
         // original transaction layout and fall back to ordinary admission.
@@ -877,6 +934,47 @@ pub const Store = struct {
         return try self.beginBatch();
     }
 
+    fn providerWriteSerialization(self: *Store) !backend_types.WriteSerialization {
+        const callback = self.vtable.write_serialization orelse return error.Unsupported;
+        const capability = try BoundaryAbi.call("write_serialization", self.boundary_dispatch, callback, .{self.ptr});
+        if (capability.gate == null and !capability.acquired_by_begin) return error.Unsupported;
+        if (self.write_gate) |gate| if (capability.gate) |shared| {
+            if (gate != shared) return error.Unsupported;
+        };
+        return capability;
+    }
+
+    /// Effective behavior of this view's ordinary beginBatch, for forwarding
+    /// adapters. Unknown providers never imply serialization from capabilities
+    /// such as atomic batches or single_writer alone.
+    pub fn writeSerialization(self: *Store) !backend_types.WriteSerialization {
+        var capability = try self.providerWriteSerialization();
+        if (self.write_gate) |gate| {
+            capability.gate = gate;
+            capability.acquired_by_begin = true;
+        }
+        return capability;
+    }
+
+    /// Serialize participating read/modify/write batches using the provider's
+    /// shared gate. Ordinary writers remain independent. Acquisition uses the
+    /// existing yielding lock and has no cancellation/progress guarantee.
+    /// On commit failure the batch remains abortable and keeps its gate until
+    /// abort, exactly as beginBatch; callers must arrange failure cleanup.
+    pub fn beginSerializedBatch(self: *Store) !Batch {
+        const capability = try self.providerWriteSerialization();
+        var view = self.*;
+        if (capability.acquired_by_begin) {
+            // A nested adapter already takes this exact gate. Taking it again
+            // in the outer erased view would deadlock.
+            if (capability.gate != null and view.write_gate == capability.gate)
+                view.write_gate = null;
+        } else {
+            view.write_gate = capability.gate;
+        }
+        return view.beginBatch();
+    }
+
     pub fn sync(self: *Store, force: bool) !void {
         if (self.vtable.sync) |sync_fn| {
             try BoundaryAbi.call("sync", self.boundary_dispatch, sync_fn, .{ self.ptr, force });
@@ -942,13 +1040,9 @@ pub const Store = struct {
         comptime callback: fn (@TypeOf(ctx), u64, []const u8) anyerror!void,
     ) !void {
         if (self.vtable.for_each_replay_from) |f| {
-            const Adapter = struct {
-                fn call(ptr: *anyopaque, sequence: u64, payload: []const u8) anyerror!void {
-                    const typed_ctx: @TypeOf(ctx) = @ptrCast(@alignCast(ptr));
-                    return try callback(typed_ctx, sequence, payload);
-                }
-            };
-            return try BoundaryAbi.call("for_each_replay_from", self.boundary_dispatch, f, .{ self.ptr, from_sequence, ctx, Adapter.call });
+            const Consumer = ReplayConsumer(@TypeOf(ctx), callback);
+            var consumer: Consumer = .{ .ctx = ctx };
+            return try consumer.complete(BoundaryAbi.call("for_each_replay_from", self.boundary_dispatch, f, .{ self.ptr, from_sequence, &consumer, Consumer.visit }));
         }
 
         const entries = try self.iterateReplayFrom(self.allocator, from_sequence);
@@ -967,28 +1061,20 @@ pub const Store = struct {
         comptime callback: fn (@TypeOf(ctx), u64, []const u8) anyerror!void,
     ) !void {
         if (self.vtable.for_each_replay_from_matching_hint_mask) |f| {
-            const Adapter = struct {
-                fn call(ptr: *anyopaque, sequence: u64, payload: []const u8) anyerror!void {
-                    const typed_ctx: @TypeOf(ctx) = @ptrCast(@alignCast(ptr));
-                    return try callback(typed_ctx, sequence, payload);
-                }
-            };
-            return try BoundaryAbi.call("for_each_replay_from_matching_hint_mask", self.boundary_dispatch, f, .{ self.ptr, from_sequence, required_hint_mask, ctx, Adapter.call });
+            const Consumer = ReplayConsumer(@TypeOf(ctx), callback);
+            var consumer: Consumer = .{ .ctx = ctx };
+            return try consumer.complete(BoundaryAbi.call("for_each_replay_from_matching_hint_mask", self.boundary_dispatch, f, .{ self.ptr, from_sequence, required_hint_mask, &consumer, Consumer.visit }));
         }
         if (self.vtable.for_each_replay_lane_from) |f| {
-            const Adapter = struct {
-                fn call(ptr: *anyopaque, sequence: u64, payload: []const u8) anyerror!void {
-                    const typed_ctx: @TypeOf(ctx) = @ptrCast(@alignCast(ptr));
-                    return try callback(typed_ctx, sequence, payload);
-                }
-            };
+            const Consumer = ReplayConsumer(@TypeOf(ctx), callback);
+            var consumer: Consumer = .{ .ctx = ctx };
             const lane_ordinal = if (required_hint_mask == 0)
                 internal_keys.replay_all_kind
             else if (replayHintOrdinalFromSingleMask(required_hint_mask)) |ordinal|
                 ordinal
             else
                 return error.Unsupported;
-            _ = try BoundaryAbi.call("for_each_replay_lane_from", self.boundary_dispatch, f, .{ self.ptr, lane_ordinal, from_sequence, 0, ctx, Adapter.call });
+            _ = try consumer.complete(BoundaryAbi.call("for_each_replay_lane_from", self.boundary_dispatch, f, .{ self.ptr, lane_ordinal, from_sequence, 0, &consumer, Consumer.visit }));
             return;
         }
 
@@ -1010,13 +1096,9 @@ pub const Store = struct {
         comptime callback: fn (@TypeOf(ctx), u64, []const u8) anyerror!void,
     ) !backend_types.ReplayLaneIterationStats {
         const f = self.vtable.for_each_replay_lane_from orelse return error.Unsupported;
-        const Adapter = struct {
-            fn call(ptr: *anyopaque, sequence: u64, payload: []const u8) anyerror!void {
-                const typed_ctx: @TypeOf(ctx) = @ptrCast(@alignCast(ptr));
-                return try callback(typed_ctx, sequence, payload);
-            }
-        };
-        return try BoundaryAbi.call("for_each_replay_lane_from", self.boundary_dispatch, f, .{ self.ptr, lane_ordinal, from_sequence, max_entries, ctx, Adapter.call });
+        const Consumer = ReplayConsumer(@TypeOf(ctx), callback);
+        var consumer: Consumer = .{ .ctx = ctx };
+        return try consumer.complete(BoundaryAbi.call("for_each_replay_lane_from", self.boundary_dispatch, f, .{ self.ptr, lane_ordinal, from_sequence, max_entries, &consumer, Consumer.visit }));
     }
 
     pub fn truncateReplayUpTo(self: *Store, alloc: Allocator, up_to_sequence: u64) !void {
@@ -1029,6 +1111,8 @@ pub const NamespaceStore = struct {
     allocator: Allocator,
     ptr: *anyopaque,
     vtable: *const VTable,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
+    const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     pub const VTable = struct {
         deinit: *const fn (Allocator, *anyopaque) void,
@@ -1050,27 +1134,27 @@ pub const NamespaceStore = struct {
     }
 
     pub fn beginRead(self: *NamespaceStore) !NamespaceReadTxn {
-        return try self.vtable.begin_read(self.allocator, self.ptr);
+        return try BoundaryAbi.call("begin_read", self.boundary_dispatch, self.vtable.begin_read, .{ self.allocator, self.ptr });
     }
 
     pub fn beginProbe(self: *NamespaceStore) !NamespaceReadTxn {
         if (self.vtable.begin_probe) |begin_probe| {
-            return try begin_probe(self.allocator, self.ptr);
+            return try BoundaryAbi.call("begin_probe", self.boundary_dispatch, begin_probe, .{ self.allocator, self.ptr });
         }
         return try self.beginRead();
     }
 
     pub fn beginWrite(self: *NamespaceStore) !NamespaceWriteTxn {
-        return try self.vtable.begin_write(self.allocator, self.ptr);
+        return try BoundaryAbi.call("begin_write", self.boundary_dispatch, self.vtable.begin_write, .{ self.allocator, self.ptr });
     }
 
     pub fn beginBatch(self: *NamespaceStore) !NamespaceBatch {
-        return try self.vtable.begin_batch(self.allocator, self.ptr);
+        return try BoundaryAbi.call("begin_batch", self.boundary_dispatch, self.vtable.begin_batch, .{ self.allocator, self.ptr });
     }
 
     pub fn beginBatchWithOptions(self: *NamespaceStore, options: backend_types.BatchOptions) !NamespaceBatch {
         if (self.vtable.begin_batch_with_options) |begin_batch_with_options| {
-            return try begin_batch_with_options(self.allocator, self.ptr, options);
+            return try BoundaryAbi.call("begin_batch_with_options", self.boundary_dispatch, begin_batch_with_options, .{ self.allocator, self.ptr, options });
         }
         return try self.beginBatch();
     }
@@ -1769,18 +1853,28 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
         }
 
         fn beginWrite(alloc: Allocator, ptr: *anyopaque) anyerror!WriteTxn {
-            return try writeTxnFrom(alloc, try unbox(ptr).handle.beginWrite());
+            var opened = try unbox(ptr).handle.beginWrite();
+            errdefer opened.abort();
+            return try writeTxnFrom(alloc, opened);
         }
 
         fn beginBatch(alloc: Allocator, ptr: *anyopaque) anyerror!Batch {
-            return try batchFrom(alloc, try unbox(ptr).handle.beginBatch());
+            var opened = try unbox(ptr).handle.beginBatch();
+            errdefer opened.abort();
+            return try batchFrom(alloc, opened);
         }
 
         fn beginBatchWithOptions(alloc: Allocator, ptr: *anyopaque, options: backend_types.BatchOptions) anyerror!Batch {
             if (@hasDecl(Handle, "beginBatchWithOptions")) {
-                return try batchFrom(alloc, try unbox(ptr).handle.beginBatchWithOptions(options));
+                var opened = try unbox(ptr).handle.beginBatchWithOptions(options);
+                errdefer opened.abort();
+                return try batchFrom(alloc, opened);
             }
-            return try batchFrom(alloc, try unbox(ptr).handle.beginBatch());
+            return try beginBatch(alloc, ptr);
+        }
+
+        fn writeSerialization(ptr: *anyopaque) anyerror!backend_types.WriteSerialization {
+            return try unbox(ptr).handle.writeSerialization();
         }
 
         fn sync(ptr: *anyopaque, force: bool) anyerror!void {
@@ -1881,15 +1975,11 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             ptr: *anyopaque,
             from_sequence: u64,
             callback_ctx: *anyopaque,
-            callback: Store.ReplayCallback,
+            callback: Store.ReplayVisitor,
         ) anyerror!void {
-            if (Handle == Store) {
-                const state = unbox(ptr);
-                if (state.handle.vtable.for_each_replay_from) |f| {
-                    return try f(state.handle.ptr, from_sequence, callback_ctx, callback);
-                }
-            } else if (@hasDecl(Handle, "forEachReplayFrom")) {
-                return try unbox(ptr).handle.forEachReplayFrom(from_sequence, callback_ctx, callback);
+            var relay: Store.ReplayRelay = .{ .ctx = callback_ctx, .visitor = callback };
+            if (@hasDecl(Handle, "forEachReplayFrom")) {
+                return try unbox(ptr).handle.forEachReplayFrom(from_sequence, @as(*anyopaque, @ptrCast(&relay)), Store.ReplayRelay.consume);
             }
             if (@hasDecl(Handle, "iterateReplayFrom")) {
                 const state = unbox(ptr);
@@ -1898,9 +1988,7 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
                     for (entries) |*entry| entry.deinit(state.allocator);
                     state.allocator.free(entries);
                 }
-                for (entries) |entry| {
-                    try callback(callback_ctx, entry.sequence, entry.payload);
-                }
+                for (entries) |entry| try Store.ReplayRelay.consume(&relay, entry.sequence, entry.payload);
                 return;
             }
             return error.Unsupported;
@@ -1911,25 +1999,11 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             from_sequence: u64,
             required_hint_mask: u8,
             callback_ctx: *anyopaque,
-            callback: Store.ReplayCallback,
+            callback: Store.ReplayVisitor,
         ) anyerror!void {
-            if (Handle == Store) {
-                const state = unbox(ptr);
-                if (state.handle.vtable.for_each_replay_from_matching_hint_mask) |f| {
-                    return try f(state.handle.ptr, from_sequence, required_hint_mask, callback_ctx, callback);
-                }
-                if (state.handle.vtable.for_each_replay_lane_from) |f| {
-                    const lane_ordinal = if (required_hint_mask == 0)
-                        internal_keys.replay_all_kind
-                    else if (replayHintOrdinalFromSingleMask(required_hint_mask)) |ordinal|
-                        ordinal
-                    else
-                        return error.Unsupported;
-                    _ = try f(state.handle.ptr, lane_ordinal, from_sequence, 0, callback_ctx, callback);
-                    return;
-                }
-            } else if (@hasDecl(Handle, "forEachReplayFromMatchingHintMask")) {
-                return try unbox(ptr).handle.forEachReplayFromMatchingHintMask(from_sequence, required_hint_mask, callback_ctx, callback);
+            var relay: Store.ReplayRelay = .{ .ctx = callback_ctx, .visitor = callback };
+            if (@hasDecl(Handle, "forEachReplayFromMatchingHintMask")) {
+                return try unbox(ptr).handle.forEachReplayFromMatchingHintMask(from_sequence, required_hint_mask, @as(*anyopaque, @ptrCast(&relay)), Store.ReplayRelay.consume);
             } else if (@hasDecl(Handle, "forEachReplayLaneFrom")) {
                 const lane_ordinal = if (required_hint_mask == 0)
                     internal_keys.replay_all_kind
@@ -1937,7 +2011,7 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
                     ordinal
                 else
                     return error.Unsupported;
-                _ = try unbox(ptr).handle.forEachReplayLaneFrom(lane_ordinal, from_sequence, 0, callback_ctx, callback);
+                _ = try unbox(ptr).handle.forEachReplayLaneFrom(lane_ordinal, from_sequence, 0, @as(*anyopaque, @ptrCast(&relay)), Store.ReplayRelay.consume);
                 return;
             }
             return error.Unsupported;
@@ -1949,15 +2023,11 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             from_sequence: u64,
             max_entries: usize,
             callback_ctx: *anyopaque,
-            callback: Store.ReplayCallback,
+            callback: Store.ReplayVisitor,
         ) anyerror!backend_types.ReplayLaneIterationStats {
-            if (Handle == Store) {
-                const state = unbox(ptr);
-                if (state.handle.vtable.for_each_replay_lane_from) |f| {
-                    return try f(state.handle.ptr, lane_ordinal, from_sequence, max_entries, callback_ctx, callback);
-                }
-            } else if (@hasDecl(Handle, "forEachReplayLaneFrom")) {
-                return try unbox(ptr).handle.forEachReplayLaneFrom(lane_ordinal, from_sequence, max_entries, callback_ctx, callback);
+            var relay: Store.ReplayRelay = .{ .ctx = callback_ctx, .visitor = callback };
+            if (@hasDecl(Handle, "forEachReplayLaneFrom")) {
+                return try unbox(ptr).handle.forEachReplayLaneFrom(lane_ordinal, from_sequence, max_entries, @as(*anyopaque, @ptrCast(&relay)), Store.ReplayRelay.consume);
             }
             return error.Unsupported;
         }
@@ -1985,6 +2055,7 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             .begin_write = vt.beginWrite,
             .begin_batch = vt.beginBatch,
             .begin_batch_with_options = vt.beginBatchWithOptions,
+            .write_serialization = if (@hasDecl(Handle, "writeSerialization")) vt.writeSerialization else null,
             .sync = vt.sync,
             .sync_replay_state = vt.syncReplayState,
             .begin_bulk_ingest_session = vt.beginBulkIngestSession,
@@ -2154,6 +2225,10 @@ test "runtime store erases concrete single-namespace store handles" {
 
     const MockStore = struct {
         fail_open: *bool,
+        serialization: *?backend_types.WriteSerialization,
+        pub fn writeSerialization(self: *@This()) !backend_types.WriteSerialization {
+            return self.serialization.* orelse error.Unsupported;
+        }
         pub fn capabilities(_: *@This()) backend_types.Capabilities {
             return .{ .cursors = true };
         }
@@ -2174,10 +2249,38 @@ test "runtime store erases concrete single-namespace store handles" {
     };
 
     var fail_open = false;
-    const mock = MockStore{ .fail_open = &fail_open };
+    var serialization: ?backend_types.WriteSerialization = null;
+    const mock = MockStore{ .fail_open = &fail_open, .serialization = &serialization };
     var store = try storeFrom(std.testing.allocator, mock);
     defer store.deinit();
     var gate: std.atomic.Mutex = .unlocked;
+    store.write_gate = &gate;
+    try std.testing.expectError(error.Unsupported, store.beginSerializedBatch());
+    try std.testing.expect(gate.tryLock());
+    gate.unlock();
+    serialization = .{ .gate = &gate };
+    var other_gate: std.atomic.Mutex = .unlocked;
+    store.write_gate = &other_gate;
+    try std.testing.expectError(error.Unsupported, store.beginSerializedBatch());
+    try std.testing.expect(other_gate.tryLock());
+    other_gate.unlock();
+    store.write_gate = &gate;
+    var serialized = try store.beginSerializedBatch();
+    try std.testing.expect(!gate.tryLock());
+    serialized.abort();
+    try std.testing.expect(gate.tryLock());
+    gate.unlock();
+    store.write_gate = null;
+    serialized = try store.beginSerializedBatch();
+    try std.testing.expect(!gate.tryLock());
+    try serialized.commit();
+    try std.testing.expect(gate.tryLock());
+    gate.unlock();
+    // The capability does not change ordinary batch behavior.
+    var ordinary = try store.beginBatch();
+    try std.testing.expect(gate.tryLock());
+    gate.unlock();
+    ordinary.abort();
     store.write_gate = &gate;
     try std.testing.expect(store.capabilities().cursors);
 
@@ -2219,6 +2322,9 @@ test "runtime store erases concrete single-namespace store handles" {
     try std.testing.expect(gate.tryLock());
     gate.unlock();
     fail_open = true;
+    try std.testing.expectError(error.OpenFailed, store.beginSerializedBatch());
+    try std.testing.expect(gate.tryLock());
+    gate.unlock();
     try std.testing.expectError(error.OpenFailed, store.beginWrite());
     try std.testing.expect(gate.tryLock());
     gate.unlock();
@@ -2278,7 +2384,43 @@ test "failed commit keeps erased write handle abortable" {
         }
     };
 
+    const MockStore = struct {
+        shared: *Shared,
+        gate: *std.atomic.Mutex,
+        pub fn capabilities(_: *@This()) backend_types.Capabilities {
+            return .{};
+        }
+        pub fn writeSerialization(self: *@This()) !backend_types.WriteSerialization {
+            return .{ .gate = self.gate };
+        }
+        pub fn beginRead(self: *@This()) !MockWrite {
+            return .{ .shared = self.shared };
+        }
+        pub fn beginWrite(self: *@This()) !MockWrite {
+            return .{ .shared = self.shared };
+        }
+        pub fn beginBatch(self: *@This()) !MockWrite {
+            return .{ .shared = self.shared };
+        }
+    };
     var shared = Shared{};
+    var serialized_gate: std.atomic.Mutex = .unlocked;
+    var store = try storeFrom(std.testing.allocator, MockStore{ .shared = &shared, .gate = &serialized_gate });
+    defer store.deinit();
+    var unknown_vtable = store.vtable.*;
+    unknown_vtable.write_serialization = null;
+    var unknown = store;
+    unknown.vtable = &unknown_vtable;
+    try std.testing.expectError(error.Unsupported, unknown.beginSerializedBatch());
+    try std.testing.expectEqual(@as(usize, 0), shared.commits);
+    var serialized = try store.beginSerializedBatch();
+    try std.testing.expectError(error.CommitFailed, serialized.commit());
+    try std.testing.expect(!serialized_gate.tryLock());
+    serialized.abort();
+    try std.testing.expect(serialized_gate.tryLock());
+    serialized_gate.unlock();
+    try std.testing.expect(shared.aborted);
+    shared = .{};
     var txn = try writeTxnFrom(std.testing.allocator, MockWrite{ .shared = &shared });
     var gate: std.atomic.Mutex = .unlocked;
     try std.testing.expect(gate.tryLock());

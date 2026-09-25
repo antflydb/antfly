@@ -169,21 +169,37 @@ const ReaderState = struct {
 const ReaderTransfer = struct { executor: Borrow, state: Wire(ReaderState) };
 const Dispatch = *const fn (*const Borrow, u16, *const anyopaque, *anyopaque, ?*ReaderTransfer, ErrorNames) callconv(.c) void;
 
+const pinned_caller_capability: u64 = 1;
+
+/// Only the originating Threaded provider proves this property. A receiver
+/// preserves that proof through a synchronous ABI bridge; unknown providers
+/// stay false. This does not infer affinity from function names across archives.
+pub fn callerThreadPinned(io: std.Io) bool {
+    if (io.vtable == std.Io.Threaded.global_single_threaded.io().vtable) return true;
+    if (io.vtable != &vtable) return false;
+    const imported: *const Receiver = @ptrCast(@alignCast(io.userdata.?));
+    return imported.borrow.capabilities & pinned_caller_capability != 0;
+}
+
 pub const Borrow = extern struct {
     userdata: ?*anyopaque,
     vtable: *const anyopaque,
     contract: native.TypeContract,
     dispatch: Dispatch,
     error_names: ErrorNames,
+    /// Version 8 extends the executor contract with proven runtime properties.
+    /// No capability is assumed for an unknown provider.
+    capabilities: u64 = 0,
 
     pub fn init(io: *const std.Io) Borrow {
-        return .{ .userdata = io.userdata, .vtable = io.vtable, .contract = .of(std.Io), .dispatch = dispatchLocal, .error_names = errorName };
+        return .{ .userdata = io.userdata, .vtable = io.vtable, .contract = .of(std.Io), .dispatch = dispatchLocal, .error_names = errorName, .capabilities = if (callerThreadPinned(io.*)) pinned_caller_capability else 0 };
     }
 
-    pub fn receive(self: Borrow) !Receiver {
+    pub fn receive(self: *const Borrow) !Receiver {
         if (!self.contract.matches(.of(std.Io))) return error.InvalidArgument;
+        if (self.capabilities & ~pinned_caller_capability != 0) return error.InvalidArgument;
         if (@intFromPtr(self.vtable) % @alignOf(std.Io.VTable) != 0) return error.InvalidArgument;
-        return .{ .borrow = self };
+        return .{ .borrow = self.* };
     }
 };
 
@@ -193,8 +209,12 @@ pub const Receiver = struct {
     stderr_depth: usize = 0,
 
     pub fn io(self: *Receiver) std.Io {
-        if (self.borrow.dispatch == &dispatchLocal)
-            return .{ .userdata = self.borrow.userdata, .vtable = @ptrCast(@alignCast(self.borrow.vtable)) };
+        if (self.borrow.dispatch == &dispatchLocal) {
+            const local: std.Io = .{ .userdata = self.borrow.userdata, .vtable = @ptrCast(@alignCast(self.borrow.vtable)) };
+            // Keep proven affinity visible even if a linker folds identical
+            // dispatch functions across archives but their tables differ.
+            if (self.borrow.capabilities == 0 or callerThreadPinned(local)) return local;
+        }
         return .{ .userdata = self, .vtable = &vtable };
     }
 

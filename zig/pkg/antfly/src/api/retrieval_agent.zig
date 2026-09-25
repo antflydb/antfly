@@ -719,15 +719,16 @@ fn executeInternal(
 ) !EncodedResponse {
     if (body.len == 0) return error.InvalidRetrievalAgentRequest;
 
-    var parsed = std.json.parseFromSlice(metadata_openapi.RetrievalAgentRequest, alloc, body, .{}) catch {
+    var parsed = std.json.parseFromSlice(RetrievalAgentRequest, alloc, body, .{}) catch |err| {
+        if (err == error.OutOfMemory) return err;
         return error.InvalidRetrievalAgentRequest;
     };
     defer parsed.deinit();
-    const request = try retrieval_plan.fromPublic(alloc, parsed.value);
+    const request = parsed.value;
     const normalized_queries = @constCast(request.queries);
-    defer alloc.free(normalized_queries);
 
-    var parsed_raw = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch {
+    var parsed_raw = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| {
+        if (err == error.OutOfMemory) return err;
         return error.InvalidRetrievalAgentRequest;
     };
     defer parsed_raw.deinit();

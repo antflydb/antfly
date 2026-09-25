@@ -14,6 +14,7 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
+const completion_installation = @import("completion_installation_protocol.zig");
 const store_report_baseline = @import("store_report_baseline.zig");
 const store_report_update = @import("store_report_update.zig");
 const storage_source_options = @import("storage_source_options");
@@ -25,6 +26,9 @@ const metadata_mod = @import("domain.zig");
 const extension_domain = @import("../extensions/mod.zig");
 const metadata_api = @import("api.zig");
 const metadata_authority = @import("authority.zig");
+const completion_activation = @import("completion_activation.zig");
+const completion_attestation = @import("../api/completion_attestation_protocol.zig");
+const completion_attestation_client = @import("../api/completion_attestation_client.zig");
 const catalog_projection_reader = @import("catalog_projection_reader.zig");
 const metadata_http_client = @import("http_client.zig");
 const raft_engine = @import("raft_engine");
@@ -467,6 +471,42 @@ pub const MetadataProposalReceipt = struct {
     term: u64,
     index: u64,
 };
+
+/// Only this exact transition can enter the installation workflow. Once a
+/// physical policy exists, its shape is immutable until a successor protocol.
+pub fn completionPolicyOnlyUpdate(expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !?@import("../common/table_storage.zig").TransactionRecovery {
+    const old = expected.storage.transaction_recovery;
+    const next = replacement.storage.transaction_recovery;
+    const old_physical = if (old) |value| value.completion_protocol_version != 0 else false;
+    const next_physical = if (next) |value| value.completion_protocol_version != 0 else false;
+    if (!next_physical) {
+        if (old_physical) return error.CompletionAdmissionPolicyChanged;
+        return null;
+    }
+    try next.?.validate();
+    if (expected.table_id == 0 or (old_physical and !std.meta.eql(old, next))) return error.CompletionAdmissionPolicyChanged;
+    var rest = replacement;
+    rest.storage.transaction_recovery = old;
+    if (!metadata_table_manager.tableDefinitionsEqual(expected, rest)) return error.CompletionAdmissionPolicyChanged;
+    return next.?;
+}
+
+fn replaceCompletionPolicyStamped(service: anytype, request: api_operation.RequestContext, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !metadata_api.CatalogMutationStamp {
+    const policy = (try completionPolicyOnlyUpdate(expected, replacement)) orelse return error.InvalidTableDefinitionReplacement;
+    try request.ensureActive();
+    const store = service.projectedStore() orelse return error.MissingMetadataStore;
+    const current = (try store.getTable(service.alloc, service.metadata_group_id, expected.table_id)) orelse return error.TableNotFound;
+    defer metadata_table_manager.freeTable(service.alloc, current);
+    if (!metadata_table_manager.tableDefinitionsEqual(current, expected) and !metadata_table_manager.tableDefinitionsEqual(current, replacement)) return error.TableGenerationChanged;
+    const expected_fingerprint: ?metadata_table_manager.TableDefinitionFingerprint = if (expected.storage.transaction_recovery) |old| if (old.completion_protocol_version != 0) null else metadata_table_manager.tableDefinitionFingerprint(expected) else metadata_table_manager.tableDefinitionFingerprint(expected);
+    var pending = try service.beginCompletionActivationExpected(request, expected.table_id, policy, expected_fingerprint);
+    defer pending.deinit();
+    const receipt = try service.activateCompletionPolicy(request, expected.table_id);
+    const applied = (try store.getTable(service.alloc, service.metadata_group_id, expected.table_id)) orelse return error.MetadataMutationOutcomeUnknown;
+    defer metadata_table_manager.freeTable(service.alloc, applied);
+    if (!metadata_table_manager.tableDefinitionsEqual(applied, replacement)) return error.MetadataMutationOutcomeUnknown;
+    return .{ .metadata_group_id = service.metadata_group_id, .metadata_incarnation = pending.value.cluster_incarnation, .term = receipt.term, .index = receipt.index };
+}
 
 /// Complete a table-definition CAS against the exact Raft entry that admitted
 /// it. Errors before receipt assignment retain their ordinary retry semantics;
@@ -2814,7 +2854,7 @@ pub fn transitionRequiresCoordinatedDecoder(command: metadata_storage.Transition
             for (delta.upsert_tables) |table| if (table.relational_retirement_json.len != 0 or table.requiresStorageMetadataExtension()) break :blk true;
             break :blk false;
         },
-        .register_store, .upsert_store => |record| record.relational_topology_protocol_version != 0,
+        .register_store, .upsert_store => |record| record.relational_topology_protocol_version != 0 or record.internal_api_url.len != 0,
         .admit_split_transition => |admission| admission.record.table_contract.integrity_protocol != .none or admission.record.table_contract.read_schema_json.len != 0,
         .upsert_split_transition => |record| record.table_contract.integrity_protocol != .none or record.table_contract.read_schema_json.len != 0,
         .admit_online_merge => true,
@@ -2829,7 +2869,11 @@ pub fn ensureCoordinatedDecoderWithContext(service: anytype, command: metadata_s
     if (!transitionRequiresCoordinatedDecoder(command)) return;
     if (comptime !@hasDecl(@TypeOf(service.*), "ensureTableTopologyProtocolReadyWithContext"))
         return error.TableTopologyProtocolUpgradeRequired;
-    _ = try service.ensureTableTopologyProtocolReadyWithContext(request, metadata_topology_protocol.coordinated_lifecycle_version);
+    const required_version = switch (command) {
+        .register_store, .upsert_store => |record| @max(metadata_topology_protocol.coordinated_lifecycle_version, storeRecordDecoderProtocol(record)),
+        else => metadata_topology_protocol.coordinated_lifecycle_version,
+    };
+    _ = try service.ensureTableTopologyProtocolReadyWithContext(request, required_version);
 }
 
 fn prepareCoordinatedDecoderAdmission(service: anytype, commands: []const metadata_storage.TransitionCommand) !?TableTopologyProtocolReadiness {
@@ -2916,8 +2960,268 @@ fn runtimeStatusProtocolSafeCommand(
     }
 }
 
+fn tableRecordStorageProtocol(table: metadata_table_manager.TableRecord) u16 {
+    const storage = metadata_topology_protocol.tableStorageVersion(table.storage, 0);
+    return if (table.storage_migration != null) @max(storage, metadata_topology_protocol.table_storage_metadata_version) else storage;
+}
+
+fn storeRecordDecoderProtocol(record: metadata_table_manager.StoreRecord) u16 {
+    if (record.internal_api_url.len != 0) return metadata_topology_protocol.internal_endpoint_version;
+    if (record.relational_topology_protocol_version != 0) return metadata_topology_protocol.relational_integrity_topology_version;
+    return 0;
+}
+
+/// Return the exact required decoder for extended table records and secret
+/// publications, including nested JSON/CAS records and removals of an old
+/// policy. Older voters must not silently lose durable projections.
+fn commandTableStorageProtocol(alloc: std.mem.Allocator, command: metadata_storage.TransitionCommand) !u16 {
+    return switch (command) {
+        .register_store, .upsert_store => |record| storeRecordDecoderProtocol(record),
+        .apply_completion_activation => metadata_topology_protocol.completion_storage_version,
+        .publish_secret_collection => metadata_topology_protocol.secret_snapshot_version,
+        .upsert_table => |table| tableRecordStorageProtocol(table),
+        .compare_and_replace_table => |change| @max(tableRecordStorageProtocol(change.expected), tableRecordStorageProtocol(change.replacement)),
+        .apply_table_topology => |change| switch (change) {
+            .create => |create| tableRecordStorageProtocol(create.table),
+            .drop => 0,
+        },
+        .apply_extension_lifecycle, .apply_extension_lifecycle_v2 => |change| blk: {
+            var required: u16 = 0;
+            for (change.upsert_tables) |table| required = @max(required, tableRecordStorageProtocol(table));
+            break :blk required;
+        },
+        .apply_system_catalog => |bytes| blk: {
+            var parsed = try std.json.parseFromSlice(metadata_storage.raft_apply_store.SystemCatalogCommand, alloc, bytes, .{});
+            defer parsed.deinit();
+            var required: u16 = 0;
+            if (parsed.value.topology) |topology| switch (topology) {
+                .create => |create| required = tableRecordStorageProtocol(create.table),
+                .drop => {},
+            };
+            if (parsed.value.placement_update) |change| {
+                required = @max(required, @max(tableRecordStorageProtocol(change.expected), tableRecordStorageProtocol(change.replacement)));
+            }
+            break :blk required;
+        },
+        else => 0,
+    };
+}
+
+/// Physical completion shape is immutable once admitted. Node new-work
+/// enablement is independent; lowering/removing this durable shape requires
+/// an explicit group-drain/reconfiguration protocol, not an ordinary update.
+fn validateCompletionPolicyReplacement(service: anytype, replacement: metadata_table_manager.TableRecord) !void {
+    const activating_physical = if (replacement.storage.transaction_recovery) |policy| policy.completion_protocol_version != 0 else false;
+    const store = service.projectedStore() orelse {
+        // Caller-owned legacy apply hooks do not expose a projected catalog.
+        // They cannot activate physical completion: decoder activation above
+        // requires this owned durable store before accepting such a policy.
+        if (replacement.storage.transaction_recovery) |policy| {
+            if (policy.completion_protocol_version != 0) return error.MissingMetadataStore;
+        }
+        return;
+    };
+    const current = (try store.getTable(service.alloc, service.metadata_group_id, replacement.table_id)) orelse {
+        if (activating_physical) return error.CompletionAdmissionUnavailable;
+        return;
+    };
+    defer metadata_table_manager.freeTable(service.alloc, current);
+    if (current.storage.transaction_recovery) |policy| {
+        if (policy.completion_protocol_version != 0) {
+            if (!std.meta.eql(current.storage.transaction_recovery, replacement.storage.transaction_recovery))
+                return error.ImmutableTableStorageSettings;
+            return;
+        }
+    }
+    // Decoder activation proves preservation of these fields, not installed
+    // resources on data replicas. No replicated capacity barrier is minted by
+    // this proposal API yet. Existing durable policies remain replayable, but
+    // fresh activation must wait for the per-group native backing protocol.
+    if (activating_physical) return error.CompletionAdmissionUnavailable;
+}
+
+fn rejectCompletionTableTransition(service: anytype, table_id: u64) !void {
+    const store = service.projectedStore() orelse return error.MissingMetadataStore;
+    if (comptime @hasDecl(@TypeOf(store.*), "getCompletionActivation")) {
+        if (try store.getCompletionActivation(service.alloc, service.metadata_group_id, table_id)) |value| {
+            var owned = value;
+            owned.deinit();
+            return error.CompletionAdmissionPolicyChanged;
+        }
+    }
+}
+
+fn rejectCompletionGroupTransition(service: anytype, group_id: u64) !void {
+    const store = service.projectedStore() orelse return error.MissingMetadataStore;
+    if (comptime @hasDecl(@TypeOf(store.*), "getRange")) {
+        if (try store.getRange(service.alloc, service.metadata_group_id, group_id)) |range| {
+            defer metadata_table_manager.freeRange(service.alloc, range);
+            try rejectCompletionTableTransition(service, range.table_id);
+        }
+    }
+}
+
+fn validateCommandCompletionPolicy(service: anytype, command: metadata_storage.TransitionCommand) !void {
+    switch (command) {
+        .upsert_range => |range| try rejectCompletionTableTransition(service, range.table_id),
+        .remove_range => |range| try rejectCompletionGroupTransition(service, range.group_id),
+        .admit_split_transition => |change| try rejectCompletionTableTransition(service, change.record.table_contract.table_id),
+        .upsert_split_transition => |change| try rejectCompletionTableTransition(service, change.table_contract.table_id),
+        .upsert_merge_transition => |change| try rejectCompletionTableTransition(service, change.table_contract.table_id),
+        .upsert_replica_intent => |change| try rejectCompletionGroupTransition(service, change.replacement.record.group_id),
+        .remove_replica_intent => |change| try rejectCompletionGroupTransition(service, change.group_id),
+        .apply_completion_activation => |bytes| {
+            try validateCompletionActivationEvidence(service, bytes);
+        },
+        .upsert_table => |table| try validateCompletionPolicyReplacement(service, table),
+        .compare_and_replace_table => |change| {
+            if (change.expected.storage.transaction_recovery) |policy| {
+                if (policy.completion_protocol_version != 0 and !std.meta.eql(change.expected.storage.transaction_recovery, change.replacement.storage.transaction_recovery))
+                    return error.ImmutableTableStorageSettings;
+            }
+            try validateCompletionPolicyReplacement(service, change.replacement);
+        },
+        .apply_table_topology => |change| switch (change) {
+            .create => |create| try validateCompletionPolicyReplacement(service, create.table),
+            .drop => {},
+        },
+        .apply_extension_lifecycle, .apply_extension_lifecycle_v2 => |change| {
+            for (change.upsert_tables) |table| try validateCompletionPolicyReplacement(service, table);
+        },
+        .apply_system_catalog => |bytes| {
+            var parsed = try std.json.parseFromSlice(metadata_storage.raft_apply_store.SystemCatalogCommand, service.alloc, bytes, .{});
+            defer parsed.deinit();
+            if (parsed.value.topology) |topology| switch (topology) {
+                .create => |create| try validateCompletionPolicyReplacement(service, create.table),
+                .drop => {},
+            };
+            if (parsed.value.placement_update) |change| try validateCompletionPolicyReplacement(service, change.replacement);
+        },
+        else => {},
+    }
+}
+
+fn validateCompletionActivationEvidence(service: anytype, bytes: []const u8) !void {
+    var record = try completion_activation.decode(service.alloc, bytes);
+    defer record.deinit();
+    if (!@import("../common/durable_completion_policy.zig").replicated_activation_supported) {
+        const store = service.projectedStore() orelse return error.MissingMetadataStore;
+        var existing = (try store.getCompletionActivation(service.alloc, service.metadata_group_id, record.value.table_id)) orelse return error.CompletionAdmissionUnavailable;
+        defer existing.deinit();
+        if (!existing.value.sameIntent(record.value)) return error.CompletionAdmissionPolicyChanged;
+    }
+    if (record.value.phase == .active) {
+        if (comptime @hasField(@TypeOf(service.*), "completion_activation_verified")) {
+            const verified = service.completion_activation_verified orelse return error.CompletionAdmissionUnavailable;
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+            if (!std.meta.eql(digest, verified)) return error.CompletionAdmissionUnavailable;
+        } else return error.CompletionAdmissionUnavailable;
+    }
+}
+
+/// Implementation gating happens before even a protocol-upgrade proposal.
+/// Existing durable intents remain readable/resumable; none can be created
+/// while their production installation cannot finish.
+fn requireCompletionActivationAvailable(service: anytype, table_id: u64, policy: @import("../common/table_storage.zig").TransactionRecovery) !void {
+    if (@import("../common/durable_completion_policy.zig").replicated_activation_supported) return;
+    const store = service.projectedStore() orelse return error.MissingMetadataStore;
+    var existing = (try store.getCompletionActivation(service.alloc, service.metadata_group_id, table_id)) orelse return error.CompletionAdmissionUnavailable;
+    defer existing.deinit();
+    if (!std.meta.eql(existing.value.policy, policy)) return error.CompletionAdmissionPolicyChanged;
+}
+
+fn validateStorageDecoderActivation(service: anytype, raft_status: raft_engine.core.Status, required_version: u16, peers: []const ReallocationProtocolPeer) !void {
+    if (required_version == 0) return;
+    const store = service.projectedStore() orelse return error.MissingMetadataStore;
+    const incarnation = (try store.getMetadataIncarnation(service.metadata_group_id)) orelse return error.TableTopologyProtocolUpgradeRequired;
+    const ids = try collectReallocationBarrierNodeIds(service.alloc, raft_status.conf_state, peers);
+    defer service.alloc.free(ids);
+    const readiness = try tableTopologyProtocolReadiness(raft_status.hard.current_term, required_version, incarnation, ids);
+    const required: metadata_topology_protocol.Activation = .{
+        .version = required_version,
+        .incarnation = incarnation,
+        .member_count = readiness.protected_member_count,
+        .membership_fingerprint = readiness.protected_membership_fingerprint,
+    };
+    const activation = (try store.topologyActivation(service.metadata_group_id)) orelse return error.TableTopologyProtocolUpgradeRequired;
+    if (!activation.satisfies(required)) return error.TableTopologyProtocolUpgradeRequired;
+}
+
+fn commandNeedsTableStorageProtocol(alloc: std.mem.Allocator, command: metadata_storage.TransitionCommand) !bool {
+    return try commandTableStorageProtocol(alloc, command) != 0;
+}
+
+test "workload admission table legacy external apply remains separate from physical policy" {
+    const ExternalApply = struct {
+        alloc: std.mem.Allocator = std.testing.allocator,
+        metadata_group_id: u64 = 1,
+        fn projectedStore(_: *@This()) ?*metadata_storage.RaftApplyStore {
+            return null;
+        }
+    };
+    var service = ExternalApply{};
+    const legacy: metadata_table_manager.TableRecord = .{ .table_id = 42, .name = "legacy" };
+    try validateCompletionPolicyReplacement(&service, legacy);
+    var physical = legacy;
+    physical.storage.transaction_recovery = .{
+        .protocol_version = 1,
+        .max_count = 4,
+        .max_bytes = 4 * 1024 * 1024,
+        .max_transaction_bytes = 1024 * 1024,
+        .completion_protocol_version = 1,
+        .profile_version = 1,
+    };
+    try std.testing.expectError(error.MissingMetadataStore, validateCompletionPolicyReplacement(&service, physical));
+}
+
+test "workload admission extended table writers require decoder activation" {
+    const alloc = std.testing.allocator;
+    const legacy: metadata_table_manager.TableRecord = .{ .table_id = 42, .name = "table:42" };
+    var active = legacy;
+    active.storage.transaction_recovery = .{ .protocol_version = 1, .max_count = 4, .max_bytes = 4194304, .max_transaction_bytes = 1048576 };
+    try std.testing.expect(!try commandNeedsTableStorageProtocol(alloc, .{ .upsert_table = legacy }));
+    try std.testing.expect(try commandNeedsTableStorageProtocol(alloc, .{ .upsert_table = active }));
+    try std.testing.expect(try commandNeedsTableStorageProtocol(alloc, .{ .compare_and_replace_table = .{ .expected = active, .replacement = legacy } }));
+    try std.testing.expect(try commandNeedsTableStorageProtocol(alloc, .{ .compare_and_replace_table = .{ .expected = legacy, .replacement = active } }));
+    try std.testing.expect(try commandNeedsTableStorageProtocol(alloc, .{ .apply_extension_lifecycle = .{ .upsert_tables = &.{active} } }));
+    try std.testing.expect(try commandNeedsTableStorageProtocol(alloc, .{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{active} } }));
+    const topology: metadata_storage.raft_apply_store.TableTopologyMutation = .{ .create = .{ .expected_transition_generation = 0, .table = active, .ranges = &.{} } };
+    try std.testing.expect(try commandNeedsTableStorageProtocol(alloc, .{ .apply_table_topology = topology }));
+    const catalog: metadata_storage.raft_apply_store.SystemCatalogCommand = .{
+        .expected_revision = 0,
+        .mutation = .{ .action = .create, .kind = .table, .name = "docs", .table_id = 42, .storage_name = "table:42" },
+        .topology = topology,
+    };
+    const bytes = try std.json.Stringify.valueAlloc(alloc, catalog, .{});
+    defer alloc.free(bytes);
+    try std.testing.expect(try commandNeedsTableStorageProtocol(alloc, .{ .apply_system_catalog = bytes }));
+    var vector = legacy;
+    vector.storage.dense_embeddings = .vector_store;
+    try std.testing.expect(try commandNeedsTableStorageProtocol(alloc, .{ .upsert_table = vector }));
+    try std.testing.expectEqual(metadata_topology_protocol.table_storage_metadata_version, try commandTableStorageProtocol(alloc, .{ .upsert_table = vector }));
+    var migrating = legacy;
+    migrating.storage_migration = .{ .request = .{ .job_id = "move_vectors", .mode = .online } };
+    try std.testing.expectEqual(metadata_topology_protocol.table_storage_metadata_version, try commandTableStorageProtocol(alloc, .{ .upsert_table = migrating }));
+    try std.testing.expectEqual(metadata_topology_protocol.secret_snapshot_version, try commandTableStorageProtocol(alloc, .{ .publish_secret_collection = "publication" }));
+    var physical = active;
+    physical.storage.transaction_recovery.?.completion_protocol_version = 1;
+    physical.storage.transaction_recovery.?.profile_version = 1;
+    const physical_version = metadata_topology_protocol.completion_storage_version;
+    try std.testing.expectEqual(metadata_topology_protocol.table_storage_version, try commandTableStorageProtocol(alloc, .{ .upsert_table = active }));
+    try std.testing.expectEqual(physical_version, try commandTableStorageProtocol(alloc, .{ .upsert_table = physical }));
+    try std.testing.expectEqual(physical_version, try commandTableStorageProtocol(alloc, .{ .compare_and_replace_table = .{ .expected = physical, .replacement = legacy } }));
+    try std.testing.expectEqual(metadata_topology_protocol.table_storage_metadata_version, try commandTableStorageProtocol(alloc, .{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{ active, physical, vector } } }));
+    var physical_catalog = catalog;
+    physical_catalog.topology.?.create.table = physical;
+    const physical_bytes = try std.json.Stringify.valueAlloc(alloc, physical_catalog, .{});
+    defer alloc.free(physical_bytes);
+    try std.testing.expectEqual(physical_version, try commandTableStorageProtocol(alloc, .{ .apply_system_catalog = physical_bytes }));
+}
+
 const EncodedTransitionBatch = struct {
     entries: [][]const u8,
+    table_storage_protocol_version: u16 = 0,
 
     fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         for (self.entries) |entry| alloc.free(entry);
@@ -2950,6 +3254,7 @@ fn prepareEncodedTransitionBatch(
     }
 
     var total_bytes: usize = 0;
+    var table_storage_protocol_version: u16 = 0;
     for (commands) |command| {
         var owned_legacy_store: ?metadata_table_manager.StoreRecord = null;
         defer if (owned_legacy_store) |record|
@@ -2959,6 +3264,7 @@ fn prepareEncodedTransitionBatch(
             command,
             &owned_legacy_store,
         );
+        table_storage_protocol_version = @max(try commandTableStorageProtocol(service.alloc, safe_command), table_storage_protocol_version);
         try metadata_storage.validateTransitionCommandDataGroupIds(safe_command);
         const encoded = try metadata_storage.encodeTransitionCommand(service.alloc, safe_command);
         total_bytes = std.math.add(usize, total_bytes, encoded.len) catch {
@@ -2976,7 +3282,7 @@ fn prepareEncodedTransitionBatch(
             return err;
         };
     }
-    return .{ .entries = try entries.toOwnedSlice(service.alloc) };
+    return .{ .entries = try entries.toOwnedSlice(service.alloc), .table_storage_protocol_version = table_storage_protocol_version };
 }
 
 fn restoreProgressIdentityEqual(
@@ -3958,7 +4264,7 @@ const ProjectedCoreSnapshot = struct {
         for (self.stores) |record| {
             out.store_group_statuses += record.group_statuses.len;
             out.store_runtime_statuses += record.runtime_statuses.len;
-            out.estimated_bytes += record.api_url.len + record.raft_url.len + record.role.len +
+            out.estimated_bytes += record.api_url.len + record.internal_api_url.len + record.raft_url.len + record.role.len +
                 record.health_class.len + record.failure_domain.len +
                 @sizeOf(metadata_table_manager.GroupStatusReport) * record.group_statuses.len +
                 @sizeOf(metadata_table_manager.RuntimeGroupStatusReport) * record.runtime_statuses.len;
@@ -4995,7 +5301,7 @@ pub const MetadataService = struct {
         self: *MetadataService,
         request: api_operation.RequestContext,
     ) !void {
-        try request.ensureActive();
+        const platform_request = try request.platformDeadline();
         const request_id = try self.linearizable_read_tracker.registerRequest();
         defer self.linearizable_read_tracker.finishRequest(request_id);
         var request_ctx_buf: [64]u8 = undefined;
@@ -5006,7 +5312,7 @@ pub const MetadataService = struct {
         );
 
         const local_deadline_ns = platform_time.monotonicNs() +| linearizable_metadata_read_timeout_ns;
-        const deadline_ns = if (request.deadline_ns) |caller_deadline_ns|
+        const deadline_ns = if (platform_request.deadline_ns) |caller_deadline_ns|
             @min(local_deadline_ns, caller_deadline_ns)
         else
             local_deadline_ns;
@@ -5324,6 +5630,12 @@ pub const MetadataService = struct {
         defer self.unlockRuntime();
         try validateCoordinatedDecoderAdmissionLocked(self, decoder);
         try metadata_storage.validateTransitionCommandDataGroupIds(safe_command);
+        const required_version = try commandTableStorageProtocol(self.alloc, safe_command);
+        if (required_version != 0) {
+            const storage_status = self.raft.host.host.raftStatus(self.metadata_group_id) orelse return error.NotLeader;
+            try validateStorageDecoderActivation(self, storage_status, required_version, &.{});
+        }
+        try validateCommandCompletionPolicy(self, safe_command);
         const encoded = try metadata_storage.encodeTransitionCommand(self.alloc, safe_command);
         defer self.alloc.free(encoded);
         try self.raft.host.host.propose(self.metadata_group_id, encoded);
@@ -5351,6 +5663,8 @@ pub const MetadataService = struct {
             raft_status.soft.leader_id == null or
             raft_status.soft.leader_id.? != raft_status.id)
             return error.NotLeader;
+        try validateStorageDecoderActivation(self, raft_status, try commandTableStorageProtocol(self.alloc, safe_command), &.{});
+        try validateCommandCompletionPolicy(self, safe_command);
         const encoded = try metadata_storage.encodeTransitionCommand(self.alloc, safe_command);
         defer self.alloc.free(encoded);
         if (safe_command == .apply_table_topology and
@@ -5399,6 +5713,8 @@ pub const MetadataService = struct {
             raft_status.soft.leader_id == null or
             raft_status.soft.leader_id.? != raft_status.id)
             return error.NotLeader;
+        try validateStorageDecoderActivation(self, raft_status, batch.table_storage_protocol_version, &.{});
+        for (commands) |command| try validateCommandCompletionPolicy(self, command);
         try self.raft.host.host.prepareProposalReceiptTracking(self.metadata_group_id);
         var accepted_first_index: ?u64 = null;
         var accepted_last_index: ?u64 = null;
@@ -5741,7 +6057,8 @@ pub const MetadataService = struct {
     }
 
     pub fn upsertStore(self: *MetadataService, record: metadata_table_manager.StoreRecord) !void {
-        const readiness = if (record.relational_topology_protocol_version != 0) try self.ensureTableTopologyProtocolReadyWithContext(.{}, metadata_topology_protocol.relational_integrity_topology_version) else null;
+        const required_version = storeRecordDecoderProtocol(record);
+        const readiness = if (required_version != 0) try self.ensureTableTopologyProtocolReadyWithContext(.{}, required_version) else null;
         self.lockCatalogMutation();
         defer self.unlockCatalogMutation();
         if (readiness) |token| try self.validateTableTopologyProtocolReadinessWithContext(.{}, token);
@@ -5782,7 +6099,8 @@ pub const MetadataService = struct {
     }
 
     pub fn registerStore(self: *MetadataService, record: metadata_table_manager.StoreRecord) !void {
-        const readiness = if (record.relational_topology_protocol_version != 0) try self.ensureTableTopologyProtocolReadyWithContext(.{}, metadata_topology_protocol.relational_integrity_topology_version) else null;
+        const required_version = storeRecordDecoderProtocol(record);
+        const readiness = if (required_version != 0) try self.ensureTableTopologyProtocolReadyWithContext(.{}, required_version) else null;
         self.lockCatalogMutation();
         defer self.unlockCatalogMutation();
         if (readiness) |token| try self.validateTableTopologyProtocolReadinessWithContext(.{}, token);
@@ -5854,6 +6172,48 @@ pub const MetadataService = struct {
             .local_node_id = local_node_id,
             .expected_metadata_version = expected_metadata_version,
         } });
+    }
+
+    pub fn completionInstallation(self: *MetadataService, alloc: std.mem.Allocator, request: api_operation.RequestContext, frame: []const u8) ![]u8 {
+        try request.ensureActive();
+        const keys: completion_installation.Keys = .{ .primary = self.internal_service_secret orelse return error.CompletionAdmissionUnavailable, .issuer = self.internal_service_issuer orelse return error.CompletionAdmissionUnavailable };
+        // Charge one finite workspace before catalog decoding. Malformed or
+        // unexpectedly large stored records cannot grow this read unboundedly.
+        const workspace = try alloc.alloc(u8, 8 * 1024 * 1024);
+        defer alloc.free(workspace);
+        var fixed = std.heap.FixedBufferAllocator.init(workspace);
+        const bounded = fixed.allocator();
+        const query = try completion_installation.verifyRequest(bounded, keys, frame);
+        try self.ensureLinearizableReadWithContext(request);
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        const response = store.completionInstallationResponse(bounded, self.metadata_group_id, query, keys) catch |err| return switch (err) {
+            error.NotFound => error.CompletionAdmissionUnavailable,
+            else => err,
+        };
+        try request.ensureActive();
+        return alloc.dupe(u8, response);
+    }
+
+    pub fn beginCompletionActivation(self: *MetadataService, request: api_operation.RequestContext, table_id: u64, policy: @import("../common/table_storage.zig").TransactionRecovery) !std.json.Parsed(completion_activation.Record) {
+        try request.ensureActive();
+        try requireCompletionActivationAvailable(self, table_id, policy);
+        const readiness = try self.ensureTableTopologyProtocolReadyWithContext(request, metadata_topology_protocol.completion_storage_version);
+        try self.validateTableTopologyProtocolReadinessWithContext(request, readiness);
+        self.lockCatalogMutation();
+        defer self.unlockCatalogMutation();
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        const bytes = try store.captureCompletionActivation(self.alloc, self.metadata_group_id, table_id, policy);
+        defer self.alloc.free(bytes);
+        var expected = try completion_activation.decode(self.alloc, bytes);
+        defer expected.deinit();
+        if (expected.value.phase == .pending) {
+            const receipt = try self.proposeTransitionCommandWithReceipt(.{ .apply_completion_activation = bytes });
+            try self.waitForTransitionAppliedWithContext(receipt, request);
+        }
+        var current = (try store.getCompletionActivation(self.alloc, self.metadata_group_id, table_id)) orelse return error.MetadataMutationOutcomeUnknown;
+        errdefer current.deinit();
+        if (!current.value.sameIntent(expected.value)) return error.CompletionAdmissionPolicyChanged;
+        return current;
     }
 
     pub fn upsertTable(self: *MetadataService, record: metadata_table_manager.TableRecord) !void {
@@ -7418,6 +7778,9 @@ pub const MetadataService = struct {
 
 pub const MetadataHttpService = struct {
     online_merge_runtime: ?@import("online_merge_driver.zig").Runtime = null,
+    completion_activation_mutex: std.Io.Mutex = .init,
+    // Protected by runtime_mutex; only the authenticated collector sets it.
+    completion_activation_verified: ?[32]u8 = null,
     alloc: std.mem.Allocator,
     metadata_group_id: u64,
     replica_root_dir: ?[]const u8,
@@ -7881,6 +8244,12 @@ pub const MetadataHttpService = struct {
         defer self.unlockRuntime();
         try validateCoordinatedDecoderAdmissionLocked(self, decoder);
         try metadata_storage.validateTransitionCommandDataGroupIds(safe_command);
+        const required_version = try commandTableStorageProtocol(self.alloc, safe_command);
+        if (required_version != 0) {
+            const storage_status = self.raft.host.http_host.host.raftStatus(self.metadata_group_id) orelse return error.NotLeader;
+            try validateStorageDecoderActivation(self, storage_status, required_version, self.reallocation_protocol_peers);
+        }
+        try validateCommandCompletionPolicy(self, safe_command);
         const encoded = try metadata_storage.encodeTransitionCommand(self.alloc, safe_command);
         defer self.alloc.free(encoded);
         if (safe_command == .apply_table_topology and
@@ -7917,6 +8286,8 @@ pub const MetadataHttpService = struct {
             raft_status.soft.leader_id == null or
             raft_status.soft.leader_id.? != raft_status.id)
             return error.NotLeader;
+        if (batch.table_storage_protocol_version != 0) try self.validateTableStorageActivationLocked(batch.table_storage_protocol_version);
+        for (commands) |command| try validateCommandCompletionPolicy(self, command);
         try self.raft.host.http_host.host.prepareProposalReceiptTracking(self.metadata_group_id);
         var accepted_first_index: ?u64 = null;
         var accepted_last_index: ?u64 = null;
@@ -7962,6 +8333,14 @@ pub const MetadataHttpService = struct {
         return self.proposeTransitionCommandWithReceiptInExpectedTerm(command, expected_term);
     }
 
+    /// Called with the runtime lock held immediately before Raft admission.
+    /// It performs no peer I/O and binds durable decoder evidence to the exact
+    /// current membership/incarnation, covering direct CAS and batch writers.
+    fn validateTableStorageActivationLocked(self: *MetadataHttpService, required_version: u16) !void {
+        const raft_status = self.raft.host.http_host.host.raftStatus(self.metadata_group_id) orelse return error.NotLeader;
+        try validateStorageDecoderActivation(self, raft_status, required_version, self.reallocation_protocol_peers);
+    }
+
     fn proposeTransitionCommandWithReceiptInExpectedTerm(
         self: *MetadataHttpService,
         command: metadata_storage.TransitionCommand,
@@ -7971,6 +8350,7 @@ pub const MetadataHttpService = struct {
         var owned_legacy_store: ?metadata_table_manager.StoreRecord = null;
         defer if (owned_legacy_store) |record| metadata_table_manager.freeStore(self.alloc, record);
         const safe_command = try runtimeStatusProtocolSafeCommand(self, command, &owned_legacy_store);
+        const storage_protocol_version = try commandTableStorageProtocol(self.alloc, safe_command);
         self.lockRuntime();
         defer self.unlockRuntime();
         try validateCoordinatedDecoderAdmissionLocked(self, decoder);
@@ -7983,6 +8363,8 @@ pub const MetadataHttpService = struct {
         if (expected_term) |term| {
             if (raft_status.hard.current_term != term) return error.NotLeader;
         }
+        if (storage_protocol_version != 0) try self.validateTableStorageActivationLocked(storage_protocol_version);
+        try validateCommandCompletionPolicy(self, safe_command);
         const encoded = try metadata_storage.encodeTransitionCommand(self.alloc, safe_command);
         defer self.alloc.free(encoded);
         if (safe_command == .apply_table_topology and
@@ -8159,7 +8541,8 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn upsertStore(self: *MetadataHttpService, record: metadata_table_manager.StoreRecord) !void {
-        const readiness = if (record.relational_topology_protocol_version != 0) try self.ensureTableTopologyProtocolReadyWithContext(.{}, metadata_topology_protocol.relational_integrity_topology_version) else null;
+        const required_version = storeRecordDecoderProtocol(record);
+        const readiness = if (required_version != 0) try self.ensureTableTopologyProtocolReadyWithContext(.{}, required_version) else null;
         self.lockCatalogMutation();
         defer self.unlockCatalogMutation();
         if (readiness) |token| try self.validateTableTopologyProtocolReadinessWithContext(.{}, token);
@@ -8533,7 +8916,8 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn registerStore(self: *MetadataHttpService, record: metadata_table_manager.StoreRecord) !void {
-        const readiness = if (record.relational_topology_protocol_version != 0) try self.ensureTableTopologyProtocolReadyWithContext(.{}, metadata_topology_protocol.relational_integrity_topology_version) else null;
+        const required_version = storeRecordDecoderProtocol(record);
+        const readiness = if (required_version != 0) try self.ensureTableTopologyProtocolReadyWithContext(.{}, required_version) else null;
         self.lockCatalogMutation();
         defer self.unlockCatalogMutation();
         if (readiness) |token| try self.validateTableTopologyProtocolReadinessWithContext(.{}, token);
@@ -8844,6 +9228,146 @@ pub const MetadataHttpService = struct {
         } });
     }
 
+    pub fn completionInstallation(self: *MetadataHttpService, alloc: std.mem.Allocator, request: api_operation.RequestContext, frame: []const u8) ![]u8 {
+        try request.ensureActive();
+        const keys: completion_installation.Keys = .{ .primary = self.internal_service_secret orelse return error.CompletionAdmissionUnavailable, .issuer = self.internal_service_issuer orelse return error.CompletionAdmissionUnavailable };
+        // Charge one finite workspace before catalog decoding. Malformed or
+        // unexpectedly large stored records cannot grow this read unboundedly.
+        const workspace = try alloc.alloc(u8, 8 * 1024 * 1024);
+        defer alloc.free(workspace);
+        var fixed = std.heap.FixedBufferAllocator.init(workspace);
+        const bounded = fixed.allocator();
+        const query = try completion_installation.verifyRequest(bounded, keys, frame);
+        try self.ensureLinearizableReadWithContext(request);
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        const response = store.completionInstallationResponse(bounded, self.metadata_group_id, query, keys) catch |err| return switch (err) {
+            error.NotFound => error.CompletionAdmissionUnavailable,
+            else => err,
+        };
+        try request.ensureActive();
+        return alloc.dupe(u8, response);
+    }
+
+    pub fn beginCompletionActivation(self: *MetadataHttpService, request: api_operation.RequestContext, table_id: u64, policy: @import("../common/table_storage.zig").TransactionRecovery) !std.json.Parsed(completion_activation.Record) {
+        return self.beginCompletionActivationExpected(request, table_id, policy, null);
+    }
+
+    fn beginCompletionActivationExpected(self: *MetadataHttpService, request: api_operation.RequestContext, table_id: u64, policy: @import("../common/table_storage.zig").TransactionRecovery, expected_definition: ?metadata_table_manager.TableDefinitionFingerprint) !std.json.Parsed(completion_activation.Record) {
+        try request.ensureActive();
+        try requireCompletionActivationAvailable(self, table_id, policy);
+        const readiness = try self.ensureTableTopologyProtocolReadyWithContext(request, metadata_topology_protocol.completion_storage_version);
+        try self.validateTableTopologyProtocolReadinessWithContext(request, readiness);
+        self.lockCatalogMutation();
+        defer self.unlockCatalogMutation();
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        const bytes = try store.captureCompletionActivation(self.alloc, self.metadata_group_id, table_id, policy);
+        defer self.alloc.free(bytes);
+        var expected = try completion_activation.decode(self.alloc, bytes);
+        defer expected.deinit();
+        if (expected_definition) |fingerprint| if (!std.meta.eql(fingerprint, expected.value.expected_definition)) return error.TableGenerationChanged;
+        if (expected.value.phase == .pending) {
+            const receipt = try self.proposeTransitionCommandWithReceipt(.{ .apply_completion_activation = bytes });
+            self.waitForTransitionAppliedWithContext(receipt, request) catch return error.MetadataMutationOutcomeUnknown;
+        }
+        var current = (try store.getCompletionActivation(self.alloc, self.metadata_group_id, table_id)) orelse return error.MetadataMutationOutcomeUnknown;
+        errdefer current.deinit();
+        if (!current.value.sameIntent(expected.value)) return error.CompletionAdmissionPolicyChanged;
+        return current;
+    }
+
+    /// Resumes a durable installation generation. Every applying member must
+    /// return fresh native-backed evidence with the same full configuration;
+    /// a missing peer leaves the existing pending intent and fence untouched.
+    pub fn activateCompletionPolicy(self: *MetadataHttpService, request: api_operation.RequestContext, table_id: u64) !MetadataProposalReceipt {
+        self.completion_activation_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.completion_activation_mutex.unlock(std.Options.debug_io);
+        try request.ensureActive();
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        var pending = (try store.getCompletionActivation(self.alloc, self.metadata_group_id, table_id)) orelse return error.CompletionAdmissionUnavailable;
+        defer pending.deinit();
+        if (pending.value.phase != .active) {
+            const keys: completion_attestation.Keys = .{ .primary = self.internal_service_secret orelse return error.CompletionAdmissionUnavailable, .issuer = self.internal_service_issuer orelse return error.CompletionAdmissionUnavailable };
+            try completion_attestation.validateKeys(keys);
+            const stores = try self.listProjectedStores(self.alloc);
+            defer self.freeProjectedStores(self.alloc, stores);
+            const placements = try self.listProjectedPlacementIntents(self.alloc);
+            defer self.freeProjectedPlacementIntents(self.alloc, placements);
+            const runtime = try self.ensureBackendRuntime();
+            const nonce = try metadata_reallocation_request.generateRequestId(runtime.io() orelse std.Options.debug_io);
+            const now = platform_time.monotonicNs();
+            var deadline = now +| (10 * std.time.ns_per_s);
+            if (request.deadline_ns) |original| {
+                const original_now = if (request.deadline_io) |borrow| blk: {
+                    var receiver = try borrow.receive();
+                    break :blk @as(u64, @intCast(@max(0, std.Io.Clock.now(.awake, receiver.io()).nanoseconds)));
+                } else now;
+                if (original <= original_now) return error.DeadlineExceeded;
+                deadline = @min(deadline, now +| (original - original_now));
+            }
+            var cancellation = http_common.RequestCancellation.fromToken(request.cancellation);
+            cancellation.query_deadline_ns = deadline;
+            var evidence = std.crypto.hash.sha2.Sha256.init(.{});
+            evidence.update("antfly-completion-activation-evidence-v1");
+            for (pending.value.groups) |group| {
+                var expected_nodes: [completion_attestation.max_members]u64 = undefined;
+                var expected_count: usize = 0;
+                for (placements) |placement| {
+                    if (placement.record.group_id != group.group_id) continue;
+                    const node = placement.record.local_node_id;
+                    if (std.mem.indexOfScalar(u64, expected_nodes[0..expected_count], node) != null) continue;
+                    if (expected_count == expected_nodes.len) return error.CompletionAdmissionUnavailable;
+                    expected_nodes[expected_count] = node;
+                    expected_count += 1;
+                }
+                if (expected_count == 0) return error.CompletionAdmissionUnavailable;
+                std.mem.sort(u64, expected_nodes[0..expected_count], {}, std.sort.asc(u64));
+                var expected_membership: ?completion_attestation.Membership = null;
+                for (expected_nodes[0..expected_count]) |node| {
+                    try request.ensureActive();
+                    const uri = for (stores) |candidate| {
+                        if (candidate.node_id == node and candidate.live and candidate.api_url.len != 0) break candidate.api_url;
+                    } else return error.CompletionAdmissionUnavailable;
+                    const challenge: completion_attestation.Request = .{ .requester = self.raft.host.http_host.host.cfg.local_node_id, .node_id = node, .group_id = group.group_id, .nonce = nonce, .incarnation = pending.value.groupIncarnation(group), .policy_digest = completion_activation.policyDigest(pending.value.policy), .generation = pending.value.generation };
+                    const proof = completion_attestation_client.fetch(self.alloc, self.raft.host.http_host.request_executor, uri, keys, challenge, .{ .deadline_ns = deadline, .cancellation = &cancellation }) catch |err| switch (err) {
+                        error.Canceled, error.Cancelled, error.DeadlineExceeded, error.OutOfMemory => return err,
+                        else => return error.CompletionAdmissionUnavailable,
+                    };
+                    try validateCompletionActivationPeer(proof, expected_nodes[0..expected_count], expected_membership);
+                    expected_membership = proof.membership;
+                    const encoded_proof = try std.json.Stringify.valueAlloc(self.alloc, proof, .{});
+                    defer self.alloc.free(encoded_proof);
+                    evidence.update(encoded_proof);
+                }
+            }
+            try request.ensureActive();
+            pending.value.phase = .active;
+            pending.value.evidence_digest = evidence.finalResult();
+        }
+        const bytes = try completion_activation.encode(self.alloc, pending.value);
+        defer self.alloc.free(bytes);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+        self.lockCatalogMutation();
+        defer self.unlockCatalogMutation();
+        try request.ensureActive();
+        // Only this exact verified command (or a durable active retry) can
+        // traverse proposal; callers cannot substitute a capability flag.
+        self.lockRuntime();
+        self.completion_activation_verified = digest;
+        self.unlockRuntime();
+        defer {
+            self.lockRuntime();
+            self.completion_activation_verified = null;
+            self.unlockRuntime();
+        }
+        const receipt = try self.proposeTransitionCommandWithReceipt(.{ .apply_completion_activation = bytes });
+        self.waitForTransitionAppliedWithContext(receipt, request) catch return error.MetadataMutationOutcomeUnknown;
+        var applied = (try store.getCompletionActivation(self.alloc, self.metadata_group_id, table_id)) orelse return error.MetadataMutationOutcomeUnknown;
+        defer applied.deinit();
+        if (applied.value.phase != .active or !applied.value.sameIntent(pending.value)) return error.MetadataMutationOutcomeUnknown;
+        return receipt;
+    }
+
     pub fn upsertTable(self: *MetadataHttpService, record: metadata_table_manager.TableRecord) !void {
         try self.proposeTransitionCommand(.{ .upsert_table = record });
     }
@@ -8861,6 +9385,13 @@ pub const MetadataHttpService = struct {
         expected: metadata_table_manager.TableRecord,
         replacement: metadata_table_manager.TableRecord,
     ) !metadata_api.CatalogMutationStamp {
+        return self.replaceTableDefinitionStampedWithContext(.{}, expected, replacement);
+    }
+
+    pub fn replaceTableDefinitionStampedWithContext(self: *MetadataHttpService, request: api_operation.RequestContext, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !metadata_api.CatalogMutationStamp {
+        if (try completionPolicyOnlyUpdate(expected, replacement) != null)
+            return replaceCompletionPolicyStamped(self, request, expected, replacement);
+        try request.ensureActive();
         return replaceTableDefinitionStampedWithReceipt(self, expected, replacement);
     }
 
@@ -10165,7 +10696,7 @@ pub const MetadataHttpService = struct {
         self: *MetadataHttpService,
         request: api_operation.RequestContext,
     ) !void {
-        try request.ensureActive();
+        const platform_request = try request.platformDeadline();
         const request_id = try self.linearizable_read_tracker.registerRequest();
         defer self.linearizable_read_tracker.finishRequest(request_id);
         var request_ctx_buf: [64]u8 = undefined;
@@ -10176,7 +10707,7 @@ pub const MetadataHttpService = struct {
         );
 
         const local_deadline_ns = platform_time.monotonicNs() +| linearizable_metadata_read_timeout_ns;
-        const deadline_ns = if (request.deadline_ns) |caller_deadline_ns|
+        const deadline_ns = if (platform_request.deadline_ns) |caller_deadline_ns|
             @min(local_deadline_ns, caller_deadline_ns)
         else
             local_deadline_ns;
@@ -12163,10 +12694,41 @@ test "relational topology admission rejects lifecycle proposals before encoding 
     try std.testing.expect(!transitionRequiresCoordinatedDecoder(.{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{plain} } }));
 }
 
+test "internal store endpoint requires version 14 on every metadata replica before admission" {
+    const Fake = struct {
+        member_versions: []const u16,
+        requested_version: u16 = 0,
+
+        fn ensureTableTopologyProtocolReadyWithContext(self: *@This(), _: api_operation.RequestContext, required: u16) !TableTopologyProtocolReadiness {
+            self.requested_version = required;
+            for (self.member_versions) |version| if (version < required) return error.TableTopologyProtocolUpgradeRequired;
+            return tableTopologyProtocolReadiness(3, required, "0123456789abcdef0123456789abcdef".*, &.{ 1, 2, 3 });
+        }
+    };
+    const record: metadata_table_manager.StoreRecord = .{
+        .store_id = 1,
+        .node_id = 1,
+        .api_url = "https://data.example",
+        .internal_api_url = "http://data.internal:9443",
+    };
+    const command: metadata_storage.TransitionCommand = .{ .register_store = record };
+    try std.testing.expectEqual(metadata_topology_protocol.internal_endpoint_version, try commandTableStorageProtocol(std.testing.allocator, command));
+    var peer = Fake{ .member_versions = &.{ 14, 14, 13 } };
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, ensureCoordinatedDecoderWithContext(&peer, command, .{}));
+    try std.testing.expectEqual(metadata_topology_protocol.internal_endpoint_version, peer.requested_version);
+    peer.member_versions = &.{ 14, 14, 14 };
+    try ensureCoordinatedDecoderWithContext(&peer, command, .{});
+
+    var legacy = record;
+    legacy.internal_api_url = "";
+    try std.testing.expectEqual(@as(u16, 0), try commandTableStorageProtocol(std.testing.allocator, .{ .register_store = legacy }));
+    try std.testing.expect(!transitionRequiresCoordinatedDecoder(.{ .register_store = legacy }));
+}
+
 test "relational topology admission requires metadata decoder capability beyond framed status" {
     try std.testing.expectEqual(@as(u16, 11), metadata_topology_protocol.source_scope_version);
-    try std.testing.expectEqual(metadata_topology_protocol.current_version, metadata_topology_protocol.coordinated_lifecycle_version);
-    try std.testing.expectEqual(metadata_topology_protocol.current_version, metadata_topology_protocol.relational_integrity_topology_version);
+    try std.testing.expect(metadata_topology_protocol.current_version >= metadata_topology_protocol.coordinated_lifecycle_version);
+    try std.testing.expectEqual(metadata_topology_protocol.coordinated_lifecycle_version, metadata_topology_protocol.relational_integrity_topology_version);
     const incarnation: metadata_mod.MetadataClusterIncarnation = "0123456789abcdef0123456789abcdef".*;
     var status: MetadataStatus = .{ .metadata_group_id = 42, .metadata_incarnation = incarnation, .metadata_raft_local_node_id = 7, .metrics = .{}, .table_topology_protocol_version = 6, .runtime_status_record_version = metadata_runtime_status_protocol.current_record_version };
     try std.testing.expect(runtimeStatusProtocolCompatible(status, 42, 7, incarnation, metadata_runtime_status_protocol.current_record_version));
@@ -20675,6 +21237,14 @@ test "metadata http service linearizable reads leave elections to the cadence dr
     try std.testing.expect(svc.raft.host.http_host.host.isLocalLeader(2910));
     const before_read = svc.raft.host.http_host.host.runtime_host.virtualTimeMs();
     try svc.ensureLinearizableRead();
+    var read_io = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer read_io.deinit();
+    var read_io_iface = read_io.io();
+    const read_clock_now: u64 = @intCast(@max(0, std.Io.Clock.now(.awake, read_io_iface).nanoseconds));
+    try svc.ensureLinearizableReadWithContext(.{
+        .deadline_ns = read_clock_now +| 5 * std.time.ns_per_s,
+        .deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&read_io_iface),
+    });
     try std.testing.expectEqual(before_read, svc.raft.host.http_host.host.runtime_host.virtualTimeMs());
     try std.testing.expect(svc.raft.host.http_host.host.isLocalLeader(2910));
     try std.testing.expect(svc.metrics().read_index_requests > 0);
@@ -21348,4 +21918,319 @@ test "metadata service store report workload benchmark reconciliation view first
         std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
         std.debug.print("GROUP_CACHE_FIRST_READER_BENCH groups={d} p50_ms={d:.6}\n", .{ count, @as(f64, @floatFromInt(samples[4])) / 1e6 });
     }
+}
+
+test "workload admission table storage rejects proposals before decoder activation" {
+    const Factory = struct {
+        alloc: std.mem.Allocator,
+        store: *raft_engine.core.MemoryStorage,
+
+        fn iface(self: *@This()) raft_host.ReplicaDescriptorFactory {
+            return .{ .ptr = self, .vtable = &.{ .build_descriptor = buildDescriptor, .free_descriptor = freeDescriptor } };
+        }
+
+        fn buildDescriptor(ptr: *anyopaque, record: raft_host.catalog.ReplicaRecord) !raft_engine.runtime.ReplicaDescriptor {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const peers = try self.alloc.dupe(raft_engine.core.types.NodeId, &[_]raft_engine.core.types.NodeId{record.local_node_id});
+            return .{
+                .group = .{
+                    .group_id = record.group_id,
+                    .local_node_id = record.local_node_id,
+                    .raft_config = .{
+                        .id = record.local_node_id,
+                        .group_id = record.group_id,
+                        .peers = peers,
+                        .election_tick = 5,
+                        .heartbeat_tick = 1,
+                        .pre_vote = false,
+                        .check_quorum = true,
+                    },
+                    .storage = self.store.storage(),
+                },
+                .bootstrap = switch (record.bootstrap_mode) {
+                    .empty => .empty,
+                    .persisted => .persisted,
+                    .fetch_snapshot => .persisted,
+                },
+            };
+        }
+
+        fn freeDescriptor(ptr: *anyopaque, alloc: std.mem.Allocator, desc: *raft_engine.runtime.ReplicaDescriptor) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = alloc;
+            self.alloc.free(desc.group.raft_config.peers);
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-http-service-root", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_root);
+    const replica_catalog_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-http-service-catalog.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_catalog_path);
+    const snapshot_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-http-service-snapshots", .{tmp.sub_path});
+    defer std.testing.allocator.free(snapshot_root);
+
+    var store = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+    var factory = Factory{ .alloc = std.testing.allocator, .store = &store };
+
+    var svc = try MetadataHttpService.init(std.testing.allocator, .{
+        .http = .{
+            .host = .{
+                .local_node_id = 1,
+                .metadata_group_id = 2900,
+                .replica_root_dir = replica_root,
+                .replica_catalog_path = replica_catalog_path,
+            },
+            .transport = .{
+                .snapshot = .{ .root_dir = snapshot_root },
+            },
+        },
+    }, .{
+        .http = .{
+            .http = .{
+                .host = .{
+                    .descriptor_factory = factory.iface(),
+                },
+            },
+        },
+    }, .{
+        .observe_local_replica_root = false,
+    });
+    defer svc.deinit();
+
+    _ = try svc.ensureMetadataReplica(.{
+        .group_id = 2900,
+        .replica_id = 1,
+        .local_node_id = 1,
+        .bootstrap_mode = .empty,
+    });
+    try svc.campaignMetadataGroup();
+    const active: metadata_table_manager.TableRecord = .{
+        .table_id = 42,
+        .name = "table:42",
+        .storage = .{ .transaction_recovery = .{ .protocol_version = 1, .max_count = 4, .max_bytes = 4194304, .max_transaction_bytes = 1048576 } },
+    };
+    const commands = [_]metadata_storage.TransitionCommand{.{ .upsert_table = active }};
+    const initial_index = try store.storage().lastIndex();
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, svc.proposeTransitionCommandWithReceipt(commands[0]));
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, svc.proposeTransitionCommandsWithReceipt(&commands));
+    try std.testing.expectEqual(initial_index, try store.storage().lastIndex());
+    var rounds: usize = 0;
+    while (try svc.metadataIncarnation() == null and rounds < 32) : (rounds += 1) try svc.runRound();
+    const incarnation = (try svc.metadataIncarnation()) orelse return error.MissingMetadataIncarnation;
+    const raft_status = svc.raft.host.http_host.host.raftStatus(2900).?;
+    const members = try collectReallocationBarrierNodeIds(std.testing.allocator, raft_status.conf_state, svc.reallocation_protocol_peers);
+    defer std.testing.allocator.free(members);
+    const ready = try tableTopologyProtocolReadiness(raft_status.hard.current_term, metadata_topology_protocol.table_storage_version, incarnation, members);
+    const activation: metadata_topology_protocol.Activation = .{
+        .version = metadata_topology_protocol.table_storage_version,
+        .incarnation = incarnation,
+        .member_count = ready.protected_member_count,
+        .membership_fingerprint = ready.protected_membership_fingerprint,
+    };
+    var old = activation;
+    old.version -= 1;
+    const old_bytes = try std.json.Stringify.valueAlloc(std.testing.allocator, old, .{});
+    defer std.testing.allocator.free(old_bytes);
+    const old_receipt = try svc.proposeTransitionCommandWithReceipt(.{ .activate_topology_protocol = old_bytes });
+    try svc.waitForTransitionApplied(old_receipt);
+    const before_rejection = try store.storage().lastIndex();
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, svc.proposeTransitionCommandWithReceipt(commands[0]));
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, svc.proposeTransitionCommandsWithReceipt(&commands));
+    try std.testing.expectEqual(before_rejection, try store.storage().lastIndex());
+    const bytes = try std.json.Stringify.valueAlloc(std.testing.allocator, activation, .{});
+    defer std.testing.allocator.free(bytes);
+    const activated = try svc.proposeTransitionCommandWithReceipt(.{ .activate_topology_protocol = bytes });
+    try svc.waitForTransitionApplied(activated);
+    const receipt = try svc.proposeTransitionCommandsWithReceipt(&commands);
+    try svc.waitForTransitionApplied(receipt);
+    const projected = try svc.listProjectedTables(std.testing.allocator);
+    defer svc.freeProjectedTables(std.testing.allocator, projected);
+    try std.testing.expectEqual(@as(usize, 1), projected.len);
+    try std.testing.expectEqualDeep(active.storage, projected[0].storage);
+    var physical = active;
+    physical.storage.transaction_recovery.?.completion_protocol_version = 1;
+    physical.storage.transaction_recovery.?.profile_version = 1;
+    const physical_commands = [_]metadata_storage.TransitionCommand{.{ .upsert_table = physical }};
+    const before_physical = try store.storage().lastIndex();
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, svc.proposeTransitionCommandWithReceipt(physical_commands[0]));
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, svc.proposeTransitionCommandsWithReceipt(&physical_commands));
+    try std.testing.expectEqual(before_physical, try store.storage().lastIndex());
+    var upgraded = activation;
+    upgraded.version = metadata_topology_protocol.completion_storage_version;
+    const upgraded_bytes = try std.json.Stringify.valueAlloc(std.testing.allocator, upgraded, .{});
+    defer std.testing.allocator.free(upgraded_bytes);
+    const upgraded_receipt = try svc.proposeTransitionCommandWithReceipt(.{ .activate_topology_protocol = upgraded_bytes });
+    try svc.waitForTransitionApplied(upgraded_receipt);
+    const range_receipt = try svc.proposeTransitionCommandWithReceipt(.{ .upsert_range = .{ .group_id = 3101, .range_id = 1, .table_id = active.table_id, .start_key = "" } });
+    try svc.waitForTransitionApplied(range_receipt);
+    const projection = svc.projectedStore().?;
+    // This is an otherwise eligible metadata plan. Read-only capture is
+    // allowed, but public begin cannot create a permanent pending fence while
+    // production installation is not implemented.
+    const candidate = try projection.captureCompletionActivation(std.testing.allocator, svc.metadata_group_id, active.table_id, physical.storage.transaction_recovery.?);
+    defer std.testing.allocator.free(candidate);
+    const before_capacity = try store.storage().lastIndex();
+    try std.testing.expectError(error.DeadlineExceeded, svc.beginCompletionActivation(.{ .deadline_ns = 0 }, physical.table_id, physical.storage.transaction_recovery.?));
+    try std.testing.expectError(error.CompletionAdmissionUnavailable, svc.beginCompletionActivation(.{}, physical.table_id, physical.storage.transaction_recovery.?));
+    try std.testing.expectError(error.CompletionAdmissionUnavailable, svc.proposeTransitionCommandWithReceipt(.{ .apply_completion_activation = candidate }));
+    try std.testing.expect((try projection.getCompletionActivation(std.testing.allocator, svc.metadata_group_id, active.table_id)) == null);
+    try std.testing.expectEqual(@as(u32, 0), (try projection.getTableTransitionFence(svc.metadata_group_id, active.table_id)).active_count);
+    try std.testing.expectError(error.CompletionAdmissionUnavailable, svc.activateCompletionPolicy(.{}, physical.table_id));
+    try std.testing.expectError(error.CompletionAdmissionUnavailable, svc.proposeTransitionCommand(physical_commands[0]));
+    try std.testing.expectError(error.CompletionAdmissionUnavailable, svc.proposeTransitionCommandWithReceipt(physical_commands[0]));
+    try std.testing.expectError(error.CompletionAdmissionUnavailable, svc.proposeTransitionCommandsWithReceipt(&physical_commands));
+    try std.testing.expectEqual(before_capacity, try store.storage().lastIndex());
+    // Seed a previously committed policy through the owning Raft fixture to
+    // verify immutability/recovery compatibility separately from activation.
+    const seeded = try metadata_storage.encodeTransitionCommand(std.testing.allocator, physical_commands[0]);
+    defer std.testing.allocator.free(seeded);
+    try svc.raft.host.http_host.host.prepareProposalReceiptTracking(2900);
+    var seeded_index: ?u64 = null;
+    try svc.raft.host.http_host.proposeWithReceipt(2900, seeded, &seeded_index);
+    try svc.raft.host.http_host.host.trackProposalReceipt(2900, raft_status.hard.current_term, seeded_index.?);
+    try svc.waitForTransitionApplied(.{ .term = raft_status.hard.current_term, .index = seeded_index.? });
+    const completed = try svc.listProjectedTables(std.testing.allocator);
+    defer svc.freeProjectedTables(std.testing.allocator, completed);
+    try std.testing.expectEqualDeep(physical.storage, completed[0].storage);
+    const immutable_index = try store.storage().lastIndex();
+    try std.testing.expectError(error.ImmutableTableStorageSettings, svc.proposeTransitionCommand(.{ .upsert_table = active }));
+    try std.testing.expectError(error.ImmutableTableStorageSettings, svc.proposeTransitionCommandWithReceipt(.{ .compare_and_replace_table = .{ .expected = physical, .replacement = active } }));
+    try std.testing.expectError(error.ImmutableTableStorageSettings, svc.proposeTransitionCommandsWithReceipt(&.{.{ .upsert_table = active }}));
+    var changed = physical;
+    changed.storage.transaction_recovery.?.max_count -= 1;
+    try std.testing.expectError(error.ImmutableTableStorageSettings, svc.proposeTransitionCommandWithReceipt(.{ .upsert_table = changed }));
+    try std.testing.expectEqual(immutable_index, try store.storage().lastIndex());
+}
+
+fn validateCompletionActivationPeer(proof: completion_attestation.Proof, expected_nodes: []const u64, previous: ?completion_attestation.Membership) !void {
+    try completion_attestation.validateProof(proof);
+    if (proof.capacity < 4 or proof.applied_index != proof.commit_index or proof.commit_index != proof.last_index) return error.CompletionAdmissionUnavailable;
+    if (previous) |membership| if (!std.meta.eql(membership, proof.membership)) return error.CompletionAdmissionUnavailable;
+    const total = proof.membership.voters + proof.membership.outgoing + proof.membership.learners + proof.membership.learners_next;
+    const members = proof.membership.nodes[0..total];
+    for (expected_nodes) |node| if (std.mem.indexOfScalar(u64, members, node) == null) return error.CompletionAdmissionUnavailable;
+    for (members) |node| if (std.mem.indexOfScalar(u64, expected_nodes, node) == null) return error.CompletionAdmissionUnavailable;
+}
+
+test "workload admission completion activation requires every applying member and matching membership" {
+    const FakeService = struct {
+        alloc: std.mem.Allocator = std.testing.allocator,
+        metadata_group_id: u64 = 9,
+        completion_activation_verified: ?[32]u8 = null,
+        prior: ?[]const u8 = null,
+        fn projectedStore(self: *@This()) ?*@This() {
+            return self;
+        }
+        fn getCompletionActivation(self: *@This(), alloc: std.mem.Allocator, group_id: u64, table_id: u64) !?std.json.Parsed(completion_activation.Record) {
+            try std.testing.expectEqual(self.metadata_group_id, group_id);
+            try std.testing.expectEqual(@as(u64, 1), table_id);
+            return try completion_activation.decode(alloc, self.prior orelse return null);
+        }
+    };
+    var fake = FakeService{};
+    const forged: completion_activation.Record = .{
+        .phase = .active,
+        .cluster_incarnation = "11111111111111111111111111111111".*,
+        .table_id = 1,
+        .expected_definition = @splat(1),
+        .schema_catalog_digest = @splat(2),
+        .expected_transition_generation = 0,
+        .generation = 1,
+        .policy = .{ .protocol_version = 1, .max_count = 4, .max_bytes = 65536, .max_transaction_bytes = 16384, .completion_protocol_version = 1, .profile_version = 1 },
+        .groups = &.{.{ .group_id = 7, .range_id = 1, .split_attempt_epoch = 0, .range_digest = @splat(3) }},
+        .evidence_digest = @splat(4),
+    };
+    const forged_bytes = try completion_activation.encode(std.testing.allocator, forged);
+    defer std.testing.allocator.free(forged_bytes);
+    var prior = forged;
+    prior.phase = .pending;
+    prior.evidence_digest = @splat(0);
+    const prior_bytes = try completion_activation.encode(std.testing.allocator, prior);
+    defer std.testing.allocator.free(prior_bytes);
+    fake.prior = prior_bytes;
+    try requireCompletionActivationAvailable(&fake, 1, prior.policy);
+    try std.testing.expectError(error.CompletionAdmissionUnavailable, validateCompletionActivationEvidence(&fake, forged_bytes));
+    fake.prior = null;
+    try std.testing.expectError(error.CompletionAdmissionUnavailable, requireCompletionActivationAvailable(&fake, 1, prior.policy));
+    var proof: completion_attestation.Proof = .{ .request = .{ .requester = 9, .node_id = 1, .group_id = 7, .nonce = 5, .incarnation = @splat(1), .policy_digest = @splat(2), .generation = 3 }, .capacity = 4, .accepted = 4, .prepared = 4, .term = 1, .commit_index = 9, .applied_index = 9, .last_index = 9, .leader_id = 1, .membership = .{ .voters = 2, .learners = 1 } };
+    proof.membership.nodes[0..3].* = .{ 1, 2, 3 };
+    try validateCompletionActivationPeer(proof, &.{ 1, 2, 3 }, null);
+    try std.testing.expectError(error.CompletionAdmissionUnavailable, validateCompletionActivationPeer(proof, &.{ 1, 2 }, null));
+    try std.testing.expectError(error.CompletionAdmissionUnavailable, validateCompletionActivationPeer(proof, &.{ 1, 2, 3, 4 }, null));
+    const previous = proof.membership;
+    proof.membership.voters = 3;
+    proof.membership.learners = 0;
+    try std.testing.expectError(error.CompletionAdmissionUnavailable, validateCompletionActivationPeer(proof, &.{ 1, 2, 3 }, previous));
+}
+
+test {
+    _ = @import("completion_installation_client.zig");
+}
+
+test "workload admission completion policy update resumes one generation and rejects mixed definition changes" {
+    const alloc = std.testing.allocator;
+    const original: metadata_table_manager.TableRecord = .{ .table_id = 7, .name = "docs", .schema_json = "{}" };
+    var replacement = original;
+    replacement.storage.transaction_recovery = .{ .protocol_version = 1, .max_count = 4, .max_bytes = 65536, .max_transaction_bytes = 16384, .completion_protocol_version = 1, .profile_version = 1 };
+    try std.testing.expect((try completionPolicyOnlyUpdate(original, replacement)) != null);
+    var mixed = replacement;
+    mixed.schema_json = "null";
+    try std.testing.expectError(error.CompletionAdmissionPolicyChanged, completionPolicyOnlyUpdate(original, mixed));
+    mixed = replacement;
+    mixed.indexes_json = "{\"new\":{}}";
+    try std.testing.expectError(error.CompletionAdmissionPolicyChanged, completionPolicyOnlyUpdate(original, mixed));
+    mixed = replacement;
+    mixed.storage.transaction_recovery.?.max_count = 3;
+    try std.testing.expectError(error.CompletionAdmissionPolicyChanged, completionPolicyOnlyUpdate(replacement, mixed));
+    try std.testing.expectError(error.CompletionAdmissionPolicyChanged, completionPolicyOnlyUpdate(replacement, original));
+    const Fake = struct {
+        alloc: std.mem.Allocator,
+        metadata_group_id: u64 = 11,
+        current: metadata_table_manager.TableRecord,
+        wanted: metadata_table_manager.TableRecord,
+        began: usize = 0,
+        generation: u64 = 0,
+        attest: bool = false,
+        deadline: u64,
+        fn projectedStore(self: *@This()) ?*@This() {
+            return self;
+        }
+        fn getTable(self: *@This(), a: std.mem.Allocator, _: u64, _: u64) !?metadata_table_manager.TableRecord {
+            return try metadata_table_manager.cloneTable(a, self.current);
+        }
+        fn beginCompletionActivationExpected(self: *@This(), request: api_operation.RequestContext, table_id: u64, policy: @import("../common/table_storage.zig").TransactionRecovery, expected: ?metadata_table_manager.TableDefinitionFingerprint) !std.json.Parsed(completion_activation.Record) {
+            try std.testing.expectEqual(self.deadline, request.deadline_ns.?);
+            try std.testing.expectEqual(@as(u64, 7), table_id);
+            if (expected) |fingerprint| try std.testing.expectEqualDeep(metadata_table_manager.tableDefinitionFingerprint(original), fingerprint);
+            self.began += 1;
+            if (self.generation == 0) self.generation = 1;
+            const encoded = try completion_activation.encode(self.alloc, .{ .cluster_incarnation = "11111111111111111111111111111111".*, .table_id = table_id, .expected_definition = metadata_table_manager.tableDefinitionFingerprint(original), .schema_catalog_digest = @splat(1), .expected_transition_generation = 0, .generation = self.generation, .policy = policy, .groups = &.{.{ .group_id = 19, .range_id = 1, .split_attempt_epoch = 0, .range_digest = @splat(2) }} });
+            defer self.alloc.free(encoded);
+            return completion_activation.decode(self.alloc, encoded);
+        }
+        fn activateCompletionPolicy(self: *@This(), request: api_operation.RequestContext, _: u64) !MetadataProposalReceipt {
+            try std.testing.expectEqual(self.deadline, request.deadline_ns.?);
+            if (!self.attest) return error.CompletionAdmissionUnavailable;
+            self.current = self.wanted;
+            return .{ .term = 2, .index = 9 };
+        }
+    };
+    var fake: Fake = .{ .alloc = alloc, .current = original, .wanted = replacement, .deadline = platform_time.monotonicNs() + 10 * std.time.ns_per_s };
+    const request: api_operation.RequestContext = .{ .deadline_ns = fake.deadline };
+    try std.testing.expectError(error.CompletionAdmissionUnavailable, replaceCompletionPolicyStamped(&fake, request, original, replacement));
+    try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(original, fake.current));
+    try std.testing.expectEqual(@as(u64, 1), fake.generation);
+    fake.attest = true;
+    const receipt = try replaceCompletionPolicyStamped(&fake, request, original, replacement);
+    try std.testing.expectEqual(@as(u64, 9), receipt.index);
+    _ = try replaceCompletionPolicyStamped(&fake, request, original, replacement);
+    _ = try replaceCompletionPolicyStamped(&fake, request, replacement, replacement);
+    try std.testing.expectEqual(@as(u64, 1), fake.generation);
+    try std.testing.expectEqual(@as(usize, 4), fake.began);
+    const before = fake.began;
+    try std.testing.expectError(error.DeadlineExceeded, replaceCompletionPolicyStamped(&fake, .{ .deadline_ns = 0 }, original, replacement));
+    try std.testing.expectEqual(before, fake.began);
 }

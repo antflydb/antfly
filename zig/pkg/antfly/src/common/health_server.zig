@@ -31,7 +31,6 @@ const Io = std.Io;
 const platform_time = @import("antfly_platform").time;
 const prometheus = @import("prometheus.zig");
 const runtime_lifecycle = @import("runtime_lifecycle.zig");
-const metrics_cache_ttl_ms: u64 = 5 * std.time.ms_per_s;
 const graceful_shutdown_timeout_ms: u64 = 5_000;
 pub const max_connections: u32 = 16;
 
@@ -80,6 +79,7 @@ pub const HealthServer = struct {
     metrics_cache_refreshing: bool = false,
     metrics_refresh_future: ?Io.Future(void) = null,
     metrics_refresh_stop: std.atomic.Value(bool) = .init(false),
+    metrics_interval_ms: std.atomic.Value(u32) = .init(5000),
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -163,6 +163,13 @@ pub const HealthServer = struct {
         return self.listener_task.runtimeFailure();
     }
 
+    /// Background collection remains independent from scrape traffic. The
+    /// interval is a delay after collection, not a promise about sample age.
+    pub fn configureMetricsInterval(self: *HealthServer, milliseconds: u32) !void {
+        if (milliseconds < 100 or milliseconds > 60_000) return error.InvalidConfig;
+        self.metrics_interval_ms.store(milliseconds, .release);
+    }
+
     /// Conditional init + start. Returns null when `port` is unset and
     /// propagates startup errors when a port was explicitly configured, so callers
     /// can write `const hs = try HealthServer.startIfConfigured(...); defer
@@ -239,12 +246,18 @@ pub const HealthServer = struct {
             }
         else
             null;
+        const collected_at_ms = self.metrics_cache_built_at_ms;
         self.metrics_cache_mutex.unlock();
 
         if (body_copy) |body| {
             defer ctx.allocator.free(body);
             var response = try ctx.text(body);
+            errdefer response.deinit();
             try response.headers.set("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
+            var age_buffer: [20]u8 = undefined;
+            const now_ms: u64 = @intCast(platform_time.monotonicNs() / std.time.ns_per_ms);
+            const age = try std.fmt.bufPrint(&age_buffer, "{d}", .{now_ms -| collected_at_ms});
+            try response.headers.set("X-Antfly-Metrics-Age-Ms", age);
             return response;
         }
 
@@ -275,21 +288,23 @@ pub const HealthServer = struct {
 
     fn metricsRefreshTask(self: *HealthServer) void {
         while (!self.metrics_refresh_stop.load(.acquire)) {
-            sleepRefreshInterval(self.io, &self.metrics_refresh_stop);
+            sleepRefreshInterval(self.io, &self.metrics_refresh_stop, &self.metrics_interval_ms);
             if (self.metrics_refresh_stop.load(.acquire)) return;
             self.refreshMetricsCacheThread();
         }
     }
 
     fn refreshMetricsCacheSync(self: *HealthServer) !void {
+        // Age includes collection itself: serving a just-published slow
+        // snapshot must not disguise old observations as fresh samples.
+        const collected_at_ms: u64 = @intCast(platform_time.monotonicNs() / std.time.ns_per_ms);
         const body = try buildMetricsBody(std.heap.page_allocator, self.metrics);
         errdefer std.heap.page_allocator.free(body);
 
-        const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
         lockAtomic(&self.metrics_cache_mutex);
         const old = self.metrics_cache_body;
         self.metrics_cache_body = body;
-        self.metrics_cache_built_at_ms = now_ms;
+        self.metrics_cache_built_at_ms = collected_at_ms;
         self.metrics_cache_refreshing = false;
         self.metrics_cache_mutex.unlock();
         if (old) |prev| std.heap.page_allocator.free(prev);
@@ -308,10 +323,10 @@ pub const HealthServer = struct {
     }
 };
 
-fn sleepRefreshInterval(io: Io, stop: *std.atomic.Value(bool)) void {
+fn sleepRefreshInterval(io: Io, stop: *std.atomic.Value(bool), interval_ms: *const std.atomic.Value(u32)) void {
     const slice_ms: u64 = 100;
     var slept_ms: u64 = 0;
-    while (slept_ms < metrics_cache_ttl_ms and !stop.load(.acquire)) : (slept_ms += slice_ms) {
+    while (slept_ms < interval_ms.load(.acquire) and !stop.load(.acquire)) : (slept_ms += slice_ms) {
         io.sleep(Io.Duration.fromMilliseconds(@intCast(slice_ms)), .awake) catch return;
     }
 }
@@ -446,20 +461,25 @@ test "health server metrics serves cached payload within ttl" {
     try testing.expectEqual(@as(usize, 1), fake.call_count);
 }
 
-test "health server metrics request path does not refresh stale cache" {
+test "workload admission metrics expose cached sample age without refreshing on request" {
     const alloc = testing.allocator;
     var fake = FakeMetrics{};
     const hs = try HealthServer.init(alloc, std.testing.io, .{ .bind_port = 0 }, null, fake.iface());
     defer hs.deinit();
+    try hs.configureMetricsInterval(250);
+    try testing.expectEqual(@as(u32, 250), hs.metrics_interval_ms.load(.acquire));
+    try testing.expectError(error.InvalidConfig, hs.configureMetricsInterval(0));
+    try testing.expectEqual(@as(u32, 250), hs.metrics_interval_ms.load(.acquire));
 
     lockAtomic(&hs.metrics_cache_mutex);
-    hs.metrics_cache_built_at_ms = 0;
+    hs.metrics_cache_built_at_ms = @as(u64, @intCast(platform_time.monotonicNs() / std.time.ns_per_ms)) -| 10_000;
     hs.metrics_cache_mutex.unlock();
 
     var resp = try hs.executeForTest(.GET, "/metrics");
     defer resp.deinit();
 
     try testing.expectEqual(@as(u16, 200), resp.status.code);
+    try testing.expect((try std.fmt.parseInt(u64, resp.headers.get("X-Antfly-Metrics-Age-Ms").?, 10)) >= 10_000);
     try testing.expectEqual(@as(usize, 1), fake.call_count);
 }
 

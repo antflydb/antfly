@@ -21,6 +21,7 @@ const transport_iface = @import("transport_iface.zig");
 const snapshot_transport_iface = @import("snapshot_transport_iface.zig");
 const storage_iface = @import("storage_iface.zig");
 const snapshot_iface = @import("snapshot_iface.zig");
+const completion_admission_iface = @import("completion_admission_iface.zig");
 const backpressure_iface = @import("backpressure_iface.zig");
 const replica_mod = @import("replica.zig");
 const replica_catalog_iface = @import("replica_catalog_iface.zig");
@@ -67,6 +68,7 @@ pub const RuntimeConfig = struct {
 };
 
 pub const RuntimeHooks = struct {
+    completion_admission: ?completion_admission_iface.Provider = null,
     transport: ?transport_iface.Transport = null,
     snapshot_transport: ?snapshot_transport_iface.SnapshotTransport = null,
     group_storage: ?storage_iface.GroupStorage = null,
@@ -514,6 +516,7 @@ pub const MultiRaft = struct {
     scheduler: scheduler_mod.Scheduler,
     groups: std.AutoHashMapUnmanaged(core.types.GroupId, group_mod.Group) = .empty,
     group_incarnations: std.AutoHashMapUnmanaged(core.types.GroupId, u64) = .empty,
+    completion_guards: std.AutoHashMapUnmanaged(core.types.GroupId, completion_admission_iface.Guard) = .empty,
     next_group_incarnation: u64 = 1,
     pending_outbox: TransportOutbox = .{},
     pending_snapshot_submissions: std.AutoHashMapUnmanaged(
@@ -579,6 +582,9 @@ pub const MultiRaft = struct {
         while (snapshot_candidates.next()) |candidate| candidate.deinit(self.alloc);
         self.snapshot_candidates.deinit(self.alloc);
         self.scheduler.deinit();
+        var completion_guards = self.completion_guards.valueIterator();
+        while (completion_guards.next()) |guard| guard.detach();
+        self.completion_guards.deinit(self.alloc);
         std.debug.assert(self.pending_snapshot_bytes.load(.acquire) == 0);
         self.* = undefined;
     }
@@ -594,6 +600,13 @@ pub const MultiRaft = struct {
             self.alloc,
             self.groups.count() + 1,
         );
+
+        if (self.hooks.completion_admission) |provider| {
+            const guard = try provider.attach(cfg.group_id, cfg.local_node_id, cfg.storage);
+            errdefer guard.detach();
+            try self.completion_guards.put(self.alloc, cfg.group_id, guard);
+        }
+        errdefer if (self.completion_guards.fetchRemove(cfg.group_id)) |entry| entry.value.detach();
 
         var grp = try group_mod.Group.init(self.alloc, cfg);
         var grp_owned = true;
@@ -787,6 +800,7 @@ pub const MultiRaft = struct {
             transport.unserveGroup(group_id) catch unreachable;
             self.metrics.transport_group_unserves += 1;
         }
+        if (self.completion_guards.fetchRemove(group_id)) |entry| entry.value.detach();
         self.refreshMetricsTopology();
         self.refreshQueueMetrics();
         return true;
@@ -1054,13 +1068,56 @@ pub const MultiRaft = struct {
         return snapshot;
     }
 
+    /// Called by the owning state machine under the existing serialized Raft
+    /// apply. The group reference outlives Ready and pins the native DB owner.
+    pub fn applyCompletionAccepted(self: *MultiRaft, group_id: u64, term: u64, index: u64, canonical: []const u8) !void {
+        const guard = self.completion_guards.get(group_id) orelse return error.MissingCompletionAdmissionGuard;
+        try guard.applyAccepted(term, index, canonical);
+    }
+    pub fn completionProgress(self: *MultiRaft, group_id: u64) !?completion_admission_iface.Progress {
+        const guard = self.completion_guards.get(group_id) orelse return null;
+        return try guard.progress();
+    }
+    pub fn hasCompletionBacking(self: *MultiRaft, group_id: u64) bool {
+        const guard = self.completion_guards.get(group_id) orelse return false;
+        return guard.hasBacking();
+    }
+    pub fn checkCompletionSnapshot(self: *MultiRaft, group_id: u64) !void {
+        try self.checkCompletion(group_id, .snapshot_admission);
+    }
+    pub fn ownsCompletionAccepted(self: *MultiRaft, group_id: u64, term: u64, index: u64, payload: []const u8) !bool {
+        const guard = self.completion_guards.get(group_id) orelse return false;
+        return try guard.ownsAccepted(term, index, payload);
+    }
+
+    fn checkCompletion(self: *MultiRaft, group_id: core.types.GroupId, event: completion_admission_iface.Check) !void {
+        if (self.completion_guards.get(group_id)) |guard| {
+            const grp = self.group(group_id) orelse return error.UnknownGroup;
+            try guard.check(grp.status(), event);
+        } else if (self.hooks.completion_admission != null) {
+            return error.MissingCompletionAdmissionGuard;
+        }
+    }
+
     pub fn stepWithDisposition(self: *MultiRaft, group_id: core.types.GroupId, msg: core.Message) !StepDisposition {
         if (try self.activityDisposition(group_id) == .quarantined) {
             self.metrics.quarantined_inbound_messages +|= 1;
             return .quarantined;
         }
         const grp = self.group(group_id) orelse return error.UnknownGroup;
-        try grp.step(msg);
+        var admitted = msg;
+        if (self.completion_guards.get(group_id)) |guard| {
+            const count = try guard.admitInbound(grp.status(), msg, true);
+            if (count != msg.entries.len) {
+                // Preserve prev-index/term checking in Raft itself. Never
+                // acknowledge or commit the excluded prepare, including for
+                // an empty prefix used only to advance a predecessor commit.
+                const last = std.math.add(u64, msg.log_index, count) catch return error.CompletionAdmissionUnavailable;
+                admitted.entries = msg.entries[0..count];
+                admitted.commit_index = @min(msg.commit_index, last);
+            }
+        } else if (self.hooks.completion_admission != null) return error.MissingCompletionAdmissionGuard;
+        try grp.step(admitted);
         return .applied;
     }
 
@@ -1072,6 +1129,7 @@ pub const MultiRaft = struct {
     pub fn campaignGroup(self: *MultiRaft, group_id: core.types.GroupId) !void {
         try self.resumeOnActivity(group_id);
         const grp = self.group(group_id) orelse return error.UnknownGroup;
+        try self.checkCompletion(group_id, .campaign);
         try grp.campaign();
     }
 
@@ -1098,9 +1156,35 @@ pub const MultiRaft = struct {
         data: []const u8,
         accepted_index: *?core.types.Index,
     ) !void {
+        return self.proposeWithReceiptAndAdmission(group_id, data, accepted_index, null);
+    }
+
+    pub const ProposalAdmission = struct {
+        context: *const anyopaque,
+        check: *const fn (*const anyopaque) anyerror!void,
+    };
+
+    /// Admission is borrowed synchronously and is never called after RawNode
+    /// accepts the proposal. Failure after physical reservation invokes the
+    /// ordinary null-receipt cancellation path before returning.
+    pub fn proposeWithReceiptAndAdmission(
+        self: *MultiRaft,
+        group_id: core.types.GroupId,
+        data: []const u8,
+        accepted_index: *?core.types.Index,
+        admission: ?ProposalAdmission,
+    ) !void {
         accepted_index.* = null;
+        if (admission) |check| try check.check(check.context);
         try self.resumeOnActivity(group_id);
         const grp = self.group(group_id) orelse return error.UnknownGroup;
+        try self.checkCompletion(group_id, .{ .proposal = &.{data} });
+        defer if (self.completion_guards.get(group_id)) |guard| guard.proposalResult(grp.status(), .{
+            .payloads = &.{data},
+            .first_index = accepted_index.*,
+            .last_index = accepted_index.*,
+        });
+        if (admission) |check| try check.check(check.context);
         try grp.proposeWithReceipt(data, accepted_index);
     }
 
@@ -1115,6 +1199,12 @@ pub const MultiRaft = struct {
         accepted_last_index.* = null;
         try self.resumeOnActivity(group_id);
         const grp = self.group(group_id) orelse return error.UnknownGroup;
+        try self.checkCompletion(group_id, .{ .proposal = payloads });
+        defer if (self.completion_guards.get(group_id)) |guard| guard.proposalResult(grp.status(), .{
+            .payloads = payloads,
+            .first_index = accepted_first_index.*,
+            .last_index = accepted_last_index.*,
+        });
         try grp.proposeBatchWithReceipt(
             payloads,
             accepted_first_index,
@@ -1176,6 +1266,7 @@ pub const MultiRaft = struct {
     pub fn fetchSnapshot(self: *MultiRaft, req: snapshot_transport_iface.SnapshotFetchRequest) !void {
         try self.resumeOnActivity(req.group_id);
         const snapshot_transport = self.hooks.snapshot_transport orelse return error.MissingSnapshotTransport;
+        try self.checkCompletion(req.group_id, .snapshot_admission);
         try snapshot_transport.fetchSnapshot(req, self.snapshotReceiver());
     }
 
@@ -1189,6 +1280,7 @@ pub const MultiRaft = struct {
     ) !void {
         const grp = self.group(group_id) orelse return error.UnknownGroup;
         if (to != grp.localNodeId()) return error.SnapshotUploadTargetMismatch;
+        try self.checkCompletion(group_id, .snapshot_admission);
         try self.reserveSnapshotBytes(data_len);
     }
 
@@ -1206,12 +1298,14 @@ pub const MultiRaft = struct {
     pub fn proposeConfChange(self: *MultiRaft, group_id: core.types.GroupId, conf_change: core.ConfChange) !void {
         try self.resumeOnActivity(group_id);
         const grp = self.group(group_id) orelse return error.UnknownGroup;
+        try self.checkCompletion(group_id, .{ .configuration_v1 = conf_change });
         try grp.proposeConfChange(conf_change);
     }
 
     pub fn proposeConfChangeV2(self: *MultiRaft, group_id: core.types.GroupId, conf_change: core.ConfChangeV2) !void {
         try self.resumeOnActivity(group_id);
         const grp = self.group(group_id) orelse return error.UnknownGroup;
+        try self.checkCompletion(group_id, .{ .configuration = conf_change });
         try grp.proposeConfChangeV2(conf_change);
     }
 
@@ -1447,9 +1541,15 @@ pub const MultiRaft = struct {
             return false;
         }
 
-        const ready_build_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
-        var ready = grp.ready();
-        if (diagnostics) |diag| diag.ready_build_elapsed_ns = clock.elapsedSinceNs(ready_build_start_ns);
+        self.checkCompletion(group_id, .{ .ready = grp.previewReady() }) catch |err| switch (err) {
+            error.CompletionAdmissionUnavailable => {
+                self.scheduler.deferReady(group_id);
+                return false;
+            },
+            else => return err,
+        };
+
+        var ready = grp.previewReady();
         if (ready.isEmpty()) {
             self.scheduler.completeReady(group_id, false);
             return false;
@@ -1616,6 +1716,13 @@ pub const MultiRaft = struct {
             self.hooks.snapshot_throttle.?.endSnapshot(group_id);
         };
 
+        // All resource denials inspect the borrowed frontier. In async mode
+        // ready() consumes that frontier, so prepare its local storage messages
+        // separately and accept only after the ownership copy succeeds.
+        const ready_build_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
+        ready = grp.prepareReady();
+        if (diagnostics) |diag| diag.ready_build_elapsed_ns = clock.elapsedSinceNs(ready_build_start_ns);
+
         // Applying a committed configuration change mutates Raft progress and
         // can reallocate the node's aliased message buffer. Async handling also
         // steps local messages. Delay the ownership copy until all admission
@@ -1629,6 +1736,14 @@ pub const MultiRaft = struct {
         } else ready.messages;
         if (diagnostics) |diag| diag.clone_messages_elapsed_ns = clock.elapsedSinceNs(clone_messages_start_ns);
 
+        // Authorize local append acknowledgements before consuming async
+        // state. Emission still follows persistence, but a denied guard must
+        // leave the original frontier available for a later attempt.
+        if (async_storage_writes) for (ready_messages) |msg| {
+            if (msg.msg_type == .storage_append)
+                try self.checkCompletion(group_id, .{ .storage_ack = msg });
+        };
+
         // A recovery permit authorizes exactly one processing attempt for the
         // retained Ready, not one successful attempt. Everything before this
         // point is allocation/admission preflight and leaves the Ready wholly
@@ -1639,6 +1754,7 @@ pub const MultiRaft = struct {
         // still-oversized Ready and requires an explicit, newly fenced retry
         // instead of silently reusing an old operator authorization.
         recovery_attempt.crossIrreversibleBoundary();
+        grp.acceptPreparedReady(ready);
 
         if (try grp.applyCommittedConfChanges(ready.committed_entries)) {
             ready.conf_state = grp.status().conf_state;
@@ -3636,4 +3752,215 @@ test "snapshot worker startup failure leaves no task and can be drained" {
     defer worker.deinit();
     try std.testing.expectError(error.ConcurrencyUnavailable, worker.start());
     try std.testing.expect(worker.future == null);
+}
+
+test "workload admission raft completion guard fences election proposal persistence and lifecycle" {
+    const Gate = struct {
+        deny_attach: bool = false,
+        deny_all: bool = false,
+        deny_ready: bool = false,
+        deny_backpressure: bool = false,
+        deny_ack: bool = false,
+        live: usize = 0,
+        ready_checks: usize = 0,
+        ack_checks: usize = 0,
+        accepted_proposals: usize = 0,
+
+        fn provider(self: *@This()) completion_admission_iface.Provider {
+            return .{ .ptr = self, .vtable = &.{ .attach = attach } };
+        }
+        fn attach(ptr: *anyopaque, _: u64, _: u64, _: core.Storage) !completion_admission_iface.Guard {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.deny_attach) return error.CompletionAdmissionUnavailable;
+            self.live += 1;
+            return .{ .ptr = self, .vtable = &.{ .check = check, .proposal_result = proposalResult, .detach = detach } };
+        }
+        fn check(ptr: *anyopaque, _: core.Status, event: completion_admission_iface.Check, _: bool) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            std.debug.assert(self.live > 0);
+            if (event == .ready) self.ready_checks += 1;
+            if (event == .storage_ack) self.ack_checks += 1;
+            if (self.deny_all or (self.deny_ready and event == .ready) or
+                (self.deny_ack and event == .storage_ack)) return error.CompletionAdmissionUnavailable;
+        }
+        fn proposalResult(ptr: *anyopaque, _: core.Status, result: completion_admission_iface.ProposalResult) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (result.first_index != null) self.accepted_proposals += 1;
+        }
+        fn allowReady(ptr: *anyopaque, _: backpressure_iface.ReadyPressure) bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return !self.deny_backpressure;
+        }
+        fn detach(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            std.debug.assert(self.live > 0);
+            self.live -= 1;
+        }
+    };
+    for ([_]bool{ false, true }) |async_writes| {
+        var gate = Gate{ .deny_attach = true };
+        var storage = core.MemoryStorage.init(std.testing.allocator);
+        defer storage.deinit();
+        var disk = @import("memory_batcher.zig").InMemoryDiskBatcher.init(std.testing.allocator);
+        defer disk.deinit();
+        try disk.registerStore(12, &storage);
+        var runtime = MultiRaft.init(std.testing.allocator, .{}, .{
+            .completion_admission = gate.provider(),
+            .backpressure = .{ .ptr = &gate, .vtable = &.{ .allow_ready = Gate.allowReady } },
+            .disk_batcher = disk.batcher(),
+        });
+        defer runtime.deinit();
+        const cfg: group_mod.GroupConfig = .{
+            .group_id = 12,
+            .local_node_id = 1,
+            .raft_config = .{
+                .id = 1,
+                .group_id = 12,
+                .peers = &.{1},
+                .election_tick = 5,
+                .heartbeat_tick = 1,
+                .pre_vote = false,
+                .async_storage_writes = async_writes,
+            },
+            .storage = storage.storage(),
+        };
+        try std.testing.expectError(error.CompletionAdmissionUnavailable, runtime.addGroup(cfg));
+        try std.testing.expect(runtime.group(12) == null);
+        try std.testing.expectEqual(@as(usize, 0), gate.live);
+        gate.deny_attach = false;
+        try runtime.addGroup(cfg);
+        try std.testing.expectEqual(@as(usize, 1), gate.live);
+        gate.deny_all = true;
+        const before_campaign = runtime.group(12).?.status().hard;
+        try std.testing.expectError(error.CompletionAdmissionUnavailable, runtime.campaignGroup(12));
+        try std.testing.expectEqualDeep(before_campaign, runtime.group(12).?.status().hard);
+        try std.testing.expectError(error.CompletionAdmissionUnavailable, runtime.admitInboundSnapshot(12, 1, 16));
+        try std.testing.expectEqual(@as(usize, 0), runtime.pending_snapshot_bytes.load(.acquire));
+        try std.testing.expectError(error.CompletionAdmissionUnavailable, runtime.proposeConfChange(12, .{ .change_type = .add_learner_node, .node_id = 2 }));
+        gate.deny_all = false;
+        try runtime.campaignGroup(12);
+        gate.deny_ready = true;
+        const last_before = try storage.storage().lastIndex();
+        _ = try runtime.runProgressRound(16);
+        try std.testing.expect(gate.ready_checks > 0);
+        try std.testing.expectEqual(last_before, try storage.storage().lastIndex());
+        try std.testing.expectEqual(@as(usize, 0), gate.ack_checks);
+        gate.deny_ready = false;
+        gate.deny_backpressure = true;
+        _ = try runtime.runProgressRound(16);
+        try std.testing.expectEqual(last_before, try storage.storage().lastIndex());
+        try std.testing.expectEqual(@as(usize, 0), gate.ack_checks);
+        try std.testing.expect(runtime.group(12).?.hasReady());
+        gate.deny_backpressure = false;
+        if (async_writes) {
+            gate.deny_ack = true;
+            try std.testing.expectError(error.CompletionAdmissionUnavailable, runtime.processReady(12));
+            try std.testing.expectEqual(last_before, try storage.storage().lastIndex());
+            try std.testing.expect(runtime.group(12).?.hasReady());
+            gate.deny_ack = false;
+        }
+        _ = try runtime.runProgressRound(16);
+        try std.testing.expect((try storage.storage().lastIndex()) > last_before);
+        if (async_writes) try std.testing.expect(gate.ack_checks > 0);
+        var admitted: ?u64 = null;
+        try runtime.proposeWithReceipt(12, "prepared", &admitted);
+        try std.testing.expect(admitted != null);
+        try std.testing.expectEqual(@as(usize, 1), gate.accepted_proposals);
+        gate.deny_all = true;
+        var accepted: ?u64 = 999;
+        try std.testing.expectError(error.CompletionAdmissionUnavailable, runtime.proposeWithReceipt(12, "prepare", &accepted));
+        try std.testing.expect(accepted == null);
+        try std.testing.expect(runtime.removeGroup(12));
+        try std.testing.expectEqual(@as(usize, 0), gate.live);
+    }
+}
+
+test "workload admission raft completion prefix applies predecessors without acknowledging deferred prepare" {
+    const Gate = struct {
+        applied: u64 = 0,
+        invalid_prefix: bool = false,
+        fn attach(ptr: *anyopaque, _: u64, _: u64, _: core.Storage) !completion_admission_iface.Guard {
+            return .{ .ptr = ptr, .vtable = &.{ .check = check, .inbound_prefix = prefix, .proposal_result = result, .detach = detach } };
+        }
+        fn check(_: *anyopaque, status: core.Status, event: completion_admission_iface.Check, _: bool) !void {
+            if (event == .ready) for (event.ready.entries) |entry| {
+                if (std.mem.eql(u8, entry.data, "prepare") and status.applied_index < entry.index - 1)
+                    return error.CompletionAdmissionUnavailable;
+            };
+        }
+        fn prefix(ptr: *anyopaque, status: core.Status, msg: core.Message, _: bool) !usize {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.invalid_prefix) return msg.entries.len + 1;
+            if (msg.msg_type == .append_entries) for (msg.entries, 0..) |entry, i| {
+                if (std.mem.eql(u8, entry.data, "prepare") and status.applied_index < entry.index - 1) return i;
+            };
+            return msg.entries.len;
+        }
+        fn result(_: *anyopaque, _: core.Status, _: completion_admission_iface.ProposalResult) void {}
+        fn detach(_: *anyopaque) void {}
+        fn apply(ptr: *anyopaque, _: u64, _: ?core.types.Snapshot, entries: []const core.Entry, _: []const core.ReadState) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            for (entries) |entry| {
+                try std.testing.expectEqual(self.applied + 1, entry.index);
+                self.applied = entry.index;
+            }
+        }
+    };
+    for ([_]bool{ false, true }) |async_writes| {
+        var gate = Gate{};
+        var store = core.MemoryStorage.init(std.testing.allocator);
+        defer store.deinit();
+        var disk = @import("memory_batcher.zig").InMemoryDiskBatcher.init(std.testing.allocator);
+        defer disk.deinit();
+        try disk.registerStore(19, &store);
+        var host = MultiRaft.init(std.testing.allocator, .{}, .{
+            .completion_admission = .{ .ptr = &gate, .vtable = &.{ .attach = Gate.attach } },
+            .disk_batcher = disk.batcher(),
+            .state_machine = .{ .ptr = &gate, .vtable = &.{ .apply_ready = Gate.apply } },
+        });
+        defer host.deinit();
+        try host.addGroup(.{
+            .group_id = 19,
+            .local_node_id = 2,
+            .raft_config = .{ .id = 2, .group_id = 19, .peers = &.{ 1, 2 }, .election_tick = 5, .heartbeat_tick = 1, .async_storage_writes = async_writes },
+            .storage = store.storage(),
+        });
+        var predecessor = "ordinary".*;
+        var prepare = "prepare".*;
+        var entries = [_]core.Entry{
+            .{ .term = 1, .index = 1, .data = &predecessor },
+            .{ .term = 1, .index = 2, .data = &prepare },
+        };
+        const append: core.Message = .{ .msg_type = .append_entries, .from = 1, .to = 2, .term = 1, .log_index = 0, .log_term = 0, .commit_index = 2, .entries = &entries };
+        gate.invalid_prefix = true;
+        try std.testing.expectError(error.CompletionAdmissionUnavailable, host.step(19, append));
+        try std.testing.expectEqual(@as(u64, 0), host.group(19).?.status().last_index);
+        gate.invalid_prefix = false;
+        try host.step(19, append);
+        try std.testing.expectEqual(@as(u64, 1), host.group(19).?.status().last_index);
+        try std.testing.expectEqual(@as(u64, 1), host.group(19).?.status().hard.commit_index);
+        // The zero-prefix retry must still acknowledge only the predecessor.
+        var retry = append;
+        retry.log_index = 1;
+        retry.log_term = 1;
+        retry.entries = entries[1..];
+        try host.step(19, retry);
+        for (host.group(19).?.raw_node.raft.messages.items) |message| if (message.msg_type == .append_entries_response) {
+            try std.testing.expectEqual(@as(u64, 1), message.log_index);
+            try std.testing.expect(!message.reject);
+        };
+        // Prefix selection must not bypass the ordinary prev-term fence.
+        var mismatch = retry;
+        mismatch.log_term = 99;
+        try host.step(19, mismatch);
+        const messages = host.group(19).?.raw_node.raft.messages.items;
+        try std.testing.expect(messages[messages.len - 1].reject);
+        _ = try host.runProgressRound(16);
+        try std.testing.expectEqual(@as(u64, 1), gate.applied);
+        try std.testing.expectEqual(@as(u64, 1), try store.storage().lastIndex());
+        try host.step(19, retry);
+        _ = try host.runProgressRound(16);
+        try std.testing.expectEqual(@as(u64, 2), gate.applied);
+        try std.testing.expectEqual(@as(u64, 2), try store.storage().lastIndex());
+    }
 }

@@ -25,6 +25,7 @@ const doc_set = @import("../doc_set.zig");
 const doc_identity = @import("../doc_identity.zig");
 const typed_dv_coverage = @import("../typed_doc_values_coverage.zig");
 const dense_exact = @import("../dense_exact.zig");
+const workload_memory = @import("../../workload_memory.zig");
 const graph_exec = @import("graph_exec.zig");
 const result_shape = @import("result_shape.zig");
 const search_mod = @import("../../../search/search.zig");
@@ -12846,6 +12847,66 @@ fn countAnalyzedTokensInJsonValue(alloc: Allocator, value: std.json.Value) !u64 
     };
 }
 
+/// The vector API borrows a boolean cancellation callback. Keep the original
+/// native-clock deadline in that callback through every scan/rerank queue and
+/// helper join, then restore its typed outcome at the storage boundary.
+const DenseRequestLifetime = struct {
+    deadline_ns: ?u64,
+    cancellation: ?types.CancellationToken,
+
+    fn init(req: types.SearchRequest) DenseRequestLifetime {
+        return .{ .deadline_ns = req.execution_deadline_ns, .cancellation = req.cancellation };
+    }
+
+    fn check(self: *const DenseRequestLifetime) !void {
+        if (self.cancellation) |source| {
+            if (source.check_fn != null) try source.check() else if (source.isCancelled()) return error.Cancelled;
+        }
+        if (self.deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.Timeout;
+    }
+
+    fn cancelled(ptr: *const anyopaque) bool {
+        const self: *const DenseRequestLifetime = @ptrCast(@alignCast(ptr));
+        self.check() catch return true;
+        return false;
+    }
+
+    fn token(self: *const DenseRequestLifetime) ?vectorindex_mod.CancellationToken {
+        if (self.deadline_ns == null and self.cancellation == null) return null;
+        return .{ .ptr = self, .is_cancelled_fn = cancelled };
+    }
+
+    fn failure(self: *const DenseRequestLifetime, err: anyerror) anyerror {
+        if (err == error.Cancelled or err == error.Canceled) self.check() catch |cause| return cause;
+        return err;
+    }
+};
+
+test "workload admission dense request deadline cancels the real driver queue" {
+    const resource_manager = @import("../../resource_manager.zig");
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var manager = resource_manager.ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
+    defer manager.deinit(std.testing.allocator);
+    try manager.configureDenseExecution(.{ .max_runnable_tasks = 1, .max_outstanding_tasks = 2, .max_queued_tasks = 1, .max_wait_ms = 5000 });
+    var blocker = try manager.acquireDenseDriver(io, null);
+    defer blocker.release();
+    const started = platform_time.monotonicNs();
+    const lifetime = DenseRequestLifetime.init(.{ .execution_deadline_ns = started + 20 * std.time.ns_per_ms });
+    const token = lifetime.token().?;
+    if (manager.acquireDenseDriver(io, .{ .ptr = token.ptr, .is_cancelled = token.is_cancelled_fn })) |owned| {
+        var lease = owned;
+        lease.release();
+        return error.UnexpectedExecution;
+    } else |err| {
+        try std.testing.expectEqual(error.Timeout, lifetime.failure(err));
+    }
+    try std.testing.expect(platform_time.monotonicNs() - started < 2 * std.time.ns_per_s);
+    try std.testing.expectEqual(@as(u64, 0), manager.denseExecutionStats().queued);
+    try std.testing.expectEqual(@as(u64, 1), manager.denseExecutionStats().runnable);
+}
+
 pub fn searchDense(
     alloc: Allocator,
     req: types.SearchRequest,
@@ -12853,7 +12914,8 @@ pub fn searchDense(
     executor: DenseSearchExecutor,
 ) !types.SearchResult {
     var profile = DenseSearchProfile{};
-    return try searchDenseInternal(alloc, req, dense, executor, &profile, false);
+    return searchDenseInternal(alloc, req, dense, executor, &profile, false) catch |err|
+        return DenseRequestLifetime.init(req).failure(err);
 }
 
 pub fn searchDenseProfiled(
@@ -12864,7 +12926,8 @@ pub fn searchDenseProfiled(
 ) !ProfiledDenseSearchResult {
     var profile = DenseSearchProfile{};
     return .{
-        .result = try searchDenseInternal(alloc, req, dense, executor, &profile, true),
+        .result = searchDenseInternal(alloc, req, dense, executor, &profile, true) catch |err|
+            return DenseRequestLifetime.init(req).failure(err),
         .profile = profile,
     };
 }
@@ -12878,6 +12941,8 @@ fn searchDenseInternal(
     include_hbc_profile: bool,
 ) !types.SearchResult {
     resetLastSortRejectionDiagnostic();
+    const lifetime = DenseRequestLifetime.init(req);
+    try lifetime.check();
     try rejectApproximateSortPageOptions(req);
     const total_start = platform_time.monotonicNs();
 
@@ -13014,10 +13079,8 @@ fn searchDenseInternal(
             .distance_under = req.distance_under,
             .filter_ids = effective_filter_ids,
             .exclude_ids = effective_exclude_ids,
-            .cancellation = if (req.cancellation) |token|
-                vectorindex_mod.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
-            else
-                null,
+            .cancellation = lifetime.token(),
+            .read_execution = req.read_execution,
         };
 
         const hbc_search_start = platform_time.monotonicNs();
@@ -14125,8 +14188,18 @@ fn exactScoreNativeDenseFilter(
     req: vectorindex_mod.SearchRequest,
 ) !dense_exact.SearchOutcome {
     try checkVectorSearchCancelled(req);
+    var driver = try entry.index.acquireDenseExecutionDriver(req);
+    defer driver.release();
+    var memory = try workload_memory.WorkingMemory.forDenseDriver(entry.index.resource_manager, &driver, alloc);
+    defer if (memory) |*owner| owner.deinit();
+    return exactScoreNativeDenseFilterAllocated(alloc, entry, req, if (memory) |*owner| owner.allocator() else alloc) catch |err| {
+        return if (memory) |*owner| owner.allocationFailure(err) else err;
+    };
+}
+
+fn exactScoreNativeDenseFilterAllocated(alloc: Allocator, entry: *index_manager_mod.IndexManager.DenseIndex, req: vectorindex_mod.SearchRequest, work_alloc: Allocator) !dense_exact.SearchOutcome {
     const prepare_start_ns = platform_time.monotonicNs();
-    var candidates = try dense_exact.CandidateDifference.init(alloc, req.filter_ids, req.exclude_ids);
+    var candidates = try dense_exact.CandidateDifference.init(work_alloc, req.filter_ids, req.exclude_ids);
     defer candidates.deinit();
     const unique_candidate_ids = candidates.values;
     var exact_profile: dense_exact.SearchOutcome.Profile = .{
@@ -14147,17 +14220,17 @@ fn exactScoreNativeDenseFilter(
 
     var txn = try entry.index.beginReadTxn();
     defer txn.abort();
-    var vector_cursor = entry.index.openNamespacedCursor(alloc, &txn, .vecs) catch |err| switch (err) {
+    var vector_cursor = entry.index.openNamespacedCursor(work_alloc, &txn, .vecs) catch |err| switch (err) {
         error.Unsupported => null,
         else => return err,
     };
     defer if (vector_cursor) |*cursor| cursor.close();
 
-    const candidate_metadata = try alloc.alloc(
+    const candidate_metadata = try work_alloc.alloc(
         ?[]const u8,
         if (req.filter_prefix.len > 0) unique_candidate_ids.len else 0,
     );
-    defer alloc.free(candidate_metadata);
+    defer work_alloc.free(candidate_metadata);
     if (candidate_metadata.len > 0) {
         const metadata_start_ns = platform_time.monotonicNs();
         @memset(candidate_metadata, null);
@@ -14176,8 +14249,8 @@ fn exactScoreNativeDenseFilter(
         exact_profile.metadata_lookup_ns = platform_time.monotonicNs() - metadata_start_ns;
     }
 
-    const vector_scratch = try alloc.alloc(f32, entry.dims);
-    defer alloc.free(vector_scratch);
+    const vector_scratch = try work_alloc.alloc(f32, entry.dims);
+    defer work_alloc.free(vector_scratch);
     const query_measure = vector_mod.norm(req.query);
     var vectors_scored: u64 = 0;
     var matching_vectors: u64 = 0;

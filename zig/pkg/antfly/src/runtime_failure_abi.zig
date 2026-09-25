@@ -15,7 +15,7 @@
 //! Canonical failure contract shared by every internal compiled runtime ABI.
 //! Keep this module free of storage, inference, and control-runtime imports.
 
-pub const abi_version: u32 = 54;
+pub const abi_version: u32 = 61;
 
 /// Stable semantic identities used for control flow across compiled runtime
 /// boundaries. Values are append-only. Distinct expected domain failures must
@@ -658,6 +658,51 @@ pub const Status = enum(u32) {
     reserved_foreign_key_support_index = 699,
     table_lifecycle_conflict = 700,
     relational_index_key_too_large = 701,
+
+    admission_bytes_exhausted = 702,
+    admission_closed = 703,
+    admission_full = 704,
+    admission_queue_full = 705,
+    admission_request_too_large = 706,
+    admission_wait_timeout = 707,
+    completion_admission_policy_changed = 708,
+    completion_admission_unavailable = 709,
+    completion_drain_shape_changed = 710,
+    completion_fence_identity_mismatch = 711,
+    completion_file_capacity_exceeded = 712,
+    completion_foreground_capacity_exceeded = 713,
+    completion_not_prepared = 714,
+    completion_plan_capacity_exceeded = 715,
+    completion_profile_changed = 716,
+    completion_recovery_capacity_required = 717,
+    completion_reservation_busy = 718,
+    completion_resource_manager_required = 719,
+    completion_slot_checksum_mismatch = 720,
+    completion_slot_too_large = 721,
+    completion_transition_capacity_exceeded = 722,
+    completion_transition_in_progress = 723,
+    completion_writer_closed = 724,
+    completion_writer_live = 725,
+    invalid_completion_catalog = 726,
+    invalid_completion_slot = 727,
+    invalid_participant = 728,
+    invalid_txn_record = 729,
+    local_completion_authority_required = 730,
+    missing_completion_admission_guard = 731,
+    native_backup_repair_state_not_quiescent = 732,
+    pre_decision_not_proposed = 733,
+    prepared_completion_active = 734,
+    recovery_required = 735,
+    unsupported_completion_backend = 736,
+    unsupported_completion_operation = 737,
+    unsupported_completion_path = 738,
+    unsupported_completion_profile = 739,
+    unsupported_completion_provider = 740,
+    unsupported_completion_slot_version = 741,
+    unsupported_completion_template = 742,
+    unsupported_completion_template_nesting = 743,
+    unsupported_completion_template_scan = 744,
+    unsupported_completion_template_write = 745,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

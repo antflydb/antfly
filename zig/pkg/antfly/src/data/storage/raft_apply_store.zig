@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const completion_entry_protocol = @import("../../common/completion_entry_protocol.zig");
 const builtin = @import("builtin");
 const raft_engine = @import("raft_engine");
 const platform = @import("antfly_platform");
@@ -1689,6 +1690,14 @@ pub const RaftApplyStore = struct {
             decoded_entries[decoded_entries.len - 1].index != commit_index)
         {
             return error.ConflictingDataApplyBatch;
+        }
+
+        // Canonical completion is applied only through retained native
+        // ownership. A caller bypassing the DATA wrapper must fail, never
+        // persist it as an ignored JSON projection or duplicate its bytes.
+        for (decoded_entries) |entry| {
+            if (entry.entry_type == .normal and completion_entry_protocol.looksLike(entry.data))
+                return error.CompletionAdmissionUnavailable;
         }
 
         const existing_batch = try self.ensureLoaded(shard, group_id);
@@ -5738,4 +5747,25 @@ test "data apply store replay is idempotent when applied watermark lags WAL stat
         try std.testing.expectEqual(@as(u64, 1), normal_entries[0].index);
         try std.testing.expectEqual(@as(u64, 2), normal_entries[1].index);
     }
+}
+
+test "workload admission DATA projection rejects canonical completion before shadow publication" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/canonical-projection", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+    const encoded = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{.{
+        .term = 1,
+        .index = 1,
+        .data = @constCast("AFCENTRY"),
+    }});
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expectError(error.CompletionAdmissionUnavailable, store.snapshotBuilder().applyBatch(.{
+        .group_id = 1,
+        .commit_index = 1,
+        .entries_bytes = encoded,
+    }));
+    try std.testing.expectEqual(@as(?AppliedDataBatch, null), try store.latestBatch(1));
 }

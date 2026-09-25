@@ -626,8 +626,73 @@ pub const TableWriteSource = struct {
             index_json: ?[]const u8,
             stamp: metadata_api.CatalogMutationStamp,
         ) anyerror!?void = null,
+        /// Preserves the ingress deadline through all pre-decision work.
+        commit_transaction_with_context: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            tables: []const distributed_txn.TableCommitRequest,
+            sync_level: db_mod.types.SyncLevel,
+            context: distributed_txn.PreDecisionContext,
+        ) anyerror!?distributed_txn.CommitOutcome = null,
+        /// Preserves the ingress deadline through all pre-decision work.
+        commit_batch_with_context: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            tables: []const distributed_txn.TableCommitRequest,
+            sync_level: db_mod.types.SyncLevel,
+            context: distributed_txn.PreDecisionContext,
+        ) anyerror!?distributed_txn.CommitOutcome = null,
+        /// Preserves the ingress deadline through all pre-decision work.
+        commit_transaction_with_id_with_context: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            txn_id: db_mod.types.TxnId,
+            begin_timestamp: u64,
+            tables: []const distributed_txn.TableCommitRequest,
+            sync_level: db_mod.types.SyncLevel,
+            context: distributed_txn.PreDecisionContext,
+        ) anyerror!?distributed_txn.CommitOutcome = null,
+        /// First decision only. PreDecisionNotProposed certifies that no
+        /// proposal/local mutation was submitted; all other errors may be ambiguous.
+        txn_decide_group_local_with_pre_decision_context: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, db_mod.types.TxnId, db_mod.types.TxnStatus, u64, u64, db_mod.types.SyncLevel, distributed_txn.PreDecisionContext) anyerror!?void = null,
+        /// Independent recovery deadline; never borrowed from user admission.
+        txn_acknowledge_group_local_until: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, db_mod.types.TxnId, []const u8, u64) anyerror!?void = null,
+        /// Recovery owns a native monotonic deadline independently of caller admission.
+        txn_resolve_group_local_until: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, db_mod.types.TxnId, db_mod.types.TxnStatus, u64, u64, db_mod.types.SyncLevel, u64, db_mod.types.CancellationToken) anyerror!?void = null,
+        /// Raw local read after the caller owns any required Raft barrier.
+        txn_status_group_local_until: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, db_mod.types.TxnId, u64) anyerror!?db_mod.types.TxnStatus = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
+
+    pub fn txnStatusGroupLocalUntil(self: TableWriteSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, deadline_ns: u64) !?db_mod.types.TxnStatus {
+        if (@import("antfly_platform").time.monotonicNs() >= deadline_ns) return error.Timeout;
+        const callback = self.vtable.txn_status_group_local_until orelse return error.DeadlineAwareTxnStatusUnsupported;
+        return try BoundaryAbi.call("txn_status_group_local_until", self.boundary_dispatch, callback, .{ self.ptr, alloc, group_id, table_name, txn_id, deadline_ns });
+    }
+
+    pub fn txnResolveGroupLocalUntil(self: TableWriteSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, status: db_mod.types.TxnStatus, commit_version: u64, topology_epoch: u64, sync_level: db_mod.types.SyncLevel, deadline_ns: u64, cancellation: db_mod.types.CancellationToken) !?void {
+        if (@import("antfly_platform").time.monotonicNs() >= deadline_ns) return error.Timeout;
+        try cancellation.check();
+        const callback = self.vtable.txn_resolve_group_local_until orelse return error.CommitPropagationIncomplete;
+        return try BoundaryAbi.call("txn_resolve_group_local_until", self.boundary_dispatch, callback, .{ self.ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, deadline_ns, cancellation });
+    }
+
+    pub fn txnAcknowledgeGroupLocalUntil(self: TableWriteSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, participant: []const u8, deadline_ns: u64) !?void {
+        if (@import("antfly_platform").time.monotonicNs() >= deadline_ns) return error.Timeout;
+        const callback = self.vtable.txn_acknowledge_group_local_until orelse return error.CommitPropagationIncomplete;
+        return try BoundaryAbi.call("txn_acknowledge_group_local_until", self.boundary_dispatch, callback, .{ self.ptr, alloc, group_id, table_name, txn_id, participant, deadline_ns });
+    }
+
+    pub fn txnDecideGroupLocalWithPreDecisionContext(self: TableWriteSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, status: db_mod.types.TxnStatus, commit_version: u64, topology_epoch: u64, sync_level: db_mod.types.SyncLevel, context: distributed_txn.PreDecisionContext) !?void {
+        if (status != .committed) return error.PreDecisionNotProposed;
+        distributed_txn.ensurePreDecisionContextActive(context) catch return error.PreDecisionNotProposed;
+        const callback = self.vtable.txn_decide_group_local_with_pre_decision_context orelse return error.PreDecisionNotProposed;
+        return BoundaryAbi.call("txn_decide_group_local_with_pre_decision_context", self.boundary_dispatch, callback, .{ self.ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, context }) catch |err| switch (err) {
+            // This capability reserves this identity for preaccept checks only.
+            error.PreDecisionDeadlineExceeded => error.PreDecisionNotProposed,
+            else => err,
+        };
+    }
 
     pub fn batch(
         self: TableWriteSource,
@@ -952,6 +1017,50 @@ pub const TableWriteSource = struct {
         const fn_ptr = self.vtable.commit_transaction_with_id_with_cancellation orelse
             return try self.commitTransactionWithId(alloc, txn_id, begin_timestamp, tables, sync_level);
         return try BoundaryAbi.call("commit_transaction_with_id_with_cancellation", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, txn_id, begin_timestamp, tables, sync_level, cancellation });
+    }
+
+    pub fn commitTransactionWithContext(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        context: distributed_txn.PreDecisionContext,
+    ) !?distributed_txn.CommitOutcome {
+        // A null deadline preserves the legacy in-process/recovery contract.
+        if (context.deadline_ns == null) return self.commitTransactionWithCancellation(alloc, tables, sync_level, context.cancellation);
+        const callback = self.vtable.commit_transaction_with_context orelse return error.PreDecisionNotProposed;
+        try distributed_txn.ensurePreDecisionContextActive(context);
+        return try BoundaryAbi.call("commit_transaction_with_context", self.boundary_dispatch, callback, .{ self.ptr, alloc, tables, sync_level, context });
+    }
+
+    pub fn commitBatchWithContext(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        context: distributed_txn.PreDecisionContext,
+    ) !?distributed_txn.CommitOutcome {
+        // A null deadline preserves the legacy in-process/recovery contract.
+        if (context.deadline_ns == null) return self.commitBatchWithCancellation(alloc, tables, sync_level, context.cancellation);
+        const callback = self.vtable.commit_batch_with_context orelse return error.PreDecisionNotProposed;
+        try distributed_txn.ensurePreDecisionContextActive(context);
+        return try BoundaryAbi.call("commit_batch_with_context", self.boundary_dispatch, callback, .{ self.ptr, alloc, tables, sync_level, context });
+    }
+
+    pub fn commitTransactionWithIdWithContext(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        begin_timestamp: u64,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        context: distributed_txn.PreDecisionContext,
+    ) !?distributed_txn.CommitOutcome {
+        // A null deadline preserves the legacy in-process/recovery contract.
+        if (context.deadline_ns == null) return self.commitTransactionWithIdAndCancellation(alloc, txn_id, begin_timestamp, tables, sync_level, context.cancellation);
+        const callback = self.vtable.commit_transaction_with_id_with_context orelse return error.PreDecisionNotProposed;
+        try distributed_txn.ensurePreDecisionContextActive(context);
+        return try BoundaryAbi.call("commit_transaction_with_id_with_context", self.boundary_dispatch, callback, .{ self.ptr, alloc, txn_id, begin_timestamp, tables, sync_level, context });
     }
 
     pub fn acknowledgeTransactionCommit(
@@ -1533,6 +1642,167 @@ fn consumerTests() type {
     const test_owner_root = @import("antfly_source_root");
     if (@hasDecl(test_owner_root, "implementation_tests_only") and test_owner_root.implementation_tests_only) return struct {};
     const Suite = struct {
+        test "transaction recovery bounded resolve boundary preserves deadline token and accepted uncertainty" {
+            const Fake = struct {
+                calls: usize = 0,
+                expected: u64,
+                token: db_mod.types.CancellationToken,
+                fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+                    return null;
+                }
+                fn resolve(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: db_mod.types.TxnStatus, _: u64, _: u64, _: db_mod.types.SyncLevel, deadline: u64, cancellation: db_mod.types.CancellationToken) !?void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqual(self.expected, deadline);
+                    try std.testing.expectEqual(self.token.ptr, cancellation.ptr);
+                    self.calls += 1;
+                    return error.RaftBatchWriteOutcomeUnknown;
+                }
+                fn status(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, deadline: u64) !?db_mod.types.TxnStatus {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqual(self.expected, deadline);
+                    self.calls += 1;
+                    return .committed;
+                }
+                fn dispatch(contract: *const runtime_native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) runtime_error_abi.Status {
+                    return TableWriteSource.BoundaryAbi.local_dispatch(contract, callback, args, output);
+                }
+            };
+            var stopped = std.atomic.Value(bool).init(false);
+            const token = db_mod.types.CancellationToken.fromAtomic(&stopped);
+            const deadline = @import("antfly_platform").time.monotonicNs() + std.time.ns_per_s;
+            var fake: Fake = .{ .expected = deadline, .token = token };
+            const source: TableWriteSource = .{ .ptr = &fake, .boundary_dispatch = Fake.dispatch, .vtable = &.{ .batch = Fake.batch, .txn_resolve_group_local_until = Fake.resolve, .txn_status_group_local_until = Fake.status } };
+            const legacy: TableWriteSource = .{ .ptr = &fake, .vtable = &.{ .batch = Fake.batch } };
+            try std.testing.expectError(error.Timeout, source.txnResolveGroupLocalUntil(std.testing.allocator, 7, "docs", [_]u8{1} ** 16, .committed, 2, 0, .write, 0, token));
+            try std.testing.expectError(error.CommitPropagationIncomplete, legacy.txnResolveGroupLocalUntil(std.testing.allocator, 7, "docs", [_]u8{1} ** 16, .committed, 2, 0, .write, deadline, token));
+            stopped.store(true, .release);
+            try std.testing.expectError(error.Canceled, source.txnResolveGroupLocalUntil(std.testing.allocator, 7, "docs", [_]u8{1} ** 16, .committed, 2, 0, .write, deadline, token));
+            try std.testing.expectEqual(@as(usize, 0), fake.calls);
+            stopped.store(false, .release);
+            try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, source.txnResolveGroupLocalUntil(std.testing.allocator, 7, "docs", [_]u8{1} ** 16, .committed, 2, 0, .write, deadline, token));
+            try std.testing.expectEqual(@as(usize, 1), fake.calls);
+            try std.testing.expectError(error.Timeout, source.txnStatusGroupLocalUntil(std.testing.allocator, 7, "docs", [_]u8{1} ** 16, 0));
+            try std.testing.expectError(error.DeadlineAwareTxnStatusUnsupported, legacy.txnStatusGroupLocalUntil(std.testing.allocator, 7, "docs", [_]u8{1} ** 16, deadline));
+            try std.testing.expectEqual(db_mod.types.TxnStatus.committed, (try source.txnStatusGroupLocalUntil(std.testing.allocator, 7, "docs", [_]u8{1} ** 16, deadline)).?);
+            try std.testing.expectEqual(@as(usize, 2), fake.calls);
+        }
+
+        test "transaction recovery acknowledgement boundary rejects expiry and preserves accepted errors" {
+            const Fake = struct {
+                calls: usize = 0,
+                fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+                    return null;
+                }
+                fn ack(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: []const u8, _: u64) !?void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.calls += 1;
+                    return error.RaftBatchWriteOutcomeUnknown;
+                }
+                fn dispatch(contract: *const runtime_native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) runtime_error_abi.Status {
+                    return TableWriteSource.BoundaryAbi.local_dispatch(contract, callback, args, output);
+                }
+            };
+            var fake: Fake = .{};
+            const source: TableWriteSource = .{ .ptr = &fake, .boundary_dispatch = Fake.dispatch, .vtable = &.{ .batch = Fake.batch, .txn_acknowledge_group_local_until = Fake.ack } };
+            const legacy: TableWriteSource = .{ .ptr = &fake, .vtable = &.{ .batch = Fake.batch } };
+            const deadline = @import("antfly_platform").time.monotonicNs() + std.time.ns_per_s;
+            try std.testing.expectError(error.Timeout, source.txnAcknowledgeGroupLocalUntil(std.testing.allocator, 7, "docs", [_]u8{1} ** 16, "peer", 0));
+            try std.testing.expectEqual(@as(usize, 0), fake.calls);
+            try std.testing.expectError(error.CommitPropagationIncomplete, legacy.txnAcknowledgeGroupLocalUntil(std.testing.allocator, 7, "docs", [_]u8{1} ** 16, "peer", deadline));
+            try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, source.txnAcknowledgeGroupLocalUntil(std.testing.allocator, 7, "docs", [_]u8{1} ** 16, "peer", deadline));
+            try std.testing.expectEqual(@as(usize, 1), fake.calls);
+        }
+
+        test "first decision boundary preserves rejection identity and never calls legacy resolve" {
+            const Fake = struct {
+                calls: usize = 0,
+                outcome: anyerror = error.PreDecisionNotProposed,
+                fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+                    return null;
+                }
+                fn legacy(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: db_mod.types.TxnStatus, _: u64, _: u64, _: db_mod.types.SyncLevel) !?void {
+                    return error.LegacyMustNotRun;
+                }
+                fn decide(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: db_mod.types.TxnStatus, _: u64, _: u64, _: db_mod.types.SyncLevel, _: distributed_txn.PreDecisionContext) !?void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.calls += 1;
+                    return self.outcome;
+                }
+                fn dispatch(contract: *const runtime_native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) runtime_error_abi.Status {
+                    return TableWriteSource.BoundaryAbi.local_dispatch(contract, callback, args, output);
+                }
+            };
+            var fake: Fake = .{};
+            const source: TableWriteSource = .{ .ptr = &fake, .boundary_dispatch = Fake.dispatch, .vtable = &.{ .batch = Fake.batch, .txn_decide_group_local_with_pre_decision_context = Fake.decide } };
+            const legacy: TableWriteSource = .{ .ptr = &fake, .vtable = &.{ .batch = Fake.batch, .txn_resolve_group_local = Fake.legacy } };
+            try std.testing.expectError(error.PreDecisionNotProposed, legacy.txnDecideGroupLocalWithPreDecisionContext(std.testing.allocator, 7, "docs", [_]u8{1} ** 16, .committed, 42, 0, .write, .{}));
+            try std.testing.expectEqual(@as(usize, 0), fake.calls);
+            inline for (.{ error.PreDecisionNotProposed, error.Canceled, error.RaftBatchWriteOutcomeUnknown, error.CommitVisibilityNotSatisfied }) |outcome| {
+                fake.outcome = outcome;
+                try std.testing.expectError(outcome, source.txnDecideGroupLocalWithPreDecisionContext(std.testing.allocator, 7, "docs", [_]u8{1} ** 16, .committed, 42, 0, .write, .{}));
+            }
+            try std.testing.expectEqual(@as(usize, 4), fake.calls);
+        }
+
+        test "transaction commit boundary preserves ingress context and never downgrades deadlines" {
+            const Fake = struct {
+                expected: distributed_txn.PreDecisionContext,
+                calls: usize = 0,
+                fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+                    return null;
+                }
+                fn commit(ptr: *anyopaque, _: std.mem.Allocator, _: []const distributed_txn.TableCommitRequest, _: db_mod.types.SyncLevel, context: distributed_txn.PreDecisionContext) !?distributed_txn.CommitOutcome {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqual(self.expected.deadline_ns, context.deadline_ns);
+                    try std.testing.expect(context.deadline_io.?.userdata == self.expected.deadline_io.?.userdata);
+                    try std.testing.expect(context.cancellation.ptr == self.expected.cancellation.ptr);
+                    self.calls += 1;
+                    return .{ .committed = .{ .participant_count = 2, .propagation_pending = true } };
+                }
+                fn commitId(ptr: *anyopaque, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, timestamp: u64, tables: []const distributed_txn.TableCommitRequest, sync_level: db_mod.types.SyncLevel, context: distributed_txn.PreDecisionContext) !?distributed_txn.CommitOutcome {
+                    try std.testing.expectEqual(@as(u8, 7), txn_id[0]);
+                    try std.testing.expectEqual(@as(u64, 42), timestamp);
+                    return commit(ptr, alloc, tables, sync_level, context);
+                }
+                fn legacy(ptr: *anyopaque, _: std.mem.Allocator, _: []const distributed_txn.TableCommitRequest, _: db_mod.types.SyncLevel, _: db_mod.types.CancellationToken) !?distributed_txn.CommitOutcome {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.calls += 1;
+                    return .{ .committed = .{ .participant_count = 1 } };
+                }
+                fn dispatch(contract: *const runtime_native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) runtime_error_abi.Status {
+                    return TableWriteSource.BoundaryAbi.local_dispatch(contract, callback, args, output);
+                }
+            };
+            var clock = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = std.time.ns_per_s });
+            defer clock.deinit();
+            var cancelled = std.atomic.Value(bool).init(false);
+            const context: distributed_txn.PreDecisionContext = .{
+                .deadline_ns = 2 * std.time.ns_per_s,
+                .deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&clock.io()),
+                .cancellation = db_mod.types.CancellationToken.fromAtomic(&cancelled),
+            };
+            var fake: Fake = .{ .expected = context };
+            const source: TableWriteSource = .{ .ptr = &fake, .boundary_dispatch = Fake.dispatch, .vtable = &.{
+                .batch = Fake.batch,
+                .commit_transaction_with_context = Fake.commit,
+                .commit_batch_with_context = Fake.commit,
+                .commit_transaction_with_id_with_context = Fake.commitId,
+            } };
+            const committed = (try source.commitTransactionWithContext(std.testing.allocator, &.{}, .write, context)).?;
+            try std.testing.expect(committed.committed.propagation_pending);
+            _ = try source.commitBatchWithContext(std.testing.allocator, &.{}, .write, context);
+            _ = try source.commitTransactionWithIdWithContext(std.testing.allocator, [_]u8{7} ** 16, 42, &.{}, .write, context);
+            try std.testing.expectEqual(@as(usize, 3), fake.calls);
+            const legacy_source: TableWriteSource = .{ .ptr = &fake, .vtable = &.{ .batch = Fake.batch, .commit_batch_with_cancellation = Fake.legacy } };
+            try std.testing.expectError(error.PreDecisionNotProposed, legacy_source.commitBatchWithContext(std.testing.allocator, &.{}, .write, context));
+            try std.testing.expectEqual(@as(usize, 3), fake.calls);
+            _ = try legacy_source.commitBatchWithContext(std.testing.allocator, &.{}, .write, .{});
+            try std.testing.expectEqual(@as(usize, 4), fake.calls);
+            clock.monotonic_ns = 2 * std.time.ns_per_s;
+            try std.testing.expectError(error.PreDecisionDeadlineExceeded, source.commitBatchWithContext(std.testing.allocator, &.{}, .write, context));
+            try std.testing.expectEqual(@as(usize, 4), fake.calls);
+        }
+
         test "compiled table write boundary transports cancellation and committed failure identity" {
             const Fake = struct {
                 calls: usize = 0,

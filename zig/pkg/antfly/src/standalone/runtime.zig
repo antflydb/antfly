@@ -670,28 +670,14 @@ const StandaloneHealthSource = struct {
         try antfly.common.health_server.appendPromMetric(writer, "antfly_runtime_supervisor_cancelled", "gauge", "Whether process-level runtime cancellation has been requested", @intFromBool(self.supervisor.token().isCancelled()));
 
         const handler = antfly.public_api.kernel_bridge.handlerStats(self.handler);
-        try antfly.common.request_admission.appendPrometheusMetrics(writer, .query, .{
-            .capacity = handler.query_capacity,
-            .in_flight = handler.query_in_flight,
-            .peak_in_flight = handler.query_peak_in_flight,
-            .rejected_total = handler.query_rejected_total,
-        });
-        try antfly.common.request_admission.appendPrometheusMetrics(writer, .write, .{
-            .capacity = handler.write_capacity,
-            .in_flight = handler.write_in_flight,
-            .peak_in_flight = handler.write_peak_in_flight,
-            .rejected_total = handler.write_rejected_total,
-        });
-        try antfly.common.request_admission.appendPrometheusMetrics(writer, .inference, .{
-            .capacity = handler.inference_capacity,
-            .in_flight = handler.inference_in_flight,
-            .peak_in_flight = handler.inference_peak_in_flight,
-            .rejected_total = handler.inference_rejected_total,
-        });
-        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_capacity", "gauge", "Maximum concurrent streaming H2 query bodies", handler.query_body_capacity);
-        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_bodies_in_flight", "gauge", "Streaming H2 query bodies currently admitted", handler.query_body_in_flight);
-        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_peak_in_flight", "gauge", "Peak concurrent streaming H2 query bodies since process start", handler.query_body_peak_in_flight);
-        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_rejected_total", "counter", "Streaming H2 query bodies rejected by admission control", handler.query_body_rejected_total);
+        try antfly.common.request_admission.appendPrometheusMetrics(writer, .query, handler.query);
+        try antfly.common.request_admission.appendPrometheusMetrics(writer, .write, handler.write);
+        try antfly.common.request_admission.appendPrometheusMetrics(writer, .inference, handler.inference);
+        try handler.recovery.appendPrometheusMetrics(writer);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_capacity", "gauge", "Maximum concurrent streaming H2 query bodies", handler.query_body.capacity);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_bodies_in_flight", "gauge", "Streaming H2 query bodies currently admitted", handler.query_body.in_flight);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_peak_in_flight", "gauge", "Peak concurrent streaming H2 query bodies since process start", handler.query_body.peak_in_flight);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_rejected_total", "counter", "Streaming H2 query bodies rejected by admission control", handler.query_body.rejected_total);
         if (self.unified_lifecycle.runtimeStats()) |http| {
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_connection_limit", "gauge", "Maximum concurrent public HTTP connections", http.max_connections);
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_active_connections", "gauge", "Currently active public HTTP connections", http.active_connections);
@@ -699,6 +685,8 @@ const StandaloneHealthSource = struct {
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_accept_errors_total", "counter", "Public HTTP listener accept failures", http.accept_errors_total);
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_connection_dispatch_rejections_total", "counter", "Accepted public HTTP connections closed because concurrent execution was unavailable", http.connection_dispatch_rejections_total);
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_request_dispatch_rejections_total", "counter", "HTTP requests rejected before application execution because listener or runtime request capacity was unavailable", http.request_dispatch_rejections_total);
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_request_permit_rejections_total", "counter", "HTTP requests rejected because their listener request-task partition was full", http.request_permit_rejections_total);
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_request_executor_rejections_total", "counter", "HTTP requests rejected after acquiring a request permit because executor dispatch failed", http.request_executor_rejections_total);
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_h2_stream_dispatch_rejections_total", "counter", "HTTP/2 streams reset before application execution because bounded handler execution was unavailable", http.h2_stream_dispatch_rejections_total);
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_request_cancellations_total", "counter", "Public HTTP requests terminated by application cancellation", http.request_cancellations_total);
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_body_buffer_capacity_bytes", "gauge", "Aggregate HTTP request-body buffer capacity", http.body_buffer_capacity_bytes);
@@ -3722,6 +3710,8 @@ pub fn runFromIterator(
     // primary-local sidecar that is not part of the continuous HA WAL.
     try validateHARole(cli);
     const ha_role_requested = haPrimaryRequested(cli) or haStandbyRequested(cli);
+    const durable_completion_authority = @import("../common/durable_completion_policy.zig").standaloneAuthority(storage_engine == .local, ha_role_requested, lite_fsync);
+    if ((if (loaded_config) |*cfg| cfg.admission.durable_transaction_completion.enabled else false) and durable_completion_authority == .none) return error.UnsupportedCompletionBackend;
     const ha_mutation_guard_enabled = haContinuousMutationGuardEnabled(cli);
 
     const resolved = try resolvePaths(alloc, cli, if (loaded_config) |*cfg| cfg else null);
@@ -3738,11 +3728,35 @@ pub fn runFromIterator(
     var storage_kernel_context = kernel_owner_client.Context{};
     defer if (control_only_storage_sources) storage_kernel_context.deinit();
     if (comptime control_only_storage_sources) {
+        const dense = if (loaded_config) |*cfg| cfg.admission.dense_execution else (antfly.common.config.Config.AdmissionConfig{}).dense_execution;
+        const reads = if (loaded_config) |*cfg| cfg.admission.read_execution else (antfly.common.config.Config.AdmissionConfig{}).read_execution;
         try storage_kernel_context.ensureWith(.{
+            .transaction_completion_bytes = if (loaded_config) |*cfg| cfg.admission.transaction_completion_bytes else 0,
+            .durable_completion_enabled = @intFromBool(if (loaded_config) |*cfg| cfg.admission.durable_transaction_completion.enabled else false),
+            .durable_completion_authority = @intFromEnum(durable_completion_authority),
             .storage_kind = if (lite_path != null) .lite else .directory,
             .no_sync = @intFromBool(!lite_fsync),
             .storage_path = .fromSlice(lite_path orelse ""),
             .auth_storage_path = .fromSlice(if (auth_enabled) resolved.auth_store_root_dir else ""),
+            .dense_max_runnable_tasks = dense.max_runnable_tasks,
+            .dense_max_outstanding_tasks = dense.max_outstanding_tasks,
+            .dense_max_queued_tasks = dense.max_queued_tasks,
+            .dense_max_wait_ms = dense.max_wait_ms,
+            .dense_max_working_bytes = dense.max_working_bytes,
+            .dense_max_suspended_io = dense.max_suspended_io,
+            .read_max_runnable_tasks = reads.max_runnable_tasks,
+            .read_max_outstanding_tasks = reads.max_outstanding_tasks,
+            .read_max_queued_tasks = reads.max_queued_tasks,
+            .read_max_wait_ms = reads.max_wait_ms,
+            .read_max_working_bytes = reads.max_working_bytes,
+            .read_max_suspended_io = reads.max_suspended_io,
+            .read_max_scan_state_bytes = reads.max_scan_state_bytes,
+            .read_max_scan_snapshot_ms = reads.max_scan_snapshot_ms,
+            .read_protected_runnable_tasks = reads.protected.max_runnable_tasks,
+            .read_protected_outstanding_tasks = reads.protected.max_outstanding_tasks,
+            .read_protected_working_bytes = reads.protected.max_working_bytes,
+            .read_transition_tasks = reads.protected.max_transition_tasks,
+            .read_transition_bytes = reads.protected.max_transition_bytes,
         });
         const security_json = try antfly.common.config.remoteContentSecurityJsonAlloc(alloc, remote_content);
         defer alloc.free(security_json);
@@ -4340,6 +4354,17 @@ pub fn runFromIterator(
             .experimental = cli.experimental,
             .mcp_max_tool_result_bytes = if (loaded_config) |*cfg| cfg.mcp.max_tool_result_bytes else antfly.common.config.default_mcp_max_tool_result_bytes,
             .query_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.query.max_concurrent_requests else antfly.common.config.default_query_max_concurrent_requests,
+            .query_admission_waiting = if (loaded_config) |*cfg| cfg.admission.query.waiting else .{},
+            .session_max_retained_bytes = if (loaded_config) |*cfg| cfg.admission.session_max_retained_bytes else 64 * 1024 * 1024,
+            .ingress_admission = if (loaded_config) |*cfg| cfg.admission.ingress else .{},
+            .dense_execution = if (loaded_config) |*cfg| cfg.admission.dense_execution else .{},
+            .read_execution = if (loaded_config) |*cfg| cfg.admission.read_execution else .{},
+            .remote_attempt_worker = if (loaded_config) |*cfg| cfg.admission.remote_attempt_worker else .{},
+            .remote_attempt_coordinator = if (loaded_config) |*cfg| cfg.admission.remote_attempt_coordinator else .{},
+            .transaction_completion_bytes = if (loaded_config) |*cfg| cfg.admission.transaction_completion_bytes else 0,
+            .durable_transaction_completion = if (loaded_config) |*cfg| cfg.admission.durable_transaction_completion else .{},
+            .durable_completion_authority = durable_completion_authority,
+            .write_admission_waiting = if (loaded_config) |*cfg| cfg.admission.write.waiting else .{},
             .graph_execution_limits = if (loaded_config) |*cfg| cfg.graph_execution else .{},
             .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
             .inference_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.inference.max_concurrent_requests else antfly.common.config.default_inference_max_concurrent_requests,
@@ -4371,6 +4396,7 @@ pub fn runFromIterator(
             .node_config = if (loaded_config) |*cfg| cfg else null,
             .user_manager = if (user_manager) |*manager| manager else null,
             .session_store = if (lite_session_store) |*store| store else if (native_sessions) |*store| store else null,
+            .remote_attempt_exclusive_owner = if (session_backend) |*backend| backend.backend.root_writer_lock != null else false,
             .restore_job_store = if (local_metadata.lifecycle_store == null) restore_job_store else null,
             .research_job_store = if (research_job_store) |*store| store else null,
             .incoming_graph_route_store = incoming_graph_route_store,
@@ -4378,6 +4404,8 @@ pub fn runFromIterator(
             .session_cleanup_interval_ns = if (loaded_config) |*cfg| cfg.transaction_sessions.cleanup_interval_seconds * std.time.ns_per_s else standalone_session_cleanup_interval_ns,
             .session_max_count = if (loaded_config) |*cfg| cfg.transaction_sessions.max_count else standalone_session_max_count,
             .session_max_record_bytes = if (loaded_config) |*cfg| cfg.transaction_sessions.max_record_bytes else standalone_session_max_record_bytes,
+            .session_max_recovery_count = if (loaded_config) |*cfg| cfg.transaction_sessions.max_recovery_count else null,
+            .session_max_recovery_bytes = if (loaded_config) |*cfg| cfg.transaction_sessions.max_recovery_bytes else null,
             .session_savepoint_limit = if (loaded_config) |*cfg| cfg.transaction_sessions.max_savepoints else standalone_session_savepoint_limit,
         },
         .ha = if (ha_primary != null or ha_standby != null or ha_fence_store != null or ha_former_primary_log != null) .{
@@ -4573,7 +4601,7 @@ pub fn runFromIterator(
     var unified_api_ready = std.atomic.Value(bool).init(false);
 
     var unified_lifecycle = UnifiedServerLifecycle.init(control_io);
-    const public_http_config = publicHttpServerConfig(bind_host, bind_port);
+    const public_http_config = publicHttpServerConfig(bind_host, bind_port, api_server.cfg.ingress_admission.max_requests);
     var http_observer_lease = try node_backend_runtime.ptr().acquireWorkers(.{});
     defer http_observer_lease.release();
     var http_runtime = httpx.HttpRuntime.init(alloc, .{
@@ -4610,6 +4638,7 @@ pub fn runFromIterator(
         return err;
     };
     defer if (health_server) |hs| hs.deinitWithDeadline(supervisor.deadline());
+    if (health_server) |hs| try hs.configureMetricsInterval(if (loaded_config) |*cfg| cfg.health_metrics_interval_ms else 5000);
 
     var api_lane_lease = try node_backend_runtime.ptr().acquireApiLane();
     defer api_lane_lease.release();
@@ -5067,7 +5096,7 @@ fn configuredPublicHttpConnectionLimit() u32 {
     return publicHttpConnectionLimitForFdSoftLimit(@intCast(limit.cur));
 }
 
-fn publicHttpServerConfig(bind_host: []const u8, bind_port: u16) httpx.ServerConfig {
+fn publicHttpServerConfig(bind_host: []const u8, bind_port: u16, ingress_requests: u32) httpx.ServerConfig {
     return (httpx.ServerConfig{
         .host = bind_host,
         .port = bind_port,
@@ -5086,6 +5115,7 @@ fn publicHttpServerConfig(bind_host: []const u8, bind_port: u16) httpx.ServerCon
         // clients, and diagnostics. This prevents the historical 1,000-socket
         // cliff under the common 1,024 descriptor soft limit.
         .max_connections = configuredPublicHttpConnectionLimit(),
+        .max_request_tasks = @max(configuredPublicHttpConnectionLimit(), ingress_requests),
         .accept_error_backoff_initial_ms = 5,
         .accept_error_backoff_max_ms = 1_000,
         .max_requests_per_connection = public_api_max_requests_per_connection,
@@ -9970,7 +10000,7 @@ test "standalone runtime defaults public listener to antfarm port" {
 }
 
 test "standalone public HTTP server is restart-safe and uses public API request body limit" {
-    const cfg = publicHttpServerConfig("127.0.0.1", 8080);
+    const cfg = publicHttpServerConfig("127.0.0.1", 8080, 0);
     try std.testing.expect(cfg.reuse_address);
     try std.testing.expect(!cfg.reuse_port);
     try std.testing.expectEqual(antfly.public_api.http_server.public_api_max_request_body_bytes, cfg.max_body_size);
@@ -9985,6 +10015,11 @@ test "standalone public HTTP server is restart-safe and uses public API request 
     try std.testing.expectEqual(@as(u32, 128), publicHttpConnectionLimitForFdSoftLimit(512));
     try std.testing.expectEqual(@as(u32, 32), publicHttpConnectionLimitForFdSoftLimit(128));
     try std.testing.expectEqual(@as(u32, 1), publicHttpConnectionLimitForFdSoftLimit(3));
+    const scheduled = publicHttpServerConfig("127.0.0.1", 8080, 1024);
+    try std.testing.expectEqual(@as(u32, 1024), scheduled.max_request_tasks);
+    try std.testing.expectEqual(cfg.max_connections, scheduled.max_connections);
+    try std.testing.expectEqual(cfg.max_h1_inflight_bodies, scheduled.max_h1_inflight_bodies);
+    try std.testing.expectEqual(cfg.request_body_buffer_budget_bytes, scheduled.request_body_buffer_budget_bytes);
 }
 
 test "standalone rejects configured server TLS instead of serving plaintext" {

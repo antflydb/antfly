@@ -597,6 +597,14 @@ pub const OpenOptions = struct {
         degree_canary,
     };
 
+    /// Trusted local construction only; never enabled by managed data runtimes.
+    allow_local_durable_completion: bool = false,
+    /// New prepares may be disabled without disabling recovery of old slots.
+    durable_completion_enabled: bool = false,
+    durable_completion_authority: @import("../../common/durable_completion_policy.zig").Authority = .none,
+    /// Trusted installed binding, supplied before native WAL/guard recovery.
+    /// Never populated from a document request or a generic authority flag.
+    completion_pool_config: ?@import("../lsm_backend/completion_pool.zig").Config = null,
     table_storage: ?table_storage_mod.Settings = null,
     open_mode: OpenOptions.OpenMode = .writer,
     /// An authenticated restore decoder needs rows and schema layouts, never
@@ -1592,6 +1600,10 @@ const AsyncDenseCatchUpSession = struct {
 };
 
 const AsyncContext = struct {
+    completion_guard: @import("../completion_native_guard.zig").State = .{},
+    completion_pool_owner: ?*DB = null,
+    durable_completion_backlogs: [4]?struct { txn_id: transactions_mod.TxnId, admission: derived_executor_mod.BacklogAdmission, publication: DurableCompletionPublication = .{ .targets = .{ .target_scope_known = true } } } = @splat(null),
+
     alloc: Allocator,
     io: ?std.Io = null,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
@@ -3050,6 +3062,39 @@ fn prepareRelationalRows(
     if (ctx.first_error) |err| return err;
 }
 
+const DurablePhysicalPrepare = struct {
+    txn_id: transactions_mod.TxnId,
+    intents: []const transactions_mod.WriteIntent,
+    predicates: []const transactions_mod.VersionPredicate,
+    schema_binding: transactions_mod.SchemaBinding,
+    schema_namespace: u64,
+    transform_snapshot: ?*const DB.TransformReadSnapshot = null,
+    input_digest: [32]u8,
+    replicated_capture: ?*ReplicatedCompletionCapture = null,
+};
+
+const ReplicatedCompletionCapture = struct {
+    allocator: Allocator,
+    authority: @import("../completion_candidate.zig").Authority,
+    envelope: ?[]u8 = null,
+    mutation_input_digest: [32]u8 = @splat(0),
+};
+
+const DurableCompletionPublication = struct {
+    targets: ManagedSyncTargets = .{},
+    catalog: ?table_catalog_mod.Catalog = null,
+    summary: ?doc_identity.VisibilitySummary = null,
+    summary_bindings: u3 = 0,
+    columnar: bool = false,
+    artifacts: bool = false,
+    replay_sequence: u64 = 0,
+};
+
+const DurableCompletionResult = struct {
+    sequence: u64,
+    targets: ManagedSyncTargets = .{},
+};
+
 const BatchExecutionOptions = struct {
     restore_staging: ?@import("restore_staging.zig").BatchAdmission = null,
     restore_artifacts: []const @import("restore_staging.zig").Artifact = &.{},
@@ -3060,6 +3105,9 @@ const BatchExecutionOptions = struct {
     store_batch_options: backend_types.BatchOptions = .{},
     snapshot_mutation: ?*const snapshot_admission_mod.SnapshotAdmission.MutationLease = null,
     wait_for_sync_level: bool = true,
+    /// Capture the durable replay target while delaying only visibility waits
+    /// until the caller has released its mandatory-completion workspace.
+    deferred_transaction_sequence: ?*u64 = null,
     force_generated_artifact_names: []const []const u8 = &.{},
     document_child_range_dispatcher: ?DocumentArtifactChildRangeDispatcher = null,
     committed_batch_effects_observer: ?CommittedBatchEffectsObserver = null,
@@ -3072,6 +3120,8 @@ const BatchExecutionOptions = struct {
     extra_store_deletes: []const []const u8 = &.{},
     merge_chunk_expected_progress: ?[32]u8 = null,
     transaction_resolution: ?TransactionResolution = null,
+    durable_completion_prepare: ?*const DurablePhysicalPrepare = null,
+    replicated_mutation_capture: ?*ReplicatedCompletionCapture = null,
     durable_rows: ?*const std.StringHashMapUnmanaged([]const u8) = null,
     /// Borrowed by this synchronous call and consumed only after primary
     /// durability, while waiting for requested derived visibility.
@@ -5231,12 +5281,14 @@ pub const DB = struct {
     source_publication: @import("source_publication_job.zig").Job = .{},
     restore_staging_required: std.atomic.Value(bool) = .init(false),
     table_storage: table_storage_mod.Settings = .{},
+    transaction_recovery_scan_after: ?transactions_mod.TxnId = null,
     vector_migration_offline_candidate: bool = false,
     vector_migration_active: std.atomic.Value(bool) = .init(false),
     vector_migration_reopen_required: std.atomic.Value(bool) = .init(false),
     source_vectors: std.atomic.Value(?*vector_payload_store_mod.Store) = .init(null),
     source_vector_storage: ?*lsm_backend_mod.NativeStorage = null,
     closed: bool = false,
+    completion_owner_workers_quiesced: bool = false,
     stable_address: bool = false,
     alloc: Allocator,
     runtime_alloc: Allocator,
@@ -5266,6 +5318,9 @@ pub const DB = struct {
     owned_backend_runtime: ?background_runtime_mod.BackendRuntimeHandle,
     owned_resource_manager: ?*resource_manager_mod.ResourceManager,
     capacity_source: ?types.RepairCapacitySource,
+    allow_local_durable_completion: bool = false,
+    durable_completion_enabled: bool = false,
+    durable_completion_authority: @import("../../common/durable_completion_policy.zig").Authority = .none,
     executor: *derived_executor_mod.Executor,
     start_index_workers: bool,
     optional_runtime_workers_enabled: bool,
@@ -6072,6 +6127,8 @@ pub const DB = struct {
                     }
                 }
             }
+            if ((opts.allow_local_durable_completion or opts.durable_completion_authority != .none) and (opts.staged_generation != null or opts.exclusive_generation != null or opts.physical_root_mode != .filesystem_managed))
+                return error.LocalCompletionAuthorityRequired;
             const runtime_alloc = backgroundRuntimeAllocator(alloc);
             var owned_backend_runtime: ?background_runtime_mod.BackendRuntimeHandle = null;
             errdefer if (owned_backend_runtime) |*handle| handle.deinit();
@@ -6148,6 +6205,15 @@ pub const DB = struct {
                 backend_runtime.durable_jobs.closeOwner(ha_recovery_owner_id);
             var primary_lsm_background_executor: lsm_backend_mod.BackgroundExecutor = undefined;
             var effective_primary_backend = opts.primary_backend;
+            if (opts.completion_pool_config) |binding| {
+                if (opts.durable_completion_authority != .raft_apply or opts.identity_namespace == null or
+                    openModeRequiresReadOnlyBackends(opts.open_mode) or opts.primary_runtime_store != null)
+                    return error.CompletionAdmissionUnavailable;
+                switch (effective_primary_backend) {
+                    .lsm => |*lsm_opts| lsm_opts.completion_pool_config = binding,
+                    else => return error.UnsupportedCompletionBackend,
+                }
+            }
             var effective_index_backends = opts.index_backends;
             if (openModeRequiresReadOnlyBackends(opts.open_mode)) {
                 applyReadOnlyToPrimaryBackend(&effective_primary_backend);
@@ -6267,6 +6333,7 @@ pub const DB = struct {
             );
             core_owned = false;
             core_owner_initialized = true;
+            core_owner.index_manager.completion_eligibility = &core_owner.completion_eligibility;
             core_owner.identity_visibility.summary = try doc_identity.visibilitySummaryFromStore(core_owner.store);
             var db = DB{
                 .alloc = alloc,
@@ -6289,6 +6356,9 @@ pub const DB = struct {
                 .index_repair_clock = opts.index_repair_clock,
                 .capacity_source = opts.capacity_source orelse opts.resource_manager.?.capacitySource(),
                 .executor = executor,
+                .allow_local_durable_completion = opts.allow_local_durable_completion,
+                .durable_completion_enabled = opts.durable_completion_enabled,
+                .durable_completion_authority = opts.durable_completion_authority,
                 .start_index_workers = start_index_workers,
                 .optional_runtime_workers_enabled = false,
                 .run_until_idle_no_progress_timeout_ns = @as(u64, opts.run_until_idle_no_progress_timeout_ms) *| std.time.ns_per_ms,
@@ -6361,6 +6431,7 @@ pub const DB = struct {
             } else {
                 db.source_pin_gc_epoch.store(0, .release);
             }
+            try db.restoreDurableCompletionBacklog();
             const table_storage_started_ns = monotonicTimeNs();
             try db.initializeTableStorage(opts.table_storage);
             profile.table_storage_ns = elapsedSince(table_storage_started_ns);
@@ -6373,30 +6444,41 @@ pub const DB = struct {
                 db.root_incarnation = opts.external_root_incarnation;
             }
             if (opts.schema_before_index_load) |prepared_schema| {
-                // This option is used by the metadata-authoritative local
-                // provisioner. Persist directly through the core before index
-                // open; no index runtime exists yet and the metadata record is
-                // already the durable authority for this replica projection.
-                // Raft catch-up can reopen an older entry's pinned descriptor
-                // after this physical DB has durably installed a newer schema.
-                // Keep that newer epoch; the older entry's native applied
-                // marker decides whether it still needs its data mutation.
-                if (db.core.schema != null and db.core.schema.?.version > prepared_schema.runtime_schema.version) {
+                if (db.core.primary_store_owner.lsmBackend() != null and (db.core.primary_store_owner.lsmBackend().?.hasDurableCompletions() or db.core.primary_store_owner.lsmBackend().?.completion_pool != null or opts.completion_pool_config != null)) {
+                    // A managed cold open supplies the catalog projection again.
+                    // Pending obligations permit validation of the same epoch,
+                    // never a schema publication or index-generation refresh.
+                    try db.validateCompletionRestoreSchema(prepared_schema);
+                } else if (db.core.schema != null and db.core.schema.?.version > prepared_schema.runtime_schema.version) {
+                    // This option is used by the metadata-authoritative local
+                    // provisioner. Persist directly through the core before index
+                    // open; no index runtime exists yet and the metadata record is
+                    // already the durable authority for this replica projection.
+                    // Raft catch-up can reopen an older entry's pinned descriptor
+                    // after this physical DB has durably installed a newer schema.
+                    // Keep that newer epoch; the older entry's native applied
+                    // marker decides whether it still needs its data mutation.
                     std.log.debug("owner open retains newer durable schema path={s} durable_version={d} descriptor_version={d}", .{
                         path, db.core.schema.?.version, prepared_schema.runtime_schema.version,
                     });
-                } else if (prepared_schema.public_schema_json) |public_json| {
-                    const versioned_public_key = try public_table_schema.versionedSchemaKeyAlloc(alloc, prepared_schema.runtime_schema.version);
-                    defer alloc.free(versioned_public_key);
-                    _ = try db.core.commitSchemaMetadata(prepared_schema.runtime_schema, &.{
-                        .{ .key = public_schema_json_key, .value = public_json },
-                        .{ .key = versioned_public_key, .value = public_json },
-                    }, &.{}, null);
                 } else {
-                    _ = try db.core.commitSchemaMetadata(prepared_schema.runtime_schema, &.{}, &.{public_schema_json_key}, null);
+                    // This option is used by the metadata-authoritative local
+                    // provisioner. Persist directly through the core before index
+                    // open; no index runtime exists yet and the metadata record is
+                    // already the durable authority for this replica projection.
+                    if (prepared_schema.public_schema_json) |public_json| {
+                        const versioned_public_key = try public_table_schema.versionedSchemaKeyAlloc(alloc, prepared_schema.runtime_schema.version);
+                        defer alloc.free(versioned_public_key);
+                        _ = try db.core.commitSchemaMetadata(prepared_schema.runtime_schema, &.{
+                            .{ .key = public_schema_json_key, .value = public_json },
+                            .{ .key = versioned_public_key, .value = public_json },
+                        }, &.{}, null);
+                    } else {
+                        _ = try db.core.commitSchemaMetadata(prepared_schema.runtime_schema, &.{}, &.{public_schema_json_key}, null);
+                    }
+                    try db.core.refreshSchemaIndexes();
+                    try db.refreshRelationalRuntimeMode();
                 }
-                try db.core.refreshSchemaIndexes();
-                try db.refreshRelationalRuntimeMode();
             }
             if (try db.restoreStagingStatus(alloc)) |value| {
                 var staging_status = value;
@@ -6429,8 +6511,16 @@ pub const DB = struct {
                 db.requestManagedAdmissionMaterialization();
             }
 
-            if (opts.primary_only_readonly and opts.open_mode != .query_readonly) return error.UnsupportedOperation;
-            if (opts.open_mode == .status_only or opts.primary_only_readonly) {
+            if (db.core.primary_store_owner.lsmBackend() != null and (db.core.primary_store_owner.lsmBackend().?.hasDurableCompletions() or db.core.primary_store_owner.lsmBackend().?.completion_pool != null or opts.completion_pool_config != null)) {
+                // Restoration has already installed the structural fence.
+                // Bind only the proven empty catalog; ordinary load can create
+                // runtimes/backfills and must continue to reject this fence.
+                const workspace = try alloc.alloc(u8, 1024 * 1024);
+                defer alloc.free(workspace);
+                var fixed = std.heap.FixedBufferAllocator.init(workspace);
+                try db.core.loadIndexesForCompletionRestore(fixed.allocator());
+                try db.restoreDurableCompletionPublications();
+            } else if (opts.open_mode == .status_only) {
                 try db.core.loadIndexCatalogOnly();
             } else if (opts.open_mode == .query_readonly) {
                 const load_indexes_started_ns = monotonicTimeNs();
@@ -6616,6 +6706,31 @@ pub const DB = struct {
         };
     }
 
+    fn validateCompletionRestoreSchema(self: *DB, requested: SchemaBeforeIndexLoad) !void {
+        const persisted = self.core.schema orelse return error.CompletionProfileChanged;
+        const actual = try schema_mod.serializeSchema(self.alloc, persisted);
+        defer self.alloc.free(actual);
+        const expected = try schema_mod.serializeSchema(self.alloc, requested.runtime_schema);
+        defer self.alloc.free(expected);
+        if (!std.mem.eql(u8, actual, expected)) return error.CompletionProfileChanged;
+        var read = try self.core.store.beginProbeTxn();
+        defer read.abort();
+        const active = read.get(public_schema_json_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (requested.public_schema_json) |public_json| {
+            if (active == null or !std.mem.eql(u8, active.?, public_json)) return error.CompletionProfileChanged;
+            const key = try public_table_schema.versionedSchemaKeyAlloc(self.alloc, requested.runtime_schema.version);
+            defer self.alloc.free(key);
+            const versioned = read.get(key) catch |err| switch (err) {
+                error.NotFound => return error.CompletionProfileChanged,
+                else => return err,
+            };
+            if (!std.mem.eql(u8, versioned, public_json)) return error.CompletionProfileChanged;
+        } else if (active != null) return error.CompletionProfileChanged;
+    }
+
     fn initializeTableStorage(self: *DB, requested: ?table_storage_mod.Settings) !void {
         var migration_job = try vector_migration.load(self.alloc, self.core.store);
         defer if (migration_job) |*job| job.deinit();
@@ -6628,6 +6743,7 @@ pub const DB = struct {
             var parsed = try std.json.parseFromSlice(table_storage_mod.Settings, self.alloc, value, .{});
             defer parsed.deinit();
             if (requested) |settings| {
+                if (!std.meta.eql(settings.transaction_recovery, parsed.value.transaction_recovery)) return error.ImmutableTableStorageSettings;
                 if (settings.dense_embeddings != parsed.value.dense_embeddings) {
                     // Only this table's durable ownership publication can
                     // bridge a catalog update interrupted after DB commit.
@@ -6636,6 +6752,13 @@ pub const DB = struct {
                     if (!job.published() or settings.dense_embeddings != .primary_lsm or
                         parsed.value.dense_embeddings != .vector_store) return error.ImmutableTableStorageSettings;
                 }
+            }
+            if (parsed.value.transaction_recovery) |policy| {
+                try policy.validate();
+                if (self.core.table_catalog.transaction_recovery_max_count != policy.max_count or
+                    self.core.table_catalog.transaction_recovery_max_bytes != policy.max_bytes or
+                    self.core.table_catalog.transaction_admission_bytes != policy.max_transaction_bytes)
+                    return error.InvalidTableStorageSettings;
             }
             self.table_storage = parsed.value;
             if (self.table_storage.dense_embeddings == .vector_store) {
@@ -6765,6 +6888,8 @@ pub const DB = struct {
     }
 
     pub fn startVectorMigration(self: *DB, request: vector_migration.contract.Request) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         try request.validate();
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         if (request.mode == .offline and !self.vector_migration_offline_candidate) return error.VectorStoreRequiresOfflineCommand;
@@ -6833,6 +6958,8 @@ pub const DB = struct {
     }
 
     pub fn advanceVectorMigration(self: *DB, job_id: []const u8) anyerror!void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         // Staging pins index/catalog lifetime but never holds table apply over
         // corpus-sized ANN work. Completion is checked again under apply.
         const status = try self.vectorMigrationStatus(self.alloc) orelse return error.VectorMigrationNotFound;
@@ -6935,6 +7062,8 @@ pub const DB = struct {
     }
 
     pub fn publishVectorMigration(self: *DB, job_id: []const u8) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         var structural = self.beginIndexStructuralMutation("source ownership publication", "*");
         defer structural.deinit();
         try self.lockApplyForPortableRuntime();
@@ -6948,7 +7077,7 @@ pub const DB = struct {
         if (job.value.phase != .ready) return error.VectorMigrationNotReady;
         errdefer self.requireVectorMigrationRecovery();
         try vector_migration.publish(self.alloc, self.core.store, job.value);
-        self.table_storage = .{ .dense_embeddings = .vector_store };
+        self.table_storage.dense_embeddings = .vector_store;
         self.core.store.configurePayloadPolicy(self.source_vectors.load(.acquire).?.interface(), false, job.value.budget.temporary_bytes);
         self.core.index_manager.table_owns_embedding_artifacts = true;
         self.core.index_manager.source_payload_store = self.source_vectors.load(.acquire);
@@ -6957,6 +7086,8 @@ pub const DB = struct {
     }
 
     pub fn cancelVectorMigration(self: *DB, job_id: []const u8) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         return self.cancelVectorMigrationImpl(job_id, null);
     }
 
@@ -7069,6 +7200,9 @@ pub const DB = struct {
     /// Creation/provisioning-only configuration. Existing persisted authority
     /// cannot be changed, and populated roots require an explicit migration.
     pub fn configureTableStorage(self: *DB, settings: table_storage_mod.Settings) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
+        if (settings.transaction_recovery) |policy| try policy.validate();
         lockApply(self);
         defer self.core.unlockApply();
         const raw = self.core.store.get(self.alloc, &internal_keys.table_storage_settings_key) catch |err| switch (err) {
@@ -7079,7 +7213,8 @@ pub const DB = struct {
         if (raw) |value| {
             var parsed = try std.json.parseFromSlice(table_storage_mod.Settings, self.alloc, value, .{});
             defer parsed.deinit();
-            if (parsed.value.dense_embeddings != settings.dense_embeddings) return error.ImmutableTableStorageSettings;
+            if (parsed.value.dense_embeddings != settings.dense_embeddings or
+                !std.meta.eql(parsed.value.transaction_recovery, settings.transaction_recovery)) return error.ImmutableTableStorageSettings;
             return;
         }
         if (settings.dense_embeddings == .vector_store) {
@@ -7092,6 +7227,20 @@ pub const DB = struct {
             }
             try self.openSourceVectors(true);
         }
+        var next_catalog = self.core.table_catalog;
+        if (settings.transaction_recovery) |policy| {
+            // Creation only. Existing obligations need a separate, fenced
+            // migration; this path never silently activates legacy records.
+            var manager = try transactions_mod.TxnManager.init(self.alloc, self.core.store);
+            defer manager.deinit();
+            const records = try manager.listTransactionsPage(self.alloc, null, 1);
+            defer self.alloc.free(records.items);
+            if (records.items.len != 0) return error.ImmutableTableStorageSettings;
+            next_catalog.transaction_recovery_max_count = policy.max_count;
+            next_catalog.transaction_recovery_max_bytes = policy.max_bytes;
+            next_catalog.transaction_admission_bytes = policy.max_transaction_bytes;
+            next_catalog.generation +|= 1;
+        }
         const encoded = try std.json.Stringify.valueAlloc(self.alloc, settings, .{});
         defer self.alloc.free(encoded);
         // A failed primary append/sync may have persisted the marker. Fence
@@ -7100,8 +7249,14 @@ pub const DB = struct {
         errdefer if (self.source_vectors.load(.acquire)) |source| {
             source.poison();
         };
-        try self.core.store.put(&internal_keys.table_storage_settings_key, encoded);
+        var catalog_buffer: [table_catalog_mod.encoded_len]u8 = undefined;
+        const catalog_data = next_catalog.encodeForPersistence(&catalog_buffer);
+        try self.core.store.putBatch(&.{
+            .{ .key = &internal_keys.table_storage_settings_key, .value = encoded },
+            .{ .key = table_catalog_mod.key, .value = catalog_data },
+        }, &.{});
         try self.core.store.sync(true);
+        self.core.table_catalog = next_catalog;
         self.table_storage = settings;
         if (settings.dense_embeddings == .vector_store) {
             const source = self.source_vectors.load(.acquire).?;
@@ -7141,6 +7296,48 @@ pub const DB = struct {
         const collected = try source.collectDeferredMark(&self.core.store.runtime_store);
         if (collected) try self.core.index_manager.refreshSourcePayloadGeneration();
         return collected;
+    }
+
+    /// Called only after request/apply drivers stop, without their locks held.
+    /// Retained native leases may still own backlog/publication records; join
+    /// autonomous work now, but preserve those records until final close.
+    pub fn quiesceCompletionOwnerWorkers(self: *DB) void {
+        if (self.closed or self.completion_owner_workers_quiesced) return;
+        self.optional_runtime_workers_enabled = false;
+        self.resolver_workers_enabled = false;
+        self.async_context.background_closing.store(true, .release);
+        self.async_context.enrichment_desired_running.store(false, .release);
+        self.stopArtifactRepairMetadataWorker();
+        self.stopPortableActivationRetryWorker();
+        self.stopQuarantineRetryWorker();
+        if (self.transaction_runtime) |runtime| _ = runtime.stop();
+        if (self.ttl_runtime) |runtime| _ = runtime.stop();
+        if (self.enrichment_runtime) |runtime| runtime.stop();
+        self.stopResolverReplayRuntimes();
+        stopNativeProjectionMaintenance(self.async_context);
+        if (self.algebraic_hll_owner_id != 0) {
+            self.backend_runtime.durable_jobs.closeOwner(self.algebraic_hll_owner_id);
+            self.algebraic_hll_owner_id = 0;
+        }
+        if (self.ha_recovery_owner_id != 0) {
+            self.backend_runtime.durable_jobs.closeOwner(self.ha_recovery_owner_id);
+            self.ha_recovery_owner_id = 0;
+        }
+        self.backend_runtime.durable_jobs.closeOwner(self.repair_cleanup_owner_id);
+        self.backend_runtime.durable_jobs.closeOwner(self.backend_owner_id);
+        self.executor.beginShutdown();
+        if (self.text_merge_runtime) |runtime| _ = runtime.stop();
+        if (self.sparse_compaction_runtime) |runtime| _ = runtime.stop();
+        if (self.graph_metric_runtime) |runtime| {
+            runtime.deinit();
+            self.runtime_alloc.destroy(runtime);
+            self.graph_metric_runtime = null;
+        }
+        self.executor.quiesceWorkers();
+        // All possible publishers have left; detaching visibility callbacks
+        // cannot race a final worker publication after this point.
+        self.setQueryVisibilityHook(null);
+        self.completion_owner_workers_quiesced = true;
     }
 
     pub fn close(self: *DB) void {
@@ -7282,6 +7479,9 @@ pub const DB = struct {
             .text_merge_runtime = null,
         };
         self.core.index_manager.setRelationalBaseRows(self.async_context.relational_base_rows);
+        // Initialize cleanup-owned context before a restore can fail, but
+        // restore structural exclusion before constructing any executor worker.
+        try self.restoreDurableCompletionEligibility();
         self.executor.* = try derived_executor_mod.init(
             self.runtime_alloc,
             executor_config,
@@ -7736,6 +7936,8 @@ pub const DB = struct {
 
         var owned_cfg = cfg;
         defer self.deinitEnrichmentConfig(&owned_cfg);
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
 
         const query_visibility_hook_present = hasQueryVisibilityHook(self.async_context);
         var detached = try self.createDetachedEnrichmentRuntime(&owned_cfg);
@@ -7978,6 +8180,10 @@ pub const DB = struct {
         errdefer self.runtime_alloc.destroy(local_ctx);
         local_ctx.* = .{};
         var effective_cfg = cfg;
+        if (self.core.table_catalog.transaction_recovery_max_count != 0) {
+            if (self.core.index_manager.resource_manager) |manager|
+                effective_cfg.completion_metadata = manager.transactionCompletionMetadata();
+        }
         effective_cfg.resolution_extra_hooks = db_core.transactionRecoveryIdentityHooks(identity_ctx);
         effective_cfg.local_resolution_ctx = local_ctx;
         effective_cfg.resolve_local_fn = resolveRecoveredLocalTransaction;
@@ -8215,6 +8421,20 @@ pub const DB = struct {
             self.runtime_alloc.destroy(ctx);
             self.transaction_recovery_local_context = null;
         }
+        if (self.async_context.completion_pool_owner) |owner| {
+            if (self.core.primary_store_owner.lsmBackend()) |backend| if (backend.completion_pool) |pool|
+                pool.releasePublicationOwnerAfterQuiesce();
+            self.runtime_alloc.destroy(owner);
+            self.async_context.completion_pool_owner = null;
+        }
+        for (&self.async_context.durable_completion_backlogs) |*owned| {
+            if (owned.*) |*entry| {
+                entry.admission.cancel();
+                entry.publication.targets.deinit(self.alloc);
+            }
+            owned.* = null;
+        }
+
         if (self.transaction_recovery_identity_context) |ctx| {
             ctx.deinit();
             self.runtime_alloc.destroy(ctx);
@@ -8299,7 +8519,7 @@ pub const DB = struct {
             runtime.deinit();
             self.runtime_alloc.destroy(runtime);
         }
-        if (executor_ready and self.open_mode.allowsIndexWorkers()) {
+        if (executor_ready and !self.completion_owner_workers_quiesced and self.open_mode.allowsIndexWorkers()) {
             // The executor has published its final HBC coverage. Mirror the
             // human-facing lifecycle/status view once at graceful shutdown;
             // a failure cannot invalidate the authoritative posting WAL and
@@ -8352,6 +8572,29 @@ pub const DB = struct {
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
         if (!config.enabled) return .{};
+        if (try self.recoverDurableCompletion(config.clock.nowRealtimeNs())) |resolved| return .{
+            .enabled = true,
+            .lease_owned = config.lease_owned,
+            .runs = 1,
+            .scanned_records = 1,
+            .resolved_finalized = @intFromBool(resolved),
+            .deferred_unresolved = @intFromBool(!resolved),
+        };
+        if (self.core.table_catalog.transaction_recovery_max_count != 0) if (self.core.index_manager.resource_manager) |manager| if (manager.transactionCompletionMetadata()) |metadata| {
+            var effective = config;
+            effective.completion_metadata = metadata;
+            effective.completion_scan_after = &self.transaction_recovery_scan_after;
+            if (!effective.replicated_metadata) {
+                effective.local_resolution_ctx = self;
+                effective.resolve_local_fn = struct {
+                    fn call(ptr: *anyopaque, txn_id: transactions_mod.TxnId, status: transactions_mod.TxnStatus, version: u64) !void {
+                        const db: *DB = @ptrCast(@alignCast(ptr));
+                        try db.resolveTransactionIntents(txn_id, status, version);
+                    }
+                }.call;
+            }
+            return transaction_runtime_mod.recoverOnce(self.alloc, self.core.batchExecutionResources().store, effective);
+        };
         if (config.replicated_metadata) {
             return try transaction_runtime_mod.recoverOnce(
                 self.alloc,
@@ -8426,6 +8669,8 @@ pub const DB = struct {
     }
 
     pub fn beginBulkIngestSession(self: *DB) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
@@ -8496,6 +8741,8 @@ pub const DB = struct {
     }
 
     pub fn beginDenseAutoBulkIngestSession(self: *DB) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
@@ -8510,6 +8757,8 @@ pub const DB = struct {
     }
 
     pub fn beginPrimaryStoreAutoBulkIngestSession(self: *DB) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
@@ -8884,6 +9133,8 @@ pub const DB = struct {
         alloc: Allocator,
         index_name: ?[]const u8,
     ) ![]schema_mod.FieldCapability {
+        var driver = try self.acquireGeneralReadDriver(null, .{ .io = self.backend_runtime.io() orelse std.Options.debug_io });
+        defer if (driver) |*owned| owned.release();
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
         return try self.core.index_manager.observedDynamicFieldCapabilitiesAlloc(alloc, index_name);
@@ -8894,6 +9145,12 @@ pub const DB = struct {
         alloc: Allocator,
         index_name: ?[]const u8,
     ) ?[]schema_mod.FieldCapability {
+        var driver: ?resource_manager_mod.DenseExecution.Runtime.Lease = null;
+        if (self.readResourceManager()) |manager| if (manager.dense_execution) |runtime| if (runtime.scope == .all_reads) {
+            driver = runtime.tryAcquire() orelse return null;
+            driver.?.startWork(self.backend_runtime.io() orelse std.Options.debug_io);
+        };
+        defer if (driver) |*owned| owned.release();
         if (!self.core.tryLockApplyShared()) return null;
         defer self.core.unlockApplyShared();
         return self.core.index_manager.observedDynamicFieldCapabilitiesAlloc(alloc, index_name) catch null;
@@ -8904,6 +9161,13 @@ pub const DB = struct {
         alloc: Allocator,
         observation: index_manager_mod.IndexManager.DynamicFieldObservationQuery,
     ) ![]index_manager_mod.IndexManager.ObservedDynamicFieldCapabilitySet {
+        var driver = try self.acquireGeneralReadDriver(null, .{
+            .io = self.backend_runtime.io() orelse std.Options.debug_io,
+            .deadline_ns = observation.execution_deadline_ns,
+            .native_now_ns = platform_time.monotonicNs,
+            .cancellation = observation.cancellation orelse .none,
+        });
+        defer if (driver) |*owned| owned.release();
         try observation.checkActive();
         if (observation.execution_deadline_ns != null or observation.cancellation != null) {
             if (!self.core.tryLockApplyShared()) return error.StorageReadTemporarilyUnavailable;
@@ -8920,6 +9184,12 @@ pub const DB = struct {
         alloc: Allocator,
         observation: index_manager_mod.IndexManager.DynamicFieldObservationQuery,
     ) ?[]index_manager_mod.IndexManager.ObservedDynamicFieldCapabilitySet {
+        var driver: ?resource_manager_mod.DenseExecution.Runtime.Lease = null;
+        if (self.readResourceManager()) |manager| if (manager.dense_execution) |runtime| if (runtime.scope == .all_reads) {
+            driver = runtime.tryAcquire() orelse return null;
+            driver.?.startWork(self.backend_runtime.io() orelse std.Options.debug_io);
+        };
+        defer if (driver) |*owned| owned.release();
         if (!self.core.tryLockApplyShared()) return null;
         defer self.core.unlockApplyShared();
         return self.core.index_manager.observedDynamicFieldCapabilitySetsAlloc(alloc, observation) catch null;
@@ -9557,6 +9827,8 @@ pub const DB = struct {
         ha_lsn: ?u64,
         ha_payload: ?[]const u8,
     ) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
         defer snapshot_mutation.release();
         lockApply(self);
@@ -10280,22 +10552,13 @@ pub const DB = struct {
         generated_memo: *GeneratedEmbeddingMemo,
         prepared_row_allocator: *PreparedRowAllocator,
     ) anyerror!void {
-        const maintenance_contract = @import("relational_index_maintenance_contract.zig");
-        var maintenance_attempted = false;
-        defer if (maintenance_attempted) {
-            // Only a scheduling hint: the worker re-reads durable desired state.
-            // Also wake on an ambiguous result after the store committed.
-            self.relational_index_maintenance_sweep.request();
-            self.relational_index_retry_after_ns.store(0, .release);
-        };
-        for (req.writes) |write| if (relational_index_catalog.Controller.isReservedMetadataKey(write.key)) {
-            const trusted = opts.transaction_resolution != null or opts.ha_applied_lsn_marker != null;
-            if (!trusted or !maintenance_contract.isControlKey(write.key)) return error.ReservedRelationalIndexMetadataKey;
-            _ = try maintenance_contract.Control.decode(write.value);
-            maintenance_attempted = true;
-        };
-        for (req.deletes) |key| if (relational_index_catalog.Controller.isReservedMetadataKey(key)) return error.ReservedRelationalIndexMetadataKey;
-        for (req.transforms) |transform| if (relational_index_catalog.Controller.isReservedMetadataKey(transform.key)) return error.ReservedRelationalIndexMetadataKey;
+        // Topology checkpoints share this path with ordinary document writes.
+        // Only the former change the prepared completion's range authority.
+        var completion_transition = if (req.split_replication != null or req.split_checkpoint != null or req.merge_checkpoint != null)
+            try self.core.completion_eligibility.beginTransition()
+        else
+            null;
+        defer if (completion_transition) |*transition| transition.deinit();
         const schema_namespace = if (opts.transaction_resolution) |resolution|
             resolution.schema_namespace_generation orelse self.core.schemaNamespaceGeneration()
         else
@@ -10427,10 +10690,12 @@ pub const DB = struct {
         // was admitted. Metadata may have published a newer active schema
         // before this replica applies the entry, just as a prepared durable
         // transaction may finish after publication. Use the immutable
-        // historical write view for both cases without changing the active
+        // historical write view for these cases without changing the active
         // schema or its durable catalog.
         const request_schema_binding: ?transactions_mod.SchemaBinding = if (opts.transaction_resolution) |resolution|
             resolution.schema_binding
+        else if (opts.durable_completion_prepare) |prepare|
+            prepare.schema_binding
         else if (opts.raft_applied_entry_marker != null and req.relational_schema_version != null)
             .{ .version = req.relational_schema_version }
         else
@@ -10882,6 +11147,7 @@ pub const DB = struct {
                     resolution.status,
                     resolution.commit_version,
                     .{
+                        .preparation_allocator = preparation_alloc,
                         .completion_writes = completion_writes,
                         .resolved_participant = resolution.resolved_participant,
                         .expected_intent_revision = resolution.expected_intent_revision,
@@ -10890,7 +11156,7 @@ pub const DB = struct {
                 );
                 unlockProfiledApply(self, profile, &apply_mutex_held, apply_lock_acquired_ns);
                 if (!opts.bypass_ha_write_gate) try self.flushTransactionHAOutbox(resolution.txn_id);
-                try self.waitForResolvedTransactionSync(req.sync_level, outcome.replay_sequence);
+                if (opts.deferred_transaction_sequence) |out| out.* = outcome.replay_sequence else try self.waitForResolvedTransactionSync(req.sync_level, outcome.replay_sequence);
                 return;
             }
         }
@@ -11134,6 +11400,8 @@ pub const DB = struct {
         defer identity_upsert_keys.deinit(self.alloc);
         var identity_upsert_write_indexes = std.ArrayListUnmanaged(usize).empty;
         defer identity_upsert_write_indexes.deinit(self.alloc);
+        var completion_timestamp_keys = std.ArrayListUnmanaged([]const u8).empty;
+        defer completion_timestamp_keys.deinit(self.alloc);
         var identity_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
         defer {
             for (identity_writes.items) |item| {
@@ -11315,6 +11583,21 @@ pub const DB = struct {
                     else
                         try validateDocumentExtractionInlineSources(self, cleaned);
                 }
+                const completion_uses_commit_timestamp = opts.durable_completion_prepare != null and blk: {
+                    const schema = self.core.schema orelse break :blk true;
+                    if (schema.ttl_duration_ns == 0) break :blk true;
+                    if (extracted[i].logical_source) |source| {
+                        const ordinal = source.row.ordinalForName(schema.ttl_field) orelse break :blk true;
+                        const cell = (try source.row.findCell(ordinal)) orelse break :blk true;
+                        break :blk cell.is_null;
+                    }
+                    if (prepared_relational) |*prepared| if (prepared.parsed) |parsed| {
+                        const value = parsed.value;
+                        const explicit = if (value == .object) value.object.get(schema.ttl_field) else null;
+                        break :blk explicit == null or explicit.? == .null;
+                    };
+                    break :blk try ttlTimestampNsFromDocumentValue(self.alloc, schema, write.value) == null;
+                };
                 const strip_store_value_start_ns = monotonicTimeNs();
                 const store_value = if (prepared_relational) |*prepared| blk: {
                     const packed_row = prepared.takePackedRow();
@@ -11346,6 +11629,8 @@ pub const DB = struct {
                     .key = store_key,
                     .value = store_value,
                 });
+                if (completion_uses_commit_timestamp and internal_keys.isRelationalRowKey(store_key))
+                    try completion_timestamp_keys.append(self.alloc, store_key);
                 try identity_upsert_keys.append(self.alloc, write.key);
                 try identity_upsert_write_indexes.append(self.alloc, i);
                 if (shouldWriteTimestamp(write.key)) {
@@ -11358,6 +11643,7 @@ pub const DB = struct {
                         .key = timestamp_key,
                         .value = timestamp_value,
                     });
+                    if (completion_uses_commit_timestamp) try completion_timestamp_keys.append(self.alloc, timestamp_key);
                     if (use_preprepared_rows) {
                         preprepared_effects.?[i].timestamp_key = null;
                         preprepared_effects.?[i].timestamp_value = null;
@@ -11610,7 +11896,9 @@ pub const DB = struct {
             explicit_graph_artifact_writes.items.len > 0 or
             precomputed_generated.artifact_writes.len > 0)
         {
-            try self.core.appendArtifactPresenceMarker(&store_writes);
+            if (opts.replicated_mutation_capture != null) {
+                try store_writes.append(self.alloc, .{ .key = &internal_keys.artifact_presence_key, .value = "1" });
+            } else try self.core.appendArtifactPresenceMarker(&store_writes);
         }
         try appendAssetArtifactSourceIndexMutations(
             self.alloc,
@@ -11643,6 +11931,8 @@ pub const DB = struct {
         const elide_semantic_noop_replay = use_thin_replay_fast_path and
             opts.extra_store_writes.len == 0 and
             opts.transaction_resolution == null and
+            opts.durable_completion_prepare == null and
+            opts.replicated_mutation_capture == null and
             opts.ha_applied_lsn_marker == null and
             opts.raft_applied_entry_marker == null and
             !thinReplayInputsHaveDerivedWork(
@@ -11653,6 +11943,8 @@ pub const DB = struct {
             );
         const sequence = if (elide_semantic_noop_replay)
             self.core.nextDerivedSequence()
+        else if (opts.durable_completion_prepare != null or opts.replicated_mutation_capture != null)
+            self.core.nextDerivedAppendSequence()
         else
             self.core.reserveDerivedAppendSequence();
         if (profile) |active_profile| active_profile.source_sequence = sequence;
@@ -11665,7 +11957,7 @@ pub const DB = struct {
         if (effective_req.deletes.len != 0) {
             self.clearBulkIngestIdentityAllNewLocked();
         }
-        if (self.bulk_ingest_identity_all_new and
+        if (opts.durable_completion_prepare == null and opts.replicated_mutation_capture == null and self.bulk_ingest_identity_all_new and
             effective_req.deletes.len == 0 and
             identity_upsert_keys.items.len > 0 and
             (assume_all_new_identity_upserts or identityUpsertStoreWritesAreNew(identity_upsert_write_indexes.items, overwritten_flags)))
@@ -11742,7 +12034,6 @@ pub const DB = struct {
                 catalog.reconciled != previous.reconciled)
             {
                 catalog.generation +|= 1;
-                table_catalog_value = catalog.encode();
                 next_table_catalog = catalog;
             }
         } else if (self.core.table_catalog.row_count == 0 and (effective_req.writes.len != 0 or effective_req.deletes.len != 0)) {
@@ -11768,8 +12059,9 @@ pub const DB = struct {
         try store_writes.appendSlice(self.alloc, identity_writes.items);
         if (next_table_catalog != null) try store_writes.append(self.alloc, .{
             .key = table_catalog_mod.key,
-            .value = &table_catalog_value,
+            .value = next_table_catalog.?.encodeForPersistence(&table_catalog_value),
         });
+        if ((opts.durable_completion_prepare != null or opts.replicated_mutation_capture != null) and remote_child_range_dispatches.items.len != 0) return error.UnsupportedCompletionProfile;
         try appendDocumentChildRangeOutboxWrites(
             self.alloc,
             sequence,
@@ -12136,6 +12428,18 @@ pub const DB = struct {
             }
         else
             null;
+        if (opts.durable_completion_prepare) |prepare| {
+            if (schema_namespace != prepare.schema_namespace) return error.PreparedGenerationChanged;
+            if (prepare.transform_snapshot) |read_snapshot| try self.validateTransformReadSnapshot(read_snapshot.*);
+            try self.sealDurablePhysicalPlanLocked(prepare, store_writes.items, delete_keys.items, replay_append orelse return error.UnsupportedCompletionProfile, batch_timestamp_ns, completion_timestamp_keys.items);
+            unlockProfiledApply(self, profile, &apply_mutex_held, apply_lock_acquired_ns);
+            return;
+        }
+        if (opts.replicated_mutation_capture) |capture| {
+            try self.sealSinglePhasePhysicalPlanLocked(capture, effective_req, &transform_snapshot, store_writes.items, delete_keys.items, replay_append);
+            unlockProfiledApply(self, profile, &apply_mutex_held, apply_lock_acquired_ns);
+            return;
+        }
         // This is the final fallible replay-retention boundary. It is an
         // immediate node-wide reservation: no reclamation, disk I/O, or wait
         // occurs while the apply fence is held. A hard-limit failure is
@@ -12153,6 +12457,7 @@ pub const DB = struct {
                 resolution.status,
                 resolution.commit_version,
                 .{
+                    .preparation_allocator = preparation_alloc,
                     .writes = store_writes.items,
                     .deletes = delete_keys.items,
                     .replay = if (replay_append) |entry| .{ .sequence = entry.sequence, .payload = entry.payload } else null,
@@ -12180,9 +12485,11 @@ pub const DB = struct {
             schedule_ha_recovery_on_exit = durable_ha_batch_outbox_key != null or durable_ha_replay_outbox_key != null;
             break :blk transactions_mod.ResolutionOutcome{ .applied = true, .replay_sequence = sequence };
         };
+        if (opts.deferred_transaction_sequence) |out| out.* = transaction_applied.replay_sequence;
         if (!transaction_applied.applied) {
             unlockProfiledApply(self, profile, &apply_mutex_held, apply_lock_acquired_ns);
-            try self.waitForResolvedTransactionSync(effective_req.sync_level, transaction_applied.replay_sequence);
+            if (opts.deferred_transaction_sequence == null)
+                try self.waitForResolvedTransactionSync(effective_req.sync_level, transaction_applied.replay_sequence);
             return;
         }
         if (next_table_catalog) |catalog| self.core.table_catalog = catalog;
@@ -12314,7 +12621,7 @@ pub const DB = struct {
         }
         const wait_sync_start_ns = monotonicTimeNs();
         if (append_derived_replay and self.executor.hasWorkers()) {
-            if (opts.wait_for_sync_level) {
+            if (opts.wait_for_sync_level and opts.deferred_transaction_sequence == null) {
                 const sync_wait_start_ns = monotonicTimeNs();
                 try self.waitForSyncLevelWithCancellation(effective_req.sync_level, sequence, sync_targets, opts.visibility_cancellation);
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.sync_wait_ns, sync_wait_start_ns);
@@ -12329,7 +12636,7 @@ pub const DB = struct {
                 }
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.derived_apply_ns, derived_apply_start_ns);
             }
-            if (opts.wait_for_sync_level) {
+            if (opts.wait_for_sync_level and opts.deferred_transaction_sequence == null) {
                 const sync_wait_start_ns = monotonicTimeNs();
                 try self.waitForSyncLevelWithCancellation(effective_req.sync_level, sequence, sync_targets, opts.visibility_cancellation);
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.sync_wait_ns, sync_wait_start_ns);
@@ -12400,7 +12707,13 @@ pub const DB = struct {
     /// right after a DB is opened, since managed DBs open lazily and cannot
     /// thread the source through `OpenOptions`. No-op when this DB has no
     /// resolution runtime (e.g. read-only / status opens).
-    pub fn setResolutionCandidateSource(self: *DB, src: ?resolution_runtime_mod.CandidateSource) void {
+    pub fn setResolutionCandidateSource(self: *DB, src: ?resolution_runtime_mod.CandidateSource) !void {
+        // Clearing a borrowed hook is always legal during owner teardown.
+        var completion_transition = if (src != null)
+            try self.core.completion_eligibility.beginTransition()
+        else
+            null;
+        defer if (completion_transition) |*transition| transition.deinit();
         self.resolution_candidate_source = src;
         if (self.resolution_runtime) |runtime| runtime.setCandidateSource(src);
     }
@@ -12409,7 +12722,13 @@ pub const DB = struct {
     /// serving layer (managed write cache) calls this right after a DB is opened,
     /// since managed DBs open lazily and cannot thread the sink through
     /// `OpenOptions`. No-op when this DB has no promotion runtime.
-    pub fn setEntitySink(self: *DB, sink: ?promotion_runtime_mod.EntitySink) void {
+    pub fn setEntitySink(self: *DB, sink: ?promotion_runtime_mod.EntitySink) !void {
+        // Clearing a borrowed hook is always legal during owner teardown.
+        var completion_transition = if (sink != null)
+            try self.core.completion_eligibility.beginTransition()
+        else
+            null;
+        defer if (completion_transition) |*transition| transition.deinit();
         self.entity_sink = sink;
         if (self.promotion_runtime) |runtime| runtime.setSink(sink);
     }
@@ -12417,7 +12736,13 @@ pub const DB = struct {
     /// Inject (or clear) the source-shard promotion owner on an already-open DB.
     /// Serving-layer managed DBs use this to keep follower raft apply from
     /// turning replay into public entity-table writes.
-    pub fn setPromotionOwner(self: *DB, owner: ?promotion_runtime_mod.PromotionOwner) void {
+    pub fn setPromotionOwner(self: *DB, owner: ?promotion_runtime_mod.PromotionOwner) !void {
+        // Clearing a borrowed hook is always legal during owner teardown.
+        var completion_transition = if (owner != null)
+            try self.core.completion_eligibility.beginTransition()
+        else
+            null;
+        defer if (completion_transition) |*transition| transition.deinit();
         self.promotion_owner = owner;
         if (self.promotion_runtime) |runtime| runtime.setOwner(owner);
     }
@@ -22673,6 +22998,218 @@ pub const DB = struct {
         return try self.lookup(alloc, key, opts);
     }
 
+    pub fn readResourceManager(self: *DB) ?*resource_manager_mod.ResourceManager {
+        return self.async_context.resource_manager;
+    }
+
+    fn acquireGeneralReadDriver(self: *DB, borrowed: ?*resource_manager_mod.DenseExecution.Runtime.Lease, options: @import("../../common/workload_admission.zig").Options) !?resource_manager_mod.DenseExecution.Runtime.Lease {
+        const manager = self.readResourceManager() orelse {
+            if (borrowed != null) return error.InvalidLease;
+            return null;
+        };
+        if (borrowed) |driver| {
+            _ = try manager.borrowReadDriver(driver);
+            if (driver.options) |original| try original.check();
+            try options.check();
+            return null;
+        }
+        return manager.acquireReadDriver(options.io, options);
+    }
+
+    pub fn lookup(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions) !?types.LookupResult {
+        try checkLookupOptionsActive(opts);
+        var clock = if (opts.execution_io) |borrow| try borrow.receive() else null;
+        const io = self.backend_runtime.io() orelse std.Options.debug_io;
+        const options: @import("../../common/workload_admission.zig").Options = .{
+            .io = io,
+            .deadline_ns = opts.execution_deadline_ns,
+            .clock_io = if (clock) |*receiver| receiver.io() else null,
+            .native_now_ns = if (clock == null) platform_time.monotonicNs else null,
+            .cancellation = opts.cancellation orelse .none,
+        };
+        const runtime = if (self.readResourceManager()) |manager| manager.dense_execution else null;
+        const bounded = opts.read_execution == null and runtime != null and runtime.?.scope == .all_reads and runtime.?.config.protected.enabled() and
+            opts.fields.len == 0 and !opts.include_all_fields and key.len <= 512 and
+            !internal_keys.isInternalUserKey(key) and !std.mem.startsWith(u8, key, "\x00\x00__metadata__:") and !isSplitMetadataKey(key) and self.core.store.kind == .lmdb;
+        var driver: ?resource_manager_mod.DenseExecution.Runtime.Lease = if (bounded)
+            try runtime.?.acquireBoundedProbe(options)
+        else
+            try self.acquireGeneralReadDriver(opts.read_execution, options);
+        defer if (driver) |*owned| owned.release();
+        if (bounded) {
+            const result = probe: {
+                var scratch_reservation = self.readResourceManager().?.reserveWithoutReclaim(.relational_preparation_working_set, resource_manager_mod.DenseExecution.bounded_probe_bytes) catch |err| switch (err) {
+                    error.ResourceBudgetExceeded => return error.AdmissionBytesExhausted,
+                    else => return err,
+                };
+                defer scratch_reservation.release();
+                break :probe try self.tryBoundedExistenceProbe(alloc, key, opts);
+            };
+            switch (result) {
+                .completed => |value| return value,
+                .general => try driver.?.demote(),
+            }
+        }
+        var admitted = opts;
+        if (driver) |*owned| admitted.read_execution = owned;
+        return self.lookupWithReadDriver(alloc, key, admitted);
+    }
+
+    const BoundedExistenceResult = union(enum) { general, completed: ?types.LookupResult };
+
+    /// One local primary-key probe and at most 4 KiB of JSON validation, with
+    /// fixed 64 KiB scratch. No row, transaction, schema view, or allocation
+    /// survives a fallback: general execution restarts under the original
+    /// request/deadline after an atomic, prepaid lane transfer.
+    fn tryBoundedExistenceProbe(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions) !BoundedExistenceResult {
+        var scratch: [resource_manager_mod.DenseExecution.bounded_probe_bytes]u8 = undefined;
+        var fixed = std.heap.FixedBufferAllocator.init(&scratch);
+        const probe_alloc = fixed.allocator();
+        var schema_view = self.core.acquireSchemaView();
+        defer if (schema_view) |*view| view.release();
+        if (schema_view) |view| if (view.storageMode() == .relational or view.tableSchema().ttl_duration_ns != 0) return .general;
+        try checkLookupOptionsActive(opts);
+        const store_key = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, probe_alloc, key, schema_view);
+        var probe = try self.core.store.beginProbeTxn();
+        defer probe.abort();
+        const raw = probe.getLeased(store_key) catch |err| switch (err) {
+            error.NotFound => {
+                try checkLookupOptionsActive(opts);
+                return .{ .completed = null };
+            },
+            else => return err,
+        };
+        if (raw.len > 4096) return .general;
+        const parsed = std.json.parseFromSlice(std.json.Value, probe_alloc, raw, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return .general,
+            else => return err,
+        };
+        defer parsed.deinit();
+        try checkLookupOptionsActive(opts);
+        return .{ .completed = .{ .json = try alloc.dupe(u8, "{}") } };
+    }
+
+    fn lookupWithReadDriver(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions) !?types.LookupResult {
+        try checkLookupOptionsActive(opts);
+        if (self.restore_staging_required.load(.acquire) or opts.restore_staging_scope != null) {
+            var staging_read = try self.core.store.beginProbeTxn();
+            defer staging_read.abort();
+            try @import("restore_staging.zig").requireScope(alloc, &staging_read, opts.restore_staging_scope, false);
+        }
+        if (opts.relational_topology_json.len != 0) return self.lookupRelationalTopology(alloc, opts.relational_topology_json);
+        if (opts.relational_index_status_json.len != 0) return self.lookupRelationalIndexStatus(alloc, opts.relational_index_status_json, opts);
+        if (opts.relational_activation_json.len != 0) return self.lookupRelationalActivation(alloc, opts.relational_activation_json);
+        if (opts.relational_integrity_catalog) return self.lookupRelationalIntegrityCatalog(alloc);
+        if (opts.relational_integrity_action) return self.lookupRelationalIntegrityAction(alloc, key);
+        if (opts.relational_integrity_jobs_json.len != 0) return self.lookupRelationalIntegrityJobs(alloc, opts.relational_integrity_jobs_json);
+        // Pin the schema once and keep the physical row intact through TTL and
+        // projection. Relational rows carry their timestamp in the authenticated
+        // AROW header, so a point read does not need a second store lookup.
+        var schema_view = self.core.acquireSchemaView();
+        defer if (schema_view) |*view| view.release();
+        const store_key = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, alloc, key, schema_view);
+        defer alloc.free(store_key);
+        // Keep the probe's borrowed value pinned through projection. A full
+        // runtime snapshot would clone mutable state for a one-key lookup;
+        // an owned get would copy every unselected byte of a wide row.
+        var probe = if (opts.include_primary_digest)
+            try self.core.store.beginReadTxn()
+        else
+            try self.core.store.beginProbeTxn();
+        defer probe.abort();
+        const raw = probe.getLeased(store_key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        const relational = internal_keys.isRelationalRowKey(store_key);
+        var historical_schema_view: ?schema_registry_mod.SchemaView = null;
+        defer if (historical_schema_view) |*view| view.release();
+        const ordinal_row = if (relational) blk: {
+            const version = try relational_store.rowSchemaVersion(raw);
+            const row_schema = if (schema_view) |view|
+                if (view.version() == version)
+                    view
+                else historical: {
+                    historical_schema_view = (try self.core.acquireSchemaVersionView(version)) orelse
+                        return error.UnknownSchemaVersion;
+                    break :historical historical_schema_view.?;
+                }
+            else historical: {
+                historical_schema_view = (try self.core.acquireSchemaVersionView(version)) orelse
+                    return error.UnknownSchemaVersion;
+                break :historical historical_schema_view.?;
+            };
+            break :blk if (self.core.store.valuesAreAuthenticated())
+                try relational_row_codec.ordinalRowViewTrusted(
+                    raw,
+                    row_schema.tableSchema().*,
+                    row_schema.physicalLayout(),
+                )
+            else
+                try relational_row_codec.ordinalRowViewSelective(
+                    raw,
+                    row_schema.tableSchema().*,
+                    row_schema.physicalLayout(),
+                );
+        } else null;
+        if (!internal_keys.isInternalUserKey(key)) {
+            const ttl_duration_ns = if (schema_view) |view| view.visibilityTtlDurationNs() else 0;
+            if (ttl_duration_ns != 0) {
+                const timestamp_ns = if (ordinal_row) |row|
+                    row.writeTimestampNs()
+                else
+                    try self.getTimestamp(alloc, key);
+                if (timestamp_ns != 0 and ttl_mod.isExpired(timestamp_ns, ttl_duration_ns, currentTimeNs())) return null;
+            }
+        }
+        try checkLookupOptionsActive(opts);
+        const direct_fields = if (relational)
+            ordinalProjectionFields(opts.fields, opts.include_all_fields)
+        else
+            null;
+        const stored = if (direct_fields) |fields| blk: {
+            const row = ordinal_row.?;
+            var projection = try RelationalProjectionPlan.init(
+                alloc,
+                row.table_schema,
+                row.layout,
+                fields,
+            );
+            defer projection.deinit();
+            break :blk try projection.project(alloc, row);
+        } else blk: {
+            const materialized = if (ordinal_row) |row|
+                try row.reconstructValueAlloc(alloc)
+            else
+                try alloc.dupe(u8, raw);
+            if (opts.fields.len == 0 and opts.include_all_fields) break :blk materialized;
+            defer alloc.free(materialized);
+            break :blk try projectLookupStoredBytes(self, alloc, key, materialized, opts);
+        };
+        errdefer alloc.free(stored);
+        try checkLookupOptionsActive(opts);
+        var version: ?u64 = if (ordinal_row) |row| row.writeTimestampNs() else null;
+        var digest: ?[32]u8 = null;
+        if (opts.include_primary_digest) {
+            var primary_digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(raw, &primary_digest, .{});
+            digest = primary_digest;
+            if (version == null) {
+                const timestamp_key = try internal_keys.ttlKeyAlloc(alloc, key);
+                defer alloc.free(timestamp_key);
+                const timestamp = probe.get(timestamp_key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                version = if (timestamp) |bytes| blk: {
+                    if (bytes.len != 8) return error.InvalidTimestamp;
+                    break :blk std.mem.readInt(u64, bytes[0..8], .little);
+                } else 0;
+            }
+        }
+        return .{ .json = stored, .version = version, .expected_content_digest = digest };
+    }
+
     fn lookupRelationalIntegrityCatalog(self: *DB, alloc: Allocator) !?types.LookupResult {
         const catalog_mod = @import("relational_integrity_catalog.zig");
         self.core.lockApplyShared();
@@ -22975,127 +23512,6 @@ pub const DB = struct {
         return .{ .json = try std.json.Stringify.valueAlloc(alloc, Response{ .address = address, .claim = claim, .references = references.items, .next = next }, .{}) };
     }
 
-    pub fn lookup(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions) !?types.LookupResult {
-        try checkLookupOptionsActive(opts);
-        if (self.restore_staging_required.load(.acquire) or opts.restore_staging_scope != null) {
-            var staging_read = try self.core.store.beginProbeTxn();
-            defer staging_read.abort();
-            try @import("restore_staging.zig").requireScope(alloc, &staging_read, opts.restore_staging_scope, false);
-        }
-        if (opts.relational_topology_json.len != 0) return self.lookupRelationalTopology(alloc, opts.relational_topology_json);
-        if (opts.relational_index_status_json.len != 0) return self.lookupRelationalIndexStatus(alloc, opts.relational_index_status_json, opts);
-        if (opts.relational_activation_json.len != 0) return self.lookupRelationalActivation(alloc, opts.relational_activation_json);
-        if (opts.relational_integrity_catalog) return self.lookupRelationalIntegrityCatalog(alloc);
-        if (opts.relational_integrity_action) return self.lookupRelationalIntegrityAction(alloc, key);
-        if (opts.relational_integrity_jobs_json.len != 0) return self.lookupRelationalIntegrityJobs(alloc, opts.relational_integrity_jobs_json);
-        // Pin the schema once and keep the physical row intact through TTL and
-        // projection. Relational rows carry their timestamp in the authenticated
-        // AROW header, so a point read does not need a second store lookup.
-        var schema_view = self.core.acquireSchemaView();
-        defer if (schema_view) |*view| view.release();
-        const store_key = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, alloc, key, schema_view);
-        defer alloc.free(store_key);
-        // Keep the probe's borrowed value pinned through projection. A full
-        // runtime snapshot would clone mutable state for a one-key lookup;
-        // an owned get would copy every unselected byte of a wide row.
-        var probe = if (opts.include_primary_digest)
-            try self.core.store.beginReadTxn()
-        else
-            try self.core.store.beginProbeTxn();
-        defer probe.abort();
-        const raw = probe.getLeased(store_key) catch |err| switch (err) {
-            error.NotFound => return null,
-            else => return err,
-        };
-        const relational = internal_keys.isRelationalRowKey(store_key);
-        var historical_schema_view: ?schema_registry_mod.SchemaView = null;
-        defer if (historical_schema_view) |*view| view.release();
-        const ordinal_row = if (relational) blk: {
-            const version = try relational_store.rowSchemaVersion(raw);
-            const row_schema = if (schema_view) |view|
-                if (view.version() == version)
-                    view
-                else historical: {
-                    historical_schema_view = (try self.core.acquireSchemaVersionView(version)) orelse
-                        return error.UnknownSchemaVersion;
-                    break :historical historical_schema_view.?;
-                }
-            else historical: {
-                historical_schema_view = (try self.core.acquireSchemaVersionView(version)) orelse
-                    return error.UnknownSchemaVersion;
-                break :historical historical_schema_view.?;
-            };
-            break :blk if (self.core.store.valuesAreAuthenticated())
-                try relational_row_codec.ordinalRowViewTrusted(
-                    raw,
-                    row_schema.tableSchema().*,
-                    row_schema.physicalLayout(),
-                )
-            else
-                try relational_row_codec.ordinalRowViewSelective(
-                    raw,
-                    row_schema.tableSchema().*,
-                    row_schema.physicalLayout(),
-                );
-        } else null;
-        if (!internal_keys.isInternalUserKey(key)) {
-            const ttl_duration_ns = if (schema_view) |view| view.visibilityTtlDurationNs() else 0;
-            if (ttl_duration_ns != 0) {
-                const timestamp_ns = if (ordinal_row) |row|
-                    row.writeTimestampNs()
-                else
-                    try self.getTimestamp(alloc, key);
-                if (timestamp_ns != 0 and ttl_mod.isExpired(timestamp_ns, ttl_duration_ns, currentTimeNs())) return null;
-            }
-        }
-        try checkLookupOptionsActive(opts);
-        const direct_fields = if (relational)
-            ordinalProjectionFields(opts.fields, opts.include_all_fields)
-        else
-            null;
-        const stored = if (direct_fields) |fields| blk: {
-            const row = ordinal_row.?;
-            var projection = try RelationalProjectionPlan.init(
-                alloc,
-                row.table_schema,
-                row.layout,
-                fields,
-            );
-            defer projection.deinit();
-            break :blk try projection.project(alloc, row);
-        } else blk: {
-            const materialized = if (ordinal_row) |row|
-                try row.reconstructValueAlloc(alloc)
-            else
-                try alloc.dupe(u8, raw);
-            if (opts.fields.len == 0 and opts.include_all_fields) break :blk materialized;
-            defer alloc.free(materialized);
-            break :blk try projectLookupStoredBytes(self, alloc, key, materialized, opts);
-        };
-        errdefer alloc.free(stored);
-        try checkLookupOptionsActive(opts);
-        var version: ?u64 = if (ordinal_row) |row| row.writeTimestampNs() else null;
-        var digest: ?[32]u8 = null;
-        if (opts.include_primary_digest) {
-            var primary_digest: [32]u8 = undefined;
-            std.crypto.hash.sha2.Sha256.hash(raw, &primary_digest, .{});
-            digest = primary_digest;
-            if (version == null) {
-                const timestamp_key = try internal_keys.ttlKeyAlloc(alloc, key);
-                defer alloc.free(timestamp_key);
-                const timestamp = probe.get(timestamp_key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
-                version = if (timestamp) |bytes| blk: {
-                    if (bytes.len != 8) return error.InvalidTimestamp;
-                    break :blk std.mem.readInt(u64, bytes[0..8], .little);
-                } else 0;
-            }
-        }
-        return .{ .json = stored, .version = version, .expected_content_digest = digest };
-    }
-
     fn lookupRelationalRetirement(self: *DB, alloc: Allocator, request_json: []const u8) !?types.LookupResult {
         const retirement = @import("relational_integrity_retirement.zig");
         const activation = @import("relational_integrity_activation.zig");
@@ -23276,6 +23692,8 @@ pub const DB = struct {
     }
 
     pub fn updateRange(self: *DB, byte_range: types.ByteRange) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
@@ -23341,6 +23759,8 @@ pub const DB = struct {
     }
 
     pub fn setSplitState(self: *DB, state: ?types.SplitState) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         if (self.source_vectors.load(.acquire) != null) return error.VectorStoreLifecycleUnsupported;
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
@@ -23374,6 +23794,8 @@ pub const DB = struct {
     }
 
     pub fn setSplitDeltaFinalSeq(self: *DB, seq: u64) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
@@ -23398,6 +23820,8 @@ pub const DB = struct {
     }
 
     pub fn setSplitBootstrapMarker(self: *DB, marker: range_state_mod.SplitBootstrapMarker) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         try self.core.saveSplitBootstrapMarker(marker);
@@ -23412,6 +23836,8 @@ pub const DB = struct {
         byte_range: types.ByteRange,
         writes: []const types.BatchWrite,
     ) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         lockAtomicWithBackoff(&self.generation_replace_mutex);
         defer self.generation_replace_mutex.unlock();
         if (byte_range.start.len > 0 and byte_range.end.len > 0 and
@@ -23480,6 +23906,8 @@ pub const DB = struct {
         byte_range: types.ByteRange,
         writes: []const types.BatchWrite,
     ) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         try staged_generation.validatePath(self.core.path);
         if (byte_range.start.len > 0 and byte_range.end.len > 0 and
             std.mem.order(u8, byte_range.start, byte_range.end) != .lt)
@@ -23503,6 +23931,8 @@ pub const DB = struct {
         staged_generation: *const generation_lifecycle.StagedGeneration,
         byte_range: types.ByteRange,
     ) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         try staged_generation.validatePath(self.core.path);
         const range_value = try range_state_mod.encodeRangeAlloc(self.alloc, byte_range);
         defer self.alloc.free(range_value);
@@ -23528,6 +23958,8 @@ pub const DB = struct {
         base_delta_sequence: u64,
         marker: range_state_mod.SplitBootstrapMarker,
     ) !bool {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         lockAtomicWithBackoff(&self.generation_replace_mutex);
         defer self.generation_replace_mutex.unlock();
         try self.requireSupportedRelationalTopology();
@@ -23648,6 +24080,8 @@ pub const DB = struct {
         base_delta_sequence: u64,
         marker: range_state_mod.SplitBootstrapMarker,
     ) !bool {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         lockAtomicWithBackoff(&self.generation_replace_mutex);
         defer self.generation_replace_mutex.unlock();
 
@@ -23769,6 +24203,8 @@ pub const DB = struct {
     }
 
     pub fn createShadowIndexManager(self: *DB, split_key: []const u8, original_range_end: []const u8) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
@@ -23860,6 +24296,8 @@ pub const DB = struct {
         dest_dir2: []const u8,
         prepare_only: bool,
     ) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         if (self.source_vectors.load(.acquire) != null) return error.VectorStoreLifecycleUnsupported;
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
@@ -23905,6 +24343,8 @@ pub const DB = struct {
     }
 
     pub fn finalizeSplit(self: *DB, new_range: types.ByteRange) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
@@ -24143,6 +24583,8 @@ pub const DB = struct {
         expected_topology_fence: ?@import("relational_integrity_topology.zig").Fence,
         seal_only: bool,
     ) !u64 {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         try self.ensurePrimaryOnlySnapshot();
         // Serialize only snapshot construction/publication. Normal writes can
         // resume before native manifest hashing, while same-ID captures cannot
@@ -24732,6 +25174,8 @@ pub const DB = struct {
         donor: *DB,
         byte_range: types.ByteRange,
     ) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         if (self == donor or std.mem.eql(u8, self.core.path, donor.core.path))
             return error.InvalidArgument;
 
@@ -26338,6 +26782,8 @@ pub const DB = struct {
     }
 
     pub fn setSchema(self: *DB, table_schema: schema_mod.TableSchema) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         var schedule_ha_recovery_on_exit = false;
         defer if (schedule_ha_recovery_on_exit) self.scheduleDurableHAOutboxRecovery();
         var prepared_recovery = if (self.transaction_recovery_identity_context != null)
@@ -26624,6 +27070,8 @@ pub const DB = struct {
     }
 
     pub fn setSchemaJson(self: *DB, alloc: Allocator, schema_json: []const u8) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         var schedule_ha_recovery_on_exit = false;
         defer if (schedule_ha_recovery_on_exit) self.scheduleDurableHAOutboxRecovery();
         _ = alloc;
@@ -26934,9 +27382,13 @@ pub const DB = struct {
         }
         for (predicates) |predicate| if (isProtectedIntegrityKey(predicate.key)) return error.InvalidIntegrityOperation;
         try self.prepareTransactionRows(preparation_alloc, prepared_intents, view);
+        if (self.requiresDurablePhysicalCompletion()) {
+            return self.prepareDurablePhysicalCompletion(txn_id, prepared_intents, predicates, .{ .version = if (view) |pinned| pinned.version() else null }, schema_namespace, null, preparation_alloc, null);
+        }
 
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
+        try self.rejectUnreservedDurablePrepareLocked(txn_id);
         if (schema_namespace != self.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
         if (binding == null) try self.validatePreparedSchemaViewLocked(view);
         {
@@ -26962,6 +27414,119 @@ pub const DB = struct {
         try self.writeTransactionInternal(txn_id, req, null);
     }
 
+    fn replicatedCompletionAuthority(self: *DB, expected_previous: RaftAppliedEntryIdentity) !@import("../completion_candidate.zig").Authority {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        if (!self.requiresDurablePhysicalCompletion() or self.durable_completion_authority != .raft_apply or
+            !self.durable_completion_enabled) return error.CompletionAdmissionUnavailable;
+        const backend = self.core.primary_store_owner.lsmBackend() orelse return error.UnsupportedCompletionBackend;
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        const locked = @import("../lsm_backend/runtime.zig").lockBackend(lsm_backend_mod.Backend, backend);
+        defer @import("../lsm_backend/runtime.zig").unlockBackend(lsm_backend_mod.Backend, backend, locked);
+        const pool = backend.completion_pool orelse return error.CompletionAdmissionUnavailable;
+        if (!pool.ready or pool.failed or backend.manifest_recovery_required) return error.CompletionAdmissionUnavailable;
+        return .{
+            .group_id = pool.config.identity.group_id,
+            .incarnation = pool.config.identity.incarnation,
+            .policy_digest = pool.config.identity.policy_digest,
+            .schema_catalog_digest = pool.config.schema_catalog_digest,
+            .previous_term = expected_previous.term,
+            .previous_index = expected_previous.index,
+        };
+    }
+
+    fn validateSinglePhaseCompletionProfile(self: *DB) !void {
+        if (self.core.store.payload_store != null or self.shadow != null or self.core.splitState() != null or
+            self.bulk_ingest_coalescer.active or self.ha_async_batch_mirror != null or self.ha_async_effect_mirror != null or
+            self.ha_async_metadata_mirror != null or self.ha_write_gate != null)
+            return error.UnsupportedCompletionProfile;
+        const manager = self.core.index_manager;
+        manager.catalog_mutex.lockShared();
+        defer manager.catalog_mutex.unlockShared();
+        try manager.validateCompletionBackends();
+        // These producers can change primary artifact/coverage prefixes outside
+        // this Raft frontier. Point baselines cannot certify an empty prefix or
+        // a skipped coverage update. Enable them only with owned range/version
+        // dependencies, including every asynchronous producer.
+        if (manager.hasGeneratedEnrichmentTargets() or manager.graph_indexes.items.len != 0)
+            return error.UnsupportedCompletionProfile;
+    }
+
+    /// Capture ordinary document mutations at the same final planner boundary
+    /// used for publication, including all derived physical metadata. Admission
+    /// and application remain separate native operations on the returned wire.
+    pub fn compileReplicatedMutation(self: *DB, alloc: Allocator, req: types.BatchRequest, expected_previous: RaftAppliedEntryIdentity) ![]u8 {
+        if (req.transaction != null or req.graph_writes.len != 0 or req.graph_deletes.len != 0 or
+            req.split_checkpoint != null or req.split_replication != null or req.split_transition != null or
+            req.merge_source_transition != null or req.merge_checkpoint != null or req.merge_replication != null or
+            req.merge_artifacts.len != 0) return error.UnsupportedCompletionProfile;
+        try self.validateSinglePhaseCompletionProfile();
+        for (req.writes) |write| if (isMetadataKey(write.key)) return error.UnsupportedCompletionProfile;
+        for (req.deletes) |key| if (isMetadataKey(key)) return error.UnsupportedCompletionProfile;
+        for (req.transforms) |transform| if (isMetadataKey(transform.key)) return error.UnsupportedCompletionProfile;
+        var capture: ReplicatedCompletionCapture = .{
+            .allocator = alloc,
+            .authority = try self.replicatedCompletionAuthority(expected_previous),
+        };
+        const original = try std.json.Stringify.valueAlloc(alloc, req, .{});
+        defer alloc.free(original);
+        std.crypto.hash.sha2.Sha256.hash(original, &capture.mutation_input_digest, .{});
+        errdefer if (capture.envelope) |bytes| alloc.free(bytes);
+        var request = req;
+        request.reject_graph_transform_projections = true;
+        try self.batchInternal(request, null, .{ .replicated_mutation_capture = &capture, .wait_for_sync_level = false });
+        return capture.envelope orelse error.CompletionAdmissionUnavailable;
+    }
+
+    /// Compile begin metadata without creating a transaction or a document
+    /// replay event. Named participant selection/validation belongs to the
+    /// trusted local-write adapter; prepare/decision/ACK ownership is separate.
+    pub fn compileReplicatedBegin(self: *DB, alloc: Allocator, input: transactions_mod.TxnManager.BeginInput, expected_previous: RaftAppliedEntryIdentity) ![]u8 {
+        const authority = try self.replicatedCompletionAuthority(expected_previous);
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        try self.validateSinglePhaseCompletionProfile();
+        try self.core.validateTransactionCompletionPolicy();
+        var manager = try transactions_mod.TxnManager.init(alloc, self.core.store);
+        defer manager.deinit();
+        manager.completion_limits = .{
+            .max_transaction_bytes = self.core.table_catalog.transaction_admission_bytes,
+            .max_count = self.core.table_catalog.transaction_recovery_max_count,
+            .max_bytes = self.core.table_catalog.transaction_recovery_max_bytes,
+        };
+        var read = try manager.store.beginRead();
+        defer read.abort();
+        const original = try std.json.Stringify.valueAlloc(alloc, input, .{});
+        defer alloc.free(original);
+        var input_digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(original, &input_digest, .{});
+        const fence = replicatedCompletionFence(authority, input_digest);
+        return manager.compileBeginMutation(alloc, &read, input, authority, input_digest, &fence, &.{&internal_keys.table_storage_settings_key});
+    }
+
+    /// Builds a proposal candidate against a stable DB snapshot. This does not
+    /// prepare the transaction or acquire accepted ownership. DATA must hold
+    /// or revalidate its full Raft frontier before submitting the candidate;
+    /// the installed native guard validates and reserves it before acceptance.
+    pub fn compileReplicatedTransaction(
+        self: *DB,
+        alloc: Allocator,
+        txn_id: types.TxnId,
+        req: types.TransactionIntentRequest,
+        expected_previous: RaftAppliedEntryIdentity,
+    ) ![]u8 {
+        var capture: ReplicatedCompletionCapture = .{
+            .allocator = alloc,
+            .authority = try self.replicatedCompletionAuthority(expected_previous),
+        };
+        errdefer if (capture.envelope) |bytes| alloc.free(bytes);
+        var preparation: RequestPreparationContext = undefined;
+        preparation.init(self);
+        defer preparation.deinit();
+        try self.writeTransactionInternalOnce(txn_id, req, null, preparation.guard.allocator(), &capture);
+        return capture.envelope orelse error.CompletionAdmissionUnavailable;
+    }
+
     pub fn writeReplicatedTransactionAtRaftEntry(
         self: *DB,
         txn_id: types.TxnId,
@@ -26984,7 +27549,7 @@ pub const DB = struct {
         const max_prepared_retries = 2;
         var retries: usize = 0;
         while (true) {
-            self.writeTransactionInternalOnce(txn_id, req, raft_entry, preparation.guard.allocator()) catch |err| switch (err) {
+            self.writeTransactionInternalOnce(txn_id, req, raft_entry, preparation.guard.allocator(), null) catch |err| switch (err) {
                 error.PreparedGenerationChanged, error.PreparedReadSetChanged => {
                     if (retries >= max_prepared_retries) return err;
                     retries += 1;
@@ -27002,6 +27567,7 @@ pub const DB = struct {
         req: types.TransactionIntentRequest,
         raft_entry: ?RaftAppliedEntryIdentity,
         preparation_alloc: Allocator,
+        replicated_capture: ?*ReplicatedCompletionCapture,
     ) !void {
         if (req.relational_index_maintenance != null and
             (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
@@ -27086,6 +27652,10 @@ pub const DB = struct {
         }
         defer freePreparedIntentRows(preparation_alloc, intents.items);
         try self.prepareTransactionRows(preparation_alloc, intents.items, prepared_schema_view);
+        if (self.requiresDurablePhysicalCompletion()) {
+            if (raft_entry != null) return error.CompletionAdmissionUnavailable;
+            return self.prepareDurablePhysicalCompletion(txn_id, intents.items, predicates.items, .{ .version = if (prepared_schema_view) |view| view.version() else null }, schema_namespace, &transform_snapshot, preparation_alloc, replicated_capture);
+        }
 
         const integrity_catalog_mod = @import("relational_integrity_catalog.zig");
         var integrity_catalog: ?integrity_catalog_mod.Catalog = null;
@@ -27115,6 +27685,7 @@ pub const DB = struct {
 
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
+        try self.rejectUnreservedDurablePrepareLocked(txn_id);
         if (schema_namespace != self.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
         if (binding == null) try self.validatePreparedSchemaViewLocked(prepared_schema_view);
         const integrity_mod = @import("relational_integrity.zig");
@@ -27292,6 +27863,1260 @@ pub const DB = struct {
         };
     }
 
+    fn requiresDurablePhysicalCompletion(self: *const DB) bool {
+        return if (self.table_storage.transaction_recovery) |policy| policy.requiresDurableCompletion() else false;
+    }
+
+    fn completionHashBytes(hash: *std.crypto.hash.sha2.Sha256, bytes: []const u8) void {
+        var length: [8]u8 = undefined;
+        std.mem.writeInt(u64, &length, @intCast(bytes.len), .little);
+        hash.update(&length);
+        hash.update(bytes);
+    }
+
+    fn completionInputDigest(intents: []const transactions_mod.WriteIntent, predicates: []const transactions_mod.VersionPredicate, binding: transactions_mod.SchemaBinding) [32]u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        completionHashBytes(&hash, "physical-completion-input-v1");
+        var number: [8]u8 = undefined;
+        std.mem.writeInt(u64, &number, binding.version orelse 0, .little);
+        completionHashBytes(&hash, &number);
+        for (intents) |intent| {
+            completionHashBytes(&hash, intent.key);
+            hash.update(&.{@intFromBool(intent.value != null)});
+            if (intent.value) |value| completionHashBytes(&hash, value);
+            hash.update(&.{@intFromBool(intent.prepared_row != null)});
+            if (intent.prepared_row) |row| completionHashBytes(&hash, row);
+        }
+        completionHashBytes(&hash, "predicates");
+        for (predicates) |predicate| {
+            completionHashBytes(&hash, predicate.key);
+            std.mem.writeInt(u64, &number, predicate.expected_version, .little);
+            completionHashBytes(&hash, &number);
+        }
+        return hash.finalResult();
+    }
+
+    /// Persisted authority, rather than process-local generation counters.
+    /// Mutable row/cardinality facts are protected by the sealed key footprint.
+    fn physicalCompletionFence(self: *DB, input: [32]u8) ![72]u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        completionHashBytes(&hash, "physical-completion-profile-v1");
+        const io = self.backend_runtime.filesystemIo() orelse return error.MissingBackendRuntimeIo;
+        const canonical = if (std.fs.path.isAbsolute(self.core.path))
+            try std.Io.Dir.realPathFileAbsoluteAlloc(io, self.core.path, self.alloc)
+        else
+            try std.Io.Dir.cwd().realPathFileAlloc(io, self.core.path, self.alloc);
+        defer self.alloc.free(canonical);
+        completionHashBytes(&hash, canonical);
+        const physical_root = try root_identity.load(self.alloc, io, self.core.path);
+        var incarnation: [16]u8 = undefined;
+        std.mem.writeInt(u128, &incarnation, physical_root.incarnation, .little);
+        completionHashBytes(&hash, &incarnation);
+        completionHashBytes(&hash, self.core.byteRange().start);
+        completionHashBytes(&hash, self.core.byteRange().end);
+        var number: [8]u8 = undefined;
+        for ([_]u64{ self.core.identity_namespace.table_id, self.core.identity_namespace.shard_id, self.core.identity_namespace.range_id }) |value| {
+            std.mem.writeInt(u64, &number, value, .little);
+            completionHashBytes(&hash, &number);
+        }
+        var read = try self.core.store.beginProbeTxn();
+        defer read.abort();
+        for ([_][]const u8{
+            "\x00\x00__metadata__:schema",             "\x00\x00__metadata__:indexes",
+            "\x00\x00__metadata__:enrichments",        "\x00\x00__metadata__:resolvers",
+            &internal_keys.table_storage_settings_key, public_schema_json_key,
+        }) |key| {
+            completionHashBytes(&hash, key);
+            const value = read.get(key) catch |err| switch (err) {
+                error.NotFound => {
+                    hash.update(&.{0});
+                    continue;
+                },
+                else => return err,
+            };
+            hash.update(&.{1});
+            completionHashBytes(&hash, value);
+        }
+        if (self.core.schema) |schema| {
+            const key = try public_table_schema.versionedSchemaKeyAlloc(self.alloc, schema.version);
+            defer self.alloc.free(key);
+            completionHashBytes(&hash, key);
+            const value = read.get(key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            hash.update(&.{@intFromBool(value != null)});
+            if (value) |bytes| completionHashBytes(&hash, bytes);
+        }
+        var out: [72]u8 = undefined;
+        @memcpy(out[0..8], "DBCSP002");
+        hash.final(out[8..40]);
+        @memcpy(out[40..72], &input);
+        return out;
+    }
+
+    fn replicatedCompletionFence(authority: @import("../completion_candidate.zig").Authority, input: [32]u8) [72]u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly-replicated-completion-profile-v1");
+        var group: [8]u8 = undefined;
+        std.mem.writeInt(u64, &group, authority.group_id, .little);
+        hash.update(&group);
+        hash.update(&authority.incarnation);
+        hash.update(&authority.policy_digest);
+        hash.update(&authority.schema_catalog_digest);
+        var out: [72]u8 = undefined;
+        @memcpy(out[0..8], "DBCRP003");
+        hash.final(out[8..40]);
+        @memcpy(out[40..72], &input);
+        return out;
+    }
+
+    fn validatePhysicalCompletionProfileLocked(self: *DB) !void {
+        if (!self.acceptsNewLocalDurableCompletion() or self.generation_read_lease == null) return error.LocalCompletionAuthorityRequired;
+        if (self.core.store.payload_store != null) return error.UnsupportedCompletionProfile;
+        if (self.shadow != null or self.core.splitState() != null or self.bulk_ingest_coalescer.active or
+            self.ha_async_effect_mirror != null or self.ha_async_batch_mirror != null or
+            self.ha_async_metadata_mirror != null or self.ha_write_gate != null)
+            return error.UnsupportedCompletionProfile;
+        try self.core.index_manager.prepareCompletionBackends();
+    }
+
+    fn prepareDurablePhysicalCompletion(
+        self: *DB,
+        txn_id: transactions_mod.TxnId,
+        intents: []const transactions_mod.WriteIntent,
+        predicates: []const transactions_mod.VersionPredicate,
+        schema_binding: transactions_mod.SchemaBinding,
+        schema_namespace: u64,
+        read_snapshot: ?*const TransformReadSnapshot,
+        alloc: Allocator,
+        replicated_capture: ?*ReplicatedCompletionCapture,
+    ) !void {
+        if (intents.len == 0 or intents.len > 32) return error.UnsupportedCompletionProfile;
+        const digest = completionInputDigest(intents, predicates, schema_binding);
+        const backend = self.core.primary_store_owner.lsmBackend() orelse return error.UnsupportedCompletionBackend;
+        {
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            // Retries of the exact sealed input remain valid when operators
+            // disable new admission. Different input never reuses its vote.
+            if (backend.findDurableCompletion(txn_id)) |slot| {
+                if (replicated_capture != null) return error.PreparedCompletionActive;
+                const fence = slot.descriptor.descriptor.profile_fence;
+                if (fence.len != 72 or !std.mem.eql(u8, fence[0..8], "DBCSP002") or !std.mem.eql(u8, fence[40..72], &digest))
+                    return error.PreparedCompletionActive;
+                try backend.confirmDurableCompletion(txn_id);
+                return;
+            }
+            if (replicated_capture) |_| {
+                if (self.durable_completion_authority != .raft_apply or !self.durable_completion_enabled or backend.completion_pool == null)
+                    return error.CompletionAdmissionUnavailable;
+                if (self.core.store.payload_store != null or self.shadow != null or self.core.splitState() != null or self.bulk_ingest_coalescer.active)
+                    return error.UnsupportedCompletionProfile;
+            } else try self.validatePhysicalCompletionProfileLocked();
+            if (schema_namespace != self.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
+            if (read_snapshot) |observed| try self.validateTransformReadSnapshot(observed.*);
+            self.core.completion_eligibility.begin(txn_id) catch |err| switch (err) {
+                error.PreparedCompletionActive => return error.CompletionRecoveryCapacityRequired,
+                else => return err,
+            };
+        }
+        errdefer {
+            lockApply(self);
+            defer self.core.unlockApply();
+            backend.cancelUnpreparedCompletion(txn_id);
+            if (backend.findDurableCompletion(txn_id) == null) {
+                self.cancelDurableCompletionBacklog(txn_id);
+                if (replicated_capture == null) self.core.completion_eligibility.retire(txn_id) catch unreachable;
+            }
+        }
+        defer if (replicated_capture != null) {
+            lockApply(self);
+            self.core.completion_eligibility.retire(txn_id) catch unreachable;
+            self.core.unlockApply();
+        };
+        var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+        defer writes.deinit(alloc);
+        var deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer deletes.deinit(alloc);
+        var rows = std.StringHashMapUnmanaged([]const u8).empty;
+        defer rows.deinit(alloc);
+        for (intents) |intent| {
+            if (intent.key.len == 0 or isMetadataKey(intent.key) or internal_keys.isInternalUserKey(intent.key)) return error.UnsupportedCompletionProfile;
+            if (intent.value) |value| {
+                try writes.append(alloc, .{ .key = intent.key, .value = value });
+                if (intent.prepared_row) |row| try rows.put(alloc, intent.key, row);
+            } else try deletes.append(alloc, intent.key);
+        }
+        const context: DurablePhysicalPrepare = .{
+            .txn_id = txn_id,
+            .intents = intents,
+            .predicates = predicates,
+            .schema_binding = schema_binding,
+            .schema_namespace = schema_namespace,
+            .transform_snapshot = read_snapshot,
+            .input_digest = digest,
+            .replicated_capture = replicated_capture,
+        };
+        // The normal planner performs schema/index/artifact/identity expansion.
+        // Its final mutation boundary seals a plan instead of publishing rows.
+        try self.batchInternal(.{ .writes = writes.items, .deletes = deletes.items, .timestamp_ns = 1 }, null, .{
+            .durable_completion_prepare = &context,
+            .durable_rows = &rows,
+            .wait_for_sync_level = false,
+        });
+    }
+
+    fn appendSinglePhaseLogicalDependency(self: *DB, key: []const u8, dependencies: *std.ArrayListUnmanaged([]const u8), owned: *std.ArrayListUnmanaged([]u8)) !void {
+        for (0..3) |kind| {
+            if (kind == 1 and internal_keys.isInternalUserKey(key)) continue;
+            const physical = switch (kind) {
+                0 => try encodeStoreLookupKeyAlloc(self, self.alloc, key),
+                1 => try makeTimestampKey(self.alloc, key),
+                else => try transactions_mod.makeIntentLockKeyAlloc(self.alloc, key),
+            };
+            const exists = for (dependencies.items) |existing| {
+                if (std.mem.eql(u8, existing, physical)) break true;
+            } else false;
+            if (exists) {
+                self.alloc.free(physical);
+                continue;
+            }
+            owned.append(self.alloc, physical) catch |err| {
+                self.alloc.free(physical);
+                return err;
+            };
+            try dependencies.append(self.alloc, physical);
+        }
+    }
+
+    fn sealSinglePhasePhysicalPlanLocked(
+        self: *DB,
+        capture: *ReplicatedCompletionCapture,
+        request: types.BatchRequest,
+        observed: *const TransformReadSnapshot,
+        writes: []const docstore_mod.KVPair,
+        deletes: []const []const u8,
+        replay: ?docstore_mod.DocStore.ReplayAppend,
+    ) !void {
+        try self.validateSinglePhaseCompletionProfile();
+        const payloads = @import("../artifact_payload.zig");
+        var manager = try transactions_mod.TxnManager.init(self.alloc, self.core.store);
+        defer manager.deinit();
+        var read = try manager.store.beginRead();
+        defer read.abort();
+        for (writes) |write| {
+            if (payloads.isReference(write.value)) return error.UnsupportedCompletionProfile;
+            if (payloads.isEmbeddingKey(write.key)) {
+                const old = read.get(write.key) catch |err| switch (err) {
+                    error.NotFound => continue,
+                    else => return err,
+                };
+                if (payloads.isReference(old)) return error.UnsupportedCompletionProfile;
+            }
+        }
+        for (deletes) |key| if (payloads.isEmbeddingKey(key)) {
+            const old = read.get(key) catch |err| switch (err) {
+                error.NotFound => continue,
+                else => return err,
+            };
+            if (payloads.isReference(old)) return error.UnsupportedCompletionProfile;
+        };
+        var dependencies: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer dependencies.deinit(self.alloc);
+        var owned_keys: std.ArrayListUnmanaged([]u8) = .empty;
+        defer {
+            for (owned_keys.items) |key| self.alloc.free(key);
+            owned_keys.deinit(self.alloc);
+        }
+        try dependencies.appendSlice(self.alloc, &.{
+            "\x00\x00__metadata__:schema",             "\x00\x00__metadata__:indexes",
+            "\x00\x00__metadata__:enrichments",        "\x00\x00__metadata__:resolvers",
+            &internal_keys.table_storage_settings_key, public_schema_json_key,
+        });
+        if (self.core.schema) |schema| {
+            const key = try public_table_schema.versionedSchemaKeyAlloc(self.alloc, schema.version);
+            owned_keys.append(self.alloc, key) catch |err| {
+                self.alloc.free(key);
+                return err;
+            };
+            try dependencies.append(self.alloc, key);
+        }
+        for (observed.entries) |entry| try self.appendSinglePhaseLogicalDependency(entry.key, &dependencies, &owned_keys);
+        for (request.predicates) |predicate| try self.appendSinglePhaseLogicalDependency(predicate.key, &dependencies, &owned_keys);
+        // Semantic-noop classification can remove a source write from the
+        // delta, but the observed document/version/lock remains a dependency.
+        for (request.writes) |write| try self.appendSinglePhaseLogicalDependency(write.key, &dependencies, &owned_keys);
+        for (request.deletes) |key| try self.appendSinglePhaseLogicalDependency(key, &dependencies, &owned_keys);
+        const fence = replicatedCompletionFence(capture.authority, capture.mutation_input_digest);
+        capture.envelope = try @import("../completion_candidate.zig").encodePhysicalMutation(
+            capture.allocator,
+            capture.authority,
+            capture.mutation_input_digest,
+            &fence,
+            lsm_backend_mod.Backend.durable_completion_limits,
+            &read,
+            writes,
+            deletes,
+            replay,
+            dependencies.items,
+        );
+    }
+
+    fn sealDurablePhysicalPlanLocked(self: *DB, prepare: *const DurablePhysicalPrepare, writes: []const docstore_mod.KVPair, deletes: []const []const u8, replay: docstore_mod.DocStore.ReplayAppend, timestamp: u64, timestamp_keys: []const []const u8) !void {
+        const backend = self.core.primary_store_owner.lsmBackend() orelse return error.UnsupportedCompletionBackend;
+        const payloads = @import("../artifact_payload.zig");
+        // Inline artifact operations need no external payload ownership journal.
+        // Existing references must never be deleted/replaced without that journal.
+        var baseline = try self.core.store.beginProbeTxn();
+        defer baseline.abort();
+        for (writes) |write| {
+            if (payloads.isReference(write.value)) return error.UnsupportedCompletionProfile;
+            if (payloads.isEmbeddingKey(write.key)) {
+                const old = baseline.get(write.key) catch |err| switch (err) {
+                    error.NotFound => continue,
+                    else => return err,
+                };
+                if (payloads.isReference(old)) return error.UnsupportedCompletionProfile;
+            }
+        }
+        for (deletes) |key| if (payloads.isEmbeddingKey(key)) {
+            const old = baseline.get(key) catch |err| switch (err) {
+                error.NotFound => continue,
+                else => return err,
+            };
+            if (payloads.isReference(old)) return error.UnsupportedCompletionProfile;
+        };
+        var manager = try transactions_mod.TxnManager.init(self.alloc, self.core.store);
+        defer manager.deinit();
+        manager.completion_limits = .{
+            .max_transaction_bytes = self.core.table_catalog.transaction_admission_bytes,
+            .max_count = self.core.table_catalog.transaction_recovery_max_count,
+            .max_bytes = self.core.table_catalog.transaction_recovery_max_bytes,
+        };
+        var read = try manager.store.beginRead();
+        defer read.abort();
+        var marker_bytes: [raft_applied_entry_value_len]u8 = undefined;
+        const marker = raftAppliedEntryWrite(.{ .term = 1, .index = 1 }, &marker_bytes);
+        const marker_writes: []const docstore_mod.KVPair = if (prepare.replicated_capture != null) &.{marker} else &.{};
+        var templates = try manager.compileCompletionTemplates(prepare.txn_id, prepare.intents, prepare.predicates, .{ .schema_binding = prepare.schema_binding, .max_intent_admission_bytes = self.core.table_catalog.transaction_admission_bytes }, .{ .writes = writes, .deletes = deletes, .completion_writes = marker_writes, .replay = .{ .sequence = replay.sequence, .payload = replay.payload }, .skip_all_intent_application = true }, .{ .completion_writes = marker_writes }, .{ .snapshot = &read, .timestamp = timestamp, .replay_payload_sequence_offset = 6, .physical_mutations = true, .allow_raft_marker = prepare.replicated_capture != null, .timestamp_keys = timestamp_keys, .scratch_bytes = 8 * 1024 * 1024, .plan_limits = .{ .max_operations = 256, .max_bytes = 256 * 1024 } });
+        defer templates.deinit();
+        const codec = @import("../lsm_backend/completion_slot.zig");
+        const fence = if (prepare.replicated_capture) |capture|
+            replicatedCompletionFence(capture.authority, prepare.input_digest)
+        else
+            try self.physicalCompletionFence(prepare.input_digest);
+        const encoded = try codec.encode(self.alloc, .{
+            .txn_id = prepare.txn_id,
+            .intent_revision = templates.intent_revision,
+            .namespace = "docs",
+            .limits = lsm_backend_mod.Backend.durable_completion_limits,
+            .profile_fence = &fence,
+            .commit = templates.commit.operations,
+            .abort = templates.abort.operations,
+        }, .{});
+        defer self.alloc.free(encoded);
+        if (prepare.replicated_capture) |capture| {
+            var dependencies: std.ArrayListUnmanaged([]const u8) = .empty;
+            defer dependencies.deinit(self.alloc);
+            var owned_keys: std.ArrayListUnmanaged([]u8) = .empty;
+            defer {
+                for (owned_keys.items) |key| self.alloc.free(key);
+                owned_keys.deinit(self.alloc);
+            }
+            try dependencies.appendSlice(self.alloc, &.{
+                "\x00\x00__metadata__:schema",             "\x00\x00__metadata__:indexes",
+                "\x00\x00__metadata__:enrichments",        "\x00\x00__metadata__:resolvers",
+                &internal_keys.table_storage_settings_key, public_schema_json_key,
+            });
+            if (self.core.schema) |schema| {
+                const key = try public_table_schema.versionedSchemaKeyAlloc(self.alloc, schema.version);
+                owned_keys.append(self.alloc, key) catch |err| {
+                    self.alloc.free(key);
+                    return err;
+                };
+                try dependencies.append(self.alloc, key);
+            }
+            if (prepare.transform_snapshot) |observed| for (observed.entries) |entry| {
+                const key = try encodeStoreLookupKeyAlloc(self, self.alloc, entry.key);
+                owned_keys.append(self.alloc, key) catch |err| {
+                    self.alloc.free(key);
+                    return err;
+                };
+                try dependencies.append(self.alloc, key);
+            };
+            capture.envelope = try @import("../completion_candidate.zig").encode(capture.allocator, capture.authority, prepare.txn_id, prepare.input_digest, encoded, &templates, &read, dependencies.items);
+            return;
+        }
+        try self.reserveDurableCompletionBacklog(prepare.txn_id, @intCast(replay.payload.len));
+        try self.prepareDurableCompletionPublication(prepare.txn_id, templates.commit.operations);
+        _ = self.core.nextDerivedAppendSequence();
+        try backend.reserveDurableCompletion(encoded);
+        try self.core.writeIntentsExtraBatch(prepare.txn_id, prepare.intents, prepare.predicates, .{
+            .schema_binding = prepare.schema_binding,
+            .writes = &.{.{ .key = backend.findDurableCompletion(prepare.txn_id).?.storageKey(), .value = encoded }},
+        });
+        try backend.confirmDurableCompletion(prepare.txn_id);
+    }
+
+    pub const completionInstallationPreflight = @import("../completion_installation_receipt.zig").preflight;
+
+    /// Trusted pending-activation installation. The owner registry must keep
+    /// this table fenced from legacy Raft admission until activation completes.
+    /// Desired public indexes must already have passed normal reconciliation.
+    pub fn installCompletionBinding(self: *DB, binding: @import("kernel_owner_abi").completion_pool.InstallBinding, schema_json: []const u8, read_schema_json: []const u8, indexes_json: []const u8, desired_settings: table_storage_mod.Settings) !void {
+        const receipt_codec = @import("../completion_installation_receipt.zig");
+        try receipt_codec.validateCatalog(self.alloc, binding, schema_json, read_schema_json, indexes_json);
+        const policy = desired_settings.transaction_recovery orelse return error.CompletionProfileChanged;
+        try policy.validate();
+        if (!policy.requiresDurableCompletion() or !std.mem.eql(u8, &binding.identity.policy_digest, &@import("../../metadata/completion_activation.zig").policyDigest(policy))) return error.CompletionProfileChanged;
+        if (self.generation_read_lease == null or self.core.store.payload_store != null or self.shadow != null or
+            self.core.splitState() != null or self.bulk_ingest_coalescer.active or self.root_incarnation == 0)
+            return error.UnsupportedCompletionProfile;
+        const backend = self.core.primary_store_owner.lsmBackend() orelse return error.UnsupportedCompletionBackend;
+        const io = self.backend_runtime.filesystemIo() orelse return error.MissingBackendRuntimeIo;
+        {
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            if (self.core.identity_namespace.table_id != binding.table_id or self.core.identity_namespace.range_id != binding.range_id)
+                return error.CompletionProfileChanged;
+            const actual_public = try self.core.getStoreValue(self.alloc, public_schema_json_key);
+            defer if (actual_public) |value| self.alloc.free(value);
+            const catalog = @import("../../common/completion_catalog_digest.zig");
+            const actual_schema = try catalog.digest(self.alloc, actual_public orelse "", "", "");
+            const wanted_schema = try catalog.digest(self.alloc, schema_json, "", "");
+            if (!std.mem.eql(u8, &actual_schema, &wanted_schema)) return error.CompletionProfileChanged;
+            const existing = try receipt_codec.load(self.alloc, io, self.core.path);
+            if (existing) |receipt| {
+                const expected_binding = try receipt_codec.bindingDigest(binding);
+                const fingerprint = try self.physicalCompletionFence(@splat(0));
+                if (receipt.incarnation != self.root_incarnation or !std.mem.eql(u8, &receipt.binding_digest, &expected_binding) or
+                    !std.mem.eql(u8, &receipt.physical_digest, fingerprint[8..40])) return error.CompletionProfileChanged;
+                if (!std.meta.eql(self.table_storage, desired_settings)) return error.CompletionProfileChanged;
+            } else {
+                if (backend.completion_pool != null) return error.CompletionProfileChanged;
+                try self.core.completion_eligibility.checkTransition();
+                if (!std.meta.eql(self.table_storage, desired_settings)) {
+                    if (self.table_storage.dense_embeddings != desired_settings.dense_embeddings or self.requiresDurablePhysicalCompletion())
+                        return error.ImmutableTableStorageSettings;
+                    // Policy activation is a fenced migration, never an implicit
+                    // reinterpretation of preexisting transaction obligations.
+                    var manager = try transactions_mod.TxnManager.init(self.alloc, self.core.store);
+                    defer manager.deinit();
+                    const records = try manager.listTransactionsPage(self.alloc, null, 1);
+                    defer self.alloc.free(records.items);
+                    if (records.items.len != 0) return error.CompletionReservationBusy;
+                    var next_catalog = self.core.table_catalog;
+                    next_catalog.transaction_recovery_max_count = policy.max_count;
+                    next_catalog.transaction_recovery_max_bytes = policy.max_bytes;
+                    next_catalog.transaction_admission_bytes = policy.max_transaction_bytes;
+                    next_catalog.generation +|= 1;
+                    const encoded = try std.json.Stringify.valueAlloc(self.alloc, desired_settings, .{});
+                    defer self.alloc.free(encoded);
+                    var catalog_buffer: [table_catalog_mod.encoded_len]u8 = undefined;
+                    errdefer backend.fenceFailedBulkWal();
+                    try self.core.store.putBatch(&.{
+                        .{ .key = &internal_keys.table_storage_settings_key, .value = encoded },
+                        .{ .key = table_catalog_mod.key, .value = next_catalog.encodeForPersistence(&catalog_buffer) },
+                    }, &.{});
+                    try self.core.store.sync(true);
+                    self.table_storage = desired_settings;
+                    self.core.table_catalog = next_catalog;
+                }
+                // The first canonical begin cannot perform a prefix scan or
+                // invent an empty ledger. Reconcile authoritative records in
+                // this fenced, pre-pool migration, then checkpoint the ledger
+                // with the rest of installation before any accepted promise.
+                var completion_manager = try transactions_mod.TxnManager.init(self.alloc, self.core.store);
+                defer completion_manager.deinit();
+                completion_manager.completion_limits = .{
+                    .max_transaction_bytes = policy.max_transaction_bytes,
+                    .max_count = policy.max_count,
+                    .max_bytes = policy.max_bytes,
+                };
+                try completion_manager.reconcileCompletionAdmission();
+                try self.core.index_manager.prepareCompletionBackends();
+                {
+                    const locked = @import("../lsm_backend/runtime.zig").lockBackend(lsm_backend_mod.Backend, backend);
+                    defer @import("../lsm_backend/runtime.zig").unlockBackend(lsm_backend_mod.Backend, backend, locked);
+                    try backend.flushMutable();
+                }
+                try backend.checkpointWalAfterDurableBoundary();
+                const fingerprint = try self.physicalCompletionFence(@splat(0));
+                const receipt = receipt_codec.encode(.{ .incarnation = self.root_incarnation, .binding_digest = try receipt_codec.bindingDigest(binding), .physical_digest = fingerprint[8..40].* });
+                const path = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ self.core.path, receipt_codec.filename });
+                defer self.alloc.free(path);
+                const storage = backend.storage orelse return error.UnsupportedCompletionBackend;
+                var writer = try storage.beginAtomicWrite(self.alloc, path);
+                var live = true;
+                errdefer {
+                    if (live) writer.abort();
+                    backend.fenceFailedBulkWal();
+                }
+                try writer.appendSlice(&receipt);
+                live = false;
+                try writer.finish();
+            }
+            self.durable_completion_authority = .raft_apply;
+            const locked = @import("../lsm_backend/runtime.zig").lockBackend(lsm_backend_mod.Backend, backend);
+            defer @import("../lsm_backend/runtime.zig").unlockBackend(lsm_backend_mod.Backend, backend, locked);
+            if (backend.completion_pool == null) try backend.installCompletionPoolLocked(.{
+                .identity = binding.identity,
+                .schema_catalog_digest = binding.schema_catalog_digest,
+            });
+            try self.core.completion_eligibility.retainInstalledPool();
+        }
+        try self.attachCompletionPoolPublicationOwner();
+        {
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            const locked = @import("../lsm_backend/runtime.zig").lockBackend(lsm_backend_mod.Backend, backend);
+            defer @import("../lsm_backend/runtime.zig").unlockBackend(lsm_backend_mod.Backend, backend, locked);
+            const pool = backend.completion_pool.?;
+            if (!pool.ready and !pool.startup_reconciliation_pending) {
+                // Installation runs outside the DATA/Raft lock. Replayed idle
+                // state and exhausted cohorts need a durable checkpoint before
+                // another capacity qualification can be issued.
+                if (pool.maintenanceRequired(backend)) try pool.maintainLocked(backend);
+                try pool.qualifyFresh(backend);
+            }
+        }
+    }
+
+    pub fn acquireCompletionLease(self: *DB, group_id: u64, node_id: u64) !@import("kernel_owner_abi").completion_pool.Lease {
+        const stable = blk: {
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            const backend = self.core.primary_store_owner.lsmBackend() orelse return error.NotFound;
+            if (backend.completion_pool == null) return error.NotFound;
+            break :blk self.async_context.completion_pool_owner orelse return error.CompletionAdmissionUnavailable;
+        };
+        return @import("../completion_native_guard.zig").Guard(DB).lease(stable, group_id, node_id);
+    }
+
+    pub fn acquireControlCompletionLeaseV2(self: *DB, group_id: u64, node_id: u64) !@import("kernel_owner_abi").completion_pool.ControlLeaseV2 {
+        const stable = blk: {
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            const backend = self.core.primary_store_owner.lsmBackend() orelse return error.NotFound;
+            if (backend.completion_pool == null) return error.NotFound;
+            break :blk self.async_context.completion_pool_owner orelse return error.CompletionAdmissionUnavailable;
+        };
+        return @import("../completion_native_guard.zig").Guard(DB).controlLeaseV2(stable, group_id, node_id);
+    }
+
+    pub fn acquireControlCompletionLeaseV3(self: *DB, group_id: u64, node_id: u64) !@import("kernel_owner_abi").completion_pool.ControlLeaseV3 {
+        const stable = blk: {
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            const backend = self.core.primary_store_owner.lsmBackend() orelse return error.NotFound;
+            if (backend.completion_pool == null) return error.NotFound;
+            break :blk self.async_context.completion_pool_owner orelse return error.CompletionAdmissionUnavailable;
+        };
+        return @import("../completion_native_guard.zig").Guard(DB).controlLeaseV3(stable, group_id, node_id);
+    }
+
+    pub fn acquireControlCompletionLeaseV4(self: *DB, group_id: u64, node_id: u64) !@import("kernel_owner_abi").completion_pool.ControlLeaseV4 {
+        const stable = blk: {
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            const backend = self.core.primary_store_owner.lsmBackend() orelse return error.NotFound;
+            if (backend.completion_pool == null) return error.NotFound;
+            break :blk self.async_context.completion_pool_owner orelse return error.CompletionAdmissionUnavailable;
+        };
+        return @import("../completion_native_guard.zig").Guard(DB).controlLeaseV4(stable, group_id, node_id);
+    }
+
+    pub fn attestCompletionBacking(self: *DB, group_id: u64, node_id: u64) !@import("kernel_owner_abi").completion_pool.NativeAttestation {
+        const stable = self.async_context.completion_pool_owner orelse return error.CompletionAdmissionUnavailable;
+        return @import("../completion_native_guard.zig").Guard(DB).attest(stable, group_id, node_id);
+    }
+
+    const CompletionPublicationToken = struct {
+        allocator: Allocator,
+        txn_id: transactions_mod.TxnId,
+        owns_admission: bool,
+    };
+
+    /// Bind once after native restoration and before pool qualification/group
+    /// participation. The copied wrapper shares heap-stable core/async state;
+    /// callbacks never retain the movable address returned from DB.open.
+    pub fn attachCompletionPoolPublicationOwner(self: *DB) !void {
+        if (self.durable_completion_authority != .raft_apply) return error.CompletionAdmissionUnavailable;
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        if (self.async_context.completion_pool_owner != null) return;
+        const backend = self.core.primary_store_owner.lsmBackend() orelse return error.UnsupportedCompletionBackend;
+        // Restored accepted entries can need publication ownership before any
+        // ordinary replay reader has run. Warm the lazy cache while only the
+        // outer DB apply fence is held: its first read acquires backend.mu,
+        // which attachPublicationOwner's callbacks already hold below.
+        _ = self.core.nextDerivedAppendSequence();
+        const locked = @import("../lsm_backend/runtime.zig").lockBackend(lsm_backend_mod.Backend, backend);
+        defer @import("../lsm_backend/runtime.zig").unlockBackend(lsm_backend_mod.Backend, backend, locked);
+        const pool = backend.completion_pool orelse return error.CompletionAdmissionUnavailable;
+        const stable = try self.runtime_alloc.create(DB);
+        errdefer self.runtime_alloc.destroy(stable);
+        stable.* = self.*;
+        stable.bulk_ingest_coalescer = .{};
+        stable.bulk_ingest_identity_state = .{};
+        stable.bulk_ingest_seen_doc_keys = .{};
+        stable.enrichment_runtime = null;
+        stable.enrichment_append_context = null;
+        try pool.attachPublicationOwner(.{
+            .context = stable,
+            .prepare = prepareCompletionPublicationToken,
+            .applied = completionPublicationApplied,
+            .native_terminal = completionPublicationTerminal,
+            .cancel = cancelCompletionPublicationToken,
+            .release_after_quiesce = releaseCompletionPublicationToken,
+        });
+        self.async_context.completion_pool_owner = stable;
+    }
+
+    fn prepareCompletionPublicationToken(raw: *anyopaque, alloc: Allocator, entry: *const @import("../lsm_backend/completion_entry.zig").OwnedEntry) !*anyopaque {
+        const self: *DB = @ptrCast(@alignCast(raw));
+        if (self.durable_completion_authority != .raft_apply) return error.CompletionAdmissionUnavailable;
+        const authority: @import("../completion_candidate.zig").Authority = .{
+            .group_id = entry.entry.group_id,
+            .incarnation = entry.entry.group_incarnation,
+            .policy_digest = entry.entry.policy_digest,
+            .schema_catalog_digest = entry.entry.schema_catalog_digest,
+            .previous_term = entry.entry.previous_term,
+            .previous_index = entry.entry.previous_index,
+        };
+        // The native pool has already matched these fields to its installed
+        // authority. This check binds the DB profile to that same envelope.
+        const fence = replicatedCompletionFence(authority, entry.entry.original_input_digest);
+        if (!std.mem.eql(u8, &fence, entry.decoded_descriptor.descriptor.profile_fence)) return error.CompletionProfileChanged;
+        const id = entry.entry.txn_id;
+        const operations = if (entry.entry.kind == .mutation) entry.entry.prepare_operations else entry.decoded_descriptor.descriptor.commit;
+        const token = try alloc.create(CompletionPublicationToken);
+        errdefer alloc.destroy(token);
+        if (entry.entry.kind == .mutation and transactions_mod.isBeginCompletionMutation(operations)) {
+            // The native accepted cell owns this metadata-only write through
+            // apply/restart. It has no derived event, visibility target or
+            // replay sequence to reserve. The installed pool fences structure.
+            token.* = .{ .allocator = alloc, .txn_id = id, .owns_admission = false };
+            return token;
+        }
+        const new_admission = self.findDurableCompletionBacklog(id) == null;
+        token.* = .{ .allocator = alloc, .txn_id = id, .owns_admission = new_admission };
+        if (new_admission) {
+            try self.core.completion_eligibility.begin(id);
+            errdefer self.core.completion_eligibility.retire(id) catch unreachable;
+            var replay_bytes: ?usize = null;
+            for (operations) |op| if (op.kind == .put and op.key.len == internal_keys.replay_key_len and
+                op.key[0] == internal_keys.replay_namespace and op.key[1] == internal_keys.replay_all_kind)
+            {
+                replay_bytes = op.value.len;
+            };
+            try self.reserveDurableCompletionBacklog(id, @intCast(replay_bytes orelse return error.InvalidCompletionSlot));
+            errdefer self.cancelDurableCompletionBacklog(id);
+            try self.prepareDurableCompletionPublication(id, operations);
+            _ = self.core.nextDerivedAppendSequence();
+        }
+        return token;
+    }
+
+    fn completionPublicationApplied(_: *anyopaque, _: *anyopaque, _: u64, _: u64) void {
+        // Prepare publishes no user rows. Its backlog, visibility targets and
+        // eligibility ownership were installed before the accepted sidecar.
+    }
+    fn completionPublicationTerminal(_: *anyopaque, raw_token: *anyopaque) void {
+        const token: *CompletionPublicationToken = @ptrCast(@alignCast(raw_token));
+        // DB resolution consumes its shared backlog after native completion
+        // returns. Retiring the cell must not cancel that separate admission.
+        token.allocator.destroy(token);
+    }
+    fn cancelCompletionPublicationToken(raw: *anyopaque, raw_token: *anyopaque) void {
+        const self: *DB = @ptrCast(@alignCast(raw));
+        const token: *CompletionPublicationToken = @ptrCast(@alignCast(raw_token));
+        if (token.owns_admission) {
+            self.cancelDurableCompletionBacklog(token.txn_id);
+            self.core.completion_eligibility.retire(token.txn_id) catch unreachable;
+        }
+        token.allocator.destroy(token);
+    }
+    fn releaseCompletionPublicationToken(_: *anyopaque, raw_token: *anyopaque) void {
+        const token: *CompletionPublicationToken = @ptrCast(@alignCast(raw_token));
+        // Quiesced DB teardown separately releases shared transient admissions.
+        // The accepted sidecar remains the restart ownership authority.
+        token.allocator.destroy(token);
+    }
+
+    fn prepareDurableCompletionPublication(self: *DB, id: transactions_mod.TxnId, operations: []const @import("../lsm_backend/completion_slot.zig").Operation) !void {
+        for (&self.async_context.durable_completion_backlogs) |*owned| if (owned.*) |*entry| {
+            if (!std.mem.eql(u8, &entry.txn_id, &id)) continue;
+            var publication: DurableCompletionPublication = .{};
+            errdefer publication.targets.deinit(self.alloc);
+            for (operations) |op| {
+                if (internal_keys.isRelationalRowKey(op.key)) publication.columnar = true;
+                if (op.kind != .put) continue;
+                if (std.mem.eql(u8, op.key, &internal_keys.artifact_presence_key)) publication.artifacts = true;
+                if (std.mem.eql(u8, op.key, table_catalog_mod.key)) publication.catalog = try table_catalog_mod.Catalog.decode(op.value);
+                if (std.mem.eql(u8, op.key, &internal_keys.identity_visibility_summary_key)) {
+                    publication.summary = try doc_identity.visibilitySummaryFromWrites(&.{.{ .key = op.key, .value = op.value }});
+                    for (op.bindings) |binding| if (binding.kind == .replay_sequence and binding.target == .value) {
+                        const mask: u3 = switch (binding.offset) {
+                            16 => 1,
+                            24 => 2,
+                            32 => 4,
+                            else => return error.InvalidCompletionSlot,
+                        };
+                        publication.summary_bindings |= mask;
+                    };
+                }
+                if (op.key.len == internal_keys.replay_key_len and op.key[0] == internal_keys.replay_namespace and op.key[1] == internal_keys.replay_all_kind) {
+                    var decoded = try change_journal_mod.decodeRecord(self.alloc, op.value);
+                    defer decoded.deinit();
+                    if (publication.replay_sequence != 0 or decoded.record.sequence == 0 or
+                        decoded.record.sequence != std.mem.readInt(u64, op.key[2..10], .big)) return error.InvalidCompletionSlot;
+                    publication.replay_sequence = decoded.record.sequence;
+                    publication.targets = try collectManagedSyncTargetsForRecord(self.alloc, self.core.index_manager, decoded.record);
+                }
+            }
+            entry.publication.targets.deinit(self.alloc);
+            entry.publication = publication;
+            return;
+        };
+        return error.CompletionRecoveryCapacityRequired;
+    }
+
+    fn restoreDurableCompletionPublications(self: *DB) !void {
+        const backend = self.core.primary_store_owner.lsmBackend() orelse return;
+        for (backend.durableCompletionSlots()) |member| if (member) |slot| {
+            if (slot.retired) continue;
+            try self.prepareDurableCompletionPublication(slot.descriptor.descriptor.txn_id, slot.descriptor.descriptor.commit);
+        };
+    }
+
+    fn hasLocalDurableCompletionAuthority(self: *const DB) bool {
+        return self.allow_local_durable_completion or self.durable_completion_authority == .standalone_local;
+    }
+
+    fn acceptsNewLocalDurableCompletion(self: *const DB) bool {
+        return self.allow_local_durable_completion or
+            (self.durable_completion_enabled and self.durable_completion_authority == .standalone_local);
+    }
+
+    fn findDurableCompletionBacklog(self: *DB, txn_id: transactions_mod.TxnId) ?*derived_executor_mod.BacklogAdmission {
+        for (&self.async_context.durable_completion_backlogs) |*owned| if (owned.*) |*entry| {
+            if (std.mem.eql(u8, &entry.txn_id, &txn_id)) return &entry.admission;
+        };
+        return null;
+    }
+
+    fn reserveDurableCompletionBacklog(self: *DB, txn_id: transactions_mod.TxnId, bytes: u64) !void {
+        if (self.findDurableCompletionBacklog(txn_id) != null) return;
+        for (&self.async_context.durable_completion_backlogs) |*owned| if (owned.* == null) {
+            owned.* = .{ .txn_id = txn_id, .admission = try self.executor.admitBacklogBytes(bytes) };
+            return;
+        };
+        return error.CompletionRecoveryCapacityRequired;
+    }
+
+    fn cancelDurableCompletionBacklog(self: *DB, txn_id: transactions_mod.TxnId) void {
+        for (&self.async_context.durable_completion_backlogs) |*owned| if (owned.*) |*entry| {
+            if (std.mem.eql(u8, &entry.txn_id, &txn_id)) {
+                entry.admission.cancel();
+                entry.publication.targets.deinit(self.alloc);
+                owned.* = null;
+                return;
+            }
+        };
+    }
+
+    /// Internal opt-in local path only. Reservation precedes the real prepared
+    /// vote; ordinary transaction APIs never select this profile automatically.
+    pub fn prepareDurableCompletion(
+        self: *DB,
+        txn_id: transactions_mod.TxnId,
+        intents: []const transactions_mod.WriteIntent,
+        predicates: []const transactions_mod.VersionPredicate,
+    ) !void {
+        if (!self.acceptsNewLocalDurableCompletion() or self.generation_read_lease == null) return error.LocalCompletionAuthorityRequired;
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        const backend = self.core.primary_store_owner.lsmBackend() orelse return error.UnsupportedCompletionBackend;
+        if (backend.findDurableCompletion(txn_id) != null) return error.PreparedCompletionActive;
+        try self.core.completion_eligibility.begin(txn_id);
+        errdefer {
+            backend.cancelUnpreparedCompletion(txn_id);
+            // An uncertain or durable prepare keeps both physical ownership
+            // and structural exclusion until reconciliation/reopen.
+            if (backend.findDurableCompletion(txn_id) == null) {
+                self.cancelDurableCompletionBacklog(txn_id);
+                self.core.completion_eligibility.retire(txn_id) catch unreachable;
+            }
+        }
+        const observation = try self.inspectSingleOverwriteCompletionProfileLocked(self.alloc, txn_id, intents);
+        const key = intents[0].key;
+        const replacement = intents[0].value.?;
+        const store_key = try encodeStoreLookupKeyAlloc(self, self.alloc, key);
+        defer self.alloc.free(store_key);
+        const primary = try self.core.store.get(self.alloc, store_key);
+        defer self.alloc.free(primary);
+        const changed = !storedDocumentValuesEqual(self.alloc, primary, replacement);
+        // Use the same thin replay builder as normal document transaction
+        // resolution, including equal-value empty replay and overwrite hints.
+        const extracted = [_]mapper.ExtractedWrite{.{
+            .cleaned_value = @constCast(replacement),
+            .cleaned_value_owned = false,
+            .graph_writes = &.{},
+            .mentioned_graph_indexes = &.{},
+            .dense_embeddings = &.{},
+            .sparse_embeddings = &.{},
+        }};
+        const payload = try encodeThinReplayRecordPayload(self.alloc, .{ .writes = &.{.{ .key = key, .value = replacement }} }, &extracted, &.{}, &.{}, &.{true}, &.{changed}, 1, false, null, null);
+        defer self.alloc.free(payload);
+        var manager = try transactions_mod.TxnManager.init(self.alloc, self.core.store);
+        defer manager.deinit();
+        manager.completion_limits = .{
+            .max_transaction_bytes = if (self.core.table_catalog.transaction_recovery_max_count != 0) self.core.table_catalog.transaction_admission_bytes else 0,
+            .max_count = self.core.table_catalog.transaction_recovery_max_count,
+            .max_bytes = self.core.table_catalog.transaction_recovery_max_bytes,
+        };
+        var txn_snapshot = try manager.store.beginRead();
+        defer txn_snapshot.abort();
+        var templates = try manager.compileCompletionTemplates(txn_id, intents, predicates, .{ .schema_binding = .{}, .max_intent_admission_bytes = self.core.table_catalog.transaction_admission_bytes }, .{ .replay = .{ .sequence = 1, .payload = payload } }, .{}, .{ .snapshot = &txn_snapshot, .timestamp = 1, .replay_payload_sequence_offset = 6 });
+        defer templates.deinit();
+        const codec = @import("../lsm_backend/completion_slot.zig");
+        const fence_bytes = try self.encodeCompletionProfileObservation(observation);
+        const encoded = try codec.encode(self.alloc, .{
+            .txn_id = txn_id,
+            .intent_revision = templates.intent_revision,
+            .namespace = "docs",
+            .limits = lsm_backend_mod.Backend.durable_completion_limits,
+            .profile_fence = &fence_bytes,
+            .commit = templates.commit.operations,
+            .abort = templates.abort.operations,
+        }, .{});
+        defer self.alloc.free(encoded);
+        // Initialize the cached counter before voting; resolution must not
+        // acquire ordinary provider memory merely to choose its replay number.
+        _ = self.core.nextDerivedAppendSequence();
+        try self.reserveDurableCompletionBacklog(txn_id, @intCast(payload.len));
+        try backend.reserveDurableCompletion(encoded);
+        try self.core.writeIntentsExtraBatch(txn_id, intents, predicates, .{
+            .schema_binding = .{},
+            .writes = &.{.{ .key = backend.findDurableCompletion(txn_id).?.storageKey(), .value = encoded }},
+        });
+        try backend.confirmDurableCompletion(txn_id);
+    }
+
+    fn encodeCompletionProfileObservation(self: *DB, observation: CompletionProfileObservation) ![200]u8 {
+        var out: [200]u8 = undefined;
+        @memcpy(out[0..8], "DBCSF001");
+        var offset: usize = 8;
+        for ([_]u64{ observation.root_generation, observation.schema_namespace_generation, observation.index_generation }) |value| {
+            std.mem.writeInt(u64, out[offset..][0..8], value, .little);
+            offset += 8;
+        }
+        @memcpy(out[offset..][0..32], &observation.range_digest);
+        offset += 32;
+        for ([_]u64{ observation.identity_namespace.table_id, observation.identity_namespace.shard_id, observation.identity_namespace.range_id, observation.ordinal, observation.identity_created_generation }) |value| {
+            std.mem.writeInt(u64, out[offset..][0..8], value, .little);
+            offset += 8;
+        }
+        @memcpy(out[offset..][0..32], &observation.primary_digest);
+        @memcpy(out[offset + 32 ..][0..32], &observation.input_digest);
+        const io = self.backend_runtime.filesystemIo() orelse return error.MissingBackendRuntimeIo;
+        const canonical = if (std.fs.path.isAbsolute(self.core.path))
+            try std.Io.Dir.realPathFileAbsoluteAlloc(io, self.core.path, self.alloc)
+        else
+            try std.Io.Dir.cwd().realPathFileAlloc(io, self.core.path, self.alloc);
+        defer self.alloc.free(canonical);
+        std.crypto.hash.sha2.Sha256.hash(canonical, out[168..200], .{});
+        return out;
+    }
+
+    fn restoreDurableCompletionEligibility(self: *DB) !void {
+        const backend = self.core.primary_store_owner.lsmBackend() orelse return;
+        if (backend.completion_pool != null) try self.core.completion_eligibility.retainInstalledPool();
+        for (backend.durableCompletionSlots()) |member| if (member) |slot| {
+            if (slot.retired) continue;
+            try self.restoreDurableSlotEligibility(slot);
+        };
+    }
+
+    fn restoreDurableSlotEligibility(self: *DB, slot: anytype) !void {
+        if (slot.pooled_owner != null) {
+            if (self.durable_completion_authority != .raft_apply) return error.CompletionAdmissionUnavailable;
+        } else if (!self.hasLocalDurableCompletionAuthority()) return error.LocalCompletionAuthorityRequired;
+        if (slot.descriptor.descriptor.namespace == null or !std.mem.eql(u8, slot.descriptor.descriptor.namespace.?, "docs"))
+            return error.UnsupportedCompletionProfile;
+        try self.core.completion_eligibility.restore(slot.descriptor.descriptor.txn_id);
+        const descriptor = slot.descriptor.descriptor;
+        if (slot.pooled_owner != null) {
+            const backend = self.core.primary_store_owner.lsmBackend() orelse return error.UnsupportedCompletionBackend;
+            const pool = backend.completion_pool orelse return error.CompletionAdmissionUnavailable;
+            if (descriptor.profile_fence.len != 72 or slot.accepted_identity == null) return error.CompletionProfileChanged;
+            const config = pool.config;
+            const fence = replicatedCompletionFence(.{
+                .group_id = config.identity.group_id,
+                .incarnation = config.identity.incarnation,
+                .policy_digest = config.identity.policy_digest,
+                .schema_catalog_digest = config.schema_catalog_digest,
+                .previous_term = 0,
+                .previous_index = 0,
+            }, descriptor.profile_fence[40..72].*);
+            if (!std.mem.eql(u8, &fence, descriptor.profile_fence)) return error.CompletionProfileChanged;
+            return;
+        }
+        if (descriptor.profile_fence.len == 72 and std.mem.eql(u8, descriptor.profile_fence[0..8], "DBCSP002")) {
+            const current = try self.physicalCompletionFence(descriptor.profile_fence[40..72].*);
+            if (!std.mem.eql(u8, &current, descriptor.profile_fence)) return error.CompletionProfileChanged;
+            return;
+        }
+        var primary: ?@import("../lsm_backend/completion_slot.zig").Operation = null;
+        for (descriptor.commit) |op| if (op.kind == .put and internal_keys.isPrimaryDocumentKey(op.key)) {
+            if (primary != null) return error.UnsupportedCompletionProfile;
+            primary = op;
+        };
+        const op = primary orelse return error.InvalidCompletionSlot;
+        const key = (try internal_keys.decodePrimaryDocumentKeyAlloc(self.alloc, op.key)) orelse return error.InvalidCompletionSlot;
+        defer self.alloc.free(key);
+        const observation = try self.inspectSingleOverwriteCompletionProfile(self.alloc, descriptor.txn_id, &.{.{ .key = key, .value = op.value }});
+        const current = try self.encodeCompletionProfileObservation(observation);
+        // Runtime generation counters may reset on reopen. Fresh inspection
+        // already proves no unsupported schema/index work; compare durable
+        // range/identity/value/root binding, not those process-local counters.
+        if (descriptor.profile_fence.len != current.len or
+            !std.mem.eql(u8, descriptor.profile_fence[0..8], current[0..8]) or
+            !std.mem.eql(u8, descriptor.profile_fence[32..], current[32..])) return error.CompletionProfileChanged;
+    }
+
+    fn restoreDurableCompletionBacklog(self: *DB) !void {
+        const backend = self.core.primary_store_owner.lsmBackend() orelse return;
+        for (backend.durableCompletionSlots()) |member| if (member) |slot| {
+            if (slot.retired) continue;
+            var replay_bytes: ?usize = null;
+            for (slot.descriptor.descriptor.commit) |op| {
+                if (op.kind == .put and op.key.len == internal_keys.replay_key_len and
+                    op.key[0] == internal_keys.replay_namespace and op.key[1] == internal_keys.replay_all_kind)
+                    replay_bytes = op.value.len;
+            }
+            const bytes = replay_bytes orelse return error.InvalidCompletionSlot;
+            _ = self.core.nextDerivedAppendSequence();
+            try self.reserveDurableCompletionBacklog(slot.descriptor.descriptor.txn_id, @intCast(bytes));
+        };
+    }
+
+    /// Returns the committed replay fence. The live-slot path performs no
+    /// ordinary request workspace or backlog admission after prepare.
+    pub fn resolveDurableCompletion(self: *DB, txn_id: transactions_mod.TxnId, status: transactions_mod.TxnStatus, timestamp: u64) !u64 {
+        if (!self.hasLocalDurableCompletionAuthority()) return error.LocalCompletionAuthorityRequired;
+        if (status == .pending or timestamp == 0) return error.InvalidArgument;
+        const sequence = blk: {
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            break :blk try self.resolveDurableCompletionLocked(txn_id, status, timestamp);
+        };
+        self.notifyDurableCompletion(sequence);
+        return sequence.sequence;
+    }
+
+    /// Native storage publication runs under backend serialization; DB cache
+    /// and visibility publication follows under the outer apply fence using
+    /// only targets/backlog already owned before consensus acceptance.
+    pub fn applyAcceptedCompletion(self: *DB, term: u64, index: u64, digest: [32]u8) !void {
+        var cleanup_error: ?anyerror = null;
+        const result = blk: {
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            const backend = self.core.primary_store_owner.lsmBackend() orelse return error.UnsupportedCompletionBackend;
+            const mutation_id = try backend.applyAcceptedCompletion(term, index, digest);
+            var publication: DurableCompletionResult = .{ .sequence = 0 };
+            if (mutation_id) |id| {
+                if (self.findDurableCompletionBacklog(id) != null) {
+                    const sequence = for (self.async_context.durable_completion_backlogs) |entry| {
+                        if (entry) |owned| if (std.mem.eql(u8, &owned.txn_id, &id)) break owned.publication.replay_sequence;
+                    } else return error.CompletionRecoveryCapacityRequired;
+                    if (sequence == 0) return error.InvalidReplaySequence;
+                    publication = try self.consumeDurableCompletionPublicationLocked(id, .committed, sequence);
+                }
+                backend.finishAcceptedMutation() catch |err| {
+                    cleanup_error = err;
+                };
+            }
+            break :blk publication;
+        };
+        // Even uncertain guard cleanup cannot discard the notification for a
+        // successfully committed primary batch and its preowned derived debt.
+        self.notifyDurableCompletion(result);
+        if (cleanup_error) |err| return err;
+    }
+
+    /// Retained native-owner entrypoint. Pool admission has already bound the
+    /// exact original Raft payload digest to this transaction and outcome.
+    pub fn resolveAcceptedCompletion(self: *DB, txn_id: transactions_mod.TxnId, commit: bool, timestamp: u64, identity: RaftAppliedEntryIdentity, payload_digest: [32]u8) !void {
+        const result = blk: {
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            break :blk try self.resolveDurableCompletionAtRaftEntryLocked(txn_id, if (commit) .committed else .aborted, timestamp, identity, payload_digest);
+        };
+        self.notifyDurableCompletion(result);
+    }
+
+    fn notifyDurableCompletion(self: *DB, result: DurableCompletionResult) void {
+        var targets = result.targets;
+        defer targets.deinit(self.alloc);
+        if (result.sequence == 0) return;
+        notifyQueryVisibilityTargetAdvancedScoped(self.async_context, result.sequence, targets.target_identities, targets.target_scope_known);
+        self.executor.notifySequence(result.sequence);
+    }
+
+    fn resolveDurableCompletionLocked(self: *DB, txn_id: transactions_mod.TxnId, status: transactions_mod.TxnStatus, timestamp: u64) !DurableCompletionResult {
+        return self.resolveDurableCompletionAtRaftEntryLocked(txn_id, status, timestamp, null, null);
+    }
+
+    fn resolveDurableCompletionAtRaftEntryLocked(self: *DB, txn_id: transactions_mod.TxnId, status: transactions_mod.TxnStatus, timestamp: u64, raft_entry: ?RaftAppliedEntryIdentity, payload_digest: ?[32]u8) !DurableCompletionResult {
+        if (status == .pending or timestamp == 0) return error.InvalidArgument;
+        const backend = self.core.primary_store_owner.lsmBackend() orelse return error.UnsupportedCompletionBackend;
+        const slot = backend.findDurableCompletion(txn_id) orelse return error.CompletionNotPrepared;
+        if (slot.pooled_owner != null) {
+            if (self.durable_completion_authority != .raft_apply or raft_entry == null or payload_digest == null) return error.CompletionAdmissionUnavailable;
+            const accepted = slot.accepted_identity orelse return error.InvalidCompletionSlot;
+            if (raft_entry.?.term == 0 or raft_entry.?.index <= accepted.index) return error.InvalidCompletionSlot;
+        } else if (raft_entry != null) return error.UnsupportedCompletionProfile;
+        const sequence = self.core.store.next_replay_sequence_cached.load(.acquire);
+        if (sequence == 0 or sequence == std.math.maxInt(u64)) return error.InvalidReplaySequence;
+        _ = self.findDurableCompletionBacklog(txn_id) orelse return error.CompletionRecoveryCapacityRequired;
+        try backend.completeDurableCompletion(txn_id, status == .committed, .{
+            .commit_timestamp = timestamp,
+            .replay_sequence = sequence,
+            // The native serialized completion boundary derives authoritative
+            // post-retirement ledger values; caller-supplied samples are unused.
+            .shared_ledger_count = 0,
+            .shared_ledger_bytes = 0,
+            .raft_term = if (raft_entry) |identity| identity.term else 0,
+            .raft_index = if (raft_entry) |identity| identity.index else 0,
+            .canonical_payload_digest = payload_digest orelse @splat(0),
+        });
+        return self.consumeDurableCompletionPublicationLocked(txn_id, status, sequence);
+    }
+
+    fn consumeDurableCompletionPublicationLocked(self: *DB, txn_id: transactions_mod.TxnId, status: transactions_mod.TxnStatus, sequence: u64) !DurableCompletionResult {
+        const backlog = self.findDurableCompletionBacklog(txn_id) orelse return error.CompletionRecoveryCapacityRequired;
+        if (status == .committed) {
+            self.core.store.observeExternalReplayCommit(sequence);
+            self.executor.commitBacklogAdmission(sequence, backlog);
+        } else backlog.cancel();
+        var result: DurableCompletionResult = .{ .sequence = if (status == .committed) sequence else 0 };
+        for (&self.async_context.durable_completion_backlogs) |*owned| if (owned.*) |*entry| {
+            if (!std.mem.eql(u8, &entry.txn_id, &txn_id)) continue;
+            if (status == .committed) {
+                const publication = &entry.publication;
+                if (publication.catalog) |catalog| self.core.table_catalog = catalog;
+                if (publication.summary) |sample| {
+                    var summary = sample;
+                    if (publication.summary_bindings & 1 != 0) summary.max_created_generation = sequence;
+                    if (publication.summary_bindings & 2 != 0) summary.min_deleted_generation = sequence;
+                    if (publication.summary_bindings & 4 != 0) summary.max_deleted_generation = sequence;
+                    self.core.identity_visibility.summary = summary;
+                    self.clearLiveDocSetCache();
+                    self.clearNonVisibleDocSetCache();
+                }
+                if (publication.columnar) _ = self.core.store.columnar_revision.fetchAdd(1, .release);
+                if (publication.artifacts) self.core.artifact_cleanup_maybe.store(true, .release);
+                result.targets = publication.targets;
+                publication.targets = .{};
+            }
+            break;
+        };
+        self.cancelDurableCompletionBacklog(txn_id);
+        try self.core.completion_eligibility.retire(txn_id);
+        return result;
+    }
+
+    fn recoverDurableCompletion(self: *DB, fallback_timestamp: u64) !?bool {
+        const sequence = blk: {
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            const backend = self.core.primary_store_owner.lsmBackend() orelse return null;
+            var pending = false;
+            for (backend.durableCompletionSlots()) |member| if (member) |slot| {
+                pending = true;
+                // Replicated decisions complete only through ordered Raft apply.
+                if (slot.pooled_owner != null) continue;
+                const txn_id = slot.descriptor.descriptor.txn_id;
+                const decision = try backend.durableCompletionDecision(txn_id);
+                if (decision.status == .pending) continue;
+                const timestamp = if (decision.status == .committed and decision.commit_version != 0) decision.commit_version else if (decision.finalized_at != 0) decision.finalized_at else fallback_timestamp;
+                break :blk try self.resolveDurableCompletionLocked(txn_id, if (decision.status == .committed) .committed else .aborted, timestamp);
+            };
+            return if (pending) false else null;
+        };
+        self.notifyDurableCompletion(sequence);
+        return true;
+    }
+
+    fn rejectUnreservedDurablePrepareLocked(self: *DB, txn_id: transactions_mod.TxnId) !void {
+        if (self.core.primary_store_owner.lsmBackend()) |backend| {
+            if (backend.findDurableCompletion(txn_id) != null) return error.PreparedCompletionActive;
+        }
+    }
+
+    /// Internal process-local observation only. It owns no schema/topology lease,
+    /// prepaid resources or durable authority after this call returns.
+    const CompletionProfileObservation = struct {
+        root_generation: u64,
+        schema_namespace_generation: u64,
+        index_generation: u64,
+        range_digest: [32]u8,
+        identity_namespace: doc_identity.Namespace,
+        ordinal: doc_identity.DocOrdinal,
+        identity_created_generation: u64,
+        primary_digest: [32]u8,
+        input_digest: [32]u8,
+    };
+
+    fn inspectSingleOverwriteCompletionProfile(
+        self: *DB,
+        backing: Allocator,
+        txn_id: transactions_mod.TxnId,
+        intents: []const transactions_mod.WriteIntent,
+    ) !CompletionProfileObservation {
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        return self.inspectSingleOverwriteCompletionProfileLocked(backing, txn_id, intents);
+    }
+
+    fn inspectSingleOverwriteCompletionProfileLocked(
+        self: *DB,
+        backing: Allocator,
+        txn_id: transactions_mod.TxnId,
+        intents: []const transactions_mod.WriteIntent,
+    ) !CompletionProfileObservation {
+        const workspace = try backing.alloc(u8, 1024 * 1024);
+        defer backing.free(workspace);
+        var fixed = std.heap.FixedBufferAllocator.init(workspace);
+        const alloc = fixed.allocator();
+        if (intents.len != 1 or intents[0].key.len == 0 or intents[0].key.len > 1024 or
+            isMetadataKey(intents[0].key) or internal_keys.isInternalUserKey(intents[0].key) or
+            intents[0].prepared_row != null) return error.UnsupportedCompletionProfile;
+        const replacement = intents[0].value orelse return error.UnsupportedCompletionProfile;
+        try inspectCompletionInlineDocument(alloc, replacement);
+        // Initially only explicitly schemaless local document tables qualify.
+        // Even index-free schema validation/TTL evolution needs a later fence.
+        if (self.core.schema != null or self.core.table_catalog.storage_mode != .document or
+            self.shadow != null or self.core.splitState() != null or self.bulk_ingest_coalescer.active or
+            self.ha_async_effect_mirror != null or self.ha_async_batch_mirror != null or
+            self.ha_async_metadata_mirror != null or self.ha_write_gate != null or
+            self.enrichment_runtime != null or self.resolution_candidate_source != null or
+            self.resolution_embedder != null or self.promotion_owner != null or self.entity_sink != null)
+            return error.UnsupportedCompletionProfile;
+        // A missing participant sidecar also occurs for an unknown identity;
+        // require the transaction itself before interpreting local-only state.
+        _ = try self.core.getTransactionStatus(txn_id);
+        if (try self.core.transactionHasHAOutbox(txn_id)) return error.UnsupportedCompletionProfile;
+        const participants = try self.core.getTransactionParticipants(alloc, txn_id);
+        defer transactions_mod.freeParticipantList(alloc, participants);
+        // Empty participants is the existing local-only transaction spelling;
+        // named participants require routing/placement authority not held here.
+        if (participants.len != 0) return error.UnsupportedCompletionProfile;
+        const manager = self.core.index_manager;
+        manager.catalog_mutex.lockShared();
+        defer manager.catalog_mutex.unlockShared();
+        if (manager.text_indexes.items.len != 0 or manager.dense_indexes.items.len != 0 or
+            manager.sparse_indexes.items.len != 0 or manager.graph_indexes.items.len != 0 or
+            manager.algebraic_indexes.items.len != 0 or manager.enrichments.items.len != 0 or
+            manager.resolvers.items.len != 0 or manager.status_only_index_configs.len != 0)
+            return error.UnsupportedCompletionProfile;
+        try index_manager_mod.IndexManager.validateEmptyCompletionCatalog(alloc, self.core.store);
+        const key = intents[0].key;
+        if (!self.core.byteRange().contains(key)) return error.UnsupportedCompletionProfile;
+        const store_key = try encodeStoreLookupKeyAlloc(self, alloc, key);
+        defer alloc.free(store_key);
+        // The process-wide artifact hint conservatively becomes true on any
+        // nonempty legacy/reopened store. Prove the actual target footprint:
+        // only its inline primary and optional version timestamp may exist.
+        // The third entry necessarily rejects; no prefix is materialized.
+        const document_prefix = try internal_keys.documentExactPrefixAlloc(alloc, key);
+        defer alloc.free(document_prefix);
+        const version_key = try internal_keys.ttlKeyAlloc(alloc, key);
+        defer alloc.free(version_key);
+        {
+            var profile_scan = try self.core.store.beginCurrentScanTxn();
+            defer profile_scan.abort();
+            var cursor = try profile_scan.openCursor();
+            defer cursor.close();
+            var entry = try cursor.seekAtOrAfter(document_prefix);
+            var seen: usize = 0;
+            while (entry) |current| {
+                if (!std.mem.startsWith(u8, current.key, document_prefix)) break;
+                seen += 1;
+                if (seen > 2) return error.UnsupportedCompletionProfile;
+                if (!std.mem.eql(u8, current.key, store_key) and
+                    !(std.mem.eql(u8, current.key, version_key) and current.value.len == 8))
+                    return error.UnsupportedCompletionProfile;
+                entry = try cursor.next();
+            }
+        }
+        var read = try self.core.store.beginProbeTxn();
+        defer read.abort();
+        const primary = read.get(store_key) catch |err| switch (err) {
+            error.NotFound => return error.UnsupportedCompletionProfile,
+            else => return err,
+        };
+        try inspectCompletionInlineDocument(alloc, primary);
+        const namespace = (try doc_identity.loadNamespaceTxn(&read)) orelse return error.UnsupportedCompletionProfile;
+        if (!namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
+        const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &read, key)) orelse return error.UnsupportedCompletionProfile;
+        const state = (try doc_identity.lookupStateTxn(&read, ordinal)) orelse return error.UnsupportedCompletionProfile;
+        if (!state.isLive()) return error.UnsupportedCompletionProfile;
+        if (state.canonical_doc_id != doc_identity.canonicalDocIdForNamespace(namespace, key)) return error.InvalidDocIdentity;
+        const canonical = (try doc_identity.lookupCanonicalOrdinalTxn(&read, state.canonical_doc_id)) orelse return error.UnsupportedCompletionProfile;
+        if (canonical != ordinal) return error.InvalidDocIdentity;
+        const reverse = (try doc_identity.lookupDocIdTxn(alloc, &read, ordinal)) orelse return error.UnsupportedCompletionProfile;
+        defer alloc.free(reverse);
+        if (!std.mem.eql(u8, reverse, key)) return error.InvalidDocIdentity;
+        var observation: CompletionProfileObservation = .{
+            .root_generation = self.core.root_generation,
+            .schema_namespace_generation = self.core.schemaNamespaceGeneration(),
+            .index_generation = manager.writePlanGeneration(),
+            .range_digest = undefined,
+            .identity_namespace = namespace,
+            .ordinal = ordinal,
+            .identity_created_generation = state.created_generation,
+            .primary_digest = undefined,
+            .input_digest = undefined,
+        };
+        var range_hash = std.crypto.hash.sha2.Sha256.init(.{});
+        for ([_][]const u8{ self.core.byteRange().start, self.core.byteRange().end }) |bound| {
+            var length: [8]u8 = undefined;
+            std.mem.writeInt(u64, &length, @intCast(bound.len), .big);
+            range_hash.update(&length);
+            range_hash.update(bound);
+        }
+        range_hash.final(&observation.range_digest);
+        std.crypto.hash.sha2.Sha256.hash(primary, &observation.primary_digest, .{});
+        std.crypto.hash.sha2.Sha256.hash(replacement, &observation.input_digest, .{});
+        return observation;
+    }
+
+    fn inspectCompletionInlineDocument(alloc: Allocator, value: []const u8) !void {
+        if (value.len == 0 or value.len > 64 * 1024) return error.UnsupportedCompletionProfile;
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, value, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.UnsupportedCompletionProfile,
+        };
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.UnsupportedCompletionProfile;
+        var fields = parsed.value.object.iterator();
+        while (fields.next()) |field| {
+            // Explicit artifacts, edges, vectors, extraction and payload
+            // references are excluded, including nested containers for now.
+            if (std.mem.startsWith(u8, field.key_ptr.*, "_")) return error.UnsupportedCompletionProfile;
+            switch (field.value_ptr.*) {
+                .null, .bool, .integer, .float, .number_string, .string => {},
+                else => return error.UnsupportedCompletionProfile,
+            }
+        }
+    }
+
     fn prepareTransactionRows(
         self: *DB,
         alloc: Allocator,
@@ -27431,6 +29256,43 @@ pub const DB = struct {
         raft_entry: ?RaftAppliedEntryIdentity,
         resolved_participant: ?[]const u8,
     ) !void {
+        {
+            var completed: ?DurableCompletionResult = null;
+            {
+                try self.lockApplyForPortableRuntime();
+                defer self.core.unlockApply();
+                if (self.core.primary_store_owner.lsmBackend()) |backend| if (backend.findDurableCompletion(txn_id) != null) {
+                    {
+                        if (resolved_participant != null) return error.UnsupportedCompletionProfile;
+                        completed = try self.resolveDurableCompletionAtRaftEntryLocked(txn_id, status, commit_version, raft_entry, null);
+                    }
+                };
+            }
+            if (completed) |sequence| {
+                self.notifyDurableCompletion(sequence);
+                if (status == .committed) try self.waitForResolvedTransactionSyncWithCancellation(sync_level, sequence.sequence, visibility_cancellation);
+                return;
+            }
+        }
+        if (self.core.table_catalog.transaction_recovery_max_count != 0) if (self.core.index_manager.resource_manager) |manager| if (manager.transactionCompletion()) |workspace| {
+            var resolved_sequence: u64 = 0;
+            {
+                var completion = try workspace.tryAcquire();
+                defer completion.release();
+                var guard: PreparedRowAllocator = .{
+                    .child = completion.allocator(),
+                    .io = self.backend_runtime.io() orelse std.Options.debug_io,
+                };
+                self.resolveTransactionIntentsPrepared(txn_id, status, commit_version, sync_level, .none, raft_entry, resolved_participant, &guard, &resolved_sequence) catch |err| {
+                    // The durable decision remains authoritative. A private reserve
+                    // shortage is deferred work, never evidence of an abort.
+                    if (err == error.OutOfMemory and completion.denied()) return error.TransactionCompletionCapacityMismatch;
+                    return err;
+                };
+            }
+            if (status == .committed) try self.waitForResolvedTransactionSyncWithCancellation(sync_level, resolved_sequence, visibility_cancellation);
+            return;
+        };
         var preparation: RequestPreparationContext = undefined;
         preparation.init(self);
         defer preparation.deinit();
@@ -27443,6 +29305,7 @@ pub const DB = struct {
             raft_entry,
             resolved_participant,
             &preparation.guard,
+            null,
         ) catch |err| return preparation.mapError(err);
     }
 
@@ -27456,6 +29319,7 @@ pub const DB = struct {
         raft_entry: ?RaftAppliedEntryIdentity,
         resolved_participant: ?[]const u8,
         preparation: *PreparedRowAllocator,
+        deferred_sequence: ?*u64,
     ) !void {
         const alloc = preparation.allocator();
         var staging_progress = if (self.restore_staging_required.load(.acquire)) try self.restoreStagingStatus(alloc) else null;
@@ -27479,6 +29343,7 @@ pub const DB = struct {
                 break :blk &.{raftAppliedEntryWrite(identity, &marker_value_buf)};
             } else &.{};
             _ = self.core.resolveTransactionIntentsWithExtraBatch(txn_id, status, commit_version, .{
+                .preparation_allocator = alloc,
                 .completion_writes = marker_writes,
                 .resolved_participant = resolved_participant,
             }) catch |err| switch (err) {
@@ -27525,6 +29390,7 @@ pub const DB = struct {
                     status,
                     commit_version,
                     .{
+                        .preparation_allocator = alloc,
                         .completion_writes = marker_writes,
                         .resolved_participant = resolved_participant,
                         .expected_intent_revision = intents.revision,
@@ -27537,7 +29403,7 @@ pub const DB = struct {
                 };
                 self.core.unlockApply();
                 try self.flushTransactionHAOutbox(txn_id);
-                try self.waitForResolvedTransactionSyncWithCancellation(sync_level, outcome.replay_sequence, visibility_cancellation);
+                if (deferred_sequence) |out| out.* = outcome.replay_sequence else try self.waitForResolvedTransactionSyncWithCancellation(sync_level, outcome.replay_sequence, visibility_cancellation);
                 return;
             }
 
@@ -27557,7 +29423,8 @@ pub const DB = struct {
                 .restore_staging_scope = restore_scope,
             }, null, .{
                 .visibility_cancellation = visibility_cancellation,
-                .bypass_ha_write_gate = bypass_ha,
+                .deferred_transaction_sequence = deferred_sequence,
+                .bypass_ha_write_gate = raft_entry != null,
                 .raft_applied_entry_marker = raft_entry,
                 .durable_rows = &durable_rows,
                 .transaction_resolution = .{
@@ -28255,9 +30122,71 @@ pub const DB = struct {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
+        const native_pending = if (try self.recoverDurableCompletion(resolution_timestamp)) |resolved| blk: {
+            if (resolved) return .{ .scanned_records = 1, .resolved_finalized = 1 };
+            break :blk true;
+        } else false;
+        const CompletionWorkspace = @import("../../common/workload_completion.zig").Workspace;
+        const workspace: ?*CompletionWorkspace = if (self.core.table_catalog.transaction_recovery_max_count != 0)
+            if (self.core.index_manager.resource_manager) |resources| resources.transactionCompletionMetadata() else null
+        else
+            null;
+        if (workspace != null or native_pending) {
+            var metadata: ?CompletionWorkspace.Borrow = if (workspace) |available| try available.tryAcquire() else null;
+            defer if (metadata) |*borrow| borrow.release();
+            const alloc = if (metadata) |*borrow| borrow.allocator() else self.alloc;
+            var manager = try transactions_mod.TxnManager.init(alloc, self.core.store);
+            defer manager.deinit();
+            const page = try manager.listTransactionsPage(alloc, self.transaction_recovery_scan_after, 1);
+            defer alloc.free(page.items);
+            // Advancing past a blocked row preserves fairness without erasing
+            // its durable obligation. The next rotation retries it.
+            self.transaction_recovery_scan_after = page.next_after;
+            var resolved: u64 = 0;
+            for (page.items) |txn| {
+                const native_owned = blk: {
+                    try self.lockApplyForPortableRuntime();
+                    defer self.core.unlockApply();
+                    break :blk if (self.core.primary_store_owner.lsmBackend()) |backend| backend.findDurableCompletion(txn.txn_id) != null else false;
+                };
+                if (native_owned or txn.status == .pending or (!try manager.hasIntents(txn.txn_id) and !try manager.hasHAOutbox(txn.txn_id))) continue;
+                try self.resolveTransactionIntentsWithSyncLevel(txn.txn_id, txn.status, if (txn.status == .committed and txn.commit_version != 0) txn.commit_version else resolution_timestamp, .propose);
+                resolved += 1;
+            }
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            // Recheck ownership under apply: a native prepare may have been
+            // installed after the page read. Its pending vote must never enter
+            // ordinary presumed-abort/cleanup, even after the timeout expires.
+            var legacy_count: usize = 0;
+            var native_skipped: u64 = 0;
+            for (page.items) |txn| {
+                if (self.core.primary_store_owner.lsmBackend()) |backend| if (backend.findDurableCompletion(txn.txn_id) != null) {
+                    native_skipped += 1;
+                    continue;
+                };
+                page.items[legacy_count] = txn;
+                legacy_count += 1;
+            }
+            var page_stats = try manager.recoverTransactionSummariesWithExtraBatchHooksAndOptions(page.items[0..legacy_count], cutoff_timestamp, resolution_timestamp, .{}, .{
+                .presume_abort_distributed = false,
+                .resolve_terminal_intents = false,
+            });
+            page_stats.scanned_records += native_skipped;
+            page_stats.deferred_unresolved += native_skipped;
+            page_stats.resolved_finalized += resolved;
+            return page_stats;
+        }
         const resolved_finalized = try self.resolveFinalizedTransactionIntentsForRecovery(resolution_timestamp);
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
+        // A newly prepared native slot may have appeared while finalized
+        // legacy work resolved outside apply. Defer to the bounded filtered
+        // rotation next time instead of feeding it to broad legacy recovery.
+        if (self.core.primary_store_owner.lsmBackend()) |backend| if (backend.hasDurableCompletions()) return .{
+            .resolved_finalized = resolved_finalized,
+            .deferred_unresolved = 1,
+        };
         var recovery_stats = try self.core.recoverTransactions(cutoff_timestamp, resolution_timestamp);
         recovery_stats.resolved_finalized += resolved_finalized;
         return recovery_stats;
@@ -28707,14 +30636,18 @@ pub const DB = struct {
         graph_queries: []const types.NamedGraphQuery,
         input_sets: []const types.NamedGraphInputSet,
     ) ![]types.GraphSearchResult {
+        var driver = try self.acquireSearchReadDriver(req, .{});
+        defer if (driver) |*owned| owned.release();
+        var admitted = req;
+        if (driver) |*owned| admitted.read_execution = owned;
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
-        if (req.identity_read_generation == null) {
+        if (admitted.identity_read_generation == null) {
             for (input_sets) |input_set| {
                 if (input_set.hit_ids.len > 0) return error.UnsupportedQueryRequest;
             }
         }
-        const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(req);
+        const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(admitted);
 
         var named_sets = try alloc.alloc(NamedResultSet, input_sets.len);
         defer alloc.free(named_sets);
@@ -28888,6 +30821,8 @@ pub const DB = struct {
         cfg: types.IndexConfig,
         admission_mode: IndexAdmissionMode,
     ) !InstalledIndex {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         {
@@ -36650,6 +38585,8 @@ pub const DB = struct {
     }
 
     pub fn reassignIdentityNamespaceForInternalTransition(self: *DB, namespace: doc_identity.Namespace) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         if (self.open_mode == .status_only) return error.UnsupportedOperation;
         lockApply(self);
         defer self.core.unlockApply();
@@ -36948,6 +38885,8 @@ pub const DB = struct {
         backup: []const u8,
         target_identity: doc_identity.Namespace,
     ) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         if (self.open_mode == .status_only or self.open_mode == .query_readonly) return error.UnsupportedOperation;
 
         lockApply(self);
@@ -37901,6 +39840,8 @@ pub const DB = struct {
     }
 
     fn importPortableLogicalSourceFile(self: *DB, alloc: Allocator, io: Io, file: std.Io.File, file_size: u64, target_identity: doc_identity.Namespace, cohort: ?portable_backup.CohortProof, cancellation: types.CancellationToken) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         if (self.open_mode == .status_only or self.open_mode == .query_readonly) return error.UnsupportedOperation;
 
         lockApply(self);
@@ -37932,6 +39873,8 @@ pub const DB = struct {
         context: anytype,
         comptime adopt: anytype,
     ) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         if (self.open_mode == .status_only or self.open_mode == .query_readonly) return error.UnsupportedOperation;
         lockApply(self);
         var apply_locked = true;
@@ -37972,6 +39915,8 @@ pub const DB = struct {
         backup: []const u8,
         target_identity: doc_identity.Namespace,
     ) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         if (self.open_mode == .status_only or self.open_mode == .query_readonly) return error.UnsupportedOperation;
         var stage = try PortableImportStage.init(alloc, self.core.path, backup, .{});
         defer stage.deinit();
@@ -38006,6 +39951,8 @@ pub const DB = struct {
     /// Refresh every schema-dependent runtime view after a portable restore
     /// has replaced durable metadata beneath this already-open DB.
     pub fn reloadSchemaForInternalRestore(self: *DB) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         if (self.open_mode == .status_only) return error.UnsupportedOperation;
         lockApply(self);
         defer self.core.unlockApply();
@@ -39616,6 +41563,26 @@ pub const DB = struct {
         opts: types.ScanOptions,
         visitor: types.ScanVisitor,
     ) !void {
+        var driver = try self.acquireGeneralReadDriver(opts.read_execution, .{
+            .io = self.backend_runtime.io() orelse std.Options.debug_io,
+            .deadline_ns = opts.execution_deadline_ns,
+            .native_now_ns = platform_time.monotonicNs,
+            .cancellation = opts.cancellation orelse .none,
+        });
+        defer if (driver) |*owned| owned.release();
+        var admitted = opts;
+        if (driver) |*owned| admitted.read_execution = owned;
+        return self.scanVisitWithReadDriver(alloc, from_key, to_key, admitted, visitor);
+    }
+
+    fn scanVisitWithReadDriver(
+        self: *DB,
+        alloc: Allocator,
+        from_key: []const u8,
+        to_key: []const u8,
+        opts: types.ScanOptions,
+        visitor: types.ScanVisitor,
+    ) !void {
         if (opts.relational_query_json.len != 0) return self.scanRelationalRowsVisit(alloc, from_key, to_key, opts, visitor);
         const projection_plan = db_query_projection.buildLookupFieldSelectionPlan(.{
             .fields = opts.fields,
@@ -39654,10 +41621,10 @@ pub const DB = struct {
             if (byte_range.end.len == 0 or std.mem.order(u8, to_key, byte_range.end) == .lt) break :blk to_key;
             break :blk byte_range.end;
         };
-        const lower = try self.core.documentRangeLowerAlloc(lower_raw);
-        defer self.core.alloc.free(lower);
-        const upper = if (upper_raw.len > 0) try self.core.documentRangeUpperAlloc(upper_raw) else null;
-        defer if (upper) |buf| self.core.alloc.free(buf);
+        const lower = try documentRangeLowerAlloc(alloc, lower_raw);
+        defer alloc.free(lower);
+        const upper = if (upper_raw.len > 0) try documentRangeUpperAlloc(alloc, upper_raw) else null;
+        defer if (upper) |buf| alloc.free(buf);
 
         var prepared_filter = if (opts.filter_query_json.len > 0)
             try db_query_graph.PreparedPatternFilter.init(alloc, opts.filter_query_json)
@@ -39986,8 +41953,8 @@ pub const DB = struct {
         };
         defer state.deinit();
         try state.checkActive();
-        const resume_lower = if (columnar_progress.delivered != 0) try self.core.documentRangeLowerAlloc(columnar_progress.last_key.items) else null;
-        defer if (resume_lower) |key| self.core.alloc.free(key);
+        const resume_lower = if (columnar_progress.delivered != 0) try documentRangeLowerAlloc(alloc, columnar_progress.last_key.items) else null;
+        defer if (resume_lower) |key| alloc.free(key);
         if (schema_view) |view| if (view.storageMode() == .relational) {
             const Check = struct {
                 fn owner(ptr: ?*anyopaque, _: []const u8) !docstore_mod.DocStore.ScanAction {
@@ -40018,7 +41985,27 @@ pub const DB = struct {
     /// The public response currently has one dense profile slot; compositions
     /// with multiple dense lanes intentionally leave it unset rather than
     /// publishing an ambiguous aggregate.
+    fn acquireSearchReadDriver(self: *DB, req: types.SearchRequest, exec_ctx: types.ExecutionContext) !?resource_manager_mod.DenseExecution.Runtime.Lease {
+        if (req.read_execution != null and exec_ctx.read_execution != null and req.read_execution != exec_ctx.read_execution) return error.InvalidLease;
+        return self.acquireGeneralReadDriver(req.read_execution orelse exec_ctx.read_execution, .{
+            .io = exec_ctx.io orelse self.backend_runtime.io() orelse std.Options.debug_io,
+            .deadline_ns = req.execution_deadline_ns,
+            .native_now_ns = platform_time.monotonicNs,
+            .cancellation = req.cancellation orelse .none,
+        });
+    }
+
     pub fn searchWithDenseProfile(self: *DB, alloc: Allocator, req: types.SearchRequest) !SearchWithDenseProfileResult {
+        var driver = try self.acquireSearchReadDriver(req, .{});
+        defer if (driver) |*owned| owned.release();
+        var admitted = req;
+        if (driver) |*owned| admitted.read_execution = owned;
+        var result = try self.searchWithDenseProfileAdmitted(alloc, admitted);
+        result.request.read_execution = req.read_execution;
+        return result;
+    }
+
+    fn searchWithDenseProfileAdmitted(self: *DB, alloc: Allocator, req: types.SearchRequest) !SearchWithDenseProfileResult {
         try self.enforcePortableRuntimeGate();
         if (self.async_context.resource_manager) |manager| manager.beginForegroundQuery();
         defer if (self.async_context.resource_manager) |manager| manager.finishForegroundQuery();
@@ -40109,12 +42096,31 @@ pub const DB = struct {
         req: types.SearchRequest,
         exec_ctx: types.ExecutionContext,
     ) !SearchWithCapturedRequestResult {
+        var driver = try self.acquireSearchReadDriver(req, exec_ctx);
+        defer if (driver) |*owned| owned.release();
+        var admitted = req;
+        admitted.read_execution = if (driver) |*owned| owned else req.read_execution orelse exec_ctx.read_execution;
+        var execution = exec_ctx;
+        execution.read_execution = admitted.read_execution;
+        if (admitted.read_execution != null) execution.max_parallelism = 1;
+        var result = try self.searchWithCapturedRequestAndExecutionContextAdmitted(alloc, admitted, execution);
+        // The captured request may outlive this synchronous driver stack.
+        result.request.read_execution = req.read_execution;
+        return result;
+    }
+
+    fn searchWithCapturedRequestAndExecutionContextAdmitted(
+        self: *DB,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        exec_ctx: types.ExecutionContext,
+    ) !SearchWithCapturedRequestResult {
         if (self.async_context.resource_manager) |manager| manager.beginForegroundQuery();
         defer if (self.async_context.resource_manager) |manager| manager.finishForegroundQuery();
         // Keep degraded requests out of catalog/apply lock queues. Revalidate
         // after admission below to close publication's check-to-use race.
         try self.enforcePortableRuntimeGate();
-        if (std.meta.eql(exec_ctx, types.ExecutionContext{})) {
+        if (exec_ctx.io == null and (exec_ctx.max_parallelism == null or (exec_ctx.read_execution != null and exec_ctx.max_parallelism == 1))) {
             const snapshot_input = directSingleVectorRequest(req) orelse req;
             const dense = snapshot_input.dense orelse if (snapshot_input.query == .dense_knn) snapshot_input.query.dense_knn else null;
             if (dense) |query| if (try self.trySnapshotDenseSearch(alloc, snapshot_input, query, false)) |captured| {
@@ -41127,6 +43133,8 @@ pub const DB = struct {
     }
 
     pub fn collectSearchRequestTextStats(self: *DB, alloc: Allocator, req: types.SearchRequest) ![]const @import("../../search/distributed_stats.zig").TextFieldStats {
+        var driver = try self.acquireSearchReadDriver(req, .{});
+        defer if (driver) |*owned| owned.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
         return try db_query_search.collectSearchRequestTextStats(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), .{
@@ -41165,9 +43173,13 @@ pub const DB = struct {
         max_work: u32,
         exec_ctx: types.ExecutionContext,
     ) !planning_stats_mod.PlanningStatsSummary {
+        var driver = try self.acquireSearchReadDriver(req, exec_ctx);
+        defer if (driver) |*owned| owned.release();
+        var admitted = req;
+        admitted.read_execution = if (driver) |*owned| owned else req.read_execution orelse exec_ctx.read_execution;
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
-        return try self.collectPlanningStatsLocked(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), max_work, exec_ctx);
+        return try self.collectPlanningStatsLocked(alloc, try self.searchRequestAtCurrentIdentityGeneration(admitted), max_work, exec_ctx);
     }
 
     fn collectPlanningStatsLocked(
@@ -41213,6 +43225,8 @@ pub const DB = struct {
     }
 
     pub fn collectExplicitTextStats(self: *DB, alloc: Allocator, requests: []const db_query_search.ExplicitTextStatRequest) ![]const @import("../../search/distributed_stats.zig").TextFieldStats {
+        var driver = try self.acquireGeneralReadDriver(null, .{ .io = self.backend_runtime.io() orelse std.Options.debug_io });
+        defer if (driver) |*owned| owned.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
         return try db_query_search.collectExplicitTextStats(alloc, requests, .{
@@ -41227,6 +43241,8 @@ pub const DB = struct {
         alloc: Allocator,
         requests: []const db_query_search.ExplicitBackgroundTextStatRequest,
     ) ![]const aggregations_mod.DistributedBackgroundTextStats {
+        var driver = try self.acquireGeneralReadDriver(null, .{ .io = self.backend_runtime.io() orelse std.Options.debug_io });
+        defer if (driver) |*owned| owned.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
         return try db_query_search.collectExplicitBackgroundTextStats(alloc, requests, .{
@@ -41837,6 +43853,21 @@ pub const DB = struct {
     /// Profiled counterpart to `searchWithCapturedRequest`; the request token
     /// and dense result are created under one DB search lease.
     pub fn searchDenseProfiledWithCapturedRequest(
+        self: *DB,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        dense: types.DenseKnnQuery,
+    ) !ProfiledDenseSearchWithCapturedRequestResult {
+        var driver = try self.acquireSearchReadDriver(req, .{});
+        defer if (driver) |*owned| owned.release();
+        var admitted = req;
+        if (driver) |*owned| admitted.read_execution = owned;
+        var result = try self.searchDenseProfiledWithCapturedRequestAdmitted(alloc, admitted, dense);
+        result.request.read_execution = req.read_execution;
+        return result;
+    }
+
+    fn searchDenseProfiledWithCapturedRequestAdmitted(
         self: *DB,
         alloc: Allocator,
         req: types.SearchRequest,
@@ -43171,10 +45202,14 @@ pub const DB = struct {
         req: types.SearchRequest,
         keys: []const []const u8,
     ) ![]types.SearchHit {
+        var driver = try self.acquireSearchReadDriver(req, .{});
+        defer if (driver) |*owned| owned.release();
+        var admitted_req = req;
+        if (driver) |*owned| admitted_req.read_execution = owned;
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
 
-        const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(req);
+        const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(admitted_req);
         var admission = try self.filterGraphKeysWithOrdinalsAlloc(
             alloc,
             snapshot_req,
@@ -43217,6 +45252,20 @@ pub const DB = struct {
         expected: index_manager_mod.IndexManager.CoverageIdentity,
         identity_read_generation: ?u64,
     ) ![]bool {
+        return self.graphHasIncomingEdgesForInternalReadWithContext(alloc, index_name, keys, expected, identity_read_generation, .{});
+    }
+
+    pub fn graphHasIncomingEdgesForInternalReadWithContext(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        keys: []const []const u8,
+        expected: index_manager_mod.IndexManager.CoverageIdentity,
+        identity_read_generation: ?u64,
+        req: types.SearchRequest,
+    ) ![]bool {
+        var driver = try self.acquireSearchReadDriver(req, .{});
+        defer if (driver) |*owned| owned.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
         // Validate under the same apply lease as the reverse snapshot. A
@@ -75224,6 +77273,45 @@ test "relational prepared intents reject physical overflow before voting and per
     try std.testing.expectEqual(digest, try relational_row_codec.rowSemanticHash(stored));
 }
 
+test "workload admission replicated transaction backlog rejection preserves applied entry and restart debt" {
+    const alloc = std.testing.allocator;
+    var resources = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer resources.deinit(alloc);
+    try resources.configureTransactionCompletion(512 * 1024);
+    const policy: table_storage_mod.Settings = .{ .transaction_recovery = .{
+        .protocol_version = 1,
+        .max_count = 1,
+        .max_bytes = 64 * 1024,
+        .max_transaction_bytes = 64 * 1024,
+    } };
+    var path_tmp = try TestDirectory.init("db-completion-ledger");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    const first: types.TxnId = .{81} ** 16;
+    const second: types.TxnId = .{82} ** 16;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .resource_manager = &resources, .table_storage = policy, .start_optional_runtimes = false });
+        defer db.close();
+        _ = try db.beginReplicatedTransactionAtRaftEntry(first, 100, 100, &.{}, false, false, .{ .term = 1, .index = 1 });
+        try std.testing.expectError(error.TransactionRecoveryCapacityExhausted, db.beginReplicatedTransactionAtRaftEntry(second, 101, 101, &.{}, false, false, .{ .term = 1, .index = 2 }));
+        try std.testing.expectEqual(@as(u64, 1), (try db.raftAppliedEntry()).?.index);
+        try db.writeReplicatedTransactionAtRaftEntry(first, .{ .writes = &.{.{ .key = "a", .value = "{\"n\":1}" }} }, .{ .term = 1, .index = 3 });
+    }
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .resource_manager = &resources, .table_storage = policy, .start_optional_runtimes = false });
+        defer db.close();
+        try std.testing.expectEqual(@as(u64, 1), db.core.table_catalog.transaction_recovery_max_count);
+        try std.testing.expectError(error.TransactionRecoveryCapacityExhausted, db.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(second, 101, 101, &.{}, false, false));
+        try db.resolveReplicatedTransactionAtRaftEntry(first, .committed, 200, .propose, .none, .{ .term = 1, .index = 4 }, null);
+        _ = try db.beginReplicatedTransactionAtRaftEntry(second, 201, 201, &.{}, false, false, .{ .term = 1, .index = 5 });
+        try std.testing.expectEqual(@as(u64, 5), (try db.raftAppliedEntry()).?.index);
+        const row = (try db.get(alloc, "a")).?;
+        defer alloc.free(row);
+        try std.testing.expectEqualStrings("{\"n\":1}", row);
+    }
+}
+
 test "relational cumulative prepares remain committable within the preparation envelope" {
     const alloc = std.testing.allocator;
     var options = resource_manager_mod.Options{ .identity_allocator = alloc };
@@ -85826,7 +87914,7 @@ test "db managed resolver changes fence in-flight replay and reset durable curso
                 return false;
             }
         };
-        if (follower) db.setPromotionOwner(.{ .ptr = undefined, .vtable = &.{ .is_local_owner = FollowerOwner.isLocal } });
+        if (follower) try db.setPromotionOwner(.{ .ptr = undefined, .vtable = &.{ .is_local_owner = FollowerOwner.isLocal } });
         // Retirement is durable replay work; keep the catalog until it finishes.
         try std.testing.expectError(error.WriterLocked, db.removeResolverWithoutDrain(cfg.name));
         try db.runUntilIdle();
@@ -87374,7 +89462,7 @@ test "db mention edge weight is fused from extractor trust and mention confidenc
     defer db.close();
     var promotion_sink = FakePromotionSink{ .alloc = alloc };
     defer promotion_sink.deinit();
-    db.setEntitySink(promotion_sink.sink());
+    try db.setEntitySink(promotion_sink.sink());
 
     try db.addIndex(.{
         .name = "prov_graph",
@@ -140529,5 +142617,3080 @@ test "source vector migration converts legacy ANN generations in both modes" {
         var result = try migrated.search(alloc, .{ .index_name = "model", .dense = .{ .vector = &.{ 1, 0, 0 }, .k = 1 }, .limit = 1 });
         defer result.deinit();
         try std.testing.expectEqualStrings("a", result.hits[0].id);
+    }
+}
+
+test "workload admission broad DB reads share capacity and return no stack driver" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db-read-admission");
+    defer path_tmp.cleanup();
+    var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer manager.deinit(alloc);
+    var db = try DB.open(alloc, std.mem.span(path_tmp.path().ptr), .{ .resource_manager = &manager });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }}, .sync_level = .full_index });
+    try manager.configureReadExecution(.{ .max_runnable_tasks = 1, .max_outstanding_tasks = 2 });
+    var blocker = (try manager.acquireReadDriver(std.testing.io, .{ .io = std.testing.io })).?;
+    var blocker_live = true;
+    defer if (blocker_live) blocker.release();
+    try std.testing.expectError(error.AdmissionFull, db.lookup(alloc, "doc:a", .{}));
+    try std.testing.expectError(error.AdmissionFull, db.searchWithCapturedRequest(alloc, .{}));
+    try std.testing.expectError(error.AdmissionFull, db.searchWithDenseProfile(alloc, .{}));
+    try std.testing.expectError(error.AdmissionFull, db.searchDenseProfiledWithCapturedRequest(alloc, .{}, .{ .vector = &.{ 0, 0 }, .k = 1 }));
+    // A synchronous nested lookup borrows the caller's sole slot.
+    var borrowed_lookup = (try db.lookup(alloc, "doc:a", .{ .read_execution = &blocker })).?;
+    borrowed_lookup.deinit(alloc);
+    var planning = try db.collectPlanningStatsWithExecutionContext(alloc, .{}, 100, .{ .read_execution = &blocker });
+    planning.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), manager.denseExecutionStats().runnable);
+    // A derived operation cannot refresh the original driver's deadline.
+    blocker.options.?.deadline_ns = 0;
+    try std.testing.expectError(error.DeadlineExceeded, db.lookup(alloc, "doc:a", .{ .read_execution = &blocker }));
+    blocker.options.?.deadline_ns = null;
+    blocker.release();
+    blocker_live = false;
+    var looked_up = (try db.lookup(alloc, "doc:a", .{})).?;
+    looked_up.deinit(alloc);
+    var captured = try db.searchWithCapturedRequest(alloc, .{});
+    defer captured.result.deinit();
+    try std.testing.expect(captured.request.read_execution == null);
+    try std.testing.expect(manager.denseExecutionStats().all_reads);
+    try std.testing.expectEqual(@as(u64, 0), manager.denseExecutionStats().outstanding);
+    try std.testing.expectEqual(@as(u64, 0), manager.denseExecutionStats().runnable);
+}
+
+test "workload admission protected existence probes progress and demote wide rows without retaining snapshots" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db-protected-existence");
+    defer path_tmp.cleanup();
+    var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer manager.deinit(alloc);
+    var db = try DB.open(alloc, std.mem.span(path_tmp.path().ptr), .{ .resource_manager = &manager, .primary_backend = .lmdb });
+    defer db.close();
+    try std.testing.expectEqual(.lmdb, db.core.store.kind);
+    const wide = "{\"body\":\"" ++ ("x" ** 5000) ++ "\"}";
+    try db.batch(.{ .writes = &.{ .{ .key = "small", .value = "{\"title\":\"small\"}" }, .{ .key = "wide", .value = wide } } });
+    try manager.configureReadExecution(.{
+        .max_runnable_tasks = 2,
+        .max_outstanding_tasks = 8,
+        .max_queued_tasks = 4,
+        .max_wait_ms = 2,
+        .max_working_bytes = 512 * 1024,
+        .protected = .{ .max_runnable_tasks = 1, .max_outstanding_tasks = 1, .max_working_bytes = 64 * 1024, .max_transition_tasks = 1, .max_transition_bytes = 64 * 1024 },
+    });
+    const runtime = manager.dense_execution.?;
+    var blocker = try runtime.acquire(.{ .io = std.testing.io });
+    defer blocker.release();
+    const projection: types.LookupOptions = .{ .include_all_fields = false };
+    var small = (try db.lookup(alloc, "small", projection)).?;
+    small.deinit(alloc);
+    try std.testing.expect((try db.lookup(alloc, "missing", projection)) == null);
+    // Wide rows cannot do unbounded decoding under protected capacity. Their
+    // parked request unwinds on the original admission wait ceiling.
+    try std.testing.expectError(error.AdmissionWaitTimeout, db.lookup(alloc, "wide", projection));
+    try std.testing.expectError(error.AdmissionWaitTimeout, db.lookup(alloc, "small", .{ .fields = &.{"_id"}, .include_all_fields = false }));
+    const after = runtime.ledger.snapshot();
+    try std.testing.expectEqual(@as(u64, 1), after.total.requests);
+    try std.testing.expectEqual(@as(u64, 0), after.total.retained_bytes);
+    try std.testing.expectEqual(@as(u64, 0), after.transition_reserved.requests);
+    try std.testing.expectEqual(@as(u64, 0), after.lanes[@intFromEnum(@import("../../common/workload_resources.zig").Lane.bounded_read)].requests);
+    blocker.release();
+    var demoted = (try db.lookup(alloc, "wide", projection)).?;
+    defer demoted.deinit(alloc);
+    try std.testing.expectEqualStrings("{}", demoted.json);
+    try std.testing.expectEqual(@as(u64, 0), runtime.ledger.snapshot().total.handles);
+}
+
+test "workload admission protected recovery rows survive reentrant metadata and restart" {
+    const alloc = std.testing.allocator;
+    var resources = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer resources.deinit(alloc);
+    try resources.configureTransactionCompletion(512 * 1024);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    const policy: table_storage_mod.Settings = .{ .transaction_recovery = .{
+        .protocol_version = 1,
+        .max_count = 4,
+        .max_bytes = 512 * 1024,
+        .max_transaction_bytes = 128 * 1024,
+    } };
+    const coordinator: transactions_mod.TxnId = .{1} ** 16;
+    const participant: transactions_mod.TxnId = .{2} ** 16;
+    const later_coordinator: transactions_mod.TxnId = .{3} ** 16;
+    {
+        var setup = try DB.open(alloc, std.mem.span(path), .{
+            .resource_manager = &resources,
+            .table_storage = policy,
+            .start_optional_runtime_workers = false,
+            .start_index_workers = false,
+        });
+        defer setup.close();
+        _ = try setup.beginTransactionWithIdAndParticipants(coordinator, 1000, &.{"remote"});
+        _ = try setup.beginTransactionWithIdAndParticipants(participant, 1000, &.{});
+        try setup.writeTransaction(participant, .{ .writes = &.{.{ .key = "recovered", .value = "{}" }} });
+        try setup.resolveTransactionIntents(coordinator, .committed, 2000);
+        _ = try setup.beginTransactionWithIdAndParticipants(later_coordinator, 1000, &.{"remote"});
+        try setup.resolveTransactionIntents(later_coordinator, .committed, 2000);
+    }
+    const Resolver = struct {
+        db: ?*DB = null,
+        resources: *resource_manager_mod.ResourceManager,
+        calls: usize = 0,
+        fn resolve(ptr: *anyopaque, _: transactions_mod.TxnId, _: []const u8, _: transactions_mod.TxnStatus, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(self.resources.transactionCompletionMetadata().?.in_use.load(.acquire));
+            // The metadata lane remains live through this in-process RPC;
+            // the distinct row lane must make mandatory completion progress.
+            try self.db.?.resolveTransactionIntents(participant, .committed, 3000);
+            self.calls += 1;
+        }
+    };
+    var resolver: Resolver = .{ .resources = &resources };
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .resource_manager = &resources,
+        .table_storage = policy,
+        .start_optional_runtime_workers = false,
+        .start_index_workers = false,
+        .transaction_recovery = .{
+            .enabled = true,
+            .resolver_ctx = &resolver,
+            .resolve_participant_fn = Resolver.resolve,
+            .cutoff_ns = std.math.maxInt(u64),
+            .max_records_per_run = 2,
+        },
+    });
+    defer db.close();
+    resolver.db = &db;
+    try db.prepareTransactionRecoveryOwner();
+    const stats = resources.sliceStats(.relational_preparation_working_set);
+    var ordinary = try resources.reserveWithoutReclaim(.relational_preparation_working_set, stats.hard_limit_bytes - stats.used_bytes);
+    defer ordinary.release();
+    try std.testing.expectError(error.ResourceBudgetExceeded, resources.reserveWithoutReclaim(.relational_preparation_working_set, 1));
+    try db.transaction_runtime.?.runOnce();
+    try std.testing.expectEqual(@as(usize, 1), resolver.calls);
+    try std.testing.expectEqual(@as(u64, 2), db.transaction_runtime.?.stats().scanned_records);
+    try db.transaction_runtime.?.runOnce();
+    try std.testing.expectEqual(@as(usize, 2), resolver.calls);
+    try std.testing.expectEqual(@as(u64, 3), db.transaction_runtime.?.stats().scanned_records);
+    try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try db.getTransactionStatus(participant));
+    const value = (try db.get(alloc, "recovered")).?;
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("{}", value);
+    try std.testing.expect(!resources.transactionCompletion().?.in_use.load(.acquire));
+    try std.testing.expect(!resources.transactionCompletionMetadata().?.in_use.load(.acquire));
+}
+
+test "workload admission completion policy never blocks ordinary table opening" {
+    const alloc = std.testing.allocator;
+    var resources = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer resources.deinit(alloc);
+    try resources.configureTransactionCompletion(1024);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    var db = try DB.open(alloc, std.mem.span(path_tmp.path().ptr), .{
+        .resource_manager = &resources,
+        .start_optional_runtimes = false,
+        .start_index_workers = false,
+    });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "ordinary", .value = "{}" }} });
+    const value = (try db.get(alloc, "ordinary")).?;
+    defer alloc.free(value);
+    try std.testing.expectError(error.TransactionCompletionPolicyRequired, db.beginTransaction(1000));
+}
+
+test "workload admission transaction releases completion lane before cancelable visibility" {
+    const alloc = std.testing.allocator;
+    var resources = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer resources.deinit(alloc);
+    try resources.configureTransactionCompletion(2 * 1024 * 1024);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    var db = try DB.open(alloc, std.mem.span(path_tmp.path().ptr), .{
+        .resource_manager = &resources,
+        .table_storage = .{ .transaction_recovery = .{
+            .protocol_version = 1,
+            .max_count = 4,
+            .max_bytes = 512 * 1024,
+            .max_transaction_bytes = 128 * 1024,
+        } },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+    });
+    defer db.close();
+    try db.addIndex(.{ .name = "full_text", .kind = .full_text, .config_json = "{}" });
+    const txn_id = try db.beginTransaction(1000);
+    try db.writeTransaction(txn_id, .{ .writes = &.{.{ .key = "durable", .value = "{\"title\":\"hello\"}" }} });
+    const Probe = struct {
+        resources: *resource_manager_mod.ResourceManager,
+        fn check(ptr: *const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(!self.resources.transactionCompletion().?.in_use.load(.acquire));
+            var peer = try self.resources.transactionCompletion().?.tryAcquire();
+            peer.release();
+            return error.Canceled;
+        }
+    };
+    var probe: Probe = .{ .resources = &resources };
+    try std.testing.expectError(error.EnrichmentWaitCanceled, db.resolveTransactionIntentsWithSyncLevelAndCancellation(txn_id, .committed, 2000, .full_text, .{ .ptr = &probe, .check_fn = Probe.check }));
+    try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try db.getTransactionStatus(txn_id));
+    const value = (try db.get(alloc, "durable")).?;
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("{\"title\":\"hello\"}", value);
+}
+
+test "workload admission missing completion pool blocks new debt but never existing replay" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = std.mem.span(path_tmp.path().ptr);
+    const policy: table_storage_mod.Settings = .{ .transaction_recovery = .{
+        .protocol_version = 1,
+        .max_count = 4,
+        .max_bytes = 512 * 1024,
+        .max_transaction_bytes = 128 * 1024,
+    } };
+    const txn_id: transactions_mod.TxnId = .{3} ** 16;
+    {
+        var resources = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+        defer resources.deinit(alloc);
+        try resources.configureTransactionCompletion(512 * 1024);
+        var db = try DB.open(alloc, path, .{ .resource_manager = &resources, .table_storage = policy, .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        _ = try db.beginTransactionWithId(txn_id, 1000);
+        try db.writeTransaction(txn_id, .{ .writes = &.{.{ .key = "existing", .value = "{}" }} });
+    }
+    var db = try DB.open(alloc, path, .{ .table_storage = policy, .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try std.testing.expectError(error.TransactionCompletionPolicyRequired, db.beginTransaction(2000));
+    _ = try db.beginTransactionWithId(txn_id, 1000);
+    try db.resolveTransactionIntents(txn_id, .committed, 3000);
+    const value = (try db.get(alloc, "existing")).?;
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("{}", value);
+    try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try db.getTransactionStatus(txn_id));
+}
+
+test "workload admission one-shot recovery never bypasses a busy protected row lane" {
+    const alloc = std.testing.allocator;
+    var resources = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer resources.deinit(alloc);
+    try resources.configureTransactionCompletion(512 * 1024);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    var db = try DB.open(alloc, std.mem.span(path_tmp.path().ptr), .{
+        .resource_manager = &resources,
+        .table_storage = .{ .transaction_recovery = .{
+            .protocol_version = 1,
+            .max_count = 4,
+            .max_bytes = 512 * 1024,
+            .max_transaction_bytes = 128 * 1024,
+        } },
+        .start_optional_runtimes = false,
+        .start_index_workers = false,
+    });
+    defer db.close();
+    const txn_id = try db.beginTransaction(1000);
+    try db.writeTransaction(txn_id, .{ .writes = &.{.{ .key = "deferred", .value = "{}" }} });
+    // Crash fixture: the terminal decision survived, while prepared physical
+    // intents still await local application. Preserve all other record flags.
+    const prefix = "\x00\x00__txn_records__:";
+    var key: [prefix.len + 16]u8 = undefined;
+    @memcpy(key[0..prefix.len], prefix);
+    @memcpy(key[prefix.len..], &txn_id);
+    const record = try db.core.store.get(alloc, &key);
+    defer alloc.free(record);
+    record[0] = @intFromEnum(transactions_mod.TxnStatus.committed);
+    std.mem.writeInt(u64, record[9..17], 2000, .little);
+    std.mem.writeInt(u64, record[25..33], 2000, .little);
+    try db.core.store.put(&key, record);
+    var recorder = TxnResolverRecorder{};
+    const config: transaction_runtime_mod.Config = .{
+        .enabled = true,
+        .cutoff_ns = std.math.maxInt(u64),
+        .resolver_ctx = &recorder,
+        .resolve_participant_fn = TxnResolverRecorder.resolve,
+    };
+    {
+        var competing = try resources.transactionCompletion().?.tryAcquire();
+        defer competing.release();
+        try std.testing.expectError(error.TransactionCompletionBusy, db.recoverTransactions(0, 3000));
+        const deferred = try db.runTransactionRecoveryOnce(config);
+        try std.testing.expectEqual(@as(u64, 1), deferred.notification_failures);
+        try std.testing.expect(try db.core.transactionHasIntents(txn_id));
+        const still_absent = try db.get(alloc, "deferred");
+        defer if (still_absent) |value| alloc.free(value);
+        try std.testing.expect(still_absent == null);
+    }
+    const completed = try db.runTransactionRecoveryOnce(config);
+    try std.testing.expectEqual(@as(u64, 0), completed.notification_failures);
+    try std.testing.expect(!try db.core.transactionHasIntents(txn_id));
+    const value = (try db.get(alloc, "deferred")).?;
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("{}", value);
+}
+
+test "workload admission enabling small node reserve never strands legacy committed rows" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = std.mem.span(path_tmp.path().ptr);
+    const txn_id: transactions_mod.TxnId = .{4} ** 16;
+    const body = try std.fmt.allocPrint(alloc, "{{\"payload\":\"{s}\"}}", .{([_]u8{'a'} ** 8192)[0..]});
+    defer alloc.free(body);
+    {
+        var db = try DB.open(alloc, path, .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        _ = try db.beginTransactionWithId(txn_id, 1000);
+        try db.writeTransaction(txn_id, .{ .writes = &.{.{ .key = "legacy", .value = body }} });
+        const prefix = "\x00\x00__txn_records__:";
+        var key: [prefix.len + 16]u8 = undefined;
+        @memcpy(key[0..prefix.len], prefix);
+        @memcpy(key[prefix.len..], &txn_id);
+        const record = try db.core.store.get(alloc, &key);
+        defer alloc.free(record);
+        record[0] = @intFromEnum(transactions_mod.TxnStatus.committed);
+        std.mem.writeInt(u64, record[9..17], 2000, .little);
+        std.mem.writeInt(u64, record[25..33], 2000, .little);
+        try db.core.store.put(&key, record);
+    }
+    var resources = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer resources.deinit(alloc);
+    try resources.configureTransactionCompletion(1024);
+    var db = try DB.open(alloc, path, .{ .resource_manager = &resources, .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try std.testing.expectError(error.TransactionCompletionPolicyRequired, db.beginTransaction(3000));
+    _ = try db.recoverTransactions(0, 3000);
+    const recovered = (try db.get(alloc, "legacy")).?;
+    defer alloc.free(recovered);
+    try std.testing.expectEqualStrings(body, recovered);
+    try std.testing.expect(!try db.core.transactionHasIntents(txn_id));
+}
+
+test "workload admission durable DB completion uses reserved resources across unrelated writes and repeated resolve" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |equal_value| {
+        var tmp = try TestDirectory.init("durable-db-completion");
+        defer tmp.cleanup();
+        var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+        defer manager.deinit(alloc);
+        try manager.configureTransactionCompletion(1024 * 1024);
+        var db = try DB.open(alloc, std.mem.span(tmp.path().ptr), .{
+            .allow_local_durable_completion = true,
+            .resource_manager = &manager,
+            .table_storage = .{ .transaction_recovery = .{ .protocol_version = 1, .max_count = 16, .max_bytes = 1024 * 1024, .max_transaction_bytes = 64 * 1024 } },
+            .start_index_workers = false,
+            .start_optional_runtimes = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        try db.batch(.{ .writes = &.{.{ .key = "document", .value = "{\"value\":1}" }} });
+        const id = try db.beginTransaction(1000);
+        const replacement = if (equal_value) "{\"value\":1}" else "{\"value\":2}";
+        const intents = [_]transactions_mod.WriteIntent{.{ .key = "document", .value = replacement }};
+        try db.prepareDurableCompletion(id, &intents, &.{});
+        try std.testing.expect(db.core.primary_store_owner.lsmBackend().?.durable_completion != null);
+        try std.testing.expectError(error.PreparedCompletionActive, db.writeIntents(id, &intents, &.{}));
+        try std.testing.expectError(error.PreparedCompletionActive, db.writeTransaction(id, .{ .writes = &.{.{ .key = "document", .value = replacement }} }));
+        const other = try db.beginTransaction(1001);
+        try db.writeIntents(other, &.{.{ .key = "other-transaction", .value = "{\"independent\":true}" }}, &.{});
+        for (0..16) |n| {
+            var key_buf: [32]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buf, "unrelated-{d}", .{n});
+            try db.batch(.{ .writes = &.{.{ .key = key, .value = "{\"independent\":true}" }} });
+        }
+        const Hook = struct {
+            calls: usize = 0,
+            sequence: u64 = 0,
+            known_empty: bool = false,
+            fn changed(ptr: *anyopaque, _: []const u8, _: u64, _: ?*DB, event: QueryVisibilityEvent) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                if (event.change != .target_advanced) return;
+                self.calls += 1;
+                self.sequence = event.target_sequence orelse 0;
+                self.known_empty = event.target_scope_known and event.target_indexes.len == 0;
+            }
+        };
+        var hook: Hook = .{};
+        db.setQueryVisibilityHook(.{ .ptr = &hook, .table_name = "docs", .group_id = 1, .db = &db, .on_change = Hook.changed });
+        defer db.setQueryVisibilityHook(null);
+        const old_limit = manager.memory.budget.hard_limit_bytes;
+        manager.memory.budget.hard_limit_bytes = 1;
+        const completed = db.resolveTransactionIntents(id, .committed, 2000);
+        manager.memory.budget.hard_limit_bytes = old_limit;
+        try completed;
+        try std.testing.expectEqual(@as(usize, 1), hook.calls);
+        try std.testing.expectEqual(db.core.nextDerivedSequence(), hook.sequence);
+        try std.testing.expect(hook.known_empty);
+        try std.testing.expect(db.core.primary_store_owner.lsmBackend().?.durable_completion == null);
+        try db.core.completion_eligibility.checkTransition();
+        const usage = try db.core.store.get(alloc, "\x00\x00__metadata__:txn_completion_v1");
+        defer alloc.free(usage);
+        try std.testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, usage[0..8], .little));
+        const result = (try db.get(alloc, "document")).?;
+        defer alloc.free(result);
+        try std.testing.expectEqualStrings(replacement, result);
+        try std.testing.expectEqual(@as(u64, 2000), try db.getTimestamp(alloc, "document"));
+        const replay = try db.core.store.iterateReplayFrom(alloc, db.core.nextDerivedSequence());
+        defer {
+            for (replay) |*entry| entry.deinit(alloc);
+            alloc.free(replay);
+        }
+        try std.testing.expectEqual(@as(usize, 1), replay.len);
+        var decoded = try change_journal_mod.decodeRecord(alloc, replay[0].payload);
+        defer decoded.deinit();
+        try std.testing.expectEqual(@as(usize, if (equal_value) 0 else 1), decoded.record.changed_doc_keys.len);
+        try std.testing.expectEqual(@as(usize, if (equal_value) 0 else 1), decoded.record.overwritten_doc_keys.len);
+        try db.batch(.{ .writes = &.{.{ .key = "document", .value = "{\"value\":3}" }} });
+        try db.resolveTransactionIntents(id, .committed, 2000);
+        const newer = (try db.get(alloc, "document")).?;
+        defer alloc.free(newer);
+        try std.testing.expectEqualStrings("{\"value\":3}", newer);
+    }
+}
+
+test "workload admission durable DB completion reservation failure precedes vote and abort releases ownership" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("durable-db-reservation-abort");
+    defer tmp.cleanup();
+    var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer manager.deinit(alloc);
+    try manager.configureTransactionCompletion(1024 * 1024);
+    var db = try DB.open(alloc, std.mem.span(tmp.path().ptr), .{
+        .allow_local_durable_completion = true,
+        .resource_manager = &manager,
+        .table_storage = .{ .transaction_recovery = .{ .protocol_version = 1, .max_count = 16, .max_bytes = 1024 * 1024, .max_transaction_bytes = 64 * 1024 } },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "document", .value = "{\"value\":1}" }}, .timestamp_ns = 100 });
+    const id = try db.beginTransaction(200);
+    const intents = [_]transactions_mod.WriteIntent{.{ .key = "document", .value = "{\"value\":2}" }};
+    const before_sequence = db.core.nextDerivedSequence();
+    const backlog_slice = @intFromEnum(resource_manager_mod.Slice.derived_backlog);
+    const before_backlog = manager.snapshot().slices[backlog_slice].used_bytes;
+    {
+        const previous_limit = manager.memory.budget.hard_limit_bytes;
+        manager.memory.budget.hard_limit_bytes = 32 * 1024 * 1024;
+        defer manager.memory.budget.hard_limit_bytes = previous_limit;
+        if (db.prepareDurableCompletion(id, &intents, &.{})) |_| {
+            return error.TestExpectedError;
+        } else |err| {
+            try std.testing.expect(err == error.ResourceBudgetExceeded or err == error.CompletionRecoveryCapacityRequired);
+        }
+    }
+    const record_key = "\x00\x00__txn_records__:".* ++ id;
+    const record = try db.core.store.get(alloc, &record_key);
+    defer alloc.free(record);
+    try std.testing.expectEqual(@as(usize, 53), record.len);
+    try std.testing.expectEqual(@as(u8, 0), record[49]);
+    try std.testing.expect(!try db.core.transactionHasIntents(id));
+    try std.testing.expect(db.core.primary_store_owner.lsmBackend().?.durable_completion == null);
+    try std.testing.expect(db.findDurableCompletionBacklog(id) == null);
+    try db.core.completion_eligibility.checkTransition();
+    try std.testing.expectEqual(before_backlog, manager.snapshot().slices[backlog_slice].used_bytes);
+    try std.testing.expectEqual(before_sequence, db.core.nextDerivedSequence());
+    try db.prepareDurableCompletion(id, &intents, &.{});
+    try std.testing.expect(db.findDurableCompletionBacklog(id) != null);
+    try db.abortTransaction(id, 300);
+    try std.testing.expectEqual(transactions_mod.TxnStatus.aborted, try db.getTransactionStatus(id));
+    try std.testing.expect(!try db.core.transactionHasIntents(id));
+    try std.testing.expect(db.core.primary_store_owner.lsmBackend().?.durable_completion == null);
+    try std.testing.expect(db.findDurableCompletionBacklog(id) == null);
+    try db.core.completion_eligibility.checkTransition();
+    try std.testing.expectEqual(before_backlog, manager.snapshot().slices[backlog_slice].used_bytes);
+    try std.testing.expectEqual(before_sequence, db.core.nextDerivedSequence());
+    const usage = try db.core.store.get(alloc, "\x00\x00__metadata__:txn_completion_v1");
+    defer alloc.free(usage);
+    try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, usage[0..8], .little));
+    try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, usage[8..16], .little));
+    const actual = (try db.get(alloc, "document")).?;
+    defer alloc.free(actual);
+    try std.testing.expectEqualStrings("{\"value\":1}", actual);
+    try std.testing.expectEqual(@as(u64, 100), try db.getTimestamp(alloc, "document"));
+}
+
+test "workload admission durable DB completion restores pending and durable decisions before recovery" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |decided| {
+        var tmp = try TestDirectory.init("durable-db-reopen");
+        defer tmp.cleanup();
+        const path = std.mem.span(tmp.path().ptr);
+        const options: OpenOptions = .{ .allow_local_durable_completion = true, .start_index_workers = false, .start_optional_runtimes = false, .ttl_cleanup = .{ .enabled = false } };
+        const id: transactions_mod.TxnId = @splat(151);
+        {
+            var db = try DB.open(alloc, path, options);
+            defer db.close();
+            try db.batch(.{ .writes = &.{.{ .key = "document", .value = "{\"value\":1}" }} });
+            _ = try db.beginTransactionWithId(id, 1000);
+            try db.prepareDurableCompletion(id, &.{.{ .key = "document", .value = "{\"value\":2}" }}, &.{});
+            if (decided) {
+                const prefix = "\x00\x00__txn_records__:";
+                const key = prefix.* ++ id;
+                const raw = try db.core.store.get(alloc, &key);
+                defer alloc.free(raw);
+                raw[0] = @intFromEnum(transactions_mod.TxnStatus.committed);
+                std.mem.writeInt(u64, raw[9..17], 2000, .little);
+                std.mem.writeInt(u64, raw[25..33], 2000, .little);
+                try db.core.store.put(&key, raw);
+            }
+        }
+        var unauthorized = options;
+        unauthorized.allow_local_durable_completion = false;
+        try std.testing.expectError(error.LocalCompletionAuthorityRequired, DB.open(alloc, path, unauthorized));
+        var reopened = try DB.open(alloc, path, options);
+        defer reopened.close();
+        try std.testing.expectError(error.PreparedCompletionActive, reopened.core.completion_eligibility.checkTransition());
+        const recovered = try reopened.recoverTransactions(std.math.maxInt(u64), 3000);
+        if (decided) {
+            try std.testing.expectEqual(@as(u64, 1), recovered.resolved_finalized);
+        } else {
+            try std.testing.expectEqual(@as(u64, 1), recovered.deferred_unresolved);
+            try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try reopened.getTransactionStatus(id));
+            try reopened.resolveTransactionIntents(id, .aborted, 2000);
+        }
+        try std.testing.expect(reopened.core.primary_store_owner.lsmBackend().?.durable_completion == null);
+        try reopened.core.completion_eligibility.checkTransition();
+        const actual = (try reopened.get(alloc, "document")).?;
+        defer alloc.free(actual);
+        try std.testing.expectEqualStrings(if (decided) "{\"value\":2}" else "{\"value\":1}", actual);
+    }
+}
+
+test "workload admission durable DB completion requires explicit local authority and releases failed profile fence" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("durable-db-local-authority");
+    defer tmp.cleanup();
+    var db = try DB.open(alloc, std.mem.span(tmp.path().ptr), .{ .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "document", .value = "{\"value\":1}" }} });
+    const id = try db.beginTransaction(1000);
+    try std.testing.expectError(error.LocalCompletionAuthorityRequired, db.prepareDurableCompletion(id, &.{.{ .key = "document", .value = "{\"value\":2}" }}, &.{}));
+    db.allow_local_durable_completion = true;
+    try std.testing.expectError(error.UnsupportedCompletionProfile, db.prepareDurableCompletion(id, &.{.{ .key = "document", .value = "{\"nested\":{}}" }}, &.{}));
+    try db.core.completion_eligibility.checkTransition();
+    try std.testing.expect(!try db.core.transactionHasIntents(id));
+}
+
+test "workload admission completion profile observation exercises real prepare resolve and becomes stale" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("completion-profile");
+    defer tmp.cleanup();
+    const path = tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"value\":1}" }} });
+    const txn = try db.beginTransaction(1000);
+    const intents = [_]transactions_mod.WriteIntent{.{ .key = "doc:a", .value = "{\"value\":2}" }};
+    const before = try db.inspectSingleOverwriteCompletionProfile(alloc, txn, &intents);
+    try db.writeIntents(txn, &intents, &.{});
+    const prepared = try db.inspectSingleOverwriteCompletionProfile(alloc, txn, &intents);
+    try std.testing.expect(std.meta.eql(before, prepared));
+    try db.resolveTransactionIntents(txn, .committed, 2000);
+    const current = (try db.get(alloc, "doc:a")) orelse return error.TestExpectedEqual;
+    defer alloc.free(current);
+    try std.testing.expectEqualStrings("{\"value\":2}", current);
+    try std.testing.expectEqual(@as(u64, 2000), try db.getTimestamp(alloc, "doc:a"));
+    const after = try db.inspectSingleOverwriteCompletionProfile(alloc, txn, &intents);
+    try std.testing.expect(!std.mem.eql(u8, &before.primary_digest, &after.primary_digest));
+    try std.testing.expectEqual(before.ordinal, after.ordinal);
+    try db.batch(.{ .deletes = &.{"doc:a"} });
+    try std.testing.expectError(error.UnsupportedCompletionProfile, db.inspectSingleOverwriteCompletionProfile(alloc, txn, &intents));
+}
+
+test "workload admission completion profile rejects unsupported inputs before prepare and index changes" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("completion-profile");
+    defer tmp.cleanup();
+    const path = tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"value\":1}" }} });
+    const txn = try db.beginTransaction(1000);
+    const ordinary = [_]transactions_mod.WriteIntent{.{ .key = "doc:a", .value = "{\"value\":2}" }};
+    _ = try db.inspectSingleOverwriteCompletionProfile(alloc, txn, &ordinary);
+    try std.testing.expectError(error.TxnNotFound, db.inspectSingleOverwriteCompletionProfile(alloc, @splat(254), &ordinary));
+    // Durable obligations can remain even after every active HA hook is gone.
+    inline for (.{ transactions_mod.makeTransactionHABatchOutboxKey(txn), transactions_mod.makeTransactionHAReplayOutboxKey(txn) }) |outbox_key| {
+        try db.core.store.putBatch(&.{.{ .key = &outbox_key, .value = "retained" }}, &.{});
+        try std.testing.expectError(error.UnsupportedCompletionProfile, db.inspectSingleOverwriteCompletionProfile(alloc, txn, &ordinary));
+        const retained = try db.core.store.get(alloc, &outbox_key);
+        defer alloc.free(retained);
+        try std.testing.expectEqualStrings("retained", retained);
+        try db.core.store.putBatch(&.{}, &.{&outbox_key});
+    }
+    _ = try db.inspectSingleOverwriteCompletionProfile(alloc, txn, &ordinary);
+    for ([_]transactions_mod.WriteIntent{
+        .{ .key = "absent", .value = "{}" },
+        .{ .key = "doc:a", .value = null },
+        .{ .key = "doc:a", .value = "{\"_edges\":[]}" },
+        .{ .key = "doc:a", .value = "{\"nested\":{}}" },
+        .{ .key = "doc:a", .value = "not-json" },
+    }) |unsupported| try std.testing.expectError(error.UnsupportedCompletionProfile, db.inspectSingleOverwriteCompletionProfile(alloc, txn, &.{unsupported}));
+    try std.testing.expectError(error.UnsupportedCompletionProfile, db.inspectSingleOverwriteCompletionProfile(alloc, txn, &.{ ordinary[0], ordinary[0] }));
+    const artifact = try internal_keys.artifactRootPrefixAlloc(alloc, "doc:a");
+    defer alloc.free(artifact);
+    try db.core.store.putBatch(&.{.{ .key = artifact, .value = "retained child" }}, &.{});
+    try std.testing.expectError(error.UnsupportedCompletionProfile, db.inspectSingleOverwriteCompletionProfile(alloc, txn, &ordinary));
+    try db.core.store.putBatch(&.{}, &.{artifact});
+    // A conservative startup hint is not evidence of target child records.
+    db.core.artifact_cleanup_maybe.store(true, .release);
+    _ = try db.inspectSingleOverwriteCompletionProfile(alloc, txn, &ordinary);
+    try db.addIndex(.{ .name = "profile_text", .kind = .full_text, .config_json = "{}" });
+    try std.testing.expectError(error.UnsupportedCompletionProfile, db.inspectSingleOverwriteCompletionProfile(alloc, txn, &ordinary));
+    const summaries = try db.core.listTransactions(alloc);
+    defer alloc.free(summaries);
+    try std.testing.expectEqual(@as(usize, 1), summaries.len);
+    try std.testing.expect(!summaries[0].prepared);
+    var pending = try db.core.collectTransactionIntentBatch(alloc, txn);
+    defer pending.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), pending.writes.len);
+    try std.testing.expectEqual(@as(usize, 0), pending.deletes.len);
+}
+
+test "workload admission completion profile requires complete bidirectional live identity" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("completion-profile");
+    defer tmp.cleanup();
+    const path = tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{}" }} });
+    const txn = try db.beginTransaction(1000);
+    const intents = [_]transactions_mod.WriteIntent{.{ .key = "doc:a", .value = "{\"value\":2}" }};
+    const observation = try db.inspectSingleOverwriteCompletionProfile(alloc, txn, &intents);
+    const reverse = internal_keys.identityOrdinalToDocKey(observation.ordinal);
+    try db.core.store.putBatch(&.{}, &.{&reverse});
+    try std.testing.expectError(error.UnsupportedCompletionProfile, db.inspectSingleOverwriteCompletionProfile(alloc, txn, &intents));
+    try db.core.store.putBatch(&.{.{ .key = &reverse, .value = "doc:wrong" }}, &.{});
+    try std.testing.expectError(error.InvalidDocIdentity, db.inspectSingleOverwriteCompletionProfile(alloc, txn, &intents));
+    try db.core.store.putBatch(&.{.{ .key = &reverse, .value = "doc:a" }}, &.{});
+    const canonical = internal_keys.identityCanonicalToOrdinalKey(doc_identity.canonicalDocIdForNamespace(observation.identity_namespace, "doc:a"));
+    try db.core.store.putBatch(&.{}, &.{&canonical});
+    try std.testing.expectError(error.UnsupportedCompletionProfile, db.inspectSingleOverwriteCompletionProfile(alloc, txn, &intents));
+    const summaries = try db.core.listTransactions(alloc);
+    defer alloc.free(summaries);
+    try std.testing.expect(!summaries[0].prepared);
+}
+
+test "workload admission completion profile excludes named participants and TTL schema before prepare" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("completion-profile");
+    defer tmp.cleanup();
+    const path = tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{}" }} });
+    const remote = try db.beginTransactionWithParticipants(1000, &.{"remote"});
+    const local = try db.beginTransaction(1100);
+    const intents = [_]transactions_mod.WriteIntent{.{ .key = "doc:a", .value = "{\"value\":2}" }};
+    try std.testing.expectError(error.UnsupportedCompletionProfile, db.inspectSingleOverwriteCompletionProfile(alloc, remote, &intents));
+    _ = try db.inspectSingleOverwriteCompletionProfile(alloc, local, &intents);
+    try db.setSchemaJson(alloc, "{\"ttl_duration_ns\":1000000000}");
+    try std.testing.expectError(error.UnsupportedCompletionProfile, db.inspectSingleOverwriteCompletionProfile(alloc, local, &intents));
+    const summaries = try db.core.listTransactions(alloc);
+    defer alloc.free(summaries);
+    try std.testing.expectEqual(@as(usize, 2), summaries.len);
+    for (summaries) |summary| try std.testing.expect(!summary.prepared);
+}
+
+test "workload admission completion eligibility fences real structural entry points through prepare and resolve" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("completion-eligibility");
+    defer tmp.cleanup();
+    const path = tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"value\":1}" }} });
+    const txn = try db.beginTransaction(1000);
+    const intents = [_]transactions_mod.WriteIntent{.{ .key = "doc:a", .value = "{\"value\":2}" }};
+    _ = try db.inspectSingleOverwriteCompletionProfile(alloc, txn, &intents);
+    // The durable slot integration owns this bracket; this regression tests
+    // the real mutation boundaries without pretending this fence is durable.
+    try db.core.completion_eligibility.begin(txn);
+    try db.writeIntents(txn, &intents, &.{});
+    try std.testing.expectError(error.PreparedCompletionActive, db.setSchemaJson(alloc, "{}"));
+    try std.testing.expectError(error.PreparedCompletionActive, db.setSchema(.{ .version = 1 }));
+    try std.testing.expectError(error.PreparedCompletionActive, db.updateRange(.{ .start = "a", .end = "z" }));
+    try std.testing.expectError(error.PreparedCompletionActive, db.core.updateRange(.{ .start = "a", .end = "z" }));
+    try std.testing.expectError(error.PreparedCompletionActive, db.setSplitState(null));
+    try std.testing.expectError(error.PreparedCompletionActive, db.configureTableStorage(.{}));
+    try std.testing.expectError(error.PreparedCompletionActive, db.beginBulkIngestSession());
+    try std.testing.expectError(error.PreparedCompletionActive, db.beginDenseAutoBulkIngestSession());
+    try std.testing.expectError(error.PreparedCompletionActive, db.beginPrimaryStoreAutoBulkIngestSession());
+    const Hooks = struct {
+        fn get(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8) anyerror!?[]u8 {
+            return error.UnexpectedRuntimeHook;
+        }
+        fn upsert(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: []const u8) anyerror!void {
+            return error.UnexpectedRuntimeHook;
+        }
+        fn isLocal(_: *anyopaque) bool {
+            return false;
+        }
+    };
+    var hook_context: u8 = 0;
+    const candidate: resolution_runtime_mod.CandidateSource = .{ .ptr = &hook_context, .vtable = &.{ .get = Hooks.get } };
+    const sink: promotion_runtime_mod.EntitySink = .{ .ptr = &hook_context, .vtable = &.{ .upsert = Hooks.upsert } };
+    const owner: promotion_runtime_mod.PromotionOwner = .{ .ptr = &hook_context, .vtable = &.{ .is_local_owner = Hooks.isLocal } };
+    try std.testing.expectError(error.PreparedCompletionActive, db.setResolutionCandidateSource(candidate));
+    try std.testing.expectError(error.PreparedCompletionActive, db.setEntitySink(sink));
+    try std.testing.expectError(error.PreparedCompletionActive, db.setPromotionOwner(owner));
+    try db.setResolutionCandidateSource(null);
+    try db.setEntitySink(null);
+    try db.setPromotionOwner(null);
+    try std.testing.expect(db.resolution_candidate_source == null and db.entity_sink == null and db.promotion_owner == null);
+    try std.testing.expectError(error.PreparedCompletionActive, db.reassignIdentityNamespaceForInternalTransition(db.core.identity_namespace));
+    try std.testing.expectError(error.PreparedCompletionActive, db.importPortableIntoEmpty(alloc, "invalid", db.core.identity_namespace));
+    const index: types.IndexConfig = .{ .name = "blocked", .kind = .full_text, .config_json = "{}" };
+    try std.testing.expectError(error.PreparedCompletionActive, db.addIndex(index));
+    try std.testing.expectError(error.PreparedCompletionActive, db.core.index_manager.add(db.core.store, index));
+    try std.testing.expectError(error.PreparedCompletionActive, db.core.index_manager.registerShadowIndex(db.core.store, index));
+    try std.testing.expectError(error.PreparedCompletionActive, db.core.index_manager.registerReplacementIndex(db.core.store, index));
+    try std.testing.expectError(error.PreparedCompletionActive, db.core.index_manager.upsertEnrichment(db.core.store, undefined));
+    try std.testing.expectError(error.PreparedCompletionActive, db.core.index_manager.upsertResolver(db.core.store, undefined));
+    // Independent ordinary writes remain available while the structural
+    // profile is fixed. The normal transaction manager owns key conflicts.
+    try db.batch(.{ .writes = &.{.{ .key = "doc:b", .value = "{\"value\":3}" }} });
+    try db.resolveTransactionIntents(txn, .committed, 2000);
+    try std.testing.expectError(error.PreparedCompletionActive, db.core.completion_eligibility.checkTransition());
+    const value = (try db.get(alloc, "doc:a")).?;
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("{\"value\":2}", value);
+    try std.testing.expectEqual(@as(usize, 0), db.core.indexCount());
+    try std.testing.expect(db.core.schema == null);
+    try db.core.completion_eligibility.retire(txn);
+    try db.setSchemaJson(alloc, "{}");
+    try db.addIndex(index);
+    try std.testing.expectEqual(@as(usize, 1), db.core.indexCount());
+}
+
+test "workload admission completion eligibility rejects prepare during a nested catalog transition" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("completion-eligibility-transition");
+    defer tmp.cleanup();
+    const path = tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    var transition = (try db.core.index_manager.beginCompletionTransition()).?;
+    try db.updateRange(.{ .start = "a", .end = "z" });
+    try std.testing.expectError(error.CompletionTransitionInProgress, db.core.completion_eligibility.begin(@splat(1)));
+    transition.deinit();
+    try db.core.completion_eligibility.restore(@splat(1));
+    try std.testing.expectError(error.PreparedCompletionActive, db.reloadSchemaForInternalRestore());
+    try db.core.completion_eligibility.retire(@splat(1));
+    try db.reloadSchemaForInternalRestore();
+}
+
+test "workload admission physical completion pending native vote does not starve legacy recovery" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("completion-legacy-recovery-fairness");
+    defer tmp.cleanup();
+    var resources = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer resources.deinit(alloc);
+    try resources.configureTransactionCompletion(2 * 1024 * 1024);
+    var db = try DB.open(alloc, std.mem.span(tmp.path().ptr), .{
+        .resource_manager = &resources,
+        .allow_local_durable_completion = true,
+        .table_storage = .{ .transaction_recovery = .{ .protocol_version = 1, .max_count = 16, .max_bytes = 1024 * 1024, .max_transaction_bytes = 64 * 1024 } },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.batch(.{ .writes = &.{ .{ .key = "native", .value = "{\"value\":1}" }, .{ .key = "legacy", .value = "{\"value\":1}" } }, .timestamp_ns = 100 });
+    const native_id: transactions_mod.TxnId = @splat(1);
+    const legacy_id: transactions_mod.TxnId = @splat(2);
+    _ = try db.beginTransactionWithId(native_id, 200);
+    _ = try db.beginTransactionWithId(legacy_id, 200);
+    try db.writeIntents(legacy_id, &.{.{ .key = "legacy", .value = "{\"value\":3}" }}, &.{});
+    // Reconstruct the existing legacy recovery condition: durable terminal
+    // metadata remains alongside unresolved prepared intents after a crash.
+    const legacy_record_key = "\x00\x00__txn_records__:" ++ legacy_id;
+    const record = try db.core.store.get(alloc, legacy_record_key);
+    defer alloc.free(record);
+    try std.testing.expectEqual(@as(usize, 53), record.len);
+    record[0] = @intFromEnum(transactions_mod.TxnStatus.committed);
+    std.mem.writeInt(u64, record[9..17], 300, .little);
+    std.mem.writeInt(u64, record[25..33], 300, .little);
+    try db.core.store.put(legacy_record_key, record);
+    try db.prepareDurableCompletion(native_id, &.{.{ .key = "native", .value = "{\"value\":2}" }}, &.{});
+    const first = try db.recoverTransactions(std.math.maxInt(u64), 400);
+    try std.testing.expectEqual(@as(u64, 1), first.scanned_records);
+    try std.testing.expectEqual(@as(u64, 1), first.deferred_unresolved);
+    try std.testing.expectEqual(@as(u64, 0), first.auto_aborted);
+    const second = try db.recoverTransactions(std.math.maxInt(u64), 400);
+    try std.testing.expectEqual(@as(u64, 1), second.scanned_records);
+    try std.testing.expectEqual(@as(u64, 1), second.resolved_finalized);
+    try std.testing.expectEqual(@as(u64, 0), second.auto_aborted);
+    try std.testing.expect(db.core.primary_store_owner.lsmBackend().?.findDurableCompletion(native_id) != null);
+    try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try db.getTransactionStatus(native_id));
+    try std.testing.expect(try db.core.transactionHasIntents(native_id));
+    const native_value = (try db.get(alloc, "native")).?;
+    defer alloc.free(native_value);
+    try std.testing.expectEqualStrings("{\"value\":1}", native_value);
+    const legacy_value = (try db.get(alloc, "legacy")).?;
+    defer alloc.free(legacy_value);
+    try std.testing.expectEqualStrings("{\"value\":3}", legacy_value);
+    try std.testing.expectEqual(@as(u64, 300), try db.getTimestamp(alloc, "legacy"));
+    try db.resolveTransactionIntents(native_id, .aborted, 500);
+    try std.testing.expect(!db.core.primary_store_owner.lsmBackend().?.hasDurableCompletions());
+    try db.core.completion_eligibility.checkTransition();
+}
+
+test "workload admission physical completion managed schema restore validates without publication" {
+    const table_schema_api = @import("../../schema/mod.zig");
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("completion-managed-schema-restore");
+    defer tmp.cleanup();
+    const path = std.mem.span(tmp.path().ptr);
+    const schema_json = "{\"version\":1,\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\"}}}}";
+    var parsed = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    var resources = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer resources.deinit(alloc);
+    try resources.configureTransactionCompletion(2 * 1024 * 1024);
+    var options: OpenOptions = .{
+        .resource_manager = &resources,
+        .durable_completion_enabled = true,
+        .durable_completion_authority = .standalone_local,
+        .table_storage = .{ .transaction_recovery = .{
+            .protocol_version = 1,
+            .max_count = 4,
+            .max_bytes = 1024 * 1024,
+            .max_transaction_bytes = 64 * 1024,
+            .completion_protocol_version = 1,
+            .profile_version = 1,
+        } },
+        .schema_before_index_load = .{ .runtime_schema = runtime_schema, .public_schema_json = schema_json },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    };
+    const id: transactions_mod.TxnId = @splat(182);
+    {
+        var db = try DB.open(alloc, path, options);
+        defer db.close();
+        try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"value\":1}" }}, .timestamp_ns = 100 });
+        _ = try db.beginTransactionWithId(id, 200);
+        try db.writeTransaction(id, .{ .writes = &.{.{ .key = "doc", .value = "{\"value\":2}" }} });
+        try std.testing.expect(db.core.primary_store_owner.lsmBackend().?.findDurableCompletion(id) != null);
+    }
+    options.durable_completion_enabled = false;
+    var changed = runtime_schema;
+    changed.ttl_duration_ns = 1000;
+    options.schema_before_index_load.?.runtime_schema = changed;
+    try std.testing.expectError(error.CompletionProfileChanged, DB.open(alloc, path, options));
+    options.schema_before_index_load.?.runtime_schema = runtime_schema;
+    options.schema_before_index_load.?.public_schema_json = "{}";
+    try std.testing.expectError(error.CompletionProfileChanged, DB.open(alloc, path, options));
+    options.schema_before_index_load.?.public_schema_json = null;
+    try std.testing.expectError(error.CompletionProfileChanged, DB.open(alloc, path, options));
+    options.schema_before_index_load.?.public_schema_json = schema_json;
+    var db = try DB.open(alloc, path, options);
+    defer db.close();
+    try std.testing.expect(db.core.primary_store_owner.lsmBackend().?.findDurableCompletion(id) != null);
+    try std.testing.expectError(error.PreparedCompletionActive, db.core.completion_eligibility.checkTransition());
+    try db.resolveTransactionIntents(id, .committed, 300);
+    const value = (try db.get(alloc, "doc")).?;
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("{\"value\":2}", value);
+    try std.testing.expectEqual(@as(u64, 300), try db.getTimestamp(alloc, "doc"));
+    const persisted_public = (try db.core.getStoreValue(alloc, public_schema_json_key)).?;
+    defer alloc.free(persisted_public);
+    try std.testing.expectEqualStrings(schema_json, persisted_public);
+    try db.core.completion_eligibility.checkTransition();
+}
+
+test "workload admission physical completion retained native lease prepares and resolves without ordinary admission" {
+    const alloc = std.testing.allocator;
+    const abi = @import("kernel_owner_abi").completion_pool;
+    var tmp = try TestDirectory.init("physical-native-lease");
+    defer tmp.cleanup();
+    var resources = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer resources.deinit(alloc);
+    try resources.configureTransactionCompletion(1024 * 1024);
+    const settings: table_storage_mod.Settings = .{ .transaction_recovery = .{
+        .protocol_version = 1,
+        .max_count = 4,
+        .max_bytes = 1024 * 1024,
+        .max_transaction_bytes = 64 * 1024,
+        .completion_protocol_version = 1,
+        .profile_version = 1,
+    } };
+    const options: OpenOptions = .{
+        .resource_manager = &resources,
+        .durable_completion_enabled = true,
+        .durable_completion_authority = .standalone_local,
+        .table_storage = settings,
+        .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    };
+    const path = std.mem.span(tmp.path().ptr);
+    var binding: abi.InstallBinding = .{ .identity = .{ .group_id = 2, .node_id = 7, .capacity = 4, .generation = 1, .incarnation = @splat(15), .policy_digest = @import("../../metadata/completion_activation.zig").policyDigest(settings.transaction_recovery.?) }, .table_id = 1, .range_id = 3 };
+    binding.schema_catalog_digest = try @import("../../common/completion_catalog_digest.zig").digest(alloc, "", "", "{}");
+    {
+        var db = try DB.open(alloc, path, options);
+        defer db.close();
+        try std.testing.expectError(error.NotFound, db.acquireCompletionLease(2, 7));
+        const id = try db.beginTransaction(100);
+        try db.installCompletionBinding(binding, "", "", "{}", settings);
+        const lease = try db.acquireCompletionLease(2, 7);
+        defer lease.vtable.release(lease.context);
+        try std.testing.expectError(error.CompletionAdmissionUnavailable, db.attestCompletionBacking(2, 7));
+        var cells: abi.DurableCells = undefined;
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.durable_cells.?(lease.context, &cells));
+        try std.testing.expectEqual(@as(u32, 0), cells.count);
+        const proof: abi.DurableLog = .{ .mode = .startup_complete, .last_index = 1, .commit_index = 1 };
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.reconcile_durable.?(lease.context, &proof));
+        // A restored physical lane must not attest full table readiness while
+        // ordinary begin/decision/ack reservations are still unsupported.
+        try std.testing.expectError(error.CompletionAdmissionUnavailable, db.attestCompletionBacking(2, 7));
+        const wire = try db.compileReplicatedTransaction(alloc, id, .{ .writes = &.{.{ .key = "doc", .value = "{\"value\":2}" }} }, .{ .term = 1, .index = 1 });
+        defer alloc.free(wire);
+        var output: abi.CheckResult = undefined;
+        const payloads = [_]abi.Bytes{.{ .ptr = wire.ptr, .len = wire.len }};
+        var proposal: abi.Check = .{ .kind = .proposal, .new_work_allowed = 1, .state = .{ .term = 2, .applied_term = 1, .applied_term_known = 1, .applied_index = 1, .commit_index = 1, .last_index = 1 }, .proposals = .{ .ptr = &payloads, .len = 1 } };
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.check(lease.context, &proposal, &output));
+        const accepted: abi.ProposalResult = .{ .state = proposal.state, .first_index = 2, .last_index = 2, .payloads = proposal.proposals };
+        lease.vtable.proposal_result(lease.context, &accepted);
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.apply_accepted.?(lease.context, 2, 2, payloads[0]));
+        try std.testing.expect((try db.get(alloc, "doc")) == null);
+        const resolve = try @import("../../data/raft_batch.zig").encode(alloc, "docs", .{ .transaction = .{ .resolve = .{ .txn_id = id, .status = .committed, .commit_version = 300 } } });
+        defer alloc.free(resolve);
+        const resolve_payloads = [_]abi.Bytes{.{ .ptr = resolve.ptr, .len = resolve.len }};
+        // Disabling new work cannot block a previously promised completion.
+        proposal.new_work_allowed = 0;
+        proposal.state.applied_term = 2;
+        proposal.state.applied_index = 2;
+        proposal.state.commit_index = 2;
+        proposal.state.last_index = 2;
+        proposal.proposals = .{ .ptr = &resolve_payloads, .len = 1 };
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.check(lease.context, &proposal, &output));
+        const terminal: abi.ProposalResult = .{ .state = proposal.state, .first_index = 3, .last_index = 3, .payloads = proposal.proposals };
+        lease.vtable.proposal_result(lease.context, &terminal);
+        {
+            const previous = resources.memory.budget.hard_limit_bytes;
+            resources.memory.budget.hard_limit_bytes = 1;
+            defer resources.memory.budget.hard_limit_bytes = previous;
+            try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.apply_accepted.?(lease.context, 2, 3, resolve_payloads[0]));
+            try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.apply_accepted.?(lease.context, 2, 3, resolve_payloads[0]));
+        }
+        var progress: abi.Progress = undefined;
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.progress.?(lease.context, &progress));
+        try std.testing.expectEqual(@as(u64, 3), progress.index);
+        const value = (try db.get(alloc, "doc")).?;
+        defer alloc.free(value);
+        try std.testing.expectEqualStrings("{\"value\":2}", value);
+    }
+    const io = std.Options.debug_io;
+    const config = (try DB.completionInstallationPreflight(alloc, io, path, binding, "", "", "{}")).?;
+    var reopen = options;
+    reopen.durable_completion_authority = .raft_apply;
+    reopen.completion_pool_config = config;
+    var db = try DB.open(alloc, path, reopen);
+    defer db.close();
+    try db.installCompletionBinding(binding, "", "", "{}", settings);
+    const value = (try db.get(alloc, "doc")).?;
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("{\"value\":2}", value);
+}
+
+test "workload admission physical completion single-phase compiler captures actual batch without publication" {
+    const alloc = std.testing.allocator;
+    const abi = @import("kernel_owner_abi").completion_pool;
+    const candidate = @import("../completion_candidate.zig");
+    const entry_codec = @import("../lsm_backend/completion_entry.zig");
+    const Checks = struct {
+        fn projectedStore(before: []const docstore_mod.OwnedKVPair, after: []const docstore_mod.OwnedKVPair, operations: []const @import("../lsm_backend/completion_slot.zig").Operation) !void {
+            var projected = std.StringHashMapUnmanaged([]const u8).empty;
+            defer projected.deinit(std.testing.allocator);
+            for (before) |row| try projected.put(std.testing.allocator, row.key, row.value);
+            for (operations) |op| switch (op.kind) {
+                .put => try projected.put(std.testing.allocator, op.key, op.value),
+                .delete => {
+                    _ = projected.remove(op.key);
+                },
+            };
+            try std.testing.expectEqual(after.len, projected.count());
+            for (after) |row| try std.testing.expectEqualSlices(u8, row.value, projected.get(row.key) orelse return error.TestUnexpectedResult);
+        }
+
+        fn baseline(pool: anytype, backend: *lsm_backend_mod.Backend, entry: *const @import("../lsm_backend/completion_entry.zig").OwnedEntry) !void {
+            const backend_runtime_mod = @import("../lsm_backend/runtime.zig");
+            const locked = backend_runtime_mod.lockBackend(lsm_backend_mod.Backend, backend);
+            defer backend_runtime_mod.unlockBackend(lsm_backend_mod.Backend, backend, locked);
+            try pool.validateBaseline(backend, std.testing.allocator, entry);
+        }
+    };
+    // Exercise document rows and the relational writer's columnar dirty/token
+    // effects with the same independently published reference operation.
+    for ([_]bool{ false, true }) |relational| {
+        var tmp = try TestDirectory.init("completion-single-phase-compiler");
+        defer tmp.cleanup();
+        var expected_tmp = try TestDirectory.init("completion-single-phase-reference");
+        defer expected_tmp.cleanup();
+        var resources = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+        defer resources.deinit(alloc);
+        try resources.configureTransactionCompletion(1024 * 1024);
+        const settings: table_storage_mod.Settings = .{ .transaction_recovery = .{
+            .protocol_version = 1,
+            .max_count = 4,
+            .max_bytes = 1024 * 1024,
+            .max_transaction_bytes = 64 * 1024,
+            .completion_protocol_version = 1,
+            .profile_version = 1,
+        } };
+        const options: OpenOptions = .{
+            .resource_manager = &resources,
+            .durable_completion_enabled = true,
+            .durable_completion_authority = .standalone_local,
+            .table_storage = settings,
+            .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 },
+            .start_index_workers = false,
+            .start_optional_runtimes = false,
+            .ttl_cleanup = .{ .enabled = false },
+        };
+        var db = try DB.open(alloc, std.mem.span(tmp.path().ptr), options);
+        defer db.close();
+        var expected = try DB.open(alloc, std.mem.span(expected_tmp.path().ptr), options);
+        defer expected.close();
+        if (relational) {
+            const table_schema: schema_mod.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{.{ .name = "value", .path = "value", .column_type = .integer }} };
+            try db.setSchema(table_schema);
+            try expected.setSchema(table_schema);
+        }
+        const initial: types.BatchRequest = .{ .writes = &.{
+            .{ .key = "a", .value = "{\"value\":1}" },
+            .{ .key = "b", .value = "{\"value\":2}" },
+            .{ .key = "d", .value = "{\"value\":5}" },
+        }, .timestamp_ns = 100 };
+        try db.batch(initial);
+        try expected.batch(initial);
+        var binding: abi.InstallBinding = .{ .identity = .{ .group_id = 2, .node_id = 7, .capacity = 4, .generation = 1, .incarnation = @splat(19), .policy_digest = @import("../../metadata/completion_activation.zig").policyDigest(settings.transaction_recovery.?) }, .table_id = 1, .range_id = 3 };
+        binding.schema_catalog_digest = try @import("../../common/completion_catalog_digest.zig").digest(alloc, "", "", "{}");
+        try db.installCompletionBinding(binding, "", "", "{}", settings);
+        const lease = try db.acquireCompletionLease(2, 7);
+        defer lease.vtable.release(lease.context);
+        const proof: abi.DurableLog = .{ .mode = .startup_complete, .last_index = 1, .commit_index = 1 };
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.reconcile_durable.?(lease.context, &proof));
+        const request: types.BatchRequest = .{ .writes = &.{
+            .{ .key = "a", .value = "{\"value\":3}" },
+            .{ .key = "c", .value = "{\"value\":4}" },
+        }, .deletes = &.{"b"}, .predicates = &.{.{ .key = "d", .expected_version = 100 }}, .timestamp_ns = 200 };
+        const physical_before = try db.core.store.scanPrefix(alloc, "");
+        defer docstore_mod.DocStore.freeResults(alloc, physical_before);
+        const reference_before = try expected.core.store.scanPrefix(alloc, "");
+        defer docstore_mod.DocStore.freeResults(alloc, reference_before);
+        const sequence_before = db.core.nextDerivedAppendSequence();
+        const wire = try db.compileReplicatedMutation(alloc, request, .{ .term = 1, .index = 1 });
+        defer alloc.free(wire);
+        const retry = try db.compileReplicatedMutation(alloc, request, .{ .term = 1, .index = 1 });
+        defer alloc.free(retry);
+        try std.testing.expectEqualSlices(u8, wire, retry);
+        try std.testing.expectEqual(sequence_before, db.core.nextDerivedAppendSequence());
+        const before_a = (try db.get(alloc, "a")).?;
+        defer alloc.free(before_a);
+        const before_b = (try db.get(alloc, "b")).?;
+        defer alloc.free(before_b);
+        try std.testing.expectEqualStrings("{\"value\":1}", before_a);
+        try std.testing.expectEqualStrings("{\"value\":2}", before_b);
+        try std.testing.expect((try db.get(alloc, "c")) == null);
+        const physical_after_capture = try db.core.store.scanPrefix(alloc, "");
+        defer docstore_mod.DocStore.freeResults(alloc, physical_after_capture);
+        try Checks.projectedStore(physical_before, physical_after_capture, &.{});
+        var decoded = try entry_codec.decode(alloc, wire);
+        defer decoded.deinit();
+        try std.testing.expectEqual(entry_codec.protocol.Kind.mutation, decoded.entry.kind);
+        try std.testing.expectEqual(@as(usize, 0), decoded.decoded_descriptor.descriptor.commit.len);
+        try std.testing.expectEqual(@as(usize, 0), decoded.decoded_descriptor.descriptor.abort.len);
+        try std.testing.expectEqualSlices(u8, &candidate.mutationId(.{
+            .group_id = 2,
+            .incarnation = binding.identity.incarnation,
+            .policy_digest = binding.identity.policy_digest,
+            .schema_catalog_digest = binding.schema_catalog_digest,
+            .previous_term = 1,
+            .previous_index = 1,
+        }, decoded.entry.original_input_digest), &decoded.entry.txn_id);
+        // The independent predicate's primary value is unchanged. Alter only its
+        // timestamp, then only its absent intent lock: each must invalidate the
+        // native baseline even though neither key is a compiled write target.
+        const pool = db.core.primary_store_owner.lsmBackend().?.completion_pool.?;
+        const baseline_backend = db.core.primary_store_owner.lsmBackend().?;
+        try Checks.baseline(pool, baseline_backend, &decoded);
+        const timestamp_key = try makeTimestampKey(alloc, "d");
+        defer alloc.free(timestamp_key);
+        const intent_key = try transactions_mod.makeIntentLockKeyAlloc(alloc, "d");
+        defer alloc.free(intent_key);
+        for ([_][]const u8{ timestamp_key, intent_key }) |dependency| {
+            var found = false;
+            for (decoded.entry.baseline_keys) |key| if (std.mem.eql(u8, key, dependency)) {
+                found = true;
+                break;
+            };
+            try std.testing.expect(found);
+            for (decoded.entry.prepare_operations) |op| try std.testing.expect(!std.mem.eql(u8, op.key, dependency));
+        }
+        var timestamp_bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &timestamp_bytes, 101, .little);
+        try db.core.store.put(timestamp_key, &timestamp_bytes);
+        try std.testing.expectError(error.CompletionProfileChanged, Checks.baseline(pool, baseline_backend, &decoded));
+        std.mem.writeInt(u64, &timestamp_bytes, 100, .little);
+        try db.core.store.put(timestamp_key, &timestamp_bytes);
+        try Checks.baseline(pool, baseline_backend, &decoded);
+        const intent_owner: [16]u8 = @splat(211);
+        try db.core.store.put(intent_key, &intent_owner);
+        try std.testing.expectError(error.CompletionProfileChanged, Checks.baseline(pool, baseline_backend, &decoded));
+        try db.core.store.delete(intent_key);
+        try Checks.baseline(pool, baseline_backend, &decoded);
+
+        // Apply the complete ordered candidate to the independent BEFORE image and
+        // compare every surviving/deleted/inserted key against ordinary publication.
+        // Checking only emitted operations would overlook a missing physical effect.
+        try expected.batch(request);
+        const reference_after = try expected.core.store.scanPrefix(alloc, "");
+        defer docstore_mod.DocStore.freeResults(alloc, reference_after);
+        try std.testing.expect(decoded.entry.prepare_operations.len > request.writes.len + request.deletes.len);
+        try Checks.projectedStore(reference_before, reference_after, decoded.entry.prepare_operations);
+        var cells: abi.DurableCells = undefined;
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.durable_cells.?(lease.context, &cells));
+        try std.testing.expectEqual(@as(u32, 0), cells.count);
+        // The actual retained C lease reserves and applies this same physical
+        // candidate after ordinary request memory admission is exhausted.
+        const payloads = [_]abi.Bytes{.{ .ptr = wire.ptr, .len = wire.len }};
+        const proposal: abi.Check = .{
+            .kind = .proposal,
+            .new_work_allowed = 1,
+            .state = .{ .term = 2, .applied_term = 1, .applied_term_known = 1, .applied_index = 1, .commit_index = 1, .last_index = 1 },
+            .proposals = .{ .ptr = &payloads, .len = 1 },
+        };
+        var result: abi.CheckResult = undefined;
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.check(lease.context, &proposal, &result));
+        const accepted: abi.ProposalResult = .{ .state = proposal.state, .first_index = 2, .last_index = 2, .payloads = proposal.proposals };
+        lease.vtable.proposal_result(lease.context, &accepted);
+        {
+            const ordinary_limit = resources.memory.budget.hard_limit_bytes;
+            resources.memory.budget.hard_limit_bytes = 1;
+            defer resources.memory.budget.hard_limit_bytes = ordinary_limit;
+            try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.apply_accepted.?(lease.context, 2, 2, payloads[0]));
+            try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.apply_accepted.?(lease.context, 2, 2, payloads[0]));
+        }
+        const applied = try db.core.store.scanPrefix(alloc, "");
+        defer docstore_mod.DocStore.freeResults(alloc, applied);
+        var expected_native = std.ArrayListUnmanaged(@import("../lsm_backend/completion_slot.zig").Operation).empty;
+        defer expected_native.deinit(alloc);
+        try expected_native.appendSlice(alloc, decoded.entry.prepare_operations);
+        const native_keys = [_][]const u8{
+            &internal_keys.raft_document_applied_entry_key,
+            entry_codec.group_progress_key,
+            @import("../lsm_backend/completion_runtime.zig").applied_keys[0],
+        };
+        for (native_keys) |key| {
+            const value = for (applied) |row| {
+                if (std.mem.eql(u8, key, row.key)) break row.value;
+            } else return error.TestUnexpectedResult;
+            try expected_native.append(alloc, .{ .kind = .put, .key = key, .value = value });
+        }
+        try Checks.projectedStore(physical_before, applied, expected_native.items);
+        try std.testing.expectError(error.TxnNotFound, db.getTransactionStatus(decoded.entry.txn_id));
+        try std.testing.expectEqual(sequence_before + 1, db.core.nextDerivedAppendSequence());
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.durable_cells.?(lease.context, &cells));
+        try std.testing.expectEqual(@as(u32, 0), cells.count);
+    }
+}
+
+test "workload admission physical completion begin captures real coordinator and follower metadata without replay" {
+    const alloc = std.testing.allocator;
+    const abi = @import("kernel_owner_abi").completion_pool;
+    const local = @import("../local_write.zig");
+    const codec = @import("../lsm_backend/completion_entry.zig");
+    for ([_]bool{ false, true }) |coordinator| {
+        var tmp = try TestDirectory.init("completion-begin");
+        defer tmp.cleanup();
+        var reference_tmp = try TestDirectory.init("completion-begin-reference");
+        defer reference_tmp.cleanup();
+        var resources = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+        defer resources.deinit(alloc);
+        try resources.configureTransactionCompletion(1024 * 1024);
+        const settings: table_storage_mod.Settings = .{ .transaction_recovery = .{
+            .protocol_version = 1,
+            .max_count = 4,
+            .max_bytes = 1024 * 1024,
+            .max_transaction_bytes = 64 * 1024,
+            .completion_protocol_version = 1,
+            .profile_version = 1,
+        } };
+        const options: OpenOptions = .{
+            .resource_manager = &resources,
+            .durable_completion_enabled = true,
+            .durable_completion_authority = .standalone_local,
+            .table_storage = settings,
+            .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 },
+            .start_index_workers = false,
+            .start_optional_runtimes = false,
+            .ttl_cleanup = .{ .enabled = false },
+        };
+        var db = try DB.open(alloc, std.mem.span(tmp.path().ptr), options);
+        defer db.close();
+        var reference = try DB.open(alloc, std.mem.span(reference_tmp.path().ptr), options);
+        defer reference.close();
+        var binding: abi.InstallBinding = .{ .identity = .{ .group_id = 2, .node_id = 7, .capacity = 4, .generation = 1, .incarnation = @splat(27), .policy_digest = @import("../../metadata/completion_activation.zig").policyDigest(settings.transaction_recovery.?) }, .table_id = 1, .range_id = 3 };
+        binding.schema_catalog_digest = try @import("../../common/completion_catalog_digest.zig").digest(alloc, "", "", "{}");
+        try db.installCompletionBinding(binding, "", "", "{}", settings);
+        const lease = try db.acquireCompletionLease(2, 7);
+        defer lease.vtable.release(lease.context);
+        const startup: abi.DurableLog = .{ .mode = .startup_complete };
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.reconcile_durable.?(lease.context, &startup));
+        const id: transactions_mod.TxnId = @splat(209);
+        const participant2 = try @import("../../api/distributed_txn.zig").participantIdForGroup(alloc, "docs", 2);
+        defer alloc.free(participant2);
+        const participant3 = try @import("../../api/distributed_txn.zig").participantIdForGroup(alloc, "docs", 3);
+        defer alloc.free(participant3);
+        const request: types.BatchRequest = .{ .transaction = .{ .begin = .{
+            .txn_id = id,
+            .begin_timestamp = 100,
+            .created_at_ns = 90,
+            .topology_epoch = 1,
+            .retain_terminal = true,
+            .participants = if (coordinator) &.{ participant2, participant3 } else &.{ participant3, participant2 },
+        } } };
+        const before = try reference.core.store.scanPrefix(alloc, "");
+        defer docstore_mod.DocStore.freeResults(alloc, before);
+        const sequence = db.core.nextDerivedAppendSequence();
+        const wire = try local.compileStorageKernelReplicatedCompletion(alloc, &db, "docs", 2, request, .{ .term = 0, .index = 0 });
+        defer alloc.free(wire);
+        const retry = try local.compileStorageKernelReplicatedCompletion(alloc, &db, "docs", 2, request, .{ .term = 0, .index = 0 });
+        defer alloc.free(retry);
+        try std.testing.expectEqualSlices(u8, wire, retry);
+        try std.testing.expectError(error.TxnNotFound, db.getTransactionStatus(id));
+        try std.testing.expectEqual(sequence, db.core.nextDerivedAppendSequence());
+        var entry = try codec.decode(alloc, wire);
+        defer entry.deinit();
+        try std.testing.expect(transactions_mod.isBeginCompletionMutation(entry.entry.prepare_operations));
+        try std.testing.expect(!std.mem.eql(u8, &id, &entry.entry.txn_id));
+        // A truncated fresh BEGIN would create a transaction record without
+        // its participant and lifetime-credit rows. Reject it before the
+        // accepted sidecar is published or a cell is spent.
+        const record_prefix = @import("../completion_control_budget.zig").records_prefix;
+        const record_op = for (entry.entry.prepare_operations) |op| {
+            if (std.mem.startsWith(u8, op.key, record_prefix)) break op;
+        } else return error.TestUnexpectedResult;
+        var malformed_entry = entry.entry;
+        const truncated_operations = [_]@import("../lsm_backend/completion_slot.zig").Operation{record_op};
+        malformed_entry.prepare_operations = &truncated_operations;
+        const malformed = try codec.encode(alloc, malformed_entry);
+        defer alloc.free(malformed);
+        {
+            const backend = db.core.primary_store_owner.lsmBackend().?;
+            const backend_runtime = @import("../lsm_backend/runtime.zig");
+            const locked = backend_runtime.lockBackend(lsm_backend_mod.Backend, backend);
+            defer backend_runtime.unlockBackend(lsm_backend_mod.Backend, backend, locked);
+            const pool = backend.completion_pool.?;
+            try std.testing.expectError(error.UnsupportedCompletionProfile, pool.accept(backend, 1, 1, 0, 0, malformed));
+            try std.testing.expectEqual(@import("../lsm_backend/completion_pool.zig").Pool(lsm_backend_mod.Backend).Phase.free, pool.cells[0].phase);
+            try std.testing.expectError(error.FileNotFound, pool.io.storage().fileSize(pool.accepted_paths[0]));
+        }
+        // Independent legacy begin must produce exactly the candidate delta,
+        // including coordinator selection, participants and completion credit.
+        try local.applyReplicatedTransactionMutationInternal(alloc, &reference, "docs", 2, request, .{}, null);
+        const after = try reference.core.store.scanPrefix(alloc, "");
+        defer docstore_mod.DocStore.freeResults(alloc, after);
+        var projected = std.StringHashMapUnmanaged([]const u8).empty;
+        defer projected.deinit(alloc);
+        for (before) |row| try projected.put(alloc, row.key, row.value);
+        for (entry.entry.prepare_operations) |op| switch (op.kind) {
+            .put => try projected.put(alloc, op.key, op.value),
+            .delete => {
+                _ = projected.remove(op.key);
+            },
+        };
+        try std.testing.expectEqual(after.len, projected.count());
+        for (after) |row| try std.testing.expectEqualSlices(u8, row.value, projected.get(row.key) orelse return error.TestUnexpectedResult);
+        const payloads = [_]abi.Bytes{.{ .ptr = wire.ptr, .len = wire.len }};
+        const proposal: abi.Check = .{ .kind = .proposal, .new_work_allowed = 1, .state = .{ .term = 1, .applied_term_known = 1 }, .proposals = .{ .ptr = &payloads, .len = 1 } };
+        var result: abi.CheckResult = undefined;
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.check(lease.context, &proposal, &result));
+        lease.vtable.proposal_result(lease.context, &.{ .state = proposal.state, .first_index = 1, .last_index = 1, .payloads = proposal.proposals });
+        const ordinary_limit = resources.memory.budget.hard_limit_bytes;
+        resources.memory.budget.hard_limit_bytes = 1;
+        defer resources.memory.budget.hard_limit_bytes = ordinary_limit;
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.apply_accepted.?(lease.context, 1, 1, payloads[0]));
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.apply_accepted.?(lease.context, 1, 1, payloads[0]));
+        try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try db.getTransactionStatus(id));
+        try std.testing.expectEqual(sequence, db.core.nextDerivedAppendSequence());
+        try std.testing.expect(db.findDurableCompletionBacklog(entry.entry.txn_id) == null);
+        for (after) |row| {
+            const actual = (try db.core.getStoreValue(alloc, row.key)).?;
+            defer alloc.free(actual);
+            try std.testing.expectEqualSlices(u8, row.value, actual);
+        }
+    }
+}
+
+test "workload admission physical completion staged control BEGIN retains a pool reservation and fences reopen" {
+    const alloc = std.testing.allocator;
+    const abi = @import("kernel_owner_abi").completion_pool;
+    const local = @import("../local_write.zig");
+    const control_guard = @import("../lsm_backend/completion_control_guard.zig");
+    const control_record = @import("../lsm_backend/completion_control_record.zig");
+    var tmp = try TestDirectory.init("completion-staged-control-begin");
+    defer tmp.cleanup();
+    var resources = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer resources.deinit(alloc);
+    try resources.configureTransactionCompletion(1024 * 1024);
+    const settings: table_storage_mod.Settings = .{ .transaction_recovery = .{
+        .protocol_version = 1,
+        .max_count = 4,
+        .max_bytes = 1024 * 1024,
+        .max_transaction_bytes = 64 * 1024,
+        .completion_protocol_version = 1,
+        .profile_version = 1,
+    } };
+    const options: OpenOptions = .{
+        .resource_manager = &resources,
+        .durable_completion_enabled = true,
+        .durable_completion_authority = .standalone_local,
+        .table_storage = settings,
+        .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    };
+    const binding: abi.InstallBinding = .{
+        .identity = .{ .group_id = 2, .node_id = 7, .capacity = 4, .generation = 1, .incarnation = @splat(27), .policy_digest = @import("../../metadata/completion_activation.zig").policyDigest(settings.transaction_recovery.?) },
+        .table_id = 1,
+        .range_id = 3,
+        .schema_catalog_digest = try @import("../../common/completion_catalog_digest.zig").digest(alloc, "", "", "{}"),
+    };
+    const id: transactions_mod.TxnId = @splat(211);
+    {
+        var db = try DB.open(alloc, std.mem.span(tmp.path().ptr), options);
+        defer db.close();
+        try db.installCompletionBinding(binding, "", "", "{}", settings);
+        const lease = try db.acquireCompletionLease(2, 7);
+        defer lease.vtable.release(lease.context);
+        const startup: abi.DurableLog = .{ .mode = .startup_complete };
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.reconcile_durable.?(lease.context, &startup));
+        const backend = db.core.primary_store_owner.lsmBackend().?;
+        {
+            const backend_runtime = @import("../lsm_backend/runtime.zig");
+            const locked = backend_runtime.lockBackend(lsm_backend_mod.Backend, backend);
+            defer backend_runtime.unlockBackend(lsm_backend_mod.Backend, backend, locked);
+            try backend.completion_pool.?.enableControlOwnerStaging(backend);
+        }
+        const participant = try @import("../../api/distributed_txn.zig").participantIdForGroup(alloc, "docs", 3);
+        defer alloc.free(participant);
+        const local_participant = try @import("../../api/distributed_txn.zig").participantIdForGroup(alloc, "docs", 2);
+        defer alloc.free(local_participant);
+        const unacknowledged_participant = try @import("../../api/distributed_txn.zig").participantIdForGroup(alloc, "docs", 4);
+        defer alloc.free(unacknowledged_participant);
+        const request: types.BatchRequest = .{ .transaction = .{ .begin = .{
+            .txn_id = id,
+            .begin_timestamp = 100,
+            .created_at_ns = 90,
+            .topology_epoch = 1,
+            .retain_terminal = true,
+            .participants = &.{ local_participant, participant, unacknowledged_participant },
+        } } };
+        const wire = try local.compileStorageKernelReplicatedCompletion(alloc, &db, "docs", 2, request, .{ .term = 0, .index = 0 });
+        defer alloc.free(wire);
+        const payloads = [_]abi.Bytes{.{ .ptr = wire.ptr, .len = wire.len }};
+        const proposal: abi.Check = .{ .kind = .proposal, .new_work_allowed = 1, .state = .{ .term = 1, .applied_term_known = 1 }, .proposals = .{ .ptr = &payloads, .len = 1 } };
+        var result: abi.CheckResult = undefined;
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.check(lease.context, &proposal, &result));
+        const pool = backend.completion_pool.?;
+        const held = pool.control_owners[0] orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualDeep(id, held.declaration.txn_id);
+        try std.testing.expect(held.held.wal_credit > 0);
+        try std.testing.expect(held.held.publication.remainingBytes() > 0);
+        try std.testing.expect(held.output_pin.path != null);
+        const authority: control_record.Authority = .{
+            .group_id = binding.identity.group_id,
+            .incarnation = binding.identity.incarnation,
+            .policy_digest = binding.identity.policy_digest,
+            .schema_catalog_digest = binding.schema_catalog_digest,
+            .generation = binding.identity.generation,
+        };
+        var restored = (try control_guard.load(alloc, backend.storage.?, backend.root_dir.?, 0, authority)) orelse return error.TestUnexpectedResult;
+        defer restored.deinit();
+        try std.testing.expectEqualDeep(id, restored.declaration.txn_id);
+        try std.testing.expectEqual(@as(u64, 1), restored.guard.record.begin.index);
+        const output_path = try @import("../lsm_backend/repository.zig").runPath(alloc, backend.root_dir.?, restored.guard.record.output_run_id);
+        defer alloc.free(output_path);
+        try std.testing.expectEqualStrings(output_path, held.output_pin.path.?);
+        lease.vtable.proposal_result(lease.context, &.{ .state = proposal.state, .first_index = 1, .last_index = 1, .payloads = proposal.proposals });
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.apply_accepted.?(lease.context, 1, 1, payloads[0]));
+        try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try db.getTransactionStatus(id));
+
+        // The real metadata decision compiler produces a fresh mutation ID.
+        // A generic document cell must not spend the retained BEGIN owner's
+        // control capacity before owner-backed decision replay exists.
+        var manager = try transactions_mod.TxnManager.init(alloc, db.core.store);
+        defer manager.deinit();
+        manager.completion_limits = .{
+            .max_transaction_bytes = db.core.table_catalog.transaction_admission_bytes,
+            .max_count = db.core.table_catalog.transaction_recovery_max_count,
+            .max_bytes = db.core.table_catalog.transaction_recovery_max_bytes,
+        };
+        const decision_wire = blk: {
+            var read = try manager.store.beginRead();
+            defer read.abort();
+            break :blk try manager.compileControlMutation(alloc, &read, .{
+                .txn_id = id,
+                .action = .{ .resolve_metadata = .{ .status = .committed, .timestamp = 200 } },
+            }, .{
+                .group_id = binding.identity.group_id,
+                .incarnation = binding.identity.incarnation,
+                .policy_digest = binding.identity.policy_digest,
+                .schema_catalog_digest = binding.schema_catalog_digest,
+                .previous_term = 1,
+                .previous_index = 1,
+            }, @splat(19), "staged-control-decision-test", &.{});
+        };
+        defer alloc.free(decision_wire);
+        {
+            const backend_runtime = @import("../lsm_backend/runtime.zig");
+            const locked = backend_runtime.lockBackend(lsm_backend_mod.Backend, backend);
+            defer backend_runtime.unlockBackend(lsm_backend_mod.Backend, backend, locked);
+            try pool.maintainLocked(backend);
+            try pool.qualifyFresh(backend);
+            var guard_before = (try control_guard.load(alloc, backend.storage.?, backend.root_dir.?, 0, authority)) orelse return error.TestUnexpectedResult;
+            defer guard_before.deinit();
+            try std.testing.expectError(error.CompletionAdmissionUnavailable, pool.accept(backend, 2, 2, 1, 1, decision_wire));
+            try std.testing.expect(pool.control_owners[0] != null);
+            try std.testing.expectEqual(@import("../lsm_backend/completion_pool.zig").Pool(lsm_backend_mod.Backend).Phase.free, pool.cells[0].phase);
+            try std.testing.expectError(error.FileNotFound, pool.io.storage().fileSize(pool.accepted_paths[0]));
+            var guard_after = (try control_guard.load(alloc, backend.storage.?, backend.root_dir.?, 0, authority)) orelse return error.TestUnexpectedResult;
+            defer guard_after.deinit();
+            try std.testing.expectEqualDeep(guard_before.guard.record, guard_after.guard.record);
+        }
+        try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try db.getTransactionStatus(id));
+        var readers: [3]?@import("../backend_erased.zig").ReadTxn = @splat(null);
+        defer for (&readers) |*reader| if (reader.*) |*held_reader| held_reader.abort();
+        readers[0] = try db.core.store.runtime_store.beginRead();
+        for (1..4) |ordinal| {
+            const next_id: transactions_mod.TxnId = @splat(@intCast(211 + ordinal));
+            const next_request: types.BatchRequest = .{ .transaction = .{ .begin = .{
+                .txn_id = next_id,
+                .begin_timestamp = 100 + ordinal,
+                .created_at_ns = 90 + ordinal,
+                .topology_epoch = 1,
+                .retain_terminal = true,
+                .participants = &.{ local_participant, participant },
+            } } };
+            const previous: u64 = @intCast(ordinal);
+            const next_wire = try local.compileStorageKernelReplicatedCompletion(alloc, &db, "docs", 2, next_request, .{ .term = 1, .index = previous });
+            defer alloc.free(next_wire);
+            const next_payloads = [_]abi.Bytes{.{ .ptr = next_wire.ptr, .len = next_wire.len }};
+            const next_proposal: abi.Check = .{ .kind = .proposal, .new_work_allowed = 1, .state = .{
+                .term = 1,
+                .applied_term = 1,
+                .applied_term_known = 1,
+                .applied_index = previous,
+                .last_index = previous,
+            }, .proposals = .{ .ptr = &next_payloads, .len = 1 } };
+            try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.check(lease.context, &next_proposal, &result));
+            const accepted_index = previous + 1;
+            lease.vtable.proposal_result(lease.context, &.{ .state = next_proposal.state, .first_index = accepted_index, .last_index = accepted_index, .payloads = next_proposal.proposals });
+            try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.apply_accepted.?(lease.context, 1, accepted_index, next_payloads[0]));
+            try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try db.getTransactionStatus(next_id));
+            try std.testing.expect(pool.control_owners[ordinal] != null);
+            try std.testing.expect(pool.control_owners[ordinal].?.output_pin.path != null);
+            if (ordinal < 3) {
+                readers[ordinal] = try db.core.store.runtime_store.beginRead();
+                const backend_runtime = @import("../lsm_backend/runtime.zig");
+                const locked = backend_runtime.lockBackend(lsm_backend_mod.Backend, backend);
+                defer backend_runtime.unlockBackend(lsm_backend_mod.Backend, backend, locked);
+                try pool.maintainLocked(backend);
+                try pool.qualifyFresh(backend);
+            }
+        }
+        for (pool.control_owners) |owner| try std.testing.expect(owner != null);
+        // The separate v2 channel inventories all retained BEGINs after their
+        // reusable document cells drain. Exact persisted-entry observations
+        // pass; a same-index replacement or compacted BEGIN cannot retire one.
+        const control_lease = try @import("../completion_native_guard.zig").Guard(DB).controlLeaseV2(&db, 2, 7);
+        defer control_lease.vtable.release(control_lease.context);
+        var owners: abi.ControlDurableOwnersV2 = .{};
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, control_lease.vtable.durable_owners(control_lease.context, &owners));
+        try std.testing.expectEqual(@as(u32, 4), owners.count);
+        const stale_v1: abi.DurableLog = .{ .mode = .persisted_replacement, .last_index = 4, .commit_index = 4 };
+        try std.testing.expectEqual(runtime_failure_abi.Status.completion_admission_unavailable, lease.vtable.reconcile_durable.?(lease.context, &stale_v1));
+        var control_proof: abi.ControlDurableLogV2 = .{ .mode = .persisted_replacement, .last_index = 4, .commit_index = 4, .count = owners.count, .document = stale_v1 };
+        for (owners.owners[0..owners.count], 0..) |owner, i| {
+            var guard_owner = (try control_guard.load(alloc, backend.storage.?, backend.root_dir.?, @intCast(owner.slot_index), authority)) orelse return error.TestUnexpectedResult;
+            defer guard_owner.deinit();
+            try std.testing.expectEqualDeep(guard_owner.guard.record.begin, control_record.Receipt{
+                .term = owner.identity.term,
+                .index = owner.identity.index,
+                .digest = owner.identity.payload_digest,
+            });
+            control_proof.observations[i] = .{ .expected = owner.identity, .present = 1, .observed_term = owner.identity.term, .observed_digest = @import("../../common/completion_entry_protocol.zig").payloadDigest(guard_owner.guard.envelope) };
+        }
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, control_lease.vtable.reconcile_durable(control_lease.context, &control_proof));
+        // A later v1 call cannot reuse that proof after a same-index suffix
+        // replacement; the v2 callback included both proofs atomically.
+        try std.testing.expectEqual(runtime_failure_abi.Status.completion_admission_unavailable, lease.vtable.reconcile_durable.?(lease.context, &stale_v1));
+        control_proof.document.last_index = 5;
+        try std.testing.expectEqual(runtime_failure_abi.Status.invalid_argument, control_lease.vtable.reconcile_durable(control_lease.context, &control_proof));
+        control_proof.document.last_index = 4;
+        control_proof.observations[1].observed_term += 1;
+        try std.testing.expectEqual(runtime_failure_abi.Status.recovery_required, control_lease.vtable.reconcile_durable(control_lease.context, &control_proof));
+        control_proof.observations[1].observed_term -= 1;
+        control_proof.compacted_index = 1;
+        control_proof.compacted_term = 1;
+        control_proof.document.compacted_index = 1;
+        control_proof.document.compacted_term = 1;
+        try std.testing.expectEqual(runtime_failure_abi.Status.recovery_required, control_lease.vtable.reconcile_durable(control_lease.context, &control_proof));
+        // Test-only transition staging uses the same retained owner after four
+        // interleaved BEGINs and reader snapshots. The decision must append
+        // through that owner without consuming a reusable document cell.
+        // The two retired path generations are deliberately pinned by the
+        // oldest readers above; release those before a fresh maintenance
+        // cycle while retaining the newest reader across the decision.
+        if (readers[0]) |*reader| reader.abort();
+        readers[0] = null;
+        if (readers[1]) |*reader| reader.abort();
+        readers[1] = null;
+        {
+            const backend_runtime = @import("../lsm_backend/runtime.zig");
+            const locked = backend_runtime.lockBackend(lsm_backend_mod.Backend, backend);
+            defer backend_runtime.unlockBackend(lsm_backend_mod.Backend, backend, locked);
+            try pool.maintainLocked(backend);
+            try pool.qualifyFresh(backend);
+            // Leave just enough append counter headroom for the ordinary
+            // foreground and every reusable document cell. The four retained
+            // control owners also need their future decision/ACK WAL, so the
+            // ordinary preflight must reject before consuming that promise.
+            for (pool.cells[0..pool.cell_count]) |cell| try std.testing.expectEqual(@import("../lsm_backend/completion_pool.zig").Pool(lsm_backend_mod.Backend).Phase.free, cell.phase);
+            var ordinary: @import("../lsm_backend/state.zig").ActiveMemTable = .{};
+            defer ordinary.deinit(alloc);
+            try ordinary.upsert(alloc, .{}, "ordinary-control-pressure", "value", false);
+            const runtime = @import("../lsm_backend/completion_runtime.zig");
+            const document_bytes = @as(u64, @intCast(pool.cell_count)) * (runtime.prepare_append_budget.bytes + runtime.outcome_append_budget.bytes);
+            const saved_bytes = backend.write_stats.wal_append_bytes;
+            const saved_start = pool.wal_bytes_start;
+            defer {
+                backend.write_stats.wal_append_bytes = saved_bytes;
+                pool.wal_bytes_start = saved_start;
+            }
+            backend.write_stats.wal_append_bytes = std.math.maxInt(u64) - document_bytes - runtime.foreground_append_budget.bytes - 4096;
+            pool.wal_bytes_start = backend.write_stats.wal_append_bytes;
+            try std.testing.expectError(error.UnsupportedCompletionProfile, pool.checkOrdinary(backend, &ordinary));
+            for (pool.control_owners) |owner| try std.testing.expect(owner != null and owner.?.pending == null);
+            backend.write_stats.wal_append_bytes = saved_bytes;
+            pool.wal_bytes_start = saved_start;
+            try pool.enableControlTransitionStaging();
+            try std.testing.expectError(error.CompletionReservationBusy, pool.checkOrdinary(backend, &ordinary));
+            try std.testing.expectError(error.CompletionReservationBusy, pool.maintainLocked(backend));
+        }
+        const owned_decision = blk: {
+            var read = try manager.store.beginRead();
+            defer read.abort();
+            break :blk try manager.compileControlMutation(alloc, &read, .{
+                .txn_id = id,
+                .action = .{ .resolve_metadata = .{ .status = .committed, .timestamp = 200 } },
+            }, .{
+                .group_id = binding.identity.group_id,
+                .incarnation = binding.identity.incarnation,
+                .policy_digest = binding.identity.policy_digest,
+                .schema_catalog_digest = binding.schema_catalog_digest,
+                .previous_term = 1,
+                .previous_index = 4,
+            }, @splat(19), "owned-control-decision-test", &.{});
+        };
+        defer alloc.free(owned_decision);
+        const decision_payloads = [_]abi.Bytes{.{ .ptr = owned_decision.ptr, .len = owned_decision.len }};
+        const decision_proposal: abi.Check = .{ .kind = .proposal, .new_work_allowed = 1, .state = .{
+            .term = 1,
+            .applied_term = 1,
+            .applied_term_known = 1,
+            .applied_index = 4,
+            .last_index = 4,
+        }, .proposals = .{ .ptr = &decision_payloads, .len = 1 } };
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.check(lease.context, &decision_proposal, &result));
+        lease.vtable.proposal_result(lease.context, &.{ .state = decision_proposal.state, .first_index = 5, .last_index = 5, .payloads = decision_proposal.proposals });
+        const accepted_path = pool.control_accepted_paths[0];
+        const accepted_size = try pool.io.storage().fileSize(accepted_path);
+        const accepted_bytes = try alloc.alloc(u8, @intCast(accepted_size));
+        defer alloc.free(accepted_bytes);
+        try pool.io.storage().readFileRangeInto(alloc, accepted_path, 0, accepted_bytes);
+        const accepted = try @import("../lsm_backend/completion_control_accepted.zig").Accepted.decode(accepted_bytes);
+        try std.testing.expectEqualDeep(id, accepted.txn_id);
+        try std.testing.expectEqual(@as(u64, 5), accepted.transition.index);
+        try std.testing.expectEqualSlices(u8, owned_decision, accepted.envelope);
+        try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try db.getTransactionStatus(id));
+        try std.testing.expectEqual(@as(u64, 4), pool.progress.?.index);
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.apply_accepted.?(lease.context, 1, 5, decision_payloads[0]));
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.apply_accepted.?(lease.context, 1, 5, decision_payloads[0]));
+        try std.testing.expectError(error.FileNotFound, pool.io.storage().fileSize(accepted_path));
+        try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try db.getTransactionStatus(id));
+        try std.testing.expect(pool.control_owners[0] != null and pool.control_owners[0].?.pending == null);
+        try std.testing.expectEqual(@as(u64, 5), pool.progress.?.index);
+        const progress_key = control_record.progressKey(id);
+        const progress_bytes = (try db.core.getStoreValue(alloc, &progress_key)).?;
+        defer alloc.free(progress_bytes);
+        const progress = try control_record.Progress.decode(progress_bytes);
+        try std.testing.expectEqual(control_record.Progress.Phase.decision, progress.phase);
+        try std.testing.expectEqual(control_record.Progress.Decision.committed, progress.decision);
+        try std.testing.expectEqual(@as(u64, 1), progress.begin.index);
+        try std.testing.expectEqual(@as(u64, 5), progress.latest.index);
+        // ACK order differs from immutable enlistment order, so the v3 bitmap
+        // must identify names by ordinal rather than by arrival count.
+        const ack_names = [_][]const u8{ participant, local_participant };
+        for (ack_names, 0..) |name, ordinal| {
+            const previous: u64 = @intCast(5 + ordinal);
+            const ack_wire = blk: {
+                var read = try manager.store.beginRead();
+                defer read.abort();
+                break :blk try manager.compileControlMutation(alloc, &read, .{
+                    .txn_id = id,
+                    .action = .{ .acknowledge = name },
+                }, .{
+                    .group_id = binding.identity.group_id,
+                    .incarnation = binding.identity.incarnation,
+                    .policy_digest = binding.identity.policy_digest,
+                    .schema_catalog_digest = binding.schema_catalog_digest,
+                    .previous_term = 1,
+                    .previous_index = previous,
+                }, @splat(19), "owned-control-ack-test", &.{});
+            };
+            defer alloc.free(ack_wire);
+            const ack_payloads = [_]abi.Bytes{.{ .ptr = ack_wire.ptr, .len = ack_wire.len }};
+            const ack_proposal: abi.Check = .{ .kind = .proposal, .new_work_allowed = 1, .state = .{
+                .term = 1,
+                .applied_term = 1,
+                .applied_term_known = 1,
+                .applied_index = previous,
+                .last_index = previous,
+            }, .proposals = .{ .ptr = &ack_payloads, .len = 1 } };
+            try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.check(lease.context, &ack_proposal, &result));
+            const accepted_index = previous + 1;
+            lease.vtable.proposal_result(lease.context, &.{ .state = ack_proposal.state, .first_index = accepted_index, .last_index = accepted_index, .payloads = ack_proposal.proposals });
+            try std.testing.expectEqual(@as(u64, previous), pool.progress.?.index);
+            try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.apply_accepted.?(lease.context, 1, accepted_index, ack_payloads[0]));
+            try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.apply_accepted.?(lease.context, 1, accepted_index, ack_payloads[0]));
+            const ack_value = (try db.core.getStoreValue(alloc, &progress_key)).?;
+            defer alloc.free(ack_value);
+            try std.testing.expectEqualStrings("AFCTLRP3", ack_value[0..8]);
+            const ack_progress = try control_record.Progress.decode(ack_value);
+            try std.testing.expectEqual(control_record.Progress.Phase.acknowledgement, ack_progress.phase);
+            try std.testing.expectEqual(@as(u32, @intCast(ordinal + 1)), ack_progress.acknowledged);
+            try std.testing.expectEqual(@as(u8, if (ordinal == 0) 2 else 3), ack_progress.ack_bitmap[0]);
+            try std.testing.expectEqual(accepted_index, ack_progress.latest.index);
+            try std.testing.expectError(error.FileNotFound, pool.io.storage().fileSize(accepted_path));
+            if (ordinal == 0) {
+                const duplicate = blk: {
+                    var read = try manager.store.beginRead();
+                    defer read.abort();
+                    break :blk try manager.compileControlMutation(alloc, &read, .{
+                        .txn_id = id,
+                        .action = .{ .acknowledge = name },
+                    }, .{
+                        .group_id = binding.identity.group_id,
+                        .incarnation = binding.identity.incarnation,
+                        .policy_digest = binding.identity.policy_digest,
+                        .schema_catalog_digest = binding.schema_catalog_digest,
+                        .previous_term = 1,
+                        .previous_index = accepted_index,
+                    }, @splat(19), "owned-control-duplicate-ack-test", &.{});
+                };
+                defer alloc.free(duplicate);
+                const duplicate_payloads = [_]abi.Bytes{.{ .ptr = duplicate.ptr, .len = duplicate.len }};
+                const duplicate_proposal: abi.Check = .{ .kind = .proposal, .new_work_allowed = 1, .state = .{
+                    .term = 1,
+                    .applied_term = 1,
+                    .applied_term_known = 1,
+                    .applied_index = accepted_index,
+                    .last_index = accepted_index,
+                }, .proposals = .{ .ptr = &duplicate_payloads, .len = 1 } };
+                try std.testing.expectEqual(runtime_failure_abi.Status.unsupported_completion_profile, lease.vtable.check(lease.context, &duplicate_proposal, &result));
+                try std.testing.expectError(error.FileNotFound, pool.io.storage().fileSize(accepted_path));
+            }
+        }
+        // The last ACK cannot be accepted while three other BEGIN guards
+        // still own uncheckpointed state. It must not create a sidecar.
+        const terminal_wire = blk: {
+            var read = try manager.store.beginRead();
+            defer read.abort();
+            break :blk try manager.compileControlMutation(alloc, &read, .{
+                .txn_id = id,
+                .action = .{ .acknowledge = unacknowledged_participant },
+            }, .{
+                .group_id = binding.identity.group_id,
+                .incarnation = binding.identity.incarnation,
+                .policy_digest = binding.identity.policy_digest,
+                .schema_catalog_digest = binding.schema_catalog_digest,
+                .previous_term = 1,
+                .previous_index = 7,
+            }, @splat(19), "owned-control-terminal-checkpoint-fence", &.{});
+        };
+        defer alloc.free(terminal_wire);
+        const terminal_payloads = [_]abi.Bytes{.{ .ptr = terminal_wire.ptr, .len = terminal_wire.len }};
+        const terminal_check: abi.Check = .{ .kind = .proposal, .new_work_allowed = 1, .state = .{
+            .term = 1,
+            .applied_term = 1,
+            .applied_term_known = 1,
+            .applied_index = 7,
+            .last_index = 7,
+        }, .proposals = .{ .ptr = &terminal_payloads, .len = 1 } };
+        try std.testing.expectEqual(runtime_failure_abi.Status.completion_reservation_busy, lease.vtable.check(lease.context, &terminal_check, &result));
+        try std.testing.expectError(error.FileNotFound, pool.io.storage().fileSize(accepted_path));
+        try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try db.getTransactionStatus(id));
+    }
+    try std.testing.expectError(error.CompletionRecoveryCapacityRequired, DB.open(alloc, std.mem.span(tmp.path().ptr), options));
+    const path = std.mem.span(tmp.path().ptr);
+    const config = (try DB.completionInstallationPreflight(alloc, std.Options.debug_io, path, binding, "", "", "{}")).?;
+    var reopen = options;
+    reopen.durable_completion_authority = .raft_apply;
+    reopen.completion_pool_config = config;
+    // Trusted local guard decoding now runs during startup, but no control
+    // owner can become runnable without exact durable-log reconciliation.
+    try std.testing.expectError(error.CompletionRecoveryCapacityRequired, DB.open(alloc, path, reopen));
+    var storage = try @import("../lsm_backend/storage_io.zig").NativeStorage.init(alloc, .threaded);
+    defer storage.deinit();
+    const guard_path = try std.fs.path.join(alloc, &.{ path, control_guard.filenames[0] });
+    defer alloc.free(guard_path);
+    const storage_io = storage.storage();
+    const size = try storage_io.fileSize(guard_path);
+    const bytes = try alloc.alloc(u8, @intCast(size));
+    defer alloc.free(bytes);
+    try storage_io.readFileRangeInto(alloc, guard_path, 0, bytes);
+    bytes[bytes.len - 1] ^= 1;
+    try storage_io.writeFileAbsolute(guard_path, bytes);
+    try std.testing.expectError(error.CompletionSlotChecksumMismatch, DB.open(alloc, path, reopen));
+}
+
+test "workload admission physical completion restores two interleaved BEGIN owners after exact v2 proof" {
+    try exerciseInterleavedBeginOwnerRestart(2);
+}
+
+test "workload admission physical completion refuses three interleaved BEGIN owners on restart" {
+    try exerciseInterleavedBeginOwnerRestart(3);
+}
+
+fn exerciseInterleavedBeginOwnerRestart(owner_count: usize) !void {
+    const alloc = std.testing.allocator;
+    const abi = @import("kernel_owner_abi").completion_pool;
+    const local = @import("../local_write.zig");
+    var tmp = try TestDirectory.init("completion-two-control-begins");
+    defer tmp.cleanup();
+    var resources = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer resources.deinit(alloc);
+    try resources.configureTransactionCompletion(1024 * 1024);
+    const settings: table_storage_mod.Settings = .{ .transaction_recovery = .{
+        .protocol_version = 1,
+        .max_count = 4,
+        .max_bytes = 1024 * 1024,
+        .max_transaction_bytes = 64 * 1024,
+        .completion_protocol_version = 1,
+        .profile_version = 1,
+    } };
+    const options: OpenOptions = .{
+        .resource_manager = &resources,
+        .durable_completion_enabled = true,
+        .durable_completion_authority = .standalone_local,
+        .table_storage = settings,
+        .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    };
+    const binding: abi.InstallBinding = .{
+        .identity = .{
+            .group_id = 2,
+            .node_id = 7,
+            .capacity = 4,
+            .generation = 1,
+            .incarnation = @splat(27),
+            .policy_digest = @import("../../metadata/completion_activation.zig").policyDigest(settings.transaction_recovery.?),
+        },
+        .table_id = 1,
+        .range_id = 3,
+        .schema_catalog_digest = try @import("../../common/completion_catalog_digest.zig").digest(alloc, "", "", "{}"),
+    };
+    const ids = [_]transactions_mod.TxnId{ @splat(181), @splat(182), @splat(183) };
+    var digests: [3][32]u8 = undefined;
+    {
+        var db = try DB.open(alloc, std.mem.span(tmp.path().ptr), options);
+        defer db.close();
+        try db.installCompletionBinding(binding, "", "", "{}", settings);
+        const lease = try db.acquireCompletionLease(2, 7);
+        defer lease.vtable.release(lease.context);
+        const empty: abi.DurableLog = .{ .mode = .startup_complete };
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.reconcile_durable.?(lease.context, &empty));
+        const backend = db.core.primary_store_owner.lsmBackend().?;
+        {
+            const backend_runtime = @import("../lsm_backend/runtime.zig");
+            const locked = backend_runtime.lockBackend(lsm_backend_mod.Backend, backend);
+            defer backend_runtime.unlockBackend(lsm_backend_mod.Backend, backend, locked);
+            try backend.completion_pool.?.enableControlOwnerStaging(backend);
+        }
+        const participant = try @import("../../api/distributed_txn.zig").participantIdForGroup(alloc, "docs", 3);
+        defer alloc.free(participant);
+        const local_participant = try @import("../../api/distributed_txn.zig").participantIdForGroup(alloc, "docs", 2);
+        defer alloc.free(local_participant);
+        for (ids[0..owner_count], 0..) |id, i| {
+            if (i != 0) {
+                const backend_runtime = @import("../lsm_backend/runtime.zig");
+                const locked = backend_runtime.lockBackend(lsm_backend_mod.Backend, backend);
+                defer backend_runtime.unlockBackend(lsm_backend_mod.Backend, backend, locked);
+                try backend.completion_pool.?.maintainLocked(backend);
+                try backend.completion_pool.?.qualifyFresh(backend);
+            }
+            const request: types.BatchRequest = .{ .transaction = .{ .begin = .{
+                .txn_id = id,
+                .begin_timestamp = 100 + i,
+                .created_at_ns = 90 + i,
+                .topology_epoch = 1,
+                .retain_terminal = true,
+                .participants = &.{ local_participant, participant },
+            } } };
+            const previous: u64 = @intCast(i);
+            const wire = try local.compileStorageKernelReplicatedCompletion(alloc, &db, "docs", 2, request, .{ .term = if (i == 0) 0 else 1, .index = previous });
+            defer alloc.free(wire);
+            digests[i] = @import("../../common/completion_entry_protocol.zig").payloadDigest(wire);
+            const payloads = [_]abi.Bytes{.{ .ptr = wire.ptr, .len = wire.len }};
+            const proposal: abi.Check = .{ .kind = .proposal, .new_work_allowed = 1, .state = .{
+                .term = 1,
+                .applied_term = if (i == 0) 0 else 1,
+                .applied_term_known = 1,
+                .applied_index = previous,
+                .last_index = previous,
+            }, .proposals = .{ .ptr = &payloads, .len = 1 } };
+            var result: abi.CheckResult = undefined;
+            try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.check(lease.context, &proposal, &result));
+            lease.vtable.proposal_result(lease.context, &.{ .state = proposal.state, .first_index = previous + 1, .last_index = previous + 1, .payloads = proposal.proposals });
+            try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.apply_accepted.?(lease.context, 1, previous + 1, payloads[0]));
+        }
+    }
+    const path = std.mem.span(tmp.path().ptr);
+    const config = (try DB.completionInstallationPreflight(alloc, std.Options.debug_io, path, binding, "", "", "{}")).?;
+    var reopen = options;
+    reopen.durable_completion_authority = .raft_apply;
+    reopen.completion_pool_config = config;
+    if (owner_count == 3) {
+        try std.testing.expectError(error.CompletionRecoveryCapacityRequired, DB.open(alloc, path, reopen));
+        return;
+    }
+    {
+        const control_guard = @import("../lsm_backend/completion_control_guard.zig");
+        var storage = try @import("../lsm_backend/storage_io.zig").NativeStorage.init(alloc, .threaded);
+        defer storage.deinit();
+        const first_guard_path = try std.fs.path.join(alloc, &.{ path, control_guard.filenames[0] });
+        defer alloc.free(first_guard_path);
+        const second_guard_path = try std.fs.path.join(alloc, &.{ path, control_guard.filenames[1] });
+        defer alloc.free(second_guard_path);
+        const first_bytes = try storage.storage().readFileAlloc(alloc, first_guard_path, control_guard.max_bytes);
+        defer alloc.free(first_bytes);
+        const second_bytes = try storage.storage().readFileAlloc(alloc, second_guard_path, control_guard.max_bytes);
+        defer alloc.free(second_bytes);
+        const first_guard = try control_guard.Guard.decode(first_bytes);
+        var alias = try control_guard.Guard.decode(second_bytes);
+        alias.record.output_run_id = first_guard.record.output_run_id;
+        const bad = try alias.encode(alloc);
+        defer alloc.free(bad);
+        try storage.storage().writeFileAbsolute(second_guard_path, bad);
+        try std.testing.expectError(error.InvalidCompletionSlot, DB.open(alloc, path, reopen));
+        try storage.storage().writeFileAbsolute(second_guard_path, second_bytes);
+        const accepted_path = try std.fs.path.join(alloc, &.{ path, @import("../lsm_backend/completion_control_accepted.zig").filenames[0] });
+        defer alloc.free(accepted_path);
+        try storage.storage().writeFileAbsolute(accepted_path, "pending-interleaved-transition");
+        try std.testing.expectError(error.CompletionRecoveryCapacityRequired, DB.open(alloc, path, reopen));
+        try std.testing.expectEqual(@as(u64, "pending-interleaved-transition".len), try storage.storage().fileSize(accepted_path));
+        try storage.storage().deleteFileAbsolute(accepted_path);
+    }
+    var db = try DB.open(alloc, path, reopen);
+    defer db.close();
+    try db.installCompletionBinding(binding, "", "", "{}", settings);
+    const backend = db.core.primary_store_owner.lsmBackend().?;
+    const pool = backend.completion_pool.?;
+    try std.testing.expect(pool.restored_control_pending and !pool.ready);
+    try std.testing.expect(pool.control_owners[0] != null and pool.control_owners[1] != null);
+    const lease = try @import("../completion_native_guard.zig").Guard(DB).controlLeaseV2(&db, 2, 7);
+    defer lease.vtable.release(lease.context);
+    var owners: abi.ControlDurableOwnersV2 = .{};
+    try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.durable_owners(lease.context, &owners));
+    try std.testing.expectEqual(@as(u32, 2), owners.count);
+    var proof: abi.ControlDurableLogV2 = .{
+        .mode = .startup_complete,
+        .last_index = 2,
+        .commit_index = 2,
+        .count = 2,
+        .document = .{ .mode = .startup_complete, .last_index = 2, .commit_index = 2 },
+    };
+    for (owners.owners[0..owners.count], 0..) |owner, i| proof.observations[i] = .{
+        .expected = owner.identity,
+        .present = 1,
+        .observed_term = 1,
+        .observed_digest = digests[owner.slot_index],
+    };
+    proof.observations[1].present = 0;
+    try std.testing.expectEqual(runtime_failure_abi.Status.recovery_required, lease.vtable.reconcile_durable(lease.context, &proof));
+    try std.testing.expect(!pool.ready);
+    proof.observations[1].present = 1;
+    proof.observations[1].observed_digest[0] ^= 1;
+    try std.testing.expectEqual(runtime_failure_abi.Status.recovery_required, lease.vtable.reconcile_durable(lease.context, &proof));
+    try std.testing.expect(!pool.ready);
+    proof.observations[1].observed_digest[0] ^= 1;
+    try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.reconcile_durable(lease.context, &proof));
+    try std.testing.expect(pool.ready and !pool.restored_control_pending);
+    for (ids[0..owner_count]) |id| try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try db.getTransactionStatus(id));
+    try std.testing.expectEqual(@as(usize, 2), pool.restored_control_owner_limit);
+    const apply_lease = try db.acquireCompletionLease(2, 7);
+    defer apply_lease.vtable.release(apply_lease.context);
+    const local_participant = try @import("../../api/distributed_txn.zig").participantIdForGroup(alloc, "docs", 2);
+    defer alloc.free(local_participant);
+    const remote_participant = try @import("../../api/distributed_txn.zig").participantIdForGroup(alloc, "docs", 3);
+    defer alloc.free(remote_participant);
+    const third: types.BatchRequest = .{ .transaction = .{ .begin = .{
+        .txn_id = ids[2],
+        .begin_timestamp = 102,
+        .created_at_ns = 92,
+        .topology_epoch = 1,
+        .retain_terminal = true,
+        .participants = &.{ local_participant, remote_participant },
+    } } };
+    const wire = try local.compileStorageKernelReplicatedCompletion(alloc, &db, "docs", 2, third, .{ .term = 1, .index = 2 });
+    defer alloc.free(wire);
+    const payloads = [_]abi.Bytes{.{ .ptr = wire.ptr, .len = wire.len }};
+    const proposal: abi.Check = .{ .kind = .proposal, .new_work_allowed = 1, .state = .{
+        .term = 1,
+        .applied_term = 1,
+        .applied_term_known = 1,
+        .applied_index = 2,
+        .last_index = 2,
+    }, .proposals = .{ .ptr = &payloads, .len = 1 } };
+    var result: abi.CheckResult = undefined;
+    try std.testing.expectEqual(runtime_failure_abi.Status.completion_reservation_busy, apply_lease.vtable.check(apply_lease.context, &proposal, &result));
+    try std.testing.expect(pool.control_owners[2] == null);
+}
+
+test "workload admission physical completion restores one BEGIN owner after exact v2 startup proof" {
+    const alloc = std.testing.allocator;
+    const abi = @import("kernel_owner_abi").completion_pool;
+    const local = @import("../local_write.zig");
+    const control_guard = @import("../lsm_backend/completion_control_guard.zig");
+    var tmp = try TestDirectory.init("completion-control-begin-restart");
+    defer tmp.cleanup();
+    var resources = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer resources.deinit(alloc);
+    try resources.configureTransactionCompletion(1024 * 1024);
+    const settings: table_storage_mod.Settings = .{ .transaction_recovery = .{
+        .protocol_version = 1,
+        .max_count = 4,
+        .max_bytes = 1024 * 1024,
+        .max_transaction_bytes = 64 * 1024,
+        .completion_protocol_version = 1,
+        .profile_version = 1,
+    } };
+    const options: OpenOptions = .{
+        .resource_manager = &resources,
+        .durable_completion_enabled = true,
+        .durable_completion_authority = .standalone_local,
+        .table_storage = settings,
+        .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    };
+    const binding: abi.InstallBinding = .{
+        .identity = .{
+            .group_id = 2,
+            .node_id = 7,
+            .capacity = 4,
+            .generation = 1,
+            .incarnation = @splat(27),
+            .policy_digest = @import("../../metadata/completion_activation.zig").policyDigest(settings.transaction_recovery.?),
+        },
+        .table_id = 1,
+        .range_id = 3,
+        .schema_catalog_digest = try @import("../../common/completion_catalog_digest.zig").digest(alloc, "", "", "{}"),
+    };
+    const id: transactions_mod.TxnId = @splat(218);
+    var begin_digest: [32]u8 = undefined;
+    var decision_digest: [32]u8 = undefined;
+    var ack_digest: [32]u8 = undefined;
+    var retained_owner_wal_credit: u64 = 0;
+    var output_run_id: u64 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(tmp.path().ptr), options);
+        defer db.close();
+        try db.installCompletionBinding(binding, "", "", "{}", settings);
+        const lease = try db.acquireCompletionLease(2, 7);
+        defer lease.vtable.release(lease.context);
+        const empty: abi.DurableLog = .{ .mode = .startup_complete };
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.reconcile_durable.?(lease.context, &empty));
+        const backend = db.core.primary_store_owner.lsmBackend().?;
+        {
+            const locked = @import("../lsm_backend/runtime.zig").lockBackend(lsm_backend_mod.Backend, backend);
+            defer @import("../lsm_backend/runtime.zig").unlockBackend(lsm_backend_mod.Backend, backend, locked);
+            try backend.completion_pool.?.enableControlOwnerStaging(backend);
+        }
+        const local_name = try @import("../../api/distributed_txn.zig").participantIdForGroup(alloc, "docs", 2);
+        defer alloc.free(local_name);
+        const remote_name = try @import("../../api/distributed_txn.zig").participantIdForGroup(alloc, "docs", 3);
+        defer alloc.free(remote_name);
+        const request: types.BatchRequest = .{ .transaction = .{ .begin = .{
+            .txn_id = id,
+            .begin_timestamp = 100,
+            .created_at_ns = 90,
+            .topology_epoch = 1,
+            .retain_terminal = true,
+            .participants = &.{ local_name, remote_name },
+        } } };
+        const wire = try local.compileStorageKernelReplicatedCompletion(alloc, &db, "docs", 2, request, .{ .term = 0, .index = 0 });
+        defer alloc.free(wire);
+        begin_digest = @import("../../common/completion_entry_protocol.zig").payloadDigest(wire);
+        const payloads = [_]abi.Bytes{.{ .ptr = wire.ptr, .len = wire.len }};
+        const proposal: abi.Check = .{
+            .kind = .proposal,
+            .new_work_allowed = 1,
+            .state = .{ .term = 1, .applied_term_known = 1 },
+            .proposals = .{ .ptr = &payloads, .len = 1 },
+        };
+        var result: abi.CheckResult = undefined;
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.check(lease.context, &proposal, &result));
+        lease.vtable.proposal_result(lease.context, &.{ .state = proposal.state, .first_index = 1, .last_index = 1, .payloads = proposal.proposals });
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.apply_accepted.?(lease.context, 1, 1, payloads[0]));
+        output_run_id = backend.completion_pool.?.control_output_ids[0];
+        retained_owner_wal_credit = backend.completion_pool.?.control_owners[0].?.held.wal_credit;
+        try std.testing.expect(retained_owner_wal_credit > 0);
+        try std.testing.expect(backend.runs.count() <= 64);
+    }
+    const path = std.mem.span(tmp.path().ptr);
+    try std.testing.expectError(error.CompletionRecoveryCapacityRequired, DB.open(alloc, path, options));
+    const config = (try DB.completionInstallationPreflight(alloc, std.Options.debug_io, path, binding, "", "", "{}")).?;
+    var reopen = options;
+    reopen.durable_completion_authority = .raft_apply;
+    reopen.completion_pool_config = config;
+    {
+        var storage = try @import("../lsm_backend/storage_io.zig").NativeStorage.init(alloc, .threaded);
+        defer storage.deinit();
+        const orphan = try std.fs.path.join(alloc, &.{ path, @import("../lsm_backend/completion_runtime.zig").guard_filenames[0] });
+        defer alloc.free(orphan);
+        try storage.storage().writeFileAbsolute(orphan, "orphan-document-guard");
+        try std.testing.expectError(error.InvalidCompletionSlot, DB.open(alloc, path, reopen));
+        try storage.storage().deleteFileAbsolute(orphan);
+    }
+    // The guard's output must not alias a newly reserved document-cell run
+    // even if the alias is absent from the current manifest.
+    const document_output_id = blk: {
+        var probe = try DB.open(alloc, path, reopen);
+        defer probe.close();
+        break :blk probe.core.primary_store_owner.lsmBackend().?.completion_pool.?.cohort.base_run_id;
+    };
+    {
+        var storage = try @import("../lsm_backend/storage_io.zig").NativeStorage.init(alloc, .threaded);
+        defer storage.deinit();
+        const guard_path = try std.fs.path.join(alloc, &.{ path, control_guard.filenames[0] });
+        defer alloc.free(guard_path);
+        const size = try storage.storage().fileSize(guard_path);
+        const original = try alloc.alloc(u8, @intCast(size));
+        defer alloc.free(original);
+        try storage.storage().readFileRangeInto(alloc, guard_path, 0, original);
+        var alias = try control_guard.Guard.decode(original);
+        alias.record.output_run_id = document_output_id;
+        const encoded = try alias.encode(alloc);
+        defer alloc.free(encoded);
+        try storage.storage().writeFileAbsolute(guard_path, encoded);
+        try std.testing.expectError(error.InvalidCompletionSlot, DB.open(alloc, path, reopen));
+        const output_path = try @import("../lsm_backend/repository.zig").runPath(alloc, path, document_output_id);
+        defer alloc.free(output_path);
+        try std.testing.expectError(error.FileNotFound, storage.storage().fileSize(output_path));
+        try storage.storage().writeFileAbsolute(guard_path, original);
+    }
+    {
+        var db = try DB.open(alloc, path, reopen);
+        defer db.close();
+        // Reattach the trusted local installation binding. No transaction-manager
+        // or metadata-service inventory is used to reconstruct the owner.
+        try db.installCompletionBinding(binding, "", "", "{}", settings);
+        const backend = db.core.primary_store_owner.lsmBackend().?;
+        const pool = backend.completion_pool.?;
+        try std.testing.expect(pool.restored_control_pending and !pool.ready);
+        try std.testing.expect(pool.control_owners[0] != null);
+        try std.testing.expectEqualDeep(id, pool.control_owners[0].?.declaration.txn_id);
+        try std.testing.expect(pool.control_owners[0].?.held.wal_credit > 0);
+        try std.testing.expect(pool.control_owners[0].?.output_pin.path != null);
+        try std.testing.expectEqual(output_run_id, pool.control_output_ids[0]);
+        const control_lease = try @import("../completion_native_guard.zig").Guard(DB).controlLeaseV2(&db, 2, 7);
+        defer control_lease.vtable.release(control_lease.context);
+        var owners: abi.ControlDurableOwnersV2 = .{};
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, control_lease.vtable.durable_owners(control_lease.context, &owners));
+        try std.testing.expectEqual(@as(u32, 1), owners.count);
+        var proof: abi.ControlDurableLogV2 = .{
+            .mode = .startup_complete,
+            .last_index = 1,
+            .commit_index = 1,
+            .count = 1,
+            .document = .{ .mode = .startup_complete, .last_index = 1, .commit_index = 1 },
+        };
+        proof.observations[0] = .{
+            .expected = owners.owners[0].identity,
+            .present = 1,
+            .observed_term = 1,
+            .observed_digest = begin_digest,
+        };
+        proof.observations[0].observed_digest[0] ^= 1;
+        try std.testing.expectEqual(runtime_failure_abi.Status.recovery_required, control_lease.vtable.reconcile_durable(control_lease.context, &proof));
+        try std.testing.expect(!pool.ready);
+        proof.observations[0].observed_digest[0] ^= 1;
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, control_lease.vtable.reconcile_durable(control_lease.context, &proof));
+        try std.testing.expect(pool.ready and pool.control_transition_staging and !pool.restored_control_pending);
+        try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try db.getTransactionStatus(id));
+        var manager = try transactions_mod.TxnManager.init(alloc, db.core.store);
+        defer manager.deinit();
+        manager.completion_limits = .{
+            .max_transaction_bytes = db.core.table_catalog.transaction_admission_bytes,
+            .max_count = db.core.table_catalog.transaction_recovery_max_count,
+            .max_bytes = db.core.table_catalog.transaction_recovery_max_bytes,
+        };
+        const decision_wire = blk: {
+            var read = try manager.store.beginRead();
+            defer read.abort();
+            break :blk try manager.compileControlMutation(alloc, &read, .{
+                .txn_id = id,
+                .action = .{ .resolve_metadata = .{ .status = .committed, .timestamp = 200 } },
+            }, .{
+                .group_id = binding.identity.group_id,
+                .incarnation = binding.identity.incarnation,
+                .policy_digest = binding.identity.policy_digest,
+                .schema_catalog_digest = binding.schema_catalog_digest,
+                .previous_term = 1,
+                .previous_index = 1,
+            }, @splat(19), "restored-owner-decision", &.{});
+        };
+        defer alloc.free(decision_wire);
+        decision_digest = @import("../../common/completion_entry_protocol.zig").payloadDigest(decision_wire);
+        const lease = try db.acquireCompletionLease(2, 7);
+        defer lease.vtable.release(lease.context);
+        const payloads = [_]abi.Bytes{.{ .ptr = decision_wire.ptr, .len = decision_wire.len }};
+        const proposal: abi.Check = .{
+            .kind = .proposal,
+            .new_work_allowed = 1,
+            .state = .{ .term = 1, .applied_term = 1, .applied_term_known = 1, .applied_index = 1, .last_index = 1 },
+            .proposals = .{ .ptr = &payloads, .len = 1 },
+        };
+        var result: abi.CheckResult = undefined;
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.check(lease.context, &proposal, &result));
+        lease.vtable.proposal_result(lease.context, &.{ .state = proposal.state, .first_index = 2, .last_index = 2, .payloads = proposal.proposals });
+        try std.testing.expect(pool.control_owners[0].?.pending != null);
+        try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try db.getTransactionStatus(id));
+    }
+    {
+        var storage = try @import("../lsm_backend/storage_io.zig").NativeStorage.init(alloc, .threaded);
+        defer storage.deinit();
+        const accepted_path = try std.fs.path.join(alloc, &.{ path, @import("../lsm_backend/completion_control_accepted.zig").filenames[0] });
+        defer alloc.free(accepted_path);
+        const size = try storage.storage().fileSize(accepted_path);
+        const original = try alloc.alloc(u8, @intCast(size));
+        defer alloc.free(original);
+        try storage.storage().readFileRangeInto(alloc, accepted_path, 0, original);
+        const damaged = try alloc.dupe(u8, original);
+        defer alloc.free(damaged);
+        damaged[damaged.len - 1] ^= 1;
+        try storage.storage().writeFileAbsolute(accepted_path, damaged);
+        try std.testing.expectError(error.CompletionSlotChecksumMismatch, DB.open(alloc, path, reopen));
+        try storage.storage().writeFileAbsolute(accepted_path, "");
+        try std.testing.expectError(error.InvalidCompletionSlot, DB.open(alloc, path, reopen));
+        try storage.storage().writeFileAbsolute(accepted_path, original);
+    }
+    {
+        var db = try DB.open(alloc, path, reopen);
+        defer db.close();
+        try db.installCompletionBinding(binding, "", "", "{}", settings);
+        const pool = db.core.primary_store_owner.lsmBackend().?.completion_pool.?;
+        try std.testing.expect(pool.restored_control_pending and !pool.ready);
+        const old = try db.acquireControlCompletionLeaseV3(2, 7);
+        defer old.vtable.release(old.context);
+        var old_proof: abi.ControlDurableLogV3 = .{
+            .mode = .startup_complete,
+            .last_index = 2,
+            .commit_index = 2,
+            .count = 1,
+            .document = .{ .mode = .startup_complete, .last_index = 2, .commit_index = 2 },
+        };
+        old_proof.begins[0] = .{ .expected = .{ .term = 1, .index = 1, .payload_digest = begin_digest }, .present = 1, .observed_term = 1, .observed_digest = begin_digest };
+        old_proof.latest[0] = old_proof.begins[0];
+        try std.testing.expectEqual(runtime_failure_abi.Status.completion_admission_unavailable, old.vtable.reconcile_durable(old.context, &old_proof));
+        const lease = try db.acquireControlCompletionLeaseV4(2, 7);
+        defer lease.vtable.release(lease.context);
+        var owners: abi.ControlDurableOwnersV4 = .{};
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.durable_owners(lease.context, &owners));
+        try std.testing.expectEqual(@as(u32, 1), owners.count);
+        try std.testing.expectEqual(@as(u8, 1), owners.owners[0].has_accepted);
+        var proof: abi.ControlDurableLogV4 = .{
+            .accepted_mask = 1,
+            .applied = .{ .mode = .startup_complete, .last_index = 2, .commit_index = 2, .count = 1, .document = .{ .mode = .startup_complete, .last_index = 2, .commit_index = 2 } },
+        };
+        proof.applied.begins[0] = .{ .expected = owners.owners[0].applied.begin, .present = 1, .observed_term = 1, .observed_digest = begin_digest };
+        proof.applied.latest[0] = proof.applied.begins[0];
+        proof.accepted[0] = .{ .expected = owners.owners[0].accepted, .present = 1, .observed_term = 1, .observed_digest = decision_digest };
+        proof.accepted[0].observed_digest[0] ^= 1;
+        try std.testing.expectEqual(runtime_failure_abi.Status.recovery_required, lease.vtable.reconcile_durable(lease.context, &proof));
+        try std.testing.expect(!pool.ready);
+        proof.accepted[0].observed_digest[0] ^= 1;
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.reconcile_durable(lease.context, &proof));
+        try std.testing.expect(pool.ready and !pool.restored_control_pending);
+        try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try db.getTransactionStatus(id));
+    }
+    {
+        var db = try DB.open(alloc, path, reopen);
+        defer db.close();
+        try db.installCompletionBinding(binding, "", "", "{}", settings);
+        const backend = db.core.primary_store_owner.lsmBackend().?;
+        const pool = backend.completion_pool.?;
+        try std.testing.expect(pool.restored_control_pending and !pool.ready);
+        try std.testing.expectEqual(@as(u64, 2), pool.control_owners[0].?.latest.?.index);
+        try std.testing.expectEqual(retained_owner_wal_credit, pool.control_owners[0].?.held.wal_credit);
+        try std.testing.expect(backend.wal_retention.primary.?.bytes > 0);
+        try std.testing.expectEqual(backend.wal_retention.primary.?.bytes, backend.tracked_wal_retention_bytes);
+        const old_lease = try db.acquireControlCompletionLeaseV2(2, 7);
+        defer old_lease.vtable.release(old_lease.context);
+        var old_proof: abi.ControlDurableLogV2 = .{
+            .mode = .startup_complete,
+            .last_index = 2,
+            .commit_index = 2,
+            .count = 1,
+            .document = .{ .mode = .startup_complete, .last_index = 2, .commit_index = 2 },
+        };
+        old_proof.observations[0] = .{ .expected = .{ .term = 1, .index = 1, .payload_digest = begin_digest }, .present = 1, .observed_term = 1, .observed_digest = begin_digest };
+        try std.testing.expectEqual(runtime_failure_abi.Status.completion_admission_unavailable, old_lease.vtable.reconcile_durable(old_lease.context, &old_proof));
+        try std.testing.expect(!pool.ready);
+        const lease = try db.acquireControlCompletionLeaseV3(2, 7);
+        defer lease.vtable.release(lease.context);
+        var owners: abi.ControlDurableOwnersV3 = .{};
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.durable_owners(lease.context, &owners));
+        try std.testing.expectEqual(@as(u32, 1), owners.count);
+        var proof: abi.ControlDurableLogV3 = .{
+            .mode = .startup_complete,
+            .last_index = 2,
+            .commit_index = 2,
+            .count = 1,
+            .document = .{ .mode = .startup_complete, .last_index = 2, .commit_index = 2 },
+        };
+        proof.begins[0] = .{ .expected = owners.owners[0].begin, .present = 1, .observed_term = 1, .observed_digest = begin_digest };
+        proof.latest[0] = .{ .expected = owners.owners[0].latest, .present = 1, .observed_term = 1, .observed_digest = decision_digest };
+        proof.latest[0].observed_digest[0] ^= 1;
+        try std.testing.expectEqual(runtime_failure_abi.Status.recovery_required, lease.vtable.reconcile_durable(lease.context, &proof));
+        try std.testing.expect(!pool.ready);
+        proof.latest[0].observed_digest[0] ^= 1;
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.reconcile_durable(lease.context, &proof));
+        try std.testing.expect(pool.ready and !pool.restored_control_pending);
+        try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try db.getTransactionStatus(id));
+        const remote = try @import("../../api/distributed_txn.zig").participantIdForGroup(alloc, "docs", 3);
+        defer alloc.free(remote);
+        var manager = try transactions_mod.TxnManager.init(alloc, db.core.store);
+        defer manager.deinit();
+        manager.completion_limits = .{
+            .max_transaction_bytes = db.core.table_catalog.transaction_admission_bytes,
+            .max_count = db.core.table_catalog.transaction_recovery_max_count,
+            .max_bytes = db.core.table_catalog.transaction_recovery_max_bytes,
+        };
+        const ack_wire = blk: {
+            var read = try manager.store.beginRead();
+            defer read.abort();
+            break :blk try manager.compileControlMutation(alloc, &read, .{
+                .txn_id = id,
+                .action = .{ .acknowledge = remote },
+            }, .{
+                .group_id = binding.identity.group_id,
+                .incarnation = binding.identity.incarnation,
+                .policy_digest = binding.identity.policy_digest,
+                .schema_catalog_digest = binding.schema_catalog_digest,
+                .previous_term = 1,
+                .previous_index = 2,
+            }, @splat(19), "restored-owner-ack", &.{});
+        };
+        defer alloc.free(ack_wire);
+        ack_digest = @import("../../common/completion_entry_protocol.zig").payloadDigest(ack_wire);
+        const apply_lease = try db.acquireCompletionLease(2, 7);
+        defer apply_lease.vtable.release(apply_lease.context);
+        const payloads = [_]abi.Bytes{.{ .ptr = ack_wire.ptr, .len = ack_wire.len }};
+        const proposal: abi.Check = .{
+            .kind = .proposal,
+            .new_work_allowed = 1,
+            .state = .{ .term = 1, .applied_term = 1, .applied_term_known = 1, .applied_index = 2, .last_index = 2 },
+            .proposals = .{ .ptr = &payloads, .len = 1 },
+        };
+        var result: abi.CheckResult = undefined;
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, apply_lease.vtable.check(apply_lease.context, &proposal, &result));
+        apply_lease.vtable.proposal_result(apply_lease.context, &.{ .state = proposal.state, .first_index = 3, .last_index = 3, .payloads = proposal.proposals });
+        try std.testing.expect(pool.control_owners[0].?.pending != null);
+    }
+    {
+        var db = try DB.open(alloc, path, reopen);
+        defer db.close();
+        try db.installCompletionBinding(binding, "", "", "{}", settings);
+        const pool = db.core.primary_store_owner.lsmBackend().?.completion_pool.?;
+        try std.testing.expect(pool.restored_control_pending and !pool.ready);
+        const lease = try db.acquireControlCompletionLeaseV4(2, 7);
+        defer lease.vtable.release(lease.context);
+        var owners: abi.ControlDurableOwnersV4 = .{};
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.durable_owners(lease.context, &owners));
+        var proof: abi.ControlDurableLogV4 = .{
+            .accepted_mask = 1,
+            .applied = .{ .mode = .startup_complete, .last_index = 3, .commit_index = 3, .count = 1, .document = .{ .mode = .startup_complete, .last_index = 3, .commit_index = 3 } },
+        };
+        proof.applied.begins[0] = .{ .expected = owners.owners[0].applied.begin, .present = 1, .observed_term = 1, .observed_digest = begin_digest };
+        proof.applied.latest[0] = .{ .expected = owners.owners[0].applied.latest, .present = 1, .observed_term = 1, .observed_digest = decision_digest };
+        proof.accepted[0] = .{ .expected = owners.owners[0].accepted, .present = 1, .observed_term = 1, .observed_digest = ack_digest };
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.reconcile_durable(lease.context, &proof));
+        try std.testing.expect(pool.ready and !pool.restored_control_pending);
+        const progress_bytes = (try db.core.getStoreValue(alloc, &@import("../lsm_backend/completion_control_record.zig").progressKey(id))).?;
+        defer alloc.free(progress_bytes);
+        const progress = try @import("../lsm_backend/completion_control_record.zig").Progress.decode(progress_bytes);
+        try std.testing.expectEqual(@as(u32, 1), progress.acknowledged);
+        try std.testing.expectEqual(@as(u64, 3), progress.latest.index);
+    }
+    {
+        var db = try DB.open(alloc, path, reopen);
+        defer db.close();
+        try db.installCompletionBinding(binding, "", "", "{}", settings);
+        const backend = db.core.primary_store_owner.lsmBackend().?;
+        const pool = backend.completion_pool.?;
+        try std.testing.expect(pool.restored_control_pending and !pool.ready);
+        try std.testing.expectEqual(retained_owner_wal_credit, pool.control_owners[0].?.held.wal_credit);
+        try std.testing.expect(backend.wal_retention.primary.?.bytes > 0);
+        try std.testing.expectEqual(backend.wal_retention.primary.?.bytes, backend.tracked_wal_retention_bytes);
+        const lease = try db.acquireControlCompletionLeaseV3(2, 7);
+        defer lease.vtable.release(lease.context);
+        var owners: abi.ControlDurableOwnersV3 = .{};
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.durable_owners(lease.context, &owners));
+        try std.testing.expectEqual(@as(u64, 3), owners.owners[0].latest.index);
+        var proof: abi.ControlDurableLogV3 = .{
+            .mode = .startup_complete,
+            .last_index = 3,
+            .commit_index = 3,
+            .count = 1,
+            .document = .{ .mode = .startup_complete, .last_index = 3, .commit_index = 3 },
+        };
+        proof.begins[0] = .{ .expected = owners.owners[0].begin, .present = 1, .observed_term = 1, .observed_digest = begin_digest };
+        proof.latest[0] = .{ .expected = owners.owners[0].latest, .present = 1, .observed_term = 1, .observed_digest = ack_digest };
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.reconcile_durable(lease.context, &proof));
+        try std.testing.expect(pool.ready and !pool.restored_control_pending);
+        const progress_bytes = (try db.core.getStoreValue(alloc, &@import("../lsm_backend/completion_control_record.zig").progressKey(id))).?;
+        defer alloc.free(progress_bytes);
+        const progress = try @import("../lsm_backend/completion_control_record.zig").Progress.decode(progress_bytes);
+        try std.testing.expectEqual(@as(u32, 1), progress.acknowledged);
+        try std.testing.expectEqual(@as(u64, 3), progress.latest.index);
+    }
+    // The local owner guard alone is enough to make a missing manifest an
+    // unsafe startup, even if the installation guard is also absent.
+    const descriptor_path = try std.fs.path.join(alloc, &.{ path, "manifest.bin" });
+    defer alloc.free(descriptor_path);
+    const installation_path = try std.fs.path.join(alloc, &.{ path, "completion-installation.guard" });
+    defer alloc.free(installation_path);
+    try std.Io.Dir.deleteFileAbsolute(std.Options.debug_io, descriptor_path);
+    try std.Io.Dir.deleteFileAbsolute(std.Options.debug_io, installation_path);
+    try std.testing.expectError(error.InvalidManifest, DB.open(alloc, path, reopen));
+}
+
+test "workload admission physical completion final named ACK checkpoints retained owner before reopen" {
+    const alloc = std.testing.allocator;
+    const abi = @import("kernel_owner_abi").completion_pool;
+    const local = @import("../local_write.zig");
+    const control_guard = @import("../lsm_backend/completion_control_guard.zig");
+    const control_record = @import("../lsm_backend/completion_control_record.zig");
+    const pool_module = @import("../lsm_backend/completion_pool.zig");
+    const storage_io = @import("../lsm_backend/storage_io.zig");
+    const Fault = struct {
+        var fired: bool = false;
+        var point_to_fail: storage_io.CompletionIoFault = .append_sync;
+        fn fail(point: storage_io.CompletionIoFault, file: []const u8) bool {
+            const match = point == point_to_fail and std.mem.endsWith(u8, file, ".journal");
+            if (match) fired = true;
+            return match;
+        }
+    };
+    for (0..5) |scenario| {
+        defer pool_module.test_control_checkpoint_fault = null;
+        defer storage_io.test_completion_io_fault = null;
+        pool_module.test_control_checkpoint_fault_hit = false;
+        Fault.fired = false;
+        Fault.point_to_fail = if (scenario == 4) .partial_append else .append_sync;
+        var tmp = try TestDirectory.init("completion-terminal-control-ack");
+        defer tmp.cleanup();
+        const path = std.mem.span(tmp.path().ptr);
+        var resources = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+        defer resources.deinit(alloc);
+        try resources.configureTransactionCompletion(1024 * 1024);
+        const settings: table_storage_mod.Settings = .{ .transaction_recovery = .{
+            .protocol_version = 1,
+            .max_count = 4,
+            .max_bytes = 1024 * 1024,
+            .max_transaction_bytes = 64 * 1024,
+            .completion_protocol_version = 1,
+            .profile_version = 1,
+        } };
+        const options: OpenOptions = .{
+            .resource_manager = &resources,
+            .durable_completion_enabled = true,
+            .durable_completion_authority = .standalone_local,
+            .table_storage = settings,
+            .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 },
+            .start_index_workers = false,
+            .start_optional_runtimes = false,
+            .ttl_cleanup = .{ .enabled = false },
+        };
+        const binding: abi.InstallBinding = .{
+            .identity = .{ .group_id = 2, .node_id = 7, .capacity = 4, .generation = 1, .incarnation = @splat(27), .policy_digest = @import("../../metadata/completion_activation.zig").policyDigest(settings.transaction_recovery.?) },
+            .table_id = 1,
+            .range_id = 3,
+            .schema_catalog_digest = try @import("../../common/completion_catalog_digest.zig").digest(alloc, "", "", "{}"),
+        };
+        const id: transactions_mod.TxnId = @splat(224);
+        {
+            var db = try DB.open(alloc, path, options);
+            defer db.close();
+            try db.installCompletionBinding(binding, "", "", "{}", settings);
+            const lease = try db.acquireCompletionLease(2, 7);
+            defer lease.vtable.release(lease.context);
+            const startup: abi.DurableLog = .{ .mode = .startup_complete };
+            try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.reconcile_durable.?(lease.context, &startup));
+            const backend = db.core.primary_store_owner.lsmBackend().?;
+            const pool = backend.completion_pool.?;
+            {
+                const backend_runtime = @import("../lsm_backend/runtime.zig");
+                const locked = backend_runtime.lockBackend(lsm_backend_mod.Backend, backend);
+                defer backend_runtime.unlockBackend(lsm_backend_mod.Backend, backend, locked);
+                try pool.enableControlOwnerStaging(backend);
+            }
+            const first = try @import("../../api/distributed_txn.zig").participantIdForGroup(alloc, "docs", 2);
+            defer alloc.free(first);
+            const second = try @import("../../api/distributed_txn.zig").participantIdForGroup(alloc, "docs", 3);
+            defer alloc.free(second);
+            const request: types.BatchRequest = .{ .transaction = .{ .begin = .{
+                .txn_id = id,
+                .begin_timestamp = 100,
+                .created_at_ns = 90,
+                .topology_epoch = 1,
+                .retain_terminal = true,
+                .participants = &.{ first, second },
+            } } };
+            const begin_wire = try local.compileStorageKernelReplicatedCompletion(alloc, &db, "docs", 2, request, .{ .term = 0, .index = 0 });
+            defer alloc.free(begin_wire);
+            const begin_payloads = [_]abi.Bytes{.{ .ptr = begin_wire.ptr, .len = begin_wire.len }};
+            const begin_check: abi.Check = .{ .kind = .proposal, .new_work_allowed = 1, .state = .{ .term = 1, .applied_term_known = 1 }, .proposals = .{ .ptr = &begin_payloads, .len = 1 } };
+            var result: abi.CheckResult = undefined;
+            try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.check(lease.context, &begin_check, &result));
+            lease.vtable.proposal_result(lease.context, &.{ .state = begin_check.state, .first_index = 1, .last_index = 1, .payloads = begin_check.proposals });
+            try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.apply_accepted.?(lease.context, 1, 1, begin_payloads[0]));
+            {
+                const backend_runtime = @import("../lsm_backend/runtime.zig");
+                const locked = backend_runtime.lockBackend(lsm_backend_mod.Backend, backend);
+                defer backend_runtime.unlockBackend(lsm_backend_mod.Backend, backend, locked);
+                try pool.maintainLocked(backend);
+                try pool.qualifyFresh(backend);
+                try pool.enableControlTransitionStaging();
+            }
+            var manager = try transactions_mod.TxnManager.init(alloc, db.core.store);
+            defer manager.deinit();
+            manager.completion_limits = .{
+                .max_transaction_bytes = db.core.table_catalog.transaction_admission_bytes,
+                .max_count = db.core.table_catalog.transaction_recovery_max_count,
+                .max_bytes = db.core.table_catalog.transaction_recovery_max_bytes,
+            };
+            for (0..3) |step| {
+                const previous: u64 = @intCast(step + 1);
+                const wire = blk: {
+                    var read = try manager.store.beginRead();
+                    defer read.abort();
+                    break :blk try manager.compileControlMutation(alloc, &read, .{
+                        .txn_id = id,
+                        .action = if (step == 0) .{ .resolve_metadata = .{ .status = .committed, .timestamp = 200 } } else .{ .acknowledge = if (step == 1) second else first },
+                    }, .{
+                        .group_id = binding.identity.group_id,
+                        .incarnation = binding.identity.incarnation,
+                        .policy_digest = binding.identity.policy_digest,
+                        .schema_catalog_digest = binding.schema_catalog_digest,
+                        .previous_term = 1,
+                        .previous_index = previous,
+                    }, @splat(19), "terminal-control-test", &.{});
+                };
+                defer alloc.free(wire);
+                const payloads = [_]abi.Bytes{.{ .ptr = wire.ptr, .len = wire.len }};
+                const check: abi.Check = .{ .kind = .proposal, .new_work_allowed = 1, .state = .{
+                    .term = 1,
+                    .applied_term = 1,
+                    .applied_term_known = 1,
+                    .applied_index = previous,
+                    .last_index = previous,
+                }, .proposals = .{ .ptr = &payloads, .len = 1 } };
+                try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.check(lease.context, &check, &result));
+                const accepted_index = previous + 1;
+                const prior_runs = backend.runs.count();
+                lease.vtable.proposal_result(lease.context, &.{ .state = check.state, .first_index = accepted_index, .last_index = accepted_index, .payloads = check.proposals });
+                if (step == 2 and scenario != 0) {
+                    if (scenario >= 3) storage_io.test_completion_io_fault = Fault.fail else pool_module.test_control_checkpoint_fault = if (scenario == 1) .after_manifest else .after_wal_reset;
+                }
+                const applied = lease.vtable.apply_accepted.?(lease.context, 1, accepted_index, payloads[0]);
+                if (step == 2 and scenario != 0) {
+                    try std.testing.expect(applied != runtime_failure_abi.Status.ok);
+                    try std.testing.expect(if (scenario >= 3) Fault.fired else pool_module.test_control_checkpoint_fault_hit);
+                    try std.testing.expect(pool.failed);
+                    try std.testing.expect(try control_guard.hasAny(backend.storage.?, alloc, backend.root_dir.?));
+                    continue;
+                }
+                try std.testing.expectEqual(runtime_failure_abi.Status.ok, applied);
+                if (step == 2) {
+                    try std.testing.expect(pool.control_owners[0] == null);
+                    try std.testing.expect(!try control_guard.hasAny(backend.storage.?, alloc, backend.root_dir.?));
+                    try std.testing.expectEqual(prior_runs + 1, backend.runs.count());
+                }
+            }
+            if (scenario == 0) {
+                try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try db.getTransactionStatus(id));
+                try std.testing.expect((try db.core.getStoreValue(alloc, &control_record.ownerKey(id))) == null);
+                const progress_bytes = (try db.core.getStoreValue(alloc, &control_record.progressKey(id))).?;
+                defer alloc.free(progress_bytes);
+                const progress = try control_record.Progress.decode(progress_bytes);
+                try std.testing.expectEqual(@as(u32, 2), progress.acknowledged);
+                try std.testing.expectEqual(@as(u8, 3), progress.ack_bitmap[0]);
+                const backend_runtime = @import("../lsm_backend/runtime.zig");
+                const locked = backend_runtime.lockBackend(lsm_backend_mod.Backend, backend);
+                defer backend_runtime.unlockBackend(lsm_backend_mod.Backend, backend, locked);
+                var ordinary: @import("../lsm_backend/state.zig").ActiveMemTable = .{};
+                defer ordinary.deinit(alloc);
+                try ordinary.upsert(alloc, .{}, "post-terminal", "value", false);
+                try std.testing.expectError(error.CompletionReservationBusy, pool.checkOrdinary(backend, &ordinary));
+                try pool.maintainLocked(backend);
+                try pool.qualifyFresh(backend);
+                try pool.checkOrdinary(backend, &ordinary);
+            }
+        }
+        pool_module.test_control_checkpoint_fault = null;
+        storage_io.test_completion_io_fault = null;
+        const config = (try DB.completionInstallationPreflight(alloc, std.Options.debug_io, path, binding, "", "", "{}")).?;
+        var reopen = options;
+        reopen.durable_completion_authority = .raft_apply;
+        reopen.completion_pool_config = config;
+        if (scenario != 0) {
+            if (DB.open(alloc, path, reopen)) |opened| {
+                var unexpected = opened;
+                unexpected.close();
+                return error.TestUnexpectedResult;
+            } else |_| {}
+            continue;
+        }
+        var reopened = try DB.open(alloc, path, reopen);
+        defer reopened.close();
+        try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try reopened.getTransactionStatus(id));
+        const durable = (try reopened.core.getStoreValue(alloc, &control_record.progressKey(id))).?;
+        defer alloc.free(durable);
+        try std.testing.expectEqual(@as(u32, 2), (try control_record.Progress.decode(durable)).acknowledged);
+    }
+}
+
+test "workload admission physical completion rejected staged BEGIN retires native owner before reopen" {
+    const alloc = std.testing.allocator;
+    const abi = @import("kernel_owner_abi").completion_pool;
+    const local = @import("../local_write.zig");
+    const control_guard = @import("../lsm_backend/completion_control_guard.zig");
+    var tmp = try TestDirectory.init("completion-rejected-control-begin");
+    defer tmp.cleanup();
+    const path = std.mem.span(tmp.path().ptr);
+    var resources = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer resources.deinit(alloc);
+    try resources.configureTransactionCompletion(1024 * 1024);
+    const settings: table_storage_mod.Settings = .{ .transaction_recovery = .{
+        .protocol_version = 1,
+        .max_count = 4,
+        .max_bytes = 1024 * 1024,
+        .max_transaction_bytes = 64 * 1024,
+        .completion_protocol_version = 1,
+        .profile_version = 1,
+    } };
+    const options: OpenOptions = .{
+        .resource_manager = &resources,
+        .durable_completion_enabled = true,
+        .durable_completion_authority = .standalone_local,
+        .table_storage = settings,
+        .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    };
+    const binding: abi.InstallBinding = .{
+        .identity = .{ .group_id = 2, .node_id = 7, .capacity = 4, .generation = 1, .incarnation = @splat(27), .policy_digest = @import("../../metadata/completion_activation.zig").policyDigest(settings.transaction_recovery.?) },
+        .table_id = 1,
+        .range_id = 3,
+        .schema_catalog_digest = try @import("../../common/completion_catalog_digest.zig").digest(alloc, "", "", "{}"),
+    };
+    {
+        var db = try DB.open(alloc, path, options);
+        defer db.close();
+        try db.installCompletionBinding(binding, "", "", "{}", settings);
+        const lease = try db.acquireCompletionLease(2, 7);
+        defer lease.vtable.release(lease.context);
+        const startup: abi.DurableLog = .{ .mode = .startup_complete };
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.reconcile_durable.?(lease.context, &startup));
+        const backend = db.core.primary_store_owner.lsmBackend().?;
+        {
+            const backend_runtime = @import("../lsm_backend/runtime.zig");
+            const locked = backend_runtime.lockBackend(lsm_backend_mod.Backend, backend);
+            defer backend_runtime.unlockBackend(lsm_backend_mod.Backend, backend, locked);
+            try backend.completion_pool.?.enableControlOwnerStaging(backend);
+        }
+        const local_participant = try @import("../../api/distributed_txn.zig").participantIdForGroup(alloc, "docs", 2);
+        defer alloc.free(local_participant);
+        const peer = try @import("../../api/distributed_txn.zig").participantIdForGroup(alloc, "docs", 3);
+        defer alloc.free(peer);
+        const id: transactions_mod.TxnId = @splat(212);
+        const request: types.BatchRequest = .{ .transaction = .{ .begin = .{
+            .txn_id = id,
+            .begin_timestamp = 100,
+            .created_at_ns = 90,
+            .topology_epoch = 1,
+            .retain_terminal = true,
+            .participants = &.{ local_participant, peer },
+        } } };
+        const wire = try local.compileStorageKernelReplicatedCompletion(alloc, &db, "docs", 2, request, .{ .term = 0, .index = 0 });
+        defer alloc.free(wire);
+        const payloads = [_]abi.Bytes{.{ .ptr = wire.ptr, .len = wire.len }};
+        const proposal: abi.Check = .{ .kind = .proposal, .new_work_allowed = 1, .state = .{ .term = 1, .applied_term_known = 1 }, .proposals = .{ .ptr = &payloads, .len = 1 } };
+        var result: abi.CheckResult = undefined;
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.check(lease.context, &proposal, &result));
+        try std.testing.expect(backend.completion_pool.?.control_owners[0] != null);
+        try std.testing.expect(backend.completion_pool.?.control_owners[0].?.output_pin.path != null);
+        lease.vtable.proposal_result(lease.context, &.{ .state = proposal.state, .payloads = proposal.proposals });
+        try std.testing.expect(backend.completion_pool.?.control_owners[0] == null);
+        try std.testing.expect(!try control_guard.hasAny(backend.storage.?, alloc, backend.root_dir.?));
+        try std.testing.expectError(error.TxnNotFound, db.getTransactionStatus(id));
+    }
+    const config = (try DB.completionInstallationPreflight(alloc, std.Options.debug_io, path, binding, "", "", "{}")).?;
+    var reopen = options;
+    reopen.durable_completion_authority = .raft_apply;
+    reopen.completion_pool_config = config;
+    var db = try DB.open(alloc, path, reopen);
+    defer db.close();
+    try db.installCompletionBinding(binding, "", "", "{}", settings);
+}
+
+test "workload admission physical completion staged BEGIN rejects unbacked 69th run input before acceptance" {
+    const alloc = std.testing.allocator;
+    const abi = @import("kernel_owner_abi").completion_pool;
+    const local = @import("../local_write.zig");
+    const control_guard = @import("../lsm_backend/completion_control_guard.zig");
+    var tmp = try TestDirectory.init("completion-control-run-frontier");
+    defer tmp.cleanup();
+    const path = std.mem.span(tmp.path().ptr);
+    var resources = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer resources.deinit(alloc);
+    try resources.configureTransactionCompletion(1024 * 1024);
+    const settings: table_storage_mod.Settings = .{ .transaction_recovery = .{
+        .protocol_version = 1,
+        .max_count = 4,
+        .max_bytes = 1024 * 1024,
+        .max_transaction_bytes = 64 * 1024,
+        .completion_protocol_version = 1,
+        .profile_version = 1,
+    } };
+    const options: OpenOptions = .{
+        .resource_manager = &resources,
+        .durable_completion_enabled = true,
+        .durable_completion_authority = .standalone_local,
+        .table_storage = settings,
+        .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 },
+        .primary_backend = .{ .lsm = .{ .flush_threshold = 1024 * 1024, .compact_threshold_runs = 100, .foreground_soft_compaction = false } },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    };
+    const binding: abi.InstallBinding = .{
+        .identity = .{ .group_id = 2, .node_id = 7, .capacity = 4, .generation = 1, .incarnation = @splat(27), .policy_digest = @import("../../metadata/completion_activation.zig").policyDigest(settings.transaction_recovery.?) },
+        .table_id = 1,
+        .range_id = 3,
+        .schema_catalog_digest = try @import("../../common/completion_catalog_digest.zig").digest(alloc, "", "", "{}"),
+    };
+    {
+        var db = try DB.open(alloc, path, options);
+        defer db.close();
+        try db.configureTableStorage(settings);
+        const backend = db.core.primary_store_owner.lsmBackend().?;
+        var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+        defer runtime.deinit();
+        var i: usize = 0;
+        // Installation flushes its reconciled completion ledger into one more
+        // run. Leave exactly 63 inputs so the installed pool sees 64.
+        while (backend.runs.count() < 63) : (i += 1) {
+            var key: [32]u8 = undefined;
+            const name = try std.fmt.bufPrint(&key, "frontier-{d:0>3}", .{i});
+            var write = try runtime.beginWrite();
+            errdefer write.abort();
+            try write.put(name, "{}");
+            try write.commit();
+            const backend_runtime = @import("../lsm_backend/runtime.zig");
+            const locked = backend_runtime.lockBackend(lsm_backend_mod.Backend, backend);
+            defer backend_runtime.unlockBackend(lsm_backend_mod.Backend, backend, locked);
+            try backend.flushMutable();
+        }
+        try std.testing.expectEqual(@as(usize, 63), backend.runs.count());
+        try db.installCompletionBinding(binding, "", "", "{}", settings);
+        try std.testing.expectEqual(@as(usize, 64), backend.runs.count());
+        const lease = try db.acquireCompletionLease(2, 7);
+        defer lease.vtable.release(lease.context);
+        const startup: abi.DurableLog = .{ .mode = .startup_complete };
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.reconcile_durable.?(lease.context, &startup));
+        {
+            const backend_runtime = @import("../lsm_backend/runtime.zig");
+            const locked = backend_runtime.lockBackend(lsm_backend_mod.Backend, backend);
+            defer backend_runtime.unlockBackend(lsm_backend_mod.Backend, backend, locked);
+            try backend.completion_pool.?.enableControlOwnerStaging(backend);
+        }
+        const local_participant = try @import("../../api/distributed_txn.zig").participantIdForGroup(alloc, "docs", 2);
+        defer alloc.free(local_participant);
+        const peer = try @import("../../api/distributed_txn.zig").participantIdForGroup(alloc, "docs", 3);
+        defer alloc.free(peer);
+        const id: transactions_mod.TxnId = @splat(214);
+        const request: types.BatchRequest = .{ .transaction = .{ .begin = .{
+            .txn_id = id,
+            .begin_timestamp = 100,
+            .created_at_ns = 90,
+            .topology_epoch = 1,
+            .retain_terminal = true,
+            .participants = &.{ local_participant, peer },
+        } } };
+        const wire = try local.compileStorageKernelReplicatedCompletion(alloc, &db, "docs", 2, request, .{ .term = 0, .index = 0 });
+        defer alloc.free(wire);
+        {
+            const backend_runtime = @import("../lsm_backend/runtime.zig");
+            const locked = backend_runtime.lockBackend(lsm_backend_mod.Backend, backend);
+            defer backend_runtime.unlockBackend(lsm_backend_mod.Backend, backend, locked);
+            const pool = backend.completion_pool.?;
+            // 64 current inputs plus four document outputs and one retained
+            // control output require 69. The installed native path plan has 68.
+            try std.testing.expectError(error.UnsupportedCompletionProfile, pool.accept(backend, 1, 1, 0, 0, wire));
+            try std.testing.expect(pool.control_owners[0] == null);
+            try std.testing.expectError(error.FileNotFound, pool.io.storage().fileSize(pool.accepted_paths[0]));
+            try std.testing.expect(!try control_guard.hasAny(backend.storage.?, alloc, backend.root_dir.?));
+        }
+        try std.testing.expectError(error.TxnNotFound, db.getTransactionStatus(id));
+    }
+    const config = (try DB.completionInstallationPreflight(alloc, std.Options.debug_io, path, binding, "", "", "{}")).?;
+    var reopen = options;
+    reopen.durable_completion_authority = .raft_apply;
+    reopen.completion_pool_config = config;
+    var reopened = try DB.open(alloc, path, reopen);
+    defer reopened.close();
+}
+
+test "workload admission physical completion single-phase restart after WAL and manifest publication" {
+    const alloc = std.testing.allocator;
+    const abi = @import("kernel_owner_abi").completion_pool;
+    const native = @import("../lsm_backend/completion_runtime.zig");
+    const Cut = struct {
+        fn stop() bool {
+            return true;
+        }
+    };
+    const Stage = enum { accepted, wal, manifest };
+    for ([_]bool{ false, true }) |begin| {
+        for ([_]Stage{ .accepted, .wal, .manifest }) |stage| {
+            var tmp = try TestDirectory.init("completion-single-phase-restart");
+            defer tmp.cleanup();
+            const path = std.mem.span(tmp.path().ptr);
+            var resources = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+            defer resources.deinit(alloc);
+            try resources.configureTransactionCompletion(1024 * 1024);
+            const settings: table_storage_mod.Settings = .{ .transaction_recovery = .{
+                .protocol_version = 1,
+                .max_count = 4,
+                .max_bytes = 1024 * 1024,
+                .max_transaction_bytes = 64 * 1024,
+                .completion_protocol_version = 1,
+                .profile_version = 1,
+            } };
+            var options: OpenOptions = .{
+                .resource_manager = &resources,
+                .durable_completion_enabled = true,
+                .durable_completion_authority = .standalone_local,
+                .table_storage = settings,
+                .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 },
+                .start_index_workers = false,
+                .start_optional_runtimes = false,
+                .ttl_cleanup = .{ .enabled = false },
+            };
+            var binding: abi.InstallBinding = .{ .identity = .{ .group_id = 2, .node_id = 7, .capacity = 4, .generation = 1, .incarnation = @splat(23), .policy_digest = @import("../../metadata/completion_activation.zig").policyDigest(settings.transaction_recovery.?) }, .table_id = 1, .range_id = 3 };
+            binding.schema_catalog_digest = try @import("../../common/completion_catalog_digest.zig").digest(alloc, "", "", "{}");
+            var wire: ?[]u8 = null;
+            defer if (wire) |value| alloc.free(value);
+            var mutation_id: transactions_mod.TxnId = undefined;
+            {
+                var db = try DB.open(alloc, path, options);
+                defer db.close();
+                try db.installCompletionBinding(binding, "", "", "{}", settings);
+                const lease = try db.acquireCompletionLease(2, 7);
+                defer lease.vtable.release(lease.context);
+                const startup: abi.DurableLog = .{ .mode = .startup_complete };
+                try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.reconcile_durable.?(lease.context, &startup));
+                wire = if (begin) try db.compileReplicatedBegin(alloc, .{
+                    .txn_id = @splat(210),
+                    .timestamp = 100,
+                    .created_at = 90,
+                    .topology_epoch = 1,
+                    .participants = &.{},
+                    .coordinator = true,
+                    .retain_terminal = true,
+                }, .{ .term = 0, .index = 0 }) else try db.compileReplicatedMutation(alloc, .{ .writes = &.{.{ .key = "doc", .value = "{\"value\":7}" }}, .timestamp_ns = 100 }, .{ .term = 0, .index = 0 });
+                var decoded = try @import("../lsm_backend/completion_entry.zig").decode(alloc, wire.?);
+                defer decoded.deinit();
+                mutation_id = decoded.entry.txn_id;
+                const payloads = [_]abi.Bytes{.{ .ptr = wire.?.ptr, .len = wire.?.len }};
+                const proposal: abi.Check = .{ .kind = .proposal, .new_work_allowed = 1, .state = .{ .term = 1, .applied_term_known = 1 }, .proposals = .{ .ptr = &payloads, .len = 1 } };
+                var result: abi.CheckResult = undefined;
+                try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.check(lease.context, &proposal, &result));
+                const accepted: abi.ProposalResult = .{ .state = proposal.state, .first_index = 1, .last_index = 1, .payloads = proposal.proposals };
+                lease.vtable.proposal_result(lease.context, &accepted);
+                if (stage == .manifest) native.test_after_manifest = Cut.stop;
+                if (stage == .wal) native.test_after_wal = Cut.stop;
+                defer {
+                    native.test_after_manifest = null;
+                    native.test_after_wal = null;
+                }
+                if (stage != .accepted) try std.testing.expectEqual(runtime_failure_abi.Status.recovery_required, lease.vtable.apply_accepted.?(lease.context, 1, 1, payloads[0]));
+            }
+            // Restore actual primary WAL/manifest state with admission disabled.
+            // This is a component crash cut; quorum/process failures are separate.
+            options.durable_completion_authority = .raft_apply;
+            options.durable_completion_enabled = false;
+            options.completion_pool_config = (try DB.completionInstallationPreflight(alloc, std.Options.debug_io, path, binding, "", "", "{}")).?;
+            var db = try DB.open(alloc, path, options);
+            defer db.close();
+            try db.installCompletionBinding(binding, "", "", "{}", settings);
+            const lease = try db.acquireCompletionLease(2, 7);
+            defer lease.vtable.release(lease.context);
+            if (stage == .accepted) {
+                var cells: abi.DurableCells = undefined;
+                try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.durable_cells.?(lease.context, &cells));
+                var proof: abi.DurableLog = .{ .mode = .startup_complete, .last_index = 1, .commit_index = 1, .count = cells.count };
+                for (cells.cells[0..cells.count], proof.observations[0..cells.count]) |cell, *observation| {
+                    observation.* = .{ .expected = cell.identity, .present = 1, .observed_term = cell.identity.term, .observed_digest = cell.identity.payload_digest };
+                }
+                try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.reconcile_durable.?(lease.context, &proof));
+                try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.apply_accepted.?(lease.context, 1, 1, .{ .ptr = wire.?.ptr, .len = wire.?.len }));
+            }
+            if (begin) {
+                try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try db.getTransactionStatus(@splat(210)));
+            } else {
+                const value = (try db.get(alloc, "doc")).?;
+                defer alloc.free(value);
+                try std.testing.expectEqualStrings("{\"value\":7}", value);
+            }
+            try std.testing.expectError(error.TxnNotFound, db.getTransactionStatus(mutation_id));
+            var progress: abi.Progress = undefined;
+            try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.progress.?(lease.context, &progress));
+            try std.testing.expectEqual(@as(u64, 1), progress.term);
+            try std.testing.expectEqual(@as(u64, 1), progress.index);
+            try std.testing.expectEqualSlices(u8, &@import("../../common/completion_entry_protocol.zig").payloadDigest(wire.?), &progress.payload_digest);
+            const payload: abi.Bytes = .{ .ptr = wire.?.ptr, .len = wire.?.len };
+            try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.apply_accepted.?(lease.context, 1, 1, payload));
+            if (!begin) try std.testing.expectEqual(@as(u64, 1), db.core.identity_visibility.summary.?.live_ordinals);
+        }
+    }
+}
+
+test "workload admission physical completion normal APIs cover multi-document insert delete retry and disabled restart" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("physical-completion-api");
+    defer tmp.cleanup();
+    const path = std.mem.span(tmp.path().ptr);
+    const id: transactions_mod.TxnId = @splat(181);
+    var resources = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer resources.deinit(alloc);
+    try resources.configureTransactionCompletion(1024 * 1024);
+    var options: OpenOptions = .{
+        .resource_manager = &resources,
+        .durable_completion_enabled = true,
+        .durable_completion_authority = .standalone_local,
+        .table_storage = .{ .transaction_recovery = .{
+            .protocol_version = 1,
+            .max_count = 4,
+            .max_bytes = 1024 * 1024,
+            .max_transaction_bytes = 64 * 1024,
+            .completion_protocol_version = 1,
+            .profile_version = 1,
+        } },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    };
+    const request: types.TransactionIntentRequest = .{
+        .writes = &.{ .{ .key = "old", .value = "{\"nested\":{\"value\":2}}" }, .{ .key = "new", .value = "{\"value\":3}" } },
+        .deletes = &.{"gone"},
+    };
+    {
+        var db = try DB.open(alloc, path, options);
+        defer db.close();
+        try db.batch(.{ .writes = &.{ .{ .key = "old", .value = "{\"value\":1}" }, .{ .key = "gone", .value = "{}" } }, .timestamp_ns = 100 });
+        _ = try db.beginTransactionWithId(id, 200);
+        try db.writeTransaction(id, request);
+        try std.testing.expect(db.core.primary_store_owner.lsmBackend().?.findDurableCompletion(id) != null);
+        try std.testing.expect((try db.get(alloc, "new")) == null);
+        db.durable_completion_enabled = false;
+        try db.writeTransaction(id, request);
+        try std.testing.expectError(error.PreparedCompletionActive, db.writeTransaction(id, .{ .writes = &.{.{ .key = "old", .value = "{}" }} }));
+    }
+    options.durable_completion_enabled = false;
+    var db = try DB.open(alloc, path, options);
+    defer db.close();
+    try db.resolveTransactionIntents(id, .committed, 300);
+    const old = (try db.get(alloc, "old")).?;
+    defer alloc.free(old);
+    try std.testing.expectEqualStrings(request.writes[0].value, old);
+    const inserted = (try db.get(alloc, "new")).?;
+    defer alloc.free(inserted);
+    try std.testing.expectEqualStrings(request.writes[1].value, inserted);
+    try std.testing.expect((try db.get(alloc, "gone")) == null);
+    try std.testing.expectEqual(@as(u64, 300), try db.getTimestamp(alloc, "new"));
+    const stats = try doc_identity.fastStatsFromStore(db.core.store);
+    try std.testing.expectEqual(@as(u64, 2), stats.live_ordinals);
+    try std.testing.expectEqual(@as(u64, 2), db.core.identity_visibility.summary.?.live_ordinals);
+    try db.core.completion_eligibility.checkTransition();
+    const other = try db.beginTransaction(400);
+    try std.testing.expectError(error.LocalCompletionAuthorityRequired, db.writeIntents(other, &.{.{ .key = "blocked", .value = "{}" }}, &.{}));
+    try std.testing.expect(!try db.core.transactionHasIntents(other));
+}
+
+test "workload admission physical completion cohort shares new reservations with stable recovery owner" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("physical-completion-cohort");
+    defer tmp.cleanup();
+    var resources = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer resources.deinit(alloc);
+    try resources.configureTransactionCompletion(1024 * 1024);
+    var recorder = TxnResolverRecorder{};
+    var db = try DB.open(alloc, std.mem.span(tmp.path().ptr), .{
+        .resource_manager = &resources,
+        .durable_completion_enabled = true,
+        .durable_completion_authority = .standalone_local,
+        .table_storage = .{ .transaction_recovery = .{
+            .protocol_version = 1,
+            .max_count = 8,
+            .max_bytes = 1024 * 1024,
+            .max_transaction_bytes = 64 * 1024,
+            .completion_protocol_version = 1,
+            .profile_version = 1,
+        } },
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .transaction_recovery = .{ .enabled = true, .resolver_ctx = &recorder, .resolve_participant_fn = TxnResolverRecorder.resolve },
+    });
+    defer db.close();
+    try db.prepareTransactionRecoveryOwner();
+    const recovery = db.transaction_recovery_local_context.?.stable_owner.?;
+    try std.testing.expect(&db.async_context.durable_completion_backlogs == &recovery.async_context.durable_completion_backlogs);
+    const keys = [_][]const u8{ "one", "two", "three", "four", "five" };
+    var ids: [5]transactions_mod.TxnId = undefined;
+    for (keys, &ids) |key, *id| {
+        try db.batch(.{ .writes = &.{.{ .key = key, .value = "{\"value\":1}" }}, .timestamp_ns = 100 });
+        id.* = try db.beginTransaction(200);
+    }
+    for (keys[0..4], ids[0..4]) |key, id| try db.writeTransaction(id, .{ .writes = &.{.{ .key = key, .value = "{\"value\":2}" }} });
+    try std.testing.expectError(error.CompletionRecoveryCapacityRequired, db.writeTransaction(ids[4], .{ .writes = &.{.{ .key = keys[4], .value = "{\"value\":2}" }} }));
+    try std.testing.expect(!try db.core.transactionHasIntents(ids[4]));
+    {
+        const previous = resources.memory.budget.hard_limit_bytes;
+        resources.memory.budget.hard_limit_bytes = 1;
+        defer resources.memory.budget.hard_limit_bytes = previous;
+        try recovery.resolveTransactionIntents(ids[3], .committed, 300);
+        try recovery.resolveTransactionIntents(ids[2], .aborted, 300);
+        try recovery.resolveTransactionIntents(ids[1], .committed, 300);
+        try recovery.resolveTransactionIntents(ids[0], .committed, 300);
+    }
+    try db.core.completion_eligibility.checkTransition();
+    try std.testing.expect(!db.core.primary_store_owner.lsmBackend().?.hasDurableCompletions());
+    for (keys, 0..) |key, i| {
+        const value = (try db.get(alloc, key)).?;
+        defer alloc.free(value);
+        try std.testing.expectEqualStrings(if (i == 2 or i == 4) "{\"value\":1}" else "{\"value\":2}", value);
+    }
+}
+
+test "workload admission physical completion relational restart preserves TTL fields checksums and index targets" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("physical-relational-completion");
+    defer tmp.cleanup();
+    var resources = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer resources.deinit(alloc);
+    try resources.configureTransactionCompletion(1024 * 1024);
+    const options: OpenOptions = .{
+        .resource_manager = &resources,
+        .durable_completion_enabled = true,
+        .durable_completion_authority = .standalone_local,
+        .table_storage = .{ .transaction_recovery = .{
+            .protocol_version = 1,
+            .max_count = 4,
+            .max_bytes = 1024 * 1024,
+            .max_transaction_bytes = 64 * 1024,
+            .completion_protocol_version = 1,
+            .profile_version = 1,
+        } },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    };
+    const path = std.mem.span(tmp.path().ptr);
+    const id: transactions_mod.TxnId = @splat(182);
+    {
+        var db = try DB.open(alloc, path, options);
+        defer db.close();
+        try db.setSchema(.{
+            .version = 1,
+            .storage_mode = .relational,
+            .ttl_duration_ns = std.math.maxInt(u64),
+            .ttl_field = "when",
+            .relational_columns = &.{ .{ .name = "title", .path = "title", .column_type = .string, .required = true }, .{ .name = "when", .path = "when", .column_type = .integer } },
+        });
+        try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+        _ = try db.beginTransactionWithId(id, 100);
+        try db.writeTransaction(id, .{ .writes = &.{
+            .{ .key = "fallback", .value = "{\"title\":\"future commit clock\"}" },
+            .{ .key = "explicit", .value = "{\"title\":\"user clock\",\"when\":1}" },
+        } });
+    }
+    var db = try DB.open(alloc, path, options);
+    defer db.close();
+    const Hook = struct {
+        known: bool = false,
+        found: bool = false,
+        fn changed(ptr: *anyopaque, _: []const u8, _: u64, _: ?*DB, event: QueryVisibilityEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (event.change != .target_advanced) return;
+            self.known = event.target_scope_known;
+            for (event.target_indexes) |index| if (std.mem.eql(u8, index.index_name, "text")) {
+                self.found = true;
+            };
+        }
+    };
+    var hook: Hook = .{};
+    db.setQueryVisibilityHook(.{ .ptr = &hook, .table_name = "docs", .group_id = 1, .db = &db, .on_change = Hook.changed });
+    defer db.setQueryVisibilityHook(null);
+    const revision = db.core.store.columnar_revision.load(.acquire);
+    try db.resolveTransactionIntents(id, .committed, 300);
+    try std.testing.expect(db.core.store.columnar_revision.load(.acquire) > revision);
+    try std.testing.expect(hook.known and hook.found);
+    for ([_][]const u8{ "fallback", "explicit" }, [_]u64{ 300, 1 }) |key, timestamp| {
+        const encoded = try internal_keys.relationalRowKeyAlloc(alloc, key);
+        defer alloc.free(encoded);
+        const row = try db.core.store.get(alloc, encoded);
+        defer alloc.free(row);
+        try std.testing.expectEqual(timestamp, try relational_row_codec.rowWriteTimestampNs(row));
+        try std.testing.expectEqual(timestamp, try db.getTimestamp(alloc, key));
     }
 }

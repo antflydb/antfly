@@ -18,8 +18,9 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 65;
+pub const abi_version: u32 = 71;
 pub const Status = failure_abi.Status;
+pub const completion_pool = @import("completion_pool_abi.zig");
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
 pub const failure_error_name_capacity = failure_abi.failure_error_name_capacity;
@@ -304,6 +305,30 @@ pub const ContextRequest = extern struct {
     _reserved0: [7]u8 = @splat(0),
     storage_path: BorrowedBytes = .{},
     auth_storage_path: BorrowedBytes = .{},
+    dense_max_runnable_tasks: u32 = 0,
+    dense_max_outstanding_tasks: u32 = 0,
+    dense_max_queued_tasks: u32 = 0,
+    dense_max_wait_ms: u32 = 0,
+    dense_max_working_bytes: u64 = 0,
+    dense_max_suspended_io: u32 = 0,
+    read_max_runnable_tasks: u32 = 0,
+    read_max_outstanding_tasks: u32 = 0,
+    read_max_queued_tasks: u32 = 0,
+    read_max_wait_ms: u32 = 0,
+    read_max_working_bytes: u64 = 0,
+    read_max_suspended_io: u32 = 0,
+    read_max_scan_state_bytes: u64 = 0,
+    read_max_scan_snapshot_ms: u32 = 30_000,
+    read_protected_runnable_tasks: u32 = 0,
+    read_protected_outstanding_tasks: u32 = 0,
+    read_protected_working_bytes: u64 = 0,
+    read_transition_tasks: u32 = 0,
+    read_transition_bytes: u64 = 0,
+    transaction_completion_bytes: u64 = 0,
+    durable_completion_enabled: u8 = 0,
+    /// Trusted runtime bootstrap tag, not a client-supplied authority claim.
+    durable_completion_authority: u8 = 0,
+    _completion_reserved: [6]u8 = @splat(0),
 };
 
 /// One low-volume engine namespace used by control-plane metadata or durable
@@ -406,6 +431,9 @@ pub const ContextCacheKindStats = extern struct {
 pub const ContextMetricsResult = extern struct {
     version: u32 = abi_version,
     _reserved0: u32 = 0,
+    durable_completion_enabled: u8 = 0,
+    durable_completion_authority: u8 = 0,
+    _completion_reserved: [6]u8 = @splat(0),
     lsm_cache_used_bytes: u64 = 0,
     lsm_cache_entry_count: u64 = 0,
     lsm_run_state: ContextCacheKindStats = .{},
@@ -413,6 +441,24 @@ pub const ContextMetricsResult = extern struct {
     lsm_run_table_index: ContextCacheKindStats = .{},
     lsm_run_table_block: ContextCacheKindStats = .{},
     lsm_run_table_physical_block: ContextCacheKindStats = .{},
+    dense_max_runnable_tasks: u32 = 0,
+    dense_max_outstanding_tasks: u32 = 0,
+    dense_max_queued_tasks: u32 = 0,
+    dense_max_wait_ms: u32 = 0,
+    dense_all_reads: u8 = 0,
+    read_bounded_runnable: u64 = 0,
+    read_bounded_outstanding: u64 = 0,
+    read_transition_outstanding: u64 = 0,
+    read_transition_bytes: u64 = 0,
+
+    dense_runnable: u64 = 0,
+    dense_outstanding: u64 = 0,
+    dense_queued: u64 = 0,
+    dense_max_working_bytes: u64 = 0,
+    dense_max_suspended_io: u32 = 0,
+    dense_suspended_io: u64 = 0,
+    dense_effective_max_suspended_io: u32 = 0,
+    dense_working_bytes: u64 = 0,
 };
 
 /// Process-owned data-Raft apply/projection store. Requests are deliberately
@@ -469,6 +515,9 @@ pub const MetadataApplyPrepareSnapshotRequest = extern struct {
     applied_index: u64 = 0,
 };
 
+pub const completion_projection_max_request_bytes: usize = 64 * 1024;
+pub const completion_projection_max_response_bytes: usize = 8 * 1024 * 1024;
+
 pub const MetadataProjectionKind = enum(u32) {
     latest_checkpoint = 0,
     metadata_incarnation = 1,
@@ -514,7 +563,8 @@ pub const MetadataProjectionKind = enum(u32) {
     table_restore_admission = 38,
     verify_table_create_projection = 39,
     system_catalog = 41,
-    backup_cohort = 63,
+    /// Opaque binary AFSC bytes (empty = absent), unlike JSON projections.
+    secret_collection = 42,
     backup_cohort_progress = 43,
     backup_cohorts = 44,
     restore_staging_job = 45,
@@ -535,8 +585,12 @@ pub const MetadataProjectionKind = enum(u32) {
     migrate_standalone_restore_jobs = 60,
     restore_staging_authority_allowed = 61,
     merge_transition = 62,
-    /// Opaque binary AFSC bytes (empty = absent), unlike JSON projections.
-    secret_collection = 42,
+    backup_cohort = 63,
+    /// Completion projections return bounded raw owned bytes, without an
+    /// additional JSON-string envelope around the already encoded record.
+    capture_completion_activation = 64,
+    completion_activation = 65,
+    completion_installation_response = 66,
 };
 
 pub const MetadataHABindRequest = extern struct {
@@ -1030,6 +1084,10 @@ pub const RestoreAdmission = extern struct {
 pub const OpenRequest = extern struct {
     version: u32 = abi_version,
     _reserved0: u32 = 0,
+    /// Synchronously borrowed from the runtime's verified installation registry.
+    completion_installation: ?*const completion_pool.InstallBinding = null,
+    completion_read_schema_json: BorrowedBytes = .{},
+    completion_settings_json: BorrowedBytes = .{},
     context: ?*anyopaque = null,
     path: BorrowedBytes = .{},
     table_name: BorrowedBytes = .{},
@@ -1065,11 +1123,32 @@ pub const OpenRequest = extern struct {
     restore: RestoreAdmission = .{},
 };
 
+pub const InstallCompletionRequest = extern struct {
+    version: u32 = abi_version,
+    reserved: u32 = 0,
+    binding: completion_pool.InstallBinding,
+    schema_json: BorrowedBytes = .{},
+    read_schema_json: BorrowedBytes = .{},
+    indexes_json: BorrowedBytes = .{},
+    settings_json: BorrowedBytes = .{},
+};
+
 pub const JsonOperationRequest = extern struct {
     version: u32 = abi_version,
     _reserved0: u32 = 0,
     table_name: BorrowedBytes = .{},
     request_json: BorrowedBytes = .{},
+};
+
+/// Leader-only proposal candidate compilation. The returned bytes grant no
+/// authority; the retained native guard must adopt resources before acceptance.
+pub const CompileReplicatedCompletionRequest = extern struct {
+    version: u32 = abi_version,
+    reserved: u32 = 0,
+    table_name: BorrowedBytes = .{},
+    request_json: BorrowedBytes = .{},
+    previous_term: u64 = 0,
+    previous_index: u64 = 0,
 };
 
 /// One committed data-Raft mutation. The log identity is persisted atomically
@@ -1795,6 +1874,7 @@ pub extern fn antfly_storage_owner_open(
     out_owner: *?*anyopaque,
 ) callconv(.c) Status;
 
+pub extern fn antfly_storage_owner_quiesce(owner: ?*anyopaque) callconv(.c) Status;
 pub extern fn antfly_storage_owner_close(owner: ?*anyopaque) callconv(.c) void;
 
 pub extern fn antfly_storage_hot_standby_seed_activate_json(
@@ -1870,6 +1950,12 @@ pub extern fn antfly_storage_owner_replicated_batch_json(
 pub extern fn antfly_storage_owner_replicated_batch_at_raft_entry_json(
     owner: ?*anyopaque,
     request: *const ReplicatedBatchAtRaftEntryRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_owner_compile_replicated_completion(
+    owner: ?*anyopaque,
+    request: *const CompileReplicatedCompletionRequest,
     out_response: *OwnedBytes,
 ) callconv(.c) Status;
 
@@ -2212,3 +2298,11 @@ pub extern fn antfly_storage_wal_append_idempotent(
     request: *const WalIdempotentAppendRequest,
     result: *WalIdempotentAppendResult,
 ) Status;
+
+pub extern fn antfly_storage_owner_acquire_completion_lease(owner: ?*anyopaque, group_id: u64, node_id: u64, output: *completion_pool.Lease) Status;
+pub extern fn antfly_storage_owner_acquire_control_proof_lease_v2(owner: ?*anyopaque, group_id: u64, node_id: u64, output: *completion_pool.ControlLeaseV2) Status;
+pub extern fn antfly_storage_owner_acquire_control_proof_lease_v3(owner: ?*anyopaque, group_id: u64, node_id: u64, output: *completion_pool.ControlLeaseV3) Status;
+pub extern fn antfly_storage_owner_acquire_control_proof_lease_v4(owner: ?*anyopaque, group_id: u64, node_id: u64, output: *completion_pool.ControlLeaseV4) Status;
+pub extern fn antfly_storage_owner_attest_completion_backing(owner: ?*anyopaque, group_id: u64, node_id: u64, output: *completion_pool.NativeAttestation) Status;
+
+pub extern fn antfly_storage_owner_install_completion(owner: ?*anyopaque, request: *const InstallCompletionRequest) Status;

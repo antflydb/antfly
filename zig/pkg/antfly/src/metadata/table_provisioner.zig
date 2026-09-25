@@ -157,6 +157,14 @@ pub fn provisioningFingerprint(
         hasher.update(std.mem.asBytes(&table.table_id));
         hashBytes(&hasher, table.name);
         if (table.storage.dense_embeddings != .primary_lsm) hashBytes(&hasher, @tagName(table.storage.dense_embeddings));
+        if (table.storage.transaction_recovery) |policy| {
+            hashBytes(&hasher, "transaction-recovery-v1");
+            inline for (std.meta.fields(@TypeOf(policy))) |field| {
+                var bytes: [8]u8 = undefined;
+                std.mem.writeInt(u64, &bytes, @field(policy, field.name), .little);
+                hasher.update(&bytes);
+            }
+        }
         hashBytes(&hasher, table.schema_json);
         hashBytes(&hasher, table.read_schema_json);
         hashBytes(&hasher, table.indexes_json);

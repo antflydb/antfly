@@ -24,18 +24,35 @@ const std = @import("std");
 /// Version 5 adds conditional restore admission; ordinary job updates retain
 /// their existing wire format.
 /// Version 6 adds digest-conditional restore expiry.
-/// Versions 7–10 add system catalog publication, sparse store reports,
-/// membership-bound protocol activation, and resumable store inventories.
-/// Version 11 additionally requires relational topology, coordinated
-/// backup/restore/retirement, Scope-v2 sources, staged rewrite final cuts, and
-/// table storage metadata. Main's v10 decoders do not understand these commands.
-pub const current_version: u16 = 11;
+/// Version 7 adds system catalog records and atomic catalog/table publication.
+/// Version 8 adds acknowledged sparse store reports.
+/// Version 9 adds durable membership-bound protocol activation.
+/// Version 10 adds resumable store inventories and atomic schema-progress batches.
+/// Version 11 preserves nondefault table storage policy in binary records.
+/// Version 12 preserves physical completion policy and profile versions.
+/// Version 13 decodes ATS1 table metadata and snapshots secret collections.
+/// Version 14 decodes the optional internal HTTP endpoint in store records.
+pub const current_version: u16 = 14;
+pub const internal_endpoint_version: u16 = 14;
+pub const completion_storage_version: u16 = 12;
+pub const table_storage_version: u16 = 11;
+pub const table_storage_metadata_version: u16 = 13;
+pub const secret_snapshot_version: u16 = 13;
+
+pub fn tableStorageVersion(settings: @import("../common/table_storage.zig").Settings, minimum: u16) u16 {
+    if (settings.transaction_recovery) |policy| {
+        if (policy.completion_protocol_version != 0 or policy.profile_version != 0)
+            return @max(minimum, completion_storage_version);
+    }
+    if (settings.transaction_recovery == null and settings.dense_embeddings != .primary_lsm)
+        return @max(minimum, table_storage_metadata_version);
+    return if (settings.transaction_recovery != null) @max(minimum, table_storage_version) else minimum;
+}
 pub const durable_activation_version: u16 = 9;
 pub const store_report_update_version: u16 = 8;
 // Preflight and final append require the same complete decoder capability.
 pub const relational_integrity_topology_version: u16 = coordinated_lifecycle_version;
 pub const coordinated_lifecycle_version: u16 = 11;
-pub const table_storage_metadata_version: u16 = 11;
 pub const source_scope_version: u16 = 11;
 pub const restore_job_admission_version: u16 = 5;
 pub const restore_job_expiry_version: u16 = 6;
@@ -199,3 +216,27 @@ pub const store_report_baseline_version: u16 = 10;
 
 /// Atomic, bounded acknowledgements for local schema migration readiness.
 pub const schema_progress_batch_version: u16 = 10;
+
+test "workload admission storage activation requires exact membership incarnation and decoder" {
+    const required: Activation = .{
+        .version = table_storage_version,
+        .incarnation = "0123456789abcdef0123456789abcdef".*,
+        .member_count = 3,
+        .membership_fingerprint = [_]u8{42} ** 32,
+    };
+    try std.testing.expect(required.satisfies(required));
+    var stale = required;
+    stale.version = table_storage_version - 1;
+    try std.testing.expect(!stale.satisfies(required));
+    stale = required;
+    stale.incarnation[0] = '9';
+    try std.testing.expect(!stale.satisfies(required));
+    stale = required;
+    stale.membership_fingerprint[0] ^= 1;
+    try std.testing.expect(!stale.satisfies(required));
+    stale = required;
+    stale.member_count += 1;
+    try std.testing.expect(!stale.satisfies(required));
+    try std.testing.expectEqual(system_catalog_version, tableStorageVersion(.{}, system_catalog_version));
+    try std.testing.expectEqual(table_storage_metadata_version, tableStorageVersion(.{ .dense_embeddings = .vector_store }, system_catalog_version));
+}

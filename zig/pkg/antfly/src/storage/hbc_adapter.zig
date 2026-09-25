@@ -5471,6 +5471,9 @@ pub const HBCIndex = struct {
         /// as this search transaction. External exact-vector projections must
         /// not return a revision newer than this sequence.
         source_sequence: ?u64 = null,
+        /// Borrowed from this search transaction's admission owner. Only the
+        /// synchronous callback may use it; never retain or send to helpers.
+        execution_owner: ?*@import("dense_execution.zig").Runtime.Lease = null,
     };
     pub const ExternalVectorBatchDistanceLoader = *const fn (
         ctx: *anyopaque,
@@ -8556,6 +8559,13 @@ pub const HBCIndex = struct {
         if (lease.release != ExperimentalPostingReadGeneration.releaseOpaque) return null;
         const generation: *ExperimentalPostingReadGeneration = @ptrCast(@alignCast(lease.ptr));
         return generation.covered_source_sequence.load(.acquire);
+    }
+
+    fn denseExecutionDriverFromTxn(txn: anytype) ?*@import("dense_execution.zig").Runtime.Lease {
+        const Txn = comptime txnLikeChild(@TypeOf(txn));
+        if (comptime !@hasField(Txn, "execution_context")) return null;
+        const context = txn.execution_context orelse return null;
+        return @ptrCast(@alignCast(context));
     }
 
     fn experimentalPostingGenerationFromTxn(txn: anytype) ?*ExperimentalPostingReadGeneration {
@@ -13612,11 +13622,20 @@ pub const HBCIndex = struct {
                     .release = ExperimentalPostingReadGeneration.releaseOpaque,
                 };
                 txn.cache_fill_epoch = admission.cache_fill_epoch;
+                txn.execution_context = if (admission.driver.scheduledLease()) |driver|
+                    if (driver.runtime.?.config.max_suspended_io != 0) driver else null
+                else
+                    null;
                 return txn;
             }
             generation.release();
         }
-        return try self.beginRuntimeSearchTxnForCoverage(complete_snapshot);
+        var txn = try self.beginRuntimeSearchTxnForCoverage(complete_snapshot);
+        txn.execution_context = if (admission.driver.scheduledLease()) |driver|
+            if (driver.runtime.?.config.max_suspended_io != 0) driver else null
+        else
+            null;
+        return txn;
     }
 
     pub fn beginCompleteSnapshotRead(
@@ -16644,6 +16663,7 @@ pub const HBCIndex = struct {
             .vector_views = vector_view_storage,
             .bounded_projections = bounded_projection_storage[0..miss_count],
             .source_sequence = source_sequence,
+            .execution_owner = denseExecutionDriverFromTxn(txn),
         };
         if (bounded_error_bounds) |_| {
             bounded_loader.?(
@@ -18271,7 +18291,7 @@ pub const HBCIndex = struct {
     pub const SearchAdmissionLease = struct {
         bandwidth: resource_manager_mod.DenseSearchAdmissionLease = .{},
         rerank: resource_manager_mod.DenseWorkAdmission.Queue.Lease = .{},
-        driver: resource_manager_mod.DenseWorkAdmission.Queue.Lease = .{},
+        driver: resource_manager_mod.ResourceManager.DenseDriverLease = .{},
         generation: ?*ExperimentalPostingReadGeneration = null,
         /// Capture before retaining the generation. Sampling when a delayed
         /// admission becomes a transaction could pair old storage with new caches.
@@ -18372,6 +18392,18 @@ pub const HBCIndex = struct {
         return @max(@min(@max(baseline_scan_bytes, layout_scan_bytes), max_possible_scan_bytes), 1);
     }
 
+    /// Exact scorers share the configured dense task budget without changing
+    /// legacy exact routing's admission behavior when the scheduler is off.
+    pub fn acquireDenseExecutionDriver(self: *HBCIndex, req: SearchRequest) !resource_manager_mod.ResourceManager.DenseDriverLease {
+        const manager = self.resource_manager orelse return .{};
+        if (req.read_execution) |raw| return manager.borrowReadDriver(@ptrCast(@alignCast(raw)));
+        if (manager.dense_execution == null) return .{};
+        return manager.acquireDenseDriver(self.runtimeIo(), if (req.cancellation) |token|
+            .{ .ptr = token.ptr, .is_cancelled = token.is_cancelled_fn }
+        else
+            null);
+    }
+
     pub fn acquireSearchAdmission(
         self: *HBCIndex,
         active_count: u64,
@@ -18381,13 +18413,16 @@ pub const HBCIndex = struct {
         // One aggregate slot accounts for the caller throughout both phases.
         // Acquire it before any scan permit or generation lease. Helpers only
         // try the same pool; they cannot wait while the caller owns a slot.
-        var driver: resource_manager_mod.DenseWorkAdmission.Queue.Lease = .{};
+        var driver: resource_manager_mod.ResourceManager.DenseDriverLease = .{};
         errdefer driver.release();
-        if (self.resource_manager) |manager| if (manager.dense_aggregate_admission and active_count != 0) {
-            driver = try manager.dense_driver_admission.acquire(self.runtimeIo(), if (req.cancellation) |token|
-                .{ .ptr = token.ptr, .is_cancelled = token.is_cancelled_fn }
+        if (self.resource_manager) |manager| if (active_count != 0) {
+            driver = if (req.read_execution) |raw|
+                try manager.borrowReadDriver(@ptrCast(@alignCast(raw)))
             else
-                null);
+                try manager.acquireDenseDriver(self.runtimeIo(), if (req.cancellation) |token|
+                    .{ .ptr = token.ptr, .is_cancelled = token.is_cancelled_fn }
+                else
+                    null);
         };
         var lease = try self.acquireSearchAdmissionWork(active_count, node_count, req);
         lease.driver = driver;
@@ -23498,6 +23533,70 @@ test "hbc retains a bounded pool of concurrent search scratch" {
         primary_bytes,
         resource_manager.sliceStats(.dense_search_working_set).used_bytes,
     );
+}
+
+test "workload admission HBC search binds its driver to the transaction and retires cancellation" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+    var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer manager.deinit(alloc);
+    try manager.configureReadExecution(.{ .max_runnable_tasks = 1, .max_outstanding_tasks = 2, .max_queued_tasks = 1, .max_wait_ms = 5000, .max_working_bytes = 65536, .max_suspended_io = 1 });
+    var idx = try HBCIndex.open(alloc, path, .{ .dims = 2, .leaf_size = 64, .branching_factor = 2, .use_quantization = false });
+    defer idx.close();
+    try idx.insert(1, &.{ 0, 0 });
+    try idx.insert(2, &.{ 1, 1 });
+    idx.attachResourceManager(&manager);
+    {
+        var admission = try idx.acquireSearchAdmission(2, idx.metadata.node_count, .{ .query = &.{ 0, 0 }, .k = 2 });
+        defer idx.releaseSearchAdmission(&admission);
+        var txn = try idx.beginRuntimeSearchTxnForCoverageWithAdmission(&admission, false);
+        defer txn.abort();
+        try std.testing.expect(HBCIndex.denseExecutionDriverFromTxn(&txn) == &admission.driver.scheduled);
+    }
+    {
+        var outer = (try manager.acquireReadDriver(std.testing.io, .{ .io = std.testing.io })).?;
+        defer outer.release();
+        var admission = try idx.acquireSearchAdmission(2, idx.metadata.node_count, .{ .query = &.{ 0, 0 }, .k = 2, .read_execution = &outer });
+        var txn = try idx.beginRuntimeSearchTxnForCoverageWithAdmission(&admission, false);
+        try std.testing.expect(HBCIndex.denseExecutionDriverFromTxn(&txn) == &outer);
+        txn.abort();
+        idx.releaseSearchAdmission(&admission);
+        // The nested HBC admission never reacquires the sole runnable slot or
+        // releases its caller's lease when its own buffers retire.
+        try std.testing.expectEqual(@as(u64, 1), manager.denseExecutionStats().runnable);
+        try std.testing.expectEqual(@as(u64, 1), manager.denseExecutionStats().outstanding);
+    }
+    const Observer = struct {
+        manager: *resource_manager_mod.ResourceManager,
+        observed: bool = false,
+        cancel_on_load: bool = false,
+        cancelled: bool = false,
+        fn load(raw: ?*anyopaque, _: *HBCIndex, _: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const stats = self.manager.denseExecutionStats();
+            self.observed = stats.runnable == 1 and stats.outstanding == 1;
+            if (self.cancel_on_load) self.cancelled = true;
+        }
+        fn isCancelled(raw: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            return self.cancelled;
+        }
+    };
+    var observer: Observer = .{ .manager = &manager };
+    setTestGetVectorViewOrScratchHook(&observer, Observer.load);
+    defer setTestGetVectorViewOrScratchHook(null, null);
+    var results = try idx.searchWithRequest(.{ .query = &.{ 0, 0 }, .k = 2 });
+    results.deinit();
+    try std.testing.expect(observer.observed);
+    try std.testing.expectEqual(@as(u64, 0), manager.denseExecutionStats().outstanding);
+    observer.observed = false;
+    observer.cancel_on_load = true;
+    idx.clearVectorCache();
+    try std.testing.expectError(error.Cancelled, idx.searchWithRequest(.{ .query = &.{ 0, 0 }, .k = 2, .cancellation = .{ .ptr = &observer, .is_cancelled_fn = Observer.isCancelled } }));
+    try std.testing.expect(observer.observed);
+    try std.testing.expectEqual(@as(u64, 0), manager.denseExecutionStats().outstanding);
 }
 
 test "hbc search charges estimated quantized scan bytes to node admission" {

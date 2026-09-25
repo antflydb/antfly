@@ -24,6 +24,7 @@ pub const WalReplicaProviderConfig = struct {
     root_dir: []const u8,
     state: wal_replica_state.WalReplicaStateConfig = .{},
     flush_on_deinit: bool = true,
+    completion_provider: ?raft_engine.runtime.completion_admission_iface.Provider = null,
 };
 
 pub const WalReplicaProvider = struct {
@@ -45,6 +46,7 @@ pub const WalReplicaProvider = struct {
     root_dir: []u8,
     base_factory: host.ReplicaDescriptorFactory,
     states: std.AutoHashMapUnmanaged(u64, *wal_replica_state.WalReplicaState) = .empty,
+    node_ids: std.AutoHashMapUnmanaged(u64, u64) = .empty,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -67,6 +69,7 @@ pub const WalReplicaProvider = struct {
             self.alloc.destroy(state.*);
         }
         self.states.deinit(self.alloc);
+        self.node_ids.deinit(self.alloc);
         self.alloc.free(self.root_dir);
         self.* = undefined;
     }
@@ -102,13 +105,12 @@ pub const WalReplicaProvider = struct {
         };
     }
 
+    fn appliedSinkVTable(comptime durable: bool) *const state_machine.AppliedIndexSink.VTable {
+        return &.{ .set_applied_index = setAppliedIndex, .set_native_applied = if (durable) setNativeApplied else null, .set_durable_noop = if (durable) setDurableNoop else null };
+    }
+
     pub fn appliedIndexSink(self: *WalReplicaProvider) state_machine.AppliedIndexSink {
-        return .{
-            .ptr = self,
-            .vtable = &.{
-                .set_applied_index = setAppliedIndex,
-            },
-        };
+        return .{ .ptr = self, .vtable = if (self.cfg.state.wal.no_sync) appliedSinkVTable(false) else appliedSinkVTable(true) };
     }
 
     pub fn stateForGroup(self: *WalReplicaProvider, group_id: u64) ?*wal_replica_state.WalReplicaState {
@@ -147,6 +149,16 @@ pub const WalReplicaProvider = struct {
         }
         var desc = try self.base_factory.buildDescriptor(effective_record);
         errdefer self.base_factory.freeDescriptor(self.alloc, &desc);
+        // The base factory installs/restores native ownership. Query its
+        // durable evidence only afterward, before publishing this descriptor.
+        if (self.cfg.completion_provider) |provider| {
+            if (!state.native_startup_reconciled) {
+                try provider.reconcileDurable(record.group_id, record.local_node_id, state.completionDurableLog(true, null));
+                state.native_startup_reconciled = true;
+            }
+            if (try provider.restoredProgress(record.group_id, record.local_node_id)) |progress|
+                try state.restoreNativeProgress(progress);
+        }
         try state.seedConfStateIfEmpty(desc.initial_voters orelse desc.group.raft_config.peers);
         desc.group.storage = state.storage();
         desc.group.raft_config.applied = state.completedAppliedIndex();
@@ -168,6 +180,16 @@ pub const WalReplicaProvider = struct {
         const self: *WalReplicaProvider = @ptrCast(@alignCast(ptr));
         const state = self.states.get(group_id) orelse return error.UnknownGroup;
         try state.groupStorage().persistReady(group_id, ready);
+        try self.reconcilePersisted(group_id, state, ready);
+    }
+
+    fn reconcilePersisted(self: *WalReplicaProvider, group_id: u64, state: *wal_replica_state.WalReplicaState, ready: raft_engine.core.Ready) !void {
+        const provider = self.cfg.completion_provider orelse return;
+        const node_id = self.node_ids.get(group_id) orelse return error.UnknownGroup;
+        provider.reconcileDurable(group_id, node_id, state.completionDurableLog(false, ready)) catch |err| {
+            state.native_progress_blocked = true;
+            return err;
+        };
     }
 
     fn persistReadyWithDiagnostics(
@@ -179,6 +201,7 @@ pub const WalReplicaProvider = struct {
         const self: *WalReplicaProvider = @ptrCast(@alignCast(ptr));
         const state = self.states.get(group_id) orelse return error.UnknownGroup;
         try state.groupStorage().persistReadyWithDiagnostics(group_id, ready, diag);
+        try self.reconcilePersisted(group_id, state, ready);
     }
 
     fn compactSnapshot(ptr: *anyopaque, group_id: u64, snapshot: raft_engine.core.types.Snapshot, compact_index: u64) !void {
@@ -209,6 +232,18 @@ pub const WalReplicaProvider = struct {
         try state.setAppliedIndex(index);
     }
 
+    fn setDurableNoop(ptr: *anyopaque, group_id: u64, entry: raft_engine.core.Entry) !void {
+        const self: *WalReplicaProvider = @ptrCast(@alignCast(ptr));
+        const replica = self.states.get(group_id) orelse return error.UnknownGroup;
+        try replica.setDurableNoop(entry);
+    }
+
+    fn setNativeApplied(ptr: *anyopaque, group_id: u64, progress: state_machine.applied_sink.NativeProgress, entry: raft_engine.core.Entry) !void {
+        const self: *WalReplicaProvider = @ptrCast(@alignCast(ptr));
+        const replica = self.states.get(group_id) orelse return error.UnknownGroup;
+        try replica.setNativeApplied(progress, entry);
+    }
+
     fn retireGroup(ptr: *anyopaque, group_id: u64) void {
         const self: *WalReplicaProvider = @ptrCast(@alignCast(ptr));
         const state = self.states.get(group_id) orelse {
@@ -218,6 +253,7 @@ pub const WalReplicaProvider = struct {
             std.log.err("raft WAL replica retirement flush failed group_id={d} error={s}", .{ group_id, @errorName(err) });
         };
         const removed = self.states.fetchRemove(group_id) orelse unreachable;
+        _ = self.node_ids.remove(group_id);
         removed.value.deinit();
         self.alloc.destroy(removed.value);
     }
@@ -233,10 +269,102 @@ pub const WalReplicaProvider = struct {
         state.* = try wal_replica_state.WalReplicaState.init(self.alloc, layout, self.cfg.state);
         errdefer state.deinit();
 
+        try self.node_ids.put(self.alloc, record.group_id, record.local_node_id);
+        errdefer _ = self.node_ids.remove(record.group_id);
         try self.states.put(self.alloc, record.group_id, state);
         return state;
     }
 };
+
+test "workload admission native installation precedes durable reconciliation and descriptor publication" {
+    const completion = raft_engine.runtime.completion_admission_iface;
+    const Fixture = struct {
+        store: *raft_engine.core.MemoryStorage,
+        installed: bool = false,
+        reject_reconciliation: bool = true,
+        reconciliations: usize = 0,
+        progress_queries: usize = 0,
+        frees: usize = 0,
+        proof: completion.Progress,
+
+        fn build(raw: *anyopaque, record: catalog.ReplicaRecord) !raft_engine.runtime.ReplicaDescriptor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const peers = try std.testing.allocator.dupe(u64, &.{record.local_node_id});
+            // Production installs the native owner inside this base factory.
+            self.installed = true;
+            return .{ .group = .{
+                .group_id = record.group_id,
+                .local_node_id = record.local_node_id,
+                .raft_config = .{ .id = record.local_node_id, .group_id = record.group_id, .peers = peers },
+                .storage = self.store.storage(),
+            }, .bootstrap = .persisted };
+        }
+        fn free(raw: *anyopaque, alloc: std.mem.Allocator, desc: *raft_engine.runtime.ReplicaDescriptor) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.frees += 1;
+            alloc.free(desc.group.raft_config.peers);
+        }
+        fn attach(_: *anyopaque, _: u64, _: u64, _: raft_engine.core.Storage) !completion.Guard {
+            return error.UnexpectedGuardAttachment;
+        }
+        fn reconcile(raw: *anyopaque, _: u64, _: u64, log: completion.DurableLog) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(self.installed);
+            try std.testing.expect(log.mode == .startup_complete and log.durability_confirmed);
+            try std.testing.expectEqual(@as(u64, 1), log.commit_index);
+            self.reconciliations += 1;
+            if (self.reject_reconciliation) return error.CompletionAdmissionUnavailable;
+        }
+        fn progress(raw: *anyopaque, _: u64, _: u64) !?completion.Progress {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(self.installed and self.reconciliations != 0 and !self.reject_reconciliation);
+            self.progress_queries += 1;
+            return self.proof;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/completion-order", .{tmp.sub_path});
+    defer alloc.free(root);
+    var store = raft_engine.core.MemoryStorage.init(alloc);
+    defer store.deinit();
+    const payload = "accepted-native-entry";
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
+    var fixture: Fixture = .{ .store = &store, .proof = .{ .term = 2, .index = 1, .payload_digest = digest } };
+    var provider = try WalReplicaProvider.init(alloc, .{ .root_dir = root, .completion_provider = .{
+        .ptr = &fixture,
+        .vtable = &.{ .attach = Fixture.attach, .reconcile_durable = Fixture.reconcile, .restored_progress = Fixture.progress },
+    } }, .{ .ptr = &fixture, .vtable = &.{ .build_descriptor = Fixture.build, .free_descriptor = Fixture.free } });
+    defer provider.deinit();
+    const record: catalog.ReplicaRecord = .{ .group_id = 19, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .persisted };
+    const state = try provider.ensureState(record);
+    try state.groupStorage().persistReady(19, .{
+        .hard_state = .{ .current_term = 2, .commit_index = 1 },
+        .entries = &.{.{ .term = 2, .index = 1, .data = @constCast(payload) }},
+    });
+    try std.testing.expectError(error.CompletionAdmissionUnavailable, provider.descriptorFactory().buildDescriptor(record));
+    try std.testing.expect(!state.native_startup_reconciled);
+    try std.testing.expectEqual(@as(usize, 1), fixture.frees);
+    try std.testing.expectEqual(@as(usize, 0), fixture.progress_queries);
+    fixture.reject_reconciliation = false;
+    {
+        var desc = try provider.descriptorFactory().buildDescriptor(record);
+        defer provider.descriptorFactory().freeDescriptor(alloc, &desc);
+        // Native proof advances the physical apply watermark, but Raft must
+        // replay the entry through its state machine before reporting completion.
+        try std.testing.expectEqual(@as(u64, 1), state.appliedIndex());
+        try std.testing.expectEqual(@as(u64, 0), desc.group.raft_config.applied);
+    }
+    try state.setAppliedIndex(1);
+    var desc = try provider.descriptorFactory().buildDescriptor(record);
+    defer provider.descriptorFactory().freeDescriptor(alloc, &desc);
+    try std.testing.expectEqual(@as(u64, 1), desc.group.raft_config.applied);
+    try std.testing.expect(state.native_startup_reconciled);
+    try std.testing.expectEqual(@as(usize, 2), fixture.reconciliations);
+    try std.testing.expectEqual(@as(usize, 2), fixture.progress_queries);
+}
 
 test "wal replica provider wires host through WAL-backed local state" {
     const BaseFactory = struct {

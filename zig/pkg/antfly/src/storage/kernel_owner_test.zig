@@ -51,6 +51,15 @@ test "opaque owner retries a stale schema descriptor without regressing durable 
     var stale = options;
     stale.schema_json = .fromSlice("{\"version\":1}");
     try std.testing.expectError(error.StorageBusy, client.Owner.open(stale));
+    var historical = stale;
+    historical.historical_raft_apply = 1;
+    {
+        var owner = try client.Owner.open(historical);
+        defer owner.deinit();
+        var row = try owner.lookupJson("docs", "{\"key\":\"a\"}");
+        defer row.deinit();
+        try std.testing.expect(std.mem.indexOf(u8, row.bytes(), "\"n\":1") != null);
+    }
     {
         var owner = try client.Owner.open(options);
         defer owner.deinit();
@@ -2194,9 +2203,25 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     try std.testing.expect(std.mem.indexOf(u8, repaired.bytes(), "\"scanned\":0") != null);
 
     try std.testing.expectError(error.InvalidArgument, owner.beginBulkIngest("articles"));
-    var before_bulk_query = try owner.queryJson("docs", query_json);
-    defer before_bulk_query.deinit();
-    try std.testing.expect(std.mem.indexOf(u8, before_bulk_query.bytes(), "doc:a") != null);
+    // The prior artifact fixture leaves only a chunk-backed text index and
+    // moves its child range away. A parent-only bulk row cannot match that
+    // index. Build an ordinary text index to verify bulk search publication.
+    const bulk_indexes_json = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s},\"bulk_visibility\":{{\"type\":\"full_text\"}}}}",
+        .{replacement_indexes_json[0 .. replacement_indexes_json.len - 1]},
+    );
+    defer std.testing.allocator.free(bulk_indexes_json);
+    var bulk_index_ready = false;
+    for (0..64) |_| {
+        const result = try owner.reconcile("docs", "", bulk_indexes_json, "bulk_visibility", true);
+        try std.testing.expect(result.state != .degraded);
+        if (result.state == .complete) {
+            bulk_index_ready = true;
+            break;
+        }
+    }
+    try std.testing.expect(bulk_index_ready);
     try owner.beginBulkIngest("docs");
     var bulk_batch = try owner.batchJson(
         "docs",
@@ -2209,7 +2234,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     });
     var bulk_query = try owner.queryJson(
         "docs",
-        "{\"query\":{\"match_all\":{}},\"limit\":10}",
+        "{\"query\":{\"match_all\":{}},\"indexes\":[\"bulk_visibility\"],\"limit\":10}",
     );
     defer bulk_query.deinit();
     var bulk_lookup = try owner.lookupJson("docs", "{\"key\":\"doc:bulk\",\"include_all_fields\":true}");
@@ -2235,6 +2260,27 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     try std.testing.expect(std.mem.indexOf(u8, portable_backup.bytes(), "\"group_id\":7001") != null);
     try std.testing.expect(std.mem.indexOf(u8, portable_backup.bytes(), "portable-owner/groups/7001.afb") != null);
     try std.testing.expect(std.mem.indexOf(u8, portable_backup.bytes(), "\"artifact_sha256\"") != null);
+
+    // The sibling index may still need repair, or its background owner may
+    // already have completed it. A native backup succeeds only in the latter
+    // case; either way the explicit repair below must reach quiescence.
+    if (owner.backupJson("docs", backup_root, "pending-repair", .native)) |ready| {
+        var backup = ready;
+        backup.deinit();
+    } else |err| {
+        if (err != error.NativeBackupRepairStateNotQuiescent) return err;
+    }
+    var repair_quiescent = false;
+    for (0..64) |_| {
+        const progress = try owner.repairIndex("docs", null, .{});
+        try std.testing.expect(progress.state != .degraded);
+        if (progress.state == .complete) {
+            try std.testing.expectEqual(@as(u64, 0), progress.repair_remaining);
+            repair_quiescent = true;
+            break;
+        }
+    }
+    try std.testing.expect(repair_quiescent);
 
     var native_backup = try owner.backupJson(
         "docs",
@@ -2545,6 +2591,87 @@ test "opaque storage owner transaction recovery crosses callback ABI" {
     try std.testing.expect(cleaned);
 }
 
+test "opaque storage context validates durable completion authority and reports disabled recovery policy" {
+    var context: ?*anyopaque = null;
+    for ([_]abi.ContextRequest{
+        .{ .durable_completion_enabled = 2 },
+        .{ .durable_completion_authority = 255 },
+        .{ .durable_completion_authority = 2 },
+        .{ ._completion_reserved = .{ 1, 0, 0, 0, 0, 0 } },
+    }) |request| {
+        try std.testing.expectEqual(abi.Status.invalid_config, abi.antfly_storage_context_create(&request, &context));
+        try std.testing.expect(context == null);
+    }
+    for ([_]abi.ContextRequest{
+        .{ .durable_completion_authority = 1, .no_sync = 1 },
+        .{ .durable_completion_authority = 1, .storage_kind = .lite },
+    }) |request| {
+        try std.testing.expectEqual(abi.Status.unsupported_completion_backend, abi.antfly_storage_context_create(&request, &context));
+        try std.testing.expect(context == null);
+    }
+    try std.testing.expectEqual(abi.Status.ok, abi.antfly_storage_context_create(&.{
+        .durable_completion_authority = 1,
+        .durable_completion_enabled = 0,
+    }, &context));
+    defer _ = abi.antfly_storage_context_destroy(context);
+    var metrics: abi.ContextMetricsResult = .{};
+    try std.testing.expectEqual(abi.Status.ok, abi.antfly_storage_context_metrics(context, &metrics));
+    try std.testing.expectEqual(@as(u8, 0), metrics.durable_completion_enabled);
+    try std.testing.expectEqual(@as(u8, 1), metrics.durable_completion_authority);
+}
+
+test "opaque storage context activates and validates dense execution policy" {
+    var context: ?*anyopaque = null;
+    try std.testing.expectEqual(abi.Status.invalid_config, abi.antfly_storage_context_create(&.{
+        .dense_max_runnable_tasks = 2,
+        .dense_max_outstanding_tasks = 1,
+    }, &context));
+    try std.testing.expect(context == null);
+    try std.testing.expectEqual(abi.Status.ok, abi.antfly_storage_context_create(&.{
+        .dense_max_runnable_tasks = 2,
+        .dense_max_outstanding_tasks = 8,
+        .dense_max_queued_tasks = 4,
+        .dense_max_wait_ms = 25,
+        .dense_max_working_bytes = 65536,
+        .dense_max_suspended_io = 1,
+    }, &context));
+    defer _ = abi.antfly_storage_context_destroy(context);
+    var metrics: abi.ContextMetricsResult = undefined;
+    try std.testing.expectEqual(abi.Status.ok, abi.antfly_storage_context_metrics(context, &metrics));
+    try std.testing.expectEqual(@as(u32, 2), metrics.dense_max_runnable_tasks);
+    try std.testing.expectEqual(@as(u32, 8), metrics.dense_max_outstanding_tasks);
+    try std.testing.expectEqual(@as(u32, 4), metrics.dense_max_queued_tasks);
+    try std.testing.expectEqual(@as(u32, 25), metrics.dense_max_wait_ms);
+    try std.testing.expectEqual(@as(u64, 65536), metrics.dense_max_working_bytes);
+    try std.testing.expectEqual(@as(u32, 1), metrics.dense_max_suspended_io);
+    try std.testing.expectEqual(@as(u64, 0), metrics.dense_suspended_io);
+    try std.testing.expectEqual(@as(u64, 0), metrics.dense_working_bytes);
+    try std.testing.expectEqual(@as(u64, 0), metrics.dense_runnable);
+    try std.testing.expectEqual(@as(u64, 0), metrics.dense_outstanding);
+}
+
+test "opaque storage context dense execution policy preserves imported runtime affinity" {
+    const services = @import("kernel_runtime_services.zig");
+    var unknown_vtable = std.testing.io.vtable.*;
+    const unknown_io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &unknown_vtable };
+    for ([_]std.Io{ std.testing.io, unknown_io }, 0..) |io, i| {
+        var borrow = services.executor.Borrow.init(&io);
+        var context = client.Context{};
+        try context.ensureWithRuntime(.{ .context = .{
+            .dense_max_runnable_tasks = 1,
+            .dense_max_outstanding_tasks = 2,
+            .dense_max_queued_tasks = 1,
+            .dense_max_wait_ms = 5000,
+            .dense_max_working_bytes = 65536,
+            .dense_max_suspended_io = 1,
+        }, .io = &borrow });
+        defer context.deinit();
+        const metrics = try context.metrics();
+        try std.testing.expectEqual(@as(u32, 1), metrics.dense_max_suspended_io);
+        try std.testing.expectEqual(@as(u32, if (i == 0) 1 else 0), metrics.dense_effective_max_suspended_io);
+    }
+}
+
 test "opaque storage context enforces owner lifetime and shares process storage state" {
     const first_path = "/tmp/antfly-storage-kernel-context-first";
     const second_path = "/tmp/antfly-storage-kernel-context-second";
@@ -2661,7 +2788,7 @@ test "opaque native Raft snapshot captures once and stages native plus logical p
     response.deinit();
     var source = try data_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = raw_source_path, .context = context.handle });
     defer source.deinit();
-    const barrier = "{\"table\":\"rows\",\"protocol_barrier\":10,\"batch\":null}";
+    const barrier = std.fmt.comptimePrint("{{\"table\":\"rows\",\"protocol_barrier\":{d},\"batch\":null}}", .{@import("../common/data_raft_protocol.zig").batch_native_snapshot_protocol_version});
     var log: [25 + barrier.len]u8 = undefined;
     std.mem.writeInt(u32, log[0..4], 1, .little);
     std.mem.writeInt(u64, log[4..12], 2, .little);
@@ -3426,6 +3553,95 @@ test "opaque metadata apply owner preserves semantic error identity" {
     );
 }
 
+test "opaque metadata completion installation survives compiled projection boundary and reopen" {
+    const alloc = std.testing.allocator;
+    // Only the command codec is used in this consumer; every mutation and
+    // observation goes through the separately compiled opaque owner.
+    const metadata_codec = @import("../metadata/storage/mod.zig");
+    const entry_codec = @import("../raft/state_machine/mod.zig");
+    const activation = @import("../metadata/completion_activation.zig");
+    const installation = @import("../metadata/completion_installation_protocol.zig");
+    const group_id = @import("../common/group_ids.zig").main_metadata_group_id;
+    const Apply = struct {
+        fn command(store: *metadata_apply_client.RaftApplyStore, index: u64, value: metadata_codec.TransitionCommand) !void {
+            const bytes = try metadata_codec.encodeTransitionCommand(alloc, value);
+            defer alloc.free(bytes);
+            const entries = try entry_codec.encodeCommittedEntries(alloc, &.{.{ .term = 1, .index = index, .data = bytes }});
+            defer alloc.free(entries);
+            try store.snapshotBuilder().applyBatch(.{ .group_id = group_id, .commit_index = index, .entries_bytes = entries });
+        }
+    };
+    const path = "/tmp/antfly-storage-kernel-metadata-completion";
+    cleanup(path);
+    defer cleanup(path);
+    const policy: @import("../common/table_storage.zig").TransactionRecovery = .{ .protocol_version = 1, .max_count = 4, .max_bytes = 65536, .max_transaction_bytes = 16384, .completion_protocol_version = 1, .profile_version = 1 };
+    const query: installation.Request = .{ .requester = 12, .group_id = 1001, .cluster_incarnation = "11111111111111111111111111111111".*, .nonce = 77 };
+    const keys: installation.Keys = .{ .primary = "compiled-owner-installation-test-key", .issuer = "compiled-metadata-test" };
+    {
+        var store = try metadata_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = path });
+        defer store.deinit();
+        try Apply.command(&store, 1, .{ .initialize_metadata_incarnation = query.cluster_incarnation });
+        try Apply.command(&store, 2, .{ .apply_table_topology = .{ .create = .{
+            .table = .{ .table_id = 7, .name = "docs", .min_ranges = 1 },
+            .expected_transition_generation = 0,
+            .ranges = &.{.{ .group_id = query.group_id, .range_id = 3, .table_id = 7, .start_key = "" }},
+        } } });
+        try Apply.command(&store, 3, .{ .upsert_node = .{ .node_id = query.requester } });
+        try Apply.command(&store, 4, .{ .upsert_replica_intent = .{
+            .expected_metadata_version = null,
+            .expected_version_fence = 0,
+            .expected_target_drain_requested = false,
+            .replacement = .{ .record = .{ .group_id = query.group_id, .replica_id = 1, .local_node_id = query.requester }, .peer_node_ids = &.{query.requester} },
+        } });
+        const absent = try store.completionInstallationResponse(alloc, group_id, query, keys);
+        defer alloc.free(absent);
+        var absent_verified = try installation.verifyResponse(alloc, keys, absent, query);
+        defer absent_verified.deinit();
+        try std.testing.expect(absent_verified.value.installation == null);
+        const pending_wire = try store.captureCompletionActivation(alloc, group_id, 7, policy);
+        defer alloc.free(pending_wire);
+        try std.testing.expect((try store.getCompletionActivation(alloc, group_id, 7)) == null);
+        try Apply.command(&store, 5, .{ .apply_completion_activation = pending_wire });
+        var pending = (try store.getCompletionActivation(alloc, group_id, 7)).?;
+        defer pending.deinit();
+        try std.testing.expectEqual(activation.Phase.pending, pending.value.phase);
+        const signed = try store.completionInstallationResponse(alloc, group_id, query, keys);
+        defer alloc.free(signed);
+        var verified = try installation.verifyResponse(alloc, keys, signed, query);
+        defer verified.deinit();
+        try std.testing.expect(verified.value.installation.?.sameIntent(pending.value));
+        var wrong = query;
+        wrong.cluster_incarnation = "22222222222222222222222222222222".*;
+        try std.testing.expectError(error.CompletionAdmissionPolicyChanged, store.completionInstallationResponse(alloc, group_id, wrong, keys));
+        var response: abi.OwnedBytes = .{};
+        try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_metadata_apply_store_projection(store.handle, &.{ .version = abi.abi_version - 1, .kind = .completion_activation, .group_id = group_id, .arg0 = 7 }, &response));
+        try std.testing.expectEqual(@as(usize, 0), response.slice().len);
+        var oversized: [abi.completion_projection_max_request_bytes + 1]u8 = undefined;
+        try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_metadata_apply_store_projection(store.handle, &.{ .kind = .completion_installation_response, .group_id = group_id, .key = .fromSlice(&oversized) }, &response));
+        try std.testing.expectEqual(@as(usize, 0), response.slice().len);
+        pending.value.phase = .active;
+        pending.value.evidence_digest = @splat(9);
+        const active_wire = try activation.encode(alloc, pending.value);
+        defer alloc.free(active_wire);
+        try Apply.command(&store, 6, .{ .apply_completion_activation = active_wire });
+    }
+    var reopened = try metadata_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = path });
+    defer reopened.deinit();
+    var active = (try reopened.getCompletionActivation(alloc, group_id, 7)).?;
+    defer active.deinit();
+    try std.testing.expectEqual(activation.Phase.active, active.value.phase);
+    const retry_wire = try reopened.captureCompletionActivation(alloc, group_id, 7, policy);
+    defer alloc.free(retry_wire);
+    var retry = try activation.decode(alloc, retry_wire);
+    defer retry.deinit();
+    try std.testing.expect(retry.value.sameIntent(active.value));
+    const signed = try reopened.completionInstallationResponse(alloc, group_id, query, keys);
+    defer alloc.free(signed);
+    var verified = try installation.verifyResponse(alloc, keys, signed, query);
+    defer verified.deinit();
+    try std.testing.expectEqual(activation.Phase.active, verified.value.installation.?.phase);
+}
+
 test "opaque metadata listener boundary preserves incarnation commit ordering" {
     const path = "/tmp/antfly-storage-kernel-metadata-listener-ordering";
     cleanup(path);
@@ -3943,44 +4159,222 @@ test "opaque WAL rejects custom simulation hooks even without a context pointer"
     try std.testing.expectError(error.UnsupportedKernelWalOptions, wal_client.WAL.open("/unused", TestWalOptions{ .commit_scheduler = .{ .wait_ns_fn = Hooks.wait } }));
 }
 
-test "opaque metadata secret collection preserves binary ciphertext across owner ABI" {
-    const alloc = std.testing.allocator;
-    const records = @import("../common/secret_record.zig");
-    const collections = @import("../common/secret_collection.zig");
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "keyring.json", .data = "{\"active\":\"test\",\"keys\":[{\"id\":\"test\",\"key\":\"1111111111111111111111111111111111111111111111111111111111111111\"}]}" });
-    const keyring_path = try tmp.dir.realPathFileAlloc(std.testing.io, "keyring.json", alloc);
-    defer alloc.free(keyring_path);
-    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
-    defer alloc.free(path);
-    var keys = @import("../common/secret_keyring.zig").Keyring{ .alloc = alloc, .io = std.testing.io, .path = keyring_path };
-    const identity = records.Identity{ .scope = "scope", .key = "token", .revision = 1 };
-    const envelope = try records.seal(alloc, std.testing.io, keys.provider(), identity, "\x00\xff\xfe\x01");
-    defer alloc.free(envelope);
-    var before = try collections.decode(alloc, "scope", null);
-    defer before.deinit(alloc);
-    const collection = try collections.replace(alloc, std.testing.io, "scope", before, "token", envelope);
-    defer alloc.free(collection);
-    // Transition tag 60 contains expected-revision (0) followed by AFSC.
-    const transition = try alloc.alloc(u8, 6 + 4 + 8 + collection.len);
-    defer alloc.free(transition);
-    @memcpy(transition[0..6], "afmd1\x3c");
-    std.mem.writeInt(u32, transition[6..10], @intCast(8 + collection.len), .little);
-    std.mem.writeInt(u64, transition[10..18], 0, .little);
-    @memcpy(transition[18..], collection);
-    const committed = try @import("../raft/state_machine/mod.zig").encodeCommittedEntries(alloc, &.{.{ .term = 1, .index = 1, .entry_type = .normal, .data = transition }});
-    defer alloc.free(committed);
-    var store = try metadata_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = path });
+test "opaque storage context activates shared read policy and rejects competing dense policy" {
+    var context: ?*anyopaque = null;
+    try std.testing.expectEqual(abi.Status.invalid_config, abi.antfly_storage_context_create(&.{
+        .dense_max_runnable_tasks = 1,
+        .dense_max_outstanding_tasks = 2,
+        .read_max_runnable_tasks = 1,
+        .read_max_outstanding_tasks = 2,
+    }, &context));
+    try std.testing.expect(context == null);
+    try std.testing.expectEqual(abi.Status.ok, abi.antfly_storage_context_create(&.{
+        .read_max_runnable_tasks = 2,
+        .read_max_outstanding_tasks = 8,
+        .read_max_queued_tasks = 4,
+        .read_max_wait_ms = 25,
+        .read_max_working_bytes = 524288,
+        .read_protected_runnable_tasks = 1,
+        .read_protected_outstanding_tasks = 1,
+        .read_protected_working_bytes = 65536,
+        .read_transition_tasks = 1,
+        .read_transition_bytes = 65536,
+    }, &context));
+    defer _ = abi.antfly_storage_context_destroy(context);
+    var metrics: abi.ContextMetricsResult = undefined;
+    try std.testing.expectEqual(abi.Status.ok, abi.antfly_storage_context_metrics(context, &metrics));
+    try std.testing.expectEqual(@as(u8, 1), metrics.dense_all_reads);
+    try std.testing.expectEqual(@as(u32, 2), metrics.dense_max_runnable_tasks);
+    try std.testing.expectEqual(@as(u64, 0), metrics.read_bounded_outstanding);
+    try std.testing.expectEqual(@as(u64, 0), metrics.read_transition_outstanding);
+}
+
+extern fn antfly_test_backend_read(*const @import("../runtime_native_abi.zig").TypeContract, *anyopaque) callconv(.c) @import("../runtime_error_abi.zig").Status;
+extern fn antfly_test_backend_probe(*const @import("../runtime_native_abi.zig").TypeContract, *anyopaque) callconv(.c) @import("../runtime_error_abi.zig").Status;
+extern fn antfly_test_backend_not_found_ordinal() callconv(.c) u32;
+
+test "compiled backend read callbacks preserve semantic errors and child ownership" {
+    const erased = @import("backend_erased.zig");
+    const native = @import("../runtime_native_abi.zig");
+    const callback = @import("../runtime_callback_abi.zig");
+    var read: erased.ReadTxn = undefined;
+    const contract = native.TypeContract.of(erased.ReadTxn);
+    var old_contract = contract;
+    old_contract.version -= 1;
+    try std.testing.expect(!antfly_test_backend_read(&old_contract, &read).isOk());
+    try std.testing.expect(antfly_test_backend_read(&contract, &read).isOk());
+    var read_live = true;
+    defer if (read_live) read.abort();
+    // These assertions prove this isn't accidentally a same-unit test whose
+    // raw Zig error values happen to be interpreted correctly.
+    try std.testing.expect(read.boundary_dispatch != callback.Boundary(erased.ReadTxn.VTable).local_dispatch);
+    try std.testing.expect(antfly_test_backend_not_found_ordinal() != @intFromError(error.NotFound));
+    try std.testing.expectError(error.NotFound, read.get("missing"));
+    try std.testing.expectEqualStrings("value", try read.get("present"));
+    var values: [2]?[]const u8 = undefined;
+    try read.getManySorted(&.{ "missing", "present" }, &values);
+    try std.testing.expect(values[0] == null);
+    try std.testing.expectEqualStrings("value", values[1].?);
+    var fork = try read.forkRead();
+    defer fork.abort();
+    var scope = try read.openReadScope(std.testing.allocator);
+    defer scope.close();
+    var cursor = try read.openCursor();
+    defer cursor.close();
+    read.abort();
+    read_live = false;
+    try std.testing.expectError(error.NotFound, fork.get("missing"));
+    try std.testing.expectError(error.NotFound, scope.get("missing"));
+    try std.testing.expect((try cursor.first()) == null);
+    try std.testing.expectError(error.InvalidArgument, cursor.next());
+    var probe: erased.ProbeTxn = undefined;
+    const probe_contract = native.TypeContract.of(erased.ProbeTxn);
+    try std.testing.expect(antfly_test_backend_probe(&probe_contract, &probe).isOk());
+    defer probe.abort();
+    try std.testing.expectError(error.NotFound, probe.get("missing"));
+    try std.testing.expectError(error.NotFound, probe.getLeased("missing"));
+    try probe.getManySorted(&.{ "missing", "present" }, &values);
+    try std.testing.expect(values[0] == null);
+    try std.testing.expectEqualStrings("value", values[1].?);
+}
+
+extern fn antfly_test_backend_replay_store(*const @import("../runtime_native_abi.zig").TypeContract, *anyopaque) callconv(.c) @import("../runtime_error_abi.zig").Status;
+
+test "compiled backend replay visitors preserve consumer errors" {
+    const erased = @import("backend_erased.zig");
+    const native = @import("../runtime_native_abi.zig");
+    var store: erased.Store = undefined;
+    const contract = native.TypeContract.of(erased.Store);
+    try std.testing.expect(antfly_test_backend_replay_store(&contract, &store).isOk());
     defer store.deinit();
-    try std.testing.expect((try store.getSecretCollection(alloc, 91, "scope")) == null);
-    try store.snapshotBuilder().applyBatch(.{ .group_id = 91, .commit_index = 1, .entries_bytes = committed });
-    const recovered = (try store.getSecretCollection(alloc, 91, "scope")).?;
-    defer alloc.free(recovered);
-    try std.testing.expectEqualSlices(u8, collection, recovered);
-    var decoded = try collections.decode(alloc, "scope", recovered);
-    defer decoded.deinit(alloc);
-    var opened = try records.open(alloc, keys.provider(), identity, decoded.entries[0].envelope);
-    defer opened.deinit(alloc);
-    try std.testing.expectEqualSlices(u8, "\x00\xff\xfe\x01", opened.bytes);
+    const Consumer = struct {
+        calls: usize = 0,
+        failure: ?anyerror = error.ConsumerPrivateStop,
+        fn consume(self: *@This(), sequence: u64, payload: []const u8) anyerror!void {
+            self.calls += 1;
+            if (sequence == 7) {
+                try std.testing.expectEqualStrings("replay", payload);
+            } else {
+                try std.testing.expectEqual(@as(u64, 8), sequence);
+                try std.testing.expectEqualStrings("unreachable", payload);
+            }
+            if (self.failure) |err| return err;
+        }
+    };
+    var consumer: Consumer = .{};
+    try std.testing.expectError(error.ConsumerPrivateStop, store.forEachReplayFrom(1, &consumer, Consumer.consume));
+    try std.testing.expectEqual(@as(usize, 1), consumer.calls);
+    try std.testing.expectError(error.ConsumerPrivateStop, store.forEachReplayFromMatchingHintMask(1, 1, &consumer, Consumer.consume));
+    try std.testing.expectEqual(@as(usize, 2), consumer.calls);
+    try std.testing.expectError(error.ConsumerPrivateStop, store.forEachReplayLaneFrom(1, 1, 0, &consumer, Consumer.consume));
+    try std.testing.expectEqual(@as(usize, 3), consumer.calls);
+    // Successful callbacks and provider errors are not replaced by a stale
+    // consumer failure; every call owns a fresh synchronous bridge.
+    consumer = .{ .failure = null };
+    try store.forEachReplayFrom(1, &consumer, Consumer.consume);
+    try std.testing.expectEqual(@as(usize, 2), consumer.calls);
+    consumer.calls = 0;
+    try std.testing.expectError(error.InvalidArgument, store.forEachReplayFrom(99, &consumer, Consumer.consume));
+    try std.testing.expectEqual(@as(usize, 0), consumer.calls);
+    try std.testing.expectError(error.InvalidArgument, store.forEachReplayFrom(98, &consumer, Consumer.consume));
+    try std.testing.expectEqual(@as(usize, 1), consumer.calls);
+    consumer = .{};
+    try std.testing.expectError(error.ConsumerPrivateStop, store.forEachReplayFrom(98, &consumer, Consumer.consume));
+    try std.testing.expectEqual(@as(usize, 1), consumer.calls);
+    // Re-erasing a foreign store must use its dispatcher, not a direct foreign
+    // vtable call; the private error stays with the outermost consumer.
+    var nested = try erased.storeFrom(std.testing.allocator, store);
+    defer nested.deinit();
+    consumer = .{};
+    try std.testing.expectError(error.ConsumerPrivateStop, nested.forEachReplayFrom(1, &consumer, Consumer.consume));
+    try std.testing.expectError(error.ConsumerPrivateStop, nested.forEachReplayFromMatchingHintMask(1, 1, &consumer, Consumer.consume));
+    try std.testing.expectError(error.ConsumerPrivateStop, nested.forEachReplayLaneFrom(1, 1, 0, &consumer, Consumer.consume));
+    try std.testing.expectEqual(@as(usize, 3), consumer.calls);
+}
+
+test "opaque storage owner canonical completion compilation requires actual pool without mutating documents" {
+    const path = "/tmp/antfly-storage-owner-canonical-candidate";
+    cleanup(path);
+    defer cleanup(path);
+    var owner = try client.Owner.open(.{ .path = .fromSlice(path), .table_name = .fromSlice("docs"), .group_id = 7001 });
+    defer owner.deinit();
+    const prepare =
+        \\{"inserts":{"doc:txn":{"title":"candidate"}},"_transaction":{"phase":"prepare","txn_id":"000102030405060708090a0b0c0d0e0f","topology_epoch":"7"},"sync_level":"write"}
+    ;
+    try std.testing.expectError(error.CompletionAdmissionUnavailable, owner.compileReplicatedCompletion("docs", prepare, 2, 9));
+    try std.testing.expectError(error.CompletionAdmissionUnavailable, owner.compileReplicatedCompletion("docs", "{\"inserts\":{\"doc:txn\":{}}}", 2, 9));
+    try std.testing.expectError(error.InvalidArgument, owner.compileReplicatedCompletion("docs", prepare, 0, 9));
+    try std.testing.expectError(error.NotFound, owner.lookupJson("docs", "{\"key\":\"doc:txn\",\"include_all_fields\":true}"));
+    var output: abi.OwnedBytes = .{};
+    try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_owner_compile_replicated_completion(owner.handle, &.{
+        .reserved = 1,
+        .table_name = .fromSlice("docs"),
+        .request_json = .fromSlice(prepare),
+        .previous_term = 2,
+        .previous_index = 9,
+    }, &output));
+    try std.testing.expectEqual(@as(u64, 0), output.len);
+    try std.testing.expect(output.ptr == null);
+}
+
+test "opaque storage owner retained completion lease survives worker quiesce and owner close" {
+    const path = "/tmp/antfly-storage-owner-retained-completion";
+    cleanup(path);
+    defer cleanup(path);
+    var context: ?*anyopaque = null;
+    try std.testing.expectEqual(abi.Status.ok, abi.antfly_storage_context_create(&.{
+        .transaction_completion_bytes = 1024 * 1024,
+        .durable_completion_enabled = 1,
+    }, &context));
+    defer _ = abi.antfly_storage_context_destroy(context);
+    const settings = @import("../common/table_storage.zig").Settings{ .transaction_recovery = .{
+        .protocol_version = 1,
+        .max_count = 4,
+        .max_bytes = 1024 * 1024,
+        .max_transaction_bytes = 64 * 1024,
+        .completion_protocol_version = 1,
+        .profile_version = 1,
+    } };
+    const settings_json = try std.json.Stringify.valueAlloc(std.testing.allocator, settings, .{});
+    defer std.testing.allocator.free(settings_json);
+    var binding: abi.completion_pool.InstallBinding = .{
+        .identity = .{ .group_id = 2, .node_id = 7, .capacity = 4, .generation = 1, .incarnation = @splat(15), .policy_digest = @import("../metadata/completion_activation.zig").policyDigest(settings.transaction_recovery.?) },
+        .table_id = 1,
+        .range_id = 3,
+    };
+    binding.schema_catalog_digest = try @import("../common/completion_catalog_digest.zig").digest(std.testing.allocator, "", "", "{}");
+    var owner = try client.Owner.open(.{
+        .context = context,
+        .path = .fromSlice(path),
+        .table_name = .fromSlice("docs"),
+        .group_id = 2,
+        .has_identity_namespace = 1,
+        .identity_table_id = 1,
+        .identity_shard_id = 2,
+        .identity_range_id = 3,
+        .indexes_json = .fromSlice("{}"),
+        .completion_installation = &binding,
+        .completion_settings_json = .fromSlice(settings_json),
+    });
+    var owner_live = true;
+    defer if (owner_live) owner.deinit();
+    const lease = try owner.acquireCompletionLease(2, 7);
+    defer lease.vtable.release(lease.context);
+    const control_lease = try owner.acquireControlProofLeaseV2(2, 7);
+    defer control_lease.vtable.release(control_lease.context);
+    try owner.quiesce();
+    try owner.quiesce();
+    owner.deinit();
+    owner_live = false;
+    // The compiled owner and its context must remain pinned after cache close.
+    // This callback reads real native ownership, not an API-side stand-in.
+    var cells: abi.completion_pool.DurableCells = undefined;
+    try std.testing.expectEqual(abi.Status.ok, lease.vtable.durable_cells.?(lease.context, &cells));
+    try std.testing.expectEqual(@as(u32, 0), cells.count);
+    var controls: abi.completion_pool.ControlDurableOwnersV2 = .{};
+    try std.testing.expectEqual(abi.Status.ok, control_lease.vtable.durable_owners(control_lease.context, &controls));
+    try std.testing.expectEqual(abi.completion_pool.control_proof_abi_version, controls.version);
+    try std.testing.expectEqual(@as(u32, 0), controls.count);
+    var progress: abi.completion_pool.Progress = undefined;
+    try std.testing.expectEqual(abi.Status.not_found, lease.vtable.progress.?(lease.context, &progress));
 }

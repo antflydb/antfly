@@ -33,7 +33,7 @@ pub const public_operation_policies = [_]PublicOperationPolicy{
     .{ .operation_id = "dropNamespaceTable", .class = .none },
     .{ .operation_id = "backupNamespaceTable", .class = .none },
     .{ .operation_id = "batchNamespaceTable", .class = .write },
-    .{ .operation_id = "lookupNamespaceTableDocument", .class = .none },
+    .{ .operation_id = "lookupNamespaceTableDocument", .class = .query },
     .{ .operation_id = "listNamespaceTableIndexes", .class = .none },
     .{ .operation_id = "getNamespaceTableIndex", .class = .none },
     .{ .operation_id = "createNamespaceTableIndex", .class = .none },
@@ -107,31 +107,20 @@ pub const public_operation_policies = [_]PublicOperationPolicy{
     .{ .operation_id = "listArtifactEnrichments", .class = .none },
     .{ .operation_id = "putArtifactEnrichment", .class = .none },
     .{ .operation_id = "deleteArtifactEnrichment", .class = .none },
-    .{ .operation_id = "reprocessDocumentArtifactRange", .class = .none },
+    .{ .operation_id = "reprocessDocumentArtifactRange", .class = .write },
     .{ .operation_id = "startDocumentArtifactReprocessJob", .class = .none },
     .{ .operation_id = "getDocumentArtifactReprocessJob", .class = .none },
     .{ .operation_id = "advanceDocumentArtifactReprocessJob", .class = .none },
     .{ .operation_id = "cancelDocumentArtifactReprocessJob", .class = .none },
     .{ .operation_id = "backupTable", .class = .none },
     .{ .operation_id = "batchWrite", .class = .write },
-    .{ .operation_id = "scanKeys", .class = .query },
-    .{ .operation_id = "queryRelationalRows", .class = .query },
-    .{ .operation_id = "queryNamespaceRelationalRows", .class = .query },
-    .{ .operation_id = "mutateNamespaceRelationalRows", .class = .write },
-    .{ .operation_id = "getNamespaceRelationalConstraintStatus", .class = .query },
-    .{ .operation_id = "repairNamespaceRelationalConstraints", .class = .write },
-    .{ .operation_id = "retryNamespaceRelationalConstraints", .class = .write },
-    .{ .operation_id = "retireNamespaceRelationalConstraints", .class = .write },
-    .{ .operation_id = "repairNamespaceIndex", .class = .write },
-    .{ .operation_id = "retryNamespaceIndex", .class = .write },
-    .{ .operation_id = "repairIndex", .class = .write },
-    .{ .operation_id = "retryIndex", .class = .write },
     .{ .operation_id = "mutateRelationalRows", .class = .write },
-    .{ .operation_id = "getRelationalConstraintStatus", .class = .query },
     .{ .operation_id = "repairRelationalConstraints", .class = .write },
     .{ .operation_id = "retryRelationalConstraints", .class = .write },
     .{ .operation_id = "retireRelationalConstraints", .class = .write },
-    .{ .operation_id = "lookupKey", .class = .none },
+    .{ .operation_id = "getRelationalConstraintStatus", .class = .query },
+    .{ .operation_id = "scanKeys", .class = .query },
+    .{ .operation_id = "lookupKey", .class = .query },
     .{ .operation_id = "listDocumentArtifactManifests", .class = .none },
     .{ .operation_id = "getDocumentArtifactManifest", .class = .none },
     .{ .operation_id = "reprocessDocumentArtifact", .class = .none },
@@ -185,7 +174,7 @@ pub fn publicOperationClass(operation_id: []const u8) ?Class {
 /// classification exhaustive so adding a tool cannot bypass the shared gate.
 pub fn mcpOperationClass(operation: contextual_operations.McpApplicationOperation) Class {
     return switch (operation) {
-        .query, .sample_documents => .query,
+        .query, .sample_documents, .get_document => .query,
         .batch => .write,
         .list_tables,
         .create_table,
@@ -194,7 +183,6 @@ pub fn mcpOperationClass(operation: contextual_operations.McpApplicationOperatio
         .list_indexes,
         .create_index,
         .drop_index,
-        .get_document,
         .backup,
         .restore,
         => .none,
@@ -208,4 +196,19 @@ pub fn extensionHostOperationClass(operation: ExtensionHostOperation) Class {
         .query => .query,
         .batch => .write,
     };
+}
+
+test "workload admission data lookups share query capacity while metadata control bypasses" {
+    try std.testing.expectEqual(Class.query, publicOperationClass("lookupKey").?);
+    try std.testing.expectEqual(Class.query, publicOperationClass("lookupNamespaceTableDocument").?);
+    try std.testing.expectEqual(Class.query, mcpOperationClass(.{ .get_document = .{ .table_name = "docs", .key = "key" } }));
+    try std.testing.expectEqual(Class.none, publicOperationClass("getStatus").?);
+    try std.testing.expectEqual(Class.none, publicOperationClass("getTable").?);
+    try std.testing.expectEqual(Class.none, mcpOperationClass(.{ .describe_table = .{ .table_name = "docs" } }));
+}
+
+test "workload admission synchronous artifact range reprocessing uses foreground write capacity" {
+    try std.testing.expectEqual(Class.write, publicOperationClass("reprocessDocumentArtifactRange").?);
+    try std.testing.expectEqual(Class.none, publicOperationClass("startDocumentArtifactReprocessJob").?);
+    try std.testing.expectEqual(Class.none, publicOperationClass("getDocumentArtifactReprocessJob").?);
 }

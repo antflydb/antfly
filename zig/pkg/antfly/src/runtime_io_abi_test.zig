@@ -6,6 +6,27 @@ const bridge = @import("runtime_io_abi.zig");
 extern fn runtime_io_abi_test_borrow(*bridge.Borrow) callconv(.c) void;
 extern fn runtime_io_abi_test_inject(bool) callconv(.c) void;
 extern fn runtime_io_abi_test_destroy(*const bridge.Borrow) callconv(.c) void;
+extern fn runtime_io_abi_test_borrow_threaded(*bridge.Borrow) callconv(.c) void;
+
+test "executor archive boundary preserves only proven caller thread affinity" {
+    var threaded: bridge.Borrow = undefined;
+    runtime_io_abi_test_borrow_threaded(&threaded);
+    defer runtime_io_abi_test_destroy(&threaded);
+    var imported = try threaded.receive();
+    try std.testing.expect(bridge.callerThreadPinned(imported.io()));
+    var forwarded = bridge.Borrow.init(&imported.io());
+    var reimported = try forwarded.receive();
+    try std.testing.expect(bridge.callerThreadPinned(reimported.io()));
+
+    var unknown: bridge.Borrow = undefined;
+    runtime_io_abi_test_borrow(&unknown);
+    defer runtime_io_abi_test_destroy(&unknown);
+    var imported_unknown = try unknown.receive();
+    try std.testing.expect(!bridge.callerThreadPinned(imported_unknown.io()));
+    var old = threaded;
+    old.contract.version -= 1;
+    try std.testing.expectError(error.InvalidArgument, old.receive());
+}
 
 test "executor archive boundary cancels futures and drains group ownership" {
     var borrow: bridge.Borrow = undefined;

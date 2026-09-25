@@ -43,6 +43,50 @@ fn boundedControl(request: RequestContext) !RequestContext {
     return result;
 }
 
+// Primary prefetch slots execute concurrently, while the request's admitted
+// allocator may be an unsynchronized arena. Keep every transient observation
+// inside that request budget without allowing concurrent allocator mutation.
+const PrefetchBacking = struct {
+    parent: Allocator,
+    mutex: std.atomic.Mutex = .unlocked,
+
+    fn lock(self: *@This()) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn allocator(self: *@This()) Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
+        return self.parent.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
+        return self.parent.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
+        return self.parent.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
+        self.parent.rawFree(memory, alignment, ret_addr);
+    }
+};
+
 pub fn requiresCoordination(alloc: Allocator, schema_json: []const u8) !bool {
     if (schema_json.len == 0) return false;
     var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
@@ -408,9 +452,12 @@ const Builder = struct {
         const borrow = self.control.fanout_io orelse self.control.deadline_io orelse return;
         if (keys.len < 2) return;
         const Slot = struct {
-            arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
+            arena: std.heap.ArenaAllocator,
             row: ?reads.LookupResponse = null,
             failure: ?anyerror = null,
+            fn init(backing: Allocator) @This() {
+                return .{ .arena = .init(backing) };
+            }
             fn run(slot: *@This(), source: reads.TableReadSource, name: []const u8, key: []const u8, control: RequestContext) void {
                 slot.row = source.lookup(slot.arena.allocator(), name, key, .{ .include_primary_digest = true, .execution_deadline_ns = control.deadline_ns, .execution_io = control.deadline_io, .cancellation = control.cancellation }, .read_index) catch |err| {
                     slot.failure = err;
@@ -421,10 +468,12 @@ const Builder = struct {
         var receiver = try borrow.receive();
         const io = receiver.io();
         const width = 8;
+        var backing = PrefetchBacking{ .parent = self.alloc };
         var start: usize = 0;
         while (start < keys.len) : (start += width) {
             try self.control.ensureActive();
-            var slots: [width]Slot = @splat(.{});
+            var slots: [width]Slot = undefined;
+            for (&slots) |*slot| slot.* = .init(backing.allocator());
             defer for (&slots) |*slot| slot.arena.deinit();
             const batch = keys[start..@min(start + width, keys.len)];
             var tasks: std.Io.Group = .init;
@@ -1590,6 +1639,42 @@ test "distributed txn primary prefetch owns observations and drains failed batch
             try std.testing.expectEqual(keys.len, fixture.calls.load(.monotonic));
         }
     }
+}
+
+test "distributed txn primary prefetch charges parallel scratch to request quota" {
+    const Fixture = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+
+        fn lookup(ptr: *anyopaque, alloc: Allocator, _: []const u8, _: []const u8, _: types.LookupOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.calls.fetchAdd(1, .acq_rel);
+            // Both observations stay live until the whole wave completes.
+            // One fits the request quota; two cannot.
+            const json = try alloc.alloc(u8, 600 * 1024);
+            @memset(json, 'x');
+            return .{ .json = json, .version = 7, .expected_content_digest = @splat(3) };
+        }
+    };
+
+    const storage = try std.testing.allocator.alloc(u8, 1024 * 1024);
+    defer std.testing.allocator.free(storage);
+    var quota = std.heap.FixedBufferAllocator.init(storage);
+    var fixture: Fixture = .{};
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .limited(2) });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var table: Loaded = undefined;
+    table.name = "rows";
+    var builder: Builder = .{
+        .alloc = quota.allocator(),
+        .metadata = &.{},
+        .source = .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.lookup, .scan = undefined, .query = undefined } },
+        .control = .{ .fanout_io = @import("../runtime_io_abi.zig").Borrow.init(&io) },
+    };
+    defer builder.deinit();
+    try std.testing.expectError(error.OutOfMemory, builder.preloadWork(&table, &.{ "a", "b" }));
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), builder.work.items.len);
 }
 
 fn testCatalogEnvelope(alloc: Allocator, table_id: u64, json: []const u8) ![]u8 {

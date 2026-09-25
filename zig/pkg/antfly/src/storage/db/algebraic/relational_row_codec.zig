@@ -56,6 +56,9 @@ pub const semantic_hash_len: usize = std.crypto.hash.Blake3.digest_length;
 // participates in the checksum but never in the semantic content hash.
 const ordinal_semantic_hash_offset: usize = 16;
 const ordinal_write_timestamp_offset: usize = ordinal_semantic_hash_offset + semantic_hash_len;
+/// Stable physical offset used only after version/checksum validation by the
+/// durable plan compiler; completion also recomputes the physical checksum.
+pub const completion_timestamp_offset: u32 = ordinal_write_timestamp_offset;
 const ordinal_header_len: usize = ordinal_write_timestamp_offset + @sizeOf(u64);
 const checksum_len: usize = @sizeOf(u32);
 const capability_sparse_slots: u32 = 1;

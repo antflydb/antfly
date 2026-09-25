@@ -59,6 +59,11 @@ export fn runtime_io_abi_test_borrow(output: *bridge.Borrow) callconv(.c) void {
     const io: std.Io = .{ .userdata = runtime, .vtable = &vtable };
     output.* = bridge.Borrow.init(&io);
 }
+export fn runtime_io_abi_test_borrow_threaded(output: *bridge.Borrow) callconv(.c) void {
+    const runtime = std.heap.page_allocator.create(std.Io.Threaded) catch @panic("test allocator exhausted");
+    runtime.* = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    output.* = bridge.Borrow.init(&runtime.io());
+}
 export fn runtime_io_abi_test_destroy(borrow: *const bridge.Borrow) callconv(.c) void {
     const runtime: *std.Io.Threaded = @ptrCast(@alignCast(borrow.userdata.?));
     runtime.deinit();

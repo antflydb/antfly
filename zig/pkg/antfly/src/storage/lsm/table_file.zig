@@ -1108,6 +1108,33 @@ pub const StreamingEncoderResult = struct {
     compression_stats: CompressionStats,
 };
 
+pub const BoundedEncoderLimits = struct {
+    metadata_bytes: usize,
+    record_bytes: usize,
+    key_bytes: usize,
+};
+
+pub const BoundedEncoderWorkspace = struct { persistent_bytes: usize, compression_bytes: usize };
+
+/// Covers precise-capacity arrays, completed block payloads, fixed run filters,
+/// and alignment in a monotonic writer arena. Prefix extraction must be none;
+/// the run filter uses one expected entry and the maintenance fixed 64 bits.
+pub fn boundedEncoderWorkspace(limits: BoundedEncoderLimits) !BoundedEncoderWorkspace {
+    if (limits.metadata_bytes < 256 or limits.record_bytes == 0 or limits.key_bytes > limits.record_bytes)
+        return error.TableFileTooLarge;
+    const logical = @max(default_block_size, limits.record_bytes);
+    var persistent: usize = 512; // Two <=64-byte encoded run filters, 8 filter bytes and array alignment.
+    persistent = try checkedAddUsize(persistent, limits.metadata_bytes); // packed entry offsets
+    persistent = try checkedAddUsize(persistent, try std.math.mul(usize, limits.metadata_bytes / 60, @sizeOf(OwnedEncodedBlockMeta)));
+    persistent = try checkedAddUsize(persistent, limits.metadata_bytes); // completed bounds/filter payloads
+    persistent = try checkedAddUsize(persistent, limits.metadata_bytes); // reusable encoded block filter
+    persistent = try checkedAddUsize(persistent, logical);
+    persistent = try checkedAddUsize(persistent, try std.math.mul(usize, limits.key_bytes, 2));
+    persistent = try checkedAddUsize(persistent, try std.math.mul(usize, default_block_size / 13 + 1, @sizeOf([2]u64)));
+    const snappy_bytes = try checkedAddUsize(logical, try checkedAddUsize(logical / 6, 32));
+    return .{ .persistent_bytes = persistent, .compression_bytes = try checkedAddUsize(try prefixBlockWorkspaceBytes(logical), snappy_bytes) };
+}
+
 pub const StreamingEncoder = struct {
     allocator: std.mem.Allocator,
     sink: *TableSink,
@@ -1158,6 +1185,24 @@ pub const StreamingEncoder = struct {
     block_largest_namespace_buffer: std.ArrayListUnmanaged(u8) = .empty,
     block_largest_key_buffer: std.ArrayListUnmanaged(u8) = .empty,
     finished: bool = false,
+    bounded_limits: ?BoundedEncoderLimits = null,
+    block_workspace: ?[]u8 = null,
+
+    pub fn configureBoundedWorkspace(self: *StreamingEncoder, limits: BoundedEncoderLimits, workspace: []u8) !void {
+        const sizes = try boundedEncoderWorkspace(limits);
+        if (self.entry_count != 0 or self.finished or self.prefix_extractor != .none or
+            self.filter_builder.bytes.len != 8 or workspace.len < sizes.compression_bytes)
+            return error.TableFileTooLarge;
+        try self.entry_offsets.ensureTotalCapacityPrecise(self.allocator, limits.metadata_bytes / 2);
+        try self.blocks.ensureTotalCapacityPrecise(self.allocator, limits.metadata_bytes / 60);
+        try self.block_bytes.ensureTotalCapacityPrecise(self.allocator, @max(default_block_size, limits.record_bytes));
+        try self.encoded_filter_bytes.ensureTotalCapacityPrecise(self.allocator, limits.metadata_bytes);
+        try self.block_hashes.ensureTotalCapacityPrecise(self.allocator, default_block_size / 13 + 1);
+        try self.block_largest_namespace_buffer.ensureTotalCapacityPrecise(self.allocator, limits.key_bytes);
+        try self.block_largest_key_buffer.ensureTotalCapacityPrecise(self.allocator, limits.key_bytes);
+        self.bounded_limits = limits;
+        self.block_workspace = workspace;
+    }
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -1313,6 +1358,14 @@ pub const StreamingEncoder = struct {
         const entry_start_usize = self.logical_entry_data_len;
         const entry_start = try checkedU32(entry_start_usize);
         const entry_len = try tableEntryEncodedLen(entry);
+        if (self.bounded_limits) |limits| {
+            if (entry_len > limits.record_bytes or try checkedAddUsize(entry.key.len, if (entry.namespace_name) |ns| ns.len else 0) > limits.key_bytes or
+                self.entry_offsets.items.len >= self.entry_offsets.capacity)
+                return error.TableFileTooLarge;
+            const total = try self.encodedSizeUpperBoundAfterEntry(entry);
+            const data = try checkedAddUsize(self.sink.len(), try checkedAddUsize(self.block_bytes.items.len, try checkedAddUsize(entry_len, footer_len)));
+            if (total < data or total - data > limits.metadata_bytes) return error.TableFileTooLarge;
+        }
         if (entry_start_usize > max_entry_data_len or entry_len > max_entry_data_len - entry_start_usize) {
             return error.TableFileTooLarge;
         }
@@ -1484,13 +1537,16 @@ pub const StreamingEncoder = struct {
 
         const attempt_snappy = self.compression_policy == .snappy_adaptive and self.snappy_reprobe_countdown == 0;
         if (self.snappy_reprobe_countdown > 0) self.snappy_reprobe_countdown -= 1;
-        var encoded_payload = try encodeBlockPayloadAlloc(
-            self.allocator,
-            self.block_bytes.items,
-            self.compression_policy,
-            attempt_snappy,
-            &self.compression_bytes,
-        );
+        var encoded_payload = if (self.block_workspace) |workspace|
+            try encodeBlockPayloadInto(self.block_bytes.items, self.compression_policy, attempt_snappy, workspace)
+        else
+            try encodeBlockPayloadAlloc(
+                self.allocator,
+                self.block_bytes.items,
+                self.compression_policy,
+                attempt_snappy,
+                &self.compression_bytes,
+            );
         defer encoded_payload.deinit(self.allocator);
         if (encoded_payload.snappy_attempted) {
             self.snappy_attempted_blocks += 1;
@@ -1961,6 +2017,28 @@ fn encodeBlockPayloadAlloc(
     return payload;
 }
 
+fn encodeBlockPayloadInto(raw: []const u8, policy: CompressionPolicy, attempt_snappy: bool, workspace: []u8) !EncodedBlockPayload {
+    const prefix_bytes = try prefixBlockWorkspaceBytes(raw.len);
+    const snappy_bytes = try checkedAddUsize(raw.len, try checkedAddUsize(raw.len / 6, 32));
+    if (workspace.len < try checkedAddUsize(prefix_bytes, snappy_bytes)) return error.TableFileTooLarge;
+    var payload: EncodedBlockPayload = .{ .payload = raw, .compression = .none };
+    if (policy != .none) {
+        const prefix = try encodePrefixCompressedBlockInto(raw, workspace[0..prefix_bytes]);
+        if (prefix.len < raw.len) payload = .{ .payload = prefix, .compression = .prefix };
+    }
+    if (policy == .snappy_adaptive and attempt_snappy and payload.payload.len >= min_compress_block_bytes) {
+        payload.snappy_attempted = true;
+        var output: std.ArrayListUnmanaged(u8) = .{ .items = workspace[prefix_bytes..][0..0], .capacity = snappy_bytes };
+        var forbidden = std.heap.FixedBufferAllocator.init(&.{});
+        const compressed = try snappy.encodeInto(forbidden.allocator(), &output, payload.payload);
+        if (compressed.len < payload.payload.len - payload.payload.len / compression_savings_denominator) {
+            payload.payload = compressed;
+            payload.compression = if (payload.compression == .prefix) .prefix_snappy else .snappy;
+        }
+    }
+    return payload;
+}
+
 fn encodePrefixCompressedBlockAlloc(allocator: std.mem.Allocator, block_bytes: []const u8) ![]u8 {
     var encoded_entries = std.ArrayListUnmanaged(u8).empty;
     defer encoded_entries.deinit(allocator);
@@ -2218,6 +2296,139 @@ fn commonPrefixLen(lhs: []const u8, rhs: []const u8) usize {
     var index: usize = 0;
     while (index < limit and lhs[index] == rhs[index]) : (index += 1) {}
     return index;
+}
+
+/// Decode using two disjoint caller-owned buffers. The physical payload starts
+/// in first[0..physical_len]; either buffer may hold the returned logical bytes.
+/// Supported prefix+Snappy blocks have an intermediate prefix payload no larger
+/// than the logical block, as emitted by the adaptive encoder. No heap is used.
+pub fn decodeBlockPayloadInto(
+    compression: BlockCompression,
+    first: []u8,
+    physical_len: usize,
+    second: []u8,
+    expected_len: usize,
+    expected_checksum: u32,
+) ![]u8 {
+    if (physical_len > first.len or expected_len > first.len or expected_len > second.len)
+        return error.TableFileTooLarge;
+    const payload = first[0..physical_len];
+    try validateBlockPayload(payload, expected_checksum);
+    switch (compression) {
+        .none => {
+            if (physical_len != expected_len) return error.InvalidTableFile;
+            return first[0..expected_len];
+        },
+        .prefix => return decodePrefixCompressedBlockInto(payload, second[0..expected_len]),
+        .snappy, .prefix_snappy => {
+            const decoded_len = try snappy.decodedLen(payload);
+            if (decoded_len > expected_len) return error.TableFileTooLarge;
+            var fixed = std.heap.FixedBufferAllocator.init(second);
+            const decoded = try snappy.decode(fixed.allocator(), payload);
+            if (compression == .prefix_snappy)
+                return decodePrefixCompressedBlockInto(decoded, first[0..expected_len]);
+            if (decoded.len != expected_len) return error.InvalidTableFile;
+            return decoded;
+        },
+    }
+}
+
+fn decodePrefixCompressedBlockInto(payload: []const u8, out: []u8) ![]u8 {
+    const view = try parsePrefixBlockPayload(payload);
+    var previous_key: []const u8 = &.{};
+    var input: usize = 0;
+    var output: usize = 0;
+    for (0..view.entry_count) |i| {
+        if (i % view.restart_interval == 0 and try view.restartOffset(i / view.restart_interval) != input)
+            return error.InvalidTableFile;
+        const tombstone = try readByte(view.encoded_entries, &input);
+        if (tombstone > 1) return error.InvalidTableFile;
+        const ns_len: usize = try readU32(view.encoded_entries, &input);
+        const shared: usize = try readU32(view.encoded_entries, &input);
+        const unshared: usize = try readU32(view.encoded_entries, &input);
+        const value_len: usize = try readU32(view.encoded_entries, &input);
+        if (shared > previous_key.len) return error.InvalidTableFile;
+        const ns = try readSlice(view.encoded_entries, &input, ns_len);
+        const suffix = try readSlice(view.encoded_entries, &input, unshared);
+        const value = try readSlice(view.encoded_entries, &input, value_len);
+        const key_len = try checkedAddUsize(shared, unshared);
+        const record_len = try checkedAddUsize(13, try checkedAddUsize(ns_len, try checkedAddUsize(key_len, value_len)));
+        if (record_len > out.len - output) return error.InvalidTableFile;
+        const record = out[output..][0..record_len];
+        record[0] = tombstone;
+        std.mem.writeInt(u32, record[1..5], try checkedU32(ns_len), .little);
+        std.mem.writeInt(u32, record[5..9], try checkedU32(key_len), .little);
+        std.mem.writeInt(u32, record[9..13], try checkedU32(value_len), .little);
+        @memcpy(record[13..][0..ns_len], ns);
+        const key = record[13 + ns_len ..][0..key_len];
+        @memcpy(key[0..shared], previous_key[0..shared]);
+        @memcpy(key[shared..], suffix);
+        @memcpy(record[13 + ns_len + key_len ..], value);
+        previous_key = key;
+        output += record_len;
+    }
+    if (input != view.encoded_entries.len or output != out.len) return error.InvalidTableFile;
+    return out;
+}
+
+/// Worst-case prefix framing is four extra bytes per raw entry and one restart
+/// offset per interval. Two raw lengths plus the header safely cover both.
+pub fn prefixBlockWorkspaceBytes(logical_bytes: usize) !usize {
+    return checkedAddUsize(try std.math.mul(usize, logical_bytes, 2), 64);
+}
+
+/// Byte-identical prefix encoding without temporary key or growing vectors.
+/// The input remains immutable; previous keys borrow it until the next entry.
+fn encodePrefixCompressedBlockInto(raw: []const u8, out: []u8) ![]u8 {
+    var input: usize = 0;
+    var count: usize = 0;
+    var encoded_len: usize = 0;
+    var previous: []const u8 = &.{};
+    while (input < raw.len) : (count += 1) {
+        const entry = try parseEntryAt(raw, input);
+        const len = try tableEntryEncodedLen(entry);
+        if (len > raw.len - input) return error.InvalidTableFile;
+        const shared = if (count % prefix_restart_interval == 0) 0 else commonPrefixLen(previous, entry.key);
+        encoded_len = try checkedAddUsize(encoded_len, len + 4 - shared);
+        previous = entry.key;
+        input += len;
+    }
+    const restart_count = (count + prefix_restart_interval - 1) / prefix_restart_interval;
+    const header_bytes = prefix_block_magic.len + 4 * @sizeOf(u32);
+    const total = try checkedAddUsize(header_bytes, try checkedAddUsize(encoded_len, try std.math.mul(usize, restart_count, 4)));
+    if (total > out.len) return error.TableFileTooLarge;
+    @memcpy(out[0..prefix_block_magic.len], prefix_block_magic);
+    var h = prefix_block_magic.len;
+    for ([_]usize{ count, prefix_restart_interval, restart_count, encoded_len }) |n| {
+        std.mem.writeInt(u32, out[h..][0..4], try checkedU32(n), .little);
+        h += 4;
+    }
+    input = 0;
+    previous = &.{};
+    var output = header_bytes;
+    var restart = header_bytes + encoded_len;
+    for (0..count) |i| {
+        const entry = try parseEntryAt(raw, input);
+        const shared = if (i % prefix_restart_interval == 0) 0 else commonPrefixLen(previous, entry.key);
+        if (i % prefix_restart_interval == 0) {
+            std.mem.writeInt(u32, out[restart..][0..4], try checkedU32(output - header_bytes), .little);
+            restart += 4;
+        }
+        out[output] = @intFromBool(entry.tombstone);
+        output += 1;
+        const ns = entry.namespace_name orelse "";
+        for ([_]usize{ ns.len, shared, entry.key.len - shared, entry.value.len }) |n| {
+            std.mem.writeInt(u32, out[output..][0..4], try checkedU32(n), .little);
+            output += 4;
+        }
+        for ([_][]const u8{ ns, entry.key[shared..], entry.value }) |bytes| {
+            @memcpy(out[output..][0..bytes.len], bytes);
+            output += bytes.len;
+        }
+        previous = entry.key;
+        input += try tableEntryEncodedLen(entry);
+    }
+    return out[0..total];
 }
 
 pub fn decodeBlockPayloadAlloc(
@@ -3840,4 +4051,82 @@ test "streaming table unnamed block publication cleans up allocation failures" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "completion fixed block workspaces preserve binary oversized prefix and compressed format" {
+    const alloc = std.testing.allocator;
+    var raw: std.ArrayListUnmanaged(u8) = .empty;
+    defer raw.deinit(alloc);
+    var key: [40000]u8 = @splat(0x81);
+    const value: [256]u8 = @splat(0x17);
+    for (0..20) |i| {
+        key[key.len - 1] = @intCast(i);
+        try appendEntryBytesToList(alloc, &raw, .{ .namespace_name = "ns\x00\xff", .key = &key, .value = &value, .tombstone = i % 3 == 0 });
+    }
+    const prefix = try encodePrefixCompressedBlockAlloc(alloc, raw.items);
+    defer alloc.free(prefix);
+    const workspace = try alloc.alloc(u8, try prefixBlockWorkspaceBytes(raw.items.len));
+    defer alloc.free(workspace);
+    try std.testing.expectEqualSlices(u8, prefix, try encodePrefixCompressedBlockInto(raw.items, workspace));
+    try std.testing.expectError(error.TableFileTooLarge, encodePrefixCompressedBlockInto(raw.items, workspace[0 .. prefix.len - 1]));
+    const compressed = try snappy.encode(alloc, raw.items);
+    defer alloc.free(compressed);
+    const prefix_compressed = try snappy.encode(alloc, prefix);
+    defer alloc.free(prefix_compressed);
+    const first = try alloc.alloc(u8, @max(raw.items.len, @max(prefix.len, @max(compressed.len, prefix_compressed.len))));
+    defer alloc.free(first);
+    const second = try alloc.alloc(u8, raw.items.len);
+    defer alloc.free(second);
+    for ([_]BlockCompression{ .none, .snappy, .prefix, .prefix_snappy }, [_][]const u8{ raw.items, compressed, prefix, prefix_compressed }) |compression, encoded| {
+        const checksum = Crc32.hash(encoded);
+        const ordinary = try decodeBlockPayloadAlloc(alloc, compression, encoded, raw.items.len, checksum);
+        defer alloc.free(ordinary);
+        for (0..32) |_| {
+            @memcpy(first[0..encoded.len], encoded);
+            try std.testing.expectEqualSlices(u8, ordinary, try decodeBlockPayloadInto(compression, first, encoded.len, second, raw.items.len, checksum));
+        }
+        @memcpy(first[0..encoded.len], encoded);
+        try std.testing.expectError(error.TableBlockChecksumMismatch, decodeBlockPayloadInto(compression, first, encoded.len, second, raw.items.len, checksum ^ 1));
+        try std.testing.expectError(error.TableFileTooLarge, decodeBlockPayloadInto(compression, first, encoded.len, second[0 .. second.len - 1], raw.items.len, checksum));
+    }
+}
+
+test "completion bounded encoder arena preserves full streaming bytes and reuses each output workspace" {
+    const alloc = std.testing.allocator;
+    const limits: BoundedEncoderLimits = .{ .metadata_bytes = 1024 * 1024, .record_bytes = 65536, .key_bytes = 40004 };
+    const sizes = try boundedEncoderWorkspace(limits);
+    const arena_bytes = try alloc.alloc(u8, sizes.persistent_bytes);
+    defer alloc.free(arena_bytes);
+    const compression = try alloc.alloc(u8, sizes.compression_bytes);
+    defer alloc.free(compression);
+    const options: StreamingEncoderOptions = .{ .bloom_config = .{ .bits_per_key = 1, .min_bits = 64, .max_hash_count = 1 }, .block_compression = .snappy_adaptive, .prefix_extractor = .none };
+    for (0..4) |iteration| {
+        var ordinary_sink = MemoryTableSink.init(alloc);
+        defer ordinary_sink.deinit();
+        var bounded_sink = MemoryTableSink.init(alloc);
+        defer bounded_sink.deinit();
+        var ordinary_view = ordinary_sink.sink();
+        var bounded_view = bounded_sink.sink();
+        var ordinary = try StreamingEncoder.init(alloc, &ordinary_view, 1, options);
+        defer ordinary.deinit();
+        var fixed = std.heap.FixedBufferAllocator.init(arena_bytes);
+        var bounded = try StreamingEncoder.init(fixed.allocator(), &bounded_view, 1, options);
+        defer bounded.deinit();
+        try bounded.configureBoundedWorkspace(limits, compression);
+        var key: [40000]u8 = @splat(0x91);
+        const value: [1024]u8 = @splat(0x45);
+        for (0..256) |i| {
+            const key_len: usize = if (i % 23 == 0) key.len else 64;
+            std.mem.writeInt(u32, key[key_len - 4 ..][0..4], @intCast(i + iteration), .big);
+            const entry: Entry = .{ .namespace_name = "n\x00\xffs", .key = key[0..key_len], .value = &value, .tombstone = i % 9 == 0 };
+            try ordinary.appendEntry(entry);
+            try bounded.appendEntry(entry);
+        }
+        var normal_result = try ordinary.finish();
+        defer normal_result.filter.deinit(alloc);
+        var bounded_result = try bounded.finish();
+        defer bounded_result.filter.deinit(fixed.allocator());
+        try std.testing.expectEqual(normal_result.size_bytes, bounded_result.size_bytes);
+        try std.testing.expectEqualSlices(u8, ordinary_sink.out.items, bounded_sink.out.items);
+    }
 }

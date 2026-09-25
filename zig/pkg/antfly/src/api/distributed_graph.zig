@@ -1709,8 +1709,8 @@ const GraphExpandFanoutSlot = struct {
     result: ?GraphExpandResponse = null,
     err: ?anyerror = null,
 
-    fn init() GraphExpandFanoutSlot {
-        return .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
+    fn init(backing: std.mem.Allocator) GraphExpandFanoutSlot {
+        return .{ .arena = std.heap.ArenaAllocator.init(backing) };
     }
 
     fn deinit(self: *GraphExpandFanoutSlot) void {
@@ -1719,13 +1719,67 @@ const GraphExpandFanoutSlot = struct {
     }
 };
 
+// Fanout responses may be larger than the final merged page. Charge their
+// entire concurrent lifetime to the request allocator, which may itself be an
+// unsynchronized arena or an admitted allocator.
+const GraphFanoutBacking = struct {
+    parent: std.mem.Allocator,
+    mutex: std.atomic.Mutex = .unlocked,
+
+    fn lock(self: *@This()) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn allocator(self: *@This()) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = alloc,
+            .resize = resize,
+            .remap = remap,
+            .free = free,
+        } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
+        return self.parent.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
+        return self.parent.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
+        return self.parent.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
+        self.parent.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+const GraphExpandFanoutSlots = struct {
+    backing: *GraphFanoutBacking,
+    slots: []GraphExpandFanoutSlot,
+};
+
 const GraphHydrateFanoutSlot = struct {
     arena: std.heap.ArenaAllocator,
     result: ?GraphHydrateResponse = null,
     err: ?anyerror = null,
 
-    fn init() GraphHydrateFanoutSlot {
-        return .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
+    fn init(backing: std.mem.Allocator) GraphHydrateFanoutSlot {
+        return .{ .arena = std.heap.ArenaAllocator.init(backing) };
     }
 
     fn deinit(self: *GraphHydrateFanoutSlot) void {
@@ -1739,8 +1793,8 @@ const GraphEdgesFanoutSlot = struct {
     result: ?GraphEdgesResponse = null,
     err: ?anyerror = null,
 
-    fn init() GraphEdgesFanoutSlot {
-        return .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
+    fn init(backing: std.mem.Allocator) GraphEdgesFanoutSlot {
+        return .{ .arena = std.heap.ArenaAllocator.init(backing) };
     }
 
     fn deinit(self: *GraphEdgesFanoutSlot) void {
@@ -2245,6 +2299,10 @@ fn executeCrossRangeOnce(
         };
         initialized += 1;
     }
+    // The last worker reply may have completed just before cancellation or
+    // deadline expiry. Keep the original request active through publication,
+    // including result-only postprocessing after the final RPC.
+    try worker.ensureActive();
     return results;
 }
 
@@ -3246,12 +3304,13 @@ const DistributedEdgeReader = struct {
 
         if (fanout_io) |io| {
             if (plan.parallel) {
+                var fanout_backing = GraphFanoutBacking{ .parent = a };
                 const slots = try a.alloc(GraphEdgesFanoutSlot, plan.width);
                 defer {
                     for (slots) |*slot| slot.deinit();
                     a.free(slots);
                 }
-                for (slots) |*slot| slot.* = .init();
+                for (slots) |*slot| slot.* = .init(fanout_backing.allocator());
 
                 const Fiber = struct {
                     fn run(
@@ -3307,7 +3366,7 @@ const DistributedEdgeReader = struct {
                             fair_bytes,
                         });
                     }
-                    group.await(io) catch {};
+                    try group.await(io);
 
                     // Balanced shards complete concurrently within a fair share
                     // of the remaining request budget. A skewed shard retries
@@ -3360,7 +3419,7 @@ const DistributedEdgeReader = struct {
                     }
                     for (slots[0..wave_len]) |*slot| {
                         slot.deinit();
-                        slot.* = .init();
+                        slot.* = .init(fanout_backing.allocator());
                     }
                 }
                 return try edges.toOwnedSlice(a);
@@ -4338,7 +4397,7 @@ fn executeDistributedTraverse(
                 }
             } else {
                 const fanout_start_ns = platform_time.monotonicNs();
-                const slots = try executeGraphExpandBatchesParallel(
+                const fanout = try executeGraphExpandBatchesParallel(
                     alloc,
                     io,
                     graph_fanout_plan.width,
@@ -4352,9 +4411,9 @@ fn executeDistributedTraverse(
                     consistency,
                 );
                 recordGraphParallelFanout(.expand, @intCast(platform_time.monotonicNs() - fanout_start_ns));
-                defer deinitGraphExpandFanoutSlots(alloc, slots);
+                defer deinitGraphExpandFanoutSlots(alloc, fanout);
 
-                for (slots, batch_entries) |slot, batch_entry| {
+                for (fanout.slots, batch_entries) |slot, batch_entry| {
                     const step_result = slot.result.?;
                     try consumeDistributedExpansionWork(request_work_budget, step_result.expansions);
                     const admitted = try graphExpansionNodeAdmissionMaskAlloc(
@@ -5957,6 +6016,7 @@ fn appendIncomingProbeBatchWindow(
     if (fanout_io) |io| {
         if (plan.parallel) {
             const start_ns = platform_time.monotonicNs();
+            var fanout_backing = GraphFanoutBacking{ .parent = alloc };
             const Fiber = struct {
                 fn run(
                     worker_inner: Worker,
@@ -5991,7 +6051,7 @@ fn appendIncomingProbeBatchWindow(
                 const end = @min(start + plan.width, entries.len);
                 const slots = try alloc.alloc(GraphHydrateFanoutSlot, end - start);
                 defer alloc.free(slots);
-                for (slots) |*slot| slot.* = .init();
+                for (slots) |*slot| slot.* = .init(fanout_backing.allocator());
                 defer for (slots) |*slot| slot.deinit();
                 var group: std.Io.Group = .init;
                 for (entries[start..end], 0..) |entry, i| {
@@ -6007,7 +6067,7 @@ fn appendIncomingProbeBatchWindow(
                         consistency,
                     });
                 }
-                group.await(io) catch {};
+                try group.await(io);
                 for (slots) |slot| if (slot.err) |err| return err;
                 for (slots, entries[start..end]) |slot, entry| {
                     try Probe.appendPositive(alloc, batches, table_state, entry, probe_frontier_ids, slot.result.?.has_incoming);
@@ -6084,13 +6144,21 @@ test "distributed graph incoming probe expands only positive source shards" {
         calls: usize = 0,
         max_keys_per_call: usize = 0,
         echo_index_identity: bool = true,
+        io_impl: ?*std.Io.Threaded = null,
+        scratch_bytes: usize = 0,
     };
     const FakeWorker = struct {
         fn iface(state: *TestState) Worker {
             return .{ .ptr = state, .vtable = &.{
                 .execute_graph_expand = executeGraphExpand,
                 .execute_graph_hydrate = executeGraphHydrate,
+                .fanout_io = fanoutIo,
             } };
+        }
+
+        fn fanoutIo(ptr: *anyopaque) ?std.Io {
+            const state: *TestState = @ptrCast(@alignCast(ptr));
+            return if (state.io_impl) |io_impl| io_impl.io() else null;
         }
 
         fn executeGraphExpand(
@@ -6113,6 +6181,10 @@ test "distributed graph incoming probe expands only positive source shards" {
             _: raft_mod.ReadConsistency,
         ) !GraphHydrateResponse {
             const state: *TestState = @ptrCast(@alignCast(ptr));
+            if (state.scratch_bytes != 0) {
+                _ = try a.alloc(u8, state.scratch_bytes);
+                return error.UnexpectedUnboundedScratch;
+            }
             state.calls += 1;
             state.max_keys_per_call = @max(state.max_keys_per_call, req.keys.len);
             try std.testing.expectEqualStrings("graph_idx", req.incoming_index_name);
@@ -6198,6 +6270,27 @@ test "distributed graph incoming probe expands only positive source shards" {
         &.{11},
         &.{0},
         &.{"doc:a"},
+        "graph_idx",
+        .read_index,
+    ));
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    state.io_impl = &io_impl;
+    state.scratch_bytes = 2 * 1024 * 1024;
+    const limited_buffer = try alloc.alloc(u8, 1024 * 1024);
+    defer alloc.free(limited_buffer);
+    var limited = std.heap.FixedBufferAllocator.init(limited_buffer);
+    var quota_batches = GraphExpandBatches.empty;
+    defer freeFrontierBatches(limited.allocator(), &quota_batches);
+    try std.testing.expectError(error.OutOfMemory, appendIncomingProbeBatches(
+        limited.allocator(),
+        FakeWorker.iface(&state),
+        &quota_batches,
+        &table_state,
+        &.{ 11, 22, 33 },
+        &.{ 0, 1 },
+        &.{ "doc:a", "doc:z" },
         "graph_idx",
         .read_index,
     ));
@@ -6718,16 +6811,20 @@ fn collectGraphExpandBatchEntries(
     return entries;
 }
 
-fn initGraphExpandFanoutSlots(alloc: std.mem.Allocator, count: usize) ![]GraphExpandFanoutSlot {
+fn initGraphExpandFanoutSlots(alloc: std.mem.Allocator, count: usize) !GraphExpandFanoutSlots {
+    const backing = try alloc.create(GraphFanoutBacking);
+    errdefer alloc.destroy(backing);
+    backing.* = .{ .parent = alloc };
     const slots = try alloc.alloc(GraphExpandFanoutSlot, count);
     errdefer alloc.free(slots);
-    for (slots) |*slot| slot.* = .init();
-    return slots;
+    for (slots) |*slot| slot.* = .init(backing.allocator());
+    return .{ .backing = backing, .slots = slots };
 }
 
-fn deinitGraphExpandFanoutSlots(alloc: std.mem.Allocator, slots: []GraphExpandFanoutSlot) void {
-    for (slots) |*slot| slot.deinit();
-    alloc.free(slots);
+fn deinitGraphExpandFanoutSlots(alloc: std.mem.Allocator, fanout: GraphExpandFanoutSlots) void {
+    for (fanout.slots) |*slot| slot.deinit();
+    alloc.free(fanout.slots);
+    alloc.destroy(fanout.backing);
 }
 
 fn executeGraphExpandBatchesParallel(
@@ -6742,9 +6839,10 @@ fn executeGraphExpandBatchesParallel(
     include_paths: bool,
     algebraic_semiring_selected: bool,
     consistency: raft_mod.ReadConsistency,
-) ![]GraphExpandFanoutSlot {
-    const slots = try initGraphExpandFanoutSlots(alloc, entries.len);
-    errdefer deinitGraphExpandFanoutSlots(alloc, slots);
+) !GraphExpandFanoutSlots {
+    const fanout = try initGraphExpandFanoutSlots(alloc, entries.len);
+    errdefer deinitGraphExpandFanoutSlots(alloc, fanout);
+    const slots = fanout.slots;
 
     const Fiber = struct {
         fn run(
@@ -6798,13 +6896,15 @@ fn executeGraphExpandBatchesParallel(
                 consistency,
             });
         }
-        group.await(io) catch {};
+        // Await joins every worker before the shared request-backed allocator
+        // can retire; a canceled group cannot provide complete slot results.
+        try group.await(io);
     }
 
     for (slots) |slot| {
         if (slot.err) |err| return err;
     }
-    return slots;
+    return fanout;
 }
 
 fn collectSeenNodes(
@@ -7192,12 +7292,13 @@ fn hydrateHitsForKeys(
             entry_index += 1;
         }
 
+        var fanout_backing = GraphFanoutBacking{ .parent = alloc };
         const slots = try alloc.alloc(GraphHydrateFanoutSlot, entries.len);
         defer {
             for (slots) |*slot| slot.deinit();
             alloc.free(slots);
         }
-        for (slots) |*slot| slot.* = .init();
+        for (slots) |*slot| slot.* = .init(fanout_backing.allocator());
 
         const Fiber = struct {
             fn run(
@@ -7251,7 +7352,7 @@ fn hydrateHitsForKeys(
                 .group_count = end - start,
                 .cancellation = worker.cancellation,
             });
-            group.await(io) catch {};
+            try group.await(io);
         }
         recordGraphParallelFanout(.hydrate, @intCast(platform_time.monotonicNs() - fanout_start_ns));
         for (slots) |slot| {
@@ -7464,6 +7565,7 @@ pub fn probeIncomingEdgesForKeys(
     if (fanout_io) |io| {
         if (plan.parallel) {
             const start_ns = platform_time.monotonicNs();
+            var fanout_backing = GraphFanoutBacking{ .parent = alloc };
             const Fiber = struct {
                 fn run(
                     worker_inner: Worker,
@@ -7502,7 +7604,7 @@ pub fn probeIncomingEdgesForKeys(
                 defer alloc.free(probe_keys);
                 const slots = try alloc.alloc(GraphHydrateFanoutSlot, end - start);
                 defer alloc.free(slots);
-                for (slots) |*slot| slot.* = .init();
+                for (slots) |*slot| slot.* = .init(fanout_backing.allocator());
                 defer for (slots) |*slot| slot.deinit();
                 var group: std.Io.Group = .init;
                 for (group_ids[start..end], 0..) |group_id, i| {
@@ -7518,7 +7620,7 @@ pub fn probeIncomingEdgesForKeys(
                         consistency,
                     });
                 }
-                group.await(io) catch {};
+                try group.await(io);
                 for (slots) |slot| if (slot.err) |err| return err;
                 for (slots, group_ids[start..end]) |slot, group_id| {
                     try Probe.copy(
@@ -7564,6 +7666,8 @@ test "distributed graph root probe retires resolved keys between shard waves" {
     const TestState = struct {
         calls: usize = 0,
         request_sizes: [3]usize = .{ 0, 0, 0 },
+        io_impl: ?*std.Io.Threaded = null,
+        scratch_bytes: usize = 0,
     };
     const FakeCatalog = struct {
         const tables = [_]metadata_table_manager.TableRecord{
@@ -7609,7 +7713,13 @@ test "distributed graph root probe retires resolved keys between shard waves" {
             return .{ .ptr = state, .vtable = &.{
                 .execute_graph_expand = executeGraphExpand,
                 .execute_graph_hydrate = executeGraphHydrate,
+                .fanout_io = fanoutIo,
             } };
+        }
+
+        fn fanoutIo(ptr: *anyopaque) ?std.Io {
+            const state: *TestState = @ptrCast(@alignCast(ptr));
+            return if (state.io_impl) |io_impl| io_impl.io() else null;
         }
 
         fn executeGraphExpand(
@@ -7632,6 +7742,10 @@ test "distributed graph root probe retires resolved keys between shard waves" {
             _: raft_mod.ReadConsistency,
         ) !GraphHydrateResponse {
             const state: *TestState = @ptrCast(@alignCast(ptr));
+            if (state.scratch_bytes != 0) {
+                _ = try a.alloc(u8, state.scratch_bytes);
+                return error.UnexpectedUnboundedScratch;
+            }
             if (state.calls >= state.request_sizes.len) return error.UnexpectedTestCall;
             state.request_sizes[state.calls] = req.keys.len;
             state.calls += 1;
@@ -7674,6 +7788,25 @@ test "distributed graph root probe retires resolved keys between shard waves" {
     try std.testing.expectEqualSlices(bool, &.{ true, true }, roots);
     try std.testing.expectEqual(@as(usize, 2), state.calls);
     try std.testing.expectEqualSlices(usize, &.{ 2, 1, 0 }, &state.request_sizes);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    state.io_impl = &io_impl;
+    state.scratch_bytes = 2 * 1024 * 1024;
+    const limited_buffer = try alloc.alloc(u8, 1024 * 1024);
+    defer alloc.free(limited_buffer);
+    var limited = std.heap.FixedBufferAllocator.init(limited_buffer);
+    try std.testing.expectError(error.OutOfMemory, probeIncomingEdgesForKeys(
+        limited.allocator(),
+        catalog,
+        FakeWorker.iface(&state),
+        "docs",
+        topology_epoch,
+        null,
+        "graph_idx",
+        &.{ "root:a", "root:b" },
+        .stale,
+    ));
 }
 
 fn finalizeHydratedHits(
@@ -13435,8 +13568,11 @@ test "distributed graph edge reader routes outgoing and fans out incoming adjace
     };
 
     const TestState = struct {
-        edge_calls: u32 = 0,
-        probe_calls: u32 = 0,
+        edge_calls: std.atomic.Value(u32) = .init(0),
+        probe_calls: std.atomic.Value(u32) = .init(0),
+        io_impl: ?*std.Io.Threaded = null,
+        probe_all: bool = false,
+        edge_scratch_bytes: usize = 0,
     };
 
     const FakeWorker = struct {
@@ -13447,8 +13583,14 @@ test "distributed graph edge reader routes outgoing and fans out incoming adjace
                     .execute_graph_expand = executeGraphExpand,
                     .execute_graph_hydrate = executeGraphHydrate,
                     .execute_graph_get_edges = executeGraphGetEdges,
+                    .fanout_io = fanoutIo,
                 },
             };
+        }
+
+        fn fanoutIo(ptr: *anyopaque) ?std.Io {
+            const state: *TestState = @ptrCast(@alignCast(ptr));
+            return if (state.io_impl) |io_impl| io_impl.io() else null;
         }
 
         fn executeGraphExpand(
@@ -13471,10 +13613,10 @@ test "distributed graph edge reader routes outgoing and fans out incoming adjace
             _: raft_mod.ReadConsistency,
         ) !GraphHydrateResponse {
             const state: *TestState = @ptrCast(@alignCast(ptr));
-            state.probe_calls += 1;
+            _ = state.probe_calls.fetchAdd(1, .monotonic);
             try std.testing.expectEqualStrings("graph_idx", req.incoming_index_name);
             const mask = try inner_alloc.alloc(bool, req.keys.len);
-            @memset(mask, group_id == 22);
+            @memset(mask, state.probe_all or group_id == 22);
             return .{ .has_incoming = mask };
         }
 
@@ -13487,7 +13629,11 @@ test "distributed graph edge reader routes outgoing and fans out incoming adjace
             consistency: raft_mod.ReadConsistency,
         ) !GraphEdgesResponse {
             const state: *TestState = @ptrCast(@alignCast(ptr));
-            state.edge_calls += 1;
+            if (state.edge_scratch_bytes != 0) {
+                _ = try inner_alloc.alloc(u8, state.edge_scratch_bytes);
+                return error.UnexpectedUnboundedScratch;
+            }
+            _ = state.edge_calls.fetchAdd(1, .monotonic);
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
             try std.testing.expectEqualStrings("graph_idx", req.index_name);
@@ -13543,14 +13689,52 @@ test "distributed graph edge reader routes outgoing and fans out incoming adjace
     const edges = try reader.getEdges(alloc, null, "doc:a", &.{"links"}, .out);
     defer reader.freeEdges(alloc, edges);
     try std.testing.expectEqual(@as(usize, 0), edges.len);
-    try std.testing.expectEqual(@as(u32, 1), state.edge_calls);
+    try std.testing.expectEqual(@as(u32, 1), state.edge_calls.load(.monotonic));
 
     const incoming = try reader.getEdges(alloc, null, "doc:a", &.{"links"}, .in);
     defer reader.freeEdges(alloc, incoming);
     try std.testing.expectEqual(@as(usize, 1), incoming.len);
     try std.testing.expectEqualStrings("doc:z", incoming[0].source);
-    try std.testing.expectEqual(@as(u32, 2), state.probe_calls);
-    try std.testing.expectEqual(@as(u32, 2), state.edge_calls);
+    try std.testing.expectEqual(@as(u32, 2), state.probe_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 2), state.edge_calls.load(.monotonic));
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    state.io_impl = &io_impl;
+    state.probe_all = true;
+    state.edge_scratch_bytes = 2 * 1024 * 1024;
+    const limited_buffer = try alloc.alloc(u8, 1024 * 1024);
+    defer alloc.free(limited_buffer);
+    var limited = std.heap.FixedBufferAllocator.init(limited_buffer);
+    var quota_admission = GraphNodeAdmissionContext.init(
+        limited.allocator(),
+        FakeCatalog.iface(),
+        FakeWorker.iface(&state),
+        "docs",
+        "graph_idx",
+        topology_epoch,
+        .{ .identity_read_generation = 12345 },
+        null,
+        &.{},
+        .{},
+        .read_index,
+    );
+    defer quota_admission.deinit();
+    const quota_reader = DistributedEdgeReader{
+        .catalog = FakeCatalog.iface(),
+        .worker = FakeWorker.iface(&state),
+        .source_table = "docs",
+        .index_name = "graph_idx",
+        .consistency = .read_index,
+        .admission = &quota_admission,
+    };
+    try std.testing.expectError(error.OutOfMemory, quota_reader.getEdges(
+        limited.allocator(),
+        null,
+        "doc:a",
+        &.{"links"},
+        .in,
+    ));
 }
 
 test "distributed graph edges response round trips owned edges" {
@@ -15069,6 +15253,11 @@ test "distributed graph retries once on topology change and succeeds" {
         phase: u32 = 0,
         expand_calls: u32 = 0,
         hydrate_calls: u32 = 0,
+        cancelled: std.atomic.Value(bool) = .init(false),
+        cancel_on_hydration: bool = false,
+        retry_first_expand: bool = true,
+        socket_io: ?std.Io = null,
+        socket_address: ?std.Io.net.IpAddress = null,
         lifecycle_counts: [@typeInfo(LifecyclePhase).@"enum".fields.len]u32 =
             .{0} ** @typeInfo(LifecyclePhase).@"enum".fields.len,
         lifecycle_valid: bool = true,
@@ -15145,7 +15334,11 @@ test "distributed graph retries once on topology change and succeeds" {
                         std.mem.eql(u8, "walk", event.query_name) and
                         event.depth == 1 and event.result_count == 1;
                 },
-                .hydration_started, .hydration_completed => state.lifecycle_valid = state.lifecycle_valid and std.mem.eql(u8, "walk", event.query_name),
+                .hydration_started, .hydration_completed => {
+                    state.lifecycle_valid = state.lifecycle_valid and std.mem.eql(u8, "walk", event.query_name);
+                    if (event.phase == .hydration_completed and state.cancel_on_hydration)
+                        state.cancelled.store(true, .release);
+                },
                 // A scheduled fanout batch may contain one group.
                 .hydration_fanout_started => state.lifecycle_valid = state.lifecycle_valid and event.group_count > 0,
                 .attempt_failed => {
@@ -15167,7 +15360,7 @@ test "distributed graph retries once on topology change and succeeds" {
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expectEqual(@as(usize, 1), req.frontier.len);
             state.expand_calls += 1;
-            if (state.expand_calls == 1) {
+            if (state.retry_first_expand and state.expand_calls == 1) {
                 state.phase = 1;
                 return error.TopologyChanged;
             }
@@ -15210,6 +15403,23 @@ test "distributed graph retries once on topology change and succeeds" {
             try std.testing.expectEqual(@as(u64, 22), group_id);
             try std.testing.expect(req.topology_epoch != 0);
             state.hydrate_calls += 1;
+            if (state.socket_address) |address| {
+                const httpx = @import("httpx");
+                var socket = try httpx.Socket.connect(address, state.socket_io.?);
+                defer socket.close();
+                try socket.setRecvTimeout(5_000);
+                try socket.sendAll("GET /worker HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
+                var response: [8192]u8 = undefined;
+                var used: usize = 0;
+                while (true) {
+                    if (used == response.len) return error.TestUnexpectedResult;
+                    const received = try socket.recv(response[used..]);
+                    if (received == 0) break;
+                    used += received;
+                }
+                const start = (std.mem.indexOf(u8, response[0..used], "\r\n\r\n") orelse return error.TestUnexpectedResult) + 4;
+                return try parseGraphHydrateResponse(alloc, response[start..used]);
+            }
             const hits = try alloc.alloc(db_mod.types.SearchHit, 1);
             hits[0] = .{
                 .id = try alloc.dupe(u8, "doc:b"),
@@ -15270,6 +15480,138 @@ test "distributed graph retries once on topology change and succeeds" {
     try std.testing.expectEqual(@as(u32, 1), state.lifecycle_counts[@intFromEnum(LifecyclePhase.hydration_started)]);
     try std.testing.expectEqual(@as(u32, 1), state.lifecycle_counts[@intFromEnum(LifecyclePhase.hydration_completed)]);
     try std.testing.expect(state.lifecycle_valid);
+
+    // Cancel after the final hydration reply, when there is no further RPC
+    // whose post-reply check could catch it. The coordinator must not publish
+    // the otherwise complete graph result.
+    var cancelled_state = TestState{ .phase = 1, .cancel_on_hydration = true, .retry_first_expand = false };
+    var cancelled_req = req;
+    cancelled_req.cancellation = CancellationToken.fromAtomic(&cancelled_state.cancelled);
+    try std.testing.expectError(error.Cancelled, executeCrossRange(
+        std.testing.allocator,
+        FakeCatalog.iface(&cancelled_state),
+        FakeWorker.iface(&cancelled_state),
+        "docs",
+        cancelled_req,
+        base_result,
+        .read_index,
+    ));
+    try std.testing.expectEqual(@as(u32, 1), cancelled_state.expand_calls);
+    try std.testing.expectEqual(@as(u32, 1), cancelled_state.hydrate_calls);
+    try std.testing.expectEqual(@as(u32, 1), cancelled_state.lifecycle_counts[@intFromEnum(LifecyclePhase.hydration_completed)]);
+
+    // A real socket peer can finish after the coordinator's original request
+    // has ended. The returned wire payload must never become a graph result.
+    if (@import("builtin").os.tag != .windows and @import("builtin").os.tag != .freestanding) {
+        const httpx = @import("httpx");
+        const SocketFixture = struct {
+            const Mode = enum { cancel, timeout };
+            const Self = @This();
+            body: []const u8,
+            entered: std.atomic.Value(bool) = .init(false),
+            release: std.atomic.Value(bool) = .init(false),
+            calls: std.atomic.Value(usize) = .init(0),
+
+            fn handle(self: *Self, ctx: *httpx.Context) !httpx.Response {
+                _ = self.calls.fetchAdd(1, .acq_rel);
+                self.entered.store(true, .release);
+                while (!self.release.load(.acquire)) std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+                return ctx.text(self.body);
+            }
+
+            const Coordinator = struct {
+                state: *TestState,
+                request: db_mod.types.SearchRequest,
+                source: db_mod.types.SearchResult,
+                result_error: ?anyerror = null,
+                published: bool = false,
+
+                fn run(self: *@This()) void {
+                    const output = executeCrossRange(
+                        std.testing.allocator,
+                        FakeCatalog.iface(self.state),
+                        FakeWorker.iface(self.state),
+                        "docs",
+                        self.request,
+                        self.source,
+                        .read_index,
+                    ) catch |err| {
+                        self.result_error = err;
+                        return;
+                    };
+                    defer {
+                        for (output) |*result| result.deinit(std.testing.allocator);
+                        std.testing.allocator.free(output);
+                    }
+                    self.published = true;
+                }
+            };
+
+            fn runMode(mode: Mode, request: db_mod.types.SearchRequest, source: db_mod.types.SearchResult) !void {
+                const alloc = std.testing.allocator;
+                var server_io = std.Io.Threaded.init(alloc, .{});
+                defer server_io.deinit();
+                var client_io = std.Io.Threaded.init(alloc, .{});
+                defer client_io.deinit();
+                var hit = [_]db_mod.types.SearchHit{.{ .id = @constCast("doc:b"), .stored_data = @constCast("{\"title\":\"beta\"}") }};
+                const body = try encodeGraphHydrateResponse(alloc, .{ .hits = &hit });
+                defer alloc.free(body);
+                var fixture = Self{ .body = body };
+                var server = httpx.Server.initWithConfig(alloc, server_io.io(), .{ .host = "127.0.0.1", .port = 0, .max_connections = 2, .max_request_tasks = 2 });
+                defer server.deinit();
+                try server.get("/worker", httpx.Handler.bind(&fixture, Self.handle));
+                var listener = httpx.ListenerTask.init(&server);
+                try listener.start();
+                defer {
+                    fixture.release.store(true, .release);
+                    listener.requestStop();
+                    listener.join() catch {};
+                }
+                var socket_state = TestState{
+                    .phase = 1,
+                    .retry_first_expand = false,
+                    .socket_io = client_io.io(),
+                    .socket_address = server.boundAddress() orelse return error.TestUnexpectedResult,
+                };
+                var controlled = request;
+                controlled.cancellation = CancellationToken.fromAtomic(&socket_state.cancelled);
+                if (mode == .timeout) controlled.execution_deadline_ns = platform_time.monotonicNs() + 2 * std.time.ns_per_s;
+                var coordinator = Coordinator{ .state = &socket_state, .request = controlled, .source = source };
+                var future = std.Io.async(client_io.io(), Coordinator.run, .{&coordinator});
+                var awaited = false;
+                defer if (!awaited) {
+                    fixture.release.store(true, .release);
+                    future.await(client_io.io());
+                };
+                for (0..5_000) |_| {
+                    if (fixture.entered.load(.acquire)) break;
+                    try client_io.io().sleep(.fromMilliseconds(1), .awake);
+                }
+                try std.testing.expect(fixture.entered.load(.acquire));
+                switch (mode) {
+                    .cancel => socket_state.cancelled.store(true, .release),
+                    .timeout => while (platform_time.monotonicNs() < controlled.execution_deadline_ns.?)
+                        try client_io.io().sleep(.fromMilliseconds(1), .awake),
+                }
+                fixture.release.store(true, .release);
+                future.await(client_io.io());
+                awaited = true;
+                try std.testing.expectEqual(if (mode == .cancel) error.Cancelled else error.Timeout, coordinator.result_error orelse return error.TestUnexpectedResult);
+                try std.testing.expect(!coordinator.published);
+                try std.testing.expectEqual(@as(usize, 1), fixture.calls.load(.acquire));
+                try std.testing.expectEqual(@as(u32, 1), socket_state.expand_calls);
+                try std.testing.expectEqual(@as(u32, 1), socket_state.hydrate_calls);
+                for (0..5_000) |_| {
+                    if (server.runtimeStats().active_connections == 0 and server.runtimeStats().active_requests == 0) break;
+                    try client_io.io().sleep(.fromMilliseconds(1), .awake);
+                }
+                try std.testing.expectEqual(@as(usize, 0), server.runtimeStats().active_connections);
+                try std.testing.expectEqual(@as(usize, 0), server.runtimeStats().active_requests);
+            }
+        };
+        try SocketFixture.runMode(.cancel, req, base_result);
+        try SocketFixture.runMode(.timeout, req, base_result);
+    }
 }
 
 test "distributed graph stops after single retry on repeated topology churn" {
@@ -15404,6 +15746,8 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
         hydrate_active: std.atomic.Value(u32) = .init(0),
         max_expand_active: std.atomic.Value(u32) = .init(0),
         max_hydrate_active: std.atomic.Value(u32) = .init(0),
+        expand_scratch_bytes: usize = 0,
+        hydrate_scratch_bytes: usize = 0,
 
         fn updateMax(max_value: *std.atomic.Value(u32), current: u32) void {
             var observed = max_value.load(.monotonic);
@@ -15493,6 +15837,14 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
                 .raw = .fromNanoseconds(10 * std.time.ns_per_ms),
             }, state.io_impl.io());
 
+            if (state.expand_scratch_bytes != 0) {
+                // The worker may decode transient data that is never merged
+                // into the final page. Its slot allocator must still be
+                // charged to the original request.
+                const scratch = try alloc.alloc(u8, state.expand_scratch_bytes);
+                @memset(scratch, 0x5a);
+            }
+
             try std.testing.expectEqual(@as(usize, 1), req.frontier.len);
             const node_key = if (group_id == 11) "doc:b" else "doc:o";
             const nodes = try alloc.alloc(graph_query_mod.GraphResultNode, 1);
@@ -15539,6 +15891,11 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
                 .raw = .fromNanoseconds(10 * std.time.ns_per_ms),
             }, state.io_impl.io());
             try std.testing.expectEqual(@as(?u64, 77), req.identity_read_generation);
+
+            if (state.hydrate_scratch_bytes != 0) {
+                const scratch = try alloc.alloc(u8, state.hydrate_scratch_bytes);
+                @memset(scratch, 0x5a);
+            }
 
             const hits = try alloc.alloc(db_mod.types.SearchHit, req.keys.len);
             var initialized: usize = 0;
@@ -15623,6 +15980,39 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
         .read_index,
     ));
     try std.testing.expectEqual(@as(u32, 2), state.expand_calls.load(.monotonic));
+
+    cancellation.store(false, .release);
+    state.expand_scratch_bytes = 2 * 1024 * 1024;
+    const limited_buffer = try std.testing.allocator.alloc(u8, 1024 * 1024);
+    defer std.testing.allocator.free(limited_buffer);
+    var limited = std.heap.FixedBufferAllocator.init(limited_buffer);
+    var limited_req = req;
+    limited_req.execution_deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    try std.testing.expectError(error.OutOfMemory, executeCrossRange(
+        limited.allocator(),
+        FakeCatalog.iface(),
+        FakeWorker.iface(&state),
+        "docs",
+        limited_req,
+        base_result,
+        .read_index,
+    ));
+    try std.testing.expect(state.expand_calls.load(.monotonic) >= 4);
+
+    state.expand_scratch_bytes = 0;
+    state.hydrate_scratch_bytes = 2 * 1024 * 1024;
+    limited.reset();
+    limited_req.execution_deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    try std.testing.expectError(error.OutOfMemory, executeCrossRange(
+        limited.allocator(),
+        FakeCatalog.iface(),
+        FakeWorker.iface(&state),
+        "docs",
+        limited_req,
+        base_result,
+        .read_index,
+    ));
+    try std.testing.expect(state.hydrate_calls.load(.monotonic) >= 4);
 }
 
 test "system catalog graph binding alone performs no admission hydration" {

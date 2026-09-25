@@ -39,8 +39,22 @@ pub const HandlerCreateContext = abi.HandlerCreateContext;
 const ServerState = struct {
     owner_alloc: std.mem.Allocator,
     server: server_mod.ApiHttpServer,
+    refs: std.atomic.Value(usize) = .init(1),
+    // Exported allocator descriptors may outlive server resources. Never point
+    // them at a field overwritten by ApiHttpServer.deinit().
+    request_alloc: std.mem.Allocator,
     request_alloc_abi: abi.memory_abi.Allocator,
     runtime_io: RuntimeIoReceivers = .{},
+
+    fn retain(self: *ServerState) void {
+        const previous = self.refs.fetchAdd(1, .monotonic);
+        std.debug.assert(previous > 0);
+    }
+
+    fn release(self: *ServerState) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        self.owner_alloc.destroy(self);
+    }
 };
 
 const RuntimeIoReceivers = struct {
@@ -67,6 +81,7 @@ const RuntimeIoReceivers = struct {
 };
 
 const HandlerState = struct {
+    server_owner: ?*ServerState = null,
     alloc: std.mem.Allocator,
     handler: handler_mod.AntflyApiHandler,
     routes: std.ArrayListUnmanaged(*RouteState) = .empty,
@@ -82,6 +97,7 @@ const RouteState = struct {
 };
 
 const HttpResponseState = struct {
+    server_owner: ?*ServerState = null,
     alloc: std.mem.Allocator,
     response: httpx.Response,
     header_views: []abi.HeaderView,
@@ -169,6 +185,7 @@ pub fn create(context: *const CreateContext) callconv(.c) abi.Status {
     defer if (!published) owner_alloc.destroy(state);
 
     state.owner_alloc = owner_alloc;
+    state.refs = .init(1);
     state.runtime_io = .{};
     var imported_cfg = cfg.*;
     imported_cfg.imported_runtime_io = null;
@@ -176,6 +193,8 @@ pub fn create(context: *const CreateContext) callconv(.c) abi.Status {
         state.runtime_io.init(borrows) catch |err| return fail(err);
         imported_cfg.imported_runtime_io = state.runtime_io.views();
     }
+    if ((imported_cfg.remote_attempt_worker.max_attempts != 0 or imported_cfg.remote_attempt_coordinator.max_attempts != 0) and context.flags & CreateContext.fallible_init == 0)
+        return fail(error.RemoteAttemptDurabilityRequired);
     state.server = if (context.flags & CreateContext.fallible_init != 0)
         server_mod.ApiHttpServer.initWithConfig(owner_alloc, imported_cfg, source.*, reads.*, writes.*) catch |err| {
             std.log.err("API kernel create failed initializing server: error.{s}", .{@errorName(err)});
@@ -183,8 +202,19 @@ pub fn create(context: *const CreateContext) callconv(.c) abi.Status {
         }
     else
         server_mod.ApiHttpServer.initWithProcessRequestAllocator(owner_alloc, imported_cfg, source.*, reads.*, writes.*);
+    // Reconstruct mandatory completion reservations at the final address,
+    // before any foreground/session traffic can consume the retained budget.
+    state.server.ensureTransactionSessionMemory() catch |err| {
+        state.server.deinit();
+        return fail(err);
+    };
+    state.server.ensureJoinJobMemory() catch |err| {
+        state.server.deinit();
+        return fail(err);
+    };
     if (reads.*) |read_source| read_source.bindIncomingGraphRoutes(&state.server.incoming_graph_routes);
-    state.request_alloc_abi = .fromStd(&state.server.alloc);
+    state.request_alloc = state.server.alloc;
+    state.request_alloc_abi = .fromStd(&state.request_alloc);
     context.out_handle.* = state;
     context.out_request_alloc.* = &state.request_alloc_abi;
     published = true;
@@ -193,9 +223,8 @@ pub fn create(context: *const CreateContext) callconv(.c) abi.Status {
 
 pub fn destroy(opaque_handle: *anyopaque) callconv(.c) void {
     const state: *ServerState = @ptrCast(@alignCast(opaque_handle));
-    const owner_alloc = state.owner_alloc;
     state.server.deinit();
-    owner_alloc.destroy(state);
+    state.release();
 }
 
 pub fn requestStats(context: *const CallContext) callconv(.c) abi.Status {
@@ -207,6 +236,20 @@ pub fn requestStats(context: *const CallContext) callconv(.c) abi.Status {
 pub fn queryAdmissionStats(context: *const CallContext) callconv(.c) abi.Status {
     if (validateCall(void, server_mod.RequestAdmission.Stats, context)) |failure| return failure;
     output(server_mod.RequestAdmission.Stats, context).* = serverState(context).server.queryAdmissionStats();
+    return .ok;
+}
+
+pub fn closeForegroundAdmission(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateCall(void, void, context)) |failure| return failure;
+    serverState(context).server.closeForegroundAdmission();
+    return .ok;
+}
+
+pub fn coordinatorPort(context: *const CallContext) callconv(.c) abi.Status {
+    const Result = @import("../runtime_workload_abi.zig").OptionalCoordinatorPort;
+    if (validateCall(void, Result, context)) |failure| return failure;
+    const port = serverState(context).server.coordinatorPort();
+    output(Result, context).* = if (port) |value| .{ .present = 1, .port = value } else .{};
     return .ok;
 }
 
@@ -315,10 +358,12 @@ pub fn handlerCreate(context: *const HandlerCreateContext) callconv(.c) abi.Stat
     const api_state: *ServerState = @ptrCast(@alignCast(context.api_server_handle));
     const state = api_state.owner_alloc.create(HandlerState) catch |err| return fail(err);
     state.* = .{
+        .server_owner = api_state,
         .alloc = api_state.owner_alloc,
         .handler = .{ .api_server = &api_state.server },
         .route_validator = httpx.Router.init(api_state.owner_alloc),
     };
+    api_state.retain();
     context.out_handle.* = state;
     return .ok;
 }
@@ -343,22 +388,11 @@ pub fn handlerStats(context: *const CallContext) callconv(.c) abi.Status {
     const inference = handler.api_server.inferenceAdmissionStats();
     const query_body = handler.query_body_admission.stats();
     output(abi.HandlerStats, context).* = .{
-        .query_capacity = query.capacity,
-        .query_in_flight = query.in_flight,
-        .query_peak_in_flight = query.peak_in_flight,
-        .query_rejected_total = query.rejected_total,
-        .write_capacity = write.capacity,
-        .write_in_flight = write.in_flight,
-        .write_peak_in_flight = write.peak_in_flight,
-        .write_rejected_total = write.rejected_total,
-        .inference_capacity = inference.capacity,
-        .inference_in_flight = inference.in_flight,
-        .inference_peak_in_flight = inference.peak_in_flight,
-        .inference_rejected_total = inference.rejected_total,
-        .query_body_capacity = query_body.capacity,
-        .query_body_in_flight = query_body.in_flight,
-        .query_body_peak_in_flight = query_body.peak_in_flight,
-        .query_body_rejected_total = query_body.rejected_total,
+        .query = .fromNative(query),
+        .write = .fromNative(write),
+        .inference = .fromNative(inference),
+        .query_body = .fromNative(query_body),
+        .recovery = .collect(handler.api_server),
     };
     return .ok;
 }
@@ -390,11 +424,16 @@ pub fn handlerRouteManifest(context: *const abi.RouteManifestContext) callconv(.
 }
 
 fn exportHttpResponse(
+    server_owner: ?*ServerState,
     alloc: std.mem.Allocator,
     response: httpx.Response,
     out_handle: *?*anyopaque,
     out_view: *abi.HttpResponseView,
 ) !void {
+    // Consume the response on both paths. The ABI callers return Status rather
+    // than an error union, so their errdefer cannot handle export failures.
+    var owned_response = response;
+    errdefer owned_response.deinit();
     const response_state = try alloc.create(HttpResponseState);
     errdefer alloc.destroy(response_state);
     const response_headers = response.headers.iterator();
@@ -407,10 +446,12 @@ fn exportHttpResponse(
         };
     }
     response_state.* = .{
+        .server_owner = server_owner,
         .alloc = alloc,
         .response = response,
         .header_views = header_views,
     };
+    if (server_owner) |owner| owner.retain();
     out_handle.* = response_state;
     out_view.* = .{
         .status = response.status.code,
@@ -454,11 +495,35 @@ pub fn handlerAuthorizeInternalService(context: *const abi.InternalServiceAuthCo
     defer http_context.deinit();
     var legacy_accepted = false;
     if (state.handler.authorizeHostInternalServiceRoute(&http_context, &legacy_accepted) catch |err| return fail(err)) |response| {
-        var owned_response = response;
-        errdefer owned_response.deinit();
-        exportHttpResponse(alloc, owned_response, context.out_response_handle, context.out_response) catch |err| return fail(err);
+        exportHttpResponse(state.server_owner, alloc, response, context.out_response_handle, context.out_response) catch |err| return fail(err);
     } else if (legacy_accepted) {
         context.out_legacy_accepted.* = 1;
+    }
+    return .ok;
+}
+
+pub fn handlerDispatchPolicy(context: *const abi.DispatchPolicyContext) callconv(.c) abi.Status {
+    if (validateContext(abi.DispatchPolicyContext, context.abi_version, context.struct_size)) |failure| return failure;
+    const state: *HandlerState = @ptrCast(@alignCast(context.handler_handle));
+    const config = state.handler.api_server.ingress_admission.config;
+    context.out_policy.* = .{
+        .max_requests = config.max_requests,
+        .control_requests = if (config.max_requests != 0) config.control_requests else 0,
+        .recovery_requests = if (config.max_requests != 0) config.recovery_requests else 0,
+    };
+    context.out_lane.* = 0;
+    if (context.request) |request| {
+        if (request.body_complete > 1) return .ok;
+        context.out_lane.* = @intFromEnum(state.handler.classifyIngressRequest(.{
+            .method = request.method.slice(),
+            .path = request.path.slice(),
+            .content_length = request.content_length.slice(),
+            .transfer_encoding = request.transfer_encoding.slice(),
+            .content_encoding = request.content_encoding.slice(),
+            .credential = request.credential.slice(),
+            .body_received_bytes = request.body_received_bytes,
+            .body_complete = request.body_complete != 0,
+        }));
     }
     return .ok;
 }
@@ -503,23 +568,25 @@ pub fn handlerHandleHttp(context: *const abi.HttpHandleContext) callconv(.c) abi
     defer http_context.deinit();
     http_context.params = params;
     runtime_http_bridge.installInbound(&http_context, &context.cancellation, &context.body_source, &context.stream);
-    var response = state.handler.dispatchLinkedRoute(&http_context, route.handler) catch |err| return fail(err);
-    errdefer response.deinit();
+    const response = state.handler.dispatchLinkedRoute(&http_context, route.handler) catch |err| return fail(err);
 
-    exportHttpResponse(alloc, response, context.out_response_handle, context.out_response) catch |err| return fail(err);
+    exportHttpResponse(state.server_owner, alloc, response, context.out_response_handle, context.out_response) catch |err| return fail(err);
     return .ok;
 }
 
 pub fn handlerDestroyHttpResponse(response_handle: *anyopaque) callconv(.c) void {
     const state: *HttpResponseState = @ptrCast(@alignCast(response_handle));
+    const server_owner = state.server_owner;
     const alloc = state.alloc;
     state.response.deinit();
     alloc.free(state.header_views);
     alloc.destroy(state);
+    if (server_owner) |owner| owner.release();
 }
 
 pub fn handlerDestroy(opaque_handle: *anyopaque) callconv(.c) void {
     const state: *HandlerState = @ptrCast(@alignCast(opaque_handle));
+    const server_owner = state.server_owner;
     const alloc = state.alloc;
     for (state.routes.items) |route| alloc.destroy(route);
     state.routes.deinit(alloc);
@@ -527,6 +594,7 @@ pub fn handlerDestroy(opaque_handle: *anyopaque) callconv(.c) void {
     state.route_validator.deinit();
     state.handler.deinitRuntime();
     alloc.destroy(state);
+    if (server_owner) |owner| owner.release();
 }
 
 const function_table: abi.FunctionTable = .{
@@ -535,11 +603,14 @@ const function_table: abi.FunctionTable = .{
     .capabilities = abi.Capability.core |
         abi.Capability.route_manifest |
         abi.Capability.inference_admission_stats |
-        abi.Capability.internal_service_ingress,
+        abi.Capability.internal_service_ingress |
+        abi.Capability.workload_coordinator |
+        abi.Capability.dispatch_admission,
     .create = &create,
     .destroy = &destroy,
     .request_stats = &requestStats,
     .query_admission_stats = &queryAdmissionStats,
+    .close_foreground_admission = &closeForegroundAdmission,
     .write_admission_stats = &writeAdmissionStats,
     .set_provider = &setProvider,
     .set_ha_executor = &setHAExecutor,
@@ -561,6 +632,8 @@ const function_table: abi.FunctionTable = .{
     .handler_destroy = &handlerDestroy,
     .inference_admission_stats = &inferenceAdmissionStats,
     .handler_authorize_internal_service = &handlerAuthorizeInternalService,
+    .coordinator_port = &coordinatorPort,
+    .handler_dispatch_policy = &handlerDispatchPolicy,
 };
 
 pub fn getFunctionTable() callconv(.c) *const abi.FunctionTable {
@@ -724,6 +797,74 @@ fn responseHeader(response: abi.HttpResponseView, name: []const u8) ?[]const u8 
         if (std.ascii.eqlIgnoreCase(header.name.slice(), name)) return header.value.slice();
     }
     return null;
+}
+
+test "workload admission failed kernel response export retires output ownership" {
+    const alloc = std.testing.allocator;
+    const Owner = @import("../common/workload_allocator.zig").Owner;
+    const Controller = @import("../common/workload_admission.zig").Controller;
+    for (0..2) |failure_index| {
+        var gate = Controller.initConfigured(1, .{ .max_retained_bytes = 4096 });
+        defer gate.deinitMemory();
+        const owner = try Owner.create(alloc, &gate);
+        var response = httpx.Response.init(alloc, 200);
+        response.body = try owner.allocator().dupe(u8, "retained query output");
+        response.body_owned = true;
+        response.body_allocator = owner.allocator();
+        response.retirement = .{ .ptr = owner, .release = struct {
+            fn release(raw: *anyopaque) void {
+                const value: *Owner = @ptrCast(@alignCast(raw));
+                value.release();
+            }
+        }.release };
+        try response.headers.set("Content-Type", "application/json");
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = failure_index });
+        var handle: ?*anyopaque = null;
+        var view: abi.HttpResponseView = undefined;
+        // Fail the response-state allocation, then its nonempty header-view
+        // allocation. Both paths consume the already-produced response.
+        try std.testing.expectError(error.OutOfMemory, exportHttpResponse(null, failing.allocator(), response, &handle, &view));
+        try std.testing.expect(handle == null);
+        try std.testing.expectEqual(@as(usize, 0), gate.stats().retained_bytes);
+    }
+}
+
+test "workload admission exported kernel response survives server teardown" {
+    const alloc = std.testing.allocator;
+    var status = KernelIngressTestStatus{};
+    const state = try alloc.create(ServerState);
+    state.* = .{
+        .owner_alloc = alloc,
+        .server = server_mod.ApiHttpServer.init(alloc, .{
+            .query_admission_waiting = .{ .max_retained_bytes = 4096 },
+        }, status.source(), null, null),
+        .request_alloc = alloc,
+        .request_alloc_abi = undefined,
+    };
+    state.request_alloc_abi = .fromStd(&state.request_alloc);
+    const Owner = @import("../common/workload_allocator.zig").Owner;
+    const owner = try Owner.create(state.request_alloc, &state.server.query_admission);
+    var response = httpx.Response.init(state.request_alloc, 200);
+    response.body = try owner.allocator().dupe(u8, "kernel-owned output");
+    response.body_owned = true;
+    response.body_allocator = owner.allocator();
+    response.retirement = .{ .ptr = owner, .release = struct {
+        fn release(raw: *anyopaque) void {
+            const value: *Owner = @ptrCast(@alignCast(raw));
+            value.release();
+        }
+    }.release };
+    var handle: ?*anyopaque = null;
+    var view: abi.HttpResponseView = undefined;
+    try exportHttpResponse(state, state.request_alloc, response, &handle, &view);
+    const exported_allocator = state.request_alloc_abi.asStd();
+    const before = owner.account.retainedBytes();
+    destroy(state); // closes resources, but exported allocation state survives
+    try std.testing.expectEqual(before, owner.account.retainedBytes());
+    try std.testing.expectEqualStrings("kernel-owned output", view.body.slice());
+    const probe = try exported_allocator.alloc(u8, 16);
+    exported_allocator.free(probe);
+    handlerDestroyHttpResponse(handle.?);
 }
 
 test "linked API route manifest preserves internal scan response streaming" {
@@ -1163,8 +1304,249 @@ test "API kernel create enforces owner I/O capabilities and preserves their life
         const imported = state.server.sharedApiFilesystemIo().?;
         var future = try state.server.sharedApiIo().?.concurrent(Probe.run, .{imported});
         try future.await(state.server.sharedApiIo().?);
+        var admission_lease = try state.server.acquireQuery(64, .{});
+        try std.testing.expect(closeForegroundAdmission(&.{ .abi_version = abi.abi_version, .handle = handle.? }).isOk());
+        try std.testing.expectError(error.AdmissionClosed, state.server.acquireQuery(64, .{}));
+        try std.testing.expectEqual(@as(usize, 1), state.server.queryAdmissionStats().in_flight);
+        admission_lease.release();
+        try std.testing.expectEqual(@as(usize, 0), state.server.queryAdmissionStats().retained_bytes);
         destroy(handle.?);
         handle = null;
         try Probe.run(std.testing.io);
     }
+}
+
+test "workload admission kernel telemetry preserves live ownership policy and diagnostics" {
+    const admission = @import("../common/request_admission.zig");
+    const bridge = @import("kernel_bridge.zig");
+    const alloc = std.testing.allocator;
+    var runtime = std.Io.Threaded.init(alloc, .{});
+    defer runtime.deinit();
+    const io = runtime.io();
+    const policy: admission.workload.Config = .{
+        .max_wait_ms = 5000,
+        .max_queued_requests = 1,
+        .max_queued_bytes = 8192,
+        .max_retained_bytes = 16384,
+    };
+    var source: KernelIngressTestStatus = .{};
+    var server = server_mod.ApiHttpServer.init(alloc, .{
+        .query_max_concurrent_requests = 1,
+        .query_admission_waiting = policy,
+        .write_max_concurrent_requests = 3,
+        .write_admission_waiting = .{ .max_retained_bytes = 4096 },
+    }, source.source(), null, null);
+    defer server.deinit();
+    var state: HandlerState = .{
+        .alloc = alloc,
+        .handler = .{ .api_server = &server },
+        .route_validator = httpx.Router.init(alloc),
+    };
+    defer state.route_validator.deinit();
+    var first = try server.query_admission.acquire(.{ .io = io, .retained_bytes = 32 });
+    defer first.release();
+    var write = try server.write_admission.acquire(.{ .io = io, .retained_bytes = 16 });
+    defer write.release();
+    const Worker = struct {
+        owner: *server_mod.RequestAdmission,
+        io: std.Io,
+        fn run(self: *@This()) !void {
+            var lease = try self.owner.acquire(.{ .io = self.io, .retained_bytes = 64 });
+            defer lease.release();
+        }
+    };
+    var worker: Worker = .{ .owner = &server.query_admission, .io = io };
+    var future = try io.concurrent(Worker.run, .{&worker});
+    defer _ = future.cancel(io) catch {};
+    const deadline = (admission.workload.Options{ .io = io }).now() + 2 * std.time.ns_per_s;
+    while (server.query_admission.stats().queued != 1) {
+        if ((admission.workload.Options{ .io = io }).now() >= deadline) return error.TestUnexpectedResult;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectError(error.AdmissionQueueFull, server.query_admission.acquire(.{ .io = io, .retained_bytes = 8 }));
+    try std.testing.expectError(error.AdmissionRequestTooLarge, server.query_admission.reserveMemory(32768));
+    try server.query_admission.reconfigure(1, policy);
+    const live = bridge.handlerStatsFromKernel(&state, getFunctionTable());
+    try std.testing.expectEqualDeep(server.queryAdmissionStats(), live.query);
+    try std.testing.expectEqualDeep(server.writeAdmissionStats(), live.write);
+    try std.testing.expectEqualDeep(server.inferenceAdmissionStats(), live.inference);
+    try std.testing.expectEqualDeep(state.handler.query_body_admission.stats(), live.query_body);
+    // Nonzero assertions ensure this test cannot pass with default-filled data.
+    try std.testing.expectEqual(@as(usize, 1), live.query.queued);
+    try std.testing.expectEqual(@as(usize, 64), live.query.queued_bytes);
+    try std.testing.expectEqual(@as(usize, 96), live.query.retained_bytes);
+    try std.testing.expectEqual(@as(u64, 2), live.query.policy_generation);
+    try std.testing.expectEqual(@as(u64, 1), live.query.rejection_reasons[@intFromEnum(admission.workload.RejectionReason.queue_count)]);
+    try std.testing.expectEqual(@as(u64, 1), live.query.allocation_denials[@intFromEnum(admission.workload.AllocationDenial.allocation_bytes)]);
+    var rendered: std.Io.Writer.Allocating = .init(alloc);
+    defer rendered.deinit();
+    try admission.appendPrometheusMetrics(&rendered.writer, .query, live.query);
+    try admission.appendPrometheusMetrics(&rendered.writer, .write, live.write);
+    for ([_][]const u8{
+        "antfly_admission_query_queue_capacity_requests 1\n",
+        "antfly_admission_query_retained_bytes 96\n",
+        "antfly_admission_query_policy_generation 2\n",
+        "antfly_admission_query_rejections_by_reason_total{reason=\"queue_count\"} 1\n",
+        "antfly_admission_write_retained_bytes 16\n",
+    }) |line| try std.testing.expect(std.mem.indexOf(u8, rendered.writer.buffered(), line) != null);
+    first.release();
+    try future.await(io);
+    const completed = bridge.handlerStatsFromKernel(&state, getFunctionTable());
+    try std.testing.expectEqualDeep(server.queryAdmissionStats(), completed.query);
+    try std.testing.expectEqual(@as(u64, 1), completed.query.wait_completed_total);
+    try std.testing.expectEqual(@as(u64, 1), completed.query.wait_buckets[completed.query.wait_buckets.len - 1]);
+    try std.testing.expect(completed.query.wait_ns_total > 0);
+    try std.testing.expectEqual(@as(usize, 0), completed.query.queued);
+    try std.testing.expectEqual(@as(usize, 0), completed.query.retained_bytes);
+    server.closeForegroundAdmission();
+    try std.testing.expect(bridge.handlerStatsFromKernel(&state, getFunctionTable()).query.draining);
+}
+
+test "workload admission compiled coordinator port preserves durable uncertainty and transport errors" {
+    const alloc = std.testing.allocator;
+    const common = @import("../common/http/http_common.zig");
+    const protocol = @import("workload_attempt_protocol.zig");
+    const wire = @import("../runtime_workload_abi.zig");
+    var backend = @import("../storage/mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    var storage = try backend.runtimeStore(alloc, .{ .name = "system/kernel-coordinator" });
+    defer storage.deinit();
+    var durable = @import("transactions.zig").DurableSessionStore.initRuntime(alloc, &storage);
+    const Fake = struct {
+        calls: usize = 0,
+        fn execute(raw: *anyopaque, allocator: std.mem.Allocator, request: common.HttpRequest) !common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expect(request.header(protocol.request_header) != null);
+            return .{ .status = 200, .body = try allocator.dupe(u8, "{}") };
+        }
+    };
+    var fake: Fake = .{};
+    const cfg: server_mod.ApiHttpServerConfig = .{
+        .session_store = &durable,
+        .session_executor = .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } },
+        .remote_attempt_coordinator = .{ .max_attempts = 2, .max_bytes = 8192, .max_destination_attempts = 1, .max_destinations = 2 },
+        .remote_attempt_node_id = 7,
+        .internal_service_secret = "s" ** 32,
+        .internal_service_issuer = "cluster",
+    };
+    var source_owner: KernelIngressTestStatus = .{};
+    const source = source_owner.source();
+    const reads: ?table_reads.TableReadSource = null;
+    const writes: ?table_writes.TableWriteSource = null;
+    const allocator = abi.memory_abi.Allocator.fromStd(&alloc);
+    var handle: ?*anyopaque = null;
+    var request_alloc: ?*const abi.memory_abi.Allocator = null;
+    const created = create(&.{
+        .abi_version = abi.abi_version,
+        .flags = CreateContext.fallible_init,
+        .owner_alloc = &allocator,
+        .cfg = &cfg,
+        .cfg_contract = .of(server_mod.ApiHttpServerConfig),
+        .source = &source,
+        .source_contract = .of(server_mod.StatusSource),
+        .table_reads = &reads,
+        .table_reads_contract = .of(?table_reads.TableReadSource),
+        .table_writes = &writes,
+        .table_writes_contract = .of(?table_writes.TableWriteSource),
+        .out_handle = &handle,
+        .out_request_alloc = &request_alloc,
+    });
+    try std.testing.expect(created.isOk());
+    defer destroy(handle.?);
+    const state: *ServerState = @ptrCast(@alignCast(handle.?));
+    const owner = state.server.remote_attempt_coordinator.?;
+    try owner.store.ready(.{ .version = 1, .coordinator = 7, .destination = 8, .worker_namespace = 44, .worker_incarnation = 10, .fenced_through = owner.store.generation - 1, .quiesced_through = owner.store.generation - 1 });
+    var exported: wire.OptionalCoordinatorPort = .{};
+    try std.testing.expect(abi.validFunctionTable(getFunctionTable(), abi.Capability.workload_coordinator));
+    try std.testing.expect(getFunctionTable().coordinator_port(&.{ .abi_version = abi.abi_version, .handle = handle.?, .output = &exported, .output_contract = .of(wire.OptionalCoordinatorPort) }).isOk());
+    try std.testing.expectEqual(@as(u8, 1), exported.present);
+    const request: common.HttpRequest = .{ .method = .POST, .uri = "http://worker/internal/v1/groups/1/tables/docs/_query", .body = "{}" };
+    const deadline = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s;
+    try std.testing.expectError(error.DistributedQueryUnavailable, exported.port.execute(alloc, 8, "http://worker", request, deadline));
+    try std.testing.expectEqual(@as(u32, 1), (try owner.store.usage()).attempts);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectError(error.AdmissionFull, exported.port.execute(alloc, 8, "http://worker", request, deadline));
+    try std.testing.expectEqual(@as(u32, 1), (try owner.store.usage()).attempts);
+    try std.testing.expectEqual(@as(u32, 0), owner.active.load(.acquire));
+}
+
+test "workload admission dispatch ABI authenticates protected lanes without heap allocation" {
+    const alloc = std.testing.allocator;
+    const bridge = @import("kernel_bridge.zig");
+    const dispatch = @import("workload_dispatch.zig");
+    const service_auth = @import("internal_service_auth.zig");
+    var source: KernelIngressTestStatus = .{};
+    var failing = std.testing.FailingAllocator.init(alloc, .{});
+    const secret = "d" ** 32;
+    var server = try server_mod.ApiHttpServer.initWithConfig(failing.allocator(), .{
+        .internal_service_secret = secret,
+        .internal_service_verification_secret = "e" ** 32,
+        .internal_service_issuer = "cluster",
+        .ingress_admission = .{ .max_requests = 3, .max_retained_bytes = 256 * 1024, .control_requests = 1, .control_retained_bytes = 64 * 1024, .recovery_requests = 1, .recovery_retained_bytes = 64 * 1024 },
+    }, source.source(), null, null);
+    defer server.deinit();
+    var state: HandlerState = .{
+        .alloc = failing.allocator(),
+        .handler = .{ .api_server = &server },
+        .route_validator = httpx.Router.init(alloc),
+    };
+    defer state.route_validator.deinit();
+    const token = try service_auth.tokenAlloc(alloc, .{ .secret = secret, .issuer = "cluster", .node_id = 7 }, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
+    defer alloc.free(token);
+    const previous_token = try service_auth.tokenAlloc(alloc, .{ .secret = "e" ** 32, .issuer = "cluster", .node_id = 7 }, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
+    defer alloc.free(previous_token);
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    const policy = try bridge.dispatchPolicyFromKernel(&state, getFunctionTable());
+    try std.testing.expectEqualDeep(abi.DispatchPolicy{ .max_requests = 3, .control_requests = 1, .recovery_requests = 1 }, policy);
+    const Case = struct { request: dispatch.Request, lane: dispatch.Lane };
+    const control_path = @import("http_routes.zig").Routes.workload_attempt_control;
+    const cases = [_]Case{
+        .{ .request = .{ .method = "GET", .path = "/healthz", .body_complete = true }, .lane = .control },
+        .{ .request = .{ .method = "HEAD", .path = "/readyz", .body_complete = true }, .lane = .control },
+        .{ .request = .{ .method = "GET", .path = "/healthz", .body_complete = false }, .lane = .general },
+        .{ .request = .{ .method = "GET", .path = "/healthz", .body_complete = true, .content_length = "1" }, .lane = .general },
+        .{ .request = .{ .method = "GET", .path = "/healthz", .body_complete = true, .content_length = "invalid" }, .lane = .general },
+        .{ .request = .{ .method = "GET", .path = "/healthz", .body_complete = true, .transfer_encoding = "chunked" }, .lane = .general },
+        .{ .request = .{ .method = "POST", .path = control_path, .body_complete = true }, .lane = .general },
+        .{ .request = .{ .method = "POST", .path = control_path, .body_complete = true, .credential = "forged" }, .lane = .general },
+        .{ .request = .{ .method = "POST", .path = "/internal/v1/groups/7/tables/txn-resolve", .body_complete = true }, .lane = .general },
+        .{ .request = .{ .method = "POST", .path = "/internal/v1/groups/7/tables/txn-status", .body_complete = true }, .lane = .general },
+        .{ .request = .{ .method = "POST", .path = "/internal/v1/groups/7/tables/txn-acknowledge", .body_complete = true }, .lane = .general },
+        .{ .request = .{ .method = "POST", .path = "/internal/v1/groups/7/tables//txn-status", .body_complete = true, .credential = token }, .lane = .general },
+        .{ .request = .{ .method = "POST", .path = control_path, .body_complete = true, .credential = token }, .lane = .recovery },
+        .{ .request = .{ .method = "POST", .path = control_path, .body_complete = true, .credential = previous_token }, .lane = .recovery },
+        .{ .request = .{ .method = "POST", .path = "/internal/v1/groups/7/tables/docs/txn-resolve", .body_complete = true, .credential = token }, .lane = .recovery },
+        .{ .request = .{ .method = "POST", .path = "/internal/v1/groups/7/tables/docs/txn-status", .body_complete = true, .credential = token }, .lane = .recovery },
+        .{ .request = .{ .method = "POST", .path = "/internal/v1/groups/7/tables/docs/txn-acknowledge", .body_complete = true, .credential = token }, .lane = .recovery },
+        .{ .request = .{ .method = "POST", .path = control_path, .body_complete = true, .credential = "x" ** 4097 }, .lane = .general },
+        .{ .request = .{ .method = "POST", .path = control_path, .content_length = "8192", .credential = token }, .lane = .recovery },
+        .{ .request = .{ .method = "POST", .path = control_path, .credential = token }, .lane = .general },
+        .{ .request = .{ .method = "POST", .path = control_path, .content_length = "8193", .credential = token }, .lane = .general },
+        .{ .request = .{ .method = "POST", .path = control_path, .body_complete = true, .body_received_bytes = 8193, .credential = token }, .lane = .general },
+        .{ .request = .{ .method = "POST", .path = control_path, .body_complete = true, .content_encoding = "gzip", .credential = token }, .lane = .general },
+        .{ .request = .{ .method = "POST", .path = "/db/v1/tables/docs/batch", .body_complete = true, .credential = token }, .lane = .general },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.lane, state.handler.classifyIngressRequest(case.request));
+        try std.testing.expectEqual(case.lane, bridge.classifyIngressFromKernel(&state, getFunctionTable(), case.request));
+    }
+    var incompatible = getFunctionTable().*;
+    incompatible.capabilities &= ~abi.Capability.dispatch_admission;
+    try std.testing.expectError(error.UnsupportedVersion, bridge.dispatchPolicyFromKernel(&state, &incompatible));
+    try std.testing.expectEqual(dispatch.Lane.general, bridge.classifyIngressFromKernel(&state, &incompatible, cases[0].request));
+    incompatible = getFunctionTable().*;
+    incompatible.struct_size = abi.requiredFunctionTableSize(abi.Capability.dispatch_admission).? - 1;
+    try std.testing.expectError(error.UnsupportedVersion, bridge.dispatchPolicyFromKernel(&state, &incompatible));
+    try std.testing.expectEqual(dispatch.Lane.general, bridge.classifyIngressFromKernel(&state, &incompatible, cases[0].request));
+    const InvalidLane = struct {
+        fn classify(context: *const abi.DispatchPolicyContext) callconv(.c) abi.Status {
+            context.out_lane.* = 255;
+            return .ok;
+        }
+    };
+    incompatible = getFunctionTable().*;
+    incompatible.handler_dispatch_policy = InvalidLane.classify;
+    try std.testing.expectEqual(dispatch.Lane.general, bridge.classifyIngressFromKernel(&state, &incompatible, cases[0].request));
 }

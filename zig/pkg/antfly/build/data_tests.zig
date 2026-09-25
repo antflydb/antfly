@@ -26,6 +26,7 @@ pub const AddTestsOptions = struct {
 };
 pub const AddTestsResult = struct {
     consumer: @import("linked_tests.zig").Artifact,
+    implementation: *std.Build.Step.Compile,
     linked_consumer_tests: []const *std.Build.Step.Compile,
     run_lib_data_runtime_tests: *std.Build.Step.Run,
     run_lib_data_storage_tests: *std.Build.Step.Run,
@@ -36,9 +37,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const data_runtime_test_mod = options.data_runtime_test_mod;
     const data_storage_test_mod = options.data_storage_test_mod;
     const lib_data_runtime_default_filters = [_][]const u8{
+        "workload admission cache metrics emit unique sample identities",
         "data ownership fallback requires a single store across all roles",
         "data relational maintenance yields to raft persistence and follows elections",
         "data runtime background worker capacity is reserved and closes with its owner",
+        "data runtime status refresh retries bounded executor pressure without losing wakes",
         "failed full index enrichment does not make resident reads unavailable",
         "enrichment runtime status reports worker lifecycle diagnostics",
         "enrichment index status encodes worker lifecycle diagnostics",
@@ -122,6 +125,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data raft apply records transaction conflicts without stopping replica progress",
         "db raced replicated transaction completion persists receipt and participant acknowledgement",
         "data runtime structural changes preserve writer-published runtime status",
+        "data runtime admission metrics preserve configured policy and live ownership",
         "data runtime startup catch-up prefers cached admin snapshot",
         "data runtime startup catch-up clears dirty bit for terminal degraded index load",
         "data runtime startup catch-up retains deferred inspection despite clean cached status",
@@ -169,6 +173,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data runtime cli accepts ARD identity flags",
         "data runtime parses experimental flag",
         "data public API listener uses public API request body limit",
+        "data public API listener carries configured ingress capacity without increasing upload buffers",
+        "data public upload buffering follows the process memory envelope",
+        "data public upload budget completes one maximum-sized request",
         "data server can register a store without enabling data raft",
         "data server registered data raft uses wal state backend by default",
         "data raft read safety deadline and cancellation cover owner lock admission",
@@ -210,7 +217,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "system catalog read peer routing honors expired and canceled admission budgets",
         "system catalog read peer routing retains healthy relocation views across publication and invalidation",
         "system catalog remote reads survive elections without skipping peers or extending budgets",
-        "system catalog remote reads spend one caller budget across bounded RPC attempts",
         "system catalog report failover preserves repair signals and stable peer order",
         "metadata capability client distinguishes advertised routing from N-1 absence",
         "data server wires configured HA executors into API server",
@@ -402,6 +408,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     return .{
         .consumer = lib_data_runtime_tests,
+        .implementation = implementation_tests,
         .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{lib_data_runtime_tests.executable}) catch @panic("OOM"),
         .run_lib_data_runtime_tests = run_lib_data_runtime_tests,
         .run_lib_data_storage_tests = run_lib_data_storage_tests,

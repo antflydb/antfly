@@ -10,9 +10,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-// Routed writers and Raft batchers now carry their owning error-domain
-// dispatcher. Reject older native handles before reading the added field.
-pub const abi_version: u32 = 8;
+pub const abi_version: u32 = 16;
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 
 pub const TypeContract = extern struct {

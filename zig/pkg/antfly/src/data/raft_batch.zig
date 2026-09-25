@@ -18,6 +18,8 @@ const db_mod = @import("../storage/db/selected_root.zig").db;
 const descriptor_contract = @import("../storage/kernel_owner_descriptor.zig");
 const internal_batch_forwarding = @import("../api/internal_batch_forwarding.zig");
 
+pub const completion_protocol_version = @import("../common/data_raft_protocol.zig").batch_completion_protocol_version;
+pub const mutation_completion_protocol_version = @import("../common/data_raft_protocol.zig").batch_mutation_completion_protocol_version;
 pub const protocol_version = internal_batch_forwarding.raft_batch_protocol_version;
 pub const timestamp_protocol_version = internal_batch_forwarding.raft_batch_timestamp_protocol_version;
 pub const activation_barrier_protocol_version = internal_batch_forwarding.raft_batch_activation_barrier_protocol_version;

@@ -17,6 +17,13 @@
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 
+pub mod admission;
+pub mod read_retries;
+pub use admission::{
+    AdmissionConfig, AdmissionError, AdmissionPool, Admitted, PooledClient, RunError,
+};
+pub use read_retries::{QueryRetryClient, QueryRetryError, ReadRetryPolicy};
+
 pub const MAX_ARTIFACT_SOURCES: usize = 64;
 
 /// A successful metadata mutation. `Committed` is not a failed write: observe

@@ -20,6 +20,7 @@ const compaction_mod = @import("compaction.zig");
 const runtime_mod = @import("runtime.zig");
 const storage_io = @import("storage_io.zig");
 const platform = @import("antfly_platform");
+const completion_recovery = @import("completion_recovery.zig");
 
 fn openDebugLogsEnabled() bool {
     return platform.env.getenv("ANTFLY_LSM_OPEN_DEBUG") != null;
@@ -71,11 +72,17 @@ fn finishOpenFailure(comptime BackendType: type, backend: *BackendType) void {
 
 pub fn open(comptime BackendType: type, allocator: Allocator, root_dir: []const u8, options: backend_types.OpenOptions, backend_options: anytype) !BackendType {
     var backend: BackendType = undefined;
-    try openInto(BackendType, &backend, allocator, root_dir, options, backend_options);
+    try openIntoPolicy(BackendType, &backend, allocator, root_dir, options, backend_options, false);
     return backend;
 }
 
+/// Restored completion slots pin accounting identities at the backend's final
+/// address. The caller must retain this address until close/abandon completes.
 pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Allocator, root_dir: []const u8, options: backend_types.OpenOptions, backend_options: anytype) !void {
+    return openIntoPolicy(BackendType, backend, allocator, root_dir, options, backend_options, true);
+}
+
+fn openIntoPolicy(comptime BackendType: type, backend: *BackendType, allocator: Allocator, root_dir: []const u8, options: backend_types.OpenOptions, backend_options: anytype, stable_address: bool) !void {
     if (@hasDecl(BackendType, "initInPlace")) {
         BackendType.initInPlace(backend, allocator, backend_options);
     } else {
@@ -114,6 +121,10 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
         }
     }
     errdefer cleanup(BackendType, backend, false);
+    errdefer if (@hasField(BackendType, "durable_completion")) {
+        backend.releaseDurableCompletion();
+        if (@hasDecl(BackendType, "releaseCompletionPool")) backend.releaseCompletionPool();
+    };
     errdefer finishOpenFailure(BackendType, backend);
     if (@hasDecl(BackendType, "initOutputCleanup")) try backend.initOutputCleanup();
 
@@ -127,6 +138,75 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
         try backend.prepareWalOperationLockFile();
     }
 
+    if (comptime @hasField(BackendType, "durable_completion")) {
+        if (!stable_address) {
+            for (@import("completion_runtime.zig").guard_filenames) |filename| {
+                const guard = try std.fs.path.join(allocator, &.{ root_dir, filename });
+                defer allocator.free(guard);
+                if (backend.storage.?.fileSize(guard)) |_| return error.UnsupportedCompletionBackend else |err| {
+                    if (err != error.FileNotFound) return err;
+                }
+            }
+        }
+    }
+    const accepted_pool_guarded = if (comptime @hasField(BackendType, "completion_pool"))
+        try @import("completion_pool.zig").hasAcceptedGuards(backend.storage.?, allocator, root_dir)
+    else
+        false;
+    var restore_control_owner = false;
+    var accepted_control_guarded = false;
+    if (comptime @hasField(BackendType, "completion_pool")) {
+        // A transition sidecar may contain an accepted Raft entry whose WAL
+        // publication was interrupted. It is an independent startup debt,
+        // even if its BEGIN guard was lost or removed out of order.
+        accepted_control_guarded = try @import("completion_control_accepted.zig").hasAny(backend.storage.?, allocator, root_dir);
+        const control_guard = @import("completion_control_guard.zig");
+        // Published owners with a trusted installation enter the bounded
+        // restoration path. Accepted multi-owner transitions still require
+        // an interleaved Raft suffix proof and remain fenced by the pool.
+        if (try control_guard.hasAny(backend.storage.?, allocator, root_dir)) {
+            if (backend.options.completion_pool_config) |config| {
+                const authority: @import("completion_control_record.zig").Authority = .{
+                    .group_id = config.identity.group_id,
+                    .incarnation = config.identity.incarnation,
+                    .policy_digest = config.identity.policy_digest,
+                    .schema_catalog_digest = config.schema_catalog_digest,
+                    .generation = config.identity.generation,
+                };
+                var local = try control_guard.loadAll(allocator, backend.storage.?, root_dir, authority);
+                defer local.deinit();
+                if (local.count == 0 or local.count > 2) return error.CompletionRecoveryCapacityRequired;
+                restore_control_owner = true;
+            } else {
+                return error.CompletionRecoveryCapacityRequired;
+            }
+        }
+        if (accepted_control_guarded and !restore_control_owner) return error.CompletionRecoveryCapacityRequired;
+    }
+    if (accepted_pool_guarded) {
+        if (!stable_address) return error.UnsupportedCompletionBackend;
+        if (backend.options.completion_pool_config == null) return error.CompletionRecoveryCapacityRequired;
+    }
+    const pool_configured = if (comptime @hasField(BackendType, "completion_pool")) backend.options.completion_pool_config != null else false;
+    const installed_pool_guarded = installed: {
+        const path = try std.fs.path.join(allocator, &.{ root_dir, "completion-installation.guard" });
+        defer allocator.free(path);
+        if (backend.storage.?.fileSize(path)) |_| break :installed true else |err| {
+            if (err != error.FileNotFound) return err;
+            break :installed false;
+        }
+    };
+    if (installed_pool_guarded and !pool_configured) return error.CompletionRecoveryCapacityRequired;
+    if (pool_configured and !stable_address) return error.UnsupportedCompletionBackend;
+    if (pool_configured and !accepted_pool_guarded) {
+        // A local reservation cannot be silently reinterpreted as a replicated
+        // pool merely because trusted startup configuration changed.
+        for (@import("completion_runtime.zig").guard_filenames) |filename| {
+            const path = try std.fs.path.join(allocator, &.{ root_dir, filename });
+            defer allocator.free(path);
+            if (backend.storage.?.fileSize(path)) |_| return error.InvalidCompletionSlot else |err| if (err != error.FileNotFound) return err;
+        }
+    }
     cleanupRecoveredRunFiles(BackendType, backend, "before_manifest", true);
 
     const loaded_manifest = blk: {
@@ -198,6 +278,9 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
             },
         );
     }
+    // An installed/accepted owner cannot become a fresh empty store merely
+    // because its authoritative manifest disappeared.
+    if (!loaded_manifest and (installed_pool_guarded or accepted_pool_guarded or restore_control_owner or accepted_control_guarded)) return error.InvalidManifest;
     if (!loaded_manifest and options.create_if_missing) {
         const phase_start = beginOpenPhase(BackendType, backend, .ensuring_dirs);
         defer finishOpenPhase(BackendType, backend, .ensuring_dirs, phase_start);
@@ -215,11 +298,44 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
         const locked = runtime_mod.lockBackend(BackendType, backend);
         defer runtime_mod.unlockBackend(BackendType, backend, locked);
 
+        // Native completion needs the manifest metadata/baseline mounted so
+        // its entire physical reservation can be reconstructed before replay.
+        if (comptime @hasField(BackendType, "durable_completion")) {
+            if (@hasDecl(BackendType, "registerOpenManifestRunRefs")) try backend.registerOpenManifestRunRefs();
+            if (@hasDecl(BackendType, "mountRunDirectory")) try backend.mountRunDirectory();
+        }
+        // Trusted installed policy also owns idle/receipt-only replay. Waiting
+        // for an accepted sidecar would replay into ordinary memory and lose the
+        // fixed restart envelope immediately after the last slot retired.
+        const restore_pool = pool_configured and loaded_manifest;
+        if (comptime @hasField(BackendType, "completion_pool")) {
+            if (restore_pool) {
+                try backend.installCompletionPoolLocked(backend.options.completion_pool_config.?);
+                if (restore_control_owner) try backend.completion_pool.?.restoreControlOwnersBeforeReplay(backend);
+            }
+        }
+        const guarded = if (comptime @hasField(BackendType, "durable_completion"))
+            if (restore_pool) false else try completion_recovery.restoreBeforeReplay(BackendType, backend)
+        else
+            false;
         if (@hasDecl(BackendType, "replayWalIntoMutable")) {
             if (debug_open) std.log.info("lsm backend open wal replay begin root={s}", .{backend.root_dir.?});
             const phase_start = beginOpenPhase(BackendType, backend, .replaying_wal);
             defer finishOpenPhase(BackendType, backend, .replaying_wal, phase_start);
-            try backend.replayWalIntoMutable();
+            if (comptime @hasField(BackendType, "durable_completion")) {
+                if (restore_pool) {
+                    const pool = backend.completion_pool.?;
+                    try pool.replayBeforePublication(backend);
+                    try pool.restoreMaterialized(backend);
+                    if (restore_control_owner) try pool.validateRestoredControlAfterReplay(backend);
+                } else if (guarded) {
+                    const replay_stats = try completion_recovery.replay(BackendType, backend);
+                    try completion_recovery.finish(BackendType, backend, replay_stats);
+                } else {
+                    try backend.replayWalIntoMutable();
+                    try completion_recovery.rejectUnanchored(BackendType, backend);
+                }
+            } else try backend.replayWalIntoMutable();
             recordOpenReplayComplete(BackendType, backend);
             if (debug_open) {
                 std.log.info(
@@ -235,7 +351,9 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
         const phase_start = beginOpenPhase(BackendType, backend, .mounting_runs);
         defer finishOpenPhase(BackendType, backend, .mounting_runs, phase_start);
         if (comptime @TypeOf(backend.runs) != @import("run_store.zig").Store) compaction_mod.sortRuns(backend.runs.items);
-        if (@hasDecl(BackendType, "registerOpenManifestRunRefs")) try backend.registerOpenManifestRunRefs();
+        if (comptime !@hasField(BackendType, "durable_completion")) {
+            if (@hasDecl(BackendType, "registerOpenManifestRunRefs")) try backend.registerOpenManifestRunRefs();
+        }
         // Build cold metadata before publishing the opened backend. Subsequent
         // writes maintain this root incrementally, including before first read.
         if (@hasDecl(BackendType, "mountRunDirectory")) try backend.mountRunDirectory();

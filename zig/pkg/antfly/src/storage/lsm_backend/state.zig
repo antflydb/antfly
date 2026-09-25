@@ -163,7 +163,7 @@ const SharedEntry = struct {
         if (self.references.fetchSub(1, .acq_rel) != 1) return;
         const allocator = self.allocator;
         const bytes: [*]align(@alignOf(SharedEntry)) u8 = @ptrCast(self);
-        if (self.account) |account| account.discharge(self.allocation_len);
+        if (self.account) |account| account.dischargeAllocated(self.allocation_len, allocator);
         allocator.free(bytes[0..self.allocation_len]);
     }
 };
@@ -684,23 +684,72 @@ pub const ActiveMemTable = struct {
     }
 
     pub fn accountedMemoryBytes(self: *const ActiveMemTable, pass: u64) u64 {
-        if (self.ordered_enabled) return (if (self.ordered.account) |account| account.chargeOnce(pass) else 0) + self.ordered.spare.capacity * @sizeOf(*OrderedIndex.Node);
+        if (self.ordered_enabled) return (if (self.ordered.account) |account| account.chargeOnce(pass) else 0) + (if (self.ordered.spare_allocator != null and @import("completion_allocator.zig").isPrepaid(self.ordered.spare_allocator.?)) @as(u64, 0) else self.ordered.spare.capacity * @sizeOf(*OrderedIndex.Node));
         return self.estimatedMemoryBytes();
     }
 
     /// Build the complete successor before WAL append. The live root is never
     /// edited, including when any allocation fails halfway through the batch.
+    /// Allocation contexts must outlive every retained generation allocated
+    /// through them. Provenance is preserved; this does not retain the context
+    /// or exempt these allocations from the shared memory Account.
     pub fn preparePublication(self: *ActiveMemTable, allocator: Allocator, incoming: *const ActiveMemTable) !ActiveMemTable {
+        return self.preparePublicationInternal(allocator, incoming, false);
+    }
+
+    /// Copy payloads into the publication domain as well as the index nodes.
+    /// This keeps temporary incoming scratch independently reclaimable while
+    /// mutable/readers retain their exact publication allocation provenance.
+    pub fn preparePublicationOwned(self: *ActiveMemTable, allocator: Allocator, incoming: *const ActiveMemTable) !ActiveMemTable {
+        return self.preparePublicationInternal(allocator, incoming, true);
+    }
+
+    fn preparePublicationInternal(self: *ActiveMemTable, allocator: Allocator, incoming: *const ActiveMemTable, copy_payloads: bool) !ActiveMemTable {
         std.debug.assert(self.ordered_enabled);
         var candidate = ActiveMemTable{ .ordered = self.ordered.fork(), .logical_bytes = self.logical_bytes };
-        std.mem.swap(std.ArrayListUnmanaged(*OrderedIndex.Node), &candidate.ordered.spare, &self.ordered.spare);
+        if (self.ordered.spare_allocator) |spare_allocator| {
+            if (spare_allocator.ptr == allocator.ptr and spare_allocator.vtable == allocator.vtable) {
+                std.mem.swap(std.ArrayListUnmanaged(*OrderedIndex.Node), &candidate.ordered.spare, &self.ordered.spare);
+                std.mem.swap(?Allocator, &candidate.ordered.spare_allocator, &self.ordered.spare_allocator);
+            }
+        }
         errdefer candidate.deinit(allocator);
         for (0..incoming.entryCount()) |i| {
-            var entry = try cloneEntry(allocator, incoming.entryAt(i));
+            const source = incoming.entryAt(i);
+            var entry = if (copy_payloads)
+                try initSharedEntry(allocator, namespaceOf(source), source.key, source.value, source.tombstone)
+            else
+                try cloneEntry(allocator, source);
             errdefer entry.deinit(allocator);
             try candidate.upsertMove(allocator, entry);
         }
         return candidate;
+    }
+
+    /// Publication from bounded canonical point operations; includes record
+    /// clones even when shared incoming ownership avoids those copies today.
+    pub fn publicationAllocationBound(max_entries: usize, edits: usize, record_bytes: usize) !usize {
+        const footprint = @import("completion_allocator.zig").RecyclingScratch.allocationFootprint;
+        const records = try std.math.add(usize, record_bytes, try std.math.mul(usize, edits, try footprint(@sizeOf(SharedEntry), @alignOf(SharedEntry))));
+        return std.math.add(usize, records, try OrderedIndex.insertionAllocationBound(max_entries, edits));
+    }
+
+    /// A control lifetime can alternate allocators with other owners and keep
+    /// a reader after every publication. Charge a fresh spare/vector/account
+    /// pool per edit; no continuous spare-pool reuse is assumed across batches.
+    pub fn cumulativePublicationAllocationBound(max_entries: usize, edits: usize, record_bytes: usize) !usize {
+        const footprint = @import("completion_allocator.zig").RecyclingScratch.allocationFootprint;
+        const records = try std.math.add(usize, record_bytes, try std.math.mul(usize, edits, try footprint(@sizeOf(SharedEntry), @alignOf(SharedEntry))));
+        return std.math.add(usize, records, try OrderedIndex.sequentialAllocationBound(max_entries, edits));
+    }
+
+    /// Only for replay into an initially empty ordered table, before any
+    /// reader/root snapshot can share nodes. Payload bytes count every version,
+    /// even replacements, and the index bound counts all cumulative allocations.
+    pub fn uniqueReplayAllocationBound(edits: usize, record_bytes: usize) !usize {
+        const footprint = @import("completion_allocator.zig").RecyclingScratch.allocationFootprint;
+        const records = try std.math.add(usize, record_bytes, try std.math.mul(usize, edits, try footprint(@sizeOf(SharedEntry), @alignOf(SharedEntry))));
+        return std.math.add(usize, records, try OrderedIndex.uniqueInsertionAllocationBound(edits));
     }
 
     /// No allocation, validation, or fallible work may follow the WAL boundary
@@ -760,7 +809,7 @@ pub const ActiveMemTable = struct {
             }
             if (owned.shared.?.account == null) {
                 owned.shared.?.account = account;
-                account.charge(owned.shared.?.allocation_len);
+                account.chargeAllocated(owned.shared.?.allocation_len, owned.shared.?.allocator);
             }
             self.ordered.putPrepared(allocator, owned);
             const root = self.ordered.root.?;
@@ -1257,6 +1306,61 @@ test "prepared mutable publication is atomic at every allocation failure" {
     try std.testing.expect(failures > 1 and successes > 1);
 }
 
+test "workload admission mixed allocator publication preserves pinned reclamation provenance" {
+    const alloc = std.testing.allocator;
+    var counted = std.testing.FailingAllocator.init(alloc, .{});
+    var live: ActiveMemTable = .{};
+    try live.upsert(alloc, .{}, "a", "old", false);
+    var old = try live.snapshot(alloc);
+    var incoming: ActiveMemTable = .{ .ordered_enabled = false };
+    try incoming.upsert(alloc, .{}, "a", "new", false);
+    var candidate = try live.preparePublication(counted.allocator(), &incoming);
+    live.publishPrepared(&candidate);
+    candidate.deinit(alloc);
+    incoming.deinit(alloc);
+    try std.testing.expectEqualStrings("old", try old.get(.{}, "a"));
+    try std.testing.expectEqualStrings("new", try live.get(.{}, "a"));
+    const pass = memory_account.nextPass();
+    const shared = live.accountedMemoryBytes(pass);
+    try std.testing.expect(shared >= counted.allocated_bytes - counted.freed_bytes);
+    try std.testing.expectEqual(@as(u64, 0), old.accountedMemoryBytes(pass));
+    const retained = try live.snapshot(alloc);
+    live.deinit(alloc);
+    old.deinit(alloc);
+    try std.testing.expect(counted.allocated_bytes > counted.freed_bytes);
+    var retirement = State.Reclaimer.init(retained);
+    while (true) {
+        var credits: usize = 1;
+        if (retirement.step(alloc, &credits)) break;
+    }
+    try std.testing.expectEqual(counted.allocated_bytes, counted.freed_bytes);
+}
+
+test "workload admission publication spare pool changes allocator domains atomically" {
+    const alloc = std.testing.allocator;
+    var counted = std.testing.FailingAllocator.init(alloc, .{});
+    var live: ActiveMemTable = .{};
+    defer live.deinit(alloc);
+    try live.upsert(alloc, .{}, "a", "old", false);
+    const account = live.ordered.account.?;
+    const alternate = counted.allocator();
+    try live.ordered.prepareEdits(alternate, 2);
+    try std.testing.expectEqual(account, live.ordered.account.?);
+    for (live.ordered.spare.items) |node| {
+        try std.testing.expectEqual(alternate.ptr, node.allocation_allocator.ptr);
+        try std.testing.expectEqual(alternate.vtable, node.allocation_allocator.vtable);
+    }
+    counted.fail_index = counted.alloc_index;
+    try live.ordered.prepareEdits(alloc, 2);
+    try std.testing.expectEqual(account, live.ordered.account.?);
+    for (live.ordered.spare.items) |node| {
+        try std.testing.expectEqual(alloc.ptr, node.allocation_allocator.ptr);
+        try std.testing.expectEqual(alloc.vtable, node.allocation_allocator.vtable);
+    }
+    try std.testing.expectEqual(counted.allocated_bytes, counted.freed_bytes);
+    try std.testing.expectEqualStrings("old", try live.get(.{}, "a"));
+}
+
 test "ordered generations account shared allocations once and rotate without allocation" {
     var counter = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const alloc = counter.allocator();
@@ -1667,4 +1771,33 @@ test "EntryIndex stores unique hashes inline and preserves collision lookup" {
     try std.testing.expectEqual(@as(?usize, 0), index.find(entries.items, forced_hash, .{}, "alpha"));
     try std.testing.expectEqual(@as(?usize, 1), index.find(entries.items, forced_hash, .{}, "beta"));
     try std.testing.expectEqual(@as(?usize, null), index.find(entries.items, forced_hash, .{}, "missing"));
+}
+
+test "workload admission completion publication copies payloads out of scratch while readers retain provenance" {
+    const alloc = std.testing.allocator;
+    const domains = @import("completion_allocator.zig");
+    const resources = @import("../resource_manager.zig");
+    var manager = resources.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer manager.deinit(alloc);
+    const scratch = try domains.RecyclingScratch.create(alloc, &manager, 64 * 1024);
+    defer scratch.destroy() catch unreachable;
+    var published = std.testing.FailingAllocator.init(alloc, .{});
+    var live: ActiveMemTable = .{};
+    defer live.deinit(alloc);
+    {
+        var incoming: ActiveMemTable = .{ .ordered_enabled = false };
+        defer incoming.deinit(scratch.allocator());
+        try incoming.upsert(scratch.allocator(), .{ .name = "ns\x00" }, "binary\xff", "retained value", false);
+        var candidate = try live.preparePublicationOwned(published.allocator(), &incoming);
+        defer candidate.deinit(alloc);
+        live.publishPrepared(&candidate);
+    }
+    try std.testing.expect(scratch.isEmpty());
+    var reader = try live.snapshot(alloc);
+    live.deinit(alloc);
+    live = .{};
+    try std.testing.expectEqualStrings("retained value", try reader.get(.{ .name = "ns\x00" }, "binary\xff"));
+    try std.testing.expect(published.allocated_bytes > published.freed_bytes);
+    reader.deinit(alloc);
+    try std.testing.expectEqual(published.allocated_bytes, published.freed_bytes);
 }

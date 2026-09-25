@@ -218,6 +218,19 @@ pub const JoinContext = struct {
         return out;
     }
 
+    /// Decoding consumes the same worker budget as execution. Parsed requests
+    /// carry a native deadline captured before decoding; typed local callers
+    /// without that timestamp retain the relative-budget contract.
+    fn withReceivedExecutionBudget(self: JoinContext, request: anytype) !JoinContext {
+        const received_deadline = request.received_deadline_ns orelse
+            return self.withRemainingExecutionBudgetMs(request.remaining_timeout_ms);
+        var out = self.withNativeExecutionDeadline(received_deadline);
+        if (self.execution_deadline_ns) |local_deadline|
+            out.execution_deadline_ns = @min(local_deadline, out.execution_deadline_ns.?);
+        try out.ensureExecutionDeadline();
+        return out;
+    }
+
     /// Returns a ceiling-rounded relative budget so serialization cannot make
     /// a live sub-millisecond deadline expire early on the receiving node.
     pub fn remainingExecutionBudgetMs(self: JoinContext) !?u64 {
@@ -808,6 +821,8 @@ pub const LoadedRightJoinQuery = struct {
 };
 
 pub const JoinPartitionRequest = struct {
+    /// Process-local only; never serialized to another host.
+    received_deadline_ns: ?u64 = null,
     job_id: ?u64 = null,
     join: SupportedJoinRequest,
     left_hits: []const std.json.Value,
@@ -826,6 +841,8 @@ pub const JoinPartitionRequest = struct {
 };
 
 pub const JoinRowsRequest = struct {
+    /// Process-local only; never serialized to another host.
+    received_deadline_ns: ?u64 = null,
     job_id: ?u64 = null,
     join: SupportedJoinRequest,
     partition_index: usize = 0,
@@ -841,6 +858,8 @@ pub const JoinRowsRequest = struct {
 };
 
 pub const JoinUnmatchedRequest = struct {
+    /// Process-local only; never serialized to another host.
+    received_deadline_ns: ?u64 = null,
     join: SupportedJoinRequest,
     left_hit_count: usize = 0,
     left_fields: []const []const u8 = &.{},
@@ -857,6 +876,8 @@ pub const JoinUnmatchedRequest = struct {
 };
 
 pub const JoinFinalizeRequest = struct {
+    /// Process-local only; never serialized to another host.
+    received_deadline_ns: ?u64 = null,
     job_id: ?u64 = null,
     handoff_owner_group_id: ?u64 = null,
     join: SupportedJoinRequest,
@@ -875,6 +896,7 @@ pub const JoinFinalizeRequest = struct {
 };
 
 pub const EncodedJoinPartitionRequest = struct {
+    budget_version: ?u16 = null,
     job_id: ?u64 = null,
     join: BoundJoinClause,
     left_hits: []const std.json.Value,
@@ -886,6 +908,7 @@ pub const EncodedJoinPartitionRequest = struct {
 };
 
 pub const EncodedJoinRowsRequest = struct {
+    budget_version: ?u16 = null,
     job_id: ?u64 = null,
     join: BoundJoinClause,
     partition_index: ?u64 = null,
@@ -894,6 +917,7 @@ pub const EncodedJoinRowsRequest = struct {
 };
 
 pub const EncodedJoinUnmatchedRequest = struct {
+    budget_version: ?u16 = null,
     join: BoundJoinClause,
     left_hit_count: ?u64 = null,
     left_fields: ?[]const []const u8 = null,
@@ -903,6 +927,7 @@ pub const EncodedJoinUnmatchedRequest = struct {
 };
 
 pub const EncodedJoinFinalizeRequest = struct {
+    budget_version: ?u16 = null,
     job_id: ?u64 = null,
     handoff_owner_group_id: ?u64 = null,
     join: BoundJoinClause,
@@ -987,6 +1012,8 @@ pub const JoinedBaseQueryRewrite = struct {
 
 pub const JoinJobStore = struct {
     alloc: std.mem.Allocator,
+    backing_alloc: std.mem.Allocator,
+    retained_owner: ?*@import("../common/workload_allocator.zig").Owner = null,
     ctx: ?JoinContext = null,
     cfg: JoinJobStoreConfig,
     opened_join_job_store: ?*OpenedJoinJobStore = null,
@@ -997,8 +1024,20 @@ pub const JoinJobStore = struct {
     pub fn init(alloc: std.mem.Allocator, cfg: JoinJobStoreConfig) JoinJobStore {
         return .{
             .alloc = alloc,
+            .backing_alloc = alloc,
             .cfg = cfg,
         };
+    }
+
+    /// Install once, before publication or the first cached job. The owner is
+    /// process-backed and independent of the request that creates a job.
+    pub fn installRetainedOwner(self: *JoinJobStore, owner: *@import("../common/workload_allocator.zig").Owner) !void {
+        lockAtomic(&self.join_jobs_mutex);
+        defer self.join_jobs_mutex.unlock();
+        if (self.retained_owner != null or self.join_jobs.capacity() != 0) return error.JoinJobAllocatorAlreadyInstalled;
+        owner.retain();
+        self.retained_owner = owner;
+        self.alloc = owner.allocator();
     }
 
     pub fn initWithStore(alloc: std.mem.Allocator, cfg: JoinJobStoreConfig) !JoinJobStore {
@@ -1027,8 +1066,9 @@ pub const JoinJobStore = struct {
         self.join_jobs.deinit(self.alloc);
         if (self.opened_join_job_store) |store| {
             store.deinit();
-            self.alloc.destroy(store);
+            self.backing_alloc.destroy(store);
         }
+        if (self.retained_owner) |owner| owner.release();
         self.* = undefined;
     }
 
@@ -1181,6 +1221,25 @@ pub const JoinJobStore = struct {
         try opened.docstore.put(key, encoded);
     }
 
+    fn cloneRetainedState(self: *JoinJobStore, source: JoinShuffleJobState) !JoinShuffleJobState {
+        var result = source;
+        result.last_error = null;
+        result.partial_response = null;
+        result.cached_response = null;
+        errdefer result.deinit(self.alloc);
+        if (source.last_error) |value| result.last_error = try self.alloc.dupe(u8, value);
+        if (source.partial_response) |value| result.partial_response = try self.alloc.dupe(u8, value);
+        if (source.cached_response) |value| result.cached_response = try self.alloc.dupe(u8, value);
+        return result;
+    }
+
+    fn cachePersistedStateLocked(self: *JoinJobStore, job_id: u64, source: JoinShuffleJobState) !void {
+        if (self.join_jobs.contains(job_id)) return;
+        var copy = try self.cloneRetainedState(source);
+        errdefer copy.deinit(self.alloc);
+        try self.join_jobs.put(self.alloc, job_id, copy);
+    }
+
     fn loadPersistedJoinJobState(self: *JoinJobStore, alloc: std.mem.Allocator, job_id: u64) !?JoinShuffleJobState {
         const opened = self.opened_join_job_store orelse return null;
         const key = try joinJobKey(alloc, job_id);
@@ -1194,9 +1253,10 @@ pub const JoinJobStore = struct {
     }
 
     fn deletePersistedJoinJobState(self: *JoinJobStore, alloc: std.mem.Allocator, job_id: u64) void {
+        _ = alloc;
         const opened = self.opened_join_job_store orelse return;
-        const key = joinJobKey(alloc, job_id) catch return;
-        defer alloc.free(key);
+        var buffer: [64]u8 = undefined;
+        const key = joinJobKeyBuffer(&buffer, job_id) catch return;
         opened.docstore.delete(key) catch {};
     }
 
@@ -1206,14 +1266,13 @@ pub const JoinJobStore = struct {
         const now_ms = self.nowMillis();
         lockAtomic(&self.join_jobs_mutex);
         defer self.join_jobs_mutex.unlock();
-        var expired = std.ArrayListUnmanaged(u64).empty;
-        defer expired.deinit(self.alloc);
+        // Removing the current bucket does not resize this unmanaged map, so
+        // the iterator's next bucket remains valid. Cleanup allocates no list
+        // when the very budget it needs to free has been exhausted.
         var it = self.join_jobs.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.expires_at_millis == 0 or entry.value_ptr.expires_at_millis > now_ms) continue;
-            expired.append(self.alloc, entry.key_ptr.*) catch continue;
-        }
-        for (expired.items) |job_id| {
+            const job_id = entry.key_ptr.*;
             if (self.join_jobs.fetchRemove(job_id)) |removed| {
                 var state = removed.value;
                 state.deinit(self.alloc);
@@ -1267,7 +1326,6 @@ pub const JoinJobStore = struct {
         defer self.join_jobs_mutex.unlock();
         const state = self.join_jobs.getPtr(job_id) orelse return;
         const encoded = try self.encodeJoinPartitionResponse(self.alloc, partial_result);
-        errdefer self.alloc.free(encoded);
         if (state.partial_response) |value| self.alloc.free(value);
         state.partial_response = encoded;
         state.completed_partitions = partial_result.completed_partitions;
@@ -1290,6 +1348,7 @@ pub const JoinJobStore = struct {
         lockAtomic(&self.join_jobs_mutex);
         defer self.join_jobs_mutex.unlock();
         const state = self.join_jobs.getPtr(job_id) orelse return;
+        const replacement = try self.alloc.dupe(u8, encoded_response);
         if (state.cached_response) |value| self.alloc.free(value);
         if (state.partial_response) |value| {
             self.alloc.free(value);
@@ -1305,7 +1364,7 @@ pub const JoinJobStore = struct {
         state.next_partition_index = state.total_partitions;
         state.finalizer_retries = finalizer_retries;
         state.coordinator_finalized = coordinator_finalized;
-        state.cached_response = try self.alloc.dupe(u8, encoded_response);
+        state.cached_response = replacement;
         state.last_updated_at_millis = self.nowMillis();
         state.expires_at_millis = self.joinJobExpiryForPhase(.succeeded, state.last_updated_at_millis);
         try self.persistJoinJobState(job_id, state.*);
@@ -1315,13 +1374,14 @@ pub const JoinJobStore = struct {
         lockAtomic(&self.join_jobs_mutex);
         defer self.join_jobs_mutex.unlock();
         const state = self.join_jobs.getPtr(job_id) orelse return;
+        const replacement = try self.alloc.dupe(u8, @errorName(err));
         if (state.last_error) |value| self.alloc.free(value);
         if (state.partial_response) |value| {
             self.alloc.free(value);
             state.partial_response = null;
         }
         state.phase = .failed;
-        state.last_error = try std.fmt.allocPrint(self.alloc, "{s}", .{@errorName(err)});
+        state.last_error = replacement;
         state.last_updated_at_millis = self.nowMillis();
         state.expires_at_millis = self.joinJobExpiryForPhase(.failed, state.last_updated_at_millis);
         try self.persistJoinJobState(job_id, state.*);
@@ -1349,15 +1409,21 @@ pub const JoinJobStore = struct {
             const phase = state.phase;
             const finalizer_retries = state.finalizer_retries;
             const coordinator_finalized = state.coordinator_finalized;
+            const expiry = state.expires_at_millis;
+            const owned = alloc.dupe(u8, cached) catch |err| {
+                self.join_jobs_mutex.unlock();
+                return err;
+            };
             self.join_jobs_mutex.unlock();
-            var result = try self.parseJoinPartitionResponse(alloc, cached);
+            defer alloc.free(owned);
+            var result = try self.parseJoinPartitionResponse(alloc, owned);
             result.job_id = job_id;
             result.total_partitions = total_partitions;
             result.completed_partitions = completed_partitions;
             result.job_phase = phase;
             result.finalizer_retries = finalizer_retries;
             result.coordinator_finalized = coordinator_finalized;
-            result.expires_at_millis = state.expires_at_millis;
+            result.expires_at_millis = expiry;
             return result;
         }
         self.join_jobs_mutex.unlock();
@@ -1373,21 +1439,7 @@ pub const JoinJobStore = struct {
 
         lockAtomic(&self.join_jobs_mutex);
         defer self.join_jobs_mutex.unlock();
-        const entry = try self.join_jobs.getOrPut(self.alloc, job_id);
-        if (!entry.found_existing) {
-            entry.value_ptr.* = .{
-                .owner_group_id = persisted.owner_group_id,
-                .phase = persisted.phase,
-                .total_partitions = persisted.total_partitions,
-                .completed_partitions = persisted.completed_partitions,
-                .worker_retries = persisted.worker_retries,
-                .finalizer_retries = persisted.finalizer_retries,
-                .coordinator_finalized = persisted.coordinator_finalized,
-                .last_updated_at_millis = persisted.last_updated_at_millis,
-                .last_error = if (persisted.last_error) |value| try self.alloc.dupe(u8, value) else null,
-                .cached_response = try self.alloc.dupe(u8, cached),
-            };
-        }
+        try self.cachePersistedStateLocked(job_id, persisted);
         var result = try self.parseJoinPartitionResponse(alloc, cached);
         result.job_id = job_id;
         result.total_partitions = persisted.total_partitions;
@@ -1418,9 +1470,14 @@ pub const JoinJobStore = struct {
                 return null;
             }
             const next_partition_index = state.next_partition_index;
+            const owned = alloc.dupe(u8, partial) catch |err| {
+                self.join_jobs_mutex.unlock();
+                return err;
+            };
             self.join_jobs_mutex.unlock();
+            defer alloc.free(owned);
             return .{
-                .result = try self.parseJoinPartitionResponse(alloc, partial),
+                .result = try self.parseJoinPartitionResponse(alloc, owned),
                 .next_partition_index = next_partition_index,
             };
         }
@@ -1440,24 +1497,7 @@ pub const JoinJobStore = struct {
         errdefer result.deinit(alloc);
         lockAtomic(&self.join_jobs_mutex);
         defer self.join_jobs_mutex.unlock();
-        const entry = try self.join_jobs.getOrPut(self.alloc, job_id);
-        if (!entry.found_existing) {
-            entry.value_ptr.* = .{
-                .owner_group_id = persisted.owner_group_id,
-                .phase = persisted.phase,
-                .total_partitions = persisted.total_partitions,
-                .completed_partitions = persisted.completed_partitions,
-                .next_partition_index = persisted.next_partition_index,
-                .worker_retries = persisted.worker_retries,
-                .finalizer_retries = persisted.finalizer_retries,
-                .coordinator_finalized = persisted.coordinator_finalized,
-                .last_updated_at_millis = persisted.last_updated_at_millis,
-                .expires_at_millis = persisted.expires_at_millis,
-                .last_error = if (persisted.last_error) |value| try self.alloc.dupe(u8, value) else null,
-                .partial_response = try self.alloc.dupe(u8, partial),
-                .cached_response = null,
-            };
-        }
+        try self.cachePersistedStateLocked(job_id, persisted);
         return .{
             .result = result,
             .next_partition_index = persisted.next_partition_index,
@@ -1474,9 +1514,8 @@ pub const JoinJobStore = struct {
                 self.cleanupExpiredJoinJobs();
                 return null;
             }
-            const encoded = try encodeJoinJobState(alloc, job_id, state.*);
-            self.join_jobs_mutex.unlock();
-            return encoded;
+            defer self.join_jobs_mutex.unlock();
+            return try encodeJoinJobState(alloc, job_id, state.*);
         }
         self.join_jobs_mutex.unlock();
 
@@ -1492,29 +1531,16 @@ pub const JoinJobStore = struct {
 
     pub fn installJoinJobStateSnapshot(self: *JoinJobStore, alloc: std.mem.Allocator, job_id: u64, body: []const u8) !void {
         var parsed = try parseJoinJobState(alloc, body);
-        errdefer parsed.deinit(alloc);
         defer parsed.deinit(alloc);
         lockAtomic(&self.join_jobs_mutex);
         defer self.join_jobs_mutex.unlock();
+        var replacement = try self.cloneRetainedState(parsed);
+        var published = false;
+        defer if (!published) replacement.deinit(self.alloc);
         const entry = try self.join_jobs.getOrPut(self.alloc, job_id);
-        if (entry.found_existing) {
-            entry.value_ptr.deinit(self.alloc);
-        }
-        entry.value_ptr.* = .{
-            .owner_group_id = parsed.owner_group_id,
-            .phase = parsed.phase,
-            .total_partitions = parsed.total_partitions,
-            .completed_partitions = parsed.completed_partitions,
-            .next_partition_index = parsed.next_partition_index,
-            .worker_retries = parsed.worker_retries,
-            .finalizer_retries = parsed.finalizer_retries,
-            .coordinator_finalized = parsed.coordinator_finalized,
-            .last_updated_at_millis = parsed.last_updated_at_millis,
-            .expires_at_millis = parsed.expires_at_millis,
-            .last_error = if (parsed.last_error) |value| try self.alloc.dupe(u8, value) else null,
-            .partial_response = if (parsed.partial_response) |value| try self.alloc.dupe(u8, value) else null,
-            .cached_response = if (parsed.cached_response) |value| try self.alloc.dupe(u8, value) else null,
-        };
+        if (entry.found_existing) entry.value_ptr.deinit(self.alloc);
+        entry.value_ptr.* = replacement;
+        published = true;
         try self.persistJoinJobState(job_id, entry.value_ptr.*);
     }
 
@@ -1526,66 +1552,33 @@ pub const JoinJobStore = struct {
         result: JoinPartitionExecutionResult,
     ) ![]u8 {
         _ = self;
-        var root = std.json.Value{ .object = std.json.ObjectMap.empty };
-        defer deinitJsonValue(alloc, &root);
-
-        var hits_value = std.json.Value{ .array = std.json.Array.init(alloc) };
-        errdefer deinitJsonValue(alloc, &hits_value);
-        for (result.hits) |hit| {
-            try hits_value.array.append(try cloneJsonValue(alloc, hit));
-        }
-        try putOwnedJsonField(alloc, &root.object, "hits", hits_value);
-
-        var stats_value = std.json.Value{ .object = std.json.ObjectMap.empty };
-        errdefer deinitJsonValue(alloc, &stats_value);
-        try putOwnedJsonField(alloc, &stats_value.object, "left_rows_scanned", .{ .integer = result.stats.left_rows_scanned });
-        try putOwnedJsonField(alloc, &stats_value.object, "right_rows_scanned", .{ .integer = result.stats.right_rows_scanned });
-        try putOwnedJsonField(alloc, &stats_value.object, "rows_matched", .{ .integer = result.stats.rows_matched });
-        try putOwnedJsonField(alloc, &stats_value.object, "rows_unmatched_left", .{ .integer = result.stats.rows_unmatched_left });
-        try putOwnedJsonField(alloc, &stats_value.object, "rows_unmatched_right", .{ .integer = result.stats.rows_unmatched_right });
-        try putOwnedJsonField(alloc, &root.object, "stats", stats_value);
-        var matched_right_ids_value = std.json.Value{ .array = std.json.Array.init(alloc) };
-        errdefer deinitJsonValue(alloc, &matched_right_ids_value);
-        for (result.matched_right_ids) |matched_id| {
-            try matched_right_ids_value.array.append(.{ .string = try alloc.dupe(u8, matched_id) });
-        }
-        try putOwnedJsonField(alloc, &root.object, "matched_right_ids", matched_right_ids_value);
-        if (result.job_id) |value| try putOwnedJsonU64Field(alloc, &root.object, "job_id", value);
-        if (result.job_phase) |value| try putOwnedJsonField(alloc, &root.object, "job_phase", .{ .string = try alloc.dupe(u8, phaseString(value)) });
-        try putOwnedJsonField(alloc, &root.object, "total_partitions", .{ .integer = @intCast(result.total_partitions) });
-        try putOwnedJsonField(alloc, &root.object, "completed_partitions", .{ .integer = @intCast(result.completed_partitions) });
-        try putOwnedJsonField(alloc, &root.object, "expires_at_millis", .{ .integer = @intCast(result.expires_at_millis) });
-        try putOwnedJsonField(alloc, &root.object, "worker_retries", .{ .integer = @intCast(result.worker_retries) });
-        try putOwnedJsonField(alloc, &root.object, "finalizer_retries", .{ .integer = @intCast(result.finalizer_retries) });
-        if (result.finalizer_group_id) |group_id| {
-            try putOwnedJsonU64Field(alloc, &root.object, "finalizer_group_id", group_id);
-        }
-        try putOwnedJsonField(alloc, &root.object, "coordinator_finalized", .{ .bool = result.coordinator_finalized });
-        if (result.imported_owner_group_id) |group_id| {
-            try putOwnedJsonU64Field(alloc, &root.object, "imported_owner_group_id", group_id);
-        }
-        try putOwnedJsonField(alloc, &root.object, "imported_partial_state", .{ .bool = result.imported_partial_state });
-        try putOwnedJsonField(alloc, &root.object, "imported_cached_result", .{ .bool = result.imported_cached_result });
-        var attempts_value = std.json.Value{ .array = std.json.Array.init(alloc) };
-        errdefer deinitJsonValue(alloc, &attempts_value);
-        for (result.worker_attempts) |attempt| {
-            var attempt_obj = std.json.ObjectMap.empty;
-            try putOwnedJsonField(alloc, &attempt_obj, "partition_index", .{ .integer = @intCast(attempt.partition_index) });
-            try putOwnedJsonU64Field(alloc, &attempt_obj, "worker_group_id", attempt.worker_group_id);
-            try putOwnedJsonField(alloc, &attempt_obj, "succeeded", .{ .bool = attempt.succeeded });
-            try attempts_value.array.append(.{ .object = attempt_obj });
-        }
-        try putOwnedJsonField(alloc, &root.object, "worker_attempts", attempts_value);
-        var finalizer_attempts_value = std.json.Value{ .array = std.json.Array.init(alloc) };
-        errdefer deinitJsonValue(alloc, &finalizer_attempts_value);
-        for (result.finalizer_attempts) |attempt| {
-            var attempt_obj = std.json.ObjectMap.empty;
-            try putOwnedJsonU64Field(alloc, &attempt_obj, "worker_group_id", attempt.worker_group_id);
-            try putOwnedJsonField(alloc, &attempt_obj, "succeeded", .{ .bool = attempt.succeeded });
-            try finalizer_attempts_value.array.append(.{ .object = attempt_obj });
-        }
-        try putOwnedJsonField(alloc, &root.object, "finalizer_attempts", finalizer_attempts_value);
-        return try stringifyJsonValueAlloc(alloc, root);
+        // Borrow the completed result while encoding. Building an owned JSON
+        // tree here duplicated every hit and introduced partial-transfer cleanup.
+        return std.json.Stringify.valueAlloc(alloc, .{
+            .hits = result.hits,
+            .stats = .{
+                .left_rows_scanned = result.stats.left_rows_scanned,
+                .right_rows_scanned = result.stats.right_rows_scanned,
+                .rows_matched = result.stats.rows_matched,
+                .rows_unmatched_left = result.stats.rows_unmatched_left,
+                .rows_unmatched_right = result.stats.rows_unmatched_right,
+            },
+            .matched_right_ids = result.matched_right_ids,
+            .job_id = result.job_id,
+            .job_phase = if (result.job_phase) |value| phaseString(value) else @as(?[]const u8, null),
+            .total_partitions = result.total_partitions,
+            .completed_partitions = result.completed_partitions,
+            .expires_at_millis = result.expires_at_millis,
+            .worker_retries = result.worker_retries,
+            .finalizer_retries = result.finalizer_retries,
+            .finalizer_group_id = result.finalizer_group_id,
+            .coordinator_finalized = result.coordinator_finalized,
+            .imported_owner_group_id = result.imported_owner_group_id,
+            .imported_partial_state = result.imported_partial_state,
+            .imported_cached_result = result.imported_cached_result,
+            .worker_attempts = result.worker_attempts,
+            .finalizer_attempts = result.finalizer_attempts,
+        }, .{ .emit_null_optional_fields = false });
     }
 
     pub fn parseJoinPartitionResponse(
@@ -1599,22 +1592,33 @@ pub const JoinJobStore = struct {
         });
         defer parsed.deinit();
         const owned_hits = try alloc.alloc(std.json.Value, parsed.value.hits.len);
-        errdefer alloc.free(owned_hits);
+        var hits_initialized: usize = 0;
+        errdefer {
+            for (owned_hits[0..hits_initialized]) |*hit| deinitJsonValue(alloc, hit);
+            alloc.free(owned_hits);
+        }
         for (parsed.value.hits, 0..) |item, i| {
             owned_hits[i] = try cloneJsonValue(alloc, item);
+            hits_initialized += 1;
         }
 
         const matched_right_ids: [][]u8 = if (parsed.value.matched_right_ids) |value| blk: {
             const ids = try alloc.alloc([]u8, value.len);
+            var initialized: usize = 0;
             errdefer {
-                for (ids[0..]) |id| alloc.free(id);
+                for (ids[0..initialized]) |id| alloc.free(id);
                 alloc.free(ids);
             }
             for (value, 0..) |item, i| {
                 ids[i] = try alloc.dupe(u8, item);
+                initialized += 1;
             }
             break :blk ids;
         } else &.{};
+        errdefer {
+            for (matched_right_ids) |id| alloc.free(id);
+            alloc.free(matched_right_ids);
+        }
 
         const worker_attempts: []JoinPartitionExecutionResult.WorkerAttempt = if (parsed.value.worker_attempts) |value| blk: {
             const attempts = try alloc.alloc(JoinPartitionExecutionResult.WorkerAttempt, value.len);
@@ -1711,6 +1715,80 @@ pub const JoinJobStore = struct {
         );
     }
 };
+
+test "workload admission retained join jobs bound replacement overlap and clean up while closed" {
+    const alloc = std.testing.allocator;
+    const admission = @import("../common/request_admission.zig");
+    const Owner = @import("../common/workload_allocator.zig").Owner;
+    var gate = admission.RequestAdmission.initConfigured(0, .{ .max_retained_bytes = 64 * 1024 });
+    defer gate.deinitMemory();
+    const owner = try Owner.create(alloc, &gate);
+    defer owner.release();
+    var store = JoinJobStore.init(alloc, .{});
+    defer store.deinit();
+    try store.installRetainedOwner(owner);
+    try store.recordJoinJobStart(1, null, 1);
+    const metadata_bytes = owner.live.load(.acquire);
+    const original = try alloc.alloc(u8, 32 * 1024);
+    defer alloc.free(original);
+    @memset(original, 'a');
+    const replacement = try alloc.alloc(u8, 40 * 1024);
+    defer alloc.free(replacement);
+    @memset(replacement, 'b');
+    try store.recordJoinJobSucceeded(1, null, 0, true, original);
+    try std.testing.expect(owner.live.load(.acquire) >= metadata_bytes + original.len);
+    try std.testing.expectError(error.OutOfMemory, store.recordJoinJobSucceeded(1, null, 0, true, replacement));
+    try std.testing.expectEqualSlices(u8, original, store.join_jobs.get(1).?.cached_response.?);
+    try store.recordJoinJobStart(1, null, 1);
+    try store.recordJoinJobSucceeded(1, null, 0, true, replacement);
+    try std.testing.expectEqualSlices(u8, replacement, store.join_jobs.get(1).?.cached_response.?);
+    gate.close();
+    store.join_jobs.getPtr(1).?.expires_at_millis = 1;
+    store.cleanupExpiredJoinJobs();
+    try std.testing.expectEqual(@as(usize, 0), store.join_jobs.count());
+    try std.testing.expectEqual(metadata_bytes, owner.live.load(.acquire));
+}
+
+test "workload admission join snapshot replacement unwinds every allocation failure" {
+    const Scope = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var store = JoinJobStore.init(alloc, .{});
+            defer store.deinit();
+            try store.recordJoinJobStart(1, null, 1);
+            try store.recordJoinJobSucceeded(1, null, 0, true, "old");
+            const encoded = try encodeJoinJobState(alloc, 1, .{
+                .last_error = @constCast("error"),
+                .partial_response = @constCast("partial"),
+                .cached_response = @constCast("replacement"),
+            });
+            defer alloc.free(encoded);
+            try store.installJoinJobStateSnapshot(alloc, 1, encoded);
+            const snapshot = (try store.loadJoinJobStateSnapshot(alloc, 1)).?;
+            defer alloc.free(snapshot);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Scope.run, .{});
+}
+
+test "workload admission join partition decoding unwinds every allocation failure" {
+    const Scope = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var store = JoinJobStore.init(alloc, .{});
+            defer store.deinit();
+            var result = try store.parseJoinPartitionResponse(alloc,
+                \\{"hits":[{"_id":"left","nested":["value"]},{"_id":"right"}],"stats":{"left_rows_scanned":2,"right_rows_scanned":2,"rows_matched":2,"rows_unmatched_left":0,"rows_unmatched_right":0},"matched_right_ids":["one","two"],"worker_attempts":[{"partition_index":0,"worker_group_id":1,"succeeded":true}],"finalizer_attempts":[{"worker_group_id":2,"succeeded":true}],"job_phase":"succeeded"}
+            );
+            defer result.deinit(alloc);
+            const encoded = try store.encodeJoinPartitionResponse(alloc, result);
+            defer alloc.free(encoded);
+            var roundtrip = try store.parseJoinPartitionResponse(alloc, encoded);
+            defer roundtrip.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 2), roundtrip.hits.len);
+            try std.testing.expectEqual(@as(usize, 2), roundtrip.matched_right_ids.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Scope.run, .{});
+}
 
 // ---------------------------------------------------------------------------
 // Execution functions (top-level pub)
@@ -3250,7 +3328,7 @@ pub fn executeJoinFinalizeWorkerLocalTyped(
     table_name: []const u8,
     req: JoinFinalizeRequest,
 ) !JoinPartitionExecutionResult {
-    var binding = try JoinReadBinding.init(try ctx.withRemainingExecutionBudgetMs(req.remaining_timeout_ms), alloc, unbound_source);
+    var binding = try JoinReadBinding.init(try ctx.withReceivedExecutionBudget(req), alloc, unbound_source);
     defer binding.deinit();
     const worker_ctx = binding.ctx;
     const source = binding.source;
@@ -3320,7 +3398,7 @@ pub fn executeJoinRowsLocalTyped(
     table_name: []const u8,
     req: JoinRowsRequest,
 ) ![]std.json.Value {
-    const worker_ctx = try ctx.withRemainingExecutionBudgetMs(req.remaining_timeout_ms);
+    const worker_ctx = try ctx.withReceivedExecutionBudget(req);
     try worker_ctx.ensureExecutionDeadline();
     if (!std.mem.eql(u8, req.join.right_table, table_name)) return error.InvalidQueryRequest;
     if (req.join.nested_join != null) return error.UnsupportedQueryRequest;
@@ -3383,7 +3461,7 @@ pub fn executeJoinUnmatchedLocalTyped(
     table_name: []const u8,
     req: JoinUnmatchedRequest,
 ) !EncodedJoinUnmatchedResponse {
-    const worker_ctx = try ctx.withRemainingExecutionBudgetMs(req.remaining_timeout_ms);
+    const worker_ctx = try ctx.withReceivedExecutionBudget(req);
     try worker_ctx.ensureExecutionDeadline();
     if (!std.mem.eql(u8, req.join.right_table, table_name)) return error.InvalidQueryRequest;
     if (req.join.nested_join != null) return error.UnsupportedQueryRequest;
@@ -3505,7 +3583,7 @@ pub fn executeJoinPartitionWorkerLocalTyped(
     table_name: []const u8,
     req: JoinPartitionRequest,
 ) !JoinPartitionExecutionResult {
-    const worker_ctx = try ctx.withRemainingExecutionBudgetMs(req.remaining_timeout_ms);
+    const worker_ctx = try ctx.withReceivedExecutionBudget(req);
     job_store.setContext(worker_ctx);
     try worker_ctx.ensureExecutionDeadline();
     if (!std.mem.eql(u8, req.join.right_table, table_name)) return error.InvalidQueryRequest;
@@ -4526,6 +4604,7 @@ fn executeRightJoinQueryParsedAlloc(
     query_value: std.json.Value,
     nested_foreign_leaf_join: bool,
 ) !std.json.Parsed(std.json.Value) {
+    try ctx.ensureExecutionDeadline();
     const query_body = try stringifyJsonValueAlloc(alloc, query_value);
     defer alloc.free(query_body);
 
@@ -4548,9 +4627,14 @@ fn executeRightJoinQueryParsedAlloc(
             return err;
         };
         defer right_result.deinit(alloc);
+        try ctx.ensureExecutionDeadline();
         break :blk try alloc.dupe(u8, right_result.json);
     };
     defer alloc.free(right_json);
+    // A worker may complete just as the original coordinator request expires.
+    // Reject its reply before parsing or widening a partial right-side page
+    // into a second remote query.
+    try ctx.ensureExecutionDeadline();
 
     return std.json.parseFromSlice(std.json.Value, alloc, right_json, .{}) catch return error.InternalFailure;
 }
@@ -4864,7 +4948,22 @@ fn putTransportBudgetFields(
     remaining_timeout_ms: ?u64,
 ) !void {
     const remaining_ms = remaining_timeout_ms orelse return;
+    if (remaining_ms == 0) return error.Timeout;
+    try putOwnedJsonU64Field(alloc, object, "budget_version", 1);
     try putOwnedJsonU64Field(alloc, object, "remaining_timeout_ms", remaining_ms);
+}
+
+/// An absent version is the legacy millisecond protocol. Reject explicit
+/// unknown versions before constructing any executable worker request. A
+/// deadline is cancellation input, never evidence that remote work quiesced.
+fn receivedTransportDeadline(version: ?u16, remaining_ms: ?u64, received_ns: u64) !?u64 {
+    if (version) |value| if (value != 1) return error.UnsupportedQueryRequest;
+    const duration_ms = remaining_ms orelse {
+        if (version != null) return error.InvalidQueryRequest;
+        return null;
+    };
+    if (duration_ms == 0) return error.Timeout;
+    return received_ns +| duration_ms *| std.time.ns_per_ms;
 }
 
 fn encodeJoinJobStateRequest(
@@ -4881,11 +4980,14 @@ pub fn parseJoinPartitionRequest(
     alloc: std.mem.Allocator,
     body: []const u8,
 ) !JoinPartitionRequest {
+    const received_ns = platform_time.monotonicNs();
     var parsed = try std.json.parseFromSlice(EncodedJoinPartitionRequest, alloc, body, .{
         .ignore_unknown_fields = true,
     });
     errdefer parsed.deinit();
+    const received_deadline_ns = try receivedTransportDeadline(parsed.value.budget_version, parsed.value.remaining_timeout_ms, received_ns);
     return .{
+        .received_deadline_ns = received_deadline_ns,
         .job_id = parsed.value.job_id,
         .join = try supportedBoundJoinFromWire(alloc, parsed.value.join),
         .left_hits = parsed.value.left_hits,
@@ -4992,11 +5094,14 @@ pub fn parseJoinRowsRequest(
     alloc: std.mem.Allocator,
     body: []const u8,
 ) !JoinRowsRequest {
+    const received_ns = platform_time.monotonicNs();
     var parsed = try std.json.parseFromSlice(EncodedJoinRowsRequest, alloc, body, .{
         .ignore_unknown_fields = true,
     });
     errdefer parsed.deinit();
+    const received_deadline_ns = try receivedTransportDeadline(parsed.value.budget_version, parsed.value.remaining_timeout_ms, received_ns);
     return .{
+        .received_deadline_ns = received_deadline_ns,
         .job_id = parsed.value.job_id,
         .join = try supportedBoundJoinFromWire(alloc, parsed.value.join),
         .partition_index = if (parsed.value.partition_index) |value|
@@ -5019,11 +5124,14 @@ pub fn parseJoinUnmatchedRequest(
     alloc: std.mem.Allocator,
     body: []const u8,
 ) !JoinUnmatchedRequest {
+    const received_ns = platform_time.monotonicNs();
     var parsed = try std.json.parseFromSlice(EncodedJoinUnmatchedRequest, alloc, body, .{
         .ignore_unknown_fields = true,
     });
     errdefer parsed.deinit();
+    const received_deadline_ns = try receivedTransportDeadline(parsed.value.budget_version, parsed.value.remaining_timeout_ms, received_ns);
     return .{
+        .received_deadline_ns = received_deadline_ns,
         .join = try supportedBoundJoinFromWire(alloc, parsed.value.join),
         .left_hit_count = if (parsed.value.left_hit_count) |value|
             std.math.cast(usize, value) orelse return error.InvalidQueryRequest
@@ -5041,11 +5149,14 @@ pub fn parseJoinFinalizeRequest(
     alloc: std.mem.Allocator,
     body: []const u8,
 ) !JoinFinalizeRequest {
+    const received_ns = platform_time.monotonicNs();
     var parsed = try std.json.parseFromSlice(EncodedJoinFinalizeRequest, alloc, body, .{
         .ignore_unknown_fields = true,
     });
     errdefer parsed.deinit();
+    const received_deadline_ns = try receivedTransportDeadline(parsed.value.budget_version, parsed.value.remaining_timeout_ms, received_ns);
     return .{
+        .received_deadline_ns = received_deadline_ns,
         .job_id = parsed.value.job_id,
         .handoff_owner_group_id = parsed.value.handoff_owner_group_id,
         .join = try supportedBoundJoinFromWire(alloc, parsed.value.join),
@@ -5141,9 +5252,7 @@ fn parseJoinRowsResponse(
 }
 
 pub fn encodeJoinJobState(alloc: std.mem.Allocator, job_id: u64, state: JoinShuffleJobState) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try std.json.Stringify.value(EncodedJoinJobState{
+    return std.json.Stringify.valueAlloc(alloc, EncodedJoinJobState{
         .job_id = job_id,
         .owner_group_id = state.owner_group_id,
         .phase = phaseString(state.phase),
@@ -5158,8 +5267,7 @@ pub fn encodeJoinJobState(alloc: std.mem.Allocator, job_id: u64, state: JoinShuf
         .last_error = state.last_error,
         .partial_response = state.partial_response,
         .cached_response = state.cached_response,
-    }, .{}, &out.writer);
-    return try out.toOwnedSlice();
+    }, .{});
 }
 
 fn parseJoinJobState(alloc: std.mem.Allocator, body: []const u8) !JoinShuffleJobState {
@@ -5820,7 +5928,9 @@ fn appendClonedJsonHitsToArray(
     hits: []const std.json.Value,
 ) !void {
     for (hits) |hit| {
-        try out.append(try cloneJsonValue(alloc, hit));
+        var owned = try cloneJsonValue(alloc, hit);
+        errdefer deinitJsonValue(alloc, &owned);
+        try out.append(owned);
     }
 }
 
@@ -6356,7 +6466,211 @@ test "distributed join context forwards one absolute deadline to every query cal
     );
 }
 
-test "distributed join transports relative budgets and rejects exhausted handoffs" {
+test "distributed join rejects late right worker reply before widening partial page" {
+    const Fake = struct {
+        const Mode = enum { cancel, timeout };
+        calls: usize = 0,
+        now_ns: u64 = 0,
+        cancelled: std.atomic.Value(bool) = .init(false),
+        mode: Mode = .cancel,
+
+        fn now(ptr: *anyopaque) u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.now_ns;
+        }
+
+        fn plain(ptr: *anyopaque, alloc: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, deadline: ?u64, cancellation: ?CancellationToken) !query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(deadline != null);
+            try std.testing.expect(cancellation != null);
+            switch (self.mode) {
+                .cancel => self.cancelled.store(true, .release),
+                .timeout => self.now_ns = 100,
+            }
+            // Without the post-reply check this partial page (one hit, two
+            // total) causes loadRightJoinQueryAlloc to issue another RPC.
+            return .{ .json = try alloc.dupe(u8, "{\"responses\":[{\"hits\":{\"total\":{\"value\":2,\"relation\":\"exact\"},\"hits\":[{\"_id\":\"a\",\"_source\":{}}]}}]}") };
+        }
+    };
+
+    var fake: Fake = .{};
+    const join = SupportedJoinRequest{
+        .right_table = @constCast("right"),
+        .left_field = @constCast("left_id"),
+        .right_field = @constCast("right_id"),
+    };
+    const source: table_reads.TableReadSource = undefined;
+    for ([_]Fake.Mode{ .cancel, .timeout }) |mode| {
+        fake.mode = mode;
+        fake.calls = 0;
+        fake.now_ns = 0;
+        fake.cancelled.store(false, .release);
+        var query_value = std.json.Value{ .object = std.json.ObjectMap.empty };
+        const ctx = JoinContext{
+            .ptr = &fake,
+            .vtable = &.{
+                .acquire_planning = undefined,
+                .execute_plain_query = Fake.plain,
+                .execute_query_dispatch = undefined,
+                .build_owned_search_request = undefined,
+                .ensure_foreign_registry = undefined,
+                .monotonic_now_ns = Fake.now,
+            },
+            .execution_deadline_ns = 100,
+            .cancellation = CancellationToken.fromAtomic(&fake.cancelled),
+        };
+        try std.testing.expectError(if (mode == .cancel) error.Cancelled else error.Timeout, loadRightJoinQueryAlloc(
+            ctx,
+            undefined,
+            std.testing.allocator,
+            source,
+            join,
+            &query_value,
+            false,
+            .{},
+        ));
+        try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    }
+}
+
+test "distributed join rejects a delayed socket worker reply after the original request ends" {
+    if (@import("builtin").os.tag == .windows or @import("builtin").os.tag == .freestanding) return error.SkipZigTest;
+    const httpx = @import("httpx");
+    const Fixture = struct {
+        const Self = @This();
+        const Mode = enum { cancel, timeout };
+        const partial = "{\"responses\":[{\"hits\":{\"total\":{\"value\":2,\"relation\":\"exact\"},\"hits\":[{\"_id\":\"a\",\"_source\":{}}]}}]}";
+        io: std.Io,
+        address: std.Io.net.IpAddress,
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        calls: std.atomic.Value(usize) = .init(0),
+        now_ns: std.atomic.Value(u64) = .init(0),
+        cancelled: std.atomic.Value(bool) = .init(false),
+
+        fn handle(self: *@This(), ctx: *httpx.Context) !httpx.Response {
+            _ = self.calls.fetchAdd(1, .acq_rel);
+            self.entered.store(true, .release);
+            while (!self.release.load(.acquire)) std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+            return ctx.text(partial);
+        }
+
+        fn now(ptr: *anyopaque) u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.now_ns.load(.acquire);
+        }
+
+        fn plain(ptr: *anyopaque, alloc: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, deadline: ?u64, cancellation: ?CancellationToken) !query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            // The adapter converts this fixture's clock to the native query
+            // clock before handing the absolute deadline to transport.
+            try std.testing.expect(deadline != null);
+            try std.testing.expect(cancellation != null);
+            var socket = try httpx.Socket.connect(self.address, self.io);
+            defer socket.close();
+            try socket.setRecvTimeout(5_000);
+            try socket.sendAll("GET /worker HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
+            var response: [8192]u8 = undefined;
+            var used: usize = 0;
+            while (true) {
+                if (used == response.len) return error.TestUnexpectedResult;
+                const received = try socket.recv(response[used..]);
+                if (received == 0) break;
+                used += received;
+            }
+            const start = (std.mem.indexOf(u8, response[0..used], "\r\n\r\n") orelse return error.TestUnexpectedResult) + 4;
+            return .{ .json = try alloc.dupe(u8, response[start..used]) };
+        }
+
+        const Coordinator = struct {
+            fixture: *Self,
+            result_error: ?anyerror = null,
+            published: bool = false,
+
+            fn run(self: *@This()) void {
+                const join = SupportedJoinRequest{
+                    .right_table = @constCast("right"),
+                    .left_field = @constCast("left_id"),
+                    .right_field = @constCast("right_id"),
+                };
+                var query_value = std.json.Value{ .object = std.json.ObjectMap.empty };
+                const ctx = JoinContext{
+                    .ptr = self.fixture,
+                    .vtable = &.{
+                        .acquire_planning = undefined,
+                        .execute_plain_query = Self.plain,
+                        .execute_query_dispatch = undefined,
+                        .build_owned_search_request = undefined,
+                        .ensure_foreign_registry = undefined,
+                        .monotonic_now_ns = Self.now,
+                    },
+                    .execution_deadline_ns = 100,
+                    .cancellation = CancellationToken.fromAtomic(&self.fixture.cancelled),
+                };
+                var loaded = loadRightJoinQueryAlloc(ctx, undefined, std.testing.allocator, undefined, join, &query_value, false, .{}) catch |err| {
+                    self.result_error = err;
+                    return;
+                };
+                defer loaded.deinit();
+                self.published = true;
+            }
+        };
+
+        fn runMode(mode: Mode) !void {
+            const alloc = std.testing.allocator;
+            var server_io = std.Io.Threaded.init(alloc, .{});
+            defer server_io.deinit();
+            var client_io = std.Io.Threaded.init(alloc, .{});
+            defer client_io.deinit();
+            var server = httpx.Server.initWithConfig(alloc, server_io.io(), .{ .host = "127.0.0.1", .port = 0, .max_connections = 2, .max_request_tasks = 2 });
+            defer server.deinit();
+            var fixture = Self{ .io = client_io.io(), .address = undefined };
+            try server.get("/worker", httpx.Handler.bind(&fixture, Self.handle));
+            var listener = httpx.ListenerTask.init(&server);
+            try listener.start();
+            defer {
+                fixture.release.store(true, .release);
+                listener.requestStop();
+                listener.join() catch {};
+            }
+            fixture.address = server.boundAddress() orelse return error.TestUnexpectedResult;
+            var coordinator = Coordinator{ .fixture = &fixture };
+            var future = std.Io.async(client_io.io(), Coordinator.run, .{&coordinator});
+            var awaited = false;
+            defer if (!awaited) {
+                fixture.release.store(true, .release);
+                future.await(client_io.io());
+            };
+            for (0..5_000) |_| {
+                if (fixture.entered.load(.acquire)) break;
+                try client_io.io().sleep(.fromMilliseconds(1), .awake);
+            }
+            try std.testing.expect(fixture.entered.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 1), fixture.calls.load(.acquire));
+            switch (mode) {
+                .cancel => fixture.cancelled.store(true, .release),
+                .timeout => fixture.now_ns.store(100, .release),
+            }
+            fixture.release.store(true, .release);
+            future.await(client_io.io());
+            awaited = true;
+            try std.testing.expectEqual(if (mode == .cancel) error.Cancelled else error.Timeout, coordinator.result_error orelse return error.TestUnexpectedResult);
+            try std.testing.expect(!coordinator.published);
+            try std.testing.expectEqual(@as(usize, 1), fixture.calls.load(.acquire));
+            for (0..5_000) |_| {
+                if (server.runtimeStats().active_connections == 0 and server.runtimeStats().active_requests == 0) break;
+                try client_io.io().sleep(.fromMilliseconds(1), .awake);
+            }
+            try std.testing.expectEqual(@as(usize, 0), server.runtimeStats().active_connections);
+            try std.testing.expectEqual(@as(usize, 0), server.runtimeStats().active_requests);
+        }
+    };
+    try Fixture.runMode(.cancel);
+    try Fixture.runMode(.timeout);
+}
+
+test "workload admission distributed join transports relative budgets and rejects exhausted handoffs" {
     var state: u8 = 0;
     const ctx = JoinContext{
         .ptr = &state,
@@ -6387,15 +6701,81 @@ test "distributed join transports relative budgets and rejects exhausted handoff
         remaining_ms,
     );
     defer alloc.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"budget_version\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "budget_started_at_unix_ms") == null);
     var parsed = try parseJoinPartitionRequest(alloc, body);
     defer parsed.deinit(alloc);
     try std.testing.expectEqual(@as(?u64, remaining_ms), parsed.remaining_timeout_ms);
+    try std.testing.expect(parsed.received_deadline_ns != null);
     const worker_ctx = try (JoinContext{
         .ptr = &state,
         .vtable = &.{ .acquire_planning = undefined, .execute_plain_query = undefined, .execute_query_dispatch = undefined, .build_owned_search_request = undefined, .ensure_foreign_registry = undefined },
     }).withRemainingExecutionBudgetMs(parsed.remaining_timeout_ms);
     try worker_ctx.ensureExecutionDeadline();
+}
+
+test "workload admission join worker budget includes decoding and preserves earlier deadlines" {
+    var state: u8 = 0;
+    const now = platform_time.monotonicNs();
+    const ctx = JoinContext{
+        .ptr = &state,
+        .vtable = &.{ .acquire_planning = undefined, .execute_plain_query = undefined, .execute_query_dispatch = undefined, .build_owned_search_request = undefined, .ensure_foreign_registry = undefined },
+        .execution_deadline_ns = now + std.time.ns_per_s,
+    };
+    // A queued or decoded request must not receive a fresh duration when it
+    // finally reaches the typed worker entry point.
+    try std.testing.expectError(error.Timeout, ctx.withReceivedExecutionBudget(.{
+        .received_deadline_ns = @as(?u64, 1),
+        .remaining_timeout_ms = @as(?u64, 60_000),
+    }));
+    const live = try ctx.withReceivedExecutionBudget(.{
+        .received_deadline_ns = @as(?u64, now + 2 * std.time.ns_per_s),
+        .remaining_timeout_ms = @as(?u64, 2_000),
+    });
+    try std.testing.expectEqual(ctx.execution_deadline_ns, live.execution_deadline_ns);
+    try std.testing.expectEqual(@as(?u64, 10 + std.time.ns_per_ms), try receivedTransportDeadline(1, 1, 10));
+    try std.testing.expectEqual(@as(?u64, 10 + std.time.ns_per_ms), try receivedTransportDeadline(null, 1, 10));
+    try std.testing.expectEqual(@as(?u64, null), try receivedTransportDeadline(null, null, 10));
+    try std.testing.expectError(error.Timeout, receivedTransportDeadline(1, 0, 10));
+    try std.testing.expectError(error.InvalidQueryRequest, receivedTransportDeadline(1, null, 10));
+    try std.testing.expectError(error.UnsupportedQueryRequest, receivedTransportDeadline(2, 1, 10));
+}
+
+test "workload admission every join worker parser rejects unsupported budget versions" {
+    const alloc = std.testing.allocator;
+    var join = try testSupportedJoinRequestAlloc(alloc);
+    defer join.deinit(alloc);
+    const bodies = [_][]u8{
+        try encodeJoinPartitionRequest(alloc, null, join, &.{}, false, 0, 1, &.{}, 100),
+        try encodeJoinRowsRequest(alloc, null, join, 0, 1, 100),
+        try encodeJoinUnmatchedRequest(alloc, join, 0, &.{}, false, &.{}, 100),
+        try encodeJoinFinalizeRequest(alloc, 1, null, join, &.{}, &.{}, false, 1, 100),
+    };
+    defer for (bodies) |body| alloc.free(body);
+    var state: u8 = 0;
+    const expired_context = JoinContext{
+        .ptr = &state,
+        .vtable = &.{ .acquire_planning = undefined, .execute_plain_query = undefined, .execute_query_dispatch = undefined, .build_owned_search_request = undefined, .ensure_foreign_registry = undefined },
+    };
+    inline for (.{ parseJoinPartitionRequest, parseJoinRowsRequest, parseJoinUnmatchedRequest, parseJoinFinalizeRequest }, 0..) |parse, i| {
+        var valid = try parse(alloc, bodies[i]);
+        defer valid.deinit(alloc);
+        try std.testing.expect(valid.received_deadline_ns != null);
+        valid.received_deadline_ns = 1;
+        // Every real typed worker must reject expiry before using storage or
+        // job-store dependencies, even though the wire duration remains live.
+        try std.testing.expectError(error.Timeout, switch (i) {
+            0 => executeJoinPartitionWorkerLocalTyped(expired_context, undefined, alloc, undefined, 1, "customers", valid),
+            1 => executeJoinRowsLocalTyped(expired_context, alloc, undefined, 1, "customers", valid),
+            2 => executeJoinUnmatchedLocalTyped(expired_context, alloc, undefined, 1, "customers", valid),
+            3 => executeJoinFinalizeWorkerLocalTyped(expired_context, undefined, alloc, undefined, 1, "customers", valid),
+            else => unreachable,
+        });
+        const marker = "\"budget_version\":1";
+        const index = std.mem.indexOf(u8, bodies[i], marker) orelse return error.TestExpectedVersion;
+        bodies[i][index + marker.len - 1] = '2';
+        try std.testing.expectError(error.UnsupportedQueryRequest, parse(alloc, bodies[i]));
+    }
 }
 
 test "distributed join transport passes timeout out of band without parsing payload" {
@@ -6677,10 +7057,61 @@ const JoinReadJob = struct {
     req: db_mod.types.SearchRequest,
 };
 
+// Parallel right-side reads retain response and parsed-JSON scratch until the
+// whole batch has joined. Charge that lifetime to the caller's request budget,
+// and serialize access because the caller allocator may be an arena.
+const JoinFanoutBacking = struct {
+    parent: std.mem.Allocator,
+    mutex: std.atomic.Mutex = .unlocked,
+
+    fn lock(self: *@This()) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn allocator(self: *@This()) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
+        return self.parent.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
+        return self.parent.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
+        return self.parent.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
+        self.parent.rawFree(memory, alignment, ret_addr);
+    }
+};
+
 /// Bounded fanout owns isolated result arenas. Request preparation and output
 /// publication stay on the caller, in catalog order; all launched I/O is drained
 /// before any arena or request-scoped routing lease can be released.
 fn appendJoinReadJobs(ctx: JoinContext, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table_name: []const u8, jobs: []const JoinReadJob, hits: *std.json.Array) !bool {
+    // A later worker or batch may fail. Keep every new hit private until the
+    // complete fanout succeeds, so callers never observe a partial join.
+    var staged = std.json.Array.init(alloc);
+    defer {
+        for (staged.items) |*hit| deinitJsonValue(alloc, hit);
+        staged.deinit();
+    }
     // Match ordinary query fanout: graph phases share request-wide retained
     // state budgets and need completion-aware admission before parallelizing.
     const has_graph = for (jobs) |job| {
@@ -6689,16 +7120,22 @@ fn appendJoinReadJobs(ctx: JoinContext, alloc: std.mem.Allocator, source: table_
     if (ctx.fanout_io == null or jobs.len < 2 or has_graph) {
         for (jobs) |job| {
             try ctx.ensureExecutionDeadline();
-            if (!try appendGroupLocalJoinHits(alloc, source, job.group_id, table_name, job.req, false, hits)) return false;
+            if (!try appendGroupLocalJoinHits(alloc, source, job.group_id, table_name, job.req, false, &staged)) return false;
         }
         try ctx.ensureExecutionDeadline();
+        try hits.ensureUnusedCapacity(staged.items.len);
+        for (staged.items) |hit| hits.appendAssumeCapacity(hit);
+        staged.clearRetainingCapacity();
         return true;
     }
     const Slot = struct {
-        arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
+        arena: std.heap.ArenaAllocator,
         hits: ?std.json.Array = null,
         failure: ?anyerror = null,
         supported: bool = false,
+        fn init(backing: std.mem.Allocator) @This() {
+            return .{ .arena = .init(backing) };
+        }
         fn run(slot: *@This(), src: table_reads.TableReadSource, table: []const u8, job: JoinReadJob) void {
             const owned = slot.arena.allocator();
             slot.hits = std.json.Array.init(owned);
@@ -6711,10 +7148,12 @@ fn appendJoinReadJobs(ctx: JoinContext, alloc: std.mem.Allocator, source: table_
     var receiver = try ctx.fanout_io.?.receive();
     const io = receiver.io();
     const width = 8;
+    var fanout_backing = JoinFanoutBacking{ .parent = alloc };
     var start: usize = 0;
     while (start < jobs.len) : (start += width) {
         try ctx.ensureExecutionDeadline();
-        var slots: [width]Slot = @splat(.{});
+        var slots: [width]Slot = undefined;
+        for (&slots) |*slot| slot.* = .init(fanout_backing.allocator());
         defer for (&slots) |*slot| slot.arena.deinit();
         const batch = jobs[start..@min(start + width, jobs.len)];
         var tasks: std.Io.Group = .init;
@@ -6727,9 +7166,12 @@ fn appendJoinReadJobs(ctx: JoinContext, alloc: std.mem.Allocator, source: table_
         for (slots[0..batch.len]) |slot| if (!slot.supported) {
             return false;
         };
-        for (slots[0..batch.len]) |slot| try appendClonedJsonHitsToArray(alloc, hits, slot.hits.?.items);
+        for (slots[0..batch.len]) |slot| try appendClonedJsonHitsToArray(alloc, &staged, slot.hits.?.items);
     }
     try ctx.ensureExecutionDeadline();
+    try hits.ensureUnusedCapacity(staged.items.len);
+    for (staged.items) |hit| hits.appendAssumeCapacity(hit);
+    staged.clearRetainingCapacity();
     return true;
 }
 
@@ -6900,6 +7342,10 @@ pub fn phaseFromString(text: []const u8) !JoinShuffleJobPhase {
     if (std.mem.eql(u8, text, "succeeded")) return .succeeded;
     if (std.mem.eql(u8, text, "failed")) return .failed;
     return error.InvalidQueryRequest;
+}
+
+fn joinJobKeyBuffer(buffer: []u8, job_id: u64) ![]const u8 {
+    return std.fmt.bufPrint(buffer, "__api_join_jobs__:{d}", .{job_id});
 }
 
 fn joinJobKey(alloc: std.mem.Allocator, job_id: u64) ![]u8 {
@@ -9513,7 +9959,7 @@ test "distributed join fanout bounds concurrency drains errors and preserves gro
         active: std.atomic.Value(usize) = .init(0),
         peak: std.atomic.Value(usize) = .init(0),
         calls: std.atomic.Value(usize) = .init(0),
-        fail: bool = false,
+        fail_group: ?u64 = null,
         fn query(ptr: *anyopaque, alloc: std.mem.Allocator, group: u64, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const active = self.active.fetchAdd(1, .acq_rel) + 1;
@@ -9522,7 +9968,7 @@ test "distributed join fanout bounds concurrency drains errors and preserves gro
             _ = self.calls.fetchAdd(1, .acq_rel);
             // Complete out of order to test deterministic publication.
             try std.Io.sleep(std.Options.debug_io, .fromMilliseconds(@intCast(10 - group % 8)), .awake);
-            if (self.fail and group == 2) return error.TopologyChanged;
+            if (self.fail_group == group) return error.TopologyChanged;
             return .{ .json = try std.fmt.allocPrint(alloc, "{{\"responses\":[{{\"hits\":{{\"total\":{{\"value\":1,\"relation\":\"exact\"}},\"hits\":[{{\"_id\":\"{d}\",\"_source\":{{}}}}]}}}}]}}", .{group}) };
         }
     };
@@ -9546,22 +9992,67 @@ test "distributed join fanout bounds concurrency drains errors and preserves gro
     try std.testing.expect(fixture.peak.load(.acquire) <= 8);
     for (hits.items, 0..) |hit, i| try std.testing.expectEqual(i, try std.fmt.parseInt(usize, hit.object.get("_id").?.string, 10));
     const published = hits.items.len;
-    fixture.fail = true;
+    fixture.fail_group = 2;
     fixture.calls.store(0, .release);
     try std.testing.expectError(error.TopologyChanged, appendJoinReadJobs(ctx, alloc, source, "customers", &jobs, &hits));
     try std.testing.expectEqual(@as(usize, 0), fixture.active.load(.acquire));
     try std.testing.expectEqual(@as(usize, 8), fixture.calls.load(.acquire));
     try std.testing.expectEqual(published, hits.items.len);
+    // The first batch succeeds; a later batch must not publish those hits
+    // when one of its workers fails. The same rule applies without fanout I/O.
+    fixture.fail_group = 10;
+    fixture.calls.store(0, .release);
+    try std.testing.expectError(error.TopologyChanged, appendJoinReadJobs(ctx, alloc, source, "customers", &jobs, &hits));
+    try std.testing.expectEqual(@as(usize, 16), fixture.calls.load(.acquire));
+    try std.testing.expectEqual(published, hits.items.len);
+    ctx.fanout_io = null;
+    try std.testing.expectError(error.TopologyChanged, appendJoinReadJobs(ctx, alloc, source, "customers", &jobs, &hits));
+    try std.testing.expectEqual(published, hits.items.len);
+    ctx.fanout_io = @import("../runtime_io_abi.zig").Borrow.init(&io);
+    const calls_before_cancel = fixture.calls.load(.acquire);
     var cancelled = std.atomic.Value(bool).init(true);
     ctx.cancellation = CancellationToken.fromAtomic(&cancelled);
     try std.testing.expectError(error.Cancelled, appendJoinReadJobs(ctx, alloc, source, "customers", &jobs, &hits));
-    try std.testing.expectEqual(@as(usize, 8), fixture.calls.load(.acquire));
+    try std.testing.expectEqual(calls_before_cancel, fixture.calls.load(.acquire));
     ctx.cancellation = null;
-    fixture.fail = false;
+    fixture.fail_group = null;
     fixture.peak.store(0, .release);
     jobs[0].req.graph_query_transport = .{ .dialect = .canonical, .operations_json = "{}", .admitted_operations_ptr = &fixture, .admitted_operations_len = 0 };
     try std.testing.expect(try appendJoinReadJobs(ctx, alloc, source, "customers", jobs[0..2], &hits));
     try std.testing.expectEqual(@as(usize, 1), fixture.peak.load(.acquire));
+}
+
+test "distributed join fanout charges worker scratch to request quota" {
+    const Fixture = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+
+        fn query(ptr: *anyopaque, alloc: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.calls.fetchAdd(1, .acq_rel);
+            // Each worker retains this scratch in its result arena until the
+            // batch joins. Either fits alone; both exceed the request quota.
+            const scratch = try alloc.alloc(u8, 600 * 1024);
+            @memset(scratch, 'x');
+            return .{ .json = try alloc.dupe(u8, "{\"responses\":[{\"hits\":{\"total\":{\"value\":0,\"relation\":\"exact\"},\"hits\":[]}}]}") };
+        }
+    };
+
+    const storage = try std.testing.allocator.alloc(u8, 1024 * 1024);
+    defer std.testing.allocator.free(storage);
+    var quota = std.heap.FixedBufferAllocator.init(storage);
+    const alloc = quota.allocator();
+    var fixture: Fixture = .{};
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .limited(2) });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ctx = JoinContext{ .ptr = &fixture, .fanout_io = @import("../runtime_io_abi.zig").Borrow.init(&io), .vtable = undefined };
+    const source = table_reads.TableReadSource{ .ptr = &fixture, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .query_group_local = Fixture.query } };
+    var hits = std.json.Array.init(alloc);
+    defer hits.deinit();
+    const jobs = [_]JoinReadJob{ .{ .group_id = 1, .req = .{} }, .{ .group_id = 2, .req = .{} } };
+    try std.testing.expectError(error.OutOfMemory, appendJoinReadJobs(ctx, alloc, source, "customers", &jobs, &hits));
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), hits.items.len);
 }
 
 test "distributed join finalizer refuses to replace an admitted split topology" {

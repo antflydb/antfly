@@ -1,0 +1,12 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
+
+pub const antfly_sources = @import("source_owner_physical.zig");
+
+test {
+    _ = @import("storage/db/db.zig");
+    _ = @import("storage/transactions.zig");
+    _ = @import("storage/completion_physical.zig");
+    _ = @import("storage/completion_process_test.zig");
+    _ = @import("storage/completion_two_process_raft_test.zig");
+}

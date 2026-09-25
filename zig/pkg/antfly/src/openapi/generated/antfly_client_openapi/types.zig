@@ -14933,7 +14933,7 @@ pub const GlobalStatefulQueryRequest = struct {
     limit: ?i64 = null,
     /// Number of results to skip for pagination. Supported for text-backed, match_all, and filter-only requests. Approximate semantic requests do not support offset on their own. Semantic and hybrid requests support it when a reranker is configured: Antfly retrieves a bounded candidate window and applies offset after coordinator-owned reranking.
     offset: ?i64 = null,
-    /// Optional query execution deadline in milliseconds. The server applies this as a cooperative deadline across query planning, search execution, aggregation reruns, sorting, and response post-processing. If the deadline expires before the query completes, the HTTP API returns 504. When omitted, semantic query embedding planning and provider I/O use a 30-second default deadline.
+    /// Optional query execution deadline in milliseconds. The server applies this as a cooperative deadline across admission waiting, query planning, search execution, aggregation reruns, sorting, and response post-processing. If the deadline expires before the query completes, the HTTP API returns 504. When omitted, semantic query embedding planning and provider I/O use a 30-second default deadline. NDJSON batches share their submission time and use the shortest explicit timeout in the batch. Waiting, retries, and later batch lines do not reset this budget.
     timeout_ms: ?i64 = null,
     /// Sort order for results. Array of sort fields with direction. Antfly appends `_id` ascending as a stable tie-breaker when it is omitted. Hierarchy child traversal requires `_hierarchy.position` ascending; its opaque, sortable value is bound to the complete source hierarchy revision. Supported for exact text-backed, match_all, and filter-only requests when each non-`_id` field is a mapped exact scalar field with sortable native doc-value coverage. Sortable mapping types are keyword, numeric/number/integer, boolean/bool, datetime/date/timestamp, and link. Declare the field with `x-antfly-field` and `sortable: true`; `x-antfly-types` shorthand declarations alone are not sortable. Analyzed `text` fields and `search_as_you_type`, geo, embedding, blob, html, object, and array fields are not directly sortable; sort on an exact scalar mapping such as `title.keyword` instead. Requests that cannot be executed through an exact native sort path return 422 rather than falling back to stored JSON sorting. Semantic searches are always sorted by similarity score. Not supported when `count` is true.
     order_by: ?[]const SortField = null,
@@ -30108,7 +30108,7 @@ pub const QueryRequest = struct {
     limit: ?i64 = null,
     /// Number of results to skip for pagination. Supported for text-backed, match_all, and filter-only requests. Approximate semantic requests do not support offset on their own. Semantic and hybrid requests support it when a reranker is configured: Antfly retrieves a bounded candidate window and applies offset after coordinator-owned reranking.
     offset: ?i64 = null,
-    /// Optional query execution deadline in milliseconds. The server applies this as a cooperative deadline across query planning, search execution, aggregation reruns, sorting, and response post-processing. If the deadline expires before the query completes, the HTTP API returns 504. When omitted, semantic query embedding planning and provider I/O use a 30-second default deadline.
+    /// Optional query execution deadline in milliseconds. The server applies this as a cooperative deadline across admission waiting, query planning, search execution, aggregation reruns, sorting, and response post-processing. If the deadline expires before the query completes, the HTTP API returns 504. When omitted, semantic query embedding planning and provider I/O use a 30-second default deadline. NDJSON batches share their submission time and use the shortest explicit timeout in the batch. Waiting, retries, and later batch lines do not reset this budget.
     timeout_ms: ?i64 = null,
     /// Sort order for results. Array of sort fields with direction. Antfly appends `_id` ascending as a stable tie-breaker when it is omitted. Hierarchy child traversal requires `_hierarchy.position` ascending; its opaque, sortable value is bound to the complete source hierarchy revision. Supported for exact text-backed, match_all, and filter-only requests when each non-`_id` field is a mapped exact scalar field with sortable native doc-value coverage. Sortable mapping types are keyword, numeric/number/integer, boolean/bool, datetime/date/timestamp, and link. Declare the field with `x-antfly-field` and `sortable: true`; `x-antfly-types` shorthand declarations alone are not sortable. Analyzed `text` fields and `search_as_you_type`, geo, embedding, blob, html, object, and array fields are not directly sortable; sort on an exact scalar mapping such as `title.keyword` instead. Requests that cannot be executed through an exact native sort path return 422 rather than falling back to stored JSON sorting. Semantic searches are always sorted by similarity score. Not supported when `count` is true.
     order_by: ?[]const SortField = null,
@@ -36768,7 +36768,7 @@ pub const StatefulQueryRequest = struct {
     limit: ?i64 = null,
     /// Number of results to skip for pagination. Supported for text-backed, match_all, and filter-only requests. Approximate semantic requests do not support offset on their own. Semantic and hybrid requests support it when a reranker is configured: Antfly retrieves a bounded candidate window and applies offset after coordinator-owned reranking.
     offset: ?i64 = null,
-    /// Optional query execution deadline in milliseconds. The server applies this as a cooperative deadline across query planning, search execution, aggregation reruns, sorting, and response post-processing. If the deadline expires before the query completes, the HTTP API returns 504. When omitted, semantic query embedding planning and provider I/O use a 30-second default deadline.
+    /// Optional query execution deadline in milliseconds. The server applies this as a cooperative deadline across admission waiting, query planning, search execution, aggregation reruns, sorting, and response post-processing. If the deadline expires before the query completes, the HTTP API returns 504. When omitted, semantic query embedding planning and provider I/O use a 30-second default deadline. NDJSON batches share their submission time and use the shortest explicit timeout in the batch. Waiting, retries, and later batch lines do not reset this budget.
     timeout_ms: ?i64 = null,
     /// Sort order for results. Array of sort fields with direction. Antfly appends `_id` ascending as a stable tie-breaker when it is omitted. Hierarchy child traversal requires `_hierarchy.position` ascending; its opaque, sortable value is bound to the complete source hierarchy revision. Supported for exact text-backed, match_all, and filter-only requests when each non-`_id` field is a mapped exact scalar field with sortable native doc-value coverage. Sortable mapping types are keyword, numeric/number/integer, boolean/bool, datetime/date/timestamp, and link. Declare the field with `x-antfly-field` and `sortable: true`; `x-antfly-types` shorthand declarations alone are not sortable. Analyzed `text` fields and `search_as_you_type`, geo, embedding, blob, html, object, and array fields are not directly sortable; sort on an exact scalar mapping such as `title.keyword` instead. Requests that cannot be executed through an exact native sort path return 422 rather than falling back to stored JSON sorting. Semantic searches are always sorted by similarity score. Not supported when `count` is true.
     order_by: ?[]const SortField = null,
@@ -38420,11 +38420,13 @@ pub const TableStorageMode = enum {
 
 /// Immutable source embedding ownership. Omit storage when creating a table to select vector_store for a local single-shard standalone table without HA or replication, and primary_lsm for other deployments. Existing tables retain their recorded ownership; changing the creation default does not migrate data. Snapshot/backup and split operations currently reject vector_store tables; explicitly select primary_lsm when these operations are required.
 pub const TableStorageSettings = struct {
+    transaction_recovery: OpenApiOptionalNullable(TransactionRecoveryStoragePolicy) = .absent,
     /// Explicit ownership choice. vector_store requires a fresh local single-shard standalone table without HA or replication. An explicit empty storage object keeps primary_lsm; omit the storage object to use the deployment default.
     dense_embeddings: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "transaction_recovery", "transaction_recovery", false },
         .{ "dense_embeddings", "dense_embeddings", true },
     };
 
@@ -38438,6 +38440,17 @@ pub const TableStorageSettings = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        switch (self.transaction_recovery) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("transaction_recovery");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("transaction_recovery");
+                try jw.write(value);
+            },
+        }
         if (self.dense_embeddings) |value| {
             try jw.objectField("dense_embeddings");
             try jw.write(value);
@@ -39147,6 +39160,58 @@ pub const TransactionReadItem = struct {
     key: []const u8,
     /// Version token observed at read time (from X-Antfly-Version header). Use "0" to assert the key did not exist at read time.
     version: []const u8,
+};
+
+/// Immutable, creation-only transaction completion policy. Enable only after every replica is upgraded to support protocol version 1. Existing tables require a separate migration; this setting does not fence older live peers. The node transaction completion reserve must accommodate this policy.
+pub const TransactionRecoveryStoragePolicy = struct {
+    protocol_version: u32,
+    /// Physical completion protocol. Zero retains logical recovery accounting only; version 1 requires reserved completion and matching profile version 1. Requires compatible metadata and storage owners; no legacy prepare fallback is permitted.
+    completion_protocol_version: ?u32 = null,
+    /// Version of the bounded point-plan profile. Must be zero with completion protocol zero, or one with completion protocol one.
+    profile_version: ?u32 = null,
+    max_count: u64,
+    max_bytes: u64,
+    /// Total deterministic metadata and intent completion credits per transaction; cannot exceed max_bytes.
+    max_transaction_bytes: u64,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "protocol_version", "protocol_version", false },
+        .{ "completion_protocol_version", "completion_protocol_version", true },
+        .{ "profile_version", "profile_version", true },
+        .{ "max_count", "max_count", false },
+        .{ "max_bytes", "max_bytes", false },
+        .{ "max_transaction_bytes", "max_transaction_bytes", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("protocol_version");
+        try jw.write(self.protocol_version);
+        if (self.completion_protocol_version) |value| {
+            try jw.objectField("completion_protocol_version");
+            try jw.write(value);
+        }
+        if (self.profile_version) |value| {
+            try jw.objectField("profile_version");
+            try jw.write(value);
+        }
+        try jw.objectField("max_count");
+        try jw.write(self.max_count);
+        try jw.objectField("max_bytes");
+        try jw.write(self.max_bytes);
+        try jw.objectField("max_transaction_bytes");
+        try jw.write(self.max_transaction_bytes);
+        try jw.endObject();
+    }
 };
 
 pub const TransactionSavepointResponse = struct {

@@ -89,6 +89,11 @@ pub const Backend = struct {
         pub fn beginBatch(self: *@This()) !BoundBatch {
             return try BoundBatch.open(self.backend, self.namespace);
         }
+
+        pub fn writeSerialization(_: *@This()) !backend_types.WriteSerialization {
+            // LMDB owns the environment writer slot from begin through close.
+            return .{ .acquired_by_begin = true };
+        }
     };
 
     const BoundTxn = struct {
@@ -548,7 +553,7 @@ test "lmdb backend runtime erases bound store handles with cursor access" {
     try std.testing.expect(!runtime.capabilities().native_namespaces);
 
     {
-        var txn = try runtime.beginWrite();
+        var txn = try runtime.beginSerializedBatch();
         try txn.put("doc:a", "A");
         try txn.put("doc:b", "B");
         try txn.commit();

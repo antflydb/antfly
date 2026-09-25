@@ -323,6 +323,49 @@ pub fn applyStorageKernelReplicatedBatch(
         try db.batchReplicatedApply(req);
 }
 
+/// Compile ordinary writes, begin or prepare; do not discard another batch
+/// operation or publish any of its mutations while producing the candidate.
+pub fn compileStorageKernelReplicatedCompletion(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    table_name: []const u8,
+    group_id: u64,
+    req: db_mod.types.BatchRequest,
+    expected_previous: db_mod.RaftAppliedEntryIdentity,
+) ![]u8 {
+    try validateTableBatchAgainstLocalSchema(alloc, db, req.writes, req.deletes, req.transforms);
+    const mutation = req.transaction orelse return db.compileReplicatedMutation(alloc, req, expected_previous);
+    if (mutation == .begin) {
+        if (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or req.predicates.len != 0 or
+            req.graph_writes.len != 0 or req.graph_deletes.len != 0 or req.merge_artifacts.len != 0 or
+            req.split_checkpoint != null or req.split_replication != null or req.split_transition != null or
+            req.merge_source_transition != null or req.merge_checkpoint != null or req.merge_replication != null)
+            return error.InvalidBatchRequest;
+        const begin = mutation.begin;
+        var selection = try selectBeginParticipants(alloc, table_name, group_id, begin.participants, req.restore_staging_scope, req.restore_staging_plan_id);
+        defer selection.deinit(alloc);
+        return db.compileReplicatedBegin(alloc, .{
+            .txn_id = begin.txn_id,
+            .timestamp = begin.begin_timestamp,
+            .created_at = begin.created_at_ns,
+            .topology_epoch = begin.topology_epoch,
+            .participants = selection.durableParticipants(begin.participants),
+            .coordinator = selection.coordinator,
+            .retain_terminal = begin.retain_terminal,
+        }, expected_previous);
+    }
+    if (mutation != .prepare or req.graph_writes.len != 0 or req.graph_deletes.len != 0 or
+        req.reject_graph_transform_projections or req.split_checkpoint != null or req.split_replication != null or
+        req.split_transition != null or req.merge_source_transition != null or req.merge_checkpoint != null or
+        req.merge_replication != null or req.merge_artifacts.len != 0) return error.InvalidBatchRequest;
+    return db.compileReplicatedTransaction(alloc, mutation.prepare.txn_id, .{
+        .writes = batchWritesAsTransactionWrites(req.writes),
+        .deletes = req.deletes,
+        .transforms = req.transforms,
+        .predicates = req.predicates,
+    }, expected_previous);
+}
+
 pub fn applyStorageKernelReplicatedBatchAtRaftEntry(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
@@ -364,6 +407,35 @@ pub fn applyReplicatedTransactionMutationAtRaftEntry(
     try applyReplicatedTransactionMutationInternal(alloc, db, table_name, group_id, req, .none, raft_entry);
 }
 
+const BeginParticipantSelection = struct {
+    local: [1][]const u8,
+    coordinator: bool,
+
+    fn durableParticipants(self: *const @This(), all: []const []const u8) []const []const u8 {
+        return if (self.coordinator) all else &self.local;
+    }
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.local[0]);
+    }
+};
+
+fn selectBeginParticipants(alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, participants: []const []const u8, restore_staging_scope: ?[32]u8, restore_staging_plan_id: ?[16]u8) !BeginParticipantSelection {
+    if (participants.len == 0) return error.InvalidBatchRequest;
+    const local = try distributed_txn.participantIdForGroupScoped(alloc, table_name, group_id, restore_staging_scope, restore_staging_plan_id);
+    errdefer alloc.free(local);
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(alloc);
+    var local_present = false;
+    for (participants) |participant| {
+        if (distributed_txn.parseParticipantRef(participant) == null) return error.InvalidBatchRequest;
+        const entry = try seen.getOrPut(alloc, participant);
+        if (entry.found_existing) return error.InvalidBatchRequest;
+        if (std.mem.eql(u8, participant, local)) local_present = true;
+    }
+    if (!local_present) return error.InvalidBatchRequest;
+    return .{ .local = .{local}, .coordinator = std.mem.eql(u8, participants[0], local) };
+}
+
 pub fn applyReplicatedTransactionMutationInternal(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
@@ -377,32 +449,19 @@ pub fn applyReplicatedTransactionMutationInternal(
     if (req.relational_index_maintenance) |command| if (command.owner_group_id != group_id) return error.PreparedGenerationChanged;
     switch (mutation) {
         .begin => |begin| {
-            const local_participant = try distributed_txn.participantIdForGroupScoped(alloc, table_name, group_id, req.restore_staging_scope, req.restore_staging_plan_id);
-            defer alloc.free(local_participant);
-            if (begin.participants.len == 0) return error.InvalidBatchRequest;
-            var seen = std.StringHashMapUnmanaged(void).empty;
-            defer seen.deinit(alloc);
-            var local_present = false;
-            for (begin.participants) |participant| {
-                if (distributed_txn.parseParticipantRef(participant) == null) return error.InvalidBatchRequest;
-                const entry = try seen.getOrPut(alloc, participant);
-                if (entry.found_existing) return error.InvalidBatchRequest;
-                if (std.mem.eql(u8, participant, local_participant)) local_present = true;
-            }
-            if (!local_present) return error.InvalidBatchRequest;
-            const coordinator = std.mem.eql(u8, begin.participants[0], local_participant);
-            const local_only = [_][]const u8{local_participant};
+            var selection = try selectBeginParticipants(alloc, table_name, group_id, begin.participants, req.restore_staging_scope, req.restore_staging_plan_id);
+            defer selection.deinit(alloc);
             // Only the coordinator owns the full participant fan-out. A
             // follower tracks itself, making successful cleanup O(N) rather
             // than every participant retrying every other participant.
-            const durable_participants: []const []const u8 = if (coordinator) begin.participants else &local_only;
+            const durable_participants = selection.durableParticipants(begin.participants);
             if (raft_entry) |entry|
                 _ = try db.beginReplicatedTransactionScoped(
                     begin.txn_id,
                     begin.begin_timestamp,
                     begin.created_at_ns,
                     durable_participants,
-                    coordinator,
+                    selection.coordinator,
                     begin.retain_terminal,
                     entry,
                     req.restore_staging_scope,
@@ -413,7 +472,7 @@ pub fn applyReplicatedTransactionMutationInternal(
                     begin.begin_timestamp,
                     begin.created_at_ns,
                     durable_participants,
-                    coordinator,
+                    selection.coordinator,
                     begin.retain_terminal,
                     req.restore_staging_scope,
                 );
@@ -890,6 +949,12 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
             namespace: ?doc_identity.Namespace,
             open_options: ManagedDbOpenOptions,
         ) !db_mod.DB {
+            // Staged/repair owners may not inherit live-root completion
+            // authority from the process. Promotion installs its own proof;
+            // a staged prepared descriptor must fail closed until then.
+            const completion_staged = open_mode == .restore_repair or open_options.staged_generation != null;
+            const completion_enabled = !completion_staged and (if (manager) |value| value.durable_completion_enabled else false);
+            const completion_authority: @import("../common/durable_completion_policy.zig").Authority = if (completion_staged) .none else if (manager) |value| value.durable_completion_authority else .none;
             const schema_before_index_load = try prepareManagedSchemaBeforeIndexLoad(allocator, open_mode, open_options.schema_json_before_index_load);
             defer if (schema_before_index_load) |schema| storage_schema.freeSchema(allocator, schema.runtime_schema);
 
@@ -917,6 +982,8 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                 resolved.start_optional_runtime_workers = false;
                 resolved.ttl_cleanup = .{ .enabled = false };
                 resolved.transaction_recovery = .{ .enabled = false };
+                resolved.durable_completion_enabled = false;
+                resolved.durable_completion_authority = .none;
                 resolved.text_merge = .{ .enabled = false };
                 resolved.index_backends.dense_native_migration_policy_source = open_options.dense_native_migration_policy_source;
                 return try db_mod.DB.open(allocator, db_path, resolved);
@@ -928,6 +995,8 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                 .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
                 .lsm_root_generation = root_generation,
                 .resource_manager = manager,
+                .durable_completion_enabled = completion_enabled,
+                .durable_completion_authority = completion_authority,
                 .backend_runtime = runtime,
                 .secret_store = store,
                 .remote_content = remote,
@@ -952,6 +1021,8 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
+                        .durable_completion_enabled = completion_enabled,
+                        .durable_completion_authority = completion_authority,
                         .backend_runtime = runtime,
                         .secret_store = store,
                         .remote_content = remote,
@@ -972,6 +1043,8 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
+                        .durable_completion_enabled = completion_enabled,
+                        .durable_completion_authority = completion_authority,
                         .backend_runtime = runtime,
                         .secret_store = store,
                         .remote_content = remote,
@@ -999,6 +1072,8 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
+                        .durable_completion_enabled = completion_enabled,
+                        .durable_completion_authority = completion_authority,
                         .backend_runtime = runtime,
                         .secret_store = store,
                         .remote_content = remote,
@@ -1020,6 +1095,8 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                     .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
                     .lsm_root_generation = root_generation,
                     .resource_manager = manager,
+                    .durable_completion_enabled = completion_enabled,
+                    .durable_completion_authority = completion_authority,
                     .backend_runtime = runtime,
                     .secret_store = store,
                     .remote_content = remote,
@@ -1063,6 +1140,8 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
+                        .durable_completion_enabled = completion_enabled,
+                        .durable_completion_authority = completion_authority,
                         .backend_runtime = runtime,
                         .secret_store = store,
                         .remote_content = remote,
@@ -1087,6 +1166,8 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
+                        .durable_completion_enabled = completion_enabled,
+                        .durable_completion_authority = completion_authority,
                         .backend_runtime = runtime,
                         .secret_store = store,
                         .remote_content = remote,
@@ -1110,6 +1191,8 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
+                        .durable_completion_enabled = completion_enabled,
+                        .durable_completion_authority = completion_authority,
                         .backend_runtime = runtime,
                         .secret_store = store,
                         .remote_content = remote,
@@ -1130,6 +1213,8 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
+                        .durable_completion_enabled = completion_enabled,
+                        .durable_completion_authority = completion_authority,
                         .backend_runtime = runtime,
                         .secret_store = store,
                         .remote_content = remote,
@@ -1149,6 +1234,8 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
+                        .durable_completion_enabled = completion_enabled,
+                        .durable_completion_authority = completion_authority,
                         .backend_runtime = runtime,
                         .secret_store = store,
                         .remote_content = remote,
@@ -1169,6 +1256,8 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
+                        .durable_completion_enabled = completion_enabled,
+                        .durable_completion_authority = completion_authority,
                         .backend_runtime = runtime,
                         .secret_store = store,
                         .remote_content = remote,
@@ -1815,7 +1904,13 @@ pub fn configureStorageKernelOwnerDbAtOpen(
             null;
         defer if (descriptor_schema) |*parsed| parsed.deinit(alloc);
         const descriptor_version: u32 = if (descriptor_schema) |parsed| parsed.version else 0;
-        if (descriptor_version < durable_schema.version) return;
+        if (descriptor_version < durable_schema.version) {
+            // Only an immutable Raft entry may reopen through an older pinned
+            // descriptor. An ordinary owner must retry with current catalog
+            // authority rather than silently accepting a stale open.
+            if (historical_raft_apply) return;
+            return error.StorageBusy;
+        }
     }
     if (schema_json.len > 0) try applyLocalTableSchemaJson(alloc, db, schema_json);
     if (indexes_json.len > 0) {

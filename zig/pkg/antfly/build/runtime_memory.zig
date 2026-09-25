@@ -97,9 +97,10 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
         // scheduler can overlap whichever roots fit without forcing
         // callers to serialize the whole build.
         .inference => 16 * 1024 * 1024 * 1024,
-        // Clean aarch64-macOS ReleaseFast codegen currently peaks
-        // around 2.23 GB, just above the former 2 GiB reservation.
-        .cli => 3 * 1024 * 1024 * 1024,
+        // The current aarch64-macOS ReleaseFast CLI root peaks above
+        // 3 GiB. Reserve 4 GiB so the scheduler admits the compile with
+        // margin while retaining the existing reservation elsewhere.
+        .cli => @as(usize, if (target.os.tag == .macos) 4 else 3) * 1024 * 1024 * 1024,
     };
 }
 
@@ -112,6 +113,13 @@ test "measured release reservations admit storage with inference and preserve un
         .host = macos,
         .target = macos,
         .optimize = .ReleaseSafe,
+        .strip = false,
+        .cpu_inference = true,
+    }));
+    try std.testing.expectEqual(@as(usize, 4) * 1024 * 1024 * 1024, runtimeCompileMaxRss(.cli, .{
+        .host = macos,
+        .target = macos,
+        .optimize = .ReleaseFast,
         .strip = false,
         .cpu_inference = true,
     }));

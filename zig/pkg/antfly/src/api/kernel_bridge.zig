@@ -30,6 +30,19 @@ const backend_erased = @import("../storage/backend_erased.zig");
 const ha_http_operation = @import("../storage/hot_standby/http_operation.zig");
 const httpx = @import("httpx");
 const internal_routes = @import("../internal/routes.zig");
+const api_routes = @import("http_routes.zig").Routes;
+
+fn protectedRecoveryRoute(method: anytype, path: []const u8) bool {
+    if (method != .post) return false;
+    const table_prefix = api_routes.internal_groups_prefix ++ ":group_id/tables/:table_name";
+    return std.mem.eql(u8, path, api_routes.workload_attempt_control) or
+        std.mem.eql(u8, path, table_prefix ++ api_routes.txn_resolve_suffix) or
+        std.mem.eql(u8, path, table_prefix ++ api_routes.txn_decide_suffix) or
+        std.mem.eql(u8, path, table_prefix ++ api_routes.txn_resolve_recovery_suffix) or
+        std.mem.eql(u8, path, table_prefix ++ api_routes.txn_acknowledge_recovery_suffix) or
+        std.mem.eql(u8, path, table_prefix ++ api_routes.txn_status_suffix) or
+        std.mem.eql(u8, path, table_prefix ++ api_routes.txn_acknowledge_suffix);
+}
 
 const CreateContext = abi.CreateContext;
 const CallContext = abi.CallContext;
@@ -39,6 +52,17 @@ const direct_codegen = builtin.is_test;
 const BoundaryAllocator = struct {
     allocator: std.mem.Allocator,
     abi_allocator: abi.memory_abi.Allocator,
+    refs: std.atomic.Value(usize) = .init(1),
+
+    fn retain(self: *BoundaryAllocator) void {
+        const previous = self.refs.fetchAdd(1, .monotonic);
+        std.debug.assert(previous > 0);
+    }
+
+    fn release(self: *BoundaryAllocator) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        self.allocator.destroy(self);
+    }
 };
 
 extern fn antfly_api_kernel_get_function_table() callconv(.c) *const abi.FunctionTable;
@@ -94,9 +118,8 @@ const OpaqueApiHttpServer = struct {
 
     pub fn deinit(self: *OpaqueApiHttpServer) void {
         const boundary_allocator = self.boundary_allocator;
-        const allocator = boundary_allocator.allocator;
         self.functions.destroy(self.opaque_handle);
-        allocator.destroy(boundary_allocator);
+        boundary_allocator.release();
         self.* = undefined;
     }
 
@@ -110,6 +133,18 @@ const OpaqueApiHttpServer = struct {
         var out: AdmissionStats = undefined;
         callInfallible(void, AdmissionStats, self.functions.query_admission_stats, self.opaque_handle, null, &out);
         return out;
+    }
+
+    pub fn closeForegroundAdmission(self: *OpaqueApiHttpServer) void {
+        callInfallible(void, void, self.functions.close_foreground_admission, self.opaque_handle, null, null);
+    }
+
+    pub fn coordinatorPort(self: *const OpaqueApiHttpServer) ?@import("../runtime_workload_abi.zig").CoordinatorPort {
+        if (!abi.validFunctionTable(self.functions, abi.Capability.workload_coordinator)) return null;
+        const Result = @import("../runtime_workload_abi.zig").OptionalCoordinatorPort;
+        var out: Result = .{};
+        callInfallible(void, Result, self.functions.coordinator_port, self.opaque_handle, null, &out);
+        return if (out.present != 0) out.port else null;
     }
 
     pub fn writeAdmissionStats(self: *const OpaqueApiHttpServer) AdmissionStats {
@@ -228,6 +263,7 @@ fn createOpaqueServer(
     const boundary_allocator = try owner_alloc.create(BoundaryAllocator);
     errdefer owner_alloc.destroy(boundary_allocator);
     boundary_allocator.allocator = owner_alloc;
+    boundary_allocator.refs = .init(1);
     boundary_allocator.abi_allocator = .fromStd(&boundary_allocator.allocator);
     const status = functions.create(&.{
         .abi_version = abi.abi_version,
@@ -289,19 +325,81 @@ fn callInfallible(
     callFallible(Input, Output, function, handle, input, output) catch @panic("infallible API kernel call failed");
 }
 
-pub const HandlerStats = abi.HandlerStats;
+pub const HandlerStats = struct {
+    const AdmissionStats = server_mod.RequestAdmission.Stats;
+    query: AdmissionStats,
+    write: AdmissionStats,
+    inference: AdmissionStats,
+    query_body: AdmissionStats,
+    recovery: @import("admission_stats_abi.zig").RecoveryStats = .{},
+
+    fn fromWire(value: abi.HandlerStats) HandlerStats {
+        return .{
+            .query = value.query.toNative(AdmissionStats),
+            .write = value.write.toNative(AdmissionStats),
+            .inference = value.inference.toNative(AdmissionStats),
+            .query_body = value.query_body.toNative(AdmissionStats),
+            .recovery = value.recovery,
+        };
+    }
+};
+
+pub fn dispatchPolicyFromKernel(handle: *anyopaque, functions: *const abi.FunctionTable) !abi.DispatchPolicy {
+    if (!abi.validFunctionTable(functions, abi.Capability.dispatch_admission)) return error.UnsupportedVersion;
+    var policy: abi.DispatchPolicy = .{};
+    var lane: u8 = 0;
+    try callError(functions.handler_dispatch_policy(&.{
+        .abi_version = abi.abi_version,
+        .handler_handle = handle,
+        .out_policy = &policy,
+        .out_lane = &lane,
+    }));
+    return policy;
+}
+
+pub fn classifyIngressFromKernel(handle: *anyopaque, functions: *const abi.FunctionTable, request: @import("workload_dispatch.zig").Request) @import("workload_dispatch.zig").Lane {
+    if (!abi.validFunctionTable(functions, abi.Capability.dispatch_admission)) return .general;
+    const wire: abi.DispatchRequest = .{
+        .method = .init(request.method),
+        .path = .init(request.path),
+        .content_length = .init(request.content_length),
+        .transfer_encoding = .init(request.transfer_encoding),
+        .content_encoding = .init(request.content_encoding),
+        .credential = .init(request.credential),
+        .body_received_bytes = request.body_received_bytes,
+        .body_complete = @intFromBool(request.body_complete),
+    };
+    var policy: abi.DispatchPolicy = .{};
+    var lane: u8 = 0;
+    const status = functions.handler_dispatch_policy(&.{
+        .abi_version = abi.abi_version,
+        .handler_handle = handle,
+        .request = &wire,
+        .out_policy = &policy,
+        .out_lane = &lane,
+    });
+    if (!status.isOk()) return .general;
+    return switch (lane) {
+        1 => .control,
+        2 => .recovery,
+        else => .general,
+    };
+}
 
 const OpaqueHttpxHandler = struct {
     const RouteSelection = enum {
         all,
         all_without_probes,
         generated_with_probes,
+        protected_recovery,
     };
 
     handle: *anyopaque,
     functions: *const abi.FunctionTable,
     alloc: ?std.mem.Allocator = null,
     runtime_routes: std.ArrayListUnmanaged(*RuntimeRoute) = .empty,
+    boundary_allocator: ?*BoundaryAllocator = null,
+    protected_recovery_auth_configured: bool = false,
 
     pub fn initRuntime(self: *OpaqueHttpxHandler, alloc: std.mem.Allocator) !void {
         try callFallible(void, void, self.functions.handler_init, self.handle, null, null);
@@ -309,9 +407,7 @@ const OpaqueHttpxHandler = struct {
     }
 
     pub fn stats(self: *const OpaqueHttpxHandler) HandlerStats {
-        var out: HandlerStats = undefined;
-        callInfallible(void, HandlerStats, self.functions.handler_stats, self.handle, null, &out);
-        return out;
+        return handlerStatsFromKernel(self.handle, self.functions);
     }
 
     pub fn registerRoutes(self: *OpaqueHttpxHandler, server: *httpx.Server) !void {
@@ -324,6 +420,12 @@ const OpaqueHttpxHandler = struct {
 
     pub fn registerGeneratedRoutesWithProbes(self: *OpaqueHttpxHandler, server: *httpx.Server) !void {
         return self.registerRoutesWithOptions(server, .generated_with_probes);
+    }
+
+    pub fn registerProtectedRecoveryRoutes(self: *OpaqueHttpxHandler, server: *httpx.Server) !void {
+        if (!self.protected_recovery_auth_configured) return error.InternalServiceAuthenticationRequired;
+        try self.installHostInternalServiceAuth(server);
+        return self.registerRoutesWithOptions(server, .protected_recovery);
     }
 
     fn installHostInternalServiceAuth(self: *OpaqueHttpxHandler, server: *httpx.Server) !void {
@@ -379,7 +481,7 @@ const OpaqueHttpxHandler = struct {
             .out_legacy_accepted = &legacy_accepted,
         }));
         if (response_handle) |owned_handle|
-            return copyKernelResponse(context, self.functions, owned_handle, response_view);
+            return copyKernelResponse(context, self.functions, owned_handle, response_view, self.boundary_allocator);
 
         var response = try next.call(context);
         errdefer response.deinit();
@@ -388,10 +490,33 @@ const OpaqueHttpxHandler = struct {
         return response;
     }
 
+    fn classifyTransportIngress(raw: ?*anyopaque, view: httpx.RequestDispatchView) httpx.RequestTaskLane {
+        const self: *OpaqueHttpxHandler = @ptrCast(@alignCast(raw.?));
+        return switch (classifyIngressFromKernel(self.handle, self.functions, @import("workload_dispatch.zig").Request.fromTransport(view))) {
+            .general => .general,
+            .control => .control,
+            .recovery => .recovery,
+        };
+    }
+
+    fn configureTransportIngress(self: *OpaqueHttpxHandler, server: *httpx.Server) !void {
+        const policy = try dispatchPolicyFromKernel(self.handle, self.functions);
+        if (policy.max_requests == 0) return;
+        if (server.config.max_request_tasks < policy.max_requests) return error.InvalidConfig;
+        try server.configureRequestDispatch(.{
+            .control_tasks = policy.control_requests,
+            .recovery_tasks = policy.recovery_requests,
+            .recovery_h1_bodies = @intFromBool(policy.recovery_requests != 0),
+            .classifier = .{ .ctx = self, .classify = classifyTransportIngress },
+            .h1_rejection_response = @import("workload_dispatch.zig").busy_response,
+        });
+    }
+
     fn registerRoutesWithOptions(self: *OpaqueHttpxHandler, server: *httpx.Server, selection: RouteSelection) !void {
         if (!abi.validFunctionTable(self.functions, abi.Capability.route_manifest)) return error.UnsupportedVersion;
         if (self.runtime_routes.items.len != 0) return error.RoutesAlreadyRegistered;
         const alloc = self.alloc orelse return error.ApiKernelNotInitialized;
+        if (selection != .protected_recovery) try self.configureTransportIngress(server);
         var entries_ptr: ?[*]const abi.RouteManifestEntry = null;
         var entries_len: usize = 0;
         try callError(self.functions.handler_route_manifest(&.{
@@ -412,12 +537,15 @@ const OpaqueHttpxHandler = struct {
                 .all => {},
                 .all_without_probes => if (is_probe) continue,
                 .generated_with_probes => if (!is_generated and !is_probe) continue,
+                .protected_recovery => if (!protectedRecoveryRoute(entry.method, path)) continue,
             }
             const route = try alloc.create(RuntimeRoute);
             errdefer alloc.destroy(route);
             route.* = .{
+                .boundary_allocator = self.boundary_allocator,
                 .functions = self.functions,
                 .kernel_route_handle = entry.route_handle,
+                .method = entry.method,
                 .request_body = entry.request_body,
                 .streaming_response = entry.streaming_response != 0,
             };
@@ -439,6 +567,7 @@ const OpaqueHttpxHandler = struct {
             self.runtime_routes.deinit(alloc);
         }
         self.functions.handler_destroy(self.handle);
+        if (self.boundary_allocator) |owner| owner.release();
         self.* = undefined;
     }
 };
@@ -454,8 +583,10 @@ fn requiresHostInternalServicePrincipal(path: []const u8) bool {
 }
 
 const RuntimeRoute = struct {
+    boundary_allocator: ?*BoundaryAllocator = null,
     functions: *const abi.FunctionTable,
     kernel_route_handle: *anyopaque,
+    method: abi.HttpMethod = .get,
     request_body: abi.RequestBodyMode,
     streaming_response: bool,
 };
@@ -479,6 +610,9 @@ fn runtimeApiHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
     const request_view: abi.HttpRequestView = .{
         .method = switch (context.request.method) {
             .GET => .get,
+            // httpx selects the GET route for HEAD and suppresses its body on
+            // the original host context. Preserve that fallback across the ABI.
+            .HEAD => if (route.method == .get) .get else return error.MethodNotAllowed,
             .POST => .post,
             .PUT => .put,
             .DELETE => .delete,
@@ -514,6 +648,7 @@ fn runtimeApiHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
         route.functions,
         response_handle orelse return error.RuntimeBoundaryFailure,
         response_view,
+        route.boundary_allocator,
     );
 }
 
@@ -522,8 +657,9 @@ fn copyKernelResponse(
     functions: *const abi.FunctionTable,
     owned_response_handle: *anyopaque,
     response_view: abi.HttpResponseView,
+    boundary_allocator: ?*BoundaryAllocator,
 ) !httpx.Response {
-    defer functions.handler_destroy_http_response(owned_response_handle);
+    errdefer functions.handler_destroy_http_response(owned_response_handle);
     var response = httpx.Response.init(context.allocator, response_view.status);
     errdefer response.deinit();
     if (response_view.content_type.slice()) |content_type|
@@ -534,9 +670,31 @@ fn copyKernelResponse(
             std.ascii.eqlIgnoreCase(header.name.slice(), "Content-Type")) continue;
         try response.headers.append(header.name.slice(), header.value.slice());
     }
-    const body = try context.allocator.dupe(u8, response_view.body.slice());
-    response.body = body;
-    response.body_owned = true;
+    const Retirement = struct {
+        allocator: std.mem.Allocator,
+        boundary_allocator: ?*BoundaryAllocator,
+        functions: *const abi.FunctionTable,
+        handle: *anyopaque,
+
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.functions.handler_destroy_http_response(self.handle);
+            const allocator = self.allocator;
+            const boundary = self.boundary_allocator;
+            allocator.destroy(self);
+            if (boundary) |owner| owner.release();
+        }
+    };
+    // Retirement itself must not use the kernel allocator descriptor which
+    // destroying the final opaque response can retire.
+    const retirement_alloc = if (boundary_allocator) |owner| owner.allocator else context.allocator;
+    const retirement = try retirement_alloc.create(Retirement);
+    if (boundary_allocator) |owner| owner.retain();
+    retirement.* = .{ .allocator = retirement_alloc, .boundary_allocator = boundary_allocator, .functions = functions, .handle = owned_response_handle };
+    // Keep the kernel allocation and its admission charge through output drain.
+    // The opaque handle owns the body; no uncharged host-side copy is needed.
+    response.body = response_view.body.slice();
+    response.retirement = .{ .ptr = retirement, .release = Retirement.release };
     return response;
 }
 
@@ -557,9 +715,17 @@ pub fn createHandler(server: *ApiHttpServer) !HttpxHandler {
         .out_handle = &handle,
     });
     try callError(status);
+    const owned_handle = handle orelse return error.ApiKernelOperationFailed;
+    server.boundary_allocator.retain();
     return .{
-        .handle = handle orelse return error.ApiKernelOperationFailed,
+        .handle = owned_handle,
         .functions = server.functions,
+        .boundary_allocator = server.boundary_allocator,
+        .protected_recovery_auth_configured = blk: {
+            const secret = server.cfg.internal_service_secret orelse break :blk false;
+            const issuer = server.cfg.internal_service_issuer orelse break :blk false;
+            break :blk secret.len != 0 and issuer.len != 0 and !server.cfg.internal_service_accept_legacy_unauthenticated;
+        },
     };
 }
 
@@ -570,25 +736,22 @@ pub fn handlerStats(handler: *const HttpxHandler) HandlerStats {
         const inference = handler.api_server.inferenceAdmissionStats();
         const query_body = handler.query_body_admission.stats();
         return .{
-            .query_capacity = query.capacity,
-            .query_in_flight = query.in_flight,
-            .query_peak_in_flight = query.peak_in_flight,
-            .query_rejected_total = query.rejected_total,
-            .write_capacity = write.capacity,
-            .write_in_flight = write.in_flight,
-            .write_peak_in_flight = write.peak_in_flight,
-            .write_rejected_total = write.rejected_total,
-            .inference_capacity = inference.capacity,
-            .inference_in_flight = inference.in_flight,
-            .inference_peak_in_flight = inference.peak_in_flight,
-            .inference_rejected_total = inference.rejected_total,
-            .query_body_capacity = query_body.capacity,
-            .query_body_in_flight = query_body.in_flight,
-            .query_body_peak_in_flight = query_body.peak_in_flight,
-            .query_body_rejected_total = query_body.rejected_total,
+            .query = query,
+            .write = write,
+            .inference = inference,
+            .query_body = query_body,
+            .recovery = .collect(handler.api_server),
         };
     }
     return handler.stats();
+}
+
+/// The production opaque path and tests use the same checked C call and full
+/// snapshot conversion; never reconstruct default-filled controller stats.
+pub fn handlerStatsFromKernel(handle: *anyopaque, functions: *const abi.FunctionTable) HandlerStats {
+    var out: abi.HandlerStats = undefined;
+    callInfallible(void, abi.HandlerStats, functions.handler_stats, handle, null, &out);
+    return HandlerStats.fromWire(out);
 }
 
 pub fn deinitHandler(handler: *HttpxHandler) void {
@@ -600,6 +763,39 @@ pub fn setAntflyProvider(server: *ApiHttpServer, provider: ?managed_embedder.Ant
         server.antfly_provider = provider
     else
         server.setAntflyProvider(provider);
+}
+
+test "workload admission host response retains ABI allocator after producer teardown" {
+    const alloc = std.testing.allocator;
+    const boundary = try alloc.create(BoundaryAllocator);
+    boundary.* = .{ .allocator = alloc, .abi_allocator = undefined };
+    boundary.abi_allocator = .fromStd(&boundary.allocator);
+    const foreign = boundary.abi_allocator.asStd();
+    const Payload = struct {
+        allocator: std.mem.Allocator,
+        body: []u8,
+        fn destroy(raw: *anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const backing = self.allocator;
+            backing.free(self.body);
+            backing.destroy(self);
+        }
+    };
+    const payload = try foreign.create(Payload);
+    payload.* = .{ .allocator = foreign, .body = try foreign.dupe(u8, "opaque body") };
+    var functions: abi.FunctionTable = undefined;
+    functions.handler_destroy_http_response = Payload.destroy;
+    var request = try httpx.Request.init(alloc, .GET, "/");
+    defer request.deinit();
+    var context = httpx.Context.init(foreign, std.testing.io, &request);
+    var response = try copyKernelResponse(&context, &functions, payload, .{
+        .status = 200,
+        .body = abi.Bytes.init(payload.body),
+    }, boundary);
+    context.deinit();
+    boundary.release(); // producer/server releases its reference
+    try std.testing.expectEqualStrings("opaque body", response.body.?);
+    response.deinit(); // headers, foreign payload, then allocator descriptor
 }
 
 test "opaque host middleware protects direct internal routes across the kernel ABI" {
@@ -671,6 +867,26 @@ test "opaque host middleware protects direct internal routes across the kernel A
     try std.testing.expectEqual(@as(usize, 2), FakeKernel.calls);
 }
 
+test "opaque HTTP adapter reserves recovery body ingress from kernel policy" {
+    const FakeKernel = struct {
+        fn policy(context: *const abi.DispatchPolicyContext) callconv(.c) abi.Status {
+            context.out_policy.* = .{ .max_requests = 3, .control_requests = 1, .recovery_requests = 1 };
+            context.out_lane.* = 0;
+            return .ok;
+        }
+    };
+    var functions: abi.FunctionTable = undefined;
+    functions.abi_version = abi.abi_version;
+    functions.struct_size = @sizeOf(abi.FunctionTable);
+    functions.capabilities = abi.Capability.dispatch_admission;
+    functions.handler_dispatch_policy = FakeKernel.policy;
+    var handler = OpaqueHttpxHandler{ .handle = @ptrFromInt(1), .functions = &functions };
+    var server = httpx.Server.initWithConfig(std.testing.allocator, std.testing.io, .{ .max_connections = 3, .max_request_tasks = 3 });
+    defer server.deinit();
+    try handler.configureTransportIngress(&server);
+    try std.testing.expectEqual(@as(u32, 1), server.request_dispatch_config.recovery_h1_bodies);
+}
+
 test "linked transport projects the universal request cancellation callback" {
     const FakeKernel = struct {
         var saw_cancellation = false;
@@ -711,6 +927,45 @@ test "linked transport projects the universal request cancellation callback" {
     try std.testing.expectEqual(@as(u16, 200), response.status.code);
     try std.testing.expectEqualStrings("ok", response.body.?);
     try std.testing.expect(FakeKernel.saw_cancellation);
+}
+
+test "linked API dispatch preserves HEAD fallback to a GET kernel route" {
+    const FakeKernel = struct {
+        var calls: usize = 0;
+        fn handle(context: *const abi.HttpHandleContext) callconv(.c) abi.Status {
+            if (context.request.method != .get) return abi.statusFromError(error.TestUnexpectedResult);
+            calls += 1;
+            context.out_response_handle.* = @ptrFromInt(1);
+            context.out_response.* = .{ .status = 200, .body = abi.Bytes.init("healthy") };
+            return .ok;
+        }
+        fn destroy(_: *anyopaque) callconv(.c) void {}
+    };
+    var functions: abi.FunctionTable = undefined;
+    functions.handler_handle_http = FakeKernel.handle;
+    functions.handler_destroy_http_response = FakeKernel.destroy;
+    var route = RuntimeRoute{
+        .functions = &functions,
+        .kernel_route_handle = @ptrFromInt(1),
+        .method = .get,
+        .request_body = .none,
+        .streaming_response = false,
+    };
+    var request = try httpx.Request.init(std.testing.allocator, .HEAD, "/healthz");
+    defer request.deinit();
+    var context = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer context.deinit();
+    context.route_data = &route;
+    FakeKernel.calls = 0;
+    var response = try runtimeApiHttpHandler(&context);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    try std.testing.expectEqualStrings("healthy", response.body.?);
+    try std.testing.expectEqual(httpx.Method.HEAD, request.method);
+    try std.testing.expectEqual(@as(usize, 1), FakeKernel.calls);
+    route.method = .post;
+    try std.testing.expectError(error.MethodNotAllowed, runtimeApiHttpHandler(&context));
+    try std.testing.expectEqual(@as(usize, 1), FakeKernel.calls);
 }
 
 test "linked transport admits a streaming body before the kernel pulls it" {

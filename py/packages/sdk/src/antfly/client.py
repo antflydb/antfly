@@ -56,6 +56,7 @@ from antfly.client_generated.models import (
 )
 from antfly.client_generated.types import UNSET
 
+from .admission import AdmissionAsyncHTTPClient, AdmissionHTTPClient, AdmissionPool, ClientAdmission
 from .exceptions import (
     AntflyException,
     IndexMutationTemporarilyUnavailableError,
@@ -66,6 +67,7 @@ from .exceptions import (
 from .graph_queries import require_graph_identifier as _require_graph_identifier
 from .graph_results import decode_query_responses
 from .index_config import validate_create_index_request_relationships
+from .read_retries import ReadRetryAsyncHTTPClient, ReadRetryHTTPClient, ReadRetryPolicy
 
 DEFAULT_WRITE_MAX_REQUEST_BYTES = 64 << 20
 DEFAULT_MAX_JSON_RESPONSE_BYTES = 64 << 20
@@ -641,6 +643,8 @@ class AntflyClient:
         max_write_request_bytes: int = DEFAULT_WRITE_MAX_REQUEST_BYTES,
         max_json_response_bytes: int = DEFAULT_MAX_JSON_RESPONSE_BYTES,
         max_error_response_bytes: int = DEFAULT_MAX_ERROR_RESPONSE_BYTES,
+        admission: ClientAdmission | AdmissionPool | None = None,
+        read_retries: ReadRetryPolicy | None = None,
     ):
         """
         Initialize Antfly client.
@@ -660,6 +664,8 @@ class AntflyClient:
             max_write_request_bytes: Maximum encoded JSON bytes for write requests
             max_json_response_bytes: Maximum bytes read for a successful JSON response
             max_error_response_bytes: Maximum bytes read from an error response
+            admission: Optional shared bound on active requests and local waiting
+            read_retries: Optional bounded retries for explicit query admission rejections
         """
         if max_json_response_bytes <= 0 or max_error_response_bytes <= 0:
             raise ValueError("response byte limits must be positive")
@@ -697,6 +703,20 @@ class AntflyClient:
                 timeout=Timeout(timeout),
                 httpx_args=httpx_args,
             )
+        if admission is not None or read_retries is not None:
+            pool = admission if isinstance(admission, AdmissionPool) else None
+            if isinstance(admission, ClientAdmission):
+                pool = AdmissionPool(admission)
+            headers: dict[str, str] = {}
+            if isinstance(self._client, AuthenticatedClient):
+                headers[self._client.auth_header_name] = f"{self._client.prefix} {self._client.token}".strip()
+            args = {"base_url": self.base_url, "timeout": Timeout(timeout), "headers": headers, **httpx_args}
+            if read_retries is None:
+                self._client.set_httpx_client(AdmissionHTTPClient(pool, **args))
+                self._client.set_async_httpx_client(AdmissionAsyncHTTPClient(pool, **args))
+            else:
+                self._client.set_httpx_client(ReadRetryHTTPClient(read_retries, pool, **args))
+                self._client.set_async_httpx_client(ReadRetryAsyncHTTPClient(read_retries, pool, **args))
         self.indexes = IndexOperations(self)
 
     def _request(

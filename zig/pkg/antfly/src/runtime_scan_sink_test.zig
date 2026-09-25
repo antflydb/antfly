@@ -77,3 +77,23 @@ test "scan sink local calls retain private consumer errors" {
     try sink.start();
     try std.testing.expectError(error.ConsumerStopped, sink.write(consumer.expected));
 }
+
+extern fn scan_sink_test_constrain(*const Sink, u64) callconv(.c) errors.Status;
+
+test "scan sink archive deadline preserves original absolute timestamp and error" {
+    const Receiver = struct {
+        seen: u64 = 0,
+        fn start(_: ?*anyopaque) !void {}
+        fn write(_: ?*anyopaque, _: []const u8) !void {}
+        fn constrain(raw: ?*anyopaque, deadline: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.seen = deadline;
+            return error.Timeout;
+        }
+    };
+    var receiver = Receiver{};
+    const sink = Sink{ .context = &receiver, .start_fn = Receiver.start, .write_fn = Receiver.write, .constrain_deadline_fn = Receiver.constrain };
+    const result = scan_sink_test_constrain(&sink, 12345);
+    try std.testing.expectEqual(error.Timeout, errors.errorFromStatus(result));
+    try std.testing.expectEqual(@as(u64, 12345), receiver.seen);
+}

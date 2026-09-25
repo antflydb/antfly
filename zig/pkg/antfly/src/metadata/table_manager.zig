@@ -46,7 +46,7 @@ pub const TableDefinition = TableRecord;
 
 pub fn tableDefinitionsEqual(lhs: TableDefinition, rhs: TableDefinition) bool {
     return @import("../common/vector_migration.zig").admissionsEqual(lhs.storage_migration, rhs.storage_migration) and
-        lhs.storage.dense_embeddings == rhs.storage.dense_embeddings and
+        std.meta.eql(lhs.storage, rhs.storage) and
         lhs.table_id == rhs.table_id and
         std.mem.eql(u8, lhs.name, rhs.name) and
         std.mem.eql(u8, lhs.description, rhs.description) and
@@ -87,6 +87,22 @@ pub fn tableDefinitionFingerprint(table: TableDefinition) TableDefinitionFingerp
     // Preserve fingerprints of existing default-mode tables.
     if (table.storage.dense_embeddings != .primary_lsm)
         hashTableDefinitionPart(&hasher, @tagName(table.storage.dense_embeddings));
+    if (table.storage.transaction_recovery) |policy| {
+        hashTableDefinitionPart(&hasher, "transaction-recovery-v1");
+        inline for (.{ "protocol_version", "max_count", "max_bytes", "max_transaction_bytes" }) |field| {
+            var bytes: [8]u8 = undefined;
+            std.mem.writeInt(u64, &bytes, @field(policy, field), .little);
+            hasher.update(&bytes);
+        }
+        if (policy.completion_protocol_version != 0 or policy.profile_version != 0) {
+            hashTableDefinitionPart(&hasher, "physical-completion-policy-v1");
+            inline for (.{ "completion_protocol_version", "profile_version" }) |field| {
+                var bytes: [8]u8 = undefined;
+                std.mem.writeInt(u64, &bytes, @field(policy, field), .little);
+                hasher.update(&bytes);
+            }
+        }
+    }
     var encoded: [@sizeOf(u64)]u8 = undefined;
     std.mem.writeInt(u64, &encoded, table.table_id, .little);
     hasher.update(&encoded);
@@ -467,6 +483,9 @@ pub const StoreRecord = struct {
     dense_native_storage_protocol_version: u16 = 0,
     relational_topology_protocol_version: u16 = 0,
     api_url: []const u8 = "",
+    /// Optional node-to-node HTTP endpoint. Empty on older registrations;
+    /// public clients and existing peer routes continue to use api_url.
+    internal_api_url: []const u8 = "",
     raft_url: []const u8 = "",
     role: []const u8 = "data",
     health_class: []const u8 = "healthy",
@@ -1424,6 +1443,8 @@ pub const TableManager = struct {
     pub fn publishVectorMigrationTable(self: *TableManager, expected: TableRecord, record: TableRecord) !void {
         const current = self.tables.get(expected.table_id) orelse return error.UnknownTable;
         if (!tableDefinitionsEqual(current, expected)) return error.TableGenerationChanged;
+        if (!std.meta.eql(expected.storage.transaction_recovery, record.storage.transaction_recovery))
+            return error.ImmutableTableStorageSettings;
         var contract = record;
         contract.storage = expected.storage;
         contract.storage_migration = expected.storage_migration;
@@ -2550,6 +2571,8 @@ pub fn freeNode(alloc: std.mem.Allocator, record: NodeRecord) void {
 pub fn cloneStore(alloc: std.mem.Allocator, record: StoreRecord) !StoreRecord {
     const api_url = try alloc.dupe(u8, record.api_url);
     errdefer alloc.free(api_url);
+    const internal_api_url = try alloc.dupe(u8, record.internal_api_url);
+    errdefer alloc.free(internal_api_url);
     const raft_url = try alloc.dupe(u8, record.raft_url);
     errdefer alloc.free(raft_url);
     const role = try alloc.dupe(u8, record.role);
@@ -2572,6 +2595,7 @@ pub fn cloneStore(alloc: std.mem.Allocator, record: StoreRecord) !StoreRecord {
         .dense_native_storage_protocol_version = record.dense_native_storage_protocol_version,
         .relational_topology_protocol_version = record.relational_topology_protocol_version,
         .api_url = api_url,
+        .internal_api_url = internal_api_url,
         .raft_url = raft_url,
         .role = role,
         .health_class = health_class,
@@ -2592,6 +2616,7 @@ pub fn cloneStore(alloc: std.mem.Allocator, record: StoreRecord) !StoreRecord {
 
 pub fn freeStore(alloc: std.mem.Allocator, record: StoreRecord) void {
     alloc.free(record.api_url);
+    alloc.free(record.internal_api_url);
     alloc.free(record.raft_url);
     alloc.free(record.role);
     alloc.free(record.health_class);
@@ -3538,4 +3563,31 @@ test "system catalog table name index replacement is atomic on allocation failur
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "workload admission recovery policy participates in table identity" {
+    const base: TableDefinition = .{ .table_id = 7, .name = "docs" };
+    var active = base;
+    active.storage.transaction_recovery = .{ .protocol_version = 1, .max_count = 2, .max_bytes = 65536, .max_transaction_bytes = 8192 };
+    try std.testing.expect(!tableDefinitionsEqual(base, active));
+    try std.testing.expect(!std.mem.eql(u8, &tableDefinitionFingerprint(base), &tableDefinitionFingerprint(active)));
+    const previous = active;
+    active.storage.transaction_recovery.?.max_count += 1;
+    try std.testing.expect(!tableDefinitionsEqual(previous, active));
+    try std.testing.expect(!std.mem.eql(u8, &tableDefinitionFingerprint(previous), &tableDefinitionFingerprint(active)));
+}
+
+test "workload admission table completion policy preserves legacy definition fingerprint" {
+    var table: TableDefinition = .{ .table_id = 42, .name = "table:42", .storage = .{ .transaction_recovery = .{
+        .protocol_version = 1,
+        .max_count = 4,
+        .max_bytes = 4194304,
+        .max_transaction_bytes = 1048576,
+    } } };
+    // Golden predecessor digest: only the original four recovery fields.
+    const legacy = tableDefinitionFingerprint(table);
+    try std.testing.expectEqualStrings("1c0a13766acf4ae016a84cb528e8b29e2f0d526f674568b445c2c96b3e065878", &std.fmt.bytesToHex(legacy, .lower));
+    table.storage.transaction_recovery.?.completion_protocol_version = 1;
+    table.storage.transaction_recovery.?.profile_version = 1;
+    try std.testing.expect(!std.mem.eql(u8, &legacy, &tableDefinitionFingerprint(table)));
 }

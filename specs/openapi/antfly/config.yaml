@@ -120,6 +120,13 @@ components:
           description: "Port for the health/metrics server. Defaults to 4200."
           default: 4200
           example: 4200
+        health_metrics_interval_ms:
+          type: integer
+          format: uint32
+          minimum: 100
+          maximum: 60000
+          default: 5000
+          description: Delay between background metrics collections. Scraping does not trigger collection. Lower intervals improve observation freshness at the cost of additional collection work; responses report their actual sample age.
         admission:
           $ref: "#/components/schemas/AdmissionConfig"
         graph_execution:
@@ -892,12 +899,323 @@ components:
       additionalProperties: false
       description: Node-local foreground database request admission settings.
       properties:
+        ingress:
+          $ref: "#/components/schemas/IngressAdmissionConfig"
+        session_max_retained_bytes:
+          type: integer
+          format: uint64
+          minimum: 4096
+          maximum: 1099511627776
+          default: 67108864
+          description: Shared retained-memory ceiling for MCP, A2A, and transaction sessions, separate from foreground query and write budgets.
+        transaction_completion_bytes:
+          type: integer
+          format: uint64
+          minimum: 0
+          maximum: 1099511627776
+          default: 0
+          description: Node-wide prepaid scratch memory for completing durable storage transactions. Zero preserves legacy allocation. Reserve this before foreground admission; this setting is independent of replicated limits on outstanding recovery obligations.
+        durable_transaction_completion:
+          type: object
+          additionalProperties: false
+          description: Permit new reserved transaction prepares for tables with a supported persisted completion policy. Disabling admission does not release existing obligations or disable recovery. Runtime ownership and storage support are verified separately.
+          properties:
+            enabled:
+              type: boolean
+              default: false
+        remote_attempt_worker:
+          $ref: "#/components/schemas/RemoteAttemptWorkerConfig"
+        remote_attempt_coordinator:
+          $ref: "#/components/schemas/RemoteAttemptCoordinatorConfig"
+        dense_execution:
+          $ref: "#/components/schemas/DenseExecutionConfig"
+        read_execution:
+          $ref: "#/components/schemas/ReadExecutionConfig"
         query:
           $ref: "#/components/schemas/QueryAdmissionConfig"
         write:
           $ref: "#/components/schemas/WriteAdmissionConfig"
         inference:
           $ref: "#/components/schemas/InferenceAdmissionConfig"
+
+    RemoteAttemptCoordinatorConfig:
+      type: object
+      additionalProperties: false
+      description: Opt-in durable remote read ownership. Requires stable node identity, internal authentication, and a continuous durable session store; unavailable or unsupported workers never downgrade to unaccounted execution.
+      properties:
+        max_attempts:
+          type: integer
+          format: uint32
+          minimum: 0
+          maximum: 4096
+          default: 0
+        max_bytes:
+          type: integer
+          format: uint64
+          minimum: 0
+          maximum: 67108864
+          default: 0
+        max_destination_attempts:
+          type: integer
+          format: uint32
+          minimum: 0
+          maximum: 4096
+          default: 0
+        max_destinations:
+          type: integer
+          format: uint32
+          minimum: 0
+          maximum: 256
+          default: 0
+        max_run_ms:
+          type: integer
+          format: uint32
+          minimum: 1
+          maximum: 60000
+          default: 30000
+
+    IngressAdmissionConfig:
+      type: object
+      additionalProperties: false
+      description: >-
+        Opt-in request/planning envelope held through transport drain. Totals
+        include a nonborrowable readiness/control partition. Transport framing
+        and durable session state use separate bounded pools. Zero requests
+        disables the envelope and requires zero retained bytes.
+      properties:
+        max_requests:
+          type: integer
+          format: uint32
+          minimum: 0
+          maximum: 65536
+          default: 0
+        max_retained_bytes:
+          type: integer
+          format: uint64
+          minimum: 0
+          maximum: 1099511627776
+          default: 0
+        control_requests:
+          type: integer
+          format: uint32
+          minimum: 1
+          maximum: 65535
+          default: 2
+        control_retained_bytes:
+          type: integer
+          format: uint64
+          minimum: 4096
+          maximum: 1099511627776
+          default: 262144
+
+        recovery_requests:
+          type: integer
+          minimum: 0
+          maximum: 65535
+          default: 0
+          description: Nonborrowable ingress slots for authenticated bounded recovery/control RPCs, inside max_requests. Zero disables this partition.
+        recovery_retained_bytes:
+          type: integer
+          minimum: 0
+          maximum: 1099511627776
+          default: 0
+          description: Nonborrowable recovery/control ingress bytes, inside max_retained_bytes. Requires recovery_requests and at least 65536 bytes when enabled.
+
+    RemoteAttemptWorkerConfig:
+      type: object
+      additionalProperties: false
+      description: >-
+        Opt-in durable join-row worker deduplication and generation fencing.
+        Requires the node's durable API session backend and internal service
+        authentication. Journal bytes include active and uncertain attempts,
+        terminal tombstones and coordinator fences. Coordinator dispatch is
+        not enabled by this setting. Unknown prior incarnations remain charged.
+      properties:
+        max_attempts:
+          type: integer
+          format: uint32
+          minimum: 0
+          maximum: 4096
+          default: 0
+          description: Zero disables worker execution under the attempt protocol.
+        max_bytes:
+          type: integer
+          format: uint64
+          minimum: 0
+          maximum: 67108864
+          default: 0
+          description: Journal reservation ceiling; enabled workers require at least 4096 bytes.
+        max_run_ms:
+          type: integer
+          format: uint32
+          minimum: 1
+          maximum: 60000
+          default: 30000
+          description: Local execution budget ceiling; expiry never certifies quiescence.
+
+    DenseExecutionConfig:
+      type: object
+      additionalProperties: false
+      description: >-
+        Opt-in fixed dense operator scheduling shared by callers and read helpers
+        on a provisioned storage node. Defaults preserve existing admission.
+        Coarse execution leases remain held through helper join; this does not
+        provide cooperative lane isolation or replace working-memory limits.
+      properties:
+        max_runnable_tasks:
+          type: integer
+          minimum: 0
+          maximum: 65536
+          default: 0
+          description: Maximum combined dense callers and helpers; zero disables this scheduler.
+        max_working_bytes:
+          type: integer
+          minimum: 0
+          maximum: 1099511627776
+          default: 0
+          description: >-
+            Hard aggregate ceiling for dense memory participating in scheduler
+            accounting. Covers scoped exact-search and opted-in native read arenas; pooled
+            HBC scratch and result ownership keep their existing memory policy.
+            Zero preserves the legacy memory path. Requires a nonzero task limit.
+        max_suspended_io:
+          type: integer
+          minimum: 0
+          maximum: 65536
+          default: 0
+          description: >-
+            Maximum native exact positional reads that can release runnable
+            capacity during synchronous I/O. Enables scoped native read arenas;
+            requires working memory and waiting budgets. Zero keeps coarse
+            driver ownership. Requires a runtime that keeps callers on their
+            original thread during I/O; other runtimes remain coarse. The
+            operating-system read is not preemptible.
+        max_outstanding_tasks:
+          type: integer
+          minimum: 0
+          maximum: 65536
+          default: 0
+          description: Hard bound on active and queued dense tasks; must cover runnable capacity.
+        max_queued_tasks:
+          type: integer
+          minimum: 0
+          maximum: 65536
+          default: 0
+          description: Waiting dense callers; helpers never queue. Must not exceed outstanding capacity.
+        max_wait_ms:
+          type: integer
+          minimum: 0
+          maximum: 60000
+          default: 0
+          description: Queue wait ceiling within the request deadline; zero requires a zero queue limit.
+
+    ReadExecutionConfig:
+      type: object
+      additionalProperties: false
+      description: >-
+        Opt-in shared storage read scheduling for text, vector, graph,
+        aggregation, document lookups, and scans. Dense helpers use the same
+        ledger. Cannot be enabled together with dense_execution. Unknown or
+        nonyielding operators retain a general-lane execution lease through
+        completion. Defaults preserve existing scheduling.
+      properties:
+        protected:
+          $ref: "#/components/schemas/ProtectedReadExecutionConfig"
+        max_scan_state_bytes:
+          type: integer
+          minimum: 0
+          maximum: 1099511627776
+          default: 0
+          description: Per-scan saved-state reservation for audited output suspension; zero keeps coarse ownership. Does not measure MVCC pages pinned by snapshots.
+        max_scan_snapshot_ms:
+          type: integer
+          minimum: 1
+          maximum: 60000
+          default: 30000
+          description: Absolute lifetime ceiling for suspended scan snapshots, within the original request deadline.
+        max_runnable_tasks:
+          type: integer
+          minimum: 0
+          maximum: 65536
+          default: 0
+          description: Maximum combined read callers and helpers; zero disables this scheduler.
+        max_working_bytes:
+          type: integer
+          minimum: 0
+          maximum: 1099511627776
+          default: 0
+          description: >-
+            Hard aggregate ceiling for read memory participating in scheduler
+            accounting. Covers scoped exact-search and opted-in native read arenas; pooled
+            HBC scratch and result ownership keep their existing memory policy.
+            Zero preserves the legacy memory path. Requires a nonzero task limit.
+        max_suspended_io:
+          type: integer
+          minimum: 0
+          maximum: 65536
+          default: 0
+          description: >-
+            Maximum native exact positional reads that can release runnable
+            capacity during synchronous I/O. Enables scoped native read arenas;
+            requires working memory and waiting budgets. Zero keeps coarse
+            driver ownership. Requires a runtime that keeps callers on their
+            original thread during I/O; other runtimes remain coarse. The
+            operating-system read is not preemptible.
+        max_outstanding_tasks:
+          type: integer
+          minimum: 0
+          maximum: 65536
+          default: 0
+          description: Hard bound on active and queued read tasks; must cover runnable capacity.
+        max_queued_tasks:
+          type: integer
+          minimum: 0
+          maximum: 65536
+          default: 0
+          description: Waiting read callers; helpers never queue. Must not exceed outstanding capacity.
+        max_wait_ms:
+          type: integer
+          minimum: 0
+          maximum: 60000
+          default: 0
+          description: Queue wait ceiling within the request deadline; zero requires a zero queue limit.
+
+    ProtectedReadExecutionConfig:
+      type: object
+      additionalProperties: false
+      description: >-
+        Opt-in hard partition within read_execution totals for verified local
+        existence probes. Each possible probe prepays 64 KiB scratch and a
+        transition ticket before execution. General reads cannot consume these
+        floors. Both protected and transition bytes/counts are inside totals.
+        Supported on provisioned local LMDB reads only; serverless rejects this
+        partition. All zero values disable it.
+      properties:
+        max_runnable_tasks:
+          type: integer
+          minimum: 0
+          maximum: 65536
+          default: 0
+        max_outstanding_tasks:
+          type: integer
+          minimum: 0
+          maximum: 65536
+          default: 0
+        max_working_bytes:
+          type: integer
+          minimum: 0
+          maximum: 1099511627776
+          default: 0
+        max_transition_tasks:
+          type: integer
+          minimum: 0
+          maximum: 65536
+          default: 0
+        max_transition_bytes:
+          type: integer
+          minimum: 0
+          maximum: 1099511627776
+          default: 0
 
     GraphExecutionConfig:
       type: object
@@ -985,10 +1303,45 @@ components:
           default: 3600
           description: End-to-end ceiling for one table or cluster backup. Increase this for exceptionally large datasets; cleanup fencing remains independent.
 
+    AdmissionWaitingConfig:
+      type: object
+      additionalProperties: false
+      description: |
+        Opt-in bounded admission waiting. Configure all queue limits together.
+        Zero max_wait_ms keeps fail-fast behavior. Request payload reservations
+        and tracked query, planning, and output allocations remain charged
+        through response retirement. Other execution, storage, and transport
+        memory remains independently bounded.
+      properties:
+        max_queued_requests:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+          default: 0
+        max_queued_bytes:
+          type: integer
+          minimum: 0
+          maximum: 9007199254740991
+          default: 0
+        max_retained_bytes:
+          type: integer
+          minimum: 0
+          maximum: 9007199254740991
+          default: 0
+          description: Payload, admission metadata, and tracked query, planning, and output allocations through response retirement; must cover max_queued_bytes. Other execution, storage, and transport memory remains independently bounded.
+        max_wait_ms:
+          type: integer
+          minimum: 0
+          maximum: 60000
+          default: 0
+          description: Maximum admission wait within the original request deadline; zero disables queueing.
+
     QueryAdmissionConfig:
       type: object
       additionalProperties: false
       properties:
+        waiting:
+          $ref: "#/components/schemas/AdmissionWaitingConfig"
         max_concurrent_requests:
           type: integer
           minimum: 0
@@ -1004,7 +1357,7 @@ components:
             scans consume it. Point lookups and operational/control-plane reads
             remain outside it. Excess HTTP work is rejected immediately with
             HTTP 429 and Retry-After: 1; asynchronous protocols use their native failure
-            response. Excess work is not queued. Set to 0 to disable query
+            response. Bounded waiting is opt-in through waiting. Set to 0 to disable query
             admission. This budget is independent of transport safeguards,
             write admission, and
             admission.inference.max_concurrent_requests.
@@ -1013,6 +1366,8 @@ components:
       type: object
       additionalProperties: false
       properties:
+        waiting:
+          $ref: "#/components/schemas/AdmissionWaitingConfig"
         max_concurrent_requests:
           type: integer
           minimum: 0
@@ -1030,7 +1385,7 @@ components:
 
             Excess HTTP work in either foreground class is rejected immediately
             with HTTP 429 and Retry-After: 1; asynchronous protocols use their
-            native failure response. Excess work is not queued. Both budgets are
+            native failure response. Bounded waiting is opt-in through waiting. Both budgets are
             independent of transport safeguards and
             admission.inference.max_concurrent_requests.
 
@@ -1330,6 +1685,16 @@ components:
           minimum: 65536
           maximum: 67108864
           default: 16777216
+        max_recovery_count:
+          type: integer
+          minimum: 1
+          maximum: 65536
+          description: "Optional cap on transaction sessions with unfinished commit or coordinator acknowledgement. New commits reserve capacity before preparation; existing recovery always proceeds."
+        max_recovery_bytes:
+          type: integer
+          minimum: 65536
+          maximum: 1099511627776
+          description: "Optional retained recovery reservation cap. Each pending session reserves at least max_record_bytes. Admission scans durable session metadata under the write transaction, bounded by max_count records and max_count times max_record_bytes examined bytes."
         max_savepoints:
           type: integer
           minimum: 1

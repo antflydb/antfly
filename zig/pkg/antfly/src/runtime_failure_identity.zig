@@ -29,6 +29,50 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .invalid_participant, .err = error.InvalidParticipant },
+    .{ .status = .pre_decision_not_proposed, .err = error.PreDecisionNotProposed },
+    .{ .status = .invalid_completion_catalog, .err = error.InvalidCompletionCatalog },
+    .{ .status = .completion_admission_unavailable, .err = error.CompletionAdmissionUnavailable },
+    .{ .status = .completion_admission_policy_changed, .err = error.CompletionAdmissionPolicyChanged },
+    .{ .status = .missing_completion_admission_guard, .err = error.MissingCompletionAdmissionGuard },
+    .{ .status = .local_completion_authority_required, .err = error.LocalCompletionAuthorityRequired },
+    .{ .status = .unsupported_completion_backend, .err = error.UnsupportedCompletionBackend },
+    .{ .status = .unsupported_completion_profile, .err = error.UnsupportedCompletionProfile },
+    .{ .status = .unsupported_completion_slot_version, .err = error.UnsupportedCompletionSlotVersion },
+    .{ .status = .unsupported_completion_template, .err = error.UnsupportedCompletionTemplate },
+    .{ .status = .unsupported_completion_template_nesting, .err = error.UnsupportedCompletionTemplateNesting },
+    .{ .status = .unsupported_completion_template_scan, .err = error.UnsupportedCompletionTemplateScan },
+    .{ .status = .unsupported_completion_template_write, .err = error.UnsupportedCompletionTemplateWrite },
+    .{ .status = .unsupported_completion_operation, .err = error.UnsupportedCompletionOperation },
+    .{ .status = .unsupported_completion_path, .err = error.UnsupportedCompletionPath },
+    .{ .status = .unsupported_completion_provider, .err = error.UnsupportedCompletionProvider },
+    .{ .status = .completion_recovery_capacity_required, .err = error.CompletionRecoveryCapacityRequired },
+    .{ .status = .completion_resource_manager_required, .err = error.CompletionResourceManagerRequired },
+    .{ .status = .completion_profile_changed, .err = error.CompletionProfileChanged },
+    .{ .status = .completion_drain_shape_changed, .err = error.CompletionDrainShapeChanged },
+    .{ .status = .completion_not_prepared, .err = error.CompletionNotPrepared },
+    .{ .status = .invalid_completion_slot, .err = error.InvalidCompletionSlot },
+    .{ .status = .completion_slot_checksum_mismatch, .err = error.CompletionSlotChecksumMismatch },
+    .{ .status = .completion_slot_too_large, .err = error.CompletionSlotTooLarge },
+    .{ .status = .completion_plan_capacity_exceeded, .err = error.CompletionPlanCapacityExceeded },
+    .{ .status = .completion_reservation_busy, .err = error.CompletionReservationBusy },
+    .{ .status = .completion_foreground_capacity_exceeded, .err = error.CompletionForegroundCapacityExceeded },
+    .{ .status = .completion_file_capacity_exceeded, .err = error.CompletionFileCapacityExceeded },
+    .{ .status = .completion_writer_closed, .err = error.CompletionWriterClosed },
+    .{ .status = .completion_writer_live, .err = error.CompletionWriterLive },
+    .{ .status = .recovery_required, .err = error.RecoveryRequired },
+    .{ .status = .invalid_txn_record, .err = error.InvalidTxnRecord },
+    .{ .status = .prepared_completion_active, .err = error.PreparedCompletionActive },
+    .{ .status = .completion_transition_in_progress, .err = error.CompletionTransitionInProgress },
+    .{ .status = .completion_transition_capacity_exceeded, .err = error.CompletionTransitionCapacityExceeded },
+    .{ .status = .completion_fence_identity_mismatch, .err = error.CompletionFenceIdentityMismatch },
+    .{ .status = .native_backup_repair_state_not_quiescent, .err = error.NativeBackupRepairStateNotQuiescent },
+    .{ .status = .admission_full, .err = error.AdmissionFull },
+    .{ .status = .admission_queue_full, .err = error.AdmissionQueueFull },
+    .{ .status = .admission_bytes_exhausted, .err = error.AdmissionBytesExhausted },
+    .{ .status = .admission_request_too_large, .err = error.AdmissionRequestTooLarge },
+    .{ .status = .admission_wait_timeout, .err = error.AdmissionWaitTimeout },
+    .{ .status = .admission_closed, .err = error.AdmissionClosed },
     .{ .status = .catalog_already_exists, .err = error.CatalogAlreadyExists },
     .{ .status = .catalog_command_too_large, .err = error.CatalogCommandTooLarge },
     .{ .status = .catalog_generation_changed, .err = error.CatalogGenerationChanged },
@@ -924,4 +968,68 @@ test "index readiness survives the local query and storage owner boundary" {
         };
         try std.testing.expectEqual(expected, transported);
     }
+}
+
+test "workload admission completion eligibility survives compiled storage failure envelopes" {
+    for ([_]anyerror{ error.PreparedCompletionActive, error.CompletionTransitionInProgress, error.CompletionTransitionCapacityExceeded, error.CompletionFenceIdentityMismatch }) |expected| {
+        const failure = failureFromError(expected, .local_query, abi.abi_version, 1);
+        try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+        const restored = blk: {
+            statusToError(failure.status) catch |err| break :blk err;
+            return error.ExpectedEligibilityFailure;
+        };
+        try std.testing.expectEqual(expected, restored);
+    }
+}
+
+test "workload admission native completion startup failures survive storage envelopes" {
+    for ([_]anyerror{ error.LocalCompletionAuthorityRequired, error.UnsupportedCompletionBackend, error.UnsupportedCompletionProfile, error.UnsupportedCompletionSlotVersion, error.UnsupportedCompletionTemplate, error.UnsupportedCompletionTemplateNesting, error.UnsupportedCompletionTemplateScan, error.UnsupportedCompletionTemplateWrite, error.UnsupportedCompletionOperation, error.UnsupportedCompletionPath, error.UnsupportedCompletionProvider, error.CompletionRecoveryCapacityRequired, error.CompletionResourceManagerRequired, error.CompletionProfileChanged, error.CompletionDrainShapeChanged, error.CompletionNotPrepared, error.InvalidCompletionSlot, error.CompletionSlotChecksumMismatch, error.CompletionSlotTooLarge, error.CompletionPlanCapacityExceeded, error.CompletionReservationBusy, error.CompletionForegroundCapacityExceeded, error.CompletionFileCapacityExceeded, error.CompletionWriterClosed, error.CompletionWriterLive }) |expected| {
+        const failure = failureFromError(expected, .local_query, abi.abi_version, 1);
+        try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+        const restored = blk: {
+            statusToError(failure.status) catch |err| break :blk err;
+            return error.ExpectedCompletionFailure;
+        };
+        try std.testing.expectEqual(expected, restored);
+    }
+}
+
+test "workload admission uncertain completion recovery preserves exact storage failure" {
+    for ([_]anyerror{ error.RecoveryRequired, error.InvalidTxnRecord }) |expected| {
+        const failure = failureFromError(expected, .local_query, abi.abi_version, 1);
+        try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+        try std.testing.expect(failure.status != .internal);
+        const restored = blk: {
+            statusToError(failure.status) catch |err| break :blk err;
+            return error.ExpectedRecoveryFailure;
+        };
+        try std.testing.expectEqual(expected, restored);
+    }
+}
+
+test "workload admission replicated completion guard failures preserve exact identity" {
+    for ([_]anyerror{ error.CompletionAdmissionUnavailable, error.CompletionAdmissionPolicyChanged, error.MissingCompletionAdmissionGuard, error.InvalidCompletionCatalog }) |expected| {
+        const failure = failureFromError(expected, .storage_owner, abi.abi_version, 1);
+        try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+        try std.testing.expect(failure.status != .internal);
+        const restored = blk: {
+            statusToError(failure.status) catch |err| break :blk err;
+            return error.ExpectedCompletionFailure;
+        };
+        try std.testing.expectEqual(expected, restored);
+    }
+}
+
+test "first decision rejection preserves exact compiled failure identity" {
+    const failure = failureFromError(error.PreDecisionNotProposed, .storage_owner, abi.abi_version, 1);
+    try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+    try std.testing.expectEqual(abi.Status.pre_decision_not_proposed, failure.status);
+    try std.testing.expectError(error.PreDecisionNotProposed, statusToError(failure.status));
+}
+
+test "transaction recovery invalid participant preserves failure identity" {
+    const failure = failureFromError(error.InvalidParticipant, .storage_owner, abi.abi_version, 1);
+    try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+    try std.testing.expectEqual(abi.Status.invalid_participant, failure.status);
+    try std.testing.expectError(error.InvalidParticipant, statusToError(failure.status));
 }

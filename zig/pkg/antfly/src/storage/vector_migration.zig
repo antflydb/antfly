@@ -275,7 +275,21 @@ pub fn publish(alloc: Allocator, primary: *docstore.DocStore, job: contract.Job)
         next.replay_cursor = std.mem.readInt(u64, bytes[0..8], .little);
     }
     next.publication_fence = next.replay_cursor;
-    try txn.put(&internal_keys.table_storage_settings_key, "{\"dense_embeddings\":\"vector_store\"}");
+    const Settings = @import("../common/table_storage.zig").Settings;
+    const settings_raw = txn.get(&internal_keys.table_storage_settings_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    var settings: Settings = .{};
+    if (settings_raw) |raw| {
+        var parsed = try std.json.parseFromSlice(Settings, alloc, raw, .{});
+        defer parsed.deinit();
+        settings = parsed.value;
+    }
+    settings.dense_embeddings = .vector_store;
+    const encoded_settings = try std.json.Stringify.valueAlloc(alloc, settings, .{});
+    defer alloc.free(encoded_settings);
+    try txn.put(&internal_keys.table_storage_settings_key, encoded_settings);
     try save(alloc, &txn, next);
     try txn.commit();
     committed = true;

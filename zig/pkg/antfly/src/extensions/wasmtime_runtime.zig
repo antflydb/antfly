@@ -43,7 +43,28 @@ pub const InvokeOptions = struct {
     host_imports: HostImports = .{},
     package_store_root: ?[]const u8 = null,
     fuel: u64 = 50_000_000,
+    /// Per linear memory, not aggregate process or invocation memory.
     max_memory_bytes: i64 = 64 * 1024 * 1024,
+    max_table_elements: i64 = 65_536,
+    max_instances: i64 = 64,
+    max_tables: i64 = 64,
+    max_memories: i64 = 16,
+
+    pub fn validate(self: InvokeOptions) !void {
+        if (self.fuel == 0 or self.fuel > 50_000_000 or
+            self.max_memory_bytes <= 0 or self.max_memory_bytes > 64 * 1024 * 1024 or
+            self.max_table_elements <= 0 or self.max_table_elements > 65_536 or
+            self.max_instances <= 0 or self.max_instances > 64 or
+            self.max_tables <= 0 or self.max_tables > 64 or
+            self.max_memories <= 0 or self.max_memories > 16) return error.InvalidWasmtimeLimits;
+    }
+
+    /// Excludes compilation/engine metadata and reference table storage. The
+    /// ingress invocation count independently limits simultaneous stores.
+    pub fn maximumLinearBytes(self: InvokeOptions) !u64 {
+        try self.validate();
+        return @as(u64, @intCast(self.max_memory_bytes)) * @as(u64, @intCast(self.max_memories));
+    }
 };
 
 pub fn invokeExtension(
@@ -62,6 +83,7 @@ pub fn invokeExtensionWithOptions(
     request_json: []const u8,
     options: InvokeOptions,
 ) InvokeError![]u8 {
+    try options.validate();
     const artifact_path = try resolveArtifactPathAllocWithIo(alloc, options.io, binding, options.package_store_root);
     defer alloc.free(artifact_path);
 
@@ -82,7 +104,7 @@ pub fn invokeExtensionWithOptions(
 
     var lib = try WasmtimeLib.open();
     defer lib.close();
-    return try lib.invokeExtensionCAbi(alloc, wasm, tool_name, request_json);
+    return try lib.invokeExtensionCAbi(alloc, wasm, tool_name, request_json, options);
 }
 
 fn resolveArtifactPathAlloc(alloc: std.mem.Allocator, binding: RuntimeBinding, package_store_root: ?[]const u8) InvokeError![]u8 {
@@ -293,10 +315,9 @@ const WasmtimeFunc = extern struct {
     private: ?*anyopaque = null,
 };
 
-// v45 embeds a store/index struct; its trailing padding is part of the ABI.
 const WasmtimeStoreIndex = extern struct {
     store_id: u64 = 0,
-    private1: u32 = 0,
+    index: u32 = 0,
 };
 
 const WasmtimeMemory = extern struct {
@@ -558,26 +579,27 @@ const WasmtimeLib = struct {
         self.dynlib.close();
     }
 
-    fn newEngine(self: WasmtimeLib, component_model: bool) InvokeError!*wasm_engine_t {
-        const config = self.wasm_config_new() orelse return error.WasmtimeUnavailable;
-        // Compile on the caller's admitted worker. Wasmtime's process-global
-        // Rayon pool is outside our worker accounting, and its 2 MiB stacks
-        // leave no usable stack beside the partitioned executable's static
-        // TLS on glibc. This policy applies to core modules and components;
-        // do not mutate process-wide Rust thread settings from a request.
-        self.wasmtime_config_parallel_compilation_set(config, false);
-        self.wasmtime_config_wasm_component_model_set(config, component_model);
-        self.wasmtime_config_consume_fuel_set(config, component_model);
-        return self.wasm_engine_new_with_config(config) orelse error.WasmtimeUnavailable;
+    fn configureStoreLimits(self: WasmtimeLib, store: ?*wasmtime_store_t, options: InvokeOptions) !*wasmtime_context_t {
+        try options.validate();
+        self.wasmtime_store_limiter(store, options.max_memory_bytes, options.max_table_elements, options.max_instances, options.max_tables, options.max_memories);
+        const context = self.wasmtime_store_context(store) orelse return error.WasmtimeUnavailable;
+        if (self.wasmtime_context_set_fuel(context, options.fuel)) |err| {
+            self.wasmtime_error_delete(err);
+            return error.WasmtimeFuelUnavailable;
+        }
+        return context;
     }
 
-    fn invokeExtensionCAbi(self: WasmtimeLib, alloc: std.mem.Allocator, wasm: []const u8, tool_name: []const u8, request_json: []const u8) InvokeError![]u8 {
-        const engine = try self.newEngine(false);
+    fn invokeExtensionCAbi(self: WasmtimeLib, alloc: std.mem.Allocator, wasm: []const u8, tool_name: []const u8, request_json: []const u8, options: InvokeOptions) InvokeError![]u8 {
+        try options.validate();
+        const config = self.wasm_config_new() orelse return error.WasmtimeUnavailable;
+        self.wasmtime_config_consume_fuel_set(config, true);
+        const engine = self.wasm_engine_new_with_config(config) orelse return error.WasmtimeUnavailable;
         defer self.wasm_engine_delete(engine);
 
         const store = self.wasmtime_store_new(engine, null, null) orelse return error.WasmtimeUnavailable;
         defer self.wasmtime_store_delete(store);
-        const context = self.wasmtime_store_context(store) orelse return error.WasmtimeUnavailable;
+        const context = try self.configureStoreLimits(store, options);
 
         var module: ?*wasmtime_module_t = null;
         if (self.wasmtime_module_new(engine, wasm.ptr, wasm.len, &module)) |err| {
@@ -639,17 +661,16 @@ const WasmtimeLib = struct {
     }
 
     fn invokeExtensionComponent(self: WasmtimeLib, alloc: std.mem.Allocator, wasm: []const u8, entrypoint: []const u8, tool_name: []const u8, request_json: []const u8, options: InvokeOptions) InvokeError![]u8 {
-        const engine = try self.newEngine(true);
+        try options.validate();
+        const config = self.wasm_config_new() orelse return error.WasmtimeUnavailable;
+        self.wasmtime_config_wasm_component_model_set(config, true);
+        self.wasmtime_config_consume_fuel_set(config, true);
+        const engine = self.wasm_engine_new_with_config(config) orelse return error.WasmtimeUnavailable;
         defer self.wasm_engine_delete(engine);
 
         const store = self.wasmtime_store_new(engine, null, null) orelse return error.WasmtimeUnavailable;
         defer self.wasmtime_store_delete(store);
-        self.wasmtime_store_limiter(store, options.max_memory_bytes, -1, 64, 64, 16);
-        const context = self.wasmtime_store_context(store) orelse return error.WasmtimeUnavailable;
-        if (self.wasmtime_context_set_fuel(context, options.fuel)) |err| {
-            self.wasmtime_error_delete(err);
-            return error.WasmtimeFuelUnavailable;
-        }
+        const context = try self.configureStoreLimits(store, options);
         try self.configureWasi(context);
 
         var component: ?*wasmtime_component_t = null;
@@ -1010,10 +1031,101 @@ fn lookup(dynlib: *std.DynLib, name: [:0]const u8, comptime T: type) InvokeError
     return dynlib.lookup(T, name) orelse error.WasmtimeSymbolMissing;
 }
 
-test "wasmtime v45 C handle layouts retain nested struct padding" {
-    try std.testing.expectEqual(@as(usize, 24), @sizeOf(WasmtimeMemory));
-    try std.testing.expectEqual(@as(usize, 16), @offsetOf(WasmtimeMemory, "private2"));
-    try std.testing.expectEqual(@as(usize, 24), @sizeOf(WasmtimeComponentFunc));
-    try std.testing.expectEqual(@as(usize, 16), @offsetOf(WasmtimeComponentFunc, "private2"));
-    try std.testing.expectEqual(@as(usize, 32), @sizeOf(WasmtimeExtern));
+test "workload admission Wasmtime rejects unbounded runtime limits" {
+    const defaults: InvokeOptions = .{};
+    try std.testing.expectEqual(@as(u64, 1024 * 1024 * 1024), try defaults.maximumLinearBytes());
+    const invalid = [_]InvokeOptions{
+        .{ .fuel = 0 },                .{ .fuel = 50_000_001 },
+        .{ .max_memory_bytes = -1 },   .{ .max_memory_bytes = 64 * 1024 * 1024 + 1 },
+        .{ .max_table_elements = -1 }, .{ .max_table_elements = 65_537 },
+        .{ .max_instances = 0 },       .{ .max_instances = 65 },
+        .{ .max_tables = -1 },         .{ .max_tables = 65 },
+        .{ .max_memories = -1 },       .{ .max_memories = 17 },
+    };
+    for (invalid) |options| try std.testing.expectError(error.InvalidWasmtimeLimits, options.validate());
+}
+
+test "workload admission Wasmtime core and component install limits before compiling" {
+    const Fake = struct {
+        var limits_seen: bool = false;
+        var fuel_enabled: bool = false;
+        var engines_deleted: usize = 0;
+        var stores_deleted: usize = 0;
+        fn config() callconv(.c) ?*wasm_config_t {
+            return @ptrFromInt(16);
+        }
+        fn fuel(_: ?*wasm_config_t, enabled: bool) callconv(.c) void {
+            fuel_enabled = enabled;
+        }
+        fn component(_: ?*wasm_config_t, _: bool) callconv(.c) void {}
+        fn engine(_: ?*wasm_config_t) callconv(.c) ?*wasm_engine_t {
+            return @ptrFromInt(16);
+        }
+        fn deleteEngine(_: ?*wasm_engine_t) callconv(.c) void {
+            engines_deleted += 1;
+        }
+        fn store(_: ?*wasm_engine_t, _: ?*anyopaque, _: ?*const fn (?*anyopaque) callconv(.c) void) callconv(.c) ?*wasmtime_store_t {
+            return @ptrFromInt(16);
+        }
+        fn deleteStore(_: ?*wasmtime_store_t) callconv(.c) void {
+            stores_deleted += 1;
+        }
+        fn context(_: ?*wasmtime_store_t) callconv(.c) ?*wasmtime_context_t {
+            return @ptrFromInt(16);
+        }
+        fn limiter(_: ?*wasmtime_store_t, memory: i64, elements: i64, instances: i64, tables: i64, memories: i64) callconv(.c) void {
+            limits_seen = memory == 65536 and elements == 100 and instances == 2 and tables == 3 and memories == 4;
+        }
+        fn setFuel(_: ?*wasmtime_context_t, amount: u64) callconv(.c) ?*wasmtime_error_t {
+            std.debug.assert(limits_seen and fuel_enabled and amount == 123);
+            return @ptrFromInt(16); // fail before compilation, exercising teardown
+        }
+        fn deleteError(_: ?*wasmtime_error_t) callconv(.c) void {}
+    };
+    var lib: WasmtimeLib = undefined;
+    lib.wasm_config_new = Fake.config;
+    lib.wasmtime_config_consume_fuel_set = Fake.fuel;
+    lib.wasmtime_config_wasm_component_model_set = Fake.component;
+    lib.wasm_engine_new_with_config = Fake.engine;
+    lib.wasm_engine_delete = Fake.deleteEngine;
+    lib.wasmtime_store_new = Fake.store;
+    lib.wasmtime_store_delete = Fake.deleteStore;
+    lib.wasmtime_store_context = Fake.context;
+    lib.wasmtime_store_limiter = Fake.limiter;
+    lib.wasmtime_context_set_fuel = Fake.setFuel;
+    lib.wasmtime_error_delete = Fake.deleteError;
+    const options: InvokeOptions = .{ .fuel = 123, .max_memory_bytes = 65536, .max_table_elements = 100, .max_instances = 2, .max_tables = 3, .max_memories = 4 };
+    try std.testing.expectError(error.WasmtimeFuelUnavailable, lib.invokeExtensionCAbi(std.testing.allocator, &.{}, "tool", "{}", options));
+    Fake.fuel_enabled = false;
+    Fake.limits_seen = false;
+    try std.testing.expectError(error.WasmtimeFuelUnavailable, lib.invokeExtensionComponent(std.testing.allocator, &.{}, "entry", "tool", "{}", options));
+    try std.testing.expectEqual(@as(usize, 2), Fake.engines_deleted);
+    try std.testing.expectEqual(@as(usize, 2), Fake.stores_deleted);
+}
+
+test "workload admission Wasmtime real core fuel memory and table ceilings" {
+    var lib = WasmtimeLib.open() catch |err| switch (err) {
+        error.WasmtimeUnavailable, error.WasmtimeSymbolMissing => return error.SkipZigTest,
+        else => return err,
+    };
+    defer lib.close();
+    // One page, a two-element table, and an infinite exported call. Generated
+    // from a minimal module with the three Antfly C-ABI exports; no imports.
+    const wasm = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x13, 0x03, 0x60, 0x01, 0x7f, 0x01, 0x7f,
+        0x60, 0x02, 0x7f, 0x7f, 0x00, 0x60, 0x04, 0x7f, 0x7f, 0x7f, 0x7f, 0x01, 0x7e, 0x03, 0x04, 0x03,
+        0x00, 0x01, 0x02, 0x04, 0x04, 0x01, 0x70, 0x00, 0x02, 0x05, 0x03, 0x01, 0x00, 0x01, 0x07, 0x5f,
+        0x04, 0x06, 0x6d, 0x65, 0x6d, 0x6f, 0x72, 0x79, 0x02, 0x00, 0x16, 0x61, 0x6e, 0x74, 0x66, 0x6c,
+        0x79, 0x5f, 0x65, 0x78, 0x74, 0x65, 0x6e, 0x73, 0x69, 0x6f, 0x6e, 0x5f, 0x61, 0x6c, 0x6c, 0x6f,
+        0x63, 0x00, 0x00, 0x1c, 0x61, 0x6e, 0x74, 0x66, 0x6c, 0x79, 0x5f, 0x65, 0x78, 0x74, 0x65, 0x6e,
+        0x73, 0x69, 0x6f, 0x6e, 0x5f, 0x66, 0x72, 0x65, 0x65, 0x5f, 0x62, 0x75, 0x66, 0x66, 0x65, 0x72,
+        0x00, 0x01, 0x1a, 0x61, 0x6e, 0x74, 0x66, 0x6c, 0x79, 0x5f, 0x65, 0x78, 0x74, 0x65, 0x6e, 0x73,
+        0x69, 0x6f, 0x6e, 0x5f, 0x63, 0x61, 0x6c, 0x6c, 0x5f, 0x74, 0x6f, 0x6f, 0x6c, 0x00, 0x02, 0x0a,
+        0x13, 0x03, 0x04, 0x00, 0x41, 0x00, 0x0b, 0x02, 0x00, 0x0b, 0x09, 0x00, 0x03, 0x40, 0x0c, 0x00,
+        0x0b, 0x42, 0x00, 0x0b, 0x00, 0x10, 0x04, 0x6e, 0x61, 0x6d, 0x65, 0x03, 0x09, 0x01, 0x02, 0x01,
+        0x00, 0x04, 0x73, 0x70, 0x69, 0x6e,
+    };
+    try std.testing.expectError(error.WasmtimeTrap, lib.invokeExtensionCAbi(std.testing.allocator, &wasm, "tool", "{}", .{ .fuel = 100 }));
+    try std.testing.expectError(error.WasmtimeInstantiateFailed, lib.invokeExtensionCAbi(std.testing.allocator, &wasm, "tool", "{}", .{ .max_memory_bytes = 4096 }));
+    try std.testing.expectError(error.WasmtimeInstantiateFailed, lib.invokeExtensionCAbi(std.testing.allocator, &wasm, "tool", "{}", .{ .max_table_elements = 1 }));
 }

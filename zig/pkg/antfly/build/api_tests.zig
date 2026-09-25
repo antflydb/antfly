@@ -231,10 +231,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "scan request errors map to stable client responses",
         "httpx antfly reads preserve availability and terminal failures",
         "httpx lookup revalidates missing catalog bindings across restore",
+        "workload admission scan owns runtime buffers and honors optional body and bad requests",
         "httpx antfly scan honors optional body and documented bad requests",
         "httpx antfly scan reports a stale owner descriptor as temporarily unavailable",
         "httpx multi batch route uses the batch commit hook and public response contract",
-        "httpx stable transaction commit durably hands off recovery before acknowledgement",
+        "workload admission stable transaction commit durably hands off recovery before acknowledgement",
         "httpx shared registrar keeps root probes and rejects removed data aliases",
         "httpx storage maintenance routes call typed operations directly",
         "httpx antfly routes require auth and enforce admin middleware",
@@ -1067,6 +1068,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "coordinator prunes the final score domain before paging",
             "profiled composed dense query preserves exact route telemetry",
             "aggregation completeness requires exact total relation",
+            "parallel text stats fanout charges retained response scratch to request quota",
+            "parallel text stats joins canceled wave without publishing or dispatching later groups",
+            "hosted text stats transport fanout shares request quota and stops canceled waves",
+            "parallel search charges retained response scratch and stops after canceled wave",
+            "parallel preflight charges retained response scratch to request quota",
             "aggregation-only collection preserves controls and clears only internal hits",
             "aggregation full-result rerun includes newly published text documents at the same identity generation",
             "aggregation full-result rerun preserves the graph reranked hit page",
@@ -1122,6 +1128,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "typed routed batch preserves forwarding cancellation and identity conflicts",
             "typed internal query workers preserve identity generation validation",
             "remote shard query phases propagate deadline and request cancellation",
+            "parallel preflight joins canceled wave without dispatching later groups",
             "provisioned table read cache has a finite worker ceiling",
             "provisioned read cache invalidates repeated ownership moves with pinned leases",
             "provisioned read cache exclusive access drains active read leases",
@@ -1241,6 +1248,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "distributed graph root probe retires resolved keys between shard waves",
             "distributed graph supports cross-range traverse target selectors",
             "distributed graph traverse routes cross-table frontier by table generation",
+            "distributed graph fans out per-group expand and hydrate with worker io",
+            "distributed graph edge reader routes outgoing and fans out incoming adjacency",
         }),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -1524,6 +1533,32 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_api_table_writes_docid_tests = @import("linked_tests.zig").runPair(b, api_table_writes_docid_tests, write_implementation_tests);
     const run_api_table_reads_docid_tests = @import("linked_tests.zig").runPair(b, api_table_reads_linked_tests, write_implementation_tests);
     b.step("antfly-api-table-read-test", "Run table-read routing and internal group contracts").dependOn(&run_api_table_reads_docid_tests.step);
+    const api_text_stats_fanout_tests = b.addTest(.{
+        .name = "api-text-stats-fanout-tests",
+        .root_module = api_table_reads_docid_test_mod,
+        .filters = &.{ "parallel text stats fanout charges retained response scratch to request quota", "parallel text stats joins canceled wave without publishing or dispatching later groups" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-text-stats-fanout-test", "Run text-stat request quota fanout regression").dependOn(&addFilteredTestRunArtifact(b, api_text_stats_fanout_tests).step);
+    const api_read_fanout_tests = b.addTest(.{
+        .name = "api-read-fanout-tests",
+        .root_module = api_table_reads_docid_test_mod,
+        .filters = &.{
+            "parallel text stats joins canceled wave without publishing or dispatching later groups",
+            "parallel search charges retained response scratch and stops after canceled wave",
+            "parallel preflight charges retained response scratch to request quota",
+            "parallel preflight joins canceled wave without dispatching later groups",
+        },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-read-fanout-test", "Run search and preflight request quota and cancellation regressions").dependOn(&addFilteredTestRunArtifact(b, api_read_fanout_tests).step);
+    const api_hosted_text_stats_fanout_tests = b.addTest(.{
+        .name = "api-hosted-text-stats-fanout-tests",
+        .root_module = api_table_reads_docid_test_mod,
+        .filters = &.{"hosted text stats transport fanout shares request quota and stops canceled waves"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-hosted-text-stats-fanout-test", "Run hosted text-stat transport quota and cancellation regression").dependOn(&addFilteredTestRunArtifact(b, api_hosted_text_stats_fanout_tests).step);
     const api_aggregation_tests = @import("linked_tests.zig").addPair(b, .{
         .name = "api-aggregation-tests",
         .root_module = api_table_reads_docid_test_mod,
@@ -1533,7 +1568,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-api-aggregation-test", "Run captured aggregation collection, completeness and generation regressions").dependOn(&api_aggregation_tests.run(b).step);
     const api_transaction_contract_tests = b.addTest(.{
         .root_module = api_transactions_docid_test_mod,
-        .filters = &.{ "distributed txn", "hosted participant", "stable distributed transaction retry", "internal batch parser owns binary staged restore controls", "merge page internal codec", "online merge private" },
+        .filters = &.{ "distributed txn", "hosted participant", "stable distributed transaction retry", "transaction session commit request is sealed across retries", "internal batch parser owns binary staged restore controls", "merge page internal codec", "online merge private" },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-transactions-test", "Run transaction coordinator and participant contracts").dependOn(&addFilteredTestRunArtifact(b, api_transaction_contract_tests).step);
@@ -2023,7 +2058,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .run_api_transactions_docid_tests = run_api_transactions_docid_tests,
         .run_api_table_writes_docid_tests = run_api_table_writes_docid_tests,
         .run_api_table_reads_docid_tests = run_api_table_reads_docid_tests,
-        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{ api_table_reads_linked_tests.executable, lib_api_distributed_query_availability_tests.executable, api_table_writes_docid_tests.executable, api_relational_topology_contract_tests.consumer.executable, api_table_writes_production_regression_tests.consumer.executable, hosted_batch_tests.consumer.executable, api_create_structural_retry_tests.consumer.executable, api_table_writes_restore_repeat_tests.consumer.executable }) catch @panic("OOM"),
+        // Stateful parity now reaches the storage-owner ABI through public API
+        // owner acquisition, so link it with the other compiled consumers.
+        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{ public_api_parity_tests, api_table_reads_linked_tests.executable, lib_api_distributed_query_availability_tests.executable, api_table_writes_docid_tests.executable, api_relational_topology_contract_tests.consumer.executable, api_table_writes_production_regression_tests.consumer.executable, hosted_batch_tests.consumer.executable, api_create_structural_retry_tests.consumer.executable, api_table_writes_restore_repeat_tests.consumer.executable }) catch @panic("OOM"),
         .run_api_public_table_http_docid_tests = run_api_public_table_http_docid_tests,
         .run_raft_transition_runtime_docid_tests = run_raft_transition_runtime_docid_tests,
         .run_api_table_writes_production_regression_unit_tests = run_api_table_writes_production_regression_unit_tests,

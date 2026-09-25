@@ -304,6 +304,7 @@ pub const TransactionCommitResponse = types.TransactionCommitResponse;
 pub const TransactionConflict = types.TransactionConflict;
 pub const TransactionConflictParticipant = types.TransactionConflictParticipant;
 pub const TransactionReadItem = types.TransactionReadItem;
+pub const TransactionRecoveryStoragePolicy = types.TransactionRecoveryStoragePolicy;
 pub const TransactionSavepointResponse = types.TransactionSavepointResponse;
 pub const TransactionSessionCleanupResponse = types.TransactionSessionCleanupResponse;
 pub const TransactionSessionCommitResponse = types.TransactionSessionCommitResponse;

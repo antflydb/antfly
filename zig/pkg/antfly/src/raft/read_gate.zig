@@ -52,6 +52,14 @@ pub const AppliedReadTracker = struct {
         return .{ .allocator = allocator, .incarnation = incarnation };
     }
 
+    /// Reserve publication bookkeeping before a host can accept protected work.
+    /// The host's max_groups bound and retirement preserve this capacity.
+    pub fn reserveGroupCapacity(self: *AppliedReadTracker, max_groups: u32) !void {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        try self.applied_indexes.ensureTotalCapacity(self.allocator, max_groups);
+    }
+
     pub fn deinit(self: *AppliedReadTracker) void {
         self.applied_indexes.deinit(self.allocator);
         self.waiters.deinit(self.allocator);
@@ -628,4 +636,17 @@ test "applied read tracker never reuses identities after counter exhaustion" {
     try std.testing.expectError(error.AppliedReadIdentityExhausted, tracker.register(1, &buffer));
     try std.testing.expectError(error.AppliedReadIdentityExhausted, tracker.register(1, &buffer));
     try std.testing.expectEqual(@as(usize, 0), tracker.pendingCount());
+}
+
+test "workload admission completion read progress uses reserved group capacity" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var tracker = AppliedReadTracker.init(failing.allocator(), 7);
+    defer tracker.deinit();
+    try tracker.reserveGroupCapacity(4);
+    failing.fail_index = failing.alloc_index;
+    for (1..5) |group| try tracker.noteApplied(group, 2);
+    tracker.retireGroup(2);
+    try tracker.noteApplied(5, 3);
+    try std.testing.expectEqual(@as(usize, 4), tracker.applied_indexes.count());
+    try std.testing.expectEqual(@as(u64, 3), tracker.applied_indexes.get(5).?);
 }

@@ -2364,17 +2364,22 @@ fn freeClonedJsonValues(alloc: std.mem.Allocator, values: []const std.json.Value
 }
 
 fn parseQueryTimeoutMs(alloc: std.mem.Allocator, body: []const u8) !?u64 {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidQueryRequest;
-    const value = parsed.value.object.get("timeout_ms") orelse return null;
-    return switch (value) {
-        .null => null,
-        .integer => |v| if (v >= 0) @as(u64, @intCast(v)) else error.InvalidQueryRequest,
-        .float => error.InvalidQueryRequest,
-        .number_string => |v| std.fmt.parseUnsigned(u64, v, 10) catch error.InvalidQueryRequest,
-        else => error.InvalidQueryRequest,
+    // Admission needs only this scalar. Skip vectors/documents without building
+    // an owned JSON tree before the request has an execution reservation.
+    const Timeout = struct {
+        value: ?u64 = null,
+        pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+            return switch (try source.next()) {
+                .null => .{},
+                .number => |raw| .{ .value = if (std.mem.eql(u8, raw, "-0")) 0 else std.fmt.parseUnsigned(u64, raw, 10) catch return error.InvalidNumber },
+                else => error.UnexpectedToken,
+            };
+        }
     };
+    const Envelope = struct { timeout_ms: Timeout = .{} };
+    var parsed = std.json.parseFromSlice(Envelope, alloc, body, .{ .ignore_unknown_fields = true }) catch return error.InvalidQueryRequest;
+    defer parsed.deinit();
+    return parsed.value.timeout_ms.value;
 }
 
 const QueryBodyContractFields = struct {
@@ -2562,9 +2567,40 @@ fn queryBodyContractFields(alloc: std.mem.Allocator, body: []const u8) !QueryBod
 }
 
 pub fn queryExecutionDeadlineNsFromBody(alloc: std.mem.Allocator, body: []const u8) !?u64 {
-    const started_ns = platform_time.monotonicNs();
+    return queryExecutionDeadlineNsFromBodyAt(alloc, body, platform_time.monotonicNs());
+}
+
+pub fn queryExecutionDeadlineNsFromBodyAt(alloc: std.mem.Allocator, body: []const u8, started_ns: u64) !?u64 {
     const timeout_ms = (try parseQueryTimeoutMs(alloc, body)) orelse return null;
     return started_ns +| timeout_ms *| std.time.ns_per_ms;
+}
+
+/// All lines in one submitted batch share its submission time. The shortest
+/// explicit budget bounds the batch; no line/retry obtains a fresh deadline.
+pub fn publicQueryDeadline(alloc: std.mem.Allocator, body: []const u8, ndjson: bool, incoming: ?u64) !?u64 {
+    const started_ns = platform_time.monotonicNs();
+    var deadline = incoming;
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    while (true) {
+        const line = if (ndjson) std.mem.trim(u8, lines.next() orelse break, " \t\r") else body;
+        if (line.len != 0) {
+            if (try queryExecutionDeadlineNsFromBodyAt(alloc, line, started_ns)) |candidate|
+                deadline = @min(deadline orelse candidate, candidate);
+        }
+        if (!ndjson) break;
+    }
+    return deadline;
+}
+
+test "workload admission parses only timeout and preserves the original deadline" {
+    var buffer: [4096]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&buffer);
+    const body = "{\"vector\":[" ++ ("0.25," ** 10000) ++ "0],\"timeout_ms\":25}";
+    try std.testing.expectEqual(@as(?u64, 7 + 25 * std.time.ns_per_ms), try queryExecutionDeadlineNsFromBodyAt(bounded.allocator(), body, 7));
+    try std.testing.expectEqual(@as(?u64, 0), try publicQueryDeadline(std.testing.allocator, "{\"timeout_ms\":1000}", false, 0));
+    try std.testing.expectError(error.InvalidQueryRequest, publicQueryDeadline(std.testing.allocator, "{\"timeout_ms\":-1}", false, null));
+    try std.testing.expectError(error.InvalidQueryRequest, publicQueryDeadline(std.testing.allocator, "{\"timeout_ms\":\"20\"}", false, null));
+    try std.testing.expectEqual(@as(?u64, null), try publicQueryDeadline(std.testing.allocator, "{}\n{}", true, null));
 }
 
 fn ensureQueryDeadline(deadline_ns: ?u64) !void {

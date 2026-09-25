@@ -34,12 +34,18 @@ pub const Method = enum {
 /// Executors must only borrow it synchronously; it is not serializable and
 /// must never outlive the request that supplied it.
 pub const RequestCancellation = struct {
+    /// Borrowed class allocation owner, including ingress ancestors.
+    allocation_owner: ?*@import("../workload_allocator.zig").Owner = null,
     cancelled: std.atomic.Value(bool) = .init(false),
     /// Optional listener-owned signal (for example an H2 RST_STREAM). It is
     /// borrowed for the request lifetime and complements local cancellation.
     borrowed: ?*const std.atomic.Value(bool) = null,
     borrowed_context: ?*const anyopaque = null,
     borrowed_is_cancelled: ?*const fn (*const anyopaque) bool = null,
+    borrowed_check: ?*const fn (*const anyopaque) anyerror!void = null,
+    /// Native monotonic query deadline captured before foreground admission.
+    /// This is local-only; routed requests serialize remaining duration.
+    query_deadline_ns: ?u64 = null,
 
     pub fn cancel(self: *RequestCancellation) void {
         self.cancelled.store(true, .release);
@@ -53,6 +59,10 @@ pub const RequestCancellation = struct {
 
     fn isBorrowedCallbackCancelled(self: *const RequestCancellation) bool {
         const context = self.borrowed_context orelse return false;
+        if (self.borrowed_check) |check_fn| {
+            check_fn(context) catch return true;
+            return false;
+        }
         const callback = self.borrowed_is_cancelled orelse return false;
         return callback(context);
     }
@@ -72,6 +82,17 @@ pub const RequestCancellation = struct {
                     return cancellation.isCancelled();
                 }
             }.call,
+            .check_fn = struct {
+                fn call(raw: *const anyopaque) !void {
+                    const cancellation: *const RequestCancellation = @ptrCast(@alignCast(raw));
+                    if (cancellation.cancelled.load(.acquire) or
+                        (cancellation.borrowed != null and cancellation.borrowed.?.load(.acquire))) return error.Canceled;
+                    if (cancellation.borrowed_context) |context| {
+                        if (cancellation.borrowed_check) |check_fn| return check_fn(context);
+                    }
+                    if (cancellation.isBorrowedCallbackCancelled()) return error.Canceled;
+                }
+            }.call,
         };
     }
 
@@ -79,6 +100,7 @@ pub const RequestCancellation = struct {
         return .{
             .borrowed_context = token_value.ptr,
             .borrowed_is_cancelled = token_value.is_cancelled_fn,
+            .borrowed_check = token_value.check_fn,
         };
     }
 };
@@ -95,6 +117,19 @@ test "RequestCancellation safely ignores incomplete semantic tokens" {
     var state = false;
     const cancellation = RequestCancellation.fromToken(.{ .ptr = &state });
     try std.testing.expect(!cancellation.isCancelled());
+}
+
+test "workload admission preserves fallible query cancellation across HTTP adapters" {
+    const Scope = struct {
+        fn check(_: *const anyopaque) !void {
+            return error.DeadlineExceeded;
+        }
+    };
+    var context: u8 = 0;
+    const first = RequestCancellation.fromToken(.{ .ptr = &context, .check_fn = Scope.check });
+    const second = RequestCancellation.fromToken(first.token());
+    try std.testing.expect(second.isCancelled());
+    try std.testing.expectError(error.DeadlineExceeded, second.token().check());
 }
 
 pub const HttpRequest = struct {
@@ -181,6 +216,9 @@ pub const HttpResponse = struct {
     content_type: ?[]u8 = null,
     headers: []Header = &.{},
     body: []u8 = &.{},
+    /// Optional lifetime for the allocator itself, released after its buffers.
+    /// Transport adapters retain this when a response outlives its producer.
+    allocation_owner: ?struct { ptr: *anyopaque, release: *const fn (*anyopaque) void } = null,
 
     pub fn header(self: HttpResponse, name: []const u8) ?[]const u8 {
         for (self.headers) |entry| {
@@ -195,6 +233,7 @@ pub const HttpResponse = struct {
         for (self.headers) |*entry| entry.deinit(alloc);
         if (self.headers.len > 0) alloc.free(self.headers);
         if (self.body.len > 0) alloc.free(self.body);
+        if (self.allocation_owner) |owner| owner.release(owner.ptr);
         self.* = undefined;
     }
 };

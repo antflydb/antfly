@@ -375,13 +375,57 @@ pub const H2Connection = struct {
     /// **Caller must hold `write_mutex`**. The mutex is temporarily released
     /// while waiting for window space so the receive loop can process frames.
     pub fn writeDataBlocking(self: *Self, writer: anytype, stream_id: u31, data: []const u8, end_stream: bool) !void {
+        return self.writeDataBlockingDeadline(writer, stream_id, data, end_stream, .none);
+    }
+
+    /// Absolute per-stream lifetime is independent of the progress-based idle
+    /// timer. Neither unrelated wakeups nor trickled DATA extend this bound.
+    pub fn writeDataBlockingDeadline(self: *Self, writer: anytype, stream_id: u31, data: []const u8, end_stream: bool, timeout: Io.Timeout) !void {
+        return self.writeDataWithDeadline(writer, stream_id, data, end_stream, timeout, null);
+    }
+
+    /// Own the write mutex so a timed-out stream can leave a flow-control wait
+    /// without reacquiring a mutex held by another stream's blocked writer.
+    pub fn writeDataScoped(self: *Self, writer: anytype, stream_id: u31, data: []const u8, end_stream: bool, timeout: Io.Timeout) !void {
+        const deadline = timeout.toDeadline(self.io);
+        try self.lockWriteUntil(deadline);
+        var held = true;
+        defer if (held) self.write_mutex.unlock(self.io);
+        return self.writeDataWithDeadline(writer, stream_id, data, end_stream, deadline, &held);
+    }
+
+    pub fn lockWriteUntil(self: *Self, timeout: Io.Timeout) !void {
+        const deadline = timeout.toDeadline(self.io);
+        if (deadline == .none) return self.write_mutex.lock(self.io);
+        while (true) {
+            const remaining = deadline.toDurationFromNow(self.io).?;
+            if (remaining.raw.nanoseconds <= 0) return error.Timeout;
+            if (self.write_mutex.tryLock()) return;
+            try self.io.sleep(.{ .nanoseconds = @min(remaining.raw.nanoseconds, std.time.ns_per_ms) }, .awake);
+        }
+    }
+
+    fn writeDataWithDeadline(self: *Self, writer: anytype, stream_id: u31, data: []const u8, end_stream: bool, timeout: Io.Timeout, lock_held: ?*bool) !void {
+        const absolute_timeout = timeout.toDeadline(self.io);
         const max_size = self.peer_settings.max_frame_size;
 
+        // WINDOW_UPDATE for another stream is not progress for this writer.
+        // Keep one idle deadline until actual DATA bytes have been sent.
+        var idle_timeout = self.send_window_timeout.toDeadline(self.io);
         var offset: usize = 0;
         while (offset < data.len) {
             const stream = self.stream_manager.getStream(stream_id) orelse return error.InvalidStreamId;
             if (stream.responseWriteError(self.is_server)) |err| return err;
 
+            if (idle_timeout.toDurationFromNow(self.io)) |remaining_time| {
+                if (remaining_time.raw.nanoseconds <= 0) return error.Timeout;
+            }
+            const wait_timeout = blk: {
+                const absolute = absolute_timeout.toDurationFromNow(self.io) orelse break :blk idle_timeout;
+                if (absolute.raw.nanoseconds <= 0) return error.Timeout;
+                const idle = idle_timeout.toDurationFromNow(self.io) orelse break :blk absolute_timeout;
+                break :blk if (absolute.raw.nanoseconds <= idle.raw.nanoseconds) absolute_timeout else idle_timeout;
+            };
             const remaining = data.len - offset;
 
             // Available window = min(stream, connection), clamped to 0.
@@ -391,22 +435,20 @@ pub const H2Connection = struct {
             const chunk_size = @min(remaining, @min(window, max_size));
 
             if (chunk_size == 0) {
-                // Window exhausted — release mutex, wait for WINDOW_UPDATE, reacquire.
+                // Reset while holding the lock: WINDOW_UPDATE cannot race the
+                // reset, and its event persists after we release the lock.
+                self.send_window_event.reset();
+                self.write_mutex.unlock(self.io);
+                if (lock_held) |held| held.* = false;
                 {
-                    self.write_mutex.unlock(self.io);
-                    defer self.write_mutex.lockUncancelable(self.io);
-                    self.send_window_event.reset();
-                    // Re-check after reset (receive loop may have updated between our check and reset).
-                    const s2 = self.stream_manager.getStream(stream_id) orelse return error.InvalidStreamId;
-                    if (s2.responseWriteError(self.is_server)) |err| return err;
-                    const sw2: usize = if (s2.send_window > 0) @intCast(s2.send_window) else 0;
-                    const cw2: usize = if (self.stream_manager.connection_send_window > 0) @intCast(self.stream_manager.connection_send_window) else 0;
-                    if (sw2 == 0 or cw2 == 0) {
-                        self.send_window_event.waitTimeout(self.io, self.send_window_timeout) catch |err| switch (err) {
-                            error.Timeout => return error.Timeout,
-                            error.Canceled => return error.Canceled,
-                        };
-                    }
+                    // Legacy callers require the mutex held on every return.
+                    // Scoped stream writers instead abandon the wait unlocked.
+                    defer if (lock_held == null) self.write_mutex.lockUncancelable(self.io);
+                    try self.send_window_event.waitTimeout(self.io, wait_timeout);
+                }
+                if (lock_held) |held| {
+                    try self.lockWriteUntil(absolute_timeout);
+                    held.* = true;
                 }
                 continue;
             }
@@ -424,6 +466,7 @@ pub const H2Connection = struct {
                 return err;
             };
             offset += chunk_size;
+            idle_timeout = self.send_window_timeout.toDeadline(self.io);
         }
 
         if (data.len == 0 and end_stream) {
@@ -809,6 +852,37 @@ pub const H2Connection = struct {
     // Per-stream mailbox delivery and frame pumping
     // ---------------------------------------------------------------
 
+    /// Validate request framing before publishing a header mailbox to a
+    /// handler/dispatch classifier. HPACK decoding remains connection-owned.
+    /// Client response metadata (including HEAD/304 Content-Length) is not a
+    /// request body declaration and does not pass through this validator.
+    fn requestContentLength(headers: []const hpack.DecodedHeader, trailers: bool) !?u64 {
+        var seen_pseudo: u8 = 0;
+        var ordinary_seen = false;
+        var content_length: ?u64 = null;
+        for (headers) |header| {
+            if (header.name.len == 0) return error.InvalidRequestHeaders;
+            for (header.name) |byte| if (std.ascii.isUpper(byte)) return error.InvalidRequestHeaders;
+            if (header.name[0] == ':') {
+                if (trailers or ordinary_seen) return error.InvalidRequestHeaders;
+                const bit: u8 = if (std.mem.eql(u8, header.name, ":method")) 1 else if (std.mem.eql(u8, header.name, ":path")) 2 else if (std.mem.eql(u8, header.name, ":scheme")) 4 else if (std.mem.eql(u8, header.name, ":authority")) 8 else return error.InvalidRequestHeaders;
+                if (seen_pseudo & bit != 0) return error.InvalidRequestHeaders;
+                seen_pseudo |= bit;
+            } else {
+                ordinary_seen = true;
+                if (std.mem.eql(u8, header.name, "content-length")) {
+                    // Reject even identical duplicates: no downstream reader
+                    // may select a different interpretation of the envelope.
+                    if (trailers or content_length != null or header.value.len == 0) return error.InvalidRequestHeaders;
+                    for (header.value) |byte| if (!std.ascii.isDigit(byte)) return error.InvalidRequestHeaders;
+                    content_length = std.fmt.parseInt(u64, header.value, 10) catch return error.InvalidRequestHeaders;
+                }
+                if (std.mem.eql(u8, header.name, "transfer-encoding")) return error.InvalidRequestHeaders;
+            }
+        }
+        return content_length;
+    }
+
     /// Delivers a stream-level frame to the target stream's mailbox.
     /// Copies payload data so the original frame can be freed afterward.
     /// HPACK decoding happens here (in the receive loop) to avoid concurrent
@@ -854,6 +928,18 @@ pub const H2Connection = struct {
                     return err;
                 };
                 if (dec.priority) |p| stream.priority = p;
+                const request_length: ?u64 = if (self.is_server)
+                    requestContentLength(dec.headers, stream.got_headers) catch |err| {
+                        stream_mod.freeDecodedHeaders(self.allocator, dec.headers);
+                        stream.stream_error = err;
+                        stream.got_headers = true;
+                        stream.completed = true;
+                        if (stream.data_event) |ev| ev.set(self.io);
+                        stream.completion_event.set(self.io);
+                        return;
+                    }
+                else
+                    null;
 
                 if (stream.got_headers) {
                     // RFC 7540 §8.1: Trailing HEADERS MUST include END_STREAM.
@@ -898,20 +984,24 @@ pub const H2Connection = struct {
 
                     // RFC 7540 §8.1.2.6: Extract content-length for
                     // END_STREAM validation.
-                    for (dec.headers) |h| {
-                        if (std.ascii.eqlIgnoreCase(h.name, "content-length")) {
-                            stream.content_length = std.fmt.parseInt(u64, h.value, 10) catch null;
-                            break;
+                    if (self.is_server) {
+                        stream.content_length = request_length;
+                    } else {
+                        for (dec.headers) |h| {
+                            if (std.ascii.eqlIgnoreCase(h.name, "content-length")) {
+                                stream.content_length = std.fmt.parseInt(u64, h.value, 10) catch null;
+                                break;
+                            }
                         }
                     }
                 }
 
                 if (stream.data_event) |ev| ev.set(self.io);
                 if (frame.header.flags & FLAG_END_STREAM != 0) {
-                    // RFC 7540 §8.1.2.6: HEADERS with END_STREAM and a
-                    // non-zero content-length is a stream error.
+                    // Initial END_STREAM HEADERS must describe no received
+                    // body. Trailers close the body already delivered.
                     if (stream.content_length) |cl| {
-                        if (cl != 0) {
+                        if (cl != stream.total_data_received) {
                             stream.stream_error = error.ContentLengthMismatch;
                             stream.completed = true;
                             if (stream.data_event) |ev2| ev2.set(self.io);
@@ -985,6 +1075,18 @@ pub const H2Connection = struct {
                     stream.completion_event.set(self.io);
                     return;
                 };
+                // Check request framing before mailbox allocation, not only
+                // at END_STREAM. A peer cannot declare a tiny protected RPC
+                // and retain arbitrarily larger DATA while withholding END.
+                if (self.is_server) if (stream.content_length) |declared| {
+                    if (new_size > declared) {
+                        stream.stream_error = error.ContentLengthMismatch;
+                        stream.completed = true;
+                        if (stream.data_event) |ev| ev.set(self.io);
+                        stream.completion_event.set(self.io);
+                        return;
+                    }
+                };
                 if (stream_data_limit) |limit| {
                     // Use total_data_received, not data_buf.items.len — compactDataBuf()
                     // shrinks the buffer, so buffer length alone is bypassable.
@@ -998,24 +1100,24 @@ pub const H2Connection = struct {
                         return;
                     }
                 }
-                const budget = self.recv_data_budget;
-                if (budget) |shared| {
-                    if (!shared.tryReserve(data_payload.len)) {
-                        stream.stream_error = error.BodyCapacityExceeded;
+                stream.data_budget = self.recv_data_budget;
+                @import("body_budget.zig").ensureBufferCapacity(
+                    stream.data_budget,
+                    self.allocator,
+                    &stream.data_buf,
+                    try std.math.add(usize, stream.data_buf.items.len, data_payload.len),
+                    &stream.data_budget_reserved,
+                ) catch |err| {
+                    if (err == error.BodyCapacityExceeded) {
+                        stream.stream_error = err;
                         stream.completed = true;
                         if (stream.data_event) |ev| ev.set(self.io);
                         stream.completion_event.set(self.io);
                         return;
                     }
-                }
-                stream.data_buf.appendSlice(self.allocator, data_payload) catch |err| {
-                    if (budget) |shared| shared.release(data_payload.len);
                     return err;
                 };
-                if (budget) |shared| {
-                    stream.data_budget = shared;
-                    stream.data_budget_reserved += data_payload.len;
-                }
+                stream.data_buf.appendSliceAssumeCapacity(data_payload);
                 stream.total_data_received = new_size;
                 if (stream.data_event) |ev| ev.set(self.io);
                 if (frame.header.flags & FLAG_END_STREAM != 0) {
@@ -1091,7 +1193,7 @@ pub const H2Connection = struct {
             // RFC 7540 §5.1: If deliverToMailbox flagged a stream error (e.g.
             // DATA on half-closed-remote), send RST_STREAM so the peer stops.
             // This runs after accumulateWindowUpdate so flow control stays balanced.
-            if (sf.header.frame_type == .data) {
+            if (sf.header.frame_type == .data or sf.header.frame_type == .headers) {
                 if (self.stream_manager.getStream(sf.header.stream_id)) |stream| {
                     if (stream.stream_error != null) {
                         // A server handler already waiting on this body can
@@ -1101,6 +1203,8 @@ pub const H2Connection = struct {
                         if (!(is_body_capacity and stream.data_event != null)) {
                             const code: Http2ErrorCode = if (is_body_capacity)
                                 .enhance_your_calm
+                            else if (stream.stream_error.? == error.InvalidRequestHeaders or stream.stream_error.? == error.ContentLengthMismatch)
+                                .protocol_error
                             else
                                 .stream_closed;
                             self.sendRstStream(writer, sf.header.stream_id, code) catch {};
@@ -1157,13 +1261,15 @@ pub const H2Connection = struct {
                 // RFC 7540 §5.1: If deliverToMailbox flagged a stream error (e.g.
                 // DATA on half-closed-remote), send RST_STREAM so the peer stops.
                 // This runs after accumulateWindowUpdate so flow control stays balanced.
-                if (sf.header.frame_type == .data) {
+                if (sf.header.frame_type == .data or sf.header.frame_type == .headers) {
                     if (self.stream_manager.getStream(sf.header.stream_id)) |stream| {
                         if (stream.stream_error != null) {
                             const is_body_capacity = if (stream.stream_error) |err| err == error.BodyCapacityExceeded else false;
                             if (!(is_body_capacity and stream.data_event != null)) {
                                 const code: Http2ErrorCode = if (is_body_capacity)
                                     .enhance_your_calm
+                                else if (stream.stream_error.? == error.InvalidRequestHeaders or stream.stream_error.? == error.ContentLengthMismatch)
+                                    .protocol_error
                                 else
                                     .stream_closed;
                                 self.sendRstStream(writer, sf.header.stream_id, code) catch {};
@@ -3531,4 +3637,237 @@ test "H2 error envelopes select their bounded limit before DATA allocation" {
             try std.testing.expectEqual(@as(usize, 0), stream.data_buf.items.len);
         }
     }
+}
+
+test "H2 stalled output deadline survives unrelated window wakeups" {
+    const FakeIo = struct {
+        now_ns: i96 = 0,
+        wakeups: usize = 0,
+        connection: *H2Connection = undefined,
+
+        fn now(raw: ?*anyopaque, _: Io.Clock) Io.Timestamp {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return .{ .nanoseconds = self.now_ns };
+        }
+
+        fn wait(raw: ?*anyopaque, ptr: *const u32, _: u32, _: Io.Timeout) Io.Cancelable!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            // Control traffic must retain the connection mutex while output
+            // is stalled, without requiring an extra thread for this waiter.
+            std.debug.assert(self.connection.write_mutex.state.load(.acquire) == .unlocked);
+            self.wakeups += 1;
+            if (self.wakeups > 10) return error.Canceled;
+            self.now_ns += 3 * std.time.ns_per_ms;
+            @atomicStore(u32, @constCast(ptr), @intFromEnum(Io.Event.is_set), .release);
+        }
+    };
+    var fake: FakeIo = .{};
+    var vtable = std.testing.io.vtable.*;
+    vtable.now = FakeIo.now;
+    vtable.futexWait = FakeIo.wait;
+    const io: Io = .{ .userdata = &fake, .vtable = &vtable };
+    var server = H2Connection.initServer(std.testing.allocator, io);
+    defer server.deinit();
+    fake.connection = &server;
+    server.send_window_timeout = .{ .duration = .{ .raw = Io.Duration.fromMilliseconds(5), .clock = .awake } };
+    const stalled = try server.stream_manager.getOrCreateStream(1);
+    stalled.state = .open;
+    stalled.send_window = 0;
+    var wire = std.ArrayListUnmanaged(u8).empty;
+    defer wire.deinit(std.testing.allocator);
+    const writer = testWriter(&wire, std.testing.allocator);
+    server.write_mutex.lockUncancelable(io);
+    defer server.write_mutex.unlock(io);
+    try std.testing.expectError(error.Timeout, server.writeDataBlocking(writer, 1, "pending", false));
+    try std.testing.expectEqual(@as(usize, 2), fake.wakeups);
+    try std.testing.expectEqual(@as(usize, 0), wire.items.len);
+    // The write contract reacquires the mutex and leaves other streams usable.
+    const other = try server.stream_manager.getOrCreateStream(3);
+    other.state = .open;
+    try server.writeDataBlocking(writer, 3, "control", true);
+    try std.testing.expect(other.end_stream_sent);
+}
+
+test "H2 stalled output absolute deadline survives DATA progress" {
+    const FakeIo = struct {
+        now_ns: i96 = 0,
+        wakeups: usize = 0,
+        connection: *H2Connection = undefined,
+
+        fn now(raw: ?*anyopaque, _: Io.Clock) Io.Timestamp {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return .{ .nanoseconds = self.now_ns };
+        }
+
+        fn wait(raw: ?*anyopaque, ptr: *const u32, _: u32, _: Io.Timeout) Io.Cancelable!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            // Control traffic must retain the connection mutex while output
+            // is stalled, without requiring an extra thread for this waiter.
+            std.debug.assert(self.connection.write_mutex.state.load(.acquire) == .unlocked);
+            self.wakeups += 1;
+            if (self.wakeups > 10) return error.Canceled;
+            self.now_ns += 3 * std.time.ns_per_ms;
+            self.connection.stream_manager.getStream(1).?.send_window = 1;
+            @atomicStore(u32, @constCast(ptr), @intFromEnum(Io.Event.is_set), .release);
+        }
+    };
+    var fake: FakeIo = .{};
+    var vtable = std.testing.io.vtable.*;
+    vtable.now = FakeIo.now;
+    vtable.futexWait = FakeIo.wait;
+    const io: Io = .{ .userdata = &fake, .vtable = &vtable };
+    var server = H2Connection.initServer(std.testing.allocator, io);
+    defer server.deinit();
+    fake.connection = &server;
+    server.send_window_timeout = .{ .duration = .{ .raw = Io.Duration.fromMilliseconds(50), .clock = .awake } };
+    const stalled = try server.stream_manager.getOrCreateStream(1);
+    stalled.state = .open;
+    stalled.send_window = 0;
+    var wire = std.ArrayListUnmanaged(u8).empty;
+    defer wire.deinit(std.testing.allocator);
+    const writer = testWriter(&wire, std.testing.allocator);
+    try std.testing.expectError(error.Timeout, server.writeDataScoped(writer, 1, "pending", false, .{ .duration = .{ .raw = Io.Duration.fromMilliseconds(5), .clock = .awake } }));
+    try std.testing.expectEqual(@as(usize, 2), fake.wakeups);
+    try std.testing.expect(wire.items.len > 0);
+    try std.testing.expect(server.write_mutex.tryLock());
+    defer server.write_mutex.unlock(io);
+    // Scoped timeout leaves the mutex available to unrelated streams.
+    const other = try server.stream_manager.getOrCreateStream(3);
+    other.state = .open;
+    try server.writeDataBlocking(writer, 3, "control", true);
+    try std.testing.expect(other.end_stream_sent);
+}
+
+test "H2 request framing rejects ambiguous headers before dispatch" {
+    const alloc = std.testing.allocator;
+    const base = [_]hpack.HeaderEntry{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/recover" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":authority", .value = "localhost" },
+    };
+    const invalid = [_][]const hpack.HeaderEntry{
+        &.{.{ .name = ":method", .value = "GET" }},
+        &.{.{ .name = ":path", .value = "/different" }},
+        &.{.{ .name = ":scheme", .value = "https" }},
+        &.{.{ .name = ":authority", .value = "other" }},
+        &.{.{ .name = ":status", .value = "200" }},
+        &.{ .{ .name = "x-test", .value = "v" }, .{ .name = ":path", .value = "/recover" } },
+        &.{ .{ .name = "content-length", .value = "1" }, .{ .name = "content-length", .value = "1" } },
+        &.{ .{ .name = "content-length", .value = "1" }, .{ .name = "content-length", .value = "8193" } },
+        &.{.{ .name = "content-length", .value = "1, 1" }},
+        &.{.{ .name = "content-length", .value = "+1" }},
+        &.{.{ .name = "content-length", .value = "1_0" }},
+        &.{.{ .name = "content-length", .value = "" }},
+        &.{.{ .name = "content-length", .value = "18446744073709551616" }},
+        &.{.{ .name = "transfer-encoding", .value = "chunked" }},
+    };
+    for ([_]bool{ false, true }) |locked| for (invalid) |extra| {
+        var server = H2Connection.initServer(alloc, std.testing.io);
+        defer server.deinit();
+        var client = H2Connection.initClient(alloc, std.testing.io);
+        defer client.deinit();
+        var headers = std.ArrayListUnmanaged(hpack.HeaderEntry).empty;
+        defer headers.deinit(alloc);
+        try headers.appendSlice(alloc, &base);
+        try headers.appendSlice(alloc, extra);
+        var wire = std.ArrayListUnmanaged(u8).empty;
+        defer wire.deinit(alloc);
+        try client.sendHeaders(testWriter(&wire, alloc), 1, headers.items, false);
+        var reply = std.ArrayListUnmanaged(u8).empty;
+        defer reply.deinit(alloc);
+        var reader = TestReader{ .data = wire.items };
+        if (locked) _ = try server.processOneFrameLocked(&reader, testWriter(&reply, alloc)) else _ = try server.processOneFrame(&reader, testWriter(&reply, alloc));
+        const stream = server.stream_manager.getStream(1).?;
+        try std.testing.expect(stream.stream_error != null);
+        try std.testing.expectEqual(error.InvalidRequestHeaders, stream.stream_error.?);
+        try std.testing.expect(stream.request_headers == null);
+        try std.testing.expect(stream.completed);
+        try std.testing.expectEqual(@as(usize, 0), stream.data_buf.capacity);
+        try std.testing.expectEqual(@as(usize, 13), reply.items.len);
+        try std.testing.expectEqual(@intFromEnum(http.Http2FrameType.rst_stream), reply.items[3]);
+        try std.testing.expectEqual(@as(u32, @intFromEnum(Http2ErrorCode.protocol_error)), std.mem.readInt(u32, reply.items[9..13], .big));
+    };
+}
+
+test "H2 request framing rejects excess incremental DATA before buffering without END_STREAM" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |locked| {
+        var server = H2Connection.initServer(alloc, std.testing.io);
+        defer server.deinit();
+        var client = H2Connection.initClient(alloc, std.testing.io);
+        defer client.deinit();
+        var wire = std.ArrayListUnmanaged(u8).empty;
+        defer wire.deinit(alloc);
+        const headers = [_]hpack.HeaderEntry{
+            .{ .name = ":method", .value = "POST" },
+            .{ .name = ":path", .value = "/recover" },
+            .{ .name = ":scheme", .value = "http" },
+            .{ .name = "content-length", .value = "1" },
+        };
+        _ = try client.stream_manager.createStream();
+        try client.sendHeaders(testWriter(&wire, alloc), 1, &headers, false);
+        var reader = TestReader{ .data = wire.items };
+        var reply = std.ArrayListUnmanaged(u8).empty;
+        defer reply.deinit(alloc);
+        _ = try server.processOneFrameLocked(&reader, testWriter(&reply, alloc));
+        const stream = server.stream_manager.getStream(1).?;
+        try std.testing.expectEqual(@as(?u64, 1), stream.content_length);
+        var first = Frame{ .header = .{ .length = 1, .frame_type = .data, .flags = 0, .stream_id = 1 }, .payload = @constCast("a") };
+        try server.deliverToMailbox(&first);
+        const capacity = stream.data_buf.capacity;
+        wire.clearRetainingCapacity();
+        const oversized = [_]u8{'x'} ** 8193;
+        try client.writeData(testWriter(&wire, alloc), 1, &oversized, false);
+        reader = .{ .data = wire.items };
+        if (locked) _ = try server.processOneFrameLocked(&reader, testWriter(&reply, alloc)) else _ = try server.processOneFrame(&reader, testWriter(&reply, alloc));
+        try std.testing.expectEqual(error.ContentLengthMismatch, stream.stream_error.?);
+        try std.testing.expect(stream.completed);
+        try std.testing.expectEqualStrings("a", stream.data_buf.items);
+        try std.testing.expectEqual(capacity, stream.data_buf.capacity);
+        try std.testing.expectEqual(@as(u64, 1), stream.total_data_received);
+        try std.testing.expectEqual(@as(usize, 13), reply.items.len);
+        try std.testing.expectEqual(@as(u32, @intFromEnum(Http2ErrorCode.protocol_error)), std.mem.readInt(u32, reply.items[9..13], .big));
+    }
+}
+
+test "H2 request framing preserves valid HEAD and request trailers and response headers" {
+    const alloc = std.testing.allocator;
+    var server = H2Connection.initServer(alloc, std.testing.io);
+    defer server.deinit();
+    var client = H2Connection.initClient(alloc, std.testing.io);
+    defer client.deinit();
+    var wire = std.ArrayListUnmanaged(u8).empty;
+    defer wire.deinit(alloc);
+    var reply = std.ArrayListUnmanaged(u8).empty;
+    defer reply.deinit(alloc);
+    _ = try client.stream_manager.createStream();
+    try client.sendHeaders(testWriter(&wire, alloc), 1, &.{ .{ .name = ":method", .value = "HEAD" }, .{ .name = ":path", .value = "/health" }, .{ .name = ":scheme", .value = "http" } }, true);
+    var reader = TestReader{ .data = wire.items };
+    _ = try server.processOneFrameLocked(&reader, testWriter(&reply, alloc));
+    const head = server.stream_manager.getStream(1).?;
+    try std.testing.expect(head.stream_error == null);
+    try std.testing.expect(head.completed);
+    wire.clearRetainingCapacity();
+    _ = try client.stream_manager.createStream();
+    try client.sendHeaders(testWriter(&wire, alloc), 3, &.{ .{ .name = ":method", .value = "POST" }, .{ .name = ":path", .value = "/recover" }, .{ .name = ":scheme", .value = "http" }, .{ .name = "content-length", .value = "3" } }, false);
+    try client.writeData(testWriter(&wire, alloc), 3, "abc", false);
+    try client.sendHeaders(testWriter(&wire, alloc), 3, &.{.{ .name = "x-checksum", .value = "verified" }}, true);
+    reader = .{ .data = wire.items };
+    for (0..3) |_| _ = try server.processOneFrameLocked(&reader, testWriter(&reply, alloc));
+    const body = server.stream_manager.getStream(3).?;
+    try std.testing.expect(body.stream_error == null);
+    try std.testing.expect(body.completed);
+    try std.testing.expectEqualStrings("abc", body.data_buf.items);
+    try std.testing.expectEqualStrings("x-checksum", body.trailer_headers.?[0].name);
+    // Request pseudo-header rules must never be applied to response :status.
+    wire.clearRetainingCapacity();
+    _ = try client.stream_manager.getOrCreateStream(3);
+    try server.sendHeaders(testWriter(&wire, alloc), 3, &.{ .{ .name = ":status", .value = "200" }, .{ .name = "content-length", .value = "3" } }, false);
+    try server.writeData(testWriter(&wire, alloc), 3, "xyz", true);
+    reader = .{ .data = wire.items };
+    for (0..2) |_| _ = try client.processOneFrame(&reader, testWriter(&reply, alloc));
+    const response = client.stream_manager.getStream(3).?;
+    try std.testing.expect(response.stream_error == null);
+    try std.testing.expectEqualStrings("xyz", response.data_buf.items);
 }

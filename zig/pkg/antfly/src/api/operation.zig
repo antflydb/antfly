@@ -103,6 +103,13 @@ pub const RequestDiagnostics = struct {
 };
 
 pub const RequestContext = struct {
+    /// A request-scoped authorization callback for logical table writes.
+    /// FK expansion can discover additional physical participants after the
+    /// primary route is authenticated, so those names must be checked here.
+    table_write_authorization: ?struct {
+        ptr: *const anyopaque,
+        allows: *const fn (*const anyopaque, []const u8) bool,
+    } = null,
     /// Set only by the administrator-authorized relational recovery routes.
     relational_recovery: enum { none, repair, retry, retire } = .none,
     relational_retirement_target: ?[]const u8 = null,
@@ -119,10 +126,9 @@ pub const RequestContext = struct {
     /// the caller did not supply one; adapters may generate one in middleware.
     request_id: []const u8 = "",
     principal: ?Principal = null,
-    /// Request-lifetime capability for writes discovered after initial route
-    /// admission (for example FK cascades). Adapters retain the admitted
-    /// credential scopes; a username alone cannot reconstruct API-key rights.
-    table_write_authorization: ?TableWriteAuthorization = null,
+    /// Authenticated wire identity only; execution still requires durable
+    /// worker deduplication/fencing admission. Never populate from raw headers.
+    authenticated_remote_attempt: ?@import("workload_attempt_protocol.zig").Request = null,
     admission: ?*AdmissionReservation = null,
     /// Borrowed for the duration of the operation. This is deliberately
     /// request-scoped: std.Io tasks may resume on a different worker thread.

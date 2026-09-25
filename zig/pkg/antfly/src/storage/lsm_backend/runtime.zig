@@ -525,6 +525,12 @@ pub fn BoundStore(comptime BackendType: type) type {
             return try LocalWriteTxn.openWithOptions(self.backend, namespace, options);
         }
 
+        pub fn writeSerialization(self: *@This()) !backend_types.WriteSerialization {
+            if (comptime @hasField(BackendType, "serialized_write_mutex"))
+                return .{ .gate = &self.backend.serialized_write_mutex };
+            return error.Unsupported;
+        }
+
         pub fn sync(self: *@This(), force: bool) !void {
             if (@hasDecl(BackendType, "sync")) {
                 try self.backend.sync(force);
@@ -4359,7 +4365,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             defer unlockBackend(BackendType, backend, locked);
             try retainReadReader(BackendType, backend, .write_txn);
             errdefer releaseWriteReader(BackendType, backend, .write_txn);
-            backend.beginBatchMode(options);
+            try backend.beginBatchMode(options);
             errdefer backend.finishBatchMode(options);
             return .{
                 .allocator = backend.allocator,
@@ -4558,6 +4564,9 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
 
         fn tryCommitDirectBulkIngest(self: *@This()) !bool {
             if (self.batch_options.mode != .bulk_ingest) return false;
+            if (comptime @hasField(BackendType, "durable_completion")) {
+                if (self.backend.durable_completion != null) return error.PreparedCompletionActive;
+            }
             const entries = self.mutable.entryCount();
             if (entries == 0) return false;
             if (@hasDecl(BackendType, "recordDirectBulkIngestAttempt")) self.backend.recordDirectBulkIngestAttempt(entries);
@@ -7664,7 +7673,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             defer unlockBackend(BackendType, backend, locked);
             try retainReadReader(BackendType, backend, .write_txn);
             errdefer releaseWriteReader(BackendType, backend, .write_txn);
-            backend.beginBatchMode(options);
+            try backend.beginBatchMode(options);
             errdefer backend.finishBatchMode(options);
             return .{
                 .allocator = backend.allocator,
@@ -7862,6 +7871,9 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
 
         fn tryCommitDirectBulkIngest(self: *@This()) !bool {
             if (self.batch_options.mode != .bulk_ingest) return false;
+            if (comptime @hasField(BackendType, "durable_completion")) {
+                if (self.backend.durable_completion != null) return error.PreparedCompletionActive;
+            }
             const entries = self.mutable.entryCount();
             if (entries == 0) return false;
             if (@hasDecl(BackendType, "recordDirectBulkIngestAttempt")) self.backend.recordDirectBulkIngestAttempt(entries);
@@ -8163,7 +8175,7 @@ test "lsm namespace write txn keeps merged mutable state when flush fails after 
             self.retained_readers -= 1;
         }
 
-        fn beginBatchMode(self: *@This(), _: backend_types.BatchOptions) void {
+        fn beginBatchMode(self: *@This(), _: backend_types.BatchOptions) !void {
             self.active_batches += 1;
         }
 
@@ -8230,7 +8242,7 @@ test "lsm namespace write txn releases local mutable state when wal append fails
             self.retained_readers -= 1;
         }
 
-        fn beginBatchMode(self: *@This(), _: backend_types.BatchOptions) void {
+        fn beginBatchMode(self: *@This(), _: backend_types.BatchOptions) !void {
             self.active_batches += 1;
         }
 

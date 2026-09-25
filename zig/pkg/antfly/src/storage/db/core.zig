@@ -491,6 +491,8 @@ pub const IdentityVisibilityState = struct {
 };
 
 pub const DBCore = struct {
+    /// Stable for the published DB lifetime; manager mutations borrow this fence.
+    completion_eligibility: @import("completion_eligibility.zig").Fence = .{},
     alloc: Allocator,
     path: []u8,
     root_generation: u64,
@@ -698,6 +700,8 @@ pub const DBCore = struct {
     }
 
     pub fn updateRange(self: *DBCore, byte_range: types.ByteRange) !void {
+        var completion_transition = try self.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         try self.index_manager.validateRangeTransition(byte_range);
         const start = try self.alloc.dupe(u8, byte_range.start);
         errdefer self.alloc.free(start);
@@ -743,11 +747,15 @@ pub const DBCore = struct {
     }
 
     pub fn setSplitState(self: *DBCore, state: ?shard_mod.SplitState) !void {
+        var completion_transition = try self.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         try self.shard_manager.setSplitState(state);
         self.refreshIndexRange();
     }
 
     pub fn prepareSplit(self: *DBCore, split_key: []const u8) !void {
+        var completion_transition = try self.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         try self.shard_manager.prepareSplit(split_key);
     }
 
@@ -768,12 +776,16 @@ pub const DBCore = struct {
     }
 
     pub fn completeSplitTransition(self: *DBCore, new_shard_id: u64, split_key: []const u8) !void {
+        var completion_transition = try self.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         try self.shard_manager.split(new_shard_id, split_key);
         self.refreshIndexRange();
         try range_state_mod.saveRange(self.store, self.shard_manager.getByteRange());
     }
 
     pub fn finalizeSplitState(self: *DBCore) !void {
+        var completion_transition = try self.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         try self.shard_manager.finalizeSplit();
         self.refreshIndexRange();
         try range_state_mod.saveRange(self.store, self.shard_manager.getByteRange());
@@ -1197,6 +1209,13 @@ pub const DBCore = struct {
         try self.index_manager.loadForRestore(self.store);
     }
 
+    /// Called only before publication/workers, after restoring native slots and
+    /// their primary eligibility fence. Opens persisted runtime handles without
+    /// primary catalog writes, backfill, quarantine, or maintenance callbacks.
+    pub fn loadIndexesForCompletionRestore(self: *DBCore, scratch: Allocator) !void {
+        try self.index_manager.initializeCompletionCatalog(scratch, self.store);
+    }
+
     pub fn loadIndexesNoBackfill(self: *DBCore) !void {
         try self.index_manager.loadNoBackfill(self.store);
     }
@@ -1421,8 +1440,8 @@ pub const DBCore = struct {
         return self.commitPreparedSchemaMetadataMode(prepared, metadata_writes, metadata_deletes, reconciled_row_count, false);
     }
 
-    /// Rehydrate an exact durable schema without inventing a mutation (or an HA
-    /// outbox entry). A false result requires the ordinary authorized write path.
+    /// Reinstall an exact durable schema without inventing a mutation. A
+    /// changed descriptor must use the authorized schema-update path.
     pub fn rehydratePreparedSchemaMetadata(
         self: *DBCore,
         prepared: *PreparedSchemaMetadata,
@@ -1443,6 +1462,11 @@ pub const DBCore = struct {
         reconciled_row_count: ?u64,
         rehydrate_only: bool,
     ) !bool {
+        // An exact rehydration writes nothing. Mutable schema publication
+        // retains the transition guard through every preflight and save.
+        var completion_transition: ?@import("completion_eligibility.zig").Fence.Transition =
+            if (rehydrate_only) null else try self.completion_eligibility.beginTransition();
+        defer if (completion_transition) |*guard| guard.deinit();
         if (prepared.combined_writes.len != metadata_writes.len + 1)
             return error.InvalidSchemaUpdateRequest;
         try relational_index_catalog_mod.Controller.validateExtraMetadata(metadata_writes, metadata_deletes);
@@ -1506,25 +1530,21 @@ pub const DBCore = struct {
         const candidate_catalog_data = next_catalog.encode();
         if (!std.mem.eql(u8, &previous_catalog_data, &candidate_catalog_data))
             next_catalog.generation +|= 1;
-        const catalog_data = next_catalog.encode();
+        var catalog_buffer: [table_catalog_mod.encoded_len]u8 = undefined;
+        const catalog_data = next_catalog.encodeForPersistence(&catalog_buffer);
         @memcpy(prepared.combined_writes[0..metadata_writes.len], metadata_writes);
-        prepared.combined_writes[metadata_writes.len] = .{ .key = table_catalog_mod.key, .value = &catalog_data };
+        prepared.combined_writes[metadata_writes.len] = .{ .key = table_catalog_mod.key, .value = catalog_data };
         const Participants = struct {
             prepared: *PreparedSchemaMetadata,
             row_count: u64,
             namespace: doc_identity.Namespace,
 
             pub fn stage(participants: @This(), txn: anytype) !void {
-                // A retained source uses the immutable layouts/validator set
-                // captured at admission. Schema changes must wait for its
-                // terminal receipt; exact rehydration uses stageChanges and
-                // remains possible after restart without reopening DDL.
                 var source_namespace: [24]u8 = undefined;
                 doc_identity.encodeNamespace(&source_namespace, participants.namespace);
                 try @import("../source_pin_state.zig").requireNoPrepared(txn, source_namespace);
                 if (try @import("../retained_effects.zig").load(txn)) |retention| {
-                    if (retention.active() and std.mem.eql(u8, &retention.namespace, &source_namespace))
-                        return error.IntegrityTopologyBusy;
+                    if (retention.active() and std.mem.eql(u8, &retention.namespace, &source_namespace)) return error.IntegrityTopologyBusy;
                 }
                 try @import("relational_integrity_topology.zig").requireUnfenced(txn);
                 try @import("online_integrity_shadow.zig").requireCatalogMutable(txn);
@@ -1535,18 +1555,12 @@ pub const DBCore = struct {
                 if (participants.prepared.relational_indexes) |*indexes| _ = try indexes.metadata.stage(txn);
                 if (participants.prepared.integrity_catalog) |*catalog| {
                     const retirement_mod = @import("relational_integrity_retirement.zig");
-                    // Reopening the exact durable catalog is not DDL. Keep
-                    // the retirement proof intact so its worker can resume;
-                    // only a changed catalog may consume a ready target proof.
-                    // catalog.stage below still verifies the exact CAS base.
                     if (catalog.changed) if (try retirement_mod.current(txn)) |retirement| {
                         if (retirement.phase != .ready or !std.mem.eql(u8, &retirement.target_schema_digest, &catalog.catalog.schema_digest)) return error.ConstraintRetirementInProgress;
                         for (retirement.generations) |generation| {
                             const binding = catalog.catalog.findGeneration(generation) orelse return error.IntegrityCatalogChanged;
                             if (!binding.retired) return error.ConstraintRetirementRequired;
                         }
-                        // Consume only inside the atomic schema/catalog/outbox
-                        // transaction. Failed publication leaves admission shut.
                         try txn.delete(retirement_mod.key);
                     };
                     if (try doc_identity.loadNamespaceTxn(txn)) |stored| {
@@ -1572,10 +1586,10 @@ pub const DBCore = struct {
             participants,
         );
         if (rehydrate_only and !unchanged) return error.SchemaMetadataChanged;
+        if (unchanged) return false;
         // The current resident epoch and index snapshot were fenced above and
         // already describe these exact bytes. Keep their identities stable so
         // reopening/configuring an owner does not invalidate prepared writes.
-        if (unchanged) return false;
         const changed = try schema_mod.saveEncodedSchemaWithMetadataAndStage(
             self.store,
             self.alloc,
@@ -1721,8 +1735,9 @@ pub const DBCore = struct {
         var next = self.table_catalog;
         next.index_state = state;
         next.generation +|= 1;
-        const encoded = next.encode();
-        try self.store.putBatch(&.{.{ .key = table_catalog_mod.key, .value = &encoded }}, &.{});
+        var buffer: [table_catalog_mod.encoded_len]u8 = undefined;
+        const encoded = next.encodeForPersistence(&buffer);
+        try self.store.putBatch(&.{.{ .key = table_catalog_mod.key, .value = encoded }}, &.{});
         self.table_catalog = next;
     }
 
@@ -2066,8 +2081,42 @@ pub const DBCore = struct {
         }
     }
 
+    /// Local startup policy affects only accepting new transaction obligations,
+    /// never ordinary table opens/reads and never retirement of existing debt.
+    pub fn validateTransactionCompletionPolicy(self: *DBCore) !void {
+        const active = self.table_catalog.transaction_recovery_max_count != 0;
+        const workspace = if (self.index_manager.resource_manager) |manager| manager.transactionCompletion() else null;
+        if (workspace == null) {
+            if (active) return error.TransactionCompletionPolicyRequired;
+            return;
+        }
+        if (!active)
+            return error.TransactionCompletionPolicyRequired;
+        const required = std.math.add(u64, self.table_catalog.transaction_admission_bytes, 64 * 1024) catch
+            return error.TransactionCompletionCapacityMismatch;
+        if (workspace.?.capacity < required) return error.TransactionCompletionCapacityMismatch;
+    }
+
     pub fn initTxnManager(self: *DBCore) !transactions_mod.TxnManager {
-        return try transactions_mod.TxnManager.init(self.alloc, self.store);
+        var manager = try transactions_mod.TxnManager.init(self.alloc, self.store);
+        manager.completion_limits = .{
+            .max_transaction_bytes = if (self.table_catalog.transaction_recovery_max_count != 0) self.table_catalog.transaction_admission_bytes else 0,
+            .max_count = self.table_catalog.transaction_recovery_max_count,
+            .max_bytes = self.table_catalog.transaction_recovery_max_bytes,
+        };
+        return manager;
+    }
+
+    fn initTxnManagerForAdmission(self: *DBCore, txn_id: transactions_mod.TxnId) !transactions_mod.TxnManager {
+        var manager = try self.initTxnManager();
+        errdefer manager.deinit();
+        // Retrying an existing obligation must not reinterpret a local
+        // configuration change as a transaction rollback.
+        if (manager.getTransactionStatus(txn_id)) |_| {} else |err| switch (err) {
+            transactions_mod.TxnError.TxnNotFound => try self.validateTransactionCompletionPolicy(),
+            else => return err,
+        }
+        return manager;
     }
 
     pub fn beginTransactionWithParticipants(
@@ -2086,7 +2135,7 @@ pub const DBCore = struct {
         created_at_ns: u64,
         participants: []const []const u8,
     ) !transactions_mod.TxnId {
-        var manager = try self.initTxnManager();
+        var manager = try self.initTxnManagerForAdmission(txn_id);
         defer manager.deinit();
         try manager.initTransactionWithParticipantsCreatedAt(txn_id, timestamp_ns, created_at_ns, participants);
         return txn_id;
@@ -2119,7 +2168,7 @@ pub const DBCore = struct {
         coordinator: bool,
         retain_terminal: bool,
     ) !transactions_mod.TxnId {
-        var manager = try self.initTxnManager();
+        var manager = try self.initTxnManagerForAdmission(txn_id);
         defer manager.deinit();
         try manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(
             txn_id,
@@ -2142,7 +2191,7 @@ pub const DBCore = struct {
         retain_terminal: bool,
         extra_batch: transactions_mod.MutationExtraBatch,
     ) !transactions_mod.TxnId {
-        var manager = try self.initTxnManager();
+        var manager = try self.initTxnManagerForAdmission(txn_id);
         defer manager.deinit();
         try manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(
             txn_id,
@@ -2174,6 +2223,13 @@ pub const DBCore = struct {
     ) !void {
         var manager = try transactions_mod.TxnManager.init(extra_batch.preparation_allocator orelse self.alloc, self.store);
         defer manager.deinit();
+        manager.completion_limits = .{
+            .max_transaction_bytes = if (self.table_catalog.transaction_recovery_max_count != 0) self.table_catalog.transaction_admission_bytes else 0,
+            .max_count = self.table_catalog.transaction_recovery_max_count,
+            .max_bytes = self.table_catalog.transaction_recovery_max_bytes,
+        };
+        if (try manager.getTransactionStatus(txn_id) == .pending)
+            try self.validateTransactionCompletionPolicy();
         var bound = extra_batch;
         if (bound.max_intent_admission_bytes == 0)
             bound.max_intent_admission_bytes = self.table_catalog.transaction_admission_bytes;
@@ -2222,13 +2278,18 @@ pub const DBCore = struct {
         commit_version: u64,
         extra_batch: transactions_mod.ResolutionExtraBatch,
     ) !transactions_mod.ResolutionOutcome {
-        var manager = try self.initTxnManager();
+        var manager = try transactions_mod.TxnManager.init(extra_batch.preparation_allocator orelse self.alloc, self.store);
+        manager.completion_limits = .{
+            .max_transaction_bytes = if (self.table_catalog.transaction_recovery_max_count != 0) self.table_catalog.transaction_admission_bytes else 0,
+            .max_count = self.table_catalog.transaction_recovery_max_count,
+            .max_bytes = self.table_catalog.transaction_recovery_max_bytes,
+        };
         defer manager.deinit();
         return try manager.resolveIntentsWithExtraBatch(txn_id, status, commit_version, extra_batch);
     }
 
     pub fn collectTransactionIntentBatch(self: *DBCore, alloc: Allocator, txn_id: transactions_mod.TxnId) !transactions_mod.IntentBatch {
-        var manager = try self.initTxnManager();
+        var manager = try transactions_mod.TxnManager.init(alloc, self.store);
         defer manager.deinit();
         return try manager.collectIntentBatch(alloc, txn_id);
     }

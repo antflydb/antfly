@@ -451,6 +451,50 @@ pub fn encodeJournalFrameAlloc(allocator: std.mem.Allocator, sequence: u64, chec
     return try out.toOwnedSlice(allocator);
 }
 
+/// Exact v11 non-checkpoint edit containing one run and no removals. This
+/// excludes geometric temporary buffers from protected publication accounting.
+pub fn singleRunJournalFrameSize(path_bytes: usize, first_bound_bytes: usize, last_bound_bytes: usize) !usize {
+    comptime {
+        if (version != 11 or journal_header_len != 24) @compileError("update exact completion manifest framing");
+    }
+    // Outer header/checksum 28, removal counts 8, manifest header/checksum 32,
+    // and one fixed run header 112.
+    return std.math.add(usize, 180, try std.math.add(usize, path_bytes, try std.math.add(usize, first_bound_bytes, last_bound_bytes)));
+}
+
+pub fn encodeSingleRunJournalFrameAlloc(allocator: std.mem.Allocator, sequence: u64, next_run_id: u64, run: RunMeta) ![]u8 {
+    const fields = [_][]const u8{ run.path, run.smallest_namespace_name orelse "", run.smallest_key, run.largest_namespace_name orelse "", run.largest_key };
+    for (fields) |field| if (field.len > std.math.maxInt(u32)) return error.InvalidManifest;
+    const size = try singleRunJournalFrameSize(fields[0].len, try std.math.add(usize, fields[1].len, fields[2].len), try std.math.add(usize, fields[3].len, fields[4].len));
+    const bytes = try allocator.alloc(u8, size);
+    var offset: usize = 0;
+    putInt(u64, bytes, &offset, size - journal_header_len - checksum_len);
+    putInt(u64, bytes, &offset, sequence);
+    putInt(u32, bytes, &offset, 0);
+    putInt(u32, bytes, &offset, Crc32.hash(bytes[0..offset]));
+    const body_start = offset;
+    putInt(u32, bytes, &offset, 0);
+    putInt(u32, bytes, &offset, 0);
+    const manifest_start = offset;
+    @memcpy(bytes[offset..][0..magic.len], magic);
+    offset += magic.len;
+    putInt(u32, bytes, &offset, version);
+    putInt(u64, bytes, &offset, next_run_id);
+    putInt(u32, bytes, &offset, 1);
+    putInt(u32, bytes, &offset, 0);
+    const header = runHeader(run);
+    @memcpy(bytes[offset..][0..header.len], &header);
+    offset += header.len;
+    for (fields) |field| {
+        @memcpy(bytes[offset..][0..field.len], field);
+        offset += field.len;
+    }
+    putInt(u32, bytes, &offset, Crc32.hash(bytes[manifest_start..offset]));
+    putInt(u32, bytes, &offset, Crc32.hash(bytes[body_start..offset]));
+    std.debug.assert(offset == bytes.len);
+    return bytes;
+}
+
 fn decodeJournalBorrowed(allocator: std.mem.Allocator, raw: []u8) !BorrowedManifest {
     var runs: std.AutoHashMapUnmanaged(u64, BorrowedRunMeta) = .empty;
     defer runs.deinit(allocator);
@@ -862,4 +906,20 @@ test "manifest codec rejects plausible checksummed run metadata corruption" {
         error.InvalidManifest,
         decodeAlloc(std.testing.allocator, encoded),
     );
+}
+
+test "completion exact manifest frame preserves generic bytes and one allocation" {
+    const alloc = std.testing.allocator;
+    var key: [40000]u8 = @splat(0xff);
+    key[0] = 0;
+    for ([_]u64{ 0, 1, std.math.maxInt(u64) }, 0..) |sequence, i| {
+        const run: RunMeta = .{ .id = 42, .level = @intCast(i), .size_bytes = 123456, .path = "runs/42.tbl", .smallest_namespace_name = if (i == 0) null else "ns\x00\xff", .smallest_key = &key, .largest_namespace_name = if (i == 0) null else "", .largest_key = "z\x00", .entry_count = 5, .tombstone_count = 2, .visibility_id = 41, .oldest_tombstone_unix_ns = 123, .gc_requested = true };
+        const expected = try encodeJournalFrameAlloc(alloc, sequence, false, &.{}, &.{}, .{ .next_run_id = 43, .runs = &.{run} });
+        defer alloc.free(expected);
+        var counted = std.testing.FailingAllocator.init(alloc, .{});
+        const actual = try encodeSingleRunJournalFrameAlloc(counted.allocator(), sequence, 43, run);
+        defer counted.allocator().free(actual);
+        try std.testing.expectEqual(@as(usize, 1), counted.alloc_index);
+        try std.testing.expectEqualSlices(u8, expected, actual);
+    }
 }

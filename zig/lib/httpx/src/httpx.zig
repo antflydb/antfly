@@ -212,11 +212,15 @@ pub const PoolStats = pool.PoolStats;
 
 pub const Server = server_mod.Server;
 pub const ListenerTask = server_mod.Server.ListenerTask;
+pub const RequestDispatchView = server_mod.RequestDispatchView;
+pub const RequestTaskLane = server_mod.RequestTaskLane;
+pub const RequestDispatchConfig = server_mod.RequestDispatchConfig;
 pub const ServerConfig = server_mod.ServerConfig;
 pub const H1DisconnectCancellation = server_mod.H1DisconnectCancellation;
 pub const H1DisconnectProbe = server_mod.H1DisconnectProbe;
 pub const HttpRuntime = http_runtime.HttpRuntime;
 pub const SharedBodyBudget = @import("protocol/body_budget.zig").SharedBodyBudget;
+pub const ensureBodyBufferCapacityPrecise = @import("protocol/body_budget.zig").ensureBufferCapacityPrecise;
 pub const Context = server_mod.Context;
 pub const Handler = server_mod.Handler;
 pub const RouteParam = router.RouteParam;

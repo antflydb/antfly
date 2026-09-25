@@ -9838,10 +9838,12 @@ export interface components {
             offset?: number;
             /**
              * @description Optional query execution deadline in milliseconds. The server applies this as a
-             *     cooperative deadline across query planning, search execution, aggregation reruns,
+             *     cooperative deadline across admission waiting, query planning, search execution, aggregation reruns,
              *     sorting, and response post-processing. If the deadline expires before the query
              *     completes, the HTTP API returns 504. When omitted, semantic query embedding planning
              *     and provider I/O use a 30-second default deadline.
+             *     NDJSON batches share their submission time and use the shortest explicit timeout
+             *     in the batch. Waiting, retries, and later batch lines do not reset this budget.
              * @example 5000
              */
             timeout_ms?: number;

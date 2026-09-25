@@ -127,6 +127,10 @@ pub const NamespaceReadTxn = struct {
     /// after the transaction was created; storage backends remain unaware of
     /// its meaning.
     cache_fill_epoch: ?u64 = null,
+    /// Adapter-owned execution context borrowed only until this transaction
+    /// aborts. It does not transfer ownership, may not escape to results or
+    /// asynchronous work, and must outlive the uniquely-owned transaction.
+    execution_context: ?*anyopaque = null,
 
     pub const VTable = struct {
         abort: *const fn (Allocator, *anyopaque) void,
@@ -136,6 +140,7 @@ pub const NamespaceReadTxn = struct {
     };
 
     pub fn abort(self: *NamespaceReadTxn) void {
+        self.execution_context = null;
         const read_lease = self.read_lease;
         const value_lease = self.value_lease;
         self.vtable.abort(self.allocator, self.ptr);

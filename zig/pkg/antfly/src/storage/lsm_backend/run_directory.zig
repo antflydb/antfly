@@ -19,6 +19,7 @@ const std = @import("std");
 const repository = @import("repository.zig");
 const state = @import("state.zig");
 const Account = @import("memory_account.zig").Account;
+const completion_allocation = @import("completion_allocator.zig");
 const Run = repository.Run;
 const generation_index = @import("generation_index.zig");
 
@@ -106,6 +107,7 @@ test "directory accounting token charges selected payloads without pinning unrel
 }
 
 const Payload = struct {
+    allocation_allocator: std.mem.Allocator,
     refs: std.atomic.Value(usize) = .init(1),
     run: Run,
     owner: *anyopaque,
@@ -141,13 +143,13 @@ const Entry = struct {
         _ = self.payload.?.refs.fetchAdd(1, .monotonic);
         return self;
     }
-    pub fn deinit(self: Entry, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: Entry, _: std.mem.Allocator) void {
         const payload = self.payload orelse return;
         if (payload.refs.fetchSub(1, .acq_rel) != 1) return;
         payload.release_pin(payload.owner, &payload.run);
-        payload.run.deinit(allocator);
+        payload.run.deinit(payload.allocation_allocator);
         payload.account.discharge(payload.bytes);
-        allocator.destroy(payload);
+        payload.allocation_allocator.destroy(payload);
     }
     pub fn retainedBytes(_: Entry) usize {
         return 0;
@@ -245,6 +247,7 @@ pub const Directory = struct {
     const BoundsTree = @import("ordered_index.zig").SummarizedIndex(Entry, compareBounds, BoundsSummary);
     const EndsTree = @import("ordered_index.zig").SummarizedIndex(Entry, compareEnds, void);
     const LevelTree = @import("ordered_index.zig").Index(LevelAggregate, compareLevel);
+    allocation_allocator: std.mem.Allocator,
     tree: Tree = .{},
     ids: IdTree = .{},
     bounds: BoundsTree = .{},
@@ -257,8 +260,27 @@ pub const Directory = struct {
 
     pub fn create(allocator: std.mem.Allocator) !*Directory {
         const self = try allocator.create(Directory);
-        self.* = .{};
+        self.* = .{ .allocation_allocator = allocator };
         return self;
+    }
+
+    /// Maintenance emits level-one disk runs, so generation indexing stays
+    /// empty. The durable fork shares payloads and allocates only its header.
+    pub fn freshAllocationBound(count_: usize, bound_bytes: usize, path_bytes: usize) !usize {
+        const footprint = completion_allocation.RecyclingScratch.allocationFootprint;
+        var bytes = try std.math.mul(usize, 2, try footprint(@sizeOf(Directory), @alignOf(Directory)));
+        inline for (.{ Tree, IdTree, BoundsTree, EndsTree, LevelTree }) |Index|
+            bytes = try std.math.add(usize, bytes, try Index.sequentialAllocationBound(count_, count_));
+        const bounds = try std.math.mul(usize, 2, try std.math.add(usize, try footprint(bound_bytes, 1), try footprint(0, 1)));
+        const per_run = try std.math.add(usize, try footprint(@sizeOf(Payload), @alignOf(Payload)), try std.math.add(usize, bounds, try footprint(path_bytes, 1)));
+        return std.math.add(usize, bytes, try std.math.mul(usize, count_, per_run));
+    }
+
+    pub fn singleInsertAllocationBound(max_count: usize, bound_bytes: usize, path_bytes: usize) !usize {
+        var bytes = try freshAllocationBound(1, bound_bytes, path_bytes);
+        inline for (.{ Tree, IdTree, BoundsTree, EndsTree, LevelTree, generation_index.Tree }) |Index|
+            bytes = try std.math.add(usize, bytes, try Index.sequentialAllocationBound(max_count, 1));
+        return bytes;
     }
     pub fn fork(self: *const Directory, allocator: std.mem.Allocator) !*Directory {
         const out = try create(allocator);
@@ -274,7 +296,7 @@ pub const Directory = struct {
     }
     pub fn destroy(self: *Directory, allocator: std.mem.Allocator) void {
         self.destroyContents(allocator);
-        allocator.destroy(self);
+        self.allocation_allocator.destroy(self);
     }
 
     pub const Reclaimer = struct {
@@ -294,9 +316,9 @@ pub const Directory = struct {
             return self.tree.step(allocator, credits) and self.ids.step(allocator, credits) and self.bounds.step(allocator, credits) and self.ends.step(allocator, credits) and self.levels.step(allocator, credits) and self.generations.step(allocator, credits);
         }
         /// Only after step reports completion, back under the accounting lock.
-        pub fn finish(self: *@This(), allocator: std.mem.Allocator) void {
+        pub fn finish(self: *@This(), _: std.mem.Allocator) void {
             self.directory.releaseAccounting();
-            allocator.destroy(self.directory);
+            self.directory.allocation_allocator.destroy(self.directory);
         }
     };
 
@@ -394,9 +416,10 @@ pub const Directory = struct {
         if (owned.smallest_namespace_name) |name| bytes += name.len;
         if (owned.largest_namespace_name) |name| bytes += name.len;
         if (owned.state) |*present| bytes += @intCast(present.estimatedMemoryBytes());
+        if (completion_allocation.isPrepaid(allocator)) bytes = 0;
         const account = self.tree.account.?;
         account.charge(bytes);
-        payload.* = .{ .run = owned, .owner = @ptrCast(backend), .release_pin = release, .account = account, .bytes = bytes };
+        payload.* = .{ .allocation_allocator = allocator, .run = owned, .owner = @ptrCast(backend), .release_pin = release, .account = account, .bytes = bytes };
         const domain = if (comptime @hasField(@TypeOf(backend.*), "options")) blk: {
             if (comptime @hasField(@TypeOf(backend.options), "run_partition_key")) {
                 if (backend.options.run_partition_key) |partition| break :blk partition(payload.run.smallest_key);
@@ -807,8 +830,13 @@ pub const Directory = struct {
         }
         return runs;
     }
+    fn ordinarySpareBytes(index: anytype) u64 {
+        if (index.spare_allocator) |allocator| if (completion_allocation.isPrepaid(allocator)) return 0;
+        return index.spare.capacity * @sizeOf(*Tree.Node);
+    }
     pub fn accountedMemoryBytes(self: *const Directory, pass: u64) u64 {
-        return @sizeOf(Directory) + (self.tree.spare.capacity + self.ids.spare.capacity + self.bounds.spare.capacity + self.ends.spare.capacity + self.levels.spare.capacity + self.generations.spare.capacity) * @sizeOf(*Tree.Node) +
+        const header_bytes: u64 = if (completion_allocation.isPrepaid(self.allocation_allocator)) 0 else @sizeOf(Directory);
+        return header_bytes + ordinarySpareBytes(self.tree) + ordinarySpareBytes(self.ids) + ordinarySpareBytes(self.bounds) + ordinarySpareBytes(self.ends) + ordinarySpareBytes(self.levels) + ordinarySpareBytes(self.generations) +
             (if (self.generations.account) |account| account.chargeOnce(pass) else 0) +
             (if (self.tree.account) |account| account.chargeOnce(pass) else 0) +
             (if (self.ids.account) |account| account.chargeOnce(pass) else 0) +
@@ -1140,4 +1168,44 @@ test "run directory path copies preserve pinned epochs through inserts removals 
     for (remaining) |*run| try candidate.remove(allocator, run);
     try std.testing.expectEqual(@as(usize, 0), candidate.count());
     try std.testing.expectEqual(baseline_pins, backend.pins);
+}
+
+test "run directory preserves prepaid allocation domains through ordinary replacement and sliced retirement" {
+    const Fixture = struct {
+        allocator: std.mem.Allocator,
+        pins: usize = 0,
+        pub fn retainRunSnapshotRef(self: *@This(), _: *Run) !void {
+            self.pins += 1;
+        }
+        pub fn releaseRunSnapshotRef(self: *@This(), _: *Run) void {
+            self.pins -= 1;
+        }
+    };
+    var prepaid = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var ordinary = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const reserved_alloc = prepaid.allocator();
+    const ordinary_alloc = ordinary.allocator();
+    var backend: Fixture = .{ .allocator = reserved_alloc };
+    const original = try Directory.create(reserved_alloc);
+    const run: Run = .{ .id = 1, .level = 1, .size_bytes = 1, .path = @constCast("reserved.sst"), .smallest_namespace_name = null, .smallest_key = @constCast("a"), .largest_namespace_name = null, .largest_key = @constCast("z"), .entry_count = 1, .bloom_filter = null, .state = null };
+    try original.put(&backend, run);
+    const pinned = original.at(0).retain();
+    const next = try original.fork(ordinary_alloc);
+    backend.allocator = ordinary_alloc;
+    var changed = run;
+    changed.largest_key = @constCast("zz");
+    try next.put(&backend, changed);
+    try std.testing.expectEqualStrings("zz", next.at(0).run.largest_key);
+    next.destroy(ordinary_alloc);
+    var retired = Directory.Reclaimer.init(original);
+    var credits: usize = 1;
+    while (!retired.step(ordinary_alloc, &credits)) credits = 1;
+    retired.finish(ordinary_alloc);
+    try std.testing.expectEqual(@as(usize, 1), backend.pins);
+    try std.testing.expect(prepaid.freed_bytes < prepaid.allocated_bytes);
+    try std.testing.expectEqualStrings("z", pinned.run.largest_key);
+    pinned.release(ordinary_alloc);
+    try std.testing.expectEqual(@as(usize, 0), backend.pins);
+    try std.testing.expectEqual(prepaid.allocated_bytes, prepaid.freed_bytes);
+    try std.testing.expectEqual(ordinary.allocated_bytes, ordinary.freed_bytes);
 }

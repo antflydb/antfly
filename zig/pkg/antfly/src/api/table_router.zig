@@ -70,6 +70,9 @@ pub const HostedGroupRouter = struct {
         node_status: ?*const fn (ptr: *anyopaque, node_id: u64, group_id: u64) raft_host.HostedReplicaStatus = null,
         node_base_uri: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, node_id: u64) anyerror!?[]u8,
         node_base_uri_for_group: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, node_id: u64, budget: RouteBudget) anyerror!?[]u8 = null,
+        /// Only authenticated control/recovery RPCs may use this endpoint.
+        /// Old routers omit it and continue through the public group URL.
+        node_control_base_uri_for_group: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, node_id: u64, budget: RouteBudget) anyerror!?[]u8 = null,
         /// Resolve a fanout from one routing snapshot. Metadata-backed routers
         /// use this to avoid copying and rescanning the full catalog once per
         /// shard; generic routers retain the scalar fallback below.
@@ -120,6 +123,12 @@ pub const HostedGroupRouter = struct {
         try self.budget.check();
         if (self.vtable.node_base_uri_for_group) |fn_ptr| return try fn_ptr(self.ptr, alloc, group_id, node_id, self.budget);
         return try self.nodeBaseUri(alloc, node_id);
+    }
+
+    pub fn nodeControlBaseUriForGroup(self: HostedGroupRouter, alloc: std.mem.Allocator, group_id: u64, node_id: u64) !?[]u8 {
+        try self.budget.check();
+        if (self.vtable.node_control_base_uri_for_group) |fn_ptr| return try fn_ptr(self.ptr, alloc, group_id, node_id, self.budget);
+        return try self.nodeBaseUriForGroup(alloc, group_id, node_id);
     }
 
     pub fn fromManagedHttpHost(host: *raft_managed_host.ManagedHttpHost) HostedGroupRouter {
@@ -174,6 +183,7 @@ pub const CatalogBackedGroupRouter = struct {
                 .node_status = catalogBackedRouterNodeStatus,
                 .node_base_uri = catalogBackedRouterNodeBaseUri,
                 .node_base_uri_for_group = catalogBackedRouterNodeBaseUriForGroup,
+                .node_control_base_uri_for_group = catalogBackedRouterNodeControlBaseUriForGroup,
             },
         };
     }
@@ -402,6 +412,16 @@ fn catalogBackedRouterNodeBaseUriForGroup(ptr: *anyopaque, alloc: std.mem.Alloca
     const store = storeForNode(snapshot.stores, node_id) orelse return null;
     if (!storeUsableForRemoteWrites(store)) return null;
     return try alloc.dupe(u8, store.api_url);
+}
+
+fn catalogBackedRouterNodeControlBaseUriForGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, node_id: u64, _: RouteBudget) !?[]u8 {
+    const router: *CatalogBackedGroupRouter = @ptrCast(@alignCast(ptr));
+    var snapshot = try router.catalog.adminSnapshot();
+    defer router.catalog.freeAdminSnapshot(&snapshot);
+    if (!nodeHasReadableGroupPlacement(snapshot.placement_intents, group_id, node_id)) return null;
+    const store = storeForNode(snapshot.stores, node_id) orelse return null;
+    if (!storeUsableForRemoteWrites(store)) return null;
+    return try alloc.dupe(u8, if (store.internal_api_url.len != 0) store.internal_api_url else store.api_url);
 }
 
 fn groupLeaderStoreId(statuses: []const metadata_reconciler.MergedGroupStatus, group_id: u64) ?u64 {
@@ -691,7 +711,7 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 4), state.batch_calls);
         }
 
-        test "catalog backed router routes metadata-owned writes to placement leader api url" {
+        test "hosted participant catalog router keeps public writes and uses internal control endpoint" {
             const FakeCatalog = struct {
                 fn iface() table_catalog.CatalogSource {
                     return .{
@@ -710,7 +730,7 @@ fn consumerTests() type {
                         .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
                         .stores = @constCast((&[_]metadata_table_manager.StoreRecord{
                             .{ .store_id = 10, .node_id = 1, .api_url = "http://node-1", .role = "data", .health_class = "healthy", .live = true },
-                            .{ .store_id = 20, .node_id = 2, .api_url = "http://node-2", .role = "data", .health_class = "healthy", .live = true },
+                            .{ .store_id = 20, .node_id = 2, .api_url = "http://node-2", .internal_api_url = "http://node-2-internal", .role = "data", .health_class = "healthy", .live = true },
                         })[0..]),
                         .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{
                             .{ .store_id = 10, .record = .{ .group_id = 77, .replica_id = 1, .local_node_id = 1 } },
@@ -737,6 +757,13 @@ fn consumerTests() type {
                     try std.testing.expectEqualStrings("http://node-2", remote.base_uri);
                 },
             }
+            const control_uri = (try catalog_router.router().nodeControlBaseUriForGroup(std.testing.allocator, 77, 2)).?;
+            defer std.testing.allocator.free(control_uri);
+            try std.testing.expectEqualStrings("http://node-2-internal", control_uri);
+            const legacy_control_uri = (try catalog_router.router().nodeControlBaseUriForGroup(std.testing.allocator, 77, 1)).?;
+            defer std.testing.allocator.free(legacy_control_uri);
+            try std.testing.expectEqualStrings("http://node-1", legacy_control_uri);
+            try std.testing.expect((try catalog_router.router().nodeControlBaseUriForGroup(std.testing.allocator, 78, 2)) == null);
         }
 
         test "catalog backed router skips non-serving relocation placements" {

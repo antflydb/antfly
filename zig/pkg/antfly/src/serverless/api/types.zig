@@ -766,6 +766,9 @@ pub const MetricsNamespace = struct {
 };
 
 pub const MetricsResult = struct {
+    read_execution: @import("../../storage/dense_execution.zig").Stats = .{},
+    query_admission: ?@import("../../common/workload_admission.zig").Controller.Stats = null,
+    write_admission: ?@import("../../common/workload_admission.zig").Controller.Stats = null,
     live: bool,
     ready: bool,
     validated: bool,

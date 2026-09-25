@@ -187,6 +187,10 @@ pub fn runFromIterator(
         .enrichment_enabled = cli.enrichment_enabled orelse try parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_ENRICHMENT_ENABLED", true),
         .remote_content = if (remote_content) |*cfg| cfg else null,
         .query_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.query.max_concurrent_requests else antfly.common.config.default_query_max_concurrent_requests,
+        .query_admission_waiting = if (loaded_config) |*cfg| cfg.admission.query.waiting else .{},
+        .write_admission_waiting = if (loaded_config) |*cfg| cfg.admission.write.waiting else .{},
+        .ingress_admission = if (loaded_config) |*cfg| cfg.admission.ingress else .{},
+        .read_execution = if (loaded_config) |*cfg| cfg.admission.read_execution else .{},
         .graph_execution_limits = if (loaded_config) |*cfg| cfg.graph_execution else .{},
         .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
         .graph_metric_max_parallelism = cli.graph_metric_max_parallelism orelse try parseEnvIntOrDefault(
@@ -237,6 +241,7 @@ pub fn runFromIterator(
         srv.httpRuntime(),
     );
     defer if (health_server) |hs| hs.deinitWithDeadline(supervisor.deadline());
+    if (health_server) |hs| try hs.configureMetricsInterval(if (loaded_config) |*cfg| cfg.health_metrics_interval_ms else 5000);
 
     try supervisor.publishReady();
     while (!supervisor.shouldStop(termination_signals.cancellationRequested())) {

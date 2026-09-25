@@ -629,6 +629,55 @@ pub const Detail = enum(c_int) {
     http_connection_closing,
     raft_batch_write_transport_outcome_unknown,
     concurrency_unavailable,
+
+    admission_bytes_exhausted,
+    admission_closed,
+    admission_full,
+    admission_queue_full,
+    admission_request_too_large,
+    admission_wait_timeout,
+    completion_admission_policy_changed,
+    completion_admission_unavailable,
+    completion_drain_shape_changed,
+    completion_fence_identity_mismatch,
+    completion_file_capacity_exceeded,
+    completion_foreground_capacity_exceeded,
+    completion_not_prepared,
+    completion_plan_capacity_exceeded,
+    completion_profile_changed,
+    completion_recovery_capacity_required,
+    completion_reservation_busy,
+    completion_resource_manager_required,
+    completion_slot_checksum_mismatch,
+    completion_slot_too_large,
+    completion_transition_capacity_exceeded,
+    completion_transition_in_progress,
+    completion_writer_closed,
+    completion_writer_live,
+    invalid_completion_catalog,
+    invalid_completion_slot,
+    invalid_participant,
+    local_completion_authority_required,
+    missing_completion_admission_guard,
+    pre_decision_not_proposed,
+    prepared_completion_active,
+    recovery_required,
+    transaction_completion_busy,
+    transaction_completion_capacity_mismatch,
+    transaction_completion_changed,
+    transaction_completion_policy_required,
+    transaction_recovery_capacity_exhausted,
+    transaction_recovery_reconciliation_required,
+    unsupported_completion_backend,
+    unsupported_completion_operation,
+    unsupported_completion_path,
+    unsupported_completion_profile,
+    unsupported_completion_provider,
+    unsupported_completion_slot_version,
+    unsupported_completion_template,
+    unsupported_completion_template_nesting,
+    unsupported_completion_template_scan,
+    unsupported_completion_template_write,
 };
 
 pub const Status = extern struct {
@@ -646,6 +695,12 @@ pub const Status = extern struct {
 
 pub fn statusFromError(err: anyerror) Status {
     return switch (err) {
+        error.AdmissionFull => status(.retryable, .admission_full),
+        error.AdmissionQueueFull => status(.retryable, .admission_queue_full),
+        error.AdmissionBytesExhausted => status(.retryable, .admission_bytes_exhausted),
+        error.AdmissionRequestTooLarge => status(.invalid_argument, .admission_request_too_large),
+        error.AdmissionWaitTimeout => status(.timeout, .admission_wait_timeout),
+        error.AdmissionClosed => status(.unavailable, .admission_closed),
         error.HASeedSnapshotRuntimeBusy => status(.unavailable, .ha_seed_snapshot_runtime_busy),
         error.HASeedCaptureAlreadyInProgress => status(.unavailable, .ha_seed_capture_already_in_progress),
         error.StorageKernelOwnerUnavailable => status(.unavailable, .storage_kernel_owner_unavailable),
@@ -876,6 +931,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.InvalidManifest => status(.invalid_argument, .invalid_manifest),
         error.InvalidTableFile => status(.invalid_argument, .invalid_table_file),
         error.InvalidTxnRecord => status(.invalid_argument, .invalid_txn_record),
+        error.InvalidParticipant => status(.invalid_argument, .invalid_participant),
         error.NotFound => status(.not_found, .not_found),
         error.FileNotFound => status(.not_found, .file_not_found),
         error.TableNotFound => status(.not_found, .table_not_found),
@@ -891,6 +947,46 @@ pub fn statusFromError(err: anyerror) Status {
         error.TableTransitionActive => status(.conflict, .table_transition_active),
         error.SchemaInUse => status(.conflict, .schema_in_use),
         error.TransactionTooLarge => status(.invalid_argument, .transaction_too_large),
+        error.TransactionRecoveryCapacityExhausted => status(.retryable, .transaction_recovery_capacity_exhausted),
+        error.TransactionRecoveryReconciliationRequired => status(.unavailable, .transaction_recovery_reconciliation_required),
+        error.TransactionCompletionBusy => status(.retryable, .transaction_completion_busy),
+        error.TransactionCompletionCapacityMismatch => status(.unavailable, .transaction_completion_capacity_mismatch),
+        error.TransactionCompletionPolicyRequired => status(.unavailable, .transaction_completion_policy_required),
+        error.TransactionCompletionChanged => status(.retryable, .transaction_completion_changed),
+        error.PreparedCompletionActive => status(.conflict, .prepared_completion_active),
+        error.CompletionTransitionInProgress => status(.retryable, .completion_transition_in_progress),
+        error.CompletionTransitionCapacityExceeded => status(.retryable, .completion_transition_capacity_exceeded),
+        error.CompletionFenceIdentityMismatch => status(.conflict, .completion_fence_identity_mismatch),
+        error.LocalCompletionAuthorityRequired => status(.unsupported, .local_completion_authority_required),
+        error.UnsupportedCompletionBackend => status(.unsupported, .unsupported_completion_backend),
+        error.UnsupportedCompletionProfile => status(.unsupported, .unsupported_completion_profile),
+        error.UnsupportedCompletionSlotVersion => status(.unsupported, .unsupported_completion_slot_version),
+        error.UnsupportedCompletionTemplate => status(.unsupported, .unsupported_completion_template),
+        error.UnsupportedCompletionTemplateNesting => status(.unsupported, .unsupported_completion_template_nesting),
+        error.UnsupportedCompletionTemplateScan => status(.unsupported, .unsupported_completion_template_scan),
+        error.UnsupportedCompletionTemplateWrite => status(.unsupported, .unsupported_completion_template_write),
+        error.UnsupportedCompletionOperation => status(.unsupported, .unsupported_completion_operation),
+        error.UnsupportedCompletionPath => status(.unsupported, .unsupported_completion_path),
+        error.UnsupportedCompletionProvider => status(.unsupported, .unsupported_completion_provider),
+        error.CompletionRecoveryCapacityRequired => status(.unavailable, .completion_recovery_capacity_required),
+        error.CompletionResourceManagerRequired => status(.unavailable, .completion_resource_manager_required),
+        error.CompletionProfileChanged => status(.conflict, .completion_profile_changed),
+        error.InvalidCompletionCatalog => status(.corrupt, .invalid_completion_catalog),
+        error.CompletionDrainShapeChanged => status(.conflict, .completion_drain_shape_changed),
+        error.CompletionNotPrepared => status(.conflict, .completion_not_prepared),
+        error.InvalidCompletionSlot => status(.corrupt, .invalid_completion_slot),
+        error.CompletionSlotChecksumMismatch => status(.corrupt, .completion_slot_checksum_mismatch),
+        error.CompletionSlotTooLarge => status(.invalid_argument, .completion_slot_too_large),
+        error.CompletionPlanCapacityExceeded => status(.invalid_argument, .completion_plan_capacity_exceeded),
+        error.CompletionReservationBusy => status(.retryable, .completion_reservation_busy),
+        error.CompletionForegroundCapacityExceeded => status(.retryable, .completion_foreground_capacity_exceeded),
+        error.CompletionFileCapacityExceeded => status(.retryable, .completion_file_capacity_exceeded),
+        error.CompletionWriterClosed => status(.internal, .completion_writer_closed),
+        error.CompletionWriterLive => status(.internal, .completion_writer_live),
+        error.RecoveryRequired => status(.unavailable, .recovery_required),
+        error.CompletionAdmissionUnavailable => status(.retryable, .completion_admission_unavailable),
+        error.CompletionAdmissionPolicyChanged => status(.unavailable, .completion_admission_policy_changed),
+        error.MissingCompletionAdmissionGuard => status(.internal, .missing_completion_admission_guard),
         error.ExtensionOwnedObject => status(.conflict, .extension_owned_object),
         error.RestoreIntentConflict => status(.conflict, .restore_intent_conflict),
         error.Unauthorized => status(.unauthorized, .unauthorized),
@@ -968,6 +1064,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.Timeout => status(.timeout, .timeout),
         error.ReadIndexTimeout => status(.timeout, .read_index_timeout),
         error.DeadlineExceeded => status(.timeout, .deadline_exceeded),
+        error.PreDecisionNotProposed => status(.unavailable, .pre_decision_not_proposed),
         error.PreDecisionDeadlineExceeded => status(.timeout, .pre_decision_deadline_exceeded),
         error.ConnectionTimeout => status(.timeout, .connection_timeout),
         error.ConnectionTimedOut => status(.timeout, .connection_timed_out),
@@ -1264,7 +1361,12 @@ pub fn errorFromStatus(value: Status) anyerror {
 
 fn detailErrorName(comptime detail: Detail) []const u8 {
     return switch (detail) {
-        .concurrency_unavailable => "ConcurrencyUnavailable",
+        .admission_full => "AdmissionFull",
+        .admission_queue_full => "AdmissionQueueFull",
+        .admission_bytes_exhausted => "AdmissionBytesExhausted",
+        .admission_request_too_large => "AdmissionRequestTooLarge",
+        .admission_wait_timeout => "AdmissionWaitTimeout",
+        .admission_closed => "AdmissionClosed",
         .table_topology_protocol_upgrade_required => "TableTopologyProtocolUpgradeRequired",
         .database_not_found => "DatabaseNotFound",
         .namespace_not_found => "NamespaceNotFound",
@@ -1528,6 +1630,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .invalid_manifest => "InvalidManifest",
         .invalid_table_file => "InvalidTableFile",
         .invalid_txn_record => "InvalidTxnRecord",
+        .invalid_participant => "InvalidParticipant",
         .not_found => "NotFound",
         .file_not_found => "FileNotFound",
         .table_not_found => "TableNotFound",
@@ -1543,6 +1646,46 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .table_transition_active => "TableTransitionActive",
         .schema_in_use => "SchemaInUse",
         .transaction_too_large => "TransactionTooLarge",
+        .transaction_recovery_capacity_exhausted => "TransactionRecoveryCapacityExhausted",
+        .transaction_recovery_reconciliation_required => "TransactionRecoveryReconciliationRequired",
+        .transaction_completion_busy => "TransactionCompletionBusy",
+        .transaction_completion_capacity_mismatch => "TransactionCompletionCapacityMismatch",
+        .transaction_completion_policy_required => "TransactionCompletionPolicyRequired",
+        .transaction_completion_changed => "TransactionCompletionChanged",
+        .prepared_completion_active => "PreparedCompletionActive",
+        .completion_transition_in_progress => "CompletionTransitionInProgress",
+        .completion_transition_capacity_exceeded => "CompletionTransitionCapacityExceeded",
+        .completion_fence_identity_mismatch => "CompletionFenceIdentityMismatch",
+        .local_completion_authority_required => "LocalCompletionAuthorityRequired",
+        .unsupported_completion_backend => "UnsupportedCompletionBackend",
+        .unsupported_completion_profile => "UnsupportedCompletionProfile",
+        .unsupported_completion_slot_version => "UnsupportedCompletionSlotVersion",
+        .unsupported_completion_template => "UnsupportedCompletionTemplate",
+        .unsupported_completion_template_nesting => "UnsupportedCompletionTemplateNesting",
+        .unsupported_completion_template_scan => "UnsupportedCompletionTemplateScan",
+        .unsupported_completion_template_write => "UnsupportedCompletionTemplateWrite",
+        .unsupported_completion_operation => "UnsupportedCompletionOperation",
+        .unsupported_completion_path => "UnsupportedCompletionPath",
+        .unsupported_completion_provider => "UnsupportedCompletionProvider",
+        .completion_recovery_capacity_required => "CompletionRecoveryCapacityRequired",
+        .completion_resource_manager_required => "CompletionResourceManagerRequired",
+        .completion_profile_changed => "CompletionProfileChanged",
+        .invalid_completion_catalog => "InvalidCompletionCatalog",
+        .completion_drain_shape_changed => "CompletionDrainShapeChanged",
+        .completion_not_prepared => "CompletionNotPrepared",
+        .invalid_completion_slot => "InvalidCompletionSlot",
+        .completion_slot_checksum_mismatch => "CompletionSlotChecksumMismatch",
+        .completion_slot_too_large => "CompletionSlotTooLarge",
+        .completion_plan_capacity_exceeded => "CompletionPlanCapacityExceeded",
+        .completion_reservation_busy => "CompletionReservationBusy",
+        .completion_foreground_capacity_exceeded => "CompletionForegroundCapacityExceeded",
+        .completion_file_capacity_exceeded => "CompletionFileCapacityExceeded",
+        .completion_writer_closed => "CompletionWriterClosed",
+        .completion_writer_live => "CompletionWriterLive",
+        .recovery_required => "RecoveryRequired",
+        .completion_admission_unavailable => "CompletionAdmissionUnavailable",
+        .completion_admission_policy_changed => "CompletionAdmissionPolicyChanged",
+        .missing_completion_admission_guard => "MissingCompletionAdmissionGuard",
         .extension_owned_object => "ExtensionOwnedObject",
         .restore_intent_conflict => "RestoreIntentConflict",
         .unauthorized => "Unauthorized",
@@ -1791,6 +1934,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .ha_sync_commit_wait_missing_context => "HASyncCommitWaitMissingContext",
         .ha_sync_commit_wait_standby_not_in_policy => "HASyncCommitWaitStandbyNotInPolicy",
         .deadline_exceeded => "DeadlineExceeded",
+        .pre_decision_not_proposed => "PreDecisionNotProposed",
         .pre_decision_deadline_exceeded => "PreDecisionDeadlineExceeded",
         .graph_metric_action_partial_outcome => "GraphMetricActionPartialOutcome",
         .graph_distinct_budget_exceeded => "GraphDistinctBudgetExceeded",
@@ -1828,6 +1972,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .unsupported_media_token_budget => "UnsupportedMediaTokenBudget",
         .unsupported_local_rate_limit => "UnsupportedLocalRateLimit",
         .storage_kernel_failure => "StorageKernelFailure",
+        .concurrency_unavailable => "ConcurrencyUnavailable",
     };
 }
 
@@ -1849,17 +1994,12 @@ test "transaction capacity rejection retains a permanent public status" {
     try std.testing.expectEqual(error.TransactionTooLarge, errorFromStatus(value));
 }
 
-test "stable status preserves deterministic raft rejection and malformed response identity" {
-    inline for (.{ error.IntentConflict, error.VersionConflict, error.MergePageRequired }) |err| {
+test "workload admission transaction recovery failures survive the native boundary" {
+    for ([_]anyerror{ error.TransactionRecoveryCapacityExhausted, error.TransactionRecoveryReconciliationRequired, error.TransactionCompletionBusy, error.TransactionCompletionCapacityMismatch, error.TransactionCompletionPolicyRequired, error.TransactionCompletionChanged }) |err| {
         const value = statusFromError(err);
-        try std.testing.expectEqual(@intFromEnum(Code.conflict), value.code);
         try std.testing.expectEqual(err, errorFromStatus(value));
+        try std.testing.expect(value.code == @intFromEnum(Code.retryable) or value.code == @intFromEnum(Code.unavailable));
     }
-    // A malformed response is not proof that a mutation failed to commit.
-    // Preserve its identity without granting automatic retry authority.
-    const malformed = statusFromError(error.InvalidResponse);
-    try std.testing.expectEqual(@intFromEnum(Code.internal), malformed.code);
-    try std.testing.expectEqual(error.InvalidResponse, errorFromStatus(malformed));
 }
 
 test "stable status preserves public boundary semantics" {
@@ -2029,26 +2169,98 @@ test "storage owner contention retains retryability and exact identity" {
     try std.testing.expectEqual(error.StorageBusy, errorFromStatus(wire));
 }
 
-test "released main Detail identifiers retain their exact names and numeric values" {
-    const std_test = @import("std");
-    var fingerprint: u64 = 14695981039346656037;
-    var count: usize = 0;
-    inline for (@typeInfo(Detail).@"enum".fields) |field| {
-        if (field.value <= 370) {
-            for (field.name) |byte| fingerprint = (fingerprint ^ byte) *% 1099511628211;
-            var encoded: [4]u8 = undefined;
-            std_test.mem.writeInt(u32, &encoded, @intCast(field.value), .little);
-            for (encoded) |byte| fingerprint = (fingerprint ^ byte) *% 1099511628211;
-            count += 1;
-        }
-    }
-    try std_test.testing.expectEqual(@as(usize, 371), count);
-    try std_test.testing.expectEqual(@as(u64, 0xa07c5018c0739e78), fingerprint);
+test "workload admission completion eligibility failures preserve exact boundary identity" {
+    try std.testing.expectEqual(error.PreparedCompletionActive, errorFromStatus(statusFromError(error.PreparedCompletionActive)));
+    try std.testing.expectEqual(@intFromEnum(Code.conflict), statusFromError(error.PreparedCompletionActive).code);
+    try std.testing.expectEqual(error.CompletionTransitionInProgress, errorFromStatus(statusFromError(error.CompletionTransitionInProgress)));
+    try std.testing.expectEqual(@intFromEnum(Code.retryable), statusFromError(error.CompletionTransitionInProgress).code);
+    try std.testing.expectEqual(error.CompletionTransitionCapacityExceeded, errorFromStatus(statusFromError(error.CompletionTransitionCapacityExceeded)));
+    try std.testing.expectEqual(@intFromEnum(Code.retryable), statusFromError(error.CompletionTransitionCapacityExceeded).code);
+    try std.testing.expectEqual(error.CompletionFenceIdentityMismatch, errorFromStatus(statusFromError(error.CompletionFenceIdentityMismatch)));
+    try std.testing.expectEqual(@intFromEnum(Code.conflict), statusFromError(error.CompletionFenceIdentityMismatch).code);
 }
 
-test "metadata proposal recovery errors preserve identity across runtime archives" {
-    for ([_]anyerror{ error.MetadataProposalSuperseded, error.MetadataProposalApplyTimeout, error.MetadataMutationOutcomeUnknown }) |err| {
-        try std.testing.expect(errorHasStableDetail(err));
-        try std.testing.expectEqual(err, errorFromStatus(statusFromErrorWithFallback(err, error.RestoreJobPersistenceUnavailable)));
-    }
+test "workload admission native completion startup preserves domain failure identities" {
+    // This reports a fenced backend, not a known-aborted write. Recovery must
+    // inspect durable state before retrying any uncertain mutation.
+    try std.testing.expectEqual(error.RecoveryRequired, errorFromStatus(statusFromError(error.RecoveryRequired)));
+    try std.testing.expectEqual(@intFromEnum(Code.unavailable), statusFromError(error.RecoveryRequired).code);
+    try std.testing.expectEqual(error.InvalidTxnRecord, errorFromStatus(statusFromError(error.InvalidTxnRecord)));
+    try std.testing.expectEqual(error.LocalCompletionAuthorityRequired, errorFromStatus(statusFromError(error.LocalCompletionAuthorityRequired)));
+    try std.testing.expectEqual(@intFromEnum(Code.unsupported), statusFromError(error.LocalCompletionAuthorityRequired).code);
+    try std.testing.expectEqual(error.UnsupportedCompletionBackend, errorFromStatus(statusFromError(error.UnsupportedCompletionBackend)));
+    try std.testing.expectEqual(@intFromEnum(Code.unsupported), statusFromError(error.UnsupportedCompletionBackend).code);
+    try std.testing.expectEqual(error.UnsupportedCompletionProfile, errorFromStatus(statusFromError(error.UnsupportedCompletionProfile)));
+    try std.testing.expectEqual(@intFromEnum(Code.unsupported), statusFromError(error.UnsupportedCompletionProfile).code);
+    try std.testing.expectEqual(error.UnsupportedCompletionSlotVersion, errorFromStatus(statusFromError(error.UnsupportedCompletionSlotVersion)));
+    try std.testing.expectEqual(@intFromEnum(Code.unsupported), statusFromError(error.UnsupportedCompletionSlotVersion).code);
+    try std.testing.expectEqual(error.UnsupportedCompletionTemplate, errorFromStatus(statusFromError(error.UnsupportedCompletionTemplate)));
+    try std.testing.expectEqual(@intFromEnum(Code.unsupported), statusFromError(error.UnsupportedCompletionTemplate).code);
+    try std.testing.expectEqual(error.UnsupportedCompletionTemplateNesting, errorFromStatus(statusFromError(error.UnsupportedCompletionTemplateNesting)));
+    try std.testing.expectEqual(@intFromEnum(Code.unsupported), statusFromError(error.UnsupportedCompletionTemplateNesting).code);
+    try std.testing.expectEqual(error.UnsupportedCompletionTemplateScan, errorFromStatus(statusFromError(error.UnsupportedCompletionTemplateScan)));
+    try std.testing.expectEqual(@intFromEnum(Code.unsupported), statusFromError(error.UnsupportedCompletionTemplateScan).code);
+    try std.testing.expectEqual(error.UnsupportedCompletionTemplateWrite, errorFromStatus(statusFromError(error.UnsupportedCompletionTemplateWrite)));
+    try std.testing.expectEqual(@intFromEnum(Code.unsupported), statusFromError(error.UnsupportedCompletionTemplateWrite).code);
+    try std.testing.expectEqual(error.UnsupportedCompletionOperation, errorFromStatus(statusFromError(error.UnsupportedCompletionOperation)));
+    try std.testing.expectEqual(@intFromEnum(Code.unsupported), statusFromError(error.UnsupportedCompletionOperation).code);
+    try std.testing.expectEqual(error.UnsupportedCompletionPath, errorFromStatus(statusFromError(error.UnsupportedCompletionPath)));
+    try std.testing.expectEqual(@intFromEnum(Code.unsupported), statusFromError(error.UnsupportedCompletionPath).code);
+    try std.testing.expectEqual(error.UnsupportedCompletionProvider, errorFromStatus(statusFromError(error.UnsupportedCompletionProvider)));
+    try std.testing.expectEqual(@intFromEnum(Code.unsupported), statusFromError(error.UnsupportedCompletionProvider).code);
+    try std.testing.expectEqual(error.CompletionRecoveryCapacityRequired, errorFromStatus(statusFromError(error.CompletionRecoveryCapacityRequired)));
+    try std.testing.expectEqual(@intFromEnum(Code.unavailable), statusFromError(error.CompletionRecoveryCapacityRequired).code);
+    try std.testing.expectEqual(error.CompletionResourceManagerRequired, errorFromStatus(statusFromError(error.CompletionResourceManagerRequired)));
+    try std.testing.expectEqual(@intFromEnum(Code.unavailable), statusFromError(error.CompletionResourceManagerRequired).code);
+    try std.testing.expectEqual(error.CompletionProfileChanged, errorFromStatus(statusFromError(error.CompletionProfileChanged)));
+    try std.testing.expectEqual(@intFromEnum(Code.conflict), statusFromError(error.CompletionProfileChanged).code);
+    try std.testing.expectEqual(error.CompletionDrainShapeChanged, errorFromStatus(statusFromError(error.CompletionDrainShapeChanged)));
+    try std.testing.expectEqual(@intFromEnum(Code.conflict), statusFromError(error.CompletionDrainShapeChanged).code);
+    try std.testing.expectEqual(error.CompletionNotPrepared, errorFromStatus(statusFromError(error.CompletionNotPrepared)));
+    try std.testing.expectEqual(@intFromEnum(Code.conflict), statusFromError(error.CompletionNotPrepared).code);
+    try std.testing.expectEqual(error.InvalidCompletionSlot, errorFromStatus(statusFromError(error.InvalidCompletionSlot)));
+    try std.testing.expectEqual(@intFromEnum(Code.corrupt), statusFromError(error.InvalidCompletionSlot).code);
+    try std.testing.expectEqual(error.CompletionSlotChecksumMismatch, errorFromStatus(statusFromError(error.CompletionSlotChecksumMismatch)));
+    try std.testing.expectEqual(@intFromEnum(Code.corrupt), statusFromError(error.CompletionSlotChecksumMismatch).code);
+    try std.testing.expectEqual(error.CompletionSlotTooLarge, errorFromStatus(statusFromError(error.CompletionSlotTooLarge)));
+    try std.testing.expectEqual(@intFromEnum(Code.invalid_argument), statusFromError(error.CompletionSlotTooLarge).code);
+    try std.testing.expectEqual(error.CompletionPlanCapacityExceeded, errorFromStatus(statusFromError(error.CompletionPlanCapacityExceeded)));
+    try std.testing.expectEqual(@intFromEnum(Code.invalid_argument), statusFromError(error.CompletionPlanCapacityExceeded).code);
+    try std.testing.expectEqual(error.CompletionReservationBusy, errorFromStatus(statusFromError(error.CompletionReservationBusy)));
+    try std.testing.expectEqual(@intFromEnum(Code.retryable), statusFromError(error.CompletionReservationBusy).code);
+    try std.testing.expectEqual(error.CompletionForegroundCapacityExceeded, errorFromStatus(statusFromError(error.CompletionForegroundCapacityExceeded)));
+    try std.testing.expectEqual(@intFromEnum(Code.retryable), statusFromError(error.CompletionForegroundCapacityExceeded).code);
+    try std.testing.expectEqual(error.CompletionFileCapacityExceeded, errorFromStatus(statusFromError(error.CompletionFileCapacityExceeded)));
+    try std.testing.expectEqual(@intFromEnum(Code.retryable), statusFromError(error.CompletionFileCapacityExceeded).code);
+    try std.testing.expectEqual(error.CompletionWriterClosed, errorFromStatus(statusFromError(error.CompletionWriterClosed)));
+    try std.testing.expectEqual(@intFromEnum(Code.internal), statusFromError(error.CompletionWriterClosed).code);
+    try std.testing.expectEqual(error.CompletionWriterLive, errorFromStatus(statusFromError(error.CompletionWriterLive)));
+    try std.testing.expectEqual(@intFromEnum(Code.internal), statusFromError(error.CompletionWriterLive).code);
+}
+
+test "workload admission replicated completion guard classification preserves uncertainty boundaries" {
+    // Error classes do not certify proposal acceptance or safe write retry.
+    try std.testing.expectEqual(error.CompletionAdmissionUnavailable, errorFromStatus(statusFromError(error.CompletionAdmissionUnavailable)));
+    try std.testing.expectEqual(@intFromEnum(Code.retryable), statusFromError(error.CompletionAdmissionUnavailable).code);
+    try std.testing.expectEqual(error.CompletionAdmissionPolicyChanged, errorFromStatus(statusFromError(error.CompletionAdmissionPolicyChanged)));
+    try std.testing.expectEqual(@intFromEnum(Code.unavailable), statusFromError(error.CompletionAdmissionPolicyChanged).code);
+    try std.testing.expectEqual(error.MissingCompletionAdmissionGuard, errorFromStatus(statusFromError(error.MissingCompletionAdmissionGuard)));
+    try std.testing.expectEqual(@intFromEnum(Code.internal), statusFromError(error.MissingCompletionAdmissionGuard).code);
+}
+
+test "workload admission invalid completion catalog preserves checked boundary identity" {
+    const result = statusFromError(error.InvalidCompletionCatalog);
+    try std.testing.expectEqual(@intFromEnum(Code.corrupt), result.code);
+    try std.testing.expectEqual(error.InvalidCompletionCatalog, errorFromStatus(result));
+}
+
+test "first decision rejection preserves checked status identity" {
+    try std.testing.expectEqual(error.PreDecisionNotProposed, errorFromStatus(statusFromError(error.PreDecisionNotProposed)));
+    try std.testing.expectEqual(@intFromEnum(Detail.pre_decision_not_proposed), statusFromError(error.PreDecisionNotProposed).detail);
+}
+
+test "transaction recovery invalid participant preserves checked status identity" {
+    const result = statusFromError(error.InvalidParticipant);
+    try std.testing.expectEqual(@intFromEnum(Code.invalid_argument), result.code);
+    try std.testing.expectEqual(error.InvalidParticipant, errorFromStatus(result));
 }

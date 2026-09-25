@@ -21,17 +21,14 @@
 /// watermarks cannot be mistaken for omitted replication work.
 /// Version 5 transfers authoritative merge artifacts through durable replay.
 /// Version 6 fences merge copy attempts across donor leadership changes.
-/// Version 7 commits source-bound merge page effects and cursor atomically.
-/// Version 8 adds source retention admission and receiver tail-watermark fences.
-/// Version 9 requires durable source pins before acknowledgement and supports
-/// resumable row chunks whose completion atomically advances receiver progress.
-/// Version 10 requires native-authoritative Raft snapshots for source groups,
-/// preserving the retained journal and prepared transaction state on replicas.
-/// Version 11 retains coordinated integrity effects with primary rows, fences
-/// shadow-interval publication, and supports retained-source staged rewrites.
-/// Version 12 binds retained source Scope v2 to an explicit Raft/native
-/// authority. Older decoders must not reinterpret its clock or pin identity.
-pub const batch_protocol_version: u16 = 12;
+/// Versions 7–12 are assigned to source transfer, native snapshots, and
+/// source-scope authority. Version 13 carries native-backed canonical
+/// completion prepares; capability alone does not grant admission without
+/// an installed retained pool. Version 14 adds atomic single-phase canonical
+/// mutations, which an older prepare parser must never reinterpret.
+pub const batch_protocol_version: u16 = 14;
+pub const batch_completion_protocol_version: u16 = 13;
+pub const batch_mutation_completion_protocol_version: u16 = 14;
 pub const batch_timestamp_protocol_version: u16 = 1;
 pub const batch_activation_barrier_protocol_version: u16 = 2;
 pub const batch_merge_transition_protocol_version: u16 = 3;
@@ -45,3 +42,12 @@ pub const batch_merge_chunk_protocol_version: u16 = 9;
 pub const batch_native_snapshot_protocol_version: u16 = 10;
 pub const batch_relational_transfer_protocol_version: u16 = 11;
 pub const batch_source_scope_protocol_version: u16 = 12;
+
+test "canonical completion activates after every source format" {
+    const std = @import("std");
+    try std.testing.expect(batch_merge_page_protocol_version < batch_completion_protocol_version);
+    try std.testing.expect(batch_online_source_protocol_version < batch_completion_protocol_version);
+    try std.testing.expect(batch_source_scope_protocol_version < batch_completion_protocol_version);
+    try std.testing.expect(batch_completion_protocol_version < batch_mutation_completion_protocol_version);
+    try std.testing.expectEqual(batch_mutation_completion_protocol_version, batch_protocol_version);
+}

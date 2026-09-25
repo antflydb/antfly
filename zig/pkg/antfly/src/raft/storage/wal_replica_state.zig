@@ -22,6 +22,7 @@ const wal_mod = @import("../../storage/wal_runtime.zig");
 const storage_mod = @import("mod.zig");
 const snapshot_payload_store = @import("snapshot_payload_store.zig");
 const storage_iface = raft_engine.runtime.storage_iface;
+const applied_sink = @import("../state_machine/applied_sink.zig");
 
 const magic: u32 = 0x41524654; // ARFT
 const legacy_inline_snapshot_version: u32 = 2;
@@ -108,8 +109,13 @@ pub const WalReplicaState = struct {
     store: raft_engine.core.MemoryStorage,
     applied_index: raft_engine.core.types.Index = 0,
     durable_applied_index: raft_engine.core.types.Index = 0,
+    /// State-machine completion is separate from native accepted progress.
     completed_applied_index: raft_engine.core.types.Index = 0,
     durable_completed_applied_index: raft_engine.core.types.Index = 0,
+    /// MemoryStorage changes before WAL persistence; after a failed persistence
+    /// it cannot authenticate native progress until reopened from durable WAL.
+    native_progress_blocked: bool = false,
+    native_startup_reconciled: bool = false,
     last_compacted_index: raft_engine.core.types.Index = 0,
     delta_records_since_checkpoint: usize = 0,
     delta_bytes_since_checkpoint: usize = 0,
@@ -244,6 +250,23 @@ pub const WalReplicaState = struct {
     pub fn appliedIndex(self: *const WalReplicaState) raft_engine.core.types.Index {
         return self.applied_index;
     }
+    pub fn completionDurableLog(self: *const WalReplicaState, startup: bool, persisted: ?raft_engine.core.Ready) raft_engine.runtime.completion_admission_iface.DurableLog {
+        const entries = self.store.entries_state.items;
+        var result: raft_engine.runtime.completion_admission_iface.DurableLog = .{
+            .mode = if (startup) .startup_complete else .persisted_replacement,
+            .durability_confirmed = !self.cfg.wal.no_sync and !self.native_progress_blocked,
+            .compacted_index = self.store.compacted_index,
+            .compacted_term = self.store.compacted_term,
+            .last_index = if (entries.len > 0) entries[entries.len - 1].index else self.store.compacted_index,
+            .commit_index = self.store.hard_state.commit_index,
+            .entries = entries,
+        };
+        if (persisted) |ready| if (ready.entries.len > 0) {
+            result.replacement_first = ready.entries[0].index;
+            result.replacement_last = ready.entries[ready.entries.len - 1].index;
+        };
+        return result;
+    }
 
     /// Snapshot persistence is deliberately not state-machine completion.
     pub fn completedAppliedIndex(self: *const WalReplicaState) u64 {
@@ -277,6 +300,75 @@ pub const WalReplicaState = struct {
         self.stats.applied_index_updates += 1;
         if (self.shouldPersistAppliedWatermark(index)) try self.persistAppliedWatermark();
         try self.persistCheckpointIfNeeded();
+    }
+
+    fn nativeProgressEntry(self: *const WalReplicaState, progress: applied_sink.NativeProgress) !raft_engine.core.Entry {
+        if (self.cfg.wal.no_sync or self.native_progress_blocked or progress.index > self.store.hard_state.commit_index or
+            self.store.entries_state.items.len == 0) return error.CompletionAdmissionUnavailable;
+        const entries = self.store.entries_state.items;
+        const first = entries[0].index;
+        if (progress.index < first or progress.index - first >= entries.len) return error.CompletionAdmissionUnavailable;
+        const entry = entries[@intCast(progress.index - first)];
+        try applied_sink.validateNativeProgress(progress, entry);
+        return entry;
+    }
+
+    /// Empty election entries have no document/projection effect. Their exact
+    /// full-sync committed WAL identity is sufficient; restart simply replays
+    /// the same no-op if no later durable watermark subsumes it.
+    pub fn setDurableNoop(self: *WalReplicaState, entry: raft_engine.core.Entry) !void {
+        if (entry.entry_type != .normal or entry.data.len != 0 or entry.term == 0 or entry.index == 0 or
+            self.cfg.wal.no_sync or self.native_progress_blocked or entry.index > self.store.hard_state.commit_index or self.store.entries_state.items.len == 0)
+            return error.CompletionAdmissionUnavailable;
+        const entries = self.store.entries_state.items;
+        const first = entries[0].index;
+        if (entry.index < first or entry.index - first >= entries.len) return error.CompletionAdmissionUnavailable;
+        const persisted = entries[@intCast(entry.index - first)];
+        if (persisted.index != entry.index or persisted.term != entry.term or persisted.entry_type != .normal or persisted.data.len != 0)
+            return error.CompletionAdmissionUnavailable;
+        if (entry.index <= self.applied_index) return;
+        if (entry.index - self.applied_index != 1) return error.CompletionAdmissionUnavailable;
+        self.applied_index = entry.index;
+        self.stats.applied_index_updates += 1;
+    }
+
+    /// Called only with a receipt from the retained native group owner. No
+    /// allocation, FD acquisition or second durable mutation is performed.
+    pub fn setNativeApplied(self: *WalReplicaState, progress: applied_sink.NativeProgress, entry: raft_engine.core.Entry) !void {
+        _ = try self.nativeProgressEntry(progress);
+        if (entry.index == 0 or entry.index > progress.index or self.store.entries_state.items.len == 0)
+            return error.CompletionAdmissionUnavailable;
+        const entries = self.store.entries_state.items;
+        const first = entries[0].index;
+        if (entry.index < first or entry.index - first >= entries.len) return error.CompletionAdmissionUnavailable;
+        const persisted = entries[@intCast(entry.index - first)];
+        if (persisted.term != entry.term or persisted.index != entry.index or persisted.entry_type != entry.entry_type or
+            !std.mem.eql(u8, persisted.data, entry.data)) return error.CompletionAdmissionUnavailable;
+        if (entry.index <= self.applied_index) return;
+        if (entry.index - self.applied_index != 1) return error.CompletionAdmissionUnavailable;
+        self.applied_index = entry.index;
+        self.stats.applied_index_updates += 1;
+    }
+
+    /// Startup-only reconciliation, before descriptor publication. The native
+    /// issuer proves durable completion of the whole prefix; the Raft WAL must
+    /// independently contain its exact committed terminal entry and ancestry.
+    pub fn restoreNativeProgress(self: *WalReplicaState, progress: applied_sink.NativeProgress) !void {
+        if (self.cfg.wal.no_sync or progress.term == 0 or progress.index == 0) return error.CompletionAdmissionUnavailable;
+        if (progress.index <= self.durable_applied_index) return;
+        _ = try self.nativeProgressEntry(progress);
+        const entries = self.store.entries_state.items;
+        if (self.applied_index < progress.index) {
+            var covered = self.applied_index;
+            for (entries) |entry| {
+                if (entry.index <= covered) continue;
+                if (entry.index > progress.index) break;
+                if (entry.index - covered != 1) return error.CompletionAdmissionUnavailable;
+                covered = entry.index;
+            }
+            if (covered != progress.index) return error.CompletionAdmissionUnavailable;
+            self.applied_index = progress.index;
+        }
     }
 
     fn persistReady(ptr: *anyopaque, group_id: u64, ready: raft_engine.core.Ready) !void {
@@ -351,6 +443,8 @@ pub const WalReplicaState = struct {
     ) !void {
         _ = group_id;
         self.stats.persist_ready_calls += 1;
+        const was_blocked = self.native_progress_blocked;
+        self.native_progress_blocked = true;
         var previous_snapshot: ?SnapshotIdentity = null;
 
         const storage_apply_started_ns = if (diagnostics != null) nowNs() else 0;
@@ -370,6 +464,7 @@ pub const WalReplicaState = struct {
         if (diagnostics) |diag| diag.storage_apply_elapsed_ns += elapsedSince(storage_apply_started_ns);
 
         try self.persistReadyDelta(ready, diagnostics);
+        self.native_progress_blocked = was_blocked;
         if (previous_snapshot) |previous| {
             self.deleteSupersededSnapshotPayload(previous, snapshotIdentity(ready.snapshot.?.metadata));
         }
@@ -1259,6 +1354,134 @@ test "wal replica state migrates legacy checkpoints and delta tails" {
 
 test "wal replica state defaults to lsm backend" {
     try std.testing.expectEqual(wal_mod.StorageBackend.lsm, ((WalReplicaStateConfig{}).wal).resolvedBackend());
+}
+
+test "workload admission native progress verifies committed identity without post-apply allocation and restores before replay" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/native-progress", .{tmp.sub_path});
+    defer alloc.free(root);
+    var layout = try storage_mod.ReplicaPathLayout.initForReplica(alloc, root, 17, 3);
+    defer layout.deinit(alloc);
+    const entries = [_]raft_engine.core.Entry{
+        .{ .term = 2, .index = 1, .data = @constCast("ordinary") },
+        .{ .term = 2, .index = 2, .data = @constCast("protected") },
+    };
+    var proof: applied_sink.NativeProgress = .{ .term = 2, .index = 2, .payload_digest = undefined };
+    std.crypto.hash.sha2.Sha256.hash(entries[1].data, &proof.payload_digest, .{});
+    {
+        var replica = try WalReplicaState.init(alloc, layout, .{});
+        defer replica.deinit();
+        try replica.groupStorage().persistReady(17, .{
+            .hard_state = .{ .current_term = 2, .commit_index = 2 },
+            .entries = &entries,
+        });
+        const persisted_evidence = replica.completionDurableLog(false, .{ .entries = &entries });
+        try std.testing.expect(persisted_evidence.durability_confirmed);
+        try std.testing.expectEqual(@as(u64, 1), persisted_evidence.replacement_first);
+        try std.testing.expectEqual(@as(u64, 2), persisted_evidence.replacement_last);
+        try std.testing.expectEqual(@as(u64, 2), persisted_evidence.commit_index);
+        try std.testing.expect(persisted_evidence.entries.ptr == replica.store.entries_state.items.ptr);
+        // A matching terminal hash alone cannot skip an unapplied predecessor.
+        try std.testing.expectError(error.CompletionAdmissionUnavailable, replica.setNativeApplied(proof, entries[1]));
+        try replica.setAppliedIndex(1);
+        var wrong = proof;
+        wrong.payload_digest[0] ^= 1;
+        try std.testing.expectError(error.CompletionAdmissionUnavailable, replica.setNativeApplied(wrong, entries[1]));
+        wrong = proof;
+        wrong.term += 1;
+        try std.testing.expectError(error.CompletionAdmissionUnavailable, replica.setNativeApplied(wrong, entries[1]));
+        const stats_before = replica.statsSnapshot();
+        var failed = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+        replica.alloc = failed.allocator();
+        defer replica.alloc = alloc;
+        try replica.setNativeApplied(proof, entries[1]);
+        try replica.setNativeApplied(proof, entries[1]);
+        try std.testing.expectEqual(@as(u64, 2), replica.appliedIndex());
+        try std.testing.expectEqual(stats_before.applied_index_persist_calls, replica.statsSnapshot().applied_index_persist_calls);
+        try std.testing.expectEqual(stats_before.checkpoint_persist_calls, replica.statsSnapshot().checkpoint_persist_calls);
+        try std.testing.expect(!failed.has_induced_failure);
+        replica.native_progress_blocked = true;
+        try std.testing.expect(!replica.completionDurableLog(false, .{ .entries = &entries }).durability_confirmed);
+        try std.testing.expectError(error.CompletionAdmissionUnavailable, replica.setNativeApplied(proof, entries[1]));
+    }
+    {
+        var reopened = try WalReplicaState.init(alloc, layout, .{});
+        defer reopened.deinit();
+        try std.testing.expect(reopened.appliedIndex() < 2);
+        const startup_evidence = reopened.completionDurableLog(true, null);
+        try std.testing.expect(startup_evidence.durability_confirmed);
+        try std.testing.expectEqual(@as(u64, 0), startup_evidence.replacement_first);
+        try std.testing.expectEqual(@as(u64, 2), startup_evidence.last_index);
+        try std.testing.expectEqualStrings("protected", startup_evidence.entries[1].data);
+        reopened.cfg.wal.no_sync = true;
+        try std.testing.expect(!reopened.completionDurableLog(true, null).durability_confirmed);
+        reopened.cfg.wal.no_sync = false;
+
+        var wrong = proof;
+        wrong.payload_digest[0] ^= 1;
+        try std.testing.expectError(error.CompletionAdmissionUnavailable, reopened.restoreNativeProgress(wrong));
+        const committed = reopened.store.hard_state.commit_index;
+        reopened.store.hard_state.commit_index = 1;
+        try std.testing.expectError(error.CompletionAdmissionUnavailable, reopened.restoreNativeProgress(proof));
+        reopened.store.hard_state.commit_index = committed;
+        try reopened.restoreNativeProgress(proof);
+        try std.testing.expectEqual(@as(u64, 2), reopened.appliedIndex());
+    }
+}
+
+test "workload admission durable election noop advances under exhaustion and replays without projection" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/durable-noop", .{tmp.sub_path});
+    defer alloc.free(root);
+    var layout = try storage_mod.ReplicaPathLayout.initForReplica(alloc, root, 21, 3);
+    defer layout.deinit(alloc);
+    const entries = [_]raft_engine.core.Entry{ .{ .term = 2, .index = 1, .data = @constCast("") }, .{ .term = 2, .index = 2, .data = @constCast("mutation") }, .{ .term = 3, .index = 3, .data = @constCast("") } };
+    {
+        var replica = try WalReplicaState.init(alloc, layout, .{});
+        defer replica.deinit();
+        try replica.groupStorage().persistReady(21, .{ .hard_state = .{ .current_term = 3, .commit_index = 3 }, .entries = &entries });
+        try std.testing.expectError(error.CompletionAdmissionUnavailable, replica.setDurableNoop(entries[2]));
+        try std.testing.expectError(error.CompletionAdmissionUnavailable, replica.setDurableNoop(entries[1]));
+        var forged = entries[1];
+        forged.data = @constCast("");
+        try std.testing.expectError(error.CompletionAdmissionUnavailable, replica.setDurableNoop(forged));
+        forged = entries[0];
+        forged.term += 1;
+        try std.testing.expectError(error.CompletionAdmissionUnavailable, replica.setDurableNoop(forged));
+        const before = replica.statsSnapshot();
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+        replica.alloc = failing.allocator();
+        defer replica.alloc = alloc;
+        try replica.setDurableNoop(entries[0]);
+        try replica.setDurableNoop(entries[0]);
+        try std.testing.expectEqual(@as(u64, 1), replica.appliedIndex());
+        try std.testing.expectEqual(before.applied_index_persist_calls, replica.statsSnapshot().applied_index_persist_calls);
+        try std.testing.expectEqual(before.checkpoint_persist_calls, replica.statsSnapshot().checkpoint_persist_calls);
+        try std.testing.expect(!failing.has_induced_failure);
+    }
+    {
+        var reopened = try WalReplicaState.init(alloc, layout, .{});
+        defer reopened.deinit();
+        try std.testing.expectEqual(@as(u64, 0), reopened.appliedIndex());
+        try reopened.setDurableNoop(entries[0]);
+        try std.testing.expectError(error.CompletionAdmissionUnavailable, reopened.setDurableNoop(entries[2]));
+        try reopened.setAppliedIndex(2);
+        reopened.store.hard_state.commit_index = 2;
+        try std.testing.expectError(error.CompletionAdmissionUnavailable, reopened.setDurableNoop(entries[2]));
+        reopened.store.hard_state.commit_index = 3;
+        reopened.native_progress_blocked = true;
+        try std.testing.expectError(error.CompletionAdmissionUnavailable, reopened.setDurableNoop(entries[2]));
+        reopened.native_progress_blocked = false;
+        reopened.cfg.wal.no_sync = true;
+        try std.testing.expectError(error.CompletionAdmissionUnavailable, reopened.setDurableNoop(entries[2]));
+        reopened.cfg.wal.no_sync = false;
+        try reopened.setDurableNoop(entries[2]);
+        try std.testing.expectEqual(@as(u64, 3), reopened.appliedIndex());
+    }
 }
 
 test "wal replica state persists ready updates across reopen" {

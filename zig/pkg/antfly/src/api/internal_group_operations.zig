@@ -31,6 +31,7 @@ const query_api = @import("query.zig");
 const runtime_preflight = @import("../storage/db/runtime_preflight.zig");
 const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
 const platform_time = @import("antfly_platform").time;
+const runtime_callback_abi = @import("../runtime_callback_abi.zig");
 
 // Bound diagnostics for repeatedly retried private lifecycle operations. Never
 // include request bodies, credentials, or user rows in this diagnostic.
@@ -63,11 +64,14 @@ pub const Error = operation.ApiError || @import("relational_integrity_errors.zig
     GraphExploredEdgeBytesBudgetExceeded,
     GroupLeaderUnavailable,
     PreDecisionDeadlineExceeded,
+    PreDecisionNotProposed,
     TransactionPreDecisionOutcomeUnknown,
     RaftBatchWriteOutcomeUnknown,
     DecisionConflict,
     TransactionConflict,
     TransactionTooLarge,
+    TransactionRecoveryCapacityExhausted,
+    TransactionRecoveryReconciliationRequired,
     EnrichmentWaitCanceled,
     EnrichmentWaitTimeout,
     EnrichmentRetryInProgress,
@@ -96,11 +100,16 @@ test "retained quota classification never labels committed resolve not written" 
 }
 
 pub const RepairCancellationLookup = struct {
+    const VTable = struct {
+        is_requested: *const fn (*anyopaque, std.mem.Allocator, []const u8, u64, u64, ?[]const u8) anyerror!bool,
+    };
+    pub const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
     ptr: *anyopaque,
     is_requested_fn: *const fn (*anyopaque, std.mem.Allocator, []const u8, u64, u64, ?[]const u8) anyerror!bool,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
     fn isRequested(self: @This(), alloc: std.mem.Allocator, table_name: []const u8, job_id: u64, attempt_id: u64, base_uri: ?[]const u8) !bool {
-        return self.is_requested_fn(self.ptr, alloc, table_name, job_id, attempt_id, base_uri);
+        return BoundaryAbi.call("is_requested", self.boundary_dispatch, self.is_requested_fn, .{ self.ptr, alloc, table_name, job_id, attempt_id, base_uri });
     }
 };
 
@@ -138,46 +147,55 @@ fn validatePrivateMergeSourceRollback(group_id: u64, input: db_mod.types.BatchRe
 }
 
 pub const RoutedRaftBatchWriter = struct {
+    pub const WriteFn = *const fn (
+        *anyopaque,
+        std.mem.Allocator,
+        RoutedBatchAuthority,
+        u64,
+        []const u8,
+        db_mod.types.BatchRequest,
+        internal_batch_forwarding.Context,
+        operation.RequestContext,
+    ) anyerror!?void;
+    const VTable = struct { write: WriteFn };
+    pub const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
+
     ptr: *anyopaque,
-    write_fn: @FieldType(VTable, "write"),
+    write_fn: WriteFn,
+    // Initialized by the callback producer, including native DataServer
+    // configurations copied into an independently compiled API kernel.
     boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
-    pub const VTable = struct {
-        write: *const fn (
-            *anyopaque,
-            std.mem.Allocator,
-            RoutedBatchAuthority,
-            u64,
-            []const u8,
-            db_mod.types.BatchRequest,
-            internal_batch_forwarding.Context,
-            operation.RequestContext,
-        ) anyerror!?void,
-    };
-    const BoundaryAbi = @import("../runtime_callback_abi.zig").Boundary(VTable);
-
-    pub fn write(self: @This(), alloc: std.mem.Allocator, authority: RoutedBatchAuthority, group_id: u64, table_name: []const u8, input: db_mod.types.BatchRequest, forwarding: internal_batch_forwarding.Context, request: operation.RequestContext) !?void {
-        // The data runtime supplies this callback to the separately compiled
-        // API runtime. Native error integers are private to each archive.
+    fn write(self: @This(), alloc: std.mem.Allocator, authority: RoutedBatchAuthority, group_id: u64, table_name: []const u8, input: db_mod.types.BatchRequest, forwarding: internal_batch_forwarding.Context, request: operation.RequestContext) !?void {
         return BoundaryAbi.call("write", self.boundary_dispatch, self.write_fn, .{ self.ptr, alloc, authority, group_id, table_name, input, forwarding, request });
     }
 };
 
 pub const BatchValidator = struct {
+    const VTable = struct {
+        validate: *const fn (*anyopaque, operation.RequestContext, []const u8, []const db_mod.types.BatchWrite) anyerror!void,
+    };
+    pub const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
     ptr: *anyopaque,
     validate_fn: *const fn (*anyopaque, operation.RequestContext, []const u8, []const db_mod.types.BatchWrite) anyerror!void,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
     fn validate(self: BatchValidator, request: operation.RequestContext, table_name: []const u8, writes: []const db_mod.types.BatchWrite) !void {
-        return self.validate_fn(self.ptr, request, table_name, writes);
+        return BoundaryAbi.call("validate", self.boundary_dispatch, self.validate_fn, .{ self.ptr, request, table_name, writes });
     }
 };
 
 pub const TxnValidator = struct {
+    const VTable = struct {
+        validate: *const fn (*anyopaque, operation.RequestContext, []const u8, []const db_mod.types.TransactionWrite) anyerror!void,
+    };
+    pub const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
     ptr: *anyopaque,
     validate_fn: *const fn (*anyopaque, operation.RequestContext, []const u8, []const db_mod.types.TransactionWrite) anyerror!void,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
     fn validate(self: TxnValidator, request: operation.RequestContext, table_name: []const u8, writes: []const db_mod.types.TransactionWrite) !void {
-        return self.validate_fn(self.ptr, request, table_name, writes);
+        return BoundaryAbi.call("validate", self.boundary_dispatch, self.validate_fn, .{ self.ptr, request, table_name, writes });
     }
 };
 
@@ -621,6 +639,9 @@ pub const Operations = struct {
                 return error.PreDecisionDeadlineExceeded;
             },
             error.DecisionConflict => return error.DecisionConflict,
+            error.TransactionRecoveryCapacityExhausted => return error.TransactionRecoveryCapacityExhausted,
+            error.TransactionRecoveryReconciliationRequired => return error.TransactionRecoveryReconciliationRequired,
+            error.TransactionCompletionBusy, error.TransactionCompletionCapacityMismatch, error.TransactionCompletionPolicyRequired, error.TransactionCompletionChanged => return error.Unavailable,
             error.TopologyChanged => return error.TopologyChanged,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.UnsupportedOperation => return error.Unsupported,
@@ -667,7 +688,10 @@ pub const Operations = struct {
             error.RetainedEffectsFull => return error.RetainedEffectsFull,
             error.OnlineSourcePinPending => return error.TransactionPreDecisionOutcomeUnknown,
             error.TransactionTooLarge => return error.TransactionTooLarge,
-            error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
+            error.TransactionRecoveryCapacityExhausted => return error.TransactionRecoveryCapacityExhausted,
+            error.TransactionRecoveryReconciliationRequired => return error.TransactionRecoveryReconciliationRequired,
+            error.TransactionCompletionBusy, error.TransactionCompletionCapacityMismatch, error.TransactionCompletionPolicyRequired, error.TransactionCompletionChanged => return error.Unavailable,
+            error.InvalidBatchRequest => return error.InvalidArgument,
             error.Canceled, error.Cancelled => return error.Canceled,
             error.Timeout, error.DeadlineExceeded => return error.TransactionPreDecisionOutcomeUnknown,
             error.PreDecisionDeadlineExceeded => {
@@ -695,12 +719,39 @@ pub const Operations = struct {
         }) orelse return error.NotFound;
     }
 
+    /// Fresh coordinator commit only; recovery uses txnResolve unchanged.
+    pub fn txnDecide(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_txn.TxnResolveRequest) Error!void {
+        if (input.status != .committed or request.deadline_ns == null) return error.PreDecisionNotProposed;
+        request.ensureActive() catch return error.PreDecisionNotProposed;
+        const writes = self.writes orelse return error.PreDecisionNotProposed;
+        _ = (writes.txnDecideGroupLocalWithPreDecisionContext(alloc, group_id, table_name, input.txn_id, input.status, input.commit_version, input.topology_epoch, input.sync_level, .{
+            .deadline_ns = request.deadline_ns,
+            .deadline_io = request.deadline_io,
+            .cancellation = request.cancellation,
+        }) catch |err| switch (err) {
+            error.PreDecisionNotProposed, error.PreDecisionDeadlineExceeded => return error.PreDecisionNotProposed,
+            error.DecisionConflict => return error.DecisionConflict,
+            error.TopologyChanged => return error.TopologyChanged,
+            error.EnrichmentWaitCanceled => return error.EnrichmentWaitCanceled,
+            error.EnrichmentWaitTimeout, error.CommitVisibilityNotSatisfied => return error.EnrichmentWaitTimeout,
+            error.EnrichmentRetryInProgress => return error.EnrichmentRetryInProgress,
+            error.EnrichmentWorkerFailed => return error.EnrichmentWorkerFailed,
+            // No arbitrary callback/transport error authorizes an opposite decision.
+            else => return error.TransactionPreDecisionOutcomeUnknown,
+        }) orelse return error.PreDecisionNotProposed;
+    }
+
     pub fn txnResolve(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_txn.TxnResolveRequest) Error!void {
         try request.ensureActive();
         const writes = self.writes orelse return error.NotFound;
-        _ = (distributed_txn.resolveGroupLocalWithRequest(writes, alloc, group_id, table_name, input, request.cancellation) catch |err| switch (err) {
-            error.OnlineSourcePinPending => return error.EnrichmentRetryInProgress,
-            error.RetainedEffectsFull => return if (input.status == .committed) error.EnrichmentRetryInProgress else error.Unavailable,
+        const deadline = @import("table_catalog.zig").RoutingBudget.init(null).deadlineFrom(.{ .deadline_ns = request.deadline_ns, .io = request.deadline_io });
+        _ = ((if (deadline) |value|
+            writes.txnResolveGroupLocalUntil(alloc, group_id, table_name, input.txn_id, input.status, input.commit_version, input.topology_epoch, input.sync_level, value, request.cancellation)
+        else
+            writes.txnResolveGroupLocalWithCancellation(alloc, group_id, table_name, input.txn_id, input.status, input.commit_version, input.topology_epoch, input.sync_level, request.cancellation)) catch |err| switch (err) {
+            error.Canceled, error.Cancelled => return error.Canceled,
+            error.Timeout, error.DeadlineExceeded => return error.DeadlineExceeded,
+            error.CommitPropagationIncomplete => return error.Unavailable,
             error.DecisionConflict => return error.DecisionConflict,
             error.TopologyChanged => return error.TopologyChanged,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
@@ -721,9 +772,8 @@ pub const Operations = struct {
     pub fn txnStatusWithRequest(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_txn.TxnStatusRequest) Error!db_mod.types.TxnStatus {
         try request.ensureActive();
         const writes = self.writes orelse return error.NotFound;
-        const status = if (input.restore_staging_scope != null or input.restore_staging_plan_id != null)
-            writes.txnStatusGroupLocalWithRequest(alloc, group_id, table_name, input, request)
-        else if (request.deadline_ns) |deadline_ns|
+        const deadline = @import("table_catalog.zig").RoutingBudget.init(null).deadlineFrom(.{ .deadline_ns = request.deadline_ns, .io = request.deadline_io });
+        const status = if (deadline) |deadline_ns|
             writes.txnStatusGroupAuthoritativeLocalUntil(alloc, group_id, table_name, input.txn_id, deadline_ns)
         else
             writes.txnStatusGroupAuthoritativeLocal(alloc, group_id, table_name, input.txn_id);
@@ -734,6 +784,7 @@ pub const Operations = struct {
             error.NotLeader,
             error.Timeout,
             error.DeadlineAwareTxnStatusUnsupported,
+            error.CommitPropagationIncomplete,
             => return error.GroupLeaderUnavailable,
             error.UnsupportedOperation => return error.Unsupported,
             error.UnknownGroup, error.TxnNotFound => return error.NotFound,
@@ -744,8 +795,10 @@ pub const Operations = struct {
     pub fn txnAcknowledge(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_txn.TxnAcknowledgeRequest) Error!void {
         try request.ensureActive();
         const writes = self.writes orelse return error.NotFound;
-        _ = (distributed_txn.acknowledgeGroupLocalWithRequest(writes, alloc, group_id, table_name, input, request.cancellation) catch |err| switch (err) {
-            error.InvalidTxnRequest, error.RestoreStagingScopeChanged => return error.InvalidArgument,
+        const deadline = @import("table_catalog.zig").RoutingBudget.init(null).deadlineFrom(.{ .deadline_ns = request.deadline_ns, .io = request.deadline_io });
+        _ = ((if (deadline) |value| writes.txnAcknowledgeGroupLocalUntil(alloc, group_id, table_name, input.txn_id, input.participant, value) else writes.txnAcknowledgeGroupLocal(alloc, group_id, table_name, input.txn_id, input.participant)) catch |err| switch (err) {
+            error.Timeout, error.DeadlineExceeded => return error.DeadlineExceeded,
+            error.CommitPropagationIncomplete => return error.Unavailable,
             error.InvalidParticipant, error.DecisionConflict => return error.DecisionConflict,
             error.UnsupportedOperation => return error.Unsupported,
             error.UnknownGroup, error.TxnNotFound => return error.NotFound,
@@ -1382,34 +1435,42 @@ fn consumerTests() type {
     const test_owner_root = @import("antfly_source_root");
     if (@hasDecl(test_owner_root, "implementation_tests_only") and test_owner_root.implementation_tests_only) return struct {};
     const Suite = struct {
-        test "distributed txn internal operations preserve every semantic participant rejection" {
-            const Source = struct {
-                failure: anyerror,
+        test "transaction recovery bounded operations translate shifted clocks and preserve cancellation" {
+            const Fake = struct {
+                calls: usize = 0,
+                token: db_mod.types.CancellationToken,
                 fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
-                    return error.UnexpectedTestCall;
+                    return null;
                 }
-                fn prepare(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: db_mod.types.TransactionIntentRequest) anyerror!?void {
-                    const self: *@This() = @ptrCast(@alignCast(ptr));
-                    return self.failure;
+                fn observe(raw: *anyopaque, deadline: u64) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    const now = platform_time.monotonicNs();
+                    try std.testing.expect(deadline > now and deadline <= now + 2 * std.time.ns_per_s);
+                    self.calls += 1;
                 }
-                fn validate(_: *anyopaque, _: operation.RequestContext, _: []const u8, _: []const db_mod.types.TransactionWrite) anyerror!void {}
+                fn status(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, deadline: u64) anyerror!?db_mod.types.TxnStatus {
+                    try observe(raw, deadline);
+                    return .committed;
+                }
+                fn resolve(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: db_mod.types.TxnStatus, _: u64, _: u64, _: db_mod.types.SyncLevel, deadline: u64, cancellation: db_mod.types.CancellationToken) anyerror!?void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try std.testing.expectEqual(self.token.ptr, cancellation.ptr);
+                    try observe(raw, deadline);
+                    return {};
+                }
             };
-            var source = Source{ .failure = error.UnexpectedTestCall };
-            const operations = Operations{
-                .reads = null,
-                .shard_db_adapter = null,
-                .writes = .{ .ptr = &source, .vtable = &.{ .batch = Source.batch, .txn_prepare_group_local = Source.prepare } },
-                .txn_validator = .{ .ptr = &source, .validate_fn = Source.validate },
-            };
-            const errors = @import("relational_integrity_errors.zig");
-            inline for (@typeInfo(errors.Error).error_set.?) |field| {
-                source.failure = @field(errors.Error, field.name);
-                try std.testing.expectError(source.failure, operations.txnPrepare(std.testing.allocator, .{}, 7, "rows", .{ .txn_id = @splat(7), .req = .{} }));
-            }
-            inline for (@typeInfo(@import("../schema/relational_expression_errors.zig").Error).error_set.?) |field| {
-                source.failure = @field(@import("../schema/relational_expression_errors.zig").Error, field.name);
-                try std.testing.expectError(source.failure, operations.txnPrepare(std.testing.allocator, .{}, 7, "rows", .{ .txn_id = @splat(7), .req = .{} }));
-            }
+            var clock = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = 10 * std.time.ns_per_s });
+            defer clock.deinit();
+            var stopped = std.atomic.Value(bool).init(false);
+            const cancellation = db_mod.types.CancellationToken.fromAtomic(&stopped);
+            var fake: Fake = .{ .token = cancellation };
+            const operations: Operations = .{ .reads = null, .shard_db_adapter = null, .writes = .{ .ptr = &fake, .vtable = &.{ .batch = Fake.batch, .txn_status_group_authoritative_local_until = Fake.status, .txn_resolve_group_local_until = Fake.resolve } } };
+            const request: operation.RequestContext = .{ .deadline_ns = 12 * std.time.ns_per_s, .deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&clock.io()), .cancellation = cancellation };
+            try std.testing.expectEqual(db_mod.types.TxnStatus.committed, try operations.txnStatus(std.testing.allocator, request, 7, "docs", [_]u8{1} ** 16));
+            try operations.txnResolve(std.testing.allocator, request, 7, "docs", .{ .txn_id = [_]u8{1} ** 16, .status = .aborted, .commit_version = 0 });
+            stopped.store(true, .release);
+            try std.testing.expectError(error.Canceled, operations.txnResolve(std.testing.allocator, request, 7, "docs", .{ .txn_id = [_]u8{1} ** 16, .status = .aborted, .commit_version = 0 }));
+            try std.testing.expectEqual(@as(usize, 2), fake.calls);
         }
 
         test "internal transaction operations preserve pre-decision leader unavailability" {
@@ -1688,6 +1749,51 @@ fn consumerTests() type {
                 "docs",
                 .{ .txn_id = txn_id, .begin_timestamp = 1, .participants = &.{"table2:docs:group:7"} },
             ));
+        }
+
+        test "workload admission typed routed batch preserves forwarding cancellation and identity conflicts across checked callbacks" {
+            const native_abi = @import("../runtime_native_abi.zig");
+            const error_abi = @import("../runtime_error_abi.zig");
+            const State = struct {
+                failure: ?anyerror = null,
+                found: bool = true,
+                calls: usize = 0,
+
+                fn write(ptr: *anyopaque, _: std.mem.Allocator, _: RoutedBatchAuthority, _: u64, _: []const u8, _: db_mod.types.BatchRequest, _: internal_batch_forwarding.Context, _: operation.RequestContext) anyerror!?void {
+                    const state: *@This() = @ptrCast(@alignCast(ptr));
+                    state.calls += 1;
+                    if (state.failure) |err| return err;
+                    return if (state.found) {} else null;
+                }
+
+                fn foreign(contract: *const native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) error_abi.Status {
+                    return RoutedRaftBatchWriter.BoundaryAbi.local_dispatch(contract, callback, args, output);
+                }
+
+                fn incompatible(contract: *const native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) error_abi.Status {
+                    var wrong = contract.*;
+                    wrong.arguments.size += 1;
+                    return RoutedRaftBatchWriter.BoundaryAbi.local_dispatch(&wrong, callback, args, output);
+                }
+            };
+            var state: State = .{};
+            var writer: RoutedRaftBatchWriter = .{ .ptr = &state, .write_fn = State.write };
+            const forwarding: internal_batch_forwarding.Context = .{ .remaining_ms = 425, .forwards_remaining = 1, .campaign_allowed = false };
+            state.failure = error.PrivateLocalCallbackError;
+            try std.testing.expectError(error.PrivateLocalCallbackError, writer.write(std.testing.allocator, .transaction, 17, "documents", .{}, forwarding, .{}));
+            writer.boundary_dispatch = State.foreign;
+            for ([_]anyerror{ error.MetadataSnapshotUnavailable, error.GroupLeaderUnavailable, error.RaftBatchWriteOutcomeUnknown, error.Canceled }) |failure| {
+                state.failure = failure;
+                try std.testing.expectError(failure, writer.write(std.testing.allocator, .transaction, 17, "documents", .{}, forwarding, .{}));
+            }
+            state.failure = null;
+            try std.testing.expect((try writer.write(std.testing.allocator, .transaction, 17, "documents", .{}, forwarding, .{})) != null);
+            state.found = false;
+            try std.testing.expect((try writer.write(std.testing.allocator, .transaction, 17, "documents", .{}, forwarding, .{})) == null);
+            const calls = state.calls;
+            writer.boundary_dispatch = State.incompatible;
+            try std.testing.expectError(error.InvalidArgument, writer.write(std.testing.allocator, .transaction, 17, "documents", .{}, forwarding, .{}));
+            try std.testing.expectEqual(calls, state.calls);
         }
 
         test "typed routed batch preserves forwarding cancellation and identity conflicts" {

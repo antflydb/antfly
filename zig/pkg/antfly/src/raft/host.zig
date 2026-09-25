@@ -120,6 +120,12 @@ pub fn stableRandomSeed(group_id: u64, local_node_id: u64) u64 {
 }
 
 pub const HostDeps = struct {
+    /// Managed hosts publish their stable address before catalog restoration.
+    /// The owner receives null before teardown, including failed startup.
+    ready_observer: ?struct {
+        ptr: *anyopaque,
+        set_host: *const fn (*anyopaque, ?*Host) void,
+    } = null,
     /// Borrowed synchronization and monotonic clock authority; must outlive the host. The default
     /// supports blocking mutex waits without allocating a worker pool.
     io: std.Io = std.Io.Threaded.global_single_threaded.io(),
@@ -424,6 +430,7 @@ pub const Host = struct {
     }
 
     pub fn deinit(self: *Host) void {
+        if (self.deps.ready_observer) |observer| observer.set_host(observer.ptr, null);
         self.lockInbound();
         var pending = self.pending_inbound;
         self.pending_inbound = .empty;
@@ -1107,12 +1114,32 @@ pub const Host = struct {
         self.runtime_host.campaignGroup(group_id) catch |err| return mapGroupActivityError(err);
     }
 
+    pub fn applyCompletionAccepted(self: *Host, group_id: u64, term: u64, index: u64, canonical: []const u8) !void {
+        try self.runtime_host.applyCompletionAccepted(group_id, term, index, canonical);
+    }
+    pub fn completionProgress(self: *Host, group_id: u64) !?raft_engine.runtime.completion_admission_iface.Progress {
+        return try self.runtime_host.completionProgress(group_id);
+    }
+    pub fn hasCompletionBacking(self: *Host, group_id: u64) bool {
+        return self.runtime_host.hasCompletionBacking(group_id);
+    }
+    pub fn checkCompletionSnapshot(self: *Host, group_id: u64) !void {
+        try self.runtime_host.checkCompletionSnapshot(group_id);
+    }
+    pub fn ownsCompletionAccepted(self: *Host, group_id: u64, term: u64, index: u64, payload: []const u8) !bool {
+        return try self.runtime_host.ownsCompletionAccepted(group_id, term, index, payload);
+    }
+
     pub fn propose(self: *Host, group_id: u64, data: []const u8) !void {
         self.runtime_host.propose(group_id, data) catch |err| return mapGroupActivityError(err);
     }
 
     pub fn proposeWithReceipt(self: *Host, group_id: u64, data: []const u8, accepted_index: *?u64) !void {
         self.runtime_host.proposeWithReceipt(group_id, data, accepted_index) catch |err| return mapGroupActivityError(err);
+    }
+
+    pub fn proposeWithReceiptAndAdmission(self: *Host, group_id: u64, data: []const u8, accepted_index: *?u64, admission: ?raft_engine.runtime.MultiRaft.ProposalAdmission) !void {
+        self.runtime_host.proposeWithReceiptAndAdmission(group_id, data, accepted_index, admission) catch |err| return mapGroupActivityError(err);
     }
 
     pub fn proposeBatchWithReceipt(
@@ -1700,6 +1727,10 @@ pub const HttpHost = struct {
         try self.host.proposeWithReceipt(group_id, data, accepted_index);
     }
 
+    pub fn proposeWithReceiptAndAdmission(self: *HttpHost, group_id: u64, data: []const u8, accepted_index: *?u64, admission: ?raft_engine.runtime.MultiRaft.ProposalAdmission) !void {
+        try self.host.proposeWithReceiptAndAdmission(group_id, data, accepted_index, admission);
+    }
+
     pub fn proposeBatchWithReceipt(
         self: *HttpHost,
         group_id: u64,
@@ -1754,6 +1785,7 @@ pub const HttpHost = struct {
 
 pub fn mergeRuntimeHooks(base: RuntimeHooks, overlay: RuntimeHooks) RuntimeHooks {
     var merged = base;
+    if (overlay.completion_admission != null) merged.completion_admission = overlay.completion_admission;
     if (overlay.transport != null) merged.transport = overlay.transport;
     if (overlay.snapshot_transport != null) merged.snapshot_transport = overlay.snapshot_transport;
     if (overlay.group_storage != null) merged.group_storage = overlay.group_storage;

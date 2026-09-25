@@ -90,6 +90,15 @@ pub const ReplayStats = struct {
     bytes: u64 = 0,
     segments: u64 = 0,
     truncated_tail_bytes: u64 = 0,
+    truncated_tail_segment: ?u64 = null,
+    multiple_truncated_segments: bool = false,
+
+    fn noteTail(self: *ReplayStats, segment: u64, bytes: usize) void {
+        if (self.truncated_tail_segment) |previous| {
+            if (previous != segment) self.multiple_truncated_segments = true;
+        } else self.truncated_tail_segment = segment;
+        self.truncated_tail_bytes += @intCast(bytes);
+    }
 };
 
 pub const ReplayHooks = struct {
@@ -123,6 +132,9 @@ pub const ReplayWorkingSetOptions = struct {
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     tracked_working_set_bytes: ?*u64 = null,
     retained_cap_bytes: usize = default_replay_scratch_retained_cap_bytes,
+    /// Optional caller-owned streaming buffer. Never grown, shrunk or freed;
+    /// it must cover an incomplete record plus the next read chunk.
+    pending_buffer: ?[]u8 = null,
 };
 
 const ReplayWorkingSetTracker = struct {
@@ -218,78 +230,302 @@ pub fn appendStateWithOptionsResult(
     options: AppendOptions,
 ) !AppendResult {
     if (state.entryCount() == 0) return .{};
-
-    const payload_len = encodedPayloadLen(state);
-    var record = try allocator.alloc(u8, record_header_len + payload_len);
-    defer allocator.free(record);
-    const payload = record[record_header_len..];
-    try encodePayloadIntoSlice(payload, state);
-
-    std.mem.writeInt(u32, record[0..4], record_magic, .little);
-    std.mem.writeInt(u16, record[4..6], record_version, .little);
-    std.mem.writeInt(u16, record[6..8], record_header_len, .little);
-    std.mem.writeInt(u32, record[8..12], @intCast(payload.len), .little);
-    std.mem.writeInt(u32, record[12..16], Crc32.hash(payload), .little);
-
-    const wal_dir = try walDirPathAlloc(allocator, root_dir);
-    defer allocator.free(wal_dir);
-    try storage.createDirPath(wal_dir);
-
-    const current = try readCurrentSegment(storage, allocator, root_dir);
-    var segment = current.segment;
-    var current_size = current.size;
-    var index_syncs: u64 = 0;
-    if (!current.index_exists) {
-        // Persist the WAL directory's own namespace entry once during
-        // initialization. Segment rotation only needs the already-durable WAL
-        // directory and does not add a steady-state parent sync.
-        if (sync) try storage.syncParentAbsolute(wal_dir);
-        try writeCurrentSegment(storage, allocator, root_dir, segment, current_size);
-        index_syncs += 1;
-        try writeCheckpointIndex(storage, allocator, root_dir, .{
-            .oldest_retained_segment = 1,
-            .covered_through_segment = 0,
-        });
-        index_syncs += 1;
-    }
-    var segment_path = try segmentPathAlloc(allocator, root_dir, segment);
-    var segment_path_owned = true;
-    errdefer if (segment_path_owned) allocator.free(segment_path);
-    if (current_size > 0 and current_size + record.len > options.segment_bytes) {
-        allocator.free(segment_path);
-        segment_path_owned = false;
-        segment += 1;
-        current_size = 0;
-        try writeCurrentSegment(storage, allocator, root_dir, segment, current_size);
-        index_syncs += 1;
-        segment_path = try segmentPathAlloc(allocator, root_dir, segment);
-        segment_path_owned = true;
-    }
-    const segment_became_nonempty = current_size == 0;
-    storage.appendFileAbsolute(allocator, segment_path, record, sync) catch |err| switch (err) {
-        error.FileNotFound => {
-            try storage.createDirPath(wal_dir);
-            try storage.appendFileAbsolute(allocator, segment_path, record, sync);
-        },
-        else => return err,
-    };
-    // fsync(file) does not make a newly-created directory entry durable on
-    // POSIX filesystems. Pay the parent-directory boundary only for the first
-    // record in a segment; steady-state appends remain one file sync.
-    if (sync and segment_became_nonempty) try storage.syncParentAbsolute(segment_path);
-    allocator.free(segment_path);
-    segment_path_owned = false;
-    return .{
-        .bytes = record.len,
-        .segment = segment,
-        .segment_became_nonempty = segment_became_nonempty,
-        .segment_syncs = @intFromBool(sync),
-        .index_syncs = index_syncs,
+    var prepared = try PreparedAppend.init(allocator, root_dir, state, sync, options);
+    defer prepared.deinit();
+    return switch (try prepared.executeWithCompatibility(storage, allocator, true)) {
+        .appended => |result| result,
+        .uncertain => |err| err,
     };
 }
 
+/// This outcome is local to the WAL caller; it must not cross a raw error ABI.
+/// Preparation errors precede every storage call. Execution errors conservatively
+/// retain uncertainty, including a provider reporting failure after a full write.
+pub const AppendOutcome = union(enum) {
+    appended: AppendResult,
+    uncertain: anyerror,
+};
+
+/// Owned, single-use WAL-layer preparation. init performs no storage calls and
+/// copies all caller data. The caller still owns backend/WAL serialization and
+/// retention admission. This is not a durable transaction or a complete physical
+/// completion ticket: storage providers may allocate through io_allocator (or
+/// their own allocator), acquire descriptors, and fail during I/O. In particular
+/// generic append may rewrite the whole segment. No bounded-provider guarantee
+/// is inferred from this preparation.
+pub const PreparedAppend = struct {
+    allocator: Allocator,
+    record: []u8,
+    wal_dir: []u8,
+    index_path: []u8,
+    checkpoint_path: []u8,
+    segment_path: []u8,
+    current_control: [control_pair_len]u8 = undefined,
+    checkpoint_control: [control_pair_len]u8 = undefined,
+    sync: bool,
+    options: AppendOptions,
+    attempted: bool = false,
+
+    /// Any failure here is provably pre-I/O. No storage provider is accepted.
+    pub fn init(allocator: Allocator, root_dir: []const u8, state: anytype, sync: bool, options: AppendOptions) !PreparedAppend {
+        var payload_len: usize = @sizeOf(u32);
+        if (state.entryCount() > std.math.maxInt(u32)) return error.WalRecordTooLarge;
+        for (0..state.entryCount()) |i| {
+            const entry = state.entryAt(i);
+            for ([_]usize{ entry_header_len, if (entry.namespace_name) |name| name.len else 0, entry.key.len, entry.value.len }) |part| {
+                if (part > std.math.maxInt(u32)) return error.WalRecordTooLarge;
+                payload_len = std.math.add(usize, payload_len, part) catch return error.WalRecordTooLarge;
+            }
+        }
+        if (payload_len > std.math.maxInt(u32)) return error.WalRecordTooLarge;
+        const record_len = if (state.entryCount() == 0) 0 else std.math.add(usize, record_header_len, payload_len) catch return error.WalRecordTooLarge;
+        const record = try allocator.alloc(u8, record_len);
+        errdefer allocator.free(record);
+        if (record.len != 0) {
+            const payload = record[record_header_len..];
+            try encodePayloadIntoSlice(payload, state);
+            std.mem.writeInt(u32, record[0..4], record_magic, .little);
+            std.mem.writeInt(u16, record[4..6], record_version, .little);
+            std.mem.writeInt(u16, record[6..8], record_header_len, .little);
+            std.mem.writeInt(u32, record[8..12], @intCast(payload.len), .little);
+            std.mem.writeInt(u32, record[12..16], Crc32.hash(payload), .little);
+        }
+        const wal_dir = try walDirPathAlloc(allocator, root_dir);
+        errdefer allocator.free(wal_dir);
+        const index_path = try indexPathAlloc(allocator, root_dir);
+        errdefer allocator.free(index_path);
+        const checkpoint_path = try checkpointPathAlloc(allocator, root_dir);
+        errdefer allocator.free(checkpoint_path);
+        // Every u64 segment has exactly 20 decimal digits when zero-padded.
+        const segment_path = try segmentPathAlloc(allocator, root_dir, 1);
+        errdefer allocator.free(segment_path);
+        var checkpoint_payload: [16]u8 = undefined;
+        std.mem.writeInt(u64, checkpoint_payload[0..8], 1, .little);
+        std.mem.writeInt(u64, checkpoint_payload[8..16], 0, .little);
+        var result: PreparedAppend = .{ .allocator = allocator, .record = record, .wal_dir = wal_dir, .index_path = index_path, .checkpoint_path = checkpoint_path, .segment_path = segment_path, .sync = sync, .options = options };
+        encodeControl(&result.checkpoint_control, .checkpoint, &checkpoint_payload);
+        return result;
+    }
+
+    pub fn deinit(self: *PreparedAppend) void {
+        self.allocator.free(self.segment_path);
+        self.allocator.free(self.checkpoint_path);
+        self.allocator.free(self.index_path);
+        self.allocator.free(self.wal_dir);
+        self.allocator.free(self.record);
+        self.* = undefined;
+    }
+
+    /// Consumes execution permission even after failure. A consumed error is
+    /// not evidence about the previous attempt and must never clear its debt.
+    pub fn execute(self: *PreparedAppend, storage: storage_io.Storage, io_allocator: Allocator) error{PreparedAppendConsumed}!AppendOutcome {
+        return self.executeWithCompatibility(storage, io_allocator, false);
+    }
+
+    fn executeWithCompatibility(self: *PreparedAppend, storage: storage_io.Storage, io_allocator: Allocator, retry_missing_directory: bool) error{PreparedAppendConsumed}!AppendOutcome {
+        if (self.attempted) return error.PreparedAppendConsumed;
+        self.attempted = true;
+        return .{ .appended = self.executeOnce(storage, io_allocator, retry_missing_directory) catch |err| return .{ .uncertain = err } };
+    }
+
+    fn setSegment(self: *PreparedAppend, segment: u64) void {
+        _ = std.fmt.bufPrint(self.segment_path[self.segment_path.len - 24 ..], "{d:0>20}.log", .{segment}) catch unreachable;
+    }
+
+    fn writeCurrent(self: *PreparedAppend, storage: storage_io.Storage, io_allocator: Allocator, segment: u64, size: u64) !void {
+        var payload: [16]u8 = undefined;
+        std.mem.writeInt(u64, payload[0..8], segment, .little);
+        std.mem.writeInt(u64, payload[8..16], size, .little);
+        encodeControl(&self.current_control, .current_segment, &payload);
+        try replaceFileAtomically(storage, io_allocator, self.index_path, &self.current_control);
+    }
+
+    fn readCurrent(self: *PreparedAppend, storage: storage_io.Storage, io_allocator: Allocator) !CurrentSegment {
+        const index_size = storage.fileSize(self.index_path) catch |err| switch (err) {
+            error.FileNotFound => return .{ .segment = 1, .size = 0, .index_exists = false },
+            else => return err,
+        };
+        if (index_size != control_pair_len) return error.CorruptLsmWalIndex;
+        try storage.readFileRangeInto(io_allocator, self.index_path, 0, &self.current_control);
+        const payload = try decodeControl(&self.current_control, .current_segment, 16);
+        const segment = std.mem.readInt(u64, payload[0..8], .little);
+        if (segment == 0) return error.CorruptLsmWalIndex;
+        self.setSegment(segment);
+        const size = storage.fileSize(self.segment_path) catch |err| switch (err) {
+            error.FileNotFound => 0,
+            else => return err,
+        };
+        return .{ .segment = segment, .size = size, .index_exists = true };
+    }
+
+    fn executeOnce(self: *PreparedAppend, storage: storage_io.Storage, io_allocator: Allocator, retry_missing_directory: bool) !AppendResult {
+        if (self.record.len == 0) return .{};
+        try storage.createDirPath(self.wal_dir);
+        const current = try self.readCurrent(storage, io_allocator);
+        var segment = current.segment;
+        var current_size = current.size;
+        var index_syncs: u64 = 0;
+        if (!current.index_exists) {
+            if (self.sync) try storage.syncParentAbsolute(self.wal_dir);
+            try self.writeCurrent(storage, io_allocator, segment, current_size);
+            index_syncs += 1;
+            try replaceFileAtomically(storage, io_allocator, self.checkpoint_path, &self.checkpoint_control);
+            index_syncs += 1;
+        }
+        self.setSegment(segment);
+        if (current_size > 0 and self.record.len > self.options.segment_bytes -| current_size) {
+            segment = std.math.add(u64, segment, 1) catch return error.CorruptLsmWalIndex;
+            current_size = 0;
+            try self.writeCurrent(storage, io_allocator, segment, current_size);
+            index_syncs += 1;
+            self.setSegment(segment);
+        }
+        const segment_became_nonempty = current_size == 0;
+        storage.appendFileAbsolute(io_allocator, self.segment_path, self.record, self.sync) catch |err| switch (err) {
+            error.FileNotFound => {
+                // Preserve the historical wrapper's missing-directory retry,
+                // but a prepared attempt cannot infer zero bytes written from
+                // an arbitrary provider error and must never resend its record.
+                if (!retry_missing_directory) return err;
+                try storage.createDirPath(self.wal_dir);
+                try storage.appendFileAbsolute(io_allocator, self.segment_path, self.record, self.sync);
+            },
+            else => return err,
+        };
+        if (self.sync and segment_became_nonempty) try storage.syncParentAbsolute(self.segment_path);
+        return .{ .bytes = self.record.len, .segment = segment, .segment_became_nonempty = segment_became_nonempty, .segment_syncs = @intFromBool(self.sync), .index_syncs = index_syncs };
+    }
+};
+
 pub fn encodedStateRecordLen(state: anytype) usize {
     return record_header_len + encodedPayloadLen(state);
+}
+
+test "lsm wal prepared append owns input and preparation allocation failures unwind" {
+    const Fixture = struct {
+        fn check(allocator: Allocator) !void {
+            var state: State = .{};
+            defer state.deinit(std.testing.allocator);
+            try state.upsert(std.testing.allocator, .{}, "key", "original", false);
+            // init cannot touch storage: no storage provider is passed to it.
+            var prepared = try PreparedAppend.init(allocator, "/prepare-only", &state, true, .{});
+            defer prepared.deinit();
+            try state.upsert(std.testing.allocator, .{}, "key", "replacement", false);
+            var memory = storage_io.MemoryStorage.init(std.testing.allocator);
+            defer memory.deinit();
+            try std.testing.expect((try prepared.execute(memory.storage(), std.testing.allocator)) == .appended);
+            try std.testing.expectError(error.PreparedAppendConsumed, prepared.execute(memory.storage(), std.testing.allocator));
+            var replayed: State = .{};
+            defer replayed.deinit(std.testing.allocator);
+            const stats = try replayIntoMutable(memory.storage(), std.testing.allocator, "/prepare-only", &replayed);
+            try std.testing.expectEqual(@as(u64, 1), stats.records);
+            try std.testing.expectEqualStrings("original", try replayed.get(.{}, "key"));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.check, .{});
+}
+
+test "lsm wal prepared append native faults preserve uncertainty and exact replay" {
+    const Fixture = struct {
+        const Fault = enum { none, before_append, partial_append, partial_missing, file_sync, parent_sync };
+        var backing: storage_io.Storage = undefined;
+        var fault: Fault = .none;
+        var calls: usize = 0;
+        var append_calls: usize = 0;
+        fn create(_: *anyopaque, path: []const u8) !void {
+            calls += 1;
+            try backing.createDirPath(path);
+        }
+        fn append(_: *anyopaque, path: []const u8, bytes: []const u8, sync: bool) !void {
+            calls += 1;
+            append_calls += 1;
+            if (fault == .before_append) return error.InjectedAppendFailure;
+            if (fault == .partial_append or fault == .partial_missing) {
+                try backing.appendFileAbsolute(std.testing.allocator, path, bytes[0 .. bytes.len / 2], sync);
+                if (fault == .partial_missing) return error.FileNotFound;
+                return error.InjectedAppendFailure;
+            }
+            try backing.appendFileAbsolute(std.testing.allocator, path, bytes, false);
+            if (sync) {
+                try backing.syncFileContentsAbsolute(path);
+                if (fault == .file_sync) return error.InjectedFileSyncFailure;
+            }
+        }
+        fn parent(_: *anyopaque, path: []const u8) !void {
+            calls += 1;
+            try backing.syncParentAbsolute(path);
+            if (fault == .parent_sync and std.mem.endsWith(u8, path, ".log")) return error.InjectedParentSyncFailure;
+        }
+    };
+    const repository = @import("repository.zig");
+    inline for (std.meta.tags(Fixture.Fault)) |fault| {
+        var path_buf: [256]u8 = undefined;
+        const root_z = repository.tmpPath(&path_buf, "prepared-wal");
+        const root = std.mem.span(root_z);
+        defer repository.cleanupTmp(root_z);
+        {
+            var native = try storage_io.NativeStorage.init(std.testing.allocator, .threaded);
+            defer native.deinit();
+            Fixture.backing = native.storage();
+            var vtable = Fixture.backing.vtable.*;
+            vtable.create_dir_path = Fixture.create;
+            vtable.append_file_absolute = Fixture.append;
+            vtable.sync_parent_absolute = Fixture.parent;
+            const injected: storage_io.Storage = .{ .ptr = Fixture.backing.ptr, .vtable = &vtable };
+            var old: State = .{};
+            defer old.deinit(std.testing.allocator);
+            try old.upsert(std.testing.allocator, .{}, "old", "before", false);
+            _ = try appendState(Fixture.backing, std.testing.allocator, root, &old, true);
+            var state: State = .{};
+            defer state.deinit(std.testing.allocator);
+            try state.upsert(std.testing.allocator, .{}, "new", "after", false);
+            Fixture.calls = 0;
+            Fixture.append_calls = 0;
+            Fixture.fault = fault;
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+            var prepared = try PreparedAppend.init(failing.allocator(), root, &state, true, .{ .segment_bytes = 1 });
+            defer prepared.deinit();
+            try std.testing.expectEqual(@as(usize, 0), Fixture.calls);
+            // Provider scratch is separate; all WAL-layer allocation is done.
+            failing.fail_index = failing.alloc_index;
+            const result = try prepared.execute(injected, std.testing.allocator);
+            try std.testing.expect(!failing.has_induced_failure);
+            if (fault == .none) {
+                try std.testing.expect(result == .appended);
+                try std.testing.expectEqual(@as(u64, 2), result.appended.segment);
+                try std.testing.expectEqual(@as(u64, 1), result.appended.index_syncs);
+            } else {
+                try std.testing.expect(result == .uncertain);
+                try std.testing.expectEqual(switch (fault) {
+                    .before_append, .partial_append => error.InjectedAppendFailure,
+                    .partial_missing => error.FileNotFound,
+                    .file_sync => error.InjectedFileSyncFailure,
+                    .parent_sync => error.InjectedParentSyncFailure,
+                    .none => unreachable,
+                }, result.uncertain);
+            }
+            const calls = Fixture.calls;
+            try std.testing.expectError(error.PreparedAppendConsumed, prepared.execute(injected, std.testing.allocator));
+            try std.testing.expectEqual(calls, Fixture.calls);
+            try std.testing.expectEqual(@as(usize, 1), Fixture.append_calls);
+        }
+        // Reopen actual files with a new provider. Injected sync errors occur
+        // after successful sync, proving failure can coexist with durable data.
+        var reopened = try storage_io.NativeStorage.init(std.testing.allocator, .threaded);
+        defer reopened.deinit();
+        var replayed: State = .{};
+        defer replayed.deinit(std.testing.allocator);
+        const stats = try replayIntoMutable(reopened.storage(), std.testing.allocator, root, &replayed);
+        try std.testing.expectEqualStrings("before", try replayed.get(.{}, "old"));
+        if (fault == .before_append or fault == .partial_append or fault == .partial_missing) {
+            try std.testing.expectEqual(@as(u64, 1), stats.records);
+            try std.testing.expectError(error.NotFound, replayed.get(.{}, "new"));
+            if (fault != .before_append) try std.testing.expect(stats.truncated_tail_bytes > 0);
+        } else {
+            try std.testing.expectEqual(@as(u64, 2), stats.records);
+            try std.testing.expectEqualStrings("after", try replayed.get(.{}, "new"));
+        }
+    }
 }
 
 pub fn currentSegment(storage: storage_io.Storage, allocator: Allocator, root_dir: []const u8) !u64 {
@@ -345,7 +581,7 @@ pub fn replayIntoMutableWithHooksAndOptions(
     const retained_cap_bytes = normalizedReplayPendingRetainedCap(options.retained_cap_bytes);
     const legacy_path = try legacyPathAlloc(allocator, root_dir);
     defer allocator.free(legacy_path);
-    try replayFileStreaming(storage, allocator, legacy_path, 0, mutable, &stats, hooks, .{}, &working_set, retained_cap_bytes);
+    try replayFileStreaming(storage, allocator, legacy_path, 0, mutable, &stats, hooks, .{}, &working_set, retained_cap_bytes, options.pending_buffer);
 
     const current_segment = (readCurrentSegmentIfPresent(storage, allocator, root_dir) catch |err| switch (err) {
         error.FileNotFound => return stats,
@@ -358,7 +594,7 @@ pub fn replayIntoMutableWithHooksAndOptions(
         errdefer allocator.free(segment_path);
         try replayFileStreaming(storage, allocator, segment_path, segment, mutable, &stats, hooks, .{
             .allow_corrupt_tail = segment == current_segment,
-        }, &working_set, retained_cap_bytes);
+        }, &working_set, retained_cap_bytes, options.pending_buffer);
         allocator.free(segment_path);
     }
 
@@ -371,6 +607,35 @@ fn normalizedReplayPendingRetainedCap(retained_cap_bytes: usize) usize {
 }
 
 pub fn reset(storage: storage_io.Storage, allocator: Allocator, root_dir: []const u8) !void {
+    return resetInternal(storage, allocator, root_dir, false);
+}
+
+/// Completion owns a durable manifest and recovery guard. Exclude every old
+/// segment durably before resetting numbering, so an interrupted reset cannot
+/// replay an older prefix over the newer manifested transaction decision.
+pub const ProtectedResetBoundary = enum { excluded_old_segments, emptied_first_segment, retired_old_segments, reset_current_index, reset_checkpoint };
+pub var test_protected_reset_hook: ?*const fn (ProtectedResetBoundary) bool = null;
+
+fn protectedResetBoundary(boundary: ProtectedResetBoundary) !void {
+    if (builtin.is_test) if (test_protected_reset_hook) |hook| if (hook(boundary)) return error.InjectedProtectedResetCrash;
+}
+
+/// A reset interrupted before reopening the checkpoint floor has no live
+/// primary WAL. Writable recovery must finish it before admitting new appends.
+pub fn hasProtectedResetCut(storage: storage_io.Storage, allocator: Allocator, root_dir: []const u8) !bool {
+    const checkpoint = try readCheckpointIndex(storage, allocator, root_dir);
+    const current = readCurrentSegmentIfPresent(storage, allocator, root_dir) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return checkpoint.oldest_retained_segment > current.segment;
+}
+
+pub fn protectedReset(storage: storage_io.Storage, allocator: Allocator, root_dir: []const u8) !void {
+    return resetInternal(storage, allocator, root_dir, true);
+}
+
+fn resetInternal(storage: storage_io.Storage, allocator: Allocator, root_dir: []const u8, protected: bool) !void {
     const wal_dir = try walDirPathAlloc(allocator, root_dir);
     defer allocator.free(wal_dir);
     try storage.createDirPath(wal_dir);
@@ -380,14 +645,43 @@ pub fn reset(storage: storage_io.Storage, allocator: Allocator, root_dir: []cons
         error.FileNotFound => CurrentSegment{ .segment = 1, .size = 0, .index_exists = false },
         else => return err,
     }).segment;
+    const first_segment = try segmentPathAlloc(allocator, root_dir, 1);
+    defer allocator.free(first_segment);
+    if (protected) {
+        const after_last = std.math.add(u64, current_segment, 1) catch return error.CorruptLsmWalIndex;
+        // Legacy replay ignores the checkpoint; retire it before establishing
+        // this cut. All its data is already in the durable manifest.
+        const legacy = try legacyPathAlloc(allocator, root_dir);
+        defer allocator.free(legacy);
+        storage.deleteFileAbsolute(legacy) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+        try storage.syncParentAbsolute(legacy);
+        try writeCheckpointIndex(storage, allocator, root_dir, .{
+            .oldest_retained_segment = after_last,
+            .covered_through_segment = current_segment,
+        });
+        try protectedResetBoundary(.excluded_old_segments);
+        try storage.writeFileAbsolute(first_segment, "");
+        try storage.syncFileContentsAbsolute(first_segment);
+        try storage.syncParentAbsolute(first_segment);
+        try protectedResetBoundary(.emptied_first_segment);
+        // Finish deletion while the old index still records the full extent.
+        // Otherwise a crash after resetting the index loses the cleanup bound,
+        // and a later rotation could append onto an orphaned old segment.
+        try deleteResetSegments(storage, allocator, root_dir, current_segment);
+        try storage.syncParentAbsolute(first_segment);
+        try protectedResetBoundary(.retired_old_segments);
+    }
     try writeCurrentSegment(storage, allocator, root_dir, 1, 0);
+    if (protected) try protectedResetBoundary(.reset_current_index);
     try writeCheckpointIndex(storage, allocator, root_dir, .{
         .oldest_retained_segment = 1,
         .covered_through_segment = 0,
     });
-    const first_segment = try segmentPathAlloc(allocator, root_dir, 1);
-    defer allocator.free(first_segment);
-    try storage.writeFileAbsolute(first_segment, "");
+    if (protected) try protectedResetBoundary(.reset_checkpoint);
+    if (!protected) try storage.writeFileAbsolute(first_segment, "");
     try writeReplayIndex(storage, allocator, root_dir, .{
         .current_segment = 1,
         .next_sequence = 1,
@@ -397,16 +691,7 @@ pub fn reset(storage: storage_io.Storage, allocator: Allocator, root_dir: []cons
     defer allocator.free(replay_segments_path);
     try replaceFileAtomically(storage, allocator, replay_segments_path, "");
 
-    var segment: u64 = 2;
-    while (segment <= current_segment) : (segment += 1) {
-        const segment_path = try segmentPathAlloc(allocator, root_dir, segment);
-        errdefer allocator.free(segment_path);
-        storage.deleteFileAbsolute(segment_path) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        };
-        allocator.free(segment_path);
-    }
+    if (!protected) try deleteResetSegments(storage, allocator, root_dir, current_segment);
 
     const legacy_path = try legacyPathAlloc(allocator, root_dir);
     defer allocator.free(legacy_path);
@@ -414,6 +699,18 @@ pub fn reset(storage: storage_io.Storage, allocator: Allocator, root_dir: []cons
         error.FileNotFound => {},
         else => return err,
     };
+}
+
+fn deleteResetSegments(storage: storage_io.Storage, allocator: Allocator, root_dir: []const u8, current_segment: u64) !void {
+    var segment: u64 = 2;
+    while (segment <= current_segment) : (segment += 1) {
+        const path = try segmentPathAlloc(allocator, root_dir, segment);
+        defer allocator.free(path);
+        storage.deleteFileAbsolute(path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+    }
 }
 
 pub fn snapshotRetention(
@@ -1114,6 +1411,7 @@ fn replayFileStreaming(
     options: ReplayFileOptions,
     working_set: *ReplayWorkingSetTracker,
     retained_cap_bytes: usize,
+    fixed_buffer: ?[]u8,
 ) !void {
     const file_size = storage.fileSize(wal_path) catch |err| switch (err) {
         error.FileNotFound => return,
@@ -1123,9 +1421,12 @@ fn replayFileStreaming(
     stats.segments += 1;
     stats.bytes += file_size;
 
-    var pending = std.ArrayListUnmanaged(u8).empty;
-    defer pending.deinit(allocator);
-    try pending.ensureTotalCapacityPrecise(allocator, retained_cap_bytes);
+    var pending: std.ArrayListUnmanaged(u8) = if (fixed_buffer) |buffer|
+        .{ .items = buffer[0..0], .capacity = buffer.len }
+    else
+        .empty;
+    defer if (fixed_buffer == null) pending.deinit(allocator);
+    if (fixed_buffer == null) try pending.ensureTotalCapacityPrecise(allocator, retained_cap_bytes);
     working_set.observePending(&pending);
     defer working_set.observe(0);
 
@@ -1133,7 +1434,9 @@ fn replayFileStreaming(
     while (offset < file_size) {
         const len: usize = @intCast(@min(@as(u64, replay_chunk_bytes), file_size - offset));
         const start = pending.items.len;
-        try pending.ensureUnusedCapacity(allocator, len);
+        if (fixed_buffer != null) {
+            if (len > pending.capacity - pending.items.len) return error.WalRecordTooLarge;
+        } else try pending.ensureUnusedCapacity(allocator, len);
         pending.items.len += len;
         working_set.observePending(&pending);
         errdefer pending.items.len = start;
@@ -1157,19 +1460,19 @@ fn replayFileStreaming(
                     segment,
                     pending.items.len,
                 });
-                stats.truncated_tail_bytes += @intCast(pending.items.len);
+                stats.noteTail(segment, pending.items.len);
                 pending.clearRetainingCapacity();
-                releaseOversizedReplayPendingBuffer(allocator, &pending, retained_cap_bytes);
+                if (fixed_buffer == null) releaseOversizedReplayPendingBuffer(allocator, &pending, retained_cap_bytes);
                 working_set.observePending(&pending);
                 break;
             },
             else => return err,
         };
-        releaseOversizedReplayPendingBuffer(allocator, &pending, retained_cap_bytes);
+        if (fixed_buffer == null) releaseOversizedReplayPendingBuffer(allocator, &pending, retained_cap_bytes);
         working_set.observePending(&pending);
     }
     if (pending.items.len > 0) {
-        stats.truncated_tail_bytes += @intCast(pending.items.len);
+        stats.noteTail(segment, pending.items.len);
     }
 }
 
@@ -2172,6 +2475,48 @@ test "lsm wal retention snapshot counts replayed segment debt and reset clears i
     try std.testing.expectEqual(@as(u64, 0), after_reset.segments);
     try std.testing.expectEqual(@as(u64, 0), after_reset.bytes);
     try std.testing.expectEqual(@as(u64, 0), after_reset.current_segment_bytes);
+}
+
+test "lsm protected WAL reset never replays an older prefix after any durable cut" {
+    const Hook = struct {
+        var target: ProtectedResetBoundary = undefined;
+        fn stop(boundary: ProtectedResetBoundary) bool {
+            return boundary == target;
+        }
+    };
+    const alloc = std.testing.allocator;
+    for (std.enums.values(ProtectedResetBoundary)) |boundary| {
+        var storage = storage_io.MemoryStorage.init(alloc);
+        defer storage.deinit();
+        const root = "/protected-reset-cuts";
+        try storage.storage().createDirPath(root);
+        var state: State = .{};
+        defer state.deinit(alloc);
+        try state.upsert(alloc, .{}, "decision", "pending", false);
+        _ = try appendStateWithOptions(storage.storage(), alloc, root, &state, true, .{ .segment_bytes = 1 });
+        try state.upsert(alloc, .{}, "decision", "committed", false);
+        _ = try appendStateWithOptions(storage.storage(), alloc, root, &state, true, .{ .segment_bytes = 1 });
+        Hook.target = boundary;
+        test_protected_reset_hook = Hook.stop;
+        defer test_protected_reset_hook = null;
+        try std.testing.expectError(error.InjectedProtectedResetCrash, protectedReset(storage.storage(), alloc, root));
+        test_protected_reset_hook = null;
+        var replayed: State = .{};
+        defer replayed.deinit(alloc);
+        const stats = try replayIntoMutable(storage.storage(), alloc, root, &replayed);
+        try std.testing.expectEqual(@as(u64, 0), stats.records);
+        try std.testing.expectEqual(@as(usize, 0), replayed.entryCount());
+        // Repeating cleanup after restart is safe and enables subsequent WAL.
+        try protectedReset(storage.storage(), alloc, root);
+        const retired = try segmentPathAlloc(alloc, root, 2);
+        defer alloc.free(retired);
+        try std.testing.expectError(error.FileNotFound, storage.storage().fileSize(retired));
+        try state.upsert(alloc, .{}, "decision", "newer", false);
+        _ = try appendStateWithOptions(storage.storage(), alloc, root, &state, true, .{ .segment_bytes = 1 });
+        const after = try replayIntoMutable(storage.storage(), alloc, root, &replayed);
+        try std.testing.expectEqual(@as(u64, 1), after.records);
+        try std.testing.expectEqualStrings("newer", try replayed.get(.{}, "decision"));
+    }
 }
 
 test "lsm wal checkpoint retires covered segments and replay starts at retained floor" {

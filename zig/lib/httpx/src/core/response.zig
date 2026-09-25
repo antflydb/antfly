@@ -27,6 +27,22 @@ pub const Response = struct {
     headers: Headers,
     body: ?[]const u8 = null,
     body_owned: bool = false,
+    /// Body storage may belong to a separately budgeted allocator or a foreign
+    /// runtime. Retirement runs after locally owned buffers have been freed.
+    body_allocator: ?Allocator = null,
+    retirement: ?Retirement = null,
+
+    pub const Retirement = struct {
+        ptr: *anyopaque,
+        release: *const fn (*anyopaque) void,
+    };
+
+    pub const BodyMemory = struct {
+        allocator: Allocator,
+        ptr: *anyopaque,
+        retain: *const fn (*anyopaque) void,
+        release: *const fn (*anyopaque) void,
+    };
 
     const Self = @This();
 
@@ -44,9 +60,10 @@ pub const Response = struct {
         self.headers.deinit();
         if (self.body_owned) {
             if (self.body) |b| {
-                self.allocator.free(b);
+                (self.body_allocator orelse self.allocator).free(b);
             }
         }
+        if (self.retirement) |owner| owner.release(owner.ptr);
     }
 
     /// Returns true if the response indicates success (2xx).
@@ -178,6 +195,9 @@ pub const ResponseBuilder = struct {
     headers: Headers,
     body_data: ?[]const u8 = null,
     body_owned: bool = false,
+    /// Installed before producing a body. The builder owns one reference and
+    /// each built response retains another, independently of context lifetime.
+    body_memory: ?Response.BodyMemory = null,
 
     const Self = @This();
 
@@ -193,16 +213,21 @@ pub const ResponseBuilder = struct {
     pub fn deinit(self: *Self) void {
         self.freeOwnedBody();
         self.headers.deinit();
+        if (self.body_memory) |owner| owner.release(owner.ptr);
     }
 
     fn freeOwnedBody(self: *Self) void {
         if (self.body_owned) {
             if (self.body_data) |b| {
-                self.allocator.free(b);
+                self.bodyAllocator().free(b);
             }
             self.body_owned = false;
             self.body_data = null;
         }
+    }
+
+    pub fn bodyAllocator(self: *const Self) Allocator {
+        return if (self.body_memory) |owner| owner.allocator else self.allocator;
     }
 
     /// Sets the status code.
@@ -228,7 +253,7 @@ pub const ResponseBuilder = struct {
     pub fn json(self: *Self, value: anytype) !*Self {
         _ = try self.header(HeaderName.CONTENT_TYPE, "application/json");
         self.freeOwnedBody();
-        const serialized = try Json.stringify(self.allocator, value);
+        const serialized = try Json.stringify(self.bodyAllocator(), value);
         self.body_data = serialized;
         self.body_owned = true;
         return self;
@@ -240,7 +265,7 @@ pub const ResponseBuilder = struct {
     pub fn openApiJson(self: *Self, value: anytype) !*Self {
         _ = try self.header(HeaderName.CONTENT_TYPE, "application/json");
         self.freeOwnedBody();
-        const serialized = try Json.stringifyOpenApi(self.allocator, value);
+        const serialized = try Json.stringifyOpenApi(self.bodyAllocator(), value);
         self.body_data = serialized;
         self.body_owned = true;
         return self;
@@ -265,6 +290,11 @@ pub const ResponseBuilder = struct {
     /// Builds the final response.
     pub fn build(self: *Self) !Response {
         var response = Response.init(self.allocator, self.status_code);
+        response.body_allocator = self.bodyAllocator();
+        if (self.body_memory) |owner| {
+            owner.retain(owner.ptr);
+            response.retirement = .{ .ptr = owner.ptr, .release = owner.release };
+        }
         errdefer response.deinit();
 
         // Transfer header ownership directly instead of copying each entry.
@@ -280,7 +310,7 @@ pub const ResponseBuilder = struct {
                 self.body_data = null;
                 self.body_owned = false;
             } else {
-                response.body = try self.allocator.dupe(u8, b);
+                response.body = try self.bodyAllocator().dupe(u8, b);
             }
             response.body_owned = true;
 

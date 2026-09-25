@@ -23,6 +23,28 @@ pub const Tracker = struct {
         reservation: ?resource_manager_mod.Reservation = null,
     };
 
+    /// Pending admissions can outlive a particular executor teardown while
+    /// callers cancel them. This stable owner contains no executor pointer.
+    const Pending = struct {
+        allocator: Allocator,
+        refs: std.atomic.Value(usize) = .init(1),
+        count: std.atomic.Value(usize) = .init(0),
+
+        fn retainAdmission(self: *Pending) void {
+            _ = self.refs.fetchAdd(1, .monotonic);
+            _ = self.count.fetchAdd(1, .release);
+        }
+
+        fn releaseAdmission(self: *Pending) void {
+            std.debug.assert(self.count.fetchSub(1, .acq_rel) > 0);
+            self.release();
+        }
+
+        fn release(self: *Pending) void {
+            if (self.refs.fetchSub(1, .acq_rel) == 1) self.allocator.destroy(self);
+        }
+    };
+
     /// Account the durable payload and the per-sequence ownership needed to
     /// release it independently. This makes the byte budget a cardinality
     /// bound too: a stream of empty or tiny replay records cannot grow the
@@ -37,15 +59,18 @@ pub const Tracker = struct {
     pub const Admission = struct {
         reservation: ?resource_manager_mod.Reservation = null,
         retained_bytes: u64 = 0,
+        pending: ?*Pending = null,
 
         pub fn cancel(self: *Admission) void {
             if (self.reservation) |*reservation| reservation.release();
+            if (self.pending) |pending| pending.releaseAdmission();
             self.* = .{};
         }
     };
 
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     entries: std.ArrayListUnmanaged(Entry) = .empty,
+    pending: ?*Pending = null,
     retained_bytes: u64 = 0,
     accounted_bytes: u64 = 0,
     // Once entry allocation fails, retain exact aggregate accounting and force
@@ -66,6 +91,7 @@ pub const Tracker = struct {
         }
         self.observe(0);
         self.entries.deinit(alloc);
+        if (self.pending) |pending| pending.release();
         self.* = undefined;
     }
 
@@ -79,10 +105,10 @@ pub const Tracker = struct {
             self.observe(self.accounted_bytes +| retained_bytes);
             return;
         }
-        self.entries.append(alloc, .{
-            .sequence = sequence,
-            .retained_bytes = retained_bytes,
-        }) catch {
+        // Observed replay entries must not consume slots reserved by a
+        // source mutation that has not committed yet.
+        const pending = if (self.pending) |owner| owner.count.load(.acquire) else 0;
+        self.entries.ensureUnusedCapacity(alloc, std.math.add(usize, pending, 1) catch return error.OutOfMemory) catch {
             self.overflow_first_sequence = sequence;
             self.overflow_last_sequence = sequence;
             self.overflow_bytes = retained_bytes;
@@ -90,22 +116,30 @@ pub const Tracker = struct {
             self.observe(self.accounted_bytes +| retained_bytes);
             return;
         };
+        self.entries.appendAssumeCapacity(.{ .sequence = sequence, .retained_bytes = retained_bytes });
         self.retained_bytes +|= retained_bytes;
         self.observe(self.accounted_bytes +| retained_bytes);
     }
 
     /// Reserves exact node-wide replay capacity at the last fallible boundary
     /// before a source mutation becomes durable. Source mutations for one DB
-    /// are serialized, so reserving list capacity here guarantees the later
-    /// post-commit transfer is allocation-free.
+    /// are serialized by the executor. Reserve space for every outstanding
+    /// admission, including durable slots retained across unrelated writes,
+    /// so a later post-commit transfer remains allocation-free.
     pub fn admit(self: *Tracker, alloc: Allocator, bytes: u64) !Admission {
         const manager = self.resource_manager orelse return .{};
-        try self.entries.ensureUnusedCapacity(alloc, 1);
+        if (self.pending == null) {
+            const pending = try alloc.create(Pending);
+            pending.* = .{ .allocator = alloc };
+            self.pending = pending;
+        }
+        const pending = self.pending.?;
+        const slots = std.math.add(usize, pending.count.load(.acquire), 1) catch return error.OutOfMemory;
+        try self.entries.ensureUnusedCapacity(alloc, slots);
         const retained_bytes = retainedCharge(bytes);
-        return .{
-            .reservation = try manager.reserveImmediate(.derived_backlog, retained_bytes),
-            .retained_bytes = retained_bytes,
-        };
+        const reservation = try manager.reserveImmediate(.derived_backlog, retained_bytes);
+        pending.retainAdmission();
+        return .{ .reservation = reservation, .retained_bytes = retained_bytes, .pending = pending };
     }
 
     /// Transfers an admitted credit after the primary WAL and replay intent
@@ -116,14 +150,16 @@ pub const Tracker = struct {
             admission.* = .{};
             return;
         }
+        const pending = admission.pending orelse unreachable;
+        std.debug.assert(self.pending == pending and pending.count.load(.acquire) > 0);
         self.entries.appendAssumeCapacity(.{
             .sequence = sequence,
             .retained_bytes = admission.retained_bytes,
             .reservation = admission.reservation,
         });
         self.retained_bytes +|= admission.retained_bytes;
-        admission.reservation = null;
-        admission.retained_bytes = 0;
+        pending.releaseAdmission();
+        admission.* = .{};
     }
 
     pub fn releaseThrough(self: *Tracker, sequence: u64) void {
@@ -384,4 +420,57 @@ test "derived backlog tracker reacts to aggregate lsm state pressure" {
     try std.testing.expectEqual(@as(?u64, 7), tracker.throttleTargetSequence());
     manager.observeUsage(.lsm_in_memory_state, &lsm_bytes, 0);
     try std.testing.expectEqual(@as(?u64, null), tracker.throttleTargetSequence());
+}
+
+test "workload admission retained backlog owns its vector slot across unrelated commits" {
+    const alloc = std.testing.allocator;
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(alloc);
+    var failing = std.testing.FailingAllocator.init(alloc, .{});
+    const backing = failing.allocator();
+    var tracker = Tracker.init(&manager);
+    defer tracker.deinit(backing);
+    var retained = try tracker.admit(backing, 32);
+    defer retained.cancel();
+    const initial_capacity = tracker.entries.capacity;
+    for (1..129) |sequence| {
+        if (sequence % 2 == 0) {
+            try tracker.track(backing, sequence, 3);
+        } else {
+            var ordinary = try tracker.admit(backing, 5);
+            defer ordinary.cancel();
+            tracker.commitAdmission(sequence, &ordinary);
+        }
+    }
+    try std.testing.expect(tracker.entries.capacity > initial_capacity);
+    try std.testing.expectEqual(@as(usize, 1), tracker.pending.?.count.load(.acquire));
+    const allocations = failing.alloc_index;
+    const resizes = failing.resize_index;
+    failing.fail_index = allocations;
+    failing.resize_fail_index = resizes;
+    tracker.commitAdmission(129, &retained);
+    try std.testing.expectEqual(@as(usize, 129), tracker.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), tracker.pending.?.count.load(.acquire));
+    try std.testing.expectEqual(allocations, failing.alloc_index);
+    try std.testing.expectEqual(resizes, failing.resize_index);
+    tracker.releaseThrough(129);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.derived_backlog).used_bytes);
+}
+
+test "workload admission backlog cancellation retires stable slots after tracker teardown" {
+    const alloc = std.testing.allocator;
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(alloc);
+    var tracker = Tracker.init(&manager);
+    var first = try tracker.admit(alloc, 11);
+    var second = try tracker.admit(alloc, 12);
+    const pending = tracker.pending.?;
+    try std.testing.expectEqual(@as(usize, 2), pending.count.load(.acquire));
+    first.cancel();
+    first.cancel();
+    try std.testing.expectEqual(@as(usize, 1), pending.count.load(.acquire));
+    tracker.deinit(alloc);
+    try std.testing.expectEqual(Tracker.retainedCharge(12), manager.sliceStats(.derived_backlog).used_bytes);
+    second.cancel();
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.derived_backlog).used_bytes);
 }

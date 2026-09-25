@@ -29,20 +29,29 @@ pub const Request = domain.Request;
 pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: Request) ![]u8 {
     try context.ensureActive();
     if (request.mutation.table_id != 0 or request.mutation.storage_name.len != 0) return error.InvalidCatalogMutation;
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.system_catalog_version);
+    // Parse before acquiring the catalog lane: capability probing can perform
+    // network I/O. Preserve the decoded request for the admission snapshot.
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const create_request = if (request.mutation.action == .create and request.mutation.kind == .table)
+        try tables_api.parseStoredCreateTableRequest(a, request.create_table_json orelse return error.InvalidCatalogMutation)
+    else
+        null;
+    const required_version = if (create_request) |req|
+        protocol.tableStorageVersion(req.storage orelse .{}, protocol.system_catalog_version)
+    else
+        protocol.system_catalog_version;
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, required_version);
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();
     try svc.ensureLinearizableReadWithContext(context);
     try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const a = arena.allocator();
     const admission = try store.systemCatalogAdmission(a, svc.metadata_group_id, request.mutation);
     var command: storage.SystemCatalogCommand = .{ .expected_revision = admission.meta.revision, .mutation = request.mutation };
     if (request.mutation.action == .create and request.mutation.kind == .table) {
-        const json = request.create_table_json orelse return error.InvalidCatalogMutation;
-        var req = try tables_api.parseStoredCreateTableRequest(a, json);
+        var req = create_request.?;
         const storage_name = request.physical_name orelse try std.fmt.allocPrint(a, "table:{d}", .{admission.meta.next_id});
         if (!std.mem.startsWith(u8, storage_name, "table:") or storage_name.len > 1024) return error.InvalidCatalogMutation;
         req.indexes_json = try tables_api.expandSchemaDerivedAlgebraicIndexesAlloc(a, storage_name, req.indexes_json orelse tables_api.default_indexes_json, tables_api.effectiveSchemaJson(req.schema_json));
@@ -170,7 +179,7 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
 /// Publish the restored physical incarnation and its logical binding together.
 /// Job retries are accepted only when both projections match exactly.
 pub fn restore(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, target: domain.Target, table: table_manager.TableRecord, source_ranges: []const table_manager.RangeRecord) !void {
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.system_catalog_version);
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.tableStorageVersion(table.storage, protocol.system_catalog_version));
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();
     try svc.ensureLinearizableReadWithContext(context);

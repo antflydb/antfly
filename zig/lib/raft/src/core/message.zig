@@ -62,6 +62,13 @@ pub const Message = struct {
     responses: []Message = &.{},
 
     pub fn clone(self: Message, alloc: std.mem.Allocator) std.mem.Allocator.Error!Message {
+        const entries = try types.cloneEntries(alloc, self.entries);
+        errdefer types.freeEntries(alloc, entries);
+        var snapshot = if (self.snapshot) |value| try value.clone(alloc) else null;
+        errdefer if (snapshot) |*value| value.deinit(alloc);
+        const context = try alloc.dupe(u8, self.context);
+        errdefer alloc.free(context);
+        const responses = try cloneMessages(alloc, self.responses);
         return .{
             .msg_type = self.msg_type,
             .from = self.from,
@@ -73,11 +80,11 @@ pub const Message = struct {
             .commit_index = self.commit_index,
             .reject = self.reject,
             .reject_hint = self.reject_hint,
-            .entries = try types.cloneEntries(alloc, self.entries),
-            .snapshot = if (self.snapshot) |snapshot| try snapshot.clone(alloc) else null,
+            .entries = entries,
+            .snapshot = snapshot,
             .snapshot_attempt_generation = self.snapshot_attempt_generation,
-            .context = try alloc.dupe(u8, self.context),
-            .responses = try cloneMessages(alloc, self.responses),
+            .context = context,
+            .responses = responses,
         };
     }
 
@@ -111,4 +118,33 @@ pub fn cloneMessages(alloc: std.mem.Allocator, msgs: []const Message) std.mem.Al
 pub fn freeMessages(alloc: std.mem.Allocator, msgs: []Message) void {
     for (msgs) |*msg| msg.deinit(alloc);
     if (msgs.len > 0) alloc.free(msgs);
+}
+
+test "workload admission raft message cloning unwinds every allocation" {
+    const Fixture = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var data = [_]u8{ 1, 2, 3 };
+            var nodes = [_]u64{ 1, 2 };
+            var entries = [_]types.Entry{.{ .term = 3, .index = 9, .data = &data }};
+            var responses = [_]Message{.{ .msg_type = .append_entries_response, .from = 2, .to = 1, .context = &data, .entries = &entries }};
+            const source: Message = .{
+                .msg_type = .storage_append,
+                .from = 1,
+                .to = LocalAppendThread,
+                .entries = &entries,
+                .context = &data,
+                .responses = &responses,
+                .snapshot = .{ .data = &data, .metadata = .{ .index = 8, .term = 3, .conf_state = .{
+                    .voters = &nodes,
+                    .voters_outgoing = &nodes,
+                    .learners = &nodes,
+                    .learners_next = &nodes,
+                } } },
+            };
+            var copy = try source.clone(alloc);
+            defer copy.deinit(alloc);
+            try std.testing.expectEqualDeep(source, copy);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }

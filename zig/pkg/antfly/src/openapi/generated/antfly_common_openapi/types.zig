@@ -14,12 +14,31 @@ const antfly_scraping_openapi = @import("antfly_scraping_openapi");
 
 /// Node-local foreground database request admission settings.
 pub const AdmissionConfig = struct {
+    ingress: ?IngressAdmissionConfig = null,
+    /// Shared retained-memory ceiling for MCP, A2A, and transaction sessions, separate from foreground query and write budgets.
+    session_max_retained_bytes: ?u64 = null,
+    /// Node-wide prepaid scratch memory for completing durable storage transactions. Zero preserves legacy allocation. Reserve this before foreground admission; this setting is independent of replicated limits on outstanding recovery obligations.
+    transaction_completion_bytes: ?u64 = null,
+    /// Permit new reserved transaction prepares for tables with a supported persisted completion policy. Disabling admission does not release existing obligations or disable recovery. Runtime ownership and storage support are verified separately.
+    durable_transaction_completion: ?std.json.Value = null,
+    remote_attempt_worker: ?RemoteAttemptWorkerConfig = null,
+    remote_attempt_coordinator: ?RemoteAttemptCoordinatorConfig = null,
+    dense_execution: ?DenseExecutionConfig = null,
+    read_execution: ?ReadExecutionConfig = null,
     query: ?QueryAdmissionConfig = null,
     write: ?WriteAdmissionConfig = null,
     inference: ?InferenceAdmissionConfig = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "ingress", "ingress", true },
+        .{ "session_max_retained_bytes", "session_max_retained_bytes", true },
+        .{ "transaction_completion_bytes", "transaction_completion_bytes", true },
+        .{ "durable_transaction_completion", "durable_transaction_completion", true },
+        .{ "remote_attempt_worker", "remote_attempt_worker", true },
+        .{ "remote_attempt_coordinator", "remote_attempt_coordinator", true },
+        .{ "dense_execution", "dense_execution", true },
+        .{ "read_execution", "read_execution", true },
         .{ "query", "query", true },
         .{ "write", "write", true },
         .{ "inference", "inference", true },
@@ -35,6 +54,38 @@ pub const AdmissionConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.ingress) |value| {
+            try jw.objectField("ingress");
+            try jw.write(value);
+        }
+        if (self.session_max_retained_bytes) |value| {
+            try jw.objectField("session_max_retained_bytes");
+            try jw.write(value);
+        }
+        if (self.transaction_completion_bytes) |value| {
+            try jw.objectField("transaction_completion_bytes");
+            try jw.write(value);
+        }
+        if (self.durable_transaction_completion) |value| {
+            try jw.objectField("durable_transaction_completion");
+            try jw.write(value);
+        }
+        if (self.remote_attempt_worker) |value| {
+            try jw.objectField("remote_attempt_worker");
+            try jw.write(value);
+        }
+        if (self.remote_attempt_coordinator) |value| {
+            try jw.objectField("remote_attempt_coordinator");
+            try jw.write(value);
+        }
+        if (self.dense_execution) |value| {
+            try jw.objectField("dense_execution");
+            try jw.write(value);
+        }
+        if (self.read_execution) |value| {
+            try jw.objectField("read_execution");
+            try jw.write(value);
+        }
         if (self.query) |value| {
             try jw.objectField("query");
             try jw.write(value);
@@ -45,6 +96,53 @@ pub const AdmissionConfig = struct {
         }
         if (self.inference) |value| {
             try jw.objectField("inference");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Opt-in bounded admission waiting. Configure all queue limits together. Zero max_wait_ms keeps fail-fast behavior. Request payload reservations and tracked query, planning, and output allocations remain charged through response retirement. Other execution, storage, and transport memory remains independently bounded.
+pub const AdmissionWaitingConfig = struct {
+    max_queued_requests: ?i64 = null,
+    max_queued_bytes: ?i64 = null,
+    /// Payload, admission metadata, and tracked query, planning, and output allocations through response retirement; must cover max_queued_bytes. Other execution, storage, and transport memory remains independently bounded.
+    max_retained_bytes: ?i64 = null,
+    /// Maximum admission wait within the original request deadline; zero disables queueing.
+    max_wait_ms: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "max_queued_requests", "max_queued_requests", true },
+        .{ "max_queued_bytes", "max_queued_bytes", true },
+        .{ "max_retained_bytes", "max_retained_bytes", true },
+        .{ "max_wait_ms", "max_wait_ms", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.max_queued_requests) |value| {
+            try jw.objectField("max_queued_requests");
+            try jw.write(value);
+        }
+        if (self.max_queued_bytes) |value| {
+            try jw.objectField("max_queued_bytes");
+            try jw.write(value);
+        }
+        if (self.max_retained_bytes) |value| {
+            try jw.objectField("max_retained_bytes");
+            try jw.write(value);
+        }
+        if (self.max_wait_ms) |value| {
+            try jw.objectField("max_wait_ms");
             try jw.write(value);
         }
         try jw.endObject();
@@ -289,6 +387,8 @@ pub const Config = struct {
     health_enabled: ?bool = null,
     /// Port for the health/metrics server. Defaults to 4200.
     health_port: ?i64 = null,
+    /// Delay between background metrics collections. Scraping does not trigger collection. Lower intervals improve observation freshness at the cost of additional collection work; responses report their actual sample age.
+    health_metrics_interval_ms: ?u32 = null,
     admission: ?AdmissionConfig = null,
     graph_execution: ?GraphExecutionConfig = null,
     mcp: ?McpConfig = null,
@@ -349,6 +449,7 @@ pub const Config = struct {
         .{ "log", "log", false },
         .{ "health_enabled", "health_enabled", true },
         .{ "health_port", "health_port", true },
+        .{ "health_metrics_interval_ms", "health_metrics_interval_ms", true },
         .{ "admission", "admission", true },
         .{ "graph_execution", "graph_execution", true },
         .{ "mcp", "mcp", true },
@@ -411,6 +512,10 @@ pub const Config = struct {
         }
         if (self.health_port) |value| {
             try jw.objectField("health_port");
+            try jw.write(value);
+        }
+        if (self.health_metrics_interval_ms) |value| {
+            try jw.objectField("health_metrics_interval_ms");
             try jw.write(value);
         }
         if (self.admission) |value| {
@@ -665,6 +770,69 @@ pub const ConnectionKind = enum {
             .{ "cdc", .cdc },
         });
         return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Opt-in fixed dense operator scheduling shared by callers and read helpers on a provisioned storage node. Defaults preserve existing admission. Coarse execution leases remain held through helper join; this does not provide cooperative lane isolation or replace working-memory limits.
+pub const DenseExecutionConfig = struct {
+    /// Maximum combined dense callers and helpers; zero disables this scheduler.
+    max_runnable_tasks: ?i64 = null,
+    /// Hard aggregate ceiling for dense memory participating in scheduler accounting. Covers scoped exact-search and opted-in native read arenas; pooled HBC scratch and result ownership keep their existing memory policy. Zero preserves the legacy memory path. Requires a nonzero task limit.
+    max_working_bytes: ?i64 = null,
+    /// Maximum native exact positional reads that can release runnable capacity during synchronous I/O. Enables scoped native read arenas; requires working memory and waiting budgets. Zero keeps coarse driver ownership. Requires a runtime that keeps callers on their original thread during I/O; other runtimes remain coarse. The operating-system read is not preemptible.
+    max_suspended_io: ?i64 = null,
+    /// Hard bound on active and queued dense tasks; must cover runnable capacity.
+    max_outstanding_tasks: ?i64 = null,
+    /// Waiting dense callers; helpers never queue. Must not exceed outstanding capacity.
+    max_queued_tasks: ?i64 = null,
+    /// Queue wait ceiling within the request deadline; zero requires a zero queue limit.
+    max_wait_ms: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "max_runnable_tasks", "max_runnable_tasks", true },
+        .{ "max_working_bytes", "max_working_bytes", true },
+        .{ "max_suspended_io", "max_suspended_io", true },
+        .{ "max_outstanding_tasks", "max_outstanding_tasks", true },
+        .{ "max_queued_tasks", "max_queued_tasks", true },
+        .{ "max_wait_ms", "max_wait_ms", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.max_runnable_tasks) |value| {
+            try jw.objectField("max_runnable_tasks");
+            try jw.write(value);
+        }
+        if (self.max_working_bytes) |value| {
+            try jw.objectField("max_working_bytes");
+            try jw.write(value);
+        }
+        if (self.max_suspended_io) |value| {
+            try jw.objectField("max_suspended_io");
+            try jw.write(value);
+        }
+        if (self.max_outstanding_tasks) |value| {
+            try jw.objectField("max_outstanding_tasks");
+            try jw.write(value);
+        }
+        if (self.max_queued_tasks) |value| {
+            try jw.objectField("max_queued_tasks");
+            try jw.write(value);
+        }
+        if (self.max_wait_ms) |value| {
+            try jw.objectField("max_wait_ms");
+            try jw.write(value);
+        }
+        try jw.endObject();
     }
 };
 
@@ -1581,6 +1749,65 @@ pub const InferenceConnectionVariant = struct {
     }
 };
 
+/// Opt-in request/planning envelope held through transport drain. Totals include a nonborrowable readiness/control partition. Transport framing and durable session state use separate bounded pools. Zero requests disables the envelope and requires zero retained bytes.
+pub const IngressAdmissionConfig = struct {
+    max_requests: ?u32 = null,
+    max_retained_bytes: ?u64 = null,
+    control_requests: ?u32 = null,
+    control_retained_bytes: ?u64 = null,
+    /// Nonborrowable ingress slots for authenticated bounded recovery/control RPCs, inside max_requests. Zero disables this partition.
+    recovery_requests: ?i64 = null,
+    /// Nonborrowable recovery/control ingress bytes, inside max_retained_bytes. Requires recovery_requests and at least 65536 bytes when enabled.
+    recovery_retained_bytes: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "max_requests", "max_requests", true },
+        .{ "max_retained_bytes", "max_retained_bytes", true },
+        .{ "control_requests", "control_requests", true },
+        .{ "control_retained_bytes", "control_retained_bytes", true },
+        .{ "recovery_requests", "recovery_requests", true },
+        .{ "recovery_retained_bytes", "recovery_retained_bytes", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.max_requests) |value| {
+            try jw.objectField("max_requests");
+            try jw.write(value);
+        }
+        if (self.max_retained_bytes) |value| {
+            try jw.objectField("max_retained_bytes");
+            try jw.write(value);
+        }
+        if (self.control_requests) |value| {
+            try jw.objectField("control_requests");
+            try jw.write(value);
+        }
+        if (self.control_retained_bytes) |value| {
+            try jw.objectField("control_retained_bytes");
+            try jw.write(value);
+        }
+        if (self.recovery_requests) |value| {
+            try jw.objectField("recovery_requests");
+            try jw.write(value);
+        }
+        if (self.recovery_retained_bytes) |value| {
+            try jw.objectField("recovery_retained_bytes");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const LiteStorageConfig = struct {
     /// Path to the single writable Antfly Lite database file.
     path: []const u8,
@@ -1953,12 +2180,65 @@ pub const ObjectStorageLocation = struct {
     }
 };
 
+/// Opt-in hard partition within read_execution totals for verified local existence probes. Each possible probe prepays 64 KiB scratch and a transition ticket before execution. General reads cannot consume these floors. Both protected and transition bytes/counts are inside totals. Supported on provisioned local LMDB reads only; serverless rejects this partition. All zero values disable it.
+pub const ProtectedReadExecutionConfig = struct {
+    max_runnable_tasks: ?i64 = null,
+    max_outstanding_tasks: ?i64 = null,
+    max_working_bytes: ?i64 = null,
+    max_transition_tasks: ?i64 = null,
+    max_transition_bytes: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "max_runnable_tasks", "max_runnable_tasks", true },
+        .{ "max_outstanding_tasks", "max_outstanding_tasks", true },
+        .{ "max_working_bytes", "max_working_bytes", true },
+        .{ "max_transition_tasks", "max_transition_tasks", true },
+        .{ "max_transition_bytes", "max_transition_bytes", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.max_runnable_tasks) |value| {
+            try jw.objectField("max_runnable_tasks");
+            try jw.write(value);
+        }
+        if (self.max_outstanding_tasks) |value| {
+            try jw.objectField("max_outstanding_tasks");
+            try jw.write(value);
+        }
+        if (self.max_working_bytes) |value| {
+            try jw.objectField("max_working_bytes");
+            try jw.write(value);
+        }
+        if (self.max_transition_tasks) |value| {
+            try jw.objectField("max_transition_tasks");
+            try jw.write(value);
+        }
+        if (self.max_transition_bytes) |value| {
+            try jw.objectField("max_transition_bytes");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const QueryAdmissionConfig = struct {
-    /// Maximum concurrent query, search, and retrieval requests in this process. The default is 32. The budget is shared by REST, MCP, retrieval-agent, A2A, and direct API-kernel execution. Full-text, vector, hybrid, graph, aggregation, federated searches, and document scans consume it. Point lookups and operational/control-plane reads remain outside it. Excess HTTP work is rejected immediately with HTTP 429 and Retry-After: 1; asynchronous protocols use their native failure response. Excess work is not queued. Set to 0 to disable query admission. This budget is independent of transport safeguards, write admission, and admission.inference.max_concurrent_requests.
+    waiting: ?AdmissionWaitingConfig = null,
+    /// Maximum concurrent query, search, and retrieval requests in this process. The default is 32. The budget is shared by REST, MCP, retrieval-agent, A2A, and direct API-kernel execution. Full-text, vector, hybrid, graph, aggregation, federated searches, and document scans consume it. Point lookups and operational/control-plane reads remain outside it. Excess HTTP work is rejected immediately with HTTP 429 and Retry-After: 1; asynchronous protocols use their native failure response. Bounded waiting is opt-in through waiting. Set to 0 to disable query admission. This budget is independent of transport safeguards, write admission, and admission.inference.max_concurrent_requests.
     max_concurrent_requests: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "waiting", "waiting", true },
         .{ "max_concurrent_requests", "max_concurrent_requests", true },
     };
 
@@ -1972,8 +2252,188 @@ pub const QueryAdmissionConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.waiting) |value| {
+            try jw.objectField("waiting");
+            try jw.write(value);
+        }
         if (self.max_concurrent_requests) |value| {
             try jw.objectField("max_concurrent_requests");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Opt-in shared storage read scheduling for text, vector, graph, aggregation, document lookups, and scans. Dense helpers use the same ledger. Cannot be enabled together with dense_execution. Unknown or nonyielding operators retain a general-lane execution lease through completion. Defaults preserve existing scheduling.
+pub const ReadExecutionConfig = struct {
+    protected: ?ProtectedReadExecutionConfig = null,
+    /// Per-scan saved-state reservation for audited output suspension; zero keeps coarse ownership. Does not measure MVCC pages pinned by snapshots.
+    max_scan_state_bytes: ?i64 = null,
+    /// Absolute lifetime ceiling for suspended scan snapshots, within the original request deadline.
+    max_scan_snapshot_ms: ?i64 = null,
+    /// Maximum combined read callers and helpers; zero disables this scheduler.
+    max_runnable_tasks: ?i64 = null,
+    /// Hard aggregate ceiling for read memory participating in scheduler accounting. Covers scoped exact-search and opted-in native read arenas; pooled HBC scratch and result ownership keep their existing memory policy. Zero preserves the legacy memory path. Requires a nonzero task limit.
+    max_working_bytes: ?i64 = null,
+    /// Maximum native exact positional reads that can release runnable capacity during synchronous I/O. Enables scoped native read arenas; requires working memory and waiting budgets. Zero keeps coarse driver ownership. Requires a runtime that keeps callers on their original thread during I/O; other runtimes remain coarse. The operating-system read is not preemptible.
+    max_suspended_io: ?i64 = null,
+    /// Hard bound on active and queued read tasks; must cover runnable capacity.
+    max_outstanding_tasks: ?i64 = null,
+    /// Waiting read callers; helpers never queue. Must not exceed outstanding capacity.
+    max_queued_tasks: ?i64 = null,
+    /// Queue wait ceiling within the request deadline; zero requires a zero queue limit.
+    max_wait_ms: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "protected", "protected", true },
+        .{ "max_scan_state_bytes", "max_scan_state_bytes", true },
+        .{ "max_scan_snapshot_ms", "max_scan_snapshot_ms", true },
+        .{ "max_runnable_tasks", "max_runnable_tasks", true },
+        .{ "max_working_bytes", "max_working_bytes", true },
+        .{ "max_suspended_io", "max_suspended_io", true },
+        .{ "max_outstanding_tasks", "max_outstanding_tasks", true },
+        .{ "max_queued_tasks", "max_queued_tasks", true },
+        .{ "max_wait_ms", "max_wait_ms", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.protected) |value| {
+            try jw.objectField("protected");
+            try jw.write(value);
+        }
+        if (self.max_scan_state_bytes) |value| {
+            try jw.objectField("max_scan_state_bytes");
+            try jw.write(value);
+        }
+        if (self.max_scan_snapshot_ms) |value| {
+            try jw.objectField("max_scan_snapshot_ms");
+            try jw.write(value);
+        }
+        if (self.max_runnable_tasks) |value| {
+            try jw.objectField("max_runnable_tasks");
+            try jw.write(value);
+        }
+        if (self.max_working_bytes) |value| {
+            try jw.objectField("max_working_bytes");
+            try jw.write(value);
+        }
+        if (self.max_suspended_io) |value| {
+            try jw.objectField("max_suspended_io");
+            try jw.write(value);
+        }
+        if (self.max_outstanding_tasks) |value| {
+            try jw.objectField("max_outstanding_tasks");
+            try jw.write(value);
+        }
+        if (self.max_queued_tasks) |value| {
+            try jw.objectField("max_queued_tasks");
+            try jw.write(value);
+        }
+        if (self.max_wait_ms) |value| {
+            try jw.objectField("max_wait_ms");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Opt-in durable remote read ownership. Requires stable node identity, internal authentication, and a continuous durable session store; unavailable or unsupported workers never downgrade to unaccounted execution.
+pub const RemoteAttemptCoordinatorConfig = struct {
+    max_attempts: ?u32 = null,
+    max_bytes: ?u64 = null,
+    max_destination_attempts: ?u32 = null,
+    max_destinations: ?u32 = null,
+    max_run_ms: ?u32 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "max_attempts", "max_attempts", true },
+        .{ "max_bytes", "max_bytes", true },
+        .{ "max_destination_attempts", "max_destination_attempts", true },
+        .{ "max_destinations", "max_destinations", true },
+        .{ "max_run_ms", "max_run_ms", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.max_attempts) |value| {
+            try jw.objectField("max_attempts");
+            try jw.write(value);
+        }
+        if (self.max_bytes) |value| {
+            try jw.objectField("max_bytes");
+            try jw.write(value);
+        }
+        if (self.max_destination_attempts) |value| {
+            try jw.objectField("max_destination_attempts");
+            try jw.write(value);
+        }
+        if (self.max_destinations) |value| {
+            try jw.objectField("max_destinations");
+            try jw.write(value);
+        }
+        if (self.max_run_ms) |value| {
+            try jw.objectField("max_run_ms");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Opt-in durable join-row worker deduplication and generation fencing. Requires the node's durable API session backend and internal service authentication. Journal bytes include active and uncertain attempts, terminal tombstones and coordinator fences. Coordinator dispatch is not enabled by this setting. Unknown prior incarnations remain charged.
+pub const RemoteAttemptWorkerConfig = struct {
+    /// Zero disables worker execution under the attempt protocol.
+    max_attempts: ?u32 = null,
+    /// Journal reservation ceiling; enabled workers require at least 4096 bytes.
+    max_bytes: ?u64 = null,
+    /// Local execution budget ceiling; expiry never certifies quiescence.
+    max_run_ms: ?u32 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "max_attempts", "max_attempts", true },
+        .{ "max_bytes", "max_bytes", true },
+        .{ "max_run_ms", "max_run_ms", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.max_attempts) |value| {
+            try jw.objectField("max_attempts");
+            try jw.write(value);
+        }
+        if (self.max_bytes) |value| {
+            try jw.objectField("max_bytes");
+            try jw.write(value);
+        }
+        if (self.max_run_ms) |value| {
+            try jw.objectField("max_run_ms");
             try jw.write(value);
         }
         try jw.endObject();
@@ -2213,6 +2673,10 @@ pub const TransactionSessionConfig = struct {
     cleanup_interval_seconds: ?i64 = null,
     max_count: ?i64 = null,
     max_record_bytes: ?i64 = null,
+    /// Optional cap on transaction sessions with unfinished commit or coordinator acknowledgement. New commits reserve capacity before preparation; existing recovery always proceeds.
+    max_recovery_count: ?i64 = null,
+    /// Optional retained recovery reservation cap. Each pending session reserves at least max_record_bytes. Admission scans durable session metadata under the write transaction, bounded by max_count records and max_count times max_record_bytes examined bytes.
+    max_recovery_bytes: ?i64 = null,
     max_savepoints: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -2221,6 +2685,8 @@ pub const TransactionSessionConfig = struct {
         .{ "cleanup_interval_seconds", "cleanup_interval_seconds", true },
         .{ "max_count", "max_count", true },
         .{ "max_record_bytes", "max_record_bytes", true },
+        .{ "max_recovery_count", "max_recovery_count", true },
+        .{ "max_recovery_bytes", "max_recovery_bytes", true },
         .{ "max_savepoints", "max_savepoints", true },
     };
 
@@ -2248,6 +2714,14 @@ pub const TransactionSessionConfig = struct {
         }
         if (self.max_record_bytes) |value| {
             try jw.objectField("max_record_bytes");
+            try jw.write(value);
+        }
+        if (self.max_recovery_count) |value| {
+            try jw.objectField("max_recovery_count");
+            try jw.write(value);
+        }
+        if (self.max_recovery_bytes) |value| {
+            try jw.objectField("max_recovery_bytes");
             try jw.write(value);
         }
         if (self.max_savepoints) |value| {
@@ -2445,11 +2919,13 @@ pub const WebSearchConnectionVariant = struct {
 };
 
 pub const WriteAdmissionConfig = struct {
-    /// Maximum concurrent foreground data mutations in this process. The default is 16. Table batch writes, cross-table batches, linear merges, and transaction commits consume this budget. Schema, index, backup, restore, repair, and other administrative operations use dedicated control or background-maintenance paths. Set to 0 to disable write admission. Excess HTTP work in either foreground class is rejected immediately with HTTP 429 and Retry-After: 1; asynchronous protocols use their native failure response. Excess work is not queued. Both budgets are independent of transport safeguards and admission.inference.max_concurrent_requests.
+    waiting: ?AdmissionWaitingConfig = null,
+    /// Maximum concurrent foreground data mutations in this process. The default is 16. Table batch writes, cross-table batches, linear merges, and transaction commits consume this budget. Schema, index, backup, restore, repair, and other administrative operations use dedicated control or background-maintenance paths. Set to 0 to disable write admission. Excess HTTP work in either foreground class is rejected immediately with HTTP 429 and Retry-After: 1; asynchronous protocols use their native failure response. Bounded waiting is opt-in through waiting. Both budgets are independent of transport safeguards and admission.inference.max_concurrent_requests.
     max_concurrent_requests: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "waiting", "waiting", true },
         .{ "max_concurrent_requests", "max_concurrent_requests", true },
     };
 
@@ -2463,6 +2939,10 @@ pub const WriteAdmissionConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.waiting) |value| {
+            try jw.objectField("waiting");
+            try jw.write(value);
+        }
         if (self.max_concurrent_requests) |value| {
             try jw.objectField("max_concurrent_requests");
             try jw.write(value);

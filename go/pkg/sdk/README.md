@@ -16,6 +16,31 @@ request/response helpers, request-size bounds, and retry/merge utilities. The
 API it talks to is rooted at `/db/v1` (plus `/auth/v1` and `/ai/v1` for auth
 and inference).
 
+## Client admission
+
+Reuse a client to reuse HTTP connections. Optional local admission bounds active
+operations and waiting across the database and inference APIs:
+
+```go
+client, err := sdk.NewClient(sdk.Config{
+    BaseURL: "http://localhost:8080",
+    Admission: &sdk.ClientAdmission{
+        MaxInFlight: 16,
+        MaxQueued: 32,
+        MaxWait: 100 * time.Millisecond,
+    },
+})
+```
+
+These are illustrative limits, not server capacity estimates. Queue waits respect
+the request context's deadline and cancellation. `errors.Is(err, sdk.ErrClientBusy)`
+identifies a request rejected before dispatch. Close streaming response bodies to
+release capacity; fully reading a response releases it at EOF. The pool preserves
+the supplied HTTP client's settings and does not automatically retry writes.
+Server admission still protects the instance across all clients. Structured
+`APIError` values expose `Reason`, `Stage`, `RetryAfterSeconds`, and the optional
+`ExecutionStarted` flag; an absent flag leaves the outcome unknown.
+
 ## Install
 
 ```bash

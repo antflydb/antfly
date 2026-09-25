@@ -70,6 +70,7 @@ pub const AddTestsOptions = struct {
 };
 pub const AddTestsResult = struct {
     linked_consumer_tests: []const *std.Build.Step.Compile,
+    data_runtime_implementation_tests: *std.Build.Step.Compile,
     storage_test_step: *std.Build.Step,
     vopr_soak_test_step: *std.Build.Step,
     storage_workload_soak_step: *std.Build.Step,
@@ -123,6 +124,23 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const reader_config_mod = options.antfly_imports.reader_config;
     const antfly_imports = options.antfly_imports;
     const test_imports = @import("test_support.zig").Imports{ .runtime = antfly_imports, .vopr = options.vopr, .lmdb_engine = options.lmdb_engine };
+
+    const workload_admission_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/workload_admission_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, workload_admission_mod, true, true);
+    workload_admission_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const workload_admission_tests = b.addTest(.{
+        .root_module = workload_admission_mod,
+        .filters = &.{ "workload admission", "request_admission.test", "httpx query admission", "httpx write admission", "httpx request lifecycle hook", "shared application admission", "API kernel", "linked API dispatch", "serverless http handler serves internal namespace lifecycle", "durable commit decision", "distributed txn propagates one absolute deadline", "db one-shot transaction recovery", "db transaction recovery runtime" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
+    });
+    const run_workload_admission_tests = addFilteredTestRunArtifact(b, workload_admission_tests);
+    b.step("antfly-workload-admission-test", "Run workload admission ownership, transport, ABI, and VOPR regressions").dependOn(&run_workload_admission_tests.step);
+
     const vopr_mod = options.vopr;
     const casbin_mod = antfly_imports.casbin;
     const antfly_mod = options.antfly_mod;
@@ -184,6 +202,48 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         test_imports.configure(b, test_mod.*, true, true);
         test_mod.*.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     }
+
+    // Metadata persistence and proposal guards live outside the request-runtime
+    // test root. Keep them in a separate artifact so the admission gate covers
+    // the real table codec without widening its main compilation root.
+    const workload_metadata_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[1],
+        .filters = &.{"workload admission"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
+    });
+    const run_workload_metadata_tests = addFilteredTestRunArtifact(b, workload_metadata_tests);
+    b.step("antfly-workload-admission-metadata-test", "Run workload policy persistence and metadata capability regressions").dependOn(&run_workload_metadata_tests.step);
+    run_workload_admission_tests.step.dependOn(&run_workload_metadata_tests.step);
+    const durable_completion_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/durable_completion_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, durable_completion_mod, true, true);
+    durable_completion_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const durable_completion_tests = b.addTest(.{
+        .root_module = durable_completion_mod,
+        .filters = &.{ "workload admission physical completion", "workload admission durable DB completion", "workload admission completion compiler" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-durable-completion-test", "Run bounded durable prepare, completion, and restart regressions").dependOn(&addFilteredTestRunArtifact(b, durable_completion_tests).step);
+
+    const completion_attestation_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/completion_attestation_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, completion_attestation_mod, true, true);
+    completion_attestation_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const completion_attestation_tests = b.addTest(.{
+        .root_module = completion_attestation_mod,
+        .filters = &.{"workload admission completion attestation"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-completion-attestation-test", "Run native backing attestation transport and verification regressions").dependOn(&addFilteredTestRunArtifact(b, completion_attestation_tests).step);
 
     const store_observer_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[2],
@@ -720,6 +780,31 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const run_runtime_io_abi_tests = b.addRunArtifact(runtime_io_abi_tests);
     b.step("runtime-io-abi-test", "Run executor contracts across independent error domains").dependOn(&run_runtime_io_abi_tests.step);
+
+    const runtime_callback_abi_provider = b.addLibrary(.{
+        .name = "runtime-callback-abi-test-provider",
+        .linkage = .static,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/src/runtime_callback_abi_test_provider.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const runtime_callback_abi_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/runtime_callback_abi_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    runtime_callback_abi_provider.root_module.addImport("antfly_platform", platform_mod);
+    runtime_callback_abi_test_mod.linkLibrary(runtime_callback_abi_provider);
+    const runtime_callback_abi_tests = b.addTest(.{
+        .root_module = runtime_callback_abi_test_mod,
+        .filters = &.{"callback archive boundary"},
+    });
+    const run_runtime_callback_abi_tests = b.addRunArtifact(runtime_callback_abi_tests);
+    b.step("runtime-callback-abi-test", "Run admission and write outcomes across independently compiled callback archives").dependOn(&run_runtime_callback_abi_tests.step);
 
     const scan_sink_provider = b.addLibrary(.{
         .name = "runtime-scan-sink-test-provider",
@@ -1545,6 +1630,31 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "index encoders expose graph sources once in normalized config",
         "api http client round-trips public status and internal capability routes",
         "api http client requires explicit not-proposed marker and tracks delivery phase",
+        "workload admission coordinator late terminal",
+        "workload admission coordinator rejects mismatched live attempt rows",
+        "stable distributed transaction retry requires matching begin identity before claiming commit",
+        "distributed txn preserves original deadline across participant waves and cleanup",
+        "transaction first decision distinguishes rejected admission from accepted and resumed recovery",
+        "transaction recovery endpoint requires budget and translates the ingress clock",
+        "transaction recovery shares abort and acknowledgement budget independently of admission",
+        "transaction recovery retains shutdown cancellation and rejects unbounded fallback",
+        "transaction recovery acknowledgement boundary rejects expiry and preserves accepted errors",
+        "transaction recovery provisioned adapter never loses budget through legacy Raft callbacks",
+        "transaction recovery transport requires bounded versioned peers without fallback",
+        "transaction recovery invalid participant preserves checked status identity",
+        "transaction recovery bounded",
+        "first decision transport never downgrades endpoint or ambiguous delivery",
+        "first decision endpoint emits proof only for precise preaccept rejection",
+        "first decision boundary preserves rejection identity and never calls legacy resolve",
+        "first decision rejection preserves",
+        "transaction commit boundary preserves ingress context and never downgrades deadlines",
+        "compiled table write boundary transports cancellation and committed failure identity",
+        "httpx multi batch route uses the batch commit hook and public response contract",
+        "workload admission stable transaction commit durably hands off recovery before acknowledgement",
+        "routed atomic batch preserves deadline without changing accepted outcome",
+        "public transaction ingress establishes one original deadline before dispatch",
+        "shared stateless batch retries borrow IO and preserve unknown outcomes",
+        "transaction attempt budgets follow the borrowed transport clock",
         "index activation client preserves progress and transport classifications",
         "api http retryable embedding failures provide retry guidance",
         "api http server obtains query embedding policy from resource manager",
@@ -1596,6 +1706,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "native executor borrows validate before reconstructing std.Io",
         "httpx production path sheds 128 abandoned queries and preserves control recovery",
         "httpx write admission rejects saturated table mutations",
+        "workload admission synchronous artifact range",
         "httpx request lifecycle hook suspends after admission without leaking capacity",
         "httpx owned response preserves retryable JSON metadata",
         "httpx inference connection uses the configured shared admission owner",
@@ -1618,6 +1729,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "api http client distinguishes invalid restore sources from retryable owners",
         "distributed join translates native and borrowed deadline boundaries",
         "distributed join context forwards one absolute deadline to every query callback",
+        "distributed join fanout bounds concurrency drains errors and preserves group order",
+        "distributed join fanout charges worker scratch to request quota",
         "distributed graph translates native worker and catalog deadline boundaries",
         "query embedding cache translates native query deadlines",
         "typed internal HTTP errors preserve conflict semantics",
@@ -1671,6 +1784,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         api_http_runtime_tests,
         api_http_runtime_filters,
     );
+    const join_fanout_quota_tests = b.addTest(.{
+        .name = "api-join-fanout-quota-tests",
+        .root_module = api_http_runtime_test_mod,
+        .filters = &.{ "distributed join fanout bounds concurrency drains errors and preserves group order", "distributed join fanout charges worker scratch to request quota", "distributed join rejects late right worker reply before widening partial page", "distributed join rejects a delayed socket worker reply after the original request ends" },
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 17 else 7) * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-join-fanout-test", "Run request quota accounting for parallel distributed join reads").dependOn(&addFilteredTestRunArtifact(b, join_fanout_quota_tests).step);
     const relational_index_http_tests = b.addTest(.{
         .name = "relational-index-http-tests",
         .root_module = api_http_runtime_test_mod,
@@ -1678,6 +1799,19 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-relational-index-http-test", "Run unified relational index CRUD and document index compatibility").dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, relational_index_http_tests, &.{ "api http server unified relational index CRUD", "api http server serves table index metadata routes", "index maintenance actions require table admin permission" }).step);
+    const api_ingress_adapter_filters = [_][]const u8{
+        "workload admission authenticated recovery control survives full ingress and foreground drain",
+        "protected recovery registrar excludes public routes and refuses legacy service auth",
+        "opaque HTTP adapter reserves recovery body ingress from kernel policy",
+    };
+    const api_ingress_adapter_tests = b.addTest(.{
+        .name = "api-ingress-adapter-tests",
+        .root_module = api_http_runtime_test_mod,
+        .filters = &api_ingress_adapter_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-ingress-adapters-test", "Run direct and linked API ingress adapter contracts")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, api_ingress_adapter_tests, &api_ingress_adapter_filters).step);
     const api_http_runtime_test_step = b.step("antfly-api-test", "Run API contracts and linked-boundary tests");
     root_test_step.dependOn(&run_api_http_runtime_tests.step);
 
@@ -4370,10 +4504,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     unit_test_step.dependOn(&run_lib_reranking_runtime_tests.step);
     unit_test_step.dependOn(&run_lib_common_tests.step);
     unit_test_step.dependOn(&run_lib_common_config_tests.step);
+    unit_test_step.dependOn(&run_workload_admission_tests.step);
     unit_test_step.dependOn(&run_lib_preload_model_spec_tests.step);
     unit_test_step.dependOn(&run_lib_common_secrets_tests.step);
     unit_test_step.dependOn(&run_secret_store_abi_tests.step);
     unit_test_step.dependOn(&run_runtime_io_abi_tests.step);
+    unit_test_step.dependOn(&run_runtime_callback_abi_tests.step);
     unit_test_step.dependOn(&run_scan_sink_tests.step);
     unit_test_step.dependOn(&run_shard_ops_tests.step);
 
@@ -6193,6 +6329,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .compiled_recall_tests = compiled_recall_tests,
         .storage_test_step = lib_storage_test_step,
         .linked_consumer_tests = std.mem.concat(b.allocator, *std.Build.Step.Compile, &.{ api_tests_addTests_result.linked_consumer_tests, data_tests_addTests_result.linked_consumer_tests, &.{ provisioned_query_visibility_tests.consumer.executable, graph_metric_remote_wire_tests.consumer.executable } }) catch @panic("OOM"),
+        .data_runtime_implementation_tests = data_tests_addTests_result.implementation,
     };
 }
 
