@@ -107,7 +107,7 @@ pub const public_operation_policies = [_]PublicOperationPolicy{
     .{ .operation_id = "listArtifactEnrichments", .class = .none },
     .{ .operation_id = "putArtifactEnrichment", .class = .none },
     .{ .operation_id = "deleteArtifactEnrichment", .class = .none },
-    .{ .operation_id = "reprocessDocumentArtifactRange", .class = .none },
+    .{ .operation_id = "reprocessDocumentArtifactRange", .class = .write },
     .{ .operation_id = "startDocumentArtifactReprocessJob", .class = .none },
     .{ .operation_id = "getDocumentArtifactReprocessJob", .class = .none },
     .{ .operation_id = "advanceDocumentArtifactReprocessJob", .class = .none },
@@ -205,4 +205,10 @@ test "workload admission data lookups share query capacity while metadata contro
     try std.testing.expectEqual(Class.none, publicOperationClass("getStatus").?);
     try std.testing.expectEqual(Class.none, publicOperationClass("getTable").?);
     try std.testing.expectEqual(Class.none, mcpOperationClass(.{ .describe_table = .{ .table_name = "docs" } }));
+}
+
+test "workload admission synchronous artifact range reprocessing uses foreground write capacity" {
+    try std.testing.expectEqual(Class.write, publicOperationClass("reprocessDocumentArtifactRange").?);
+    try std.testing.expectEqual(Class.none, publicOperationClass("startDocumentArtifactReprocessJob").?);
+    try std.testing.expectEqual(Class.none, publicOperationClass("getDocumentArtifactReprocessJob").?);
 }

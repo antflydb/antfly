@@ -1706,6 +1706,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "native executor borrows validate before reconstructing std.Io",
         "httpx production path sheds 128 abandoned queries and preserves control recovery",
         "httpx write admission rejects saturated table mutations",
+        "workload admission synchronous artifact range",
         "httpx request lifecycle hook suspends after admission without leaking capacity",
         "httpx owned response preserves retryable JSON metadata",
         "httpx inference connection uses the configured shared admission owner",

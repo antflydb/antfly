@@ -8271,6 +8271,9 @@ pub const AntflyApiHandler = struct {
         defer alloc.free(decoded_table_name);
         const decoded_artifact_name = (try decodePathParamOrBadRequest(ctx, artifact_name)) orelse return ctx.text("invalid path parameter");
         defer alloc.free(decoded_artifact_name);
+        var admission_lease: ?RequestAdmission.Lease = null;
+        if (try self.acquirePublicOperation(ctx, "reprocessDocumentArtifactRange", &admission_lease)) |response| return response;
+        defer self.releasePublicOperation("reprocessDocumentArtifactRange", &admission_lease);
         const body_data = (try ctx.body()) orelse "";
         var resp = try public_table_http.handleReprocessDocumentArtifactRange(alloc, decoded_table_name, decoded_artifact_name, body_data, self.api_server.tableApi(operationContext(ctx, authenticated_identity)));
         return respondOwnedApiResponse(ctx, &resp);
@@ -11501,6 +11504,37 @@ test "httpx request lifecycle hook suspends after admission without leaking capa
         handler.acquirePublicOperation(&ctx, "queryTable", &admission_lease),
     );
     try std.testing.expectEqual(@as(usize, 0), api_server.queryAdmissionStats().in_flight);
+}
+
+test "workload admission synchronous artifact range pass holds write capacity until release" {
+    const alloc = std.testing.allocator;
+    var source = AuthStatusSource{};
+    var api_server = ApiHttpServer.init(alloc, .{ .write_max_concurrent_requests = 1 }, source.iface(), null, null);
+    defer api_server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &api_server };
+
+    var first_request = try httpx.Request.init(alloc, .POST, "/db/v1/tables/docs/artifacts/preview/reprocess");
+    defer first_request.deinit();
+    var first_ctx = httpx.Context.init(alloc, std.testing.io, &first_request);
+    defer first_ctx.deinit();
+    var first_lease: ?RequestAdmission.Lease = null;
+    defer if (first_lease) |*owned| owned.release();
+    try std.testing.expect((try handler.acquirePublicOperation(&first_ctx, "reprocessDocumentArtifactRange", &first_lease)) == null);
+    try std.testing.expectEqual(@as(usize, 1), api_server.writeAdmissionStats().in_flight);
+
+    var second_request = try httpx.Request.init(alloc, .POST, "/db/v1/tables/docs/artifacts/preview/reprocess");
+    defer second_request.deinit();
+    var second_ctx = httpx.Context.init(alloc, std.testing.io, &second_request);
+    defer second_ctx.deinit();
+    var second_lease: ?RequestAdmission.Lease = null;
+    var overloaded = (try handler.acquirePublicOperation(&second_ctx, "reprocessDocumentArtifactRange", &second_lease)).?;
+    defer overloaded.deinit();
+    try std.testing.expectEqual(@as(u16, 429), overloaded.status.code);
+    try std.testing.expect(second_lease == null);
+    try std.testing.expectEqual(@as(usize, 1), api_server.writeAdmissionStats().in_flight);
+
+    handler.releasePublicOperation("reprocessDocumentArtifactRange", &first_lease);
+    try std.testing.expectEqual(@as(usize, 0), api_server.writeAdmissionStats().in_flight);
 }
 
 test "workload admission output bytes survive context and retire with response" {
