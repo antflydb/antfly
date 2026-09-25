@@ -20,6 +20,36 @@ this requested implementation/correctness scope.
 
 ## Current work
 
+- V4 proof validation now rejects an out-of-range owner count before using it
+  as a shift amount. The focused durable gate passed 52/52, including malformed
+  ABI counts of 8 and `u32` maximum, with no leaks.
+- The final-ACK checkpoint fault matrix now includes a protected journal
+  partial append: the test writes and fsyncs a real frame prefix, then checks
+  that the live owner is fenced, its guard remains, and reopen is rejected.
+  The durable gate passed 52/52 after the ABI fix; workload admission passed
+  312/312 owning and 395 broad tests with one skip, with no leaks. Full
+  power-loss and replicated storage-fault schedules remain open.
+- Distributed graph now checks the original request cancellation/deadline
+  after final hydration and before publishing assembled results. A lifecycle
+  regression cancels at that boundary and the owning gate passed 1/1 with no
+  leaks. A later real-socket worker fixture holds its hydration reply until
+  cancellation or the original deadline, then verifies no result publication,
+  one worker request, and drained server work; its curated graph gate passed
+  17/17 with no leaks. The socket uses a test worker callback rather than the
+  hosted router. An inherited remote-read test expectation was corrected to
+  match the intentional transient-error normalization; its owning gate passed
+  3/3.
+- A same-source compiled CAPI owner fixture now injects an isolated FD pool:
+  physical-owner open waits behind a preowned protected native scope, the
+  scope fsyncs its SST, and owner open resumes with no FD waiter left. The
+  focused CAPI gate passed 1/1 with no leaks. The production C ABI is unchanged;
+  DATA's separate CAPI context and disk-full behavior are not covered by this
+  test.
+- The existing combined DATA socket fixture already saturates the public
+  HTTP body-byte budget while authenticated protected status and native flush
+  progress. Public and protected listeners have separate bounded body budgets,
+  but both still allocate from the shared process heap. Actual heap exhaustion
+  and a reserved protected heap policy remain unqualified.
 - A versioned v4 control proof now binds an accepted-but-unapplied decision or
   named ACK sidecar to BEGIN, latest applied, and the exact committed accepted
   entry from one immutable DATA WAL image. Restart loads its owned capacity
