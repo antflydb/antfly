@@ -25,14 +25,27 @@ const Shape = ml.Shape;
 /// `batch` rows of `sequence` physical tokens each.
 pub const Layout = struct { batch: u32, sequence: u32 };
 
+/// `materialized_v1` builds `[B*heads,S,S]` scores from primitives and dense
+/// masks. `fused_v1` uses the ModernBERT training attention op
+/// (ops/modernbert_training_attention.zig): storage linear in the sequence,
+/// driven by one i32 control of key ranges and logical positions.
+pub const AttentionProfile = enum { materialized_v1, fused_v1 };
+
 /// Runtime inputs the encoder reads. The caller declares them, so it controls
 /// their names and the order in which graph nodes are created.
 pub const Inputs = struct {
     ids: Id, // [N] i32 token ids
-    encoder_bias: Id, // [B*heads,S,S] additive mask for global layers
-    local_bias: Id, // encoder_bias plus the logical sliding window, for local layers
+    encoder_bias: Id = ml.null_node, // materialized: [B*heads,S,S] additive mask for global layers
+    local_bias: Id = ml.null_node, // materialized: encoder_bias plus the logical sliding window
     rope: [2][2]Id, // [global, local][cos, sin], each [N*heads, head_dim/2]
+    profile: AttentionProfile = .materialized_v1,
+    control: Id = ml.null_node, // fused: [N*7] i32 key ranges then positions (`controlShape`)
 };
+
+/// Shape of the fused profile's control input.
+pub fn controlShape(l: Layout) Shape {
+    return Shape.init(.i32, &.{@as(i64, l.batch) * l.sequence * 7});
+}
 
 pub const Dropout = struct { node: Id, probability: f32 };
 pub const Trace = struct { name: []const u8, node: Id };
@@ -196,6 +209,38 @@ pub fn paddingBiases(a: std.mem.Allocator, cfg: modern.Config, l: Layout, key_va
     return .{ global, local };
 }
 
+/// Fused-profile control for right-padded rows: every query (padded ones
+/// too) sees its row's valid keys, and positions are `0..S-1` per row, as the
+/// Hugging Face key-padding mask and `paddingBiases` define. Valid keys must
+/// form a prefix of each row.
+pub fn paddingControl(a: std.mem.Allocator, l: Layout, key_valid: []const bool) ![]i32 {
+    const s: usize = l.sequence;
+    const tokens = @as(usize, l.batch) * s;
+    if (key_valid.len != tokens) return error.InvalidModernBertTrainingLayout;
+    const words = try a.alloc(i32, tokens * 7);
+    errdefer a.free(words);
+    @memset(words[0 .. tokens * 6], 0);
+    for (0..l.batch) |row| {
+        var length: usize = 0;
+        while (length < s and key_valid[row * s + length]) length += 1;
+        for (key_valid[row * s + length .. (row + 1) * s]) |valid| if (valid) return error.InvalidModernBertTrainingLayout;
+        for (0..s) |i| {
+            const token = row * s + i;
+            words[token * 6] = @intCast(row * s);
+            words[token * 6 + 1] = @intCast(row * s + length);
+            words[tokens * 6 + token] = @intCast(i);
+        }
+    }
+    return words;
+}
+
+/// Fused attention over `[N, h*d]` projections; `window` is the logical
+/// half-width (`maxInt(u32)` for global attention).
+pub fn fusedAttention(b: *B, q: Id, k: Id, v: Id, control: Id, l: Layout, h: u32, d: u32, window: u32) !Id {
+    const packed_rows = try b.concat(try b.concat(q, k, 0), v, 0);
+    return b.modernBertTrainingAttentionV1(packed_rows, control, .{ .batch = l.batch, .seq_len = l.sequence, .num_heads = h, .head_dim = d, .window = window });
+}
+
 /// Embeddings, `num_hidden_layers` pre-norm layers (global attention every
 /// `global_attn_every_n_layers`, local otherwise), and the final norm.
 /// Returns the `[batch*sequence, hidden]` hidden states. Traces the embedding
@@ -203,6 +248,9 @@ pub fn paddingBiases(a: std.mem.Allocator, cfg: modern.Config, l: Layout, key_va
 /// same names as the weights.
 pub fn encoder(b: *B, sites: *Sites, cfg: modern.Config, l: Layout, in: Inputs, names_prefix: []const u8) !Id {
     try validate(cfg, l);
+    const fused = in.profile == .fused_v1;
+    if ((fused and in.control == ml.null_node) or (!fused and (in.encoder_bias == ml.null_node or in.local_bias == ml.null_node)))
+        return error.InvalidModernBertTrainingLayout;
     const a = b.graph.allocator;
     const h = cfg.hidden_size;
     const n = l.batch * l.sequence;
@@ -224,7 +272,10 @@ pub fn encoder(b: *B, sites: *Sites, cfg: modern.Config, l: Layout, in: Inputs, 
         const q = try rope(b, try b.sliceLastDim(qkv, 0, h), tables, l, nh, h / nh);
         const k = try rope(b, try b.sliceLastDim(qkv, h, h * 2), tables, l, nh, h / nh);
         const v = try b.sliceLastDim(qkv, h * 2, h * 3);
-        const attn = try attention(b, sites, q, k, v, if (global) in.encoder_bias else in.local_bias, l, nh, h / nh, 0);
+        const attn = if (fused)
+            try fusedAttention(b, q, k, v, in.control, l, nh, h / nh, if (global) std.math.maxInt(u32) else cfg.local_attention_window / 2)
+        else
+            try attention(b, sites, q, k, v, if (global) in.encoder_bias else in.local_bias, l, nh, h / nh, 0);
         x = try b.add(x, try linear(b, attn, try std.fmt.bufPrint(&names, "{s}.attn.Wo", .{prefix}), n, h, h, false));
         const normed = try norm(b, x, try std.fmt.bufPrint(&names, "{s}.mlp_norm", .{prefix}), h, cfg.layer_norm_eps, false);
         const up = try linear(b, normed, try std.fmt.bufPrint(&names, "{s}.mlp.Wi", .{prefix}), n, h, cfg.intermediate_size * 2, false);

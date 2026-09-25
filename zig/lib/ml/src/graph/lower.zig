@@ -72,6 +72,7 @@ pub fn lower(allocator: std.mem.Allocator, graph: *const Graph) !LowerResult {
         // A materialized alternate would discard replay/control semantics and
         // reintroduce quadratic owners. These versioned kernels have a VJP.
         if (n.op == .fused_deberta_training_attention_v1 or n.op == .fused_deberta_training_attention_backward_v1) continue;
+        if (n.op == .fused_modernbert_training_attention_v1 or n.op == .fused_modernbert_training_attention_backward_v1) continue;
         if (n.op.isFused() and n.vjp_alternate != null_node) {
             if (n.vjp_alternate == i) return error.CyclicGraph;
             redirect[i] = n.vjp_alternate;

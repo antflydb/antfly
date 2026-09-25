@@ -112,11 +112,12 @@ fn exerciseWithBoundaryAttention(a: std.mem.Allocator, execution: controller.Exe
 
 /// A two-layer ModernBERT trunk (one global, one local layer) under the same
 /// full and heads-only jobs, cancellation, limits, and durable resume.
-fn exerciseModernBert(a: std.mem.Allocator, execution: controller.Execution) !void {
+/// `replay_tiled_v1` selects the fused trunk attention.
+fn exerciseModernBert(a: std.mem.Allocator, execution: controller.Execution, attention_profile: step.AttentionProfile) !void {
     var config = helper.config();
     config.backbone = .modern_bert;
     config.encoder = .{ .hidden_size = 4, .intermediate_size = 8, .num_hidden_layers = 2, .num_attention_heads = 2, .vocab_size = 512, .max_position_embeddings = 256, .position_buckets = 0, .layer_norm_eps = 1e-5, .hidden_dropout_prob = 0, .attention_probs_dropout_prob = 0, .pad_token_id = 0, .family = .modern_bert, .global_rope_theta = 160000, .local_rope_theta = 10000, .local_attention_window = 8, .global_attn_every_n_layers = 2 };
-    return exerciseConfig(a, execution, .materialized_v1, .retained_v1, false, config);
+    return exerciseConfig(a, execution, attention_profile, .retained_v1, false, config);
 }
 
 fn exerciseConfig(a: std.mem.Allocator, execution: controller.Execution, attention_profile: step.AttentionProfile, activation_profile: step.ActivationProfile, fused_boundary: bool, config: @import("../../models/gliner_boundary.zig").Config) !void {
@@ -342,13 +343,23 @@ fn exerciseConfig(a: std.mem.Allocator, execution: controller.Execution, attenti
 }
 
 test "boundary native trainer composes ModernBERT full and heads jobs with cancellation and durable partial resume" {
-    try exerciseModernBert(std.testing.allocator, .native);
+    try exerciseModernBert(std.testing.allocator, .native, .materialized_v1);
 }
 
 test "boundary native trainer resident Metal composes ModernBERT full and heads jobs with exact durable resume" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
-    try exerciseModernBert(std.testing.allocator, .resident_metal);
+    try exerciseModernBert(std.testing.allocator, .resident_metal, .materialized_v1);
+}
+
+test "boundary native trainer composes ModernBERT fused-attention full and heads jobs with durable partial resume" {
+    try exerciseModernBert(std.testing.allocator, .native, .replay_tiled_v1);
+}
+
+test "boundary native trainer resident Metal composes ModernBERT fused-attention full and heads jobs with exact durable resume" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+    try exerciseModernBert(std.testing.allocator, .resident_metal, .replay_tiled_v1);
 }
 
 test "boundary native trainer composes immutable batches full and heads training cancellation and durable partial resume" {
